@@ -1,15 +1,26 @@
-import type { Board } from "./bi-store"
+import type { Board } from "../contracts/dashboards"
 import type {
+  ChartLineage,
   CreateBoardInput,
   DashboardFolder,
   DashboardService,
+  JoinSuggestions,
+  RestoredItem,
+  RevertResult,
   SaveSqlSourceInput,
+  ShortcutItem,
+  Shortcuts,
   SqlSource,
   SqlSourcePreview,
+  TrashList,
   UpdateBoardInput,
+  VersionHistory,
+} from "../contracts/dashboards"
+import type {
+  CommentPerson, DashboardComment, EmbedInfo, GranteeMatches, ItemAccess, MoveEffect, PublicLink, PublicLinkState,
 } from "../contracts/dashboards"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor, type ServiceErrorCode } from "../errors"
 
 /**
  * DashboardService NYATA — board disimpan di ClickHouse
@@ -29,18 +40,46 @@ import { ServiceError } from "../errors"
  * with the server's message naming what is blocking it.
  */
 
+/**
+ * The service error code for a status: a 401 or 403 goes through `deniedFor`
+ * (`errors.ts`, WEB-12), so it never reaches here; 404 is "not found", a 5xx
+ * is the service being unavailable, the rest is a request the server refused.
+ * One rule for every call here.
+ */
+function codeFor(status: number): ServiceErrorCode {
+  if (status === 404) return "not_found"
+  if (status >= 500) return "unavailable"
+  return "invalid_request"
+}
+
 async function readJson<T>(res: Response): Promise<T> {
   const json = await res.json().catch(() => null)
   if (!res.ok) {
-    const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500
-            ? "unavailable"
-            : "invalid_request"
-    throw new ServiceError(kind, json?.error ?? `Gagal (${res.status})`)
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
+    throw new ServiceError(codeFor(res.status), json?.error ?? `Gagal (${res.status})`)
+  }
+  return json as T
+}
+
+/**
+ * A dashboard write's answer (BI-18 part C review fix (SHOULD-FIX) R19): the
+ * answer is checked, and a refusal throws with the server's sentence. A
+ * refusal without one says the status. The `code:` prefix the server may put
+ * in front of its sentence is for the log: the page shows the readable
+ * sentence (`readableErrorMessage`).
+ */
+async function checkedWrite<T>(res: Response): Promise<T> {
+  const json = await res.json().catch(() => null)
+  if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
+    throw new ServiceError(
+      codeFor(res.status),
+      json?.error ?? `The change was refused (${res.status}).`
+    )
   }
   return json as T
 }
@@ -53,15 +92,10 @@ async function request<T>(
   const res = await apiFetch(url, init)
   const json = await res.json().catch(() => null)
   if (!res.ok) {
-    const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500
-            ? "unavailable"
-            : "invalid_request"
-    throw new ServiceError(kind, json?.error ?? fallbackMessage)
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
+    throw new ServiceError(codeFor(res.status), json?.error ?? fallbackMessage)
   }
   return json as T
 }
@@ -77,7 +111,7 @@ async function writeBoard(
     body: JSON.stringify(body),
     signal,
   })
-  const json = await readJson<{ board?: Board }>(res)
+  const json = await checkedWrite<{ board?: Board }>(res)
   // PUT hanya mengembalikan `{ok:true}`; POST mengembalikan board barunya.
   return json.board ?? ({ id: String(body.id ?? ""), name: "" } as Board)
 }
@@ -108,7 +142,104 @@ export const clickhouseDashboardService: DashboardService = {
       method: "DELETE",
       signal,
     })
-    await readJson<unknown>(res)
+    await checkedWrite<unknown>(res)
+  },
+  /**
+   * Save the tile layout of a dashboard (`PUT /api/dashboard/boards`). The
+   * console's own write; it needs `dashboard:write`.
+   */
+  async saveBoardLayout(id, layout, signal) {
+    const res = await apiFetch("/api/dashboard/boards", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ id, layout }),
+      signal,
+    })
+    await checkedWrite<unknown>(res)
+  },
+  /**
+   * Delete one saved chart card (`DELETE /api/dashboard/specs`). It needs
+   * `dashboard:write`.
+   */
+  async deleteChart(id, signal) {
+    const res = await apiFetch(`/api/dashboard/specs?id=${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      signal,
+    })
+    await checkedWrite<unknown>(res)
+  },
+  /**
+   * Save a chart from the builder's high-level input (`WEB-7` D6). The
+   * server answers `{ chart }` on success and its own `{ error }` otherwise;
+   * the error is thrown as the service error whose message the builder
+   * shows, which is what the direct call it replaces did.
+   */
+  async saveChart(input, edit, signal) {
+    const res = await apiFetch("/api/dashboard/specs", {
+      method: edit ? "PUT" : "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(input),
+      signal,
+    })
+    if (!res.ok) {
+      const json = (await res.json().catch(() => null)) as { error?: string } | null
+      // WEB-12: a refusal goes through deniedFor (errors.ts).
+      const denied = deniedFor(res.status, json)
+      if (denied) throw denied
+      throw new ServiceError(codeFor(res.status), json?.error ?? "Failed to save chart", res.status)
+    }
+    // `BI-48`: the route answers `{ ok, chart }`; a tile's Duplicate places the
+    // new tile below the original by this id. An answer without one is `""`:
+    // the chart exists, and the caller saves no layout for it.
+    const json = (await res.json().catch(() => null)) as { chart?: { id?: unknown } } | null
+    return { id: typeof json?.chart?.id === "string" ? json.chart.id : "" }
+  },
+  /**
+   * The marts, by name (`WEB-7` D7). The route answers rows with them; the
+   * picker only needs what to call each one.
+   */
+  async listMarts(signal) {
+    const json = await request<{ marts?: { name?: string; rows?: number }[] }>(
+      "/api/dashboard/fields",
+      { cache: "no-store", signal },
+      "The marts could not be loaded"
+    )
+    return (json.marts ?? [])
+      .filter((mart): mart is { name: string; rows?: number } =>
+        typeof mart.name === "string" && mart.name.length > 0
+      )
+      .map((mart) => ({ name: mart.name }))
+  },
+  /**
+   * The measures of one mart (`WEB-7` D7). The route also answers its
+   * dimensions and kinds; a rule watches measures, so those are what it
+   * returns.
+   */
+  async listMartMeasures(mart, signal) {
+    const json = await request<{ measures?: string[] }>(
+      `/api/dashboard/fields?mart=${encodeURIComponent(mart)}`,
+      { cache: "no-store", signal },
+      "The fields could not be loaded"
+    )
+    return json.measures ?? []
+  },
+  /**
+   * One stored chart, read from the list the console already calls. The list
+   * is what the server has: there is no by-id route, and adding one is not
+   * this change's business (`WEB-7` D6).
+   */
+  async getChart(id, signal) {
+    const json = await request<{
+      charts?: { id: string; title?: string; board?: string; def?: Record<string, unknown> }[]
+    }>("/api/dashboard/specs", { cache: "no-store", signal }, "The chart could not be loaded")
+    const found = (json.charts ?? []).find((chart) => chart.id === id)
+    if (!found) return null
+    return {
+      id: found.id,
+      title: found.title ?? found.id,
+      board: found.board ?? "default",
+      def: found.def ?? {},
+    }
   },
 
   async listSqlSources(signal) {
@@ -147,6 +278,13 @@ export const clickhouseDashboardService: DashboardService = {
       "/api/dashboard/sources/preview",
       { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(chart ? { sql, chart } : { sql }), signal },
       "SQL source preview failed"
+    )
+  },
+  async joinSuggestions(left, right, signal) {
+    return request<JoinSuggestions>(
+      `/api/dashboard/join-suggestions?left=${encodeURIComponent(left)}&right=${encodeURIComponent(right)}`,
+      { cache: "no-store", signal },
+      "Join suggestions could not be loaded"
     )
   },
   async listFolders(signal) {
@@ -191,5 +329,262 @@ export const clickhouseDashboardService: DashboardService = {
       },
       "Dashboard could not be moved"
     )
+  },
+
+  // SEC-12. The server's messages for these are fixed and ours, so they are
+  // shown as they come (`request` carries `error` into the `ServiceError`).
+  async getEmbedInfo(board, signal, chart) {
+    const json = await request<Partial<EmbedInfo>>(
+      `/api/dashboard/embed-info?board=${encodeURIComponent(board)}${chart ? `&chart=${encodeURIComponent(chart)}` : ""}`,
+      { cache: "no-store", signal },
+      "Embedding state could not be loaded"
+    )
+    return {
+      enabled: Boolean(json.enabled),
+      supported: json.supported !== false,
+      reason: json.reason,
+      sampleToken: json.sampleToken,
+      maxLifetimeSeconds: json.maxLifetimeSeconds ?? 86_400,
+      revokedBefore: json.revokedBefore ?? null,
+      allowedOrigins: json.allowedOrigins ?? [],
+      filterModes: json.filterModes ?? {},
+      filterColumns: json.filterColumns ?? [],
+      hiddenOnlyColumns: json.hiddenOnlyColumns ?? [],
+    }
+  },
+  async setEmbedFilterModes(board, modes, signal) {
+    const res = await apiFetch("/api/dashboard/embed-settings", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ board, filterModes: modes }),
+      signal,
+    })
+    await checkedWrite<{ ok: boolean }>(res)
+  },
+  async listBoardCharts(board, signal) {
+    const json = await request<{ charts?: { id: string; title?: string; board?: string }[] }>(
+      "/api/dashboard/specs",
+      { cache: "no-store", signal },
+      "The charts could not be loaded"
+    )
+    return (json.charts ?? [])
+      .filter((c) => c.board === board)
+      .map((c) => ({ id: c.id, title: c.title ?? c.id }))
+  },
+  // BI-19 part A. The server's sentences are ours, so they are shown as they come.
+  async getPublicLink(board, signal) {
+    const json = await request<Partial<PublicLinkState>>(
+      `/api/dashboard/public-link?board=${encodeURIComponent(board)}`,
+      { cache: "no-store", signal },
+      "The public link could not be loaded"
+    )
+    return { enabled: json.enabled !== false, link: json.link ?? null }
+  },
+  async savePublicLink(input, signal) {
+    const res = await apiFetch("/api/dashboard/public-link", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(input),
+      signal,
+    })
+    const json = await checkedWrite<{ link: PublicLink }>(res)
+    return json.link
+  },
+  async endPublicLink(board, signal) {
+    const res = await apiFetch(`/api/dashboard/public-link?board=${encodeURIComponent(board)}`, {
+      method: "DELETE",
+      signal,
+    })
+    await checkedWrite<{ ok: boolean }>(res)
+  },
+  // BI-19 part E. The server's sentences are ours, so they are shown as they come.
+  async listComments(board, signal) {
+    const json = await request<{ comments?: DashboardComment[]; truncated?: boolean }>(
+      `/api/dashboard/comments?board=${encodeURIComponent(board)}`,
+      { cache: "no-store", signal },
+      "The comments could not be loaded"
+    )
+    return { comments: json.comments ?? [], truncated: json.truncated === true }
+  },
+  async postComment(input, signal) {
+    const res = await apiFetch("/api/dashboard/comments", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(input),
+      signal,
+    })
+    return await checkedWrite<DashboardComment>(res)
+  },
+  async editComment(id, body, mentions, signal) {
+    const res = await apiFetch(`/api/dashboard/comments/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(mentions === undefined ? { body } : { body, mentions }),
+      signal,
+    })
+    return await checkedWrite<DashboardComment>(res)
+  },
+  async deleteComment(id, signal) {
+    const res = await apiFetch(`/api/dashboard/comments/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      signal,
+    })
+    await checkedWrite<{ ok: boolean }>(res)
+  },
+  async commentPeople(board, query, signal) {
+    const json = await request<{ items?: CommentPerson[] }>(
+      `/api/dashboard/comments/people?board=${encodeURIComponent(board)}&q=${encodeURIComponent(query)}`,
+      { cache: "no-store", signal },
+      "The people could not be loaded"
+    )
+    return json.items ?? []
+  },
+  // BI-19 part B. The server's sentences are ours, so they are shown as they come.
+  async getAccess(kind, id, signal) {
+    return await request<ItemAccess>(
+      `/api/dashboard/access?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`,
+      { cache: "no-store", signal },
+      "The permissions could not be loaded"
+    )
+  },
+  async saveAccess(input, signal) {
+    const res = await apiFetch("/api/dashboard/access", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(input),
+      signal,
+    })
+    return await checkedWrite<ItemAccess>(res)
+  },
+  async findGrantees(query, signal) {
+    const json = await request<{ items?: GranteeMatches["people"]; roles?: GranteeMatches["roles"] }>(
+      `/api/reports/recipients?roles=1&q=${encodeURIComponent(query)}`,
+      { cache: "no-store", signal },
+      "People could not be searched"
+    )
+    return { people: json.items ?? [], roles: json.roles ?? [] }
+  },
+  async previewMove(board, folderId, signal) {
+    return await request<MoveEffect>(
+      `/api/dashboard/access-preview?board=${encodeURIComponent(board)}&folder=${encodeURIComponent(folderId)}`,
+      { cache: "no-store", signal },
+      "The effect of the move could not be worked out"
+    )
+  },
+  async setEmbedOrigins(board, origins, signal) {
+    const json = await request<{ embedOrigins?: string[] }>(
+      "/api/dashboard/boards",
+      {
+        method: "PUT",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ id: board, embedOrigins: origins }),
+        signal,
+      },
+      "Allowed sites could not be saved"
+    )
+    return json.embedOrigins ?? origins
+  },
+  async revokeAllEmbedTokens(board, signal) {
+    const json = await request<{ embedRevokedBefore?: number }>(
+      "/api/dashboard/boards",
+      {
+        method: "PUT",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ id: board, embedRevokeAll: true }),
+        signal,
+      },
+      "Embed tokens could not be withdrawn"
+    )
+    return json.embedRevokedBefore ?? 0
+  },
+  async revokeEmbedToken(board, token, signal) {
+    const json = await request<{ withdrawn?: string }>(
+      "/api/dashboard/embed-revoke",
+      {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ board, token }),
+        signal,
+      },
+      "The token could not be withdrawn"
+    )
+    return json.withdrawn ?? ""
+  },
+
+  // BI-18 part C, part 2. The server's sentences are fixed and ours (a revert
+  // that cannot be done says which chart and why), so they are shown as they come.
+  async listVersions(board, signal) {
+    return request<VersionHistory>(
+      `/api/dashboard/versions?board=${encodeURIComponent(board)}`,
+      { cache: "no-store", signal },
+      "Version history could not be loaded"
+    )
+  },
+  async revertToVersion(board, version, signal) {
+    return request<RevertResult>(
+      "/api/dashboard/versions/revert",
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ board, version }), signal },
+      "That version could not be restored"
+    )
+  },
+  async listTrash(signal) {
+    return request<TrashList>(
+      "/api/dashboard/trash",
+      { cache: "no-store", signal },
+      "The trash could not be loaded"
+    )
+  },
+  async restoreFromTrash(kind, id, signal) {
+    const json = await request<{ restored: RestoredItem }>(
+      "/api/dashboard/trash/restore",
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ kind, id }), signal },
+      "It could not be restored"
+    )
+    return json.restored
+  },
+  async ensurePersonalSpace(signal) {
+    const json = await request<{ folder: DashboardFolder }>(
+      "/api/dashboard/personal",
+      { method: "POST", signal },
+      "The personal space could not be opened"
+    )
+    return json.folder
+  },
+  async shortcuts(signal) {
+    const json = await request<Partial<Shortcuts>>(
+      "/api/dashboard/shortcuts",
+      { cache: "no-store", signal },
+      "Favourites could not be loaded"
+    )
+    return { favourites: json.favourites ?? [], recent: json.recent ?? [] }
+  },
+  async setFavourite(kind, id, on, signal) {
+    await request<{ ok: true }>(
+      "/api/dashboard/favourites",
+      { method: "PUT", headers: JSON_HEADERS, body: JSON.stringify({ kind, id, on }), signal },
+      "The favourite could not be saved"
+    )
+  },
+  async touchRecent(kind, id, signal) {
+    await request<{ ok: true }>(
+      "/api/dashboard/recent",
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ kind, id }), signal },
+      "Recent items could not be saved"
+    )
+  },
+  chartLineage(id, signal) {
+    return request<ChartLineage>(
+      `/api/dashboard/charts/${encodeURIComponent(id)}/lineage`,
+      { cache: "no-store", signal },
+      "Lineage is unavailable"
+    )
+  },
+  async searchItems(text, signal): Promise<ShortcutItem[]> {
+    const json = await request<{ hits?: ShortcutItem[] }>(
+      `/api/dashboard/search?q=${encodeURIComponent(text)}`,
+      { cache: "no-store", signal },
+      "Search is unavailable"
+    )
+    return json.hits ?? []
   },
 }

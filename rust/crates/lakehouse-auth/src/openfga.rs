@@ -43,21 +43,26 @@
 //! precedent rather than introducing a second dialing pattern into this
 //! crate.
 
+use std::time::Duration;
+
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::secret::Secret;
 
-/// The five machine principals every provisioned warehouse needs granted
+/// The four machine principals every provisioned warehouse needs granted
 /// onto it so the stack's existing services can actually read/write a
 /// new tenant's data — see the module doc comment for why this is a
 /// fixed list, not the calling user's own identity: these are the
 /// service accounts every warehouse needs regardless of who provisioned
 /// it. Matches `docker-compose.yml`'s `lakekeeper-authz-init`
 /// `grant()` calls exactly (verb sets included).
+/// How long a dropped table can be undropped: 7 days, the spec's retention
+/// window (`DATA-15` F4). The compose warehouse inits write the same number.
+pub const DELETE_RETENTION_SECONDS: u64 = 604_800;
+
 const MACHINE_GRANTS: &[(&str, &[&str])] = &[
     ("rust-iceberg", &["create", "modify", "select"]),
-    ("debezium", &["create", "modify", "select"]),
     ("dlt", &["create", "modify", "select"]),
     ("clickhouse-reader", &["select", "modify"]),
     ("trino", &["select", "modify"]),
@@ -105,6 +110,20 @@ fn classify_status(status: reqwest::StatusCode) -> Result<(), OpenfgaError> {
     }
 }
 
+/// Whether `text` is a non-empty plain identifier: an ASCII letter, a digit or
+/// `_`, nothing else (`DATA-55` D2). It is what may go into a catalog URL path,
+/// and it is the shape of an upload's table name (`[a-z0-9_]`). A `/`, a `.` or
+/// a percent-encoded byte would let a caller address another path, so anything
+/// else is refused before a request is built.
+///
+/// Public because the drop route asks it of a registry's table name BEFORE
+/// anything is written, with this one definition rather than a second copy
+/// (`DATA-55` review R7, QA `LH-DATA-15-06`, `TC-1731`).
+#[must_use]
+pub fn is_plain_identifier(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 #[derive(Debug, Deserialize)]
 struct WarehouseListResponse {
     warehouses: Vec<WarehouseEntry>,
@@ -114,6 +133,53 @@ struct WarehouseListResponse {
 struct WarehouseEntry {
     id: String,
     name: String,
+}
+
+/// A soft-deleted table `Lakekeeper` still lists (`DATA-15` F4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedTabular {
+    /// The table's id, which `undrop` takes.
+    pub id: String,
+    /// When it was dropped, RFC 3339.
+    pub deleted_at: String,
+    /// When it stops being recoverable, RFC 3339.
+    pub expires_at: String,
+}
+
+/// The outcome of looking for a soft-deleted table.
+// PR #106 review R1 SHOULD-FIX DATA-15 2
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletedTableLookup {
+    /// A soft-deleted table was found.
+    Found(DeletedTabular),
+    /// Reached the end of the deleted list without finding a matching table.
+    None,
+    /// The search reached the page limit (20 pages) while more pages remained.
+    CouldNotTell,
+}
+
+/// Pages of 100 `find_deleted_table` reads before it stops looking: a
+/// warehouse with more than 2,000 soft-deleted tables inside the window is
+/// not a case this lookup serves.
+const DELETED_LIST_MAX_PAGES: usize = 20;
+
+#[derive(Debug, Deserialize)]
+struct DeletedTabularsPage {
+    tabulars: Vec<DeletedTabularEntry>,
+    #[serde(rename = "next-page-token")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeletedTabularEntry {
+    id: String,
+    name: String,
+    namespace: Vec<String>,
+    typ: String,
+    #[serde(rename = "deleted-at")]
+    deleted_at: String,
+    #[serde(rename = "expiration-date")]
+    expiration_date: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,7 +262,16 @@ pub struct LakekeeperAdminClient {
     base_url: String,
     admin_token: Secret,
     http: reqwest::Client,
+    drop_timeout: Duration,
 }
+
+/// The bound on the drop's own `DELETE` (`DATA-55` review R1, QA
+/// `LH-DATA-15-06`, `TC-1731`): a catalog that accepts the connection and never
+/// answers becomes [`OpenfgaError::Transport`] after this, instead of holding
+/// the request until the route's own deadline drops the handler mid-drop.
+/// Fifteen seconds is longer than a healthy drop takes and shorter than the
+/// route's sixty.
+const DROP_TABLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl LakekeeperAdminClient {
     /// Build a client. `base_url` is `Lakekeeper`'s own base (no trailing
@@ -210,7 +285,19 @@ impl LakekeeperAdminClient {
             base_url: base_url.into(),
             admin_token,
             http: reqwest::Client::new(),
+            drop_timeout: DROP_TABLE_TIMEOUT,
         }
+    }
+
+    /// Set how long the drop's own request waits ([`DROP_TABLE_TIMEOUT`]).
+    ///
+    /// Exists for the test that proves a catalog which never answers ends the
+    /// drop as an unknown outcome without waiting fifteen seconds; a deployment
+    /// never calls it and always gets [`DROP_TABLE_TIMEOUT`].
+    #[must_use]
+    pub fn with_drop_timeout(mut self, bound: Duration) -> Self {
+        self.drop_timeout = bound;
+        self
     }
 
     /// Render the `Authorization` header value. Kept as its own method so
@@ -252,20 +339,12 @@ impl LakekeeperAdminClient {
         storage_prefix: &str,
         storage: &TenantWarehouseStorage,
     ) -> Result<String, OpenfgaError> {
-        let list_response = self
-            .http
-            .get(format!("{}/management/v1/warehouse", self.base_url))
-            .header("Authorization", self.auth_header())
-            .send()
-            .await
-            .map_err(|_| OpenfgaError::Transport)?;
-        classify_status(list_response.status())?;
-        let list: WarehouseListResponse = list_response
-            .json()
-            .await
-            .map_err(|_| OpenfgaError::Server)?;
-        if let Some(existing) = list.warehouses.iter().find(|w| w.name == name) {
-            return Ok(existing.id.clone());
+        if let Some(existing) = self.find_warehouse_id(name).await? {
+            // `DATA-15` F4: also on a warehouse that already exists, so a
+            // tenant warehouse made before soft delete shipped gets it on
+            // its next provisioning call.
+            self.set_soft_delete_profile(&existing).await?;
+            return Ok(existing);
         }
 
         let create_response = self
@@ -299,7 +378,240 @@ impl LakekeeperAdminClient {
             .json()
             .await
             .map_err(|_| OpenfgaError::Server)?;
+        self.set_soft_delete_profile(&created.warehouse_id).await?;
         Ok(created.warehouse_id)
+    }
+
+    /// The id of the warehouse called `name`, or `None` when there is none.
+    /// The lookup half of [`Self::ensure_warehouse`], also used by the asset
+    /// page's restore (`DATA-15` F4) to find the configured warehouse.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if the request never reaches
+    /// `Lakekeeper`; [`OpenfgaError::Rejected`] on a `4xx`;
+    /// [`OpenfgaError::Server`] on a `5xx` or a body that does not parse.
+    pub async fn find_warehouse_id(&self, name: &str) -> Result<Option<String>, OpenfgaError> {
+        let response = self
+            .http
+            .get(format!("{}/management/v1/warehouse", self.base_url))
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .map_err(|_| OpenfgaError::Transport)?;
+        classify_status(response.status())?;
+        let list: WarehouseListResponse =
+            response.json().await.map_err(|_| OpenfgaError::Server)?;
+        Ok(list
+            .warehouses
+            .into_iter()
+            .find(|w| w.name == name)
+            .map(|w| w.id))
+    }
+
+    /// The newest soft-deleted table `namespace.table` in `warehouse_id`, if
+    /// `Lakekeeper` still lists one (`DATA-15` F4). Lists the warehouse's
+    /// deleted tabulars page by page (at most [`DELETED_LIST_MAX_PAGES`]
+    /// pages of 100) and matches on the namespace and name here: the
+    /// endpoint filters by namespace *id*, which the product does not hold.
+    /// An entry whose `expires_at` has passed may still be listed until
+    /// `Lakekeeper` purges it; the caller compares the date.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if a request never reaches `Lakekeeper`;
+    /// [`OpenfgaError::Rejected`] on a `4xx`; [`OpenfgaError::Server`] on a
+    /// `5xx` or a body that does not parse.
+    // PR #106 review R1 SHOULD-FIX DATA-15 2
+    pub async fn find_deleted_table(
+        &self,
+        warehouse_id: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<DeletedTableLookup, OpenfgaError> {
+        let mut found: Option<DeletedTabular> = None;
+        let mut token: Option<String> = None;
+        for _ in 0..DELETED_LIST_MAX_PAGES {
+            let mut request = self
+                .http
+                .get(format!(
+                    "{}/management/v1/warehouse/{warehouse_id}/deleted-tabulars",
+                    self.base_url
+                ))
+                .header("Authorization", self.auth_header())
+                .query(&[("pageSize", "100")]);
+            if let Some(token) = &token {
+                request = request.query(&[("pageToken", token.as_str())]);
+            }
+            let response = request.send().await.map_err(|_| OpenfgaError::Transport)?;
+            classify_status(response.status())?;
+            let page: DeletedTabularsPage =
+                response.json().await.map_err(|_| OpenfgaError::Server)?;
+            for t in page.tabulars {
+                let matches = t.typ == "table"
+                    && t.name == table
+                    && t.namespace.len() == 1
+                    && t.namespace[0] == namespace;
+                if !matches {
+                    continue;
+                }
+                let candidate = DeletedTabular {
+                    id: t.id,
+                    deleted_at: t.deleted_at,
+                    expires_at: t.expiration_date,
+                };
+                // Dropped and recreated more than once: the newest drop.
+                if found
+                    .as_ref()
+                    .is_none_or(|best| candidate.deleted_at > best.deleted_at)
+                {
+                    found = Some(candidate);
+                }
+            }
+            match page.next_page_token {
+                Some(next) if !next.is_empty() => token = Some(next),
+                _ => {
+                    token = None;
+                    break;
+                }
+            }
+        }
+        if let Some(tabular) = found {
+            Ok(DeletedTableLookup::Found(tabular))
+        } else if token.is_some() {
+            // PR #106 review R1 SHOULD-FIX DATA-15 2: stopped after 20 pages with more pages remaining
+            Ok(DeletedTableLookup::CouldNotTell)
+        } else {
+            Ok(DeletedTableLookup::None)
+        }
+    }
+
+    /// Undrops the soft-deleted table `tabular_id` in `warehouse_id`
+    /// (`DATA-15` F4). A `4xx` (for instance a table of that name exists
+    /// again) is [`OpenfgaError::Rejected`].
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if the request never reaches
+    /// `Lakekeeper`; [`OpenfgaError::Rejected`] on a `4xx`;
+    /// [`OpenfgaError::Server`] on a `5xx`.
+    pub async fn undrop_table(
+        &self,
+        warehouse_id: &str,
+        tabular_id: &str,
+    ) -> Result<(), OpenfgaError> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/management/v1/warehouse/{warehouse_id}/deleted-tabulars/undrop",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header())
+            .json(&json!({ "targets": [{ "id": tabular_id, "type": "table" }] }))
+            .send()
+            .await
+            .map_err(|_| OpenfgaError::Transport)?;
+        classify_status(response.status())
+    }
+
+    /// Drops the table `namespace`.`table` in `warehouse_id` through the
+    /// Iceberg REST catalog (`DATA-55` D2/D3; QA `LH-DATA-15-06`, `TC-1731`).
+    ///
+    /// This is the catalog's drop, sent as the admin principal — the identity
+    /// that also undrops a table, so "who drops is who undrops" (D3). On a
+    /// warehouse whose delete profile is soft the table is kept for
+    /// [`DELETE_RETENTION_SECONDS`] and can be undropped; the caller writes
+    /// that profile first ([`Self::set_soft_delete_profile`]) and drops
+    /// nothing if it could not. There is no `purgeRequested` query: a purge
+    /// is exactly the hard delete this feature promises not to make, and the
+    /// same request without one is what the G3a gate sends and what
+    /// `iceberg-catalog-rest` 0.10.1's `drop_table` sends.
+    ///
+    /// `namespace` and `table` go into a URL path, so each must be a plain
+    /// identifier (ASCII letter, digit or `_`, non-empty); an upload's table
+    /// name is `[a-z0-9_]`. Anything else is [`OpenfgaError::Rejected`] and
+    /// nothing is sent.
+    ///
+    /// Returns `Ok(false)` when the catalog holds no table of that name (a
+    /// `404`), `Ok(true)` when it dropped one. A failed send is
+    /// [`OpenfgaError::Transport`], and every other status is classified by
+    /// [`classify_status`].
+    ///
+    /// The request has a bound of its own ([`DROP_TABLE_TIMEOUT`]): a catalog
+    /// that never answers ends as [`OpenfgaError::Transport`] rather than
+    /// holding the caller until its own deadline.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if the request never reaches the catalog, or
+    /// the connection is lost, or the bound passes — including a connection lost
+    /// AFTER the catalog acted, which is why a caller treats this as "the
+    /// outcome is not known" rather than "nothing happened"; [`OpenfgaError::Rejected`]
+    /// on a `4xx`, or on a name that is not a plain identifier;
+    /// [`OpenfgaError::Server`] on a `5xx`.
+    pub async fn drop_table(
+        &self,
+        warehouse_id: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<bool, OpenfgaError> {
+        if !is_plain_identifier(namespace) || !is_plain_identifier(table) {
+            return Err(OpenfgaError::Rejected);
+        }
+        let response = self
+            .http
+            .delete(format!(
+                "{}/catalog/v1/{warehouse_id}/namespaces/{namespace}/tables/{table}",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header())
+            // `DATA-55` review R1: a catalog that accepts the connection and
+            // never answers must not hold the drop until the route's own
+            // deadline cuts the handler in half. Fifteen seconds is longer than
+            // a healthy drop takes and short enough to end as a known
+            // [`OpenfgaError::Transport`] the caller can act on.
+            .timeout(self.drop_timeout)
+            .send()
+            .await
+            .map_err(|_| OpenfgaError::Transport)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        classify_status(response.status())?;
+        Ok(true)
+    }
+
+    /// Makes a dropped table in `warehouse_id` soft-deleted for
+    /// [`DELETE_RETENTION_SECONDS`] (7 days) instead of hard-deleted, so it
+    /// can be undropped (`DATA-15` F4). `Lakekeeper` 0.13.3 defaults to a
+    /// hard delete, which cannot come back. Idempotent: the same profile
+    /// written twice is the same profile. A failure is returned, not
+    /// swallowed: a warehouse left on hard delete would silently lose the
+    /// restore the asset page promises.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if the request never reaches
+    /// `Lakekeeper`; [`OpenfgaError::Rejected`] on a `4xx`;
+    /// [`OpenfgaError::Server`] on a `5xx`.
+    pub async fn set_soft_delete_profile(&self, warehouse_id: &str) -> Result<(), OpenfgaError> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/management/v1/warehouse/{warehouse_id}/delete-profile",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header())
+            .json(&json!({
+                "delete-profile": {
+                    "type": "soft",
+                    "expiration-seconds": DELETE_RETENTION_SECONDS
+                }
+            }))
+            .send()
+            .await
+            .map_err(|_| OpenfgaError::Transport)?;
+        classify_status(response.status())
     }
 
     /// Grant [`MACHINE_GRANTS`] onto `warehouse_id`. A `409` response (an
@@ -336,5 +648,60 @@ impl LakekeeperAdminClient {
             }
         }
         Ok(())
+    }
+
+    /// Grant the `select` relation on ONE namespace to `principal`.
+    ///
+    /// ADR 0016 point 3: the `outside-readers` principal must be able to
+    /// READ the `gold` namespace — and only that namespace, so the
+    /// catalog itself refuses anything outside `gold` even if the API had
+    /// a bug. This is the FIRST namespace-scoped grant in this stack:
+    /// every other grant here is warehouse-scoped, because every other
+    /// principal here needs its reach across the whole warehouse.
+    ///
+    /// `Lakekeeper` 0.13's namespace assignments endpoint is
+    /// `POST /management/v1/permissions/namespace/{id}/assignments`,
+    /// where `{id}` is the namespace's UUID — the catalog's own namespace
+    /// load answers it as the `namespace_id` property. The relation set
+    /// a namespace accepts is `ownership`, `pass_grants`,
+    /// `manage_grants`, `describe`, `select`, `create`, `modify`;
+    /// `select` is the one an outside reader needs.
+    ///
+    /// Idempotent: `204` granted, `409` an identical tuple already
+    /// exists (a re-run against an already-granted stack) — both fine,
+    /// exactly as [`Self::grant_machine_principals`] treats them.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if a request never reaches
+    /// `Lakekeeper`; [`OpenfgaError::Rejected`] on a `4xx` (our request
+    /// was refused — an unknown namespace, a principal the catalog does
+    /// not know); [`OpenfgaError::Server`] on a `5xx`.
+    pub async fn grant_namespace_select(
+        &self,
+        namespace_id: &str,
+        principal: &str,
+    ) -> Result<(), OpenfgaError> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/management/v1/permissions/namespace/{namespace_id}/assignments",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header())
+            .json(&json!({
+                "writes": [{ "type": "select", "user": format!("oidc~{principal}") }]
+            }))
+            .send()
+            .await
+            .map_err(|_| OpenfgaError::Transport)?;
+        let status = response.status();
+        if status.as_u16() == 409 {
+            // An identical tuple already exists (a re-run against an
+            // already-granted stack) — the same shape
+            // `grant_machine_principals` treats as success.
+            return Ok(());
+        }
+        classify_status(status)
     }
 }

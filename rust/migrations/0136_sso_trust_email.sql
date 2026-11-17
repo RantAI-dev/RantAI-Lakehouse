@@ -1,0 +1,20 @@
+-- `SEC-65` (D3): "trust this provider's emails", saved from
+-- Settings → Sign-in alongside the rest of the single sign-on settings
+-- (`ADM-12`, `0134_sso_settings.sql`).
+--
+-- Why this column: since `SEC-65`, single sign-on joins an existing account
+-- by email only when the provider confirmed the address (`email_verified:
+-- true`). Some providers never send that claim, and without an escape hatch
+-- their users could never reach an existing account again. This is the
+-- escape hatch: one switch per connection, off by default, that says the
+-- deployment trusts whatever address this provider reports.
+--
+-- Nullable, like every other setting column in this table: NULL means "not
+-- set in the console", so the resolver falls through to `OIDC_TRUST_EMAIL`
+-- and then to the code default (off). A server-set `OIDC_TRUST_EMAIL` owns
+-- the value as a unit and the console cannot change it, exactly like
+-- `oidc_jit_provisioning`.
+--
+-- No backfill: an existing row keeps NULL, which resolves to "off", the
+-- safe value this task exists to establish.
+ALTER TABLE sso_settings ADD COLUMN IF NOT EXISTS oidc_trust_email BOOLEAN;

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """G9 acceptance test (file upload, DATA-9): a file is uploaded, previewed,
 loaded into a raw table, loaded again with `append`, deleted, and the table is
-checked to be still there -- the end-to-end proof that the upload routes, the
-`file_ingest_job` run and the query route work together on a deployed stack,
-which their unit and route tests, each with the other side faked, cannot show.
-T9 of `docs/superpowers/plans/2026-10-02-upload-file.md`, under ADR 0014.
+checked to be still there, and then a pipeline is built over that uploaded
+table, re-run by a re-upload of it, left alone by an upload into another
+table, and traced back to the upload in lineage -- the end-to-end proof that
+the upload routes, the `file_ingest_job` run, the dependency sensor and the
+query route work together on a deployed stack, which their unit and route
+tests, each with the other side faked, cannot show. T9 of
+`docs/superpowers/plans/2026-10-02-upload-file.md`, under ADR 0014; step 10
+is `DATA-19`
+(`docs/superpowers/plans/2026-10-14-data-19-uploads-feed-pipelines.md`).
 
 # What it checks, in order
 
@@ -27,9 +32,14 @@ T9 of `docs/superpowers/plans/2026-10-02-upload-file.md`, under ADR 0014.
 4. It loads the same upload again with `append`: the table holds twice the
    rows.
 5. It reads the table's rows back: they are the file's own text, leading zeros
-   intact. And every column is text, as ClickHouse types it (`toTypeName`):
-   `file_ingest.py` declares them so because dlt would otherwise type what it
-   recognises.
+   intact. And every column has the type the load was told (`DATA-18`, T3.6):
+   step 3 sends the column list the preview offered, as the console does, so
+   `plnt` and `qty` come out `Int64` and `material` (`0000100`, a leading zero)
+   `String`, as ClickHouse types them (`toTypeName`). Until `DATA-18` this step
+   asserted that EVERY column was text, because the load had no way to type one;
+   the assertion changed on purpose, not to get green: text everywhere is now what
+   a caller that sends NO column list gets (decision 11), and the workbook, Parquet
+   and typed steps below prove that case and the typed one separately.
 6. `GET /api/governance/ingest-runs` holds exactly one row per load, both
    `succeeded`, with the rows loaded and no error.
 7. It deletes the upload: the answer is 204, the upload is gone from the list
@@ -54,6 +64,68 @@ T9 of `docs/superpowers/plans/2026-10-02-upload-file.md`, under ADR 0014.
    `ingest_run`, and deletes the upload. The API converts the file and stores
    the text beside it; the load job is the one step 3 runs, unchanged.
 
+10. An uploaded table feeding a pipeline (`DATA-19`,
+    `docs/superpowers/plans/2026-10-14-data-19-uploads-feed-pipelines.md`):
+    it authors a `bronze.<table>` -> `silver.<table>_clean` pipeline whose
+    `dependsOn` names `file_ingest_job` -- the console's "Run again after
+    this table is re-uploaded" switch, sent here as the field it sends --
+    activates it, waits for the orchestrator to build the job, triggers one
+    run and waits for it to succeed, and reads the Silver table through
+    `POST /api/query/run`. Then it re-uploads the same table with ONE row
+    changed, expects the pipeline to run AGAIN on its own (no trigger call:
+    the `authored__<id>_after` sensor fired on the new `file_ingest_job`
+    SUCCESS), and expects the Silver table to show the change. Then it loads
+    a file into a DIFFERENT table and expects the pipeline NOT to run again
+    -- the sensor counts only the runs that loaded its own source table.
+    Finally it asks the lineage route for the Silver table and expects the
+    chain `upload:<id> -> bronze.<table> -> silver.<table>_clean`.
+
+8. SEC-17: it uploads a CSV file with 1,001 columns. Its preview answers 400
+   with "The file has more than 1,000 columns." and the same file read with
+   another delimiter previews again; a load request for it answers 400 with the
+   same sentence, before any table name is claimed. The upload is deleted.
+
+9. Several files into one table (`DATA-17` slice 5, decision 4): it uploads three
+   CSV files with the same columns, one of them with its columns in another order,
+   and a fourth with an extra column. The comparison lists only the fourth, with the
+   extra column named. A load of all four is refused (400) with the file named, and
+   nothing is claimed or marked. A load of the first three is accepted as ONE run:
+   the table holds every row of the three files, each value under its own column
+   (the reordered file proves columns are matched by name), the row count is the
+   sum, there is one `ingest_run` row, the other two files settle as `ingested`
+   with `loadedWith` naming the first, and lineage says "<first file> and 2 more".
+   The four uploads are deleted at the end; the table stays.
+
+10. Folders for uploaded files (`DATA-35`,
+    `docs/superpowers/plans/2026-10-26-data-35-upload-folders.md`, decisions 2, 3 and 8):
+    it makes folders two levels deep and a third, and a fourth level is refused (400) with
+    the limit named. It loads a file into a new table choosing the inner folder; the upload
+    is in it. Deleting the inner folder (it holds a file) and its parent (it holds a folder)
+    is refused (409). A second file is moved to another folder and out again. A re-upload
+    into the same table, naming no folder, joins the table's folder. Then every file is
+    moved out, the three folders are deleted (204) and are gone from the list. The files
+    are deleted; the table stays.
+
+11. A workbook that asks for more memory than the machine has (`SEC-22`): it
+    uploads `ops/fixtures/uploads/hostile/huge_shared_strings.xlsx`, whose
+    shared strings declare two billion strings, so the file asks for 48 GB
+    before a single cell is read. The upload is refused with the one
+    sentence of `SEC-22` D4 ("This file needs more memory or time to read
+    than an upload is allowed. Save it as CSV and upload that instead."),
+    because the read happens in a child process that runs under a memory
+    limit and the CHILD is the one that ends. The API is still there: the
+    list of the uploads answers 200.
+
+12. A table name of the full 128 characters (`DATA-50`, `LH-DATA-9-37`): one
+    file loads into it with `replace` and again with `append`, and the table
+    holds both loads' rows. QA found the load failing at 52 characters while
+    the page and the API accept 128: `dlt` names the pipeline
+    `bronze_ingest_<table>` and refuses a schema name past 64 characters,
+    which is a table name past 50. The count is read through
+    `POST /api/query/run`, under a `WHERE` (R11), so the catalog server and the
+    query engine are proven to take the name too. Every version of the table
+    names the person who started the loads (`DATA-52`).
+
 Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 <reason>` on stderr and exit code 1.
 
@@ -68,9 +140,17 @@ Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
   API itself is set to.
 - `DAGSTER_URL`: the Dagster GraphQL endpoint. Optional: when set, the gate
   waits for the code location to list `file_ingest_job` before it starts.
+  Step 10 needs it: without it the gate cannot prove the orchestrator built
+  the authored job it authors, and it says so instead of pretending.
 - `G9_TENANT_ID`: a tenant the account belongs to, sent as `X-Tenant`.
   Optional: without it the gate puts the account into the seeded tenant
   `meridian-group` (`step_ensure_tenant`) and sends that tenant's id.
+
+Step 10 also needs the stack to have `PIPELINE_RUN_TOKEN` set (the same
+value for `lakehouse-api` and the Dagster code location). Unset, the code
+location loads zero authored jobs and zero chain sensors, so the gate's
+first wait would fail with "the orchestrator never built the job" -- which
+is the honest answer for such a stack.
 
 It reads the fixtures from `ops/fixtures/uploads/`, `ops/fixtures/workbooks/` and
 `ops/fixtures/parquet/` beside this directory, so a container that runs it needs `ops/` and not only
@@ -81,7 +161,10 @@ It reads the fixtures from `ops/fixtures/uploads/`, `ops/fixtures/workbooks/` an
 The raw tables `g9_upload_<suffix>` (four rows), `g9_upload_<suffix>_xlsx`
 (three) and `g9_upload_<suffix>_parquet` (three) with their Iceberg files and
 catalog entries; the claims on their names, which are never released; four
-`ingest_run` rows; audit events and query history entries. A raw table and
+`ingest_run` rows; audit events and query history entries. Step 10 adds the
+Silver table `g9_upload_<suffix>_clean` (two rows, written by the authored
+pipeline), its authored pipeline row and its version row, the corrected copy's
+`ingest_run` row, and the claim on `g9_upload_<suffix>_other`. A raw table and
 its claim cannot be removed through the API (deleting a raw table is outside
 the plan, section 5), so an operator who wants them gone removes them by hand.
 The upload itself is deleted at the end, and also when a step fails, as far as
@@ -90,12 +173,15 @@ the API lets it (an upload that is still loading cannot be deleted).
 from __future__ import annotations
 
 import argparse
+import gzip
+import io
 import json
 import os
 import re
 import secrets
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "uploads"
@@ -140,6 +226,30 @@ LOAD_TIMEOUT_S = 240
 # ClickHouse's `DataLakeCatalog` engine after the run that wrote it reported
 # success (`g6_ingest_matrix_test.py` polls for the same reason, for 30 s).
 VISIBLE_TIMEOUT_S = 60
+
+# DATA-19 step 10. An authored pipeline needs its job BUILT before it can
+# be triggered, and the build happens on the code-location reload the
+# activate call asks for -- a cold code server on a stack that has just
+# booted is the slow case, so these are bounds for a slow stack, not
+# measurements.
+JOB_BUILT_TIMEOUT_S = 300
+# One authored run: read Bronze through the job's own `DataLakeCatalog`
+# database, write Silver, report the row delta.
+PIPELINE_RUN_TIMEOUT_S = 420
+# `GET /api/pipelines/{id}/runs` speaks the API's own vocabulary, not
+# Dagster's: `lakehouse_dagster::map_run_status` renders a run's SUCCESS
+# as `completed` and its FAILURE as `failed`, and every other state as
+# `queued` / `running` / `cancelled` / `unknown`. The gate matches those
+# words, so a run that succeeded is never mistaken for one that is still
+# going.
+RUN_COMPLETED = "completed"
+RUN_FAILED = "failed"
+
+# How long the gate watches a pipeline that must NOT run. Longer than a
+# sensor evaluation: Dagster's daemon evaluates a run-status sensor on its
+# tick, so anything shorter would prove nothing -- a sensor that fired late
+# would read as "did not fire".
+NO_RETRIGGER_WAIT_S = 180
 
 API_URL = os.environ.get("LAKEHOUSE_API_URL", "http://lakehouse-api:8080")
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "")
@@ -327,7 +437,16 @@ def step_upload_and_preview(api, state: dict) -> tuple[str, dict, dict]:
     listed = _expect(api.get(f"{API_URL}/api/uploads", timeout=30), 200, "GET /api/uploads").json()
     if upload_id not in [u.get("id") for u in listed]:
         raise G9Failure("the new upload is not in this tenant's list")
-    return upload_id, preview["using"], expected
+    # What the console does with the preview: the guessed list goes back with Load (DATA-18).
+    specs = preview.get("columnSpecs") or []
+    if [c["source"] for c in specs] != expected["columns"]:
+        raise G9Failure(f"the preview offers columns {[c.get('source') for c in specs]}, the fixture says {expected['columns']}")
+    columns = [
+        {k: c[k] for k in ("source", "name", "type", "dateFormat", "timezone") if k in c and c[k] is not None} for c in specs
+    ]
+    state["column_types"] = {c["name"]: c["type"] for c in columns}
+    print(f"[g9] guessed types: {state['column_types']}")
+    return upload_id, {**preview["using"], "columns": columns, "onBadValue": "stop"}, expected
 
 
 def step_load(api, upload_id: str, table: str, mode: str, using: dict, file_rows: int, table_rows: int) -> None:
@@ -342,6 +461,8 @@ def step_load(api, upload_id: str, table: str, mode: str, using: dict, file_rows
             # A workbook is loaded one sheet at a time; the API reads UTF-8 and
             # commas for it whatever `encoding` and `delimiter` say.
             **({"sheet": using["sheet"]} if using.get("sheet") else {}),
+            # DATA-18: the column list, when the caller has one (the console always sends it).
+            **({"columns": using["columns"], "onBadValue": using.get("onBadValue", "stop")} if using.get("columns") else {}),
         },
         timeout=60,
     )
@@ -385,13 +506,29 @@ def step_load(api, upload_id: str, table: str, mode: str, using: dict, file_rows
     print(f"[g9] {mode}: the table holds {table_rows} rows (counted under a WHERE)")
 
 
-def step_rows_and_types(api, table: str, expected: dict) -> None:
+# What ClickHouse calls the type each column type is stored as (`toTypeName`).
+CLICKHOUSE_TYPE = {
+    "text": "String",
+    "integer": "Int64",
+    "decimal": "Decimal(38, 9)",
+    "boolean": "Bool",
+    "date": "Date32",
+    "timestamp": "DateTime64",
+    "float": "Float64",
+}
+
+
+def step_rows_and_types(api, table: str, expected: dict, column_types: dict) -> None:
     columns = ["plnt", "material", "description", "qty"]
     body = run_query(api, f"SELECT {', '.join(columns)} FROM {QUERY_DB}.`bronze.{table}` WHERE 1 ORDER BY material, plnt")
-    got = [[row[c] for c in columns] for row in body["rows"]]
+    # Compared as text: `plnt` and `qty` are integers now, `material` keeps its leading zeros.
+    # DATA-29: `/api/query/run` answers a NULL cell as JSON `null`, so a cell that holds no
+    # value reads as the empty value here -- this gate compares text, and these columns are
+    # typed plain, so a null cell is not a value the file had. It must not print Python's
+    # `None` as if it were the cell's text.
+    got = [["" if row[c] is None else str(row[c]) for c in columns] for row in body["rows"]]
     want = sorted(expected["rows"], key=lambda r: (r[1], r[0]))
-    # The table holds the file twice after the append: compare the distinct rows,
-    # in the file's own text (`0000100`, not `100`).
+    # The table holds the file twice after the append: compare the distinct rows.
     distinct = [list(r) for r in sorted({tuple(r) for r in got}, key=lambda r: (r[1], r[0]))]
     if distinct != want:
         raise G9Failure(f"the table holds {distinct}, the file says {want}")
@@ -402,10 +539,16 @@ def step_rows_and_types(api, table: str, expected: dict) -> None:
         + ", ".join(f"toTypeName({c}) AS t_{c}" for c in columns)
         + f" FROM {QUERY_DB}.`bronze.{table}` WHERE 1 LIMIT 1",
     )["rows"][0]
-    not_text = {c: types[f"t_{c}"] for c in columns if "String" not in types[f"t_{c}"]}
-    if not_text:
-        raise G9Failure(f"every column should be text, these are not: {not_text}")
-    print(f"[g9] the rows are the file's own text and every column is text ({types['t_plnt']})")
+    wrong = {
+        c: (types[f"t_{c}"], CLICKHOUSE_TYPE[column_types[c]])
+        for c in columns
+        if CLICKHOUSE_TYPE[column_types[c]] not in types[f"t_{c}"]
+    }
+    if wrong:
+        raise G9Failure(f"these columns are not the type the load was told (got, wanted): {wrong}")
+    if column_types["material"] != "text" or "String" not in types["t_material"]:
+        raise G9Failure("a column with leading zeros (`0000100`) must stay text, whatever else is typed")
+    print(f"[g9] the rows are the file's own values and each column has the type it was told: {column_types}")
 
 
 def step_one_ingest_run_per_load(api, upload_id: str, table: str, file_rows: int) -> None:
@@ -435,6 +578,55 @@ def step_delete_keeps_the_table(api, upload_id: str, table: str, table_rows: int
     if left != table_rows:
         raise G9Failure(f"deleting the upload should keep the table's {table_rows} rows, it holds {left}")
     print(f"[g9] the upload is gone and the table keeps its {left} rows")
+
+
+# SEC-17: the sentence for the column cap, as `routes/uploads.rs` words it
+# (`JOB_TOO_MANY_COLUMNS`) and `file_ingest.py` records it (`TOO_MANY_COLUMNS`).
+TOO_MANY_COLUMNS = "The file has more than 1,000 columns."
+# The one sentence of `SEC-22` D4 for a file that needed more memory or more
+# time than a read is allowed: a child that was killed, ran out of time or ran
+# out of memory looks the same from here.
+NEEDS_MORE_MEMORY = (
+    "This file needs more memory or time to read than an upload is allowed. "
+    "Save it as CSV and upload that instead."
+)
+
+
+def step_column_cap(api) -> None:
+    """A file of 1,001 columns is refused at the preview and at the load request,
+    with the one sentence, and a delimiter that reads it as fewer columns
+    previews again (a wrong guess must not lock a good file out). The 400 at the
+    load request comes before any claim, mark or launch, so nothing is left
+    behind but the upload, which is deleted."""
+    header = ",".join(f"c{n}" for n in range(1_001))
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={"file": ("g9_wide.csv", f"{header}\n1\n".encode(), "text/csv")},
+        timeout=60,
+    )
+    upload_id = _expect(resp, 201, "POST /api/uploads (1,001 columns)").json()["id"]
+    try:
+        refused = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}/preview", timeout=30), 400, "preview of 1,001 columns")
+        if refused.json().get("error") != TOO_MANY_COLUMNS:
+            raise G9Failure(f"the preview's 400 should say {TOO_MANY_COLUMNS!r}, it said {refused.text[:200]}")
+        again = _expect(
+            api.get(f"{API_URL}/api/uploads/{upload_id}/preview", params={"delimiter": ";"}, timeout=30),
+            200,
+            "preview of the same file with another delimiter",
+        ).json()
+        if len(again.get("columns", [])) != 1:
+            raise G9Failure(f"with ';' the file is one column, the preview shows {again.get('columns')}")
+        body = {"bronzeTable": f"g9_wide_{secrets.token_hex(4)}", "encoding": "utf-8", "delimiter": ",", "headerRow": 0}
+        ingest = _expect(api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json=body, timeout=30), 400, "ingest of 1,001 columns")
+        if ingest.json().get("error") != TOO_MANY_COLUMNS:
+            raise G9Failure(f"the ingest's 400 should say {TOO_MANY_COLUMNS!r}, it said {ingest.text[:200]}")
+        print("[g9] 1,001 columns: refused at the preview and at the load request, one column under ';'")
+    finally:
+        # Never loaded, so the delete is allowed; a failed delete must not hide
+        # the failure that matters, so it is reported and not raised.
+        gone = api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30)
+        if gone.status_code != 204:
+            print(f"[g9] cleanup: DELETE of the wide upload answered {gone.status_code}", file=sys.stderr)
 
 
 def step_workbook(api, base_table: str, state: dict) -> None:
@@ -570,6 +762,1031 @@ def step_parquet(api, base_table: str, state: dict) -> None:
     print("[g9] parquet: PASS (the upload is gone, the table stays)")
 
 
+def step_hostile_workbook(api, state: dict) -> None:
+    """A workbook that asks for more memory than the machine has must not end
+    the API (`SEC-22`).
+
+    The fixture is a real workbook whose shared strings declare two billion
+    strings: the reader reserves room for all of them before it reads one, so
+    the file asks for 48 GB. The read happens in a child process that runs
+    under a memory limit, so the CHILD is the one that ends, and the answer is
+    the one sentence of `SEC-22` D4. The upload itself is refused, so there is
+    no upload to preview: the API reads the workbook to list its sheets when it
+    arrives.
+
+    The API is still there afterwards: the list of the uploads answers 200.
+    """
+    path = FIXTURES / "hostile" / "huge_shared_strings.xlsx"
+    if not path.is_file():
+        raise G9Failure(f"fixture missing: {path} (this gate reads ops/fixtures/uploads/ beside it)")
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={
+            "file": (
+                "hostile.xlsx",
+                path.read_bytes(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+        timeout=120,
+    )
+    if resp.status_code != 400:
+        raise G9Failure(
+            f"the hostile workbook should be refused with 400, it answered {resp.status_code}: {resp.text[:200]}"
+        )
+    if resp.json().get("error") != NEEDS_MORE_MEMORY:
+        raise G9Failure(
+            f"the refusal should say {NEEDS_MORE_MEMORY!r}, it said {resp.text[:200]}"
+        )
+    _expect(api.get(f"{API_URL}/api/uploads", timeout=30), 200, "GET /api/uploads after the hostile workbook")
+    print("[g9] hostile workbook: refused with the one sentence, the API is still there")
+
+
+def _dagster_lists_job(requests, job_name: str) -> bool:
+    """Whether the code location's job list holds `job_name`."""
+    query = "{ repositoriesOrError { ... on RepositoryConnection { nodes { jobs { name } } } } }"
+    resp = requests.post(DAGSTER_URL, json={"query": query}, timeout=10)
+    resp.raise_for_status()
+    nodes = (resp.json().get("data") or {}).get("repositoriesOrError", {}).get("nodes") or []
+    return any(job.get("name") == job_name for node in nodes for job in node.get("jobs", []))
+
+
+# DATA-18 (T3.6): columns with types. Invented rows; `007` is the postcode-like value that must stay text.
+TYPED_CSV = (
+    "id,price,when_at,active,code,qty\n"
+    "1,1.50,2026-10-16,yes,007,5\n"
+    "2,12,2026-10-17,no,008,6\n"
+    "3,0.25,2026-10-18,yes,009,7\n"
+)
+# The same file with one value that is not an integer.
+TYPED_CSV_BAD = TYPED_CSV.replace(",007,5\n", ",007,five\n", 1)
+TYPED_GUESS = {"id": "integer", "price": "decimal", "when_at": "date", "active": "boolean", "code": "text", "qty": "integer"}
+BAD_VALUES_REASON = "Some values do not fit their column's type."
+
+
+def _upload_text(api, name: str, text: str, state: dict) -> str:
+    resp = api.post(f"{API_URL}/api/uploads", files={"file": (name, text.encode(), "text/csv")}, timeout=60)
+    upload_id = _expect(resp, 201, f"POST /api/uploads ({name})").json()["id"]
+    state["upload_id"], state["deleted"] = upload_id, False
+    return upload_id
+
+
+def _settle(api, upload_id: str, what: str) -> dict:
+    """Wait for a load to leave `ingesting`; returns the settled upload (ingested OR failed)."""
+
+    def done():
+        upload = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 200, "GET /api/uploads/{id}").json()
+        return upload if upload.get("status") in ("ingested", "failed") else None
+
+    return _wait_for(f"{what}: upload {upload_id} settled", done, LOAD_TIMEOUT_S)
+
+
+def _typed_body(table: str, columns: list, on_bad: str, mode: str = "replace") -> dict:
+    return {
+        "bronzeTable": table,
+        "mode": mode,
+        "encoding": "utf-8",
+        "delimiter": ",",
+        "headerRow": 0,
+        "columns": columns,
+        "onBadValue": on_bad,
+    }
+
+
+def _types_of(api, table: str, columns: list[str]) -> dict:
+    row = run_query(
+        api,
+        "SELECT "
+        + ", ".join(f"toTypeName({c}) AS t_{c}" for c in columns)
+        + f" FROM {QUERY_DB}.`bronze.{table}` WHERE 1 LIMIT 1",
+    )["rows"][0]
+    return {c: row[f"t_{c}"] for c in columns}
+
+
+def step_typed_columns(api, base_table: str, state: dict) -> None:
+    """The column types end to end (DATA-18 AC1, AC5, AC6, AC7, AC9 and decision 9).
+
+    1. The preview guesses `id` and `qty` integers, `price` a decimal, `when_at` an
+       ISO date, `active` a boolean, and leaves `code` (`007`) text.
+    2. The check lists the one value of a column made Integer that does not fit.
+    3. A typed load: the table's types are those told (Int64, Decimal(38, 9), Date32,
+       Bool, String), a sum and a date-range filter work on them, and `007` is intact.
+    4. A load told to STOP at a value that does not fit fails with the fixed reason,
+       the report, and the table unchanged.
+    5. The same told to load it as EMPTY succeeds with the report, and the cell is NULL.
+    6. A REPLACE that changes the types (every column text, no list: decision 11) works
+       and the table's columns are text afterwards: the case dlt and Iceberg refuse
+       unless the table is dropped between the normalize and the load.
+    """
+    table = f"{base_table}_typed"
+    columns_names = list(TYPED_GUESS)
+    upload_id = _upload_text(api, "typed.csv", TYPED_CSV, state)
+    preview = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}/preview", timeout=30), 200, "typed preview").json()
+    guessed = {c["name"]: c["type"] for c in preview.get("columnSpecs", [])}
+    if guessed != TYPED_GUESS:
+        raise G9Failure(f"the preview should guess {TYPED_GUESS}, it guessed {guessed}")
+    specs = [
+        {k: c[k] for k in ("source", "name", "type", "dateFormat", "timezone") if k in c and c[k] is not None}
+        for c in preview["columnSpecs"]
+    ]
+    print(f"[g9] typed: guessed {guessed}")
+
+    as_integer = [dict(c, type="integer") if c["name"] == "code" else c for c in specs]
+    as_integer = [{k: v for k, v in c.items() if k not in ("dateFormat", "timezone") or c["type"] in ("date", "timestamp")} for c in as_integer]
+    checked = _expect(
+        api.post(f"{API_URL}/api/uploads/{upload_id}/check", json={"columns": as_integer}, timeout=30), 200, "check"
+    ).json()
+    if checked.get("count") != 0:
+        raise G9Failure(f"`007`, `008` and `009` fit Integer, the check should list nothing: {checked}")
+    bad_check = [dict(c, type="date", dateFormat="iso") if c["name"] == "qty" else c for c in specs]
+    refused = _expect(
+        api.post(f"{API_URL}/api/uploads/{upload_id}/check", json={"columns": bad_check}, timeout=30), 200, "check (dates)"
+    ).json()
+    if refused.get("count") != 3 or refused["rows"][0]["column"] != "qty":
+        raise G9Failure(f"qty read as dates should fail three values, got {refused}")
+
+    resp = api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json=_typed_body(table, specs, "stop"), timeout=60)
+    _expect(resp, 200, "typed ingest")
+    done = _settle(api, upload_id, "typed load")
+    if done["status"] != "ingested" or done.get("rows") != 3 or done.get("badValues"):
+        raise G9Failure(f"the typed load should be ingested with 3 rows and nothing that did not fit: {done}")
+    _wait_for(f"{table} holds 3 rows", lambda: count_rows(api, table) == 3, VISIBLE_TIMEOUT_S, retry_failures=True)
+    types = _types_of(api, table, columns_names)
+    for name, kind in TYPED_GUESS.items():
+        if CLICKHOUSE_TYPE[kind] not in types[name]:
+            raise G9Failure(f"column {name} should be {CLICKHOUSE_TYPE[kind]}, ClickHouse says {types[name]}")
+    totals = run_query(
+        api,
+        f"SELECT toString(sum(price)) AS total, toString(count()) AS late FROM {QUERY_DB}.`bronze.{table}` "
+        "WHERE when_at >= toDate('2026-10-17')",
+    )["rows"][0]
+    if totals["late"] != "2":
+        raise G9Failure(f"two rows are on or after 2026-10-17, the date filter says {totals}")
+    codes = sorted(r["code"] for r in run_query(api, f"SELECT code FROM {QUERY_DB}.`bronze.{table}` WHERE 1")["rows"])
+    if codes != ["007", "008", "009"]:
+        raise G9Failure(f"the leading zeros must survive as text, got {codes}")
+    asset = api.get(f"{API_URL}/api/catalog/{table.replace('_', '-')}", timeout=30)
+    if asset.ok and isinstance(asset.json().get("columns"), list) and all(isinstance(c, dict) for c in asset.json()["columns"]):
+        in_catalog = {c.get("name"): str(c.get("type")) for c in asset.json()["columns"]}
+        wrong = {n: in_catalog.get(n) for n, k in TYPED_GUESS.items() if n in in_catalog and CLICKHOUSE_TYPE[k] not in in_catalog[n]}
+        if wrong:
+            raise G9Failure(f"the Catalog shows other types than the table holds: {wrong}")
+    else:
+        print(f"[g9] typed: the Catalog answered {asset.status_code} or in a shape this gate does not read; types asserted through the query route only")
+    print(f"[g9] typed: {table} holds {types}, a date filter and the leading zeros work")
+    _delete_upload(api, upload_id, state)
+
+    bad_id = _upload_text(api, "typed_bad.csv", TYPED_CSV_BAD, state)
+    resp = api.post(f"{API_URL}/api/uploads/{bad_id}/ingest", json=_typed_body(table, specs, "stop"), timeout=60)
+    _expect(resp, 200, "typed ingest (stop)")
+    stopped = _settle(api, bad_id, "the load told to stop")
+    report = stopped.get("badValues") or {}
+    if stopped["status"] != "failed" or stopped.get("error") != BAD_VALUES_REASON or report.get("count") != 1:
+        raise G9Failure(f"a load told to stop should fail with {BAD_VALUES_REASON!r} and one bad value: {stopped}")
+    if report["rows"][0] != {"row": 1, "column": "qty", "value": "five"}:
+        raise G9Failure(f"the report should name row 1, qty, 'five': {report}")
+    if count_rows(api, table) != 3 or CLICKHOUSE_TYPE["integer"] not in _types_of(api, table, ["qty"])["qty"]:
+        raise G9Failure("a load told to stop must leave the table as it was")
+    print("[g9] typed: told to stop, the load failed with the report and the table was left alone")
+
+    resp = api.post(f"{API_URL}/api/uploads/{bad_id}/ingest", json=_typed_body(table, specs, "null"), timeout=60)
+    _expect(resp, 200, "typed ingest (empty)")
+    emptied = _settle(api, bad_id, "the load told to load as empty")
+    if emptied["status"] != "ingested" or (emptied.get("badValues") or {}).get("count") != 1:
+        raise G9Failure(f"told to load it as empty, the load should succeed with the report: {emptied}")
+    nulls = run_query(api, f"SELECT toString(count()) AS n FROM {QUERY_DB}.`bronze.{table}` WHERE qty IS NULL")["rows"][0]["n"]
+    if nulls != "1":
+        raise G9Failure(f"exactly one qty should be empty, got {nulls}")
+    print("[g9] typed: told to load as empty, the cell is NULL and the report says so")
+
+    text_only = {k: v for k, v in _typed_body(table, specs, "stop").items() if k not in ("columns", "onBadValue")}
+    resp = api.post(f"{API_URL}/api/uploads/{bad_id}/ingest", json=text_only, timeout=60)
+    _expect(resp, 200, "text ingest over a typed table")
+    retyped = _settle(api, bad_id, "the replace that changes the types")
+    if retyped["status"] != "ingested" or retyped.get("badValues"):
+        raise G9Failure(f"a replace with no column list should load as text and report nothing: {retyped}")
+    _wait_for(
+        f"{table} is text again",
+        lambda: all("String" in t for t in _types_of(api, table, columns_names).values()),
+        VISIBLE_TIMEOUT_S,
+        retry_failures=True,
+    )
+    print("[g9] typed: a replace with no column list changed every column to text (decision 9, 11)")
+    _delete_upload(api, bad_id, state)
+
+
+def _delete_upload(api, upload_id: str, state: dict) -> None:
+    _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, "DELETE upload")
+    state["deleted"] = True
+
+
+# DATA-17 (slice 4): JSON, JSON Lines, Avro, gzip and zip. The files are the shared fixtures of
+# ops/fixtures/uploads/formats/ (the API's preview tests and the job's tests read them too).
+FORMATS_DIR = FIXTURES / "formats"
+NEW_FORMATS = [
+    # file, layout the preview reports, the dialect the load is told (None: JSON and Avro have none)
+    ("orders.json", {"format": "json", "compression": "none"}, None),
+    ("orders.jsonl", {"format": "jsonl", "compression": "none"}, None),
+    ("orders.avro", {"format": "avro", "compression": "none"}, None),
+    ("orders.csv.gz", {"format": "delimited", "compression": "gzip"}, "dialect"),
+    ("three.zip", {"format": "delimited", "compression": "zip"}, "dialect"),
+]
+# `DATA-51` (`LH-DATA-17-13`): the sentence names the cap the file passed.
+UNPACKED_SENTENCE = "The file is larger than the 2 GB limit once unpacked."
+
+
+def step_new_formats(api, base_table: str, state: dict) -> None:
+    """One small file per format loads and reads back (DATA-17 AC6, AC7), and a gzip and a zip
+    bomb are refused and stored nowhere (decision 2): no column list, so every column is text
+    and a nested value is JSON text (decision 11)."""
+    for index, (name, layout, dialect) in enumerate(NEW_FORMATS):
+        expected = json.loads((FORMATS_DIR / f"{name}.expected.json").read_text(encoding="utf-8"))
+        names = expected["columns"]
+        raw = (FORMATS_DIR / name).read_bytes()
+        state["upload_id"], state["deleted"] = None, False
+        resp = api.post(f"{API_URL}/api/uploads", files={"file": (name, raw, "application/octet-stream")}, timeout=60)
+        upload_id = _expect(resp, 201, f"POST /api/uploads ({name})").json()["id"]
+        state["upload_id"] = upload_id
+        preview = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}/preview", timeout=60), 200, f"{name} preview").json()
+        if preview.get("layout") != layout or preview.get("columns") != names:
+            raise G9Failure(f"{name}: the preview should say {layout} and list {names}, got {preview.get('layout')} and {preview.get('columns')}")
+        if name == "three.zip":
+            files = [f["name"] for f in preview["archive"]["files"]]
+            if files != expected["entries"] or not all(f["matchesFirst"] for f in preview["archive"]["files"]):
+                raise G9Failure(f"{name}: the preview should list {expected['entries']} with matching columns, got {preview.get('archive')}")
+        if name == "orders.avro":
+            kinds = [c["type"] for c in preview["columnSpecs"]]
+            if kinds != expected["declared"]:
+                raise G9Failure(f"{name}: the schema's types are the starting guess {expected['declared']}, got {kinds}")
+
+        table = f"{base_table}_f{index}"
+        body = {"bronzeTable": table, "mode": "replace"}
+        if dialect:
+            using = preview["using"]
+            body.update(encoding=using["encoding"], delimiter=using["delimiter"], headerRow=using["headerRow"])
+        launched = _expect(api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json=body, timeout=60), 200, f"POST .../ingest ({name})").json()
+        if not launched.get("runId"):
+            raise G9Failure(f"{name}: an accepted load should return a run id, got {launched}")
+
+        def settled():
+            current = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 200, "GET /api/uploads/{id}").json()
+            if current.get("status") == "failed":
+                raise G9Failure(f"{name}: the load failed: {current.get('error')!r}")
+            return current if current.get("status") == "ingested" else None
+
+        loaded = _wait_for(f"{name} ingested", settled, LOAD_TIMEOUT_S)
+        if loaded.get("rows") != len(expected["rows"]) or loaded.get("bronzeTable") != table:
+            raise G9Failure(f"{name}: the load settled with rows {loaded.get('rows')!r} in {loaded.get('bronzeTable')!r}, expected {len(expected['rows'])} in {table!r}")
+        _wait_for(f"{table} holds its rows", lambda: count_rows(api, table) == len(expected["rows"]), VISIBLE_TIMEOUT_S, retry_failures=True)
+        # PR #186 review BLOCKER 4: a value read through `/api/query/run` must tell a missing
+        # key (decision 11: null) from an empty string. DATA-29: the route answers a NULL cell
+        # as JSON `null` now, so the cell itself says so. The gate still asks ClickHouse
+        # `isNull` beside each value, so its own answer to "is this cell NULL" does not depend
+        # on the route's shape, and a cell is None only where ClickHouse says it is NULL.
+        # Nothing is loosened: a table that held "" where the fixture says null still fails
+        # here.
+        flags = ", ".join(f"isNull({c}) AS is_null_{i}" for i, c in enumerate(names))
+        got = run_query(api, f"SELECT {', '.join(names)}, {flags} FROM {QUERY_DB}.`bronze.{table}` WHERE 1")["rows"]
+        got_rows = sorted(
+            ([None if r[f"is_null_{i}"] == "1" else r[c] for i, c in enumerate(names)] for r in got),
+            key=lambda row: str(row[0]),
+        )
+        want_rows = sorted(expected["rows"], key=lambda row: str(row[0]))
+        types = _types_of(api, table, names)
+        if got_rows != want_rows:
+            raise G9Failure(f"{name}: the table holds {got_rows}, the fixture says {want_rows}; the columns are {types}")
+        print(f"[g9] formats: {name} columns are {types}")
+        print(f"[g9] formats: {name} loaded {len(want_rows)} rows into {table}")
+        _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, f"DELETE {name}")
+        state["deleted"] = True
+
+    # Bombs: a few MiB of gzip or zip that unpack past the 2 GiB unpacked cap (MAX_UNPACKED_BYTES,
+    # plan T6.2 item 2; it was 50 MB) are refused, and nothing is kept. `PR #186 CI`: the gate's bomb
+    # was 51 MiB and became a valid upload; it is 2 GiB + 1 byte of one repeated letter, written in
+    # blocks (never held whole) and packing about 1000 to 1.
+    before = len(_expect(api.get(f"{API_URL}/api/uploads", timeout=30), 200, "GET /api/uploads").json())
+    block = b"a" * (1024 * 1024)
+    blocks = 2048  # 2 GiB, and the header line below is the byte over
+    head = b"id,name\n"
+    gz = io.BytesIO()
+    with gzip.GzipFile(fileobj=gz, mode="wb", compresslevel=9) as packer:
+        packer.write(head)
+        for _ in range(blocks):
+            packer.write(block)
+    zipped = io.BytesIO()
+    with zipfile.ZipFile(zipped, "w", zipfile.ZIP_DEFLATED) as archive:
+        # force_zip64: the entry is past 2 GiB, which the plain header cannot declare.
+        with archive.open("a.csv", "w", force_zip64=True) as entry:
+            entry.write(head)
+            for _ in range(blocks):
+                entry.write(block)
+    for name, raw in (("bomb.csv.gz", gz.getvalue()), ("bomb.zip", zipped.getvalue())):
+        if len(raw) > 8 * 1024 * 1024:
+            raise G9Failure(f"{name}: the setup should be a small file, it is {len(raw)} bytes")
+        resp = api.post(f"{API_URL}/api/uploads", files={"file": (name, raw, "application/octet-stream")}, timeout=60)
+        refused = _expect(resp, 400, f"POST /api/uploads ({name})").json()
+        if refused.get("error") != UNPACKED_SENTENCE:
+            raise G9Failure(f"{name}: a bomb should be refused with {UNPACKED_SENTENCE!r}, got {refused}")
+    after = len(_expect(api.get(f"{API_URL}/api/uploads", timeout=30), 200, "GET /api/uploads").json())
+    if after != before:
+        raise G9Failure(f"a refused bomb must leave no upload behind, the list went from {before} to {after}")
+    print("[g9] formats: a gzip bomb and a zip bomb were refused and nothing was stored")
+
+
+# DATA-17 (slice 5): several files into one table.
+SEVERAL_FILES = [
+    ("stock_a.csv", "id,name,qty\n1,bolt,10\n2,nut,20\n"),
+    # The same columns in another order: matched by name, not by position.
+    ("stock_b.csv", "qty,id,name\n30,3,screw\n40,4,washer\n"),
+    ("stock_c.csv", "id,name,qty\n5,pin,50\n"),
+]
+EXTRA_COLUMN_FILE = ("stock_d.csv", "id,name,qty,notes\n6,rivet,60,fragile\n")
+SEVERAL_ROWS = [("1", "bolt", "10"), ("2", "nut", "20"), ("3", "screw", "30"), ("4", "washer", "40"), ("5", "pin", "50")]
+
+
+def _upload_one(api, name: str, text: str, state: dict) -> str:
+    resp = api.post(f"{API_URL}/api/uploads", files={"file": (name, text.encode(), "text/csv")}, timeout=60)
+    upload_id = _expect(resp, 201, f"POST /api/uploads ({name})").json()["id"]
+    state.setdefault("others", []).append(upload_id)
+    return upload_id
+
+
+def step_several_files(api, base_table: str, state: dict) -> None:
+    """Three CSV files, one with its columns in another order, load into one table with every
+    row, and a fourth with an extra column is refused with the list (DATA-17 AC, decision 4)."""
+    table = f"{base_table}_many"
+    ids = [_upload_one(api, name, text, state) for name, text in SEVERAL_FILES]
+    extra_id = _upload_one(api, EXTRA_COLUMN_FILE[0], EXTRA_COLUMN_FILE[1], state)
+    first = ids[0]
+
+    # The comparison lists the file with the extra column, and only it.
+    compared = _expect(
+        api.post(f"{API_URL}/api/uploads/{first}/compare", json={"alsoUploads": ids[1:] + [extra_id]}, timeout=60),
+        200,
+        "POST .../compare",
+    ).json()
+    listed = [(m["uploadId"], m["file"], m["missing"], m["extra"]) for m in compared["mismatches"]]
+    if listed != [(extra_id, EXTRA_COLUMN_FILE[0], [], ["notes"])]:
+        raise G9Failure(f"only {EXTRA_COLUMN_FILE[0]} (extra column notes) should be listed, got {compared}")
+
+    # A load that includes it is refused with the same list, and claims and marks nothing.
+    body = {"bronzeTable": table, "mode": "replace", "encoding": "utf-8", "delimiter": ",", "headerRow": 0}
+    refused = _expect(
+        api.post(f"{API_URL}/api/uploads/{first}/ingest", json={**body, "alsoUploads": ids[1:] + [extra_id]}, timeout=60),
+        400,
+        "POST .../ingest with a file of other columns",
+    ).json()
+    if EXTRA_COLUMN_FILE[0] not in refused.get("error", "") or "notes" not in refused.get("error", ""):
+        raise G9Failure(f"the refusal should name {EXTRA_COLUMN_FILE[0]} and the column notes, got {refused}")
+    after_refusal = _expect(api.get(f"{API_URL}/api/uploads/{first}", timeout=30), 200, "GET first upload").json()
+    if after_refusal.get("status") != "uploaded":
+        raise G9Failure(f"a refused load must leave the first file untouched, it is {after_refusal.get('status')!r}")
+
+    # The three that match load as one run.
+    launched = _expect(
+        api.post(f"{API_URL}/api/uploads/{first}/ingest", json={**body, "alsoUploads": ids[1:]}, timeout=60),
+        200,
+        "POST .../ingest (three files)",
+    ).json()
+    if not launched.get("runId"):
+        raise G9Failure(f"an accepted load should return a run id, got {launched}")
+    settled = _settle(api, first, "three files into one table")
+    if settled.get("status") != "ingested":
+        raise G9Failure(f"the load of three files failed: {settled.get('error')!r}")
+    if settled.get("rows") != len(SEVERAL_ROWS):
+        raise G9Failure(f"the first file carries the total, {len(SEVERAL_ROWS)} rows, got {settled.get('rows')!r}")
+    for other in ids[1:]:
+        current = _expect(api.get(f"{API_URL}/api/uploads/{other}", timeout=30), 200, "GET an upload of the load").json()
+        if current.get("status") != "ingested" or current.get("loadedWith") != first or "rows" in current:
+            raise G9Failure(f"{other} should be ingested, loaded with {first} and carry no count of its own, got {current}")
+
+    # Every row of every file, each value under its own column.
+    _wait_for(f"{table} holds {len(SEVERAL_ROWS)} rows", lambda: count_rows(api, table) == len(SEVERAL_ROWS), VISIBLE_TIMEOUT_S, retry_failures=True)
+    body_rows = run_query(api, f"SELECT id, name, qty FROM {QUERY_DB}.`bronze.{table}` WHERE 1 ORDER BY id")["rows"]
+    got = [(str(r["id"]), str(r["name"]), str(r["qty"])) for r in body_rows]
+    if got != SEVERAL_ROWS:
+        raise G9Failure(f"the table holds {got}, the three files say {SEVERAL_ROWS}")
+
+    # One run, one outcome row, filed under the first file.
+    runs = _expect(
+        api.get(f"{API_URL}/api/governance/ingest-runs", params={"connectorId": f"upload:{first}"}, timeout=30), 200, "GET ingest-runs"
+    ).json()
+    if len(runs) != 1 or runs[0].get("status") != "succeeded" or runs[0].get("rows") != len(SEVERAL_ROWS):
+        raise G9Failure(f"one succeeded ingest_run with {len(SEVERAL_ROWS)} rows was expected, found {runs}")
+    for other in ids[1:]:
+        extra_runs = _expect(
+            api.get(f"{API_URL}/api/governance/ingest-runs", params={"connectorId": f"upload:{other}"}, timeout=30), 200, "GET ingest-runs"
+        ).json()
+        if extra_runs:
+            raise G9Failure(f"the other files of a load have no run of their own, {other} has {extra_runs}")
+
+    # Lineage names the first file and how many came with it.
+    lineage = _expect(
+        api.get(f"{API_URL}/api/governance/lineage", params={"focus": f"bronze.{table}"}, timeout=60), 200, "GET lineage"
+    ).json()
+    node = next((n for n in lineage.get("nodes", []) if n.get("id") == f"upload:{first}"), None)
+    if node is None or node.get("label") != f"{SEVERAL_FILES[0][0]} and 2 more":
+        raise G9Failure(f"lineage should label the upload '{SEVERAL_FILES[0][0]} and 2 more', got {node}")
+    print(f"[g9] several files: {len(SEVERAL_ROWS)} rows of 3 files in {table}; {EXTRA_COLUMN_FILE[0]} was refused with its extra column")
+
+    for upload_id in ids + [extra_id]:
+        _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, "DELETE an upload of the load")
+    state["others"] = []
+    left = count_rows(api, table)
+    if left != len(SEVERAL_ROWS):
+        raise G9Failure(f"deleting the uploads should keep the table's {len(SEVERAL_ROWS)} rows, it holds {left}")
+
+
+# DATA-50 (LH-DATA-9-37): the full 128 characters the page and the API accept for a table
+# name. QA found 52 failing: `dlt` names a table's pipeline `bronze_ingest_<table>`, fourteen
+# characters longer, and refuses a schema name past 64 -- a table name past 50.
+LONG_TABLE_NAME_LENGTH = 128
+
+
+def step_long_table_name(api, state: dict) -> None:
+    """One file loads with `replace` and again with `append` into a table named the full 128
+    characters, and the table holds both loads' rows (DATA-50, LH-DATA-9-37)."""
+    table = (f"g9_long_{secrets.token_hex(4)}_" + "x" * LONG_TABLE_NAME_LENGTH)[:LONG_TABLE_NAME_LENGTH]
+    if len(table) != LONG_TABLE_NAME_LENGTH:
+        raise G9Failure(f"the table name should be {LONG_TABLE_NAME_LENGTH} characters, it is {len(table)}")
+    upload_id = _upload_one(api, "long_name.csv", "id,name\n1,a\n2,b\n", state)
+    body = {"bronzeTable": table, "mode": "replace", "encoding": "utf-8", "delimiter": ",", "headerRow": 0}
+    for mode, this_load, total in (("replace", 2, 2), ("append", 2, 4)):
+        _expect(
+            api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json={**body, "mode": mode}, timeout=60),
+            200,
+            f"POST .../ingest into a {LONG_TABLE_NAME_LENGTH}-character name ({mode})",
+        )
+        settled = _settle(api, upload_id, f"the {mode} into a long table name")
+        if settled.get("status") != "ingested" or settled.get("rows") != this_load:
+            raise G9Failure(
+                f"the {mode} into a {LONG_TABLE_NAME_LENGTH}-character table should load {this_load} rows, "
+                f"it is {settled.get('status')!r}: {settled.get('error')!r}"
+            )
+        counted: list[int] = []
+
+        def holds() -> bool:
+            counted.append(count_rows(api, table))
+            return counted[-1] == total
+
+        try:
+            _wait_for(f"{QUERY_DB}.`bronze.{table}` holds {total} rows", holds, VISIBLE_TIMEOUT_S, retry_failures=True)
+        except G9Failure as exc:
+            raise G9Failure(f"{exc}; the last count was {counted[-1] if counted else 'never read'}") from exc
+
+    # `DATA-52` (`LH-DATA-15-08`): a version written by an upload names the person who
+    # started it, so no snapshot of this table says "unknown".
+    detail = _expect(
+        api.get(f"{API_URL}/api/lakehouse/tables/bronze/{table}", timeout=60),
+        200,
+        "GET /api/lakehouse/tables/bronze/{table}",
+    ).json()
+    snapshots = detail.get("snapshots") or []
+    if not snapshots:
+        raise G9Failure(f"the table {table} should have snapshots after two loads, it has none: {detail}")
+    unnamed = [s for s in snapshots if not str(s.get("author") or "").endswith(" (file upload)")]
+    if unnamed:
+        raise G9Failure(f"every version of {table} should name who started the load, these do not: {unnamed}")
+    _delete_upload(api, upload_id, state)
+    print(f"[g9] long name: {table} holds 4 rows after a replace and an append, its versions name the uploader")
+
+
+# DATA-55 D11: the API's own sentence for a load into a dropped table's name.
+# It is a copy of `TABLE_DROPPED` in `routes/uploads.rs` on purpose: a gate
+# proves the deployed stack, so it must read the sentence as text, and this
+# line is where the two are kept in step.
+TABLE_DROPPED = (
+    "That table was dropped and can still be restored. "
+    "Restore it from its page in the Catalog, or choose another name."
+)
+
+
+def step_drop_and_restore(api, state: dict) -> None:
+    """A table an upload made is dropped from the console, kept by the catalog,
+    restored from its page, and its name is closed while it can be restored
+    (`DATA-55`, QA `LH-DATA-15-06`, `TC-1731`).
+
+    What this proves that no unit test can: that the catalog's admin identity
+    may drop a table the `dlt` principal created (D3 — the identity is the one
+    every other call of the feature uses), that the warehouse's delete profile
+    really keeps it so the existing restore brings it back with its rows, and
+    that a load into the name is refused in between."""
+    table = f"g9_drop_{secrets.token_hex(4)}"
+    slug = table.replace("_", "-")
+    upload_id = _upload_one(api, "drop_me.csv", "id,name\n1,a\n2,b\n", state)
+    body = {"bronzeTable": table, "mode": "replace", "encoding": "utf-8", "delimiter": ",", "headerRow": 0}
+    _expect(
+        api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json=body, timeout=60),
+        200,
+        f"POST .../ingest into {table}",
+    )
+    settled = _settle(api, upload_id, f"the load into {table}")
+    if settled.get("status") != "ingested" or settled.get("rows") != 2:
+        raise G9Failure(
+            f"the load into {table} should be `ingested` with 2 rows, "
+            f"it is {settled.get('status')!r}: {settled.get('error')!r}"
+        )
+    counted: list[int] = []
+
+    def holds() -> bool:
+        counted.append(count_rows(api, table))
+        return counted[-1] == 2
+
+    try:
+        _wait_for(f"{QUERY_DB}.`bronze.{table}` holds 2 rows", holds, VISIBLE_TIMEOUT_S, retry_failures=True)
+    except G9Failure as exc:
+        raise G9Failure(f"{exc}; the last count was {counted[-1] if counted else 'never read'}") from exc
+
+    def droppable() -> dict | None:
+        resp = api.get(f"{API_URL}/api/catalog/{slug}/drop?withRowCount=true", timeout=30)
+        _expect(resp, 200, f"GET /api/catalog/{slug}/drop")
+        answer = resp.json()
+        return answer if answer.get("droppable") else None
+
+    ready = _wait_for(f"{slug} can be dropped", droppable, VISIBLE_TIMEOUT_S, retry_failures=True)
+    if ready.get("table") != f"bronze.{table}":
+        raise G9Failure(f"the drop status should name bronze.{table}, it names {ready.get('table')!r}")
+    if ready.get("rowCount") != 2:
+        raise G9Failure(f"the drop status should count 2 rows, it counts {ready.get('rowCount')!r}")
+
+    dropped = _expect(
+        api.post(f"{API_URL}/api/catalog/{slug}/drop", timeout=120),
+        200,
+        f"POST /api/catalog/{slug}/drop",
+    ).json()
+    if dropped.get("rowCount") != 2 or not dropped.get("expiresAt"):
+        raise G9Failure(f"the drop should answer 2 rows and an expiry, it answered {dropped}")
+    refused = api.post(f"{API_URL}/api/catalog/{slug}/drop", timeout=60)
+    if refused.status_code != 409:
+        raise G9Failure(f"a second drop should be 409, it is {refused.status_code}: {refused.text[:300]}")
+
+    listed = _expect(api.get(f"{API_URL}/api/catalog/dropped/tables", timeout=30), 200, "GET /api/catalog/dropped/tables").json()
+    if not any(row.get("assetId") == slug for row in listed.get("tables") or []):
+        raise G9Failure(f"the dropped list should hold {slug}, it holds {listed}")
+
+    # D11: the name is closed while it can be restored.
+    again = api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json=body, timeout=60)
+    if again.status_code != 409 or (again.json() or {}).get("error") != TABLE_DROPPED:
+        raise G9Failure(
+            f"a load into the dropped name should be 409 with {TABLE_DROPPED!r}, "
+            f"it is {again.status_code}: {again.text[:300]}"
+        )
+
+    def restorable() -> dict | None:
+        resp = api.get(f"{API_URL}/api/catalog/{slug}/restore", timeout=30)
+        _expect(resp, 200, f"GET /api/catalog/{slug}/restore")
+        answer = resp.json()
+        return answer if answer.get("restorable") else None
+
+    _wait_for(f"{slug} can be restored", restorable, VISIBLE_TIMEOUT_S, retry_failures=True)
+    _expect(
+        api.post(f"{API_URL}/api/catalog/{slug}/restore", timeout=120),
+        200,
+        f"POST /api/catalog/{slug}/restore",
+    )
+
+    after = _expect(api.get(f"{API_URL}/api/catalog/dropped/tables", timeout=30), 200, "GET /api/catalog/dropped/tables").json()
+    if any(row.get("assetId") == slug for row in after.get("tables") or []):
+        raise G9Failure(f"{slug} should be gone from the dropped list after its restore, it is there")
+
+    def visible() -> bool:
+        return api.get(f"{API_URL}/api/lakehouse/tables/bronze/{table}", timeout=30).status_code == 200
+
+    _wait_for(f"/api/lakehouse/tables/bronze/{table} answers again", visible, VISIBLE_TIMEOUT_S, retry_failures=True)
+    restored: list[int] = []
+
+    def back() -> bool:
+        restored.append(count_rows(api, table))
+        return restored[-1] == 2
+
+    try:
+        # How long ClickHouse needs to see a restored table again was not
+        # measured; 120 s is the plan's bound, not a measurement.
+        _wait_for(f"{QUERY_DB}.`bronze.{table}` holds 2 rows again", back, 120, retry_failures=True)
+    except G9Failure as exc:
+        raise G9Failure(f"{exc}; the last count was {restored[-1] if restored else 'never read'}") from exc
+
+    _delete_upload(api, upload_id, state)
+    print(
+        f"[g9] drop and restore: {table} was dropped, refused a new load while it could be "
+        f"restored, and came back with 2 rows"
+    )
+
+
+def step_create_pipeline_over_uploaded_table(api, requests, table: str, silver_table: str) -> str:
+    """Author a `bronze.<table>` -> `silver.<silver_table>` pipeline whose
+    `dependsOn` names `file_ingest_job`, exactly the body the console's
+    "Run again after this table is re-uploaded" switch sends
+    (`src/features/pipelines/pipeline-create-page.tsx`, `DATA-19` D3).
+
+    `schedule` is `manual` on purpose: every run this gate cares about is
+    either triggered explicitly or launched by the sensor, and a cron would
+    add runs nobody asked for and the "did not run again" step could no
+    longer tell them apart."""
+    resp = api.post(
+        f"{API_URL}/api/pipelines",
+        json={
+            "name": f"g9_pipeline_{secrets.token_hex(3)}",
+            "kind": "batch",
+            "sourceZone": "bronze",
+            "sourceTable": table,
+            "incrementalColumn": "",
+            "transforms": [],
+            "targetZone": "silver",
+            "targetTable": silver_table,
+            "schedule": "manual",
+            "dependsOn": ["file_ingest_job"],
+        },
+        timeout=60,
+    )
+    created = _expect(resp, 201, "POST /api/pipelines").json()
+    pipeline_id = created.get("id")
+    if not pipeline_id or created.get("source") != f"bronze.{table}":
+        raise G9Failure(f"the created pipeline should name bronze.{table}, got {created}")
+    print(f"[g9] pipeline {pipeline_id}: bronze.{table} -> silver.{silver_table}, depends on file_ingest_job")
+
+    # An authored pipeline is a `draft` until it is activated, and only a
+    # `ready` one is built into a job with a sensor.
+    activated = _expect(
+        api.post(f"{API_URL}/api/pipelines/{pipeline_id}/status", json={"status": "ready"}, timeout=60),
+        200,
+        "POST /api/pipelines/{id}/status",
+    ).json()
+    if activated.get("status") != "ready":
+        raise G9Failure(f"the pipeline should be ready after activation, got {activated.get('status')!r}")
+
+    if not DAGSTER_URL:
+        raise G9Failure(
+            "step 10 needs DAGSTER_URL: without the orchestrator there is no job to trigger "
+            "and no sensor to fire, so this step would prove nothing"
+        )
+    job_name = f"authored__{pipeline_id.replace('-', '_')}"
+    _wait_for(f"the orchestrator built {job_name}", lambda: _dagster_lists_job(requests, job_name), JOB_BUILT_TIMEOUT_S)
+    print(f"[g9] the orchestrator built {job_name}")
+    return pipeline_id
+
+
+def _pipeline_runs(api, pipeline_id: str) -> list[dict]:
+    body = _expect(
+        api.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=60), 200, "GET /api/pipelines/{id}/runs"
+    ).json()
+    if body.get("unavailable"):
+        raise G9Failure(f"the orchestrator could not be asked for runs: {body['unavailable']}")
+    return body.get("runs", [])
+
+
+def _succeeded(api, pipeline_id: str) -> list[dict]:
+    return [r for r in _pipeline_runs(api, pipeline_id) if r.get("status") == RUN_COMPLETED]
+
+
+def step_first_pipeline_run(api, pipeline_id: str, silver_table: str, table_rows: int) -> None:
+    """Trigger one run and wait for it, then read the Silver table it
+    wrote. The trigger is what makes the later "it ran again on its own"
+    step meaningful: without a prior run there is no `start_time` for the
+    sensor's freshness rule to beat."""
+    triggered = _expect(
+        api.post(f"{API_URL}/api/pipelines/{pipeline_id}/trigger", json={}, timeout=60),
+        200,
+        "POST /api/pipelines/{id}/trigger",
+    ).json()
+    print(f"[g9] pipeline: triggered run {triggered.get('runId') or triggered.get('id')}")
+
+    def succeeded() -> bool:
+        runs = _pipeline_runs(api, pipeline_id)
+        failed = [r for r in runs if r.get("status") == RUN_FAILED]
+        if failed:
+            raise G9Failure(f"the authored run failed: {failed[0]}")
+        return [r for r in runs if r.get("status") == RUN_COMPLETED]
+
+    try:
+        _wait_for("the authored pipeline run succeeded", succeeded, PIPELINE_RUN_TIMEOUT_S)
+    except G9Failure as exc:
+        # The statuses are what a reader needs: "completed" is the API's
+        # word for a successful run (`map_run_status`), and a run stuck in
+        # `running` says the wait, not this gate, was the problem.
+        statuses = [r.get("status") for r in _pipeline_runs(api, pipeline_id)]
+        raise G9Failure(f"{exc}; the pipeline's runs were {statuses}") from exc
+
+    counted: list[int] = []
+
+    def holds() -> bool:
+        counted.append(count_silver_rows(api, silver_table))
+        return counted[-1] == table_rows
+
+    try:
+        _wait_for(f"silver.{silver_table} holds {table_rows} rows", holds, VISIBLE_TIMEOUT_S, retry_failures=True)
+    except G9Failure as exc:
+        raise G9Failure(f"{exc}; the last count was {counted[-1] if counted else 'never read'}") from exc
+    print(f"[g9] pipeline: silver.{silver_table} holds {table_rows} rows, read from its Bronze source")
+
+
+def count_silver_rows(api, silver_table: str) -> int:
+    """Every count in this gate runs under a `WHERE` (R11). A Silver table
+    is a `ClickHouse` `MergeTree`, but the rule costs nothing and the
+    Bronze ones beside it depend on it."""
+    body = run_query(api, f"SELECT count() AS n FROM silver.`{silver_table}` WHERE 1")
+    return int(body["rows"][0]["n"])
+
+
+def step_reupload_reruns_the_pipeline(api, table: str, silver_table: str, pipeline_id: str, using: dict, expected: dict, state: dict) -> str:
+    """Re-upload the SAME table with one row changed and expect the
+    pipeline to run again by itself.
+
+    The changed file is built from the fixture itself (same encoding,
+    delimiter and header row, one cell changed), so the second load is the
+    first one with different data -- exactly what a user re-uploading a
+    corrected export does."""
+    upload_id = upload_changed_copy(api, expected, state)
+    print(f"[g9] re-upload: {upload_id} into {table} (one row changed)")
+    step_load(api, upload_id, table, "replace", using, len(expected["rows"]), table_rows=len(expected["rows"]))
+
+    before = len(_succeeded(api, pipeline_id))
+
+    def reran() -> bool:
+        return len(_succeeded(api, pipeline_id)) > before
+
+    _wait_for("the pipeline ran again after the re-upload", reran, PIPELINE_RUN_TIMEOUT_S)
+    after = _succeeded(api, pipeline_id)
+    print(f"[g9] the pipeline ran again without being triggered ({before} -> {len(after)} successful runs)")
+
+    # And the change is in the Silver table: the fixture's own row, with
+    # the quantity the changed file carries.
+    qty = CHANGED_QTY
+    columns = ["plnt", "material", "description", "qty"]
+
+    def shows_change() -> bool:
+        body = run_query(
+            api,
+            f"SELECT {', '.join(columns)} FROM silver.`{silver_table}` WHERE 1 ORDER BY material",
+        )
+        got = [[row[c] for c in columns] for row in body["rows"]]
+        return any(row[3] == qty for row in got)
+
+    try:
+        _wait_for(f"silver.{silver_table} shows the changed row ({qty})", shows_change, VISIBLE_TIMEOUT_S, retry_failures=True)
+    except G9Failure as exc:
+        body = run_query(api, f"SELECT {', '.join(columns)} FROM silver.`{silver_table}` WHERE 1 ORDER BY material")
+        raise G9Failure(f"{exc}; the table holds {body['rows']}") from exc
+    print(f"[g9] silver.{silver_table} shows the re-uploaded row")
+    _delete_upload(api, upload_id, state)
+    return upload_id
+
+
+# The quantity the changed copy of `sap_report_utf16.xls` carries in the
+# row the gate asserts on. The original says `4`; the changed copy says
+# `9001`, which no other fixture and no earlier step mentions.
+CHANGED_QTY = "9001"
+# The last data row of the fixture, as tab-separated cells.
+_CHANGED_ROW = ["8250", "0000200", "PP BAND", CHANGED_QTY]
+
+
+def changed_fixture_bytes(expected: dict) -> bytes:
+    """`sap_report_utf16.xls` with its last data row's quantity changed.
+
+    Built from the fixture's OWN expected rows, so the header, the title
+    lines, the encoding, the BOM and the CRLF endings stay exactly as the
+    preview detected them: the only difference a re-upload introduces here
+    is the cell the gate asserts on. Re-encoded as UTF-16 LE with the BOM
+    the fixture starts with, which is what makes the API's preview detect
+    `utf-16` again."""
+    raw, _expected = _fixture()
+    text = raw.decode("utf-16")
+    lines = text.split("\r\n")
+    header = expected["columns"]
+    # The header cells are the fixture's own, lower-cased by the loader;
+    # the changed row is matched on its position in the file (the last
+    # non-blank record), not on a guess about its content.
+    for index in range(len(lines) - 1, -1, -1):
+        cells = lines[index].split("\t")
+        if len(cells) == len(header) and cells[0] == expected["rows"][-1][0] and cells[1] == expected["rows"][-1][1]:
+            lines[index] = "\t".join(_CHANGED_ROW)
+            return b"\xff\xfe" + "\r\n".join(lines).encode("utf-16-le")
+    raise G9Failure("the fixture's last data row could not be found, so it cannot be changed")
+
+
+def upload_changed_copy(api, expected: dict, state: dict) -> str:
+    """Upload the changed copy of the fixture as a new upload of its own
+    (the same bytes would be refused as a duplicate)."""
+    raw = changed_fixture_bytes(expected)
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={"file": (f"{FIXTURE}_corrected.xls", raw, "application/vnd.ms-excel")},
+        timeout=60,
+    )
+    upload = _expect(resp, 201, "POST /api/uploads (corrected copy)").json()
+    state["upload_id"] = upload["id"]
+    state["deleted"] = False
+    return upload["id"]
+
+
+def _delete_upload(api, upload_id: str, state: dict) -> None:
+    _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, "DELETE /api/uploads/{id}")
+    if state.get("upload_id") == upload_id:
+        state["deleted"] = True
+
+
+def step_other_table_does_not_rerun(api, table: str, pipeline_id: str, state: dict) -> None:
+    """Load a file into a DIFFERENT table and expect no run.
+
+    This is the step that distinguishes "the pipeline runs after an
+    upload" from "the pipeline runs after a re-upload of ITS OWN table":
+    without the per-table filter in the sensor, this load would fire the
+    chain just as the re-upload did."""
+    other = f"{table}_other"
+    path = PARQUETS / PARQUET
+    if not path.is_file():
+        raise G9Failure(f"fixture missing: {path}")
+    raw = path.read_bytes()
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={"file": (PARQUET, raw, "application/octet-stream")},
+        timeout=60,
+    )
+    upload_id = _expect(resp, 201, "POST /api/uploads (other table)").json()["id"]
+    state["upload_id"], state["deleted"] = upload_id, False
+    launched = _expect(
+        api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json={"bronzeTable": other, "mode": "replace"}, timeout=60),
+        200,
+        f"POST .../ingest (into {other})",
+    ).json()
+    if not launched.get("runId"):
+        raise G9Failure(f"the other table's load should have launched, got {launched}")
+
+    def settled() -> bool:
+        current = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 200, "GET /api/uploads/{id}").json()
+        if current.get("status") == "failed":
+            raise G9Failure(f"the {other} load failed: {current.get('error')!r}")
+        return current.get("status") == "ingested"
+
+    _wait_for(f"upload {upload_id} into {other} ingested", settled, LOAD_TIMEOUT_S)
+
+    before = len(_succeeded(api, pipeline_id))
+    print(f"[g9] other table: {other} loaded; watching {NO_RETRIGGER_WAIT_S}s for a run that must not come")
+    time.sleep(NO_RETRIGGER_WAIT_S)
+    after = len(_succeeded(api, pipeline_id))
+    if after != before:
+        raise G9Failure(
+            f"loading {other} ran the pipeline ({before} -> {after} successful runs); "
+            "only a re-upload of the pipeline's own source table may trigger it"
+        )
+    print(f"[g9] other table: the pipeline did not run again ({after} successful runs, unchanged)")
+    _delete_upload(api, upload_id, state)
+
+
+def step_lineage_shows_the_upload(api, upload_id: str, table: str, silver_table: str) -> None:
+    """`GET /api/governance/lineage` for the Silver table must show the
+    upload that made its Bronze source: `upload:<id>` -> `bronze.<table>`
+    -> `silver.<silver_table>`. The first edge is DATA-19's own
+    (`upload_table_claim`); the second is the authored pipeline's."""
+    resp = api.get(f"{API_URL}/api/governance/lineage", params={"focus": f"silver.{silver_table}"}, timeout=60)
+    body = _expect(resp, 200, "GET /api/governance/lineage").json()
+    wanted = [
+        (f"upload:{upload_id}", f"bronze:{table}", "upload"),
+        (f"bronze:{table}", f"table:silver.{silver_table}", "pipeline"),
+    ]
+    missing = [
+        f"{f} -> {t} [{k}]"
+        for f, t, k in wanted
+        if not any(
+            edge.get("from") == f and edge.get("to") == t and edge.get("kind") == k
+            for edge in body.get("edges", [])
+        )
+    ]
+    if missing:
+        drawn = sorted(
+            f"{edge.get('from')} -> {edge.get('to')} [{edge.get('kind')}]"
+            for edge in body.get("edges", [])
+        )
+        raise G9Failure(f"the lineage of silver.{silver_table} is missing {missing}; it draws {drawn}")
+    node = next((n for n in body.get("nodes", []) if n.get("id") == f"upload:{upload_id}"), None)
+    if node is None:
+        raise G9Failure(f"the lineage has no node for upload:{upload_id}: {body.get('nodes')}")
+    print(f"[g9] lineage: upload:{upload_id} -> bronze.{table} -> silver.{silver_table} ({node.get('label')!r})")
+
+
+def step_feeds_a_pipeline(
+    api, requests, table: str, first_upload_id: str, using: dict, expected: dict, state: dict
+) -> None:
+    """DATA-19, the whole feature in five assertions, in the order they
+    can each fail informatively:
+
+    1. a Bronze table an upload made is a pipeline's source;
+    2. the pipeline runs once and its Silver table holds the rows;
+    3. re-uploading the source table runs it AGAIN, with no trigger call,
+       and the changed row reaches Silver;
+    4. loading a DIFFERENT table does NOT run it;
+    5. lineage draws `upload -> bronze.<table> -> silver.<out>`.
+
+    `first_upload_id` is the upload the first load was made from, so the
+    lineage step names the upload the table really came from -- the claim
+    records the FIRST upload to ask for a table name, and the corrected
+    copy of step 3 keeps that claim (a claim is never taken away)."""
+    silver_table = f"{table}_clean"
+    pipeline_id = step_create_pipeline_over_uploaded_table(api, requests, table, silver_table)
+    # The table holds the `replace` load AND the `append` of it that step
+    # 4 made, so the pipeline copies twice the file's rows. The re-upload
+    # below replaces them again, which is the point: a re-upload that
+    # changes nothing would not show anything downstream either.
+    step_first_pipeline_run(api, pipeline_id, silver_table, 2 * len(expected["rows"]))
+    step_reupload_reruns_the_pipeline(api, table, silver_table, pipeline_id, using, expected, state)
+    step_other_table_does_not_rerun(api, table, pipeline_id, state)
+    step_lineage_shows_the_upload(api, first_upload_id, table, silver_table)
+    print("[g9] pipeline: PASS (uploaded table -> pipeline, re-upload re-ran it, another upload did not)")
+
+
+# DATA-35: folders for uploaded files.
+FOLDER_TOO_DEEP = "Folders can be nested at most 3 levels deep."
+FOLDER_NOT_EMPTY = "This folder still holds files or folders. Move them out and delete its folders first."
+
+
+def _make_folder(api, name: str, parent: str | None, state: dict) -> str:
+    body: dict = {"name": name}
+    if parent is not None:
+        body["parentId"] = parent
+    made = _expect(api.post(f"{API_URL}/api/uploads/folders", json=body, timeout=30), 201, f"POST /api/uploads/folders ({name})").json()
+    state.setdefault("folders", []).append(made["id"])
+    return made["id"]
+
+
+def _folder_of(api, upload_id: str) -> str | None:
+    current = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 200, "GET an upload").json()
+    return current.get("folderId")
+
+
+def _ids_in(api, query: str) -> list[str]:
+    listed = _expect(api.get(f"{API_URL}/api/uploads{query}", timeout=30), 200, f"GET /api/uploads{query}").json()
+    return [u["id"] for u in listed]
+
+
+def step_folders(api, base_table: str, state: dict) -> None:
+    """Folders two levels deep and a third; a fourth is refused with the limit; a file loaded with
+    the inner folder chosen is in it; a folder that holds a file or a folder cannot be deleted; files
+    move in and out; a re-upload into the table joins its folder; once everything is out the folders
+    are deleted (DATA-35 AC1 to AC4, AC7)."""
+    table = f"{base_table}_fold"
+    outer = _make_folder(api, "g9 outer", None, state)
+    middle = _make_folder(api, "g9 middle", outer, state)
+    inner = _make_folder(api, "g9 inner", middle, state)
+    too_deep = _expect(
+        api.post(f"{API_URL}/api/uploads/folders", json={"name": "g9 fourth", "parentId": inner}, timeout=30),
+        400,
+        "POST /api/uploads/folders (a fourth level)",
+    ).json()
+    if too_deep.get("error") != FOLDER_TOO_DEEP:
+        raise G9Failure(f"a fourth level should be refused with {FOLDER_TOO_DEEP!r}, got {too_deep}")
+
+    first = _upload_one(api, SEVERAL_FILES[0][0], SEVERAL_FILES[0][1], state)
+    spare = _upload_one(api, "g9_spare.csv", "id,name,qty\n9,rod,90\n", state)
+    body = {"bronzeTable": table, "mode": "replace", "encoding": "utf-8", "delimiter": ",", "headerRow": 0}
+    _expect(api.post(f"{API_URL}/api/uploads/{first}/ingest", json={**body, "folderId": inner}, timeout=60), 200, "POST .../ingest into a folder")
+    settled = _settle(api, first, "a load into a folder")
+    if settled.get("status") != "ingested":
+        raise G9Failure(f"the load into a folder failed: {settled.get('error')!r}")
+    if settled.get("folderId") != inner:
+        raise G9Failure(f"the upload should sit in the inner folder {inner}, it sits in {settled.get('folderId')!r}")
+    if first not in _ids_in(api, f"?folderId={inner}"):
+        raise G9Failure("the inner folder's list should hold the upload")
+
+    # A folder that holds a file, and one that holds a folder, cannot be deleted.
+    for held in (inner, middle):
+        refused = _expect(api.delete(f"{API_URL}/api/uploads/folders/{held}", timeout=30), 409, f"DELETE a folder that holds something ({held})").json()
+        if refused.get("error") != FOLDER_NOT_EMPTY:
+            raise G9Failure(f"deleting a folder that holds something should say {FOLDER_NOT_EMPTY!r}, got {refused}")
+
+    # A file moves into a folder and out again; the search finds it with its folder.
+    moved = _expect(api.post(f"{API_URL}/api/uploads/move", json={"uploadIds": [spare], "folderId": middle}, timeout=30), 200, "POST /api/uploads/move").json()
+    if moved.get("moved") != 1 or _folder_of(api, spare) != middle:
+        raise G9Failure(f"the spare file should have moved into {middle}, got {moved} and {_folder_of(api, spare)!r}")
+    found = [u for u in _expect(api.get(f"{API_URL}/api/uploads", params={"q": "g9_spare"}, timeout=30), 200, "GET /api/uploads?q").json()]
+    if [(u["id"], u.get("folderId")) for u in found] != [(spare, middle)]:
+        raise G9Failure(f"the search should find the spare file in its folder, got {found}")
+    _expect(api.post(f"{API_URL}/api/uploads/move", json={"uploadIds": [spare], "folderId": None}, timeout=30), 200, "POST /api/uploads/move (out)")
+    if _folder_of(api, spare) is not None:
+        raise G9Failure("the spare file should be out of every folder")
+
+    # A re-upload into the table, naming no folder, joins the table's folder (decision 2).
+    again = _upload_one(api, SEVERAL_FILES[2][0], SEVERAL_FILES[2][1], state)
+    _expect(api.post(f"{API_URL}/api/uploads/{again}/ingest", json={**body, "mode": "append"}, timeout=60), 200, "POST .../ingest (re-upload)")
+    if _settle(api, again, "a re-upload into the table").get("status") != "ingested":
+        raise G9Failure("the re-upload should have loaded")
+    if _folder_of(api, again) != inner:
+        raise G9Failure(f"the re-upload should join the table's folder {inner}, it sits in {_folder_of(api, again)!r}")
+
+    # Everything out, then the folders go, innermost first.
+    _expect(api.post(f"{API_URL}/api/uploads/move", json={"uploadIds": [first, again], "folderId": None}, timeout=30), 200, "POST /api/uploads/move (all out)")
+    for folder_id in (inner, middle, outer):
+        _expect(api.delete(f"{API_URL}/api/uploads/folders/{folder_id}", timeout=30), 204, f"DELETE an empty folder ({folder_id})")
+    state["folders"] = []
+    left = {f["id"] for f in _expect(api.get(f"{API_URL}/api/uploads/folders", timeout=30), 200, "GET /api/uploads/folders").json()}
+    if left & {inner, middle, outer}:
+        raise G9Failure(f"the deleted folders should be gone from the list, found {left & {inner, middle, outer}}")
+    print(f"[g9] folders: a fourth level was refused, {table} loaded into a folder, a re-upload joined it, the folders were deleted once empty")
+
+    for upload_id in (first, spare, again):
+        _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, "DELETE an upload of the folder step")
+    state["others"] = []
+
+
 def main() -> int:
     argparse.ArgumentParser(
         description=__doc__,
@@ -591,11 +1808,20 @@ def main() -> int:
         print(f"[g9] table for this run: {table}")
         step_load(api, upload_id, table, "replace", using, file_rows, table_rows=file_rows)
         step_load(api, upload_id, table, "append", using, file_rows, table_rows=2 * file_rows)
-        step_rows_and_types(api, table, expected)
+        step_rows_and_types(api, table, expected, state["column_types"])
         step_one_ingest_run_per_load(api, upload_id, table, file_rows)
         step_delete_keeps_the_table(api, upload_id, table, 2 * file_rows, state)
+        step_column_cap(api)
         step_workbook(api, table, state)
         step_parquet(api, table, state)
+        step_hostile_workbook(api, state)
+        step_typed_columns(api, table, state)
+        step_new_formats(api, table, state)
+        step_several_files(api, table, state)
+        step_long_table_name(api, state)
+        step_drop_and_restore(api, state)
+        step_folders(api, table, state)
+        step_feeds_a_pipeline(api, requests, table, upload_id, using, expected, state)
     except (G9Failure, requests.RequestException) as exc:
         reason = str(exc) if isinstance(exc, G9Failure) else f"{type(exc).__name__}: {exc}"
         print(f"[g9] FAILED: {reason}", file=sys.stderr)
@@ -610,13 +1836,21 @@ def _clean_up_upload(api, state: dict) -> None:
     out, so a failed gate does not leave a file in the bucket and a row in the
     list. The table and its claim stay, as after a pass. An upload that is
     still loading answers 409 and stays."""
-    if not state["upload_id"] or state["deleted"]:
-        return
-    try:
-        resp = api.delete(f"{API_URL}/api/uploads/{state['upload_id']}", timeout=30)
-        print(f"[g9] cleanup: DELETE upload {state['upload_id']} answered {resp.status_code}", file=sys.stderr)
-    except Exception as exc:  # noqa: BLE001 -- the failure that matters is the one already reported
-        print(f"[g9] cleanup: upload {state['upload_id']} was not deleted ({type(exc).__name__})", file=sys.stderr)
+    # DATA-17 slice 5: the files of a load of several are in `others`.
+    pending = [] if not state["upload_id"] or state["deleted"] else [state["upload_id"]]
+    for upload_id in pending + list(state.get("others", [])):
+        try:
+            resp = api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30)
+            print(f"[g9] cleanup: DELETE upload {upload_id} answered {resp.status_code}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 -- the failure that matters is the one already reported
+            print(f"[g9] cleanup: upload {upload_id} was not deleted ({type(exc).__name__})", file=sys.stderr)
+    # DATA-35: the folders of a failed step, innermost first (a folder that still holds a file stays).
+    for folder_id in reversed(list(state.get("folders", []))):
+        try:
+            resp = api.delete(f"{API_URL}/api/uploads/folders/{folder_id}", timeout=30)
+            print(f"[g9] cleanup: DELETE folder {folder_id} answered {resp.status_code}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 -- the failure that matters is the one already reported
+            print(f"[g9] cleanup: folder {folder_id} was not deleted ({type(exc).__name__})", file=sys.stderr)
 
 
 if __name__ == "__main__":

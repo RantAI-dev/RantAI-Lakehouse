@@ -261,6 +261,118 @@ conflicts. Use current main's frontend tooling as provided, not older dependency
 versions. Re-run the frontend verification and compare any failure to the newly
 fetched main baseline. Parent re-review is mandatory before merge.
 
+### Worker reconciliation handoff: merge of current main (2026-11-17)
+
+Merged `origin/main` (`cb855d5b923d978f14371c3e61d88f1d8be1ef8b`, 3277
+commits since the audit base `eb9eaa18`) into `fix/required-field-consistency`
+with `git merge origin/main --no-edit` (no rebase, no force push). All 32
+conflicts were resolved hunk by hunk: 26 content conflicts and six
+modify/delete conflicts for forms main deleted. No whole-file
+`--ours`/`--theirs` resolution was used on a file both sides changed; where
+all our hunks were superseded by main's code the per-hunk resolution leaves a
+file byte-identical to main (verified with `diff` against `origin/main`).
+
+**Deleted forms not resurrected.** Main removed the inline create sheets and
+dedicated forms; the UX-1 markers were translated to the forms that replaced
+them. The six remove-side files were deleted with `git rm`:
+`agents/employee-detail-page.tsx`, `agents/employees-page.tsx` (the whole
+Digital Employees surface is gone in main), `governance/classification-page.tsx`
+(classification moved onto the table's columns), `governance/policy-create-page.tsx`
+(the wizard was removed by WEB-3/SEC-61), `queries/save-query-sheet.tsx`
+→ `queries/save-query-page.tsx`, and `queries/save-sql-source-sheet.tsx`
+→ `queries/save-sql-source-page.tsx`.
+
+**Inventory corrections for the current tree (anchors at the merge head):**
+- Admin create → `admin/role-form-page.tsx`, `admin/tenant-create-page.tsx`,
+  `admin/service-identity-create-page.tsx`, `admin/invite-user-page.tsx`.
+  Roles/permissions/description, tenant name/slug/plan/residency and identity
+  name/scopes/environment remain required by the same submit guards. Invite
+  keeps the exact `Username` label and groups username-or-email with a visible
+  explanation rather than a second star: the guard requires one of the two.
+- Quality → `governance/quality-rule-create-page.tsx` and the shared
+  `governance/quality-check-fields.tsx` (`CheckFields`). Rule name, asset,
+  threshold and dimension are required; a check's Column, Minimum rows and
+  Rows-that-must-have-a-value are required when that check is selected. The
+  range/stat bounds keep the UX-1-R4 group star ("at least one"), not a star
+  on both inputs. Generated names elsewhere stay unstarred.
+- Freshness SLA → `governance/freshness-target-dialog.tsx`: amount required,
+  unit defaulted. Removal still needs no value.
+- Alerts → `alerts/alert-rule-page.tsx`: name and delivery target required by
+  the same on-save guards; the list page is unchanged from main.
+- Pipelines → `pipelines/pipeline-editor.tsx` (the create/edit page is now a
+  thin wrapper). Its current "why it cannot be saved yet" status already
+  communicates the guards; no new markers were added there because the
+  current editor has no per-field `Label`/`Field` layer to attach them to
+  without inventing a new form design — reported, not improvised.
+- Chart Builder was rewritten by main with accordion sections and its own
+  `Req()` markers. Those stars were preserved; the UX-1-R3 contribution is the
+  label association and `aria-required` on `ch-source`, `ch-dimension`,
+  `ch-breakdown`, `ch-lat`, `ch-lon`, `ch-content` and the conditional title,
+  plus one `RequiredLegend`. The measure and grouping rows now live in
+  `chart-shape-section.tsx`, which main already marks; they were not duplicated.
+- Connector ingest KeyFields (UX-1-R6) now uses a visible `Key *` group label
+  and a linked requirement sentence on the current form; no `aria-required`
+  was put on the fieldset or a button. `TablePicker` gained an opt-in
+  `required` prop for the governance table fields; the star and
+  `aria-required` go on the textbox, never the Faceted trigger button.
+- Oracle TLS DN conditional state was corrected to main's semantics: Oracle's
+  `require` mode is native network encryption with no DN check, so the DN is
+  required only for a certificate-verifying mode (`verify-ca`), not for
+  `require`. CDC slot/publication are required only on the PostgreSQL driver
+  that renders them. This follows the current server/runtime requirement and
+  adds no validation.
+- Main's plain `Label` was kept; the UX-1 `required` prop remains opt-in in
+  the shared Label component. No dependencies, versions, tooling, APIs,
+  permissions or validation rules were changed to resolve a conflict.
+
+**UX-1 test adjustments (checks kept, not weakened).** `dial-forms-required.test.tsx`
+now drives the current `SelectField`-based REST/OAuth form by rendering each
+mode explicitly instead of `fireEvent.change` on a native select; it still
+asserts every conditional star and `aria-required`. The CDC case asserts the
+driver-specific fields it now renders. `connector-ingest-panel.test.tsx`
+asserts the current visible group label, `aria-label` fieldset and absence of
+`aria-required` on the fieldset/checkboxes. `catalog/required-groups.test.tsx`
+renders the shared `CheckFields` directly for the range bounds, asserts the
+asset rule-name field separately, stubs the current incident/schedule/learning
+responses, and restores `next/navigation` in `afterAll`. `chart-builder.test.tsx`
+keeps main's entire 50-test suite plus two UX-1 association tests adapted to
+the current ids/labels. `login-page.test.tsx` uses main's current label text.
+`sql-source-panel.test.tsx` restores the real `@/components/sql-editor` module
+in `afterAll` so the module mock cannot leak into later files.
+`copilot/chat-composer.tsx` kept `aria-label="Message AI Copilot"` on both
+composer variants so existing accessible-name queries still resolve.
+
+**Verification (foreground, final tree, current main tooling).** The full
+baseline was reproduced from a `git archive origin/main` extraction (same
+installed `node_modules`): `bun test src` → 4444 pass, 1 skip, 0 fail, 4445
+tests across 409 files, exit 0. Final merged tree:
+
+- `bun run typecheck` → exit 0, no diagnostics.
+- `bun run lint` → exit 0, **0 errors and 11 warnings**; all are pre-existing
+  on main (the baseline run reported the same set; the UX-1 test was initially
+  flagged for an unused `fireEvent`, which was removed). No new warning.
+- `bun run test` → exit 0, **4467 pass, 1 skip, 0 fail, 4468 tests across 415
+  files**. Ten new tests (415 vs 409 files) pass; no baseline failure remains.
+  The 24 happy-dom/Motion unhandled AbortErrors recorded at the old base are
+  absent from this current-main run; UX-2 remains a backlog item and this
+  result does not claim those tests were fixed by UX-1.
+- Scoped foreground runs: `dial-forms-required.test.tsx` 7 pass / 55 expects;
+  `chart-builder.test.tsx` 50 pass / 338 expects; the ingest panel suite 95
+  pass / 352 expects; login + catalog group tests 9 pass / 27 expects;
+  `invite-user-page.test.tsx` 7 pass / 33 expects; per-role navigation 6 pass
+  / 43 expects; asset-detail tabs 169 pass / 561 expects; SQL panel + schema
+  browser + keyboard shortcuts 23 pass / 93 expects.
+- `git status`: no tracked changes left after the merge commit; unrelated
+  user-untracked files (`,`, `.claude/`, `reports/`, `research_notes/`, the
+  NDJSON/manifest pair) untouched. Regenerable caches were cleared only when
+  the filesystem filled; no project source was deleted.
+
+No Rust/Python/Compose commands were run: the diff is frontend TypeScript and
+this documentation only. Not verified: browser rendering, keyboard/screen-reader
+inspection, light/dark/narrow layouts, AI-15 assistant smoke checks and owner
+acceptance. The parent must independently review the merge diff and verify
+before pushing the branch or merging the PR.
+
 ### Final parent review (2026-11-17, code head 39617ff62)
 
 All round-1 BLOCKER findings R1–R6 and SHOULD-FIX R7 are resolved by source

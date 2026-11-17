@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { RequiredLegend } from "@/components/patterns/required-legend"
@@ -59,16 +60,22 @@ export function SqlDialForm({
       {askDriver ? (
         <div className="space-y-1.5 sm:col-span-2">
           <Label htmlFor="sql-dial-driver">Driver</Label>
-          <select
+          {/* WEB-9 D3/D2a: the three drivers this form serves, as before. A
+              stored dial may name a driver outside them (Oracle has its own
+              form), so the empty trigger says what to pick instead of drawing
+              the first option as if it were chosen. */}
+          <SelectField
             id="sql-dial-driver"
-            className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+            className="w-full"
             value={dial.driver}
-            onChange={(e) => set("driver", e.target.value as SqlDial["driver"])}
-          >
-            <option value="postgres">PostgreSQL</option>
-            <option value="mysql">MySQL</option>
-            <option value="mssql">SQL Server</option>
-          </select>
+            placeholder="Pick a driver"
+            options={[
+              { value: "postgres", label: "PostgreSQL" },
+              { value: "mysql", label: "MySQL" },
+              { value: "mssql", label: "SQL Server" },
+            ]}
+            onValueChange={(next) => set("driver", next as SqlDial["driver"])}
+          />
         </div>
       ) : null}
       <div className="grid gap-3 sm:col-span-2 sm:grid-cols-[minmax(0,1fr)_7rem]">
@@ -121,13 +128,26 @@ export function SqlDialForm({
       </div>
       <div className="space-y-1.5 sm:col-span-2">
         <Label htmlFor="sql-dial-ssl-mode">SSL mode (optional)</Label>
+        {/* WEB-8 S2 review round 1, B1: this is free text because no batch
+            loader for the drivers this form serves (PostgreSQL, MySQL/MariaDB,
+            SQL Server) reads `sslMode` — see the help line. Offering the
+            change-capture modes here would claim a TLS guarantee the load
+            does not make. The API stores the field as free text
+            (`SqlDial::ssl_mode`, `lakehouse-store/src/ingest_spec.rs`), so a
+            text input is exactly what the server accepts. */}
         <Input
           id="sql-dial-ssl-mode"
           value={dial.sslMode ?? ""}
           onChange={(e) => set("sslMode", e.target.value === "" ? null : e.target.value)}
-          placeholder={dial.driver === "postgres" ? "require" : "Leave blank for the driver default"}
+          placeholder="Leave blank for no value"
           autoComplete="off"
+          aria-describedby="sql-dial-ssl-mode-help"
         />
+        <p id="sql-dial-ssl-mode-help" className="text-xs text-muted-foreground">
+          Stored with the connector and sent to the ingestion job as typed. This build&apos;s batch
+          loaders for PostgreSQL, MySQL/MariaDB and SQL Server set their own TLS posture and do not
+          read this value.
+        </p>
       </div>
     </div>
   )

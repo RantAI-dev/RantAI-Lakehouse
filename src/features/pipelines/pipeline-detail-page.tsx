@@ -18,6 +18,7 @@ import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -28,19 +29,22 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { useAuth } from "@/features/auth/auth-provider"
 import { formatDateTime, formatDuration, formatRelativeTime } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
 import type { EntityStatus } from "@/lib/status"
 import { cn } from "@/lib/utils"
-import { pipelineService } from "@/services"
+import { identityService, pipelineService } from "@/services"
 import type { PipelineDetail, PipelineRun } from "@/services/contracts/pipelines"
 import { AuthoredFlow, DagsterDefinition } from "./pipeline-definition"
 import { PipelineMasthead, PipelineVitals } from "./pipeline-detail-header"
 import { isLiveRun, runDurationMs, summarizeRuns } from "./pipeline-run-stats"
 import { describeCron, isScheduleRunning, localizeScheduleTime, parseSchedule } from "./pipeline-schedule"
 import { RunHistoryStrip, runFill, statusLabel } from "./run-history-strip"
+import { authorChoices, readsAs } from "./pipeline-reads-as"
 import { RunInspector } from "./run-inspector"
 import { ScheduleHistory } from "./schedule-history"
+import { PipelineFreshnessPanel } from "./pipeline-freshness-panel"
 
 /** Poll cadence: fast while a run is live or one was just launched, slow otherwise. */
 const LIVE_POLL_MS = 4000
@@ -172,9 +176,42 @@ export function PipelineDetailPage() {
   const summary = React.useMemo(() => summarizeRuns(runs), [runs])
   const anyLive = runs.some(isLiveRun)
 
+  // BLD-1 / D2: who this pipeline reads as. The NAME rides along with the
+  // detail read, so everyone sees it; the user LIST is only needed by the
+  // assign control below, which is `identity:write` — and that list is
+  // `identity:read`, which no ordinary role holds. So it is fetched only
+  // for a caller who can use it, rather than 403-ing on every pipeline
+  // page an ordinary operator opens.
+  const { hasPermission } = useAuth()
+  const canAssignReadsAs = hasPermission("identity:write")
+  const usersState = useService(
+    (s) => (canAssignReadsAs ? identityService.listUsers(s) : Promise.resolve([])),
+    [canAssignReadsAs]
+  )
+  const users = React.useMemo(
+    () => (usersState.status === "success" ? usersState.data : []),
+    [usersState]
+  )
+  // The user id chosen in the assign control, or `null` for "nothing
+  // chosen". Reset whenever the pipeline changes, so an id chosen on one
+  // pipeline can never be submitted for another.
+  const [readsAsChoice, setReadsAsChoice] = React.useState<string | null>(null)
+  React.useEffect(() => {
+    setReadsAsChoice(null)
+  }, [pipelineId])
+
   const [now, setNow] = React.useState(() => Date.now())
   const fastUntil = React.useRef(0)
   const reloadRuns = runsState.reload
+  // BLD-8: this effect re-arms the poll timer, so its dependencies decide
+  // whether a live run's list ever refreshes again. `runsStatus` (not
+  // `runsState`) is deliberate: `useService` returns a fresh object on
+  // every render, and while a run is live the `now` interval below renders
+  // the page once a second -- with the whole object here, each tick cleared
+  // and re-armed the timeout, it never fired, and a run that had ended
+  // stayed "Running" until a manual reload. `runsStatus` changes only when
+  // a reload actually starts or finishes, so the timer survives a tick.
+  const runsStatus = runsState.status
   React.useEffect(() => {
     const fast = anyLive || Date.now() < fastUntil.current
     const t = setTimeout(
@@ -185,7 +222,7 @@ export function PipelineDetailPage() {
       fast ? LIVE_POLL_MS : IDLE_POLL_MS
     )
     return () => clearTimeout(t)
-  }, [anyLive, reloadRuns, runsState])
+  }, [anyLive, reloadRuns, runsStatus])
   // A live run's clock ticks every second; the rest of the page does not need it.
   React.useEffect(() => {
     if (!anyLive) return
@@ -236,6 +273,20 @@ export function PipelineDetailPage() {
     })
   )
 
+  // BLD-1 / D2: assign the user this pipeline reads as. The page reloads
+  // afterwards because the detail read is what carries `runAsName` — the
+  // row that just changed is the same one the masthead is describing.
+  const assignReadsAs = useServiceAction(
+    withNotify(
+      { success: "Pipeline now reads as the chosen user", error: "The author could not be assigned" },
+      async (signal, id: string) => {
+        if (!readsAsChoice) return true
+        await pipelineService.assignRunAs(id, readsAsChoice, signal)
+        return true
+      }
+    )
+  )
+
   const afterLaunch = React.useCallback(
     (focusNewest: boolean) => {
       fastUntil.current = Date.now() + LAUNCH_WINDOW_MS
@@ -258,6 +309,8 @@ export function PipelineDetailPage() {
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
   const p = state.data
   const authored = p.engine === "authored"
+  const readsAsState = readsAs(p, users)
+  const authorChoicesState = authorChoices(users, p.tenantId)
   const schedule = parseSchedule(p.schedule)
   // A Dagster job's status is its newest run's, never "paused": whether it
   // is paused lives in its schedule's state. An authored pipeline carries
@@ -360,7 +413,56 @@ export function PipelineDetailPage() {
         schedule={schedule}
         schedulePaused={schedulePaused}
         actions={actions}
+        readsAs={readsAsState}
       />
+
+      {/* BLD-1 / D2: the one control that can change who a pipeline reads
+          as. Platform Admin only (`identity:write`), the same grant the
+          route requires — and the page hides it rather than offering a
+          control the API would refuse. It offers only choices the API will
+          accept: active users inside this pipeline's own tenant. */}
+      {authored && canAssignReadsAs ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-card/60 px-3 py-2">
+          <label className="text-xs text-muted-foreground" htmlFor="pipeline-reads-as">
+            Reads as
+          </label>
+          <SelectField
+            id="pipeline-reads-as"
+            className="min-w-52"
+            value={readsAsChoice ?? ""}
+            disabled={authorChoicesState.options.length === 0}
+            /* WEB-9 D2: the empty value is a real choice ("nobody"), so it
+               stays an option; its label is the same sentence as before. */
+            options={[
+              {
+                value: "",
+                label:
+                  readsAsState.kind === "unset"
+                    ? "Nobody — this pipeline cannot run"
+                    : "Choose a user…",
+              },
+              ...authorChoicesState.options.map((option) => ({ value: option.id, label: option.name })),
+            ]}
+            onValueChange={(next) => setReadsAsChoice(next || null)}
+          />
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={!readsAsChoice || assignReadsAs.status === "pending"}
+            onClick={async () => {
+              if (await assignReadsAs.run(pipelineId)) {
+                setReadsAsChoice(null)
+                state.reload()
+              }
+            }}
+          >
+            Assign
+          </Button>
+          {authorChoicesState.blocked ? (
+            <span className="text-xs text-muted-foreground">{authorChoicesState.blocked}</span>
+          ) : null}
+        </div>
+      ) : null}
 
       {authored && !isDraft && !p.orchestratorJob ? (
         <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
@@ -380,6 +482,8 @@ export function PipelineDetailPage() {
           now={now}
         />
       ) : null}
+
+      <PipelineFreshnessPanel pipeline={p} onUpdated={state.reload} />
 
       <Tabs value={tab} onValueChange={(v) => setParam("tab", String(v))}>
         <TabsList variant="line" className="gap-4 border-b border-border pb-1">
@@ -482,11 +586,22 @@ export function PipelineDetailPage() {
             setParam("tab", "runs")
             selectRun(id)
           }} />
+          {/* WEB-3 S3-D9: a pipeline that names its target table opens that
+              table's Lineage tab; one that names none keeps the Lineage page. */}
           <p className="mt-3 text-xs text-muted-foreground">
             Lineage for this pipeline:{" "}
-            <Link href={`/lineage?focus=${encodeURIComponent(p.id)}`} className="text-primary hover:underline">
-              open in Lineage
-            </Link>
+            {p.targetAssetId ? (
+              <Link
+                href={`/data/assets/${encodeURIComponent(p.targetAssetId)}?tab=lineage`}
+                className="text-primary hover:underline"
+              >
+                open its target table&apos;s Lineage tab
+              </Link>
+            ) : (
+              <Link href={`/lineage?focus=${encodeURIComponent(p.id)}`} className="text-primary hover:underline">
+                open in Lineage
+              </Link>
+            )}
           </p>
         </TabsContent>
       </Tabs>

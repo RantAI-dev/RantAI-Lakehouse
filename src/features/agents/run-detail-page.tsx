@@ -11,7 +11,6 @@ import { RunTimeline } from "@/components/patterns/run-timeline"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { SectionCard } from "@/components/patterns/section-card"
 import { AgentRunStatusBadge, ApprovalBadge } from "@/components/patterns/status-badge"
-import { Button } from "@/components/ui/button"
 import { useService } from "@/hooks/use-service"
 import { formatDateTime, formatRelativeTime, formatTokens } from "@/lib/format"
 import { fmtMeasured } from "@/lib/measured"
@@ -50,15 +49,13 @@ export function RunDetailPage() {
   return (
     <div className="flex flex-col gap-4">
       <EntityHeader
-        eyebrow={<Link href="/agents/runs" className="hover:underline">Agent Runs</Link>}
+        // WEB-3 D3: this page stays (an approval links here), but the runs
+        // list it used to sit under was removed, so the eyebrow is text, not
+        // a link to a route that no longer exists.
+        eyebrow={<span>Agent run</span>}
         title={r.id}
         titleAccessory={<AgentRunStatusBadge status={r.status} />}
         description={`${r.trigger} run of ${employeeName}`}
-        actions={
-          <Button size="sm" variant="outline" render={<Link href={`/agents/employees/${encodeURIComponent(r.employeeId)}`} />}>
-            View employee
-          </Button>
-        }
       />
 
       {r.status === "waiting_approval" ? (
@@ -73,8 +70,8 @@ export function RunDetailPage() {
           <Link
             href={
               lastApproval
-                ? `/agents/approvals?id=${encodeURIComponent(lastApproval.id)}`
-                : "/agents/approvals"
+                ? `/governance/approvals?id=${encodeURIComponent(lastApproval.id)}`
+                : "/governance/approvals"
             }
             className="mt-2 inline-flex items-center gap-1 font-medium text-amber-800 underline underline-offset-2 dark:text-amber-300"
           >
@@ -86,17 +83,9 @@ export function RunDetailPage() {
       <SectionCard title="Summary">
         <MetadataList
           items={[
-            {
-              label: "Employee",
-              value: (
-                <Link
-                  href={`/agents/employees/${encodeURIComponent(r.employeeId)}`}
-                  className="text-primary hover:underline"
-                >
-                  {employeeName}
-                </Link>
-              ),
-            },
+            // WEB-3 D7: the employee detail page was removed, so the name
+            // is plain text. The run still says whose run it was.
+            { label: "Employee", value: employeeName },
             { label: "Trigger", value: r.trigger },
             { label: "Actor", value: r.actor },
             { label: "Delegated user", value: r.delegatedUser ?? "—" },
@@ -140,7 +129,7 @@ export function RunDetailPage() {
                 className="flex flex-wrap items-center justify-between gap-2 border-b border-border py-2 last:border-b-0"
               >
                 <Link
-                  href={`/agents/approvals?id=${encodeURIComponent(a.id)}`}
+                  href={`/governance/approvals?id=${encodeURIComponent(a.id)}`}
                   className="font-mono text-xs font-medium hover:underline"
                 >
                   {a.id}

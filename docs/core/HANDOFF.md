@@ -53,10 +53,11 @@ The owner asked for this to stay small. Do not add new document types.
 one file per task, generated together so they share a format. A number a
 spec marks *(proposed)* is the planner's, not a competitor's; the owner
 signs it on the feature page before a plan uses it.
-Several older documents contradict the build (`PRODUCT_SPECS.md`,
-`docs/FEATURE_COVERAGE.md`, `docs/UX_FLOWS.md`, parts of `README.md`, the
-sales playbook). Where they differ from `docs/core/PRODUCT.md` and the code,
-trust the code. Fixing them is backlog `DOC-1`.
+Older documents that contradicted the build were moved to `docs/archive/`
+and `README.md` was corrected on 2026-10-15 (`DOC-1`); the sales playbook
+still carries the old positioning (`PRODUCT.md` section 6, decision 6).
+Where any document differs from `docs/core/PRODUCT.md` and the code, trust
+the code.
 
 ## 4. What has been merged
 

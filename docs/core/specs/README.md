@@ -91,6 +91,17 @@ A spec is not a plan. Before building, a task still needs a feature page in [`..
 | [`SRC-4`](src-4.md) | More databases, with live change capture | Next | L |
 | [`SRC-3`](src-3.md) | Connectors for business apps | Later | L |
 
+### Pipelines (Build)
+
+| ID | Spec | When | Size |
+| --- | --- | --- | --- |
+| [`BLD-1`](bld-1.md) | Joins, aggregations and a SQL step | Next | L, in two parts |
+| [`BLD-2`](bld-2.md) | Tables that refresh themselves within a target lag | Later | L |
+| [`DATA-2`](data-2.md) | Keep the last copies of a published Gold table | Next | M |
+| [`DATA-6`](data-6.md) | A latest-copy-only table for outside readers | Next | S |
+| [`DATA-4`](data-4.md) | Publish Silver in open format | Later | M |
+| [`DATA-3`](data-3.md) | Store Gold in open format first | Later | L |
+
 ### Query Studio
 
 | ID | Spec | When | Size |
@@ -100,3 +111,15 @@ A spec is not a plan. Before building, a task still needs a feature page in [`..
 | [`QS-3`](qs-3.md) | Saved queries done properly | Next | M |
 | [`QS-4`](qs-4.md) | History and query profile | Next | M |
 | [`QS-5`](qs-5.md) | Parameters, snippets and charts from results | Next | L |
+
+### Access, sign-in and forms
+
+| ID | Spec | When | Size |
+| --- | --- | --- | --- |
+| [`ADM-13`](adm-13.md) | Each role sees only the pages it may use | Now | M |
+| [`GOV-7`](gov-7.md) | Read access per schema and table | Now | L |
+| [`GOV-1`](gov-1.md) | Audit trail covers every console change | Now | L, in two parts |
+| [`ADM-11`](adm-11.md) | Usernames, optional email, admin-set first password | Next | M |
+| [`ADM-12`](adm-12.md) | Single sign-on in Settings (OIDC; SAML after ADR 0017) | Next | M |
+| [`WEB-7`](web-7.md) | Side-panel forms become full pages | Next | M |
+| [`WEB-8`](web-8.md) | Forms offer the allowed values | Next | M, in two parts |

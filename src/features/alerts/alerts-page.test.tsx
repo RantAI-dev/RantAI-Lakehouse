@@ -1,15 +1,25 @@
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "bun:test"
 import type { AlertRule } from "@/services/contracts/alerts"
+import { RUN_ALERTS_OFF, RunAlertsNotice } from "./alerts-page"
+// `WEB-7` T7: the rule form is its own page now; its pure helpers moved with
+// it, and every assertion below is unchanged.
 import {
-  RUN_ALERTS_OFF,
-  RunAlertsNotice,
   alertRuleFormFields,
   alertRuleSaveInput,
   connectorForKind,
+  isMetricRule,
+  legacyOwnerNote,
   seesEveryTenant,
-} from "./alerts-page"
-import { ruleKindLabel, ruleScope } from "./rules-columns"
+} from "./alert-rule-page"
+import {
+  chartAlertHref,
+  getRuleColumns,
+  lastDeliveryLabel,
+  ruleKindLabel,
+  ruleScope,
+} from "./rules-columns"
+import { formatDateTime } from "@/lib/format"
 
 afterEach(cleanup)
 
@@ -51,11 +61,35 @@ describe("alertRuleFormFields", () => {
       ...NO_LOAD_FIELDS,
     })
   })
+
+  it("shows no mart/measure, board, or freshness target for pipeline_behind_target", () => {
+    expect(alertRuleFormFields("pipeline_behind_target")).toEqual({
+      martMeasure: false,
+      board: false,
+      freshnessTarget: false,
+      ...NO_LOAD_FIELDS,
+    })
+  })
+})
+
+describe("a rule that watches a metric (BI-2)", () => {
+  it("is a metric rule as soon as it has a metric field, even before one is picked, and not otherwise", () => {
+    expect(isMetricRule({ metric: "" })).toBe(true)
+    expect(isMetricRule({ metric: "total_visitors" })).toBe(true)
+    expect(isMetricRule({})).toBe(false)
+    expect(isMetricRule({ metric: undefined })).toBe(false)
+  })
+
+  it("still shows the condition fields of an alert rule, which hold the metric choice", () => {
+    expect(alertRuleFormFields("alert").martMeasure).toBe(true)
+  })
 })
 
 const NONE = { martMeasure: false, board: false, freshnessTarget: false }
-const NOT_RAISED_SRC11 =
-  "Nothing raises this yet. It starts working when automatic pausing (SRC-11) is installed."
+// SRC-11 D3: the disabled kind used to pin "Nothing raises this yet..." which became false once automatic
+// pausing landed; it now pins the true sentence.
+const RAISED_BY_AUTO_DISABLE =
+  "Raised once when a connector fails runs in a row (30 by default) and is paused. Resume it from its page."
 // SRC-17 D-c: this constant used to pin "Nothing raises this yet..." for the
 // schema change kind, which was false once SRC-8 landed (it raises the kind).
 // It now pins the true sentence; the disabled kind's sentence is unchanged.
@@ -86,8 +120,8 @@ describe("alertRuleFormFields for connector and upload rules", () => {
     })
   })
 
-  it("says the disabled kind is not raised yet, and that schema changes raise the schema change kind", () => {
-    expect(alertRuleFormFields("connector_disabled").note).toBe(NOT_RAISED_SRC11)
+  it("says automatic pausing raises the disabled kind, and that schema changes raise the schema change kind", () => {
+    expect(alertRuleFormFields("connector_disabled").note).toBe(RAISED_BY_AUTO_DISABLE)
     expect(alertRuleFormFields("connector_schema_change").note).toBe(
       RAISED_BY_SCHEMA_CHANGES
     )
@@ -151,6 +185,23 @@ describe("alertRuleSaveInput", () => {
     expect(body.type).toBe("upload_failure")
   })
 
+  it("sends a pipeline_behind_target rule with pipeline wildcard when none is given", () => {
+    expect(
+      alertRuleSaveInput({
+        ...FORM,
+        type: "pipeline_behind_target",
+        connector: undefined,
+      })
+    ).toEqual({
+      name: "Load failed",
+      type: "pipeline_behind_target",
+      channel: "webhook",
+      target: "https://hooks.example.com/x",
+      enabled: true,
+      pipeline: "*",
+    })
+  })
+
   it("sends the form unchanged for the older kinds", () => {
     const alert = { ...FORM, type: "alert", connector: undefined }
     expect(alertRuleSaveInput(alert)).toBe(alert)
@@ -167,6 +218,7 @@ describe("the rules table's labels and scope", () => {
     expect(ruleKindLabel("connector_schema_change")).toBe("Connector schema changed")
     expect(ruleKindLabel("connector_success")).toBe("Connector run succeeded")
     expect(ruleKindLabel("upload_failure")).toBe("Upload failed")
+    expect(ruleKindLabel("pipeline_behind_target")).toBe("Pipeline behind target lag")
   })
 
   it("shows the connector's name when known, its id otherwise, All connectors for *, Uploads for uploads", () => {
@@ -174,7 +226,58 @@ describe("the rules table's labels and scope", () => {
     expect(ruleScope({ type: "connector_failure", connector: "conn-z" }, connectors)).toBe("conn-z")
     expect(ruleScope({ type: "connector_failure", connector: "*" }, connectors)).toBe("All connectors")
     expect(ruleScope({ type: "upload_failure", connector: "*" }, connectors)).toBe("Uploads")
+    expect(ruleScope({ type: "pipeline_behind_target", pipeline: "pl-x" }, connectors)).toBe("pl-x")
+    expect(ruleScope({ type: "pipeline_behind_target", pipeline: "*" }, connectors)).toBe("All pipelines")
+    expect(ruleScope({ type: "pipeline_behind_target" }, connectors)).toBe("All pipelines")
     expect(ruleScope({ type: "alert" }, connectors)).toBeNull()
+  })
+})
+
+describe("the quality incident kind (DATA-14)", () => {
+  const base: AlertRule = {
+    id: "",
+    name: "  Quality  ",
+    type: "quality_incident",
+    agg: "sum",
+    op: ">",
+    threshold: 0,
+    channel: "webhook",
+    target: " https://hooks.example.com/x ",
+    enabled: true,
+  }
+
+  it("has no mart, measure, board, connector or table-name field of the other kinds", () => {
+    for (const admin of [false, true]) {
+      expect(alertRuleFormFields("quality_incident", admin)).toEqual({
+        martMeasure: false,
+        board: false,
+        freshnessTarget: false,
+        ...NO_LOAD_FIELDS,
+      })
+    }
+  })
+
+  it("saves only the fields that apply: name, kind, delivery, severity and the table", () => {
+    expect(alertRuleSaveInput({ ...base, asset: " Silver.Orders ", severity: "high" })).toEqual({
+      name: "Quality",
+      type: "quality_incident",
+      channel: "webhook",
+      target: "https://hooks.example.com/x",
+      enabled: true,
+      severity: "high",
+      asset: "Silver.Orders",
+    })
+    // No mart, aggregate, threshold or connector rides along, and no severity
+    // when there is none.
+    const sent = alertRuleSaveInput({ ...base, asset: "*", mart: "x", connector: "conn-a" })
+    expect(Object.keys(sent).sort()).toEqual(["asset", "channel", "enabled", "name", "target", "type"])
+  })
+
+  it("is named in words and scoped to its table, or to every table", () => {
+    expect(ruleKindLabel("quality_incident")).toBe("Quality incident opened")
+    expect(ruleScope({ type: "quality_incident", asset: "silver.orders" }, [])).toBe("silver.orders")
+    expect(ruleScope({ type: "quality_incident", asset: "*" }, [])).toBe("All tables")
+    expect(ruleScope({ type: "quality_incident" }, [])).toBeNull()
   })
 })
 
@@ -195,5 +298,161 @@ describe("RunAlertsNotice", () => {
       </>
     )
     expect(container.textContent).toBe("")
+  })
+})
+
+// BI-19 owner QA 2026-10-28, QA-9: a chart alert read as "Threshold alert ·
+// sum() on > 1" because the column treated it as a mart rule.
+describe("a chart alert in the rules list (BI-19 QA-9)", () => {
+  const base = {
+    id: "r1", name: "Alert: Pengunjung per bulan", type: "alert", agg: "", op: ">", threshold: 1,
+    channel: "email", target: "a@b.c", enabled: true, chart: "ch1", series: "visitors", condition: "above",
+  } as unknown as AlertRule
+  const cols = getRuleColumns({
+    onEdit: () => {}, onToggle: () => {}, onRun: () => {}, onDelete: () => {}, busy: false, boards: [], connectors: [],
+  })
+  const cell = (id: string, rule: AlertRule) => {
+    const col = cols.find((c) => c.id === id)
+    const render_ = col?.cell as (ctx: unknown) => React.ReactNode
+    return render_({ row: { original: rule } })
+  }
+
+  it("shows the Chart alert badge and the series and condition in words", () => {
+    render(<div>{cell("type", base)}{cell("condition", base)}</div>)
+    expect(screen.getByText("Chart alert")).toBeTruthy()
+    expect(screen.getByText("Dashboard chart · visitors goes above 1")).toBeTruthy()
+  })
+
+  it("words the below and any-rows conditions", () => {
+    render(<div>{cell("condition", { ...base, condition: "below", threshold: 5 })}</div>)
+    expect(screen.getByText("Dashboard chart · visitors goes below 5")).toBeTruthy()
+    cleanup()
+    render(<div>{cell("condition", { ...base, condition: "any_rows", series: undefined })}</div>)
+    expect(screen.getByText("Dashboard chart · returns any rows")).toBeTruthy()
+  })
+
+  // `BI-39` D8: the rule list names the chart and its dashboard, read live,
+  // and links the name to that dashboard.
+  it("names the chart and its dashboard, and links the name", () => {
+    const named = {
+      ...base,
+      chartTitle: "Visitors",
+      dashboardId: "b_pub",
+      dashboardTitle: "Public board",
+    } as unknown as AlertRule
+    render(<div>{cell("condition", named)}</div>)
+    const link = screen.getByRole("link", { name: "Visitors" })
+    expect(link.getAttribute("href")).toBe("/dashboards/b_pub")
+    expect(screen.getByText(/on Public board · visitors goes above 1/)).toBeTruthy()
+    cleanup()
+    // The chart's name without its dashboard is not a link and not a claim.
+    render(<div>{cell("condition", { ...base, chartTitle: "Visitors" } as unknown as AlertRule)}</div>)
+    expect(screen.getByText("Dashboard chart · visitors goes above 1")).toBeTruthy()
+    expect(screen.queryByRole("link")).toBeNull()
+  })
+
+  it("links only a chart whose dashboard the list named", () => {
+    expect(chartAlertHref({ chartTitle: "Visitors", dashboardId: "b1" })).toBe("/dashboards/b1")
+    expect(chartAlertHref({ chartTitle: "Visitors" })).toBeNull()
+    expect(chartAlertHref({ dashboardId: "b1" })).toBeNull()
+  })
+})
+
+// `BI-39` D4: a rule saved before alerts had owners reads as the Dashboard
+// Viewer role, and the editor says so; an owned one says nothing.
+describe("the legacy-owner note (BI-39 D4)", () => {
+  it("says what saving a rule with no owner does", () => {
+    expect(legacyOwnerNote({ type: "alert" })).toBe(
+      "This alert was set before alerts had owners and reads as the Dashboard Viewer role. Saving it makes it read as you."
+    )
+  })
+
+  it("stays quiet for an owned rule, a digest, and a new rule", () => {
+    expect(legacyOwnerNote({ type: "alert", ownerId: "u1" })).toBeNull()
+    expect(legacyOwnerNote({ type: "digest" })).toBeNull()
+    expect(legacyOwnerNote(null)).toBeNull()
+  })
+})
+
+// DEC-16 (QA LH-SRC-7-04, SRC-42): a caller who may not manage a rule sees
+// where it sends, not the address. The API sends the rule without `target`
+// and with `targetHidden: true`.
+describe("a rule whose target is hidden (DEC-16)", () => {
+  const base = {
+    id: "r1", name: "Orders failed", type: "connector_failure", agg: "sum", op: ">",
+    threshold: 0, enabled: true, connector: "*",
+  } as unknown as AlertRule
+  const cols = getRuleColumns({
+    onEdit: () => {}, onToggle: () => {}, onRun: () => {}, onDelete: () => {}, busy: false, boards: [], connectors: [],
+  })
+  const cell = (id: string, rule: AlertRule) => {
+    const col = cols.find((c) => c.id === id)
+    const render_ = col?.cell as (ctx: unknown) => React.ReactNode
+    return render_({ row: { original: rule } })
+  }
+
+  it("says Webhook for a hidden webhook rule, shows its state without a switch and shows no actions", () => {
+    // `SRC-40` D9 replaced #485's D19 ("the switch is shown but disabled"): a
+    // rule this caller may not manage gets no switch at all, and the state is
+    // text. The decision changed, so the assertion follows it; nothing here
+    // was loosened.
+    const hidden = { ...base, channel: "webhook", targetHidden: true } as AlertRule
+    render(<div>{cell("delivery", hidden)}{cell("enabled", hidden)}{cell("actions", hidden)}</div>)
+    expect(screen.getByText("Webhook")).toBeTruthy()
+    expect(screen.queryByRole("switch")).toBeNull()
+    expect(screen.getByText("Active")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Test run now" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "More rule actions" })).toBeNull()
+  })
+
+  it("says E-mail for a hidden e-mail rule", () => {
+    const hidden = { ...base, channel: "email", targetHidden: true } as AlertRule
+    render(<div>{cell("delivery", hidden)}</div>)
+    expect(screen.getByText("E-mail")).toBeTruthy()
+  })
+
+  it("shows when a success rule last sent, under its delivery", () => {
+    // QA TC-1695 (SRC-40): a "run succeeded" alert opens no incident, so its
+    // latest delivery is shown here. The expected text is built with
+    // `formatDateTime` and never a typed date: the zone differs by machine.
+    const at = "2026-11-12T03:04:05.000Z"
+    const rule = {
+      ...base, type: "connector_success", channel: "webhook", target: "https://hooks.example.com/t",
+      lastDelivery: { at, delivered: true },
+    } as AlertRule
+    render(<div>{cell("delivery", rule)}</div>)
+    expect(screen.getByText(`Last sent ${formatDateTime(at)}`)).toBeTruthy()
+  })
+
+  it("says a success alert was not delivered, with the reason", () => {
+    const at = "2026-11-12T03:04:05.000Z"
+    const rule = {
+      ...base, type: "connector_success", channel: "webhook", target: "https://hooks.example.com/t",
+      lastDelivery: { at, delivered: false, reason: "the webhook server answered with an error" },
+    } as AlertRule
+    render(<div>{cell("delivery", rule)}</div>)
+    expect(
+      screen.getByText(
+        `Last attempt ${formatDateTime(at)} · Not delivered: the webhook server answered with an error`
+      )
+    ).toBeTruthy()
+  })
+
+  it("shows no second line for a rule with no recorded delivery", () => {
+    const rule = {
+      ...base, type: "connector_success", channel: "webhook", target: "https://hooks.example.com/t",
+    } as AlertRule
+    render(<div>{cell("delivery", rule)}</div>)
+    expect(lastDeliveryLabel(rule)).toBeNull()
+    expect(screen.queryByText(/Last sent/)).toBeNull()
+    expect(screen.queryByText(/Last attempt/)).toBeNull()
+  })
+
+  it("shows the address, an enabled switch and the actions when the target is returned", () => {
+    const shown = { ...base, channel: "webhook", target: "https://hooks.example.com/t" } as AlertRule
+    render(<div>{cell("delivery", shown)}{cell("enabled", shown)}{cell("actions", shown)}</div>)
+    expect(screen.getByText("https://hooks.example.com/t")).toBeTruthy()
+    expect(screen.getByRole("switch").getAttribute("aria-disabled")).toBeNull()
+    expect(screen.getByRole("button", { name: "Test run now" })).toBeTruthy()
   })
 })

@@ -1,48 +1,114 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
+import { useRouter } from "next/navigation"
 import { PlusIcon } from "lucide-react"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
-import { CreateSheet } from "@/components/patterns/create-sheet"
-import { RequiredLegend } from "@/components/patterns/required-legend"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useDataTable } from "@/hooks/use-data-table"
 import { filterDataClientSide } from "@/lib/data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { withNotify } from "@/lib/notify"
-import { identityService } from "@/services"
-import { getRoleColumns } from "./roles-columns"
+import { notifySuccess } from "@/lib/notify"
+import { identityService, type RoleTableAccess } from "@/services"
+import type { Role } from "@/services/contracts/identity"
+import { getRoleColumns, type RoleRow } from "./roles-columns"
+import { tableAccessSummary } from "./role-table-access"
 
+/**
+ * Each role's read access, one read per role (`GOV-7` S2). The roles list
+ * endpoint does not carry `read_scope`, and the API is not widened for the
+ * console, so this is N requests for N roles on a page an administrator
+ * opens by hand. One role's failure is a `null` entry — its row says "—" —
+ * rather than failing the whole list.
+ */
+async function loadRoleTableAccesses(
+  ids: readonly string[],
+  signal: AbortSignal
+): Promise<Record<string, RoleTableAccess | null>> {
+  const entries = await Promise.all(
+    ids.map(async (id): Promise<[string, RoleTableAccess | null]> => {
+      try {
+        return [id, await identityService.getRoleTableAccess(id, signal)]
+      } catch {
+        return [id, null]
+      }
+    })
+  )
+  return Object.fromEntries(entries)
+}
+
+/**
+ * The summary column's empty map, kept as one object so a render while the
+ * reads are in flight does not rebuild the rows.
+ */
+const EMPTY_ACCESS: Record<string, RoleTableAccess | null> = {}
+
+/**
+ * Roles (`WEB-3` S3-D8, was "Teams & Roles"): create, edit and delete a
+ * role, each with `identity:write`. Creating and editing are their own
+ * pages (`WEB-7` D2); deleting stays a confirmation on this list. Deleting
+ * a role people still hold, or a built-in role, is refused by the API with
+ * a 409 whose sentence the dialog shows as it is (S3a-D2).
+ */
 export function RolesPage() {
   const { hasPermission } = useAuth()
   const canWrite = hasPermission("identity:write")
+  const router = useRouter()
   const state = useService((s) => identityService.listRoles(s), [])
-  const [createOpen, setCreateOpen] = React.useState(false)
-  const [name, setName] = React.useState("")
-  const [permissions, setPermissions] = React.useState("")
-  const [description, setDescription] = React.useState("")
-  const create = useServiceAction(
-    withNotify(
-      { success: "Role created", error: "Failed to create role" },
-      (signal, input: Parameters<typeof identityService.createRole>[0]) =>
-        identityService.createRole(input, signal)
-    )
+  const [deleting, setDeleting] = React.useState<Role | null>(null)
+
+  // The summary column's values. Keyed by the ids the list returned, so a
+  // refresh does not read a role that left the list.
+  const roleIds = (state.data ?? []).map((role) => role.id)
+  const roleIdsKey = roleIds.join(",")
+  const tableAccessState = useService(
+    (signal) => loadRoleTableAccesses(roleIdsKey ? roleIdsKey.split(",") : [], signal),
+    [roleIdsKey]
+  )
+  const accessLoaded = tableAccessState.status === "success"
+  const accessById: Record<string, RoleTableAccess | null> = accessLoaded
+    ? tableAccessState.data
+    : EMPTY_ACCESS
+
+  // The rows the table renders, with the summary worked out here. `columns`
+  // stays the same object while the summaries arrive: a rebuild would
+  // remount every cell, closing a row's open menu under the reader.
+  const rows = React.useMemo<RoleRow[]>(
+    () =>
+      (state.data ?? []).map((role) => {
+        const access = accessById[role.id] ?? null
+        return {
+          ...role,
+          tables: tableAccessSummary(access, role.permissions),
+          tablesFailed: accessLoaded && access === null,
+        }
+      }),
+    [state.data, accessById, accessLoaded]
   )
 
-  const columns = React.useMemo(() => getRoleColumns(), [])
+  const columns = React.useMemo(
+    () =>
+      canWrite
+        ? getRoleColumns({
+            onEdit: (role) => router.push(`/admin/roles/${encodeURIComponent(role.id)}/edit`),
+            onDelete: setDeleting,
+          })
+        : getRoleColumns(),
+    [canWrite, router]
+  )
 
   const tableUrlState = useTableUrlState()
   const filteredData = React.useMemo(
     () =>
-      filterDataClientSide(state.data ?? [], {
+      filterDataClientSide(rows, {
         search: tableUrlState.search,
         searchFields: [
           (r) => r.name,
@@ -52,7 +118,7 @@ export function RolesPage() {
         filters: tableUrlState.filters,
         joinOperator: tableUrlState.joinOperator,
       }),
-    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+    [rows, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
   )
 
   const { table } = useDataTable({
@@ -70,34 +136,15 @@ export function RolesPage() {
     getRowId: (row) => row.id,
   })
 
-  function resetForm() {
-    setName("")
-    setPermissions("")
-    setDescription("")
-  }
-
-  async function handleCreate() {
-    const result = await create.run({
-      name: name.trim(),
-      permissions: permissions.trim(),
-      description: description.trim(),
-    })
-    if (result) {
-      setCreateOpen(false)
-      resetForm()
-      state.reload()
-    }
-  }
-
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Teams & Roles"
-        description="Role templates, permissions, and membership."
+        title="Roles"
+        description="What each role may do, and how many people hold it."
         actions={
           <Button
             size="sm"
-            onClick={() => setCreateOpen(true)}
+            render={<Link href="/admin/roles/new" />}
             disabled={!canWrite}
             title={canWrite ? undefined : "You don't have permission to create roles."}
           >
@@ -122,43 +169,67 @@ export function RolesPage() {
           </div>
         </div>
       ) : null}
-      <CreateSheet
-        open={createOpen}
-        onOpenChange={(open) => {
-          setCreateOpen(open)
-          if (!open) resetForm()
-        }}
-        title="Create Role"
-        description="Define a role template with permissions."
-        canSubmit={Boolean(name.trim() && permissions.trim() && description.trim())}
-        submitting={create.status === "pending"}
-        onSubmit={handleCreate}
-      >
-        <RequiredLegend />
-        <div className="space-y-1.5">
-          <Label htmlFor="role-name" required>Name</Label>
-          <Input id="role-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="role-perms" required>Permissions</Label>
-          <Input
-            id="role-perms"
-            aria-required
-            value={permissions}
-            onChange={(e) => setPermissions(e.target.value)}
-            placeholder="catalog:read, query:run"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="role-desc" required>Description</Label>
-          <Input
-            id="role-desc"
-            aria-required
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-          />
-        </div>
-      </CreateSheet>
+      {deleting ? (
+        <DeleteRoleDialog
+          role={deleting}
+          onClose={() => setDeleting(null)}
+          onDeleted={() => {
+            setDeleting(null)
+            state.reload()
+          }}
+        />
+      ) : null}
     </div>
+  )
+}
+
+/**
+ * Delete one role (`DELETE /api/identity/roles/{id}`). The API refuses a
+ * role people still hold, or a built-in one, with a 409 and a fixed
+ * sentence; the dialog stays open and shows it, read from the action's
+ * state on the next render (not from the closure that awaited it).
+ */
+function DeleteRoleDialog({
+  role,
+  onClose,
+  onDeleted,
+}: {
+  role: Role
+  onClose: () => void
+  onDeleted: () => void
+}) {
+  const remove = useServiceAction((signal) =>
+    identityService.deleteRole(role.id, signal).then(() => true)
+  )
+
+  async function confirm() {
+    const done = await remove.run()
+    if (done === null) return
+    notifySuccess(`Deleted role ${role.name}`)
+    onDeleted()
+  }
+
+  return (
+    <ConfirmActionDialog
+      open
+      onOpenChange={(open) => (open ? undefined : onClose())}
+      title="Delete role"
+      description={`Delete ${role.name}?`}
+      impact={
+        role.members > 0
+          ? `${role.members} ${role.members === 1 ? "person holds" : "people hold"} it. A role can be deleted only once nobody holds it.`
+          : "Nobody holds it. Its permissions go with it."
+      }
+      confirmLabel="Delete role"
+      destructive
+      confirming={remove.status === "pending"}
+      onConfirm={() => void confirm()}
+    >
+      {remove.status === "error" ? (
+        <p role="alert" className="text-sm text-destructive">
+          {remove.error.message}
+        </p>
+      ) : null}
+    </ConfirmActionDialog>
   )
 }

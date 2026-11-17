@@ -1,6 +1,7 @@
 "use client"
 
 import { DatabaseIcon } from "lucide-react"
+import { trinoBronzeName } from "@/lib/asset-query"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { RequiredLegend } from "@/components/patterns/required-legend"
@@ -29,6 +30,7 @@ export function UploadTableStep({
   offersMode,
   mode,
   onMode,
+  folderField = null,
 }: {
   readonly tableName: string
   readonly onTableName: (name: string) => void
@@ -36,6 +38,8 @@ export function UploadTableStep({
   readonly offersMode: boolean
   readonly mode: UploadLoadMode
   readonly onMode: (mode: UploadLoadMode) => void
+  /** The folder picker (`DATA-35`), or nothing when the folders could not be read: the load then names no folder. */
+  readonly folderField?: React.ReactNode
 }) {
   const problem = tableName === "" ? null : tableNameFault(tableName)
   // The fieldset below has `min-w-0`: a fieldset defaults to its content's min width, which a long name would push past the card.
@@ -64,7 +68,7 @@ export function UploadTableStep({
       <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 px-3 py-2.5">
         <DatabaseIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden />
         <div className="min-w-0">
-          <p className="text-xs font-medium text-muted-foreground">Lands in Data Explorer as</p>
+          <p className="text-xs font-medium text-muted-foreground">Lands in the Catalog as</p>
           {valid ? (
             <p className="break-all font-mono text-sm" data-testid="upload-destination">
               {rawTableFullName(tableName)}
@@ -72,8 +76,20 @@ export function UploadTableStep({
           ) : (
             <p className="text-sm text-muted-foreground">Enter a valid name to see it.</p>
           )}
+          {/* `DATA-53` (QA `LH-DATA-9-07`): the Catalog's name is not the one Query Studio
+              reads on Trino, so both are given. */}
+          {valid ? (
+            <p className="text-xs text-muted-foreground">
+              In Query Studio, on the Trino engine:{" "}
+              <span className="break-all font-mono" data-testid="upload-query-name">
+                {trinoBronzeName(tableName)}
+              </span>
+            </p>
+          ) : null}
         </div>
       </div>
+
+      {folderField}
 
       {offersMode ? (
         <fieldset className="min-w-0 space-y-2">
@@ -109,7 +125,10 @@ export function UploadTableStep({
         </fieldset>
       ) : null}
 
-      <UploadNotice>Every column is stored as text. Numbers and dates have to be converted afterwards.</UploadNotice>
+      <UploadNotice>
+        The columns keep the names and types chosen on the previous step. Adding to a table that already exists keeps that
+        table&apos;s names and types.
+      </UploadNotice>
     </div>
   )
 }

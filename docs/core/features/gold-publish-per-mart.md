@@ -24,7 +24,9 @@ Nothing inside the console uses the open copy. It exists for outside tools.
 2. See the table published automatically after its pipeline succeeds,
    without pressing anything.
 3. See on the table's page: last published time, the snapshot ID, and one of
-   "Up to date", "Out of date", "Not measured", "Never published".
+   "Up to date", "Out of date", "Not measured", "Never published", or "Last
+   publish failed" (with the time and the reason) when the most recent publish
+   failed.
 4. Press "Publish now" to repair a failed or stale publish.
 5. See a failed publish with its reason. It is never shown as published.
 6. Switch publishing off. Updates stop; the published table stays.
@@ -66,6 +68,8 @@ that changes who can read the data.
   they will see every past copy. Storage grows by one copy per publish.
 - Tables over 5,000,000 rows are refused, not cut short. An operator can
   raise the limit.
+- A decimal column is published as a decimal of the same precision and scale.
+  A decimal wider than 38 digits is refused, and the refusal names the column.
 - The open copy is current only after the publish that follows a pipeline
   run.
 - If the system cannot tell when a table last changed, the page says "Not
@@ -74,6 +78,22 @@ that changes who can read the data.
   alter copies already published.
 - Automatic publishing needs the operator to set the export run token.
   Without it, only "Publish now" works.
+- A publish that fails before the copy starts (for example, the catalog's credentials
+  cannot be read) is recorded as a failed publish with its reason, also for an
+  automatic publish. A request that is turned away is not a publish and is not
+  recorded: no permission, a table of another organisation, or another publish of the
+  same table still running. If the database that keeps the publish history is itself
+  down, nothing can be recorded. Changed 2026-11-12 (`DATA-56`), *(proposed, not yet
+  signed)*.
+
+## How an outside tool reads a published table
+
+The console's own API is the door: an outside tool reads a published table
+through `<console>/api/iceberg` with a service identity's key, and the
+console counts who read what. The operator steps — publishing the storage
+address, creating the identity, the `pyiceberg` and DuckDB examples — are
+in [`docs/OPERATIONS.md`](../../OPERATIONS.md), "Outside tools read
+published tables (DATA-5, ADR 0016)".
 
 ## Acceptance checklist
 

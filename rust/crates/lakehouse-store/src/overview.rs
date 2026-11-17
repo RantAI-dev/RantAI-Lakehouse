@@ -12,12 +12,12 @@
 //! `POST /api/overview/alerts/{id}/silence`.
 
 use serde::Serialize;
-use sqlx::FromRow;
+use sqlx::{FromRow, Postgres, QueryBuilder};
 use time::OffsetDateTime;
 
 use crate::{PgPool, StoreError};
 
-fn iso_millis(at: OffsetDateTime) -> String {
+pub(crate) fn iso_millis(at: OffsetDateTime) -> String {
     let at = at.to_offset(time::UtcOffset::UTC);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
@@ -143,9 +143,9 @@ const ALERT_COLUMNS: &str = "id, title, severity, source, affected, status, assi
     delivery_reason";
 
 /// `alert_instance.delivery_status` of an instance whose delivery arrived.
-const DELIVERED: &str = "delivered";
+pub(crate) const DELIVERED: &str = "delivered";
 /// `alert_instance.delivery_status` of an instance whose delivery failed.
-const NOT_DELIVERED: &str = "not_delivered";
+pub(crate) const NOT_DELIVERED: &str = "not_delivered";
 
 /// How a delivery ended, as [`insert_from_fired_rule_with_delivery`] records
 /// it (`SRC-17` F1).
@@ -166,7 +166,10 @@ pub enum DeliveryRecord<'a> {
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_alerts(pool: &PgPool) -> Result<Vec<AlertItem>, StoreError> {
     let sql = format!("SELECT {ALERT_COLUMNS} FROM alert_instance ORDER BY at DESC");
-    let rows: Vec<AlertRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constant `ALERT_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<AlertRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(AlertItem::from).collect())
 }
 
@@ -180,7 +183,11 @@ pub async fn acknowledge_alert(pool: &PgPool, id: &str) -> Result<Option<AlertIt
     let sql = format!(
         "UPDATE alert_instance SET status = 'acknowledged' WHERE id = $1 RETURNING {ALERT_COLUMNS}"
     );
-    let row: Option<AlertRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    // safe: only the constant `ALERT_COLUMNS` is formatted in; values are bound.
+    let row: Option<AlertRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(AlertItem::from))
 }
 
@@ -199,7 +206,8 @@ pub async fn resolve_alert(
         "UPDATE alert_instance SET status = 'resolved', resolution_note = $2 \
          WHERE id = $1 RETURNING {ALERT_COLUMNS}"
     );
-    let row: Option<AlertRow> = sqlx::query_as(&sql)
+    // safe: only the constant `ALERT_COLUMNS` is formatted in; values are bound.
+    let row: Option<AlertRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(note)
         .fetch_optional(pool)
@@ -302,7 +310,8 @@ pub async fn insert_from_fired_rule_with_delivery(
          VALUES ($1,$2,$3,$4,$5,'open',$6,$7,$8,$6,$9,$10) \
          RETURNING {ALERT_COLUMNS}"
     );
-    let row: AlertRow = sqlx::query_as(&sql)
+    // safe: only the constant `ALERT_COLUMNS` is formatted in; values are bound.
+    let row: AlertRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(fired.title)
         .bind(fired.severity)
@@ -317,6 +326,39 @@ pub async fn insert_from_fired_rule_with_delivery(
         .await?;
     tx.commit().await?;
     Ok(Some(row.into()))
+}
+
+/// A delivery of a rule's crossing that is tried again after a failure
+/// (`BI-19` C review SF-2): when `rule_id` already has an open instance whose
+/// delivery failed, `delivery` is recorded on it and `true` is returned, so the
+/// caller adds no second instance for the same crossing. `false` when there is
+/// no such instance.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any query failure.
+pub async fn retry_open_undelivered(
+    pool: &PgPool,
+    rule_id: &str,
+    delivery: DeliveryRecord<'_>,
+) -> Result<bool, StoreError> {
+    let (status, reason) = match delivery {
+        DeliveryRecord::Delivered => (DELIVERED, None),
+        DeliveryRecord::NotDelivered(reason) => (NOT_DELIVERED, Some(reason)),
+    };
+    let done = sqlx::query(
+        "UPDATE alert_instance SET delivery_status = $2, delivery_reason = $3 \
+         WHERE id = (SELECT id FROM alert_instance \
+                     WHERE rule_id = $1 AND status = 'open' AND delivery_status = $4 \
+                     ORDER BY fired_at DESC LIMIT 1)",
+    )
+    .bind(rule_id)
+    .bind(status)
+    .bind(reason)
+    .bind(NOT_DELIVERED)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
 }
 
 /// `POST /api/overview/alerts/{id}/silence` — sets `silenced_until` and
@@ -335,7 +377,8 @@ pub async fn silence_alert(
         "UPDATE alert_instance SET status = 'acknowledged', silenced_until = $2 \
          WHERE id = $1 RETURNING {ALERT_COLUMNS}"
     );
-    let row: Option<AlertRow> = sqlx::query_as(&sql)
+    // safe: only the constant `ALERT_COLUMNS` is formatted in; values are bound.
+    let row: Option<AlertRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(until)
         .fetch_optional(pool)
@@ -571,17 +614,37 @@ impl From<ActivityRow> for ActivityItem {
 
 /// The most recent audited actions, newest first.
 ///
+/// `only_principal` narrows the feed to the rows whose `principal_id` is that
+/// value (the audit writers store the principal's id as text); `None` reads
+/// the rows of everyone. The value is bound, never formatted into the
+/// statement.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn recent_activity(pool: &PgPool, limit: i64) -> Result<Vec<ActivityItem>, StoreError> {
-    let rows: Vec<ActivityRow> = sqlx::query_as(
+pub async fn recent_activity(
+    pool: &PgPool,
+    limit: i64,
+    only_principal: Option<&str>,
+) -> Result<Vec<ActivityItem>, StoreError> {
+    // The principal clause is added only when a filter is given, instead of
+    // `($2::text IS NULL OR principal_id = $2)`: after five executions of a
+    // prepared statement Postgres may pick a generic plan, which cannot use
+    // `audit_event_principal_idx` as an index condition and would scan
+    // `audit_event_at_idx` with a filter over a trail that is never pruned
+    // (`audit::build_filtered` adds its filters the same way, and migration
+    // 0143's EXPLAIN evidence for `audit_event_principal_idx` is for a plain
+    // `principal_id = value` clause).
+    let mut qb = QueryBuilder::<Postgres>::new(
         "SELECT id, at, principal_kind, actor_label, action, resource_kind, resource_id, outcome \
-         FROM audit_event ORDER BY at DESC LIMIT $1",
-    )
-    .bind(limit.clamp(1, 200))
-    .fetch_all(pool)
-    .await?;
+         FROM audit_event",
+    );
+    if let Some(principal) = only_principal {
+        qb.push(" WHERE principal_id = ").push_bind(principal);
+    }
+    qb.push(" ORDER BY at DESC LIMIT ")
+        .push_bind(limit.clamp(1, 200));
+    let rows: Vec<ActivityRow> = qb.build_query_as().fetch_all(pool).await?;
     Ok(rows.into_iter().map(ActivityItem::from).collect())
 }
 

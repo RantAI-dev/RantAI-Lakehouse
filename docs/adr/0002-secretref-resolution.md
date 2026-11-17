@@ -472,3 +472,147 @@ in a type whose `Debug` is redacted.
 - Deleting a connector removes its managed credential files. A failed
   credential swap removes the files it wrote, except any file the
   connector names at that moment.
+
+## Addendum 5: managed credentials are encrypted at rest (`SRC-12`, 2026-10-15)
+
+### Context
+
+Addendum 4 stores the value a user types as a plain file on the
+`connector_secrets` volume and names encryption as the follow-up ("would
+replace `connector_secret_store` without changing any route or resolver").
+`SRC-12` asks for it: without a secret manager, a stored credential must be
+unreadable without a key from the environment, and compose must refuse to
+start without that key. The product owner signed AES-256-GCM on
+2026-10-14 (feature page `docs/core/features/credentials-done-properly.md`,
+decision 4).
+
+### Decision
+
+- **One key per installation**, `CONNECTOR_SECRETS_KEY`: 32 random bytes,
+  base64. The API and the orchestrator both receive it; both are refused a
+  start without it (`${CONNECTOR_SECRETS_KEY:?…}` in compose). There is no
+  default anywhere, `.env.example` included.
+- **Only `managed` files are encrypted.** `env:` variables and operator
+  `file:`s stay the operator's, as they are.
+- **Format of a managed file**: a version byte, a 96-bit random nonce, then
+  the AES-256-GCM ciphertext with its tag. The associated data is the file's
+  name, so a file copied under another connector's name does not open.
+- **Who does what**: only the API seals (it is the only writer, as in
+  addendum 4); the API and the orchestrator both open. A shared test vector
+  is checked by both test suites so the two implementations cannot drift.
+- **First start with the key**: a plain managed file found at start-up is
+  sealed in place (sealed copy written, fsynced, renamed over the plain
+  one). Leftover temporary and backup files of an interrupted replace are
+  removed at start-up, so no older value survives on disk.
+- **Changing the key**: an operator command re-seals every managed file
+  with a new key. While it runs, and until the old key is removed from the
+  environment, the old key (`CONNECTOR_SECRETS_KEY_PREVIOUS`) still opens
+  files; it never seals.
+
+### Deliberate limits
+
+- The key sits in the same environment as the processes that use it. This
+  protects a copied volume or backup, not a compromised API or
+  orchestrator process. A secret manager (`SRC-12` part B) is the answer
+  for that.
+- Losing the key loses every managed credential: they must be entered again.
+
+### Consequences
+
+- Every installation, development ones included, must set the key once.
+- Gates set a CI-only key in their override files.
+- `connector_secret_store` and both resolvers change; no route changes.
+
+## Addendum 6: references to an external secret manager (`SRC-12` part B, 2026-10-15)
+
+### Context
+
+`SRC-12` asks that a connector can read its password from HashiCorp Vault,
+AWS Secrets Manager, Google Secret Manager or Azure Key Vault, with no copy
+on the product's file system (feature page
+`docs/core/features/credentials-done-properly.md`, decisions 1 to 3, signed
+2026-10-14). The `SecretResolver` seam of this ADR was built for it.
+
+### Decision
+
+- **One manager per installation**, chosen by the operator with
+  `SECRET_MANAGER`; its sign-in is the operator's, in the environment of the
+  API and the orchestrator, never in the console.
+- **A reference is a credential kind** (`vault:`, `aws-sm:`, `gcp-sm:`,
+  `azure-kv:`), stored instead of a value. The API and the orchestrator each
+  read it from the manager at every use, with no cache, through a small HTTP
+  client per manager (no cloud SDK).
+- **Which secrets may be referenced is the operator's choice, and closed by
+  default.** `SECRET_MANAGER_ALLOWED_PREFIXES` lists reference prefixes,
+  compared segment by segment; `{tenant}` in a prefix is the connector's
+  tenant. With a manager set and no prefixes, no reference is accepted. The
+  rule is checked when a reference is saved and again at every use, in the
+  API and in the orchestrator. Without it, anyone allowed to manage a
+  connector could point it at any secret the product's identity can read
+  and, with a host of their choosing, carry that secret off in a connection
+  test (found in the planner's review of part B).
+- **Fixed error texts** for every manager failure; never the manager's own
+  text.
+
+### Deliberate limits
+
+- At use, the resolvers do not know the connector, so `{tenant}` matches
+  any one segment there; the exact tenant is checked when the reference is
+  saved through the API.
+- Vault: KV version 2, no namespaces. Azure: the public cloud. Google: a
+  service-account key file or the platform's metadata identity.
+- Google Secret Manager and Azure Key Vault are proven by tests against
+  their documented interfaces, not against the services; Vault and AWS by
+  gates against local stand-ins (the Vault image is a CI fixture under
+  BUSL-1.1; OpenBao is the drop-in).
+
+### Consequences
+
+- An operator who sets `SECRET_MANAGER` must also set
+  `SECRET_MANAGER_ALLOWED_PREFIXES`, and should give the product's manager
+  identity a policy no wider than those prefixes.
+- Typed credentials stay available unless `CONNECTOR_TYPED_CREDENTIALS=false`.
+
+## Addendum 7: OAuth sign-in for REST connectors (`SRC-12` part C, 2026-10-15)
+
+### Context
+
+`SRC-12` asks for the OAuth 2.0 authorization-code flow, with token refresh,
+for every connector whose source offers it; in this product that is the
+REST connector (feature page decisions 6 to 8, signed 2026-10-14).
+
+### Decision
+
+- A REST connector can use the auth kind `oauth2_authorization_code`. The
+  user starts the sign-in from the connector page; the product creates a
+  one-time `state` (stored hashed, bound to the connector and the user,
+  expiring after 10 minutes) and a PKCE S256 verifier, and returns the
+  provider's sign-in address. The provider returns to the product's own
+  callback address, which the operator sets (`CONNECTOR_OAUTH_REDIRECT_URI`)
+  and which is never taken from a request. The callback consumes the state
+  first, requires the same signed-in user, the connector's tenant and
+  `connector:manage`, exchanges the code, and stores only the refresh token,
+  sealed as in addendum 5. Access tokens are never stored.
+- Loads fetch an access token with the refresh token and fetch again once
+  on a 401. A rotated refresh token is sent by the orchestrator to the API
+  on a service route and sealed in place of the old one; the orchestrator
+  never writes the credentials volume. A refused refresh fails the run as
+  "sign in again", not retried.
+- The token and revocation addresses are dialled only over `https`, after
+  the same address check as connection tests, without following redirects
+  (`CONNECTOR_OAUTH_ALLOW_HTTP` exists for the gate's own provider and is
+  off unless exactly `true`). Both addresses are part of the connector's
+  target identity, so `SEC-14`'s re-point rule covers them.
+- Signing out, removing the credential or deleting the connector revokes
+  the token when the provider has a revocation address, and says so.
+
+### Deliberate limits
+
+- A connector signed in this way cannot be re-pointed to another provider:
+  `SEC-14` requires new credentials for every slot, and a refresh token can
+  only come from a new sign-in. A new connector is needed instead.
+- Client authentication is `client_secret_post` only.
+- Two runs of the same connector at once can race on a provider that
+  rotates refresh tokens.
+- The PKCE verifier is kept in clear for at most the 10 minutes of a
+  sign-in; alone, without the one-time code, it signs nobody in.

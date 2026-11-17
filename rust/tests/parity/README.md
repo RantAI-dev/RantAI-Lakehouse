@@ -65,7 +65,7 @@ The harness must normalize these rather than compare them by value:
   `secret` field, redacted at capture time; see "Intentional post-cutover
   divergences" below — it is gone from both the corpus and the live
   response now, not merely normalized.)
-- **Clock/id-derived** — `query-run-ok.id` (`q-<epoch ms>`), `metrics.durationMs`,
+- **Clock/id-derived** — `query-run-ok.id` (`q-<epoch ms>` or `q-<epoch ms>-<32 lowercase hex>`), `metrics.durationMs`,
   Dagster run ids and `startedAt`/`endedAt` in `pipelines-*` and `overview-*`,
   `ops-workloads.workloads[].elapsedMs` (an in-flight query's live elapsed
   time).

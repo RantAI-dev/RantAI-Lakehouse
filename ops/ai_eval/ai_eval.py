@@ -43,7 +43,43 @@ the saved answers for any case whose score moves.
 
 `--only id1,id2` runs a subset. Results go to `--out` (default: a JSON file
 in the system temp directory), with every answer and tool trace, so two
-runs can be compared case by case.
+runs can be compared case by case. A relative `--out` is also taken under the
+temp directory, so a run from the repository never writes results into it.
+
+# The dashboard set
+
+`dashboard_cases.json` is the standard set of dashboard requests. One command
+brings up a throwaway stack, seeds it, runs the set and takes the stack away
+again:
+
+    LLM_KEY=… ops/ai_eval/run_dashboard_eval.sh --out /tmp/baseline.json
+
+The set passes at 90% of its cases or more. `--repeat N --need K` runs each
+case N times and needs K of them to pass, so one flaky answer does not decide
+a case; the run above uses `--repeat 3 --need 2`. `--baseline <results.json>`
+adds a second rule: a case that passed in the baseline and fails now fails the
+set however good the percentage is. A case the baseline never saw is a new
+case, not a regression.
+
+Every case sets up the objects it needs, confirms what the assistant drafts
+the way the console does, checks the state it created, and deletes it again,
+so the set does not depend on what the stack happens to hold and does not
+leave anything behind. A run that could not finish is a failed case, not a
+crash, and a delete that fails is a problem of that case.
+
+A case that changes something the deletes cannot undo (a certification mark
+on an asset) names the call that undoes it in `cleanup`; those calls run
+after the deletes, on every exit of the run.
+
+Exit code 0 when the set passes, 1 when it fails, 2 when the run could not
+start (no stack, no login, a port already in use).
+
+This run belongs to a person, not to CI: it needs a model key, and whoever
+runs it reads the answers. The runner (`run_dashboard_eval.sh`) builds the api
+image from the working tree under its own tag, or uses the image given with
+`--image`, and removes what it built when it ends. Put the numbers in the
+review of the PR that changed the tool or prompt. Results are never kept in
+the repository.
 """
 
 from __future__ import annotations
@@ -112,10 +148,19 @@ REFUSAL_CUES = (
     "tidak mencakup",
     "hanya mencakup",
     "hanya tersedia",
+    "can't",
+    "cannot",
+    "can not",
+    "not able to",
+    "tidak bisa",
+    "tidak dapat",
 )
 
 # Words that appear in almost any Indonesian answer and almost never in an
-# English one; three or more distinct hits reads as Indonesian.
+# English one, and the words a short confirmation is built of ("sudah siap",
+# "tinjau pratinjaunya di bawah lalu konfirmasi"): a short answer carries too
+# few of the common words to reach three, so the words such an answer uses
+# count as markers too. Three or more distinct hits reads as Indonesian.
 INDONESIAN_MARKERS = (
     "yang",
     "dan",
@@ -142,9 +187,61 @@ INDONESIAN_MARKERS = (
     "ke",
     "usaha",
     "berdasarkan",
+    "sudah",
+    "siap",
+    "silakan",
+    "lalu",
+    "bawah",
+    "tinjau",
+    "periksa",
+    "konfirmasi",
 )
 
 RAW_ERROR_PATTERNS = (r"DB::Exception", r"Code: \d+", r"\bstack trace\b", r"SQLSTATE")
+
+def continuation_text(turn_confirms: list[dict[str, Any]], next_step: str) -> str:
+    """The text a continuation is sent as (`AI-15`): the objects the person
+    confirmed and that were saved, then the step the request still has.
+
+    The model reads only the text of the chat, so the saved objects have to
+    be named in it — without them it drafts them again. One item per
+    confirmed step that succeeded, in the order of the confirms. The console
+    builds the same text from its stored steps, so the runner measures the
+    product and not a variant of it.
+    """
+    items = [item for confirm in turn_confirms if (item := saved_item(confirm)) is not None]
+    return f"Confirmed and saved: {'; '.join(items)}. Do not draft these again. Continue: {next_step}"
+
+
+def saved_item(confirm: dict[str, Any]) -> str | None:
+    """The item that names one saved object, or None when the confirm saved
+    nothing: one that did not come back `executed` with HTTP 200.
+
+    The id is `result.id`, or `result.field.id` for a calculated field; the
+    title is `result.title`, else `result.name`, else `result.field.name`.
+    A part the result does not carry is left out, never invented, so the
+    item is the tool name alone when there is neither an id nor a title.
+    """
+    if not confirm_succeeded(confirm):
+        return None
+    result = confirmed_result(confirm)
+    field = result.get("field")
+    if not isinstance(field, dict):
+        field = {}
+    ident = _text_of(result.get("id")) or _text_of(field.get("id"))
+    title = _text_of(result.get("title")) or _text_of(result.get("name")) or _text_of(field.get("name"))
+    tool = str(confirm.get("tool") or "")
+    return tool + (f" {ident}" if ident else "") + (f' "{title}"' if title else "")
+
+
+def _text_of(value: Any) -> str | None:
+    """The text a result carries, or None when it carries none."""
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+# How many continuation messages may follow one scripted turn. The console
+# has the same cap.
+MAX_CONTINUATIONS = 3
 
 MULTIPLIERS = {
     "million": 1e6,
@@ -211,10 +308,18 @@ def api_get(cfg: Config, session: requests.Session, path: str) -> Any:
 
 
 def dig(value: Any, path: str) -> list[Any]:
-    """`a.b[].c` style lookup; `[]` fans out over a list."""
+    """`a.b[].c` style lookup; `[]` fans out over a list and `[N]` takes the
+    Nth element of one (`tabs[0].title` is the first tab's title, which is
+    how a case checks the order the tabs are in)."""
     current = [value]
     for part in path.split("."):
         fan = part.endswith("[]")
+        index: int | None = None
+        if not fan:
+            match = re.search(r"\[(\d+)\]$", part)
+            if match:
+                index = int(match.group(1))
+                part = part[: match.start()]
         key = part[:-2] if fan else part
         nxt: list[Any] = []
         for item in current:
@@ -224,10 +329,153 @@ def dig(value: Any, path: str) -> list[Any]:
                 continue
             if fan and isinstance(item, list):
                 nxt.extend(item)
-            elif not fan:
+            elif index is not None:
+                if isinstance(item, list) and index < len(item):
+                    nxt.append(item[index])
+            else:
                 nxt.append(item)
         current = nxt
     return current
+
+
+def _tool_arg(args: Any, key: str) -> Any:
+    """The value at a dotted `key` of a tool call's args, or `None` when any
+    part of the path is absent (so a missing key never matches an empty want)."""
+    current = args
+    for part in key.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def tool_args_match(args: Any, want: dict[str, Any]) -> bool:
+    """Whether a tool call's args carry every `want` key (dotted keys read
+    into nested args, so the match does not depend on key order).
+
+    BLD-2 review R4 BLOCKER 2 / decision R15, restoring the string
+    semantics commit `5ec778414e86` broke: a wanted NUMBER matches only a
+    number EQUAL to it (`minutes: 10` never matches `100` -- the
+    SHOULD-FIX 9/10 intent stays), but a wanted STRING matches
+    case-insensitively as a substring of a string value AND of the JSON
+    text of a list or object value (`"filters": "tahun"` matches a filters
+    array of objects, `silver.orders_clean` matches `"pipeline":
+    "orders_clean"`), because a schema never guarantees a value's exact
+    string shape. A wanted string never matches a number and vice versa.
+
+    BLD-2 review R5 SHOULD-FIX 5: a wanted BOOL matches only a bool of the
+    same value. In Python `1 == True` and `1.0 == True`, so comparing
+    without a type check scored a call that sent `1` for a case that asked
+    for `true` -- the same number-is-not-a-bool rule the other two arms
+    already enforce. The JSON text is dumped with `ensure_ascii=False`, so a
+    wanted non-ASCII string is looked for as itself and not as the
+    `\\uXXXX` escape `json.dumps` writes by default."""
+    for key, wanted in want.items():
+        got = _tool_arg(args, key)
+        if got is None:
+            return False
+        if isinstance(wanted, bool):
+            if not isinstance(got, bool) or got != wanted:
+                return False
+        elif wanted is None:
+            if got != wanted:
+                return False
+        elif isinstance(wanted, (int, float)):
+            # The number comparison is member-wise over a list but is an
+            # equality per member: 10 must never match 100.
+            if isinstance(got, list):
+                if not any(
+                    isinstance(member, (int, float))
+                    and not isinstance(member, bool)
+                    and member == wanted
+                    for member in got
+                ):
+                    return False
+            elif not (
+                isinstance(got, (int, float)) and not isinstance(got, bool) and got == wanted
+            ):
+                return False
+        else:
+            wanted_text = str(wanted).lower()
+            if isinstance(got, str):
+                matched = wanted_text in got.lower()
+            elif isinstance(got, (list, dict)):
+                matched = wanted_text in json.dumps(got, ensure_ascii=False).lower()
+            else:
+                matched = False
+            if not matched:
+                return False
+    return True
+
+
+def where_matches(item: Any, where: dict[str, Any]) -> bool:
+    """Whether `item` satisfies every `where` key. A flat key reads the item's
+    own field; a dotted key reads into it (`def.grain` is the `grain` of the
+    item's `def`, as `GET /api/dashboard/specs` nests it). A key that is absent
+    does not match. A field that holds a list matches when the value is one of
+    its members, or when a member is an object whose `column` names it
+    (`def.measures` names a measure the chart uses)."""
+    if not isinstance(item, dict):
+        return False
+    for key, want in where.items():
+        found = dig(item, key)
+        if not found:
+            return False
+        if not any(_is_or_holds(got, want) for got in found):
+            return False
+    return True
+
+
+def _is_or_holds(got: Any, want: Any) -> bool:
+    """Whether a value read from an item satisfies a `where` value.
+
+    A list matches when the wanted value is one of its members, or when the
+    wanted value is a string and a member is an object whose `column` names
+    it: the model writes a measure as `{"column": "per_event", "aggregate":
+    "sum"}`, so a case that asks for the measure `per_event` has to match
+    that object. Only the column names the measure; the aggregate does not.
+    The column match is exact and case-sensitive, like the string arm."""
+    if isinstance(got, list):
+        if want in got:
+            return True
+        if isinstance(want, str):
+            return any(
+                isinstance(member, dict) and member.get("column") == want
+                for member in got
+            )
+        return False
+    return got == want
+
+
+def tile_on_tab_matches(item: Any, spec: dict[str, Any]) -> bool:
+    """Whether the board puts the chart `spec["chart"]` on the tab titled
+    `spec["tab_title"]`.
+
+    A tile names its tab by that tab's id. A tile that names no tab, or names
+    one the board does not have, leaves the chart on the first tab. A board
+    with no tabs is on no tab, and a chart with no tile in the layout is on no
+    tab either."""
+    if not isinstance(item, dict):
+        return False
+    tabs = item.get("tabs")
+    if not isinstance(tabs, list) or not tabs:
+        return False
+    layout = item.get("layout")
+    tile = layout.get(spec.get("chart")) if isinstance(layout, dict) else None
+    if not isinstance(tile, dict):
+        return False
+    named = tile.get("tab")
+    tab: Any = None
+    if named is not None:
+        for candidate in tabs:
+            if isinstance(candidate, dict) and candidate.get("id") == named:
+                tab = candidate
+                break
+    if tab is None:
+        tab = tabs[0]
+    if not isinstance(tab, dict):
+        return False
+    return tab.get("title") == spec.get("tab_title")
 
 
 def resolve_fact(cfg: Config, session: requests.Session, fact: dict[str, Any]) -> list[Any]:
@@ -238,7 +486,7 @@ def resolve_fact(cfg: Config, session: requests.Session, fact: dict[str, Any]) -
     if "api" in fact:
         items = dig(api_get(cfg, session, fact["api"]), fact["path"])
         where = fact.get("where", {})
-        items = [i for i in items if all(isinstance(i, dict) and i.get(k) == v for k, v in where.items())]
+        items = [i for i in items if where_matches(i, where)]
         if "field" in fact:
             items = [i.get(fact["field"]) for i in items if isinstance(i, dict)]
         return items[: fact.get("limit", 50)]
@@ -298,11 +546,21 @@ def looks_indonesian(text: str) -> bool:
 # ── one case ─────────────────────────────────────────────────────────────
 
 
-def ask(cfg: Config, session: requests.Session, mode: str, messages: list[dict[str, str]]) -> dict[str, Any]:
+def ask(
+    cfg: Config,
+    session: requests.Session,
+    mode: str,
+    messages: list[dict[str, str]],
+    context: str | None = None,
+) -> dict[str, Any]:
     started = time.monotonic()
+    payload: dict[str, Any] = {"mode": mode, "messages": messages, "stream": False}
+    if context:
+        # `ChatBody.context` (routes/ai/mod.rs): the page the person is looking at.
+        payload["context"] = context
     resp = session.post(
         f"{cfg.api_url}/api/ai/chat",
-        json={"mode": mode, "messages": messages, "stream": False},
+        json=payload,
         timeout=cfg.timeout_s,
     )
     elapsed = time.monotonic() - started
@@ -316,16 +574,621 @@ def ask(cfg: Config, session: requests.Session, mode: str, messages: list[dict[s
     return body
 
 
+class CaseError(Exception):
+    """A case file entry the harness cannot run (a bad `modes` list)."""
+
+
+class SetupError(Exception):
+    """A case's `setup` call was refused: the run is not scored."""
+
+
+# The collection a created object is in, by its API route; the cleanup and
+# `expect_state` both name objects by these kinds.
+DELETE_ROUTES = {
+    "chart": "/api/dashboard/specs",
+    "field": "/api/dashboard/calc-fields",
+    "source": "/api/dashboard/sources",
+    "board": "/api/dashboard/boards",
+    "metric": "/api/dashboard/metrics",
+    # BI-37: an alert or digest rule, deleted by id like the others
+    # (`DELETE /api/alerts?id=`).
+    "alert": "/api/alerts",
+}
+# Newest first: a chart may use a field, a field a source, and a board holds
+# charts, so the dependants go before what they depend on. An alert watches a
+# chart, so it goes before the charts.
+CLEANUP_ORDER = ("alert", "chart", "metric", "field", "source", "board")
+
+
+def kind_of_path(path: str) -> str | None:
+    for kind, route in DELETE_ROUTES.items():
+        if path == route or path.startswith(route + "/"):
+            return kind
+    return None
+
+
+def turn_modes(case: dict[str, Any]) -> list[str]:
+    """One mode per turn: `modes` when given, else the case's `mode`."""
+    turns = case["turns"]
+    if "modes" in case:
+        modes = case["modes"]
+        if len(modes) != len(turns):
+            raise CaseError(f"{case.get('id', '?')}: modes has {len(modes)} entries for {len(turns)} turns")
+        return list(modes)
+    return [case.get("mode", "ask")] * len(turns)
+
+
+def fill_names(text: str, names: dict[str, str]) -> str:
+    """Replace `{name}` in a turn with the id a setup call saved under it."""
+    return re.sub(r"\{(\w+)\}", lambda match: names.get(match.group(1), match.group(0)), text)
+
+
+def fill_value(value: Any, names: dict[str, str]) -> Any:
+    """`fill_names` through a JSON value: strings, and the strings in lists and
+    objects. A setup body and an `expect_state` `where` use the same names."""
+    if isinstance(value, str):
+        return fill_names(value, names)
+    if isinstance(value, list):
+        return [fill_value(v, names) for v in value]
+    if isinstance(value, dict):
+        return {k: fill_value(v, names) for k, v in value.items()}
+    return value
+
+
+def fill_check(check: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
+    """An `expect_state` with its `{name}` keys and values replaced by the run's ids."""
+    filled = dict(check)
+    # The keys are filled too: a board's layout is keyed by chart id, so a
+    # `where` key such as `layout.{chart}.w` names a chart this run created.
+    filled["where"] = {
+        fill_names(key, names): fill_value(value, names)
+        for key, value in check.get("where", {}).items()
+    }
+    filled["path"] = fill_names(check["path"], names)
+    if "tile_on_tab" in check:
+        # The chart of a `tile_on_tab` is a name the run saved, like the ids
+        # of a `where`.
+        filled["tile_on_tab"] = fill_value(check["tile_on_tab"], names)
+    return filled
+
+
+CREATED_RE = re.compile(r"\{created:(\w+)\}")
+
+
+def fill_created_ids(value: Any, created: list[dict[str, str]]) -> Any:
+    """Replace `{created:<kind>}` with the id of the first object of that
+    kind this run created. A kind this run did not create is left as
+    written, so it matches nothing.
+
+    `BI-41` T1: `set_cache_rule` after a continuation names a chart the
+    assistant made itself, so `expect_tool.args_contains` needs the created
+    id as much as an `expect_state` `where` does. `fill_created` applies this
+    to a `where`; both callers read the same first-id rule."""
+    first: dict[str, str] = {}
+    for obj in created:
+        first.setdefault(obj["kind"], obj["id"])
+
+    def sub(value: Any) -> Any:
+        if isinstance(value, str):
+            return CREATED_RE.sub(lambda mt: first.get(mt.group(1), mt.group(0)), value)
+        if isinstance(value, dict):
+            return {k: sub(v) for k, v in value.items()}
+        return value
+
+    return sub(value)
+
+
+def fill_created(check: dict[str, Any], created: list[dict[str, str]]) -> dict[str, Any]:
+    """Replace `{created:<kind>}` in a `where` value with the id of the first
+    object of that kind this run created (from the trace or a confirm). The
+    assistant makes such an object itself, so its id is not known when the case
+    is written. A kind this run did not create is left as written, so it
+    matches nothing."""
+    filled = dict(check)
+    filled["where"] = fill_created_ids(check.get("where", {}), created)
+    return filled
+
+
+def formula_problems(
+    trace: list[dict[str, Any]], confirms: list[dict[str, Any]], forbidden: list[str]
+) -> list[str]:
+    """`formula_forbid`: the formula of every calculated field the run created
+    must not contain any of `forbidden`. The answer is scored as text; the
+    formula is a field of the tool's result and is checked here.
+
+    Both places a created field's result can arrive are read. A tool the
+    model called with `confirmed` itself answers in the trace. A tool the
+    person confirmed -- which is the flow every writing case in the set
+    uses -- returns the pending `{needs_confirmation, tool, args}` in the
+    trace and the executed `{ok, field}` only in `confirms`, so reading the
+    trace alone would find no formula and let the case pass unchecked."""
+    formulas: list[str] = []
+    for step in trace:
+        if step.get("tool") == "create_calculated_field":
+            formulas.append(_created_formula(step.get("result")))
+    for confirm in confirms:
+        if confirm.get("tool") == "create_calculated_field":
+            formulas.append(_created_formula(confirmed_result(confirm)))
+    problems: list[str] = []
+    for formula in formulas:
+        for word in forbidden:
+            if re.search(word, formula, re.IGNORECASE):
+                problems.append(f"formula contains {word}")
+    return problems
+
+
+def confirmed_result(confirm: dict[str, Any]) -> dict[str, Any]:
+    """The tool's own result inside a confirm. `send_confirm` keeps the whole
+    `POST /api/ai/tool` reply `{tool, outcome, result}` under `result`, so the
+    created object's `id` and `created` are one level further in."""
+    reply = confirm.get("result")
+    inner = reply.get("result") if isinstance(reply, dict) else None
+    return inner if isinstance(inner, dict) else {}
+
+
+def _created_formula(result: Any) -> str:
+    """The formula of a `create_calculated_field` result, or `""` when the
+    result is the pending confirmation rather than the executed call."""
+    field = result.get("field") if isinstance(result, dict) else None
+    return str((field or {}).get("formula", "")) if isinstance(field, dict) else ""
+
+
+def pending_of(step: dict[str, Any]) -> dict[str, Any]:
+    """The call a trace step asks the person to confirm (use-copilot.ts:380-382):
+    the step's result when it holds one, else the step's own tool and args."""
+    result = step.get("result") or {}
+    if isinstance(result, dict) and result.get("needs_confirmation"):
+        return {"tool": result.get("tool", step.get("tool")), "args": result.get("args", {})}
+    return {"tool": step.get("tool"), "args": step.get("args", {})}
+
+
+def confirm_body(pending: dict[str, Any], mode: str, session_id: str | None) -> dict[str, Any]:
+    """The `POST /api/ai/tool` body the console sends to confirm a draft
+    (use-copilot.ts:384-401): `title` copied from `caption`, `name` or `text`
+    when it is missing or empty, then `confirmed: true`."""
+    args = dict(pending.get("args") or {})
+    if not args.get("title") and (args.get("caption") or args.get("name") or args.get("text")):
+        args["title"] = str(args.get("caption") or args.get("name") or args.get("text"))
+    args["confirmed"] = True
+    return {"tool": pending.get("tool"), "args": args, "mode": mode, "sessionId": session_id}
+
+
+def send_confirm(
+    cfg: Config, session: requests.Session, step: dict[str, Any], mode: str, session_id: str | None
+) -> dict[str, Any]:
+    resp = session.post(
+        f"{cfg.api_url}/api/ai/tool",
+        json=confirm_body(pending_of(step), mode, session_id),
+        timeout=cfg.timeout_s,
+    )
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {"error": f"non-JSON response, HTTP {resp.status_code}"}
+    body["_status"] = resp.status_code
+    return body
+
+
+def confirm_pending(
+    cfg: Config,
+    session: requests.Session,
+    body: dict[str, Any],
+    mode: str,
+    confirms: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Confirm every draft of the body that waits for the person.
+
+    The confirms of this turn are returned as well as recorded: the request
+    only goes on when every one of them succeeded, which is what the console
+    does.
+    """
+    made: list[dict[str, Any]] = []
+    for step in body.get("toolTrace", []):
+        result = step.get("result") or {}
+        if isinstance(result, dict) and result.get("needs_confirmation"):
+            response = send_confirm(cfg, session, step, mode, body.get("sessionId"))
+            entry = {"tool": pending_of(step)["tool"], "result": response}
+            made.append(entry)
+            confirms.append(entry)
+    return made
+
+
+def confirm_succeeded(confirm: dict[str, Any]) -> bool:
+    """Whether a confirm came back `executed`, without an error."""
+    reply = confirm.get("result")
+    if not isinstance(reply, dict):
+        return False
+    return (
+        reply.get("_status") == 200
+        and reply.get("outcome") == "executed"
+        and "error" not in reply
+    )
+
+
+def confirm_problems(confirms: list[dict[str, Any]]) -> list[str]:
+    """A confirm that did not come back `executed` with HTTP 200 is a problem of
+    the case: HTTP 400 and up, an `error` in the reply, or any other `outcome`.
+    Without this a rejected confirm only shows as an object missing from the
+    state check, or not at all."""
+    problems: list[str] = []
+    for confirm in confirms:
+        reply = confirm.get("result")
+        if not isinstance(reply, dict):
+            reply = {}
+        status = reply.get("_status")
+        outcome = reply.get("outcome")
+        if status == 200 and outcome == "executed" and "error" not in reply:
+            continue
+        text = f"confirm {confirm.get('tool')}: HTTP {status}, outcome {outcome}"
+        if reply.get("error"):
+            text += f", error {reply['error']}"
+        problems.append(text)
+    return problems
+
+
+def run_setup(
+    cfg: Config, session: requests.Session, setup: list[dict[str, Any]]
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Make the case's own objects through the API. Returns the ids saved under
+    each name and the objects created, for cleanup. A call without an `id_at`
+    only changes what an earlier call made: it saves no name and adds nothing
+    for the cleanup to delete."""
+    names: dict[str, str] = {}
+    created: list[dict[str, str]] = []
+    for call in setup:
+        resp = session.request(
+            call["method"],
+            f"{cfg.api_url}{fill_names(call['path'], names)}",
+            json=fill_value(call.get("body"), names),
+            timeout=60,
+        )
+        if resp.status_code >= 400:
+            raise SetupError(f"setup {call.get('name', call['path'])}: HTTP {resp.status_code}")
+        if not call.get("id_at"):
+            # A call that only changes what an earlier call made (the tabs of
+            # a board) replies without an id: it saves no name, and the
+            # cleanup must not delete the object the earlier call created.
+            continue
+        body = resp.json()
+        found = dig(body, call["id_at"])
+        if not found:
+            raise SetupError(f"setup {call.get('name', call['path'])}: no {call['id_at']} in the reply")
+        obj_id = str(found[0])
+        if "name" in call:
+            names[call["name"]] = obj_id
+        kind = kind_of_path(call["path"])
+        if kind:
+            created.append({"kind": kind, "id": obj_id})
+    return names, created
+
+
+def collect_created(
+    setup_created: list[dict[str, str]],
+    traces: list[list[dict[str, Any]]],
+    confirms: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Every object this run created: setup calls, trace results marked
+    created with an id, the calculated fields and boards the tools made, and
+    (BI-37) the alert or digest rule `create_alert_rule` saved."""
+    found = list(setup_created)
+
+    def note(tool: str | None, result: Any) -> None:
+        """Collect one reply's object, by the shape that tool answers with."""
+        if not isinstance(result, dict):
+            return
+        if result.get("id"):
+            if tool == "create_chart" and result.get("created"):
+                found.append({"kind": "chart", "id": str(result["id"])})
+            elif tool == "create_board" and result.get("created"):
+                found.append({"kind": "board", "id": str(result["id"])})
+            elif tool == "create_calculated_field" and result.get("ok") is True:
+                found.append({"kind": "field", "id": str(result["id"])})
+            return
+        # BI-37: `create_alert_rule` answers `{ok: true, rule: {id, ...}}` — the
+        # object to clean up is the rule, not the reply.
+        rule = result.get("rule")
+        if tool == "create_alert_rule" and isinstance(rule, dict) and rule.get("id"):
+            found.append({"kind": "alert", "id": str(rule["id"])})
+
+    for trace in traces:
+        for step in trace:
+            note(step.get("tool"), step.get("result"))
+    for confirm in confirms:
+        note(confirm.get("tool"), confirmed_result(confirm))
+    return found
+
+
+def cleanup_plan(created: list[dict[str, str]]) -> list[dict[str, str]]:
+    """The deletes, in the order they must run: charts, calculated fields, SQL
+    sources, boards, and within a kind the last created first."""
+    ordered: list[dict[str, str]] = []
+    for kind in CLEANUP_ORDER:
+        ordered.extend(reversed([c for c in created if c["kind"] == kind]))
+    return ordered
+
+
+def run_cleanup(cfg: Config, session: requests.Session, created: list[dict[str, str]]) -> list[str]:
+    """Delete what the run created. A failed delete is returned as a problem."""
+    problems: list[str] = []
+    for obj in cleanup_plan(created):
+        route = DELETE_ROUTES[obj["kind"]]
+        try:
+            resp = session.delete(f"{cfg.api_url}{route}?id={obj['id']}", timeout=60)
+        except requests.RequestException as err:
+            problems.append(f"cleanup {obj['kind']} {obj['id']}: {type(err).__name__}")
+            continue
+        if resp.status_code >= 400:
+            problems.append(f"cleanup {obj['kind']} {obj['id']}: HTTP {resp.status_code}")
+    return problems
+
+
+def run_teardown(
+    cfg: Config,
+    session: requests.Session,
+    calls: list[dict[str, Any]],
+    names: dict[str, str],
+) -> list[str]:
+    """Undo what the case changed that deleting objects cannot undo: a mark it
+    put on an asset. Each call is made the way a setup call is, so a case
+    names it the same way; a call that fails is a problem of the run, not a
+    crash."""
+    problems: list[str] = []
+    for call in calls:
+        path = call.get("path", "?")
+        try:
+            resp = session.request(
+                call["method"],
+                f"{cfg.api_url}{fill_names(path, names)}",
+                json=fill_value(call.get("body"), names),
+                timeout=60,
+            )
+        except requests.RequestException as err:
+            problems.append(f"teardown {path}: {type(err).__name__}")
+            continue
+        if resp.status_code >= 400:
+            problems.append(f"teardown {path}: HTTP {resp.status_code}")
+    return problems
+
+
+def expect_state_problems(
+    cfg: Config,
+    session: requests.Session,
+    check: dict[str, Any],
+    own_ids: set[str],
+) -> list[str]:
+    """`expect_state`: list a collection and count the objects matching `where`.
+    Only objects this run created count, unless `scope` is `all`."""
+    resp = session.get(f"{cfg.api_url}{check['path']}", timeout=60)
+    resp.raise_for_status()
+    items = resp.json().get(check["list"], [])
+    where = check.get("where", {})
+    tile_on_tab = check.get("tile_on_tab")
+    matches = [
+        i
+        for i in items
+        if where_matches(i, where)
+        and (check.get("scope") == "all" or str(i.get("id")) in own_ids)
+        and (tile_on_tab is None or tile_on_tab_matches(i, tile_on_tab))
+    ]
+    if "min" in check:
+        if len(matches) < check["min"]:
+            return [f"state {check['path']} {where}: {len(matches)} found, at least {check['min']} expected"]
+        return []
+    want = check.get("count", 1)
+    if len(matches) != want:
+        return [f"state {check['path']} {where}: {len(matches)} found, {want} expected"]
+    return []
+
+
+def approval_problems(trace: list[dict[str, Any]], tool: str) -> list[str]:
+    """`expect_approval`: the tool's step must hold `needs_approval: true`."""
+    for step in trace:
+        result = step.get("result") or {}
+        if step.get("tool") == tool and isinstance(result, dict) and result.get("needs_approval") is True:
+            return []
+    return [f"approval: {tool} did not ask for approval"]
+
+
+def no_tool_problems(trace: list[dict[str, Any]], names: list[str]) -> list[str]:
+    """`expect_no_tool`: none of the named tools may appear with `ok: true`."""
+    return [
+        f"ran {step.get('tool')} (ok)"
+        for step in trace
+        if step.get("tool") in names and step.get("ok") is True
+    ]
+
+
+def forbid_unless_problems(
+    answer: str, trace: list[dict[str, Any]], pattern: str, result_key: str
+) -> list[str]:
+    """`forbid_unless_tool`: the answer may match `pattern` only when some trace
+    result carries `result_key`. It catches a claim such as "waiting in
+    Approvals" that the server never backed with a `needs_approval` result."""
+    if not re.search(pattern, answer, re.IGNORECASE):
+        return []
+    for step in trace:
+        result = step.get("result") or {}
+        if isinstance(result, dict) and result_key in result:
+            return []
+    return [f"forbidden: {pattern} without {result_key}"]
+
+
+def with_run_fields(scored: dict[str, Any], runs: list[dict[str, Any]], need: int) -> dict[str, Any]:
+    """Add `runs` and `passed` to a case's scored result; every existing key is kept."""
+    out = dict(scored)
+    out["runs"] = runs
+    out["passed"] = sum(1 for r in runs if run_passed(r)) >= need
+    return out
+
+
+def run_passed(run: dict[str, Any]) -> bool:
+    """A run passes when it has no missing item and no problem item."""
+    return not run.get("missing") and not run.get("problems")
+
+
+def case_verdict(case_id: str, runs: list[dict[str, Any]], need: int) -> dict[str, Any]:
+    passed = sum(1 for r in runs if run_passed(r)) >= need
+    return {"id": case_id, "runs": runs, "passed": passed}
+
+
+def set_verdict(cases: list[dict[str, Any]], baseline: dict[str, bool] | None) -> dict[str, Any]:
+    """The set passes at 90% of its cases or more, and with a baseline no case
+    that passed there may fail. A case not in the baseline is not a regression."""
+    total = len(cases)
+    passed = sum(1 for c in cases if c["passed"])
+    regressed = []
+    if baseline is not None:
+        regressed = [c["id"] for c in cases if baseline.get(c["id"]) and not c["passed"]]
+    failed = [c["id"] for c in cases if not c["passed"]]
+    enough = total > 0 and passed * 10 >= total * 9
+    return {
+        "pass": enough and not regressed,
+        "passed": passed,
+        "total": total,
+        "failed": failed,
+        "regressed": regressed,
+    }
+
+
+def summary_line(verdict: dict[str, Any]) -> str:
+    pct = round(100 * verdict["passed"] / verdict["total"]) if verdict["total"] else 0
+    head = "PASS" if verdict["pass"] else "FAIL"
+    text = f"{head} {verdict['passed']}/{verdict['total']} ({pct}%), "
+    if verdict["regressed"]:
+        text += "regressions: " + ", ".join(verdict["regressed"])
+    else:
+        text += "regressions: none"
+    if verdict["failed"]:
+        text += "; failed: " + ", ".join(verdict["failed"])
+    return text
+
+
+def exit_code(setup_error: bool, verdict: dict[str, Any] | None) -> int:
+    if setup_error:
+        return 2
+    return 0 if verdict and verdict["pass"] else 1
+
+
+def result_document(label: str, cases: list[dict[str, Any]], verdict: dict[str, Any] | None) -> dict[str, Any]:
+    return {"label": label, "summary": {}, "results": cases, "verdict": verdict}
+
+
 def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> dict[str, Any]:
-    mode = case.get("mode", "ask")
+    """One run of one case: setup, the turns (with confirms), the checks, then
+    cleanup in a `finally`. A failed cleanup is a problem of this run's result."""
+    modes = turn_modes(case)
     messages: list[dict[str, str]] = []
     bodies: list[dict[str, Any]] = []
-    for turn in case["turns"]:
-        messages.append({"role": "user", "content": turn})
-        body = ask(cfg, session, mode, messages)
-        bodies.append(body)
-        messages.append({"role": "assistant", "content": plain_text(body.get("answer", ""))})
-    return score_case(cfg, session, case, bodies)
+    confirms: list[dict[str, Any]] = []
+    setup_created: list[dict[str, str]] = []
+    names: dict[str, str] = {}
+    scored: dict[str, Any] | None = None
+    _raised_run: BaseException | None = None
+    try:
+        names, setup_created = run_setup(cfg, session, case.get("setup", []))
+        context = fill_names(case["context"], names) if case.get("context") else None
+        for turn, mode in zip(case["turns"], modes):
+            messages.append({"role": "user", "content": fill_names(turn, names)})
+            body = ask(cfg, session, mode, messages, context=context)
+            bodies.append(body)
+            turn_confirms = (
+                confirm_pending(cfg, session, body, mode, confirms) if case.get("confirm") else []
+            )
+            messages.append({"role": "assistant", "content": plain_text(body.get("answer", ""))})
+            # The request had steps left: the console sends them back once
+            # the draft is confirmed, and the runner measures the product,
+            # so it does the same, with the same cap.
+            continuations = 0
+            while continuations < MAX_CONTINUATIONS and body.get("nextStep"):
+                if not turn_confirms or not all(confirm_succeeded(c) for c in turn_confirms):
+                    break
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": continuation_text(turn_confirms, str(body["nextStep"])),
+                    }
+                )
+                body = ask(cfg, session, mode, messages, context=context)
+                bodies.append(body)
+                turn_confirms = (
+                    confirm_pending(cfg, session, body, mode, confirms)
+                    if case.get("confirm")
+                    else []
+                )
+                messages.append({"role": "assistant", "content": plain_text(body.get("answer", ""))})
+                continuations += 1
+        trace = [s for b in bodies for s in b.get("toolTrace", [])]
+        created = collect_created(setup_created, [trace], confirms)
+        scored = score_case(cfg, session, case, bodies, names, created)
+        scored["confirms"] = confirms
+        scored["problems"].extend(confirm_problems(confirms))
+        own_ids = {c["id"] for c in created}
+        for check in case.get("expect_state", []):
+            try:
+                filled = fill_created(fill_check(check, names), created)
+                scored["problems"].extend(expect_state_problems(cfg, session, filled, own_ids))
+            except requests.RequestException as err:
+                scored["problems"].append(f"state check failed: {type(err).__name__}")
+        if "expect_approval" in case:
+            scored["problems"].extend(approval_problems(trace, case["expect_approval"]))
+        if "expect_no_tool" in case:
+            scored["problems"].extend(no_tool_problems(trace, case["expect_no_tool"]))
+        if "forbid_unless_tool" in case:
+            spec = case["forbid_unless_tool"]
+            scored["problems"].extend(
+                forbid_unless_problems(scored["answer"], trace, spec["pattern"], spec["result_key"])
+            )
+        if "formula_forbid" in case:
+            scored["problems"].extend(formula_problems(trace, confirms, case["formula_forbid"]))
+    except BaseException as raised:  # noqa: BLE001 - a failed run is a result, not a crash
+        _raised_run = raised
+    finally:
+        # Cleanup runs on every exit. A run that scored keeps its problems on the
+        # result; a run that raised becomes a failed result with the same problems,
+        # so a failed cleanup is never only on stderr.
+        cleanup_problems = _cleanup(cfg, session, setup_created, bodies, confirms)
+        cleanup_problems.extend(run_teardown(cfg, session, case.get("cleanup", []), names))
+        if scored is None:
+            scored = _failed_run(case, _raised_run, cleanup_problems)
+        else:
+            scored["problems"].extend(cleanup_problems)
+    return scored
+
+
+def _failed_run(
+    case: dict[str, Any], raised: BaseException | None, cleanup_problems: list[str]
+) -> dict[str, Any]:
+    """A run that could not finish is a failed run, not a crash: the reason it
+    raised is its first problem, and a cleanup failure is a problem of the run."""
+    if isinstance(raised, requests.RequestException):
+        problems = [f"request failed: {type(raised).__name__}"]
+    elif isinstance(raised, (SetupError, CaseError)):
+        problems = [f"setup: {raised}"]
+    elif raised is None:
+        problems = ["run failed for an unknown reason"]
+    else:
+        problems = [f"run failed: {type(raised).__name__}: {raised}"]
+    problems.extend(cleanup_problems)
+    return {
+        "id": case["id"],
+        "completeness": 0,
+        "accuracy": 0,
+        "experience": 0,
+        "overall": 0,
+        "problems": problems,
+        "missing": [],
+    }
+
+
+def _cleanup(
+    cfg: Config,
+    session: requests.Session,
+    setup_created: list[dict[str, str]],
+    bodies: list[dict[str, Any]],
+    confirms: list[dict[str, Any]],
+) -> list[str]:
+    trace = [s for b in bodies for s in b.get("toolTrace", [])]
+    return run_cleanup(cfg, session, collect_created(setup_created, [trace], confirms))
 
 
 def bodies_from_saved(result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -347,8 +1210,18 @@ def bodies_from_saved(result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def score_case(
-    cfg: Config, session: requests.Session, case: dict[str, Any], bodies: list[dict[str, Any]]
+    cfg: Config,
+    session: requests.Session,
+    case: dict[str, Any],
+    bodies: list[dict[str, Any]],
+    names: dict[str, str] | None = None,
+    created: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    """Score one case from its response bodies. `names` are the ids the case's
+    setup saved, used to fill `{name}` in `expect_tool.args_contains` the way
+    the turns are filled; `created` are the objects the run made, used to fill
+    `{created:<kind>}` there (`BI-41` T1). `--rescore` has no setup and no
+    confirms, so it passes neither."""
     final = bodies[-1]
     raw_answer = final.get("answer", "") or ""
     answer = plain_text(raw_answer)
@@ -378,13 +1251,15 @@ def score_case(
     if expect_tool:
         required += 1
         trace = [t for b in bodies for t in b.get("toolTrace", []) if t.get("tool") == expect_tool["name"]]
-        want = expect_tool.get("args_contains", {})
-        if any(all(str(v).lower() in str(t.get("args", {}).get(k, "")).lower() for k, v in want.items()) for t in trace):
+        want = fill_created_ids(fill_value(expect_tool.get("args_contains", {}), names or {}), created or [])
+        if any(tool_args_match(t.get("args", {}), want) for t in trace):
             hit += 1
         else:
             missing.append(f"tool={expect_tool['name']}{want}")
 
-    refused = any(cue in lowered for cue in REFUSAL_CUES)
+    # The cues are written with a straight apostrophe; a model often answers
+    # with a curly one.
+    refused = any(cue in lowered.replace("\u2019", "'") for cue in REFUSAL_CUES)
     # No expected facts (e.g. no pipeline is failing right now): completeness
     # is about declining only when the case expects that.
     if required:
@@ -440,32 +1315,89 @@ def score_case(
     }
 
 
+def print_row(result: dict[str, Any]) -> None:
+    print(
+        f"{result['id']:<24} C={result['completeness']:.2f} A={result['accuracy']:.2f} "
+        f"E={result['experience']:.2f} O={result['overall']:.2f} "
+        f"{result.get('elapsed_s', 0):>5}s tools={','.join(t or '?' for t in result.get('tools', []))} "
+        f"{'; '.join(result.get('problems', []) + ['missing ' + ', '.join(result.get('missing', []))] if result.get('missing') else result.get('problems', []))}",
+        flush=True,
+    )
+
+
+def resolve_out(out: str, label: str) -> Path:
+    """Where the results go. An absolute `--out` is kept as given; a relative
+    one, and the default when none is given, goes under the temp directory, so
+    a run from the repository never writes its results into it (S3)."""
+    if out and Path(out).is_absolute():
+        return Path(out)
+    tmp = Path(tempfile.gettempdir())
+    if not out:
+        return tmp / f"ai-eval-{label}-{int(time.time())}.json"
+    return tmp / out
+
+
+def load_baseline(path: str) -> dict[str, bool]:
+    """Which cases passed in a saved run's verdict (a run with `passed`)."""
+    doc = json.loads(Path(path).read_text())
+    return {r["id"]: bool(r.get("passed")) for r in doc.get("results", []) if "passed" in r}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--label", default="run")
     parser.add_argument("--cases", default=str(HERE / "cases.json"))
     parser.add_argument("--only", default="")
+    parser.add_argument(
+        "--exclude",
+        default="",
+        help="case ids to leave out of the run, applied after --only; an id naming no case is a setup error",
+    )
     parser.add_argument("--out", default="")
     parser.add_argument(
         "--rescore",
         default="",
         help="score the answers saved in this results file again, without asking the API",
     )
-    args = parser.parse_args()
-
-    cfg = Config.from_env()
-    cases = json.loads(Path(args.cases).read_text())
-    if args.only:
-        wanted = set(args.only.split(","))
-        cases = [c for c in cases if c["id"] in wanted]
-
-    session = requests.Session()
-    login = session.post(
-        f"{cfg.api_url}/api/auth/login",
-        json={"email": cfg.email, "password": cfg.password},
-        timeout=30,
+    parser.add_argument("--repeat", type=int, default=1, help="runs per case")
+    parser.add_argument("--need", type=int, default=1, help="runs that must pass for a case to pass")
+    parser.add_argument(
+        "--baseline",
+        default="",
+        help="a saved results file; a case that passed there and fails now fails the set",
     )
-    login.raise_for_status()
+    args = parser.parse_args()
+    if args.need < 1 or args.need > args.repeat:
+        parser.error("--need must be between 1 and --repeat")
+
+    try:
+        cfg = Config.from_env()
+        cases = all_cases = json.loads(Path(args.cases).read_text())
+        if args.only:
+            wanted = set(args.only.split(","))
+            cases = [c for c in cases if c["id"] in wanted]
+        excluded = args.exclude.split(",") if args.exclude else []
+        # Checked against every case in the file, so a stale or mistyped id
+        # stops the run instead of silently leaving a broken case in the count.
+        known = {c["id"] for c in all_cases}
+        unknown = [i for i in excluded if i not in known]
+        if unknown:
+            raise ValueError(f"--exclude names no case: {', '.join(unknown)}")
+        cases = [c for c in cases if c["id"] not in excluded]
+        if excluded:
+            print(f"excluded: {', '.join(excluded)}")
+        baseline = load_baseline(args.baseline) if args.baseline else None
+
+        session = requests.Session()
+        login = session.post(
+            f"{cfg.api_url}/api/auth/login",
+            json={"email": cfg.email, "password": cfg.password},
+            timeout=30,
+        )
+        login.raise_for_status()
+    except (SystemExit, OSError, ValueError, requests.RequestException) as err:
+        print(f"setup error: {err}", file=sys.stderr)
+        return exit_code(setup_error=True, verdict=None)
 
     saved = {}
     if args.rescore:
@@ -473,23 +1405,28 @@ def main() -> int:
         cases = [c for c in cases if c["id"] in saved]
 
     results = []
+    verdict_cases = []
     for case in cases:
-        try:
-            if saved:
-                result = score_case(cfg, session, case, bodies_from_saved(saved[case["id"]]))
-            else:
-                result = run_case(cfg, session, case)
-        except requests.RequestException as err:
-            result = {"id": case["id"], "completeness": 0, "accuracy": 0, "experience": 0,
-                      "overall": 0, "problems": [f"request failed: {type(err).__name__}"]}
+        runs: list[dict[str, Any]] = []
+        for _ in range(args.repeat):
+            try:
+                if saved:
+                    runs.append(score_case(cfg, session, case, bodies_from_saved(saved[case["id"]])))
+                else:
+                    runs.append(run_case(cfg, session, case))
+            except requests.RequestException as err:
+                runs.append({"id": case["id"], "completeness": 0, "accuracy": 0, "experience": 0,
+                             "overall": 0, "problems": [f"request failed: {type(err).__name__}"]})
+            except (SetupError, CaseError) as err:
+                runs.append({"id": case["id"], "completeness": 0, "accuracy": 0, "experience": 0,
+                             "overall": 0, "problems": [f"setup: {err}"]})
+        # The run whose own problems are fewest is the case's shown result;
+        # the verdict counts every run.
+        shown = min(runs, key=lambda r: (len(r.get("problems", [])) + len(r.get("missing", []))))
+        result = with_run_fields(shown, runs=runs, need=args.need)
         results.append(result)
-        print(
-            f"{result['id']:<24} C={result['completeness']:.2f} A={result['accuracy']:.2f} "
-            f"E={result['experience']:.2f} O={result['overall']:.2f} "
-            f"{result.get('elapsed_s', 0):>5}s tools={','.join(t or '?' for t in result.get('tools', []))} "
-            f"{'; '.join(result.get('problems', []) + ['missing ' + ', '.join(result.get('missing', []))] if result.get('missing') else result.get('problems', []))}",
-            flush=True,
-        )
+        verdict_cases.append({"id": case["id"], "passed": result["passed"], "runs": runs})
+        print_row(shown)
 
     n = len(results) or 1
     summary = {
@@ -497,10 +1434,15 @@ def main() -> int:
         for key in ("completeness", "accuracy", "experience", "overall")
     }
     print(f"\n{args.label}: " + "  ".join(f"{k}={v:.3f}" for k, v in summary.items()))
-    out = Path(args.out) if args.out else Path(tempfile.gettempdir()) / f"ai-eval-{args.label}-{int(time.time())}.json"
-    out.write_text(json.dumps({"label": args.label, "summary": summary, "results": results}, ensure_ascii=False, indent=2))
+
+    verdict = set_verdict(verdict_cases, baseline=baseline) if verdict_cases else None
+    if verdict:
+        print(summary_line(verdict))
+    out = resolve_out(args.out, args.label)
+    document = result_document(args.label, results, verdict) | {"summary": summary, "excluded": excluded}
+    out.write_text(json.dumps(document, ensure_ascii=False, indent=2))
     print(f"saved {out}")
-    return 0
+    return exit_code(setup_error=False, verdict=verdict)
 
 
 if __name__ == "__main__":

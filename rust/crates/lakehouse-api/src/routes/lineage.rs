@@ -14,6 +14,7 @@
 //! | publisher -> dataset | `bronze_meta.dataset_sync.author` |
 //! | dataset -> Gold table | `bronze_meta.dataset_catalog.table_name` (the catalog registry) |
 //! | connector -> Bronze table | the connector's ingest spec (`source_objects[].target`) |
+//! | upload -> Bronze table | `upload_table_claim` (who owns the raw table name, `DATA-19`) |
 //! | source -> target of an authored pipeline | `pipeline_definition.source`/`target` |
 //! | table -> view | the view's own `SELECT` in `system.tables.as_select` |
 //! | Gold table -> Gold Iceberg table | a successful row in `console.gold_export_run` |
@@ -24,12 +25,14 @@
 //!
 //! # Tenancy
 //!
-//! Connectors and authored pipelines are read for the caller's own tenant
-//! only (`tenant_scope::resolve`), exactly like their list routes. The
-//! catalog, the `ClickHouse` tables and the Gold export history are one per
+//! Connectors, authored pipelines and uploaded tables are read for the
+//! caller's own tenant only (`tenant_scope::resolve`), exactly like their
+//! list routes. The catalog, the `ClickHouse` tables, the Gold export
+//! history and the dashboard charts are one per
 //! deployment with no tenant column; they are included only when
 //! `catalog::catalog_tenant_refusal` allows this caller to read the shared
-//! catalog, the same single rule the catalog route applies.
+//! catalog, the same single rule the catalog route applies (`SEC-20`, plan
+//! 96: the charts too, on every route that draws them).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -38,10 +41,18 @@ use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use serde_json::{Map, Value, json};
 
+use crate::routes::catalog::NOT_IN_PRIMARY;
 use crate::state::AppState;
 
 // One more record: what each table was last built from (see the module).
 mod builds;
+// Column-level lineage (`DATA-13`): producers, and the route that reads it.
+pub(crate) mod columns;
+// `BI-14`: charts, SQL sources and metrics in the graph, and the route that
+// walks one chart's path upstream.
+pub(crate) mod charts;
+// `BI-14`: which charts read a table.
+pub(crate) mod used_by;
 
 /// Most nodes one response carries, so a focus on a hub table cannot
 /// return the whole warehouse.
@@ -52,6 +63,10 @@ struct Graph {
     nodes: BTreeMap<String, (String, &'static str)>,
     edges: Vec<(String, String, &'static str, String)>,
     coverage: Vec<String>,
+    /// When a node was last refreshed and what says so (`BI-14` D3): a
+    /// `silver`/`serving` table's last build in `system.query_log` (UTC,
+    /// `YYYY-MM-DD HH:MM`). A node with no entry has no recorded time.
+    refreshed: BTreeMap<String, (String, &'static str)>,
 }
 
 impl Graph {
@@ -80,6 +95,20 @@ fn text(row: &Map<String, Value>, key: &str) -> String {
 /// The node id of a `ClickHouse` table.
 fn table_id(db: &str, table: &str) -> String {
     format!("table:{db}.{table}")
+}
+
+/// The canonical `schema.table` a lineage node id names, or `None` when the
+/// node is not a table (`GOV-7` D6): `table:<db>.<t>` and `iceberg:<db>.<t>`
+/// name `db.t`, and `bronze:<t>` names `bronze.t`.
+fn node_table_key(id: &str) -> Option<String> {
+    if let Some(rest) = id
+        .strip_prefix("table:")
+        .or_else(|| id.strip_prefix("iceberg:"))
+    {
+        return rest.contains('.').then(|| rest.to_owned());
+    }
+    id.strip_prefix("bronze:")
+        .map(|table| format!("bronze.{table}"))
 }
 
 /// The node for an authored pipeline's `"zone.table"` end: `bronze` is an
@@ -231,14 +260,26 @@ async fn add_catalog(ch: &lakehouse_clickhouse::ChClient, g: &mut Graph) {
             "the Bronze catalog registry could not be read, so datasets are not shown".to_owned(),
         ),
     }
-    let publishers = ch
-        .rows(
-            "SELECT slug, author FROM lake.`bronze_meta.dataset_sync` \
-             UNION ALL SELECT slug, author FROM lake.`bronze_meta_sec.dataset_sync`",
-            None,
-        )
-        .await
-        .unwrap_or_default();
+    // DATA-42 D1/D3: the primary registry wins, and every registry table
+    // this reader touches is read with `FINAL`.
+    //
+    // D1: the secondary branch drops the slugs the primary registry holds
+    // (see [`crate::routes::catalog::NOT_IN_PRIMARY`]), so a dataset that
+    // is in both registries gets ONE publisher edge — the graph used to
+    // draw one per registry, so two publishers for one dataset whenever
+    // the two registries named different authors.
+    //
+    // D3: `FINAL`, for the reason the catalog's reads give (`DATA-40` D4):
+    // the registry is a `ReplacingMergeTree ORDER BY slug` that every run
+    // of a connector writes again, and `ClickHouse` merges the copies
+    // only in the background. Without it a slug a second run registered
+    // got a second publisher edge.
+    let publishers_sql = format!(
+        "SELECT slug, author FROM lake.`bronze_meta.dataset_sync` FINAL
+         UNION ALL SELECT slug, author FROM lake.`bronze_meta_sec.dataset_sync` FINAL
+         WHERE slug {NOT_IN_PRIMARY}"
+    );
+    let publishers = ch.rows(&publishers_sql, None).await.unwrap_or_default();
     for row in &publishers {
         let (slug, author) = (text(row, "slug"), text(row, "author"));
         if author.is_empty() {
@@ -277,13 +318,98 @@ async fn add_exports(ch: &lakehouse_clickhouse::ChClient, g: &mut Graph) {
     }
 }
 
-async fn add_tenant_owned(state: &AppState, tenant: Option<uuid::Uuid>, g: &mut Graph) {
+/// The label of an upload whose `file_upload` row is gone (DATA-19 / D5).
+/// The claim outlives the upload — deleting an upload deletes its row for
+/// real, the claim on the table name is never released — so lineage keeps
+/// the origin visible and says plainly that the file behind it is gone. The
+/// name is NEVER guessed back: `original_filename` is the only source, and
+/// a missing row has none.
+const DELETED_UPLOAD_LABEL: &str = "deleted upload";
+
+/// The edge kind of an upload, and the record every such edge names.
+const UPLOAD: &str = "upload";
+const UPLOAD_EVIDENCE: &str = "upload table claim (upload_table_claim)";
+
+/// Draws `upload_table_claim`'s rows: an edge from the upload that asked
+/// for a raw table name into the Bronze table that name became.
+///
+/// [`lakehouse_store::uploads::list_claims`] has already applied the
+/// caller's tenant (`ConnectorFilter`'s rule: a claim whose tenant was
+/// deleted is invisible to every tenant-scoped caller), so another tenant's
+/// claim never reaches this function and can never become an edge.
+fn add_claim_rows(g: &mut Graph, claims: &[lakehouse_store::uploads::ClaimedTable]) {
+    for claim in claims {
+        let upload = format!("upload:{}", claim.upload_id);
+        let name = claim
+            .original_filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        // `DATA-17` slice 5: a table loaded from several files says so. The count is of
+        // the files that loaded with the claiming upload, of its own tenant
+        // (`list_claims`); a deleted upload has no name to attach it to.
+        let label = match name {
+            Some(name) if claim.also_loaded > 0 => {
+                format!("{name} and {} more", claim.also_loaded)
+            }
+            Some(name) => name.to_owned(),
+            None => DELETED_UPLOAD_LABEL.to_owned(),
+        };
+        g.node(&upload, &label, UPLOAD);
+        let bronze = format!("bronze:{}", claim.bronze_table);
+        g.node(&bronze, &format!("bronze.{}", claim.bronze_table), "bronze");
+        g.edge(&upload, &bronze, UPLOAD, UPLOAD_EVIDENCE);
+    }
+}
+
+/// [`add_claim_rows`] over the caller's own claims. A claim table this
+/// build cannot read costs a `coverage` note rather than a failed request:
+/// the rest of the graph is still an honest answer.
+async fn add_upload_claims(
+    pool: &lakehouse_store::PgPool,
+    tenant: Option<uuid::Uuid>,
+    g: &mut Graph,
+) {
+    match lakehouse_store::uploads::list_claims(pool, tenant).await {
+        Ok(claims) => add_claim_rows(g, &claims),
+        Err(err) => {
+            tracing::warn!(?err, "lineage: the upload table claims could not be read");
+            g.coverage.push(
+                "uploaded tables are not shown: their table claims could not be read".to_owned(),
+            );
+        }
+    }
+}
+
+/// Adds tenant-owned lineage records: connector ingest, authored pipelines,
+/// and file upload claims.
+///
+/// DATA-19 review BLOCKER 1: when `tenant` is `None` and the caller is not
+/// unrestricted ([`crate::routes::catalog::is_unrestricted`]), no tenant-owned
+/// edges are added and a coverage note is pushed. An unrestricted caller retains
+/// the unscoped read across all tenants.
+async fn add_tenant_owned(
+    state: &AppState,
+    principal: &Principal,
+    tenant: Option<uuid::Uuid>,
+    g: &mut Graph,
+) {
     let Some(pool) = state.pg.as_deref() else {
         g.coverage.push(
             "no Postgres pool: connector ingest and authored pipelines are not shown".to_owned(),
         );
         return;
     };
+    if tenant.is_none() && !crate::routes::catalog::is_unrestricted(principal) {
+        // DATA-19 review BLOCKER 1: a caller belonging to no tenant at all
+        // must not see every tenant's connectors, pipelines and upload claims.
+        // Only an unrestricted caller (`*:*`) retains the unscoped read.
+        g.coverage.push(
+            "connectors, pipelines and uploads are not shown: you belong to no tenant".to_owned(),
+        );
+        return;
+    }
+    add_upload_claims(pool, tenant, g).await;
     let connectors = lakehouse_store::connectors::list_connectors(
         pool,
         &lakehouse_store::connectors::ConnectorFilter { tenant_id: tenant },
@@ -324,25 +450,31 @@ async fn add_tenant_owned(state: &AppState, tenant: Option<uuid::Uuid>, g: &mut 
         pool,
         &lakehouse_store::pipelines::PipelineFilter {
             tenant_id: tenant,
-            all_tenants: false,
+            all_tenants: tenant.is_none(),
         },
     )
     .await
     .unwrap_or_default();
     for pipeline in &pipelines {
-        let (Some((from, from_label, from_kind)), Some((to, to_label, to_kind))) =
-            (zone_node(&pipeline.source), zone_node(&pipeline.target))
-        else {
+        // BLD-1 part 1 / D11 and review R1-B7: a pipeline reads EVERY input,
+        // so it draws one edge per input. `input_tables_of` is the store's one
+        // rule for a row that predates the column.
+        let Some((to, to_label, to_kind)) = zone_node(&pipeline.target) else {
             continue;
         };
-        g.node(&from, &from_label, from_kind);
         g.node(&to, &to_label, to_kind);
-        g.edge(
-            &from,
-            &to,
-            "pipeline",
-            &format!("authored pipeline {} ({})", pipeline.name, pipeline.id),
-        );
+        for table in lakehouse_store::pipelines::input_tables_of(pipeline) {
+            let Some((from, from_label, from_kind)) = zone_node(&table) else {
+                continue;
+            };
+            g.node(&from, &from_label, from_kind);
+            g.edge(
+                &from,
+                &to,
+                "pipeline",
+                &format!("authored pipeline {} ({})", pipeline.name, pipeline.id),
+            );
+        }
     }
 }
 
@@ -372,8 +504,19 @@ fn matches_focus(g: &Graph, focus: &str) -> Vec<String> {
 /// back, outgoing edges walked forward, never sideways (a sibling that
 /// shares a parent is not in the focus's lineage).
 fn reachable(g: &Graph, start: &[String]) -> BTreeSet<String> {
+    walk(g, start, &[true, false])
+}
+
+/// Only what is upstream of `start` (`BI-14`: where a chart comes from), the
+/// same walk as [`reachable`] with the forward pass left out.
+fn upstream(g: &Graph, start: &[String]) -> BTreeSet<String> {
+    walk(g, start, &[false])
+}
+
+/// [`reachable`]'s walk over the given directions (`true` forward).
+fn walk(g: &Graph, start: &[String], directions: &[bool]) -> BTreeSet<String> {
     let mut keep: BTreeSet<String> = start.iter().cloned().collect();
-    for forward in [true, false] {
+    for &forward in directions {
         let mut frontier: Vec<String> = start.to_vec();
         while let Some(node) = frontier.pop() {
             if keep.len() >= MAX_NODES {
@@ -396,6 +539,94 @@ fn reachable(g: &Graph, start: &[String]) -> BTreeSet<String> {
     keep
 }
 
+/// The table graph as recorded for `principal`, before any focus is applied
+/// (`BI-14` D2: the chart route walks the same graph the lineage page draws,
+/// it does not build a second one), with the tenant and shared-catalog rules
+/// the walk and the column mappings need.
+struct Assembled {
+    g: Graph,
+    tenant: Option<uuid::Uuid>,
+    shared: bool,
+}
+
+/// Every record the graph draws, for `principal`.
+///
+/// # Errors
+///
+/// As [`build`].
+async fn assemble(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> Result<Assembled, ApiError> {
+    let tenant = crate::tenant_scope::resolve(principal, headers)?;
+    let mut g = Graph::default();
+    let shared =
+        match crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await? {
+            None => {
+                add_shared(state, &mut g).await;
+                true
+            }
+            Some(reason) => {
+                g.coverage.push(format!(
+                    "shared catalog, ClickHouse tables and Gold exports are not shown: {reason}"
+                ));
+                false
+            }
+        };
+    add_tenant_owned(state, principal, tenant, &mut g).await;
+    builds::drop_repeats(&mut g);
+    g.coverage.push(
+        "only recorded edges are drawn; what a table is built from is read from the statement \
+         that last wrote it, so a table filled some other way has no incoming edge"
+            .to_owned(),
+    );
+    Ok(Assembled { g, tenant, shared })
+}
+
+/// `SEC-20`, plan 95: which of `tables` are Bronze tables an upload of
+/// another tenant holds, for a caller whose reach is `reach`. One claim read
+/// for all of them ([`crate::routes::query::claims_on`]).
+///
+/// Only the claim [`lakehouse_store::uploads::TableClaim::Theirs`] is acted
+/// on, not the whole of `table_is_reachable`: a Bronze table no upload claimed
+/// (one a connector ingests into) is unclaimed and the caller's own, and the
+/// lineage page draws it. "Another tenant holds it" is the arm that rule
+/// never reaches for anybody (`table_is_reachable`'s own doc comment).
+///
+/// A caller with no tenant owns no upload, so any claim is another's: it is
+/// asked as the nil tenant, which holds none. The shared-catalog rule admits
+/// such a caller only when a tenant appeared since it last counted, and the
+/// answer then fails closed.
+///
+/// # Errors
+///
+/// 503 when the claims cannot be read.
+async fn held_by_others(
+    state: &AppState,
+    reach: crate::routes::query::TenantReach,
+    tables: &[String],
+) -> Result<BTreeSet<String>, ApiError> {
+    use crate::routes::query::TenantReach;
+
+    let asking = match reach {
+        TenantReach::All => return Ok(BTreeSet::new()),
+        TenantReach::Tenant { tenant_id, .. } => tenant_id,
+        TenantReach::NoTenant => uuid::Uuid::nil(),
+    };
+    let bronze: Vec<String> = tables
+        .iter()
+        .filter(|table| table.starts_with("bronze."))
+        .cloned()
+        .collect();
+    let claims = crate::routes::query::claims_on(state, asking, &bronze).await?;
+    Ok(claims
+        .into_iter()
+        .filter(|(_, claim)| *claim == lakehouse_store::uploads::TableClaim::Theirs)
+        .map(|(table, _)| table)
+        .collect())
+}
+
 /// The recorded lineage around `focus` for `principal` (see the module
 /// doc). An empty or unknown focus returns an empty graph with a note, so
 /// the response never depends on which data a deployment holds.
@@ -404,29 +635,22 @@ fn reachable(g: &Graph, start: &[String]) -> BTreeSet<String> {
 ///
 /// [`ApiError::NotFound`] when `X-Tenant` names a tenant the caller does
 /// not belong to, and [`ApiError::Unavailable`] when the shared-catalog
-/// rule cannot be evaluated: both from the same helpers the catalog and
-/// connector routes use.
+/// rule cannot be evaluated or an upload table's claim cannot be read: all
+/// from the same helpers the catalog and connector routes use.
 pub(crate) async fn build(
     state: &AppState,
     principal: &Principal,
     headers: &HeaderMap,
     focus: &str,
 ) -> Result<Value, ApiError> {
-    let tenant = crate::tenant_scope::resolve(principal, headers)?;
-    let mut g = Graph::default();
-    match crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await? {
-        None => add_shared(state, &mut g).await,
-        Some(reason) => g.coverage.push(format!(
-            "shared catalog, ClickHouse tables and Gold exports are not shown: {reason}"
-        )),
-    }
-    add_tenant_owned(state, tenant, &mut g).await;
-    builds::drop_repeats(&mut g);
-    g.coverage.push(
-        "only recorded edges are drawn; what a table is built from is read from the statement \
-         that last wrote it, so a table filled some other way has no incoming edge"
-            .to_owned(),
-    );
+    let Assembled {
+        mut g,
+        tenant,
+        shared,
+    } = assemble(state, principal, headers).await?;
+    // BI-14 (D2, D5): the charts, SQL sources and metrics the caller may see,
+    // downstream of the tables they read.
+    charts::add_dashboard_nodes(state, principal, tenant, shared, &mut g).await;
 
     let base = json!({ "focus": focus, "columnMappings": [], "supported": true });
     let empty = |note: String| {
@@ -445,7 +669,32 @@ pub(crate) async fn build(
     if start.is_empty() {
         return Ok(empty(format!("no recorded lineage mentions {focus}")));
     }
-    let keep = reachable(&g, &start);
+    let mut keep = reachable(&g, &start);
+    // `GOV-7` D6: a node for a table the caller's roles hide is not drawn,
+    // and neither are the edges that touch it. Only table-shaped node ids
+    // (`table:`, `iceberg:`, `bronze:`) name a table; a dataset, chart,
+    // metric, source or pipeline node is not a table read.
+    let access = crate::routes::catalog::table_access_for(state, principal).await?;
+    if !access.is_all() {
+        let hidden: Vec<String> = g
+            .nodes
+            .iter()
+            .filter(|(id, _)| node_table_key(id).is_some_and(|key| !access.allows_key(&key)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in hidden {
+            keep.remove(&id);
+        }
+    }
+    // SEC-20, plan 95: a Bronze node for an upload table another tenant holds
+    // is not drawn either, and neither are the edges that touch it, even for
+    // the tenant that owns the shared catalog. A tenant's own records name
+    // only its own claims, but an authored pipeline can name any table as an
+    // input.
+    let reach = crate::routes::query::resolve_reach(state, principal, headers).await?;
+    let in_graph: Vec<String> = keep.iter().filter_map(|id| node_table_key(id)).collect();
+    let held = held_by_others(state, reach, &in_graph).await?;
+    keep.retain(|id| node_table_key(id).is_none_or(|key| !held.contains(&key)));
     let nodes: Vec<Value> = g
         .nodes
         .iter()
@@ -465,6 +714,30 @@ pub(crate) async fn build(
         })
         .collect();
     let mut body = base;
+    // DATA-13 (F1): the recorded column mappings that touch the focus, in the
+    // row shape `GET /api/governance/lineage/columns` answers, under the same
+    // tenant rules as the graph above.
+    //
+    // SEC-20, plan 95: a mapping that names a table another tenant holds is
+    // left out, as the node is, whichever end it is on: a focus on such a
+    // table has only mappings that name it, so it gets none. The tables are
+    // only known once the mappings are read, so the claims are read again for
+    // them (one read).
+    let mut mappings = columns::mappings_touching(state, principal, tenant, shared, &start).await;
+    if let Some(rows) = mappings.as_array_mut() {
+        let named: Vec<String> = rows
+            .iter()
+            .flat_map(|row| [&row["from"]["table"], &row["to"]["table"]])
+            .filter_map(|table| table.as_str().map(str::to_owned))
+            .collect();
+        let held = held_by_others(state, reach, &named).await?;
+        rows.retain(|row| {
+            [&row["from"]["table"], &row["to"]["table"]]
+                .iter()
+                .all(|table| table.as_str().is_none_or(|table| !held.contains(table)))
+        });
+    }
+    body["columnMappings"] = mappings;
     body["nodes"] = json!(nodes);
     body["edges"] = json!(edges);
     body["coverage"] = json!(g.coverage);
@@ -473,7 +746,13 @@ pub(crate) async fn build(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use lakehouse_store::uploads::ClaimedTable;
+
     use super::*;
+    use crate::config::Config;
 
     fn graph() -> Graph {
         let mut g = Graph::default();
@@ -529,7 +808,7 @@ mod tests {
             matches_focus(&g, "gold.mart_visits"),
             vec!["iceberg:gold.mart_visits".to_owned()]
         );
-        assert!(matches_focus(&g, "nothing").is_empty());
+        assert_eq!(matches_focus(&g, "nothing"), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -569,5 +848,608 @@ mod tests {
             Some("table:serving.m".to_owned())
         );
         assert_eq!(zone_node("orders"), None);
+    }
+
+    fn claim(table: &str, upload_id: &str, filename: Option<&str>) -> ClaimedTable {
+        ClaimedTable {
+            bronze_table: table.to_owned(),
+            upload_id: upload_id.to_owned(),
+            original_filename: filename.map(str::to_owned),
+            also_loaded: 0,
+        }
+    }
+
+    /// DATA-19 / D5: an uploaded table's origin is drawn from the record
+    /// that owns its name, with the file name the upload carried while the
+    /// upload still exists. This is the answer to "where did this Bronze
+    /// table come from" for a table nothing but an upload ever wrote.
+    #[test]
+    fn an_upload_draws_an_edge_into_the_bronze_table_it_claimed() {
+        let mut g = Graph::default();
+        add_claim_rows(
+            &mut g,
+            &[
+                claim("stock_raw", "up-1", Some("stock.csv")),
+                claim("orders_raw", "up-2", Some("orders.tsv")),
+            ],
+        );
+
+        assert_eq!(
+            g.edges
+                .iter()
+                .map(|(from, to, kind, _)| (from.as_str(), to.as_str(), *kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("upload:up-1", "bronze:stock_raw", "upload"),
+                ("upload:up-2", "bronze:orders_raw", "upload"),
+            ]
+        );
+        assert_eq!(
+            g.edges[0].3, "upload table claim (upload_table_claim)",
+            "an edge must name the record it is drawn from"
+        );
+        assert_eq!(
+            g.nodes.get("upload:up-1").map(|n| (n.0.as_str(), n.1)),
+            Some(("stock.csv", "upload"))
+        );
+        // The Bronze table becomes a node the graph can walk on from, and
+        // an upload's origin is reached by focusing the table it loaded.
+        assert_eq!(
+            g.nodes.get("bronze:stock_raw").map(|n| (n.0.as_str(), n.1)),
+            Some(("bronze.stock_raw", "bronze"))
+        );
+        let keep = reachable(&g, &["bronze:stock_raw".to_owned()]);
+        assert!(keep.contains("upload:up-1"));
+        assert!(
+            !keep.contains("upload:up-2"),
+            "another table's upload is not lineage"
+        );
+    }
+
+    /// `DATA-17` slice 5: a table loaded from several files names the first file and
+    /// how many others came with it; a load of one file keeps the plain name, and a
+    /// deleted upload keeps its own label whatever the count says (the name is never
+    /// guessed back).
+    #[test]
+    fn a_table_loaded_from_several_files_says_how_many_came_with_the_first() {
+        let mut g = Graph::default();
+        let mut several = claim("stock_raw", "up-1", Some("stock_a.csv"));
+        several.also_loaded = 2;
+        let mut gone = claim("other_raw", "up-2", None);
+        gone.also_loaded = 3;
+        add_claim_rows(
+            &mut g,
+            &[several, claim("solo_raw", "up-3", Some("solo.csv")), gone],
+        );
+
+        let label = |id: &str| g.nodes.get(id).map(|n| n.0.as_str());
+        assert_eq!(label("upload:up-1"), Some("stock_a.csv and 2 more"));
+        assert_eq!(label("upload:up-3"), Some("solo.csv"));
+        assert_eq!(label("upload:up-2"), Some(DELETED_UPLOAD_LABEL));
+    }
+
+    /// A claim outlives the upload that made it (deleting an upload
+    /// deletes its row for real and releases nothing), so the origin stays
+    /// visible after the file is gone — and says so. The name is never
+    /// guessed back: an empty or absent `original_filename` is the same
+    /// case, because there is nothing to show but the fact.
+    #[test]
+    fn an_upload_that_was_deleted_is_labelled_as_such_and_still_drawn() {
+        let mut g = Graph::default();
+        add_claim_rows(
+            &mut g,
+            &[
+                claim("stock_raw", "up-1", None),
+                claim("other_raw", "up-2", Some("  ")),
+            ],
+        );
+
+        assert_eq!(
+            g.nodes.get("upload:up-1").map(|n| (n.0.as_str(), n.1)),
+            Some((DELETED_UPLOAD_LABEL, "upload"))
+        );
+        assert_eq!(
+            g.nodes.get("upload:up-2").map(|n| n.0.as_str()),
+            Some(DELETED_UPLOAD_LABEL),
+            "a blank file name says no more than a missing one"
+        );
+        assert_eq!(
+            g.edges
+                .iter()
+                .map(|(from, to, kind, _)| (from.as_str(), to.as_str(), *kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("upload:up-1", "bronze:stock_raw", "upload"),
+                ("upload:up-2", "bronze:other_raw", "upload"),
+            ],
+            "a deleted upload still explains where its table came from"
+        );
+    }
+
+    fn database_url_for(pool: &lakehouse_store::PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options.get_database().unwrap_or_default(),
+        )
+    }
+
+    fn state_for(pool: &lakehouse_store::PgPool) -> Result<AppState, crate::config::ConfigError> {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+        let config = Config::from_map(&env)?;
+        Ok(AppState::new(config))
+    }
+
+    /// SEC-20, plan 95: which Bronze tables a caller must not be shown, for
+    /// each reach. A tenant is told of the uploads another tenant holds, never
+    /// of its own or of an unclaimed table; a caller with no tenant is told of
+    /// every claimed one (fail closed); an unrestricted reach is told of none.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn held_by_others_names_the_bronze_tables_another_tenant_holds(
+        pool: lakehouse_store::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::routes::query::TenantReach;
+
+        let state = state_for(&pool)?;
+        let (mine, theirs) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        for (id, name) in [(mine, "mine"), (theirs, "theirs")] {
+            sqlx::query(
+                "INSERT INTO tenant (id, name, slug, plan, residency) \
+                 VALUES ($1, $2, $2, 'Standard', 'US')",
+            )
+            .bind(id)
+            .bind(name)
+            .execute(&pool)
+            .await?;
+        }
+        assert!(lakehouse_store::uploads::claim_table(&pool, mine, "mine_raw", "u1").await?);
+        assert!(lakehouse_store::uploads::claim_table(&pool, theirs, "theirs_raw", "u2").await?);
+        let tables: Vec<String> = [
+            "bronze.mine_raw",
+            "bronze.theirs_raw",
+            "bronze.free_raw",
+            "silver.theirs_raw",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let set = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+
+        let as_tenant = TenantReach::Tenant {
+            tenant_id: mine,
+            owns_catalog: true,
+        };
+        assert_eq!(
+            held_by_others(&state, as_tenant, &tables).await?,
+            set(&["bronze.theirs_raw"])
+        );
+        assert_eq!(
+            held_by_others(&state, TenantReach::NoTenant, &tables).await?,
+            set(&["bronze.mine_raw", "bronze.theirs_raw"])
+        );
+        assert_eq!(
+            held_by_others(&state, TenantReach::All, &tables).await?,
+            set(&[])
+        );
+        Ok(())
+    }
+
+    fn restricted_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(uuid::Uuid::from_u128(100)),
+            tenant_ids: Vec::new(),
+            display_name: "Restricted Analyst".to_owned(),
+            permissions: PermissionSet::parse("lineage:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    fn unrestricted_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(uuid::Uuid::from_u128(101)),
+            tenant_ids: Vec::new(),
+            display_name: "Platform Admin".to_owned(),
+            permissions: PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    fn tenant_principal(tenant_id: uuid::Uuid) -> Principal {
+        Principal {
+            id: PrincipalId::User(uuid::Uuid::from_u128(102)),
+            tenant_ids: vec![tenant_id],
+            display_name: "Tenant Member".to_owned(),
+            permissions: PermissionSet::parse("lineage:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    async fn seed_test_tenant_owned(pool: &lakehouse_store::PgPool) -> Result<(), sqlx::Error> {
+        let tenant_1 = uuid::Uuid::from_u128(1);
+        let tenant_2 = uuid::Uuid::from_u128(2);
+
+        sqlx::query(
+            "INSERT INTO tenant (id, name, slug, plan, residency) VALUES ($1, $2, $3, 'Standard', 'US')",
+        )
+        .bind(tenant_1)
+        .bind("Tenant 1")
+        .bind("tenant-1")
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO tenant (id, name, slug, plan, residency) VALUES ($1, $2, $3, 'Standard', 'US')",
+        )
+        .bind(tenant_2)
+        .bind("Tenant 2")
+        .bind("tenant-2")
+        .execute(pool)
+        .await?;
+
+        // Tenant 1
+        sqlx::query(
+            "INSERT INTO connector (id, tenant_id, name, type, direction, host, secret_ref, environment, tenant, adapter, ingest_mode, dial, source_objects)              VALUES ($1, $2, $3, 'PostgreSQL', 'source', 'unused', 'env:SECRET', 'production', 't1', 'sql', 'batch', '{}'::jsonb, $4::jsonb)",
+        )
+        .bind("conn-t1")
+        .bind(tenant_1)
+        .bind("Connector 1")
+        .bind(json!([{"target": "t1_raw"}]).to_string())
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO pipeline_definition (id, name, kind, status, source, target, schedule, tenant_id)              VALUES ($1, $2, 'batch', 'draft', $3, $4, '@hourly', $5)",
+        )
+        .bind("pl-t1")
+        .bind("Pipeline 1")
+        .bind("bronze.t1_raw")
+        .bind("silver.t1_clean")
+        .bind(tenant_1)
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO upload_table_claim (bronze_table, tenant_id, upload_id)              VALUES ($1, $2, $3)",
+        )
+        .bind("t1_upload_raw")
+        .bind(tenant_1)
+        .bind("up-t1")
+        .execute(pool)
+        .await?;
+
+        // Tenant 2
+        sqlx::query(
+            "INSERT INTO connector (id, tenant_id, name, type, direction, host, secret_ref, environment, tenant, adapter, ingest_mode, dial, source_objects)              VALUES ($1, $2, $3, 'PostgreSQL', 'source', 'unused', 'env:SECRET', 'production', 't2', 'sql', 'batch', '{}'::jsonb, $4::jsonb)",
+        )
+        .bind("conn-t2")
+        .bind(tenant_2)
+        .bind("Connector 2")
+        .bind(json!([{"target": "t2_raw"}]).to_string())
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO pipeline_definition (id, name, kind, status, source, target, schedule, tenant_id)              VALUES ($1, $2, 'batch', 'draft', $3, $4, '@hourly', $5)",
+        )
+        .bind("pl-t2")
+        .bind("Pipeline 2")
+        .bind("bronze.t2_raw")
+        .bind("silver.t2_clean")
+        .bind(tenant_2)
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO upload_table_claim (bronze_table, tenant_id, upload_id)              VALUES ($1, $2, $3)",
+        )
+        .bind("t2_upload_raw")
+        .bind(tenant_2)
+        .bind("up-t2")
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// DATA-19 review BLOCKER 1: a caller belonging to no tenant who is not
+    /// unrestricted sees none of the three tenant-owned resources (connectors,
+    /// authored pipelines, upload claims) and receives a coverage note.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_zero_tenant_restricted_caller_sees_none_of_the_three(
+        pool: lakehouse_store::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = state_for(&pool)?;
+        seed_test_tenant_owned(&pool).await?;
+
+        let principal = restricted_principal();
+        let mut g = Graph::default();
+        add_tenant_owned(&state, &principal, None, &mut g).await;
+
+        assert!(g.edges.is_empty(), "must add no tenant-owned edges");
+        assert!(g.nodes.is_empty(), "must add no tenant-owned nodes");
+        assert!(
+            g.coverage.contains(
+                &"connectors, pipelines and uploads are not shown: you belong to no tenant"
+                    .to_owned()
+            ),
+            "must push coverage note explaining why tenant-owned rows are omitted"
+        );
+        Ok(())
+    }
+
+    /// DATA-19 review BLOCKER 1: an unrestricted caller (`*:*`) with no tenant
+    /// retains the unscoped read and sees all three tenant-owned resources
+    /// across all tenants.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_unrestricted_caller_sees_all(
+        pool: lakehouse_store::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = state_for(&pool)?;
+        seed_test_tenant_owned(&pool).await?;
+
+        let principal = unrestricted_principal();
+        let mut g = Graph::default();
+        add_tenant_owned(&state, &principal, None, &mut g).await;
+
+        let edge_tuples: Vec<(&str, &str, &str)> = g
+            .edges
+            .iter()
+            .map(|(from, to, kind, _)| (from.as_str(), to.as_str(), *kind))
+            .collect();
+
+        // Tenant 1
+        assert!(edge_tuples.contains(&("connector:conn-t1", "bronze:t1_raw", "ingest")));
+        assert!(edge_tuples.contains(&("bronze:t1_raw", "table:silver.t1_clean", "pipeline")));
+        assert!(edge_tuples.contains(&("upload:up-t1", "bronze:t1_upload_raw", "upload")));
+
+        // Tenant 2
+        assert!(edge_tuples.contains(&("connector:conn-t2", "bronze:t2_raw", "ingest")));
+        assert!(edge_tuples.contains(&("bronze:t2_raw", "table:silver.t2_clean", "pipeline")));
+        assert!(edge_tuples.contains(&("upload:up-t2", "bronze:t2_upload_raw", "upload")));
+
+        assert!(!g.coverage.contains(
+            &"connectors, pipelines and uploads are not shown: you belong to no tenant".to_owned()
+        ));
+        Ok(())
+    }
+
+    /// BLD-1 part 1 / D11 and review R1-B7: the graph draws one pipeline edge
+    /// per INPUT, not one for the first — a pipeline with two inputs is
+    /// downstream of both producers.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_two_input_pipeline_has_one_edge_per_input(
+        pool: lakehouse_store::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = state_for(&pool)?;
+        let tenant = uuid::Uuid::from_u128(1);
+        sqlx::query(
+            "INSERT INTO tenant (id, name, slug, plan, residency) \
+             VALUES ($1, $2, $3, 'Standard', 'US')",
+        )
+        .bind(tenant)
+        .bind("Tenant 1")
+        .bind("tenant-1")
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO pipeline_definition \
+                (id, name, kind, status, source, target, schedule, tenant_id, input_tables) \
+             VALUES ('pl-multi', 'Pipeline multi', 'batch', 'draft', \
+                     'bronze.first', 'silver.multi', '@hourly', $1, \
+                     ARRAY['bronze.first', 'bronze.second'])",
+        )
+        .bind(tenant)
+        .execute(&pool)
+        .await?;
+
+        let principal = restricted_principal();
+        let mut g = Graph::default();
+        add_tenant_owned(&state, &principal, Some(tenant), &mut g).await;
+
+        let edge_tuples: Vec<(&str, &str, &str)> = g
+            .edges
+            .iter()
+            .map(|(from, to, kind, _)| (from.as_str(), to.as_str(), *kind))
+            .collect();
+        assert!(
+            edge_tuples.contains(&("bronze:first", "table:silver.multi", "pipeline")),
+            "the first input's edge: {edge_tuples:?}"
+        );
+        assert!(
+            edge_tuples.contains(&("bronze:second", "table:silver.multi", "pipeline")),
+            "the second input's edge: {edge_tuples:?}"
+        );
+        Ok(())
+    }
+
+    /// DATA-19 review BLOCKER 1: a caller belonging to a tenant sees only its
+    /// own connectors, authored pipelines, and upload claims, never another
+    /// tenant's.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_tenant_caller_sees_only_its_own(
+        pool: lakehouse_store::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = state_for(&pool)?;
+        seed_test_tenant_owned(&pool).await?;
+
+        let tenant_1 = uuid::Uuid::from_u128(1);
+        let principal = tenant_principal(tenant_1);
+        let mut g = Graph::default();
+        add_tenant_owned(&state, &principal, Some(tenant_1), &mut g).await;
+
+        let edge_tuples: Vec<(&str, &str, &str)> = g
+            .edges
+            .iter()
+            .map(|(from, to, kind, _)| (from.as_str(), to.as_str(), *kind))
+            .collect();
+
+        // Tenant 1 edges are present
+        assert!(edge_tuples.contains(&("connector:conn-t1", "bronze:t1_raw", "ingest")));
+        assert!(edge_tuples.contains(&("bronze:t1_raw", "table:silver.t1_clean", "pipeline")));
+        assert!(edge_tuples.contains(&("upload:up-t1", "bronze:t1_upload_raw", "upload")));
+
+        // Tenant 2 edges are NOT present
+        assert!(!edge_tuples.contains(&("connector:conn-t2", "bronze:t2_raw", "ingest")));
+        assert!(!edge_tuples.contains(&("bronze:t2_raw", "table:silver.t2_clean", "pipeline")));
+        assert!(!edge_tuples.contains(&("upload:up-t2", "bronze:t2_upload_raw", "upload")));
+        assert!(!g.nodes.contains_key("connector:conn-t2"));
+        assert!(!g.nodes.contains_key("bronze:t2_upload_raw"));
+
+        assert!(!g.coverage.contains(
+            &"connectors, pipelines and uploads are not shown: you belong to no tenant".to_owned()
+        ));
+        Ok(())
+    }
+
+    // ── DATA-42 D1/D3: the primary registry wins. ────────────────────────
+    //
+    // The publisher edges are drawn from the Bronze sync registries. A slug
+    // that is in both got ONE edge per registry, so a dataset had two
+    // publishers whenever the two registries named different authors.
+    //
+    // These tests run against a REAL `ClickHouse` (the compose file's own
+    // `26.8` tag, through `testcontainers`), because the fix is a
+    // statement: `FINAL` and the `NOT IN (SELECT slug FROM ...)` clause
+    // are the engine's, and a fake that answered them would only prove
+    // that this module asks for what it means to ask for.
+    mod registry_clash {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_clickhouse::ChClient;
+
+        use super::*;
+        use crate::routes::bronze_registry_fixture::{
+            clickhouse, seed_catalog, seed_sync_with_author,
+        };
+
+        /// The publisher edges that point at `dataset:<slug>`.
+        fn publishers_of<'a>(
+            g: &'a Graph,
+            slug: &str,
+        ) -> Vec<&'a (String, String, &'static str, String)> {
+            let dataset = format!("dataset:{slug}");
+            g.edges
+                .iter()
+                .filter(|(_, to, kind, _)| to == &dataset && *kind == "publisher")
+                .collect()
+        }
+
+        /// A slug the two registries both hold: one dataset, one publisher,
+        /// and the PRIMARY's author.
+        #[tokio::test]
+        async fn a_clashing_dataset_has_one_publisher_edge_from_the_primary() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "clash_lineage",
+                "Primary lineage",
+                "clash_lineage_raw",
+            )
+            .await;
+            seed_sync_with_author(
+                &ch,
+                "bronze_meta",
+                "clash_lineage",
+                "Primary lineage",
+                "clash_lineage_raw",
+                10,
+                "primary_team",
+            )
+            .await;
+            seed_catalog(
+                &ch,
+                "bronze_meta_sec",
+                "clash_lineage",
+                "Secondary lineage",
+                "clash_lineage_sec_raw",
+            )
+            .await;
+            seed_sync_with_author(
+                &ch,
+                "bronze_meta_sec",
+                "clash_lineage",
+                "Secondary lineage",
+                "clash_lineage_sec_raw",
+                99,
+                "secondary_team",
+            )
+            .await;
+
+            let mut g = Graph::default();
+            add_catalog(&ch, &mut g).await;
+
+            let publishers = publishers_of(&g, "clash_lineage");
+            assert_eq!(
+                publishers.len(),
+                1,
+                "one dataset, one publisher: {publishers:?}"
+            );
+            assert_eq!(
+                publishers[0].0, "source:primary_team",
+                "the primary's publisher, not the secondary's: {publishers:?}"
+            );
+        }
+
+        /// A slug a second run wrote again has one publisher edge, not two.
+        ///
+        /// DATA-42 D3: without `FINAL` the two copies of the row are two
+        /// rows, so the graph draws the edge twice.
+        #[tokio::test]
+        async fn a_slug_written_twice_to_the_primary_has_one_publisher_edge() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            // The two copies of the row stay apart: no merge may collapse
+            // them before the graph reads them.
+            ch.exec("SYSTEM STOP MERGES lake.`bronze_meta.dataset_sync`", None)
+                .await
+                .expect("stop the merges of the sync table");
+
+            seed_sync_with_author(
+                &ch,
+                "bronze_meta",
+                "twice_lineage",
+                "Twice lineage",
+                "twice_lineage_raw",
+                10,
+                "primary_team",
+            )
+            .await;
+            // The same run again, before `ClickHouse` merged the parts.
+            seed_sync_with_author(
+                &ch,
+                "bronze_meta",
+                "twice_lineage",
+                "Twice lineage again",
+                "twice_lineage_raw",
+                20,
+                "primary_team",
+            )
+            .await;
+
+            let mut g = Graph::default();
+            add_catalog(&ch, &mut g).await;
+
+            let publishers = publishers_of(&g, "twice_lineage");
+            assert_eq!(
+                publishers.len(),
+                1,
+                "one dataset, one publisher: {publishers:?}"
+            );
+        }
     }
 }

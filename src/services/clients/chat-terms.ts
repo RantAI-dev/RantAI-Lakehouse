@@ -1,6 +1,6 @@
 import type { ChatTerm, ChatTermService } from "../contracts/chat-terms"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 
 /**
  * The caller's chat terms over `/api/ai/terms`. An error body's text is the
@@ -17,12 +17,10 @@ export const chatTermService: ChatTermService = {
     })
     const json = await res.json().catch(() => null)
     if (!res.ok) {
-      const kind =
-        res.status === 401 || res.status === 403
-          ? "permission_denied"
-          : res.status >= 500
-            ? "unavailable"
-            : "invalid_request"
+      // WEB-12: a refusal goes through deniedFor (errors.ts).
+      const denied = deniedFor(res.status, json)
+      if (denied) throw denied
+      const kind = res.status >= 500 ? "unavailable" : "invalid_request"
       throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status)
     }
     return json as ChatTerm

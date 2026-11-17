@@ -1,8 +1,8 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import {
   Dialog,
   DialogClose,
@@ -14,13 +14,14 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useServiceAction } from "@/hooks/use-service"
 import { notifySuccess } from "@/lib/notify"
 import { SEVERITY_LABEL, type Severity } from "@/lib/status"
 import { governanceService } from "@/services"
 import type { QualityRule, UpdateQualityRuleInput } from "@/services/contracts/governance"
-
-const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+import { ThresholdForms } from "./quality-check-fields"
+import { TablePicker, useTableCatalog } from "./table-picker"
 
 /** What the dialog needs of a rule — a list row and an asset's check both have it. */
 export type EditableRule = {
@@ -69,11 +70,15 @@ export function EditRuleDialog({
   const [severity, setSeverity] = React.useState<Severity>(
     isSeverity(rule.severity) ? rule.severity : "medium"
   )
+  // WEB-8 D8: the table is picked from the catalog, with the rule's own
+  // table shown even if the catalog no longer lists it.
+  const catalog = useTableCatalog()
   const save = useServiceAction((signal, input: UpdateQualityRuleInput) =>
     governanceService.updateQualityRule(rule.id, input, signal)
   )
   const rewrite = ruleRewrite(rule, { asset, threshold, severity })
-  // Results describe what the rule checked; a different check has none yet.
+  // DATA-14 (F2): the results stay in the rule's history, but they describe
+  // what it checked before, so a different check shows none yet.
   const clearsResults =
     asset.trim() !== rule.asset || threshold.trim() !== rule.threshold
 
@@ -101,17 +106,14 @@ export function EditRuleDialog({
         </DialogHeader>
         <div className="grid gap-3">
           <RequiredLegend />
-          <div className="grid gap-1.5">
-            <Label htmlFor="edit-rule-asset" required>Table</Label>
-            <Input
-              id="edit-rule-asset"
-              aria-required
-              className="font-mono"
-              value={asset}
-              onChange={(e) => setAsset(e.target.value)}
-              placeholder="silver.orders"
-            />
-          </div>
+          <TablePicker
+            id="edit-rule-asset"
+            label="Table"
+            value={asset}
+            onChange={setAsset}
+            catalog={catalog}
+            required
+          />
           <div className="grid gap-1.5">
             <Label htmlFor="edit-rule-threshold" required>Threshold</Label>
             <Input
@@ -123,32 +125,27 @@ export function EditRuleDialog({
               placeholder="email not null >= 95%"
             />
             <p className="text-xs text-muted-foreground">
-              To be runnable, write it as: <span className="font-mono">rows &gt;= 1000</span>,{" "}
-              <span className="font-mono">column not null &gt;= 95%</span>,{" "}
-              <span className="font-mono">column unique</span> or{" "}
-              <span className="font-mono">column between 0 and 100</span>, and name the table as
+              To be runnable, write it as one of: <ThresholdForms />. Name the table as
               silver.table, serving.table or bronze.table.
             </p>
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor="edit-rule-severity">Severity</Label>
-            <select
+            <SelectField
               id="edit-rule-severity"
-              className={selectClassName}
+              className="w-full"
               value={severity}
-              onChange={(e) => setSeverity(e.target.value as Severity)}
-            >
-              {(Object.keys(SEVERITY_LABEL) as Severity[]).map((s) => (
-                <option key={s} value={s}>
-                  {SEVERITY_LABEL[s]}
-                </option>
-              ))}
-            </select>
+              options={(Object.keys(SEVERITY_LABEL) as Severity[]).map((s) => ({
+                value: s,
+                label: SEVERITY_LABEL[s],
+              }))}
+              onValueChange={(next) => setSeverity(next as Severity)}
+            />
           </div>
           {clearsResults ? (
             <p className="text-xs text-muted-foreground">
-              The results recorded for this rule are cleared: they describe what it checked
-              before. It reads &quot;not run yet&quot; until it runs again.
+              The results recorded for this rule are kept in its history, but they describe what
+              it checked before. It reads &quot;not run yet&quot; until it runs again.
             </p>
           ) : null}
           {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}

@@ -85,6 +85,46 @@ interface UseDataTableProps<TData>
   startTransition?: React.TransitionStartFunction;
   /** Page buttons (`pages`) or infinite scroll (`infinite`). */
   paginationMode?: "pages" | "infinite";
+  /**
+   * Columns the page hides for its own reasons — the Data Explorer hides
+   * what does not fit the window.
+   *
+   * They stay in the column list, so their filters, sorts and group-bys keep
+   * working, and the hide is never written into the stored layout: a resize
+   * cannot overwrite the choices the user saved, and widening the window
+   * brings back what they had.
+   */
+  hiddenColumns?: string[];
+}
+
+/**
+ * Writes the user's visibility choices back to the stored layout, leaving the
+ * columns the page hides alone.
+ *
+ * The updater sees the whole visibility state, the page's hides included, so
+ * a plain write would store "hidden" for a column the user never touched and
+ * keep it hidden after the window grows. The stored value wins for those
+ * columns; the page's hide rides on top of the state instead of being
+ * written into it.
+ */
+function keepStoredVisibility(
+  updaterOrValue: Updater<VisibilityState>,
+  effective: VisibilityState,
+  stored: VisibilityState,
+  forcedHidden: readonly string[]
+): VisibilityState {
+  const next =
+    typeof updaterOrValue === "function"
+      ? updaterOrValue(effective)
+      : updaterOrValue;
+  if (forcedHidden.length === 0) return next;
+
+  const merged: VisibilityState = { ...next };
+  for (const id of forcedHidden) {
+    if (id in stored) merged[id] = stored[id];
+    else delete merged[id];
+  }
+  return merged;
 }
 
 /**
@@ -140,6 +180,7 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     manualPagination = true,
     manualSorting = true,
     manualFiltering = true,
+    hiddenColumns,
     ...tableProps
   } = props;
   const pageKey = queryKeys?.page ?? PAGE_KEY;
@@ -264,6 +305,26 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     resetStoredLayout();
   }, [resetStoredLayout]);
 
+  // The page's own hides, as a stable list: the page builds a fresh array
+  // whenever the window changes, and a new array every render would rebuild
+  // the table's visibility state on every render.
+  const hiddenSignature = hiddenColumns?.join("\0") ?? "";
+  const forcedHidden = React.useMemo(
+    () => (hiddenSignature ? hiddenSignature.split("\0") : []),
+    [hiddenSignature]
+  );
+
+  // The page's hides ride on top of the stored layout instead of replacing
+  // it: the columns stay in the list — their filters keep working — and the
+  // user's saved choice for them is left alone, so widening the window brings
+  // back what they had.
+  const columnVisibility = React.useMemo<VisibilityState>(() => {
+    if (forcedHidden.length === 0) return layout.columnVisibility;
+    const merged: VisibilityState = { ...layout.columnVisibility };
+    for (const id of forcedHidden) merged[id] = false;
+    return merged;
+  }, [layout.columnVisibility, forcedHidden]);
+
   const onColumnOrderChange = React.useCallback(
     (updaterOrValue: Updater<ColumnOrderState>) => {
       setLayout({
@@ -281,13 +342,15 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     (updaterOrValue: Updater<VisibilityState>) => {
       setLayout({
         ...layout,
-        columnVisibility:
-          typeof updaterOrValue === "function"
-            ? updaterOrValue(layout.columnVisibility)
-            : updaterOrValue,
+        columnVisibility: keepStoredVisibility(
+          updaterOrValue,
+          columnVisibility,
+          layout.columnVisibility,
+          forcedHidden
+        ),
       });
     },
-    [layout, setLayout]
+    [layout, setLayout, columnVisibility, forcedHidden]
   );
 
   // Normalised before it reaches the table, so a layout stored before the
@@ -508,7 +571,7 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     state: {
       pagination,
       sorting,
-      columnVisibility: layout.columnVisibility,
+      columnVisibility,
       columnOrder: layout.columnOrder,
       columnPinning,
       rowSelection,
@@ -547,6 +610,10 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
       setGroupBy,
       paginationMode,
       memoryKeys: stableMemoryKeys,
+      // The columns the page hides for its own reasons. The settings menu
+      // leaves them out: they are not the user's to toggle, they come back
+      // with the width.
+      hiddenColumns: forcedHidden,
     },
   });
 

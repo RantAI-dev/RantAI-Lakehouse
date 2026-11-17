@@ -6,7 +6,6 @@
 //! read back the response), with no vendor SDK, exactly as the TypeScript
 //! client does with `fetch`.
 
-use lakehouse_core::ApiError;
 use reqwest::StatusCode;
 use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE};
 use serde::Deserialize;
@@ -68,8 +67,7 @@ pub enum ChError {
     ///
     /// The `Display` impl deliberately does NOT include `reqwest`'s message:
     /// `reqwest::Error`'s `Display` appends `" for url (http://host:port/)"`,
-    /// which — through `ChError -> ApiError::Unprocessable(err.to_string())`
-    /// — would leak the internal `ClickHouse` host/port to an unauthenticated
+    /// which — had it been rendered into a response body — would leak the internal `ClickHouse` host/port to an unauthenticated
     /// caller. `src/services/clients/clickhouse.ts` never sees that URL
     /// either: Node's `fetch` (undici) rejects a connection failure with a
     /// `TypeError` whose `.message` is the fixed string `"fetch failed"`
@@ -83,9 +81,9 @@ pub enum ChError {
     #[error("fetch failed")]
     Transport(#[source] reqwest::Error),
     /// `ClickHouse` responded with a non-2xx status. The message is the
-    /// `ClickHouse` error body, trimmed, verbatim — callers surface it to
-    /// users — falling back to `ClickHouse HTTP <status>` when the body is
-    /// empty.
+    /// `ClickHouse` error body, trimmed, verbatim — SEC-11: it is for the
+    /// log, never for a response body — falling back to
+    /// `ClickHouse HTTP <status>` when the body is empty.
     #[error("{0}")]
     Server(String),
     /// The request was cancelled via the caller-supplied
@@ -97,10 +95,119 @@ pub enum ChError {
     /// (`AbortSignal`-triggered aborts surface as a generic fetch rejection
     /// in the TS client, and none of the captured routes exercise that
     /// path), so this mapping is unobservable against the parity corpus;
-    /// [`ApiError::Internal`] is the least surprising choice — a cancelled
-    /// request is a server-side condition, not a client input error.
+    /// a cancelled request is a server-side condition, not a client input
+    /// error.
     #[error("request cancelled")]
     Cancelled,
+}
+
+impl ChError {
+    /// The `ClickHouse` error code of a [`ChError::Server`] body such as
+    /// `Code: 159. DB::Exception: Timeout exceeded ...`, if it has that
+    /// shape. The text itself is for the log only (SEC-11); callers branch on
+    /// the code and write their own sentence.
+    #[must_use]
+    pub fn server_code(&self) -> Option<u32> {
+        let Self::Server(text) = self else {
+            return None;
+        };
+        let rest = text.trim_start().strip_prefix("Code: ")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    }
+
+    /// Whether the engine stopped the query for running past its
+    /// `max_execution_time` (`TIMEOUT_EXCEEDED`, code 159).
+    #[must_use]
+    pub fn is_time_limit(&self) -> bool {
+        self.server_code() == Some(TIMEOUT_EXCEEDED)
+    }
+
+    /// Whether the query was killed on the engine (`QUERY_WAS_CANCELLED`,
+    /// code 394), for example by `KILL QUERY` after a Stop.
+    #[must_use]
+    pub fn is_killed_on_engine(&self) -> bool {
+        self.server_code() == Some(QUERY_WAS_CANCELLED)
+    }
+}
+
+/// `ClickHouse` error code `TIMEOUT_EXCEEDED`.
+pub const TIMEOUT_EXCEEDED: u32 = 159;
+/// `ClickHouse` error code `QUERY_WAS_CANCELLED`.
+pub const QUERY_WAS_CANCELLED: u32 = 394;
+
+/// How far past the engine's own limit the HTTP request waits (`BI-5` plan
+/// D3): the engine stops the query at `max_execution_time` and answers with
+/// its error, and this margin keeps the client from giving up first and
+/// turning that answer into a bare transport timeout.
+pub const LIMIT_MARGIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What one limited, identified query asks of the engine (`BI-5` plan D3).
+///
+/// Every field is a URL setting of that one request, not text in the SQL, so
+/// the statement the caller wrote is the statement that runs. (A statement-
+/// level `SETTINGS` clause overrides these; the SQL source's own cap is kept
+/// in the statement for that reason, see `lakehouse_bi::builder`.)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryOptions {
+    /// `max_execution_time`: the engine stops the query after this long. Also
+    /// sets the request's own timeout to this plus [`LIMIT_MARGIN`].
+    pub max_execution_time: Option<std::time::Duration>,
+    /// `max_result_rows` with `result_overflow_mode = break`: pass the number
+    /// of rows to keep plus one to learn whether the engine had more.
+    pub max_result_rows: Option<u64>,
+    /// `query_id`: lets `KILL QUERY WHERE query_id ...` find this query.
+    pub query_id: Option<String>,
+    /// `output_format_json_quote_decimals = 1`: the engine writes a decimal as JSON
+    /// TEXT, with every digit, instead of a number, which this client reads as a 64-bit
+    /// float and so keeps about fifteen digits of (`DATA-53`, QA `LH-DATA-9-32`). Read by
+    /// [`ChClient::query_with_options`] only: a caller whose cells are text anyway asks
+    /// for it; a chart's numbers are not changed. Review round 1 R6: the row stream and the
+    /// byte stream do not send it, so a tile and a download receive what they did before
+    /// (`D20`). Default `false`.
+    pub quote_decimals: bool,
+}
+
+/// Most progress headers one limited request may receive; hyper's client
+/// refuses a response with more than 100 headers in all.
+const PROGRESS_HEADERS_MAX: u128 = 80;
+
+/// The milliseconds between progress headers for a query allowed to run
+/// `limit`: one second, or more for a long limit so the count stays at most
+/// [`PROGRESS_HEADERS_MAX`].
+fn progress_interval_ms(limit: std::time::Duration) -> u128 {
+    (limit.as_millis() / PROGRESS_HEADERS_MAX).max(1000)
+}
+
+/// The `max_execution_time` URL setting for `limit`: whole seconds, rounded
+/// up, so a limit is never shortened.
+fn max_execution_time_seconds(limit: std::time::Duration) -> String {
+    limit
+        .as_secs()
+        .saturating_add(u64::from(limit.subsec_nanos() > 0))
+        .to_string()
+}
+
+/// The progress-header settings of a limited request.
+///
+/// The headers give the server something to write while the query runs, so a
+/// client that goes away is noticed on the engine. The interval keeps the
+/// number of headers under [`PROGRESS_HEADERS_MAX`].
+fn push_progress_settings(limit: std::time::Duration, settings: &mut Vec<(&str, String)>) {
+    settings.push(("send_progress_in_http_headers", "1".to_owned()));
+    settings.push((
+        "http_headers_progress_interval_ms",
+        progress_interval_ms(limit).to_string(),
+    ));
+}
+
+impl QueryOptions {
+    /// The request's own timeout: the time limit plus [`LIMIT_MARGIN`], or
+    /// `None` (the client's default) without a limit.
+    #[must_use]
+    pub fn request_timeout(&self) -> Option<std::time::Duration> {
+        self.max_execution_time.map(|limit| limit + LIMIT_MARGIN)
+    }
 }
 
 impl From<reqwest::Error> for ChError {
@@ -109,20 +216,12 @@ impl From<reqwest::Error> for ChError {
     }
 }
 
-impl From<ChError> for ApiError {
-    /// `ClickHouse` errors are almost always the caller's SQL, not our
-    /// outage, so `Transport`/`Server` map to `422 Unprocessable` — matching
-    /// `src/app/api/query/run/route.ts`, which returns 422 (not 500) when
-    /// `chQuery` throws. `Cancelled` is a server-side condition rather than
-    /// a client input error, so it maps to `500 Internal` instead — see the
-    /// doc comment on [`ChError::Cancelled`].
-    fn from(err: ChError) -> Self {
-        match err {
-            ChError::Cancelled => Self::Internal(err.to_string()),
-            other => Self::Unprocessable(other.to_string()),
-        }
-    }
-}
+// There is deliberately NO `From<ChError> for ApiError` (SEC-11). It used to
+// exist and turned `ChError::Server`'s text -- the database's own message,
+// with table names and the server version -- into a response body at every
+// `?`. A handler now has to say how it reports the failure
+// (`lakehouse_api::upstream_error`), so a new `?` on a `ChError` in a route
+// does not compile instead of leaking.
 
 /// HTTP client for `ClickHouse`'s plain HTTP interface.
 ///
@@ -192,17 +291,126 @@ impl ChClient {
         sql: &str,
         cancel: Option<&CancellationToken>,
     ) -> Result<ChResult, ChError> {
+        self.query_with_settings(sql, &[], None, cancel).await
+    }
+
+    /// Run `sql` like [`ChClient::query`], but ask the engine to stop
+    /// producing rows once `max_result_rows` have been produced.
+    ///
+    /// The two settings travel as URL parameters of this one request
+    /// (`max_result_rows` and `result_overflow_mode=break`), not in the SQL
+    /// text, so the statement the caller wrote is the statement that runs.
+    /// With `break`, `ClickHouse` stops at a block boundary: up to one block
+    /// more than `max_result_rows` can still arrive, so a caller that needs
+    /// an exact count truncates the result itself. A caller that wants to
+    /// know whether the engine had more rows than it keeps passes one more
+    /// than the number it keeps.
+    ///
+    /// # Errors
+    ///
+    /// See [`ChClient::query`].
+    pub async fn query_limited(
+        &self,
+        sql: &str,
+        max_result_rows: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<ChResult, ChError> {
+        self.query_with_options(
+            sql,
+            &QueryOptions {
+                max_result_rows: Some(u64::try_from(max_result_rows).unwrap_or(u64::MAX)),
+                ..QueryOptions::default()
+            },
+            cancel,
+        )
+        .await
+    }
+
+    /// Run `sql` like [`ChClient::query`] under the limits and identity of
+    /// `options` (`BI-5` plan D3): `max_execution_time`, `max_result_rows`
+    /// (with `result_overflow_mode = break`) and `query_id` travel as URL
+    /// settings of this request, together with
+    /// `cancel_http_readonly_queries_on_client_close = 1`, so the engine also
+    /// ends the query when this request is dropped (the pattern
+    /// [`ChClient::query_stream`] already uses).
+    ///
+    /// `wait_end_of_query = 1` is sent with a time limit: without it the
+    /// engine may already have written part of the JSON body when the limit
+    /// hits, and the error arrives as text after a `200`, which the parse
+    /// below would read as an empty result instead of an error.
+    ///
+    /// When `max_execution_time` is set the request's own timeout is that
+    /// plus [`LIMIT_MARGIN`], replacing the client's fixed 60 s for this call
+    /// only.
+    ///
+    /// # Errors
+    ///
+    /// See [`ChClient::query`]. A query the engine stopped for its time limit
+    /// is a [`ChError::Server`] for which [`ChError::is_time_limit`] holds.
+    pub async fn query_with_options(
+        &self,
+        sql: &str,
+        options: &QueryOptions,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<ChResult, ChError> {
+        let mut settings: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = options.max_execution_time {
+            settings.push(("max_execution_time", max_execution_time_seconds(limit)));
+            settings.push(("wait_end_of_query", "1".to_owned()));
+            // `cancel_http_readonly_queries_on_client_close` only takes effect
+            // when the server writes to the connection and finds it closed; a
+            // buffered `SELECT count()` writes nothing until it ends, so the
+            // query ran on after the client left (measured on `ClickHouse`
+            // 26.8, `docs/plans/BI-5-RESULT.md` E2). Progress headers give the
+            // server something to write: with them the query was gone 0.5 to
+            // 1 s after the client closed. hyper reads at most 100 response
+            // headers, so the interval is stretched until a limit's headers
+            // stay under `PROGRESS_HEADERS_MAX`.
+            push_progress_settings(limit, &mut settings);
+        }
+        if let Some(rows) = options.max_result_rows {
+            settings.push(("max_result_rows", rows.to_string()));
+            settings.push(("result_overflow_mode", "break".to_owned()));
+        }
+        if let Some(id) = &options.query_id {
+            settings.push(("query_id", id.clone()));
+        }
+        if options.quote_decimals {
+            settings.push(("output_format_json_quote_decimals", "1".to_owned()));
+        }
+        settings.push((
+            "cancel_http_readonly_queries_on_client_close",
+            "1".to_owned(),
+        ));
+        let borrowed: Vec<(&str, &str)> = settings.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        self.query_with_settings(sql, &borrowed, options.request_timeout(), cancel)
+            .await
+    }
+
+    /// The body of [`ChClient::query`] and [`ChClient::query_with_options`]:
+    /// `settings` are sent as URL parameters of this request only, and
+    /// `timeout`, when given, replaces the client's default for it.
+    async fn query_with_settings(
+        &self,
+        sql: &str,
+        settings: &[(&str, &str)],
+        timeout: Option<std::time::Duration>,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<ChResult, ChError> {
         let body = build_query_body(sql);
         let fut = async {
-            let response = self
+            let mut request = self
                 .client
                 .post(&self.url)
+                .query(settings)
                 .basic_auth(&self.user, Some(&self.password))
                 .header(CONTENT_TYPE, "text/plain; charset=utf-8")
                 .header(CACHE_CONTROL, "no-store")
-                .body(body)
-                .send()
-                .await?;
+                .body(body);
+            if let Some(timeout) = timeout {
+                request = request.timeout(timeout);
+            }
+            let response = request.send().await?;
             let status = response.status();
             let text = response.text().await?;
             if !status.is_success() {
@@ -211,7 +419,19 @@ impl ChClient {
             // Non-tabular statements (e.g. issued without a SELECT) return a
             // bare `Ok.` body — not JSON. Treat that as an empty result
             // rather than an error, matching the TS client's try/catch.
-            Ok(serde_json::from_str::<ChResult>(&text).unwrap_or_default())
+            match serde_json::from_str::<ChResult>(&text) {
+                Ok(result) => Ok(result),
+                // Once progress headers have gone out the status line is
+                // already `200`, so an error that comes later (the time
+                // limit, a kill) arrives as the body (measured on
+                // `ClickHouse` 26.8, `docs/plans/BI-5-RESULT.md` E5). Read as
+                // "not JSON, so empty" it would turn a stopped query into an
+                // empty result.
+                Err(_) if body_is_exception(&text) => {
+                    Err(ChError::Server(server_error_message(status, &text)))
+                }
+                Err(_) => Ok(ChResult::default()),
+            }
         };
         run_cancellable(fut, cancel).await
     }
@@ -300,6 +520,329 @@ impl ChClient {
         };
         run_cancellable(fut, cancel).await
     }
+
+    /// Run `sql` and hand the rows back one at a time, without holding the
+    /// result (`BI-1` D6, a download of up to a million rows).
+    ///
+    /// The statement gets `FORMAT JSONCompactEachRowWithNamesAndTypes`: a
+    /// line of column names, a line of column types, then one JSON array per
+    /// row. (Not `JSONEachRow`: an empty result still has its header, so a file
+    /// of no rows still has its column names, and a row is an ordered array, so
+    /// two columns with one name do not collapse.) The request has its own
+    /// `timeout` in place of the client's 60 seconds, which would cut a big
+    /// download short; the body is read as it arrives. Dropping the returned
+    /// [`RowStream`] closes the connection; closing it does not by itself stop a
+    /// running `SELECT`, so every request carries
+    /// `cancel_http_readonly_queries_on_client_close=1`, which makes `ClickHouse`
+    /// cancel the query when the client goes (`BI-1` review fix (SHOULD-FIX)
+    /// R10; the comment used to say the close alone did it).
+    ///
+    /// This is [`ChClient::query_stream_with_options`] with the default
+    /// options: no query id and no time limit.
+    ///
+    /// # Errors
+    ///
+    /// [`ChError::Transport`] on a network failure, [`ChError::Server`] on a
+    /// non-2xx status or when the header lines are not what the format promises.
+    pub async fn query_stream(
+        &self,
+        sql: &str,
+        timeout: std::time::Duration,
+    ) -> Result<RowStream, ChError> {
+        self.query_stream_with_options(sql, timeout, &QueryOptions::default())
+            .await
+    }
+
+    /// Run `sql` like [`ChClient::query_stream`], under the identity and the
+    /// time limit of `options`.
+    ///
+    /// `query_id` and `max_execution_time` travel as URL settings of this one
+    /// request, together with the progress headers a limited request needs,
+    /// so the statement the caller wrote is the statement that runs. The
+    /// request's own timeout is the longer of `timeout` and
+    /// `options.request_timeout()` (the time limit plus [`LIMIT_MARGIN`]): the
+    /// engine's own "time limit" answer then arrives instead of a bare
+    /// transport timeout.
+    ///
+    /// `wait_end_of_query` is **not** sent: the rows are handed over while
+    /// the query runs, and a query that hits its time limit after the first
+    /// rows are out ends the stream with a line that is not a row.
+    ///
+    /// `options.max_result_rows` is not sent either: this stream is not
+    /// capped by the engine's row limit. The caller that owns the cap counts
+    /// the rows as they arrive, and the engine's own cap would cut the
+    /// result at a block boundary anyway.
+    ///
+    /// # Errors
+    ///
+    /// See [`ChClient::query_stream`].
+    pub async fn query_stream_with_options(
+        &self,
+        sql: &str,
+        timeout: std::time::Duration,
+        options: &QueryOptions,
+    ) -> Result<RowStream, ChError> {
+        let mut settings: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = options.max_execution_time {
+            settings.push(("max_execution_time", max_execution_time_seconds(limit)));
+            push_progress_settings(limit, &mut settings);
+        }
+        if let Some(id) = &options.query_id {
+            settings.push(("query_id", id.clone()));
+        }
+        settings.push((
+            "cancel_http_readonly_queries_on_client_close",
+            "1".to_owned(),
+        ));
+        let borrowed: Vec<(&str, &str)> = settings.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let body = format!(
+            "{}\nFORMAT JSONCompactEachRowWithNamesAndTypes",
+            strip_trailing_semicolon(sql)
+        );
+        let request_timeout = match options.request_timeout() {
+            Some(limit_timeout) => timeout.max(limit_timeout),
+            None => timeout,
+        };
+        let response = self
+            .client
+            .post(&self.url)
+            .basic_auth(&self.user, Some(&self.password))
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(CACHE_CONTROL, "no-store")
+            .query(&borrowed)
+            .timeout(request_timeout)
+            .body(body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await?;
+            return Err(ChError::Server(server_error_message(status, &text)));
+        }
+        let mut stream = RowStream {
+            response,
+            buffer: Vec::new(),
+            finished: false,
+            names: Vec::new(),
+            types: Vec::new(),
+        };
+        let names = stream.next_line().await?;
+        let types = stream.next_line().await?;
+        stream.names = header_strings(names.as_deref())?;
+        stream.types = header_strings(types.as_deref())?;
+        Ok(stream)
+    }
+
+    /// Run `sql` and hand the response body back as bytes, as they arrive.
+    ///
+    /// The statement goes to the engine verbatim — no `FORMAT` is appended —
+    /// so the caller says which format it wants (`FORMAT Parquet`).
+    ///
+    /// The body is not held: [`ByteStream::next_chunk`] hands over one chunk
+    /// at a time, so a big file costs no more memory than the chunk in the
+    /// caller's hands.
+    ///
+    /// The URL settings are `query_id` and `max_execution_time` when
+    /// `options` names them, plus `wait_end_of_query=1` when a time limit is
+    /// set: the engine writes a file whole, so a failure after the first
+    /// bytes arrives as a status instead of as bytes, and the caller learns
+    /// that the file is incomplete rather than writing a truncated one. The
+    /// progress headers of a limited request are sent too, and
+    /// `cancel_http_readonly_queries_on_client_close=1` always, so a dropped
+    /// download stops the query on the engine.
+    ///
+    /// The request's own timeout is `options.request_timeout()` (the time
+    /// limit plus [`LIMIT_MARGIN`]); without a time limit the client's own
+    /// default applies.
+    ///
+    /// # Errors
+    ///
+    /// [`ChError::Transport`] on a network failure, [`ChError::Server`] when
+    /// `ClickHouse` responds with a non-2xx status.
+    pub async fn byte_stream(
+        &self,
+        sql: &str,
+        options: &QueryOptions,
+    ) -> Result<ByteStream, ChError> {
+        let mut settings: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = options.max_execution_time {
+            settings.push(("max_execution_time", max_execution_time_seconds(limit)));
+            settings.push(("wait_end_of_query", "1".to_owned()));
+            push_progress_settings(limit, &mut settings);
+        }
+        if let Some(id) = &options.query_id {
+            settings.push(("query_id", id.clone()));
+        }
+        settings.push((
+            "cancel_http_readonly_queries_on_client_close",
+            "1".to_owned(),
+        ));
+        let borrowed: Vec<(&str, &str)> = settings.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let mut request = self
+            .client
+            .post(&self.url)
+            .basic_auth(&self.user, Some(&self.password))
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(CACHE_CONTROL, "no-store")
+            .query(&borrowed)
+            .body(sql.to_owned());
+        if let Some(timeout) = options.request_timeout() {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await?;
+            return Err(ChError::Server(server_error_message(status, &text)));
+        }
+        Ok(ByteStream {
+            response,
+            bytes_read: 0,
+            checked_first_chunk: false,
+        })
+    }
+}
+
+/// The longest line a [`RowStream`] buffers. One row of a table of text
+/// columns is far below it; a body with no line break past it is not rows.
+const MAX_STREAM_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// A `ClickHouse` result read line by line (see [`ChClient::query_stream`]).
+pub struct RowStream {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+    finished: bool,
+    names: Vec<String>,
+    types: Vec<String>,
+}
+
+/// A header line: a JSON array of strings.
+fn header_strings(line: Option<&[u8]>) -> Result<Vec<String>, ChError> {
+    line.and_then(|l| serde_json::from_slice::<Vec<String>>(l).ok())
+        .ok_or_else(|| ChError::Server("the result stream has no header".to_owned()))
+}
+
+impl RowStream {
+    /// The column names, in the order a row lists its values.
+    #[must_use]
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// The column types (`Int64`, `Nullable(String)`, ...), same order.
+    #[must_use]
+    pub fn types(&self) -> &[String] {
+        &self.types
+    }
+
+    /// The next row, or `None` at the end of the result.
+    ///
+    /// # Errors
+    ///
+    /// [`ChError::Transport`] when the connection fails or times out
+    /// mid-result; [`ChError::Server`] when a line is not a JSON array (the
+    /// engine writes an error into the body when it fails after it began to
+    /// answer, so a truncated result is never taken for a complete one).
+    pub async fn next_row(&mut self) -> Result<Option<Vec<Value>>, ChError> {
+        let Some(line) = self.next_line().await? else {
+            return Ok(None);
+        };
+        match serde_json::from_slice::<Value>(&line) {
+            Ok(Value::Array(row)) => Ok(Some(row)),
+            _ => Err(ChError::Server(
+                "the result stream broke off or held a line that is not a row".to_owned(),
+            )),
+        }
+    }
+
+    /// The next non-empty line without its line break.
+    async fn next_line(&mut self) -> Result<Option<Vec<u8>>, ChError> {
+        loop {
+            if let Some(at) = self.buffer.iter().position(|b| *b == b'\n') {
+                let mut line: Vec<u8> = self.buffer.drain(..=at).collect();
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                return Ok(Some(line));
+            }
+            if self.finished {
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(std::mem::take(&mut self.buffer)));
+            }
+            if self.buffer.len() > MAX_STREAM_LINE_BYTES {
+                return Err(ChError::Server(
+                    "a line of the result is too long".to_owned(),
+                ));
+            }
+            match self.response.chunk().await? {
+                Some(chunk) => self.buffer.extend_from_slice(&chunk),
+                None => self.finished = true,
+            }
+        }
+    }
+}
+
+/// A `ClickHouse` response body read as bytes (see [`ChClient::byte_stream`]).
+///
+/// The body is handed over chunk by chunk, as it arrives: nothing is held
+/// but the chunk the caller has in its hands. Dropping the stream closes the
+/// connection, and the engine is told to cancel the query when the client
+/// goes.
+pub struct ByteStream {
+    response: reqwest::Response,
+    bytes_read: u64,
+    checked_first_chunk: bool,
+}
+
+impl ByteStream {
+    /// The next chunk of the body as it arrives, or `None` at the end of the
+    /// body.
+    ///
+    /// The first chunk is checked for the engine's exception text: a query
+    /// that fails before the engine writes anything answers with a `200` and
+    /// that text in the body, and handing it over as bytes would write an
+    /// error message into the file. Only the first chunk is checked — the
+    /// rest of the body is not held, so a failure after it is not caught
+    /// here; the time limit a download runs under is what covers that (the
+    /// engine writes the file whole, so its failure arrives as a status).
+    ///
+    /// # Errors
+    ///
+    /// [`ChError::Transport`] when the connection fails or times out
+    /// mid-body; [`ChError::Server`] when the first chunk holds the engine's
+    /// exception text.
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ChError> {
+        let Some(chunk) = self.response.chunk().await? else {
+            return Ok(None);
+        };
+        if !self.checked_first_chunk {
+            self.checked_first_chunk = true;
+            // Read as text, lossy: a `Parquet` file starts with `PAR1` and
+            // does not match the engine's exception text.
+            let text = String::from_utf8_lossy(&chunk);
+            if body_is_exception(&text) {
+                return Err(ChError::Server(text.into_owned()));
+            }
+        }
+        self.bytes_read = self.bytes_read.saturating_add(chunk.len() as u64);
+        Ok(Some(chunk.to_vec()))
+    }
+
+    /// How many bytes have been handed over so far.
+    ///
+    /// A chunk that turned out to be the engine's exception is not counted:
+    /// it was never handed over. The download route counts the same way to
+    /// decide when to refuse a result that is over its cap.
+    #[must_use]
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
 }
 
 /// Race `fut` against `cancel` being cancelled, when a token is supplied.
@@ -337,7 +880,12 @@ fn build_query_body(sql: &str) -> String {
 /// mirroring the TypeScript `sql.replace(/;\s*$/, "")`. If `sql` has no
 /// trailing `;`, it is returned unchanged — including any trailing
 /// whitespace, which is then carried into the `FORMAT JSON` line.
-fn strip_trailing_semicolon(sql: &str) -> &str {
+///
+/// Public because a caller that appends its own `FORMAT` clause to a
+/// statement it sends verbatim needs the same rule this crate applies to
+/// the statements it formats itself.
+#[must_use]
+pub fn strip_trailing_semicolon(sql: &str) -> &str {
     let end_trimmed = sql.trim_end_matches(char::is_whitespace);
     end_trimmed.strip_suffix(';').unwrap_or(sql)
 }
@@ -413,6 +961,16 @@ fn is_ascii_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// Whether a `200` body is the engine's exception text (`Code: 159. ...`),
+/// alone or after the part of the result that was written before it hit.
+fn body_is_exception(text: &str) -> bool {
+    text.trim_start().starts_with("Code: ")
+        || text
+            .lines()
+            .last()
+            .is_some_and(|last| last.starts_with("Code: ") && last.contains("DB::Exception"))
+}
+
 /// The message for a non-2xx `ClickHouse` response: the trimmed body, or a
 /// `ClickHouse HTTP <status>` fallback when the body is empty.
 fn server_error_message(status: StatusCode, body: &str) -> String {
@@ -428,7 +986,7 @@ fn server_error_message(status: StatusCode, body: &str) -> String {
 mod tests {
     #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
     use super::*;
-    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::matchers::{body_string_contains, method, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client(url: &str) -> ChClient {
@@ -507,7 +1065,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows, 0);
-        assert!(result.data.is_empty());
+        assert_eq!(
+            result.data,
+            [] as [serde_json::Map<std::string::String, serde_json::Value>; 0]
+        );
         assert!(result.meta.is_empty());
     }
 
@@ -588,20 +1149,6 @@ mod tests {
         let rows = c.rows("SELECT n FROM t", None).await.unwrap();
         assert_eq!(rows, full.data);
         assert_eq!(rows.len(), 2);
-    }
-
-    #[test]
-    fn ch_error_converts_to_unprocessable_api_error() {
-        let api_err: ApiError = ChError::Server("bad sql".to_owned()).into();
-        assert_eq!(api_err.status(), 422);
-        assert_eq!(api_err.to_string(), "bad sql");
-    }
-
-    #[test]
-    fn cancelled_converts_to_internal_api_error() {
-        let api_err: ApiError = ChError::Cancelled.into();
-        assert_eq!(api_err.status(), 500);
-        assert_eq!(api_err.to_string(), "request cancelled");
     }
 
     /// A real transport failure (connection refused) must never leak the
@@ -716,5 +1263,659 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ChError::Server(msg) if msg.contains("Unknown identifier")));
+    }
+
+    #[tokio::test]
+    async fn query_stream_reads_the_header_then_one_row_per_line() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains(
+                "FORMAT JSONCompactEachRowWithNamesAndTypes",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    "[\"a\",\"b\"]\n[\"Int64\",\"String\"]\n[1,\"x\"]\n[2,null]\n",
+                ),
+            )
+            .mount(&server)
+            .await;
+        let mut rows = client(&server.uri())
+            .query_stream("SELECT 1;", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(
+            sent[0].url.query(),
+            Some("cancel_http_readonly_queries_on_client_close=1"),
+            "a dropped download cancels its query (R10)"
+        );
+        assert_eq!(rows.names(), ["a", "b"]);
+        assert_eq!(rows.types(), ["Int64", "String"]);
+        assert_eq!(
+            rows.next_row().await.unwrap(),
+            Some(vec![serde_json::json!(1), serde_json::json!("x")])
+        );
+        assert_eq!(
+            rows.next_row().await.unwrap(),
+            Some(vec![serde_json::json!(2), Value::Null])
+        );
+        assert_eq!(rows.next_row().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn query_stream_of_an_empty_result_still_has_its_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[\"a\"]\n[\"Int64\"]\n"))
+            .mount(&server)
+            .await;
+        let mut rows = client(&server.uri())
+            .query_stream("SELECT 1", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(rows.names(), ["a"]);
+        assert_eq!(rows.next_row().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn query_stream_reports_a_server_error_and_a_line_that_is_not_a_row() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("bad"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Code: 62. DB::Exception"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    "[\"a\"]\n[\"Int64\"]\n[1]\nCode: 241. DB::Exception: memory\n",
+                ),
+            )
+            .mount(&server)
+            .await;
+        let c = client(&server.uri());
+        assert!(matches!(
+            c.query_stream("SELECT bad", std::time::Duration::from_secs(5))
+                .await,
+            Err(ChError::Server(_))
+        ));
+        let mut rows = c
+            .query_stream("SELECT 1", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(rows.next_row().await.unwrap().is_some());
+        assert!(matches!(rows.next_row().await, Err(ChError::Server(_))));
+    }
+
+    // -- query_limited (SEC-21) -------------------------------------------
+
+    #[tokio::test]
+    async fn query_limited_sends_the_cap_as_url_parameters_not_in_the_sql() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param("max_result_rows", "2001"))
+            .and(query_param("result_overflow_mode", "break"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":[{"name":"n","type":"UInt64"}],"data":[{"n":1}],"rows":1}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client(&server.uri())
+            .query_limited("SELECT n FROM t", 2001, None)
+            .await
+            .unwrap();
+        assert_eq!(result.rows, 1);
+
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(
+            !body.contains("SETTINGS"),
+            "the SQL text stays as written: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_sends_no_url_parameters() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .mount(&server)
+            .await;
+
+        client(&server.uri()).query("SELECT 1", None).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests[0].url.query(), None);
+    }
+
+    // -- query_with_options (BI-5 plan D3) ---------------------------------
+
+    #[tokio::test]
+    async fn query_with_options_sends_the_limits_the_id_and_the_cancel_setting_as_url_parameters() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param("max_execution_time", "45"))
+            .and(query_param("max_result_rows", "2001"))
+            .and(query_param("result_overflow_mode", "break"))
+            .and(query_param("query_id", "u:r:1"))
+            .and(query_param(
+                "cancel_http_readonly_queries_on_client_close",
+                "1",
+            ))
+            .and(query_param("wait_end_of_query", "1"))
+            .and(query_param("send_progress_in_http_headers", "1"))
+            .and(query_param("http_headers_progress_interval_ms", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":[{"name":"n","type":"UInt64"}],"data":[{"n":1}],"rows":1}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = QueryOptions {
+            max_execution_time: Some(std::time::Duration::from_secs(45)),
+            max_result_rows: Some(2001),
+            query_id: Some("u:r:1".to_owned()),
+            quote_decimals: false,
+        };
+        let result = client(&server.uri())
+            .query_with_options("SELECT n FROM t", &options, None)
+            .await
+            .unwrap();
+        assert_eq!(result.rows, 1);
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(
+            !body.contains("SETTINGS"),
+            "the SQL text stays as written: {body}"
+        );
+    }
+
+    /// `DATA-53` (QA `LH-DATA-9-32`): the setting goes on the request only when the
+    /// caller asks for it, so no other reader of this client changes.
+    #[tokio::test]
+    async fn query_with_options_asks_for_quoted_decimals_only_when_told() {
+        let server = MockServer::start().await;
+        // The row stream reads two header lines; the other calls take the JSON answer.
+        Mock::given(method("POST"))
+            .and(body_string_contains(
+                "FORMAT JSONCompactEachRowWithNamesAndTypes",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("[\"d\"]\n[\"Decimal(38, 9)\"]\n"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":[{"name":"d","type":"Decimal(38, 9)"}],"data":[{"d":"1.5"}],"rows":1}"#,
+            ))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let client = client(&server.uri());
+
+        let quoted = QueryOptions {
+            quote_decimals: true,
+            ..QueryOptions::default()
+        };
+        let result = client
+            .query_with_options("SELECT toDecimal64(1.5, 9) AS d", &quoted, None)
+            .await
+            .unwrap();
+        assert_eq!(result.rows, 1);
+
+        let plain = QueryOptions::default();
+        client
+            .query_with_options("SELECT 1 AS d", &plain, None)
+            .await
+            .unwrap();
+
+        // Review round 1 R6: the option is `query_with_options`'s only (`D20` keeps a
+        // tile's numbers and a download's bytes as they are), so a stream asked for it
+        // does not send the setting.
+        client
+            .query_stream_with_options("SELECT 1", std::time::Duration::from_secs(5), &quoted)
+            .await
+            .unwrap();
+        client
+            .byte_stream("SELECT 1 FORMAT Parquet", &quoted)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let queries: Vec<String> = requests
+            .iter()
+            .map(|request| request.url.query().unwrap_or_default().to_owned())
+            .collect();
+        assert!(
+            queries[0].contains("output_format_json_quote_decimals=1"),
+            "{}",
+            queries[0]
+        );
+        for (index, query) in queries.iter().enumerate().skip(1) {
+            assert!(
+                !query.contains("output_format_json_quote_decimals"),
+                "request {index}: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_request_waits_the_limit_plus_ten_seconds_and_a_call_without_a_limit_keeps_the_client_default()
+     {
+        let limited = QueryOptions {
+            max_execution_time: Some(std::time::Duration::from_secs(300)),
+            ..QueryOptions::default()
+        };
+        assert_eq!(
+            limited.request_timeout(),
+            Some(std::time::Duration::from_secs(310))
+        );
+        assert_eq!(QueryOptions::default().request_timeout(), None);
+    }
+
+    #[test]
+    fn progress_headers_stay_under_the_header_cap_for_every_allowed_limit() {
+        for seconds in [10_u64, 60, 600, 1800] {
+            let limit = std::time::Duration::from_secs(seconds);
+            let interval = progress_interval_ms(limit);
+            assert!(interval >= 1000);
+            assert!(
+                limit.as_millis() / interval <= PROGRESS_HEADERS_MAX,
+                "{seconds}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exception_that_arrives_in_a_200_body_is_an_error_not_an_empty_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "Code: 159. DB::Exception: Timeout exceeded: elapsed 10000.343 ms, maximum: 10000. (TIMEOUT_EXCEEDED)",
+            ))
+            .mount(&server)
+            .await;
+        let err = client(&server.uri())
+            .query("SELECT 1", None)
+            .await
+            .unwrap_err();
+        assert!(err.is_time_limit(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_bare_ok_body_is_still_an_empty_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .mount(&server)
+            .await;
+        let result = client(&server.uri()).query("SELECT 1", None).await.unwrap();
+        assert_eq!(result.rows, 0);
+    }
+
+    #[tokio::test]
+    async fn a_limit_given_in_fractions_of_a_second_is_rounded_up() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param("max_execution_time", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let options = QueryOptions {
+            max_execution_time: Some(std::time::Duration::from_millis(1500)),
+            ..QueryOptions::default()
+        };
+        client(&server.uri())
+            .query_with_options("SELECT 1", &options, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_engine_error_is_classified_by_its_code_and_never_by_its_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 159. DB::Exception: Timeout exceeded: elapsed 1.0 seconds, maximum: 1. (TIMEOUT_EXCEEDED)",
+            ))
+            .mount(&server)
+            .await;
+        let err = client(&server.uri())
+            .query("SELECT 1", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.server_code(), Some(159));
+        assert!(err.is_time_limit());
+        assert!(!err.is_killed_on_engine());
+
+        assert!(
+            ChError::Server(
+                "Code: 394. DB::Exception: Query was cancelled. (QUERY_WAS_CANCELLED)".to_owned()
+            )
+            .is_killed_on_engine()
+        );
+        assert_eq!(
+            ChError::Server("Code: 62. DB::Exception: Syntax error".to_owned()).server_code(),
+            Some(62)
+        );
+        assert_eq!(
+            ChError::Server("ClickHouse HTTP 500".to_owned()).server_code(),
+            None
+        );
+        assert_eq!(ChError::Cancelled.server_code(), None);
+    }
+
+    // -- the row stream under options --------------------------------------
+
+    /// The URL settings of a request a mock server received, as decoded
+    /// pairs.
+    fn url_settings(request: &wiremock::Request) -> Vec<(String, String)> {
+        request
+            .url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_row_stream_carries_the_query_id_and_the_time_limit_and_never_waits_for_the_end() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[\"a\"]\n[\"Int64\"]\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = QueryOptions {
+            max_execution_time: Some(std::time::Duration::from_secs(45)),
+            query_id: Some("u:r:1".to_owned()),
+            ..QueryOptions::default()
+        };
+        let rows = client(&server.uri())
+            .query_stream_with_options("SELECT 1", std::time::Duration::from_secs(5), &options)
+            .await
+            .unwrap();
+        assert_eq!(rows.names(), ["a"]);
+        let requests = server.received_requests().await.unwrap();
+        let settings = url_settings(&requests[0]);
+        assert!(
+            settings.contains(&("query_id".to_owned(), "u:r:1".to_owned())),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&("max_execution_time".to_owned(), "45".to_owned())),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&("send_progress_in_http_headers".to_owned(), "1".to_owned())),
+            "{settings:?}"
+        );
+        assert!(
+            !settings.iter().any(|(key, _)| key == "wait_end_of_query"),
+            "the row stream answers while the query runs: {settings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_row_stream_is_not_capped_by_the_engine_row_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[\"a\"]\n[\"Int64\"]\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = QueryOptions {
+            max_result_rows: Some(10),
+            ..QueryOptions::default()
+        };
+        client(&server.uri())
+            .query_stream_with_options("SELECT 1", std::time::Duration::from_secs(5), &options)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let settings = url_settings(&requests[0]);
+        assert!(
+            !settings.iter().any(|(key, _)| key == "max_result_rows"),
+            "{settings:?}"
+        );
+        assert!(
+            !settings
+                .iter()
+                .any(|(key, _)| key == "result_overflow_mode"),
+            "{settings:?}"
+        );
+    }
+
+    // -- the byte stream ---------------------------------------------------
+
+    #[tokio::test]
+    async fn the_byte_stream_sends_the_statement_verbatim() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FORMAT Parquet"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PAR1payloadPAR1"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut stream = client(&server.uri())
+            .byte_stream("SELECT 1 FORMAT Parquet", &QueryOptions::default())
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next_chunk().await.unwrap() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"PAR1payloadPAR1");
+
+        let requests = server.received_requests().await.unwrap();
+        let sent = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert_eq!(
+            sent, "SELECT 1 FORMAT Parquet",
+            "the statement goes to the engine as it was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_byte_stream_carries_the_query_id_the_time_limit_and_the_wait_for_the_end() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PAR1"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = QueryOptions {
+            max_execution_time: Some(std::time::Duration::from_secs(45)),
+            query_id: Some("u:r:1:download".to_owned()),
+            ..QueryOptions::default()
+        };
+        client(&server.uri())
+            .byte_stream("SELECT 1 FORMAT Parquet", &options)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let settings = url_settings(&requests[0]);
+        assert!(
+            settings.contains(&("query_id".to_owned(), "u:r:1:download".to_owned())),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&("max_execution_time".to_owned(), "45".to_owned())),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&("wait_end_of_query".to_owned(), "1".to_owned())),
+            "the engine writes the file whole, so a failure arrives as a status: {settings:?}"
+        );
+        assert!(
+            settings.contains(&("send_progress_in_http_headers".to_owned(), "1".to_owned())),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&(
+                "cancel_http_readonly_queries_on_client_close".to_owned(),
+                "1".to_owned()
+            )),
+            "{settings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_byte_stream_without_a_time_limit_never_waits_for_the_end() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PAR1"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server.uri())
+            .byte_stream("SELECT 1 FORMAT Parquet", &QueryOptions::default())
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let settings = url_settings(&requests[0]);
+        assert!(
+            !settings.iter().any(|(key, _)| key == "wait_end_of_query"),
+            "{settings:?}"
+        );
+        assert!(
+            !settings.iter().any(|(key, _)| key == "max_execution_time"),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&(
+                "cancel_http_readonly_queries_on_client_close".to_owned(),
+                "1".to_owned()
+            )),
+            "a dropped download stops the query on the engine: {settings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_byte_stream_fails_when_the_engine_writes_its_exception_instead_of_a_file() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "Code: 159. DB::Exception: Timeout exceeded: elapsed 45000.0 ms, maximum: 45000. (TIMEOUT_EXCEEDED)",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut stream = client(&server.uri())
+            .byte_stream("SELECT 1 FORMAT Parquet", &QueryOptions::default())
+            .await
+            .unwrap();
+        let err = stream.next_chunk().await.unwrap_err();
+        assert!(
+            matches!(&err, ChError::Server(msg) if msg.contains("TIMEOUT_EXCEEDED")),
+            "{err:?}"
+        );
+        assert!(err.is_time_limit(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn the_byte_stream_maps_a_non_2xx_status_to_ch_error_server() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("Code: 47. Unknown identifier"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let Err(err) = client(&server.uri())
+            .byte_stream("SELECT bogus FORMAT Parquet", &QueryOptions::default())
+            .await
+        else {
+            panic!("the engine's answer was taken for a file");
+        };
+        assert!(
+            matches!(&err, ChError::Server(msg) if msg.contains("Unknown identifier")),
+            "{err:?}"
+        );
+    }
+
+    /// A server that answers with a chunked body: the first chunk goes out at
+    /// once, the second one after `pause`. A client that held the whole body
+    /// before handing anything over could not answer before the pause is
+    /// over.
+    fn chunked_body_server(first: &[u8], second: &[u8], pause: std::time::Duration) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let first = first.to_vec();
+        let second = second.to_vec();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the request head; the body is short and the client writes
+            // it before it reads the response.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            for (index, chunk) in [&first, &second].into_iter().enumerate() {
+                if index > 0 {
+                    std::thread::sleep(pause);
+                }
+                stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .unwrap();
+                stream.write_all(chunk).unwrap();
+                stream.write_all(b"\r\n").unwrap();
+                stream.flush().unwrap();
+            }
+            stream.write_all(b"0\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn the_byte_stream_hands_the_body_over_as_it_arrives() {
+        let url = chunked_body_server(
+            b"PAR1first",
+            b"secondPAR1",
+            std::time::Duration::from_secs(2),
+        );
+        let mut stream = client(&url)
+            .byte_stream("SELECT 1 FORMAT Parquet", &QueryOptions::default())
+            .await
+            .unwrap();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next_chunk())
+            .await
+            .expect("the first chunk arrives before the rest of the body exists")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, b"PAR1first");
+        assert_eq!(stream.bytes_read(), 9);
+
+        let mut body = first;
+        while let Some(chunk) = stream.next_chunk().await.unwrap() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"PAR1firstsecondPAR1");
+        assert_eq!(stream.bytes_read(), 19);
     }
 }

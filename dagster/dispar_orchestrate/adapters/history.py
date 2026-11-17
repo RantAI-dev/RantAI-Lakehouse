@@ -136,7 +136,7 @@ from dlt.extract.resource import DltResource
 from dlt.extract.source import DltSource
 from pyiceberg.expressions import And, EqualTo, In, IsNull, NotNull
 
-from dispar_orchestrate.adapters import dedup
+from dispar_orchestrate.adapters import dedup, iceberg_stream
 
 HISTORY_COLUMNS = ("_valid_from", "_valid_to", "_is_current", "_row_hash")
 # The columns the sink and `dlt` own: never taken from the source, never hashed.
@@ -401,9 +401,16 @@ def open_table(pipeline: Any, table: str, *, sync: bool = True) -> Any | None:
     owns it (in production Lakekeeper's REST catalog, as the sink installs it), or
     `None` when `dlt` does not know the table. Syncs the pipeline from the bucket
     first: a recreated container has no local copy of its schema (`sync=False` when
-    the caller already did)."""
+    the caller already did). A pipeline that knows no schema knows no table, and is
+    answered `None` before a client is asked for."""
     if sync:
         pipeline.sync_destination()
+    if not pipeline.default_schema_name:
+        # QA LH-DATA-9-37 (DATA-50): a pipeline with no schema knows no table, so the
+        # client `dlt` would build answers "not there" anyway; asking for it makes
+        # `dlt` build a schema named after the pipeline, which it refuses past 64
+        # characters -- that is a table name past 50 (`bronze_ingest_<table>`).
+        return None
     try:
         with pipeline.destination_client() as client:
             return client.load_open_table("iceberg", table)
@@ -499,20 +506,46 @@ def ensure_columns(
     table: str,
     schema: pa.Schema,
     adapt: Callable[[DltResource], Any],
+    *,
+    author: str = "",
 ) -> None:
     """Let `dlt` create the table, or add the columns of `schema` it lacks, by running
     the pipeline on a ZERO-row Arrow table of that schema. `adapt` puts the sink's
     table hints (day partition on `_ingested_at`, format version 2) on the resource,
     the one definition `sink.load_via_sink` uses too. A `dlt` run with nothing to add
     still costs one empty commit, so the caller runs it only when a column is missing
-    (`test_an_ensure_step_with_nothing_to_add_...`)."""
+    (`test_an_ensure_step_with_nothing_to_add_...`).
+
+    `author` is the run's label (`DATA-52`, review round 1 R2): this commit is one a
+    history load makes, so it records the run as `rantai.author` like the load's data
+    commit does, carried by `iceberg_stream.snapshot_properties_for` because `dlt`
+    calls that write from its own thread with no argument of ours."""
     resource = dlt.resource(pa.Table.from_pylist([], schema=schema), name=table, columns=HISTORY_HINTS)
     adapt(resource)
-    pipeline.run(resource, table_name=table, table_format="iceberg", write_disposition="append")
+    with iceberg_stream.snapshot_properties_for(table, snapshot_properties(author)):
+        pipeline.run(resource, table_name=table, table_format="iceberg", write_disposition="append")
+
+
+AUTHOR_PROPERTY = "rantai.author"
+
+
+def snapshot_properties(author: str) -> dict[str, str]:
+    """The snapshot summary entries that record who made a commit (`DATA-15` F5): the
+    one key the console's Snapshots card reads as the version's author. Empty for an
+    empty `author`, so a commit made without a run context records nothing rather than a
+    guess, and the page says "unknown". `pyiceberg` copies these into the snapshot's
+    summary, next to the keys it writes itself."""
+    return {AUTHOR_PROPERTY: author} if author else {}
 
 
 def write_versions(
-    iceberg_table: Any, key: tuple[str, ...], versions: Versions, *, table: str, load_time: datetime
+    iceberg_table: Any,
+    key: tuple[str, ...],
+    versions: Versions,
+    *,
+    table: str,
+    load_time: datetime,
+    author: str = "",
 ) -> None:
     """ONE transaction: the closed rows replace the current rows they close (matched
     on the key and `_valid_from`) and the new rows are appended. A failure anywhere
@@ -530,11 +563,14 @@ def write_versions(
     with iceberg_table.transaction() as transaction:
         if closed_arrow is not None:
             result = transaction.upsert(
-                closed_arrow, join_cols=[*key, "_valid_from"], when_not_matched_insert_all=False
+                closed_arrow,
+                join_cols=[*key, "_valid_from"],
+                when_not_matched_insert_all=False,
+                snapshot_properties=snapshot_properties(author),
             )
             if result.rows_updated != len(versions.closed):
                 raise HistoryRefused(f"table {table!r}: its current rows changed while this load ran; load again")
-        transaction.append(new_arrow)
+        transaction.append(new_arrow, snapshot_properties=snapshot_properties(author))
 
 
 # ---------------------------------------------------------------------------
@@ -564,8 +600,10 @@ def load_history(
     *,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     limits: dedup.DedupLimits | None = None,
+    author: str = "",
 ) -> HistoryOutcome:
-    """One history load; see the module docstring. `pipeline` is the table's
+    """One history load; see the module docstring. `author` is recorded on the commits
+    as `rantai.author` (`snapshot_properties`). `pipeline` is the table's
     `dlt` pipeline with no package pending. Returns the number of NEW rows written
     (the closed rows are not counted) and of rows closed; `0, 0` when nothing
     changed, in which case nothing was written and nothing committed.
@@ -615,9 +653,9 @@ def load_history(
             pa.field("_dlt_load_id", pa.string(), nullable=False),
             pa.field("_dlt_id", pa.string(), nullable=False),
         ]
-        ensure_columns(pipeline, table, pa.schema(fields), adapt)
+        ensure_columns(pipeline, table, pa.schema(fields), adapt, author=author)
         iceberg_table = open_table(pipeline, table)
     if iceberg_table is None:
         raise HistoryRefused(f"table {table!r}: the table could not be created")
-    write_versions(iceberg_table, key, versions, table=table, load_time=load_time)
+    write_versions(iceberg_table, key, versions, table=table, load_time=load_time, author=author)
     return HistoryOutcome(new_versions=len(versions.new), closed=len(versions.closed))

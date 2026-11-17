@@ -90,7 +90,10 @@ const POLICY_COLUMNS: &str = "id, name, scope, hot_days, warm_days, cold_after_d
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_policies(pool: &PgPool) -> Result<Vec<LifecyclePolicy>, StoreError> {
     let sql = format!("SELECT {POLICY_COLUMNS} FROM lifecycle_policy ORDER BY created_at DESC");
-    let rows: Vec<LifecyclePolicyRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constant `POLICY_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<LifecyclePolicyRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(LifecyclePolicy::from).collect())
 }
 
@@ -127,7 +130,8 @@ pub async fn create_policy(
          status, estimated_savings) VALUES ($1, $2, $3, $4, $5, $6, 'draft', 'Pending estimate') \
          RETURNING {POLICY_COLUMNS}"
     );
-    let row: LifecyclePolicyRow = sqlx::query_as(&sql)
+    // safe: only the constant `POLICY_COLUMNS` is formatted in; values are bound.
+    let row: LifecyclePolicyRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&input.name)
         .bind(&input.scope)
@@ -198,7 +202,10 @@ const TIERING_OP_COLUMNS: &str = "id, asset, asset_id, from_tier, to_tier, statu
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_operations(pool: &PgPool) -> Result<Vec<TieringOp>, StoreError> {
     let sql = format!("SELECT {TIERING_OP_COLUMNS} FROM tiering_op ORDER BY at DESC");
-    let rows: Vec<TieringOpRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constant `TIERING_OP_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<TieringOpRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(TieringOp::from).collect())
 }
 
@@ -232,7 +239,8 @@ pub async fn restore_asset(
         "INSERT INTO tiering_op (id, asset, asset_id, from_tier, to_tier, status, detail) \
          VALUES ($1, $2, $3, $4, $5, 'running', $6) RETURNING {TIERING_OP_COLUMNS}"
     );
-    let row: TieringOpRow = sqlx::query_as(&sql)
+    // safe: only the constant `TIERING_OP_COLUMNS` is formatted in; values are bound.
+    let row: TieringOpRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&input.asset_name)
         .bind(&input.asset_id)

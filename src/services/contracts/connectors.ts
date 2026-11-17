@@ -85,6 +85,11 @@ export type InactiveColumn = {
   inactiveSince: string
   /** The name the Bronze table gives the column; `null` when it was not reported, and then the Schema tab marks nothing. */
   loadedName: string | null
+  /**
+   * `SRC-11` decision 10: why the column is inactive. `removed_at_source`: the source dropped it (`SRC-8`).
+   * `excluded`: the user left it out of the load. Widened: a newer API may add a reason.
+   */
+  reason: "removed_at_source" | "excluded" | string
 }
 
 export type SchemaChangeList = {
@@ -129,6 +134,14 @@ export type ConnectorDetail = Connector & {
    */
   credentialManaged: boolean
   /**
+   * How the primary credential is held (`SRC-12` decision 10): `managed` is
+   * sealed on lakehouse's credentials volume, `env` is an operator's
+   * environment variable (read at start-up, so a change needs a restart),
+   * `file` an operator's file. `null` for any other reference scheme. A
+   * scheme only; the reference is never sent.
+   */
+  credentialSource: CredentialSource | null
+  /**
    * The stored primary credential's kind (password, access key, …), read
    * from its reference name — so the edit page asks for the right thing.
    * `null` for a hand-seeded reference with no recognizable suffix. A kind
@@ -157,6 +170,29 @@ export type ConnectorTestResult = {
   message: string
   /** `null` when `supported` is `false`: an unsupported type was never actually dialed. */
   testedAt: string | null
+  /**
+   * `true` only while a test that runs in the orchestrator has not finished (`SRC-4` T1.1: Oracle). Nothing was
+   * dialled yet, so `ok: false` is not a failure; read the end of it with `getDiscovery(id, "test")` and the
+   * probe history, as `runConnectionTest` does. Absent otherwise.
+   */
+  pending?: boolean
+  /**
+   * For a change-capture connector (`SRC-4` decision S4-f): what the source must have switched on. Absent for every
+   * other connector. Never part of `ok`: a connector can be saved whatever these say.
+   */
+  setupChecks?: SetupCheck[]
+}
+
+/**
+ * One setting a change-capture source needs, as `POST /api/connectors/{id}/test` reports it (`SRC-4` S4-f). Every
+ * word is the API's fixed text, never the server's. `unchecked` means it could not be read (usually a permission):
+ * nothing is claimed about it. `command` is the statement or line that sets a `missing` one.
+ */
+export type SetupCheck = {
+  setting: string
+  status: "ok" | "missing" | "unchecked" | string
+  message: string
+  command?: string
 }
 
 /**
@@ -194,9 +230,13 @@ export type SecretSlot = "primary" | "secondary"
 /**
  * Which resolver scheme a derived connector-credential name uses. Mirrors
  * Rust `CredentialSource` (`rust/crates/lakehouse-store/src/connectors.rs`)
- * field-for-field, including its `snake_case` wire form.
+ * field-for-field, including its `snake_case` wire form. `reference` is a
+ * reference to a secret in the installation's secret manager (`SRC-12` part
+ * B): only the reference is stored, and the value is read at every use. The
+ * client never chooses it at create time; it is set with
+ * `PUT /api/connectors/{id}/credential`.
  */
-export type CredentialSource = "env" | "file" | "managed"
+export type CredentialSource = "env" | "file" | "managed" | "reference"
 
 /**
  * The fixed suffix a derived connector-credential name ends in. Mirrors
@@ -245,10 +285,61 @@ export type CredentialValues = {
   secondary?: string
 }
 
-/** One slot's new credential in a `PUT /api/connectors/{id}/credential` body. */
-export type CredentialSlotValue = {
-  kind: CredentialKind
-  value: string
+/**
+ * One slot's new credential in a `PUT /api/connectors/{id}/credential` body:
+ * a value to store, or (when the installation has a secret manager) a
+ * reference to a secret in it. A reference names a place (`vault:...`,
+ * `aws-sm:...`, `gcp-sm:...`, `azure-kv:...`), never a value; the server
+ * reads it once and tests the connection before saving it.
+ */
+export type CredentialSlotValue = { kind: CredentialKind; value: string } | { reference: string }
+
+/**
+ * `GET /api/connectors/credential-settings`: what this installation offers
+ * for a credential (`SRC-12` part B, decision 2). `secretManager` is the one
+ * secret manager the operator set up, or `null`; `typedCredentials` is
+ * `false` when the operator turned typing a value off
+ * (`CONNECTOR_TYPED_CREDENTIALS=false`).
+ */
+export type CredentialSettings = {
+  secretManager: "vault" | "aws" | "gcp" | "azure" | null
+  typedCredentials: boolean
+  /**
+   * This product's OAuth callback address, to enter in the provider's app
+   * settings (`SRC-12` part C). `null` when the operator has not set
+   * `CONNECTOR_OAUTH_REDIRECT_URI`: signing in is then refused.
+   */
+  oauthCallbackUrl: string | null
+}
+
+/** `GET /api/connectors/{id}/oauth` (`SRC-12` part C). Holds no token. */
+export type OAuthStatus = {
+  /** Whether the connector holds a refresh token it can read. */
+  signedIn: boolean
+  /** The address to enter in the provider's app settings; `null` when the operator has not set it. */
+  callbackUrl: string | null
+  /** Whether the dial names a revocation address, so signing out can tell the provider. */
+  revocationConfigured: boolean
+}
+
+/** `POST /api/connectors/{id}/oauth/start`: the provider's sign-in page, to open in a new window. */
+export type OAuthStart = {
+  authorizeUrl: string
+  expiresInSeconds: number
+}
+
+/**
+ * What signing out did at the provider (`SRC-12` decision 8): `done`; `notConfigured`
+ * (no revocation address, the token stays valid there until it expires); `noToken`;
+ * `failed` (the provider could not be told).
+ */
+export type OAuthRevocation = "done" | "notConfigured" | "noToken" | "failed" | "notApplicable"
+
+/** `POST /api/connectors/{id}/oauth/sign-out`. The local token is gone either way. */
+export type OAuthSignOut = {
+  signedOut: boolean
+  revocation: OAuthRevocation
+  message: string
 }
 
 /**
@@ -347,6 +438,14 @@ export type CreateConnectorInput = {
   residency: string
   capabilities: string[]
   owner?: string
+  /**
+   * The connection settings, sent with the create so the API checks them
+   * BEFORE the connector exists (`SRC-41` D11, QA `LH-SRC-3-11`): a refused
+   * dial is a 400 and nothing is created. They are still stored by the
+   * `PUT .../ingest-spec` call that follows. Absent for the assistant, whose
+   * tool offers no such field.
+   */
+  connection?: { adapter: string; dial: Record<string, unknown> }
 }
 
 /**
@@ -414,17 +513,45 @@ export type SqlDial = {
   sslServerCertDn?: string | null
 }
 
-/** `CdcDial` = `SqlDial`'s fields plus `slotName`/`publicationName`,
- * both required with no fallback (`ingest_spec.rs`'s `CdcDial`). */
+/** `CdcDial` = `SqlDial`'s fields plus the change-capture settings of the
+ * driver (`ingest_spec.rs`'s `CdcDial`, `SRC-4` decision S3-a): PostgreSQL
+ * requires `slotName` and `publicationName` and refuses `serverId`; MySQL
+ * requires `serverId` (1 to 4294967295) and refuses the other two; SQL Server
+ * refuses all three. A field the driver does not use is omitted, never sent
+ * empty, because the server refuses a present one. */
 export type CdcDial = {
   driver: SqlDriver
   host: string
   port: number
   database: string
   user: string
-  slotName: string
-  publicationName: string
-  serverId: number | null
+  slotName?: string
+  publicationName?: string
+  serverId?: number | null
+  /** The pluggable database an Oracle connector reads (`database.pdb.name`, `SRC-4` slice 6, S6-b); then `database`
+   * is the container database. Omitted for a non-container Oracle database and for every other driver (the server
+   * refuses a present one). */
+  pdbName?: string
+  /** How the change-capture worker secures its connection to the source
+   * (`SRC-4` S2-d). Absent means `require`: encrypted, certificate taken as
+   * presented. `disable` is not encrypted. `verify-ca` and `verify-full` use the
+   * worker's own trust store. Widened with `string` as the other contract
+   * enums are. */
+  sslMode?: "disable" | "require" | "verify-ca" | "verify-full" | string
+}
+
+/** The `dial` of a MongoDB change-capture connector (`ingest_spec.rs`'s `CdcMongoDial`, `SRC-4`
+ * slice 5, decision S5-a): a `cdc` dial whose `driver` is `mongodb`. `hosts` are the replica set's
+ * explicit `host:port` seeds; `replicaSet` is required (change streams need a replica set). There is
+ * no connection string and no `mongodb+srv`: the server refuses an unknown field. `sslMode`
+ * is omitted unless chosen; the server then takes `require`. */
+export type CdcMongoDial = {
+  driver: "mongodb"
+  hosts: string[]
+  database: string
+  user: string
+  replicaSet: string
+  sslMode?: "disable" | "require" | "verify-ca" | "verify-full" | string
 }
 
 export type FilesProtocol = "s3" | "sftp"
@@ -441,13 +568,27 @@ export type FilesDial = {
 
 /**
  * Internally tagged on `type`, mirroring `RestAuth`
- * (`#[serde(tag = "type")]`) exactly — the same four `type` values
+ * (`#[serde(tag = "type")]`) exactly — the same five `type` values
  * `RestAuth::type_tag` names.
+ *
+ * `oauth2_authorization_code` (`SRC-12` part C) is the sign-in flow with
+ * PKCE: the client id and the addresses are configuration; the client secret
+ * is the connector's primary credential and the refresh token (written by the
+ * sign-in, never typed) its secondary one. `revocationUrl` is optional: when
+ * absent, signing out cannot tell the provider.
  */
 export type RestAuth =
   | { type: "api_key"; header: string }
   | { type: "bearer" }
   | { type: "oauth2_client_credentials"; tokenUrl: string }
+  | {
+      type: "oauth2_authorization_code"
+      clientId: string
+      authorizeUrl: string
+      tokenUrl: string
+      revocationUrl?: string
+      scopes: string[]
+    }
   | { type: "basic" }
 
 export type RestPagination =
@@ -549,6 +690,13 @@ export type SourceObject = {
    * detected survives a switch of mode; the API ignores it for a mode that
    * does not use it. */
   primaryKey?: string[]
+  /**
+   * `SRC-11` decisions 9 to 11: the columns left out of the load, stored as what is left out, not what is kept,
+   * so a column that appears later follows the schema-change policy. Accepted only for `sql` connectors on
+   * the `postgres`, `mysql` or `mssql` driver, and never a key column of a deduplicating or history object nor
+   * the cursor column (the API answers 422). Absent or empty: none left out.
+   */
+  excludedColumns?: string[]
   target: string
 }
 
@@ -602,6 +750,7 @@ export type IngestAdapter =
   | "mongodb"
   | "kafka"
   | "sftp"
+  | "saas"
   | string
 
 /**
@@ -663,6 +812,22 @@ export type IngestSpecInput = {
 }
 
 /**
+ * `dial` for the `saas` adapter (`SRC-3`): the vendor, the one part of its
+ * address a person supplies, and how the connector signs in. Mirrors Rust
+ * `SaasDial` (`lakehouse-store/src/ingest_spec.rs`). No address or secret is
+ * part of it: the vendor's addresses come from the vendor table.
+ */
+export type SaasDial = {
+  vendor: string
+  account: string
+  /** Objects the person names where the vendor has no listing of them. */
+  objects?: string[]
+  auth: { type: "oauth2_authorization_code"; clientId: string } | { type: "integration" }
+  /** NetSuite's integration credential only: the id of the certificate uploaded in NetSuite (the assertion's `kid`). */
+  certificateId?: string
+}
+
+/**
  * One row of `connector_type` (`rust/migrations/0035_connector_type.sql`),
  * as returned by the wizard's type listing. Mirrors Rust
  * `ConnectorType` (`rust/crates/lakehouse-store/src/connector_type.rs`)
@@ -679,47 +844,124 @@ export type ConnectorType = {
 }
 
 /**
- * One discovered column. Mirrors Rust `DiscoveredColumn`
- * (`rust/crates/lakehouse-api/src/connector_discover.rs`) exactly —
- * note the field is `typeName`, not `type`, and this array is never
- * `null` (only ever empty), matching that struct's plain `Vec`.
+ * Table discovery (`SRC-13`): what a connector's source holds, listed and previewed
+ * before anything is chosen to load. Mirrors the store's `connector_discovery::Answer`
+ * (`rust/crates/lakehouse-store/src/connector_discovery.rs`, camelCase) and the
+ * routes in `rust/crates/lakehouse-api/src/routes/connector_discovery.rs`.
  */
-export type DiscoveredColumn = {
+export type DiscoveryKind = "list" | "preview"
+
+/**
+ * What a discovery answer or poll can be about: the two a person starts, and `test` (`SRC-4` T1.1), the connection
+ * test of a connector only the orchestrator can dial, which `POST /api/connectors/{id}/test` launches. A test is
+ * never started on the discovery route (the API answers 400), only read there.
+ */
+export type DiscoveryReadKind = DiscoveryKind | "test"
+
+/** `running` only for the sources the orchestrator reads; the console polls until it ends. */
+export type DiscoveryState = "running" | "done" | "failed"
+
+/**
+ * Why a listing failed, from the closed list the API words (decision D10). The widening
+ * keeps a class a newer API adds from breaking the type; the console words an unknown
+ * one by the `reason` the API sent.
+ */
+export type DiscoveryErrorClass =
+  | "unreachable"
+  | "sign_in_refused"
+  | "address_refused"
+  | "no_permission"
+  | "timeout"
+  | "too_many_objects"
+  | "not_supported"
+  | "failed"
+  | string
+
+/** What a listed object is: a schema, a table, a file, a REST endpoint, a Kafka topic, a MongoDB collection, a business-app object, or (a GA4 property's fields, `schema: "fields"`) a dimension or a metric, or (a SharePoint tenant's sites, same request) a site. */
+export type DiscoveryObjectKind =
+  | "schema"
+  | "table"
+  | "file"
+  | "endpoint"
+  | "topic"
+  | "collection"
+  | "object"
+  | "dimension"
+  | "metric"
+  | "site"
+  | string
+
+/**
+ * One listed object. `name` is what a source object's `name` is in the ingest spec:
+ * `schema.table` for SQL, the key for a file, the path for an endpoint. `size` (bytes)
+ * and `modifiedAt` (RFC 3339) are present for files only.
+ */
+export type DiscoveryObject = {
+  name: string
+  kind: DiscoveryObjectKind
+  size?: number
+  modifiedAt?: string
+  /**
+   * A business-app object only (`SRC-3` decision 6): `incremental`, or
+   * `re-read in full: <reason>`. Fixed text from the vendor module's declaration.
+   */
+  load?: string
+  /**
+   * A name for a person where `name` is an id (`SRC-3` slice 5 review BLOCKER 14: a SharePoint list is
+   * `<site id>/<list id>`, labelled `Site / List`). The ingest spec keys the object by `name`, so a rename
+   * at the source changes nothing stored.
+   */
+  label?: string
+}
+
+/** One column of a preview; `inferred` is true when `typeName` was guessed from a sample (D6). */
+export type DiscoveryColumn = {
   name: string
   typeName: string
+  inferred: boolean
 }
 
 /**
- * One discovered table (or future non-SQL equivalent object). Mirrors
- * Rust `DiscoveredObject` exactly — `columns` is a plain array, never
- * nullable, and there is no `sample` field: this route reports schema
- * only, never a data preview.
+ * The answer of every discovery route. A finished list has `objects` (and `truncated`);
+ * a finished preview has `columns` (and `primaryKey` for SQL); a failure has `errorClass`
+ * and a fixed `reason`, never the source's own text. An empty `columns` is an empty
+ * topic, collection or file, not a failure.
  */
-export type DiscoveredObject = {
-  name: string
-  columns: DiscoveredColumn[]
+export type DiscoveryAnswer = {
+  kind: DiscoveryReadKind
+  state: DiscoveryState
+  /** What a list was narrowed by (the schema or the glob), when it was. */
+  scope?: string
+  /** The object a preview is about. */
+  object?: string
+  objects?: DiscoveryObject[]
+  truncated?: boolean
+  columns?: DiscoveryColumn[]
+  primaryKey?: string[]
+  /** A finished connection test: the milliseconds the connection took, as the orchestrator measured them. */
+  latencyMs?: number
   /**
-   * `SRC-10`: the columns of the table's primary key as the source declares it,
-   * in key order; `[]` when the source declares none. SQL drivers only; read from
-   * the source's own catalog views, so it is the source's word, not a guess.
+   * A finished test of a MongoDB change-capture connector (`SRC-4` Amendment 8, S8-e): what the source must have
+   * switched on, in the API's fixed words. Absent for every other kind and connector. Never part of `ok`.
    */
-  primaryKey: string[]
+  setupChecks?: SetupCheck[]
+  errorClass?: DiscoveryErrorClass
+  reason?: string
+  startedAt?: string
+  endedAt?: string
 }
 
 /**
- * The response body for `POST /api/connectors/{id}/discover`. Mirrors
- * Rust `DiscoverResult` exactly (same module). `reason` is populated
- * whenever `supported` is `false`, omitted (not `null`) otherwise — the
- * Rust field is `Option<String>` with no `skip_serializing_if`, but every
- * other `Option<String>` reason field on this route follows the same
- * "absent means not applicable" convention as `AlertRule`'s optional
- * fields (`contracts/alerts.ts`), so this widens with `?` rather than
- * `| null` for consistency; either reads a missing key the same way.
+ * The body of `POST /api/connectors/{id}/discovery/{kind}`; every field optional.
+ * `schema` empty on a SQL list asks for the schemas; `object` is required for a
+ * preview and refused for a list; `limit` is 1 to 10,000.
  */
-export type DiscoverResult = {
-  objects: DiscoveredObject[]
-  supported: boolean
-  reason?: string
+export type DiscoveryRequest = {
+  schema?: string
+  glob?: string
+  search?: string
+  limit?: number
+  object?: string
 }
 
 /**
@@ -754,60 +996,158 @@ export type IngestTableRequest = {
   action: IngestTableAction
 }
 
+/** Why a run was started (`SRC-11` decision 7). `other`: launched from the orchestrator's own screen. Widened. */
+export type RunTrigger = "schedule" | "user" | "refresh" | "clear" | "other" | string
+
+/** Where a run stands in the product's own record; `running` is also what a killed run keeps, see the Runs card. Widened. */
+export type RunStatus = "running" | "succeeded" | "failed" | "paused" | string
+
+/** Why a run ended (`SRC-11` decision 5). `timed_out`: it outlived the run limit and was stopped (`SRC-39`, QA `TC-1702`). Widened. */
+export type RunEndReason = "completed" | "table_failed" | "connector_paused" | "timed_out" | "other" | string
+
 /**
- * One row of `bronze_meta.ingest_run` (ClickHouse, WS3 item 25), as
- * returned by `GET /api/governance/ingest-runs?connectorId=`.
+ * One run of a connector, from `GET /api/connectors/{id}/runs` (newest 50 first). Mirrors the API's run record
+ * (`routes/connector_runs.rs`, `SRC-11` decision 7). Times are ISO 8601 with milliseconds.
  */
-export type IngestRun = {
-  connectorId: string
-  job: string
-  object: string
-  /** `null` means "not measured" (dlt's normalize row count was
-   * unavailable), never a fabricated `0` (WS3 plan review Z9). */
-  rows: number | null
+export type ConnectorRun = {
+  runId: string
+  trigger: RunTrigger
+  /**
+   * The one table a `refresh` or `clear` run is about, so the run list can say "Clear · public.orders"
+   * (`SRC-10` decision 5); `null` for every other run and for a run recorded before it was kept.
+   */
+  table: string | null
+  status: RunStatus
+  startedAt: string
+  /** `null` until the run reports its end; a killed run may never. */
+  endedAt: string | null
+  durationSeconds: number | null
+  /** Rows of the attempts that succeeded. */
+  rowsLoaded: number
+  /** All attempts at all tables. */
+  attempts: number
+  endReason: RunEndReason | null
+}
+
+/**
+ * `GET /api/connectors/{id}/runs`: the connector's newest 50 runs, and the run limit the API judges
+ * them by (`SRC-39`, QA `TC-1702`).
+ */
+export type ConnectorRunList = {
+  runs: ConnectorRun[]
+  /**
+   * How long a run may run before the API stops holding the connector for it, in seconds
+   * (`INGEST_RUN_MAX_RUNTIME_SECONDS`). The Runs card shows a run whose record still says `running`
+   * as going until this limit, so the number is never copied here: raising the setting keeps the page
+   * and the API in step. Absent in an older API's answer; the page then falls back to six hours.
+   */
+  maxRuntimeSeconds?: number
+}
+
+/** The closed list of why an attempt failed (`SRC-11` decision 2); a success carries none. Widened. */
+export type AttemptErrorClass =
+  | "unreachable"
+  | "timeout"
+  | "source_busy"
+  | "api_unreachable"
+  | "sign_in_refused"
+  | "address_refused"
+  | "unsupported"
+  | "setting_rejected"
+  | "schema_decision_pending"
+  | "other"
+  | "permission_missing"
+  | "rate_limited"
+  | string
+
+/** One attempt at one table of a run. */
+export type ConnectorRunAttempt = {
+  table: string
+  attempt: number
   startedAt: string
   endedAt: string
-  status: string
-  error: string
+  rowsLoaded: number
+  result: "succeeded" | "failed" | string
+  errorClass: AttemptErrorClass | null
+  /** The wait before the next attempt, in seconds; only on a failure that is retried. */
+  waitSeconds: number | null
+}
+
+/** The closed list of lines a run's log holds. Widened. */
+export type RunLogEvent =
+  | "run_started"
+  | "attempt"
+  | "retry_wait"
+  | "schema_decision_pending"
+  | "columns_left_out"
+  | "report_gap"
+  | "run_ended"
+  | string
+
+/** One line of a run's log; `text` is the product's own sentence, never the source's or the driver's. */
+export type ConnectorRunLine = {
+  at: string
+  event: RunLogEvent
+  table: string | null
+  attempt: number | null
+  text: string
+}
+
+/** `GET /api/connectors/{id}/runs/{runId}/log`. Attempts and lines older than 30 days are gone (empty arrays). */
+export type ConnectorRunLog = {
+  run: ConnectorRun
+  attempts: ConnectorRunAttempt[]
+  lines: ConnectorRunLine[]
+}
+
+/** `POST /api/connectors/{id}/resume`. */
+export type ResumeConnectorResponse = { resumed: boolean }
+
+/** `POST /api/connectors/{id}/pause` (`SRC-4` decision S2-e). */
+export type PauseConnectorResponse = { paused: boolean }
+
+/**
+ * `GET /api/connectors/{id}/change-capture`'s response (`SRC-4` decision S2-h). Mirrors Rust
+ * `ChangeCaptureResponse` (`rust/crates/lakehouse-api/src/routes/connector_runs.rs`).
+ * `supported: false` carries a fixed `reason` (a connector that captures no changes, or a
+ * deployment without Kafka Connect). `state` is `running`, `paused`, `failed`, `starting`,
+ * `not_created` (the capture service has no such connector yet) or `unreachable` (it could not
+ * be asked); never a made-up `running`.
+ */
+export type ChangeCaptureState = {
+  supported: boolean
+  reason?: string
+  state?: "running" | "paused" | "failed" | "starting" | "not_created" | "unreachable" | string
+  /** Why a failed Oracle connector failed, when its trace carries one of the two messages Debezium throws for a
+   * source that is not set up (`ARCHIVELOG` off, minimal supplemental logging off; `SRC-4` Amendment 11, S11-d). */
+  setupChecks?: SetupCheck[]
+  /** How far behind the source each table is, the limit and whether its alert is open (`SRC-4` slice 4). */
+  lag?: ChangeCaptureLag
 }
 
 /**
- * One `ingest_job` run of one connector, from
- * `GET /api/connectors/{id}/ingest/runs` (newest first). Mirrors Rust
- * `ConnectorIngestRun` (`routes/connectors.rs`). A run that failed before
- * reaching any table has no `IngestRun` rows at all; this is where it still
- * shows.
+ * One table's lag, as the API words it (`SRC-4` decision S4-c). `behind` carries `seconds`; `not_known_since` carries
+ * `since` (the time of the newest report); the others carry neither. A number is never invented: `not_known_yet`
+ * means nothing was reported, `not_known_since` that the orchestrator stopped reporting.
  */
-export type IngestJobRun = {
-  runId: string
-  /** The pipelines pages' vocabulary (`lakehouse_dagster::map_run_status`). */
-  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "unknown"
-  /** ISO 8601; `null` until the run starts. */
-  startedAt: string | null
-  /** ISO 8601; `null` until the run ends. */
-  endedAt: string | null
-  /**
-   * `SRC-10`: the one table a run of a single table named (from the run's
-   * config), `null` for a run of every table.
-   */
-  object: string | null
-  /** `refresh_keep | refresh_remove | clear` for such a run, else `null`. Widened: a newer API may add actions. */
-  action: IngestTableAction | string | null
-}
-
-/**
- * `GET /api/connectors/{id}/debezium-properties?table=`'s response.
- * Mirrors Rust `DebeziumPropertiesResponse`
- * (`rust/crates/lakehouse-api/src/routes/connectors.rs`). `properties`
- * contains ONLY `${ENV_VAR_NAME}` references for every credential-shaped
- * field, never a resolved secret — rendered as literal text, labeled with
- * `note`, and never resolved client-side.
- */
-export type DebeziumProperties = {
-  properties: string
+export type CaptureTableLag = {
   table: string
-  note: string
+  status: "up_to_date" | "behind" | "not_known_yet" | "not_known_since" | "paused" | string
+  seconds?: number
+  since?: string
 }
+
+/** Mirrors Rust `LagReadout` (`rust/crates/lakehouse-api/src/routes/capture_lag.rs`). */
+export type ChangeCaptureLag = {
+  tables: CaptureTableLag[]
+  /** The table furthest behind; absent when none is behind by a number. */
+  worst?: { table: string; seconds: number }
+  limitMinutes: number
+  alertOpen: boolean
+}
+
+/** `PUT /api/connectors/{id}/lag-limit` (`SRC-4` S4-d). */
+export type LagLimitResponse = { minutes: number }
 
 /**
  * One connector `dagster/dispar_orchestrate/ingest_factory.py` can build
@@ -848,25 +1188,33 @@ export interface ConnectorService {
    */
   listTypes(signal?: AbortSignal): Promise<ConnectorType[]>
   listIngestible(signal?: AbortSignal): Promise<IngestibleConnector[]>
-  /** `schema` is required for a `sql`/`cdc` connector: the server lists
-   * only that schema's tables (bound, never interpolated). */
-  discoverConnector(id: string, schema: string, signal?: AbortSignal): Promise<DiscoverResult>
+  /**
+   * `POST /api/connectors/{id}/discovery/{kind}` (`SRC-13`): ask for a listing or a preview.
+   * SQL sources, object storage and the REST endpoint list answer in this call; the
+   * sources only the orchestrator reads answer `running`, and `getDiscovery` is polled.
+   */
+  startDiscovery(id: string, kind: DiscoveryKind, request: DiscoveryRequest, signal?: AbortSignal): Promise<DiscoveryAnswer>
+  /** `GET /api/connectors/{id}/discovery/{kind}`: the latest answer of that kind (404 when none was asked for). */
+  getDiscovery(id: string, kind: DiscoveryReadKind, signal?: AbortSignal): Promise<DiscoveryAnswer>
   /** With `table`, a run of that one table with an action (`SRC-10`); without, every table. */
   runIngest(id: string, signal?: AbortSignal, table?: IngestTableRequest): Promise<IngestRunResult>
-  listIngestRuns(connectorId: string, signal?: AbortSignal): Promise<IngestRun[]>
-  listIngestJobRuns(connectorId: string, signal?: AbortSignal): Promise<IngestJobRun[]>
   /**
-   * `GET /api/connectors/{id}/debezium-properties?table=` — a read-only
-   * rendering of the `Debezium` `.properties` file body for a `cdc`
-   * adapter's captured table, `${ENV_VAR_NAME}` references only, never a
-   * resolved secret. `table` is required: no registry column stores which
-   * table alone until an ingest spec names one via `sourceObjects`.
+   * `GET /api/connectors/{id}/runs` (`SRC-11`): the newest 50 runs from the product's own run record,
+   * and the run limit the API judges them by (`SRC-39`).
    */
-  getDebeziumProperties(
-    id: string,
-    table: string,
-    signal?: AbortSignal
-  ): Promise<DebeziumProperties>
+  listConnectorRuns(connectorId: string, signal?: AbortSignal): Promise<ConnectorRunList>
+  /** `GET /api/connectors/{id}/runs/{runId}/log` (`SRC-11`): the attempts and lines of one run. */
+  getConnectorRunLog(connectorId: string, runId: string, signal?: AbortSignal): Promise<ConnectorRunLog>
+  /** The same log as text (`?format=text`), for the Download log button. */
+  downloadConnectorRunLog(connectorId: string, runId: string, signal?: AbortSignal): Promise<string>
+  /** `POST /api/connectors/{id}/resume` (`SRC-11` decision 4): lifts a pause set by repeated failures, or by a person (`SRC-4`); no other. */
+  resumeConnector(connectorId: string, signal?: AbortSignal): Promise<ResumeConnectorResponse>
+  /** `POST /api/connectors/{id}/pause` (`SRC-4`): pauses the connector until a person resumes it. */
+  pauseConnector(connectorId: string, signal?: AbortSignal): Promise<PauseConnectorResponse>
+  /** `GET /api/connectors/{id}/change-capture` (`SRC-4`): the connector's state in the capture service. */
+  getChangeCapture(connectorId: string, signal?: AbortSignal): Promise<ChangeCaptureState>
+  /** `PUT /api/connectors/{id}/lag-limit` (`SRC-4`): the lag, in minutes (1 to 1440), at which an alert is sent. */
+  setLagLimit(connectorId: string, minutes: number, signal?: AbortSignal): Promise<LagLimitResponse>
   /**
    * `GET /api/connectors/{id}/probe-history?limit=` — the connector's most
    * recent connectivity-probe results, newest first. `limit` defaults to
@@ -884,6 +1232,14 @@ export interface ConnectorService {
     body: RotateConnectorSecretRequest,
     signal?: AbortSignal
   ): Promise<RotateConnectorSecretResponse>
+  /** `GET /api/connectors/credential-settings` — see `CredentialSettings`. */
+  getCredentialSettings(signal?: AbortSignal): Promise<CredentialSettings>
+  /** `GET /api/connectors/{id}/oauth` (`SRC-12` part C) — see `OAuthStatus`. 409 for a connector that does not sign in with OAuth authorization code. */
+  getOAuthStatus(id: string, signal?: AbortSignal): Promise<OAuthStatus>
+  /** `POST /api/connectors/{id}/oauth/start` — see `OAuthStart`. The state and verifier stay on the server. */
+  startOAuth(id: string, signal?: AbortSignal): Promise<OAuthStart>
+  /** `POST /api/connectors/{id}/oauth/sign-out` — revoke at the provider when it can be told, and delete the stored token. */
+  signOutOAuth(id: string, signal?: AbortSignal): Promise<OAuthSignOut>
   /**
    * `PUT /api/connectors/{id}/credential` — save a user-supplied credential
    * as the connector's lakehouse-managed credential, probe-first (ADR 0002

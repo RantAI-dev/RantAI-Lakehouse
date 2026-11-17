@@ -1,10 +1,20 @@
 import { render, screen } from "@testing-library/react"
-import { describe, expect, it, mock } from "bun:test"
+import { afterAll, describe, expect, it, mock } from "bun:test"
+
+import * as realSqlEditor from "@/components/sql-editor"
+const realEditor = { ...realSqlEditor }
 
 // CodeMirror needs a real browser layout; the panel only needs to know that
 // its label and required state reach the editor, so stub it with a textbox
 // that echoes the props the panel passes through SqlEditor.
+afterAll(() => {
+  mock.module("@/components/sql-editor", () => realEditor)
+})
+// CodeMirror needs a real browser layout; the panel only needs to know that
+// its label and required state reach the editor, so stub it with a textbox
+// that echoes the props the panel passes through SqlEditor.
 mock.module("@/components/sql-editor", () => ({
+  ...realEditor,
   SqlEditor: ({ labelledBy, required }: { labelledBy?: string; required?: boolean }) => (
     <textarea aria-labelledby={labelledBy} aria-required={required} />
   ),

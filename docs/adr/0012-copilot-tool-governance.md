@@ -93,7 +93,9 @@ decision, not made by this change.
   will actually run. `POST /api/ai/tool` runs exactly one gated tool call
   directly (bypassing another LLM round-trip) — the frontend's Confirm
   button re-sends the identical call with `confirmed: true` merged in;
-  Cancel sends nothing.
+  Cancel sends nothing. The chat loop strips `confirmed` from the
+  model's own arguments before the gate, so only the Confirm button's
+  request can carry it.
 - **`WriteHigh`**: always produces an internal pending marker (never
   returned to the model/frontend as-is), turned into a real `approval_item`
   (status `pending`) + linked `agent_run` (status `waiting_approval`,

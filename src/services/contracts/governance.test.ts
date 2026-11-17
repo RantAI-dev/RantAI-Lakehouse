@@ -18,8 +18,12 @@ describe("governance contracts", () => {
       version: 1,
       owner: "o",
       updatedAt: "2026-01-01T00:00:00.000Z",
+      enforceable: false,
     }
     expect(fixture.conditions).toBeUndefined()
+    // SEC-61: nothing structured to enforce, so the list must not call it
+    // enforced even though its status is `ready`.
+    expect(fixture.enforceable).toBe(false)
   })
 
   it("Policy carries a structured conditions blob as a raw, unparsed string", () => {
@@ -35,7 +39,9 @@ describe("governance contracts", () => {
       owner: "o",
       updatedAt: "2026-01-01T00:00:00.000Z",
       conditions: '{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}',
+      enforceable: true,
     }
     expect(fixture.conditions).toContain("Analyst")
+    expect(fixture.enforceable).toBe(true)
   })
 })

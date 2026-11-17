@@ -17,7 +17,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 
@@ -228,7 +228,10 @@ async fn a_table_outside_serving_and_silver_is_a_404() {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{asset}: {reply}");
     }
-    assert!(semantic::list_all(&app.pool).await.unwrap().is_empty());
+    assert_eq!(
+        semantic::list_all(&app.pool).await.unwrap(),
+        [] as [lakehouse_store::semantic::SemanticEntry; 0]
+    );
 }
 
 #[tokio::test]

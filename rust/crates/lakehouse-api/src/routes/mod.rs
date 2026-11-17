@@ -5,61 +5,157 @@
 //! dashboard, ...), and — new in Phase 2 — the Postgres-backed `identity`
 //! domain under `/api/identity/*`.
 
-mod agents;
+pub(crate) mod agents;
 pub(crate) mod ai;
 mod alerts;
+mod audit_events;
 pub mod auth;
-mod authored_pipelines;
-mod catalog;
+// `DATA-42` D7: the `ClickHouse` registry fixture the readers' tests share
+// (`governance`, `overview`, `storage`, `lineage`, `catalog_profile`).
+// Test-only, so it is declared `#[cfg(test)]` and never reaches a build.
+#[cfg(test)]
+pub(crate) mod bronze_registry_fixture;
+mod chart_alerts;
+// `pub(crate)`, not private: `crate::pipeline_lag` (BLD-2) reads
+// `authored_pipelines::job_name` to name the job a lag run launches, and
+// re-deriving the `authored__<id>` mapping in a second place is exactly
+// the drift the one definition exists to prevent.
+pub(crate) mod authored_pipelines;
+mod calc_fields;
+mod capture_lag;
+// `pub(crate)`, not private: `main.rs` starts the background build of the
+// catalog search copy at start-up (`DATA-41` D4), so it names
+// `catalog::spawn_startup_search_copy`.
+pub(crate) mod catalog;
+mod catalog_drop;
 mod catalog_governance;
+mod catalog_grants;
 mod catalog_profile;
 mod catalog_query;
-mod catalog_search;
+mod catalog_restore;
+// `pub(crate)`, not private: `crate::catalog_search_cache` holds the
+// prepared search index (`DATA-41` D2), so the type it holds has to be
+// nameable from outside this module.
+pub(crate) mod catalog_search;
 mod catalog_source;
+mod connector_discovery;
+mod connector_oauth;
+mod connector_runs;
 mod connectors;
 mod dashboard;
+pub(crate) mod dashboard_access;
+// `pub` only so the route test can build its expected 403 body from `SERVICE_REFUSED`
+// instead of a second copy of the sentence (BI-19 E, PR #250 CI).
+pub mod dashboard_comments;
+mod dashboard_file;
 mod dashboard_folders;
+pub(crate) mod dashboard_organise;
 mod dashboard_sources;
+pub(crate) mod drill;
 mod embed;
+mod pdf_export;
+pub mod public_links;
+mod render;
+pub mod report_runner;
+mod reports;
+// DATA-10 review SHOULD-FIX 1: route modules stay private; tests call gold_export_history
 mod gold;
 mod governance;
+mod hierarchies;
 mod home;
 mod identity;
+// DATA-5 / ADR 0016: the door outside tools read published Gold tables
+// through. Its own router, because its routes answer in the Iceberg
+// error shape rather than the console's. `pub(crate)`, because
+// `crate::gold_export` names the principal it grants the `gold`
+// namespace to (ADR 0016 point 3).
+pub(crate) mod iceberg_door;
 mod knowledge;
 mod lakehouse;
+pub(crate) mod layers;
 mod lineage;
 mod load_alerts;
+mod maps;
+pub(crate) mod metrics;
 mod notifications;
 mod ops;
 mod overview;
+pub(crate) mod params;
+mod pipeline_preview;
 mod pipelines;
 mod quality;
-mod query;
+mod quality_anomaly;
+mod quality_incidents;
+mod quality_load;
+mod quality_schedules;
+mod query_cancel;
+mod query_limits;
+// `pub(crate)`, not private: `SEC-50`'s shared tenant gate
+// (`query::gate_statement` and `query::GateActor`) is asked by every site
+// that runs a statement through the policy rewrite — the query path, the
+// authored pipelines, the Gold export, and (from slice 2) the dashboards,
+// the embeds, the public links and the alerts. A second copy of the reach
+// logic in a second place is exactly the drift the one definition exists
+// to prevent (`AGENTS.md` rule 4).
+pub(crate) mod query;
+// The trash sweep is started by the binary's `main`, and the library
+// target has no caller of its own: the re-export is what keeps the
+// function reachable there, so no build calls it dead code.
+pub use query::spawn_saved_query_trash_sweep;
+mod saved_queries;
 mod schema_changes;
 pub(crate) mod schema_versions;
+mod settings;
 mod storage;
 pub(crate) mod support;
-mod uploads;
+// `pub(crate)`, because `crate::upload_convert` (the child process's
+// protocol) needs this module's own sentences: a file that is too large is
+// refused with the same words wherever it is noticed (`SEC-22` D4).
+pub(crate) mod uploads;
 
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Request};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
-use axum::middleware::{Next, from_fn, from_fn_with_state};
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post, put};
+use lakehouse_core::ApiError;
 use serde::Serialize;
 
 use crate::json::ApiJson;
 use crate::policy::auth_gate;
 use crate::state::AppState;
+use crate::upstream_error;
+
+/// The sentence a query string the route cannot read is told.
+///
+/// One sentence for every route that refuses a query string its extractor
+/// could not read — the saved-query list, the query history, the result
+/// download and the uploads. The route's own words, never the extractor's:
+/// a response never carries a library's rendering of the caller's request.
+pub(crate) const QUERY_STRING_UNREADABLE: &str = "The query string could not be read.";
+
+/// A failure of an exported file, reported under a reference with a fixed
+/// sentence (`SEC-11`). The `ctx` names the operation in the log and the
+/// words the caller reads, so each surface keeps its own.
+pub(crate) fn export_failure(
+    ctx: &upstream_error::Context,
+    err: &crate::export::ExportError,
+) -> ApiError {
+    match err {
+        crate::export::ExportError::Source(ch) => upstream_error::ch_error(ctx, ch),
+        other => upstream_error::internal_error(&upstream_error::SERVICE, other),
+    }
+}
 
 /// The `/api/auth/*` sub-router (Task 3.2), split out for the same
 /// `clippy::too_many_lines` reason as [`pipelines_router`].
 fn auth_router() -> Router<AppState> {
     Router::new()
         .route("/api/auth/login", axum::routing::post(auth::login))
+        .route("/api/auth/password-rules", get(auth::password_rules))
         .route("/api/auth/logout", axum::routing::post(auth::logout))
         .route("/api/auth/me", get(auth::me))
         .route(
@@ -112,14 +208,31 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// bound; the per-upload routes (`/api/uploads/{id}*`) keep the default.
 const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The chart and table downloads' timeout (`BI-1` review fix (BLOCKER) R2). The
+/// stream from `ClickHouse` has 300 seconds (`export::EXPORT_TIMEOUT`) and its
+/// query 280 (`max_execution_time`), then the file is written and sent; the 60
+/// second default cut a long export with a bare `request timeout`. Ten seconds
+/// above the stream, so the sentence the export itself gives wins.
+const EXPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(310);
+
+/// The PDF route's timeout (`BI-1` review fix (BLOCKER) R2): the wait for a
+/// free slot ([`crate::pdf::PDF_SLOT_WAIT`]), the client's 70 seconds with
+/// Gotenberg, and ten seconds for the token, the audit and the answer.
+const PDF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 + 70 + 10);
+
 /// Per-route request timeout, mirroring each TypeScript handler's `export
 /// const maxDuration` (grep of every `src/app/api/**/route.ts`):
 ///
 /// | route                          | TS `maxDuration` |
 /// |---------------------------------|------------------|
 /// | `/api/ai/chat`                  | 120              |
+/// | `/api/ai/tool`                  | 60 (review round 1 R3: the longest configured limit + 15, like a save — the assistant's confirmed saves run under the limit here, see [`deadline_for`]) |
 /// | `/api/alerts/run`               | 60               |
-/// | `/api/query/run`                | 60               |
+/// | `/api/query/run`                | 60 (BI-5: the longest configured limit + 15, see [`deadline_for`]) |
+/// | `/api/dashboard/specs`, `/api/dashboard/specs/preview` | 60 (BI-45: the longest configured limit + 15, see [`deadline_for`]) |
+/// | `/api/dashboard/sources/preview` | 60 (BI-45: twice the longest configured limit + 15, see [`deadline_for`]) |
+/// | board routes (`/api/dashboard`, `/api/embed/*`, `/api/public/dashboard/*`, `/api/render/data`) | 60 (BI-5: an outer cap of 35 minutes, see [`deadline_for`]) |
+/// | `/api/query/run/{id}/download`   | no TS handler (QS-2: an outer cap of 35 minutes, see [`crate::query_limits::BOARD_DEADLINE_CAP`]) |
 /// | everything else (no export)     | [`DEFAULT_REQUEST_TIMEOUT`] (60) |
 ///
 /// `/api/uploads` has no TypeScript handler to mirror and takes
@@ -134,9 +247,128 @@ const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
-        "/api/uploads" => UPLOAD_REQUEST_TIMEOUT,
+        "/api/uploads" | "/api/maps" => UPLOAD_REQUEST_TIMEOUT,
+        // BI-19 part D: an import checks and runs each of up to 200 charts, so it
+        // gets the export deadline too.
+        "/api/dashboard/chart-export" | "/api/dashboard/table-export" | "/api/dashboard/import" => {
+            EXPORT_REQUEST_TIMEOUT
+        }
+        // QS-2: a download of a whole result writes a file that can be
+        // gigabytes, so it gets the same outer bound as a board.
+        other if other.starts_with("/api/query/run/") && other.ends_with("/download") => {
+            crate::query_limits::BOARD_DEADLINE_CAP
+        }
+        "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
+        // RPT-1: "Send now" makes the PDF and the chart files in the request,
+        // so it gets the longest export deadline.
+        other if other.starts_with("/api/reports/subscriptions/") && other.ends_with("/send") => {
+            EXPORT_REQUEST_TIMEOUT
+        }
+        other if is_upload_part_path(other) => UPLOAD_REQUEST_TIMEOUT,
+        other if is_discovery_path(other) => DISCOVERY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
+}
+
+/// The routes whose queries run under the administrator's time limit
+/// (`BI-5`): their deadline follows the limit instead of the fixed 60 s.
+///
+/// `BI-45` (QA `LH-BI-5-01`): saving a chart and previewing one run its
+/// statement under the limit too, so these three join it — without that, the
+/// fixed 60-second deadline fires before the default limit can be reported.
+/// `GET`/`DELETE` on `/api/dashboard/specs` share the path and so the bound;
+/// they send no long statement, so the longer bound changes nothing for them.
+///
+/// `/api/ai/tool` joins them (`BI-45` review round 1, R3): the assistant drafts
+/// `create_chart`, `update_chart`, `format_chart` and `move_chart`, and the
+/// Confirm button executes the draft through this route, which awaits
+/// `tools::run_tool` in the request task. With the fixed 60-second deadline the
+/// default limit (60 s) could never be reported there: the engine answered
+/// `TIMEOUT_EXCEEDED` after the route had already ended in "request timeout",
+/// and the tool's `{ "error": <sentence>, "limit": … }` never reached the
+/// model or the person.
+fn limit_bearing(path: &str) -> bool {
+    path == "/api/query/run"
+        || path == "/api/dashboard/specs"
+        || path == "/api/dashboard/specs/preview"
+        || path == "/api/dashboard/sources/preview"
+        || path == "/api/ai/tool"
+        || is_board_path(path)
+}
+
+/// The routes that answer a whole board: tiles run six at a time, so one can
+/// need several rounds of the time limit.
+///
+/// `BI-5` review S1: only the routes that run a whole board's tiles. The embed
+/// frame and values routes and a public link's `unlock` run no tile, so they
+/// keep the ordinary deadline.
+fn is_board_path(path: &str) -> bool {
+    path == "/api/dashboard"
+        || path == "/api/render/data"
+        || path == "/api/embed/data"
+        || path
+            .strip_prefix("/api/public/dashboard/")
+            .is_some_and(|token| !token.is_empty() && !token.contains('/'))
+}
+
+/// The deadline of `path` given the install's longest configured time limit
+/// (`None`: not read, or not readable, which keeps [`route_timeout`]).
+///
+/// `BI-5` plan D4 says a limit-bearing route gets that limit plus 15 s, and
+/// that a board's deadline is `ceil(tiles / 6) x limit + 15 s` computed in the
+/// handler (which answers the finished tiles and marks the rest "not reached
+/// in time"). The two cannot both be the middleware's: a deadline of one limit
+/// would cut a two-round board before its handler could answer. So the
+/// middleware gives `/api/query/run` the limit plus 15 s, and a board route
+/// the 35-minute cap as an outer bound, leaving the handler's own deadline
+/// (`query_limits::board_deadline`) the one that decides.
+///
+/// `BI-45` (QA `LH-BI-5-01`): the SQL source preview runs its source TWICE
+/// with a chart — the row read, then the chart's own statement — so its
+/// deadline is twice the longest limit plus the margin; with one limit it
+/// would cut the second statement before the limit could be reported.
+///
+/// `BI-45` review round 1 R3: `/api/ai/tool` takes the same limit plus margin
+/// as a save, because the assistant's confirmed saves run there.
+fn deadline_for(path: &str, longest: Option<Duration>) -> Duration {
+    match longest {
+        Some(_) if is_board_path(path) => crate::query_limits::BOARD_DEADLINE_CAP,
+        Some(longest) if path == "/api/dashboard/sources/preview" => longest
+            .saturating_mul(2)
+            .saturating_add(crate::query_limits::DEADLINE_MARGIN),
+        Some(longest) if limit_bearing(path) => {
+            longest.saturating_add(crate::query_limits::DEADLINE_MARGIN)
+        }
+        _ => route_timeout(path),
+    }
+}
+
+/// Whether `path` is `/api/uploads/{id}/parts/{n}`: one 8 MiB piece of a
+/// chunked upload (`DATA-17`). It gets [`UPLOAD_REQUEST_TIMEOUT`], not the
+/// default 60 s, which would cut an 8 MiB piece off on a link slower than about
+/// 1 Mbit/s; the other `/api/uploads/{id}*` routes keep the default.
+fn is_upload_part_path(path: &str) -> bool {
+    path.strip_prefix("/api/uploads/")
+        .map(|rest| rest.split('/').collect::<Vec<_>>())
+        .is_some_and(|segments| {
+            matches!(segments.as_slice(), [id, "parts", n] if !id.is_empty() && !n.is_empty())
+        })
+}
+
+/// `/api/connectors/{id}/discovery/{kind}`'s timeout (`SRC-13` decision D9): the
+/// listing call's own limit is 120 seconds (`connector_listing::LIST_TIMEOUT`), so
+/// the request that carries it may take a few seconds more to answer. The route
+/// does a bounded amount of work (one connection, one or two queries, a bounded
+/// bucket scan), so the longer deadline is not an open door.
+const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(130);
+
+/// Whether `path` is `/api/connectors/{id}/discovery/list` or `.../preview`.
+fn is_discovery_path(path: &str) -> bool {
+    path.strip_prefix("/api/connectors/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(id, tail)| {
+            !id.is_empty() && matches!(tail, "discovery/list" | "discovery/preview")
+        })
 }
 
 /// `/api/ai/chat`'s timeout: `AI_CHAT_TIMEOUT_SECS` when set, else 120s.
@@ -176,6 +408,48 @@ fn chat_timeout_from(raw: Option<&str>) -> Duration {
 /// No `#[must_use]` here: `axum::Router` is already `#[must_use]`, and
 /// repeating the attribute without a message trips
 /// `clippy::double_must_use`.
+/// `POST /api/pipelines/runnable/{id}/compile` (BLD-1 part 1 / D8), the one
+/// statement the orchestrator runs for a pipeline, compiled from its stored
+/// definition and rewritten as its author.
+///
+/// Its own function for the same reason [`pipelines_router`] is: so the
+/// route can be added without pushing that function over
+/// `clippy::too_many_lines`. It merges straight back in, through
+/// [`authored_pipelines_router`], and carries no middleware or state of
+/// its own.
+fn pipeline_compile_router() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/runnable/{id}/compile",
+        axum::routing::post(authored_pipelines::compile_pipeline),
+    )
+}
+
+/// `POST /api/pipelines/preview` (BLD-1 part 1 / D16): the first rows of one
+/// input or step of a definition that is not saved yet.
+///
+/// Its own function for the same reason [`pipeline_compile_router`] is: so the
+/// route can be added without pushing [`pipelines_router`] over
+/// `clippy::too_many_lines`. It merges straight back in and carries no
+/// middleware or state of its own. Static, like `generate`, so axum never
+/// reads it as `/api/pipelines/{id}`.
+fn pipeline_preview_router() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/preview",
+        axum::routing::post(pipeline_preview::preview),
+    )
+}
+
+/// The authored-pipeline (orchestrator-only) routes: the definitions the
+/// job factory loads, and the rewrite it asks for before it runs one.
+///
+/// `pipelines_router` merges this rather than growing another four lines:
+/// every route here is orchestrator-only in the handler as well as in
+/// [`crate::policy`], and keeping them together makes that pairing the
+/// thing a reader sees first.
+fn authored_pipelines_router() -> Router<AppState> {
+    pipeline_compile_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+}
+
 /// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]
 /// purely to keep that function under `clippy::too_many_lines` — it merges
 /// straight back in, with no separate middleware/state of its own.
@@ -189,19 +463,26 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/generate",
             axum::routing::post(pipelines::generate),
         )
+        // BLD-1 part 1 / D16: the preview of one input or step of a definition
+        // that is not saved yet. Static, like `generate`, so it is never read
+        // as `/api/pipelines/{id}`.
+        .merge(pipeline_preview_router())
         // Static, so it is matched ahead of `/api/pipelines/{id}`.
-        .route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+        .merge(authored_pipelines_router())
         .route(
             "/api/pipelines/{id}",
             get(pipelines::detail)
                 .put(authored_pipelines::update)
                 .delete(authored_pipelines::delete),
         )
+        .route("/api/pipelines/{id}/source", get(pipelines::source))
         .route(
             "/api/pipelines/{id}/schedule-ticks",
             get(authored_pipelines::schedule_ticks),
         )
-        .route("/api/pipelines/{id}/source", get(pipelines::source))
+        // BLD-2: the two target-lag routes live in `target_lag_routes`,
+        // merged in above.
+        .merge(target_lag_routes())
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
         // Plan R4 2b: definition version history. Static under
         // `{id}/versions`, so it is registered BEFORE
@@ -279,6 +560,13 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/{id}/tenant",
             axum::routing::put(pipelines::assign_pipeline_tenant),
         )
+        // BLD-1 / D2: assign the user a pipeline reads as. A distinct
+        // route for the same reason as `/tenant` — who a row reads as is a
+        // governance decision, not a field on an unrelated update body.
+        .route(
+            "/api/pipelines/{id}/run-as",
+            axum::routing::put(pipelines::assign_pipeline_run_as),
+        )
         // Dagster `run_failure_sensor` posts here once per failed run;
         // see `dagster/dispar_orchestrate/pipeline_events.py`. Handler
         // enforces service-identity (the route is gated by `pipeline:write`
@@ -312,6 +600,31 @@ fn pipelines_router() -> Router<AppState> {
         .route(
             "/api/pipelines/{id}/volume",
             axum::routing::get(pipelines::volume),
+        )
+}
+
+/// BLD-2 (plan D6/D8): the target lag's own two routes, merged into the
+/// pipeline sub-router. They sit together because they are one feature's
+/// two doors — the orchestrator asks [`authored_pipelines::lag_check`] and
+/// a user sets the target through
+/// [`authored_pipelines::set_target_lag`] — and splitting them from
+/// [`pipelines_router`] is also what keeps that function under
+/// `clippy::too_many_lines`.
+///
+/// `lag-check` is under `/runnable/` because only the orchestrator may ask
+/// (the same gate as `runnable` itself), not because it lists anything.
+/// `target-lag` is its own route rather than a field on
+/// `PUT /api/pipelines/{id}`: clearing the lag (`AC8`) is a value that
+/// route's "absent means unchanged" body cannot express.
+fn target_lag_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/pipelines/runnable/{id}/lag-check",
+            post(authored_pipelines::lag_check),
+        )
+        .route(
+            "/api/pipelines/{id}/target-lag",
+            put(authored_pipelines::set_target_lag),
         )
 }
 
@@ -361,6 +674,56 @@ fn lakehouse_router() -> Router<AppState> {
 fn governance_static_router() -> Router<AppState> {
     Router::new()
         .route("/api/governance/lineage", get(governance::lineage))
+        // GOV-1 part B: the audit trail's search, one event and CSV export.
+        // Three or more segments after `/api/governance/`, so the `{kind}`
+        // capture below, which is one segment, never sees them.
+        .route("/api/governance/audit/events", get(audit_events::search))
+        .route("/api/governance/audit/events/{id}", get(audit_events::one))
+        .route(
+            "/api/governance/audit/export.csv",
+            get(audit_events::export),
+        )
+        // DATA-13: column-level lineage. A static path ahead of the
+        // `{kind}` capture like `lineage` above (and four segments deep).
+        .route(
+            "/api/governance/lineage/columns",
+            get(governance::column_lineage),
+        )
+        // BI-14 (D5): the charts that read a table. Static, ahead of `{kind}`.
+        .route(
+            "/api/governance/lineage/used-by",
+            get(lineage::used_by::used_by),
+        )
+        // DATA-14 (F2): quality incidents. Static segments, mounted ahead of
+        // `/api/governance/quality/{id}` and the `{kind}` capture.
+        .route(
+            "/api/governance/quality/incidents",
+            get(quality_incidents::list_incidents),
+        )
+        .route(
+            "/api/governance/quality/incidents/{id}/resolve",
+            axum::routing::post(quality_incidents::resolve_incident),
+        )
+        // DATA-14 (F3): when a table's rules run. Static `schedules` segment,
+        // so `/api/governance/quality/{id}/run` cannot capture it.
+        .route(
+            "/api/governance/quality/schedules",
+            get(quality_schedules::list_schedules),
+        )
+        .route(
+            // WEB-3 S3a-D3: a table's own schedule, or its absence (the
+            // default every 60 minutes).
+            "/api/governance/quality/schedules/{asset}",
+            put(quality_schedules::put_schedule).delete(quality_schedules::delete_schedule),
+        )
+        // DATA-14 (F5): whether a table's anomalies are being raised yet.
+        .route(
+            "/api/governance/quality/learning/{asset}",
+            get(quality_anomaly::learning_status),
+        )
+        // DATA-14 (F7): a rule's run history. `runs` is not `run`, so it
+        // cannot be captured by the POST route below.
+        .route("/api/governance/quality/{id}/runs", get(quality::rule_runs))
         // Evaluates one authored quality rule on request. Three segments
         // deep, so it cannot collide with the `{kind}` capture.
         .route(
@@ -377,6 +740,13 @@ fn governance_static_router() -> Router<AppState> {
             // (see `governance.rs`'s module doc comment).
             "/api/governance/ingest-runs",
             get(governance::ingest_runs),
+        )
+        // WEB-8 S2 T8 (D8): the row filter grammar the console's help line
+        // names, read from the validator's own constants. Static, ahead of
+        // the `{kind}` capture like `lineage`, `policies` and `sla`.
+        .route(
+            "/api/governance/row-filter-grammar",
+            get(governance::row_filter_grammar),
         )
         .route(
             "/api/governance/policies",
@@ -409,6 +779,16 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/classification/{id}",
             axum::routing::delete(governance::delete_classification_rule),
         )
+        // DATA-12 part 2: governed tag keys. Static segments, so they match
+        // ahead of the `{kind}` capture, as `policies` and `sla` do.
+        .route(
+            "/api/governance/tag-keys",
+            get(governance::list_tag_keys).post(governance::create_tag_key),
+        )
+        .route(
+            "/api/governance/tag-keys/{key}",
+            axum::routing::put(governance::update_tag_key).delete(governance::delete_tag_key),
+        )
 }
 
 /// The `/api/catalog/{id}/access-request` +
@@ -428,6 +808,31 @@ fn catalog_access_router() -> Router<AppState> {
             "/api/catalog/access-requests/{id}/decide",
             axum::routing::post(catalog::decide_access_request),
         )
+        // `DATA-15` F3: grant and revoke from the asset's page.
+        .route(
+            "/api/catalog/{id}/grants",
+            get(catalog_grants::list).post(catalog_grants::create),
+        )
+        .route(
+            "/api/catalog/{id}/grants/{grant_id}",
+            axum::routing::delete(catalog_grants::revoke),
+        )
+        // `DATA-15` F4: undrop a dropped Iceberg table within its window.
+        .route(
+            "/api/catalog/{id}/restore",
+            get(catalog_restore::status).post(catalog_restore::restore),
+        )
+        // `DATA-55` (QA `LH-DATA-15-06`, `TC-1731`): drop a table a file upload
+        // made, keeping the catalog's soft delete so the restore above can
+        // bring it back.
+        .route(
+            "/api/catalog/{id}/drop",
+            get(catalog_drop::status).post(catalog_drop::drop_table),
+        )
+        // `DATA-55` D13: the dropped tables of the caller's tenants. TWO
+        // literal segments, so the path can never shadow `/api/catalog/{id}`,
+        // the same shape `access-requests` explains above.
+        .route("/api/catalog/dropped/tables", get(catalog_drop::list))
 }
 
 /// The `/api/overview/alerts/*` sub-router (Task 2.6), split out for the
@@ -451,16 +856,11 @@ fn overview_alerts_router() -> Router<AppState> {
         )
 }
 
-/// The `/api/connectors/*` sub-router (Task 2.7), split out for the same
-/// `clippy::too_many_lines` reason as [`pipelines_router`].
-///
-/// Every `/api/connectors/{id}/*` route sits behind
-/// [`connectors::require_connector_in_tenants`]: the caller must belong to
-/// the connector's tenant. `PUT .../tenant` stays outside it — it is
-/// identity administration (`identity:write`), and the only way a
-/// connector with no tenant gets one.
-fn connectors_router(state: &AppState) -> Router<AppState> {
-    let per_connector = Router::new()
+/// The tenant-gated half of [`connectors_router`], split out of it for
+/// `clippy::too_many_lines` (`SRC-11` review 1 BLOCKER 1), the same way
+/// [`pipelines_router`] is split from its parent.
+fn per_connector_router(state: &AppState) -> Router<AppState> {
+    Router::new()
         .route(
             "/api/connectors/{id}",
             get(connectors::detail)
@@ -483,13 +883,12 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/credential",
             axum::routing::put(connectors::set_credential),
         )
+        // `SRC-13`: list and preview what a connector's source holds, for a
+        // person with `connector:manage` on a connector of their own tenant (D11).
+        // `{kind}` is `list` or `preview`; POST asks, GET reads the latest answer.
         .route(
-            "/api/connectors/{id}/discover",
-            axum::routing::post(connectors::discover),
-        )
-        .route(
-            "/api/connectors/{id}/debezium-properties",
-            get(connectors::debezium_properties),
+            "/api/connectors/{id}/discovery/{kind}",
+            axum::routing::post(connector_discovery::start).get(connector_discovery::poll),
         )
         .route(
             "/api/connectors/{id}/ingest-spec",
@@ -499,9 +898,38 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/ingest/run",
             axum::routing::post(connectors::ingest_run_request),
         )
+        // `SRC-11` decisions D4, D5, D7, D8: the run history, a run's log and
+        // Resume, for a person with `connector:manage` on a connector of their
+        // own tenant.
+        .route("/api/connectors/{id}/runs", get(connector_runs::list))
         .route(
-            "/api/connectors/{id}/ingest/runs",
-            get(connectors::ingest_run_history),
+            "/api/connectors/{id}/runs/{runId}/log",
+            get(connector_runs::log),
+        )
+        .route(
+            "/api/connectors/{id}/resume",
+            axum::routing::post(connector_runs::resume),
+        )
+        // `SRC-4` slice 2 (S2-e, S2-h): a person's pause, and the state of a
+        // change-capture connector in Kafka Connect.
+        .route(
+            "/api/connectors/{id}/pause",
+            axum::routing::post(connector_runs::pause),
+        )
+        .route(
+            "/api/connectors/{id}/change-capture",
+            get(connector_runs::change_capture),
+        )
+        // `SRC-12` part C: signing a REST connector in with `OAuth2`, for a
+        // person with `connector:manage` on a connector of their own tenant.
+        .route("/api/connectors/{id}/oauth", get(connector_oauth::status))
+        .route(
+            "/api/connectors/{id}/oauth/start",
+            axum::routing::post(connector_oauth::start),
+        )
+        .route(
+            "/api/connectors/{id}/oauth/sign-out",
+            axum::routing::post(connector_oauth::sign_out),
         )
         // `SRC-8` decision D6: a person with `connector:manage` on a
         // connector of their own tenant reads and approves schema changes.
@@ -516,7 +944,42 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         .route_layer(from_fn_with_state(
             state.clone(),
             connectors::require_connector_in_tenants,
+        ))
+}
+
+/// The change-capture lag routes (`SRC-4` slice 4), merged into
+/// [`connectors_router`] and split from it for `clippy::too_many_lines`. The orchestrator's
+/// observations sit outside the tenant gate (a service identity belongs to no
+/// tenant; the handler checks `schema_changes::require_orchestrator`); a
+/// person's lag limit sits behind it.
+fn capture_lag_router(state: &AppState) -> Router<AppState> {
+    let gated = Router::new()
+        .route(
+            "/api/connectors/{id}/lag-limit",
+            put(capture_lag::set_limit),
+        )
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            connectors::require_connector_in_tenants,
         ));
+    Router::new()
+        .route(
+            "/api/connectors/{id}/capture/observations",
+            post(capture_lag::observe),
+        )
+        .merge(gated)
+}
+
+/// The `/api/connectors/*` sub-router (Task 2.7), split out for the same
+/// `clippy::too_many_lines` reason as [`pipelines_router`].
+///
+/// Every `/api/connectors/{id}/*` route sits behind
+/// [`connectors::require_connector_in_tenants`]: the caller must belong to
+/// the connector's tenant. `PUT .../tenant` stays outside it — it is
+/// identity administration (`identity:write`), and the only way a
+/// connector with no tenant gets one.
+fn connectors_router(state: &AppState) -> Router<AppState> {
+    let per_connector = per_connector_router(state);
     Router::new()
         .route(
             "/api/connectors",
@@ -542,6 +1005,12 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/types",
             get(connectors::list_types),
         )
+        .route(
+            // `SRC-12` part B: static, so matched ahead of
+            // `/api/connectors/{id}` like `/types`.
+            "/api/connectors/credential-settings",
+            get(connectors::credential_settings),
+        )
         // The assignment route for connector
         // rows `0042_tenant_provisioning.sql` leaves `tenant_id = NULL`.
         .route(
@@ -559,7 +1028,53 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/schema-observations/tables",
             axum::routing::post(schema_changes::new_tables),
         )
+        // `SRC-11`: the orchestrator's run reports. Outside the tenant gate for
+        // the same reason (its caller is a service identity); each handler
+        // checks `schema_changes::require_orchestrator`.
+        .route(
+            "/api/connectors/{id}/run-reports",
+            axum::routing::post(connector_runs::report_start),
+        )
+        .route(
+            "/api/connectors/{id}/run-reports/{runId}/attempts",
+            axum::routing::post(connector_runs::report_attempt),
+        )
+        .route(
+            "/api/connectors/{id}/run-reports/{runId}/log",
+            axum::routing::post(connector_runs::report_log),
+        )
+        .route(
+            "/api/connectors/{id}/run-reports/{runId}/end",
+            axum::routing::post(connector_runs::report_end),
+        )
+        // `SRC-12` part C: the provider sends the person's browser back here. It
+        // has no connector in its path, so it sits outside the tenant gate; the
+        // handler checks the user, the tenant and `connector:manage` itself.
+        // Static, so matched ahead of `/api/connectors/{id}` like `/types`.
+        .route(
+            "/api/connectors/oauth/callback",
+            get(connector_oauth::callback),
+        )
+        // `SRC-12` part C: the orchestrator reports a refresh token the provider
+        // rotated. Outside the tenant gate (a service identity belongs to no
+        // tenant); the handler checks `schema_changes::require_orchestrator`.
+        .route(
+            "/api/connectors/{id}/oauth/refresh-token",
+            axum::routing::post(connector_oauth::update_refresh_token),
+        )
+        // `SRC-13`: the orchestrator's answer to a discovery request. Outside the
+        // tenant gate for the same reason (a service identity belongs to no
+        // tenant); the handler checks `schema_changes::require_orchestrator`. The
+        // body may carry a listing of up to 3 MiB, so this route, and only this
+        // one, takes the larger body limit.
+        .route(
+            "/api/connectors/{id}/discovery-results",
+            axum::routing::post(connector_discovery::report_result).layer(DefaultBodyLimit::max(
+                connector_discovery::MAX_RESULT_BODY_BYTES,
+            )),
+        )
         .merge(per_connector)
+        .merge(capture_lag_router(state))
 }
 
 /// The `/api/uploads/*` sub-router (ADR 0014, plan T6), shaped like
@@ -580,9 +1095,36 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
             get(uploads::get).delete(uploads::delete),
         )
         .route("/api/uploads/{id}/preview", get(uploads::preview))
+        // DATA-18: apply a column list to the sample, store nothing.
+        .route(
+            "/api/uploads/{id}/check",
+            axum::routing::post(uploads::columns::check),
+        )
         .route(
             "/api/uploads/{id}/ingest",
             axum::routing::post(uploads::ingest),
+        )
+        // DATA-17 slice 5: which other files can load into one table with this one.
+        .route(
+            "/api/uploads/{id}/compare",
+            axum::routing::post(uploads::group::compare),
+        )
+        // DATA-17: the pieces of a chunked upload. Only the piece route takes
+        // a large body, and its own limit (a piece plus 64 KiB); the other
+        // routes keep axum's 2 MB default.
+        .route(
+            "/api/uploads/{id}/parts/{n}",
+            axum::routing::put(uploads::sessions::put_part).layer(DefaultBodyLimit::max(
+                uploads::sessions::MAX_PART_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/api/uploads/{id}/parts",
+            get(uploads::sessions::list_parts),
+        )
+        .route(
+            "/api/uploads/{id}/complete",
+            axum::routing::post(uploads::sessions::complete),
         )
         .route_layer(from_fn_with_state(
             state.clone(),
@@ -595,7 +1137,48 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(uploads::MAX_REQUEST_BODY_BYTES))
                 .get(uploads::list),
         )
+        // DATA-17: opens a chunked upload. A static path next to `{id}`; it
+        // belongs to no existing upload, so it sits outside the tenant layer.
+        .route(
+            "/api/uploads/sessions",
+            axum::routing::post(uploads::sessions::create_session),
+        )
+        // DATA-35: folders for uploaded files. Static paths next to `{id}` (the
+        // router prefers a static segment, and an upload id is `up-<uuid>`), outside
+        // the per-upload layer because they name no upload: each folder is checked
+        // against the caller's tenant by the store (`uploads::folders`).
+        .route(
+            "/api/uploads/folders",
+            get(uploads::folders::list).post(uploads::folders::create),
+        )
+        .route(
+            "/api/uploads/folders/{id}",
+            axum::routing::patch(uploads::folders::update).delete(uploads::folders::delete),
+        )
+        .route(
+            "/api/uploads/move",
+            axum::routing::post(uploads::folders::move_uploads),
+        )
         .merge(per_upload)
+}
+
+/// The `/api/maps/*` sub-router (`BI-16` part C2b): `POST /api/maps` alone
+/// takes the larger body ([`maps::MAX_REQUEST_BODY_BYTES`]), as
+/// `POST /api/uploads` does; the layer on that one method router keeps the
+/// raised limit off every other route.
+fn maps_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/maps",
+            axum::routing::post(maps::create)
+                .layer(DefaultBodyLimit::max(maps::MAX_REQUEST_BODY_BYTES))
+                .get(maps::list),
+        )
+        .route(
+            "/api/maps/{id}",
+            axum::routing::patch(maps::rename).delete(maps::delete),
+        )
+        .route("/api/maps/{id}/geojson", get(maps::geojson))
 }
 
 /// The `/api/identity/*` sub-router (Phase 2 identity domain), split out
@@ -615,15 +1198,65 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/users",
             get(identity::list_users).post(identity::create_user),
         )
+        // ADM-11 D8: update a user's username and/or email.
+        .route(
+            "/api/identity/users/{id}",
+            axum::routing::patch(identity::update_user),
+        )
         // Give an existing user a tenant. Both ids are validated inside
         // the handler (400 when malformed, 404 when unknown).
         .route(
             "/api/identity/users/{id}/tenants/{tenant_id}",
             axum::routing::put(identity::add_user_to_tenant),
         )
+        // ADM-4 D2: take a user out of a tenant — the counterpart of the
+        // PUT above, under the same "who may" rule. `{id}` and
+        // `{tenant_id}` are validated inside the handler.
+        .route(
+            "/api/identity/users/{id}/tenants/{tenant_id}",
+            axum::routing::delete(identity::remove_user_from_tenant),
+        )
+        // ADM-4 D1: replace a user's local role set. The body names the
+        // user's COMPLETE role set; `{id}` is validated inside the handler.
+        .route(
+            "/api/identity/users/{id}/roles",
+            axum::routing::put(identity::set_user_roles),
+        )
+        // ADM-4 D3: switch a user off, and back on again. Both take no
+        // body; `{id}` is validated inside the handler.
+        .route(
+            "/api/identity/users/{id}/deactivate",
+            axum::routing::post(identity::deactivate_user),
+        )
+        .route(
+            "/api/identity/users/{id}/reactivate",
+            axum::routing::post(identity::reactivate_user),
+        )
+        // ADM-3 D2: hand an existing user a new temporary password. The
+        // password is generated server-side and returned once; `{id}` is
+        // validated inside the handler (400 when malformed, 404 when
+        // unknown or when the caller may not reset that user).
+        .route(
+            "/api/identity/users/{id}/reset-password",
+            axum::routing::post(identity::reset_user_password),
+        )
+        .route("/api/identity/permissions", get(identity::list_permissions))
         .route(
             "/api/identity/roles",
             get(identity::list_roles).post(identity::create_role),
+        )
+        // WEB-3 S3a-D2: a role can be rewritten and removed. `{id}` is
+        // validated inside each handler (404 on an unknown or malformed id).
+        .route(
+            "/api/identity/roles/{id}",
+            axum::routing::put(identity::update_role).delete(identity::delete_role),
+        )
+        // GOV-7 D7: what a role may read, per schema and table. Reading the
+        // console's role form needs `identity:read`; changing it is the same
+        // privilege bundle `PUT /api/identity/roles/{id}` edits.
+        .route(
+            "/api/identity/roles/{id}/table-access",
+            get(identity::get_role_table_access).put(identity::put_role_table_access),
         )
         .route(
             "/api/identity/tenants",
@@ -715,8 +1348,11 @@ fn agents_router() -> Router<AppState> {
               `storage_router`/etc. already serve for the larger groups"
 )]
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    // Every route and merged sub-router above `gated` below; the layers that
+    // gate and bound them live in one place there (Task 3.2, `SEC-72`).
+    let routes = Router::new()
         .route("/health", get(health))
+        .route("/health/ready", get(ready))
         .route("/api/catalog", get(catalog::list))
         // Registered before `/{id}`: axum prefers static segments over
         // params, but keeping them adjacent in this order makes it obvious
@@ -728,6 +1364,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/catalog/{id}/annotation",
             get(catalog::get_annotation).put(catalog::put_annotation),
+        )
+        .route(
+            "/api/catalog/{id}/certification",
+            put(catalog::put_certification),
         )
         // The semantic layer: a table's and a column's plain-words
         // description. `{asset}` is `serving.<table>` or `silver.<table>`;
@@ -757,6 +1397,11 @@ pub fn router(state: AppState) -> Router {
         )
         .merge(storage_router())
         .merge(lakehouse_router())
+        // DATA-5 / ADR 0016: the door for outside readers. Merged LAST
+        // among the domain routers because it owns a catch-all under
+        // `/api/iceberg`, and a catch-all is only unambiguous while no
+        // other router claims a path under that prefix.
+        .merge(iceberg_door::router())
         .route(
             "/api/alerts",
             get(alerts::list)
@@ -765,6 +1410,9 @@ pub fn router(state: AppState) -> Router {
                 .delete(alerts::delete),
         )
         .route("/api/alerts/status", get(alerts::status))
+        // `BI-40` D1: a person's door for one rule, next to the scheduler's
+        // (`/api/alerts/run`, unchanged, still behind `check_run_token`).
+        .route("/api/alerts/test", post(alerts::test_one))
         .route("/api/alerts/run", get(alerts::run).post(alerts::run))
         .route(
             "/api/gold/export/{mart}",
@@ -786,6 +1434,59 @@ pub fn router(state: AppState) -> Router {
             "/api/query/saved",
             get(query::list_saved).post(query::create_saved),
         )
+        // QS-3: the saved-query surface. Every route is `query:read` at
+        // the gate; the level the caller holds on the item (view, edit or
+        // manage) is checked in the handler. A route that moves or shares,
+        // or deletes a folder, needs `manage`; deleting or restoring a
+        // query needs `edit`. An item the caller may not see is a 404,
+        // never a 403 (no existence leak).
+        .route(
+            "/api/query/saved/{id}",
+            get(saved_queries::get_saved)
+                .patch(saved_queries::patch_saved)
+                .delete(saved_queries::delete_saved),
+        )
+        .route(
+            "/api/query/saved/{id}/duplicate",
+            post(saved_queries::duplicate_saved),
+        )
+        .route(
+            "/api/query/saved/{id}/restore",
+            post(saved_queries::restore_saved),
+        )
+        .route("/api/query/saved-trash", get(saved_queries::list_trash))
+        .route(
+            "/api/query/saved/{id}/versions",
+            get(saved_queries::list_versions),
+        )
+        .route(
+            "/api/query/saved/{id}/versions/{version}/revert",
+            post(saved_queries::revert_version),
+        )
+        .route(
+            "/api/query/folders",
+            get(saved_queries::list_folders).post(saved_queries::create_folder),
+        )
+        .route(
+            "/api/query/folders/{id}",
+            axum::routing::patch(saved_queries::patch_folder).delete(saved_queries::delete_folder),
+        )
+        // QS-3: the sharing surface. A query's access list is read at
+        // `manage` on the item -- reading who else has access is part of
+        // sharing -- while a folder's is read from `edit` up (`#416`): the
+        // save and move dialogs tell a person who may put a query into a
+        // folder who it is shared with. Both lists are written with
+        // `manage`, and the grantee search answers with the people and
+        // the roles of the caller's organisation.
+        .route(
+            "/api/query/saved/{id}/access",
+            get(saved_queries::get_query_access).put(saved_queries::put_query_access),
+        )
+        .route(
+            "/api/query/folders/{id}/access",
+            get(saved_queries::get_folder_access).put(saved_queries::put_folder_access),
+        )
+        .route("/api/query/grantees", get(saved_queries::search_grantees))
         .route("/api/query/history", get(query::list_history))
         .route("/api/query/run/{id}/download", get(query::download))
         .route("/api/query/scheduling", get(query::scheduling))
@@ -817,6 +1518,39 @@ pub fn router(state: AppState) -> Router {
                 .delete(dashboard_folders::delete),
         )
         .route(
+            "/api/dashboard/personal",
+            axum::routing::post(dashboard_folders::personal),
+        )
+        .route(
+            "/api/dashboard/versions",
+            get(dashboard_organise::versions_list),
+        )
+        .route(
+            "/api/dashboard/versions/revert",
+            axum::routing::post(dashboard_organise::revert),
+        )
+        .route("/api/dashboard/trash", get(dashboard_organise::trash_list))
+        .route(
+            "/api/dashboard/trash/restore",
+            axum::routing::post(dashboard_organise::trash_restore),
+        )
+        .route(
+            "/api/dashboard/shortcuts",
+            get(dashboard_organise::shortcuts),
+        )
+        .route(
+            "/api/dashboard/favourites",
+            axum::routing::put(dashboard_organise::favourite_set),
+        )
+        .route(
+            "/api/dashboard/recent",
+            axum::routing::post(dashboard_organise::recent_touch),
+        )
+        .route(
+            "/api/dashboard/search",
+            get(dashboard_organise::search_names),
+        )
+        .route(
             "/api/dashboard/sources",
             get(dashboard_sources::list)
                 .post(dashboard_sources::create)
@@ -827,15 +1561,171 @@ pub fn router(state: AppState) -> Router {
             "/api/dashboard/sources/preview",
             axum::routing::post(dashboard_sources::preview),
         )
+        .route(
+            "/api/dashboard/calc-fields",
+            get(calc_fields::list_guarded)
+                .post(calc_fields::create)
+                .put(calc_fields::update)
+                .delete(calc_fields::delete),
+        )
+        .route(
+            "/api/dashboard/calc-fields/validate",
+            axum::routing::post(calc_fields::validate),
+        )
+        .route(
+            "/api/dashboard/calc-fields/functions",
+            get(calc_fields::functions),
+        )
+        .route(
+            "/api/dashboard/metrics",
+            get(metrics::list_guarded)
+                .post(metrics::create)
+                .put(metrics::update)
+                .delete(metrics::delete),
+        )
+        .route(
+            "/api/dashboard/metrics/validate",
+            axum::routing::post(metrics::validate),
+        )
+        .route("/api/dashboard/metrics/{id}/usage", get(metrics::usage))
+        .route(
+            "/api/dashboard/segments",
+            get(metrics::list_segments_guarded)
+                .post(metrics::create_segment)
+                .put(metrics::update_segment)
+                .delete(metrics::delete_segment),
+        )
+        .route(
+            "/api/dashboard/hierarchies",
+            get(hierarchies::list_guarded)
+                .post(hierarchies::create)
+                .put(hierarchies::update)
+                .delete(hierarchies::delete),
+        )
+        .route(
+            "/api/dashboard/params",
+            get(params::list_guarded)
+                .post(params::create)
+                .put(params::update)
+                .delete(params::delete),
+        )
         .route("/api/dashboard/fields", get(dashboard::fields))
+        .route(
+            "/api/dashboard/join-suggestions",
+            get(dashboard::join_suggestions),
+        )
         .route("/api/dashboard/records", get(dashboard::records))
         .route("/api/dashboard/values", get(dashboard::values))
         .route("/api/dashboard/export", get(dashboard::export))
+        // BI-19 part D (plan D14): a dashboard file in, with a mapping preview.
+        .route(
+            "/api/dashboard/import/preview",
+            axum::routing::post(dashboard_file::import_preview),
+        )
+        .route(
+            "/api/dashboard/import",
+            axum::routing::post(dashboard_file::import),
+        )
+        .route("/api/dashboard/table-export", get(dashboard::table_export))
+        .route("/api/dashboard/chart-export", get(dashboard::chart_export))
+        // BI-14 (D1): where a chart comes from. `lineage:read` (owner decision Q6).
+        .route(
+            "/api/dashboard/charts/{id}/lineage",
+            get(lineage::charts::chart_lineage),
+        )
+        .route("/api/dashboard/export/pdf", get(pdf_export::export_pdf))
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
+        .route("/api/render/data", axum::routing::post(render::data))
+        // RPT-1 (D7): scheduled reports. Authorisation beyond `dashboard:read`
+        // (owner or administrator, download right) is in the handlers.
+        .route(
+            "/api/reports/subscriptions",
+            get(reports::list).post(reports::create),
+        )
+        .route(
+            "/api/reports/subscriptions/{id}",
+            get(reports::get)
+                .put(reports::update)
+                .delete(reports::delete),
+        )
+        .route(
+            "/api/reports/subscriptions/{id}/send",
+            axum::routing::post(reports::send_now),
+        )
+        .route(
+            "/api/reports/subscriptions/{id}/deliveries",
+            get(reports::deliveries),
+        )
+        .route("/api/reports/recipients", get(reports::recipients))
+        .route(
+            "/api/embed/frame",
+            axum::routing::post(embed::frame_origins),
+        )
+        // BI-26 (D5): the dropdown values of an editable filter, token-gated.
+        .route("/api/embed/values", axum::routing::post(embed::values))
+        // BI-26 (D8): each filter's embed mode.
+        .route(
+            "/api/dashboard/embed-settings",
+            axum::routing::put(embed::put_settings),
+        )
+        .route(
+            "/api/dashboard/embed-revoke",
+            axum::routing::post(embed::revoke_token),
+        )
         .route(
             "/api/public/dashboard/{token}",
             get(embed::public_dashboard),
+        )
+        // BI-19 part A (D4): the password of a public link.
+        .route(
+            "/api/public/dashboard/{token}/unlock",
+            axum::routing::post(public_links::unlock),
+        )
+        // BI-19 part A (D5): make, change and end a dashboard's public link.
+        // BI-19 part B1 (plan D10): who has what on a dashboard or folder.
+        .route(
+            "/api/dashboard/access",
+            get(dashboard_access::get_access).put(dashboard_access::put_access),
+        )
+        .route(
+            "/api/dashboard/access-preview",
+            get(dashboard_access::access_preview),
+        )
+        // BI-19 part E (D15): comments. The router asks "signed in"; `view` on the
+        // dashboard (and author or `manage` for delete) is checked in the handler.
+        .route(
+            "/api/dashboard/comments",
+            get(dashboard_comments::list).post(dashboard_comments::post),
+        )
+        .route(
+            "/api/dashboard/comments/people",
+            get(dashboard_comments::people),
+        )
+        .route(
+            "/api/dashboard/comments/mentions/read",
+            axum::routing::post(dashboard_comments::mark_read),
+        )
+        .route(
+            "/api/dashboard/comments/{id}",
+            axum::routing::put(dashboard_comments::edit).delete(dashboard_comments::remove),
+        )
+        .route(
+            "/api/dashboard/public-link",
+            get(public_links::get_link)
+                .put(public_links::put_link)
+                .delete(public_links::delete_link),
+        )
+        // PR #246 review BLOCKER 1: a public link and an embed read a map's
+        // boundary through their own token, the way they read the board's
+        // data; the console's own route keeps the signed-in reader.
+        .route(
+            "/api/public/dashboard/{token}/maps/{id}/geojson",
+            get(embed::public_map_geojson),
+        )
+        .route(
+            "/api/embed/maps/{id}/geojson",
+            axum::routing::post(embed::embed_map_geojson),
         )
         .route("/api/ai/chat", axum::routing::post(ai::chat))
         .route("/api/ai/tool", axum::routing::post(ai::tool_call))
@@ -865,6 +1755,68 @@ pub fn router(state: AppState) -> Router {
                 .put(home::put_layout)
                 .delete(home::delete_layout),
         )
+        // Deployment-wide report time zone and first day of the week
+        // (`BI-9`); see `routes::settings`.
+        .route(
+            "/api/settings/reporting",
+            get(settings::get_reporting).put(settings::put_reporting),
+        )
+        // The deployment's mail server, account and console address
+        // (`ADM-7`); see `routes::settings`. Reading needs
+        // `settings:write` like changing does (plan D4): a mail server's
+        // name and account are not for every signed-in person.
+        .route(
+            "/api/settings/email",
+            get(settings::get_email).put(settings::put_email),
+        )
+        // One test email to the caller's own address (`ADM-7` plan D10).
+        .route(
+            "/api/settings/email/test",
+            axum::routing::post(settings::post_email_test),
+        )
+        // Which of the deployment's features are set up (`ADM-6`); see
+        // `routes::settings`.
+        .route("/api/settings/deployment", get(settings::get_deployment))
+        // The deployment's sign-in limits (`ADM-8`): the failed-login
+        // limit, the window, the lockout, the retention and the longest
+        // life of a signed embed link. See `routes::settings`.
+        .route(
+            "/api/settings/sign-in",
+            get(settings::get_sign_in).put(settings::put_sign_in),
+        )
+        // The deployment's assistant provider (`ADM-9`): the address, the
+        // model and the key. See `routes::settings`.
+        .route(
+            "/api/settings/assistant",
+            get(settings::get_assistant).put(settings::put_assistant),
+        )
+        // One minimal request to the assistant's provider, with the saved
+        // values (`ADM-9`).
+        .route(
+            "/api/settings/assistant/test",
+            axum::routing::post(settings::post_assistant_test),
+        )
+        // The deployment's SSO / OIDC settings (`ADM-12`). See `routes::settings`.
+        .route(
+            "/api/settings/sso",
+            get(settings::get_sso).put(settings::put_sso),
+        )
+        .route(
+            "/api/settings/sso/test",
+            axum::routing::post(settings::post_sso_test),
+        )
+        .route("/api/settings/sso/test/{id}", get(settings::get_sso_test))
+        // Time and row limits of charts and Query Studio (`BI-5`); see
+        // `routes::query_limits`.
+        // Stop (`BI-5`): ends the caller's own queries of one run.
+        .route(
+            "/api/query/cancel",
+            axum::routing::post(query_cancel::cancel),
+        )
+        .route(
+            "/api/settings/limits",
+            get(query_limits::get_limits).put(query_limits::put_limits),
+        )
         // Phase 2 identity domain.
         .merge(identity_router())
         // Phase 2, Task 2.7: connector definitions.
@@ -872,6 +1824,7 @@ pub fn router(state: AppState) -> Router {
         // ADR 0014: files uploaded from the console and loaded into raw
         // tables. Tenant-scoped like connectors.
         .merge(uploads_router(&state))
+        .merge(maps_router())
         // Phase 2, Task 2.8: knowledge sources and vector jobs (metadata
         // only — no `search` route here, see `routes::knowledge`'s module
         // doc comment).
@@ -880,7 +1833,43 @@ pub fn router(state: AppState) -> Router {
         // and approvals.
         .merge(agents_router())
         // Task 3.2: login/logout/me/change-password.
-        .merge(auth_router())
+        .merge(auth_router());
+
+    gated(routes, state)
+}
+
+/// Puts `auth_gate` and the timeout around every registered route, and
+/// answers what no route serves (QA `LH-BI-13-02`, `LH-BLD-2-03`,
+/// `LH-DATA-14-04`, `LH-RPT-1-11`; `SEC-72`, decision `DEC-19`).
+///
+/// # Why the order of these seven calls is the fix
+///
+/// `.layer(auth_gate)` wraps every method handler of a path *and* the path's
+/// own "no handler for this method" fallback, which is why a request for a
+/// method no route has reached the gate and answered
+/// `500 route_policy_unclassified` before this change. The two fallbacks
+/// below are set **after** that layer, so they are not wrapped by it:
+///
+/// - a path that exists with no handler for the method answers 405 — nothing
+///   runs, so nothing is opened;
+/// - a path no route matches answers 404 — the gate's `MatchedPath` extractor
+///   used to fail there, and axum answered `500 No matched path found`.
+///
+/// A handler still runs behind the gate: one missing from `POLICY_TABLE`
+/// still answers `500 route_policy_unclassified` (principle 3, unchanged). A
+/// path registered with `axum::routing::any` (the `Iceberg` door) has a
+/// fallback of its own, which is not the default one, so it is not replaced
+/// and stays behind the gate. Do not reorder these calls.
+///
+/// `GOV-1`: `audit_gate` sits between the query scope and `auth_gate`. It
+/// needs the principal `auth_gate` puts in the request, so it must be inside
+/// it; it writes the audit row of a `Central` route after the handler answers
+/// (`crate::audit_coverage`), so it must wrap the handler, and a layer added
+/// before it (the query scope) would run per query inside the handler's
+/// response instead. Like the gate, it is added before the two fallbacks, so
+/// a `404` or `405` writes nothing.
+fn gated(routes: Router<AppState>, state: AppState) -> Router {
+    routes
         // Task 3.2: the one authorization gate every route (bar the four
         // `Policy::Public` entries in `crate::policy::POLICY_TABLE`) passes
         // through, driven entirely by that table rather than per-handler
@@ -889,23 +1878,152 @@ pub fn router(state: AppState) -> Router {
         // OUTER layer) so a slow session/permission check while a caller
         // has the connection open still counts against the request's
         // deadline instead of running unbounded outside it.
+        // `BI-5`: the run every query of this request belongs to. Inside
+        // `auth_gate` so the principal it names is already there.
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::query_limits::scope_middleware,
+        ))
+        // `GOV-1`: the central audit writer, inside `auth_gate` so the
+        // principal is already in the request.
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::audit_coverage::audit_gate,
+        ))
         .layer(from_fn_with_state(state.clone(), auth_gate))
-        .layer(from_fn(timeout_middleware))
+        .method_not_allowed_fallback(method_not_allowed)
+        .fallback(no_such_address)
+        .layer(from_fn_with_state(state.clone(), timeout_middleware))
         .with_state(state)
 }
 
-/// `GET /health` — a plain liveness check, no dependencies.
-async fn health() -> &'static str {
-    "ok"
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST /api/ai/tool`,
+/// and the action of the `refused` row `auth_gate` writes when it turns the
+/// call away (`GOV-1`). The handler writes one row per tool call under the
+/// tool's own name, through the assistant's own gate, so the table's name is
+/// only the label of a refusal at the gate. It lives here, outside
+/// `routes::ai`, because the table's guard test looks for each `Handler`
+/// action as a literal in `src/routes/`, and the tool names that are already
+/// literals there (`create_chart`) would make a refused call read as a
+/// refused tool.
+pub(crate) const ASSISTANT_TOOL_ACTION: &str = "assistant.tool";
+
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST /api/ai/chat`;
+/// see [`ASSISTANT_TOOL_ACTION`]. A chat turn writes its rows per tool call
+/// under each tool's own name.
+pub(crate) const ASSISTANT_CHAT_ACTION: &str = "assistant.chat";
+
+/// The sentence a request for a method no route serves is told (`SEC-72`,
+/// decision `DEC-19`; QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`,
+/// `LH-RPT-1-11`). One sentence for every path, like every other error.
+const METHOD_NOT_ALLOWED: &str = "This method is not allowed on this address.";
+
+/// The sentence a request for an address no route matches is told
+/// (`SEC-72`, decision `DEC-19`).
+const NO_SUCH_ADDRESS: &str = "No such address.";
+
+/// Answers 405 for a path that exists with no handler for the method asked
+/// for (QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`, `LH-RPT-1-11`;
+/// `SEC-72`, decision `DEC-19`).
+///
+/// It runs outside `auth_gate` on purpose: it serves nothing, so there is
+/// nothing to authorize, and no request the gate would refuse is answered
+/// any differently by it.
+async fn method_not_allowed() -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        ApiJson(FixedErrorBody {
+            error: METHOD_NOT_ALLOWED.to_owned(),
+        }),
+    )
+        .into_response()
 }
 
-/// The JSON body shape a request-timeout response takes — same
+/// Answers 404 for an address no route matches (QA `LH-BI-13-02`,
+/// `LH-BLD-2-03`, `LH-DATA-14-04`, `LH-RPT-1-11`; `SEC-72`, decision
+/// `DEC-19`).
+///
+/// It runs outside `auth_gate` on purpose: it serves nothing, so there is
+/// nothing to authorize, and it says nothing about what exists.
+async fn no_such_address() -> crate::error::ApiRejection {
+    ApiError::NotFound(NO_SUCH_ADDRESS.to_owned()).into()
+}
+
+/// `GET /health` — liveness, plus whether the application database is
+/// usable (`OPS-4` decision 2).
+///
+/// Answers `200` whenever this process can answer at all. With no usable
+/// Postgres it still serves every Phase 1 route (catalog, overview, query,
+/// storage), and the ops gates (`ops/g*/`) poll this endpoint for a `200`
+/// to decide the API is up — a non-`200` would report the whole API as
+/// down while most of it answers. The body carries the database's state
+/// instead, so "up but degraded" is visible rather than a green check over
+/// a schema the code cannot use.
+///
+/// `version` is this build's version (REL-2 decision D7): a console
+/// compares it with its own version to say whether the two match.
+async fn health(State(state): State<AppState>) -> ApiJson<HealthBody> {
+    ApiJson(HealthBody {
+        status: "ok",
+        database: if state.database_ready() {
+            "ok"
+        } else {
+            "unavailable"
+        },
+        version: crate::readiness::VERSION,
+    })
+}
+
+/// [`health`]'s body. `status` is `ok` for any process that answers this
+/// route; `database` is `ok` only once the start-up step confirmed the
+/// schema is at this build's version (`crate::state::AppState::
+/// database_ready`), and `unavailable` otherwise — no pool at all, an
+/// unreachable one, or one that refused the migrations.
+#[derive(Debug, Serialize)]
+struct HealthBody {
+    status: &'static str,
+    database: &'static str,
+    version: &'static str,
+}
+
+/// `GET /health/ready` — the readiness probe (REL-2 decision D7).
+///
+/// `200` when `Postgres` is at this build's schema version, `ClickHouse`
+/// answers `SELECT 1` and the Iceberg REST catalog answers its config
+/// request; `503` otherwise, with the SAME body shape so a caller learns
+/// which dependency is not ready. Each check is only `"ok"` or
+/// `"failed"` — no upstream text ever reaches this public route (AGENTS.md
+/// rule 4).
+///
+/// This is a different question from [`health`], which stays a liveness
+/// probe: an installer or an updater waits on THIS route, and the ops
+/// gates keep polling `/health`.
+///
+/// The answer is reused for two seconds (REL-2 S1 review SHOULD-FIX 1):
+/// this route is public, so a loop of anonymous requests must not turn
+/// into a Postgres query, a `ClickHouse` query and a Lakekeeper call
+/// each.
+async fn ready(State(state): State<AppState>) -> Response {
+    let body = crate::readiness::ready_body(&state).await;
+    let status = if body.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, ApiJson(body)).into_response()
+}
+
+/// The JSON body shape a fixed error response takes — same
 /// `{"error": "<message>"}` envelope every other error response in this
 /// crate uses (see [`crate::error::ApiRejection`]), rather than the bare,
 /// content-type-less body `tower_http::timeout::TimeoutLayer` produces on
 /// its own.
+///
+/// Two responses have no route of their own to render this through: the
+/// request timeout ([`timeout_middleware`]) and the 405 for a method no
+/// handler serves ([`method_not_allowed`]).
 #[derive(Debug, Serialize)]
-struct TimeoutBody {
+struct FixedErrorBody {
     error: String,
 }
 
@@ -916,18 +2034,42 @@ struct TimeoutBody {
 /// path that violated the `{"error": "<message>"}` /
 /// `application/json;charset=utf-8` contract every other response honors —
 /// this renders the same JSON error envelope via [`ApiJson`].
-async fn timeout_middleware(req: Request, next: Next) -> Response {
-    let timeout = route_timeout(req.uri().path());
+async fn timeout_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    // Only a route that runs queries under the limits reads them (BI-5 plan
+    // D4); every other route keeps its fixed deadline without a settings read.
+    let longest = if limit_bearing(path) {
+        crate::query_limits::snapshot(&state)
+            .await
+            .ok()
+            .map(|snap| snap.longest_timeout())
+    } else {
+        None
+    };
+    let timeout = deadline_for(path, longest);
     match tokio::time::timeout(timeout, next.run(req)).await {
         Ok(response) => response,
         Err(_elapsed) => (
             StatusCode::REQUEST_TIMEOUT,
-            ApiJson(TimeoutBody {
+            ApiJson(FixedErrorBody {
                 error: "request timeout".to_owned(),
             }),
         )
             .into_response(),
     }
+}
+
+/// Every AI tool permission — `routes::ai::registry::TOOLS`'s non-empty
+/// `permission` fields (`WEB-8` D5). A `pub` fn on this module because
+/// `registry` itself is only `pub(in crate::routes)`: the permission
+/// catalog's drift test (`tests/permission_catalog.rs`) reads the tool
+/// permissions through this, so `PERMISSIONS` cannot fall behind what
+/// the tools gate.
+pub fn ai_tool_permissions() -> impl Iterator<Item = &'static str> {
+    ai::registry::TOOLS
+        .iter()
+        .map(|tool| tool.permission)
+        .filter(|permission| !permission.is_empty())
 }
 
 #[cfg(test)]
@@ -939,6 +2081,164 @@ mod tests {
     /// (120s, an 8-round LLM tool loop) — a blanket 60s bound 408'd a
     /// legitimate in-flight request. Pins the per-route table to the TS
     /// `export const maxDuration` grep.
+    /// `BI-1` review fix (BLOCKER) R2: the downloads keep the budgets they were
+    /// built for. The console proxy (`next.config.ts` `proxyTimeout`) must be at
+    /// least the largest of these.
+    #[test]
+    fn the_download_routes_have_their_own_timeouts() {
+        assert_eq!(
+            route_timeout("/api/dashboard/chart-export"),
+            Duration::from_secs(310)
+        );
+        assert_eq!(
+            route_timeout("/api/dashboard/table-export"),
+            Duration::from_secs(310)
+        );
+        assert_eq!(
+            route_timeout("/api/dashboard/export/pdf"),
+            Duration::from_secs(140)
+        );
+        assert!(Duration::from_secs(310) > crate::export::EXPORT_TIMEOUT);
+        assert!(PDF_REQUEST_TIMEOUT > crate::pdf::PDF_SLOT_WAIT + crate::pdf::PDF_DEADLINE);
+        // Everything else keeps the default.
+        assert_eq!(
+            route_timeout("/api/dashboard/export"),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+    }
+
+    /// `QS-2`: a download of a whole result writes a file that can be
+    /// gigabytes, so it gets the same outer bound as a board. The run route
+    /// itself keeps the default, and a path that has nothing to do with a
+    /// download keeps it too.
+    #[test]
+    fn a_result_download_gets_the_board_outer_bound() {
+        assert_eq!(
+            route_timeout("/api/query/run/q-1750000000/download"),
+            crate::query_limits::BOARD_DEADLINE_CAP
+        );
+        assert_eq!(route_timeout("/api/query/run"), DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(route_timeout("/api/catalog"), DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /// The sentence a query string the route cannot read is told is written
+    /// down once in the crate (`QS-2`): one constant, so the routes that
+    /// answer with it cannot drift apart. The scan counts the quoted
+    /// sentence over the crate's own sources, so a second copy of it fails
+    /// this test.
+    #[test]
+    fn the_unreadable_query_string_is_written_down_once() -> std::io::Result<()> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&root, &mut files)?;
+        // The quoted sentence, so a prose mention of it in a doc comment is
+        // not counted: only a copy of the words themselves is.
+        let quoted = format!("{QUERY_STRING_UNREADABLE:?}");
+        let mut found: Vec<(String, usize)> = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path)?;
+            let count = text.matches(&quoted).count();
+            if count > 0 {
+                let name = path
+                    .strip_prefix(&root)
+                    .unwrap_or(path.as_path())
+                    .display()
+                    .to_string();
+                found.push((name, count));
+            }
+        }
+        assert_eq!(
+            found,
+            vec![("routes/mod.rs".to_owned(), 1)],
+            "the sentence must be written down once, in routes/mod.rs"
+        );
+        Ok(())
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                rust_files(&path, out)?;
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    /// `BI-5` plan D4: the query route follows the longest configured limit
+    /// plus 15 s, a board route gets the outer cap, everything else keeps its
+    /// fixed deadline, and an unreadable setting keeps the fixed one too.
+    #[test]
+    fn limit_bearing_routes_follow_the_longest_configured_limit() {
+        let longest = Some(Duration::from_secs(300));
+        assert_eq!(
+            deadline_for("/api/query/run", longest),
+            Duration::from_secs(315)
+        );
+        // BI-45: the console's save and both previews wait for the limit.
+        for path in ["/api/dashboard/specs", "/api/dashboard/specs/preview"] {
+            assert_eq!(
+                deadline_for(path, longest),
+                Duration::from_secs(315),
+                "{path}"
+            );
+            assert_eq!(deadline_for(path, None), route_timeout(path), "{path}");
+        }
+        // BI-45 review round 1 R3: the assistant's confirmed save runs here,
+        // so it waits on its statement's limit too.
+        assert_eq!(
+            deadline_for("/api/ai/tool", longest),
+            Duration::from_secs(315)
+        );
+        assert_eq!(
+            deadline_for("/api/ai/tool", None),
+            route_timeout("/api/ai/tool")
+        );
+        // Twice the limit: the source preview runs its source again for the
+        // chart.
+        assert_eq!(
+            deadline_for("/api/dashboard/sources/preview", longest),
+            Duration::from_secs(615)
+        );
+        assert_eq!(
+            deadline_for("/api/dashboard/sources/preview", None),
+            route_timeout("/api/dashboard/sources/preview")
+        );
+        for board in [
+            "/api/dashboard",
+            "/api/render/data",
+            "/api/embed/data",
+            "/api/public/dashboard/abc",
+        ] {
+            assert_eq!(
+                deadline_for(board, longest),
+                crate::query_limits::BOARD_DEADLINE_CAP,
+                "{board}"
+            );
+            assert_eq!(deadline_for(board, None), route_timeout(board), "{board}");
+        }
+        // BI-5 review S1: routes under the board prefixes that run no tile.
+        for other in [
+            "/api/dashboard/export",
+            "/api/catalog",
+            "/api/ai/chat",
+            "/api/embed/frame",
+            "/api/embed/values",
+            "/api/public/dashboard/abc/unlock",
+            "/api/public/dashboard/",
+        ] {
+            assert_eq!(
+                deadline_for(other, longest),
+                route_timeout(other),
+                "{other}"
+            );
+            assert!(!limit_bearing(other));
+        }
+    }
+
     #[test]
     fn chat_timeout_defaults_to_120s_and_clamps_an_operator_override() {
         assert_eq!(chat_timeout_from(None), Duration::from_secs(120));
@@ -946,7 +2246,7 @@ mod tests {
         assert_eq!(chat_timeout_from(Some("abc")), Duration::from_secs(120));
         assert_eq!(chat_timeout_from(Some("600")), Duration::from_secs(600));
         assert_eq!(chat_timeout_from(Some("5")), Duration::from_secs(30));
-        assert_eq!(chat_timeout_from(Some("99999")), Duration::from_secs(1800));
+        assert_eq!(chat_timeout_from(Some("99999")), Duration::from_mins(30));
     }
 
     #[test]
@@ -963,6 +2263,47 @@ mod tests {
             "no TS maxDuration export — falls back to the default"
         );
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(60));
+        // RPT-1: "Send now" makes the files in the request.
+        assert_eq!(
+            route_timeout("/api/reports/subscriptions/0b7e/send"),
+            EXPORT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            route_timeout("/api/reports/subscriptions/0b7e"),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        // BI-19 D review SF-D6: an import runs up to 200 charts; its preview is
+        // one schema read per table and keeps the default.
+        assert_eq!(
+            route_timeout("/api/dashboard/import"),
+            EXPORT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            route_timeout("/api/dashboard/import/preview"),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+    }
+
+    /// `SRC-13` decision D9: the discovery routes carry a listing call of up to
+    /// 120 s, so they get 130 s, and only they do.
+    #[test]
+    fn the_discovery_routes_take_130_seconds_and_nothing_else_under_connectors_does() {
+        for path in [
+            "/api/connectors/conn-1/discovery/list",
+            "/api/connectors/conn-1/discovery/preview",
+        ] {
+            assert_eq!(route_timeout(path), Duration::from_secs(130), "{path}");
+        }
+        for path in [
+            "/api/connectors/conn-1",
+            "/api/connectors/conn-1/test",
+            "/api/connectors/conn-1/discovery/other",
+            "/api/connectors//discovery/list",
+            "/api/connectors/discovery/list",
+            "/api/other/conn-1/discovery/list",
+        ] {
+            assert_eq!(route_timeout(path), DEFAULT_REQUEST_TIMEOUT, "{path}");
+        }
     }
 
     /// `POST /api/uploads` receives up to 50 MB: it gets the longer bound
@@ -979,12 +2320,27 @@ mod tests {
             "/api/uploads/up-1/ingest",
             "/api/uploads/",
             "/api/uploads/x/y",
+            "/api/uploads/up-1/parts",
+            "/api/uploads/up-1/complete",
+            "/api/uploads/sessions",
+            "/api/uploads/up-1/parts/",
+            "/api/uploads//parts/1",
+            "/api/uploads/up-1/parts/1/x",
         ] {
             assert_eq!(
                 route_timeout(per_upload),
                 DEFAULT_REQUEST_TIMEOUT,
                 "{per_upload}"
             );
+        }
+    }
+
+    /// `DATA-17`: one 8 MiB piece of a chunked upload gets the long bound, as
+    /// the single request it replaces did.
+    #[test]
+    fn a_piece_of_a_chunked_upload_takes_five_minutes() {
+        for piece in ["/api/uploads/up-1/parts/1", "/api/uploads/up-1/parts/256"] {
+            assert_eq!(route_timeout(piece), UPLOAD_REQUEST_TIMEOUT, "{piece}");
         }
     }
 }
@@ -1015,27 +2371,60 @@ mod tests {
 /// to failing on `entries_not_reachable`... no — it does not touch this
 /// test (which only walks entries that already exist in the table); the
 /// route that actually goes RED is a direct request to the throwaway path
-/// itself, which this module also exercises
-/// (`an_unregistered_route_denies_by_default_instead_of_serving_public`),
+/// itself, which this module also exercises through
+/// `a_handler_that_is_not_in_the_policy_table_answers_500_and_is_never_served`,
 /// asserting exactly the 500 `route_policy_unclassified` body deny-by-default
-/// produces for ANY unclassified path — a throwaway route hits that same
+/// produces for a handler with no entry — a throwaway route hits that same
 /// code path the moment it's requested, with no separate wiring needed to
 /// prove it.
+///
+/// # What an unclassified request is NOT
+///
+/// `SEC-72` (decision `DEC-19`) split this apart: only a handler that exists
+/// and has no entry answers this 500. A method no path's handler serves
+/// answers 405, and an address no route matches answers 404 — neither
+/// reaches `auth_gate`, so neither is a policy question at all.
+/// `HEAD` on a path that serves `GET` still answers 500 (`DEC-19` D8): axum
+/// answers `HEAD` with the `GET` handler, so a handler exists and
+/// `("HEAD", path)` is not in the table.
 #[cfg(test)]
 mod route_policy_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use axum::Router;
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
+    use axum::routing::get;
     use tower::ServiceExt;
 
     use crate::config::Config;
-    use crate::policy::{POLICY_TABLE, Policy};
+    use crate::policy::{ANY_METHOD, POLICY_TABLE, Policy};
     use crate::state::AppState;
 
+    /// A router whose state can AUTHENTICATE, with nothing to connect to.
+    ///
+    /// `SEC-37`: an unset `DATABASE_URL` now means "no Postgres pool", and
+    /// without one [`crate::auth::AuthenticatedPrincipal`] refuses every
+    /// protected route with 503 before it looks at the request — the honest
+    /// answer for a deployment that cannot check a credential, but it hides
+    /// the 401 this test exists to observe (a `RequiresAuth` entry with no
+    /// credential presented). So the state is built the way the old default
+    /// DSN built it: a LAZY pool (`connect_lazy` does no I/O) at a
+    /// throwaway address this test never dials, since the no-credential
+    /// path never reaches it.
     fn test_router() -> axum::Router {
-        let cfg = Config::from_map(&std::collections::HashMap::new()).unwrap();
-        super::router(AppState::new(cfg))
+        super::router(test_state())
+    }
+
+    /// The state [`test_router`] builds, for a test that assembles a router
+    /// of its own through [`super::gated`].
+    fn test_state() -> AppState {
+        let env = std::collections::HashMap::from([(
+            "DATABASE_URL".to_owned(),
+            "postgres://test:test@127.0.0.1:5432/test".to_owned(),
+        )]);
+        let cfg = Config::from_map(&env).unwrap();
+        AppState::new(cfg)
     }
 
     /// `{id}`/`{token}`/`{kind}`/`{runId}` — any `{...}` capture segment —
@@ -1090,8 +2479,17 @@ mod route_policy_tests {
     async fn every_policy_table_entry_is_mounted_and_gated_as_declared() {
         let mut failures = Vec::new();
         for (method, pattern, policy) in POLICY_TABLE {
+            // A `*` method entry (DATA-5's door, see `policy::ANY_METHOD`)
+            // is probed with a method the route does NOT serve, so the
+            // probe exercises the wildcard entry itself rather than the
+            // exact entry beside it.
+            let probe = if *method == ANY_METHOD {
+                "POST"
+            } else {
+                *method
+            };
             let path = concretize(pattern);
-            let resp = request(test_router(), method, &path).await;
+            let resp = request(test_router(), probe, &path).await;
             let status = resp.status();
             if status == StatusCode::NOT_FOUND {
                 failures.push(format!(
@@ -1107,7 +2505,9 @@ mod route_policy_tests {
                         ));
                     }
                 }
-                Policy::RequiresAuth | Policy::RequiresPermission(_) => {
+                Policy::RequiresAuth
+                | Policy::RequiresPermission(_)
+                | Policy::RequiresAnyPermission(_) => {
                     if status != StatusCode::UNAUTHORIZED {
                         failures.push(format!(
                             "{method} {pattern}: declared {policy:?} but got {status} (expected 401) with no credentials"
@@ -1119,28 +2519,97 @@ mod route_policy_tests {
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 
-    /// The deny-by-default regression itself: a `(method, path)` with NO
+    /// The deny-by-default regression itself: a handler with NO
     /// `POLICY_TABLE` entry is refused (500, `route_policy_unclassified`)
-    /// rather than silently served. This is precisely what goes RED (as a
-    /// live 200/404-vs-500 behavior change, not just this assertion) the
-    /// moment a route is registered in `router()` without a matching
-    /// table entry — see the task's final report for the throwaway-route
-    /// demonstration.
+    /// rather than silently served.
+    ///
+    /// This used to prove the same property with `DELETE /health`, a method
+    /// no handler serves. `DEC-19` (`SEC-72`) turns that request into a 405
+    /// before the gate, which is the answer it should always have been, so
+    /// the proof now needs a real handler: `GET` on a path nobody
+    /// classified. The throwaway path deliberately does not start with
+    /// `/api/`, so `every_registered_route_has_a_policy_entry`
+    /// (`tests/route_auth.rs`) — which reads this file's `.route(` calls —
+    /// does not report it, and it is the last `.route` of that chain.
     #[tokio::test]
-    async fn an_unregistered_route_denies_by_default_instead_of_serving_public() {
-        // `/health` is mounted and IS in the table (Public) — this proves
-        // the negative instead by asking for a method the health route
-        // never registers a policy entry for. `MatchedPath` still
-        // resolves to `/health` (axum matches the path regardless of
-        // method before yielding 405), so `auth_gate` still runs and still
-        // finds no `("DELETE", "/health", _)` entry.
-        let resp = request(test_router(), "DELETE", "/health").await;
+    async fn a_handler_that_is_not_in_the_policy_table_answers_500_and_is_never_served() {
+        let app = super::gated(
+            Router::new()
+                .route("/health", get(super::health))
+                .route("/__sec72_unclassified", get(super::health)),
+            test_state(),
+        );
+        let resp = request(app, "GET", "/__sec72_unclassified").await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8_lossy(&bytes);
         assert!(
             text.contains("route_policy_unclassified"),
             "expected the deny-by-default body, got: {text}"
+        );
+    }
+
+    /// QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`, `LH-RPT-1-11`;
+    /// `SEC-72` decision `DEC-19`: a path that exists with no handler for
+    /// the method asked for answers 405 with one fixed sentence, with no
+    /// credentials and never a 500.
+    #[tokio::test]
+    async fn a_method_no_handler_serves_answers_405_with_the_fixed_sentence() {
+        let expected =
+            serde_json::json!({ "error": "This method is not allowed on this address." });
+        for (method, path) in [
+            ("DELETE", "/health"),
+            ("POST", "/api/dashboard"),
+            ("GET", "/api/pipelines/x/target-lag"),
+            ("DELETE", "/api/pipelines/x/target-lag"),
+            ("POST", "/api/governance/quality/incidents"),
+            ("PATCH", "/api/reports/subscriptions/x"),
+        ] {
+            let resp = request(test_router(), method, path).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path} has no handler"
+            );
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, expected, "{method} {path}");
+        }
+    }
+
+    /// QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`, `LH-RPT-1-11`;
+    /// `SEC-72` decision `DEC-19`: an address no route matches answers 404
+    /// with one fixed sentence. These three used to answer
+    /// `500 No matched path found`, because `auth_gate`'s `MatchedPath`
+    /// extractor failed before the router could say "no such address".
+    #[tokio::test]
+    async fn an_address_no_route_matches_answers_404_with_the_fixed_sentence() {
+        let expected = serde_json::json!({ "error": "No such address." });
+        for (method, path) in [
+            ("GET", "/api/never-existed"),
+            ("PATCH", "/api/governance/quality/incidents/x"),
+            ("PUT", "/api/governance/quality/incidents/x"),
+        ] {
+            let resp = request(test_router(), method, path).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, expected, "{method} {path}");
+        }
+    }
+
+    /// `SEC-72` decision `DEC-19`: a path registered with
+    /// `axum::routing::any` (the `Iceberg` door) has its own fallback, which
+    /// is not the default one, so [`super::gated`] does not replace it. It
+    /// stays behind the gate: no credentials is 401, never a 405 that would
+    /// have reached it before the gate.
+    #[tokio::test]
+    async fn a_route_registered_for_any_method_stays_behind_the_gate() {
+        let resp = request(test_router(), "POST", "/api/iceberg/v1/config").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an any() route keeps its own gated fallback"
         );
     }
 }

@@ -8,8 +8,13 @@ import { afterEach, describe, expect, it, mock } from "bun:test"
 // by bun's test runner, so the stub is in place before the `import`
 // statements below pull in the page (same pattern as
 // `src/components/app-shell/tenant-switcher.test.tsx`).
+// `SEC-65` D2: `LoginPage` also renders `SsoNotice`, which reads
+// `useSearchParams()`; each test sets `search` before rendering.
+let search = new URLSearchParams()
+
 mock.module("next/navigation", () => ({
   usePathname: () => "/login",
+  useSearchParams: () => search,
   useRouter: () => ({
     push: () => {},
     replace: () => {},
@@ -37,6 +42,7 @@ afterEach(() => {
   // `findByLabelText` would find two email fields.
   cleanup()
   global.fetch = originalFetch
+  search = new URLSearchParams()
 })
 
 /**
@@ -71,13 +77,13 @@ function stubLoginApi(status: number, body: unknown, headers: Record<string, str
 async function submitCredentials(email: string, password: string): Promise<void> {
   // The form only renders once the mount-time session check resolved;
   // awaiting the email field is what makes these tests deterministic.
-  fireEvent.change(await screen.findByLabelText("Email"), { target: { value: email } })
+  fireEvent.change(await screen.findByLabelText("Username or email"), { target: { value: email } })
   fireEvent.change(screen.getByLabelText("Password"), { target: { value: password } })
   fireEvent.click(screen.getByRole("button", { name: /sign in/i }))
 }
 
 describe("LoginPage lockout surface (plan T5)", () => {
-  it("shows the server's lockout message and the wait in whole minutes on a 429", async () => {
+  it("shows one sentence with the wait in whole minutes on a 429", async () => {
     stubLoginApi(
       429,
       { error: "Too many failed sign-in attempts. Try again later." },
@@ -91,10 +97,62 @@ describe("LoginPage lockout surface (plan T5)", () => {
     await submitCredentials("rina@meridian.example", "whatever")
 
     const alert = await screen.findByRole("alert")
-    expect(alert.textContent).toContain("Too many failed sign-in attempts. Try again later.")
-    // 300 s renders as the whole-minute wait, pluralised properly
-    // ("minutes", not "minute(s)" — review SHOULD-FIX 6, 2026-10-03).
-    expect(alert.textContent).toContain("Try again in about 5 minutes.")
+    // QA LH-SEC-2-02 (ADM-14 D13): the console owns the whole sentence and
+    // does not repeat the server's "Try again later." after it. This case
+    // asserted both sentences until then, which was the defect.
+    expect(alert.textContent).toBe(
+      "Too many failed sign-in attempts: try again in about 5 minutes.",
+    )
+    expect(alert.textContent).not.toContain("Try again later")
+  })
+
+  it("shows the server's sentence when a 429 carries no wait", async () => {
+    stubLoginApi(429, { error: "Too many failed sign-in attempts. Try again later." })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await submitCredentials("rina@meridian.example", "whatever")
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe("Too many failed sign-in attempts. Try again later.")
+  })
+
+  it("says about one minute for a wait of 60 seconds", async () => {
+    stubLoginApi(
+      429,
+      { error: "Too many failed sign-in attempts. Try again later." },
+      { "Retry-After": "60" },
+    )
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await submitCredentials("rina@meridian.example", "whatever")
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe(
+      "Too many failed sign-in attempts: try again in about 1 minute.",
+    )
+  })
+
+  it("shows the SEC-65 refusal sentence the callback redirects with", async () => {
+    // `SEC-65` D2: the API sends a refused single sign-on here with
+    // `ssoNotice=email_not_verified`; the sentence is the console's.
+    search = new URLSearchParams("ssoNotice=email_not_verified")
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+
+    const notice = await screen.findByRole("status")
+    expect(notice.textContent).toContain(
+      "Your identity provider did not confirm your email address, so this sign-in cannot be joined to your existing account.",
+    )
   })
 
   it("still shows the credentials message on a 401", async () => {
@@ -109,7 +167,7 @@ describe("LoginPage lockout surface (plan T5)", () => {
     const alert = await screen.findByRole("alert")
     // One generic message regardless of cause — the page must not leak
     // the server's non-enumeration constant ("invalid_or_expired").
-    expect(alert.textContent).toBe("Invalid email or password.")
+    expect(alert.textContent).toBe("Invalid username/email or password.")
     expect(alert.textContent).not.toContain("invalid_or_expired")
   })
 
@@ -122,7 +180,7 @@ describe("LoginPage lockout surface (plan T5)", () => {
     )
     // findByLabelText proves the label still associates with its control
     // once the decorative star is nested inside the label.
-    const email = await screen.findByLabelText("Email")
+    const email = await screen.findByLabelText("Username or email")
     const password = screen.getByLabelText("Password")
     // Native `required` stays on the controls: noValidate means it conveys
     // semantics without changing submission behaviour.

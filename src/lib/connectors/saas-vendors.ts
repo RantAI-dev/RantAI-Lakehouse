@@ -1,0 +1,484 @@
+/**
+ * The business-app (SaaS) vendors of `SRC-3`, as the console needs them: which
+ * connector type is which vendor, what the account field asks for, which
+ * sign-ins the vendor offers, and which credential fields an integration
+ * credential fills (decision 3).
+ *
+ * `VENDORS` is a literal copy of `ops/fixtures/saas_vendors.json`, the file the
+ * Rust table (`lakehouse-store/src/saas_vendors.rs`) and the orchestrator's
+ * registry are also compared with; `saas-vendors.test.ts` compares this copy.
+ * It is a copy and not an import because the fixture sits outside `src/`. The
+ * console never builds an address from it: the account is sent as typed and
+ * the API validates it against the same table (AD2).
+ */
+
+export type SaasAccountRule =
+  | { kind: "label" | "digits" | "account_id" | "dataverse_host" | "label_tenant" | "dataverse_host_tenant" }
+  | { kind: "host_tenant"; suffixes: readonly string[] }
+
+export type SaasVendor = {
+  id: string
+  label: string
+  /** The `connector_type.name` this vendor is listed under. */
+  connectorType: string
+  account: SaasAccountRule
+  /** What the account field asks for. */
+  accountLabel: string
+  apiBase: string
+  oauth: {
+    authorizeUrl: string
+    tokenUrl: string
+    revocationUrl: string | null
+    scopes: readonly string[]
+    clientAuth: "post" | "basic" | "post_json"
+    /** The API's base address after a browser sign-in, when it is not `apiBase` (Atlassian's gateway). */
+    apiBase?: string
+  }
+  /** The integration credential, when the vendor offers one (Salesforce does not: decision 4). */
+  integration: {
+    secretKey: string
+    secretFields: readonly string[]
+    /** The scope of a client-credentials request, when the vendor needs one (Microsoft's `/.default`). */
+    scope?: string
+  } | null
+  whoami: { method: string; path: string } | null
+}
+
+export const SAAS_VENDORS: readonly SaasVendor[] = [
+  {
+    "id": "salesforce",
+    "label": "Salesforce",
+    "connectorType": "Salesforce",
+    "account": {
+      "kind": "label"
+    },
+    "accountLabel": "My Domain name (the part before .my.salesforce.com)",
+    "apiBase": "https://{account}.my.salesforce.com",
+    "oauth": {
+      "authorizeUrl": "https://{account}.my.salesforce.com/services/oauth2/authorize",
+      "tokenUrl": "https://{account}.my.salesforce.com/services/oauth2/token",
+      "revocationUrl": "https://{account}.my.salesforce.com/services/oauth2/revoke",
+      "scopes": [
+        "api",
+        "refresh_token"
+      ],
+      "clientAuth": "post"
+    },
+    "integration": null,
+    "whoami": {
+      "method": "GET",
+      "path": "/services/data/v62.0/limits"
+    }
+  },
+  {
+    "id": "servicenow",
+    "label": "ServiceNow",
+    "connectorType": "ServiceNow",
+    "account": {
+      "kind": "label"
+    },
+    "accountLabel": "Instance name (the part before .service-now.com)",
+    "apiBase": "https://{account}.service-now.com",
+    "oauth": {
+      "authorizeUrl": "https://{account}.service-now.com/oauth_auth.do",
+      "tokenUrl": "https://{account}.service-now.com/oauth_token.do",
+      "revocationUrl": null,
+      "scopes": [],
+      "clientAuth": "post"
+    },
+    "integration": {
+      "secretKey": "integration:servicenow",
+      "secretFields": [
+        "clientId",
+        "clientSecret"
+      ]
+    },
+    "whoami": {
+      "method": "GET",
+      "path": "/api/now/table/sys_user?sysparm_limit=1&sysparm_fields=sys_id"
+    }
+  },
+  {
+    "id": "workday",
+    "label": "Workday Reports",
+    "connectorType": "Workday Reports",
+    "account": {
+      "kind": "host_tenant",
+      "suffixes": [
+        ".workday.com",
+        ".myworkday.com"
+      ]
+    },
+    "accountLabel": "Workday host and tenant, as host/tenant",
+    "apiBase": "https://{host}",
+    "oauth": {
+      "authorizeUrl": "https://{host}/{tenant}/authorize",
+      "tokenUrl": "https://{host}/ccx/oauth2/{tenant}/token",
+      "revocationUrl": null,
+      "scopes": [],
+      "clientAuth": "basic"
+    },
+    "integration": {
+      "secretKey": "integration:workday",
+      "secretFields": [
+        "username",
+        "password"
+      ]
+    },
+    "whoami": null
+  },
+  {
+    "id": "ga4",
+    "label": "Google Analytics 4",
+    "connectorType": "Google Analytics 4",
+    "account": {
+      "kind": "digits"
+    },
+    "accountLabel": "GA4 property id (digits)",
+    "apiBase": "https://analyticsdata.googleapis.com",
+    "oauth": {
+      "authorizeUrl": "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline&prompt=consent",
+      "tokenUrl": "https://oauth2.googleapis.com/token",
+      "revocationUrl": "https://oauth2.googleapis.com/revoke",
+      "scopes": [
+        "https://www.googleapis.com/auth/analytics.readonly"
+      ],
+      "clientAuth": "post"
+    },
+    "integration": {
+      "secretKey": "integration:ga4",
+      "secretFields": [
+        "serviceAccountJson"
+      ]
+    },
+    "whoami": {
+      "method": "GET",
+      "path": "/v1beta/properties/{account}/metadata"
+    }
+  },
+  {
+    "id": "hubspot",
+    "label": "HubSpot",
+    "connectorType": "HubSpot",
+    "account": {
+      "kind": "digits"
+    },
+    "accountLabel": "HubSpot account id (digits)",
+    "apiBase": "https://api.hubapi.com",
+    "oauth": {
+      "authorizeUrl": "https://app.hubspot.com/oauth/authorize",
+      "tokenUrl": "https://api.hubapi.com/oauth/v1/token",
+      "revocationUrl": null,
+      "scopes": [
+        "crm.objects.companies.read",
+        "crm.objects.contacts.read",
+        "crm.objects.deals.read",
+        "crm.objects.owners.read",
+        "crm.objects.quotes.read",
+        "crm.schemas.companies.read",
+        "crm.schemas.contacts.read",
+        "crm.schemas.deals.read",
+        "crm.schemas.quotes.read",
+        "tickets",
+        "e-commerce",
+        "oauth"
+      ],
+      "clientAuth": "post"
+    },
+    "integration": {
+      "secretKey": "integration:hubspot",
+      "secretFields": [
+        "token"
+      ]
+    },
+    "whoami": {
+      "method": "GET",
+      "path": "/account-info/v3/details"
+    }
+  },
+  {
+    "id": "zendesk",
+    "label": "Zendesk",
+    "connectorType": "Zendesk",
+    "account": {
+      "kind": "label"
+    },
+    "accountLabel": "Subdomain (the part before .zendesk.com)",
+    "apiBase": "https://{account}.zendesk.com",
+    "oauth": {
+      "authorizeUrl": "https://{account}.zendesk.com/oauth/authorizations/new",
+      "tokenUrl": "https://{account}.zendesk.com/oauth/tokens",
+      "revocationUrl": null,
+      "scopes": [
+        "read"
+      ],
+      "clientAuth": "post_json"
+    },
+    "integration": {
+      "secretKey": "integration:zendesk",
+      "secretFields": [
+        "email",
+        "apiToken"
+      ]
+    },
+    "whoami": {
+      "method": "GET",
+      "path": "/api/v2/users/me.json"
+    }
+  },
+  {
+    "id": "confluence",
+    "label": "Confluence",
+    "connectorType": "Confluence",
+    "account": {
+      "kind": "label"
+    },
+    "accountLabel": "Site name (the part before .atlassian.net)",
+    "apiBase": "https://{account}.atlassian.net",
+    "oauth": {
+      "authorizeUrl": "https://auth.atlassian.com/authorize?audience=api.atlassian.com&prompt=consent",
+      "tokenUrl": "https://auth.atlassian.com/oauth/token",
+      "revocationUrl": null,
+      "scopes": [
+        "read:page:confluence",
+        "read:space:confluence",
+        "read:comment:confluence",
+        "offline_access"
+      ],
+      "clientAuth": "post_json",
+      "apiBase": "https://api.atlassian.com/ex/confluence/{cloudId}"
+    },
+    "integration": {
+      "secretKey": "integration:confluence",
+      "secretFields": [
+        "email",
+        "apiToken"
+      ]
+    },
+    "whoami": {
+      "method": "GET",
+      "path": "/wiki/api/v2/spaces?limit=1"
+    }
+  },
+  {
+    "id": "dynamics365",
+    "label": "Dynamics 365",
+    "connectorType": "Dynamics 365",
+    "account": {
+      "kind": "dataverse_host_tenant"
+    },
+    "accountLabel": "Environment address and tenant, as org.crm4.dynamics.com/tenant-id-or-domain",
+    "apiBase": "https://{account}",
+    "oauth": {
+      "authorizeUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+      "tokenUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+      "revocationUrl": null,
+      "scopes": [
+        "https://{account}/user_impersonation",
+        "offline_access"
+      ],
+      "clientAuth": "post"
+    },
+    "integration": {
+      "secretKey": "integration:dynamics365",
+      "secretFields": [
+        "clientId",
+        "clientSecret"
+      ],
+      "scope": "https://{account}/.default"
+    },
+    "whoami": {
+      "method": "GET",
+      "path": "/api/data/v9.2/WhoAmI"
+    }
+  },
+  {
+    "id": "netsuite",
+    "label": "NetSuite",
+    "connectorType": "NetSuite",
+    "account": {
+      "kind": "account_id"
+    },
+    "accountLabel": "Account id (for example 1234567 or 1234567_SB1)",
+    "apiBase": "https://{account}.suitetalk.api.netsuite.com",
+    "oauth": {
+      "authorizeUrl": "https://{account}.app.netsuite.com/app/login/oauth2/authorize.nl",
+      "tokenUrl": "https://{account}.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token",
+      "revocationUrl": "https://{account}.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/revoke",
+      "scopes": [
+        "rest_webservices"
+      ],
+      "clientAuth": "basic"
+    },
+    "integration": {
+      "secretKey": "integration:netsuite",
+      "secretFields": [
+        "clientId",
+        "privateKey"
+      ]
+    },
+    "whoami": {
+      "method": "GET",
+      "path": "/services/rest/record/v1/employee?limit=1"
+    }
+  },
+  {
+    "id": "sharepoint",
+    "label": "SharePoint",
+    "connectorType": "SharePoint",
+    "account": {
+      "kind": "label_tenant"
+    },
+    "accountLabel": "Tenant name and tenant, as contoso/tenant-id-or-domain (contoso is the part before .sharepoint.com)",
+    "apiBase": "https://graph.microsoft.com",
+    "oauth": {
+      "authorizeUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+      "tokenUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+      "revocationUrl": null,
+      "scopes": [
+        "https://graph.microsoft.com/Sites.Read.All",
+        "offline_access"
+      ],
+      "clientAuth": "post"
+    },
+    "integration": {
+      "secretKey": "integration:sharepoint",
+      "secretFields": [
+        "clientId",
+        "clientSecret"
+      ],
+      "scope": "https://graph.microsoft.com/.default"
+    },
+    "whoami": {
+      "method": "GET",
+      "path": "/v1.0/sites/{account}.sharepoint.com"
+    }
+  }
+] as const satisfies readonly SaasVendor[]
+
+/**
+ * Why `account` is not in the form `vendor` uses, or `null` when it is
+ * (`SRC-41` D13, QA `LH-SRC-3-11`). A copy of `SaasVendor::validate_account`
+ * (`lakehouse-store/src/saas_vendors.rs`): the form can say this before the
+ * connector is created, and the server stays the authority (`D11`: it checks
+ * the same dial and refuses it before a row exists). ASCII classes only, so a
+ * character outside them fails — the account is never rewritten, only judged.
+ */
+export function saasAccountProblem(vendor: SaasVendor, account: string): string | null {
+  return accountFits(vendor.account, account)
+    ? null
+    : `This is not in the form ${vendor.label} uses.`
+}
+
+/**
+ * `text` with its ASCII letters lower-cased, and nothing else (`SRC-41` D13,
+ * review round 1, R4). `String.prototype.toLowerCase` follows Unicode, where
+ * U+212A (KELVIN SIGN) becomes `k`; Rust's `to_ascii_lowercase` in
+ * `SaasVendor::validate_account` leaves it as it is. Judging with the Unicode
+ * rule let the form pass an account (`wd2.worKday.com/t`) the server refuses,
+ * so this copy lowers exactly what the server lowers.
+ */
+function asciiLower(text: string): string {
+  return text.replace(/[A-Z]/g, (letter) => letter.toLowerCase())
+}
+
+/** 1 to 63 of `[A-Za-z0-9-]`, not starting or ending with `-`. */
+function isLabel(text: string): boolean {
+  return text.length <= 63 && !text.startsWith("-") && !text.endsWith("-") && /^[A-Za-z0-9-]+$/.test(text)
+}
+
+/** 1 to 64 of `[A-Za-z0-9_-]`. */
+function isTenantWord(text: string): boolean {
+  return text.length <= 64 && /^[A-Za-z0-9_-]+$/.test(text)
+}
+
+/**
+ * A Microsoft Entra tenant: a GUID (36 characters, `-` at positions 8, 13, 18
+ * and 23), or a domain of at least two labels whose last holds a letter.
+ */
+function isEntraTenant(text: string): boolean {
+  const isGuid =
+    text.length === 36 &&
+    [...text].every((c, index) =>
+      index === 8 || index === 13 || index === 18 || index === 23 ? c === "-" : /[0-9A-Fa-f]/.test(c)
+    )
+  if (isGuid) return true
+  const labels = text.split(".")
+  return (
+    text.length <= 253 &&
+    labels.length >= 2 &&
+    labels.every(isLabel) &&
+    /[A-Za-z]/.test(labels[labels.length - 1] ?? "")
+  )
+}
+
+/** `<organisation>.<region>.dynamics.com`, the region `crm` plus at most two digits. */
+function isDataverseHost(account: string): boolean {
+  const lowered = asciiLower(account)
+  const suffix = ".dynamics.com"
+  if (!lowered.endsWith(suffix)) return false
+  const rest = lowered.slice(0, lowered.length - suffix.length)
+  const dot = rest.lastIndexOf(".")
+  if (dot < 0) return false
+  return /^crm[0-9]{0,2}$/.test(rest.slice(dot + 1)) && isLabel(rest.slice(0, dot))
+}
+
+/** `<inner>/<tenant>`: the first `/` splits; the tenant is an Entra tenant. */
+function splitTenant(account: string): { inner: string; tenant: string } | null {
+  const slash = account.indexOf("/")
+  if (slash < 0) return null
+  const split = { inner: account.slice(0, slash), tenant: account.slice(slash + 1) }
+  return isEntraTenant(split.tenant) ? split : null
+}
+
+/** `<host>/<tenant>`: a Workday suffix, one to three labels before it, a tenant word after. */
+function isHostTenant(account: string, suffixes: readonly string[]): boolean {
+  const slash = account.indexOf("/")
+  if (slash < 0) return false
+  const host = asciiLower(account.slice(0, slash))
+  const tenant = account.slice(slash + 1)
+  if (!isTenantWord(tenant)) return false
+  return suffixes.some((suffix) => {
+    if (!host.endsWith(suffix)) return false
+    const labels = host.slice(0, host.length - suffix.length).split(".")
+    return labels.length <= 3 && labels.every(isLabel)
+  })
+}
+
+function accountFits(rule: SaasAccountRule, account: string): boolean {
+  switch (rule.kind) {
+    case "label":
+      return isLabel(account)
+    case "digits":
+      return /^[0-9]{1,20}$/.test(account)
+    case "account_id":
+      return /^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,38}[A-Za-z0-9])?$/.test(account)
+    case "dataverse_host":
+      return isDataverseHost(account)
+    case "label_tenant": {
+      const split = splitTenant(account)
+      return split !== null && isLabel(split.inner)
+    }
+    case "dataverse_host_tenant": {
+      const split = splitTenant(account)
+      return split !== null && isDataverseHost(split.inner)
+    }
+    case "host_tenant":
+      return isHostTenant(account, rule.suffixes)
+    default: {
+      // A new `kind` in the table must not compile until it has a rule here.
+      const unhandled: never = rule
+      return unhandled
+    }
+  }
+}
+
+/** The vendor a connector type name stands for, or `undefined`. */
+export function saasVendorForType(typeName: string | null | undefined): SaasVendor | undefined {
+  return SAAS_VENDORS.find((vendor) => vendor.connectorType === typeName)
+}
+
+/** The vendor with this id (a `saas` dial's `vendor`), or `undefined`. */
+export function saasVendorById(id: unknown): SaasVendor | undefined {
+  return typeof id === "string" ? SAAS_VENDORS.find((vendor) => vendor.id === id) : undefined
+}

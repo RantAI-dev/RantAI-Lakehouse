@@ -14,7 +14,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { accessGrantState } from "@/lib/access-requests"
+import { accessGrantState, selfApprovalTooltip } from "@/lib/access-requests"
 import { formatRelativeTime } from "@/lib/format"
 import type { ApprovalItem } from "@/services/contracts/agents"
 import { APPROVAL_STATUS_LABEL } from "@/lib/status"
@@ -65,7 +65,7 @@ interface ApprovalColumnsProps {
   readonly onDecide?: (approval: ApprovalItem, decision: "approved" | "rejected") => void
   /** Grants this session decided, keyed by approval id — see `statusCell`. */
   readonly decidedGrants?: Record<string, string>
-  /** `true` when the signed-in user requested this row's access themselves — server-refused, disabled here only as belt-and-suspenders UX. */
+  /** `true` when the signed-in user requested this row themselves — server-refused, disabled here only as belt-and-suspenders UX. */
   readonly isSelfApproval?: (approval: ApprovalItem) => boolean
 }
 
@@ -173,18 +173,20 @@ export function getApprovalColumns({
                 {item.status === "pending" && onDecide && (
                   <>
                     <DropdownMenuSeparator />
+                    {/* SEC-57: the requester may not decide their own
+                        request — the API refuses an approve and a reject
+                        alike — so BOTH items are disabled and carry the
+                        reason. */}
                     <DropdownMenuItem
                       disabled={selfApproval}
-                      title={
-                        selfApproval
-                          ? "You requested this access; a different Governance Admin must decide it"
-                          : undefined
-                      }
+                      title={selfApproval ? selfApprovalTooltip(item.kind) : undefined}
                       onClick={() => onDecide(item, "approved")}
                     >
                       Approve
                     </DropdownMenuItem>
                     <DropdownMenuItem
+                      disabled={selfApproval}
+                      title={selfApproval ? selfApprovalTooltip(item.kind) : undefined}
                       onClick={() => onDecide(item, "rejected")}
                     >
                       Reject

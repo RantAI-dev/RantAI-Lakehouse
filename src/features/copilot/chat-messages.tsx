@@ -28,9 +28,11 @@ import { askFromStep } from "./ask-options";
 import { BuildTree } from "./build-tree";
 import { MiniMarkdown } from "./mini-markdown";
 import { PendingActionCard } from "./pending-action-card";
+import { SavedStatusLines } from "./saved-status";
 import { SuggestionButton } from "./suggestion-button";
 import { FinishedToolRow, RunningToolRow, ToolStepCard, asObj, toolLabel } from "./tool-step";
-import type { ChatProgress, Msg } from "./use-copilot";
+import { useSmoothText } from "./smooth-text";
+import { useCopilotStream, type ChatProgress, type Msg } from "./use-copilot";
 
 /*
  * Copilot's message list, laid out like the RantAI-Agents chat
@@ -217,13 +219,12 @@ function MessageFooter({
 
 /** The Copilot message list — rich rendering (tool rows, build tree, markdown). */
 export function ChatMessages({
-  messages, busy, progress, error, className, onRetry,
-  onConfirmTool, onCancelTool, onCompleteTool, confirmingKey, draft, liveReasoning,
+  messages, busy, error, className, onRetry,
+  onConfirmTool, onCancelTool, confirmingKey,
   onEdit, onDelete, onDismissError, onAnswerAsk, askNotice,
 }: {
   messages: Msg[];
   busy: boolean;
-  progress?: ChatProgress | null;
   error?: string | null;
   className?: string;
   /** Ask the last question again (after an error or a stop). */
@@ -232,14 +233,8 @@ export function ChatMessages({
   onConfirmTool?: (messageIndex: number, stepIndex: number) => void;
   /** Cancel a `needs_confirmation` tool step. */
   onCancelTool?: (messageIndex: number, stepIndex: number) => void;
-  /** Mark a pending step done with this result, without re-running the tool. */
-  onCompleteTool?: (messageIndex: number, stepIndex: number, result: Record<string, unknown>) => void;
   /** `"<messageIndex>:<stepIndex>"` of the step currently being confirmed. */
   confirmingKey?: string | null;
-  /** Answer text streamed so far (`useCopilot().draft`). */
-  draft?: string;
-  /** Reasoning streamed so far (`useCopilot().liveReasoning`). */
-  liveReasoning?: string;
   /** Replace the user message at `index` and ask again from there. */
   onEdit?: (index: number, text: string) => void;
   /** Remove the message at `index`. */
@@ -260,13 +255,33 @@ export function ChatMessages({
     ? {}
     : { initial: { opacity: 0, y: 15 }, animate: { opacity: 1, y: 0 }, transition: { duration: 0.2, ease: "easeOut" as const } };
   const rootRef = React.useRef<HTMLDivElement>(null);
-  // Changes whenever something new lands at the bottom of the list.
-  const tail = `${messages.length}:${messages[messages.length - 1]?.content.length ?? 0}:${busy}:${error ?? ""}:${progress?.phase}:${progress?.steps?.length ?? 0}:${draft?.length ?? 0}:${liveReasoning?.length ?? 0}`;
-  const { pinned, jumpToLatest } = useStickToBottom(rootRef, tail);
+  // AI-24 D6: only the message list and the status pill read the stream.
+  const { progress, draft, liveReasoning } = useCopilotStream();
   const [editing, setEditing] = React.useState<{ index: number; text: string } | null>(null);
 
   const lastIndex = messages.length - 1;
+  const lastMsg = messages[lastIndex];
   const steps = progress?.steps ?? [];
+
+  /**
+   * AI-24 D5: the reveal spans the draft and the checked answer that
+   * replaces it. While an answer streams the target is the draft; once it
+   * lands, the last message's content is the target, and because it starts
+   * with the text already shown the reveal goes on from there. A checked
+   * answer the citation check rewrote does not start with it, and the hook
+   * shows that one whole.
+   */
+  const finalText = !busy && lastMsg?.role === "assistant" && lastMsg.streamed ? lastMsg.content : "";
+  const revealTarget = busy ? (draft ?? "").trimStart() : finalText;
+  const shown = useSmoothText(revealTarget, reduce);
+  // The last answer is still being revealed; its markdown renders up to here.
+  const revealing = finalText.length > 0 && shown.length < finalText.length;
+
+  // Changes whenever something new lands at the bottom of the list, or the
+  // reveal advances. AI-24 D7: the scroll follows what is SHOWN, not what
+  // has arrived, and follows it instantly while the text is arriving.
+  const tail = `${messages.length}:${lastMsg?.content.length ?? 0}:${busy}:${error ?? ""}:${progress?.phase}:${progress?.steps?.length ?? 0}:${shown.length}:${liveReasoning.length}`;
+  const { pinned, jumpToLatest } = useStickToBottom(rootRef, tail, revealTarget.length > 0);
 
   return (
     <div ref={rootRef} className={cn("space-y-1", className)}>
@@ -328,7 +343,15 @@ export function ChatMessages({
                       </div>
                     ) : null}
                     {m.buildRunId ? <BuildTree runId={m.buildRunId} /> : null}
-                    {m.content ? <MiniMarkdown text={m.content} /> : null}
+                    {m.content ? (
+                      i === lastIndex && revealing ? (
+                        // AI-24 D5: the answer just arrived and keeps
+                        // revealing from what was on screen.
+                        <MiniMarkdown text={settleStreamingMarkdown(shown)} caret />
+                      ) : (
+                        <MiniMarkdown text={m.content} />
+                      )
+                    ) : null}
                     {ask && onAnswerAsk && i === lastIndex ? (
                       <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
                         {ask.options.map((option) => (
@@ -357,13 +380,15 @@ export function ChatMessages({
                       <div className="mt-2">
                         <PendingActionCard
                           step={pendingStep}
+                          messageIndex={i}
+                          stepIndex={pendingIndex}
                           confirming={confirmingKey === `${i}:${pendingIndex}`}
                           onConfirm={() => onConfirmTool?.(i, pendingIndex)}
                           onCancel={() => onCancelTool?.(i, pendingIndex)}
-                          onSavedInBuilder={(result) => onCompleteTool?.(i, pendingIndex, result)}
                         />
                       </div>
                     ) : null}
+                    {m.tools?.length ? <SavedStatusLines tools={m.tools} /> : null}
                     {m.chartCreated ? (
                       <Link
                         href="/dashboards"
@@ -406,7 +431,7 @@ export function ChatMessages({
                   )}
                 </div>
               ) : null}
-              {draft ? <StreamingAnswer text={draft} /> : <StatusPill progress={progress ?? null} />}
+              {draft ? <StreamingAnswer text={shown} /> : <StatusPill progress={progress ?? null} />}
             </div>
           </div>
         </div>
@@ -461,50 +486,13 @@ export function ChatMessages({
 }
 
 /**
- * Reveals `target` at a steady pace instead of in network-sized jumps, and
- * catches up faster the further behind it is (the RantAI-Agents chat's
- * pacing: ~25 chars/s, 60 when 100+ behind, 180 when 300+ behind). Shows
- * everything at once under reduced motion. When `target` restarts (a new
- * model round), so does the reveal.
+ * The answer while it is being written: paced (`useSmoothText` already
+ * revealed `text` this frame), made safe to render mid-token
+ * (`settleStreamingMarkdown`), with a caret. Numbers are only checked
+ * against tool results once the answer is complete, so the draft says so;
+ * the checked answer replaces it.
  */
-function useSmoothText(target: string): string {
-  const reduce = useReducedMotion() ?? false;
-  const [shown, setShown] = React.useState(0);
-  const shownRef = React.useRef(0);
-
-  React.useEffect(() => {
-    if (reduce) return;
-    // The draft started over (a new model round): so does the reveal.
-    if (shownRef.current > target.length) shownRef.current = 0;
-    let raf = 0;
-    let last = performance.now();
-    const tick = (now: number) => {
-      const behind = target.length - shownRef.current;
-      if (behind > 0) {
-        const rate = behind > 300 ? 180 : behind > 100 ? 60 : 25;
-        const step = Math.max(1, Math.round(((now - last) / 1000) * rate));
-        shownRef.current = Math.min(target.length, shownRef.current + step);
-        setShown(shownRef.current);
-      }
-      last = now;
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [target, reduce]);
-
-  if (reduce) return target;
-  return target.slice(0, shown <= target.length ? shown : 0);
-}
-
-/**
- * The answer while it is being written: paced, made safe to render
- * mid-token (`settleStreamingMarkdown`), with a caret. Numbers are only
- * checked against tool results once the answer is complete, so the draft
- * says so; the checked answer replaces it.
- */
-function StreamingAnswer({ text }: { text: string }) {
-  const shown = useSmoothText(text.trimStart());
+function StreamingAnswer({ text: shown }: { text: string }) {
   return (
     <div className="space-y-1.5 text-sm" aria-live="polite" aria-busy="true">
       <MiniMarkdown text={settleStreamingMarkdown(shown)} caret />
@@ -528,7 +516,11 @@ function scrollParent(el: HTMLElement | null): HTMLElement | null {
  * within 80px of the end re-attaches. Scrolls the chat's own container, so
  * the page around it never moves.
  */
-function useStickToBottom(rootRef: React.RefObject<HTMLDivElement | null>, tail: string) {
+export function useStickToBottom(
+  rootRef: React.RefObject<HTMLDivElement | null>,
+  tail: string,
+  instant = false,
+) {
   const [pinned, setPinned] = React.useState(true);
   const pinnedRef = React.useRef(true);
 
@@ -547,8 +539,12 @@ function useStickToBottom(rootRef: React.RefObject<HTMLDivElement | null>, tail:
   React.useEffect(() => {
     if (!pinnedRef.current) return;
     const scroller = scrollParent(rootRef.current);
-    scroller?.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
-  }, [rootRef, tail]);
+    // AI-24 D7: while the answer is arriving this runs once per revealed
+    // frame, and overlapping smooth scrolls fight each other and run ahead
+    // of the text. Follow it instantly instead; a new message (or "jump to
+    // latest", below) still glides.
+    scroller?.scrollTo({ top: scroller.scrollHeight, behavior: instant ? "auto" : "smooth" });
+  }, [rootRef, tail, instant]);
 
   const jumpToLatest = React.useCallback(() => {
     const scroller = scrollParent(rootRef.current);

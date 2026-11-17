@@ -1,12 +1,19 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { RequiredLegend } from "@/components/patterns/required-legend"
 import type { RestAuth, RestDial, RestEndpoint, RestPagination } from "@/services/contracts/connectors"
 
-const AUTH_TYPES: RestAuth["type"][] = ["api_key", "bearer", "oauth2_client_credentials", "basic"]
+const AUTH_TYPES: RestAuth["type"][] = [
+  "api_key",
+  "bearer",
+  "oauth2_client_credentials",
+  "oauth2_authorization_code",
+  "basic",
+]
 
 function defaultAuth(type: RestAuth["type"]): RestAuth {
   switch (type) {
@@ -14,6 +21,8 @@ function defaultAuth(type: RestAuth["type"]): RestAuth {
       return { type: "api_key", header: "" }
     case "oauth2_client_credentials":
       return { type: "oauth2_client_credentials", tokenUrl: "" }
+    case "oauth2_authorization_code":
+      return { type: "oauth2_authorization_code", clientId: "", authorizeUrl: "", tokenUrl: "", scopes: [] }
     case "bearer":
       return { type: "bearer" }
     case "basic":
@@ -42,10 +51,17 @@ function defaultPagination(type: RestPagination["type"]): RestPagination {
 export function RestDialForm({
   value,
   onChange,
+  oauthCallbackUrl,
   showLegend = true,
 }: {
   value: RestDial | null
   onChange: (next: RestDial) => void
+  /**
+   * This product's OAuth callback address (`SRC-12` part C), shown with the
+   * authorization-code fields to copy into the provider's app settings.
+   * `undefined` while it is not known yet, `null` when the operator has not set it.
+   */
+  oauthCallbackUrl?: string | null
   /** UX-1-R7: a parent step can opt out of its own legend. */
   showLegend?: boolean
 }) {
@@ -92,18 +108,15 @@ export function RestDialForm({
 
       <div className="space-y-1.5">
         <Label htmlFor="rest-dial-auth-type">Auth type</Label>
-        <select
+        {/* WEB-9 D3: the console's one dropdown; the five auth types and their
+            order are unchanged, labelled with the API's own words. */}
+        <SelectField
           id="rest-dial-auth-type"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={dial.auth.type}
-          onChange={(e) => set("auth", defaultAuth(e.target.value as RestAuth["type"]))}
-        >
-          {AUTH_TYPES.map((t) => (
-            <option key={t} value={t}>
-              {t}
-            </option>
-          ))}
-        </select>
+          options={AUTH_TYPES.map((t) => ({ value: t, label: t }))}
+          onValueChange={(next) => set("auth", defaultAuth(next as RestAuth["type"]))}
+        />
       </div>
       {dial.auth.type === "api_key" ? (
         <div className="space-y-1.5">
@@ -130,21 +143,30 @@ export function RestDialForm({
           />
         </div>
       ) : null}
+      {dial.auth.type === "oauth2_authorization_code" ? (
+        <OAuthCodeFields
+          auth={dial.auth}
+          onChange={(next) => set("auth", next)}
+          callbackUrl={oauthCallbackUrl}
+        />
+      ) : null}
       {/* bearer/basic carry no extra field here — their secret is the
           connector's own secretRef, entered elsewhere in the wizard. */}
 
       <div className="space-y-1.5">
         <Label htmlFor="rest-dial-pagination-type">Pagination</Label>
-        <select
+        {/* WEB-9 D3: the same three choices, in the same order. */}
+        <SelectField
           id="rest-dial-pagination-type"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={dial.pagination.type}
-          onChange={(e) => set("pagination", defaultPagination(e.target.value as RestPagination["type"]))}
-        >
-          <option value="none">None</option>
-          <option value="page">Page number</option>
-          <option value="cursor">Cursor</option>
-        </select>
+          options={[
+            { value: "none", label: "None" },
+            { value: "page", label: "Page number" },
+            { value: "cursor", label: "Cursor" },
+          ]}
+          onValueChange={(next) => set("pagination", defaultPagination(next as RestPagination["type"]))}
+        />
       </div>
       {dial.pagination.type === "page" ? (
         <div className="space-y-1.5">
@@ -219,6 +241,117 @@ export function RestDialForm({
         <button type="button" className="text-xs text-primary underline" onClick={addEndpoint}>
           Add endpoint
         </button>
+      </div>
+    </div>
+  )
+}
+
+type CodeAuth = Extract<RestAuth, { type: "oauth2_authorization_code" }>
+
+/** The scopes as the person types them: separated by spaces or commas. */
+function parseScopes(text: string): string[] {
+  return text.split(/[\s,]+/).filter((scope) => scope !== "")
+}
+
+/**
+ * The fields of the authorization-code sign-in (`SRC-12` part C). The client
+ * id and the addresses are configuration; the client secret is the
+ * connector's credential, entered with the other credentials, and the refresh
+ * token is obtained when the person signs in from the connector page.
+ */
+function OAuthCodeFields({
+  auth,
+  onChange,
+  callbackUrl,
+}: {
+  auth: CodeAuth
+  onChange: (next: CodeAuth) => void
+  callbackUrl?: string | null
+}) {
+  // Kept as typed, so a space at the end of the text survives until the next word.
+  const [scopeText, setScopeText] = React.useState(auth.scopes.join(" "))
+  return (
+    <div className="grid gap-3">
+      <div className="space-y-1.5">
+        <Label htmlFor="rest-dial-auth-client-id">Client ID</Label>
+        <Input
+          id="rest-dial-auth-client-id"
+          value={auth.clientId}
+          onChange={(e) => onChange({ ...auth, clientId: e.target.value })}
+          autoComplete="off"
+        />
+      </div>
+      <div className="space-y-1.5">
+        <Label htmlFor="rest-dial-auth-authorize-url">Sign-in URL</Label>
+        <Input
+          id="rest-dial-auth-authorize-url"
+          value={auth.authorizeUrl}
+          onChange={(e) => onChange({ ...auth, authorizeUrl: e.target.value })}
+          placeholder="https://login.example.com/authorize"
+          autoComplete="off"
+        />
+      </div>
+      <div className="space-y-1.5">
+        <Label htmlFor="rest-dial-auth-token-url">Token URL</Label>
+        <Input
+          id="rest-dial-auth-token-url"
+          value={auth.tokenUrl}
+          onChange={(e) => onChange({ ...auth, tokenUrl: e.target.value })}
+          placeholder="https://login.example.com/token"
+          autoComplete="off"
+        />
+      </div>
+      <div className="space-y-1.5">
+        <Label htmlFor="rest-dial-auth-revocation-url">Revocation URL (optional)</Label>
+        <Input
+          id="rest-dial-auth-revocation-url"
+          value={auth.revocationUrl ?? ""}
+          onChange={(e) => {
+            const next: CodeAuth = { ...auth }
+            if (e.target.value === "") delete next.revocationUrl
+            else next.revocationUrl = e.target.value
+            onChange(next)
+          }}
+          autoComplete="off"
+        />
+        <p className="text-xs text-muted-foreground">
+          Without one, signing out or deleting the connector cannot tell the provider: the token stays valid
+          there until it expires.
+        </p>
+      </div>
+      <div className="space-y-1.5">
+        <Label htmlFor="rest-dial-auth-scopes">Scopes</Label>
+        <Input
+          id="rest-dial-auth-scopes"
+          value={scopeText}
+          onChange={(e) => {
+            setScopeText(e.target.value)
+            onChange({ ...auth, scopes: parseScopes(e.target.value) })
+          }}
+          placeholder="read offline_access"
+          autoComplete="off"
+        />
+        <p className="text-xs text-muted-foreground">
+          Separate scopes with spaces. Many providers only issue a refresh token when an offline scope is
+          asked for.
+        </p>
+      </div>
+      <div className="space-y-1" data-testid="oauth-callback">
+        <p className="text-sm font-medium">Callback address</p>
+        {callbackUrl ? (
+          <>
+            <code className="block break-all rounded-md bg-muted px-2 py-1.5 text-xs">{callbackUrl}</code>
+            <p className="text-xs text-muted-foreground">
+              Enter this address in the provider&apos;s app settings as the redirect URI. Signing in is done
+              from the connector page, once the connector is saved.
+            </p>
+          </>
+        ) : callbackUrl === null ? (
+          <p className="text-xs text-destructive">
+            The operator has not set this installation&apos;s callback address (CONNECTOR_OAUTH_REDIRECT_URI),
+            so signing in is not possible yet.
+          </p>
+        ) : null}
       </div>
     </div>
   )

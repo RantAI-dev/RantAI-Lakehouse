@@ -1,8 +1,9 @@
-"use client"
+import { redirect } from "next/navigation"
 
-import { ServicesPage } from "@/features/ops/services-page"
-
-/** Thin App Router page for ServicesPage. */
-export default function Page() {
-  return <ServicesPage />
+/**
+ * Legacy route compatibility redirect (`WEB-3` S2-D2): Services is a section of
+ * System status now.
+ */
+export default function LegacyRedirect() {
+  redirect("/health#services")
 }

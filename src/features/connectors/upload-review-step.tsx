@@ -1,12 +1,26 @@
 "use client"
 
 import * as React from "react"
+import { Button } from "@/components/ui/button"
 import { MetadataList, type MetadataItem } from "@/components/patterns/metadata-list"
+import { trinoBronzeName } from "@/lib/asset-query"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
-import { delimiterLabel, encodingLabel, headerRowDisplay, rawTableFullName } from "@/lib/uploads"
-import type { Upload, UploadLoadMode } from "@/services/contracts/uploads"
+import {
+  columnTypeLabel,
+  delimiterLabel,
+  encodingLabel,
+  hasFixedDialect,
+  headerRowDisplay,
+  layoutLabel,
+  rawTableFullName,
+} from "@/lib/uploads"
+import type { Upload, UploadLoadMode, UploadOnBadValue, UploadPreviewColumn } from "@/services/contracts/uploads"
 import type { UploadPreviewView } from "./upload-check-step"
+import { BadValuesReport } from "./upload-columns"
 import { Refusal } from "./upload-parts"
+import type { CheckState } from "./use-column-choices"
+
+const DATE_WORDS = { iso: "year first", dmy: "day first", mdy: "month first" } as const
 
 function Group({ title, items }: { readonly title: string; readonly items: MetadataItem[] }) {
   return (
@@ -36,7 +50,12 @@ export function UploadReviewStep({
   tableName,
   offersMode,
   mode,
+  columns,
+  onBadValue,
+  check,
+  onBackToCheck,
   error,
+  otherFiles,
 }: {
   readonly upload: Upload
   readonly view: UploadPreviewView
@@ -45,24 +64,68 @@ export function UploadReviewStep({
   readonly offersMode: boolean
   /** The mode that will be sent (`replace` unless the choice was offered and made). */
   readonly mode: UploadLoadMode
+  /** The columns as chosen: names and types. */
+  readonly columns: readonly UploadPreviewColumn[]
+  /** What happens to a value that does not fit. */
+  readonly onBadValue: UploadOnBadValue
+  /** The check of the column list against the sample; its bad values are listed here (QA LH-DATA-18-08). */
+  readonly check: CheckState
+  /** Goes back to the Check step, where the types can be changed. */
+  readonly onBackToCheck: () => void
   readonly error: React.ComponentProps<typeof Refusal>["error"] | null
+  /** The names of the files loaded with the first (`DATA-17` slice 5); empty for a load of one file. */
+  readonly otherFiles: readonly string[]
 }) {
   const { settled } = view
   const using = settled?.using
   const full = rawTableFullName(tableName)
+  const files = otherFiles.length + 1
+  const several = files > 1
   const rowsSentence =
     mode === "append"
-      ? "The rows already in the table stay, and this file's are added after them."
-      : "Any rows the table already holds are replaced by this file's."
+      ? `The rows already in the table stay, and ${several ? "these files'" : "this file's"} are added after them.`
+      : `Any rows the table already holds are replaced by ${several ? "these files'" : "this file's"}.`
+
+  // QA LH-DATA-18-08 (AC8): "the mismatch is listed before loading". After "Add to its rows"
+  // the types come from the table and the check re-runs; only the Check step showed it.
+  const bad = check.status === "done" && check.result.count > 0 ? check.result : null
+  // QA fails part A review R1: while the check runs, the Review step says so; with "stop"
+  // the load waits for the answer (the load would write nothing and fail).
+  const checking = check.status === "checking"
 
   return (
     <div className="space-y-4">
+      {checking ? (
+        <p className="text-sm text-muted-foreground">Checking the values against the columns…</p>
+      ) : null}
+      {bad ? (
+        <section
+          className="space-y-3 rounded-lg border border-destructive/30 bg-destructive/5 p-4"
+          aria-label="Values that do not fit"
+        >
+          <BadValuesReport bad={bad} />
+          <p className="text-sm">
+            {onBadValue === "stop"
+              ? "The load stops at the first of these and writes nothing."
+              : "These values are loaded as empty."}
+          </p>
+          <Button type="button" variant="outline" size="sm" onClick={onBackToCheck}>
+            Back to Check
+          </Button>
+        </section>
+      ) : null}
       <div className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-muted/30">
         <Group
-          title="File"
+          title={several ? "Files" : "File"}
           items={[
-            { label: "Name", value: <Wrapped>{upload.originalFilename}</Wrapped> },
-            { label: "Size", value: formatBytes(upload.sizeBytes) },
+            { label: several ? "First file" : "Name", value: <Wrapped>{upload.originalFilename}</Wrapped> },
+            ...(several
+              ? [
+                  { label: "Files", value: `${files} files into ${full}` },
+                  ...otherFiles.map((name, index) => ({ label: `File ${index + 2}`, value: <Wrapped>{name}</Wrapped> })),
+                ]
+              : []),
+            { label: several ? "Size of the first" : "Size", value: formatBytes(upload.sizeBytes) },
             { label: "Uploaded", value: formatDateTime(upload.createdAt) },
           ]}
         />
@@ -75,33 +138,66 @@ export function UploadReviewStep({
                   { label: "Columns", value: String(settled.columns.length) },
                   { label: "Rows in the file", value: formatNumber(settled.parquet.rows) },
                 ]
-              : [
-                  ...(settled?.workbook
-                    ? [{ label: "Sheet", value: <Wrapped>{settled.workbook.sheet}</Wrapped> }]
-                    : [
-                        { label: "Encoding", value: using ? encodingLabel(using.encoding) : "—" },
-                        { label: "Delimiter", value: using ? delimiterLabel(using.delimiter) : "—" },
-                      ]),
-                  { label: "Header row", value: using ? String(headerRowDisplay(using.headerRow)) : "—" },
-                  { label: "Columns", value: settled ? String(settled.columns.length) : "—" },
-                ]),
+              : settled?.layout && hasFixedDialect(settled.layout)
+                ? [
+                    { label: "Format", value: layoutLabel(settled.layout) },
+                    { label: "Columns", value: String(settled.columns.length) },
+                  ]
+                : [
+                    ...(settled?.layout
+                      ? [{ label: "Format", value: layoutLabel(settled.layout) }]
+                      : []),
+                    ...(settled?.archive
+                      ? [{ label: "Files in the zip", value: String(settled.archive.files.length) }]
+                      : []),
+                    ...(settled?.workbook
+                      ? [{ label: "Sheet", value: <Wrapped>{settled.workbook.sheet}</Wrapped> }]
+                      : [
+                          { label: "Encoding", value: using ? encodingLabel(using.encoding) : "—" },
+                          { label: "Delimiter", value: using ? delimiterLabel(using.delimiter) : "—" },
+                        ]),
+                    { label: "Header row", value: using ? String(headerRowDisplay(using.headerRow)) : "—" },
+                    { label: "Columns", value: settled ? String(settled.columns.length) : "—" },
+                  ]),
           ]}
         />
         <Group
           title="Table"
           items={[
             { label: "Table", value: <Wrapped mono>{full}</Wrapped> },
+            // `DATA-53`: the Catalog's name and the one Query Studio reads on the Trino engine.
+            { label: "In Query Studio (Trino)", value: <Wrapped mono>{trinoBronzeName(tableName)}</Wrapped> },
             ...(offersMode
               ? [{ label: "Rows already in it", value: mode === "append" ? "Add to its rows" : "Replace its rows" }]
               : []),
-            { label: "Column types", value: "Text" },
+          ]}
+        />
+        <Group
+          title="Columns"
+          items={[
+            ...columns.map((column, index) => ({
+              label: column.name || `Column ${index + 1}`,
+              value: (
+                <Wrapped>
+                  {columnTypeLabel(column.type)}
+                  {column.dateFormat !== undefined ? `, read ${DATE_WORDS[column.dateFormat]}` : ""}
+                </Wrapped>
+              ),
+            })),
+            { label: "A value that does not fit", value: onBadValue === "stop" ? "Stops the load" : "Is loaded as empty" },
           ]}
         />
       </div>
       <p className="text-sm text-muted-foreground">
-        Load reads <span className="break-words font-medium text-foreground">{upload.originalFilename}</span> with these
-        settings and writes its rows to <span className="break-all font-mono text-foreground">{full}</span>, every column as
-        text. {rowsSentence} You can follow it on the next page.
+        Load reads{" "}
+        {several ? (
+          <span className="font-medium text-foreground">{files} files, the first of them {upload.originalFilename},</span>
+        ) : (
+          <span className="break-words font-medium text-foreground">{upload.originalFilename}</span>
+        )}{" "}
+        with these settings and writes {several ? "their" : "its"} rows to{" "}
+        <span className="break-all font-mono text-foreground">{full}</span>, each column with the type listed above.{" "}
+        {rowsSentence} You can follow it on the next page.
       </p>
       {error !== null ? <Refusal error={error} /> : null}
     </div>

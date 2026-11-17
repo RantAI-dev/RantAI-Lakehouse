@@ -8,13 +8,17 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useAuth } from "@/features/auth/auth-provider"
 import { KIND_LABEL, focusIds, type LineageNode } from "@/features/governance/lineage-graph"
+import { UsedBy } from "@/features/governance/used-by"
 import { useService, type ServiceState } from "@/hooks/use-service"
-import { assetQueryStudioHref } from "@/lib/asset-query"
+import { assetHasReadableTable, assetQueryStudioHref } from "@/lib/asset-query"
 import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { LineageGraph } from "@/services/contracts/governance"
 import { LineageMindmap, edgePipeline, mindmapModel } from "./asset-lineage-map"
+import { icebergTableOf, type IcebergTableState } from "./asset-storage"
+import { ColumnLineageCard, MappingList } from "./column-lineage"
+import { TableGrantNote } from "./table-grant-note"
 
 /**
  * What the lineage graph calls this asset: its table key
@@ -157,11 +161,13 @@ export function lineageCount(a: AssetDetail, state: AssetLineageState): number {
   )
 }
 
-function dependentHref(id: string, kind: string) {
+function dependentHref(id: string, kind: string): string | null {
   const k = kind.toLowerCase()
   const ref = encodeURIComponent(id)
   if (k.includes("pipeline")) return `/pipelines/${ref}`
-  if (k.includes("agent")) return `/agents/employees/${ref}`
+  // WEB-3 D7: an agent dependent is plain text — the digital-employee detail
+  // page it used to open was removed, and a run is reached from its approval.
+  if (k.includes("agent")) return null
   if (k.includes("dashboard")) return `/dashboards?board=${ref}`
   if (k.includes("query")) return `/query-studio?saved=${ref}`
   return `/data/assets/${ref}`
@@ -275,18 +281,37 @@ function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
 }
 
 /**
- * The Lineage tab: the recorded graph around the asset, the columns its
- * pipelines map, what reads it, and any table the catalog relates to it
+ * The Lineage tab: the recorded graph around the asset, the column view
+ * (which columns feed a column and what is built from it), what reads it, and any table the catalog relates to it
  * outside the graph.
+ *
+ * `iceberg` is the page's own state for the Iceberg table, so the query
+ * link opens Trino only when that table is there (owner, 2026-11-08).
  */
-export function AssetLineage({ asset: a, state }: { asset: AssetDetail; state: AssetLineageState }) {
+export function AssetLineage({
+  asset: a,
+  state,
+  iceberg,
+}: {
+  asset: AssetDetail
+  state: AssetLineageState
+  iceberg: IcebergTableState
+}) {
   const graph = state.status === "success" ? state.data : null
   const dependents = assetDependents(a, graph)
   const related = relatedTables(a, graph)
   const mappings = graph?.columnMappings ?? []
+  // The query link is offered only for an asset with a table the console can
+  // read: it would name a table that is not there otherwise (owner,
+  // 2026-11-09).
+  const table = icebergTableOf(iceberg)
+  const readable = assetHasReadableTable(a, table, iceberg.status === "loading")
 
   return (
     <div className="flex flex-col gap-2">
+      {/* GOV-11 (review round 1 R2): the API sent no related tables, so the
+          panels below are empty on purpose — say so instead of "none". */}
+      <TableGrantNote asset={a} />
       <div className="flex flex-wrap gap-2">
         <Button
           size="sm"
@@ -295,31 +320,31 @@ export function AssetLineage({ asset: a, state }: { asset: AssetDetail; state: A
         >
           Open lineage graph
         </Button>
-        <Button size="sm" variant="ghost" render={<Link href={assetQueryStudioHref(a)} />}>
-          Query this asset
-        </Button>
+        {readable ? (
+          <Button size="sm" variant="ghost" render={<Link href={assetQueryStudioHref(a, table)} />}>
+            Query this asset
+          </Button>
+        ) : null}
       </div>
 
       <GraphCard a={a} state={state} />
+
+      {graph?.supported ? (
+        <ColumnLineageCard tableKey={lineageKey(a)} columns={a.schema.map((c) => c.name)} />
+      ) : null}
 
       {mappings.length > 0 ? (
         <SectionCard
           size="sm"
           title="Column mappings"
-          description="How the pipelines in this graph carry columns from source to target."
+          description="Every recorded step that reads or writes a column of this table."
         >
-          <ul className="divide-y divide-border text-sm">
-            {mappings.map((m) => (
-              <li key={`${m.source}-${m.target}`} className="flex flex-wrap items-baseline gap-x-2 py-1.5">
-                <span className="font-mono text-xs">{m.source}</span>
-                <span className="text-muted-foreground">→</span>
-                <span className="font-mono text-xs">{m.target}</span>
-                <span className="ml-auto text-xs text-muted-foreground">{m.transform}</span>
-              </li>
-            ))}
-          </ul>
+          <MappingList mappings={mappings} />
         </SectionCard>
       ) : null}
+
+      {/* BI-14 (plan D5): the charts that read this table, beside the recorded dependents. */}
+      <UsedBy table={lineageKey(a)} />
 
       <div className="grid gap-2 lg:grid-cols-2">
         <SectionCard

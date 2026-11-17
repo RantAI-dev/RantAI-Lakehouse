@@ -102,6 +102,24 @@ impl PermissionSet {
         self.0.is_empty()
     }
 
+    /// Whether this set grants the unrestricted `"*:*"` token — the grant
+    /// that satisfies every permission check.
+    ///
+    /// ONE definition of "unrestricted", shared by the API's escalation
+    /// guard (`routes::catalog::is_unrestricted`, which asks it of a
+    /// caller's principal) and by every rule that asks it of an ACCOUNT
+    /// rather than of a request (ADM-4 D5: "may this caller change the
+    /// roles of an unrestricted user?", "would this change leave no active
+    /// unrestricted user?"). Two definitions of the same word would let
+    /// the two disagree about who counts — and a disagreement there is a
+    /// privilege-escalation hole, not a cosmetic difference.
+    #[must_use]
+    pub fn grants_unrestricted(&self) -> bool {
+        self.0
+            .iter()
+            .any(|(resource, action)| resource == "*" && action == "*")
+    }
+
     /// Every granted `"resource:action"` token, rendered back into its
     /// original string form. For a caller that needs to *list* what a
     /// principal can do (e.g. `GET /api/auth/me`, Task 3.2) rather than
@@ -212,6 +230,23 @@ mod tests {
             strings,
             vec!["catalog:read".to_owned(), "query:read".to_owned()]
         );
+    }
+
+    /// ADM-4 D5: the unrestricted grant is the literal `*:*` token, and
+    /// nothing else. A half-wildcard (`*:read`, `policy:*`) is NOT
+    /// unrestricted — it does not satisfy `*:*` under the wildcard rules
+    /// above either, so the two answers can never disagree.
+    #[test]
+    fn grants_unrestricted_only_for_the_full_wildcard() {
+        assert!(PermissionSet::parse("*:*").grants_unrestricted());
+        assert!(
+            PermissionSet::parse("query:read, *:*").grants_unrestricted(),
+            "the unrestricted token counts wherever it appears in the list"
+        );
+        assert!(!PermissionSet::parse("*:read").grants_unrestricted());
+        assert!(!PermissionSet::parse("policy:*").grants_unrestricted());
+        assert!(!PermissionSet::parse("query:read").grants_unrestricted());
+        assert!(!PermissionSet::default().grants_unrestricted());
     }
 
     #[test]

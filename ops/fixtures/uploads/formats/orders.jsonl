@@ -1,0 +1,4 @@
+{"id": 1, "name": "Anna", "price": 1.5, "active": true, "tags": ["a", "b"], "meta": {"x": 1, "y": "z"}, "note": null}
+{"id": 2, "name": "Budi", "price": 12, "active": false, "tags": [], "meta": {}, "extra": "only here"}
+{"id": 3, "name": "Citra é", "price": 0.25, "active": true, "tags": ["c"], "meta": {"x": 2}}
+

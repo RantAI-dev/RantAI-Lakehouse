@@ -1,0 +1,815 @@
+{
+  "label": "fixture",
+  "summary": {},
+  "results": [
+    {
+      "id": "inventory",
+      "completeness": 0.25,
+      "accuracy": 1.0,
+      "experience": 0.6,
+      "overall": 0.62,
+      "elapsed_s": 12.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [
+        "layer=bronze",
+        "layer=silver",
+        "layer=gold"
+      ],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "total_foreign_2024",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 1.0,
+      "overall": 1.0,
+      "elapsed_s": 13.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "top3_countries",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.6,
+      "overall": 0.92,
+      "elapsed_s": 14.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "yoy_growth",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 1.0,
+      "overall": 1.0,
+      "elapsed_s": 15.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "peak_month_2024",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.6,
+      "overall": 0.92,
+      "elapsed_s": 16.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "top_attraction",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 1.0,
+      "overall": 1.0,
+      "elapsed_s": 17.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "foreign_share",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.6,
+      "overall": 0.92,
+      "elapsed_s": 18.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "events_trend",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 1.0,
+      "overall": 1.0,
+      "elapsed_s": 19.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "gci_missing",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.4,
+      "overall": 0.88,
+      "elapsed_s": 20.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "culinary_top_id",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.4,
+      "overall": 0.88,
+      "elapsed_s": 21.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [
+        "did not answer in Indonesian"
+      ],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "schema_foreign",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.4,
+      "overall": 0.88,
+      "elapsed_s": 22.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "poi_atlas",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.8,
+      "overall": 0.96,
+      "elapsed_s": 23.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "neg_hotel_revenue",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.4,
+      "overall": 0.88,
+      "elapsed_s": 24.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "neg_year_out_of_range",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.8,
+      "overall": 0.96,
+      "elapsed_s": 25.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "lineage_foreign",
+      "completeness": 0.0,
+      "accuracy": 1.0,
+      "experience": 0.4,
+      "overall": 0.48,
+      "elapsed_s": 26.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [
+        "layer=bronze",
+        "layer=silver",
+        "layer=gold"
+      ],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "quality_status",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.8,
+      "overall": 0.96,
+      "elapsed_s": 27.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "failing_pipelines",
+      "completeness": 0.0,
+      "accuracy": 1.0,
+      "experience": 0.4,
+      "overall": 0.48,
+      "elapsed_s": 28.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [
+        "failed pipeline=Main"
+      ],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "connectors_empty",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.8,
+      "overall": 0.96,
+      "elapsed_s": 29.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "alert_rules_empty",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.4,
+      "overall": 0.88,
+      "elapsed_s": 30.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "dashboards_list",
+      "completeness": 0.0,
+      "accuracy": 1.0,
+      "experience": 0.8,
+      "overall": 0.56,
+      "elapsed_s": 31.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [
+        "board=Main"
+      ],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "followup_compare",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.4,
+      "overall": 0.88,
+      "elapsed_s": 32.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "cdc_health",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.8,
+      "overall": 0.96,
+      "elapsed_s": 33.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "build_chart",
+      "completeness": 1.0,
+      "accuracy": 1.0,
+      "experience": 0.4,
+      "overall": 0.88,
+      "elapsed_s": 34.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "iceberg_tables",
+      "completeness": 0.0,
+      "accuracy": 1.0,
+      "experience": 0.8,
+      "overall": 0.56,
+      "elapsed_s": 35.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [
+        "namespace=Main",
+        "gold iceberg table=Main"
+      ],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "storage_capacity",
+      "completeness": 0.0,
+      "accuracy": 1.0,
+      "experience": 0.4,
+      "overall": 0.48,
+      "elapsed_s": 36.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [
+        "bucket=Main"
+      ],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "lineage_gold_mart",
+      "completeness": 0.5,
+      "accuracy": 1.0,
+      "experience": 0.8,
+      "overall": 0.76,
+      "elapsed_s": 37.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [
+        "export=iceberg"
+      ],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "build_rebuild",
+      "completeness": 0.0,
+      "accuracy": 1.0,
+      "experience": 0.4,
+      "overall": 0.48,
+      "elapsed_s": 38.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [
+        "tool=trigger_lakehouse_build{}"
+      ],
+      "problems": [
+        "answered an English question in Indonesian"
+      ],
+      "answer": "Tidak ada data untuk itu, Malaysia 1234 yang dan di untuk dengan",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    },
+    {
+      "id": "build_pipeline_draft",
+      "completeness": 0.0,
+      "accuracy": 1.0,
+      "experience": 0.8,
+      "overall": 0.56,
+      "elapsed_s": 39.5,
+      "tools": [
+        "create_chart"
+      ],
+      "unverified": 0,
+      "missing": [
+        "tool=create_pipeline{'sourceTable': 'event_tahunan'}"
+      ],
+      "problems": [],
+      "answer": "There is no data for that. Malaysia 1234 bar chart mart_event 1,234 tahun",
+      "trace": [
+        [
+          {
+            "tool": "create_chart",
+            "args": {
+              "mart": "mart_event"
+            },
+            "ok": true,
+            "result": {}
+          }
+        ]
+      ]
+    }
+  ]
+}

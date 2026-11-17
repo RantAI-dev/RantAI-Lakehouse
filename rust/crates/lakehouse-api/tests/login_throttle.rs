@@ -14,7 +14,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 
@@ -22,7 +22,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use common::{TestApp, spin_up_with_env};
+use common::{TestApp, audit_rows, spin_up_with_env};
 
 const THROTTLED_EMAIL: &str = "fajar@meridian.example";
 const REAL_PASSWORD: &str = "Co7rect!Passw0rd";
@@ -46,12 +46,27 @@ fn env_with(max_failures: &str, lockout_secs: &str) -> HashMap<String, String> {
 }
 
 async fn login(app: &axum::Router, email: &str, password: &str) -> axum::http::Response<Body> {
+    login_with_user_agent(app, email, password, None).await
+}
+
+/// [`login`] with the browser the sign-in claims to come from (`ADM-14`):
+/// the header the session records, or none when the request carries none.
+async fn login_with_user_agent(
+    app: &axum::Router,
+    email: &str,
+    password: &str,
+    user_agent: Option<&str>,
+) -> axum::http::Response<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header("content-type", "application/json");
+    if let Some(user_agent) = user_agent {
+        request = request.header("user-agent", user_agent);
+    }
     app.clone()
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header("content-type", "application/json")
+            request
                 .body(Body::from(format!(
                     r#"{{"email": "{email}", "password": "{password}"}}"#
                 )))
@@ -203,6 +218,27 @@ async fn the_lock_sets_exactly_one_audit_event_naming_neither_the_email_nor_the_
     .await
     .expect("query audit_event");
     assert_eq!(count, 1, "one lock, one audit event");
+    // QA LH-SEC-2-06 (SEC-70): the event happened before anybody signed in,
+    // so it carries no principal at all and says what caused it in
+    // `actor_label` instead of being handed to the assistant by the list.
+    let (actor_label, principal_kind, principal_id): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT max(actor_label), max(principal_kind), max(principal_id) FROM audit_event \
+         WHERE action = 'auth.login_locked'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query audit_event");
+    assert_eq!(
+        actor_label.as_deref(),
+        Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM),
+        "the lock names the sign-in form as its cause"
+    );
+    assert_eq!(principal_kind, None, "no principal kind: nobody signed in");
+    assert_eq!(principal_id, None, "no principal id: nobody signed in");
     let resource_id = resource_id.expect("resource_id on the lock event");
     assert_eq!(resource_id.len(), 12, "resource_id is the first 12 hex");
     assert!(
@@ -216,6 +252,80 @@ async fn the_lock_sets_exactly_one_audit_event_naming_neither_the_email_nor_the_
             "audit args must not carry {forbidden}"
         );
     }
+}
+
+/// QA LH-SEC-2-06 (SEC-70), decision D4: the lockout happened before anybody
+/// signed in, so the audit list shows what caused it — the sign-in form, a
+/// service, the system — never the assistant.
+#[tokio::test]
+async fn a_lock_is_listed_in_the_audit_log_as_the_sign_in_forms_and_not_the_assistants() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+    // Walk the account into the lock exactly as the audit test above does.
+    for _ in 0..2 {
+        let resp = login(&router, THROTTLED_EMAIL, WRONG_PASSWORD).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let cookie = common::session_cookie_for_seeded_user(&pool, THROTTLED_EMAIL).await;
+    let mut resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/governance/audit")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_string(&mut resp).await).expect("audit body is JSON");
+    let entry = body["audit"]
+        .as_array()
+        .expect("audit is an array")
+        .iter()
+        .find(|row| row["action"] == "auth.login_locked")
+        .expect("the lock is listed");
+    assert_eq!(entry["actor"], "Sign-in form");
+    assert_eq!(entry["actorKind"], "service");
+    assert_eq!(entry["source"], "system");
+}
+
+/// QA LH-SEC-5-01 (`ADM-14` decisions D9 and D14): a sign-in records the
+/// browser it came from, records no network address (the API has no trusted
+/// source for one), and creates exactly one session — the six rows QA saw for
+/// one administrator are six sign-ins, not one sign-in that repeats.
+#[tokio::test]
+async fn a_sign_in_records_the_browser_and_creates_exactly_one_session() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+
+    let resp = login_with_user_agent(
+        &router,
+        THROTTLED_EMAIL,
+        REAL_PASSWORD,
+        Some("QA-Browser/1.0"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (count, user_agent, created_ip): (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT count(*), max(s.user_agent), max(s.created_ip) FROM session s \
+         JOIN app_user u ON u.id = s.app_user_id WHERE u.email = $1",
+    )
+    .bind(THROTTLED_EMAIL)
+    .fetch_one(&pool)
+    .await
+    .expect("query session");
+    assert_eq!(count, 1, "one sign-in, one session");
+    assert_eq!(user_agent.as_deref(), Some("QA-Browser/1.0"));
+    assert_eq!(
+        created_ip, None,
+        "the network address is not recorded (ADM-14 D10)"
+    );
 }
 
 #[tokio::test]
@@ -273,7 +383,7 @@ async fn a_storage_failure_during_login_is_not_rendered_or_counted_as_a_wrong_pa
 
 #[tokio::test]
 async fn an_expired_lock_lets_the_correct_password_through_again() {
-    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "1")).await;
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
     seed_password_identity(&pool).await;
 
     let resp = login(&router, THROTTLED_EMAIL, WRONG_PASSWORD).await;
@@ -283,14 +393,283 @@ async fn an_expired_lock_lets_the_correct_password_through_again() {
     let resp = login(&router, THROTTLED_EMAIL, REAL_PASSWORD).await;
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
-    // LOGIN_LOCKOUT_SECS=1: wait out the lock plus a margin for the
-    // one-second granularity of the locked_until comparison.
-    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    // SEC-49 (PR #236 CI): the lock used to last one second and the test
+    // slept it out, but the second wrong try hashes with Argon2 AFTER the
+    // lock is set, so on a slow runner the lock expired before the 429
+    // check above. The lock is now long (so the refusal cannot race the
+    // clock) and expiry is made by moving `locked_until` into the past:
+    // the product still decides by comparing it to the clock, and nothing
+    // in the lock behaviour is loosened.
+    sqlx::query(
+        "UPDATE login_throttle SET locked_until = now() - interval '1 second' \
+         WHERE locked_until IS NOT NULL",
+    )
+    .execute(&pool)
+    .await
+    .expect("expire the lock");
 
     let resp = login(&router, THROTTLED_EMAIL, REAL_PASSWORD).await;
     assert_eq!(
         resp.status(),
         StatusCode::OK,
         "a correct password after the lock expires must sign in"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn twenty_concurrent_wrong_logins_let_at_most_the_limit_reach_the_password_check() {
+    // SEC-49: a 401 is only produced after the password verifier ran, a 429
+    // never reaches it. So the number of 401s is the number of tries that
+    // were hashed; it must not exceed the limit however many arrive at once.
+    const LIMIT: usize = 5;
+    let TestApp { router, pool } = spin_up_with_env(&env_with("5", "300")).await;
+    seed_password_identity(&pool).await;
+
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let router = router.clone();
+        handles.push(tokio::spawn(async move {
+            login(&router, THROTTLED_EMAIL, WRONG_PASSWORD)
+                .await
+                .status()
+        }));
+    }
+    let mut verified = 0;
+    let mut refused = 0;
+    for handle in handles {
+        match handle.await.expect("login task") {
+            StatusCode::UNAUTHORIZED => verified += 1,
+            StatusCode::TOO_MANY_REQUESTS => refused += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(
+        verified, LIMIT,
+        "only the first {LIMIT} tries may be hashed"
+    );
+    assert_eq!(refused, 20 - LIMIT);
+
+    // The correct password is refused for the lock's lifetime.
+    let resp = login(&router, THROTTLED_EMAIL, REAL_PASSWORD).await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// `GOV-1`: a sign-in that works is on the audit trail. Nobody was signed in
+/// when the form was submitted, so the actor is the form; the principal is
+/// known only because the password verified.
+#[tokio::test]
+async fn a_successful_sign_in_writes_one_auth_login_row_without_the_email_or_the_password() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+
+    let mut resp = login(&router, THROTTLED_EMAIL, REAL_PASSWORD).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let answer = body_string(&mut resp).await;
+    let user_id =
+        serde_json::from_str::<serde_json::Value>(&answer).expect("login body is JSON")["id"]
+            .as_str()
+            .expect("login body names the user")
+            .to_owned();
+
+    let rows = audit_rows(&pool, "auth.login").await;
+    assert_eq!(rows.len(), 1, "one sign-in, one row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(
+        row["actor_label"],
+        lakehouse_store::audit::ACTOR_SIGN_IN_FORM
+    );
+    assert_eq!(row["principal_id"], user_id.as_str());
+    assert_eq!(row["principal_kind"], "user");
+    assert_eq!(row["resource_kind"], "user");
+    assert_eq!(row["resource_id"], user_id.as_str());
+    let text = row.to_string();
+    for forbidden in [THROTTLED_EMAIL, REAL_PASSWORD] {
+        assert!(
+            !text.contains(forbidden),
+            "the row must not carry {forbidden}: {text}"
+        );
+    }
+}
+
+/// `GOV-1`: a refused sign-in is on the audit trail too, with no principal
+/// (nobody proved who they were) and nothing the visitor typed.
+#[tokio::test]
+async fn a_wrong_password_writes_one_refused_auth_login_row_without_the_email_or_the_password() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+
+    let resp = login(&router, THROTTLED_EMAIL, WRONG_PASSWORD).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // The same sentence for an account that does not exist: the trail must
+    // not become the oracle the response is built not to be.
+    let resp = login(&router, GHOST_EMAIL, WRONG_PASSWORD).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let rows = audit_rows(&pool, "auth.login").await;
+    assert_eq!(rows.len(), 2, "two refused tries, two rows: {rows:?}");
+    for row in &rows {
+        assert_eq!(row["outcome"], "refused");
+        assert_eq!(
+            row["actor_label"],
+            lakehouse_store::audit::ACTOR_SIGN_IN_FORM
+        );
+        assert!(row["principal_id"].is_null(), "nobody signed in: {row}");
+        assert!(row["principal_kind"].is_null(), "nobody signed in: {row}");
+        assert_eq!(row["detail"], "The email or the password did not match.");
+        // `GOV-1 review`: the first 48 bits of an unsalted hash of what the
+        // visitor typed would let a reader of the trail test guessed emails
+        // against it (and a password typed into the identifier box leaks a
+        // prefix of its hash), so the row names no key at all.
+        assert!(row["resource_id"].is_null(), "no key prefix: {row}");
+        let text = row.to_string();
+        for forbidden in [THROTTLED_EMAIL, GHOST_EMAIL, WRONG_PASSWORD, REAL_PASSWORD] {
+            assert!(
+                !text.contains(forbidden),
+                "the row must not carry {forbidden}: {text}"
+            );
+        }
+    }
+    assert_eq!(
+        rows[0]["detail"], rows[1]["detail"],
+        "an existing and a missing account read the same"
+    );
+}
+
+/// `GOV-1`: signing out is on the audit trail, naming the person and never
+/// the session cookie.
+#[tokio::test]
+async fn signing_out_writes_one_auth_logout_row_for_the_signed_in_user() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    let cookie = common::session_cookie_for_seeded_user(&pool, THROTTLED_EMAIL).await;
+    let (user_id,): (uuid::Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+        .bind(THROTTLED_EMAIL)
+        .fetch_one(&pool)
+        .await
+        .expect("seeded user");
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/logout")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let rows = audit_rows(&pool, "auth.logout").await;
+    assert_eq!(rows.len(), 1, "one sign-out, one row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(row["principal_id"], user_id.to_string().as_str());
+    assert_eq!(row["principal_kind"], "user");
+    assert!(row["actor_label"].is_string(), "the person is named: {row}");
+    let token = cookie.trim_start_matches("lh_session=");
+    assert!(
+        !row.to_string().contains(token),
+        "the row must not carry the session token: {row}"
+    );
+}
+
+async fn change_password(
+    app: &axum::Router,
+    cookie: &str,
+    body: serde_json::Value,
+) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/change-password")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright")
+}
+
+const NEW_PASSWORD: &str = "An0ther!Passw0rd7";
+
+/// `GOV-1`: a password change is on the audit trail, and neither password is.
+#[tokio::test]
+async fn changing_the_password_writes_one_auth_password_change_row_without_either_password() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+    let cookie = common::session_cookie_for_seeded_user(&pool, THROTTLED_EMAIL).await;
+
+    let resp = change_password(
+        &router,
+        &cookie,
+        serde_json::json!({ "oldPassword": REAL_PASSWORD, "newPassword": NEW_PASSWORD }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let rows = audit_rows(&pool, "auth.password_change").await;
+    assert_eq!(rows.len(), 1, "one change, one row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(row["principal_kind"], "user");
+    assert_eq!(row["resource_kind"], "user");
+    assert_eq!(
+        row["resource_id"], row["principal_id"],
+        "the caller's own account"
+    );
+    let text = row.to_string();
+    for forbidden in [REAL_PASSWORD, NEW_PASSWORD] {
+        assert!(
+            !text.contains(forbidden),
+            "the row must not carry a password: {text}"
+        );
+    }
+}
+
+/// `GOV-1`: a refused password change (the current password is wrong, or the
+/// new one breaks the rules) is on the audit trail as refused.
+#[tokio::test]
+async fn a_refused_password_change_writes_a_refused_auth_password_change_row() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+    let cookie = common::session_cookie_for_seeded_user(&pool, THROTTLED_EMAIL).await;
+
+    let resp = change_password(
+        &router,
+        &cookie,
+        serde_json::json!({ "oldPassword": WRONG_PASSWORD, "newPassword": NEW_PASSWORD }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = change_password(
+        &router,
+        &cookie,
+        serde_json::json!({ "oldPassword": REAL_PASSWORD, "newPassword": "short" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let rows = audit_rows(&pool, "auth.password_change").await;
+    assert_eq!(rows.len(), 2, "two refusals, two rows: {rows:?}");
+    for row in &rows {
+        assert_eq!(row["outcome"], "refused");
+        assert_eq!(row["principal_kind"], "user");
+        let text = row.to_string();
+        for forbidden in [REAL_PASSWORD, WRONG_PASSWORD, NEW_PASSWORD, "short"] {
+            assert!(
+                !text.contains(forbidden),
+                "the row must not carry a password: {text}"
+            );
+        }
+    }
+    assert_eq!(rows[0]["detail"], "The current password did not match.");
+    assert_eq!(
+        rows[1]["detail"],
+        "The new password does not meet the password rules."
     );
 }

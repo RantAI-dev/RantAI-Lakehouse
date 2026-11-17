@@ -1,8 +1,9 @@
-"use client"
+import { redirect } from "next/navigation"
 
-import { LakehouseCapacityPage } from "@/features/lakehouse/capacity-page"
-
-/** Thin App Router page for LakehouseCapacityPage. */
-export default function Page() {
-  return <LakehouseCapacityPage />
+/**
+ * Legacy route compatibility redirect (`WEB-3` S2-D2): Capacity is a section of
+ * System status now.
+ */
+export default function LegacyRedirect() {
+  redirect("/health#storage")
 }

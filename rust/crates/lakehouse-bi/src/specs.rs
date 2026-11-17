@@ -67,10 +67,64 @@ pub enum ChartKind {
     Kpi,
     /// Single-number gauge tile.
     Gauge,
-    /// Raw data table.
+    /// A value against a goal as a bar with the percentage reached
+    /// (`BI-16` part B).
+    Progress,
+    /// How many rows fall in each range of one number column
+    /// (`BI-16` part B).
+    Histogram,
+    /// A value, a target marker and up to three bands, for one value or one
+    /// per category (`BI-16` part B).
+    Bullet,
+    /// Tasks drawn as bars from a `start` column to an `end` column, one row
+    /// per task (`x`), coloured by group (`series`) (`BI-16` part C1).
+    Gantt,
+    /// A picture from an allowed site (`BI-16` part B; no SQL).
+    Image,
+    /// A web page from an allowed site in a sandboxed frame (`BI-16` part B;
+    /// no SQL).
+    Web,
+    /// Data table: the grouped summary, or (`tableMode: "rows"`) raw rows.
     Table,
+    /// Pivot table: row and column fields, values, totals (`BI-16` part A).
+    Pivot,
     /// Free-text markdown tile (no SQL).
     Text,
+    /// A one-line heading between tiles (`BI-18` part C; no SQL).
+    Heading,
+    /// A rule between tiles (`BI-18` part C; no SQL, no text).
+    Divider,
+    /// A heading that folds the tiles below it, up to the next section
+    /// header on the same tab (`BI-18` part C; no SQL).
+    Section,
+}
+
+impl ChartKind {
+    /// Whether the tile carries no data: it never has a statement, reads no
+    /// relation and takes no filter, so every path that builds or runs one
+    /// skips it. `text` was the only such kind before `BI-18` part C; the
+    /// section kinds (`heading`, `divider`, `section`) and the `image` and `web`
+    /// cards of `BI-16` part B join it, and a check
+    /// on this method replaces the old `== ChartKind::Text` so a new static
+    /// kind cannot reach a statement builder by being left out of one.
+    #[must_use]
+    pub fn is_static(self) -> bool {
+        matches!(
+            self,
+            Self::Text | Self::Heading | Self::Divider | Self::Section | Self::Image | Self::Web
+        )
+    }
+
+    /// Whether this kind draws its breakdown as a series (`BI-46`, plan D12;
+    /// QA `LH-BI-6-01`): bar, hbar, line and area, where the second column is
+    /// one line or one stack per value and the chart's limit keeps the N
+    /// breakdown values with the largest total. A heatmap's second column is
+    /// an axis, a sankey's a target and a sunburst's a ring, so they keep
+    /// their own statements.
+    #[must_use]
+    pub fn breakdown_is_series(self) -> bool {
+        matches!(self, Self::Bar | Self::Hbar | Self::Line | Self::Area)
+    }
 }
 
 /// Numeric display format for a chart or KPI value.
@@ -117,6 +171,9 @@ pub enum Aggregate {
 }
 
 impl Aggregate {
+    /// The decimals every aggregate but `count` keeps (`BI-55`, `BI-57`).
+    pub const DECIMAL_SCALE: u8 = 6;
+
     /// The lowercase `ClickHouse` function name this aggregate renders as
     /// (`count` renders as `count()`, callers handle that specially).
     #[must_use]
@@ -127,6 +184,27 @@ impl Aggregate {
             Self::Max => "max",
             Self::Min => "min",
             Self::Count => "count",
+        }
+    }
+
+    /// The statement fragment this aggregate writes for `operand`, rounded
+    /// per `BI-55` (QA `LH-BI-6-04`) and `BI-57` (D9).
+    ///
+    /// Every aggregate but `count` keeps [`Aggregate::DECIMAL_SCALE`]
+    /// decimals: enough for a percent shown with four decimals, and it cuts
+    /// the tail of a binary fraction (`1466.1833333333334`). A count is whole
+    /// by construction. `round(x, 6)` of a whole number is that number in
+    /// `ClickHouse`, of the same type, so a sum, a minimum or a maximum of
+    /// whole numbers stays whole, and a sum of a `Float*` or `Decimal*`
+    /// column keeps its decimals without the builder having to know the
+    /// column's type (`BI-57`, D9).
+    #[must_use]
+    pub fn rounded(self, operand: &str) -> String {
+        match self {
+            Self::Count => "count()".to_owned(),
+            Self::Sum | Self::Avg | Self::Max | Self::Min => {
+                format!("round({self}({operand}), {})", Self::DECIMAL_SCALE)
+            }
         }
     }
 
@@ -446,6 +524,18 @@ mod tests {
         );
     }
 
+    // QA LH-BI-6-04 (BI-55, D4): an average, a minimum and a maximum keep six
+    // decimals. QA LH-BI-6-04 (BI-55), BI-57 (D9): a sum keeps them too, and a
+    // count is whole by construction.
+    #[test]
+    fn every_aggregate_but_a_count_keeps_six_decimals() {
+        assert_eq!(Aggregate::Sum.rounded("v"), "round(sum(v), 6)");
+        assert_eq!(Aggregate::Avg.rounded("v"), "round(avg(v), 6)");
+        assert_eq!(Aggregate::Max.rounded("v"), "round(max(v), 6)");
+        assert_eq!(Aggregate::Min.rounded("v"), "round(min(v), 6)");
+        assert_eq!(Aggregate::Count.rounded("v"), "count()");
+    }
+
     // `charts()`/`kpis()`/`spec_sql()` all read the process-wide
     // `KPIS`/`CHARTS` statics, which are empty unless `BUILTIN_DASHBOARD_SPEC`
     // is set (WS6) — setting that env var from within one test would race
@@ -530,8 +620,8 @@ mod tests {
     #[test]
     fn parse_builtin_dashboard_spec_defaults_both_arrays_when_absent() {
         let spec = parse_builtin_dashboard_spec("{}").unwrap();
-        assert!(spec.kpis.is_empty());
-        assert!(spec.charts.is_empty());
+        assert!(spec.kpis.is_empty(), "{:?}", spec.kpis);
+        assert!(spec.charts.is_empty(), "{:?}", spec.charts);
     }
 
     #[test]

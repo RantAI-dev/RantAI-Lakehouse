@@ -29,19 +29,41 @@
 //! in any migration yet (the `agents` domain brings its own), so it is
 //! reported as `0` rather than invented; see [`Tenant::agents`].
 //!
-//! # Read/create only
+//! # Read/create, and the ADM-4 mutations
 //!
 //! `IdentityService` (the contract) declares four list methods, one
-//! settings getter, and four creates — no update and no delete. The
-//! functions below cover exactly that surface plus `get_*` (needed to
-//! re-read a row after insert) and `delete_*` (needed to make a seeded or
-//! test-created row removable, and exercised by
-//! `tests/identity.rs`). No `update_*` exists because nothing can call one:
-//! adding an unreachable mutation path to a service that has no
-//! authorization layer would be strictly worse than not having it.
+//! settings getter, and four creates — no update beyond roles and no
+//! delete. The functions below cover exactly that surface plus `get_*`
+//! (needed to re-read a row after insert) and `delete_*` (needed to make a
+//! seeded or test-created row removable, and exercised by `tests/identity.rs`).
+//! `update_role` and `delete_role`'s console route are `WEB-3` S3a-D2.
+//!
+//! ADM-4 adds the mutations the console needs to change what a user may
+//! do — a user's role set, a user's tenant membership, and a user's
+//! status — as `*_in_tx` functions: the CALLER opens the transaction,
+//! because the rule that guards the change (ADM-4 D5: a change that would
+//! leave no active user holding `*:*` is refused, in the same transaction
+//! as the change) has to see the change and the count together. The
+//! authorization rules (who may make the change) live in
+//! `lakehouse-api`'s routes, like every other route's rules; nothing here
+//! decides who may call it.
+//!
+//! # ADM-11: usernames, and a case-insensitive uniqueness rule
+//!
+//! Every user now carries a required `username` (1 to 254 characters from
+//! `a-z 0-9 . _ @ + -`, stored lowercase), and `email` is optional. One
+//! validator ([`normalize_username`]) and one clash rule (ADM-11 D5: a
+//! username may not equal another user's username OR email, and the
+//! reverse — so one sign-in box can never match two people) are enforced
+//! HERE, inside the caller's transaction, so invite, rename and the OIDC
+//! just-in-time provisioning in `lakehouse-auth` all go through the same
+//! rule instead of three private copies of it. The schema-level backstops
+//! are `app_user_username_lower_key` (unique on `lower(username)`) and the
+//! `app_user_username_format` CHECK (`0132_usernames.sql`).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use sqlx::{Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -96,8 +118,11 @@ pub struct User {
     pub id: String,
     /// Display name.
     pub name: String,
-    /// Email address; the table's natural key.
-    pub email: String,
+    /// The unique sign-in handle, stored lowercase (ADM-11 D3).
+    pub username: String,
+    /// Email address; optional since ADM-11 (D2.4). `None` when the
+    /// account has none — senders skip such an account and say so (D9).
+    pub email: Option<String>,
     /// `"active"` or `"inactive"` — the closed union the contract declares,
     /// enforced by `app_user_status_check`.
     pub status: String,
@@ -127,7 +152,8 @@ pub struct User {
 struct UserRow {
     id: Uuid,
     name: String,
-    email: String,
+    username: String,
+    email: Option<String>,
     status: String,
     roles: Vec<String>,
     tenants: Vec<String>,
@@ -138,6 +164,7 @@ impl From<UserRow> for User {
         Self {
             id: row.id.to_string(),
             name: row.name,
+            username: row.username,
             email: row.email,
             status: row.status,
             roles: row.roles,
@@ -164,7 +191,7 @@ pub struct UserFilter {
 /// yields an empty array (not a `[null]` from `array_agg`), and the two
 /// independent many-to-many relationships cannot multiply each other's row
 /// counts the way two joins in one query would.
-const USER_SELECT: &str = "SELECT u.id, u.name, u.email, u.status, \
+const USER_SELECT: &str = "SELECT u.id, u.name, u.username, u.email, u.status, \
      ARRAY(SELECT r.name FROM app_user_role ur JOIN role r ON r.id = ur.role_id \
            WHERE ur.user_id = u.id ORDER BY r.name) AS roles, \
      ARRAY(SELECT t.name FROM app_user_tenant ut JOIN tenant t ON t.id = ut.tenant_id \
@@ -186,7 +213,8 @@ pub async fn list_users(pool: &PgPool, filter: &UserFilter) -> Result<Vec<User>,
                  WHERE ut.user_id = u.id AND t.slug = $2)) \
          ORDER BY u.created_at DESC, u.name"
     );
-    let rows: Vec<UserRow> = sqlx::query_as(&sql)
+    // safe: only the constant `USER_SELECT` is formatted in; values are bound.
+    let rows: Vec<UserRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(filter.status.as_deref())
         .bind(filter.tenant_slug.as_deref())
         .fetch_all(pool)
@@ -202,25 +230,195 @@ pub async fn list_users(pool: &PgPool, filter: &UserFilter) -> Result<Vec<User>,
 /// a UUID at all), or [`StoreError::Database`] on any other failure.
 pub async fn get_user(pool: &PgPool, id: &str) -> Result<User, StoreError> {
     let sql = format!("{USER_SELECT} WHERE u.id = $1");
-    let row: UserRow = sqlx::query_as(&sql)
+    // safe: only the constant `USER_SELECT` is formatted in; values are bound.
+    let row: UserRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(parse_id(id)?)
         .fetch_one(pool)
         .await?;
     Ok(row.into())
 }
 
-/// Everything [`create_user`] needs. Mirrors `InviteUserInput` in
-/// `contracts/identity.ts`.
+/// Everything [`create_user`] needs. Mirrors the invite body of
+/// `POST /api/identity/users` (ADM-11 D7).
 #[derive(Debug, Clone)]
 pub struct InviteUserInput {
     /// Display name.
     pub name: String,
-    /// Email address; must not collide with an existing user.
-    pub email: String,
+    /// The unique sign-in handle. Lowercased and checked against the
+    /// ADM-11 D3 rule here; refused with
+    /// [`StoreError::FieldConflict`] when another user already holds it
+    /// (or its email) as their own username or email (D5).
+    pub username: String,
+    /// Email address; optional since ADM-11 (D2.4). When present, refused
+    /// with [`StoreError::FieldConflict`] if it equals (case-insensitively)
+    /// another user's email or username (D5).
+    pub email: Option<String>,
     /// Role *names* to grant. Every name must already exist in `role`.
     pub roles: Vec<String>,
     /// Tenant *names* to join. Every name must already exist in `tenant`.
     pub tenants: Vec<String>,
+}
+
+/// The one sentence the username validator answers with, naming the ADM-11
+/// D3 rule. The [`StoreError::Validation`] message is safe to surface, so
+/// an invite or rename form can show it verbatim.
+pub(crate) const USERNAME_RULE: &str =
+    "Username must be 1 to 254 characters from a-z, 0-9, dot, underscore, at, plus and hyphen.";
+
+/// Lowercase, trim, and check `raw` against the ADM-11 D3 rule: 1 to 254
+/// characters from `a-z 0-9 . _ @ + -`, stored lowercase.
+///
+/// This is THE validator (plan D3): the invite route, the rename route and
+/// the OIDC just-in-time provisioning in `lakehouse-auth` all call it, so
+/// there is no second copy of the character-set rule anywhere. The
+/// 254-character bound mirrors `app_user_username_format`'s CHECK
+/// (`0132_usernames.sql`), and counting characters (not bytes) matches
+/// `char_length` on the database side.
+///
+/// # Errors
+///
+/// [`StoreError::Validation`] (HTTP 400) with [`USERNAME_RULE`] when the
+/// value is empty, longer than 254 characters, or carries a character
+/// outside the set.
+#[must_use = "the normalized username is the value to store"]
+pub fn normalize_username(raw: &str) -> Result<String, StoreError> {
+    let lowered = raw.trim().to_lowercase();
+    if lowered.is_empty()
+        || lowered.chars().count() > 254
+        || !lowered
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '@' | '+' | '-'))
+    {
+        return Err(StoreError::Validation(USERNAME_RULE.to_owned()));
+    }
+    Ok(lowered)
+}
+
+/// Trim the email a caller wants to store, keeping `None` as "no email"
+/// (ADM-11 D2.4) and refusing an empty string: an empty address is a
+/// typo, not an absence, and storing it would fabricate a value.
+///
+/// # Errors
+///
+/// [`StoreError::Validation`] (HTTP 400) when the value is present but
+/// blank.
+fn normalize_email(raw: Option<&str>) -> Result<Option<String>, StoreError> {
+    match raw {
+        None => Ok(None),
+        Some(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(StoreError::Validation(
+                    "Email must not be empty.".to_owned(),
+                ));
+            }
+            Ok(Some(trimmed.to_owned()))
+        }
+    }
+}
+
+/// Whether ANOTHER user (never `exclude`) already holds `username` as their
+/// username or email, or `email` as their email or username — all compared
+/// case-insensitively (ADM-11 D5). One statement, run inside the caller's
+/// transaction, so a concurrent invite or rename that commits first makes
+/// this one see it.
+///
+/// `username` must already be [`normalize_username`]'s output (lowercase);
+/// `email` is compared through `lower()` here.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any storage failure.
+async fn username_email_taken_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    username: &str,
+    email: Option<&str>,
+    exclude: Option<Uuid>,
+) -> Result<(bool, bool), StoreError> {
+    let row: (bool, bool) = sqlx::query_as(
+        "SELECT \
+           EXISTS (SELECT 1 FROM app_user o \
+                   WHERE ($1::uuid IS NULL OR o.id <> $1) \
+                     AND (lower(o.username) = $2 \
+                          OR (o.email IS NOT NULL AND lower(o.email) = $2))), \
+           EXISTS (SELECT 1 FROM app_user o \
+                   WHERE ($1::uuid IS NULL OR o.id <> $1) \
+                     AND $3::text IS NOT NULL \
+                     AND (lower(o.username) = lower($3) \
+                          OR (o.email IS NOT NULL AND lower(o.email) = lower($3))))",
+    )
+    .bind(exclude)
+    .bind(username)
+    .bind(email)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(row)
+}
+
+/// Whether ANOTHER user holds `candidate` (case-insensitively) as their
+/// username or email — the single-question form of
+/// [`username_email_taken_in_tx`] that [`next_free_username_in_tx`]'s
+/// suffix loop asks. `candidate` must already be lowercase.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any storage failure.
+async fn identifier_taken_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    candidate: &str,
+    exclude: Option<Uuid>,
+) -> Result<bool, StoreError> {
+    let (taken,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM app_user o \
+         WHERE ($1::uuid IS NULL OR o.id <> $1) \
+           AND (lower(o.username) = $2 \
+                OR (o.email IS NOT NULL AND lower(o.email) = $2)))",
+    )
+    .bind(exclude)
+    .bind(candidate)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(taken)
+}
+
+/// The first username built on `base` that no other user holds: `base`
+/// itself when free, else `base-2`, `base-3`, … — the same suffix rule the
+/// `0132_usernames.sql` backfill applies to case-variant emails (ADM-11
+/// D10: an OIDC-provisioned user whose preferred handle clashes gets the
+/// next free one instead of an error). The answer is guaranteed to pass
+/// [`normalize_username`]'s length bound only when `base` does with room
+/// for the suffix; a `base` at the 254-character limit can overflow it and
+/// is refused like any other invalid username.
+///
+/// `base` must already be [`normalize_username`]'s output (lowercase).
+///
+/// # Errors
+///
+/// [`StoreError::Validation`] when a suffixed candidate would break the
+/// D3 length bound, or [`StoreError::Database`] on any storage failure.
+pub async fn next_free_username_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    base: &str,
+    exclude: Option<Uuid>,
+) -> Result<String, StoreError> {
+    if !identifier_taken_in_tx(tx, base, exclude).await? {
+        return Ok(base.to_owned());
+    }
+    // The first candidate is taken; the numbered ones start at -2, like the
+    // backfill's `row_number` suffix. The loop always returns from inside:
+    // either a free candidate is found, or the candidate outgrows the D3
+    // length bound and is refused rather than stored broken.
+    let mut suffix: u64 = 2;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if normalize_username(&candidate).is_err() {
+            return Err(StoreError::Validation(USERNAME_RULE.to_owned()));
+        }
+        if !identifier_taken_in_tx(tx, &candidate, exclude).await? {
+            return Ok(candidate);
+        }
+        suffix += 1;
+    }
 }
 
 /// Create a user and its role/tenant memberships.
@@ -230,7 +428,11 @@ pub struct InviteUserInput {
 ///
 /// # Errors
 ///
-/// * [`StoreError::Conflict`] (409) — the email is already taken.
+/// * [`StoreError::FieldConflict`] (409) — the username (or the email,
+///   when one is given) equals another user's username or email,
+///   case-insensitively (ADM-11 D5). The message names the field.
+/// * [`StoreError::Validation`] (400) — the username breaks the D3 rule,
+///   or a given email is blank.
 /// * [`StoreError::ForeignKeyViolation`] (400) — a role or tenant name in
 ///   `input` does not exist. Membership rows are inserted by *name*
 ///   (`INSERT ... SELECT id FROM role WHERE name = $2`), so an unknown name
@@ -240,13 +442,72 @@ pub struct InviteUserInput {
 /// * [`StoreError::Database`] (500) — anything else.
 pub async fn create_user(pool: &PgPool, input: &InviteUserInput) -> Result<User, StoreError> {
     let mut tx = pool.begin().await?;
+    let id = create_user_in_tx(&mut tx, input).await?;
+    tx.commit().await?;
+    get_user(pool, &id.to_string()).await
+}
 
-    let (id,): (Uuid,) =
-        sqlx::query_as("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
-            .bind(&input.name)
-            .bind(&input.email)
-            .fetch_one(&mut *tx)
-            .await?;
+/// [`create_user`], inside a transaction the CALLER owns, returning the
+/// new user's id instead of the whole [`User`] row.
+///
+/// ADM-3 D1: an invite writes the user, its memberships AND its
+/// credential as one unit of work. The credential lives in `auth_identity`,
+/// which `lakehouse-auth` owns; the user and its memberships live here.
+/// Neither crate can open a transaction the other joins, so the CALLER
+/// (the API route) opens it and hands it to both — this function is the
+/// store's half of that.
+///
+/// Dropping `tx` without committing rolls the whole thing back (sqlx's
+/// `Transaction` starts a rollback on drop), so an unknown role or tenant
+/// name leaves no user behind.
+///
+/// # Errors
+///
+/// * [`StoreError::FieldConflict`] (409) — the username (or the email,
+///   when one is given) equals another user's username or email,
+///   case-insensitively (ADM-11 D5). Serialized by
+///   `pg_advisory_xact_lock(USER_IDENTIFIER_LOCK_KEY)` (ADM-11 review 1 S5),
+///   so two concurrent invites cannot both pass the check.
+/// * [`StoreError::Validation`] (400) — the username breaks the ADM-11 D3
+///   rule, or a given email is blank.
+/// * [`StoreError::ForeignKeyViolation`] (400) — a role or tenant name in
+///   `input` does not exist.
+/// * [`StoreError::Database`] (500) — anything else.
+pub async fn create_user_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    input: &InviteUserInput,
+) -> Result<Uuid, StoreError> {
+    // ADM-11 review 1 S5: serialize identifier checks and writes under USER_IDENTIFIER_LOCK_KEY
+    // so concurrent invites cannot both pass the check.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(USER_IDENTIFIER_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+
+    let username = normalize_username(&input.username)?;
+    let email = normalize_email(input.email.as_deref())?;
+    // ADM-11 D5: one sign-in box must never match two people, so the
+    // username is refused when it equals another user's username OR email,
+    // and the reverse for the email. Inside this transaction, so a
+    // concurrent invite or rename that commits first is seen.
+    let (username_taken, email_taken) =
+        username_email_taken_in_tx(tx, &username, email.as_deref(), None).await?;
+    if username_taken {
+        return Err(StoreError::FieldConflict(
+            "Username already in use".to_owned(),
+        ));
+    }
+    if email_taken {
+        return Err(StoreError::FieldConflict("Email already in use".to_owned()));
+    }
+    let (id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(&input.name)
+    .bind(&username)
+    .bind(&email)
+    .fetch_one(&mut **tx)
+    .await?;
 
     for role in &input.roles {
         let affected = sqlx::query(
@@ -255,7 +516,7 @@ pub async fn create_user(pool: &PgPool, input: &InviteUserInput) -> Result<User,
         )
         .bind(id)
         .bind(role)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
         if affected == 0 {
@@ -270,7 +531,7 @@ pub async fn create_user(pool: &PgPool, input: &InviteUserInput) -> Result<User,
         )
         .bind(id)
         .bind(tenant)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
         if affected == 0 {
@@ -278,8 +539,7 @@ pub async fn create_user(pool: &PgPool, input: &InviteUserInput) -> Result<User,
         }
     }
 
-    tx.commit().await?;
-    get_user(pool, &id.to_string()).await
+    Ok(id)
 }
 
 /// Add an existing user to a tenant: one `app_user_tenant` row, the same
@@ -313,6 +573,315 @@ pub async fn add_user_to_tenant(
     .await?
     .rows_affected();
     Ok(added > 0)
+}
+
+/// Whether an `app_user` row with this id exists.
+///
+/// Mirrors [`tenant_exists`] so BLD-1's `PUT /api/pipelines/{id}/run-as`
+/// can answer an unknown author with the same 404 it gives an unknown
+/// tenant, rather than leaking a foreign-key violation as a 400.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any database failure.
+pub async fn user_exists(pool: &PgPool, id: Uuid) -> Result<bool, StoreError> {
+    let present: Option<(bool,)> =
+        sqlx::query_as("SELECT EXISTS (SELECT 1 FROM app_user WHERE id = $1)")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(present.is_some_and(|(present,)| present))
+}
+
+// ── ADM-4: changing what a user may do ──────────────────────────────────
+//
+// The functions below are the store's half of ADM-4: they move a user's
+// role memberships and tenant memberships, and they do it INSIDE a
+// transaction the caller owns. The caller owns it because the rule the
+// change has to satisfy (ADM-4 D5: "any change that would leave no active
+// user holding `*:*` is refused with a 409, in the same transaction as the
+// change") needs the change and the check that guards it to be one unit of
+// work — a change committed here and checked afterwards would let two
+// concurrent changes each see the other one still holding the grant and
+// both be allowed, leaving nobody.
+//
+// The authorization half of ADM-4 (who may make the change at all) lives
+// in `lakehouse-api`'s routes, next to every other route's rules; nothing
+// in this module decides who may call it.
+
+/// One role, as the identity routes need it: the name a caller uses, the
+/// id `app_user_role.role_id` points at, and the raw `role.permissions`
+/// text the role's grant is made of.
+///
+/// The permissions are handed over VERBATIM on purpose. `role.permissions`
+/// is free text, and the ONE parser for it is `lakehouse_auth::PermissionSet`
+/// — the parser every principal's permissions go through. A second
+/// token matcher in this crate could disagree with it about what a grant
+/// means, and a disagreement about a grant is a privilege-escalation hole
+/// (AGENTS.md rule 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleGrant {
+    /// `role.name` — what `User.roles` holds and what a caller names.
+    pub name: String,
+    /// `role.id` — what `app_user_role.role_id` points at.
+    pub id: Uuid,
+    /// `role.permissions`, verbatim: the free-text grant list.
+    pub permissions: String,
+}
+
+/// Resolve `names` to the roles they name, inside the CALLER's
+/// transaction.
+///
+/// Returns the roles that EXIST, sorted by name. A name that names no
+/// role is simply absent from the answer: the caller compares the names it
+/// asked for with the names it got back and answers 400 for the
+/// difference (ADM-4 D1: "an unknown role name is a 400").
+///
+/// Duplicate names collapse — the answer is a SET of roles, and
+/// `app_user_role`'s composite primary key would refuse the same role
+/// twice.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any storage failure.
+pub async fn resolve_roles_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    names: &[String],
+) -> Result<Vec<RoleGrant>, StoreError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(String, Uuid, String)> =
+        sqlx::query_as("SELECT name, id, permissions FROM role WHERE name = ANY($1)")
+            .bind(names)
+            .fetch_all(&mut **tx)
+            .await?;
+    let mut found: Vec<RoleGrant> = rows
+        .into_iter()
+        .map(|(name, id, permissions)| RoleGrant {
+            name,
+            id,
+            permissions,
+        })
+        .collect();
+    found.sort_by(|left, right| left.name.cmp(&right.name));
+    found.dedup_by(|left, right| left.id == right.id);
+    Ok(found)
+}
+
+/// Replace `user_id`'s local role set with exactly `role_ids`, inside the
+/// CALLER's transaction.
+///
+/// ADM-4 D1: the request carries the user's COMPLETE role set, not a
+/// delta, so the user's roles after the call are exactly the roles the
+/// request named. The rows are therefore deleted and re-inserted rather
+/// than diffed: a diff would need a second implementation of "which roles
+/// changed" (here and in the audit row that names the old and the new
+/// set), and the two could disagree about what the user's role set is.
+///
+/// The delete and the inserts share the caller's transaction, so a
+/// failure anywhere in it leaves the user's roles exactly as they were.
+///
+/// # Errors
+///
+/// Returns [`StoreError::ForeignKeyViolation`] if a role id names no
+/// `role` row (the route resolves the names to ids first, so this can
+/// only happen if the role was deleted between the resolution and this
+/// write), or [`StoreError::Database`] on any other failure.
+pub async fn set_user_roles_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    role_ids: &[Uuid],
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM app_user_role WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    for role_id in role_ids {
+        sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(role_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// The names of the roles `user_id` holds, inside the CALLER's
+/// transaction.
+///
+/// Read for the audit row's "before" half: ADM-4 D6 asks the audit to
+/// name the old AND the new role names, so an operator can see what the
+/// change took away — not only what it gave.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any storage failure.
+pub async fn user_role_names_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> Result<Vec<String>, StoreError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT r.name FROM app_user_role ur JOIN role r ON r.id = ur.role_id \
+         WHERE ur.user_id = $1 ORDER BY r.name",
+    )
+    .bind(user_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows.into_iter().map(|(name,)| name).collect())
+}
+
+/// Remove `user_id` from `tenant_id` — the counterpart of
+/// [`add_user_to_tenant`], inside the CALLER's transaction.
+///
+/// Returns `true` when a membership row was removed and `false` when the
+/// user was not in that tenant (there was nothing to remove). Idempotent,
+/// exactly like the add: removing a member who is not a member changes
+/// nothing and says so.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any storage failure.
+pub async fn remove_user_from_tenant_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    tenant_id: Uuid,
+) -> Result<bool, StoreError> {
+    let removed = sqlx::query("DELETE FROM app_user_tenant WHERE user_id = $1 AND tenant_id = $2")
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    Ok(removed > 0)
+}
+
+/// Set `user_id`'s `app_user.status` to `status` (`"active"` or
+/// `"inactive"`), inside the CALLER's transaction.
+///
+/// ADM-4 D3: switching a user off is a status change AND the end of every
+/// session that user holds — ONE unit of work, so a user can never be
+/// deactivated with a live session left behind. The caller therefore owns
+/// the transaction and writes the session revocations into it too
+/// (`lakehouse_auth::session::revoke_all_sessions_for_user_in_tx`).
+///
+/// The user's data, dashboards and audit history are NOT touched: only
+/// the status changes. Deactivation is the answer to "this person has
+/// left"; deleting the account would lose who authored what.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if no such user exists, or
+/// [`StoreError::Database`] on any other failure. A `status` the schema
+/// does not allow is refused by `app_user_status_check` — a database
+/// error, not a silent write.
+pub async fn set_user_status_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    status: &str,
+) -> Result<(), StoreError> {
+    let affected = sqlx::query("UPDATE app_user SET status = $2, updated_at = now() WHERE id = $1")
+        .bind(user_id)
+        .bind(status)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    if affected == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+/// The `app_user.status` of `id` — `"active"` or `"inactive"`, the two
+/// values `app_user_status_check` allows — or `None` when there is no such
+/// user.
+///
+/// A **deactivated user is not a dead user**, and `lakehouse_auth::
+/// repository::load_principal_for_user` does not distinguish them: it
+/// reads `app_user.name` and hands back every role the user has, so a
+/// pipeline authored by a deactivated user would otherwise be enforced as
+/// if the user were still working. Callers that need the distinction read
+/// it here.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any database failure.
+pub async fn user_status(pool: &PgPool, id: Uuid) -> Result<Option<String>, StoreError> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT status FROM app_user WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(status,)| status))
+}
+
+/// Whether `user_id` is a member of `tenant_id`, read from the same
+/// `app_user_tenant` row every request's tenant list is read from
+/// (`lakehouse_auth::repository::load_principal_for_user`), so a caller's
+/// own scope check and this one can never disagree about membership.
+///
+/// Used by BLD-1's `PUT /api/pipelines/{id}/run-as` to hold the author to
+/// the pipeline's own tenant: a pipeline may only read as a user who is
+/// inside the same scope the pipeline itself lives in.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any database failure.
+pub async fn user_in_tenant(
+    pool: &PgPool,
+    user_id: Uuid,
+    tenant_id: Uuid,
+) -> Result<bool, StoreError> {
+    let present: Option<(bool,)> = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM app_user_tenant \
+         WHERE user_id = $1 AND tenant_id = $2)",
+    )
+    .bind(user_id)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(present.is_some_and(|(present,)| present))
+}
+
+/// The tenants a user belongs to (`app_user_tenant`), in no particular order.
+/// An empty list means the user belongs to no tenant.
+///
+/// Read from the same rows `lakehouse_auth::repository::load_principal_for_user`
+/// puts in `Principal::tenant_ids`, so this list and the tenant list on a
+/// request can never disagree about membership. Used by `RPT-1`'s recipient
+/// rules (review fix (SHOULD-FIX) 1): the picker and the save-time refusal
+/// ask whether a person shares a tenant with the report's owner.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any database failure.
+pub async fn user_tenant_ids(pool: &PgPool, user_id: Uuid) -> Result<Vec<Uuid>, StoreError> {
+    let rows: Vec<(Uuid,)> =
+        sqlx::query_as("SELECT tenant_id FROM app_user_tenant WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// The display name of `id`, or `None` when there is no such row.
+///
+/// Read from `app_user.name` — the same column
+/// [`lakehouse_auth::repository::load_principal_for_user`] puts in
+/// [`lakehouse_auth::Principal::display_name`], so a pipeline's page and its
+/// own enforcement agree on who the author is. Used by BLD-1's pipeline
+/// detail read: `GET /api/identity/users` needs `identity:read`, which no
+/// ordinary role holds, so the name has to travel with the pipeline or the
+/// people who operate pipelines cannot see whose permissions govern them.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any database failure.
+pub async fn display_name(pool: &PgPool, id: Uuid) -> Result<Option<String>, StoreError> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT name FROM app_user WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(name,)| name))
 }
 
 /// Delete a user; its membership rows cascade away with it.
@@ -388,7 +957,10 @@ const ROLE_SELECT: &str = "SELECT r.id, r.name, r.permissions, r.description, \
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_roles(pool: &PgPool) -> Result<Vec<Role>, StoreError> {
     let sql = format!("{ROLE_SELECT} ORDER BY r.created_at DESC, r.name");
-    let rows: Vec<RoleRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    // safe: only the constant `ROLE_SELECT` is formatted in; values are bound.
+    let rows: Vec<RoleRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(Role::from).collect())
 }
 
@@ -400,7 +972,8 @@ pub async fn list_roles(pool: &PgPool) -> Result<Vec<Role>, StoreError> {
 /// a UUID), or [`StoreError::Database`] on any other failure.
 pub async fn get_role(pool: &PgPool, id: &str) -> Result<Role, StoreError> {
     let sql = format!("{ROLE_SELECT} WHERE r.id = $1");
-    let row: RoleRow = sqlx::query_as(&sql)
+    // safe: only the constant `ROLE_SELECT` is formatted in; values are bound.
+    let row: RoleRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(parse_id(id)?)
         .fetch_one(pool)
         .await?;
@@ -457,6 +1030,191 @@ pub async fn delete_role(pool: &PgPool, id: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Advisory lock key used to serialize identifier (username / email) checks and writes
+/// across concurrent invites, user identity updates, and OIDC JIT provisioning
+/// (ADM-11 review 1 S5).
+pub const USER_IDENTIFIER_LOCK_KEY: i64 = 0x4c48_5f55_5345_5253; // "LH_USERS"
+
+/// The roles `0002_seed_identity.sql` creates: the product's built-in
+/// permission bundles, which a deployment starts with and which
+/// `DELETE /api/identity/roles/{id}` refuses (`WEB-3` S3a-D2).
+///
+/// The seed's fixed ids are the only marker it writes — there is no
+/// `system` column — and they are what this list pins. Ids, not names, so a
+/// rename (`update_role`) never turns a built-in role into a removable one.
+pub const BUILT_IN_ROLE_IDS: [&str; 7] = [
+    "22222222-2222-4222-8222-000000000001",
+    "22222222-2222-4222-8222-000000000002",
+    "22222222-2222-4222-8222-000000000003",
+    "22222222-2222-4222-8222-000000000004",
+    "22222222-2222-4222-8222-000000000005",
+    "22222222-2222-4222-8222-000000000006",
+    "22222222-2222-4222-8222-000000000007",
+];
+
+/// Whether `id` is one of [`BUILT_IN_ROLE_IDS`] (compared lower-cased, as
+/// [`Role::id`] renders a UUID).
+#[must_use]
+pub fn is_built_in_role(id: &str) -> bool {
+    let id = id.trim().to_lowercase();
+    BUILT_IN_ROLE_IDS.contains(&id.as_str())
+}
+
+/// Everything [`update_role`] needs. Mirrors `UpdateRoleInput`.
+#[derive(Debug, Clone)]
+pub struct UpdateRoleInput {
+    /// The role's new name; must not collide with another role's.
+    pub name: String,
+    /// Free-text permission list.
+    pub permissions: String,
+    /// Human-readable description.
+    pub description: String,
+}
+
+/// Rewrite a role's name, permissions and description, returning it as the
+/// list shows it (with its current member count).
+///
+/// Memberships join by id, so a rename reaches every user who holds the
+/// role at their next request. A policy's free-text `subjects` is NOT
+/// rewritten: the console's Access rules page shows the stored text, so
+/// the old name stays visible. A policy's structured `conditions` is the
+/// dangerous case — a clause names roles by name and carries that role's
+/// masks and row filters — so `routes::identity::update_role` refuses a
+/// rename while one names this role (`WEB-3` review R2) and this function
+/// is never reached with obligations still attached. It rewrites no
+/// `policy` row itself.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if no role has that id (including an id
+/// that is not a UUID), [`StoreError::Conflict`] (409) if another role has
+/// the name, or [`StoreError::Database`] on any other failure.
+pub async fn update_role(
+    pool: &PgPool,
+    id: &str,
+    input: &UpdateRoleInput,
+) -> Result<Role, StoreError> {
+    let affected = sqlx::query(
+        "UPDATE role SET name = $2, permissions = $3, description = $4, updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(parse_id(id)?)
+    .bind(&input.name)
+    .bind(&input.permissions)
+    .bind(&input.description)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if affected == 0 {
+        return Err(StoreError::NotFound);
+    }
+    get_role(pool, id).await
+}
+
+// ── Table access (`GOV-7`) ──────────────────────────────────────────────
+
+/// One table (or whole schema, with `table` `"*"`) a role may read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, sqlx::FromRow)]
+pub struct TableGrant {
+    /// The schema name.
+    pub schema: String,
+    /// The table name, or `"*"` for the whole schema.
+    pub table: String,
+}
+
+/// A role's read scope (`GOV-7` D3): `'all'`, or `'listed'` with the tables
+/// and schemas its grants name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleTableAccess {
+    /// `role.read_scope`: `'all'` or `'listed'`.
+    pub scope: String,
+    /// The granted tables and schemas, sorted, for `'listed'` roles.
+    pub grants: Vec<TableGrant>,
+}
+
+/// A role's table access. The grants are sorted, so the same role answers
+/// the same body every time.
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] if no role has that id (or `id` is not a UUID);
+/// [`StoreError::Database`] on any other failure.
+pub async fn get_role_table_access(pool: &PgPool, id: &str) -> Result<RoleTableAccess, StoreError> {
+    let role_id = parse_id(id)?;
+    let scope: Option<String> = sqlx::query_scalar("SELECT read_scope FROM role WHERE id = $1")
+        .bind(role_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(scope) = scope else {
+        return Err(StoreError::NotFound);
+    };
+    let grants: Vec<(String, String)> = sqlx::query_as(
+        "SELECT schema_name, table_name FROM role_read_grant WHERE role_id = $1          ORDER BY schema_name, table_name",
+    )
+    .bind(role_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(RoleTableAccess {
+        scope,
+        grants: grants
+            .into_iter()
+            .map(|(schema, table)| TableGrant { schema, table })
+            .collect(),
+    })
+}
+
+/// Replace a role's scope and grants in ONE transaction (`GOV-7` D7): the
+/// scope and the rows that give it meaning are one unit of work, so a reader
+/// never sees a `'listed'` role with the previous scope's grants (or the
+/// other way round).
+///
+/// A scope of `'all'` stores no grants: keeping stale rows for a role that
+/// reads everything would silently resurrect them the next time somebody
+/// narrows it.
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] if no role has that id (or `id` is not a UUID);
+/// [`StoreError::Database`] on any other failure, including a duplicate
+/// grant (the caller deduplicates first).
+pub async fn set_role_table_access(
+    pool: &PgPool,
+    id: &str,
+    scope: &str,
+    grants: &[TableGrant],
+    created_by: Option<Uuid>,
+) -> Result<RoleTableAccess, StoreError> {
+    let role_id = parse_id(id)?;
+    let mut tx = pool.begin().await?;
+    let affected = sqlx::query("UPDATE role SET read_scope = $2, updated_at = now() WHERE id = $1")
+        .bind(role_id)
+        .bind(scope)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if affected == 0 {
+        return Err(StoreError::NotFound);
+    }
+    sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+        .bind(role_id)
+        .execute(&mut *tx)
+        .await?;
+    for grant in grants {
+        sqlx::query(
+            "INSERT INTO role_read_grant (role_id, schema_name, table_name, created_by)              VALUES ($1, $2, $3, $4)",
+        )
+        .bind(role_id)
+        .bind(&grant.schema)
+        .bind(&grant.table)
+        .bind(created_by)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    get_role_table_access(pool, id).await
+}
+
 // ── Tenant ──────────────────────────────────────────────────────────────
 
 /// Slim subset of [`Tenant`] (just `id`, `name`, `slug`) used only by
@@ -478,11 +1236,19 @@ pub struct TenantSummary {
     pub slug: String,
 }
 
-/// Load `{id, name, slug}` for exactly `tenant_ids`, in no particular
-/// order. Short-circuits to `Ok(Vec::new())` on an empty input, so a caller
+/// Load `{id, name, slug}` for exactly `tenant_ids`, in ascending id order.
+/// Short-circuits to `Ok(Vec::new())` on an empty input, so a caller
 /// that already knows it has nothing to look up never pays a round trip —
 /// `routes::auth::me` relies on this to keep its service-principal /
 /// `tenant_ids.is_empty()` paths at zero queries.
+///
+/// The order is the point (`#484 review R4`): `routes::auth::me` writes the
+/// first of these as the active tenant when nothing is stored, and a person
+/// with no header is acted for as the first of `principal.tenant_ids`
+/// (`lakehouse-auth`'s `ORDER BY tenant_id`). Ascending id makes the two the
+/// same tenant, so a deploy moves nobody's data and a sign-in starts in the
+/// same tenant every time; without it the row order was whatever the scan
+/// produced.
 ///
 /// Used only by `GET /api/auth/me` to render the caller's own tenant
 /// memberships; the general tenant-listing endpoint is [`list_tenants`],
@@ -500,7 +1266,7 @@ pub async fn list_tenants_by_ids(
         return Ok(Vec::new());
     }
     let rows: Vec<(Uuid, String, String)> =
-        sqlx::query_as("SELECT id, name, slug FROM tenant WHERE id = ANY($1)")
+        sqlx::query_as("SELECT id, name, slug FROM tenant WHERE id = ANY($1) ORDER BY id")
             .bind(tenant_ids)
             .fetch_all(pool)
             .await?;
@@ -623,7 +1389,8 @@ pub async fn list_tenants(pool: &PgPool, filter: &TenantFilter) -> Result<Vec<Te
         "{TENANT_SELECT} WHERE ($1::text IS NULL OR t.plan = $1) \
          ORDER BY t.created_at DESC, t.name"
     );
-    let rows: Vec<TenantRow> = sqlx::query_as(&sql)
+    // safe: only the constant `TENANT_SELECT` is formatted in; values are bound.
+    let rows: Vec<TenantRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(filter.plan.as_deref())
         .fetch_all(pool)
         .await?;
@@ -638,7 +1405,8 @@ pub async fn list_tenants(pool: &PgPool, filter: &TenantFilter) -> Result<Vec<Te
 /// not a UUID), or [`StoreError::Database`] on any other failure.
 pub async fn get_tenant(pool: &PgPool, id: &str) -> Result<Tenant, StoreError> {
     let sql = format!("{TENANT_SELECT} WHERE t.id = $1");
-    let row: TenantRow = sqlx::query_as(&sql)
+    // safe: only the constant `TENANT_SELECT` is formatted in; values are bound.
+    let row: TenantRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(parse_id(id)?)
         .fetch_one(pool)
         .await?;
@@ -722,7 +1490,11 @@ pub async fn create_tenant(pool: &PgPool, input: &CreateTenantInput) -> Result<T
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn find_tenant_by_slug(pool: &PgPool, slug: &str) -> Result<Option<Tenant>, StoreError> {
     let sql = format!("{TENANT_SELECT} WHERE t.slug = $1");
-    let row: Option<TenantRow> = sqlx::query_as(&sql).bind(slug).fetch_optional(pool).await?;
+    // safe: only the constant `TENANT_SELECT` is formatted in; values are bound.
+    let row: Option<TenantRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(slug)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(Tenant::from))
 }
 
@@ -773,7 +1545,14 @@ pub async fn update_tenant_provisioning_status(
 ///
 /// Returns [`StoreError::NotFound`] if no such tenant exists,
 /// [`StoreError::ForeignKeyViolation`] if a user still belongs to it
-/// (`app_user_tenant.tenant_id` is `ON DELETE RESTRICT`), or
+/// (`app_user_tenant.tenant_id` is `ON DELETE RESTRICT`), a file of the
+/// tenant still sits in a folder (`file_upload.folder_id` is
+/// `ON DELETE RESTRICT`, `DATA-35` migration `0112`; `PR #259 review
+/// SHOULD-FIX 2`), or a folder still holds a sub-folder or a query in a
+/// folder (`saved_query.folder_id` and `saved_query_folder.parent_id` are
+/// `ON DELETE RESTRICT` in `0122_saved_query_access.sql`; `RESTRICT` is
+/// not deferrable, so the database refuses the delete and it fails
+/// closed, no behaviour change: plan 55 D8), or
 /// [`StoreError::Database`] on any other failure.
 pub async fn delete_tenant(pool: &PgPool, id: &str) -> Result<(), StoreError> {
     let affected = sqlx::query("DELETE FROM tenant WHERE id = $1")
@@ -901,7 +1680,8 @@ pub async fn list_service_identities(
         "{SERVICE_IDENTITY_SELECT} WHERE ($1::text IS NULL OR s.environment = $1) \
          ORDER BY s.created_at DESC, s.name"
     );
-    let rows: Vec<ServiceIdentityRow> = sqlx::query_as(&sql)
+    // safe: only the constant `SERVICE_IDENTITY_SELECT` is formatted in; values are bound.
+    let rows: Vec<ServiceIdentityRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(filter.environment.as_deref())
         .fetch_all(pool)
         .await?;
@@ -916,7 +1696,8 @@ pub async fn list_service_identities(
 /// not a UUID), or [`StoreError::Database`] on any other failure.
 pub async fn get_service_identity(pool: &PgPool, id: &str) -> Result<ServiceIdentity, StoreError> {
     let sql = format!("{SERVICE_IDENTITY_SELECT} WHERE s.id = $1");
-    let row: ServiceIdentityRow = sqlx::query_as(&sql)
+    // safe: only the constant `SERVICE_IDENTITY_SELECT` is formatted in; values are bound.
+    let row: ServiceIdentityRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(parse_id(id)?)
         .fetch_one(pool)
         .await?;
@@ -1108,6 +1889,103 @@ pub async fn delete_service_identity(pool: &PgPool, id: &str) -> Result<(), Stor
     Ok(())
 }
 
+/// Describes an update to a user's email address (ADM-11 D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmailUpdate<'a> {
+    /// Leave the existing email address unchanged.
+    Unchanged,
+    /// Clear the email address (set to NULL).
+    Clear,
+    /// Set a new email address.
+    Set(&'a str),
+}
+
+/// Update a user's username and/or email address (ADM-11 D8).
+///
+/// Refuses with [`StoreError::FieldConflict`] if the new username or email clashes
+/// with another user's username or email (case-insensitively, ADM-11 D5).
+/// Refuses with [`StoreError::Validation`] if the username breaks ADM-11 D3 rules.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `user_id` does not exist,
+/// [`StoreError::FieldConflict`] on unique clash, [`StoreError::Validation`] on
+/// invalid format, or [`StoreError::Database`] on query failure.
+pub async fn update_user_identity(
+    pool: &PgPool,
+    user_id: Uuid,
+    new_username: Option<&str>,
+    new_email: EmailUpdate<'_>,
+) -> Result<User, StoreError> {
+    let mut tx = pool.begin().await?;
+    let user = update_user_identity_in_tx(&mut tx, user_id, new_username, new_email).await?;
+    tx.commit().await?;
+    Ok(user)
+}
+
+/// [`update_user_identity`], inside a transaction the caller owns.
+///
+/// # Errors
+///
+/// Same as [`update_user_identity`].
+pub async fn update_user_identity_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    new_username: Option<&str>,
+    new_email: EmailUpdate<'_>,
+) -> Result<User, StoreError> {
+    // ADM-11 review 1 S5: serialize identifier checks and writes under USER_IDENTIFIER_LOCK_KEY.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(USER_IDENTIFIER_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+
+    let current = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT username, email FROM app_user WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
+
+    let target_username = match new_username {
+        Some(u) => normalize_username(u)?,
+        None => current.0,
+    };
+
+    let target_email = match new_email {
+        EmailUpdate::Set(e) => normalize_email(Some(e))?,
+        EmailUpdate::Clear => None,
+        EmailUpdate::Unchanged => current.1,
+    };
+
+    let (username_taken, email_taken) =
+        username_email_taken_in_tx(tx, &target_username, target_email.as_deref(), Some(user_id))
+            .await?;
+    if username_taken {
+        return Err(StoreError::FieldConflict(
+            "Username already in use".to_owned(),
+        ));
+    }
+    if email_taken {
+        return Err(StoreError::FieldConflict("Email already in use".to_owned()));
+    }
+
+    sqlx::query("UPDATE app_user SET username = $1, email = $2, updated_at = now() WHERE id = $3")
+        .bind(&target_username)
+        .bind(&target_email)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+
+    let sql = format!("{USER_SELECT} WHERE u.id = $1");
+    let row: UserRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(user_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(row.into())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1124,7 +2002,8 @@ mod tests {
         let user = User {
             id: "u".to_owned(),
             name: "Rina".to_owned(),
-            email: "rina@meridian.example".to_owned(),
+            username: "rina".to_owned(),
+            email: Some("rina@meridian.example".to_owned()),
             status: "active".to_owned(),
             roles: vec!["Analyst".to_owned()],
             tenants: vec!["Meridian Group".to_owned()],
@@ -1134,6 +2013,7 @@ mod tests {
         for key in [
             "id",
             "name",
+            "username",
             "email",
             "status",
             "roles",
@@ -1230,5 +2110,42 @@ mod tests {
     fn a_non_uuid_id_is_not_found_rather_than_a_database_error() {
         let err = parse_id("not-a-uuid").expect_err("must reject a non-UUID id");
         assert!(matches!(err, StoreError::NotFound), "got {err:?}");
+    }
+
+    /// `#484 review R4` (`DATA-56`): the list is ordered by id, so the tenant
+    /// `GET /api/auth/me` writes as the active one is the tenant the server
+    /// already acts for without a header (`ORDER BY tenant_id`). The two rows
+    /// are inserted in the reverse of their id order and the lower id's row is
+    /// updated afterwards, so its heap slot moves last: a sequential scan
+    /// returns it last, and only the `ORDER BY` puts it first.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_tenants_by_ids_returns_them_in_ascending_id_order(pool: sqlx::PgPool) {
+        let lower = Uuid::from_u128(0x1111_1111_1111_4111_8111_0000_00aa_0001);
+        let higher = Uuid::from_u128(0x1111_1111_1111_4111_8111_0000_00aa_0002);
+        for (id, name, slug) in [(higher, "Zeta", "zeta"), (lower, "Acme", "acme")] {
+            sqlx::query(
+                "INSERT INTO tenant (id, name, slug, plan, residency) \
+                 VALUES ($1, $2, $3, 'Enterprise', 'Jakarta (ID)')",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(slug)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE tenant SET name = name || ' (renamed)' WHERE id = $1")
+            .bind(lower)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows = list_tenants_by_ids(&pool, &[higher, lower]).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![lower.to_string(), higher.to_string()],
+            "ascending id is the order the console's first tenant depends on"
+        );
     }
 }

@@ -58,9 +58,9 @@ every subsequent API request.
 | --- | --- | --- | --- |
 | `OIDC_ISSUER` | to enable OIDC | unset | The provider's issuer URL. Compared byte-for-byte against the token's `iss` claim. |
 | `OIDC_CLIENT_ID` | to enable OIDC | unset | This application's client id, as registered with the provider. Must appear in the token's `aud` claim. |
-| `OIDC_CLIENT_SECRET` | no | unset | Reserved for a future authorization-code exchange. Not read by `OidcAuthenticator` — verifying a JWKS-signed token needs no shared secret. Never logged; redacted in `Config`'s `Debug`. |
+| `OIDC_CLIENT_SECRET` | no | unset | Sent as `client_secret` in the browser sign-in's authorization-code exchange (`lakehouse-api` `routes/auth.rs`); leave unset for a public client. `OidcAuthenticator` itself does not read it — verifying a JWKS-signed token needs no shared secret. Never logged; redacted in `Config`'s `Debug`. |
 | `OIDC_PROVIDER_NAME` | no | `"default"` | Short label combined with `oidc:` to form `Principal::provider` / `auth_identity.provider` (e.g. `oidc:okta`). |
-| `OIDC_JWKS_URL` | no | `{OIDC_ISSUER}/.well-known/jwks.json` | Explicit override for the JWKS endpoint, for a provider whose JWKS isn't at the conventional path. |
+| `OIDC_JWKS_URL` | no | discovery: the `jwks_uri` from `{OIDC_ISSUER}/.well-known/openid-configuration` | Explicit override for the JWKS endpoint, for a provider whose discovery document is unavailable or names a key set this deployment cannot reach. An explicit value is used as given and no discovery request is made (`SEC-38`). |
 | `OIDC_JIT_PROVISIONING` | no | `false` | `"true"` to auto-create an `app_user` for a token that validates but has no linked `auth_identity` row yet. See "JIT provisioning" below. |
 | `OIDC_ROLE_MAP` | no | empty | `"group1=Role One,group2=Role Two"` — maps an IdP group/role claim value to a local `role.name`. See "Role mapping" below. |
 | `OIDC_GROUPS_CLAIM` | no | `"groups"` | Which claim in the token carries the caller's groups/roles. |

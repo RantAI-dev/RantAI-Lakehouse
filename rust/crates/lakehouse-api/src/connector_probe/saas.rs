@@ -1,0 +1,2126 @@
+//! The connection test of a `saas` connector (`SRC-3` T1.4, plan AD2, AD8).
+//!
+//! One bounded `GET` of the vendor's "who am I" request
+//! (`SaasVendor::whoami`), at an address the vendor table builds from the
+//! connector's `account`. The same rules as the `rest` test:
+//!
+//! - the address is checked ([`resolve_checked`]) and pinned
+//!   ([`pinned_http_client`]) BEFORE any credential is resolved, so a
+//!   refused address makes no call to the secret store;
+//! - redirects are reported, never followed, and the system proxy is not used;
+//! - every message is fixed text built from the vendor's label and the status
+//!   class; nothing the vendor said is echoed (`AGENTS.md` principle 4).
+//!
+//! # What this slice tests
+//!
+//! A browser sign-in (refresh token, then an access token from the vendor's
+//! token endpoint, the client authenticating as the vendor table says), an integration credential that is a single token, Zendesk's
+//! email + API token, and Google Analytics' service-account key (an RS256 JWT-bearer exchange,
+//! slice 3 review BLOCKER 10). An
+//! integration credential of another shape (a pair, a key file) answers
+//! `supported: false` with a reason until its vendor's own task teaches this
+//! module the vendor's scheme (plan Vn.3): "unsupported, honestly".
+
+use std::time::Instant;
+
+use lakehouse_core::secret::{DynSecretResolver, SecretValue};
+use lakehouse_store::connectors::ConnectorDialInfo;
+use lakehouse_store::ingest_spec::{Dial, SaasAuth};
+use lakehouse_store::saas_vendors::{self, ClientAuth, SaasVendor};
+
+use super::{
+    DIAL_TIMEOUT, Outcome, classify_reqwest_error, parse_endpoint_host_port, pinned_http_client,
+    resolve_checked, token_failure_outcome,
+};
+use crate::connector_oauth::{self, OAuthSettings};
+use crate::internal_hosts::InternalHosts;
+
+/// What one test asks: the vendor, the account as the person typed it, the
+/// request address and the token address (both built from the vendor table),
+/// and how the connector signs in.
+struct Request<'a> {
+    vendor: &'static SaasVendor,
+    account: &'a str,
+    url: String,
+    /// A vendor whose browser tokens are served from a gateway keyed by the signed-in site
+    /// (Atlassian): the address that lists the sites the token reaches. `url` then holds
+    /// [`CLOUD_ID_PLACEHOLDER`] where the site's id goes.
+    lookup_url: Option<String>,
+    token_url: String,
+    /// The `scope` of a client-credentials request, rendered from the vendor row (Microsoft Entra
+    /// wants the resource's `/.default`, slice 5); `None` for a vendor whose row names none.
+    scope: Option<String>,
+    auth: &'a SaasAuth,
+    /// `NetSuite` only (slice 6): the certificate id from the dial, the assertion's `kid`.
+    certificate_id: Option<&'a str>,
+    /// What the assertion's `aud` claim says: the vendor table's token address for this account,
+    /// never the rebased (gate) one.
+    audience: String,
+    /// How long the who-am-i request may take. [`DIAL_TIMEOUT`], except for `Workday`, whose
+    /// who-am-i is a report that runs before Workday answers.
+    wait: std::time::Duration,
+}
+
+/// Stands for the cloud id in a gateway address until the site list has been read. A valid
+/// path segment, so the gate-only rebase (which parses the address) leaves it alone.
+const CLOUD_ID_PLACEHOLDER: &str = "cloud-id-placeholder";
+
+/// The connector's credential references and the resolver that reads them.
+struct Secrets<'a> {
+    primary: &'a str,
+    secondary: Option<&'a str>,
+    resolver: &'a dyn DynSecretResolver,
+}
+
+/// Parses `info.dial` as a `saas` dial, builds the addresses from the vendor
+/// table and runs the test.
+pub(super) async fn probe_saas_info(
+    info: &ConnectorDialInfo,
+    resolver: &dyn DynSecretResolver,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Outcome {
+    let dial = match Dial::parse("saas", &info.dial) {
+        Ok(Dial::Saas(dial)) => dial,
+        Ok(_) => {
+            return Outcome::misconfigured(
+                "connector is misconfigured: its dial does not match its own adapter \"saas\"",
+            );
+        }
+        Err(err) => return Outcome::misconfigured(format!("connector's dial is invalid: {err}")),
+    };
+    let Some(vendor) = saas_vendors::vendor(&dial.vendor) else {
+        return Outcome::misconfigured("connector is misconfigured: its vendor is not offered");
+    };
+    let Ok(parts) = vendor.validate_account(&dial.account) else {
+        return Outcome::misconfigured("connector is misconfigured: its account is not valid");
+    };
+    // `Workday` has no generic who-am-i: its test runs the first report the connector names and
+    // looks at the status (slice 6, V-Workday.3); every other vendor with none is not testable.
+    let report_path = if vendor.id == "workday" {
+        let Some(path) = workday_report_path(&dial.objects, &parts.tenant) else {
+            return Outcome::not_testable_with(
+                "Workday is tested by running one of the connector's reports. Name a report \
+                 on the connector page first, then test again.",
+            );
+        };
+        Some(path)
+    } else {
+        None
+    };
+    let who_path = match (report_path, vendor.whoami) {
+        (Some(path), _) => path,
+        (None, Some(whoami)) => whoami.path.to_owned(),
+        (None, None) => {
+            return Outcome::not_testable_with(format!(
+                "{} has no generic connection test in this build. A load reports whether the \
+                 connection worked.",
+                vendor.label
+            ));
+        }
+    };
+    // Slice 4 review BLOCKER 13: a browser sign-in whose vendor table row names its own gateway
+    // (`oauth.api_base`) is tested there, at the fixed host of the table, never at the site.
+    let gateway = match (&dial.auth, vendor.oauth.api_base) {
+        (SaasAuth::Oauth2AuthorizationCode { .. }, Some(base)) => Some(base),
+        _ => None,
+    };
+    let rebase = |url: &str| connector_oauth::gate_rebase(oauth, vendor.id, url);
+    let request = Request {
+        vendor,
+        account: &dial.account,
+        // Slice 2 review SHOULD-FIX 5: the gate-only mock origin, ignored unless the
+        // gate-only switch is on (`connector_oauth::gate_rebase`).
+        url: rebase(&SaasVendor::render(
+            &format!(
+                "{}{}",
+                gateway.map_or_else(
+                    || vendor.api_base.to_owned(),
+                    |base| base.replace("{cloudId}", CLOUD_ID_PLACEHOLDER)
+                ),
+                who_path
+            ),
+            &parts,
+        )),
+        lookup_url: gateway.and_then(|base| {
+            let origin = base.split("/ex/").next()?;
+            Some(rebase(&format!(
+                "{origin}/oauth/token/accessible-resources"
+            )))
+        }),
+        token_url: rebase(&SaasVendor::render(vendor.oauth.token_url, &parts)),
+        scope: vendor
+            .integration
+            .and_then(|integration| integration.scope)
+            .map(|scope| SaasVendor::render(scope, &parts)),
+        auth: &dial.auth,
+        certificate_id: dial.certificate_id.as_deref(),
+        audience: SaasVendor::render(vendor.oauth.token_url, &parts),
+        wait: if vendor.id == "workday" {
+            WORKDAY_REPORT_WAIT
+        } else {
+            DIAL_TIMEOUT
+        },
+    };
+    let secrets = Secrets {
+        primary: &info.secret_ref,
+        secondary: info.secret_ref_secondary.as_deref(),
+        resolver,
+    };
+    probe_saas_at(&request, &secrets, internal_hosts, oauth).await
+}
+
+/// A `Workday` report runs before Workday answers, so its who-am-i may take longer than the other
+/// vendors' (their request is a lookup). Still bounded: a report that takes longer is a failure
+/// of the test, said as one.
+const WORKDAY_REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `Workday`'s who-am-i: the address of the first named report that is a plain `owner/report`
+/// (the same rule as the orchestrator's `check_report`: nothing that could leave the path),
+/// `/ccx/service/customreport2/<tenant>/<owner>/<report>?format=json`. `None` when no report
+/// is named or the first is not plain.
+fn workday_report_path(objects: &[String], tenant: &str) -> Option<String> {
+    let (owner, report) = objects.first()?.split_once('/')?;
+    let plain = |text: &str, extra: &[char], max: usize| {
+        text.len() <= max
+            && text
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            && text.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') || extra.contains(&c)
+            })
+            && !text.contains("..")
+    };
+    (plain(owner, &['@'], 100) && plain(report, &[], 150))
+        .then(|| format!("/ccx/service/customreport2/{tenant}/{owner}/{report}?format=json"))
+}
+
+/// The access token for one test, and the refresh token a rotating vendor
+/// issued while it was obtained.
+struct Access {
+    token: SecretValue,
+    rotated: Option<SecretValue>,
+    /// `token` is the base64 of an HTTP Basic credential, not a bearer token.
+    basic: bool,
+}
+
+/// Resolve one credential reference, or the outcome that ends the test.
+async fn resolve(
+    resolver: &dyn DynSecretResolver,
+    reference: &str,
+) -> Result<SecretValue, Outcome> {
+    resolver.resolve_dyn(reference).await.map_err(|err| {
+        Outcome::misconfigured(format!(
+            "could not resolve the connector's credential: {err}"
+        ))
+    })
+}
+
+/// Resolve the credential and obtain an access token, or the outcome that
+/// ends the test instead.
+async fn access_token(
+    request: &Request<'_>,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Result<Access, Outcome> {
+    match request.auth {
+        SaasAuth::Oauth2AuthorizationCode { client_id } => {
+            refreshed_access(request, client_id, secrets, internal_hosts, oauth).await
+        }
+        SaasAuth::Integration => integration_access(request, secrets, internal_hosts, oauth).await,
+    }
+}
+
+/// A browser sign-in: exchange the saved refresh token for an access token,
+/// the client authenticating as the vendor table says (PR #214 CI clippy:
+/// split out of [`access_token`], behaviour unchanged).
+async fn refreshed_access(
+    request: &Request<'_>,
+    client_id: &str,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Result<Access, Outcome> {
+    let client_secret = resolve(secrets.resolver, secrets.primary).await?;
+    // No refresh token means nobody has signed in: nothing is wrong
+    // with the connector, so this is `supported: false` with the
+    // reason, never a failure that would stop the client secret being
+    // saved before the first sign-in (as for `rest`, `SRC-12`).
+    let refresh_token = match secrets.secondary {
+        Some(secondary) => secrets.resolver.resolve_dyn(secondary).await.ok(),
+        None => None,
+    };
+    let Some(refresh_token) = refresh_token else {
+        return Err(Outcome::not_testable_with(
+            "Nobody has signed in to this connector yet, so the connection cannot be \
+             tested. Use Sign in on the connector page, then test again.",
+        ));
+    };
+    let started = Instant::now();
+    let form = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.expose_secret()),
+    ];
+    let tokens = match request.vendor.oauth.client_auth {
+        ClientAuth::Post => {
+            connector_oauth::token_request(
+                &request.token_url,
+                &[
+                    form[0],
+                    form[1],
+                    ("client_id", client_id),
+                    ("client_secret", client_secret.expose_secret()),
+                ],
+                internal_hosts,
+                oauth,
+            )
+            .await
+        }
+        // Slice 2 review BLOCKER 3 (`client_secret_post_json`): as `Post`, a JSON body.
+        ClientAuth::PostJson => {
+            connector_oauth::token_request_json(
+                &request.token_url,
+                &[
+                    form[0],
+                    form[1],
+                    ("client_id", client_id),
+                    ("client_secret", client_secret.expose_secret()),
+                ],
+                internal_hosts,
+                oauth,
+            )
+            .await
+        }
+        // `SRC-3` AD8: the client is in the header, not the body.
+        ClientAuth::Basic => {
+            connector_oauth::token_request_basic(
+                &request.token_url,
+                &form,
+                client_id,
+                client_secret.expose_secret(),
+                internal_hosts,
+                oauth,
+            )
+            .await
+        }
+    }
+    .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
+    // PR #216 CI g6-saas: a provider may repeat the refresh token it was given (RFC 6749 6 lets
+    // it); that is not a rotation, and storing it would rewrite a credential for nothing (and
+    // fail for an operator's `file:` secret).
+    let rotated = tokens
+        .refresh_token
+        .filter(|token| token.expose_secret() != refresh_token.expose_secret());
+    Ok(Access {
+        token: tokens.access_token,
+        rotated,
+        basic: false,
+    })
+}
+
+/// The vendor's integration credential: one token, or Zendesk's email + API
+/// token (PR #214 CI clippy: split out of [`access_token`], behaviour unchanged).
+async fn integration_access(
+    request: &Request<'_>,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Result<Access, Outcome> {
+    let fields = request
+        .vendor
+        .integration
+        .map_or(&[][..], |integration| integration.secret_fields);
+    // Slice 2 (V-Zendesk.3): Zendesk's email + API token is HTTP Basic with `<email>/token` as
+    // the user name
+    // (<https://developer.zendesk.com/api-reference/introduction/security-and-auth/>); slice 4
+    // (V-Confluence.3): Atlassian's is HTTP Basic with the email as the user name
+    // (<https://developer.atlassian.com/cloud/confluence/basic-auth-for-rest-apis/>).
+    if matches!(request.vendor.id, "zendesk" | "confluence") && fields == ["email", "apiToken"] {
+        let email = resolve(secrets.resolver, secrets.primary).await?;
+        let Some(secondary) = secrets.secondary else {
+            return Err(Outcome::misconfigured(format!(
+                "connector is misconfigured: the {} API token is not saved",
+                request.vendor.label
+            )));
+        };
+        let api_token = resolve(secrets.resolver, secondary).await?;
+        let user = if request.vendor.id == "zendesk" {
+            format!("{}/token", email.expose_secret())
+        } else {
+            email.expose_secret().to_owned()
+        };
+        let pair = format!("{user}:{}", api_token.expose_secret());
+        return Ok(Access {
+            token: SecretValue::new(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                pair,
+            )),
+            rotated: None,
+            basic: true,
+        });
+    }
+    // Slice 6 (V-Workday.3): the integration system user's name and password are HTTP Basic.
+    if request.vendor.id == "workday" && fields == ["username", "password"] {
+        let user = resolve(secrets.resolver, secrets.primary).await?;
+        let Some(secondary) = secrets.secondary else {
+            return Err(Outcome::misconfigured(format!(
+                "connector is misconfigured: the {} password is not saved",
+                request.vendor.label
+            )));
+        };
+        let password = resolve(secrets.resolver, secondary).await?;
+        let pair = format!("{}:{}", user.expose_secret(), password.expose_secret());
+        return Ok(Access {
+            token: SecretValue::new(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                pair,
+            )),
+            rotated: None,
+            basic: true,
+        });
+    }
+    // Slice 6 (`V-NetSuite.3`): the `NetSuite` client credentials are a signed assertion.
+    if request.vendor.id == "netsuite" && fields == ["clientId", "privateKey"] {
+        return certificate_access(request, secrets, internal_hosts, oauth).await;
+    }
+    // Slice 4 (V-ServiceNow.3, decision 3): ServiceNow's client credentials are exchanged for a token;
+    // slice 5 (V-SharePoint.3, V-Dynamics.3): so are Microsoft Entra's, with the row's `.default` scope.
+    if (request.vendor.id == "servicenow" || request.scope.is_some())
+        && fields == ["clientId", "clientSecret"]
+    {
+        return client_credentials_access(request, secrets, internal_hosts, oauth).await;
+    }
+    // Slice 3 review BLOCKER 10 (decision 3): Google's service-account key is exchanged for a token.
+    if request.vendor.id == "ga4" && fields == ["serviceAccountJson"] {
+        return service_account_access(request, secrets, internal_hosts, oauth).await;
+    }
+    if fields != ["token"] {
+        return Err(Outcome::not_testable_with(format!(
+            "This build cannot test {}'s integration credential from the console yet. \
+             A load reports whether the connection worked.",
+            request.vendor.label
+        )));
+    }
+    Ok(Access {
+        token: resolve(secrets.resolver, secrets.primary).await?,
+        rotated: None,
+        basic: false,
+    })
+}
+
+/// The client-credentials grant of `ServiceNow`
+/// (<https://www.servicenow.com/docs/r/platform-security/authentication/client-credentials-grant-workflow.html>),
+/// `SharePoint` and `Dynamics 365` (Microsoft Entra,
+/// <https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow>):
+/// the client id and secret are resolved only now (after the address check) and sent in the
+/// form body of the token request, the address being the vendor table's for this account (for
+/// Entra it holds the validated tenant), with the row's `scope` when it has one.
+async fn client_credentials_access(
+    request: &Request<'_>,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Result<Access, Outcome> {
+    let client_id = resolve(secrets.resolver, secrets.primary).await?;
+    let Some(secondary) = secrets.secondary else {
+        return Err(Outcome::misconfigured(format!(
+            "connector is misconfigured: the {} client secret is not saved",
+            request.vendor.label
+        )));
+    };
+    let client_secret = resolve(secrets.resolver, secondary).await?;
+    let started = Instant::now();
+    let mut form = vec![
+        ("grant_type", "client_credentials"),
+        ("client_id", client_id.expose_secret()),
+        ("client_secret", client_secret.expose_secret()),
+    ];
+    if let Some(scope) = request.scope.as_deref() {
+        form.push(("scope", scope));
+    }
+    let tokens = connector_oauth::token_request(&request.token_url, &form, internal_hosts, oauth)
+        .await
+        .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
+    Ok(Access {
+        token: tokens.access_token,
+        rotated: None,
+        basic: false,
+    })
+}
+
+/// The claims of Google's JWT-bearer assertion
+/// (<https://developers.google.com/identity/protocols/oauth2/service-account>):
+/// `iss` the service account, `scope`, `aud` always Google's token address, `iat`, and
+/// `exp` at most one hour after `iat`.
+#[derive(serde::Serialize)]
+struct AssertionClaims<'a> {
+    iss: &'a str,
+    scope: &'a str,
+    aud: &'a str,
+    iat: u64,
+    exp: u64,
+}
+
+/// An assertion lives 50 minutes: under Google's one-hour maximum, with room for a clock
+/// that runs fast.
+const ASSERTION_SECONDS: u64 = 3000;
+
+/// `(client_email, private_key)` of a service-account key file, the key kept as a
+/// [`SecretValue`] so it is never printed. `None` for anything else.
+fn parse_service_account(file: &SecretValue) -> Option<(String, SecretValue)> {
+    let document: serde_json::Value = serde_json::from_str(file.expose_secret()).ok()?;
+    if document.get("type")?.as_str()? != "service_account" {
+        return None;
+    }
+    Some((
+        document.get("client_email")?.as_str()?.to_owned(),
+        SecretValue::new(document.get("private_key")?.as_str()?.to_owned()),
+    ))
+}
+
+/// The signed assertion (RS256, with the workspace's `jsonwebtoken`) for `vendor`'s first
+/// scope, addressed to the vendor table's token address and never to anything in the key
+/// file. `None` when the key is not an RSA private key or the clock is unreadable.
+fn sign_assertion(
+    vendor: &SaasVendor,
+    email: &str,
+    key: &SecretValue,
+    now: u64,
+) -> Option<SecretValue> {
+    let claims = AssertionClaims {
+        iss: email,
+        scope: vendor.oauth.scopes.first()?,
+        aud: vendor.oauth.token_url,
+        iat: now,
+        exp: now + ASSERTION_SECONDS,
+    };
+    let encoding = jsonwebtoken::EncodingKey::from_rsa_pem(key.expose_secret().as_bytes()).ok()?;
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    jsonwebtoken::encode(&header, &claims, &encoding)
+        .ok()
+        .map(SecretValue::new)
+}
+
+/// Google's service-account key (slice 3 review BLOCKER 10, decision 3): the key file is
+/// resolved only now (after the address check), signed into an RS256 assertion and
+/// exchanged at the token address with `grant_type=...:jwt-bearer` for a bearer token.
+/// A key file that is not one, or a key that cannot sign, is a fixed misconfiguration
+/// message that quotes nothing of the file.
+async fn service_account_access(
+    request: &Request<'_>,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Result<Access, Outcome> {
+    let file = resolve(secrets.resolver, secrets.primary).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let assertion = parse_service_account(&file)
+        .and_then(|(email, key)| sign_assertion(request.vendor, &email, &key, now))
+        .ok_or_else(|| {
+            Outcome::misconfigured(
+                "connector is misconfigured: the Google service-account key is not a valid key file",
+            )
+        })?;
+    let started = Instant::now();
+    let form = [
+        ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+        ("assertion", assertion.expose_secret()),
+    ];
+    let tokens = connector_oauth::token_request(&request.token_url, &form, internal_hosts, oauth)
+        .await
+        .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
+    Ok(Access {
+        token: tokens.access_token,
+        rotated: None,
+        basic: false,
+    })
+}
+
+/// The claims of `NetSuite`'s client-credentials assertion
+/// (<https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_0312092247.html>):
+/// `iss` the integration's client id, `scope`, `aud` the token address of the account, `iat`, `exp`.
+#[derive(serde::Serialize)]
+struct CertificateClaims<'a> {
+    iss: &'a str,
+    scope: &'a str,
+    aud: &'a str,
+    iat: u64,
+    exp: u64,
+}
+
+/// The assertion `NetSuite` exchanges for a token: signed with the certificate's private key,
+/// `PS256` for an RSA key and `ES256` for an elliptic-curve key (`NetSuite` does not take `RS256`;
+/// its page shows `PS256` and says the choice follows the certificate and hash), with the
+/// certificate id in the `kid` header. `None` when the key is neither, or cannot sign.
+fn sign_certificate_assertion(
+    request: &Request<'_>,
+    client_id: &str,
+    certificate_id: &str,
+    key: &SecretValue,
+    now: u64,
+) -> Option<SecretValue> {
+    let claims = CertificateClaims {
+        iss: client_id,
+        scope: request.vendor.oauth.scopes.first()?,
+        aud: &request.audience,
+        iat: now,
+        exp: now + ASSERTION_SECONDS,
+    };
+    let pem = key.expose_secret().as_bytes();
+    let (algorithm, encoding) = if let Ok(rsa) = jsonwebtoken::EncodingKey::from_rsa_pem(pem) {
+        (jsonwebtoken::Algorithm::PS256, rsa)
+    } else {
+        (
+            jsonwebtoken::Algorithm::ES256,
+            jsonwebtoken::EncodingKey::from_ec_pem(pem).ok()?,
+        )
+    };
+    let mut header = jsonwebtoken::Header::new(algorithm);
+    header.kid = Some(certificate_id.to_owned());
+    jsonwebtoken::encode(&header, &claims, &encoding)
+        .ok()
+        .map(SecretValue::new)
+}
+
+/// `NetSuite`'s client credentials with a certificate (slice 6, `V-NetSuite.3`, decision 3): the
+/// client id and the private key are resolved only now (after the address check), the key is
+/// signed into an assertion and exchanged at the token address for a bearer token. A missing
+/// certificate id, or a key that cannot sign, is a fixed misconfiguration message that quotes
+/// nothing of the key.
+async fn certificate_access(
+    request: &Request<'_>,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Result<Access, Outcome> {
+    let Some(certificate_id) = request.certificate_id else {
+        return Err(Outcome::misconfigured(
+            "connector is misconfigured: the NetSuite certificate id is not set",
+        ));
+    };
+    let client_id = resolve(secrets.resolver, secrets.primary).await?;
+    let Some(secondary) = secrets.secondary else {
+        return Err(Outcome::misconfigured(
+            "connector is misconfigured: the NetSuite private key is not saved",
+        ));
+    };
+    let key = resolve(secrets.resolver, secondary).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let assertion = sign_certificate_assertion(
+        request,
+        client_id.expose_secret(),
+        certificate_id,
+        &key,
+        now,
+    )
+    .ok_or_else(|| {
+        Outcome::misconfigured(
+            "connector is misconfigured: the NetSuite private key is not a usable RSA or P-256 key",
+        )
+    })?;
+    let started = Instant::now();
+    let form = [
+        ("grant_type", "client_credentials"),
+        (
+            "client_assertion_type",
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        ),
+        ("client_assertion", assertion.expose_secret()),
+    ];
+    let tokens = connector_oauth::token_request(&request.token_url, &form, internal_hosts, oauth)
+        .await
+        .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
+    Ok(Access {
+        token: tokens.access_token,
+        rotated: None,
+        basic: false,
+    })
+}
+
+/// The fixed sentence for a status the vendor answered with.
+fn rejected(label: &str, status: u16) -> String {
+    match status {
+        401 => format!("{label} refused the sign-in. Sign in again or check the credential."),
+        403 => format!(
+            "{label} accepted the sign-in but the account lacks a permission the connector needs."
+        ),
+        429 => format!("{label} limited the rate of requests. Try again later."),
+        other => format!("{label} request rejected: HTTP {other}"),
+    }
+}
+
+/// Whether `text` is a lower-case hexadecimal UUID (8-4-4-4-12), the shape of an Atlassian cloud
+/// id. The id goes into a request path, so nothing else is accepted.
+fn is_uuid(text: &str) -> bool {
+    text.len() == 36
+        && text.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                matches!(b, b'0'..=b'9' | b'a'..=b'f')
+            }
+        })
+}
+
+/// The cloud id of the site in Atlassian's `accessible-resources` answer whose address is
+/// `<account>.atlassian.net` and whose grant has a Confluence scope (the same id can also name a
+/// Jira-only grant). `None` when there is none or its id is not a UUID.
+fn site_cloud_id<'a>(sites: &'a serde_json::Value, account: &str) -> Option<&'a str> {
+    let wanted = format!("{}.atlassian.net", account.to_ascii_lowercase());
+    sites.as_array()?.iter().find_map(|site| {
+        let url = reqwest::Url::parse(site.get("url")?.as_str()?).ok()?;
+        let confluence = site
+            .get("scopes")?
+            .as_array()?
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|scope| scope.contains("confluence"));
+        let id = site.get("id")?.as_str()?;
+        (url.host_str()?.eq_ignore_ascii_case(&wanted) && confluence && is_uuid(id)).then_some(id)
+    })
+}
+
+/// The who-am-i address behind Atlassian's gateway: ask `lookup` which sites the token reaches,
+/// pick this connector's, put its id into the address. Every message is fixed text; nothing the
+/// vendor said is echoed (`AGENTS.md` principle 4).
+async fn gateway_url(
+    request: &Request<'_>,
+    lookup: &str,
+    client: &reqwest::Client,
+    access: &Access,
+) -> Result<String, Outcome> {
+    let label = request.vendor.label;
+    let started = Instant::now();
+    let get = client.get(lookup).bearer_auth(access.token.expose_secret());
+    let attempt = tokio::time::timeout(DIAL_TIMEOUT, get.send()).await;
+    let elapsed = started.elapsed();
+    let response = match attempt {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => {
+            return Err(Outcome::failure(
+                elapsed,
+                format!("{label} request failed: {}", classify_reqwest_error(&err)),
+            ));
+        }
+        Err(_) => {
+            return Err(Outcome::failure(
+                elapsed,
+                format!(
+                    "{label} request timed out after {}s",
+                    DIAL_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+    };
+    let status = response.status();
+    if status.is_redirection() {
+        return Err(Outcome::failure(
+            elapsed,
+            format!(
+                "{label} answered with a redirect (HTTP {}); connection tests do not follow \
+                 redirects",
+                status.as_u16()
+            ),
+        ));
+    }
+    if !status.is_success() {
+        return Err(Outcome::failure(elapsed, rejected(label, status.as_u16())));
+    }
+    let unreadable = || {
+        Outcome::failure(
+            elapsed,
+            format!("{label} answered in a form the connection test does not read"),
+        )
+    };
+    let bytes = tokio::time::timeout(DIAL_TIMEOUT, response.bytes())
+        .await
+        .map_err(|_| unreadable())?
+        .map_err(|_| unreadable())?;
+    let sites: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| unreadable())?;
+    let cloud_id = site_cloud_id(&sites, request.account).ok_or_else(|| {
+        Outcome::failure(
+            elapsed,
+            format!("{label} signed in, but the account reaches no {label} site by this connector's name."),
+        )
+    })?;
+    Ok(request.url.replace(CLOUD_ID_PLACEHOLDER, cloud_id))
+}
+
+/// Run the test for `request`. Split from [`probe_saas_info`] so a test can
+/// point the vendor's address at a local server.
+async fn probe_saas_at(
+    request: &Request<'_>,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Outcome {
+    let label = request.vendor.label;
+    let Some((host, port)) = parse_endpoint_host_port(&request.url) else {
+        return Outcome::misconfigured("connector is misconfigured: its address is not valid");
+    };
+    let approved = match resolve_checked(host, port, internal_hosts).await {
+        Ok(approved) => approved,
+        Err(message) => return Outcome::misconfigured(message),
+    };
+    let client = match pinned_http_client(&request.url, host, port, &approved) {
+        Ok(client) => client,
+        Err(message) => return Outcome::misconfigured(message),
+    };
+    // Only now are credentials read (AGENTS.md, `SEC-15`).
+    let access = match access_token(request, secrets, internal_hosts, oauth).await {
+        Ok(access) => access,
+        Err(outcome) => return outcome,
+    };
+    // Slice 4 review BLOCKER 13: the gateway address of a browser sign-in needs the signed-in
+    // site's id, read from the vendor's list of accessible sites with the same pinned client
+    // (the same fixed host as the who-am-i request).
+    let url = match &request.lookup_url {
+        Some(lookup) => match gateway_url(request, lookup, &client, &access).await {
+            Ok(url) => url,
+            Err(mut outcome) => {
+                outcome.rotated_refresh_token = access.rotated;
+                return outcome;
+            }
+        },
+        None => request.url.clone(),
+    };
+    let started = Instant::now();
+    let get = client.get(&url);
+    let get = if access.basic {
+        get.header(
+            reqwest::header::AUTHORIZATION,
+            format!("Basic {}", access.token.expose_secret()),
+        )
+    } else {
+        get.bearer_auth(access.token.expose_secret())
+    };
+    let attempt = tokio::time::timeout(request.wait, get.send()).await;
+    let elapsed = started.elapsed();
+    let mut outcome = match attempt {
+        // A redirect is reported, never followed; the `Location` is the
+        // vendor's text and may name an address.
+        Ok(Ok(response)) if response.status().is_redirection() => Outcome::failure(
+            elapsed,
+            format!(
+                "{label} answered with a redirect (HTTP {}); connection tests do not follow \
+                 redirects",
+                response.status().as_u16()
+            ),
+        ),
+        Ok(Ok(response)) if response.status().is_success() => Outcome::success(
+            elapsed,
+            format!("Connected to {label} account {}.", request.account),
+        ),
+        Ok(Ok(response)) => Outcome::failure(elapsed, rejected(label, response.status().as_u16())),
+        Ok(Err(err)) => Outcome::failure(
+            elapsed,
+            format!("{label} request failed: {}", classify_reqwest_error(&err)),
+        ),
+        Err(_) => Outcome::failure(
+            elapsed,
+            format!(
+                "{label} request timed out after {}s",
+                request.wait.as_secs()
+            ),
+        ),
+    };
+    // A vendor that rotated the refresh token has retired the old one:
+    // hand the new one back whatever the request answered.
+    outcome.rotated_refresh_token = access.rotated;
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use lakehouse_core::secret::EnvSecretResolver;
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    /// A resolver that panics when asked for anything: proves an address
+    /// refusal happens before any credential is read.
+    #[derive(Debug)]
+    struct PanicIfCalledResolver;
+
+    #[async_trait::async_trait]
+    impl DynSecretResolver for PanicIfCalledResolver {
+        async fn resolve_dyn(
+            &self,
+            _secret_ref: &str,
+        ) -> Result<SecretValue, lakehouse_core::secret::SecretError> {
+            panic!("a credential was resolved before the address was approved");
+        }
+    }
+
+    fn resolver() -> EnvSecretResolver {
+        let mut map = HashMap::new();
+        map.insert("SAAS_TEST_TOKEN".to_owned(), "token-value".to_owned());
+        map.insert("SAAS_TEST_SECRET".to_owned(), "client-secret".to_owned());
+        EnvSecretResolver::with_map(map)
+    }
+
+    fn request<'a>(
+        vendor: &str,
+        url: String,
+        token_url: String,
+        auth: &'a SaasAuth,
+    ) -> Request<'a> {
+        let row = saas_vendors::vendor(vendor).unwrap();
+        let parts = row.validate_account(sample_account(vendor)).unwrap();
+        Request {
+            vendor: row,
+            account: "acme",
+            url,
+            lookup_url: None,
+            token_url,
+            scope: row
+                .integration
+                .and_then(|integration| integration.scope)
+                .map(|scope| SaasVendor::render(scope, &parts)),
+            auth,
+            certificate_id: None,
+            audience: SaasVendor::render(row.oauth.token_url, &parts),
+            wait: DIAL_TIMEOUT,
+        }
+    }
+
+    /// An account in the shape each vendor's row accepts (slice 5: the Microsoft ones carry a tenant;
+    /// PR #216 CI rust test: `HubSpot`, GA4, Workday and `NetSuite` have their own forms, so every vendor is named).
+    fn sample_account(vendor: &str) -> &'static str {
+        match vendor {
+            "sharepoint" => "acme/00000000-0000-0000-0000-000000000001",
+            "dynamics365" => "acme.crm4.dynamics.com/00000000-0000-0000-0000-000000000001",
+            "hubspot" | "ga4" => "123456789",
+            "workday" => "wd2-impl-services1.workday.com/acme_tenant",
+            "netsuite" => "1234567_SB1",
+            _ => "acme",
+        }
+    }
+
+    async fn answer(status: u16) -> (MockServer, Outcome) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header("authorization", "Bearer token-value"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("vendor secret text"))
+            .mount(&server)
+            .await;
+        let resolver = resolver();
+        let auth = SaasAuth::Integration;
+        // HubSpot's integration credential is one token.
+        let outcome = probe_saas_at(
+            &request(
+                "hubspot",
+                format!("{}/who", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:SAAS_TEST_TOKEN",
+                secondary: None,
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        (server, outcome)
+    }
+
+    #[tokio::test]
+    async fn a_200_is_a_success_that_names_the_vendor_and_account() {
+        let (_server, outcome) = answer(200).await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        assert!(outcome.latency_ms.is_some());
+        assert_eq!(outcome.message, "Connected to HubSpot account acme.");
+    }
+
+    #[tokio::test]
+    async fn a_401_a_403_and_a_429_are_each_their_own_fixed_sentence() {
+        for (status, needle) in [
+            (401, "refused the sign-in"),
+            (403, "lacks a permission"),
+            (429, "limited the rate"),
+            (500, "HTTP 500"),
+        ] {
+            let (_server, outcome) = answer(status).await;
+            assert!(!outcome.ok && outcome.supported, "{status}");
+            assert!(
+                outcome.message.contains(needle),
+                "{status}: {}",
+                outcome.message
+            );
+            assert!(
+                !outcome.message.contains("vendor secret text"),
+                "the vendor's body must not be echoed: {}",
+                outcome.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_reported_and_never_followed() {
+        let target = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&target)
+            .await;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/internal", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+        let resolver = resolver();
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "hubspot",
+                format!("{}/who", origin.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:SAAS_TEST_TOKEN",
+                secondary: None,
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok && outcome.supported);
+        assert!(outcome.message.contains("redirect"), "{}", outcome.message);
+        assert!(
+            !outcome
+                .message
+                .contains(&target.address().port().to_string()),
+            "{}",
+            outcome.message
+        );
+        assert!(target.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_internal_address_is_refused_before_any_credential_is_read() {
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "hubspot",
+                "http://127.0.0.1:9/who".to_owned(),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:UNUSED",
+                secondary: None,
+                resolver: &PanicIfCalledResolver,
+            },
+            &InternalHosts::NONE,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok);
+        assert!(outcome.latency_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_connector_nobody_has_signed_in_to_is_not_testable_not_failed() {
+        let server = MockServer::start().await;
+        let resolver = resolver();
+        let auth = SaasAuth::Oauth2AuthorizationCode {
+            client_id: "app".to_owned(),
+        };
+        let outcome = probe_saas_at(
+            &request(
+                "zendesk",
+                format!("{}/who", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:SAAS_TEST_SECRET",
+                secondary: None,
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok && !outcome.supported);
+        assert!(outcome.message.contains("Nobody has signed in"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// PR #216 CI g6-saas: a refresh token the provider merely repeats is not a rotation.
+    #[tokio::test]
+    async fn a_repeated_refresh_token_is_not_handed_back_as_a_rotation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "refresh_token": "refresh-1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("S".to_owned(), "client-secret".to_owned());
+        map.insert("R".to_owned(), "refresh-1".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Oauth2AuthorizationCode {
+            client_id: "app".to_owned(),
+        };
+        let outcome = probe_saas_at(
+            &request(
+                "zendesk",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:S",
+                secondary: Some("env:R"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(outcome.rotated_refresh_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refresh_token_is_exchanged_and_its_replacement_handed_back() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "refresh_token": "refresh-2"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header("authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("S".to_owned(), "client-secret".to_owned());
+        map.insert("R".to_owned(), "refresh-1".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Oauth2AuthorizationCode {
+            client_id: "app".to_owned(),
+        };
+        let outcome = probe_saas_at(
+            &request(
+                "zendesk",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:S",
+                secondary: Some("env:R"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(
+            outcome.rotated_refresh_token.unwrap().expose_secret(),
+            "refresh-2"
+        );
+    }
+
+    /// `SRC-3` AD8: a vendor that takes the client in a Basic header (`NetSuite`)
+    /// is tested with exactly that, and the body carries no client secret.
+    #[tokio::test]
+    async fn a_basic_client_vendor_is_tested_with_the_client_in_the_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(header("authorization", "Basic YXBwOmNsaWVudC1zZWNyZXQ="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header("authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("S".to_owned(), "client-secret".to_owned());
+        map.insert("R".to_owned(), "refresh-1".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Oauth2AuthorizationCode {
+            client_id: "app".to_owned(),
+        };
+        let outcome = probe_saas_at(
+            &request(
+                "netsuite",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:S",
+                secondary: Some("env:R"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.message);
+        let body = String::from_utf8_lossy(&server.received_requests().await.unwrap()[0].body)
+            .into_owned();
+        assert!(!body.contains("client_secret"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn zendesks_email_and_api_token_are_sent_as_basic_with_email_slash_token() {
+        // `ZD_EMAIL`/`ZD_TOKEN` are placeholders; base64 of `agent@example.invalid/token:zd-token`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header(
+                "authorization",
+                "Basic YWdlbnRAZXhhbXBsZS5pbnZhbGlkL3Rva2VuOnpkLXRva2Vu",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("ZD_EMAIL".to_owned(), "agent@example.invalid".to_owned());
+        map.insert("ZD_TOKEN".to_owned(), "zd-token".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "zendesk",
+                format!("{}/who", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:ZD_EMAIL",
+                secondary: Some("env:ZD_TOKEN"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        assert!(!outcome.message.contains("zd-token"));
+    }
+
+    /// `SRC-3` slice 4: Atlassian's email + API token is Basic with the plain email as the user
+    /// (base64 of `agent@example.invalid:cf-token`).
+    #[tokio::test]
+    async fn confluences_email_and_api_token_are_sent_as_basic_with_the_plain_email() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header(
+                "authorization",
+                "Basic YWdlbnRAZXhhbXBsZS5pbnZhbGlkOmNmLXRva2Vu",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("CF_EMAIL".to_owned(), "agent@example.invalid".to_owned());
+        map.insert("CF_TOKEN".to_owned(), "cf-token".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "confluence",
+                format!("{}/who", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:CF_EMAIL",
+                secondary: Some("env:CF_TOKEN"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        assert!(!outcome.message.contains("cf-token"));
+    }
+
+    /// `SRC-3` slice 4: `ServiceNow`'s client credentials go to the token address in the form body
+    /// and the access token it returns is the bearer of the who-am-i request.
+    #[tokio::test]
+    async fn servicenows_client_credentials_are_exchanged_for_a_bearer_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "expires_in": 1800
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header("authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("SN_ID".to_owned(), "client".to_owned());
+        map.insert("SN_SECRET".to_owned(), "sn-secret".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "servicenow",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:SN_ID",
+                secondary: Some("env:SN_SECRET"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        let body = String::from_utf8_lossy(&server.received_requests().await.unwrap()[0].body)
+            .into_owned();
+        assert!(body.contains("grant_type=client_credentials"), "{body}");
+        assert!(!outcome.message.contains("sn-secret"));
+    }
+
+    /// Slice 5 (`V-SharePoint.3`, `V-Dynamics.3`, lesson of BLOCKERs 10 and 13): both signed ways of
+    /// both Microsoft vendors are tested. Client credentials: the form body carries the vendor's
+    /// `.default` scope (Entra: "of all the direct application permissions ... the ones associated
+    /// with the resource") and the token is the bearer of the who-am-i request.
+    #[tokio::test]
+    async fn microsofts_client_credentials_are_exchanged_with_the_default_scope_of_the_resource() {
+        for (vendor, scope) in [
+            ("sharepoint", "https%3A%2F%2Fgraph.microsoft.com%2F.default"),
+            (
+                "dynamics365",
+                "https%3A%2F%2Facme.crm4.dynamics.com%2F.default",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "access-1", "expires_in": 3599
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/who"))
+                .and(header("authorization", "Bearer access-1"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut map = HashMap::new();
+            map.insert("MS_ID".to_owned(), "app-id".to_owned());
+            map.insert("MS_SECRET".to_owned(), "ms-secret".to_owned());
+            let resolver = EnvSecretResolver::with_map(map);
+            let auth = SaasAuth::Integration;
+            let outcome = probe_saas_at(
+                &request(
+                    vendor,
+                    format!("{}/who", server.uri()),
+                    format!("{}/token", server.uri()),
+                    &auth,
+                ),
+                &Secrets {
+                    primary: "env:MS_ID",
+                    secondary: Some("env:MS_SECRET"),
+                    resolver: &resolver,
+                },
+                &InternalHosts::ALL,
+                OAuthSettings { allow_http: true },
+            )
+            .await;
+            assert!(
+                outcome.ok && outcome.supported,
+                "{vendor}: {}",
+                outcome.message
+            );
+            let body = String::from_utf8_lossy(&server.received_requests().await.unwrap()[0].body)
+                .into_owned();
+            assert!(body.contains("grant_type=client_credentials"), "{body}");
+            assert!(body.contains(&format!("scope={scope}")), "{vendor}: {body}");
+            assert!(!outcome.message.contains("ms-secret"));
+        }
+    }
+
+    /// The browser sign-in of both Microsoft vendors: the refresh token is exchanged at the tenant's
+    /// token address, the client secret in the body, and Entra's new refresh token is handed back.
+    #[tokio::test]
+    async fn microsofts_browser_sign_in_is_tested_by_refreshing_and_hands_back_the_new_refresh_token()
+     {
+        for vendor in ["sharepoint", "dynamics365"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "access-1", "refresh_token": "refresh-2"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/who"))
+                .and(header("authorization", "Bearer access-1"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut map = HashMap::new();
+            map.insert("S".to_owned(), "client-secret".to_owned());
+            map.insert("R".to_owned(), "refresh-1".to_owned());
+            let resolver = EnvSecretResolver::with_map(map);
+            let auth = SaasAuth::Oauth2AuthorizationCode {
+                client_id: "app".to_owned(),
+            };
+            let outcome = probe_saas_at(
+                &request(
+                    vendor,
+                    format!("{}/who", server.uri()),
+                    format!("{}/token", server.uri()),
+                    &auth,
+                ),
+                &Secrets {
+                    primary: "env:S",
+                    secondary: Some("env:R"),
+                    resolver: &resolver,
+                },
+                &InternalHosts::ALL,
+                OAuthSettings { allow_http: true },
+            )
+            .await;
+            assert!(
+                outcome.ok && outcome.supported,
+                "{vendor}: {}",
+                outcome.message
+            );
+            assert_eq!(
+                outcome
+                    .rotated_refresh_token
+                    .as_ref()
+                    .map(SecretValue::expose_secret),
+                Some("refresh-2")
+            );
+            let body = String::from_utf8_lossy(&server.received_requests().await.unwrap()[0].body)
+                .into_owned();
+            assert!(body.contains("grant_type=refresh_token"), "{body}");
+            assert!(body.contains("client_id=app"), "{body}");
+            assert!(!body.contains("scope="), "{body}");
+        }
+    }
+
+    /// Entra's refusal of a client secret is the fixed sign-in message, none of Microsoft's words.
+    #[tokio::test]
+    async fn a_refused_microsoft_client_secret_is_a_fixed_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "invalid_client", "error_description": "AADSTS7000215 vendor secret text"
+            })))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("MS_ID".to_owned(), "app-id".to_owned());
+        map.insert("MS_SECRET".to_owned(), "ms-secret".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "sharepoint",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:MS_ID",
+                secondary: Some("env:MS_SECRET"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert!(
+            !outcome.message.contains("vendor secret text")
+                && !outcome.message.contains("AADSTS")
+                && !outcome.message.contains("ms-secret"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    const CLOUD: &str = "0f1e2d3c-4b5a-4968-8776-655443322110";
+
+    /// Slice 4 review BLOCKER 13: the browser token is exchanged, the site list is read, this
+    /// connector's site picked (not another site, not a Jira-only grant), and the who-am-i
+    /// request goes to the gateway address with that id.
+    async fn confluence_browser(
+        sites: serde_json::Value,
+        who_status: u16,
+    ) -> (MockServer, Outcome) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "refresh_token": "refresh-2"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/oauth/token/accessible-resources"))
+            .and(header("authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sites))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/ex/confluence/{CLOUD}/wiki/api/v2/spaces")))
+            .and(header("authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(who_status).set_body_string("vendor secret text"))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("S".to_owned(), "client-secret".to_owned());
+        map.insert("R".to_owned(), "refresh-1".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Oauth2AuthorizationCode {
+            client_id: "app".to_owned(),
+        };
+        let mut req = request(
+            "confluence",
+            format!(
+                "{}/ex/confluence/{CLOUD_ID_PLACEHOLDER}/wiki/api/v2/spaces?limit=1",
+                server.uri()
+            ),
+            format!("{}/token", server.uri()),
+            &auth,
+        );
+        req.lookup_url = Some(format!("{}/oauth/token/accessible-resources", server.uri()));
+        let outcome = probe_saas_at(
+            &req,
+            &Secrets {
+                primary: "env:S",
+                secondary: Some("env:R"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        (server, outcome)
+    }
+
+    fn sites(scopes: &[&str], url: &str, id: &str) -> serde_json::Value {
+        serde_json::json!([
+            {"id": "ffffffff-0000-4000-8000-000000000000", "url": "https://other.atlassian.net",
+             "scopes": ["read:page:confluence"]},
+            {"id": id, "url": url, "scopes": scopes}
+        ])
+    }
+
+    #[tokio::test]
+    async fn confluences_browser_sign_in_finds_its_site_and_asks_the_gateway() {
+        let body = sites(
+            &["read:page:confluence"],
+            "https://acme.atlassian.net",
+            CLOUD,
+        );
+        let (_server, outcome) = confluence_browser(body, 200).await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        assert_eq!(outcome.message, "Connected to Confluence account acme.");
+        assert_eq!(
+            outcome.rotated_refresh_token.unwrap().expose_secret(),
+            "refresh-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn confluences_browser_sign_in_without_a_site_by_that_name_or_a_confluence_grant_fails_in_fixed_words()
+     {
+        for body in [
+            sites(
+                &["read:page:confluence"],
+                "https://nobody.atlassian.net",
+                CLOUD,
+            ),
+            sites(&["read:jira-work"], "https://acme.atlassian.net", CLOUD),
+            // an id that is not a UUID never reaches a request path
+            sites(
+                &["read:page:confluence"],
+                "https://acme.atlassian.net",
+                "../../x",
+            ),
+        ] {
+            let (server, outcome) = confluence_browser(body, 200).await;
+            assert!(!outcome.ok && outcome.supported, "{}", outcome.message);
+            assert!(
+                outcome.message.contains("no Confluence site"),
+                "{}",
+                outcome.message
+            );
+            assert!(!outcome.message.contains(".."));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                2,
+                "the token and the site list; no who-am-i request"
+            );
+            // the rotated refresh token is handed back whatever the outcome
+            assert!(outcome.rotated_refresh_token.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn confluences_gateway_answers_are_each_their_own_fixed_sentence() {
+        for (status, needle) in [
+            (401, "refused the sign-in"),
+            (403, "lacks a permission"),
+            (429, "limited the rate"),
+        ] {
+            let body = sites(
+                &["read:page:confluence"],
+                "https://acme.atlassian.net",
+                CLOUD,
+            );
+            let (_server, outcome) = confluence_browser(body, status).await;
+            assert!(!outcome.ok && outcome.supported, "{status}");
+            assert!(
+                outcome.message.contains(needle),
+                "{status}: {}",
+                outcome.message
+            );
+            assert!(!outcome.message.contains("vendor secret text"));
+        }
+    }
+
+    #[test]
+    fn a_cloud_id_is_a_lower_case_uuid_and_nothing_else() {
+        assert!(is_uuid(CLOUD));
+        for bad in [
+            "",
+            "../../x",
+            &CLOUD.to_uppercase(),
+            &format!("{CLOUD}/x"),
+            "0f1e2d3c4b5a49688776655443322110",
+        ] {
+            assert!(!is_uuid(bad), "{bad:?}");
+        }
+    }
+
+    /// The probe's refusal of an integration credential it cannot present stays as a defence, but
+    /// after slice 6 no vendor in the table reaches it: every shape the table names is one of these
+    /// (PR #216 lesson: a way the page signs must be testable by the API's connection test).
+    #[test]
+    fn every_integration_credential_shape_in_the_table_is_one_the_probe_can_present() {
+        let handled: [&[&str]; 6] = [
+            &["token"],
+            &["email", "apiToken"],
+            &["clientId", "clientSecret"],
+            &["serviceAccountJson"],
+            &["username", "password"],
+            &["clientId", "privateKey"],
+        ];
+        for vendor in saas_vendors::SAAS_VENDORS {
+            if let Some(integration) = vendor.integration {
+                assert!(
+                    handled.contains(&integration.secret_fields),
+                    "{}: {:?} has no arm in integration_access",
+                    vendor.id,
+                    integration.secret_fields
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_vendor_without_a_who_am_i_request_is_not_testable_and_reads_no_secret() {
+        let info = ConnectorDialInfo {
+            kind: "Workday Reports".to_owned(),
+            host: String::new(),
+            secret_ref: "env:UNUSED".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("saas".to_owned()),
+            dial: serde_json::json!({
+                "vendor": "workday",
+                "account": "wd2.workday.com/acme",
+                "auth": {"type": "integration"}
+            }),
+        };
+        let outcome = probe_saas_info(
+            &info,
+            &PanicIfCalledResolver,
+            &InternalHosts::NONE,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok && !outcome.supported);
+        assert!(outcome.latency_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dial_the_table_refuses_is_misconfigured_not_dialled() {
+        let info = ConnectorDialInfo {
+            kind: "Zendesk".to_owned(),
+            host: String::new(),
+            secret_ref: "env:UNUSED".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("saas".to_owned()),
+            dial: serde_json::json!({
+                "vendor": "zendesk",
+                "account": "evil.example.invalid",
+                "auth": {"type": "integration"}
+            }),
+        };
+        let outcome = probe_saas_info(
+            &info,
+            &PanicIfCalledResolver,
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok);
+        assert!(outcome.supported);
+        assert!(outcome.latency_ms.is_none());
+    }
+
+    /// Slice 3 review BLOCKER 10: Google's service-account key is signed into an RS256
+    /// assertion (checked here with the public half), exchanged for a bearer token, and
+    /// that token reaches the property.
+    #[tokio::test]
+    async fn a_service_account_key_is_exchanged_for_a_token_with_a_signed_assertion() {
+        use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
+
+        let mut rng = rsa::rand_core::OsRng;
+        let private = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let private_pem = private.to_pkcs1_pem(LineEnding::LF).unwrap();
+        let public_pem = private
+            .to_public_key()
+            .to_pkcs1_pem(LineEnding::LF)
+            .unwrap();
+        let key_file = serde_json::json!({
+            "type": "service_account",
+            "client_email": "reader@example.invalid",
+            "private_key": private_pem.as_str(),
+            "token_uri": "https://evil.example.invalid/token"
+        })
+        .to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "sa-access", "expires_in": 3599, "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header("authorization", "Bearer sa-access"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("KEY".to_owned(), key_file);
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "ga4",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:KEY",
+                secondary: None,
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        let received = server.received_requests().await.unwrap();
+        let body = String::from_utf8(received[0].body.clone()).unwrap();
+        let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(
+            form["grant_type"],
+            "urn:ietf:params:oauth:grant-type:jwt-bearer"
+        );
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.set_audience(&["https://oauth2.googleapis.com/token"]);
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(
+            &form["assertion"],
+            &jsonwebtoken::DecodingKey::from_rsa_pem(public_pem.as_bytes()).unwrap(),
+            &validation,
+        )
+        .expect("the assertion verifies against the public half");
+        assert_eq!(decoded.claims["iss"], "reader@example.invalid");
+        assert_eq!(
+            decoded.claims["scope"],
+            "https://www.googleapis.com/auth/analytics.readonly"
+        );
+        let span =
+            decoded.claims["exp"].as_u64().unwrap() - decoded.claims["iat"].as_u64().unwrap();
+        assert!(span <= 3600, "Google: at most one hour after iat");
+        assert!(
+            !outcome.message.contains("evil.example"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    /// A key file that is not one is a fixed message that quotes nothing, and no request goes out.
+    #[tokio::test]
+    async fn a_service_account_key_that_is_not_one_is_a_fixed_misconfiguration() {
+        let server = MockServer::start().await;
+        let mut map = HashMap::new();
+        map.insert(
+            "KEY".to_owned(),
+            "not a key file, secret-looking-text".to_owned(),
+        );
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "ga4",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:KEY",
+                secondary: None,
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert!(outcome.message.contains("not a valid key file"));
+        assert!(!outcome.message.contains("secret-looking-text"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Slice 6 (V-Workday.3): the integration user's name and password are HTTP Basic, and the
+    /// test runs the connector's first report (base64 of `isu_gate@acme_tenant:wd-password`).
+    #[tokio::test]
+    async fn workdays_integration_user_is_basic_and_the_test_runs_the_named_report() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/ccx/service/customreport2/acme_tenant/owner/Headcount",
+            ))
+            .and(query_param("format", "json"))
+            .and(header(
+                "authorization",
+                "Basic aXN1X2dhdGVAYWNtZV90ZW5hbnQ6d2QtcGFzc3dvcmQ=",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("vendor secret text"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("WD_USER".to_owned(), "isu_gate@acme_tenant".to_owned());
+        map.insert("WD_PASSWORD".to_owned(), "wd-password".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let path = workday_report_path(&["owner/Headcount".to_owned()], "acme_tenant").unwrap();
+        let outcome = probe_saas_at(
+            &request(
+                "workday",
+                format!("{}{path}", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:WD_USER",
+                secondary: Some("env:WD_PASSWORD"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        assert!(!outcome.message.contains("vendor secret text"));
+        assert!(!outcome.message.contains("wd-password"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_workday_user_is_a_fixed_sentence() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("vendor secret text"))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("WD_USER".to_owned(), "isu".to_owned());
+        map.insert("WD_PASSWORD".to_owned(), "bad".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "workday",
+                format!("{}/r?format=json", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:WD_USER",
+                secondary: Some("env:WD_PASSWORD"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok && outcome.supported);
+        assert!(
+            outcome.message.contains("refused the sign-in"),
+            "{}",
+            outcome.message
+        );
+        assert!(!outcome.message.contains("vendor secret text"));
+    }
+
+    #[test]
+    fn workdays_who_am_i_is_the_first_report_and_only_a_plain_one() {
+        let tenant = "acme_tenant";
+        assert_eq!(
+            workday_report_path(&["a.b@x/My_Report-1".to_owned(), "z/z".to_owned()], tenant),
+            Some("/ccx/service/customreport2/acme_tenant/a.b@x/My_Report-1?format=json".to_owned())
+        );
+        for bad in [
+            "",
+            "Report",
+            "/Report",
+            "owner/",
+            "owner/../x",
+            "owner/a/b",
+            "o wner/Report",
+            "owner/Report name",
+            "owner/Report?x=1",
+            "owner/%2e%2e",
+            "../owner/Report",
+            "owner/@x",
+        ] {
+            assert_eq!(
+                workday_report_path(&[bad.to_owned()], tenant),
+                None,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(workday_report_path(&[], tenant), None);
+        assert_eq!(
+            workday_report_path(&[format!("owner/{}", "a".repeat(151))], tenant),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn workday_without_a_named_report_is_not_testable_and_reads_no_secret() {
+        let info = |objects: serde_json::Value| ConnectorDialInfo {
+            kind: "Workday Reports".to_owned(),
+            host: String::new(),
+            secret_ref: "env:UNUSED".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("saas".to_owned()),
+            dial: serde_json::json!({
+                "vendor": "workday",
+                "account": "wd2.workday.com/acme",
+                "objects": objects,
+                "auth": {"type": "integration"}
+            }),
+        };
+        // No report named: nothing is sent and no secret is read.
+        let outcome = probe_saas_info(
+            &info(serde_json::json!([])),
+            &PanicIfCalledResolver,
+            &InternalHosts::NONE,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok && !outcome.supported);
+        assert!(
+            outcome.message.contains("Name a report"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    /// Slice 6 (`V-NetSuite.3`, decision 3): the `NetSuite` key is signed into a `PS256` assertion with
+    /// the certificate id as `kid` (checked here with the public half), exchanged for a bearer
+    /// token, and that token reaches the account.
+    #[tokio::test]
+    async fn netsuites_certificate_is_exchanged_for_a_token_with_a_ps256_assertion() {
+        use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
+
+        let mut rng = rsa::rand_core::OsRng;
+        let private = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let private_pem = private.to_pkcs1_pem(LineEnding::LF).unwrap();
+        let public_pem = private
+            .to_public_key()
+            .to_pkcs1_pem(LineEnding::LF)
+            .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "ns-access", "expires_in": 3600, "token_type": "bearer"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header("authorization", "Bearer ns-access"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("NS_CLIENT".to_owned(), "ns-client-id".to_owned());
+        map.insert("NS_KEY".to_owned(), private_pem.to_string());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let mut asked = request(
+            "netsuite",
+            format!("{}/who", server.uri()),
+            format!("{}/token", server.uri()),
+            &auth,
+        );
+        asked.certificate_id = Some("cert-1");
+        let outcome = probe_saas_at(
+            &asked,
+            &Secrets {
+                primary: "env:NS_CLIENT",
+                secondary: Some("env:NS_KEY"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        let received = server.received_requests().await.unwrap();
+        let body = String::from_utf8(received[0].body.clone()).unwrap();
+        let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(form["grant_type"], "client_credentials");
+        assert_eq!(
+            form["client_assertion_type"],
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+        );
+        let assertion = &form["client_assertion"];
+        let header = jsonwebtoken::decode_header(assertion).unwrap();
+        assert_eq!(header.alg, jsonwebtoken::Algorithm::PS256);
+        assert_eq!(header.kid.as_deref(), Some("cert-1"));
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::PS256);
+        validation.set_audience(&[
+            "https://1234567-sb1.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token",
+        ]);
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(
+            assertion,
+            &jsonwebtoken::DecodingKey::from_rsa_pem(public_pem.as_bytes()).unwrap(),
+            &validation,
+        )
+        .expect("the assertion verifies against the public half, with the account's own audience");
+        assert_eq!(decoded.claims["iss"], "ns-client-id");
+        assert_eq!(decoded.claims["scope"], "rest_webservices");
+        let span =
+            decoded.claims["exp"].as_u64().unwrap() - decoded.claims["iat"].as_u64().unwrap();
+        assert!(span <= 3600);
+        assert!(!outcome.message.contains("ns-client-id"));
+    }
+
+    /// A certificate id that was never set, or a key that is not one, is a fixed message that
+    /// quotes nothing, and nothing is sent to the token address.
+    #[tokio::test]
+    async fn a_netsuite_credential_without_a_certificate_id_or_a_usable_key_is_misconfigured() {
+        let server = MockServer::start().await;
+        let mut map = HashMap::new();
+        map.insert("NS_CLIENT".to_owned(), "ns-client-id".to_owned());
+        map.insert(
+            "NS_KEY".to_owned(),
+            "not a key, secret-looking-text".to_owned(),
+        );
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        for certificate_id in [None, Some("cert-1")] {
+            let mut asked = request(
+                "netsuite",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            );
+            asked.certificate_id = certificate_id;
+            let outcome = probe_saas_at(
+                &asked,
+                &Secrets {
+                    primary: "env:NS_CLIENT",
+                    secondary: Some("env:NS_KEY"),
+                    resolver: &resolver,
+                },
+                &InternalHosts::ALL,
+                OAuthSettings { allow_http: true },
+            )
+            .await;
+            assert!(!outcome.ok, "{}", outcome.message);
+            assert!(!outcome.message.contains("secret-looking-text"));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+}

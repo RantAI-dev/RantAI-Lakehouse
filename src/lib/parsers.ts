@@ -8,6 +8,14 @@ import type {
   ExtendedColumnSort,
 } from "@/types/data-table";
 
+// SEC-47 review round 3, BLOCKER 2: Zod probes for JIT support with a caught
+// `new Function("")` the first time a schema parses; under this console's
+// `script-src` (no `'unsafe-eval'`) the browser files that caught probe as a
+// `securitypolicyviolation` on every page load. Zod's own note says to skip it
+// under `jitless` (node_modules/zod/v4/core/util.js:219). Set once, here at
+// module load, before any schema is parsed.
+z.config({ jitless: true });
+
 const sortingItemSchema = z.object({
   id: z.string(),
   desc: z.boolean(),

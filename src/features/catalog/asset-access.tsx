@@ -2,11 +2,11 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Check, Minus, Plus, Tag, Trash2 } from "lucide-react"
-import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
+import { Check, Minus, Plus, XIcon } from "lucide-react"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
-import { ClassificationBadge, Pill } from "@/components/patterns/status-badge"
+import { Pill } from "@/components/patterns/status-badge"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -18,22 +18,19 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Label } from "@/components/ui/label"
 import { RequiredLegend } from "@/components/patterns/required-legend"
 import { RequiredMarker } from "@/components/ui/required"
 import { useAuth } from "@/features/auth/auth-provider"
 import { PolicyActions } from "@/features/governance/policy-actions"
-import { useServiceAction } from "@/hooks/use-service"
-import { notifyError, notifySuccess } from "@/lib/notify"
-import { CLASSIFICATION_LABEL, type Classification } from "@/lib/status"
-import { governanceService } from "@/services"
+import { useService, useServiceAction } from "@/hooks/use-service"
+import { notifySuccess } from "@/lib/notify"
+import { governanceService, identityService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
-import type {
-  CreateClassificationRuleInput,
-  CreatePolicyInput,
-} from "@/services/contracts/governance"
-import { classificationTitle } from "./asset-badges"
-import { lineageKey } from "./asset-lineage"
+import type { CreatePolicyInput } from "@/services/contracts/governance"
+import { AssetGrants } from "./asset-grants"
+import { policyCondition, policyTable, roleNames, type PolicyForm } from "./asset-policy"
 
 type PolicySummary = AssetDetail["policySummary"][number]
 
@@ -96,236 +93,6 @@ function YourAccess({ asset: a }: { asset: AssetDetail }) {
   )
 }
 
-const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
-
-/** Least to most restrictive. */
-const LEVELS: Classification[] = ["public", "internal", "confidential", "restricted"]
-
-/**
- * Classifies the asset, or one of its columns, by adding a classification
- * rule for its table key. The newest rule wins, so this is also how a
- * wrong classification is corrected.
- */
-function ClassifyDialog({
-  asset: a,
-  onClose,
-  onSaved,
-}: {
-  asset: AssetDetail
-  onClose: () => void
-  onSaved: () => void
-}) {
-  // "" is the asset as a whole.
-  const [column, setColumn] = React.useState("")
-  const [level, setLevel] = React.useState<Classification>(a.classification)
-  const save = useServiceAction((signal, input: CreateClassificationRuleInput) =>
-    governanceService.createClassificationRule(input, signal)
-  )
-
-  async function submit() {
-    const saved = await save.run({
-      asset: lineageKey(a),
-      ...(column ? { column } : {}),
-      classification: level,
-    })
-    if (saved === null) return
-    notifySuccess("Classification saved")
-    onSaved()
-  }
-
-  return (
-    <Dialog open onOpenChange={(next) => (next ? undefined : onClose())}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Classify</DialogTitle>
-          <DialogDescription>
-            How sensitive {a.name} is. An asset is never less restrictive than its most
-            restrictive column.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="grid gap-3">
-          <div className="grid gap-1.5">
-            <Label htmlFor="classify-target">Applies to</Label>
-            <select
-              id="classify-target"
-              className={selectClassName}
-              value={column}
-              onChange={(e) => setColumn(e.target.value)}
-            >
-              <option value="">The whole asset</option>
-              {a.schema.map((c) => (
-                <option key={c.name} value={c.name}>
-                  Column {c.name}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="grid gap-1.5">
-            <Label htmlFor="classify-level">Classification</Label>
-            <select
-              id="classify-level"
-              className={selectClassName}
-              value={level}
-              onChange={(e) => setLevel(e.target.value as Classification)}
-            >
-              {LEVELS.map((l) => (
-                <option key={l} value={l}>
-                  {CLASSIFICATION_LABEL[l]}
-                </option>
-              ))}
-            </select>
-          </div>
-          {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}
-        </div>
-        <DialogFooter>
-          <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
-          <Button size="sm" onClick={() => void submit()} disabled={save.status === "pending"}>
-            {save.status === "pending" ? "Saving…" : "Save"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-type ClassificationRuleInForce = NonNullable<AssetDetail["classificationRules"]>[number]
-
-/**
- * How sensitive the asset and its columns are, and on whose word. A
- * classification is a rule, and the rule in force can be removed — which
- * is the way to take one back, where adding a newer rule only overrides.
- */
-function ClassificationCard({ asset: a, onChanged }: { asset: AssetDetail; onChanged: () => void }) {
-  const { hasPermission } = useAuth()
-  const [classifying, setClassifying] = React.useState(false)
-  const [removing, setRemoving] = React.useState<ClassificationRuleInForce | null>(null)
-  const remove = useServiceAction((signal, id: string) =>
-    governanceService.deleteClassificationRule(id, signal)
-  )
-  const columns = a.schema.filter((c) => c.classification)
-  const rules = a.classificationRules ?? []
-  const canRemove = hasPermission("governance:write")
-  const ruleOf = (column?: string) => rules.find((r) => r.column === column)
-  const removeButton = (rule: ClassificationRuleInForce | undefined, what: string) =>
-    rule && canRemove ? (
-      <Button
-        size="icon-sm"
-        variant="ghost"
-        aria-label={`Remove the classification of ${what}`}
-        onClick={() => setRemoving(rule)}
-      >
-        <Trash2 />
-      </Button>
-    ) : null
-
-  async function confirmRemove() {
-    if (!removing) return
-    // `run` resolves to `null` only on failure.
-    if ((await remove.run(removing.id)) === null) {
-      notifyError("Failed to remove the classification", remove.error)
-      return
-    }
-    notifySuccess("Classification removed")
-    setRemoving(null)
-    onChanged()
-  }
-
-  return (
-    <SectionCard
-      size="sm"
-      title="Classification"
-      description={classificationTitle(a)}
-      action={
-        // SEC-23 (F4): adding a classification rule needs governance:write,
-        // the same grant as removing one (`canRemove`).
-        canRemove ? (
-          <Button size="sm" variant="outline" onClick={() => setClassifying(true)}>
-            <Tag />
-            Classify
-          </Button>
-        ) : null
-      }
-    >
-      <ul className="divide-y divide-border text-sm">
-        <li className="flex items-center gap-2 py-1.5">
-          <span>This asset</span>
-          <span className="ml-auto flex items-center gap-1">
-            <ClassificationBadge classification={a.classification} />
-            {removeButton(ruleOf(undefined), "this asset")}
-          </span>
-        </li>
-        {columns.map((c) => (
-          <li key={c.name} className="flex items-center gap-2 py-1.5">
-            <span className="font-mono text-xs">{c.name}</span>
-            <span className="text-xs text-muted-foreground">column</span>
-            <span className="ml-auto flex items-center gap-1">
-              {c.classification ? <ClassificationBadge classification={c.classification} /> : null}
-              {removeButton(ruleOf(c.name), `column ${c.name}`)}
-            </span>
-          </li>
-        ))}
-      </ul>
-      <ConfirmActionDialog
-        open={removing !== null}
-        onOpenChange={(open) => (open ? undefined : setRemoving(null))}
-        title="Remove classification"
-        description={`Remove the ${
-          removing ? CLASSIFICATION_LABEL[removing.classification] : ""
-        } classification of ${removing?.column ? `column ${removing.column}` : "this asset"}?`}
-        impact="An older rule for it applies again if there is one. Otherwise it goes back to the default level, Internal."
-        confirmLabel="Remove"
-        confirming={remove.status === "pending"}
-        destructive
-        onConfirm={() => void confirmRemove()}
-      />
-      {columns.length === 0 ? (
-        <p className="mt-2 text-xs text-muted-foreground">No column is classified on its own.</p>
-      ) : null}
-      {classifying ? (
-        <ClassifyDialog
-          asset={a}
-          onClose={() => setClassifying(false)}
-          onSaved={() => {
-            setClassifying(false)
-            onChanged()
-          }}
-        />
-      ) : null}
-    </SectionCard>
-  )
-}
-
-/**
- * The table a policy must bind to govern this asset's rows: the one its
- * reads actually go to (`queryTarget` — a Bronze dataset with a Silver
- * model is read from Silver), named the way policies name tables.
- */
-export function policyTable(a: AssetDetail): string {
-  if (a.queryTarget?.policyTable) return a.queryTarget.policyTable
-  const target = a.queryTarget?.table
-  if (!target) return lineageKey(a)
-  // An API build older than `policyTable`: icecat_api.`bronze.orders` and
-  // silver.`orders` both end in zone.table.
-  return target.replace(/`/g, "").split(".").slice(-2).join(".")
-}
-
-type PolicyForm = { roles: string; mask: string[]; rowFilter: string }
-
-/**
- * The enforceable condition (`policy_engine::PolicyCondition`) the form
- * describes, or `null` while it describes none: a policy needs a role,
- * and at least one thing to do — a column to mask or a row filter.
- */
-export function policyCondition(table: string, f: PolicyForm) {
-  const roles = f.roles
-    .split(",")
-    .map((r) => r.trim())
-    .filter((r) => r.length > 0)
-  const rowFilter = f.rowFilter.trim()
-  if (roles.length === 0 || (f.mask.length === 0 && rowFilter === "")) return null
-  return { roles, table, mask: f.mask, ...(rowFilter ? { rowFilter } : {}) }
-}
-
 /**
  * Adds a masking / row-filter policy for this asset's table without
  * leaving the page: the roles it applies to, the columns they see as
@@ -348,6 +115,35 @@ function AddPolicyDialog({
     governanceService.createPolicy(input, signal)
   )
   const condition = policyCondition(table, form)
+  // WEB-8 D8: the roles are the ones the deployment has, from
+  // `identityService.listRoles`. Without that read the field stays the free
+  // text it was, with the reason, rather than an empty list of checkboxes.
+  const rolesState = useService((signal) => identityService.listRoles(signal), [])
+  const roles = rolesState.status === "success" ? rolesState.data : null
+  // WEB-8 S2 T8 (D8): the row filter grammar comes from the server's own
+  // validator constants (functions, operators and, since S2 review round 1 S2,
+  // forms). While it loads, or when the read fails, there is no help line at
+  // all — a guessed or stale list would invite a save the server refuses.
+  const grammarState = useService((signal) => governanceService.getRowFilterGrammar(signal), [])
+  const grammar = grammarState.status === "success" ? grammarState.data : null
+  const chosenRoles = roleNames(form.roles)
+  // WEB-8 S2 review round 1, S1: a saved role the deployment no longer has
+  // must not be invisible. It stays in `form.roles` (and so in the saved
+  // `subjects`) until the person removes it, shown as a removable "Not
+  // recognised" chip the way `permission-picker.tsx` shows an unknown
+  // permission token.
+  const knownRoleNames = roles?.map((role) => role.name) ?? []
+  const unknownRoles = chosenRoles.filter((name) => !knownRoleNames.includes(name))
+
+  function toggleRole(roleName: string) {
+    setForm((f) => {
+      const current = roleNames(f.roles)
+      const next = current.includes(roleName)
+        ? current.filter((r) => r !== roleName)
+        : [...current, roleName]
+      return { ...f, roles: next.join(", ") }
+    })
+  }
 
   function toggle(column: string) {
     setForm((f) => ({
@@ -385,13 +181,71 @@ function AddPolicyDialog({
           <RequiredLegend />
           <div className="grid gap-1.5">
             <Label htmlFor="policy-roles" required>Roles it applies to</Label>
-            <Input
-              id="policy-roles"
-              aria-required
-              value={form.roles}
-              onChange={(e) => setForm((f) => ({ ...f, roles: e.target.value }))}
-              placeholder="Analyst, Dashboard Viewer"
-            />
+            {roles === null ? (
+              <>
+                <Input
+                  id="policy-roles"
+                  aria-required
+                  value={form.roles}
+                  onChange={(e) => setForm((f) => ({ ...f, roles: e.target.value }))}
+                  placeholder="Analyst, Dashboard Viewer"
+                />
+                {rolesState.status === "error" ? (
+                  <p className="text-xs text-muted-foreground">
+                    Could not read the roles; type them as a comma-separated list.
+                  </p>
+                ) : null}
+              </>
+            ) : roles.length === 0 ? (
+              <p className="text-xs text-muted-foreground">No roles defined</p>
+            ) : (
+              <ul className="grid max-h-40 gap-1 overflow-y-auto rounded-md border border-border p-1">
+                {roles.map((role) => (
+                  <li key={role.id} className="flex items-center gap-2 px-1.5 py-1 text-sm">
+                    <Checkbox
+                      id={`policy-role-${role.id}`}
+                      checked={chosenRoles.includes(role.name)}
+                      aria-label={role.name}
+                      onCheckedChange={() => toggleRole(role.name)}
+                    />
+                    <label
+                      htmlFor={`policy-role-${role.id}`}
+                      className="flex-1 cursor-pointer truncate text-xs select-none"
+                    >
+                      {role.name}
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {roles !== null && unknownRoles.length > 0 ? (
+              <div className="space-y-1.5" data-testid="unknown-roles">
+                <Label className="text-xs font-medium text-muted-foreground">Not recognised</Label>
+                <div className="flex flex-wrap gap-1.5">
+                  {unknownRoles.map((name) => (
+                    <Badge
+                      key={name}
+                      variant="outline"
+                      className="gap-1.5 border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400 py-1 px-2 font-mono text-xs"
+                    >
+                      <span>{name}</span>
+                      <span className="text-[10px] text-muted-foreground font-sans">
+                        (Not recognised)
+                      </span>
+                      <button
+                        type="button"
+                        className="hover:text-foreground inline-flex items-center justify-center cursor-pointer"
+                        onClick={() => toggleRole(name)}
+                        aria-label={`Remove ${name}`}
+                        title={`Remove ${name}`}
+                      >
+                        <XIcon className="size-3" />
+                      </button>
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ) : null}
           </div>
           {/* UX-1-R4: `policyCondition` accepts a mask OR a row filter, so
               neither option is unconditionally required. Star the group and
@@ -419,16 +273,23 @@ function AddPolicyDialog({
                 ))}
               </div>
             </fieldset>
-            <div className="grid gap-1.5">
-              <Label htmlFor="policy-filter">Row filter</Label>
-              <Input
-                id="policy-filter"
-                value={form.rowFilter}
-                onChange={(e) => setForm((f) => ({ ...f, rowFilter: e.target.value }))}
-                placeholder="region = 'ID'"
-                className="font-mono"
-              />
-            </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="policy-filter">Row filter (optional)</Label>
+            <Input
+              id="policy-filter"
+              value={form.rowFilter}
+              onChange={(e) => setForm((f) => ({ ...f, rowFilter: e.target.value }))}
+              placeholder="region = 'ID'"
+              aria-describedby={grammar ? "policy-filter-help" : undefined}
+              className="font-mono"
+            />
+            {grammar ? (
+              <p id="policy-filter-help" className="text-xs text-muted-foreground">
+                Functions: {grammar.functions.join(", ")}. Operators:{" "}
+                {grammar.operators.join(", ")}. Forms: {grammar.forms.join(", ")}.
+              </p>
+            ) : null}
+          </div>
           </fieldset>
           <div className="grid gap-1.5">
             <Label htmlFor="policy-name" required>Name</Label>
@@ -487,7 +348,11 @@ function PolicyItem({
         {p.appliesToYou ? <Pill tone="info">Applies to you</Pill> : null}
         <span className="ml-auto text-xs text-muted-foreground">{p.effect}</span>
         <PolicyActions
-          policy={{ id: p.id, name: p.name, status: p.status ?? "draft" }}
+          // Every `policySummary` entry passed `PolicyCondition::parse_opt`
+          // in `routes::catalog_governance::summarize_policies` — a policy
+          // with no enforceable condition binds no table and is left out —
+          // so these rows are enforceable by construction.
+          policy={{ id: p.id, name: p.name, status: p.status ?? "draft", enforceable: true }}
           onChanged={onChanged}
         />
       </div>
@@ -528,16 +393,18 @@ function PolicyItem({
 }
 
 /**
- * The Access tab: what the signed-in person may do with the asset, how
- * sensitive it is, then the policies that mask its columns or filter its
- * rows, and for whom.
+ * The Access tab: what the signed-in person may do with the asset, its
+ * grants, then the policies that mask its columns or filter its rows, and
+ * for whom. How sensitive a column is, and a mask on one column, are set on
+ * the column itself in the Schema tab (`WEB-3` S3-D1, S3-D2: one place per
+ * fact); this tab keeps the policies, which may span several columns.
  */
 export function AssetAccess({
   asset: a,
   onChanged,
 }: {
   asset: AssetDetail
-  /** Reloads the asset after it was classified. */
+  /** Reloads the asset after a policy changed. */
   onChanged: () => void
 }) {
   const { hasPermission } = useAuth()
@@ -547,7 +414,7 @@ export function AssetAccess({
   return (
     <div className="flex flex-col gap-2">
       <YourAccess asset={a} />
-      <ClassificationCard asset={a} onChanged={onChanged} />
+      <AssetGrants asset={a} />
       <SectionCard
         size="sm"
         title="Policies"
@@ -562,7 +429,7 @@ export function AssetAccess({
             ) : null}
             {canOpen ? (
               <Button size="sm" variant="ghost" render={<Link href="/governance/policies" />}>
-                Open policies
+                Open access rules
               </Button>
             ) : null}
           </div>

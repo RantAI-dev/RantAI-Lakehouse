@@ -10,10 +10,6 @@ import type {
   LakehouseSnapshot,
 } from "@/services/contracts/lakehouse"
 
-export function lakehouseWarehousesUrl(): string {
-  return "/api/lakehouse/warehouses"
-}
-
 export function lakehouseNamespacesUrl(warehouse?: string): string {
   return warehouse === undefined
     ? "/api/lakehouse/namespaces"

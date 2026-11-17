@@ -1,0 +1,125 @@
+# gitleaks baseline for the full-history scan (`history-scan` in
+# .github/workflows/security.yml). SEC-1, plan:
+# docs/superpowers/plans/2026-10-14-sec-1-gitleaks-baseline.md
+#
+# Each entry is one exact fingerprint (commit:file:rule:line), so the same
+# secret in a new commit, or any new secret, still turns the scan red. Never
+# add a wildcard or a file-wide entry here. gitleaks reads this file from
+# `--source` (and from the working directory); full-line `#` comments and
+# blank lines are skipped (gitleaks v8.30.1, detect/detect.go
+# AddGitleaksIgnore).
+
+# Staging tokens and a staging secret once committed in `.env.staging`.
+# Rotated (product owner, 2026-10-14); SEC-13 (#130) moves the values to
+# repository secrets `STAGING_*`. SEC-1, SEC-13.
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:21
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:22
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:23
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:24
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:25
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:26
+1d2c45cbf346c46767dac2b9511d127327c2633a:.env.staging:generic-api-key:35
+
+# Internal LLM node API key once in `src/services/clients/llm.ts`.
+# Rotated (product owner, 2026-10-14). SEC-1, SEC-13.
+8ac6ee2a016e40212576ec7bc878b8776023acd6:src/services/clients/llm.ts:rantai-llm-node-api-key:9
+
+# Private LAN addresses in old commits. Not secrets; none of these files
+# holds them today. SEC-1.
+8ac6ee2a016e40212576ec7bc878b8776023acd6:src/services/clients/llm.ts:rantai-internal-lan-host:7
+c5954ca6f47c96a1641103b7c453aa01758d7371:src/services/clients/clickhouse.ts:rantai-internal-lan-host:11
+7075682ad03622b69b10ad85cccc9f7fe9837eb9:src/services/clients/dagster.ts:rantai-internal-lan-host:6
+7075682ad03622b69b10ad85cccc9f7fe9837eb9:src/app/api/ops/[kind]/route.ts:rantai-internal-lan-host:108
+27d1e2b03051809ce87b55c4a288b9e26f614e1d:src/app/api/ai/build-status/route.ts:rantai-internal-lan-host:5
+# The same addresses reached through the root commit 6c3a7ff, an ancestor of
+# `main`, so a scan can report them through that path too. SEC-1.
+6c3a7ff42a8df4f19e3dc6eb69d04ad6463d4da3:src/app/api/ai/build-status/route.ts:rantai-internal-lan-host:5
+6c3a7ff42a8df4f19e3dc6eb69d04ad6463d4da3:src/app/api/ops/[kind]/route.ts:rantai-internal-lan-host:108
+6c3a7ff42a8df4f19e3dc6eb69d04ad6463d4da3:src/services/clients/clickhouse.ts:rantai-internal-lan-host:11
+6c3a7ff42a8df4f19e3dc6eb69d04ad6463d4da3:src/services/clients/dagster.ts:rantai-internal-lan-host:6
+
+# False positive: a test token literal, gone since #129. SEC-1.
+31ec837b57ed05740727360c1a64fb3cf3d2dedc:dagster/dispar_orchestrate/test_schema_observer.py:generic-api-key:26
+
+# False positive on branch `feat/phase-1-rest` (#144):
+# `password=matrix.CONNECTOR_MYSQL_PASSWORD` is a reference to a CI fixture
+# constant, not a value. The history scan reads every branch. SEC-1.
+4ae1bcdda704797129801f537899cf527035c6ba:ops/g6/src11_connector_operations_test.py:generic-api-key:576
+
+# Not a secret: a git commit hash. The BLD-3 plan's handoff (fix round 1)
+# quoted the full id of commit 367f304c ("BLD-3 review BLOCKER 1") as the
+# GIT_SHA an image was built with; `git cat-file -t 367f304c1db0…` prints
+# `commit`. The working-tree copy now quotes 12 characters; this entry
+# covers the one historical commit that still holds the full line.
+ee0d663df87af4fb1e3ebfa9a3a857489d340a8c:docs/superpowers/plans/2026-10-14-bld-3-bronze-pipeline-source.md:generic-api-key:623
+
+# SEC-36: CI-only and test-vector connector keys on `feat/phase-1-rest`
+# (#144, SRC-12). The history scan runs `git fetch --all`, so it reads every
+# branch and these commits turned it red on main and on every PR. Proof, per
+# value (decoded from the scanner's own output, 2026-10-15): none protects
+# anything and none was ever deployed.
+#  - base64 of the 32 ASCII characters "ci-connector-key-not-real-000000":
+#    the key written into the throwaway `.env` of the CI jobs in ci.yml
+#    (20 findings in 6 commits). It lived only on ephemeral runners;
+#    deploy-staging.yml reads the staging key from the repository secret
+#    STAGING_CONNECTOR_SECRETS_KEY, never from the repository.
+#  - base64 of the 32 ASCII characters "ci-connector-key-rotated-0000000":
+#    the "new" key of the g6-credentials rotation step (1 finding), same job.
+#  - base64 of the 32 bytes 0x00..0x1f: the key of the shared AES test vector
+#    (1 finding), whose sealed text is a fixed test string.
+# Current HEAD generates the CI keys at run time (openssl rand) and describes
+# the vector key as bytes, so no new finding appears. Exact fingerprints only.
+5b9951949209f8e0efebb261e413811599b6718c:.github/workflows/ci.yml:generic-api-key:1832
+6209593e88664cadcbf64ce5c8923dff648758b0:.github/workflows/ci.yml:generic-api-key:1652
+6209593e88664cadcbf64ce5c8923dff648758b0:.github/workflows/ci.yml:generic-api-key:1711
+6209593e88664cadcbf64ce5c8923dff648758b0:.github/workflows/ci.yml:generic-api-key:1713
+84a2f212d3914122a4636009cb084e4cbd2430f1:.github/workflows/ci.yml:generic-api-key:2045
+9bfaf58a893783372ef25cb10f0913cc55fd8a79:.github/workflows/ci.yml:generic-api-key:1792
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1075
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1225
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1317
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1412
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1541
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1654
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1717
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1839
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:397
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:435
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:619
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:731
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:808
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:936
+cfa800f4940fefbdcd66c0e78f3a3f451768eeac:.github/workflows/ci.yml:generic-api-key:1957
+f0fe3cd464cc5f115c92cc18d1b629a4681c670e:rust/crates/lakehouse-api/tests/fixtures/connector_secret_vector.json:generic-api-key:4
+
+# PR #83 (SEC-18) round 3: the developer's handoff in commit b9c71cb33dd7
+# pasted a 40-hex "git ls-remote" line for fix/sec-18-no-default-credentials.
+# Not a secret: its first 12 characters are commit cdbf7c6a0a74, the rest
+# matches no object in the repository (`git cat-file -t` fails), and the
+# next commit (6817e10a) cut it to 12 characters. Planner, 2026-10-15.
+b9c71cb33dd7f90d4bbf071a8ee282478117e8e4:docs/superpowers/plans/2026-10-08-sec-18-no-default-credentials.md:generic-api-key:536
+
+# PR #341 gitleaks: the two fake passwords in `users-page.test.tsx`. The
+# commit that introduced the file used random-looking literals, so the
+# `generic-api-key` rule (the `PASSWORD` keyword plus a high-entropy
+# value) matched them. They were never a credential: the test stub returns
+# them as the server-generated password and the test asserts on that same
+# constant, so the value is not used, stored or sent anywhere. Replaced in
+# commit a85fa55b by obviously fake, low-entropy strings
+# ("test-only-temporary-password", "test-only-reset-password"), which the
+# rule does not match. History is not rewritten (no force-push), so these
+# two exact fingerprints stay baselined; the same literal in a NEW commit
+# still turns the scan red.
+d16d0082c42c84c79128dc186f55dbe3379c46bc:src/features/admin/users-page.test.tsx:generic-api-key:46
+d16d0082c42c84c79128dc186f55dbe3379c46bc:src/features/admin/users-page.test.tsx:generic-api-key:47
+
+# Fixed dummy values in `ops/release/env-example-equivalence.sh` (REL-19),
+# used only to fill compose's five must-set variables when two templates are
+# compared; never a credential anywhere. Replaced by plain words at the
+# branch head (`not-a-secret-*`) and redacted from the plan's quoted output;
+# these two commits still carry the old values in history, which is never
+# rewritten. Lines 48 and 50 are the dummy RustFS secret and connector key;
+# plan line 303 quoted the compose output holding the RustFS one. PR #406.
+4ca4836c65d9bbcdea16acf8a290bd3b06f05085:ops/release/env-example-equivalence.sh:generic-api-key:48
+4ca4836c65d9bbcdea16acf8a290bd3b06f05085:ops/release/env-example-equivalence.sh:generic-api-key:50
+85738c2aa3431c1102b2efa7307922417be4ebb0:docs/superpowers/plans/2026-11-06-rel-19-env-cleanup.md:generic-api-key:303

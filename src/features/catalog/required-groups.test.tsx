@@ -1,7 +1,12 @@
 // UX-1-R4: group requirements must be starred at the group level when an
 // either/or choice satisfies them, and a pre-filled name that blocks Save is
 // required, not optional. These render the real dialogs through their tabs.
+import * as realNavigation from "next/navigation"
+// Restore the real module after this file: `mock.module` outlives it in
+// `bun test src` and would otherwise replace navigation for later files.
+const realNav = { ...realNavigation }
 mock.module("next/navigation", () => ({
+  ...realNav,
   usePathname: () => "/catalog/demo",
   useSearchParams: () => new URLSearchParams(),
   useRouter: () => ({
@@ -15,11 +20,17 @@ mock.module("next/navigation", () => ({
 }))
 
 import { fireEvent, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock } from "bun:test"
+import { afterAll, afterEach, describe, expect, it, mock } from "bun:test"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { AssetAccess } from "./asset-access"
 import { AssetQuality } from "./asset-quality"
+import { CheckFields } from "@/features/governance/quality-check-fields"
+import { EMPTY_FORM } from "@/features/governance/quality-checks"
+
+afterAll(() => {
+  mock.module("next/navigation", () => realNav)
+})
 
 const originalFetch = global.fetch
 afterEach(() => {
@@ -41,6 +52,20 @@ function stubFetch() {
         }),
         { status: 200, headers: { "Content-Type": "application/json" } }
       )
+    }
+    // The current Quality tab reads incidents through useService; an object
+    // here made that list crash before the Add-rule dialog could render.
+    if (url.includes("/api/governance/quality/incidents")) {
+      return new Response('{"incidents":[]}', { status: 200, headers: { "Content-Type": "application/json" } })
+    }
+    if (url.includes("/api/governance/quality/schedules")) {
+      return new Response('{"schedules":[]}', { status: 200, headers: { "Content-Type": "application/json" } })
+    }
+    if (url.includes("/api/governance/quality/learning")) {
+      return new Response('{"enabled":false,"suggestions":[]}', { status: 200, headers: { "Content-Type": "application/json" } })
+    }
+    if (url.includes("/runs")) {
+      return new Response('{"runs":[]}', { status: 200, headers: { "Content-Type": "application/json" } })
     }
     return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } })
   }) as unknown as typeof fetch
@@ -82,10 +107,26 @@ describe("catalog group requirements (UX-1-R4)", () => {
     ) as HTMLElement
     expect(mask).toBeDefined()
     expect(markerIn(mask)).toBe(false)
-    expect(document.querySelector('label[for="policy-filter"]')?.textContent).not.toContain("optional")
+    // Each alternative is individually optional; the group carries the star.
+    expect(document.querySelector('label[for="policy-filter"]')?.textContent).toContain("optional")
   })
 
   it("stars the range-bounds group and marks the generated rule name required", async () => {
+    // The range group now lives in the shared CheckFields component; render
+    // it directly with a range form (its check picker is a SelectField, not a
+    // native select, so a fireEvent.change could not drive it here).
+    render(<CheckFields form={{ ...EMPTY_FORM, kind: "range" }} onChange={mock()} columns={["email"]} idPrefix="rule" />)
+    const bounds = Array.from(document.querySelectorAll("legend")).find((l) =>
+      l.textContent?.includes("Bounds")
+    ) as HTMLElement
+    expect(bounds).toBeDefined()
+    expect(markerIn(bounds)).toBe(true)
+    expect(document.getElementById("rule-bounds-help")?.textContent).toContain("At least one bound")
+    expect(document.querySelector('label[for="rule-min"]')?.getAttribute("data-required")).toBeNull()
+    expect(document.querySelector('label[for="rule-max"]')?.getAttribute("data-required")).toBeNull()
+  })
+
+  it("marks the asset quality rule name required", async () => {
     stubFetch()
     render(
       <AuthProvider>
@@ -93,16 +134,6 @@ describe("catalog group requirements (UX-1-R4)", () => {
       </AuthProvider>
     )
     fireEvent.click(await screen.findByText("Add rule"))
-    fireEvent.change(screen.getByLabelText("Check"), { target: { value: "range" } })
-
-    const bounds = Array.from(document.querySelectorAll("legend")).find((l) =>
-      l.textContent?.includes("Range bounds")
-    ) as HTMLElement
-    expect(bounds).toBeDefined()
-    expect(markerIn(bounds)).toBe(true)
-    expect(document.getElementById("rule-range-help")?.textContent).toContain("At least one bound")
-    expect(document.querySelector('label[for="rule-min"]')?.getAttribute("data-required")).toBeNull()
-    expect(document.querySelector('label[for="rule-max"]')?.getAttribute("data-required")).toBeNull()
 
     const nameLabel = document.querySelector('label[for="rule-name"]')
     expect(nameLabel?.getAttribute("data-required")).toBe("")

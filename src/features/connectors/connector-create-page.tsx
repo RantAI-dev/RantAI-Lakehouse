@@ -3,7 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { KeyRoundIcon, NetworkIcon } from "lucide-react"
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { FormReviewSummary } from "@/components/patterns/form-review-summary"
 import { FormStepLayout, type FormStep } from "@/components/patterns/form-step-layout"
 import { RequiredLegend } from "@/components/patterns/required-legend"
@@ -15,6 +15,8 @@ import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { connectorService } from "@/services"
+import { SECRET_MANAGER_LABEL } from "@/lib/connectors/secret-reference"
+import { ACCEPTED_FORMATS } from "@/lib/uploads"
 import type { Connector, CredentialSpec } from "@/services/contracts/connectors"
 import {
   CredentialFields,
@@ -30,9 +32,12 @@ import {
   usesNoCredential as needsNoCredential,
 } from "./connector-form-parts"
 import { DIRECTION_LABEL } from "./connectors-columns"
+import { saasAccountProblem, saasVendorForType } from "@/lib/connectors/saas-vendors"
+import { readableErrorMessage } from "@/lib/notify-message"
 import { connectionReviewItems } from "./connector-review"
 import { ScopeFields } from "./connector-scope-fields"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
+import { ConnectorOAuthPanel } from "./connector-oauth-panel"
 import { ConnectorTypePicker, DirectionPicker, SelectedTypeSummary } from "./connector-type-picker"
 
 // Only 4 pre-creation steps, not the 5 this file used to have: the old
@@ -61,6 +66,14 @@ export function ConnectorCreatePage() {
   // cleared right after, never rendered back.
   const [primaryValue, setPrimaryValue] = React.useState("")
   const [secondaryValue, setSecondaryValue] = React.useState("")
+  // `SRC-12` part B: with a secret manager set up, the credential may be a
+  // reference to a secret in it instead of a typed value.
+  const settings = useService(connectorService.getCredentialSettings)
+  const [referenceChosen, setReferenceChosen] = React.useState(false)
+  const credentialSettings = settings.status === "success" ? settings.data : null
+  // The operator can turn typing off: then a reference is the only way.
+  const referenceMode =
+    credentialSettings?.secretManager != null && (referenceChosen || !credentialSettings.typedCredentials)
   const [environment, setEnvironment] = React.useState("production")
   const { user, activeTenantId } = useAuth()
   // Defaults to the tenant the user is acting as — the one the connector
@@ -113,10 +126,14 @@ export function ConnectorCreatePage() {
   // A value typed for one layout never carries into another.
   const slots = credentialSlotsFor(adapter, dial)
   const slotsKey = credentialSlotsKey(slots)
+  // OAuth authorization code (`SRC-12` part C): the refresh token comes from
+  // signing in, so the create request carries no values and the client secret
+  // is saved right after, like a reference.
+  const signInConnector = Boolean(slots.secondary?.signIn)
   React.useEffect(() => {
     setPrimaryValue("")
     setSecondaryValue("")
-  }, [slotsKey])
+  }, [slotsKey, referenceMode])
 
   const create = useServiceAction(
     withNotify(
@@ -143,17 +160,57 @@ export function ConnectorCreatePage() {
     )
   )
 
+  // A credential that cannot go in the create request is set once the
+  // connector exists, by the same probe-first route as an edit: a REFERENCE
+  // (named after the connector is created), or, for a sign-in connector, the
+  // client secret (the create request needs both slots or none, and the
+  // refresh token only comes from signing in).
+  const setCredentialAfterCreate = useServiceAction(
+    withNotify(
+      {
+        success: referenceMode ? "Secret reference saved" : "Client secret saved",
+        error: referenceMode
+          ? "The connector was created, but the secret reference was not saved"
+          : "The connector was created, but the client secret was not saved",
+      },
+      (signal, input: { id: string; primary: string; secondary: string }) =>
+        connectorService.setCredential(
+          input.id,
+          referenceMode
+            ? {
+                primary: { reference: input.primary },
+                ...(slots.secondary && !slots.secondary.signIn
+                  ? { secondary: { reference: input.secondary } }
+                  : {}),
+              }
+            : { primary: { kind: slots.primary.kind, value: normalizedCredential(slots.primary, input.primary) } },
+          signal
+        )
+    )
+  )
+
   const problems = credentialProblems({
     noCredential: usesNoCredential,
     optional: false,
     slots,
     primaryValue,
     secondaryValue,
+    referenceManager: referenceMode ? credentialSettings?.secretManager : null,
   })
+
+  // QA LH-SRC-3-11 (SRC-41 D13): for a business app the form knows the
+  // vendor's account rule, so Next waits until the account fits it. The server
+  // checks the same dial and refuses it before anything is created (D11).
+  const saasVendor = adapter === "saas" ? saasVendorForType(selectedType?.name) : undefined
+  const saasAccount = typeof dial?.account === "string" ? dial.account : ""
+  const saasAccountIssue = saasVendor ? saasAccountProblem(saasVendor, saasAccount) : null
 
   const canProceed =
     (step === 0 && Boolean(name.trim() && selectedType?.supported)) ||
-    (step === 1 && problems.primary === null && problems.secondary === null) ||
+    (step === 1 &&
+      problems.primary === null &&
+      problems.secondary === null &&
+      saasAccountIssue === null) ||
     (step === 2 && Boolean(environment.trim() && tenantId && residency.trim())) ||
     step === 3
 
@@ -167,7 +224,9 @@ export function ConnectorCreatePage() {
       source: "managed",
       primary: slots.primary.kind,
       ...(slots.secondary ? { secondary: slots.secondary.kind } : {}),
-      ...(usesNoCredential
+      // A reference is not a value to store: it is set once the connector
+      // exists, by the same probe-first route as an edit (below).
+      ...(usesNoCredential || referenceMode || signInConnector
         ? {}
         : {
             values: {
@@ -189,6 +248,9 @@ export function ConnectorCreatePage() {
       tenantId,
       residency: residency.trim(),
       capabilities: [],
+      // Checked before the row exists (`SRC-41` D11); the same settings are
+      // stored by the `saveSpec` call that follows.
+      connection: { adapter, dial: dial ?? {} },
     })
     // Never keep a credential in memory longer than the request needs it.
     setPrimaryValue("")
@@ -200,7 +262,20 @@ export function ConnectorCreatePage() {
       // connector without its host/port/user/database and fail for a
       // reason that has nothing to do with the credential.
       const saved = await saveSpec.run(result.id)
-      if (saved) {
+      // A reference is read once and the connection tested before it is
+      // saved (the credential route is probe-first), with the connection
+      // settings just saved. If that fails the connector exists without a
+      // credential and says so: the same reference can be set from its edit
+      // page.
+      const referenced =
+        saved && (referenceMode || signInConnector) && !usesNoCredential
+          ? await setCredentialAfterCreate.run({
+              id: result.id,
+              primary: primaryValue,
+              secondary: secondaryValue,
+            })
+          : saved
+      if (referenced) {
         await test.run(result.id)
       } else {
         setTestSkipped(true)
@@ -212,6 +287,18 @@ export function ConnectorCreatePage() {
   // the tables to ingest and run them, instead of redirecting past any of
   // it.
   if (createdId) {
+    // QA LH-SRC-6-39/LH-SRC-6-54 (SRC-41 D14): the created screen mounted the
+    // ingest panel at once, and that panel reads `GET .../ingest-spec` once and
+    // never again. When the read answered before the `PUT` that stores the
+    // settings landed, the card said "This connector has no connection
+    // settings saved yet" and stayed that way — a race, which is why it was
+    // intermittent. So the panels mount only once the save has answered, and
+    // the card says what it is waiting for until then.
+    const settingsSaved = saveSpec.status === "success"
+    const settingsPending =
+      saveSpec.status === "idle" ||
+      saveSpec.status === "pending" ||
+      setCredentialAfterCreate.status === "pending"
     return (
       <div className="flex flex-col gap-4">
         <PageHeader
@@ -232,7 +319,7 @@ export function ConnectorCreatePage() {
               <div className="space-y-1.5">
                 <p className="text-sm text-destructive">
                   The connection test was not run: the connection settings could not be saved.
-                  {saveSpec.status === "error" ? ` ${saveSpec.error.message}` : ""}
+                  {saveSpec.status === "error" ? ` ${readableErrorMessage(saveSpec.error.message)}` : ""}
                 </p>
                 <p className="text-xs text-muted-foreground">
                   Correct them from{" "}
@@ -242,6 +329,8 @@ export function ConnectorCreatePage() {
                   , then run the test again.
                 </p>
               </div>
+            ) : settingsPending ? (
+              <p className="text-sm text-muted-foreground">Saving the connection settings…</p>
             ) : test.status === "pending" ? (
               <p className="text-sm text-muted-foreground">Testing connection…</p>
             ) : test.status === "error" ? (
@@ -274,7 +363,13 @@ export function ConnectorCreatePage() {
                 type="button"
                 size="sm"
                 variant="outline"
-                disabled={test.status === "pending"}
+                // Review round 1, R1 (QA LH-SRC-6-39, D11): a failed save leaves
+                // the sentence above as the only statement that the settings were
+                // not stored (the ingest panel stays unmounted without a save),
+                // and this button is what would clear it. A test of a connector
+                // with no settings says nothing useful either, so it is disabled
+                // and the Edit link is the way forward.
+                disabled={test.status === "pending" || settingsPending || saveSpec.status === "error"}
                 onClick={() => {
                   setTestSkipped(false)
                   test.run(createdId)
@@ -286,11 +381,46 @@ export function ConnectorCreatePage() {
           </div>
         </SectionCard>
 
-        {!testSkipped ? (
+        {signInConnector && !testSkipped && settingsSaved ? (
+          <ConnectorOAuthPanel connectorId={createdId} />
+        ) : null}
+
+        {!testSkipped && settingsSaved ? (
           <SectionCard title="What to ingest" description="Pick the tables this connector copies into Bronze, then run it.">
             <ConnectorIngestPanel connectorId={createdId} connectorName={name.trim()} />
           </SectionCard>
         ) : null}
+      </div>
+    )
+  }
+
+  // QA LH-SRC-3-08 (SRC-41 D20): when the list of types cannot be read there is
+  // nothing to create from, so the page shows the header and the state alone —
+  // no Name, Direction, Previous or Next. A refusal says what the person can do;
+  // anything else offers Retry. The server refuses the create for the same
+  // person already (`POST /api/connectors` is `connector:manage`). A refusal is
+  // `permission_denied`: the connector client maps a 401 or 403 through
+  // `deniedFor` (WEB-11, WEB-12).
+  if (types.status === "error") {
+    return (
+      <div className="flex flex-col gap-4">
+        <PageHeader
+          title="New Connector"
+          description="Configure a source or sink with discovery and residency scope, then verify connectivity."
+          actions={
+            <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
+              Cancel
+            </Button>
+          }
+        />
+        {types.error.code === "permission_denied" ? (
+          <EmptyState
+            title="You cannot create a connector"
+            description="Creating a connector needs the connector:manage permission. Ask a workspace administrator."
+          />
+        ) : (
+          <ErrorState error={types.error} onRetry={types.reload} />
+        )}
       </div>
     )
   }
@@ -322,14 +452,13 @@ export function ConnectorCreatePage() {
                 (DATA-9, `docs/core/features/upload-file.md`). */}
             <p className="text-sm text-muted-foreground">
               <Link href="/connectors/upload" className="text-primary underline-offset-4 hover:underline">
-                Have a file instead? Upload a CSV or TSV
+                Have a file instead? Upload {ACCEPTED_FORMATS} files
               </Link>
             </p>
             {types.status === "loading" ? (
               <LoadingSkeleton rows={4} />
-            ) : types.status === "error" ? (
-              <ErrorState error={types.error} onRetry={types.reload} />
             ) : (
+              // The `error` state is answered above, before the form exists.
               <ConnectorTypePicker types={types.data} value={selectedTypeName} onChange={setSelectedTypeName} />
             )}
             <div className="grid gap-4 border-t border-border pt-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
@@ -362,7 +491,21 @@ export function ConnectorCreatePage() {
               />
               {/* UX-1-R7: the step's RequiredLegend above explains the
                   marker once; the dial and credential children opt out. */}
-              <DialFormFor adapter={adapter} typeName={selectedType?.name ?? null} dial={dial} onChange={setDial} showLegend={false} />
+              <DialFormFor
+                adapter={adapter}
+                typeName={selectedType?.name ?? null}
+                dial={dial}
+                onChange={setDial}
+                oauthCallbackUrl={credentialSettings?.oauthCallbackUrl}
+                showLegend={false}
+              />
+              {/* Nothing red before something is typed, as for the credential
+                  fields: the refusal follows what the form holds. */}
+              {saasAccountIssue !== null && saasAccount !== "" ? (
+                <p role="alert" className="text-xs text-destructive">
+                  {saasAccountIssue}
+                </p>
+              ) : null}
             </section>
             <section className="space-y-3 border-t border-border pt-5">
               <StepSectionHeading
@@ -379,6 +522,9 @@ export function ConnectorCreatePage() {
                 secondaryValue={secondaryValue}
                 onSecondaryValueChange={setSecondaryValue}
                 problems={problems}
+                settings={credentialSettings}
+                referenceMode={referenceMode}
+                onReferenceModeChange={setReferenceChosen}
                 showLegend={false}
               />
             </section>
@@ -419,7 +565,15 @@ export function ConnectorCreatePage() {
                         ? "None"
                         : `${slots.primary.label}${
                             slots.secondary ? ` + ${slots.secondary.label.toLowerCase()}` : ""
-                          } · entered, stored by lakehouse`,
+                          } · ${
+                            referenceMode
+                              ? `reference to a secret in ${
+                                  credentialSettings?.secretManager
+                                    ? SECRET_MANAGER_LABEL[credentialSettings.secretManager]
+                                    : "the secret manager"
+                                }, read at every use`
+                              : "entered, stored by lakehouse"
+                          }`,
                     },
                   ],
                 },
@@ -445,7 +599,9 @@ export function ConnectorCreatePage() {
                 <li>
                   {usesNoCredential
                     ? "No credential is stored: this connection authenticates with none."
-                    : "The credential is stored by lakehouse and never shown again."}
+                    : referenceMode
+                      ? "Only the reference to the secret is stored; the secret itself stays in the secret manager."
+                      : "The credential is stored by lakehouse and never shown again."}
                 </li>
                 <li>The connection settings are saved, then the connection is tested. You see the result here.</li>
                 <li>

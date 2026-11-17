@@ -7,6 +7,8 @@ import {
   AUDIT_OUTCOME_LABEL,
   AUTONOMY_LABEL,
   CHECK_STATUS_LABEL,
+  CERTIFICATION_DESCRIPTION,
+  CERTIFICATION_LABEL,
   CLASSIFICATION_LABEL,
   ENTITY_STATUS_DESCRIPTION,
   ENTITY_STATUS_LABEL,
@@ -14,12 +16,12 @@ import {
   RUN_STEP_STATUS_LABEL,
   SEVERITY_LABEL,
   STORAGE_TIER_LABEL,
-  WORKLOAD_STATUS_LABEL,
   type AgentRunStatus,
   type AlertStatus,
   type ApprovalStatus,
   type AuditOutcome,
   type AutonomyLevel,
+  type CertificationStatus,
   type CheckStatus,
   type Classification,
   type EntityStatus,
@@ -27,7 +29,6 @@ import {
   type RunStepStatus,
   type Severity,
   type StorageTier,
-  type WorkloadStatus,
 } from "@/lib/status"
 
 type Tone =
@@ -91,6 +92,7 @@ const STATUS_TONE: Record<EntityStatus, Tone> = {
   degraded: "warning",
   failed: "destructive",
   completed: "success",
+  stopped: "neutral",
   cancelled: "neutral",
   blocked: "warning",
   partial: "warning",
@@ -100,9 +102,16 @@ const STATUS_TONE: Record<EntityStatus, Tone> = {
 /** Shared lifecycle badge for pipelines, jobs, runs, policies, and agents. */
 export function StatusBadge({
   status,
+  label,
   className,
 }: {
   status: EntityStatus
+  /**
+   * A page's own word for the status, for a page whose spec names it
+   * differently (History says "Refused" for `blocked`). The tone and the
+   * description stay the shared ones.
+   */
+  label?: string
   className?: string
 }) {
   return (
@@ -114,7 +123,7 @@ export function StatusBadge({
       {status === "running" ? (
         <span className="size-1.5 animate-pulse rounded-full bg-current" aria-hidden />
       ) : null}
-      {ENTITY_STATUS_LABEL[status]}
+      {label ?? ENTITY_STATUS_LABEL[status]}
     </Pill>
   )
 }
@@ -165,6 +174,38 @@ export function TierBadge({
   return (
     <Pill tone={TIER_TONE[tier]} title={title} className={className}>
       {STORAGE_TIER_LABEL[tier]}
+    </Pill>
+  )
+}
+
+const CERTIFICATION_TONE: Record<CertificationStatus, Tone> = {
+  certified: "success",
+  deprecated: "warning",
+}
+
+/**
+ * Certified / deprecated mark of a table (`DATA-12`). Takes the server's
+ * string as it comes: anything but the two known marks (including none)
+ * renders nothing, so a future mark never shows as a wrong word.
+ */
+export function CertificationBadge({
+  certification,
+  title,
+  className,
+}: {
+  certification: string | null | undefined
+  /** Overrides the default explanation shown on hover. */
+  title?: string
+  className?: string
+}) {
+  if (certification !== "certified" && certification !== "deprecated") return null
+  return (
+    <Pill
+      tone={CERTIFICATION_TONE[certification]}
+      title={title ?? CERTIFICATION_DESCRIPTION[certification]}
+      className={className}
+    >
+      {CERTIFICATION_LABEL[certification]}
     </Pill>
   )
 }
@@ -363,6 +404,8 @@ const OUTCOME_TONE: Record<AuditOutcome, Tone> = {
   success: "success",
   denied: "warning",
   error: "destructive",
+  // A decision still waiting: neither a warning nor a success (GOV-5).
+  pending: "info",
 }
 
 /** Outcome pill for audited actions after policy evaluation. */
@@ -401,27 +444,3 @@ export function AlertStatusBadge({
   )
 }
 
-const WORKLOAD_STATUS_TONE: Record<WorkloadStatus, Tone> = {
-  queued: "sky",
-  running: "info",
-  completed: "success",
-  cancelled: "neutral",
-}
-
-/** Workload queue lifecycle pill. */
-export function WorkloadStatusBadge({
-  status,
-  className,
-}: {
-  status: WorkloadStatus
-  className?: string
-}) {
-  return (
-    <Pill tone={WORKLOAD_STATUS_TONE[status]} className={className}>
-      {status === "running" ? (
-        <span className="size-1.5 animate-pulse rounded-full bg-current" aria-hidden />
-      ) : null}
-      {WORKLOAD_STATUS_LABEL[status]}
-    </Pill>
-  )
-}

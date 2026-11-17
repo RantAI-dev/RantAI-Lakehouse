@@ -11,7 +11,11 @@ import { CopilotSidebar } from "@/features/copilot/copilot-sidebar";
 import { CopilotProvider } from "@/features/copilot/use-copilot";
 import { CommandPalette } from "@/components/command-palette";
 import { isPublicPath, useAuth } from "@/features/auth/auth-provider";
+import { SsoNotice } from "@/features/auth/sso-notice";
+import { VersionBanner } from "@/features/version/version-banner";
 import { AppShellSkeleton } from "@/components/app-shell/app-shell-skeleton";
+
+import { RouteGuard } from "@/components/app-shell/route-guard";
 
 /**
  * The app frame (sidebar + navbar + AI dock + command palette). For PUBLIC
@@ -33,15 +37,13 @@ export function AppFrame({ children }: Readonly<{ children: React.ReactNode }>) 
 
   return (
     <SidebarProvider>
-      <CopilotProvider>
-        <AuthenticatedFrame>{children}</AuthenticatedFrame>
-      </CopilotProvider>
+      <AuthenticatedShell>{children}</AuthenticatedShell>
     </SidebarProvider>
   );
 }
 
-function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }>) {
-  const { status } = useAuth();
+function AuthenticatedShell({ children }: Readonly<{ children: React.ReactNode }>) {
+  const { status, hasPermission } = useAuth();
   const pathname = usePathname();
 
   if (status !== "authenticated") {
@@ -52,6 +54,26 @@ function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }
     // the status flip.
     return <AppShellSkeleton pathname={pathname ?? "/"} />;
   }
+
+  const hasAssistant =
+    hasPermission("assistant:use") || hasPermission("assistant:ask");
+
+  if (hasAssistant) {
+    return (
+      <CopilotProvider>
+        <AuthenticatedFrame hasAssistant={true}>{children}</AuthenticatedFrame>
+      </CopilotProvider>
+    );
+  }
+
+  return <AuthenticatedFrame hasAssistant={false}>{children}</AuthenticatedFrame>;
+}
+
+function AuthenticatedFrame({
+  children,
+  hasAssistant,
+}: Readonly<{ children: React.ReactNode; hasAssistant: boolean }>) {
+  const pathname = usePathname();
 
   return (
     <>
@@ -67,14 +89,28 @@ function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }
           <main
             className={cn(
               "flex-1 min-w-0 p-4 sm:p-5 lg:p-6",
-              !dockHiddenOn(pathname) && "pb-24 sm:pb-24 lg:pb-28",
+              hasAssistant && !dockHiddenOn(pathname) && "pb-24 sm:pb-24 lg:pb-28",
             )}
           >
-            {children}
+            {/* `SEC-39`: the SSO callback redirects into the console with
+                a notice code in the query when the sign-in succeeded with
+                a caveat (a group overage on Entra ID). Mounted once here
+                so every landing page shows it; `useSearchParams` needs the
+                boundary even though this whole tree is a client
+                component. */}
+            <React.Suspense fallback={null}>
+              <SsoNotice />
+            </React.Suspense>
+            {/* REL-2 S1-T5: the console and the server it talks to may
+                not be the same build (an update that half-landed). The
+                banner names both versions; it renders nothing when they
+                match. */}
+            <VersionBanner />
+            <RouteGuard>{children}</RouteGuard>
           </main>
-          <CopilotSidebar />
+          {hasAssistant && <CopilotSidebar />}
         </div>
-        <CopilotDock />
+        {hasAssistant && <CopilotDock />}
       </SidebarInset>
       <CommandPalette />
     </>

@@ -22,6 +22,7 @@ import { toServiceError } from "@/services/errors";
 import { useAuth } from "./auth-provider";
 import { ChangePasswordStep } from "./change-password-step";
 import { LoginHero } from "./login-hero";
+import { SsoNotice } from "./sso-notice";
 
 /**
  * Whether an SSO button should render at all.
@@ -143,17 +144,22 @@ export function LoginPage() {
       // along. `authClient.parse` already maps 401 → `permission_denied`.
       const serviceError = toServiceError(err);
       if (serviceError.code === "too_many_requests") {
-        let msg = serviceError.message;
+        // QA LH-SEC-2-02 (ADM-14 D13): ONE sentence, the console's, when the
+        // server said how long to wait. It used to join the server's
+        // sentence to the console's — "Try again later. Try again in about 5
+        // minutes." — which says the same thing twice. Without a wait, the
+        // server's sentence stands as it is.
         if (serviceError.retryAfterSecs && serviceError.retryAfterSecs > 0) {
           const minutes = Math.ceil(serviceError.retryAfterSecs / 60);
           const minutesText = minutes === 1 ? "1 minute" : `${minutes} minutes`;
-          msg += ` Try again in about ${minutesText}.`;
+          setError(`Too many failed sign-in attempts: try again in about ${minutesText}.`);
+        } else {
+          setError(serviceError.message);
         }
-        setError(msg);
       } else {
         setError(
           serviceError.code === "permission_denied"
-            ? "Invalid email or password."
+            ? "Invalid username/email or password."
             : serviceError.message || "Could not sign in. Try again."
         );
       }
@@ -220,6 +226,14 @@ export function LoginPage() {
 
         <div className="flex flex-1 items-center justify-center py-12">
           <div className="w-full max-w-[352px]">
+            {/* `SEC-65` D2: a callback refused because the provider did
+                not confirm the email redirects here with
+                `ssoNotice=email_not_verified`, so the sentence the person
+                needs is on the page they land on. `useSearchParams` needs
+                the boundary. */}
+            <React.Suspense fallback={null}>
+              <SsoNotice />
+            </React.Suspense>
             <h1 className="text-3xl leading-[1.2] font-semibold tracking-[-0.02em] text-foreground">
               Sign in to Rantai Lake
             </h1>
@@ -239,7 +253,7 @@ export function LoginPage() {
                   <RequiredLegend />
                   <Field data-invalid={!!error}>
                     <FieldLabel htmlFor="login-email" className="text-sm" required>
-                      Email
+                      Username or email
                     </FieldLabel>
                     <InputGroup className="h-11">
                       <InputGroupAddon className="pl-3">
@@ -247,11 +261,11 @@ export function LoginPage() {
                       </InputGroupAddon>
                       <InputGroupInput
                         id="login-email"
-                        type="email"
-                        autoComplete="email"
+                        type="text"
+                        autoComplete="username"
                         autoFocus
                         required
-                        placeholder="you@company.com"
+                        placeholder="you or you@company.com"
                         className="text-sm"
                         aria-invalid={!!error}
                         aria-describedby={error ? "login-error" : undefined}

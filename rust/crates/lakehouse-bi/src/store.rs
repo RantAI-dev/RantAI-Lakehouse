@@ -26,8 +26,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::builder::{QueryBuilder, Relation, build_kpi_sql};
+use crate::access::Viewer;
+use crate::builder::{QueryBuilder, Relation};
+use crate::click::ClickAction;
+use crate::embed_access::{self, EmbedAccess, WithdrawnToken};
+use crate::fields::{self, FieldDef, SourceKind};
+use crate::filters::ColumnKind;
+use crate::grain::{Grain, TimeContext};
+use crate::shape::{self, MeasureList, RelationCheck, ShapeFields};
 use crate::specs::{Aggregate, ChartKind, ChartSource, ChartY, NumFmt};
+use crate::tables::{self, ComparePlan, TableFields};
 
 /// Errors produced while validating input or talking to `ClickHouse` through
 /// this module. Ports the `Error` throws scattered through `bi-store.ts`.
@@ -41,6 +49,36 @@ pub enum BiError {
     /// A `ClickHouse` failure while querying or writing.
     #[error(transparent)]
     Clickhouse(#[from] ChError),
+}
+
+/// Why a duplicate failed.
+///
+/// The copy's own error is what the caller gets. A half-built copy that
+/// could not be taken back is a second, separate failure: it is carried out
+/// of this module so the caller can report it — the operator has to see it —
+/// while the copy's error is kept (`PR #199 review O SHOULD-FIX 3`).
+#[derive(Debug, Error)]
+pub enum DuplicateError {
+    /// The copy failed and the half-built copy was taken back.
+    #[error(transparent)]
+    Copy(#[from] BiError),
+    /// The copy failed and the half-built copy could not be taken back, so it
+    /// is still there: the operator's problem, and the copy's own error is
+    /// what the caller gets.
+    #[error("{cause}")]
+    CopyAndCleanup {
+        /// Why the copy failed: what the caller gets.
+        cause: BiError,
+        /// Why the half-built copy could not be taken back: what the operator
+        /// has to see.
+        cleanup: ChError,
+    },
+}
+
+impl From<ChError> for DuplicateError {
+    fn from(err: ChError) -> Self {
+        Self::Copy(BiError::from(err))
+    }
 }
 
 const IDENT_ALLOWED: fn(&str) -> bool = |s| Ident::new(s).is_ok();
@@ -71,8 +109,18 @@ const KINDS: &[ChartKind] = &[
     ChartKind::Calendar,
     ChartKind::Kpi,
     ChartKind::Gauge,
+    ChartKind::Progress,
+    ChartKind::Histogram,
+    ChartKind::Gantt,
+    ChartKind::Bullet,
     ChartKind::Table,
+    ChartKind::Pivot,
     ChartKind::Text,
+    ChartKind::Heading,
+    ChartKind::Divider,
+    ChartKind::Section,
+    ChartKind::Image,
+    ChartKind::Web,
 ];
 
 /// Kinds allowed to carry a breakdown (2nd dimension). `heatmap`, `sankey`
@@ -195,6 +243,11 @@ pub struct ChartSpec {
         serialize_with = "serialize_js_number"
     )]
     pub target: Option<f64>,
+    /// What a click on the chart does instead of opening the drill menu
+    /// (`BI-18`·B). Absent on every chart saved before it existed, which the
+    /// console reads as the drill menu; that is why it defaults.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub click: Option<ClickAction>,
 }
 
 /// Serializes `Option<f64>` the way `JSON.stringify` renders a JS `number`:
@@ -207,7 +260,7 @@ pub struct ChartSpec {
     clippy::ref_option,
     reason = "serde's `serialize_with` contract requires `&Option<f64>`, not `Option<&f64>`"
 )]
-fn serialize_js_number<S: serde::Serializer>(
+pub(crate) fn serialize_js_number<S: serde::Serializer>(
     value: &Option<f64>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
@@ -241,6 +294,20 @@ pub struct StoredChartSpec {
     pub created_at: Option<String>,
 }
 
+/// Read [`ChartInput::mart`]: a string as it is, and `null` as the empty
+/// string, which is what an absent `mart` already is.
+///
+/// Any other type (a number, an object) is still a decode error, because
+/// `Option<String>` accepts only a string or `null`.
+///
+/// # Errors
+///
+/// The deserializer's own error, when the value is neither a string nor
+/// `null`: a number or an object is refused.
+fn deserialize_mart<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// High-level input (from the AI tool / UI builder) — the server assembles
 /// its SQL.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -258,7 +325,11 @@ pub struct ChartInput {
     /// downstream validation (which mirrors `specFromInput` in
     /// `bi-store.ts`) produce the proper Indonesian error message instead
     /// of failing at deserialization with "missing field `mart`".
-    #[serde(default)]
+    ///
+    /// `null` reads as no mart, like an absent field: the assistant's model
+    /// sends `null` for "no mart", and the update path then carries the
+    /// stored source over, as it does when `mart` is absent.
+    #[serde(default, deserialize_with = "deserialize_mart")]
     pub mart: String,
     /// Dashboard SQL source id, the alternative to `mart` (exactly one of
     /// the two for every kind but `text`). `camelCase` on the wire like the
@@ -268,13 +339,18 @@ pub struct ChartInput {
     /// How to render the data.
     pub kind: ChartKind,
     /// X-axis / category column.
-    #[serde(default)]
+    #[serde(default, with = "crate::params::slot")]
     pub dimension: String,
-    /// Value column(s); more than one only for `stacked`.
+    /// Value column(s); more than one only for `stacked`. An entry may be
+    /// `{"column": …, "aggregate": …}` to carry its own aggregate (`BI-6`).
     #[serde(default)]
-    pub measures: Vec<String>,
+    pub measures: MeasureList,
     /// Optional 2nd dimension: splits into multiple series.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        with = "crate::params::slot_opt"
+    )]
     pub breakdown: Option<String>,
     /// Map id (`geomap`, `pointmap`, `geoheat`); shape-checked only, the
     /// console owns the catalogue.
@@ -290,9 +366,9 @@ pub struct ChartInput {
     /// Aggregate function.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub aggregate: Option<String>,
-    /// Row limit.
+    /// Row limit: a number, or `{ "param": <number parameter> }` (`BI-11`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub limit: Option<u32>,
+    pub limit: Option<crate::params::Limit>,
     /// Sort order.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub order: Option<String>,
@@ -315,6 +391,120 @@ pub struct ChartInput {
         serialize_with = "serialize_js_number"
     )]
     pub target: Option<f64>,
+    /// What a click on the chart does; see [`ChartSpec::click`]. Checked by
+    /// [`ClickAction::validate`] when the chart is built.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub click: Option<ClickAction>,
+    /// How the date or timestamp `dimension` is grouped (`BI-9`): one of the
+    /// thirteen names in [`crate::grain::Grain`], absent on every chart saved
+    /// before it existed. A `String` and not the enum so a wrong value is
+    /// refused at save with a plain message instead of a generic "body JSON is
+    /// invalid"; read back through [`crate::grain::Grain::parse`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub grain: Option<String>,
+    /// The fields of raw tables, pivots and KPI comparisons (`BI-16` part A),
+    /// flat on the wire like every other field here and all absent on a chart
+    /// saved before they existed.
+    #[serde(flatten)]
+    pub tables: TableFields,
+    /// The chart's own filters, sort, top-N with "Other" and groupings
+    /// (`BI-6`), flat on the wire and all absent on a chart saved before.
+    #[serde(flatten)]
+    pub shape: ShapeFields,
+    /// Number and date formats, colours, axes, labels, notes, tooltip fields
+    /// and conditional colours (`BI-17` part A), flat on the wire and all
+    /// absent on a chart saved before they existed.
+    #[serde(flatten)]
+    pub style: crate::style::StyleFields,
+    /// Goal, bands, histogram ranges and the address of an image or web card
+    /// (`BI-16` part B), flat on the wire and all absent on a chart saved
+    /// before they existed.
+    #[serde(flatten)]
+    pub types: Box<crate::types_b::TypeFields>,
+}
+
+impl ChartInput {
+    /// Whether the chart uses anything `BI-6` added (a measure with its own
+    /// aggregate, its own filters, a sort, "Other", groupings). Such a chart is
+    /// rebuilt from its definition at read time, like a grained one.
+    #[must_use]
+    pub fn uses_shaping(&self) -> bool {
+        // `BI-46` (plan D14; QA `LH-BI-6-01`): a chart whose limit keeps the
+        // breakdown's top values is rebuilt from its definition on every read,
+        // like a grained one, so the rule reaches charts saved before it — with
+        // or without a dashboard filter. `finish_shaping` builds the stored
+        // statement from the same builder, so the two cannot disagree.
+        self.measures.has_own_aggregates() || self.shape.is_used() || self.caps_breakdown()
+    }
+
+    /// Whether the chart's limit keeps the breakdown's top values (`BI-46`,
+    /// plan D12): a bar, hbar, line or area chart with a breakdown, where the
+    /// second column is a series and the N values with the largest total of
+    /// the chart's measure are kept.
+    #[must_use]
+    pub fn caps_breakdown(&self) -> bool {
+        self.kind.breakdown_is_series()
+            && self
+                .breakdown
+                .as_ref()
+                .is_some_and(|breakdown| !breakdown.is_empty())
+    }
+
+    /// Whether a grained chart of this definition keeps the LATEST buckets
+    /// (`BI-46`, plan D12): only when its limit is not the breakdown's. A
+    /// chart with a breakdown keeps every period; its budget is the
+    /// breakdown's, and a relative date filter is how it narrows to recent
+    /// periods.
+    #[must_use]
+    pub fn keeps_latest_buckets(&self, grain: crate::grain::Grain) -> bool {
+        !self.caps_breakdown() && crate::grain::cuts_to_latest(grain, &self.effective_order())
+    }
+
+    /// The fixed limit, or `None` when the chart has none or takes it from a
+    /// parameter (`BI-11`): a read resolves the parameter into a fixed limit
+    /// first ([`crate::params::resolve_chart`]), so a statement is never built
+    /// from an unresolved one.
+    #[must_use]
+    pub fn limit_value(&self) -> Option<u32> {
+        match &self.limit {
+            Some(crate::params::Limit::Fixed(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Whether the definition names a parameter (a limit, a column, a
+    /// reference line).
+    #[must_use]
+    pub fn uses_params(&self) -> bool {
+        !crate::params::chart_param_names(self).is_empty()
+    }
+
+    /// `order` in the words it always had (`none`, `asc`, `desc`) once a sort
+    /// is taken into account: a sort by the dimension is `none` (by bucket),
+    /// a sort by anything else a value order. The rules for a grain's latest
+    /// buckets and part ranges read this, not `order`.
+    #[must_use]
+    pub fn effective_order(&self) -> String {
+        match &self.shape.sort {
+            None => self.order.clone().unwrap_or_else(|| "none".to_owned()),
+            Some(s) if s.by == self.dimension => "none".to_owned(),
+            Some(s) if s.descending() => "desc".to_owned(),
+            Some(_) => "asc".to_owned(),
+        }
+    }
+
+    /// Whether the statement of this chart is built from the relation's
+    /// columns at read time (a grain, a raw table, a pivot, a comparing KPI),
+    /// so a caller that skips reading them when no filter is active must read
+    /// them for this chart.
+    #[must_use]
+    pub fn needs_columns(&self) -> bool {
+        self.grain.is_some()
+            || self.uses_shaping()
+            || self.kind == ChartKind::Pivot
+            || self.tables.is_rows_mode(self.kind)
+            || self.tables.compares_to_previous(self.kind)
+    }
 }
 
 /// A dashboard.
@@ -346,6 +536,44 @@ pub struct Board {
     /// Dashboard-wide dimension filters.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub filters: Option<Vec<FilterDef>>,
+    /// The auto-refresh interval an editor saved for the board, in seconds
+    /// (`BI-18`·B; one of [`crate::click::REFRESH_SECONDS`]). `None` when
+    /// none was saved, which is also what a saved 0 ("off") reads back as, so
+    /// a board saved before the column existed serialises without the key.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub refresh_seconds: Option<u32>,
+    /// The grain an editor saved for the board's time-grouped charts (`BI-9`;
+    /// one of the truncations in [`crate::grain::Grain`]). `None` when none
+    /// was saved: each chart then uses its own.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub grain: Option<String>,
+    /// The parameters whose controls the board shows, with the value an editor
+    /// saved for each (`BI-11`). `None` when the board shows none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub params: Option<Vec<crate::params::BoardParam>>,
+    /// The tabs of the board, in order (`BI-18` part C). `None` when it has
+    /// none, which is one implicit tab and the board as it always was.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tabs: Option<Vec<crate::layout::Tab>>,
+    /// The order and heights of the tiles below 640 px, when an editor saved
+    /// a layout for the phone (`BI-18` part C). `None` stacks the tiles in
+    /// the reading order of [`Self::layout`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub phone_layout: Option<Vec<crate::layout::PhoneTile>>,
+    /// `light` or `dark` when an editor fixed the dashboard's theme
+    /// (`BI-17` part A, D6); `None` follows the console (`auto`), which is
+    /// also what a board saved before the column reads as.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub theme: Option<String>,
+    /// The id of the font an editor chose (one of
+    /// [`crate::formatting::SHIPPED_FONTS`]); `None` is the console's own.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub font: Option<String>,
+    /// How long the dashboard's tiles may be served from remembered results
+    /// (`BI-4` part B, feature decision 2). `None` follows the install's rule;
+    /// a board saved before the column reads as `None`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cache: Option<crate::cache_rule::CacheRule>,
     /// `ClickHouse`-formatted creation timestamp.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
@@ -361,8 +589,12 @@ pub struct Board {
     /// dialog and the parity corpus already read.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub updated_at: Option<String>,
-    /// Public read-only share token, when enabled.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    /// The public link token the row carried before `BI-19` part A moved links
+    /// to Postgres (migration `0098`). Nothing reads it for sharing any more and
+    /// it is never serialised: the live link is `lakehouse_store::public_links`.
+    /// It is still carried through a save because every save is a full-row
+    /// INSERT, and the start-up copy of old links reads it until it has run.
+    #[serde(skip_serializing, default)]
     pub public_token: Option<String>,
     /// Whether signed (JWT) embedding is enabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -371,10 +603,22 @@ pub struct Board {
     /// a board value built in code before it is saved.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub folder_id: Option<String>,
+    /// The principal id of the user whose personal space the board is in
+    /// (`BI-18` part C, part 2), `None` for every other board. Only its owner
+    /// and a principal with `identity:write` ever read a board that has one
+    /// ([`crate::access::Viewer`]).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub owner_id: Option<String>,
+    /// Signed-embed access state (`SEC-12`): what has been withdrawn and
+    /// which sites may frame the embed. Never serialised: the list of
+    /// withdrawn token ids is not for a dashboard listing, and it is read
+    /// through `GET /api/dashboard/embed-info`.
+    #[serde(skip)]
+    pub embed_access: EmbedAccess,
 }
 
 /// A tile's position on the 12-column grid canvas.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TileBox {
     /// Grid column.
     pub x: i32,
@@ -384,6 +628,12 @@ pub struct TileBox {
     pub w: i32,
     /// Height, in grid rows.
     pub h: i32,
+    /// The id of the tab this tile sits on (`BI-18` part C). Absent on a
+    /// board with no tabs, and on a tile saved before it had any: such a tile
+    /// sits on the first tab ([`crate::layout::tab_of`]). Left off the wire
+    /// when absent so a board saved before tabs serialises to the same bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<String>,
 }
 
 /// Layout, keyed by chart id.
@@ -395,15 +645,7 @@ pub struct TileBox {
 /// order effectively random per run and fail parity nondeterministically.
 pub type LayoutMap = IndexMap<String, TileBox>;
 
-/// A dashboard filter: a column's allowed values, applied to every tile that
-/// has that column.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FilterDef {
-    /// The column to filter on.
-    pub column: String,
-    /// Allowed values.
-    pub values: Vec<String>,
-}
+pub use crate::filters::FilterDef;
 
 // ── id generation ───────────────────────────────────────────────────────
 // Mirrors `randomUUID().slice(0, 8)` (first 8 hex chars of a v4 UUID's
@@ -431,7 +673,9 @@ fn new_chart_id() -> String {
     format!("u_{}", random_hex(4))
 }
 
-fn new_public_token() -> String {
+/// A fresh public link token (`p_` and 32 hex characters, 128 random bits).
+#[must_use]
+pub fn new_public_token() -> String {
     format!("p_{}", random_hex(16))
 }
 
@@ -449,7 +693,27 @@ fn new_public_token() -> String {
 /// and `delete_board` on a 10-chart board issued ~96 DDL statements (~2s).
 /// Caching the *outcome* here (not just documenting the option) makes
 /// repeat calls free, matching the TS.
-static BI_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+///
+/// PR #201 review F SHOULD-FIX 3: one guard for both builds, an
+/// `AtomicU8` and not a `OnceCell`. A test has to be able to put the guard
+/// back to "not started" and drive the production code path itself; a
+/// `OnceCell` cannot be reset, which is why the test build used to carry a
+/// `RwLock<bool>` stand-in that the production build never had — the test
+/// then pinned the statement count and nothing about the code that runs in
+/// production.
+static BI_TABLE_ENSURED: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(ENSURE_NOT_STARTED);
+
+/// The guard's states: the bootstrap has not run yet, or it has.
+const ENSURE_NOT_STARTED: u8 = 0;
+const ENSURE_DONE: u8 = 1;
+
+/// Serialises the bootstrap itself: one runner at a time, the others wait
+/// for its answer — the same contract as `OnceCell::get_or_try_init`.
+static BI_TABLE_BOOTSTRAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+static TEST_DDL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Create the `console` database and `bi_chart`/`bi_board` tables if they do
 /// not already exist (idempotent). Ports `ensureBiTable` in `bi-store.ts`.
@@ -464,10 +728,288 @@ static BI_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::cons
 ///
 /// Returns [`ChError`] if any DDL statement fails.
 pub async fn ensure_bi_table(ch: &ChClient) -> Result<(), ChError> {
-    BI_TABLE_ENSURED
-        .get_or_try_init(|| ensure_bi_table_uncached(ch))
-        .await
-        .map(drop)
+    use std::sync::atomic::Ordering;
+    if BI_TABLE_ENSURED.load(Ordering::Acquire) == ENSURE_DONE {
+        return Ok(());
+    }
+    let _runner = BI_TABLE_BOOTSTRAP_LOCK.lock().await;
+    if BI_TABLE_ENSURED.load(Ordering::Acquire) == ENSURE_DONE {
+        return Ok(());
+    }
+    ensure_bi_table_uncached(ch).await?;
+    BI_TABLE_ENSURED.store(ENSURE_DONE, Ordering::Release);
+    Ok(())
+}
+
+/// Put the DDL guard back to "not started", so a test can count the
+/// statements the bootstrap issues. The production build never resets it.
+#[cfg(test)]
+fn reset_bi_table_guard() {
+    BI_TABLE_ENSURED.store(ENSURE_NOT_STARTED, std::sync::atomic::Ordering::Release);
+}
+
+/// The `bi_board` columns that hold state beyond the board's name, layout
+/// and filters: the saved auto-refresh (`BI-18`·B), grain and parameters.
+/// The signed-embed access state (`SEC-12`) is deliberately not here: it
+/// lives in `console.bi_board_embed_event`. Split out of [`ensure_bi_table_uncached`] to keep
+/// it under clippy's line limit.
+async fn ensure_board_state_columns(ch: &ChClient) -> Result<(), ChError> {
+    // BI-18·B: the auto-refresh a dashboard opens with, in seconds. A
+    // constant default like the columns above, so a board saved before it
+    // existed reads as "no saved interval". No Postgres migration: boards
+    // live in ClickHouse and this is the same `ALTER ... IF NOT EXISTS` idiom.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS refresh_seconds UInt32 DEFAULT 0",
+        None,
+    )
+    .await?;
+    // BI-9: the time grain a dashboard opens with, `''` meaning "each chart's
+    // own". A constant default for the same reason as the columns above.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS grain String DEFAULT ''",
+        None,
+    )
+    .await?;
+    // BI-11: the parameters a dashboard shows and their saved values, a JSON
+    // list; `[]` is "none", so a board saved before reads as showing none.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS params_json String DEFAULT '[]'",
+        None,
+    )
+    .await?;
+    // BI-18 part C: the tabs of a dashboard and its phone layout, JSON lists;
+    // `[]` is "none" for both, so a board saved before reads as one tab and
+    // the computed stacking. Same `ALTER ... IF NOT EXISTS` idiom, no
+    // Postgres migration: boards live in ClickHouse.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS tabs_json String DEFAULT '[]'",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS phone_layout_json String DEFAULT '[]'",
+        None,
+    )
+    .await?;
+    // BI-17 part A (D6): the theme and the font of a dashboard, `''` meaning
+    // "follow the console" and "the console's own font". Same idiom: a
+    // constant default, so a board saved before reads as following the
+    // console, and no Postgres migration because boards live in ClickHouse.
+    for column in ["theme", "font"] {
+        ch.exec(
+            &format!(
+                "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS {column} String DEFAULT ''"
+            ),
+            None,
+        )
+        .await?;
+    }
+    // BI-4 part B (plan D7): the dashboard's freshness rule, `''` meaning
+    // "follow the install". Same idiom as `refresh_seconds`: a constant
+    // default, so a board saved before reads as following the install, and no
+    // Postgres migration because boards live in ClickHouse.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS cache_json String DEFAULT ''",
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The `Unix epoch` as an event `at`: every copied legacy event carries it, so
+/// any event written since sorts after it (`argMax` on `at`).
+const LEGACY_EMBED_EPOCH: &str = "toDateTime64(0, 6, 'UTC')";
+
+/// One-time copy of the embed state that `5d8f61e1` (`SEC-12`) stored on the
+/// `console.bi_board` row into `console.bi_board_embed_event` (PR #105 review
+/// R-A1 BLOCKER).
+///
+/// Why: the event table replaces three `bi_board` columns that already
+/// reached `main`. Nothing reads them any more, so without this copy a token
+/// withdrawn on a deployed database would be accepted again and a board's
+/// allowed origins would be lost. The legacy columns stay in place and are
+/// never written again; dropping them is a later migration, not this one.
+///
+/// Rules: it runs only when `system.columns` shows legacy columns on
+/// `console.bi_board` (a fresh database has none and nothing runs); every
+/// copied event has `at` = the epoch ([`LEGACY_EMBED_EPOCH`]), so a real event
+/// written since wins; it is idempotent because a board that already has an
+/// event at the epoch is skipped by the query itself; values are bound with
+/// [`SqlLiteral`], never formatted in.
+///
+/// PR #105 review R-A3 SHOULD-FIX: a board's events go in ONE multi-row
+/// `INSERT` (`ClickHouse` writes one block whole or not at all), so a process
+/// that stops mid-copy cannot leave the epoch marker without the withdrawn
+/// `jti`s. PR #105 review R-A4 SHOULD-FIX: the query does not filter on
+/// `is_deleted`, so a board in the trash (restorable) keeps its withdrawals;
+/// an event for a deleted board is never read and costs nothing.
+async fn copy_legacy_embed_state(ch: &ChClient) -> Result<(), ChError> {
+    let present = ch
+        .rows(
+            "SELECT name FROM system.columns WHERE database = 'console' AND table = 'bi_board' \
+             AND name IN ('embed_revoked_before', 'embed_revoked_jti_json', 'embed_origins_json')",
+            None,
+        )
+        .await?;
+    let has = |name: &str| present.iter().any(|r| row_str(r, "name") == name);
+    let (has_before, has_jti, has_origins) = (
+        has("embed_revoked_before"),
+        has("embed_revoked_jti_json"),
+        has("embed_origins_json"),
+    );
+    if !(has_before || has_jti || has_origins) {
+        return Ok(());
+    }
+    // A column that is not there reads as its constant default.
+    let before = if has_before {
+        "embed_revoked_before"
+    } else {
+        "0"
+    };
+    let jti = if has_jti {
+        "embed_revoked_jti_json"
+    } else {
+        "'[]'"
+    };
+    let origins = if has_origins {
+        "embed_origins_json"
+    } else {
+        "'[]'"
+    };
+    let sql = format!(
+        "SELECT id, {before} AS embed_revoked_before, {jti} AS embed_revoked_jti_json, \
+         {origins} AS embed_origins_json FROM console.bi_board FINAL \
+         WHERE ({before} > 0 OR {jti} NOT IN ('', '[]') \
+         OR {origins} NOT IN ('', '[]')) \
+         AND id NOT IN (SELECT board_id FROM console.bi_board_embed_event \
+         WHERE at = {LEGACY_EMBED_EPOCH})"
+    );
+    for row in ch.rows(&sql, None).await? {
+        if let Some(insert) = legacy_embed_insert(&row) {
+            ch.exec(&insert, None).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The single `INSERT` that carries one legacy board row's embed state over
+/// (PR #105 review R-A3 SHOULD-FIX: one statement, so it lands whole or not
+/// at all). `None` when the row holds no state, so no epoch marker is written
+/// and the board is looked at again next time, which is harmless.
+fn legacy_embed_insert(row: &serde_json::Map<String, Value>) -> Option<String> {
+    let board = SqlLiteral::from(row_str(row, "id"));
+    let revoked_before = row_u64(row, "embed_revoked_before");
+    let jti_json = row_str(row, "embed_revoked_jti_json").trim();
+    let origins_json = row_str(row, "embed_origins_json").trim();
+    // Column order: board_id, kind, revoked_before, jti, exp, origins_json, at.
+    let mut tuples: Vec<String> = Vec::new();
+    let mut revoke_all = |value: u64| {
+        tuples.push(format!(
+            "({board}, 'revoke_all', {value}, '', 0, '[]', {LEGACY_EMBED_EPOCH})"
+        ));
+    };
+    if revoked_before > 0 {
+        revoke_all(revoked_before);
+    }
+    let tokens: Option<Vec<WithdrawnToken>> = if jti_json.is_empty() {
+        Some(Vec::new())
+    } else {
+        serde_json::from_str(jti_json).ok()
+    };
+    match tokens {
+        // Fails closed like `EmbedAccess::from_stored`: a withdrawn list that
+        // does not parse withdraws every token of the board.
+        None => revoke_all(u64::MAX),
+        Some(list) => {
+            for t in list {
+                tuples.push(format!(
+                    "({board}, 'withdraw', 0, {}, {}, '[]', {LEGACY_EMBED_EPOCH})",
+                    SqlLiteral::from(t.jti.as_str()),
+                    t.exp
+                ));
+            }
+        }
+    }
+    if !origins_json.is_empty() && origins_json != "[]" {
+        tuples.push(format!(
+            "({board}, 'origins', 0, '', 0, {}, {LEGACY_EMBED_EPOCH})",
+            SqlLiteral::from(origins_json)
+        ));
+    }
+    if tuples.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "INSERT INTO console.bi_board_embed_event \
+         (board_id, kind, revoked_before, jti, exp, origins_json, at) VALUES {}",
+        tuples.join(", ")
+    ))
+}
+
+/// The tables behind saved fields and hierarchies (`BI-8`, `BI-10`). Split
+/// out of [`ensure_bi_table_uncached`] to keep it under clippy's line limit.
+async fn ensure_field_tables(ch: &ChClient) -> Result<(), ChError> {
+    // BI-8: calculated fields (`crate::fields`). Same versioned-insert shape
+    // as `bi_source`; `data_type` and `level` are what the server inferred
+    // when the formula was saved. Created here and not by a Postgres
+    // migration because dashboards live in ClickHouse.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_field (\n\
+           id String, source_kind String, source_id String, name String,\n\
+           formula String, level String DEFAULT 'row', data_type String DEFAULT '',\n\
+           created_by String DEFAULT '', created_at DateTime DEFAULT now(),\n\
+           is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
+    // BI-10: hierarchies (`crate::hierarchies`), the same versioned-insert
+    // shape; only the ordered column names are kept.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_hierarchy (\n\
+           id String, source_kind String, source_id String, name String,\n\
+           levels_json String DEFAULT '[]', created_by String DEFAULT '',\n\
+           created_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
+    // BI-11: parameters (`crate::params`), the same versioned-insert shape; the
+    // whole definition is one JSON document.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_param (\n\
+           id String, name String, def_json String DEFAULT '{}',\n\
+           created_by String DEFAULT '', created_at DateTime DEFAULT now(),\n\
+           is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
+    // BI-2: metrics and segments (`crate::metrics`), the same versioned-insert
+    // shape; the filters are one JSON document.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_metric (\n\
+           id String, name String, label String DEFAULT '', description String DEFAULT '',\n\
+           source_kind String, source_id String, formula String,\n\
+           filters_json String DEFAULT '[]', time_column String DEFAULT '',\n\
+           grain String DEFAULT '', format String DEFAULT '',\n\
+           created_by String DEFAULT '', created_at DateTime DEFAULT now(),\n\
+           is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_segment (\n\
+           id String, name String, label String DEFAULT '',\n\
+           source_kind String, source_id String, filters_json String DEFAULT '[]',\n\
+           created_by String DEFAULT '', created_at DateTime DEFAULT now(),\n\
+           is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
+    Ok(())
 }
 
 /// The actual DDL bootstrap, run at most once per process by
@@ -542,6 +1084,29 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    ensure_board_state_columns(ch).await?;
+    // SEC-12 (PR #105 review SHOULD-FIX 1): embed access state is stored in
+    // an append-only event table instead of the `bi_board` row. Because
+    // dashboard saves (`save_board_patch`) perform full-row INSERTs into a
+    // ReplacingMergeTree, keeping embed state on the board row created a race
+    // where an unrelated edit could overwrite and bring back a withdrawn
+    // token. In this table, state is written only by INSERT and read by
+    // aggregation:
+    // - `revoked_before` = `max(revoked_before)` over `revoke_all` events;
+    // - withdrawn tokens = `jti` with `max(exp)` over unexpired `withdraw` events;
+    // - allowed origins = newest `origins` event (`argMax` on `at`);
+    // - filter modes = newest `filter_modes` event (its JSON object is kept in
+    //   `origins_json`, BI-26 D2).
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_board_embed_event (\n\
+           board_id String, kind LowCardinality(String),\n\
+           revoked_before UInt64 DEFAULT 0, jti String DEFAULT '',\n\
+           exp UInt64 DEFAULT 0, origins_json String DEFAULT '[]',\n\
+           at DateTime64(6) DEFAULT now64(6)\n\
+         ) ENGINE = MergeTree ORDER BY (board_id, at)",
+        None,
+    )
+    .await?;
     ch.exec(
         "CREATE TABLE IF NOT EXISTS console.bi_folder (\n\
            id String, name String, parent_id String DEFAULT '',\n\
@@ -563,6 +1128,96 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    ensure_field_tables(ch).await?;
+    ensure_organise_tables(ch).await?;
+    // SEC-12 (PR #105 review R-A1 BLOCKER): the one-time copy of the embed
+    // state that still sits on the `bi_board` rows of a database that ran the
+    // older code. It runs LAST, after every column this branch adds exists,
+    // so the copy sees the row as it is. The legacy columns are never read
+    // again and never written again (PR #199 review N).
+    copy_legacy_embed_state(ch).await?;
+    Ok(())
+}
+
+/// The columns and tables behind the trash, the personal space, the version
+/// history and the favourites (`BI-18` part C, part 2). Split out of
+/// [`ensure_bi_table_uncached`] for the line limit. Same idiom as everything
+/// above: `ALTER ... ADD COLUMN IF NOT EXISTS` with a constant default, so a
+/// row written before the column existed reads as "not deleted, nobody's
+/// private board"; no Postgres migration, because dashboards live in
+/// `ClickHouse`.
+async fn ensure_organise_tables(ch: &ChClient) -> Result<(), ChError> {
+    // The personal space: a board in a folder that belongs to a user carries
+    // that user's principal id (`crate::access`). `''` is every other board.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS owner_id String DEFAULT ''",
+        None,
+    )
+    .await?;
+    // The trash: a deleted board or chart keeps its row with `is_deleted = 2`
+    // (so every read for `is_deleted = 0` already leaves it out), the instant
+    // it was deleted and the display name of who did it. `toDateTime(0)` is a
+    // constant, stable for rows written before the column existed.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS deleted_at DateTime DEFAULT toDateTime(0)",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS deleted_by String DEFAULT ''",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_chart ADD COLUMN IF NOT EXISTS deleted_at DateTime DEFAULT toDateTime(0)",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_chart ADD COLUMN IF NOT EXISTS deleted_by String DEFAULT ''",
+        None,
+    )
+    .await?;
+    // The board whose delete took this chart to the trash with it (`''` for a
+    // chart deleted on its own): restoring the board brings those back.
+    ch.exec(
+        "ALTER TABLE console.bi_chart ADD COLUMN IF NOT EXISTS deleted_with String DEFAULT ''",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_folder ADD COLUMN IF NOT EXISTS owner_id String DEFAULT ''",
+        None,
+    )
+    .await?;
+    // Version history (`crate::versions`): the same versioned-insert shape,
+    // so keeping the last 15 and removing a purged board's history are both
+    // tombstone inserts, never a mutation.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_board_version (\n\
+           board String, version UInt32, state_json String DEFAULT '{}',\n\
+           author_id String DEFAULT '', author_name String DEFAULT '',\n\
+           created_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY (board, version)",
+        None,
+    )
+    .await?;
+    // A version written by a revert is labelled "Restored v<n>" (BI-18 part C
+    // review fix (SHOULD-FIX) R8); every other version leaves it empty.
+    ch.exec(
+        "ALTER TABLE console.bi_board_version ADD COLUMN IF NOT EXISTS label String DEFAULT ''",
+        None,
+    )
+    .await?;
+    // Favourites and recent items per user (`crate::items`).
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_user_item (\n\
+           user_id String, list String, kind String, item_id String,\n\
+           at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(at) ORDER BY (user_id, list, kind, item_id)",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -576,7 +1231,26 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
 /// second, user-made dashboard.
 pub const DEFAULT_BOARD_ID: &str = "default";
 
-const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, toString(created_at) AS created_at";
+/// The columns a board row is read with. The three legacy SEC-12 columns
+/// (`embed_revoked_before`, `embed_revoked_jti_json`, `embed_origins_json`)
+/// are NOT here: the embed access state lives in
+/// `console.bi_board_embed_event` and is read by aggregation
+/// ([`get_board_embed_access`]), so the board row is never asked for it
+/// (`PR #105 review SHOULD-FIX 1`, kept by `PR #199 review N`).
+const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, cache_json, owner_id, toString(created_at) AS created_at";
+
+/// The `bi_board` columns a row keeps through the trash: everything but
+/// `created_at` (the version, set by the insert) and the trash columns.
+/// Said when sharing is turned on for a board in the personal space.
+///
+/// The legacy embed columns are not among them: the embed access state is in
+/// the event table, which the trash never touches, so a board that comes
+/// back from the trash keeps the withdrawals it had (`PR #199 review N`).
+pub(crate) const BOARD_KEEP_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, cache_json, owner_id";
+
+/// A board in the personal space cannot be shared. Move it to a folder first.
+pub const PERSONAL_NOT_SHAREABLE: &str =
+    "A dashboard in the personal space cannot be shared. Move it to a folder first.";
 
 fn parse_layout(s: &str) -> LayoutMap {
     if s.is_empty() {
@@ -594,6 +1268,18 @@ fn parse_filters(s: &str) -> Vec<FilterDef> {
 
 fn row_str<'a>(row: &'a serde_json::Map<String, Value>, key: &str) -> &'a str {
     row.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// A `UInt64` column: `ClickHouse` quotes 64-bit integers in JSON output by
+/// default, so it arrives as a string; a number is accepted too.
+fn row_u64(row: &serde_json::Map<String, Value>, key: &str) -> u64 {
+    row.get(key)
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| v.as_u64())
+        })
+        .unwrap_or(0)
 }
 
 fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
@@ -614,15 +1300,51 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
         created_by: Some(row_str(row, "created_by").to_owned()),
         layout: Some(parse_layout(layout_json)),
         filters: Some(parse_filters(filters_json)),
+        // 0 is "off", the same as never saved.
+        refresh_seconds: Some(row_u64(row, "refresh_seconds"))
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0),
+        grain: Some(row_str(row, "grain").to_owned()).filter(|g| !g.is_empty()),
+        params: serde_json::from_str::<Vec<crate::params::BoardParam>>(row_str(row, "params_json"))
+            .ok()
+            .filter(|p| !p.is_empty()),
+        tabs: serde_json::from_str::<Vec<crate::layout::Tab>>(row_str(row, "tabs_json"))
+            .ok()
+            .filter(|t| !t.is_empty()),
+        phone_layout: serde_json::from_str::<Vec<crate::layout::PhoneTile>>(row_str(
+            row,
+            "phone_layout_json",
+        ))
+        .ok()
+        .filter(|t| !t.is_empty()),
+        theme: Some(row_str(row, "theme").to_owned()).filter(|t| !t.is_empty()),
+        font: Some(row_str(row, "font").to_owned()).filter(|f| !f.is_empty()),
+        // Fail closed: a stored text that is not a rule (edited by hand
+        // around the validation) reads as "always fresh", never as the
+        // default, which would remember results the editor may have meant to
+        // keep fresh.
+        cache: Some(
+            crate::cache_rule::CacheRule::from_stored(row_str(row, "cache_json"))
+                .unwrap_or(crate::cache_rule::CacheRule::Fresh),
+        )
+        .filter(|rule| *rule != crate::cache_rule::CacheRule::Follow),
         created_at: Some(stamp.clone()),
         updated_at: Some(stamp),
         public_token: Some(public_token.to_owned()),
         embed_enabled: Some(embed_enabled == 1),
         folder_id: Some(row_str(row, "folder_id").to_owned()),
+        owner_id: Some(row_str(row, "owner_id").to_owned()).filter(|o| !o.is_empty()),
+        // SEC-12 (PR #105 review SHOULD-FIX 1): the embed access state is not
+        // on the board row any more. It is aggregated from
+        // `console.bi_board_embed_event` by [`get_board_embed_access`], which
+        // every reader of a board calls (`PR #199 review N`).
+        embed_access: EmbedAccess::default(),
     }
 }
 
-/// List every non-deleted user board, oldest first. Ports `listBoards`.
+/// List every live user board `viewer` may see, oldest first. Ports
+/// `listBoards`. A board in the trash (`is_deleted = 2`) and another user's
+/// personal board are not in it.
 ///
 /// Excludes the [`DEFAULT_BOARD_ID`] layout row; read that with
 /// [`get_board`].
@@ -630,13 +1352,14 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn list_boards(ch: &ChClient) -> Result<Vec<Board>, ChError> {
+pub async fn list_boards(ch: &ChClient, viewer: &Viewer) -> Result<Vec<Board>, ChError> {
     ensure_bi_table(ch).await?;
     let rows = ch
         .rows(
             &format!(
-                "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND id != {} ORDER BY created_at",
-                SqlLiteral::from(DEFAULT_BOARD_ID)
+                "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND id != {}{} ORDER BY created_at",
+                SqlLiteral::from(DEFAULT_BOARD_ID),
+                viewer.owner_clause()
             ),
             None,
         )
@@ -644,19 +1367,113 @@ pub async fn list_boards(ch: &ChClient) -> Result<Vec<Board>, ChError> {
     Ok(rows.iter().map(row_to_board).collect())
 }
 
-/// Fetch a board by id. Ports `getBoard`.
+/// What the store holds for a board id, whatever its state: the latest row's
+/// `is_deleted` and `owner_id`. `None` when the id never had a row.
+///
+/// For the checks that decide whether a WRITE may touch a board (the personal
+/// space and the trash both change that answer), which need to tell "does not
+/// exist", "in the trash" and "somebody else's" apart from the board being
+/// live and visible. A caller must not reveal which of the refusals it was.
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn get_board(ch: &ChClient, id: &str) -> Result<Option<Board>, ChError> {
+pub async fn board_row_state(ch: &ChClient, id: &str) -> Result<Option<(u8, String)>, ChError> {
+    ensure_bi_table(ch).await?;
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT is_deleted, owner_id FROM console.bi_board FINAL WHERE id = {} LIMIT 1",
+                SqlLiteral::from(id)
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows.first().map(|r| {
+        (
+            u8::try_from(row_u64(r, "is_deleted")).unwrap_or(0),
+            row_str(r, "owner_id").to_owned(),
+        )
+    }))
+}
+
+/// Where every dashboard sits, the trash included (removed-for-good rows are
+/// left out): the input [`crate::access::AccessMap::viewer`] needs to turn
+/// rules on folders and dashboards into the ids a [`Viewer`] is limited by.
+/// The built-in board is not in it. Read as the server, never from a request.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn board_placements(
+    ch: &ChClient,
+) -> Result<Vec<crate::access::BoardPlacement>, ChError> {
+    ensure_bi_table(ch).await?;
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT id, folder_id, owner_id FROM console.bi_board FINAL \
+                 WHERE is_deleted != 1 AND id != {}",
+                SqlLiteral::from(DEFAULT_BOARD_ID)
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| crate::access::BoardPlacement {
+            id: row_str(r, "id").to_owned(),
+            folder_id: row_str(r, "folder_id").to_owned(),
+            owner_id: row_str(r, "owner_id").to_owned(),
+        })
+        .collect())
+}
+
+/// The same for a chart id: its latest row's `is_deleted` and the board it is
+/// on. `None` when the id never had a row.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn chart_row_state(ch: &ChClient, id: &str) -> Result<Option<(u8, String)>, ChError> {
+    ensure_bi_table(ch).await?;
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT is_deleted, board FROM console.bi_chart FINAL WHERE id = {} LIMIT 1",
+                SqlLiteral::from(id)
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows.first().map(|r| {
+        (
+            u8::try_from(row_u64(r, "is_deleted")).unwrap_or(0),
+            row_str(r, "board").to_owned(),
+        )
+    }))
+}
+
+/// Fetch a live board by id, if `viewer` may see it. Ports `getBoard`. A
+/// deleted board, and one in somebody else's personal space, are `None`: the
+/// same answer as a board that never existed, so an id guess learns nothing.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn get_board(ch: &ChClient, id: &str, viewer: &Viewer) -> Result<Option<Board>, ChError> {
     ensure_bi_table(ch).await?;
     let sql = format!(
-        "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND id={} LIMIT 1",
-        SqlLiteral::from(id)
+        "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND id={}{} LIMIT 1",
+        SqlLiteral::from(id),
+        viewer.owner_clause()
     );
     let rows = ch.rows(&sql, None).await?;
-    Ok(rows.first().map(row_to_board))
+    let Some(mut board) = rows.first().map(row_to_board) else {
+        return Ok(None);
+    };
+    board.embed_access = get_board_embed_access(ch, &board.id).await?;
+    Ok(Some(board))
 }
 
 /// Create a new board. Ports `createBoard`.
@@ -671,6 +1488,30 @@ pub async fn create_board(
     description: &str,
     created_by: &str,
 ) -> Result<Board, BiError> {
+    create_board_in(ch, name, description, created_by, "", "").await
+}
+
+/// Create a new board in `folder_id`, owned by `owner_id` when it is not
+/// empty.
+///
+/// Why the folder and the owner travel in the FIRST insert: a board written
+/// without an owner is visible to everybody who may read dashboards, so a
+/// board that is filed in a personal space a moment later was public in
+/// between (`PR #199 review M BLOCKER 5`). A board created without them is an
+/// ordinary shared board, as before.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when `name` is blank after trimming, or
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn create_board_in(
+    ch: &ChClient,
+    name: &str,
+    description: &str,
+    created_by: &str,
+    folder_id: &str,
+    owner_id: &str,
+) -> Result<Board, BiError> {
     ensure_bi_table(ch).await?;
     let clean = name.trim();
     if clean.is_empty() {
@@ -682,11 +1523,13 @@ pub async fn create_board(
     let author = created_by.trim();
     let id = new_board_id();
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, description, created_by) VALUES ({}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, folder_id, owner_id) VALUES ({}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id.as_str()),
         SqlLiteral::from(clean),
         SqlLiteral::from(desc),
-        SqlLiteral::from(author)
+        SqlLiteral::from(author),
+        SqlLiteral::from(folder_id),
+        SqlLiteral::from(owner_id)
     );
     ch.exec(&sql, None).await?;
     Ok(Board {
@@ -696,11 +1539,21 @@ pub async fn create_board(
         created_by: Some(author.to_owned()),
         layout: Some(LayoutMap::new()),
         filters: Some(Vec::new()),
+        refresh_seconds: None,
+        grain: None,
+        params: None,
+        tabs: None,
+        phone_layout: None,
+        theme: None,
+        font: None,
+        cache: None,
         created_at: None,
         updated_at: None,
         public_token: None,
         embed_enabled: None,
-        folder_id: None,
+        folder_id: Some(folder_id.to_owned()).filter(|f| !f.is_empty()),
+        owner_id: Some(owner_id.to_owned()).filter(|o| !o.is_empty()),
+        embed_access: EmbedAccess::default(),
     })
 }
 
@@ -716,13 +1569,20 @@ async fn upsert_board(
     filters: &[FilterDef],
     public_token: &str,
     embed_enabled: bool,
-    folder_id: &str,
+    (folder_id, owner_id): (&str, &str),
+    refresh_seconds: u32,
+    (grain, params): (&str, &[crate::params::BoardParam]),
+    (tabs, phone_layout): (&[crate::layout::Tab], &[crate::layout::PhoneTile]),
+    (theme, font, cache): (&str, &str, &str),
 ) -> Result<(), ChError> {
     let layout_json = serde_json::to_string(layout).unwrap_or_else(|_| "{}".to_owned());
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_owned());
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id) VALUES \
-         ({}, {}, {}, {}, {}, {}, {}, {}, {})",
+        // SEC-12 (PR #105 review SHOULD-FIX 1): the embed access state is NOT
+        // a column of this INSERT. The row therefore never carries it, and a
+        // save can never write back a withdrawn token (`PR #199 review N`).
+        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, cache_json, owner_id) VALUES \
+         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
         SqlLiteral::from(description),
@@ -732,8 +1592,58 @@ async fn upsert_board(
         SqlLiteral::from(public_token),
         i32::from(embed_enabled),
         SqlLiteral::from(folder_id),
+        // Carried on every save: an unrelated edit must not reset the board's saved refresh (BI-18·B).
+        refresh_seconds,
+        // Carried on every save like the refresh above (BI-9).
+        SqlLiteral::from(grain),
+        // And the shown parameters with their saved values (BI-11).
+        SqlLiteral::from(serde_json::to_string(params).unwrap_or_else(|_| "[]".to_owned())),
+        // And the tabs and the phone layout (BI-18 part C), for the same
+        // reason: every save is a full-row INSERT.
+        SqlLiteral::from(serde_json::to_string(tabs).unwrap_or_else(|_| "[]".to_owned())),
+        SqlLiteral::from(serde_json::to_string(phone_layout).unwrap_or_else(|_| "[]".to_owned())),
+        // And the theme and font (BI-17 part A), for the same reason.
+        SqlLiteral::from(theme),
+        SqlLiteral::from(font),
+        // And the freshness rule (BI-4 part B), for the same reason.
+        SqlLiteral::from(cache),
+        // The personal space: carried on every save like the rest, or an
+        // unrelated edit would make a private draft public.
+        SqlLiteral::from(owner_id),
     );
     ch.exec(&sql, None).await
+}
+
+/// The live charts of a board, in creation order, with what their place on the
+/// grid depends on (`BI-18` part C review fix (BLOCKER) R13). A chart in the
+/// trash is not live; a row whose `spec_json` does not parse is skipped, as
+/// [`list_stored_charts`] skips it. The built-in board's id also matches the
+/// charts saved with no board.
+async fn live_charts_of(
+    ch: &ChClient,
+    board_id: &str,
+) -> Result<Vec<crate::layout::LiveChart>, ChError> {
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT id, spec_json FROM console.bi_chart FINAL WHERE is_deleted = 0 AND (board = {board}{none}) ORDER BY created_at",
+                board = SqlLiteral::from(board_id),
+                none = if board_id == DEFAULT_BOARD_ID { " OR board = ''" } else { "" },
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let parsed = serde_json::from_str::<StoredEnvelope>(row_str(row, "spec_json")).ok()?;
+            Some(crate::layout::LiveChart {
+                id: row_str(row, "id").to_owned(),
+                span: parsed.spec.span,
+                kind: parsed.spec.kind,
+            })
+        })
+        .collect())
 }
 
 async fn save_board_patch(
@@ -765,10 +1675,11 @@ async fn save_board_patch(
         .filters
         .or(board.filters.as_deref())
         .unwrap_or(&empty_filters);
-    let public_token = patch
-        .public_token
-        .or(board.public_token.as_deref())
-        .unwrap_or("");
+    // BI-19 part A (plan D2): a save no longer decides anything about a public
+    // link. The live link is in Postgres; this is only the old column carried
+    // forward unchanged so the full-row INSERT does not blank it before the
+    // start-up copy has read it.
+    let public_token = board.public_token.as_deref().unwrap_or("");
     let embed_enabled = patch
         .embed_enabled
         .unwrap_or_else(|| board.embed_enabled.unwrap_or(false));
@@ -776,6 +1687,37 @@ async fn save_board_patch(
     // folder must carry the current one forward or the board would fall
     // back to the root.
     let folder_id = patch.folder_id.or(board.folder_id.as_deref()).unwrap_or("");
+    let owner_id = patch.owner_id.or(board.owner_id.as_deref()).unwrap_or("");
+    let refresh_seconds = patch
+        .refresh_seconds
+        .unwrap_or_else(|| board.refresh_seconds.unwrap_or(0));
+    let grain = patch.grain.or(board.grain.as_deref()).unwrap_or("");
+    let params = patch.params.or(board.params.as_deref()).unwrap_or_default();
+    let tabs = patch.tabs.or(board.tabs.as_deref()).unwrap_or_default();
+    // BI-18 part C review fix (BLOCKER) R1: no tile of a tabbed board is left
+    // naming no tab, whatever this write was for. The first tab is the one the
+    // board had BEFORE this write.
+    let before_tabs = board.tabs.as_deref().unwrap_or_default();
+    let mut stamped = layout.clone();
+    let mut changed = crate::layout::stamp_untagged(&mut stamped, before_tabs, tabs);
+    // BI-18 part C review fix (BLOCKER) R13: every live chart of the board has a
+    // stored box. The chart list is read here, from the chart table itself,
+    // because this is the one place every board write passes through; it is the
+    // same live set the dashboard read draws, so there is no second list to
+    // keep in step.
+    let live = live_charts_of(ch, &board.id).await?;
+    changed |= crate::layout::place_unboxed(&mut stamped, before_tabs, tabs, &live);
+    let layout = if changed { &stamped } else { layout };
+    let phone_layout = patch
+        .phone_layout
+        .or(board.phone_layout.as_deref())
+        .unwrap_or_default();
+    let theme = patch.theme.or(board.theme.as_deref()).unwrap_or("");
+    let font = patch.font.or(board.font.as_deref()).unwrap_or("");
+    let cache = patch
+        .cache
+        .or(board.cache.map(crate::cache_rule::CacheRule::to_stored))
+        .unwrap_or_default();
     upsert_board(
         ch,
         &board.id,
@@ -786,7 +1728,11 @@ async fn save_board_patch(
         filters,
         public_token,
         embed_enabled,
-        folder_id,
+        (folder_id, owner_id),
+        refresh_seconds,
+        (grain, params),
+        (tabs, phone_layout),
+        (theme, font, &cache),
     )
     .await
 }
@@ -800,9 +1746,18 @@ struct BoardPatch<'a> {
     created_by: Option<&'a str>,
     layout: Option<&'a LayoutMap>,
     filters: Option<&'a [FilterDef]>,
-    public_token: Option<&'a str>,
     embed_enabled: Option<bool>,
     folder_id: Option<&'a str>,
+    owner_id: Option<&'a str>,
+    refresh_seconds: Option<u32>,
+    grain: Option<&'a str>,
+    params: Option<&'a [crate::params::BoardParam]>,
+    tabs: Option<&'a [crate::layout::Tab]>,
+    phone_layout: Option<&'a [crate::layout::PhoneTile]>,
+    theme: Option<&'a str>,
+    font: Option<&'a str>,
+    /// The stored text of the rule (`""` follows the install).
+    cache: Option<String>,
 }
 
 /// Rename a board. No-op if the board does not exist (matches the TS `if
@@ -818,7 +1773,7 @@ pub async fn rename_board(ch: &ChClient, id: &str, name: &str) -> Result<(), BiE
     if clean.is_empty() {
         return Err(BiError::Validation("name is required.".to_owned()));
     }
-    if let Some(board) = get_board(ch, id).await? {
+    if let Some(board) = get_board(ch, id, &Viewer::system()).await? {
         save_board_patch(
             ch,
             &board,
@@ -841,7 +1796,7 @@ pub async fn rename_board(ch: &ChClient, id: &str, name: &str) -> Result<(), BiE
 pub async fn describe_board(ch: &ChClient, id: &str, description: &str) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
     let clean = description.trim();
-    if let Some(board) = get_board(ch, id).await? {
+    if let Some(board) = get_board(ch, id, &Viewer::system()).await? {
         save_board_patch(
             ch,
             &board,
@@ -856,27 +1811,98 @@ pub async fn describe_board(ch: &ChClient, id: &str, description: &str) -> Resul
 }
 
 /// Move a board into folder `folder_id` (`""` = root). The caller has
-/// already checked that the folder exists.
+/// already checked that the folder exists and that its viewer may use it.
+///
+/// A folder that is somebody's personal space makes the board theirs
+/// (`owner_id`); any other folder makes it nobody's. A board with a public
+/// link or signed embeds on cannot go into the personal space: a draft that
+/// is shared is not a draft, and the link would keep working for everyone
+/// else, so the move is refused until sharing is turned off.
+/// `has_public_link` is whether the board has a link in Postgres (`BI-19` part
+/// A, plan D5): the link no longer lives on the board row, so the caller asks
+/// `lakehouse_store::public_links` and says so here.
 ///
 /// # Errors
 ///
-/// Returns [`BiError::Validation`] if the board does not exist, or
-/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
-pub async fn move_board(ch: &ChClient, id: &str, folder_id: &str) -> Result<(), BiError> {
+/// Returns [`BiError::Validation`] if the board does not exist or is shared
+/// and the folder is a personal space, or [`BiError::Clickhouse`] on a
+/// `ClickHouse` failure.
+pub async fn move_board(
+    ch: &ChClient,
+    id: &str,
+    folder_id: &str,
+    has_public_link: bool,
+) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id)
+    let board = get_board(ch, id, &Viewer::system())
         .await?
         .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
+    let owner = crate::folders::folder_owner(ch, folder_id).await?;
+    let shared = board.embed_enabled == Some(true) || has_public_link;
+    if !owner.is_empty() && shared {
+        return Err(BiError::Validation(
+            "Turn off sharing before moving a dashboard to the personal space.".to_owned(),
+        ));
+    }
     save_board_patch(
         ch,
         &board,
         BoardPatch {
             folder_id: Some(folder_id),
+            owner_id: Some(&owner),
             ..Default::default()
         },
     )
     .await?;
     Ok(())
+}
+
+/// The bare board a write creates when the row it patches does not exist yet:
+/// the built-in board has no row until something about it is first saved.
+fn shell_board(id: &str) -> Board {
+    Board {
+        id: id.to_owned(),
+        name: "Dashboard".to_owned(),
+        description: None,
+        created_by: None,
+        layout: None,
+        filters: None,
+        refresh_seconds: None,
+        grain: None,
+        params: None,
+        tabs: None,
+        phone_layout: None,
+        theme: None,
+        font: None,
+        cache: None,
+        created_at: None,
+        updated_at: None,
+        public_token: None,
+        embed_enabled: None,
+        folder_id: None,
+        owner_id: None,
+        embed_access: EmbedAccess::default(),
+    }
+}
+
+/// The board a write updates, or the built-in board's shell: it has no row
+/// until something about it is first saved.
+///
+/// Any other board with no live row is refused: a write that arrives after
+/// the board was deleted must not write a blank row over its trash entry, so
+/// the board would come back to life as an empty shell
+/// (`PR #199 review M SHOULD-FIX BI-18 3`).
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when the board is not there, or
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+async fn board_for_update(ch: &ChClient, id: &str) -> Result<Board, BiError> {
+    match get_board(ch, id, &Viewer::system()).await? {
+        Some(board) => Ok(board),
+        None if id == DEFAULT_BOARD_ID => Ok(shell_board(id)),
+        None => Err(BiError::Validation("dashboard not found.".to_owned())),
+    }
 }
 
 /// Update a board's tile layout, creating a bare `Board { id, name:
@@ -889,21 +1915,9 @@ pub async fn update_board_layout(
     ch: &ChClient,
     id: &str,
     layout: &LayoutMap,
-) -> Result<(), ChError> {
+) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
-        id: id.to_owned(),
-        name: "Dashboard".to_owned(),
-        description: None,
-        created_by: None,
-        layout: None,
-        filters: None,
-        created_at: None,
-        updated_at: None,
-        public_token: None,
-        embed_enabled: None,
-        folder_id: None,
-    });
+    let board = board_for_update(ch, id).await?;
     save_board_patch(
         ch,
         &board,
@@ -913,6 +1927,7 @@ pub async fn update_board_layout(
         },
     )
     .await
+    .map_err(BiError::Clickhouse)
 }
 
 /// Update a board's dashboard-wide filters, same fallback as
@@ -925,21 +1940,9 @@ pub async fn update_board_filters(
     ch: &ChClient,
     id: &str,
     filters: &[FilterDef],
-) -> Result<(), ChError> {
+) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
-        id: id.to_owned(),
-        name: "Dashboard".to_owned(),
-        description: None,
-        created_by: None,
-        layout: None,
-        filters: None,
-        created_at: None,
-        updated_at: None,
-        public_token: None,
-        embed_enabled: None,
-        folder_id: None,
-    });
+    let board = board_for_update(ch, id).await?;
     save_board_patch(
         ch,
         &board,
@@ -949,42 +1952,427 @@ pub async fn update_board_filters(
         },
     )
     .await
+    .map_err(BiError::Clickhouse)
 }
 
-/// Enable/disable the public read-only share link for a board. `enable =
-/// true` mints a token if one doesn't already exist; `enable = false` clears
-/// it (revoke). Returns the active token (`""` if revoked). Ports
-/// `setBoardPublic`.
+/// Save a board's auto-refresh interval in seconds (`0` = off), same
+/// fallback as [`update_board_layout`] for the built-in board's row.
 ///
 /// # Errors
 ///
-/// Returns [`BiError::Validation`] if the board does not exist, or
-/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
-pub async fn set_board_public(ch: &ChClient, id: &str, enable: bool) -> Result<String, BiError> {
+/// Returns [`BiError::Validation`] when `seconds` is not one of
+/// [`crate::click::REFRESH_SECONDS`], or [`BiError::Clickhouse`] on a
+/// `ClickHouse` failure.
+pub async fn update_board_refresh(ch: &ChClient, id: &str, seconds: u32) -> Result<(), BiError> {
+    crate::click::validate_refresh_seconds(seconds).map_err(BiError::Validation)?;
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id)
-        .await?
-        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
-    let token = if enable {
-        let existing = board.public_token.clone().unwrap_or_default();
-        if existing.is_empty() {
-            new_public_token()
-        } else {
-            existing
-        }
-    } else {
-        String::new()
-    };
+    let board = board_for_update(ch, id).await?;
     save_board_patch(
         ch,
         &board,
         BoardPatch {
-            public_token: Some(&token),
+            refresh_seconds: Some(seconds),
             ..Default::default()
         },
     )
     .await?;
-    Ok(token)
+    Ok(())
+}
+
+/// Save the grain a dashboard opens with (`BI-9`), or clear it with `""`.
+/// Same fallback as [`update_board_layout`] for the built-in board's row.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when `grain` is neither empty nor a
+/// truncation (`minute` to `year`: a part of the date cannot replace every
+/// chart's grain), or [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn update_board_grain(ch: &ChClient, id: &str, grain: &str) -> Result<(), BiError> {
+    if !grain.is_empty() && !Grain::parse(grain).is_some_and(Grain::is_truncation) {
+        return Err(BiError::Validation(
+            "grain must be one of minute, hour, day, week, month, quarter, year, or empty."
+                .to_owned(),
+        ));
+    }
+    ensure_bi_table(ch).await?;
+    let board = board_for_update(ch, id).await?;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            grain: Some(grain),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Save the parameters a dashboard shows and their saved values (`BI-11`); an
+/// empty list clears them. Same fallback as [`update_board_layout`] for the
+/// built-in board's row. The caller has checked every name against the
+/// definitions and every value against its definition.
+///
+/// # Errors
+///
+/// Returns [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn update_board_params(
+    ch: &ChClient,
+    id: &str,
+    params: &[crate::params::BoardParam],
+) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let board = board_for_update(ch, id).await?;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            params: Some(params),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Save a board's tabs, or clear them with an empty list (`BI-18` part C).
+/// Same fallback as [`update_board_layout`] for the built-in board's row. The
+/// caller has checked that the tiles and the filters of the board only name
+/// tabs that remain ([`crate::layout::check_layout_tabs`],
+/// [`crate::layout::check_filter_ties`]); this checks the tabs themselves.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when the tabs fail
+/// [`crate::layout::validate_tabs`], or [`BiError::Clickhouse`] on a
+/// `ClickHouse` failure.
+pub async fn update_board_tabs(
+    ch: &ChClient,
+    id: &str,
+    tabs: &[crate::layout::Tab],
+) -> Result<(), BiError> {
+    crate::layout::validate_tabs(tabs).map_err(BiError::Validation)?;
+    ensure_bi_table(ch).await?;
+    let board = board_for_update(ch, id).await?;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            tabs: Some(&crate::layout::clean_tabs(tabs)),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Save a board's phone layout, or clear it with an empty list (`BI-18` part
+/// C). Same fallback as [`update_board_layout`] for the built-in board's row.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when the layout fails
+/// [`crate::layout::validate_phone_layout`], or [`BiError::Clickhouse`] on a
+/// `ClickHouse` failure.
+pub async fn update_board_phone_layout(
+    ch: &ChClient,
+    id: &str,
+    phone: &[crate::layout::PhoneTile],
+) -> Result<(), BiError> {
+    crate::layout::validate_phone_layout(phone).map_err(BiError::Validation)?;
+    ensure_bi_table(ch).await?;
+    let board = board_for_update(ch, id).await?;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            phone_layout: Some(phone),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Give a chart just added to a board with tabs a tile on the first tab, so
+/// its tab is written at creation and a later reorder of the tabs cannot move
+/// it (`BI-18` part C review fix (BLOCKER) R1). A board without tabs, a chart
+/// that already has a tile (the console places it on the selected tab next) and
+/// a board that cannot be found are left as they are.
+///
+/// # Errors
+///
+/// Returns [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn place_new_chart(ch: &ChClient, board_id: &str, chart_id: &str) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let Some(board) = get_board(ch, board_id, &Viewer::system()).await? else {
+        return Ok(());
+    };
+    let tabs = board.tabs.clone().unwrap_or_default();
+    let layout = board.layout.clone().unwrap_or_default();
+    let (Some(first), false) = (tabs.first(), layout.contains_key(chart_id)) else {
+        return Ok(());
+    };
+    // A half-width tile below what is on that tab, as a move would make it.
+    let placed = crate::layout::move_to_tab(&tabs, &layout, &first.id, &[chart_id.to_owned()])
+        .map_err(BiError::Validation)?;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            layout: Some(&placed),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// The id of the board a chart's `board` value names: a blank value is the
+/// built-in board, as for a chart saved with no board.
+#[must_use]
+pub fn canonical_board_id(board_id: &str) -> &str {
+    match board_id.trim() {
+        "" => DEFAULT_BOARD_ID,
+        id => id,
+    }
+}
+
+/// Give every tile of a board a stored box, in the order the page draws them
+/// now, before one of its charts is rewritten.
+///
+/// Why: a chart row is rewritten with a new `created_at` (the version column of
+/// `bi_chart`), and the charts are listed `ORDER BY created_at`. A tile with no
+/// stored box is placed by that order, so a rewritten chart would jump to the
+/// end of the board. A board write boxes every unboxed tile in the current list
+/// order (`save_board_patch` does it for every write), so one write before
+/// the rewrite keeps each tile where the person sees it. Only `layout` can
+/// change: the rest of the board is carried forward as it is. On a tabbed
+/// board a tile that gets a box sits on the first tab, as the page draws a tile
+/// with none.
+///
+/// A board whose tiles all have a box is not written. A blank `board_id` is the
+/// built-in board, as for a chart saved with no board, and it is frozen on its
+/// shell row. A board with no live row is left as it is: a chart update does
+/// not create a board. That is why this does not reuse `board_for_update`,
+/// which refuses a missing board other than the built-in one with
+/// [`BiError::Validation`], and an error here would block the update.
+///
+/// # Errors
+///
+/// Returns [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn freeze_board_layout(ch: &ChClient, board_id: &str) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let board_id = canonical_board_id(board_id);
+    let board = match get_board(ch, board_id, &Viewer::system()).await? {
+        Some(board) => board,
+        None if board_id == DEFAULT_BOARD_ID => shell_board(board_id),
+        None => return Ok(()),
+    };
+    let live = live_charts_of(ch, &board.id).await?;
+    let layout = board.layout.as_ref();
+    if live
+        .iter()
+        .all(|chart| layout.is_some_and(|l| l.contains_key(&chart.id)))
+    {
+        return Ok(());
+    }
+    save_board_patch(ch, &board, BoardPatch::default())
+        .await
+        .map_err(BiError::Clickhouse)
+}
+
+/// Take a deleted chart's tile out of its board's layout and close the space it
+/// leaves on its tab (`BI-18` part C review fix (SHOULD-FIX) R9). A board with
+/// no tile for it, or none at all, is left as it is. When the chart comes back
+/// from the trash it is placed like a new one ([`place_new_chart`]).
+///
+/// # Errors
+///
+/// Returns [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn drop_tile_of_deleted_chart(
+    ch: &ChClient,
+    board_id: &str,
+    chart_id: &str,
+) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let Some(board) = get_board(ch, board_id, &Viewer::system()).await? else {
+        return Ok(());
+    };
+    let layout = board.layout.clone().unwrap_or_default();
+    if !layout.contains_key(chart_id) {
+        return Ok(());
+    }
+    let tabs = board.tabs.clone().unwrap_or_default();
+    let after = crate::layout::without_tile(&tabs, &layout, chart_id);
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            layout: Some(&after),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// The themes a dashboard can fix; `auto` (or empty) follows the console.
+pub const BOARD_THEMES: [&str; 3] = ["auto", "light", "dark"];
+
+/// Save the theme and the font a dashboard shows its tiles in (`BI-17` part A,
+/// D6). `theme` is `auto`, `light` or `dark` (`auto` is stored as empty);
+/// `font` is empty for the console's own or one of
+/// [`crate::formatting::SHIPPED_FONTS`]. A value left as `None` is kept.
+///
+/// Whether the font is one the administrator allows (Admin > Settings) is the
+/// caller's check: the allowed list is a Postgres setting and this crate has
+/// no Postgres.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] for a theme or a font outside those lists,
+/// or [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn update_board_theme(
+    ch: &ChClient,
+    id: &str,
+    theme: Option<&str>,
+    font: Option<&str>,
+) -> Result<(), BiError> {
+    let theme = theme.map(|t| if t == "auto" { "" } else { t });
+    if let Some(t) = theme
+        && !t.is_empty()
+        && !BOARD_THEMES.contains(&t)
+    {
+        return Err(BiError::Validation(
+            "theme must be auto, light or dark.".to_owned(),
+        ));
+    }
+    if let Some(f) = font
+        && !f.is_empty()
+        && !crate::formatting::SHIPPED_FONTS.contains(&f)
+    {
+        return Err(BiError::Validation(
+            "font must be one of the fonts the console ships.".to_owned(),
+        ));
+    }
+    ensure_bi_table(ch).await?;
+    let board = board_for_update(ch, id).await?;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            theme,
+            font,
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Save the dashboard's freshness rule (`BI-4` part B, feature decision 2).
+/// [`CacheRule::Follow`](crate::cache_rule::CacheRule::Follow) clears it. A
+/// version restore does not carry the rule (the version history covers what a
+/// dashboard shows, not how long it is remembered), so it keeps the live one.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when the board is not live, or
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn update_board_cache(
+    ch: &ChClient,
+    id: &str,
+    rule: crate::cache_rule::CacheRule,
+) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let board = board_for_update(ch, id).await?;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            cache: Some(rule.to_stored()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// The content of a board that a version holds, borrowed for
+/// [`restore_board_fields`].
+pub struct BoardFields<'a> {
+    /// Display name.
+    pub name: &'a str,
+    /// One-line purpose.
+    pub description: &'a str,
+    /// Tile layout.
+    pub layout: &'a LayoutMap,
+    /// Dashboard filters.
+    pub filters: &'a [FilterDef],
+    /// Saved auto-refresh in seconds, `None` for off.
+    pub refresh_seconds: Option<u32>,
+    /// Saved grain, `""` for each chart's own.
+    pub grain: &'a str,
+    /// Shown parameters with their saved values.
+    pub params: &'a [crate::params::BoardParam],
+    /// Tabs.
+    pub tabs: &'a [crate::layout::Tab],
+    /// Phone layout.
+    pub phone_layout: &'a [crate::layout::PhoneTile],
+    /// Saved theme, `""` for the console's.
+    pub theme: &'a str,
+    /// Saved font, `""` for the console's own.
+    pub font: &'a str,
+}
+
+/// Write back the content a version holds in ONE full-row save (`BI-18` part
+/// C, part 2): everything a version covers, nothing it does not. The public
+/// link, the signed-embed state, the folder, the owner and the author are
+/// carried from the live row, so going back never re-opens a link that was
+/// turned off or moves a dashboard.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when the board is not live, or
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn restore_board_fields(
+    ch: &ChClient,
+    id: &str,
+    fields: &BoardFields<'_>,
+) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let board = match get_board(ch, id, &Viewer::system()).await? {
+        Some(board) => board,
+        None if id == DEFAULT_BOARD_ID => shell_board(id),
+        None => return Err(BiError::Validation("dashboard not found.".to_owned())),
+    };
+    // BI-18 part C review fix (BLOCKER) R1: a version saved before tiles were
+    // stamped holds tiles that name no tab; they sat on THAT version's first
+    // tab, not on the live board's, so they are stamped with it here, before
+    // the save would stamp them with the live one.
+    let mut layout = fields.layout.clone();
+    crate::layout::stamp_untagged(&mut layout, fields.tabs, fields.tabs);
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            name: Some(fields.name),
+            description: Some(fields.description),
+            layout: Some(&layout),
+            filters: Some(fields.filters),
+            refresh_seconds: Some(fields.refresh_seconds.unwrap_or(0)),
+            grain: Some(fields.grain),
+            params: Some(fields.params),
+            tabs: Some(fields.tabs),
+            phone_layout: Some(fields.phone_layout),
+            theme: Some(fields.theme),
+            font: Some(fields.font),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 /// Enable/disable signed (JWT) embedding for a board. Ports `setBoardEmbed`.
@@ -995,9 +2383,12 @@ pub async fn set_board_public(ch: &ChClient, id: &str, enable: bool) -> Result<S
 /// [`BiError::Clickhouse`] on a `ClickHouse` failure.
 pub async fn set_board_embed(ch: &ChClient, id: &str, enable: bool) -> Result<bool, BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id)
+    let board = get_board(ch, id, &Viewer::system())
         .await?
         .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
+    if enable && board.owner_id.is_some() {
+        return Err(BiError::Validation(PERSONAL_NOT_SHAREABLE.to_owned()));
+    }
     save_board_patch(
         ch,
         &board,
@@ -1010,96 +2401,646 @@ pub async fn set_board_embed(ch: &ChClient, id: &str, enable: bool) -> Result<bo
     Ok(enable)
 }
 
-/// Fetch a board by its public share token (read-only, no auth). `None` if
-/// blank or not shared. Ports `getBoardByToken`.
-///
-/// # Errors
-///
-/// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn get_board_by_token(ch: &ChClient, token: &str) -> Result<Option<Board>, ChError> {
-    ensure_bi_table(ch).await?;
-    let t = token.trim();
-    if t.is_empty() {
-        return Ok(None);
-    }
+async fn board_exists(ch: &ChClient, id: &str) -> Result<bool, ChError> {
     let sql = format!(
-        "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND public_token={} LIMIT 1",
-        SqlLiteral::from(t)
-    );
-    let rows = ch.rows(&sql, None).await?;
-    Ok(rows.first().map(row_to_board))
-}
-
-/// Soft-delete a board (tombstone), then soft-delete every chart on it.
-/// Ports `deleteBoard`.
-///
-/// # Errors
-///
-/// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn delete_board(ch: &ChClient, id: &str) -> Result<(), ChError> {
-    ensure_bi_table(ch).await?;
-    let sql = format!(
-        "INSERT INTO console.bi_board (id, name, is_deleted) VALUES ({}, '', 1)",
+        "SELECT 1 FROM console.bi_board FINAL WHERE is_deleted = 0 AND id={} LIMIT 1",
         SqlLiteral::from(id)
     );
-    ch.exec(&sql, None).await?;
-    // Delete charts inside it via tombstone (consistent, not an async mutation).
-    let charts = list_stored_charts(ch).await?;
-    for c in charts.iter().filter(|c| c.board == id) {
-        delete_chart(ch, &c.spec.id).await?;
-    }
-    Ok(())
+    let rows = ch.rows(&sql, None).await?;
+    Ok(!rows.is_empty())
 }
 
-/// Duplicate a board along with its charts and layout (new ids). Ports
-/// `duplicateBoard`.
+/// Map rows returned by the aggregate query on `console.bi_board_embed_event`
+/// into an [`EmbedAccess`].
 ///
-/// # Errors
+/// Aggregation rules (PR #105 review SHOULD-FIX 1):
+/// - `revoked_before`: maximum across all `revoke_all` events;
+/// - `origins`: newest `origins` event;
+/// - `withdrawn`: union across distinct `jti` with maximum `exp`, dropping
+///   the tokens the cut-off already refuses (`exp <= revoked_before`).
 ///
-/// Returns [`BiError::Validation`] if the source board does not exist, or
-/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
-pub async fn duplicate_board(ch: &ChClient, id: &str, created_by: &str) -> Result<Board, BiError> {
-    ensure_bi_table(ch).await?;
-    let src = get_board(ch, id)
-        .await?
-        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
-    let charts = list_stored_charts(ch).await?;
-    let charts: Vec<_> = charts.into_iter().filter(|c| c.board == id).collect();
-    // The copy carries the original's description — it describes the same
-    // thing — but is authored by whoever pressed Duplicate, not by the
-    // person who made the original.
-    let new_board = create_board(
-        ch,
-        &format!("{} (salinan)", src.name),
-        src.description.as_deref().unwrap_or(""),
-        created_by,
-    )
-    .await?;
-    let mut id_map: HashMap<String, String> = HashMap::new();
-    for c in &charts {
-        let new_id = new_chart_id();
-        id_map.insert(c.spec.id.clone(), new_id.clone());
-        let mut clone = c.clone();
-        clone.spec.id = new_id;
-        clone.board = new_board.id.clone();
-        insert_chart(ch, &clone).await?;
-    }
-    let mut new_layout = LayoutMap::new();
-    if let Some(src_layout) = &src.layout {
-        for (old_id, tile) in src_layout {
-            if let Some(new_id) = id_map.get(old_id) {
-                new_layout.insert(new_id.clone(), *tile);
+/// PR #201 review F SHOULD-FIX 1: an expired entry is NOT dropped here. The
+/// list [`EmbedAccess::is_withdrawn`] reads must not depend on a clock
+/// tolerance: the verifier's tolerance
+/// (`lakehouse_embed::CLOCK_TOLERANCE_SECONDS`) is what decides whether a
+/// token is still acceptable at all, and a second, smaller tolerance kept
+/// here would drop a withdrawal the verifier still honours — the withdrawn
+/// token would work again. Expiry is applied where it belongs: when
+/// counting toward the cap ([`EmbedAccess::withdraw_token`]).
+pub(crate) fn embed_access_from_aggregate_rows(
+    rows: &[serde_json::Map<String, Value>],
+) -> EmbedAccess {
+    let mut revoked_before: u64 = 0;
+    let mut origins = Vec::new();
+    let mut filter_modes = std::collections::BTreeMap::new();
+    let mut withdrawn_map: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+
+    for row in rows {
+        let kind = row_str(row, "kind");
+        if kind == "revoke_all" {
+            let rb = row_u64(row, "revoked_before");
+            if rb > revoked_before {
+                revoked_before = rb;
+            }
+        } else if kind == "origins" {
+            let origins_json = row_str(row, "origins_json").trim();
+            if let Ok(list) = serde_json::from_str::<Vec<String>>(origins_json) {
+                origins = list;
+            }
+        } else if kind == "filter_modes" {
+            // BI-26 (D2): the newest `filter_modes` event, kept in the same
+            // `origins_json` column (a JSON text column) so the table needs no
+            // new column. An unreadable one leaves every filter hidden, which
+            // is the safe mode.
+            let text = row_str(row, "origins_json").trim();
+            if let Ok(modes) = serde_json::from_str::<
+                std::collections::BTreeMap<String, crate::embed_access::FilterMode>,
+            >(text)
+            {
+                filter_modes = modes;
+            }
+        } else if kind == "withdraw" {
+            let jti = row_str(row, "jti");
+            let exp = row_u64(row, "exp");
+            if !jti.is_empty() {
+                withdrawn_map
+                    .entry(jti.to_owned())
+                    .and_modify(|e| *e = (*e).max(exp))
+                    .or_insert(exp);
             }
         }
     }
-    update_board_layout(ch, &new_board.id, &new_layout).await?;
-    // The copy lands next to the original, not at the root.
+
+    let withdrawn = withdrawn_map
+        .into_iter()
+        .filter(|(_, exp)| *exp > revoked_before)
+        .map(|(jti, exp)| WithdrawnToken { jti, exp })
+        .collect();
+
+    EmbedAccess {
+        revoked_before,
+        withdrawn,
+        origins,
+        filter_modes,
+    }
+}
+
+/// Read the current embed access state for a board by aggregating its
+/// append-only embed events (`SEC-12`, PR #105 review SHOULD-FIX 1).
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn get_board_embed_access(ch: &ChClient, board_id: &str) -> Result<EmbedAccess, ChError> {
+    ensure_bi_table(ch).await?;
+    let sql = format!(
+        "SELECT kind, max(revoked_before) AS revoked_before, jti, max(exp) AS exp, argMax(origins_json, at) AS origins_json \
+         FROM console.bi_board_embed_event WHERE board_id={} GROUP BY kind, jti",
+        SqlLiteral::from(board_id)
+    );
+    let rows = ch.rows(&sql, None).await?;
+    Ok(embed_access_from_aggregate_rows(&rows))
+}
+
+/// Whether a token id has been withdrawn on ANY dashboard (`BI-26` review fix
+/// (SHOULD-FIX) R2). A chart token is withdrawn through the dashboard its chart
+/// is on; if the chart is moved, the withdrawal stays on the old dashboard's
+/// events, so a chart token is also checked against every dashboard's.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn jti_withdrawn_anywhere(ch: &ChClient, jti: &str) -> Result<bool, ChError> {
+    ensure_bi_table(ch).await?;
+    let sql = format!(
+        "SELECT count() AS n FROM console.bi_board_embed_event WHERE kind='withdraw' AND jti={}",
+        SqlLiteral::from(jti)
+    );
+    let rows = ch.rows(&sql, None).await?;
+    Ok(rows.first().map_or(0, |r| row_u64(r, "n")) > 0)
+}
+
+/// Replace the sites allowed to frame a board's embed pages (`SEC-12`).
+/// Returns the normalised list that was stored.
+///
+/// # Errors
+///
+/// [`BiError::Validation`] if the board does not exist or an entry is not an
+/// acceptable site (see [`embed_access::validate_origins`]);
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn set_board_embed_origins(
+    ch: &ChClient,
+    id: &str,
+    origins: &[String],
+) -> Result<Vec<String>, BiError> {
+    let origins = embed_access::validate_origins(origins).map_err(BiError::Validation)?;
+    ensure_bi_table(ch).await?;
+    // SEC-12 (PR #105 review SHOULD-FIX 1): the allowed sites are an EVENT,
+    // written to `console.bi_board_embed_event`. A dashboard save never
+    // carries them, so an unrelated edit cannot bring an old list back
+    // (`PR #199 review N`).
+    if !board_exists(ch, id).await? {
+        return Err(BiError::Validation("dashboard not found.".to_owned()));
+    }
+    let origins_json = serde_json::to_string(&origins).unwrap_or_else(|_| "[]".to_owned());
+    let sql = format!(
+        "INSERT INTO console.bi_board_embed_event (board_id, kind, origins_json) VALUES ({}, 'origins', {})",
+        SqlLiteral::from(id),
+        SqlLiteral::from(origins_json),
+    );
+    ch.exec(&sql, None).await?;
+    Ok(origins)
+}
+
+/// Replace the embed mode of a board's filters (`BI-26`, plan D2): an event in
+/// `console.bi_board_embed_event`, so a dashboard save cannot bring an old set
+/// back (`SEC-12` decision 8). The newest event wins. Returns what was stored.
+///
+/// # Errors
+///
+/// [`BiError::Validation`] if the board does not exist or the modes are not
+/// acceptable ([`embed_access::validate_filter_modes`]);
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn set_board_embed_filter_modes(
+    ch: &ChClient,
+    id: &str,
+    modes: &std::collections::BTreeMap<String, embed_access::FilterMode>,
+) -> Result<(), BiError> {
+    embed_access::validate_filter_modes(modes).map_err(BiError::Validation)?;
+    ensure_bi_table(ch).await?;
+    if !board_exists(ch, id).await? {
+        return Err(BiError::Validation("dashboard not found.".to_owned()));
+    }
+    let json = serde_json::to_string(modes).unwrap_or_else(|_| "{}".to_owned());
+    let sql = format!(
+        "INSERT INTO console.bi_board_embed_event (board_id, kind, origins_json) VALUES ({}, 'filter_modes', {})",
+        SqlLiteral::from(id),
+        SqlLiteral::from(json),
+    );
+    ch.exec(&sql, None).await?;
+    Ok(())
+}
+
+/// "Withdraw all embed tokens" for a board (`SEC-12`): every token whose
+/// `iat` is at or before `now_unix_seconds` is refused from the next request.
+///
+/// Returns the cut-off in force: the maximum over every `revoke_all` event
+/// of this board, which is what the refusal check enforces. A later, smaller
+/// value cannot move the cut-off back, and another session's withdrawal (a
+/// larger one) is what is enforced, so the answer is read back rather than
+/// the instant this call wrote.
+///
+/// # Errors
+///
+/// [`BiError::Validation`] if the board does not exist;
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn revoke_all_embed_tokens(
+    ch: &ChClient,
+    id: &str,
+    now_unix_seconds: u64,
+) -> Result<u64, BiError> {
+    ensure_bi_table(ch).await?;
+    // SEC-12 (PR #105 review SHOULD-FIX 1): the cut-off is an EVENT, not a
+    // value on the board row. A dashboard save never carries it, so an
+    // unrelated edit cannot move the cut-off back (`PR #199 review N`).
+    if !board_exists(ch, id).await? {
+        return Err(BiError::Validation("dashboard not found.".to_owned()));
+    }
+    let sql = format!(
+        "INSERT INTO console.bi_board_embed_event (board_id, kind, revoked_before) VALUES ({}, 'revoke_all', {})",
+        SqlLiteral::from(id),
+        now_unix_seconds,
+    );
+    ch.exec(&sql, None).await?;
+    // PR #201 review F SHOULD-FIX 7: the cut-off in force is the maximum over
+    // every `revoke_all` event of this board, not the instant this call
+    // wrote — the answer the caller shows must be the one that is enforced.
+    let access = get_board_embed_access(ch, id).await?;
+    Ok(access.revoked_before.max(now_unix_seconds))
+}
+
+/// "Withdraw one embed token" for a board (`SEC-12`): a token carrying
+/// `jti` is refused for this board until it could no longer be accepted
+/// anyway (`exp` plus `tolerance_secs`).
+///
+/// # Errors
+///
+/// [`BiError::Validation`] if the board does not exist or the list of
+/// individually withdrawn tokens is full; [`BiError::Clickhouse`] on a
+/// `ClickHouse` failure.
+pub async fn withdraw_embed_token(
+    ch: &ChClient,
+    id: &str,
+    jti: &str,
+    exp: u64,
+    now_unix_seconds: u64,
+    tolerance_secs: u64,
+) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    if !board_exists(ch, id).await? {
+        return Err(BiError::Validation("dashboard not found.".to_owned()));
+    }
+    // The cap MAX_WITHDRAWN_TOKENS is a size bound on unexpired distinct
+    // tokens, not a security property. Checking it before INSERT can be
+    // raced by two concurrent requests, which is acceptable since a small
+    // temporary overshoot does not compromise security.
+    //
+    // PR #201 review F SHOULD-FIX 2: the guard is [`EmbedAccess::withdraw_token`]
+    // and only that one — it drops the entries that could no longer be
+    // accepted anyway (the tolerance the caller passes is the verifier's,
+    // `lakehouse_embed::CLOCK_TOLERANCE_SECONDS`) and refuses a full list.
+    // The store used to re-implement both, and the two could drift apart.
+    get_board_embed_access(ch, id)
+        .await?
+        .withdraw_token(jti, exp, now_unix_seconds, tolerance_secs)
+        .map_err(BiError::Validation)?;
+    let sql = format!(
+        "INSERT INTO console.bi_board_embed_event (board_id, kind, jti, exp) VALUES ({}, 'withdraw', {}, {})",
+        SqlLiteral::from(id),
+        SqlLiteral::from(jti),
+        exp,
+    );
+    ch.exec(&sql, None).await?;
+    Ok(())
+}
+
+/// The public links that live dashboards carried in their own row before
+/// `BI-19` part A moved links to Postgres (migration `0098`): `(board id,
+/// token)` for every live dashboard with a non-empty `public_token`, outside
+/// the personal space. Read once, at start, to copy them (feature A2); nothing
+/// else reads that column any more.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn legacy_public_links(ch: &ChClient) -> Result<Vec<(String, String)>, ChError> {
+    ensure_bi_table(ch).await?;
+    let sql = format!(
+        "SELECT id, public_token FROM console.bi_board FINAL \
+         WHERE is_deleted = 0 AND public_token != ''{}",
+        Viewer::anonymous().owner_clause()
+    );
+    let rows = ch.rows(&sql, None).await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                row_str(r, "id").to_owned(),
+                row_str(r, "public_token").to_owned(),
+            )
+        })
+        .filter(|(id, token)| !id.is_empty() && !token.is_empty())
+        .collect())
+}
+
+/// Move a board and every chart on it to the trash (`BI-18` part C, part 2).
+/// Replaces the tombstone of `deleteBoard`: the rows keep their content with
+/// `is_deleted = 2`, `deleted_at` and `deleted_by`, so
+/// [`crate::trash::restore_board`] can bring them back and
+/// [`crate::trash::purge_expired`] removes them after 30 days.
+///
+/// The charts go first-class with the board: each one records the board that
+/// took it (`deleted_with`), so restoring the board restores exactly them and
+/// not a chart that was deleted earlier on its own. Both statements copy the
+/// live row with `INSERT ... SELECT`, so nothing is rebuilt in Rust and the
+/// embed state, folder and owner travel with the row.
+///
+/// The caller has checked that its viewer may see the board. The built-in
+/// board is never deleted (the route refuses it).
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn delete_board(ch: &ChClient, id: &str, deleted_by: &str) -> Result<(), ChError> {
+    ensure_bi_table(ch).await?;
+    // Charts first: if the board's statement then fails, the board is still
+    // live and a retry trashes it; the other order could leave live charts on
+    // a deleted board.
+    let charts = format!(
+        "INSERT INTO console.bi_chart (id, title, spec_json, board, created_by, is_deleted, deleted_at, deleted_by, deleted_with) \
+         SELECT id, title, spec_json, board, created_by, 2, now(), {by}, {board} \
+         FROM console.bi_chart FINAL WHERE is_deleted = 0 AND board = {board}",
+        by = SqlLiteral::from(deleted_by),
+        board = SqlLiteral::from(id),
+    );
+    ch.exec(&charts, None).await?;
+    let board = format!(
+        "INSERT INTO console.bi_board ({BOARD_KEEP_COLS}, is_deleted, deleted_at, deleted_by) \
+         SELECT {BOARD_KEEP_COLS}, 2, now(), {by} \
+         FROM console.bi_board FINAL WHERE is_deleted = 0 AND id = {board}",
+        by = SqlLiteral::from(deleted_by),
+        board = SqlLiteral::from(id),
+    );
+    ch.exec(&board, None).await
+}
+
+/// Take a board and every chart on it back for good: the rows are wiped
+/// (`is_deleted = 1`, the state the trash's own purge leaves behind), so no
+/// half-built copy of a dashboard is left behind after a write that failed
+/// (`PR #199 review M BLOCKER 5`).
+///
+/// The owner travels with the board, so what is left of a private board's
+/// charts stays private. The charts go first, like a delete does, so a
+/// failure cannot leave live charts on a board that is gone.
+///
+/// `pub` since BI-19 part D: a dashboard import that fails after the board was
+/// created takes it back the same way a failed copy does.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn wipe_board(ch: &ChClient, id: &str) -> Result<(), ChError> {
+    let charts = format!(
+        "INSERT INTO console.bi_chart (id, title, spec_json, board, created_by, is_deleted) \
+         SELECT id, '', '{{}}', board, 'system', 1 FROM console.bi_chart FINAL \
+         WHERE is_deleted = 0 AND board = {board}",
+        board = SqlLiteral::from(id),
+    );
+    ch.exec(&charts, None).await?;
+    let board = format!(
+        "INSERT INTO console.bi_board (id, name, owner_id, is_deleted) \
+         SELECT id, '', owner_id, 1 FROM console.bi_board FINAL \
+         WHERE is_deleted = 0 AND id = {board}",
+        board = SqlLiteral::from(id),
+    );
+    ch.exec(&board, None).await
+}
+
+/// The built-in board's fixed tiles as saved charts, so the built-in board
+/// can be duplicated (`BI-18` part C). The tiles are kept as the fixed
+/// statements they are: the stored definition has no mart, which is what
+/// makes the builder serve the statement as written
+/// ([`crate::builder::stored_chart_sql`]'s "unfiltered" branch), so a copy of
+/// a built-in tile shows the same numbers and, like the original, takes no
+/// dashboard filter and no year filter. Returns the saved charts with the
+/// built-in id each one came from.
+fn builtin_tiles_as_charts(board: &str, created_by: &str) -> Vec<(String, StoredChartSpec)> {
+    let mut out = Vec::new();
+    for k in crate::specs::kpis() {
+        let spec = ChartSpec {
+            id: k.id.clone(),
+            title: k.title.clone(),
+            subtitle: None,
+            kind: ChartKind::Kpi,
+            mart: k.mart.clone(),
+            sql_source: None,
+            sql: k.sql.clone(),
+            x: String::new(),
+            y: ChartY::Single("v".to_owned()),
+            series: None,
+            map: None,
+            lat: None,
+            lon: None,
+            format: Some(k.format),
+            span: Some(1),
+            text: None,
+            caption: k.caption.clone(),
+            target: None,
+            click: None,
+        };
+        out.push((k.id.clone(), builtin_as_chart(spec, board, created_by)));
+    }
+    for c in crate::specs::charts() {
+        let spec = ChartSpec {
+            id: c.id.clone(),
+            title: c.title.clone(),
+            subtitle: c.subtitle.clone(),
+            kind: c.kind,
+            mart: c.mart.clone(),
+            sql_source: None,
+            sql: c.sql.clone(),
+            x: c.x.clone(),
+            y: c.y.clone(),
+            series: c.series.clone(),
+            map: None,
+            lat: None,
+            lon: None,
+            format: c.format,
+            span: c.span,
+            text: c.text.clone(),
+            caption: c.caption.clone(),
+            target: c.target,
+            click: None,
+        };
+        out.push((c.id.clone(), builtin_as_chart(spec, board, created_by)));
+    }
+    out
+}
+
+fn builtin_as_chart(spec: ChartSpec, board: &str, created_by: &str) -> StoredChartSpec {
+    let def = ChartInput {
+        title: spec.title.clone(),
+        subtitle: spec.subtitle.clone(),
+        kind: spec.kind,
+        span: spec.span,
+        board: Some(board.to_owned()),
+        caption: spec.caption.clone(),
+        ..empty_chart_input()
+    };
+    StoredChartSpec {
+        spec,
+        source: ChartSource::Ui,
+        board: board.to_owned(),
+        def,
+        has_year: false,
+        created_by: Some(created_by.to_owned()),
+        created_at: None,
+    }
+}
+
+/// What a duplicate writes besides the board row: the copied charts under new
+/// ids, and the layout and phone layout re-keyed to them.
+struct DuplicatePlan {
+    charts: Vec<StoredChartSpec>,
+    layout: LayoutMap,
+    phone_layout: Vec<crate::layout::PhoneTile>,
+}
+
+/// The pure part of [`duplicate_board`]: every chart of `src` (and the
+/// built-in tiles, when it is the built-in board) cloned under an id from
+/// `new_id` onto `new_board`, and the layout and phone layout of `src`
+/// re-keyed to them. A tile or phone entry whose chart is gone is dropped;
+/// tabs and each tile's tab carry over unchanged because tab ids belong to a
+/// board, not to a chart.
+fn plan_duplicate(
+    src: &Board,
+    charts: Vec<StoredChartSpec>,
+    builtin: Vec<(String, StoredChartSpec)>,
+    new_board: &str,
+    mut new_id: impl FnMut() -> String,
+) -> DuplicatePlan {
+    // Old chart id -> new chart id, for the layout and the phone layout.
+    let mut id_map: HashMap<String, String> = HashMap::new();
+    let mut copies = Vec::with_capacity(charts.len() + builtin.len());
+    for mut clone in charts {
+        let fresh = new_id();
+        id_map.insert(clone.spec.id.clone(), fresh.clone());
+        clone.spec.id = fresh;
+        new_board.clone_into(&mut clone.board);
+        // The definition names its board too; the editor prefills from it.
+        clone.def.board = Some(new_board.to_owned());
+        copies.push(clone);
+    }
+    for (old_id, mut chart) in builtin {
+        let fresh = new_id();
+        id_map.insert(old_id, fresh.clone());
+        chart.spec.id = fresh;
+        copies.push(chart);
+    }
+    let mut layout = LayoutMap::new();
+    for (old_id, tile) in src.layout.iter().flatten() {
+        if let Some(fresh) = id_map.get(old_id) {
+            layout.insert(fresh.clone(), tile.clone());
+        }
+    }
+    let phone_layout = src
+        .phone_layout
+        .iter()
+        .flatten()
+        .filter_map(|t| {
+            id_map.get(&t.id).map(|fresh| crate::layout::PhoneTile {
+                id: fresh.clone(),
+                h: t.h,
+            })
+        })
+        .collect();
+    DuplicatePlan {
+        charts: copies,
+        layout,
+        phone_layout,
+    }
+}
+
+/// Duplicate a board with everything that makes it that board (`BI-18` part
+/// C): its tiles (as new charts with the same definitions), tabs, filters
+/// with their tab ties, grain, parameter controls, refresh, layout and phone
+/// layout. The copy is named "Copy of <name>" and lands in the original's
+/// folder. The sharing state is not copied: the copy has no public link, no
+/// embed and no withdrawn tokens or framing sites of its own to inherit.
+///
+/// The built-in board can be duplicated too: its fixed tiles become saved
+/// charts ([`builtin_tiles_as_charts`]).
+///
+/// # Errors
+///
+/// Returns [`DuplicateError::Copy`] if the source board does not exist or a
+/// `ClickHouse` failure stopped the copy, and
+/// [`DuplicateError::CopyAndCleanup`] when the half-built copy could not be
+/// taken back either (`PR #199 review O SHOULD-FIX 3`).
+pub async fn duplicate_board(
+    ch: &ChClient,
+    id: &str,
+    created_by: &str,
+    viewer: &Viewer,
+) -> Result<Board, DuplicateError> {
+    ensure_bi_table(ch).await?;
+    // The built-in board has a row only once its layout was first saved. A
+    // board `viewer` may not see is "not found", like one that never was.
+    let src = match get_board(ch, id, viewer).await? {
+        Some(board) => board,
+        None if id == DEFAULT_BOARD_ID => Board {
+            name: "Main".to_owned(),
+            ..shell_board(DEFAULT_BOARD_ID)
+        },
+        None => {
+            return Err(DuplicateError::Copy(BiError::Validation(
+                "dashboard not found.".to_owned(),
+            )));
+        }
+    };
+    let stored = list_stored_charts(ch, viewer).await?;
+    let charts: Vec<_> = stored.into_iter().filter(|c| c.board == id).collect();
+    // The copy lands next to the original, not at the root. In the personal
+    // space it is private to the same owner; the caller moves it into the
+    // duplicating user's own space when that is someone else.
     let folder_id = src.folder_id.clone().unwrap_or_default();
-    if !folder_id.is_empty() {
-        move_board(ch, &new_board.id, &folder_id).await?;
+    let owner_id = src.owner_id.clone().unwrap_or_default();
+    // The copy carries the original's description — it describes the same
+    // thing — but is authored by whoever pressed Duplicate, not by the
+    // person who made the original.
+    //
+    // The folder and the owner travel in this FIRST insert: a copy written
+    // without an owner is visible to everybody who may read dashboards, so a
+    // copy of a private draft was public until the last write gave it back
+    // its owner (`PR #199 review M BLOCKER 5`).
+    let new_board = create_board_in(
+        ch,
+        &format!("Copy of {}", src.name),
+        src.description.as_deref().unwrap_or(""),
+        created_by,
+        &folder_id,
+        &owner_id,
+    )
+    .await?;
+    let builtin = if id == DEFAULT_BOARD_ID {
+        builtin_tiles_as_charts(&new_board.id, created_by)
+    } else {
+        Vec::new()
+    };
+    let plan = plan_duplicate(&src, charts, builtin, &new_board.id, new_chart_id);
+    for chart in &plan.charts {
+        if let Err(err) = insert_chart(ch, chart).await {
+            // A copy that could not be finished is taken back, so no
+            // half-built dashboard is left behind. A cleanup that fails as
+            // well is not dropped: it is carried out with the copy's own
+            // error, which is what the caller gets
+            // (`PR #199 review O SHOULD-FIX 3`).
+            return Err(match wipe_board(ch, &new_board.id).await {
+                Ok(()) => DuplicateError::Copy(err.into()),
+                Err(cleanup) => DuplicateError::CopyAndCleanup {
+                    cause: err.into(),
+                    cleanup,
+                },
+            });
+        }
+    }
+    let (new_layout, new_phone) = (plan.layout, plan.phone_layout);
+    // One full-row write for everything the copy inherits.
+    if let Err(err) = save_board_patch(
+        ch,
+        &new_board,
+        BoardPatch {
+            layout: Some(&new_layout),
+            filters: Some(src.filters.as_deref().unwrap_or_default()),
+            refresh_seconds: src.refresh_seconds,
+            grain: src.grain.as_deref(),
+            params: src.params.as_deref(),
+            tabs: src.tabs.as_deref(),
+            phone_layout: Some(&new_phone),
+            theme: src.theme.as_deref(),
+            font: src.font.as_deref(),
+            cache: src.cache.map(crate::cache_rule::CacheRule::to_stored),
+            folder_id: Some(&folder_id),
+            owner_id: Some(&owner_id),
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        // The copy that could not be saved is taken back, so no half-built
+        // dashboard is left behind; a cleanup that fails as well is carried
+        // out with the copy's own error (`PR #199 review O SHOULD-FIX 3`).
+        return Err(match wipe_board(ch, &new_board.id).await {
+            Ok(()) => DuplicateError::Copy(err.into()),
+            Err(cleanup) => DuplicateError::CopyAndCleanup {
+                cause: err.into(),
+                cleanup,
+            },
+        });
     }
     Ok(Board {
+        owner_id: Some(owner_id).filter(|o| !o.is_empty()),
         layout: Some(new_layout),
+        filters: src.filters,
+        refresh_seconds: src.refresh_seconds,
+        grain: src.grain,
+        params: src.params,
+        tabs: src.tabs,
+        phone_layout: Some(new_phone).filter(|p| !p.is_empty()),
+        theme: src.theme,
+        font: src.font,
+        cache: src.cache,
         folder_id: Some(folder_id),
         ..new_board
     })
@@ -1166,18 +3107,27 @@ struct StoredPayload<'a> {
     has_year: bool,
 }
 
-/// List stored specs (live, latest per id). Ports `listStoredCharts`.
+/// List stored specs (live, latest per id) that `viewer` may see. Ports
+/// `listStoredCharts`. A chart in the trash, a chart on a board in the trash
+/// and a chart on another user's personal board are not in it
+/// ([`Viewer::chart_clause`]).
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure. A row whose `spec_json` is
 /// corrupt is silently skipped, matching the TS `catch { /* skip */ }`.
-pub async fn list_stored_charts(ch: &ChClient) -> Result<Vec<StoredChartSpec>, ChError> {
+pub async fn list_stored_charts(
+    ch: &ChClient,
+    viewer: &Viewer,
+) -> Result<Vec<StoredChartSpec>, ChError> {
     ensure_bi_table(ch).await?;
     let rows = ch
         .rows(
-            "SELECT id, spec_json, board, created_by, toString(created_at) AS created_at\n\
-               FROM console.bi_chart FINAL WHERE is_deleted = 0 ORDER BY created_at",
+            &format!(
+                "SELECT id, spec_json, board, created_by, toString(created_at) AS created_at\n\
+                   FROM console.bi_chart FINAL WHERE is_deleted = 0{} ORDER BY created_at",
+                viewer.chart_clause()
+            ),
             None,
         )
         .await?;
@@ -1221,6 +3171,30 @@ pub async fn list_stored_charts(ch: &ChClient) -> Result<Vec<StoredChartSpec>, C
     Ok(out)
 }
 
+/// A stored chart rebuilt from its stored document (`{ spec, def, hasYear }`)
+/// exactly as it was, with no validation: for a chart that is a fixed
+/// statement (the tiles copied from the built-in dashboard), which has no
+/// definition to rebuild it from. `None` when the document does not parse.
+#[must_use]
+pub fn stored_from_document(doc: &Value, board: &str, created_by: &str) -> Option<StoredChartSpec> {
+    let parsed: StoredEnvelope = serde_json::from_value(doc.clone()).ok()?;
+    let mut def = parsed.def.unwrap_or_else(empty_chart_input);
+    def.board = Some(board.to_owned());
+    Some(StoredChartSpec {
+        spec: parsed.spec,
+        source: if created_by == "ai" {
+            ChartSource::Ai
+        } else {
+            ChartSource::Ui
+        },
+        board: board.to_owned(),
+        def,
+        has_year: parsed.has_year.unwrap_or(false),
+        created_by: Some(created_by.to_owned()),
+        created_at: None,
+    })
+}
+
 fn empty_chart_input() -> ChartInput {
     ChartInput {
         title: String::new(),
@@ -1229,7 +3203,7 @@ fn empty_chart_input() -> ChartInput {
         sql_source: None,
         kind: ChartKind::Table,
         dimension: String::new(),
-        measures: Vec::new(),
+        measures: MeasureList::default(),
         breakdown: None,
         map: None,
         lat: None,
@@ -1242,6 +3216,12 @@ fn empty_chart_input() -> ChartInput {
         text: None,
         caption: None,
         target: None,
+        click: None,
+        grain: None,
+        tables: TableFields::default(),
+        shape: ShapeFields::default(),
+        style: crate::style::StyleFields::default(),
+        types: Box::default(),
     }
 }
 
@@ -1249,10 +3229,15 @@ fn empty_chart_input() -> ChartInput {
 /// mart itself exists in `serving.*` — split out of `spec_from_input` to
 /// keep it under clippy's line-count limit. Ports the `system.tables` /
 /// `system.columns` existence checks in `specFromInput`.
-async fn validated_mart_columns(
+///
+/// # Errors
+///
+/// [`BiError::Validation`] when the mart does not exist in `serving`,
+/// [`BiError::Clickhouse`] when the lookup fails.
+pub async fn validated_mart_columns(
     ch: &ChClient,
     mart: &str,
-) -> Result<std::collections::HashSet<String>, BiError> {
+) -> Result<std::collections::HashMap<String, ColumnKind>, BiError> {
     let exists_sql = format!(
         "SELECT toString(count()) AS n FROM system.tables WHERE database='serving' AND name={} AND name NOT LIKE '%\\_baru'",
         SqlLiteral::from(mart)
@@ -1273,16 +3258,22 @@ async fn validated_mart_columns(
         )));
     }
     let cols_sql = format!(
-        "SELECT name FROM system.columns WHERE database='serving' AND table={}",
+        "SELECT name, type FROM system.columns WHERE database='serving' AND table={}",
         SqlLiteral::from(mart)
     );
     let cols_rows = ch
         .rows(&cols_sql, None)
         .await
         .map_err(BiError::Clickhouse)?;
+    // The kind comes from the type, never the name (BI-9 needs it to decide
+    // whether a grain fits the dimension).
     Ok(cols_rows
         .iter()
-        .filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_owned))
+        .filter_map(|r| {
+            let name = r.get("name").and_then(Value::as_str)?;
+            let ty = r.get("type").and_then(Value::as_str).unwrap_or("");
+            Some((name.to_owned(), ColumnKind::from_clickhouse_type(ty)))
+        })
         .collect())
 }
 
@@ -1304,10 +3295,73 @@ struct KpiCtx<'a> {
     source: ChartSource,
     has_year: bool,
     created_by: &'a str,
+    /// Column names and kinds, and the report time settings, for the
+    /// comparison of `BI-16` part A.
+    cols: std::collections::HashSet<String>,
+    kinds: std::collections::HashMap<String, ColumnKind>,
+    time: &'a TimeContext,
+    /// The comparison with a metric's date column and period filled in
+    /// (`BI-2`); the stored definition keeps the comparison as written.
+    compare_fill: TableFields,
+}
+
+/// The stored SQL of a KPI. BI-16 part A: one that compares with its previous
+/// period is stored as the trend statement (the latest periods, which the
+/// console reads), the statement the dashboard rebuilds at read time with the
+/// current time settings; a goal needs only the number. `agg` was already
+/// checked against `aggregate_allowed`, so the conversion to [`Aggregate`] is
+/// exact.
+fn kpi_sql(
+    from: &Relation,
+    (measure, goal): (&Ident, Option<&Ident>),
+    agg: Aggregate,
+    compare: Option<&ComparePlan>,
+    time: &TimeContext,
+) -> Result<String, BiError> {
+    match compare {
+        Some(plan @ (ComparePlan::Previous { .. } | ComparePlan::LastYear { .. })) => {
+            tables::kpi_trend_sql(from, measure, agg, Vec::new(), plan, time).ok_or_else(|| {
+                BiError::Validation("this period does not fit the date column.".to_owned())
+            })
+        }
+        // BI-16 part B: without a goal that is a value this is `build_kpi_sql`.
+        _ => Ok(crate::builder::build_progress_sql(
+            from,
+            measure,
+            goal,
+            agg,
+            &[],
+        )),
+    }
+}
+
+/// The measures of a single-row tile: the one value of a KPI, plus the goal
+/// of a progress bar or a bullet graph measured against a value (`BI-16`
+/// part B). BI-2 review fix (BLOCKER) R1: a KPI on a metric stays a metric in
+/// its stored definition.
+fn kpi_measure(input: &ChartInput, columns: &[String]) -> MeasureList {
+    let keep = if input.types.goal_measure().is_some() {
+        2
+    } else {
+        1
+    };
+    MeasureList::from_pairs(
+        columns
+            .iter()
+            .take(keep)
+            .map(|c| (c.clone(), None))
+            .collect(),
+    )
+    .keeping_metrics_of(&input.measures, None)
 }
 
 /// Assemble the `kpi`/`gauge` branch of `specFromInput` (single number, no
 /// dimension).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one straight-line assembly of the stored definition and the spec; the style \
+              copy of BI-17 part A pushed it one line over"
+)]
 fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChartSpec, BiError> {
     let KpiCtx {
         title,
@@ -1324,13 +3378,17 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         source,
         has_year,
         created_by,
+        cols,
+        kinds,
+        time,
+        compare_fill,
     } = ctx;
     let m = measures[0].clone();
-    let target = if kind == ChartKind::Gauge {
-        input.target.filter(|t| *t > 0.0)
-    } else {
-        None
-    };
+    let compare =
+        tables::plan_compare(&compare_fill, &cols, &kinds).map_err(BiError::Validation)?;
+    let target = (kind == ChartKind::Gauge)
+        .then(|| input.target.filter(|t| *t > 0.0))
+        .flatten();
     let caption = input
         .caption
         .as_deref()
@@ -1344,7 +3402,7 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         sql_source: sql_source.clone(),
         kind,
         dimension: String::new(),
-        measures: vec![m.clone()],
+        measures: kpi_measure(input, &measures),
         breakdown: None,
         map: None,
         lat: None,
@@ -1357,12 +3415,34 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         text: None,
         caption: caption.clone(),
         target,
+        click: None,
+        grain: None,
+        tables: TableFields {
+            compare: input.tables.compare.clone(),
+            good_direction: input.tables.good_direction.clone(),
+            ..TableFields::default()
+        },
+        shape: stored_shape(input),
+        style: input.style.clone(),
+        types: input.types.clone(),
     };
     let measure_ident = Ident::new(m.as_str())
         .map_err(|_| BiError::Validation("invalid or missing measure column.".to_owned()))?;
-    // `agg` was already checked against `aggregate_allowed` above, so this
-    // conversion is exact (never hits the `Sum` fallback).
-    let sql = build_kpi_sql(&from, &measure_ident, Aggregate::from_str_lossy(&agg), &[]);
+    let goal_ident = input
+        .types
+        .goal_measure()
+        .map(|g| {
+            Ident::new(g)
+                .map_err(|_| BiError::Validation("invalid or missing measure column.".to_owned()))
+        })
+        .transpose()?;
+    let sql = kpi_sql(
+        &from,
+        (&measure_ident, goal_ident.as_ref()),
+        Aggregate::from_str_lossy(&agg),
+        compare.as_ref(),
+        time,
+    )?;
     let spec = ChartSpec {
         id: new_id,
         title,
@@ -1372,7 +3452,11 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         sql_source,
         sql,
         x: String::new(),
-        y: ChartY::Single("v".to_owned()),
+        y: if goal_ident.is_some() {
+            ChartY::Multi(vec!["v".to_owned(), "g".to_owned()])
+        } else {
+            ChartY::Single("v".to_owned())
+        },
         series: None,
         map: None,
         lat: None,
@@ -1382,6 +3466,7 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         text: None,
         caption,
         target,
+        click: None,
     };
     Ok(StoredChartSpec {
         spec,
@@ -1408,8 +3493,48 @@ struct TextCtx<'a> {
     created_by: &'a str,
 }
 
-/// Assemble the `text` branch of `specFromInput` (markdown content, no
-/// SQL/mart).
+/// Longest text of a `heading` or `section` tile, in characters.
+const SECTION_TEXT_MAX_CHARS: usize = 120;
+
+/// The text a no-data tile keeps (`BI-18` part C). `text` takes markdown and
+/// needs some; `heading` and `section` take one line of at most
+/// [`SECTION_TEXT_MAX_CHARS`] characters and need it; a `divider` has no
+/// text, and what a caller sent is dropped rather than stored. The text is
+/// only ever shown, never run: these tiles have no statement
+/// ([`ChartKind::is_static`]).
+fn static_tile_text(kind: ChartKind, raw: Option<&str>) -> Result<String, BiError> {
+    let text = raw.unwrap_or_default().trim().to_owned();
+    match kind {
+        // An image or web card keeps its address in `url`; nothing is shown
+        // as text (BI-16 part B).
+        ChartKind::Divider | ChartKind::Image | ChartKind::Web => Ok(String::new()),
+        ChartKind::Heading | ChartKind::Section => {
+            if text.is_empty() {
+                return Err(BiError::Validation("heading text is required.".to_owned()));
+            }
+            if text.chars().any(|c| c == '\n' || c == '\r') {
+                return Err(BiError::Validation(
+                    "a heading is one line of text.".to_owned(),
+                ));
+            }
+            if text.chars().count() > SECTION_TEXT_MAX_CHARS {
+                return Err(BiError::Validation(format!(
+                    "a heading is at most {SECTION_TEXT_MAX_CHARS} characters."
+                )));
+            }
+            Ok(text)
+        }
+        _ => {
+            if text.is_empty() {
+                return Err(BiError::Validation("text content is required.".to_owned()));
+            }
+            Ok(text)
+        }
+    }
+}
+
+/// Assemble the no-data branch of `specFromInput` (`text` markdown, and the
+/// `heading`, `divider` and `section` tiles of `BI-18` part C; no SQL/mart).
 fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredChartSpec, BiError> {
     let TextCtx {
         title,
@@ -1421,10 +3546,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         source,
         created_by,
     } = ctx;
-    let text = input.text.as_deref().unwrap_or_default().trim().to_owned();
-    if text.is_empty() {
-        return Err(BiError::Validation("text content is required.".to_owned()));
-    }
+    let text = static_tile_text(kind, input.text.as_deref())?;
     let def = ChartInput {
         title: title.clone(),
         subtitle: None,
@@ -1432,7 +3554,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         sql_source: None,
         kind,
         dimension: String::new(),
-        measures: Vec::new(),
+        measures: MeasureList::default(),
         breakdown: None,
         map: None,
         lat: None,
@@ -1442,9 +3564,15 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         order: None,
         span: Some(span),
         board: Some(board.clone()),
-        text: Some(text.clone()),
+        text: Some(text.clone()).filter(|t| !t.is_empty()),
         caption: None,
         target: None,
+        click: None,
+        grain: None,
+        tables: TableFields::default(),
+        shape: ShapeFields::default(),
+        style: crate::style::StyleFields::default(),
+        types: Box::new(crate::types_b::stored_card_fields(input)),
     };
     let spec = ChartSpec {
         id: new_id,
@@ -1462,9 +3590,10 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         lon: None,
         format: Some(NumFmt::Int),
         span: Some(span),
-        text: Some(text),
+        text: Some(text).filter(|t| !t.is_empty()),
         caption: None,
         target: None,
+        click: None,
     };
     Ok(StoredChartSpec {
         spec,
@@ -1496,7 +3625,11 @@ struct ChartCtx<'a> {
     has_year: bool,
     created_by: &'a str,
     cols: std::collections::HashSet<String>,
+    /// The kind of each column in `cols`, for the grain check (BI-9).
+    kinds: std::collections::HashMap<String, ColumnKind>,
     geo: GeoFields,
+    grain: Option<Grain>,
+    time: &'a TimeContext,
 }
 
 /// `map`/`lat`/`lon` of a chart input once their shape is checked: trimmed,
@@ -1540,9 +3673,14 @@ fn geo_fields(kind: ChartKind, input: &ChartInput) -> Result<GeoFields, BiError>
                 "map is only for geomap/pointmap/geoheat.".to_owned(),
             ));
         }
-        if !map_id_is_well_formed(map) {
+        // BI-16 C2b QA fix Q1: an uploaded map has a server-made id (`m_` and
+        // 12 hex digits, `crate::geo::is_map_id`) that the bundled-map shape
+        // refuses because of its underscore. Whether the uploaded map still
+        // exists is the console's call when it draws (it says "map not
+        // available"), like for a bundled id it has no file for.
+        if !map_id_is_well_formed(map) && !crate::geo::is_map_id(map) {
             return Err(BiError::Validation(format!(
-                "invalid map id: use 1-{MAP_ID_MAX_LEN} lowercase letters, digits or '-'."
+                "invalid map id: use a bundled map (1-{MAP_ID_MAX_LEN} lowercase letters, digits or '-') or an uploaded map's id."
             )));
         }
     }
@@ -1738,6 +3876,56 @@ fn build_chart_sql(
         .build())
 }
 
+/// What [`grained_chart_sql`] needs, all already checked against the
+/// relation's columns.
+struct GrainedInput<'a> {
+    column: ColumnKind,
+    dimension: &'a str,
+    measures: &'a [String],
+    agg: &'a str,
+    order: &'a str,
+    limit: u32,
+    breakdown: Option<&'a str>,
+}
+
+/// The stored SQL of a grained chart (`BI-9`): the same statement the
+/// dashboard rebuilds at read time, without dashboard filters. It is run once
+/// when the chart is saved (the smoke test) and by the builder's preview, and
+/// is never served to a dashboard, which rebuilds it with the current time
+/// settings.
+fn grained_chart_sql(
+    from: &Relation,
+    grain: Grain,
+    input: &GrainedInput<'_>,
+    time: &TimeContext,
+) -> Result<String, BiError> {
+    let ident = |name: &str, what: &str| {
+        Ident::new(name)
+            .map_err(|_| BiError::Validation(format!("invalid or missing {what} column '{name}'.")))
+    };
+    let chart = crate::builder::GrainedChart {
+        grain,
+        dimension: ident(input.dimension, "dimension")?,
+        breakdown: input.breakdown.map(|b| ident(b, "breakdown")).transpose()?,
+        measures: input
+            .measures
+            .iter()
+            .map(|m| ident(m, "measure").map(crate::builder::Measure::plain))
+            .collect::<Result<_, _>>()?,
+        agg: Aggregate::from_str_lossy(input.agg),
+        order: input.order.to_owned(),
+        limit: crate::grain::effective_limit(grain, input.order, input.limit),
+        // A chart with a sort is saved by `finish_shaping`, which rebuilds it.
+        sort: None,
+        // `BI-46` (plan D12, D14): so is a chart whose limit caps its
+        // breakdown, so this path never sees one; it keeps every bucket.
+        cap_breakdown: false,
+    };
+    crate::builder::grained_sql(from, Vec::new(), &chart, input.column, time).ok_or_else(|| {
+        BiError::Validation("a grain needs a date or timestamp dimension.".to_owned())
+    })
+}
+
 /// Re-validate the columns of a point map as [`Ident`]s and build its SQL
 /// ([`crate::builder::build_points_sql`]). Split out of `build_chart_sql`,
 /// which already takes as many arguments as clippy allows.
@@ -1775,19 +3963,35 @@ fn build_point_chart_sql(
 /// cell per day, so up to a year of rows; a point map has its own fixed cap
 /// ([`crate::builder::point_limit`]); every other kind keeps the Top-N range
 /// the builder offers (1-100).
-fn limit_and_order(kind: ChartKind, input: &ChartInput, from: &Relation) -> (u32, String) {
-    let limit = if kind == ChartKind::Calendar {
-        input.limit.unwrap_or(366).clamp(1, 366)
+fn limit_and_order(
+    kind: ChartKind,
+    input: &ChartInput,
+    from: &Relation,
+    grained: bool,
+) -> (u32, String) {
+    // BI-9: a grained chart may ask for up to a thousand buckets and, unless
+    // the editor chose a value order, is ordered by bucket.
+    let limit = if grained {
+        crate::grain::clamp_limit(kind, input.limit_value())
+    } else if kind == ChartKind::Calendar {
+        input.limit_value().unwrap_or(366).clamp(1, 366)
     } else if is_point_kind(kind) {
         crate::builder::point_limit(from)
     } else {
-        input.limit.unwrap_or(20).clamp(1, 100)
+        input.limit_value().unwrap_or(20).clamp(1, 100)
     };
+    // BI-10 review fix (SHOULD-FIX) R1: a binned dimension is ordered by bin
+    // unless an explicit `order` (or a `sort`, which wins elsewhere) says
+    // otherwise, as a time grain orders by bucket.
+    let binned = input.shape.bin.is_some();
     let order = input.order.clone().unwrap_or_else(|| {
-        if matches!(
-            kind,
-            ChartKind::Line | ChartKind::Area | ChartKind::Calendar
-        ) {
+        if grained
+            || binned
+            || matches!(
+                kind,
+                ChartKind::Line | ChartKind::Area | ChartKind::Calendar
+            )
+        {
             "none".to_owned()
         } else {
             "desc".to_owned()
@@ -1799,6 +4003,13 @@ fn limit_and_order(kind: ChartKind, input: &ChartInput, from: &Relation) -> (u32
 /// Assemble the `table`/chart branch of `specFromInput` (grouped, needs a
 /// dimension; validates `stacked`/`scatter`/`combo`/`bubble` measure-count
 /// rules and the optional breakdown column).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one straight-line assembly of the stored definition, its SQL and \
+              its render spec from one destructured context; BI-9 added the \
+              grain check and branch, and splitting them out would pass the \
+              same fifteen values through another function"
+)]
 fn spec_from_chart_input(
     input: &ChartInput,
     ctx: ChartCtx<'_>,
@@ -1819,14 +4030,28 @@ fn spec_from_chart_input(
         has_year,
         created_by,
         cols,
+        kinds,
         geo,
+        grain,
+        time,
     } = ctx;
 
     let dimension = input.dimension.clone();
-    let (limit, order) = limit_and_order(kind, input, &from);
+    let (limit, order) = limit_and_order(kind, input, &from, grain.is_some());
     let breakdown = input.breakdown.clone().unwrap_or_default();
     validate_chart_shape(kind, &dimension, &measures, &breakdown, &cols)?;
     validate_point_columns(&geo, &dimension, &measures, &cols)?;
+    tables::check_settings(&input.tables, &cols).map_err(BiError::Validation)?;
+    // A chart whose columns a parameter switches names them as `{param}`, so
+    // only the shape of its style was checked (`spec_before_relation`).
+    if !input.uses_params() {
+        crate::style::check_style_names(input, &cols).map_err(BiError::Validation)?;
+    }
+    if let Some(g) = grain {
+        // BI-9: the dimension's column type decides whether the grain fits.
+        g.validate(kind, kinds.get(&dimension).copied())
+            .map_err(BiError::Validation)?;
+    }
 
     let breakdown_opt = if breakdown.is_empty() {
         None
@@ -1840,23 +4065,45 @@ fn spec_from_chart_input(
         sql_source: sql_source.clone(),
         kind,
         dimension: dimension.clone(),
-        measures: measures.clone(),
+        measures: stored_measures(&input.measures),
         breakdown: breakdown_opt.clone(),
         map: geo.map.clone(),
         lat: geo.lat.clone(),
         lon: geo.lon.clone(),
         aggregate: Some(agg.clone()),
-        limit: Some(limit),
+        limit: Some(limit.into()),
         order: Some(order.clone()),
         span: Some(span),
         board: Some(board.clone()),
         text: None,
         caption: None,
         target: None,
+        click: None,
+        grain: grain.map(|g| g.as_str().to_owned()),
+        tables: TableFields {
+            table_mode: input.tables.table_mode.clone(),
+            column_settings: input.tables.column_settings.clone(),
+            ..TableFields::default()
+        },
+        shape: stored_shape(input),
+        style: input.style.clone(),
+        types: input.types.clone(),
     };
 
     let sql = if is_point_kind(kind) {
         build_point_chart_sql(&from, &geo, &dimension, &measures, &agg)?
+    } else if let Some(g) = grain {
+        let column = kinds.get(&dimension).copied().unwrap_or(ColumnKind::Text);
+        let input = GrainedInput {
+            column,
+            dimension: &dimension,
+            measures: &measures,
+            agg: &agg,
+            order: &order,
+            limit,
+            breakdown: breakdown_opt.as_deref(),
+        };
+        grained_chart_sql(&from, g, &input, time)?
     } else {
         build_chart_sql(
             kind,
@@ -1894,6 +4141,7 @@ fn spec_from_chart_input(
         text: None,
         caption: None,
         target: None,
+        click: None,
     };
     Ok(StoredChartSpec {
         spec,
@@ -1909,6 +4157,7 @@ fn spec_from_chart_input(
 /// Fields common to every branch of `specFromInput`, derived once and
 /// validated up front. Split out to keep `spec_from_input` under clippy's
 /// line-count limit.
+#[derive(Clone)]
 struct CommonFields {
     title: String,
     kind: ChartKind,
@@ -1921,7 +4170,7 @@ struct CommonFields {
 /// Validate/normalize the fields shared by every `specFromInput` branch:
 /// `title` (required), `kind` (must be one of [`KINDS`]), `id` (generated if
 /// absent), `board` (defaults to `"default"`), `span` (`1` or `2`), and
-/// `subtitle` (blank becomes `None`).
+/// `subtitle` (blank becomes `None`, and so does the word "null").
 fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<CommonFields, BiError> {
     let title = input.title.trim().to_owned();
     if title.is_empty() {
@@ -1944,11 +4193,17 @@ fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<Common
         .unwrap_or("default")
         .to_owned();
     let span = if input.span == Some(2) { 2 } else { 1 };
+    // A blank subtitle is no subtitle, and so is the word "null": the field is
+    // normalised for every caller of the store, the assistant's tools and the
+    // console's own chart builder alike, so whoever sends the text "null" gets
+    // no subtitle and never sees that word under the title (AI-3, 2026-11-08).
+    // The whole subtitle is compared, so a subtitle that only starts with the
+    // word ("Null values by province") is kept.
     let subtitle = input
         .subtitle
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
         .map(str::to_owned);
     Ok(CommonFields {
         title,
@@ -1963,11 +4218,20 @@ fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<Common
 /// Where a chart's rows come from, resolved and validated against the real
 /// schema: a `serving` mart's columns from `system.columns`, or a SQL
 /// source's columns as probed when it was saved.
+#[derive(Clone)]
 struct Resolved {
     mart: String,
     sql_source: Option<String>,
     from: Relation,
     cols: std::collections::HashSet<String>,
+    kinds: std::collections::HashMap<String, ColumnKind>,
+    /// The source's calculated fields (`BI-8`); empty for unsaved SQL.
+    fields: Vec<FieldDef>,
+    /// `BI-7`: the columns the joined tables add to `from`, by their flat
+    /// names. `cols` and `kinds` stay the base table's own, because a
+    /// calculated field is compiled against those alone; the joined columns
+    /// are added after the fields are prepared. Empty without joins.
+    joined: std::collections::HashMap<String, ColumnKind>,
 }
 
 /// The `sqlSource` id a spec built over [`InlineSql`] carries. It marks the
@@ -1990,15 +4254,31 @@ pub struct InlineSql<'a> {
     pub columns: &'a [crate::sources::SourceColumn],
 }
 
+/// `BI-7`: a join is between tables of the serving layer; a chart on a SQL
+/// source (stored or not) cannot have one.
+fn no_joins_on_sql(input: &ChartInput) -> Result<(), BiError> {
+    if input.shape.joins_list().is_empty() {
+        Ok(())
+    } else {
+        Err(BiError::Validation(
+            "joins are for charts on a table of the serving layer, not on a SQL source.".to_owned(),
+        ))
+    }
+}
+
 /// A stored SQL source as a relation: its CURRENT text and the columns probed
 /// when it was saved.
 fn resolved_from_stored(source: crate::sources::SqlSource) -> Resolved {
     let cols = source.column_names();
+    let kinds = source.column_kinds();
     Resolved {
         mart: String::new(),
         sql_source: Some(source.id),
         from: Relation::Sql(source.sql),
         cols,
+        kinds,
+        fields: Vec::new(),
+        joined: std::collections::HashMap::new(),
     }
 }
 
@@ -2006,6 +4286,7 @@ fn resolved_from_stored(source: crate::sources::SqlSource) -> Resolved {
 /// stored one. The chart names its columns only: a mart or a source id next
 /// to inline SQL would say two things about where the rows come from.
 fn resolved_from_inline(input: &ChartInput, inline: InlineSql<'_>) -> Result<Resolved, BiError> {
+    no_joins_on_sql(input)?;
     if !input.mart.trim().is_empty()
         || input
             .sql_source
@@ -2021,7 +4302,65 @@ fn resolved_from_inline(input: &ChartInput, inline: InlineSql<'_>) -> Result<Res
         sql_source: Some(UNSAVED_SOURCE_ID.to_owned()),
         from: Relation::Sql(inline.sql.to_owned()),
         cols: inline.columns.iter().map(|c| c.name.clone()).collect(),
+        kinds: inline
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), ColumnKind::from_clickhouse_type(&c.ty)))
+            .collect(),
+        fields: Vec::new(),
+        joined: std::collections::HashMap::new(),
     })
+}
+
+/// The SQL sources a chart definition reads: its own and its other questions'
+/// (trimmed, non-empty).
+#[must_use]
+pub fn sql_sources_named(input: &ChartInput) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(id) = input.sql_source.as_deref() {
+        out.push(id.trim().to_owned());
+    }
+    for layer in input.shape.layers_list() {
+        if let Some(id) = layer.sql_source.as_deref() {
+            out.push(id.trim().to_owned());
+        }
+    }
+    out.retain(|id| !id.is_empty());
+    out
+}
+
+/// Whether the SQL sources a chart definition names (its own and its other
+/// questions') are ones `viewer` may use, `BI-19` B2 re-review S4-b.
+///
+/// A source filed in a folder the viewer cannot see is the same "not found" as
+/// an unknown id, so a chart cannot be used to read a hidden source's rows or
+/// to learn it exists. `keep` is what the chart already uses (an edit of a tile
+/// that reads a source keeps reading it: the dashboard governs, not the folder
+/// of the source); only a source the definition newly names is checked. Called
+/// by the routes that take a definition from a person (create, update, preview,
+/// the assistant's chart tools), never by rendering or by a duplicate, which
+/// work from stored charts.
+///
+/// # Errors
+///
+/// [`BiError::Validation`] with the unknown-source sentence, or
+/// [`BiError::Clickhouse`] when the source cannot be read.
+pub async fn ensure_sources_visible(
+    ch: &ChClient,
+    input: &ChartInput,
+    viewer: &Viewer,
+    keep: &[String],
+) -> Result<(), BiError> {
+    let named = sql_sources_named(input);
+    for id in named.iter().filter(|id| !keep.contains(id)) {
+        if let Some(found) = crate::sources::get_source(ch, id).await?
+            && !found.folder_id.is_empty()
+            && !viewer.sees_folder(&found.folder_id, "")
+        {
+            return Err(BiError::Validation(format!("SQL source '{id}' not found.")));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve `input.mart` / `input.sql_source` (exactly one) into a
@@ -2038,10 +4377,22 @@ async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved,
                 "choose either a mart or a SQL source, not both.".to_owned(),
             ));
         }
+        no_joins_on_sql(input)?;
         let source = crate::sources::get_source(ch, id)
             .await?
             .ok_or_else(|| BiError::Validation(format!("SQL source '{id}' not found.")))?;
-        return Ok(resolved_from_stored(source));
+        let mut resolved = resolved_from_stored(source);
+        resolved.fields =
+            crate::fields::list_catalog_fields_for(ch, SourceKind::SqlSource, id).await?;
+        return Ok(resolved);
+    }
+    // A chart that names no source at all says what to send, so the caller
+    // is not left with an empty name.
+    if input.mart.trim().is_empty() {
+        return Err(BiError::Validation(
+            "the chart names no data source: send mart or sqlSource (list_charts gives them)"
+                .to_owned(),
+        ));
     }
     let mart = input
         .mart
@@ -2050,13 +4401,55 @@ async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved,
         .to_owned();
     let mart_ident = Ident::new(mart.as_str())
         .map_err(|_| BiError::Validation(format!("invalid mart name: {}", input.mart)))?;
-    let cols = validated_mart_columns(ch, &mart).await?;
+    let kinds = validated_mart_columns(ch, &mart).await?;
+    let cols = kinds.keys().cloned().collect();
+    let fields = crate::fields::list_catalog_fields_for(ch, SourceKind::Mart, &mart).await?;
+    let (from, joined) = joined_from(ch, input, &mart, mart_ident, &kinds).await?;
     Ok(Resolved {
         mart,
         sql_source: None,
-        from: Relation::Mart(mart_ident),
+        from,
         cols,
+        kinds,
+        fields,
+        joined,
     })
+}
+
+/// `BI-7`: the relation a mart chart reads. Without joins it is the mart; with
+/// them, each joined table's columns are read from the schema (a table that
+/// does not exist is refused like a missing mart) and [`joins::plan`] checks
+/// every table, column and pair. Returns the relation and the columns the
+/// joined tables add.
+async fn joined_from(
+    ch: &ChClient,
+    input: &ChartInput,
+    mart: &str,
+    mart_ident: Ident,
+    base_kinds: &std::collections::HashMap<String, ColumnKind>,
+) -> Result<(Relation, std::collections::HashMap<String, ColumnKind>), BiError> {
+    let list = input.shape.joins_list();
+    if list.is_empty() {
+        return Ok((Relation::Mart(mart_ident), std::collections::HashMap::new()));
+    }
+    let mut lookup = std::collections::HashMap::new();
+    lookup.insert(mart.to_owned(), base_kinds.clone());
+    for j in list {
+        let name = j.mart.strip_prefix("serving.").unwrap_or(&j.mart);
+        if Ident::new(name).is_err() {
+            return Err(BiError::Validation("invalid joined table name.".to_owned()));
+        }
+        if !lookup.contains_key(name) {
+            lookup.insert(name.to_owned(), validated_mart_columns(ch, name).await?);
+        }
+    }
+    let planned = crate::joins::plan(mart, list, &lookup).map_err(BiError::Validation)?;
+    let joined = planned
+        .joined
+        .iter()
+        .filter_map(|n| planned.kinds.get(n).map(|k| (n.clone(), *k)))
+        .collect();
+    Ok((planned.from, joined))
 }
 
 /// What [`spec_before_relation`] leaves to do.
@@ -2074,11 +4467,31 @@ fn spec_before_relation(
     source: ChartSource,
     created_by: &str,
     id: Option<String>,
+    time: &TimeContext,
 ) -> Result<Stage, BiError> {
     let common = derive_common_fields(input, id)?;
     let geo = geo_fields(common.kind, input)?;
+    tables::check_kind_fields(&input.tables, common.kind).map_err(BiError::Validation)?;
+    // BI-17 part A: which style fields the kind takes and the shape of each;
+    // the names they use are checked once the relation's columns are known.
+    crate::style::check_style(input).map_err(BiError::Validation)?;
+    crate::params::check_reference_lines(input).map_err(BiError::Validation)?;
+    // BI-16 part B: which of goal, bands, histogram, url and alt the kind
+    // takes; an image or web address must be on an allowed content site. The
+    // list rides in `time` (loaded from the settings by the route), so the
+    // console and the assistant cannot save a card around it, and a context
+    // that carries none (a test, an embed) refuses every such card.
+    crate::types_b::check_fields(input).map_err(BiError::Validation)?;
+    crate::types_b::check_content_url(input, time.content_sites()).map_err(BiError::Validation)?;
+    shape::check_kind_fields(
+        &input.measures,
+        &input.shape,
+        common.kind,
+        input.tables.is_rows_mode(common.kind),
+    )
+    .map_err(BiError::Validation)?;
     // ── TEXT — no SQL/mart ────────────────────────────────────────────
-    if common.kind == ChartKind::Text {
+    if common.kind.is_static() {
         let CommonFields {
             title,
             kind,
@@ -2111,6 +4524,11 @@ fn spec_before_relation(
 /// (no SQL) / `kpi`/`gauge` (single number) / table & chart (grouped). Ports
 /// `specFromInput`.
 ///
+/// `BI-13`: a chart with `layers` is checked as a whole ([`crate::layers`]):
+/// every layer is built as the chart it would be alone, over its own source
+/// and with the chart's grain, and its dimension must be of the chart's kind.
+/// The chart's own statement is the one it always had.
+///
 /// # Errors
 ///
 /// Returns [`BiError::Validation`] for any input/schema validation failure,
@@ -2121,14 +4539,304 @@ pub async fn spec_from_input(
     source: ChartSource,
     created_by: &str,
     id: Option<String>,
+    time: &TimeContext,
 ) -> Result<StoredChartSpec, BiError> {
-    let (common, geo) = match spec_before_relation(input, source, created_by, id)? {
-        Stage::Done(spec) => return Ok(*spec),
+    crate::layers::check_definition(input).map_err(BiError::Validation)?;
+    let mut spec = spec_from_input_base(ch, input, source, created_by, id, time).await?;
+    if !input.shape.layers_list().is_empty() {
+        spec.def.shape.layers = Some(checked_layers(ch, input, source, created_by, time).await?);
+    }
+    key_look_by_drawn_names(&mut spec);
+    Ok(spec)
+}
+
+/// The names the chart's series can take: the names the chart draws, which
+/// are the keys `colors.series` and `valueFormats` are stored under.
+#[must_use]
+pub fn drawn_names(y: &crate::specs::ChartY) -> Vec<String> {
+    match y {
+        crate::specs::ChartY::Single(y) => vec![y.clone()],
+        crate::specs::ChartY::Multi(ys) => ys.clone(),
+    }
+}
+
+/// BI-18 part C review fix (BLOCKER) R24: series colours are keyed by the name
+/// the chart draws, whichever path saved them (builder, `create_chart`,
+/// `update_chart`, `format_chart`: all end in [`spec_from_input`]).
+fn key_look_by_drawn_names(spec: &mut StoredChartSpec) {
+    let drawn = drawn_names(&spec.spec.y);
+    crate::style::key_series_by_drawn_name(&mut spec.def, &drawn);
+}
+
+/// `BI-13`: the layers of `input` as they are stored, each validated by
+/// building it over its own source as a one-dimension bar chart (the way it is
+/// read), with the chart's grain, and its dimension compared with the chart's.
+async fn checked_layers(
+    ch: &ChClient,
+    input: &ChartInput,
+    source: ChartSource,
+    created_by: &str,
+    time: &TimeContext,
+) -> Result<Vec<crate::layers::LayerDef>, BiError> {
+    let base = resolve_relation(ch, input).await?;
+    let base_kind = dimension_kind(&base, &input.dimension);
+    let grained = input.grain.is_some();
+    let mut stored = Vec::new();
+    for (i, layer) in input.shape.layers_list().iter().enumerate() {
+        let n = i + 1;
+        let prefixed = |err: BiError| match err {
+            BiError::Validation(why) => BiError::Validation(format!("question {n}: {why}")),
+            other @ BiError::Clickhouse(_) => other,
+        };
+        let layer = layer.normalized();
+        let as_chart = crate::layers::layer_input(
+            &layer,
+            &format!("question {n}"),
+            input.grain.as_deref(),
+            crate::layers::layer_order(input),
+            None,
+        );
+        let resolved = resolve_relation(ch, &as_chart).await.map_err(prefixed)?;
+        spec_from_input_base(ch, &as_chart, source, created_by, None, time)
+            .await
+            .map_err(prefixed)?;
+        crate::layers::same_dimension_kind(
+            base_kind,
+            dimension_kind(&resolved, &layer.dimension),
+            grained,
+        )
+        .map_err(|why| BiError::Validation(format!("question {n}: {}", why.as_str())))?;
+        stored.push(layer);
+    }
+    Ok(stored)
+}
+
+/// The kind of `name` in a resolved relation: a column of the table, of a
+/// joined table, or a calculated field of the source.
+fn dimension_kind(resolved: &Resolved, name: &str) -> Option<ColumnKind> {
+    resolved
+        .kinds
+        .get(name)
+        .or_else(|| resolved.joined.get(name))
+        .copied()
+        .or_else(|| {
+            resolved
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| match f.ty.as_str() {
+                    "number" => ColumnKind::Number,
+                    "date" => ColumnKind::Date,
+                    "datetime" => ColumnKind::DateTime,
+                    _ => ColumnKind::Text,
+                })
+        })
+}
+
+/// [`spec_from_input`] without the layers: one chart over one source.
+async fn spec_from_input_base(
+    ch: &ChClient,
+    input: &ChartInput,
+    source: ChartSource,
+    created_by: &str,
+    id: Option<String>,
+    time: &TimeContext,
+) -> Result<StoredChartSpec, BiError> {
+    let click = validated_click(input)?;
+    let grain = validated_grain(input)?;
+    let (common, geo) = match spec_before_relation(input, source, created_by, id, time)? {
+        Stage::Done(spec) => return Ok(with_click(*spec, click)),
         Stage::NeedsRelation(common, geo) => (common, geo),
     };
     // ── kpi/table/chart need a mart OR a SQL source ─────────────────
     let resolved = resolve_relation(ch, input).await?;
-    spec_from_resolved(input, source, created_by, common, geo, resolved)
+    // BI-11: parameters are read only when something here can name one (the
+    // chart itself, or a calculated field of its source), so a chart that
+    // uses none costs no extra read.
+    let needs_params =
+        input.uses_params() || resolved.fields.iter().any(|f| f.formula.contains('{'));
+    if needs_params {
+        let defs = crate::params::list_params(ch).await?;
+        let values = if time.params().is_empty() {
+            crate::params::ParamValues::from_defaults(&defs)
+        } else {
+            time.params().clone()
+        };
+        let with_values = time.clone().with_params(values);
+        return spec_from_param_chart(
+            input,
+            (source, created_by),
+            (common, geo, resolved),
+            GrainCtx {
+                grain,
+                time: &with_values,
+            },
+        )
+        .map(|spec| with_click(spec, click));
+    }
+    spec_from_resolved(
+        input,
+        source,
+        created_by,
+        common,
+        geo,
+        resolved,
+        GrainCtx { grain, time },
+    )
+    .map(|spec| with_click(spec, click))
+}
+
+/// `BI-11`: a chart that names a parameter, saved (or previewed) with the
+/// values in `when.time`. The statement, the render spec and the smoke test
+/// are built for those values by the very code every chart goes through; then
+/// the definition keeps the parameter forms the editor wrote, so a read
+/// resolves them again ([`crate::params::resolve_chart`]).
+///
+/// Every value of a column-switch parameter is checked as a slot of this
+/// chart, not only the current one: a choice that cannot be built (not a
+/// column of the source, a text column as a measure) is refused here, naming
+/// the parameter and the choice, so the viewer never meets it.
+fn spec_from_param_chart(
+    input: &ChartInput,
+    (source, created_by): (ChartSource, &str),
+    (common, geo, resolved): (CommonFields, GeoFields, Resolved),
+    when: GrainCtx<'_>,
+) -> Result<StoredChartSpec, BiError> {
+    use crate::params::{ParamType, Slot, chart_param_names, check_chart_shape, slots, substitute};
+    check_chart_shape(input).map_err(BiError::Validation)?;
+    let params = when.time.params();
+    for name in chart_param_names(input) {
+        let Some(found) = params.get(&name) else {
+            return Err(BiError::Validation(format!(
+                "the parameter '{name}' does not exist."
+            )));
+        };
+        let in_lines = input
+            .shape
+            .reference_lines
+            .iter()
+            .flatten()
+            .any(|l| l.params().any(|p| p.param == name));
+        let as_limit =
+            matches!(&input.limit, Some(crate::params::Limit::Param(p)) if p.param == name);
+        if (in_lines || as_limit) && found.def.ty != ParamType::Number {
+            return Err(BiError::Validation(format!(
+                "the parameter '{name}' must be a number parameter here."
+            )));
+        }
+    }
+    let effective = substitute(input, params, &|_slot, column| Some(column.to_owned()))
+        .map_err(BiError::Validation)?;
+    // Every choice of every column-switch parameter, in its slot.
+    for (slot, name) in slots(input) {
+        let choices: Vec<String> = params
+            .get(&name)
+            .map(|r| {
+                r.def
+                    .text_choices()
+                    .iter()
+                    .map(|c| (*c).to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for choice in choices {
+            let mut probe = effective.clone();
+            match slot {
+                Slot::Dimension => probe.dimension.clone_from(&choice),
+                Slot::Breakdown => probe.breakdown = Some(choice.clone()),
+                Slot::Measure(i) => {
+                    probe.measures = MeasureList::from_pairs(
+                        effective
+                            .measures
+                            .entries()
+                            .enumerate()
+                            .map(|(j, (c, a))| {
+                                (
+                                    if j == i { choice.clone() } else { c.to_owned() },
+                                    a.map(str::to_owned),
+                                )
+                            })
+                            .collect(),
+                    )
+                    .keeping_metrics_of(&effective.measures, Some(i));
+                }
+            }
+            spec_from_resolved(
+                &probe,
+                source,
+                created_by,
+                common.clone(),
+                geo.clone(),
+                resolved.clone(),
+                when,
+            )
+            .map_err(|failure| match failure {
+                BiError::Validation(why) => BiError::Validation(format!(
+                    "the choice '{choice}' of the parameter '{name}' does not work in this chart: {why}"
+                )),
+                other @ BiError::Clickhouse(_) => other,
+            })?;
+        }
+    }
+    let mut spec = spec_from_resolved(&effective, source, created_by, common, geo, resolved, when)?;
+    // The definition keeps what the editor wrote.
+    spec.def.dimension.clone_from(&input.dimension);
+    spec.def.breakdown.clone_from(&input.breakdown);
+    spec.def.measures = stored_measures(&input.measures);
+    spec.def.limit.clone_from(&input.limit);
+    spec.def
+        .shape
+        .reference_lines
+        .clone_from(&input.shape.reference_lines);
+    Ok(spec)
+}
+
+/// The grain of `input` once its name and its chart kind are checked (`BI-9`).
+/// Whether the dimension column fits it is checked later, against the
+/// relation's column types. A kind without a dimension to group (`text`,
+/// `kpi`, ...) refuses a grain here, before any schema lookup, like `click`.
+fn validated_grain(input: &ChartInput) -> Result<Option<Grain>, BiError> {
+    let Some(raw) = input.grain.as_deref() else {
+        return Ok(None);
+    };
+    let grain = Grain::parse(raw).ok_or_else(|| {
+        BiError::Validation(format!(
+            "invalid grain '{raw}': use one of {}.",
+            crate::grain::ALL_GRAINS.map(Grain::as_str).join(", ")
+        ))
+    })?;
+    // The column kind is unknown here; `DateTime` is the permissive one, so
+    // this only refuses on the chart kind.
+    grain
+        .validate(input.kind, Some(ColumnKind::DateTime))
+        .map_err(BiError::Validation)?;
+    Ok(Some(grain))
+}
+
+/// The click setting of `input` once its shape is checked (`BI-18`·B).
+/// Checked before any schema lookup, and on every kind: a `text` tile has
+/// nothing to click, so a click on one is refused rather than stored and
+/// ignored.
+fn validated_click(input: &ChartInput) -> Result<Option<ClickAction>, BiError> {
+    let Some(click) = &input.click else {
+        return Ok(None);
+    };
+    if input.kind.is_static() {
+        return Err(BiError::Validation(
+            "a text tile has nothing to click.".to_owned(),
+        ));
+    }
+    click.validate().map_err(BiError::Validation)?;
+    Ok(Some(click.clone()))
+}
+
+/// `spec` with the validated click on both the render spec and the
+/// structured definition the editor prefills from. Applied after the
+/// per-kind assembly so no kind's builder has to carry it.
+fn with_click(mut spec: StoredChartSpec, click: Option<ClickAction>) -> StoredChartSpec {
+    spec.spec.click.clone_from(&click);
+    spec.def.click = click;
+    spec
 }
 
 /// [`spec_from_input`] over SQL that is not a stored source (see
@@ -2145,50 +4853,71 @@ pub fn spec_from_inline_sql(
     inline: InlineSql<'_>,
     source: ChartSource,
     created_by: &str,
+    time: &TimeContext,
 ) -> Result<StoredChartSpec, BiError> {
-    let (common, geo) = match spec_before_relation(input, source, created_by, None)? {
-        Stage::Done(spec) => return Ok(*spec),
+    let click = validated_click(input)?;
+    crate::layers::check_definition(input).map_err(BiError::Validation)?;
+    if !input.shape.layers_list().is_empty() {
+        // BI-13: the questions of a combined chart are checked against the
+        // stored sources and tables; save the SQL first, then combine it.
+        return Err(BiError::Validation(
+            "save the SQL as a source before combining it with other questions.".to_owned(),
+        ));
+    }
+    let grain = validated_grain(input)?;
+    let (common, geo) = match spec_before_relation(input, source, created_by, None, time)? {
+        Stage::Done(spec) => return Ok(with_click(*spec, click)),
         Stage::NeedsRelation(common, geo) => (common, geo),
     };
     let resolved = resolved_from_inline(input, inline)?;
-    spec_from_resolved(input, source, created_by, common, geo, resolved)
+    spec_from_resolved(
+        input,
+        source,
+        created_by,
+        common,
+        geo,
+        resolved,
+        GrainCtx { grain, time },
+    )
+    .map(|spec| with_click(spec, click))
 }
 
-/// The part of [`spec_from_input`] that follows relation resolution, shared
-/// by the stored and the inline path so a chart is validated and its SQL
-/// built by one piece of code whichever way its rows are named.
-fn spec_from_resolved(
+/// The grain a chart is saved with and the time settings its SQL is built
+/// with (`BI-9`); bundled to keep [`spec_from_resolved`] within clippy's
+/// argument limit.
+#[derive(Clone, Copy)]
+struct GrainCtx<'a> {
+    grain: Option<Grain>,
+    time: &'a TimeContext,
+}
+
+/// The measure columns of a chart, checked against the relation. BI-16 part A:
+/// a pivot and a raw table name their columns in `rows`, `columns` and
+/// `values`, not in `dimension` and `measures`, and refuse those.
+fn check_measures(
     input: &ChartInput,
-    source: ChartSource,
-    created_by: &str,
-    common: CommonFields,
-    geo: GeoFields,
-    resolved: Resolved,
-) -> Result<StoredChartSpec, BiError> {
-    let CommonFields {
-        title,
-        kind,
-        new_id,
-        board,
-        span,
-        subtitle,
-    } = common;
-    let Resolved {
-        mart,
-        sql_source,
-        from,
-        cols,
-    } = resolved;
-    let has_year = cols.contains("tahun");
-    let agg = input
-        .aggregate
-        .clone()
-        .unwrap_or_else(|| "sum".to_owned())
-        .to_lowercase();
-    if !aggregate_allowed(&agg) {
-        return Err(BiError::Validation(format!("invalid aggregate: {agg}")));
+    kind: ChartKind,
+    measures: &[String],
+    cols: &std::collections::HashSet<String>,
+) -> Result<(), BiError> {
+    // BI-16 part B: a histogram counts the rows of its dimension; it has no
+    // measure (`types_b::check_fields` refused any).
+    if kind == ChartKind::Histogram || kind == ChartKind::Gantt {
+        return Ok(());
     }
-    let measures = input.measures.clone();
+    if kind == ChartKind::Pivot || input.tables.is_rows_mode(kind) {
+        if !measures.is_empty() || !input.dimension.is_empty() || input.breakdown.is_some() {
+            return Err(BiError::Validation(format!(
+                "a {} names its columns in its own fields, not in dimension, measures or breakdown.",
+                if kind == ChartKind::Pivot {
+                    "pivot"
+                } else {
+                    "table in rows mode"
+                }
+            )));
+        }
+        return Ok(());
+    }
     if measures.is_empty() {
         return Err(BiError::Validation(
             "at least one measure column is required.".to_owned(),
@@ -2202,10 +4931,235 @@ fn spec_from_resolved(
             "invalid or missing measure column.".to_owned(),
         ));
     }
+    Ok(())
+}
 
-    // ── KPI / GAUGE — single number (no dimension) ──────────────────
-    if kind == ChartKind::Kpi || kind == ChartKind::Gauge {
-        return spec_from_kpi_input(
+/// A KPI's comparison with the metric's date column and period filled in.
+fn metric_compare(input: &ChartInput, catalog: &fields::FieldCatalog) -> TableFields {
+    crate::metrics::fill_compare(&input.tables, &input.measures, catalog.for_chart(input))
+}
+
+/// [`shape::check_against_relation`] for the chart `input` reads over `from`.
+fn check_shaping(
+    input: &ChartInput,
+    (kind, from, cols, kinds): (
+        ChartKind,
+        &Relation,
+        &std::collections::HashSet<String>,
+        &HashMap<String, ColumnKind>,
+    ),
+    (grain, time): (Option<Grain>, &TimeContext),
+    catalog: &fields::FieldCatalog,
+) -> Result<(), BiError> {
+    // BI-2: the chart's own filters are checked as they will apply, with each
+    // segment replaced by its filters.
+    let mut checked = input.shape.clone();
+    if input
+        .shape
+        .own_filters()
+        .iter()
+        .any(|f| f.segment.is_some())
+    {
+        let expanded = catalog
+            .expand_chart_filters(input, input.shape.own_filters())
+            .map_err(BiError::Validation)?;
+        checked.filters = Some(expanded);
+    }
+    shape::check_against_relation(
+        &input.measures,
+        &checked,
+        &RelationCheck {
+            kind,
+            from,
+            cols,
+            kinds,
+            time,
+            dimension: &input.dimension,
+            breakdown: input.breakdown.as_deref().unwrap_or(""),
+            grained: grain.is_some(),
+            truncated_grain: grain.is_some_and(Grain::is_truncation),
+        },
+    )
+    .map_err(BiError::Validation)?;
+    check_steps(input, from, kinds)
+}
+
+/// `BI-6` part 2: the steps checked against the grouped result they start from,
+/// the last step's result against what the kind draws, and the sort against
+/// the last step's columns.
+fn check_steps(
+    input: &ChartInput,
+    from: &Relation,
+    kinds: &HashMap<String, ColumnKind>,
+) -> Result<(), BiError> {
+    let Some(plan) = steps_plan(input, from, kinds)? else {
+        return Ok(());
+    };
+    let need = match input.kind {
+        ChartKind::Stacked | ChartKind::Combo | ChartKind::Scatter => 2,
+        ChartKind::Bubble => 3,
+        _ => 1,
+    };
+    if plan.measures.len() < need {
+        return Err(BiError::Validation(format!(
+            "a {} needs {need} measures at the end of its steps; the last step returns {}.",
+            serde_json::to_value(input.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            plan.measures.len()
+        )));
+    }
+    if let Some(sort) = &input.shape.sort
+        && !plan
+            .groups
+            .iter()
+            .chain(&plan.measures)
+            .any(|c| c.as_str() == sort.by)
+    {
+        return Err(BiError::Validation(format!(
+            "cannot sort by '{}': after the steps the chart has {}.",
+            sort.by,
+            plan.groups
+                .iter()
+                .chain(&plan.measures)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The planned steps of `input` over its grouped result, or `None` without steps.
+fn steps_plan(
+    input: &ChartInput,
+    from: &Relation,
+    kinds: &HashMap<String, ColumnKind>,
+) -> Result<Option<crate::builder::steps::StepsSql>, BiError> {
+    let Some(list) = &input.shape.steps else {
+        return Ok(None);
+    };
+    let group_of = |name: &str, grain: Option<&str>| {
+        let kind = kinds.get(name).copied().unwrap_or(ColumnKind::Text);
+        (
+            name.to_owned(),
+            crate::builder::steps::group_kind(kind, grain.and_then(Grain::parse)),
+        )
+    };
+    let groups: Vec<(String, ColumnKind)> = match &input.shape.groupings {
+        Some(g) => g
+            .iter()
+            .map(|g| group_of(&g.column, g.grain.as_deref()))
+            .collect(),
+        None => vec![group_of(&input.dimension, None)],
+    };
+    let measures = shape::resolve_measures(&input.measures, from)
+        .ok_or_else(|| BiError::Validation("invalid or missing measure column.".to_owned()))?;
+    let names: Vec<String> = measures.iter().map(|m| m.alias.to_string()).collect();
+    crate::builder::steps::plan(list, &groups, &names)
+        .map(Some)
+        .map_err(BiError::Validation)
+}
+
+/// `BI-7`: the joined columns join the chart's columns after the fields are
+/// prepared, so a formula cannot name one (it is compiled against the base
+/// table's columns alone) and a field cannot take a joined column's name.
+fn add_joined_columns(
+    mut cols: std::collections::HashSet<String>,
+    mut kinds: HashMap<String, ColumnKind>,
+    joined: HashMap<String, ColumnKind>,
+) -> Result<
+    (
+        std::collections::HashSet<String>,
+        HashMap<String, ColumnKind>,
+    ),
+    BiError,
+> {
+    for (name, kind) in joined {
+        if kinds.insert(name.clone(), kind).is_some() {
+            return Err(BiError::Validation(format!(
+                "the calculated field '{name}' has the name of a joined column; rename the field."
+            )));
+        }
+        cols.insert(name);
+    }
+    Ok((cols, kinds))
+}
+
+/// The part of [`spec_from_input`] that follows relation resolution, shared
+/// by the stored and the inline path so a chart is validated and its SQL
+/// built by one piece of code whichever way its rows are named.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one dispatch over the kinds that destructures the resolved relation once; \
+              BI-16 part B added the single-row and histogram arms to the list"
+)]
+fn spec_from_resolved(
+    input: &ChartInput,
+    source: ChartSource,
+    created_by: &str,
+    common: CommonFields,
+    geo: GeoFields,
+    resolved: Resolved,
+    when: GrainCtx<'_>,
+) -> Result<StoredChartSpec, BiError> {
+    let GrainCtx { grain, time } = when;
+    let CommonFields {
+        title,
+        kind,
+        new_id,
+        board,
+        span,
+        subtitle,
+    } = common;
+    let Resolved {
+        mart,
+        sql_source,
+        from,
+        cols,
+        kinds,
+        fields,
+        joined,
+    } = resolved;
+    let has_year = cols.contains("tahun");
+    // BI-8: a chart that names a calculated field of its source is saved
+    // over the relation that carries it, so the stored SQL is a working
+    // fallback; at read time it is rebuilt from the field's current formula.
+    let (from, cols, kinds) = match fields::prepare(&fields, input, from.clone(), &kinds, time)
+        .map_err(BiError::Validation)?
+    {
+        Some(p) => (p.from, p.cols.keys().cloned().collect(), p.cols),
+        None => (from, cols, kinds),
+    };
+    let (cols, kinds) = add_joined_columns(cols, kinds, joined)?;
+    let agg = input
+        .aggregate
+        .clone()
+        .unwrap_or_else(|| "sum".to_owned())
+        .to_lowercase();
+    if !aggregate_allowed(&agg) {
+        return Err(BiError::Validation(format!("invalid aggregate: {agg}")));
+    }
+    let measures = input.measures.to_vec();
+    check_measures(input, kind, &measures, &cols)?;
+    // BI-6: the chart's own filters, sort, groupings and measures with their
+    // own aggregate are checked against the relation they read.
+    let catalog = fields::FieldCatalog::from_fields(fields);
+    check_shaping(input, (kind, &from, &cols, &kinds), (grain, time), &catalog)?;
+    let compare_fill = metric_compare(input, &catalog);
+    // Kept for `finish_shaping`, which builds the stored statement of a chart
+    // that uses any of it from the same relation.
+    let shaping = input
+        .uses_shaping()
+        .then(|| (from.clone(), kinds.clone(), catalog));
+
+    // ── KPI / GAUGE / PROGRESS / one BULLET — a single row (no dimension) ──
+    if kind == ChartKind::Kpi
+        || kind == ChartKind::Gauge
+        || crate::types_b::is_single_row_kind(kind, input)
+    {
+        let spec = spec_from_kpi_input(
             input,
             KpiCtx {
                 title,
@@ -2222,32 +5176,595 @@ fn spec_from_resolved(
                 source,
                 has_year,
                 created_by,
+                cols,
+                kinds,
+                time,
+                compare_fill,
             },
-        );
+        )?;
+        return finish_shaping(spec, shaping, time);
     }
 
     // ── TABLE / CHART — needs a dimension ────────────────────────────
-    spec_from_chart_input(
-        input,
-        ChartCtx {
-            title,
-            subtitle,
-            kind,
-            mart,
-            sql_source,
-            from,
-            agg,
-            measures,
-            span,
-            board,
-            new_id,
-            source,
-            has_year,
-            created_by,
-            cols,
-            geo,
-        },
+    let ctx = ChartCtx {
+        title,
+        subtitle,
+        kind,
+        mart,
+        sql_source,
+        from,
+        agg,
+        measures,
+        span,
+        board,
+        new_id,
+        source,
+        has_year,
+        created_by,
+        cols,
+        kinds,
+        geo,
+        grain,
+        time,
+    };
+    let spec = if kind == ChartKind::Gantt {
+        spec_from_gantt_input(input, ctx)
+    } else if kind == ChartKind::Histogram {
+        spec_from_histogram_input(input, ctx)
+    } else if kind == ChartKind::Pivot {
+        spec_from_pivot_input(input, ctx)
+    } else if input.tables.is_rows_mode(kind) {
+        spec_from_rows_input(input, ctx)
+    } else if input.shape.groupings.is_some() {
+        spec_from_groupings_input(input, ctx)
+    } else {
+        spec_from_chart_input(input, ctx)
+    }?;
+    finish_shaping(spec, shaping, time)
+}
+
+/// The `BI-6` fields of `input` as they are stored: the filters (none when the
+/// list is empty), sort and groupings as given, and `other` only when it is on
+/// (an `other: false` is the same chart as none, not a second spelling of it).
+fn stored_shape(input: &ChartInput) -> ShapeFields {
+    ShapeFields {
+        other: input.shape.wants_other().then_some(true),
+        // An empty list is no filters, not a second spelling of none.
+        filters: Some(input.shape.own_filters().to_vec()).filter(|f| !f.is_empty()),
+        joins: Some(input.shape.joins_list().to_vec()).filter(|j| !j.is_empty()),
+        ..input.shape.clone()
+    }
+}
+
+/// The measures as they are stored: the same list with each own aggregate in
+/// lower case, so `AVG` and `avg` are one measure and one result name.
+fn stored_measures(measures: &MeasureList) -> MeasureList {
+    MeasureList::from_pairs(
+        measures
+            .entries()
+            .map(|(c, a)| (c.to_owned(), a.map(str::to_lowercase)))
+            .collect(),
     )
+    // BI-2 review fix (BLOCKER) R1: the stored definition keeps which
+    // measures are metrics.
+    .keeping_metrics_of(measures, None)
+}
+
+/// `BI-6`: a chart that uses the chart builder's fields is saved with the
+/// statement the dashboard will build for it (its own filters applied, the
+/// sort, "Other" and groupings in place), so the smoke test at save, the
+/// builder's preview and the fallback for a definition that no longer checks
+/// out all run the same shape. A chart that uses none of them keeps the
+/// statement it was always built with, untouched.
+fn finish_shaping(
+    mut spec: StoredChartSpec,
+    shaping: Option<(Relation, HashMap<String, ColumnKind>, fields::FieldCatalog)>,
+    time: &TimeContext,
+) -> Result<StoredChartSpec, BiError> {
+    let Some((from, kinds, catalog)) = shaping else {
+        return Ok(spec);
+    };
+    spec.spec.sql =
+        crate::builder::stored_sql(&spec, &from, &kinds, time, &catalog).ok_or_else(|| {
+            BiError::Validation(
+                "this combination of filters, sort, groupings and measures cannot be built."
+                    .to_owned(),
+            )
+        })?;
+    // BI-6 part 2: after steps the chart draws the last step's columns.
+    if let Ok(Some(plan)) = steps_plan(&spec.def, &from, &kinds) {
+        spec.spec.x = plan
+            .groups
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        spec.spec.series = None;
+        let mut names: Vec<String> = plan.measures.iter().map(ToString::to_string).collect();
+        spec.spec.y = if names.len() == 1 {
+            ChartY::Single(names.remove(0))
+        } else {
+            ChartY::Multi(names)
+        };
+        return Ok(spec);
+    }
+    // The result columns of a measure with its own aggregate are named by
+    // aggregate and column (`avg_stay`), which is what the console reads.
+    if spec.def.measures.has_own_aggregates()
+        && let Some(named) = shape::resolve_measures(&spec.def.measures, &from)
+    {
+        let mut aliases: Vec<String> = named.iter().map(|m| m.alias.to_string()).collect();
+        spec.spec.y = if aliases.len() == 1 {
+            ChartY::Single(aliases.remove(0))
+        } else {
+            ChartY::Multi(aliases)
+        };
+    }
+    Ok(spec)
+}
+
+/// Assemble a `histogram` (`BI-16` part B): how many rows fall in each range
+/// of one number column. The column is the `dimension`; the statement is
+/// `BI-10`'s binned path with a count ([`crate::builder`]), so it counts the
+/// rows the viewer may see, after the dashboard's filters, and the tile gets
+/// the ranges' width, minimum and maximum with its rows.
+fn spec_from_histogram_input(
+    input: &ChartInput,
+    ctx: ChartCtx<'_>,
+) -> Result<StoredChartSpec, BiError> {
+    let column = input.dimension.clone();
+    if !IDENT_ALLOWED(&column) || !ctx.cols.contains(&column) {
+        return Err(BiError::Validation(format!(
+            "invalid or missing dimension column '{column}'."
+        )));
+    }
+    if ctx.kinds.get(&column) != Some(&ColumnKind::Number) {
+        return Err(BiError::Validation(format!(
+            "'{column}' is not a number column; a histogram counts the rows of a number."
+        )));
+    }
+    let mode = match &input.types.histogram {
+        Some(bins) => bins.mode().map_err(BiError::Validation)?,
+        None => crate::bin::BinMode::Nearest(crate::types_b::AUTO_HISTOGRAM_BINS),
+    };
+    // As for BI-10's bins: a SQL source's rows are cut at a fixed cap, so a
+    // range read from the cut result would be wrong.
+    if ctx.from.is_sql_source() && !matches!(mode, crate::bin::BinMode::Width(_)) {
+        return Err(BiError::Validation(
+            "automatic and counted ranges need a table; for a SQL source choose a width."
+                .to_owned(),
+        ));
+    }
+    let def = ChartInput {
+        title: ctx.title.clone(),
+        subtitle: ctx.subtitle.clone(),
+        mart: ctx.mart.clone(),
+        sql_source: ctx.sql_source.clone(),
+        kind: ctx.kind,
+        dimension: column.clone(),
+        measures: MeasureList::default(),
+        breakdown: None,
+        map: None,
+        lat: None,
+        lon: None,
+        aggregate: None,
+        limit: None,
+        order: None,
+        span: Some(ctx.span),
+        board: Some(ctx.board.clone()),
+        text: None,
+        caption: None,
+        target: None,
+        click: input.click.clone(),
+        grain: None,
+        tables: TableFields::default(),
+        shape: stored_shape(input),
+        style: input.style.clone(),
+        types: Box::new(crate::types_b::TypeFields {
+            histogram: input.types.histogram.clone(),
+            ..crate::types_b::TypeFields::default()
+        }),
+    };
+    let sql = crate::builder::histogram_stored_sql(&def, &ctx.from)
+        .ok_or_else(|| BiError::Validation("this histogram cannot be built.".to_owned()))?;
+    crate::style::check_style_names(input, &ctx.cols).map_err(BiError::Validation)?;
+    let (source, board, has_year, created_by) = (
+        ctx.source,
+        ctx.board.clone(),
+        ctx.has_year,
+        ctx.created_by.to_owned(),
+    );
+    let spec = ChartSpec {
+        id: ctx.new_id,
+        title: ctx.title,
+        subtitle: ctx.subtitle,
+        kind: ctx.kind,
+        mart: ctx.mart,
+        sql_source: ctx.sql_source,
+        sql,
+        x: column,
+        y: ChartY::Single(crate::builder::HISTOGRAM_COUNT.to_owned()),
+        series: None,
+        map: None,
+        lat: None,
+        lon: None,
+        format: Some(NumFmt::Int),
+        span: Some(ctx.span),
+        text: None,
+        caption: None,
+        target: None,
+        click: None,
+    };
+    Ok(StoredChartSpec {
+        spec,
+        source,
+        board,
+        def,
+        has_year,
+        created_by: Some(created_by),
+        created_at: None,
+    })
+}
+
+/// The start, end and progress columns of a Gantt chart, checked against the
+/// relation: they exist, the first two are dates or date-times, progress is a
+/// number, and the task and group columns exist.
+fn check_gantt_columns(
+    input: &ChartInput,
+    ctx: &ChartCtx<'_>,
+) -> Result<(String, String, String), BiError> {
+    let named = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (start, end, progress) = (
+        named(&input.types.start),
+        named(&input.types.end),
+        named(&input.types.progress),
+    );
+    let known = |column: &str, what: &str| {
+        if IDENT_ALLOWED(column) && ctx.cols.contains(column) {
+            Ok(())
+        } else {
+            Err(BiError::Validation(format!(
+                "invalid or missing {what} column '{column}'."
+            )))
+        }
+    };
+    known(&input.dimension, "task")?;
+    known(&start, "start")?;
+    known(&end, "end")?;
+    for (column, what) in [(&start, "start"), (&end, "end")] {
+        if !matches!(
+            ctx.kinds.get(column),
+            Some(ColumnKind::Date | ColumnKind::DateTime)
+        ) {
+            return Err(BiError::Validation(format!(
+                "'{column}' is not a date or date-time column; the {what} of a Gantt chart must be one."
+            )));
+        }
+    }
+    if !progress.is_empty() {
+        known(&progress, "progress")?;
+        if ctx.kinds.get(&progress) != Some(&ColumnKind::Number) {
+            return Err(BiError::Validation(format!(
+                "'{progress}' is not a number column; the progress of a Gantt chart must be one."
+            )));
+        }
+    }
+    if let Some(group) = input.breakdown.as_deref() {
+        known(group, "group")?;
+    }
+    Ok((start, end, progress))
+}
+
+/// A Gantt chart (`BI-16` part C1, plan D1 and D2): one row per task with its
+/// first start and last end, grouped by the optional breakdown. The task,
+/// group, start, end and progress columns are checked against the relation
+/// here; the statement itself is [`crate::builder::gantt_stored_sql`].
+fn spec_from_gantt_input(
+    input: &ChartInput,
+    ctx: ChartCtx<'_>,
+) -> Result<StoredChartSpec, BiError> {
+    let (start, end, progress) = check_gantt_columns(input, &ctx)?;
+    let def = ChartInput {
+        title: ctx.title.clone(),
+        subtitle: ctx.subtitle.clone(),
+        mart: ctx.mart.clone(),
+        sql_source: ctx.sql_source.clone(),
+        kind: ctx.kind,
+        dimension: input.dimension.clone(),
+        measures: MeasureList::default(),
+        breakdown: input.breakdown.clone(),
+        map: None,
+        lat: None,
+        lon: None,
+        aggregate: None,
+        limit: None,
+        order: None,
+        span: Some(ctx.span),
+        board: Some(ctx.board.clone()),
+        text: None,
+        caption: None,
+        target: None,
+        click: input.click.clone(),
+        grain: None,
+        tables: TableFields::default(),
+        shape: stored_shape(input),
+        style: input.style.clone(),
+        types: Box::new(crate::types_b::TypeFields {
+            start: Some(start),
+            end: Some(end),
+            progress: Some(progress).filter(|p| !p.is_empty()),
+            ..crate::types_b::TypeFields::default()
+        }),
+    };
+    let sql = crate::builder::gantt_stored_sql(&def, &ctx.from, &ctx.kinds, ctx.time)
+        .ok_or_else(|| BiError::Validation("this Gantt chart cannot be built.".to_owned()))?;
+    crate::style::check_style_names(input, &ctx.cols).map_err(BiError::Validation)?;
+    let (source, board, has_year, created_by) = (
+        ctx.source,
+        ctx.board.clone(),
+        ctx.has_year,
+        ctx.created_by.to_owned(),
+    );
+    let spec = ChartSpec {
+        id: ctx.new_id,
+        title: ctx.title,
+        subtitle: ctx.subtitle,
+        kind: ctx.kind,
+        mart: ctx.mart,
+        sql_source: ctx.sql_source,
+        sql,
+        x: input.dimension.clone(),
+        y: ChartY::Single(crate::builder::GANTT_START.to_owned()),
+        series: input.breakdown.clone(),
+        map: None,
+        lat: None,
+        lon: None,
+        format: None,
+        span: Some(ctx.span),
+        text: None,
+        caption: None,
+        target: None,
+        click: None,
+    };
+    Ok(StoredChartSpec {
+        spec,
+        source,
+        board,
+        def,
+        has_year,
+        created_by: Some(created_by),
+        created_at: None,
+    })
+}
+
+/// The stored definition shared by a raw table and a pivot: no dimension,
+/// measures or breakdown, the `BI-16` part A fields as given.
+fn tables_def(input: &ChartInput, ctx: &ChartCtx<'_>, grain: Option<Grain>) -> ChartInput {
+    ChartInput {
+        title: ctx.title.clone(),
+        subtitle: ctx.subtitle.clone(),
+        mart: ctx.mart.clone(),
+        sql_source: ctx.sql_source.clone(),
+        kind: ctx.kind,
+        dimension: String::new(),
+        measures: MeasureList::default(),
+        breakdown: None,
+        map: None,
+        lat: None,
+        lon: None,
+        aggregate: None,
+        limit: None,
+        order: None,
+        span: Some(ctx.span),
+        board: Some(ctx.board.clone()),
+        text: None,
+        caption: None,
+        target: None,
+        click: input.click.clone(),
+        grain: grain.map(|g| g.as_str().to_owned()),
+        tables: input.tables.clone(),
+        shape: stored_shape(input),
+        style: input.style.clone(),
+        types: Box::default(),
+    }
+}
+
+/// The render spec of a raw table or a pivot. The console reads the columns
+/// from the definition; `x` and `y` only name the first row field and the
+/// listed columns for the tools that still read them.
+fn tables_spec(ctx: ChartCtx<'_>, x: String, y: Vec<String>, sql: String) -> ChartSpec {
+    ChartSpec {
+        id: ctx.new_id,
+        title: ctx.title,
+        subtitle: ctx.subtitle,
+        kind: ctx.kind,
+        mart: ctx.mart,
+        sql_source: ctx.sql_source,
+        sql,
+        x,
+        y: ChartY::Multi(y),
+        series: None,
+        map: None,
+        lat: None,
+        lon: None,
+        format: Some(NumFmt::Int),
+        span: Some(ctx.span),
+        text: None,
+        caption: None,
+        target: None,
+        click: None,
+    }
+}
+
+/// Assemble a grouped `table` with several groupings (`BI-6`). The columns
+/// are named in `groupings`, so `dimension`, `breakdown` and `grain` are
+/// refused beside them; the statement is the one the dashboard rebuilds
+/// ([`finish_shaping`] sets it), and `x` names the first grouping.
+fn spec_from_groupings_input(
+    input: &ChartInput,
+    ctx: ChartCtx<'_>,
+) -> Result<StoredChartSpec, BiError> {
+    if !input.dimension.is_empty() || input.breakdown.is_some() || input.grain.is_some() {
+        return Err(BiError::Validation(
+            "a table with groupings names its columns in groupings, not in dimension, breakdown or grain."
+                .to_owned(),
+        ));
+    }
+    let first = input
+        .shape
+        .groupings
+        .iter()
+        .flatten()
+        .next()
+        .map(|g| g.column.clone())
+        .unwrap_or_default();
+    let (limit, order) = limit_and_order(ctx.kind, input, &ctx.from, false);
+    let def = ChartInput {
+        title: ctx.title.clone(),
+        subtitle: ctx.subtitle.clone(),
+        mart: ctx.mart.clone(),
+        sql_source: ctx.sql_source.clone(),
+        kind: ctx.kind,
+        dimension: String::new(),
+        measures: stored_measures(&input.measures),
+        breakdown: None,
+        map: None,
+        lat: None,
+        lon: None,
+        aggregate: Some(ctx.agg.clone()),
+        limit: Some(limit.into()),
+        order: Some(order),
+        span: Some(ctx.span),
+        board: Some(ctx.board.clone()),
+        text: None,
+        caption: None,
+        target: None,
+        click: input.click.clone(),
+        grain: None,
+        tables: TableFields {
+            column_settings: input.tables.column_settings.clone(),
+            ..TableFields::default()
+        },
+        shape: stored_shape(input),
+        style: input.style.clone(),
+        types: Box::default(),
+    };
+    let y = ChartY::Multi(ctx.measures.clone());
+    let (source, board, has_year, created_by) = (
+        ctx.source,
+        ctx.board.clone(),
+        ctx.has_year,
+        ctx.created_by.to_owned(),
+    );
+    let mut spec = tables_spec(ctx, first, Vec::new(), String::new());
+    spec.y = y;
+    Ok(StoredChartSpec {
+        spec,
+        source,
+        board,
+        def,
+        has_year,
+        created_by: Some(created_by),
+        created_at: None,
+    })
+}
+
+/// Assemble a `table` in rows mode (`BI-16` part A): its columns, its saved
+/// sort and its first page. Later pages come from the records route, built by
+/// the same [`tables::rows_sql`].
+fn spec_from_rows_input(input: &ChartInput, ctx: ChartCtx<'_>) -> Result<StoredChartSpec, BiError> {
+    if input.grain.is_some() {
+        return Err(BiError::Validation(
+            "a table in rows mode cannot group dates.".to_owned(),
+        ));
+    }
+    let plan = tables::plan_rows(&input.tables, &ctx.cols).map_err(BiError::Validation)?;
+    let sql = tables::rows_sql(&ctx.from, &plan, &[], tables::ROWS_PAGE_SIZE, 0).rows;
+    let names: Vec<String> = plan.columns.iter().map(ToString::to_string).collect();
+    let def = tables_def(input, &ctx, None);
+    let (source, board, has_year, created_by) = (
+        ctx.source,
+        ctx.board.clone(),
+        ctx.has_year,
+        ctx.created_by.to_owned(),
+    );
+    let spec = tables_spec(ctx, String::new(), names, sql);
+    Ok(StoredChartSpec {
+        spec,
+        source,
+        board,
+        def,
+        has_year,
+        created_by: Some(created_by),
+        created_at: None,
+    })
+}
+
+/// Assemble a `pivot` (`BI-16` part A): the long-format statement with its
+/// totals, with the grain on the first date field if the chart carries one.
+fn spec_from_pivot_input(
+    input: &ChartInput,
+    ctx: ChartCtx<'_>,
+) -> Result<StoredChartSpec, BiError> {
+    let plan = tables::plan_pivot(&input.tables, &ctx.cols).map_err(BiError::Validation)?;
+    // BI-10: a pivot bins its first number row or column field.
+    if input.shape.bin.is_some() && tables::pivot_bin_field(&input.tables, &ctx.kinds).is_none() {
+        return Err(BiError::Validation(
+            "a bin needs a number row or column field.".to_owned(),
+        ));
+    }
+    let date_field = plan.grain_field(&ctx.kinds);
+    let grain = match (ctx.grain, &date_field) {
+        (None, _) => None,
+        (Some(g), Some((field, kind))) => {
+            g.validate(ChartKind::Pivot, Some(*kind))
+                .map_err(BiError::Validation)?;
+            Some((g, field.clone(), *kind))
+        }
+        (Some(_), None) => {
+            return Err(BiError::Validation(
+                "a grain needs a date or timestamp row or column field.".to_owned(),
+            ));
+        }
+    };
+    let sql = tables::pivot_sql(
+        &ctx.from,
+        &plan,
+        Vec::new(),
+        // BI-10: a pivot's bin is applied when the shaped statement is built
+        // (`finish_shaping`), over the same relation.
+        (grain.as_ref().map(|(g, f, k)| (*g, f, *k)), None),
+        ctx.time,
+    )
+    .ok_or_else(|| BiError::Validation("this grain does not fit the field.".to_owned()))?;
+    let def = tables_def(input, &ctx, grain.as_ref().map(|(g, _, _)| *g));
+    let first = plan
+        .rows
+        .first()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let values: Vec<String> = plan.values.iter().map(|(c, _)| c.to_string()).collect();
+    let (source, board, has_year, created_by) = (
+        ctx.source,
+        ctx.board.clone(),
+        ctx.has_year,
+        ctx.created_by.to_owned(),
+    );
+    let spec = tables_spec(ctx, first, values, sql);
+    Ok(StoredChartSpec {
+        spec,
+        source,
+        board,
+        def,
+        has_year,
+        created_by: Some(created_by),
+        created_at: None,
+    })
 }
 
 /// Save/replace a spec (smoke-tests the SQL first, so a broken spec never
@@ -2258,10 +5775,33 @@ fn spec_from_resolved(
 /// Returns [`ChError`] if the SQL smoke test or the `INSERT` fails.
 pub async fn insert_chart(ch: &ChClient, spec: &StoredChartSpec) -> Result<(), ChError> {
     ensure_bi_table(ch).await?;
+    smoke_test_chart(ch, spec).await?;
+    insert_chart_unchecked(ch, spec).await
+}
+
+/// The smoke test of [`insert_chart`] on its own: runs the chart's statement
+/// and fails if it does not execute. Skipped for a tile with no SQL. The
+/// version revert runs it for every chart before it writes any of them.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the statement fails.
+pub async fn smoke_test_chart(ch: &ChClient, spec: &StoredChartSpec) -> Result<(), ChError> {
     if !spec.spec.sql.is_empty() {
         // Smoke test — throws if the SQL fails to execute (skipped for text).
         ch.query(&spec.spec.sql, None).await?;
     }
+    Ok(())
+}
+
+/// [`insert_chart`] without the smoke test: for a chart whose statement the
+/// caller has just run.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the `INSERT` fails.
+pub async fn insert_chart_unchecked(ch: &ChClient, spec: &StoredChartSpec) -> Result<(), ChError> {
+    ensure_bi_table(ch).await?;
     let payload = StoredPayload {
         spec: &spec.spec,
         def: &spec.def,
@@ -2288,18 +5828,23 @@ pub async fn insert_chart(ch: &ChClient, spec: &StoredChartSpec) -> Result<(), C
     ch.exec(&sql, None).await
 }
 
-/// Soft-delete (tombstone); `ReplacingMergeTree` picks up the latest
-/// version. Ports `deleteChart`.
+/// Move a chart to the trash (`BI-18` part C, part 2): its row is copied with
+/// `is_deleted = 2`, `deleted_at` and `deleted_by`, so
+/// [`crate::trash::restore_chart`] can bring it back. Replaces the tombstone
+/// of `deleteChart`; a chart that is not live (unknown, or already deleted)
+/// is a no-op, the same answer the tombstone gave.
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn delete_chart(ch: &ChClient, id: &str) -> Result<(), ChError> {
+pub async fn delete_chart(ch: &ChClient, id: &str, deleted_by: &str) -> Result<(), ChError> {
     ensure_bi_table(ch).await?;
     let sql = format!(
-        "INSERT INTO console.bi_chart (id, title, spec_json, created_by, is_deleted) VALUES \
-         ({}, '', '{{}}', 'system', 1)",
-        SqlLiteral::from(id)
+        "INSERT INTO console.bi_chart (id, title, spec_json, board, created_by, is_deleted, deleted_at, deleted_by, deleted_with) \
+         SELECT id, title, spec_json, board, created_by, 2, now(), {by}, '' \
+         FROM console.bi_chart FINAL WHERE is_deleted = 0 AND id = {id}",
+        by = SqlLiteral::from(deleted_by),
+        id = SqlLiteral::from(id),
     );
     ch.exec(&sql, None).await
 }
@@ -2342,6 +5887,7 @@ impl StoredChartSpec {
                 text: None,
                 caption: None,
                 target: None,
+                click: None,
             },
             source: ChartSource::Ui,
             board: "default".to_owned(),
@@ -2352,19 +5898,25 @@ impl StoredChartSpec {
                 sql_source: None,
                 kind,
                 dimension: dimension.to_owned(),
-                measures,
+                measures: measures.into(),
                 breakdown: None,
                 map: None,
                 lat: None,
                 lon: None,
                 aggregate: Some("sum".to_owned()),
-                limit: Some(20),
+                limit: Some(20.into()),
                 order: Some("none".to_owned()),
                 span: Some(1),
                 board: Some("default".to_owned()),
                 text: None,
                 caption: None,
                 target: None,
+                click: None,
+                grain: None,
+                tables: TableFields::default(),
+                shape: ShapeFields::default(),
+                style: crate::style::StyleFields::default(),
+                types: Box::default(),
             },
             has_year: false,
             created_by: Some("ui".to_owned()),
@@ -2382,21 +5934,93 @@ mod tests {
 
     use super::*;
 
+    // BI-9: the builders take the time settings; the tests that predate it
+    // call these shims, which pass the default context and no grain.
+    static DEFAULT_TIME: std::sync::LazyLock<TimeContext> =
+        std::sync::LazyLock::new(TimeContext::default);
+
+    fn spec_from_inline_sql(
+        input: &ChartInput,
+        inline: InlineSql<'_>,
+        source: ChartSource,
+        created_by: &str,
+    ) -> Result<StoredChartSpec, BiError> {
+        super::spec_from_inline_sql(input, inline, source, created_by, &DEFAULT_TIME)
+    }
+
+    fn spec_from_resolved(
+        input: &ChartInput,
+        source: ChartSource,
+        created_by: &str,
+        common: CommonFields,
+        geo: GeoFields,
+        resolved: Resolved,
+    ) -> Result<StoredChartSpec, BiError> {
+        let when = GrainCtx {
+            grain: validated_grain(input)?,
+            time: &DEFAULT_TIME,
+        };
+        super::spec_from_resolved(input, source, created_by, common, geo, resolved, when)
+    }
+
     fn client(url: &str) -> ChClient {
         ChClient::new(url.to_owned(), "default".to_owned(), String::new())
+    }
+
+    /// BI-10 review fix (SHOULD-FIX) R1: a binned dimension with no explicit
+    /// order is ordered by bin; an explicit order wins.
+    #[test]
+    fn a_binned_dimension_defaults_to_bin_order_and_an_explicit_order_wins() {
+        let input = |extra: serde_json::Value| -> ChartInput {
+            let mut v = serde_json::json!({
+                "title": "t", "kind": "bar", "mart": "m", "dimension": "visitors",
+                "measures": ["lat"], "bin": { "mode": "width", "width": 500 },
+            });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(v).unwrap()
+        };
+        let from = Relation::Mart(Ident::new("m").unwrap());
+        let (_, order) =
+            limit_and_order(ChartKind::Bar, &input(serde_json::json!({})), &from, false);
+        assert_eq!(order, "none");
+        let (_, order) = limit_and_order(
+            ChartKind::Bar,
+            &input(serde_json::json!({ "order": "desc" })),
+            &from,
+            false,
+        );
+        assert_eq!(order, "desc");
+        let plain: ChartInput = serde_json::from_value(serde_json::json!({
+            "title": "t", "kind": "bar", "mart": "m", "dimension": "visitors", "measures": ["lat"],
+        }))
+        .unwrap();
+        assert_eq!(
+            limit_and_order(ChartKind::Bar, &plain, &from, false).1,
+            "desc"
+        );
     }
 
     /// Regression test for H1 (`ensure_bi_table` re-issuing all 13 DDL
     /// statements on every call): the first call to any public function
     /// must run the DDL bootstrap, but every call after that — across the
     /// whole process, matching the TS's module-level `ensured` flag — must
-    /// be free. `BI_TABLE_ENSURED` is a crate-wide static, so this is the
-    /// only test in the crate allowed to exercise `ensure_bi_table`
-    /// end-to-end (a second such test would observe an already-warm cache
-    /// and could pass for the wrong reason, or race depending on test
-    /// execution order).
+    /// be free.
+    ///
+    /// PR #201 review F SHOULD-FIX 3: what this pins is the number of
+    /// statements the bootstrap issues and that the second call is free,
+    /// against the PRODUCTION guard: the guard is put back to "not started"
+    /// first ([`reset_bi_table_guard`]) and the code under test is the code
+    /// that runs in production. It used to run against a `RwLock<bool>`
+    /// stand-in that only the test build had, so it said nothing about the
+    /// production cache. `TEST_DDL_LOCK` keeps the reset away from the
+    /// other tests that count statements.
     #[tokio::test]
     async fn ensure_bi_table_runs_ddl_at_most_once_per_process() {
+        let _lock = TEST_DDL_LOCK.lock().await;
+        reset_bi_table_guard();
+
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(""))
@@ -2410,10 +6034,33 @@ mod tests {
         // `ADD COLUMN` statements added for the dashboard list page, plus
         // dashboard SQL sources (`bi_source`) and folders (`bi_folder` +
         // `bi_board.folder_id`) joining the bootstrap; the property under
-        // test — every later call is free — is unchanged.
+        // test — every later call is free — is unchanged. 14 = those 13 plus
+        // the append-only SEC-12 event table (`console.bi_board_embed_event`),
+        // which replaces the three SEC-12 `bi_board` embed columns (PR #105
+        // review SHOULD-FIX 1), so those add no statement. 15 = those 14 plus
+        // the BI-18·B `bi_board.refresh_seconds` column. 16 = those 15 plus
+        // the BI-9 `bi_board.grain` column. 17 = those 16 plus the BI-8
+        // `console.bi_field` table. 18 = those 17 plus the BI-10
+        // `console.bi_hierarchy` table. 20 = those 18 plus the BI-11
+        // `bi_board.params_json` column and the `console.bi_param` table.
+        // 22 = those 20 plus the BI-2 `console.bi_metric` and
+        // `console.bi_segment` tables. 23 = those 22 plus the one
+        // `system.columns` query that guards the legacy embed copy (R-A1):
+        // this mock answers it with no columns, so no copy runs; it is a
+        // read, not a DDL statement, but it is a request all the same.
+        //
+        // `PR #199 review N`: the merged bootstrap keeps main's 22 DDL
+        // statements (the append-only SEC-12 event table, no legacy embed
+        // columns) and adds this branch's 14: the BI-18 part C
+        // `tabs_json` and `phone_layout_json` columns, the trash and owner
+        // columns on `bi_board` and `bi_chart`, `bi_folder.owner_id`, the
+        // `console.bi_board_version` and `console.bi_user_item` tables, the
+        // `bi_board_version.label` column and the BI-17 part A `theme` and
+        // `font` columns. 37 = those 36 plus the one `system.columns` query.
+        // 38 = those 37 plus the BI-4 part B `bi_board.cache_json` column.
         assert_eq!(
-            first_call_requests, 13,
-            "first call should issue all 13 DDL statements"
+            first_call_requests, 38,
+            "first call should issue the 37 DDL statements and the one legacy-column check"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -2506,6 +6153,34 @@ mod tests {
         }
         assert!(map_id_is_well_formed(&"a".repeat(MAP_ID_MAX_LEN)));
         assert!(!map_id_is_well_formed(&"a".repeat(MAP_ID_MAX_LEN + 1)));
+    }
+
+    #[test]
+    fn a_geomap_on_an_uploaded_map_passes_and_a_malformed_uploaded_id_is_refused() {
+        // BI-16 C2b QA fix Q1: `m_` + 12 hex digits is the server-made id.
+        let mut geomap = geo_input(ChartKind::Geomap);
+        geomap.map = Some("m_0123456789ab".to_owned());
+        assert_eq!(
+            geo_fields(ChartKind::Geomap, &geomap)
+                .unwrap()
+                .map
+                .as_deref(),
+            Some("m_0123456789ab")
+        );
+        for bad in [
+            "m_XYZ",
+            "M_0123456789ab",
+            "m_0123456789AB",
+            "m_0123456789abc",
+            "m_0123456789a",
+        ] {
+            geomap.map = Some(bad.to_owned());
+            assert!(geo_fields(ChartKind::Geomap, &geomap).is_err(), "{bad}");
+        }
+        // The point kinds take an uploaded map too; the other kinds still refuse any map.
+        let mut bar = geo_input(ChartKind::Bar);
+        bar.map = Some("m_0123456789ab".to_owned());
+        assert!(geo_fields(ChartKind::Bar, &bar).is_err());
     }
 
     #[test]
@@ -2637,7 +6312,7 @@ mod tests {
             "avg",
         )
         .unwrap();
-        assert!(sql.contains("round(avg(visitors)) AS visitors"), "{sql}");
+        assert!(sql.contains("round(avg(visitors), 6) AS visitors"), "{sql}");
         assert!(sql.ends_with("LIMIT 5000"), "{sql}");
     }
 
@@ -2653,6 +6328,7 @@ mod tests {
                 y: 0,
                 w: 4,
                 h: 2,
+                tab: None,
             },
         );
         assert_eq!(parse_layout(r#"{"c1":{"x":0,"y":0,"w":4,"h":2}}"#), want);
@@ -2664,10 +6340,7 @@ mod tests {
         assert_eq!(parse_filters("nope"), Vec::<FilterDef>::new());
         assert_eq!(
             parse_filters(r#"[{"column":"kawasan","values":["Asia"]}]"#),
-            vec![FilterDef {
-                column: "kawasan".to_owned(),
-                values: vec!["Asia".to_owned()]
-            }]
+            vec![FilterDef::in_values("kawasan", vec!["Asia".to_owned()])]
         );
     }
 
@@ -2738,6 +6411,607 @@ mod tests {
         assert_eq!(parsed.has_year, Some(true));
     }
 
+    fn sample_aggregate_event_rows() -> Vec<serde_json::Map<String, serde_json::Value>> {
+        vec![
+            serde_json::json!({
+                "kind": "revoke_all",
+                "revoked_before": "1699990000"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "revoke_all",
+                "revoked_before": "1699995000"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "revoke_all",
+                "revoked_before": "1699992000"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "origins",
+                "origins_json": "[\"https://old.customer.example\"]"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "origins",
+                "origins_json": "[\"https://new.customer.example\", \"https://app.customer.example\"]"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "withdraw",
+                "jti": "tok_1",
+                "exp": "1700000500"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "withdraw",
+                "jti": "tok_1",
+                "exp": "1700000800"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({
+                "kind": "withdraw",
+                "jti": "tok_2",
+                "exp": "1700001000"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            // Expired token (exp < now): kept in the list, because the list
+            // `is_withdrawn` reads must not depend on a clock tolerance
+            // (PR #201 review F SHOULD-FIX 1).
+            serde_json::json!({
+                "kind": "withdraw",
+                "jti": "tok_expired",
+                "exp": "1699999000"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            // Token whose exp <= revoked_before: must be dropped.
+            serde_json::json!({
+                "kind": "withdraw",
+                "jti": "tok_covered",
+                "exp": "1699995000"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ]
+    }
+
+    /// `BI-26` plan D2: the filter modes are the newest `filter_modes` event
+    /// (the aggregate query gives one row per kind and `jti`, `argMax` on
+    /// `at`); no such event leaves every filter hidden; an unreadable one too.
+    #[test]
+    fn the_aggregate_read_takes_the_filter_modes_event_and_hides_what_it_cannot_read() {
+        use crate::embed_access::FilterMode;
+        let modes = |json: &str| {
+            serde_json::json!({ "kind": "filter_modes", "origins_json": json })
+                .as_object()
+                .unwrap()
+                .clone()
+        };
+        let access = embed_access_from_aggregate_rows(&[modes(
+            r#"{"region":"locked","year":"editable","city":"hidden"}"#,
+        )]);
+        assert_eq!(access.mode_of("region"), FilterMode::Locked);
+        assert_eq!(access.mode_of("year"), FilterMode::Editable);
+        assert_eq!(access.mode_of("city"), FilterMode::Hidden);
+        assert_eq!(access.mode_of("not_listed"), FilterMode::Hidden);
+        assert_eq!(
+            embed_access_from_aggregate_rows(&[]).mode_of("region"),
+            FilterMode::Hidden
+        );
+        let unreadable = embed_access_from_aggregate_rows(&[modes("not json")]);
+        assert!(unreadable.filter_modes.is_empty());
+        // The modes ride in the origins column but are not origins.
+        assert!(access.origins.is_empty(), "{:?}", access.origins);
+    }
+
+    /// PR #105 review SHOULD-FIX 1 / acceptance check (b):
+    /// the aggregate read maps rows from `console.bi_board_embed_event` to
+    /// `EmbedAccess` (max `revoked_before`, union of `jti` with max `exp`,
+    /// newest `origins`).
+    ///
+    /// Replaces the former `row_to_board_reads_the_embed_access_columns_and_does_not_serialise_them`
+    /// because embed access columns were removed from `console.bi_board`.
+    #[test]
+    fn aggregate_read_maps_rows_to_embed_access() {
+        let rows = sample_aggregate_event_rows();
+
+        let access = embed_access_from_aggregate_rows(&rows);
+        assert_eq!(access.revoked_before, 1_699_995_000, "max revoked_before");
+        assert_eq!(
+            access.origins,
+            vec![
+                "https://new.customer.example".to_owned(),
+                "https://app.customer.example".to_owned()
+            ],
+            "newest origins"
+        );
+        assert_eq!(
+            access.withdrawn.len(),
+            3,
+            "union of jtis; an expired one stays (PR #201 review F SHOULD-FIX 1)"
+        );
+        assert_eq!(access.withdrawn[0].jti, "tok_1");
+        assert_eq!(access.withdrawn[0].exp, 1_700_000_800, "max exp for tok_1");
+        assert_eq!(access.withdrawn[1].jti, "tok_2");
+        assert_eq!(access.withdrawn[1].exp, 1_700_001_000);
+        assert_eq!(access.withdrawn[2].jti, "tok_expired");
+
+        // Empty rows aggregate to EmbedAccess::default()
+        let empty_access = embed_access_from_aggregate_rows(&[]);
+        assert_eq!(empty_access, EmbedAccess::default());
+
+        // row_to_board leaves embed_access as default, and does not serialize it
+        let board_row = serde_json::json!({
+            "id": "b_1", "name": "Dash", "embed_enabled": "1",
+            "folder_id": "f_1"
+        });
+        let board = row_to_board(board_row.as_object().unwrap());
+        assert_eq!(board.embed_access, EmbedAccess::default());
+        let json = serde_json::to_string(&board).unwrap();
+        assert!(!json.contains("embed_access") && !json.contains("embedAccess"));
+    }
+
+    /// PR #201 review F SHOULD-FIX 1: a withdrawn token stays withdrawn.
+    ///
+    /// The list `is_withdrawn` reads must not depend on a clock tolerance.
+    /// The tolerance that decides whether a token is acceptable at all is
+    /// the verifier's (`lakehouse_embed::CLOCK_TOLERANCE_SECONDS`), and the
+    /// store used to keep a second copy of it (60 s). The day that constant
+    /// is raised, a withdrawal that the verifier still honours fell off the
+    /// list and the withdrawn token worked again. The list therefore keeps
+    /// every withdrawn id; expiry is applied only when counting toward the
+    /// cap.
+    #[test]
+    fn a_withdrawn_token_is_still_refused_after_it_expires() {
+        let now = 1_700_000_000u64;
+        // A token withdrawn an hour ago, whose own expiry passed five
+        // minutes ago: with a tolerance above 60 s the verifier would still
+        // accept it, so the withdrawal has to stand.
+        let rows = vec![
+            serde_json::json!({
+                "kind": "withdraw",
+                "jti": "tok_1",
+                "exp": (now - 300).to_string()
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ];
+
+        let access = embed_access_from_aggregate_rows(&rows);
+        assert!(
+            access.withdrawn.iter().any(|w| w.jti == "tok_1"),
+            "the withdrawn id stays in the list"
+        );
+        assert!(
+            access.is_withdrawn(1_699_999_400.0, Some("tok_1")),
+            "a withdrawn token is refused even after it expired"
+        );
+    }
+
+    /// PR #105 review SHOULD-FIX 1 / acceptance check (a):
+    /// a dashboard save's SQL contains none of the embed columns.
+    #[tokio::test]
+    async fn dashboard_save_sql_contains_none_of_the_embed_columns() {
+        let _lock = TEST_DDL_LOCK.lock().await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&server)
+            .await;
+        let ch = client(&server.uri());
+
+        let layout = LayoutMap::new();
+        let filters = Vec::new();
+        // `PR #199 review N`: the merged signature — the folder and the owner
+        // travel together, the tabs and the phone layout with the theme and
+        // the font — and no embed access, which is an event now.
+        upsert_board(
+            &ch,
+            "b_test",
+            "Title",
+            "Desc",
+            "User",
+            &layout,
+            &filters,
+            "tok_pub",
+            true,
+            ("f_root", ""),
+            30,
+            ("day", &[]),
+            (&[], &[]),
+            ("", "", ""),
+        )
+        .await
+        .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let save_req = reqs
+            .iter()
+            .find(|r| {
+                let sql = String::from_utf8_lossy(&r.body);
+                sql.starts_with("INSERT INTO console.bi_board")
+            })
+            .expect("INSERT INTO console.bi_board issued");
+
+        let body = String::from_utf8_lossy(&save_req.body);
+        assert!(
+            !body.contains("embed_revoked_before"),
+            "must not contain embed_revoked_before: {body}"
+        );
+        assert!(
+            !body.contains("embed_revoked_jti_json"),
+            "must not contain embed_revoked_jti_json: {body}"
+        );
+        assert!(
+            !body.contains("embed_origins_json"),
+            "must not contain embed_origins_json: {body}"
+        );
+        // BI-4 part B: the freshness rule is carried on every full-row save.
+        assert!(body.contains("cache_json"), "{body}");
+    }
+
+    /// A `ClickHouse` stand-in for the legacy embed copy: answers the
+    /// `system.columns` check with `columns`, serves one legacy board row
+    /// until an epoch-stamped event has been inserted (what the real query's
+    /// `NOT IN (... WHERE at = epoch)` does), and records nothing else.
+    struct LegacyEmbedCh {
+        columns: Vec<&'static str>,
+        copied: std::sync::atomic::AtomicBool,
+    }
+    impl wiremock::Respond for LegacyEmbedCh {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            use std::sync::atomic::Ordering;
+            let sql = String::from_utf8_lossy(&request.body);
+            let data = if sql.contains("FROM system.columns") {
+                self.columns
+                    .iter()
+                    .map(|n| serde_json::json!({ "name": n }))
+                    .collect::<Vec<_>>()
+            } else if sql.contains("FROM console.bi_board FINAL")
+                && !self.copied.load(Ordering::SeqCst)
+            {
+                vec![serde_json::json!({
+                    "id": "b_legacy",
+                    "embed_revoked_before": "1700000000",
+                    "embed_revoked_jti_json": r#"[{"jti":"gone-1","exp":4102444800}]"#,
+                    "embed_origins_json": r#"["https://a.example","https://b.example"]"#,
+                })]
+            } else {
+                if sql.starts_with("INSERT INTO console.bi_board_embed_event") {
+                    self.copied.store(true, Ordering::SeqCst);
+                }
+                Vec::new()
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "data": data, "rows": data.len()
+            }))
+        }
+    }
+
+    const ALL_LEGACY_COLUMNS: [&str; 3] = [
+        "embed_revoked_before",
+        "embed_revoked_jti_json",
+        "embed_origins_json",
+    ];
+
+    async fn run_legacy_copy(columns: Vec<&'static str>, runs: usize) -> Vec<String> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(LegacyEmbedCh {
+                columns,
+                copied: std::sync::atomic::AtomicBool::new(false),
+            })
+            .mount(&server)
+            .await;
+        let ch = client(&server.uri());
+        for _ in 0..runs {
+            copy_legacy_embed_state(&ch).await.unwrap();
+        }
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|sql| sql.starts_with("INSERT"))
+            .collect()
+    }
+
+    /// PR #105 review R-A1 BLOCKER, accept (1): a legacy database with one
+    /// withdrawn jti, a cut-off and two origins. Feeding the copied events
+    /// through the same aggregation the reads use: the jti is refused, a
+    /// token older than the cut-off is refused, a newer one is not, and the
+    /// origins are served.
+    #[tokio::test]
+    async fn the_legacy_embed_state_is_copied_and_still_refuses_what_it_refused() {
+        let inserts = run_legacy_copy(ALL_LEGACY_COLUMNS.to_vec(), 1).await;
+        // R-A3: a cut-off, a jti and origins go in ONE multi-row INSERT.
+        assert_eq!(inserts.len(), 1, "{inserts:?}");
+        assert!(
+            inserts[0].starts_with("INSERT INTO console.bi_board_embed_event")
+                && !inserts[0].contains("console.bi_board ")
+                && inserts[0].matches(LEGACY_EMBED_EPOCH).count() == 3,
+            "{inserts:?}"
+        );
+        let rows = [
+            serde_json::json!({"kind": "revoke_all", "revoked_before": "1700000000", "jti": "", "exp": "0", "origins_json": "[]"}),
+            serde_json::json!({"kind": "withdraw", "revoked_before": "0", "jti": "gone-1", "exp": "4102444800", "origins_json": "[]"}),
+            serde_json::json!({"kind": "origins", "revoked_before": "0", "jti": "", "exp": "0", "origins_json": r#"["https://a.example","https://b.example"]"#}),
+        ];
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|v| v.as_object().unwrap().clone())
+            .collect();
+        let access = embed_access_from_aggregate_rows(&rows);
+        assert!(access.is_withdrawn(2_000_000_000.0, Some("gone-1")));
+        assert!(access.is_withdrawn(1_699_999_999.0, Some("other")));
+        assert!(!access.is_withdrawn(1_700_000_001.0, Some("other")));
+        assert_eq!(access.origins, ["https://a.example", "https://b.example"]);
+    }
+
+    /// R-A1 accept (2): a second run inserts nothing more.
+    #[tokio::test]
+    async fn a_second_run_of_the_legacy_embed_copy_inserts_nothing() {
+        let once = run_legacy_copy(ALL_LEGACY_COLUMNS.to_vec(), 1).await;
+        let twice = run_legacy_copy(ALL_LEGACY_COLUMNS.to_vec(), 2).await;
+        assert_eq!(once.len(), 1);
+        assert_eq!(twice.len(), once.len(), "{twice:?}");
+    }
+
+    /// R-A1 accept (3): a fresh database has no legacy columns, so nothing
+    /// is selected and nothing is inserted.
+    #[tokio::test]
+    async fn a_database_without_the_legacy_columns_runs_no_embed_copy() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(LegacyEmbedCh {
+                columns: Vec::new(),
+                copied: std::sync::atomic::AtomicBool::new(false),
+            })
+            .mount(&server)
+            .await;
+        copy_legacy_embed_state(&client(&server.uri()))
+            .await
+            .unwrap();
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(bodies.len(), 1, "only the column check: {bodies:?}");
+        assert!(bodies[0].contains("system.columns"));
+    }
+
+    /// R-A1 accept (4): the copied `origins` event is stamped with the
+    /// epoch and the read takes the newest `origins` event by `at`, so an
+    /// origins event written since the copy wins. The SQL itself is not run
+    /// here (no live `ClickHouse`); this pins both halves of the contract.
+    #[test]
+    fn a_real_origins_event_written_after_the_copy_wins_over_it() {
+        let row = serde_json::json!({
+            "id": "b1", "embed_revoked_before": "0",
+            "embed_revoked_jti_json": "[]",
+            "embed_origins_json": r#"["https://old.example"]"#,
+        });
+        let insert = legacy_embed_insert(row.as_object().unwrap()).unwrap();
+        assert!(insert.contains("'origins'") && insert.contains(LEGACY_EMBED_EPOCH));
+        // Real writers stamp `now64(6)` (column default), later than the epoch.
+        let read = include_str!("store.rs");
+        assert!(read.contains("argMax(origins_json, at) AS origins_json"));
+    }
+
+    /// PR #105 review R-A4 SHOULD-FIX: the copy does not filter on
+    /// `is_deleted`, so a trashed (restorable) board keeps its withdrawals.
+    /// The mock serves the legacy row whatever the filter, so this pins the
+    /// query text and that the row is copied.
+    #[tokio::test]
+    async fn the_legacy_embed_copy_does_not_skip_boards_in_the_trash() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(LegacyEmbedCh {
+                columns: ALL_LEGACY_COLUMNS.to_vec(),
+                copied: std::sync::atomic::AtomicBool::new(false),
+            })
+            .mount(&server)
+            .await;
+        copy_legacy_embed_state(&client(&server.uri()))
+            .await
+            .unwrap();
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let select = bodies
+            .iter()
+            .find(|b| b.contains("FROM console.bi_board FINAL"))
+            .expect("the legacy select");
+        assert!(!select.contains("is_deleted"), "{select}");
+        assert!(bodies.iter().any(|b| b.starts_with("INSERT INTO")));
+    }
+
+    /// Fails closed like `EmbedAccess::from_stored`: a withdrawn list that
+    /// does not parse becomes a `revoke_all` of `u64::MAX`.
+    #[test]
+    fn an_unparseable_legacy_withdrawn_list_revokes_everything() {
+        let row = serde_json::json!({
+            "id": "b1", "embed_revoked_before": "0",
+            "embed_revoked_jti_json": "not json", "embed_origins_json": "[]",
+        });
+        let insert = legacy_embed_insert(row.as_object().unwrap()).unwrap();
+        assert!(insert.contains(&u64::MAX.to_string()));
+    }
+
+    struct MockBiCh;
+    impl wiremock::Respond for MockBiCh {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let sql = String::from_utf8_lossy(&request.body);
+            if sql.contains("FROM console.bi_board FINAL") {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "meta": [],
+                    "data": [{"1": 1}],
+                    "rows": 1
+                }));
+            }
+            if sql.contains("FROM console.bi_board_embed_event") {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "meta": [],
+                    "data": [],
+                    "rows": 0
+                }));
+            }
+            ResponseTemplate::new(200).set_body_string("Ok.\n")
+        }
+    }
+
+    /// PR #105 review SHOULD-FIX 1 / acceptance check (c):
+    /// each of the three writers issues an INSERT into the event table and
+    /// no INSERT into `bi_board`.
+    #[tokio::test]
+    async fn embed_writers_issue_insert_into_event_table_and_no_insert_into_bi_board() {
+        let _lock = TEST_DDL_LOCK.lock().await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(MockBiCh)
+            .mount(&server)
+            .await;
+        let ch = client(&server.uri());
+
+        let origins = vec!["https://app.customer.example".to_owned()];
+        set_board_embed_origins(&ch, "b_1", &origins).await.unwrap();
+        revoke_all_embed_tokens(&ch, "b_1", 1_700_000_000)
+            .await
+            .unwrap();
+        withdraw_embed_token(&ch, "b_1", "jti_123", 1_700_003_600, 1_700_000_000, 60)
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let insert_statements: Vec<String> = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|sql| sql.starts_with("INSERT INTO"))
+            .collect();
+
+        assert_eq!(
+            insert_statements.len(),
+            3,
+            "expected 3 insert statements, got {insert_statements:?}"
+        );
+        for stmt in &insert_statements {
+            assert!(
+                stmt.starts_with("INSERT INTO console.bi_board_embed_event"),
+                "writer must insert into event table, not bi_board: {stmt}"
+            );
+            assert!(
+                !stmt.contains("INSERT INTO console.bi_board "),
+                "writer must not insert into bi_board: {stmt}"
+            );
+        }
+
+        // Verify specific writer events
+        assert!(
+            insert_statements[0].contains("'origins'")
+                && insert_statements[0].contains("https://app.customer.example"),
+            "origins insert: {}",
+            insert_statements[0]
+        );
+        assert!(
+            insert_statements[1].contains("'revoke_all'")
+                && insert_statements[1].contains("1700000000"),
+            "revoke_all insert: {}",
+            insert_statements[1]
+        );
+        assert!(
+            insert_statements[2].contains("'withdraw'")
+                && insert_statements[2].contains("'jti_123'")
+                && insert_statements[2].contains("1700003600"),
+            "withdraw insert: {}",
+            insert_statements[2]
+        );
+    }
+
+    /// PR #201 review F SHOULD-FIX 7: "withdraw all" answers the cut-off in
+    /// force — the maximum over every `revoke_all` event of the board — not
+    /// the instant this call wrote. The response the Share dialog shows must
+    /// be the one the refusal check enforces.
+    #[tokio::test]
+    async fn a_withdraw_all_answers_the_cut_off_in_force() {
+        /// Answers the event table with a withdrawal whose instant is LATER
+        /// than the one the call under test writes.
+        struct MockEvents;
+        impl wiremock::Respond for MockEvents {
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let sql = String::from_utf8_lossy(&request.body);
+                if sql.contains("FROM console.bi_board_embed_event") {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "meta": [],
+                        "data": [{
+                            "kind": "revoke_all",
+                            "revoked_before": "1700009999",
+                            "jti": "",
+                            "exp": "0",
+                            "origins_json": "[]"
+                        }],
+                        "rows": 1
+                    }));
+                }
+                if sql.contains("FROM console.bi_board FINAL") {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "meta": [],
+                        "data": [{"1": 1}],
+                        "rows": 1
+                    }));
+                }
+                ResponseTemplate::new(200).set_body_string("Ok.\n")
+            }
+        }
+
+        let _lock = TEST_DDL_LOCK.lock().await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(MockEvents)
+            .mount(&server)
+            .await;
+        let ch = client(&server.uri());
+
+        let answer = revoke_all_embed_tokens(&ch, "b_1", 1_700_000_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            answer, 1_700_009_999,
+            "the cut-off in force, not the instant this call wrote"
+        );
+    }
+
     /// `Board`'s JSON wire shape must match the TS `Board` type
     /// (`createdAt`/`publicToken`/`embedEnabled`, not `snake_case`) — this
     /// struct isn't wired to a route yet, but when it is, the mismatch
@@ -2752,20 +7026,34 @@ mod tests {
             created_by: Some("Bootstrap Admin".to_owned()),
             layout: None,
             filters: None,
+            refresh_seconds: None,
+            grain: None,
+            params: None,
+            tabs: None,
+            phone_layout: None,
+            theme: None,
+            font: None,
+            cache: None,
             created_at: Some("2026-01-01 00:00:00".to_owned()),
             updated_at: Some("2026-01-02 00:00:00".to_owned()),
             public_token: Some("p_abc".to_owned()),
             embed_enabled: Some(true),
             folder_id: Some("f_1".to_owned()),
+            owner_id: None,
+            embed_access: EmbedAccess::default(),
         };
         let json = serde_json::to_value(&board).unwrap();
         assert_eq!(json.get("createdAt").unwrap(), "2026-01-01 00:00:00");
         assert_eq!(json.get("updatedAt").unwrap(), "2026-01-02 00:00:00");
         assert_eq!(json.get("createdBy").unwrap(), "Bootstrap Admin");
         assert_eq!(json.get("description").unwrap(), "Ringkasan kunjungan");
-        assert_eq!(json.get("publicToken").unwrap(), "p_abc");
+        // BI-19 part A: the old column is never serialised; the live link is
+        // read from Postgres and added by the dashboard list.
+        assert!(json.get("publicToken").is_none());
         assert_eq!(json.get("embedEnabled").unwrap(), true);
         assert_eq!(json.get("folderId").unwrap(), "f_1");
+        // A board nobody owns carries no owner key (BI-18 part C, part 2).
+        assert!(json.get("ownerId").is_none());
         assert!(json.get("created_at").is_none());
         assert!(json.get("updated_at").is_none());
         assert!(json.get("created_by").is_none());
@@ -2793,6 +7081,38 @@ mod tests {
         assert!(input.measures.is_empty());
     }
 
+    /// `"mart": null` reads as no mart, a mart that is neither a string nor
+    /// `null` is still refused, and the field still writes as a plain string.
+    #[test]
+    fn chart_input_reads_a_null_mart_as_no_mart_and_refuses_a_number() {
+        let null: ChartInput = serde_json::from_value(
+            serde_json::json!({ "title": "t", "kind": "text", "mart": null }),
+        )
+        .expect("a null mart decodes");
+        assert_eq!(null.mart, "");
+        let named: ChartInput = serde_json::from_value(
+            serde_json::json!({ "title": "t", "kind": "bar", "mart": "mart_x" }),
+        )
+        .expect("a named mart decodes");
+        assert_eq!(named.mart, "mart_x");
+        // A number is refused as it was before `null` was read as no mart:
+        // the assistant's model must send a name or nothing, not a number.
+        let number = serde_json::from_value::<ChartInput>(
+            serde_json::json!({ "title": "t", "kind": "bar", "mart": 7 }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(number.contains("expected a string"), "{number}");
+        let object = serde_json::from_value::<ChartInput>(
+            serde_json::json!({ "title": "t", "kind": "bar", "mart": { "name": "mart_x" } }),
+        );
+        assert!(object.is_err(), "{object:?}");
+        assert_eq!(
+            serde_json::to_value(&null).expect("serializes")["mart"],
+            serde_json::json!("")
+        );
+    }
+
     /// Same D1 regression, for `kind: "kpi"`: the tool schema doesn't
     /// require `dimension` (KPIs are dimensionless), so a schema-valid call
     /// omits it — decoding must not fail on that either.
@@ -2809,6 +7129,33 @@ mod tests {
         assert_eq!(input.mart, "mart_wisman");
         assert_eq!(input.dimension, "");
         assert_eq!(input.measures, vec!["total".to_owned()]);
+    }
+
+    // ── the subtitle ───────────────────────────────────────────────────
+
+    /// A subtitle that is only the word "null" is no subtitle: the
+    /// assistant's model writes that text when it follows the build prompt's
+    /// "send `subtitle: null`" against a schema that types the field as a
+    /// string (AI-3, 2026-11-08).
+    #[test]
+    fn a_subtitle_that_is_only_the_word_null_is_no_subtitle() {
+        let subtitle_of = |subtitle: &str| -> Option<String> {
+            let input: ChartInput = serde_json::from_value(serde_json::json!({
+                "title": "t", "kind": "bar", "mart": "mart_x", "subtitle": subtitle,
+            }))
+            .expect("the chart input decodes");
+            derive_common_fields(&input, None)
+                .expect("the common fields derive")
+                .subtitle
+        };
+        for cleared in ["null", " Null ", "NULL", "nUlL", ""] {
+            assert_eq!(subtitle_of(cleared), None, "{cleared:?} is no subtitle");
+        }
+        // A subtitle that only starts with the word is a subtitle.
+        assert_eq!(
+            subtitle_of("Null values by province"),
+            Some("Null values by province".to_owned())
+        );
     }
 
     // ── charts over SQL that is not stored (`spec_from_inline_sql`) ──────
@@ -2891,6 +7238,121 @@ mod tests {
         assert_eq!(inline.spec.y, stored.spec.y);
         assert_eq!(inline.spec.mart, stored.spec.mart);
         assert_eq!(inline.spec.sql_source.as_deref(), Some(UNSAVED_SOURCE_ID));
+    }
+
+    fn stored_source_with_fields(fields: Vec<FieldDef>) -> Resolved {
+        let source = crate::sources::SqlSource {
+            id: "s_1234abcd".to_owned(),
+            title: "t".to_owned(),
+            sql: INLINE_SQL.to_owned(),
+            columns: inline_cols(),
+            folder_id: String::new(),
+            created_by: String::new(),
+            updated_at: None,
+        };
+        let mut resolved = resolved_from_stored(source);
+        resolved.fields = fields;
+        resolved
+    }
+
+    fn calc_field(name: &str, formula: &str, level: &str) -> FieldDef {
+        FieldDef {
+            id: format!("f_{name}"),
+            source_kind: SourceKind::SqlSource,
+            source_id: "s_1234abcd".to_owned(),
+            name: name.to_owned(),
+            formula: formula.to_owned(),
+            level: level.to_owned(),
+            ty: "number".to_owned(),
+            created_by: String::new(),
+            updated_at: None,
+        }
+    }
+
+    /// `BI-8`: a chart that names a calculated field is saved, its stored SQL
+    /// is the working fallback, and its stored definition names the field
+    /// only (the formula is read again at every dashboard read).
+    #[test]
+    fn a_chart_naming_a_calculated_field_is_saved_over_the_relation_that_carries_it() {
+        let mut input = inline_chart(&serde_json::json!({ "measures": ["double"] }));
+        input.sql_source = Some("s_1234abcd".to_owned());
+        let spec = spec_from_resolved(
+            &input,
+            ChartSource::Ui,
+            "ui",
+            derive_common_fields(&input, None).unwrap(),
+            geo_fields(ChartKind::Hbar, &input).unwrap(),
+            stored_source_with_fields(vec![calc_field("double", "visitors * 2", "row")]),
+        )
+        .unwrap();
+        assert!(
+            spec.spec
+                .sql
+                .contains("(SELECT *, (visitors * 2) AS double FROM (\n"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.contains("round(sum(double), 6) AS double"),
+            "{}",
+            spec.spec.sql
+        );
+        assert_eq!(spec.def.measures, vec!["double".to_owned()]);
+        assert!(
+            !serde_json::to_string(&spec.def)
+                .unwrap()
+                .contains("visitors * 2")
+        );
+    }
+
+    #[test]
+    fn an_aggregate_field_is_refused_as_a_dimension_and_an_unknown_name_is_still_refused() {
+        let fields =
+            || stored_source_with_fields(vec![calc_field("avg_v", "Avg(visitors)", "aggregate")]);
+        let mut input = inline_chart(&serde_json::json!({ "dimension": "avg_v" }));
+        input.sql_source = Some("s_1234abcd".to_owned());
+        let err = spec_from_resolved(
+            &input,
+            ChartSource::Ui,
+            "ui",
+            derive_common_fields(&input, None).unwrap(),
+            geo_fields(ChartKind::Hbar, &input).unwrap(),
+            fields(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BiError::Validation(m) if m.contains("aggregate field")),
+            "{err:?}"
+        );
+        let mut input = inline_chart(&serde_json::json!({ "measures": ["avg_v"] }));
+        input.sql_source = Some("s_1234abcd".to_owned());
+        let ok = spec_from_resolved(
+            &input,
+            ChartSource::Ui,
+            "ui",
+            derive_common_fields(&input, None).unwrap(),
+            geo_fields(ChartKind::Hbar, &input).unwrap(),
+            fields(),
+        )
+        .unwrap();
+        assert!(
+            ok.spec.sql.contains("avg(visitors) AS avg_v"),
+            "{}",
+            ok.spec.sql
+        );
+        let mut input = inline_chart(&serde_json::json!({ "measures": ["nope"] }));
+        input.sql_source = Some("s_1234abcd".to_owned());
+        assert!(
+            spec_from_resolved(
+                &input,
+                ChartSource::Ui,
+                "ui",
+                derive_common_fields(&input, None).unwrap(),
+                geo_fields(ChartKind::Hbar, &input).unwrap(),
+                fields(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2981,5 +7443,2059 @@ mod tests {
             .unwrap_err();
             assert!(err.to_string().contains("unsaved SQL"), "{err}");
         }
+    }
+
+    // ── the click setting and the saved refresh (BI-18·B) ────────────────
+
+    fn inline_spec(extra: &serde_json::Value) -> Result<StoredChartSpec, BiError> {
+        let cols = inline_cols();
+        spec_from_inline_sql(
+            &inline_chart(extra),
+            InlineSql {
+                sql: INLINE_SQL,
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+        )
+    }
+
+    #[test]
+    fn a_chart_without_a_click_serialises_without_the_key_on_both_sides() {
+        let stored = inline_spec(&serde_json::json!({})).unwrap();
+        assert!(stored.spec.click.is_none() && stored.def.click.is_none());
+        let spec = serde_json::to_value(&stored.spec).unwrap();
+        let def = serde_json::to_value(&stored.def).unwrap();
+        assert!(spec.get("click").is_none() && def.get("click").is_none());
+    }
+
+    #[test]
+    fn a_chart_saved_before_the_click_existed_reads_back_with_none() {
+        let old = r#"{"title":"T","kind":"bar","mart":"mart_x","dimension":"d","measures":["m"]}"#;
+        let def: ChartInput = serde_json::from_str(old).unwrap();
+        assert!(def.click.is_none());
+    }
+
+    #[test]
+    fn a_valid_click_is_kept_on_the_spec_and_on_the_definition() {
+        let stored = inline_spec(&serde_json::json!({
+            "click": { "kind": "dashboard", "board": "b_1", "column": "place" }
+        }))
+        .unwrap();
+        let want = ClickAction::Dashboard {
+            board: "b_1".to_owned(),
+            column: "place".to_owned(),
+        };
+        assert_eq!(stored.spec.click.as_ref(), Some(&want));
+        assert_eq!(stored.def.click.as_ref(), Some(&want));
+    }
+
+    #[test]
+    fn a_click_with_a_refused_url_is_a_validation_error() {
+        let err = inline_spec(&serde_json::json!({
+            "click": { "kind": "url", "url": "javascript:alert(1)" }
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(err, BiError::Validation(ref m) if m.contains("click URL")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_text_tile_cannot_have_a_click() {
+        let err = inline_spec(&serde_json::json!({
+            "kind": "text", "text": "hello",
+            "click": { "kind": "url", "url": "/x" }
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(err, BiError::Validation(ref m) if m == "a text tile has nothing to click."),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_board_without_a_saved_refresh_serialises_without_the_key() {
+        let mut row = serde_json::Map::new();
+        row.insert("id".to_owned(), serde_json::json!("b_1"));
+        row.insert("refresh_seconds".to_owned(), serde_json::json!(0));
+        let board = row_to_board(&row);
+        assert_eq!(board.refresh_seconds, None);
+        assert!(
+            serde_json::to_value(&board)
+                .unwrap()
+                .get("refreshSeconds")
+                .is_none()
+        );
+        row.insert("refresh_seconds".to_owned(), serde_json::json!(300));
+        let board = row_to_board(&row);
+        assert_eq!(board.refresh_seconds, Some(300));
+        assert_eq!(serde_json::to_value(&board).unwrap()["refreshSeconds"], 300);
+    }
+
+    #[test]
+    fn a_board_row_from_before_the_column_existed_reads_as_no_refresh() {
+        let mut row = serde_json::Map::new();
+        row.insert("id".to_owned(), serde_json::json!("b_1"));
+        assert_eq!(row_to_board(&row).refresh_seconds, None);
+    }
+
+    // ── BI-9: grain at save ──────────────────────────────────────────────
+
+    fn grain_cols() -> Vec<crate::sources::SourceColumn> {
+        source_columns(&[
+            ("day", "Date"),
+            ("seen_at", "Nullable(DateTime64(3, 'UTC'))"),
+            ("place", "String"),
+            ("visitors", "UInt64"),
+        ])
+    }
+
+    fn grain_build(extra: &serde_json::Value) -> Result<StoredChartSpec, BiError> {
+        let cols = grain_cols();
+        let input = inline_chart(extra);
+        spec_from_inline_sql(
+            &input,
+            InlineSql {
+                sql: "SELECT day, seen_at, place, visitors FROM serving.mart_x",
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+        )
+    }
+
+    fn refusal(extra: &serde_json::Value) -> String {
+        match grain_build(extra) {
+            Err(BiError::Validation(m)) => m,
+            other => panic!("expected a validation refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_grain_is_saved_in_the_definition_with_a_bucket_order_and_a_thousand_bucket_limit() {
+        let spec = grain_build(&serde_json::json!({
+            "kind": "line", "dimension": "day", "grain": "month", "limit": 800,
+        }))
+        .unwrap();
+        assert_eq!(spec.def.grain.as_deref(), Some("month"));
+        assert_eq!(spec.def.limit_value(), Some(800));
+        assert_eq!(spec.def.order.as_deref(), Some("none"));
+        assert!(
+            spec.spec.sql.contains("date_trunc('month', day) AS day"),
+            "{}",
+            spec.spec.sql
+        );
+        // Without a grain the same limit is still capped at 100.
+        let plain = grain_build(&serde_json::json!({
+            "kind": "line", "dimension": "day", "limit": 800,
+        }))
+        .unwrap();
+        assert_eq!(plain.def.limit_value(), Some(100));
+        assert_eq!(plain.def.grain, None);
+        // A bar defaults to the value order, a grained bar to bucket order.
+        let bar = grain_build(&serde_json::json!({"kind": "bar", "dimension": "place"})).unwrap();
+        assert_eq!(bar.def.order.as_deref(), Some("desc"));
+        let grained_bar =
+            grain_build(&serde_json::json!({"kind": "bar", "dimension": "day", "grain": "year"}))
+                .unwrap();
+        assert_eq!(grained_bar.def.order.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn a_grain_on_a_timestamp_uses_the_report_zone() {
+        let spec = grain_build(&serde_json::json!({
+            "kind": "bar", "dimension": "seen_at", "grain": "hour_of_day",
+        }))
+        .unwrap();
+        assert!(
+            spec.spec
+                .sql
+                .contains("toHour(toTimeZone(seen_at, 'Asia/Jakarta')) AS seen_at"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    #[test]
+    fn an_unknown_grain_is_refused_with_the_list_of_valid_ones() {
+        let m =
+            refusal(&serde_json::json!({"kind": "bar", "dimension": "day", "grain": "fortnight"}));
+        assert!(
+            m.starts_with("invalid grain 'fortnight': use one of minute, hour, day,"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn a_grain_on_a_text_column_or_a_date_without_time_is_refused_in_plain_words() {
+        assert_eq!(
+            refusal(&serde_json::json!({"kind": "bar", "dimension": "place", "grain": "month"})),
+            "a grain needs a date or timestamp dimension."
+        );
+        assert_eq!(
+            refusal(&serde_json::json!({"kind": "bar", "dimension": "day", "grain": "hour"})),
+            "hour needs a timestamp column; this column has no time."
+        );
+    }
+
+    #[test]
+    fn only_the_listed_chart_kinds_take_a_grain_and_a_calendar_takes_day_only() {
+        for kind in [
+            "scatter", "table", "kpi", "gauge", "text", "boxplot", "geomap",
+        ] {
+            let m = refusal(&serde_json::json!({
+                "kind": kind, "dimension": "day", "grain": "month", "title": "t",
+            }));
+            assert_eq!(m, "this chart type cannot group dates.", "{kind}");
+        }
+        assert_eq!(
+            refusal(&serde_json::json!({"kind": "calendar", "dimension": "day", "grain": "month"})),
+            "a calendar chart can only group by day."
+        );
+        assert!(
+            grain_build(
+                &serde_json::json!({"kind": "calendar", "dimension": "seen_at", "grain": "day"})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_boards_saved_grain_reads_back_and_an_empty_one_is_none() {
+        let mut row = serde_json::Map::new();
+        row.insert("id".to_owned(), serde_json::json!("b_1"));
+        assert_eq!(row_to_board(&row).grain, None);
+        row.insert("grain".to_owned(), serde_json::json!(""));
+        assert_eq!(row_to_board(&row).grain, None);
+        row.insert("grain".to_owned(), serde_json::json!("month"));
+        let board = row_to_board(&row);
+        assert_eq!(board.grain.as_deref(), Some("month"));
+        assert_eq!(serde_json::to_value(&board).unwrap()["grain"], "month");
+    }
+    // ── BI-16 part A: raw tables, pivots, KPI comparisons at save ───────
+
+    fn bare(extra: &serde_json::Value) -> Result<StoredChartSpec, BiError> {
+        let mut base = serde_json::json!({ "dimension": "", "measures": [] });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        grain_build(&base)
+    }
+
+    fn bare_refusal(extra: &serde_json::Value) -> String {
+        match bare(extra) {
+            Err(BiError::Validation(m)) => m,
+            other => panic!("expected a validation refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_raw_table_is_saved_with_its_columns_sort_settings_and_first_page() {
+        let spec = bare(&serde_json::json!({
+            "kind": "table", "tableMode": "rows", "columns": ["place", "visitors"],
+            "sortColumn": "visitors", "sortDir": "desc",
+            "columnSettings": { "visitors": { "format": "currency", "decimals": 0, "width": 120 } },
+        }))
+        .unwrap();
+        assert_eq!(
+            spec.spec.sql,
+            "SELECT place, visitors FROM (\nSELECT day, seen_at, place, visitors FROM serving.mart_x\n) AS src \
+             ORDER BY visitors DESC, place, visitors LIMIT 50 OFFSET 0 \
+             SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60"
+        );
+        assert_eq!(spec.def.tables.table_mode.as_deref(), Some("rows"));
+        assert!(spec.def.measures.is_empty() && spec.def.dimension.is_empty());
+        // Round trip: the wire shape stays flat and camel case.
+        let json = serde_json::to_value(&spec.def).unwrap();
+        assert_eq!(json["tableMode"], "rows");
+        assert_eq!(json["columnSettings"]["visitors"]["format"], "currency");
+        let back: ChartInput = serde_json::from_value(json).unwrap();
+        assert_eq!(back, spec.def);
+    }
+
+    #[test]
+    fn a_raw_table_refuses_what_it_cannot_honour_in_plain_words() {
+        let rows = |extra: serde_json::Value| {
+            let mut v =
+                serde_json::json!({ "kind": "table", "tableMode": "rows", "columns": ["place"] });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            bare_refusal(&v)
+        };
+        assert!(rows(serde_json::json!({ "columns": [] })).contains("1 to 30 columns"));
+        assert!(rows(serde_json::json!({ "columns": ["nope"] })).contains("nope"));
+        assert!(rows(serde_json::json!({ "sortColumn": "nope" })).contains("sort"));
+        assert!(rows(serde_json::json!({ "grain": "month" })).contains("cannot group dates"));
+        assert!(rows(serde_json::json!({ "measures": ["visitors"] })).contains("own fields"));
+        assert!(
+            rows(serde_json::json!({ "columnSettings": { "place": { "width": 5 } } }))
+                .contains("width")
+        );
+        // A grouped table, or any other kind, does not take rows-mode fields.
+        let grouped = grain_build(&serde_json::json!({
+            "kind": "table", "dimension": "place", "columns": ["place"],
+        }));
+        assert!(
+            matches!(grouped, Err(BiError::Validation(m)) if m.contains("columns is only for"))
+        );
+    }
+
+    #[test]
+    fn a_grouped_table_keeps_its_column_settings_and_its_statement() {
+        let spec = grain_build(&serde_json::json!({
+            "kind": "table", "dimension": "place",
+            "columnSettings": { "place": { "label": "Where" } },
+        }))
+        .unwrap();
+        assert_eq!(
+            spec.def.tables.column_settings.unwrap()["place"]
+                .label
+                .as_deref(),
+            Some("Where")
+        );
+        assert!(
+            spec.spec.sql.contains("GROUP BY place"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    /// BI-18 part C review fix (BLOCKER) R24, the request of `AI-8-AC1` ("Show
+    /// values in rupiah, make the bars green, add a target line at 1,000") on the
+    /// chart the tile reads: the stored definition carries the currency format,
+    /// the line, and the colour under the name the chart draws.
+    #[test]
+    fn the_formatted_chart_the_tile_reads_has_the_format_the_line_and_the_colour_of_the_series_it_draws()
+     {
+        let mut spec = grain_build(&serde_json::json!({
+            "kind": "bar", "dimension": "place", "measures": ["visitors"], "aggregate": "sum",
+            "format": { "style": "currency", "currency": "IDR" },
+            "colors": { "series": { "sum_visitors": "#16a34a" } },
+            "referenceLines": [{ "value": 1000.0, "label": "Target" }],
+        }))
+        .unwrap();
+        key_look_by_drawn_names(&mut spec);
+        let drawn = match &spec.spec.y {
+            crate::specs::ChartY::Single(y) => y.clone(),
+            crate::specs::ChartY::Multi(ys) => ys[0].clone(),
+        };
+        let payload = serde_json::to_value(&spec.def).unwrap();
+        assert_eq!(payload["format"]["currency"], "IDR", "{payload}");
+        assert_eq!(payload["referenceLines"][0]["value"], 1000.0, "{payload}");
+        assert_eq!(
+            payload["colors"]["series"][drawn.as_str()],
+            "#16a34a",
+            "{payload}"
+        );
+        assert!(
+            payload["colors"]["series"].get("sum_visitors").is_none() || drawn == "sum_visitors"
+        );
+    }
+
+    /// `BI-17` part A (plan T2): the style is checked where the rest of the
+    /// definition is, kept in the stored definition, and a name it uses must
+    /// be one the chart returns.
+    #[test]
+    fn a_chart_keeps_its_style_and_a_style_naming_a_missing_column_is_refused() {
+        let spec = grain_build(&serde_json::json!({
+            "kind": "bar", "dimension": "place",
+            "format": { "style": "compact", "decimals": 1 },
+            "valueFormats": { "visitors": { "style": "percent" } },
+            "referenceLines": [{ "kind": "average" }],
+        }))
+        .unwrap();
+        assert_eq!(
+            spec.def.style.format.as_ref().map(|f| f.decimals),
+            Some(Some(1))
+        );
+        assert!(spec.def.style.value_formats.contains_key("visitors"));
+        let ghost = grain_build(&serde_json::json!({
+            "kind": "bar", "dimension": "place",
+            "valueFormats": { "ghost": { "style": "number" } },
+        }));
+        assert!(matches!(&ghost, Err(BiError::Validation(m)) if m.contains("'ghost'")));
+        let wrong_kind = grain_build(&serde_json::json!({
+            "kind": "bar", "dimension": "place",
+            "conditional": [{ "column": "visitors", "color": "#ff0000",
+                "rule": { "type": "contains", "text": "x" } }],
+        }));
+        assert!(
+            matches!(&wrong_kind, Err(BiError::Validation(m)) if m.contains("conditional colours"))
+        );
+        let currency = grain_build(&serde_json::json!({
+            "kind": "bar", "dimension": "place",
+            "format": { "style": "currency", "currency": "ZZZ" },
+        }));
+        assert!(
+            matches!(&currency, Err(BiError::Validation(m)) if m.contains("not a currency code"))
+        );
+    }
+
+    #[test]
+    fn a_pivot_is_saved_with_grouping_sets_and_a_grain_on_its_first_date_field() {
+        let spec = bare(&serde_json::json!({
+            "kind": "pivot", "rows": ["place"], "columns": ["day"],
+            "values": [{ "column": "visitors", "aggregate": "sum" }],
+            "totals": "all", "grain": "month",
+        }))
+        .unwrap();
+        assert!(
+            spec.spec.sql.contains("date_trunc('month', day) AS day"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec
+                .sql
+                .contains("GROUP BY GROUPING SETS ((place, day), (place), (day), ())"),
+            "{}",
+            spec.spec.sql
+        );
+        assert_eq!(spec.def.grain.as_deref(), Some("month"));
+        assert_eq!(spec.spec.kind, ChartKind::Pivot);
+    }
+
+    #[test]
+    fn a_pivot_refuses_a_grain_without_a_date_field_or_an_hour_on_a_plain_date() {
+        let base = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "kind": "pivot", "rows": ["place"],
+                "values": [{ "column": "visitors", "aggregate": "sum" }],
+            });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            bare_refusal(&v)
+        };
+        assert!(base(serde_json::json!({ "grain": "month" })).contains("date or timestamp"));
+        assert!(
+            base(serde_json::json!({ "columns": ["day"], "grain": "hour" })).contains("timestamp")
+        );
+        assert!(base(serde_json::json!({ "values": [] })).contains("1 to 5 values"));
+        assert!(base(serde_json::json!({ "totals": "some" })).contains("totals"));
+    }
+
+    #[test]
+    fn a_kpi_with_a_previous_period_is_stored_as_its_trend_and_a_goal_as_the_plain_number() {
+        let kpi = |compare: serde_json::Value| {
+            grain_build(&serde_json::json!({
+                "kind": "kpi", "dimension": "", "measures": ["visitors"],
+                "compare": compare, "goodDirection": "down",
+            }))
+        };
+        let trend = kpi(
+            serde_json::json!({ "kind": "previous", "dateColumn": "seen_at", "period": "month" }),
+        )
+        .unwrap();
+        assert!(
+            trend
+                .spec
+                .sql
+                .contains("date_trunc('month', toTimeZone(seen_at, 'Asia/Jakarta')) AS seen_at"),
+            "{}",
+            trend.spec.sql
+        );
+        assert_eq!(trend.def.tables.good_direction.as_deref(), Some("down"));
+        let goal = kpi(serde_json::json!({ "kind": "goal", "value": 2500 })).unwrap();
+        assert!(
+            goal.spec
+                .sql
+                .starts_with("SELECT round(sum(visitors), 6) AS v FROM"),
+            "{}",
+            goal.spec.sql
+        );
+        assert_eq!(goal.def.tables.compare.unwrap().value, Some(2500.0));
+        assert!(matches!(
+            kpi(serde_json::json!({ "kind": "previous", "dateColumn": "place", "period": "month" })),
+            Err(BiError::Validation(m)) if m.contains("date or timestamp")
+        ));
+        // A gauge, or a bar, does not compare.
+        let gauge = grain_build(&serde_json::json!({
+            "kind": "gauge", "dimension": "", "measures": ["visitors"],
+            "compare": { "kind": "goal", "value": 1 },
+        }));
+        assert!(matches!(gauge, Err(BiError::Validation(m)) if m.contains("only for kpi")));
+    }
+
+    // ── BI-6: measures with their own aggregate, own filters, sort, "Other",
+    // groupings ──────────────────────────────────────────────────────────
+
+    fn bi6_cols() -> Vec<crate::sources::SourceColumn> {
+        source_columns(&[
+            ("place", "String"),
+            ("cat", "String"),
+            ("d", "Date"),
+            ("visitors", "UInt64"),
+            ("stay", "Float64"),
+        ])
+    }
+
+    fn bi6_save(extra: &serde_json::Value) -> Result<StoredChartSpec, BiError> {
+        let cols = bi6_cols();
+        spec_from_inline_sql(
+            &inline_chart(extra),
+            InlineSql {
+                sql: "SELECT place, cat, d, visitors, stay FROM serving.mart_x",
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+        )
+    }
+
+    fn bi6_refusal(extra: &serde_json::Value) -> String {
+        match bi6_save(extra) {
+            Err(BiError::Validation(m)) => m,
+            other => panic!("expected a validation message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_measure_with_its_own_aggregate_is_saved_named_by_aggregate_and_column() {
+        let spec = bi6_save(&serde_json::json!({
+            "measures": ["visitors", {"column": "stay", "aggregate": "AVG"}],
+            "kind": "bar",
+        }))
+        .unwrap();
+        assert_eq!(
+            spec.spec.y,
+            ChartY::Multi(vec!["visitors".to_owned(), "avg_stay".to_owned()])
+        );
+        assert!(
+            spec.spec.sql.contains("round(avg(stay), 6) AS avg_stay"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec
+                .sql
+                .contains("round(sum(visitors), 6) AS visitors"),
+            "{}",
+            spec.spec.sql
+        );
+        // Stored as it was written, the aggregate in lower case.
+        let stored = serde_json::to_value(&spec.def).unwrap();
+        assert_eq!(
+            stored["measures"],
+            serde_json::json!(["visitors", {"column": "stay", "aggregate": "avg"}])
+        );
+        assert!(spec.def.uses_shaping());
+    }
+
+    /// QA `LH-BI-6-25` (`BI-49`, plan D8): a radar is a grouped kind, so the
+    /// server already saves it with several measures, each keeping its own
+    /// aggregate. The console starts to rely on this in T8; the test pins it
+    /// so a later change cannot take it away unseen.
+    #[test]
+    fn a_radar_with_two_measures_is_saved_with_both_columns() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "radar",
+            "measures": ["visitors", {"column": "stay", "aggregate": "avg"}],
+        }))
+        .expect("a radar takes several measures (plan D8)");
+        assert_eq!(
+            spec.spec.y,
+            ChartY::Multi(vec!["visitors".to_owned(), "avg_stay".to_owned()])
+        );
+        assert!(
+            spec.spec
+                .sql
+                .contains("round(sum(visitors), 6) AS visitors"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.contains("round(avg(stay), 6) AS avg_stay"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    /// QA `LH-BI-6-25` (`BI-49`, plan D7): a radar has no breakdown, before and
+    /// after this slice, so the "a breakdown or several measures" rule is never
+    /// reached for one. Pinned for the console's benefit.
+    #[test]
+    fn a_radar_is_refused_a_breakdown() {
+        assert!(
+            bi6_refusal(&serde_json::json!({ "kind": "radar", "breakdown": "cat" }))
+                .contains("breakdown is only for"),
+        );
+    }
+
+    /// `BI-46` (plan D12, D14; QA `LH-BI-6-01`): a bar chart with a breakdown
+    /// is marked as shaped — it is rebuilt on every read — and the statement it
+    /// is saved with already holds the breakdown cap, so the stored statement
+    /// and the read agree.
+    #[test]
+    fn a_bar_chart_with_a_breakdown_is_saved_with_the_capped_statement() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "bar", "breakdown": "cat", "limit": 3,
+        }))
+        .unwrap();
+        assert!(spec.def.caps_breakdown());
+        assert!(spec.def.uses_shaping(), "rebuilt on every read (D14)");
+        assert!(
+            spec.spec.sql.contains(
+                "(isNull(cat), ifNull(toString(cat), '')) IN \
+                 (SELECT isNull(cat), ifNull(toString(cat), '') FROM ("
+            ),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec
+                .sql
+                .contains("GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 3)"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    /// `BI-46` (plan D12) review round 1, R5: the exact statement a chart with
+    /// no breakdown is saved with — today's one, byte for byte, not just a
+    /// statement that happens to lack a cap.
+    #[test]
+    fn a_chart_without_a_breakdown_is_saved_with_the_statement_it_always_had() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "bar", "breakdown": serde_json::Value::Null, "limit": 3,
+        }))
+        .unwrap();
+        assert!(!spec.def.caps_breakdown());
+        assert_eq!(
+            spec.spec.sql,
+            "SELECT place, round(sum(visitors), 6) AS visitors FROM (\n\
+             SELECT place, cat, d, visitors, stay FROM serving.mart_x\n\
+             ) AS src GROUP BY place ORDER BY visitors DESC LIMIT 3 SETTINGS \
+             max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60"
+        );
+    }
+
+    #[test]
+    fn a_chart_without_any_bi_6_field_is_not_marked_as_shaped_and_keeps_its_wire_shape() {
+        let spec = bi6_save(&serde_json::json!({"kind": "bar"})).unwrap();
+        assert!(!spec.def.uses_shaping());
+        let stored = serde_json::to_value(&spec.def).unwrap();
+        for key in ["filters", "sort", "other", "groupings"] {
+            assert!(
+                stored.get(key).is_none(),
+                "{key} leaked into the stored shape"
+            );
+        }
+        assert_eq!(stored["measures"], serde_json::json!(["visitors"]));
+    }
+
+    #[test]
+    fn the_chart_own_filters_are_in_the_statement_a_chart_is_saved_with() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "bar",
+            "filters": [{"column": "cat", "values": ["Retail"]}],
+        }))
+        .unwrap();
+        assert!(
+            spec.spec.sql.contains("WHERE cat IN ('Retail')"),
+            "{}",
+            spec.spec.sql
+        );
+        assert_eq!(spec.def.shape.own_filters().len(), 1);
+    }
+
+    #[test]
+    fn a_save_is_refused_with_a_plain_sentence_for_each_unsupported_shape() {
+        let cases = [
+            (
+                serde_json::json!({"kind": "kpi", "measures": [{"column": "stay", "aggregate": "avg"}]}),
+                "takes the chart's aggregate",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "filters": [{"column": "nope", "values": ["a"]}]}),
+                "names a column this data does not have",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "filters": [{"column": "visitors", "op": "contains", "text": "a"}]}),
+                "does not fit the column's type",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "filters": [{"column": "cat", "values": []}]}),
+                "has no value",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "sort": {"by": "stay", "dir": "asc"}}),
+                "cannot sort by 'stay'",
+            ),
+            (
+                serde_json::json!({"kind": "kpi", "sort": {"by": "visitors", "dir": "asc"}}),
+                "sort is for grouped charts",
+            ),
+            (
+                serde_json::json!({"kind": "line", "other": true}),
+                "has no 'Other' group",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "dimension": "d", "grain": "month", "other": true}),
+                "not offered with a time grain",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "groupings": [{"column": "cat"}]}),
+                "only for a grouped table",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "measures": ["visitors", "visitors"]}),
+                "listed twice",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "measures": [{"column": "stay", "aggregate": "median"}]}),
+                "invalid aggregate: median",
+            ),
+        ];
+        for (extra, expected) in cases {
+            let got = bi6_refusal(&extra);
+            assert!(got.contains(expected), "{extra}: {got}");
+        }
+    }
+
+    /// A chart that names no data source says what to send: the mart or the
+    /// SQL source. The refusal comes before any query, so the server answers
+    /// nothing.
+    #[tokio::test]
+    async fn a_chart_with_no_data_source_is_refused_with_what_to_send() {
+        let server = MockServer::start().await;
+        let ch = client(&server.uri());
+        let input: ChartInput = serde_json::from_value(serde_json::json!({
+            "title": "Visitors", "kind": "bar", "dimension": "province", "measures": ["visitors"],
+        }))
+        .unwrap();
+        let err = spec_from_input(&ch, &input, ChartSource::Ai, "ai", None, &DEFAULT_TIME)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the chart names no data source: send mart or sqlSource (list_charts gives them)"
+        );
+        // A mart name that is wrong is a different refusal: it is named.
+        let wrong: ChartInput = serde_json::from_value(serde_json::json!({
+            "title": "Visitors", "kind": "bar", "mart": "bad name",
+            "dimension": "province", "measures": ["visitors"],
+        }))
+        .unwrap();
+        let err = spec_from_input(&ch, &wrong, ChartSource::Ai, "ai", None, &DEFAULT_TIME)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "invalid mart name: bad name");
+    }
+
+    /// The store keeps the console's wording: `crate::layers::check_definition`
+    /// refuses it, and that check is outside this change.
+    #[tokio::test]
+    async fn a_layer_with_no_data_source_keeps_the_consoles_wording() {
+        let server = MockServer::start().await;
+        let ch = client(&server.uri());
+        let input: ChartInput = serde_json::from_value(serde_json::json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_a",
+            "dimension": "province", "measures": ["visitors"],
+            "layers": [{
+                "dimension": "province", "measures": ["visitors"],
+                "draw": "line", "axis": "right",
+            }],
+        }))
+        .unwrap();
+        let err = spec_from_input(&ch, &input, ChartSource::Ai, "ai", None, &DEFAULT_TIME)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "question 1: choose a table or a SQL source."
+        );
+    }
+
+    #[test]
+    fn a_table_grouped_by_several_columns_is_saved_with_its_groupings() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "table",
+            "dimension": "",
+            "groupings": [{"column": "cat"}, {"column": "d", "grain": "month"}],
+            "measures": ["visitors", {"column": "stay", "aggregate": "avg"}],
+        }))
+        .unwrap();
+        assert_eq!(spec.spec.x, "cat");
+        assert_eq!(
+            spec.spec.y,
+            ChartY::Multi(vec!["visitors".to_owned(), "avg_stay".to_owned()])
+        );
+        assert!(
+            // A table's default order is by its first measure, as before.
+            spec.spec
+                .sql
+                .contains("GROUP BY cat, d ORDER BY visitors DESC, cat, d LIMIT 20"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.contains("date_trunc('month', d) AS d"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    #[test]
+    fn groupings_are_refused_beside_a_dimension_too_many_or_a_grain_that_does_not_fit() {
+        let table = |g: serde_json::Value, dimension: &str| serde_json::json!({"kind": "table", "dimension": dimension, "groupings": g});
+        assert!(
+            bi6_refusal(&table(serde_json::json!([{"column": "cat"}]), "place"))
+                .contains("names its columns in groupings")
+        );
+        assert!(
+            bi6_refusal(&table(
+                serde_json::json!([{"column": "cat", "grain": "month"}]),
+                ""
+            ))
+            .contains("date or timestamp")
+        );
+        assert!(
+            bi6_refusal(&table(
+                serde_json::json!([{"column": "d", "grain": "hour"}]),
+                ""
+            ))
+            .contains("needs a timestamp")
+        );
+        let six: Vec<_> = ["place", "cat", "d", "visitors", "stay", "place"]
+            .iter()
+            .map(|c| serde_json::json!({"column": c}))
+            .collect();
+        assert!(bi6_refusal(&table(serde_json::Value::Array(six), "")).contains("1 to 5 columns"));
+        assert!(bi6_refusal(&table(serde_json::json!([]), "")).contains("1 to 5 columns"));
+    }
+
+    #[test]
+    fn a_top_n_with_other_is_saved_as_the_statement_the_dashboard_will_run() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "bar",
+            "sort": {"by": "visitors", "dir": "desc"},
+            "limit": 5,
+            "other": true,
+        }))
+        .unwrap();
+        assert!(
+            spec.spec.sql.contains("if(__o = 1, 'Other', __k) AS __d"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(spec.spec.sql.contains("LIMIT 5)"), "{}", spec.spec.sql);
+        assert_eq!(spec.def.shape.other, Some(true));
+        // `other: false` is the chart with none, not a second spelling of it.
+        let off =
+            bi6_save(&serde_json::json!({"kind": "bar", "other": false, "filters": []})).unwrap();
+        assert_eq!(off.def.shape.other, None);
+        assert_eq!(off.def.shape.filters, None);
+        assert!(!off.def.uses_shaping());
+    }
+
+    // ── BI-6 part 2: steps ──────────────────────────────────────────────
+
+    fn steps_chart(extra: &serde_json::Value) -> serde_json::Value {
+        let mut base = serde_json::json!({
+            "kind": "table", "dimension": "",
+            "groupings": [{"column": "place"}, {"column": "d", "grain": "month"}],
+            "measures": ["visitors"],
+            "steps": [
+                {"summarise": {"by": ["place"], "measures": [{"column": "visitors", "aggregate": "sum"}]}},
+                {"filter": [{"column": "sum_visitors", "op": "gt", "value": "1000"}]},
+            ],
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        base
+    }
+
+    #[test]
+    fn a_chart_with_steps_is_saved_drawing_the_last_steps_columns() {
+        let spec = bi6_save(&steps_chart(&serde_json::json!({
+            "sort": {"by": "sum_visitors", "dir": "desc"},
+        })))
+        .unwrap();
+        assert_eq!(spec.spec.x, "place");
+        assert_eq!(spec.spec.y, ChartY::Single("sum_visitors".to_owned()));
+        assert!(spec.spec.series.is_none());
+        assert!(
+            spec.spec.sql.contains("WHERE sum_visitors > 1000"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec
+                .sql
+                .contains("ORDER BY sum_visitors DESC, place LIMIT 20"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(spec.def.uses_shaping());
+        assert_eq!(spec.def.shape.steps_list().len(), 2);
+        // A bar over a plain dimension takes the same steps.
+        let bar = bi6_save(&serde_json::json!({
+            "kind": "bar", "dimension": "place", "measures": ["visitors"],
+            "steps": [{"filter": [{"column": "visitors", "op": "gte", "value": "10"}]}],
+        }))
+        .unwrap();
+        assert_eq!(bar.spec.y, ChartY::Single("visitors".to_owned()));
+        assert!(
+            bar.spec.sql.contains("WHERE visitors >= 10"),
+            "{}",
+            bar.spec.sql
+        );
+    }
+
+    #[test]
+    fn steps_are_refused_with_a_plain_sentence_where_they_do_not_belong() {
+        let step =
+            serde_json::json!([{"filter": [{"column": "visitors", "op": "gt", "value": "1"}]}]);
+        let cases = [
+            (
+                serde_json::json!({"kind": "kpi", "measures": ["visitors"], "steps": step}),
+                "takes no steps",
+            ),
+            (
+                serde_json::json!({"kind": "pivot", "steps": step}),
+                "takes no steps",
+            ),
+            (
+                serde_json::json!({"kind": "table", "tableMode": "rows", "columns": ["place"], "steps": step}),
+                "takes no steps",
+            ),
+            (
+                serde_json::json!({"kind": "geomap", "steps": step}),
+                "takes no steps",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "other": true, "limit": 3, "steps": step}),
+                "'Other'",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "dimension": "d", "grain": "month", "steps": step}),
+                "time grain or a breakdown",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "breakdown": "cat", "steps": step}),
+                "time grain or a breakdown",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "steps": []}),
+                "1 to 2 steps",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "steps": [step[0].clone(), step[0].clone(), step[0].clone()]}),
+                "1 to 2 steps",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "steps": [{"filter": [{"column": "cat", "op": "eq", "value": "a"}]}]}),
+                "step 1",
+            ),
+            (
+                serde_json::json!({"kind": "bar", "sort": {"by": "visitors", "dir": "asc"}, "steps": [{"summarise": {"by": ["place"], "measures": [{"column": "visitors", "aggregate": "avg"}]}}]}),
+                "cannot sort by 'visitors'",
+            ),
+            (
+                serde_json::json!({"kind": "stacked", "measures": ["visitors", "stay"], "steps": [{"summarise": {"by": ["place"], "measures": [{"column": "visitors", "aggregate": "avg"}]}}]}),
+                "needs 2 measures",
+            ),
+        ];
+        for (mut extra, expected) in cases {
+            if extra.get("dimension").is_none()
+                && extra["kind"] != "pivot"
+                && extra["kind"] != "geomap"
+            {
+                extra["dimension"] = serde_json::json!(if extra["kind"] == "table" {
+                    ""
+                } else {
+                    "place"
+                });
+            }
+            if extra.get("measures").is_none()
+                && extra["kind"] != "pivot"
+                && extra["tableMode"] != "rows"
+                && extra["kind"] != "geomap"
+            {
+                extra["measures"] = serde_json::json!(["visitors"]);
+            }
+            let got = bi6_refusal(&extra);
+            assert!(got.contains(expected), "{extra}: {got}");
+        }
+    }
+
+    // ── BI-7: joins ──────────────────────────────────────────────────────
+
+    fn join_tables()
+    -> std::collections::HashMap<String, std::collections::HashMap<String, ColumnKind>> {
+        let table = |pairs: &[(&str, ColumnKind)]| {
+            pairs.iter().map(|(n, k)| ((*n).to_owned(), *k)).collect()
+        };
+        std::collections::HashMap::from([
+            (
+                "visits".to_owned(),
+                table(&[
+                    ("provinsi", ColumnKind::Text),
+                    ("visitors", ColumnKind::Number),
+                    ("visit_date", ColumnKind::Date),
+                ]),
+            ),
+            (
+                "capacity".to_owned(),
+                table(&[
+                    ("provinsi", ColumnKind::Text),
+                    ("rooms", ColumnKind::Number),
+                ]),
+            ),
+        ])
+    }
+
+    fn join_input(extra: &serde_json::Value) -> ChartInput {
+        let mut base = serde_json::json!({
+            "title": "Joined", "kind": "bar", "mart": "visits",
+            "dimension": "capacity__provinsi", "measures": ["visitors"],
+            "joins": [{
+                "mart": "capacity", "type": "full",
+                "on": [{ "left": "provinsi", "op": "=", "right": "provinsi" }],
+            }],
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    /// The relation `joined_from` hands `spec_from_resolved`, without the
+    /// schema lookups.
+    fn joined_resolved(input: &ChartInput, fields: Vec<FieldDef>) -> Resolved {
+        let tables = join_tables();
+        let planned = crate::joins::plan("visits", input.shape.joins_list(), &tables).unwrap();
+        let kinds = tables["visits"].clone();
+        Resolved {
+            mart: "visits".to_owned(),
+            sql_source: None,
+            from: planned.from,
+            cols: kinds.keys().cloned().collect(),
+            kinds,
+            fields,
+            joined: planned
+                .joined
+                .iter()
+                .map(|n| (n.clone(), planned.kinds[n]))
+                .collect(),
+        }
+    }
+
+    fn save_joined(input: &ChartInput, fields: Vec<FieldDef>) -> Result<StoredChartSpec, BiError> {
+        spec_from_resolved(
+            input,
+            ChartSource::Ui,
+            "ui",
+            derive_common_fields(input, None).unwrap(),
+            geo_fields(input.kind, input).unwrap(),
+            joined_resolved(input, fields),
+        )
+    }
+
+    /// BI-2 review fix (BLOCKER) R1: a chart saved with metrics as measures
+    /// keeps them as metrics in its stored definition, so the dashboard read
+    /// (which rebuilds from the definition) builds the metric's formula and
+    /// not a `sum(<metric name>)` over a column that does not exist.
+    #[test]
+    fn a_saved_chart_keeps_its_metric_measures_and_the_read_builds_the_formula() {
+        use crate::builder::{ReadContext, sql_with_filters_report};
+        let metric = crate::metrics::MetricDef {
+            id: "m_total".to_owned(),
+            name: "total".to_owned(),
+            label: "Total".to_owned(),
+            description: String::new(),
+            source_kind: SourceKind::Mart,
+            source_id: "visits".to_owned(),
+            formula: "Sum([visitors])".to_owned(),
+            filters: Vec::new(),
+            time_column: None,
+            grain: None,
+            format: None,
+            created_by: "u".to_owned(),
+            updated_at: None,
+        };
+        let entries = crate::metrics::catalog_entries(&[metric], &[]);
+        let input = join_input(&serde_json::json!({
+            "limit": 10,
+            "measures": [{ "metric": "total" }, "visitors"],
+        }));
+        let spec = save_joined(&input, entries.clone()).unwrap();
+        assert!(spec.def.measures.is_metric(0) && !spec.def.measures.is_metric(1));
+        assert_eq!(
+            serde_json::to_value(&spec.def.measures).unwrap(),
+            serde_json::json!([{ "metric": "total" }, "visitors"])
+        );
+        // The dashboard's read: a stored chart, a catalog, the mart's columns.
+        let catalog = fields::FieldCatalog::from_fields(entries);
+        let time = TimeContext::default();
+        let read = ReadContext {
+            time: &time,
+            grain: None,
+            fields: &catalog,
+        };
+        let marts = HashMap::from([("visits".to_owned(), join_tables()["visits"].clone())]);
+        let sql = sql_with_filters_report(&spec, &[], &[], &marts, &read).sql;
+        assert!(sql.contains("sum(visitors) AS total"), "{sql}");
+        assert!(!sql.contains("sum(total)"), "{sql}");
+        // A chart saved before the fix holds the name as a plain measure; it
+        // heals on its next read.
+        let mut legacy = spec;
+        legacy.def.measures = vec!["total".to_owned(), "visitors".to_owned()].into();
+        let healed = sql_with_filters_report(&legacy, &[], &[], &marts, &read).sql;
+        assert!(healed.contains("sum(visitors) AS total"), "{healed}");
+        assert!(!healed.contains("sum(total)"), "{healed}");
+    }
+
+    #[test]
+    fn a_chart_with_joins_is_saved_over_the_flat_relation_and_keeps_its_joins() {
+        let spec = save_joined(&join_input(&serde_json::json!({})), Vec::new()).unwrap();
+        assert!(
+            spec.spec
+                .sql
+                .contains("FULL JOIN serving.capacity AS __jn1 ON __jn0.provinsi = __jn1.provinsi"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.contains("GROUP BY capacity__provinsi"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.ends_with("SETTINGS join_use_nulls = 1"),
+            "{}",
+            spec.spec.sql
+        );
+        assert_eq!(spec.def.shape.joins_list().len(), 1);
+        assert_eq!(spec.spec.mart, "visits");
+        // The joined columns are chart columns like any other.
+        let rooms = save_joined(
+            &join_input(
+                &serde_json::json!({ "measures": ["capacity__rooms"], "aggregate": "avg" }),
+            ),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            rooms
+                .spec
+                .sql
+                .contains("round(avg(capacity__rooms), 6) AS capacity__rooms"),
+            "{}",
+            rooms.spec.sql
+        );
+    }
+
+    #[test]
+    fn a_calculated_field_of_the_base_table_works_and_one_naming_a_joined_column_is_refused() {
+        let field = |name: &str, formula: &str| {
+            let mut f = calc_field(name, formula, "row");
+            f.source_kind = SourceKind::Mart;
+            f.source_id = "visits".to_owned();
+            f
+        };
+        let ok = save_joined(
+            &join_input(&serde_json::json!({ "measures": ["double"] })),
+            vec![field("double", "visitors * 2")],
+        )
+        .unwrap();
+        assert!(
+            ok.spec.sql.contains("(visitors * 2) AS double"),
+            "{}",
+            ok.spec.sql
+        );
+        assert!(
+            ok.spec.sql.contains("FULL JOIN serving.capacity"),
+            "{}",
+            ok.spec.sql
+        );
+        let err = save_joined(
+            &join_input(&serde_json::json!({ "measures": ["double"] })),
+            vec![field("double", "capacity__rooms * 2")],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BiError::Validation(m) if m.contains("does not check out")),
+            "{err:?}"
+        );
+        // A field cannot take a joined column's name.
+        let err = save_joined(
+            &join_input(&serde_json::json!({ "measures": ["capacity__rooms"] })),
+            vec![field("capacity__rooms", "visitors * 2")],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BiError::Validation(m) if m.contains("name of a joined column")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn joins_are_refused_on_a_text_tile_a_sql_source_and_unsaved_sql() {
+        let text = serde_json::json!({ "kind": "text", "title": "t", "text": "x", "joins": [] });
+        assert!(serde_json::from_value::<ChartInput>(text).is_ok());
+        let mut input = join_input(&serde_json::json!({ "kind": "text", "text": "x" }));
+        input.mart = String::new();
+        let err = spec_from_inline_sql_text(&input);
+        assert!(err.contains("no data to join"), "{err}");
+        let mut on_source = join_input(&serde_json::json!({}));
+        on_source.mart = String::new();
+        let err = no_joins_on_sql(&on_source).unwrap_err();
+        assert!(err.to_string().contains("not on a SQL source"), "{err}");
+        let cols = inline_cols();
+        let err = super::spec_from_inline_sql(
+            &join_input(&serde_json::json!({ "mart": "", "dimension": "place" })),
+            InlineSql {
+                sql: INLINE_SQL,
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+            &DEFAULT_TIME,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not on a SQL source"), "{err}");
+    }
+
+    fn spec_from_inline_sql_text(input: &ChartInput) -> String {
+        shape::check_kind_fields(&input.measures, &input.shape, input.kind, false).unwrap_err()
+    }
+
+    #[test]
+    fn a_chart_without_joins_is_stored_without_the_field_and_an_empty_list_is_no_joins() {
+        let plain = serde_json::to_value(inline_chart(&serde_json::json!({}))).unwrap();
+        assert!(plain.get("joins").is_none());
+        let empty = inline_chart(&serde_json::json!({ "joins": [] }));
+        assert!(!empty.uses_shaping());
+        assert!(stored_shape(&empty).joins.is_none());
+    }
+
+    #[test]
+    fn dashboard_and_chart_filters_read_the_flat_relation_and_a_base_name_stays_the_base_column() {
+        use crate::builder::{ReadContext, sql_with_filters_report};
+        let spec = save_joined(
+            &join_input(&serde_json::json!({
+                "filters": [{ "column": "capacity__provinsi", "values": ["Bali"] }],
+            })),
+            Vec::new(),
+        )
+        .unwrap();
+        let dashboard: Vec<crate::filters::FilterDef> = serde_json::from_value(serde_json::json!([
+            { "column": "provinsi", "values": ["Aceh"] },
+            { "column": "capacity__rooms", "op": "between", "min": "10" },
+        ]))
+        .unwrap();
+        let tables = join_tables();
+        let report = sql_with_filters_report(
+            &spec,
+            &[],
+            &dashboard,
+            &tables,
+            &ReadContext::new(&DEFAULT_TIME),
+        );
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        // Own filter first, then the dashboard's; `provinsi` is the base column.
+        assert!(
+            report.sql.contains(
+                "capacity__provinsi IN ('Bali') AND provinsi IN ('Aceh') AND capacity__rooms >= 10"
+            ),
+            "{}",
+            report.sql
+        );
+        // A chart whose joined table went away fails to build a new statement and
+        // keeps the one it was saved with.
+        let mut gone = join_tables();
+        gone.remove("capacity");
+        let report = sql_with_filters_report(
+            &spec,
+            &[],
+            &dashboard,
+            &gone,
+            &ReadContext::new(&DEFAULT_TIME),
+        );
+        assert_eq!(report.sql, spec.spec.sql);
+    }
+
+    // ── BI-18 part C: tabs, section tiles, duplicate ───────────────────
+
+    fn static_input(kind: &str, text: Option<&str>) -> ChartInput {
+        let mut v = serde_json::json!({ "title": "t", "kind": kind, "board": "b1" });
+        if let Some(text) = text {
+            v["text"] = serde_json::json!(text);
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn built(kind: &str, text: Option<&str>) -> Result<StoredChartSpec, BiError> {
+        spec_from_inline_sql_free(&static_input(kind, text))
+    }
+
+    /// The no-data branch is reached before any schema lookup, so it runs
+    /// without a `ClickHouse`; `Stage::Done` is what a section tile returns.
+    fn spec_from_inline_sql_free(input: &ChartInput) -> Result<StoredChartSpec, BiError> {
+        let common = derive_common_fields(input, Some("u_x".to_owned()))?;
+        spec_from_text_input(
+            input,
+            TextCtx {
+                title: common.title,
+                subtitle: common.subtitle,
+                kind: common.kind,
+                new_id: common.new_id,
+                span: common.span,
+                board: common.board,
+                source: ChartSource::Ui,
+                created_by: "",
+            },
+        )
+    }
+
+    #[test]
+    fn a_heading_and_a_section_take_one_line_and_a_divider_takes_none() {
+        for kind in ["heading", "section"] {
+            let ok = built(kind, Some("  Sales by region  ")).unwrap();
+            assert_eq!(ok.spec.text.as_deref(), Some("Sales by region"));
+            assert_eq!(ok.spec.sql, "", "a section tile has no statement");
+            assert_eq!(ok.def.mart, "");
+            for bad in [
+                None,
+                Some("   "),
+                Some("two\nlines"),
+                Some("cr\rhere"),
+                Some(&"x".repeat(121)[..]),
+            ] {
+                assert!(
+                    matches!(built(kind, bad), Err(BiError::Validation(_))),
+                    "{kind} {bad:?}"
+                );
+            }
+            assert!(built(kind, Some(&"x".repeat(120))).is_ok());
+        }
+        // A divider keeps no text, whatever was sent.
+        let divider = built("divider", Some("ignored")).unwrap();
+        assert_eq!(divider.spec.text, None);
+        assert_eq!(divider.def.text, None);
+        assert!(built("divider", None).is_ok());
+        // `text` still needs its markdown, and may be several lines.
+        assert!(built("text", None).is_err());
+        assert!(built("text", Some("a\nb")).is_ok());
+    }
+
+    #[test]
+    fn a_text_in_a_heading_is_stored_as_text_and_never_as_a_statement() {
+        let hostile = "x'; DROP TABLE console.bi_chart; --";
+        let heading = built("heading", Some(hostile)).unwrap();
+        assert_eq!(heading.spec.sql, "");
+        assert_eq!(heading.spec.text.as_deref(), Some(hostile));
+        assert!(heading.spec.kind.is_static());
+    }
+
+    #[test]
+    fn a_section_tile_refuses_a_click_filters_and_joins() {
+        for kind in ["heading", "divider", "section"] {
+            let mut input = static_input(kind, Some("A"));
+            input.click = Some(ClickAction::Url {
+                url: "/x".to_owned(),
+            });
+            assert!(validated_click(&input).is_err(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_layout_tile_without_a_tab_serialises_to_the_bytes_it_always_had() {
+        let tile = TileBox {
+            x: 0,
+            y: 1,
+            w: 6,
+            h: 4,
+            tab: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&tile).unwrap(),
+            r#"{"x":0,"y":1,"w":6,"h":4}"#
+        );
+        let tabbed = TileBox {
+            tab: Some("t_a".to_owned()),
+            ..tile
+        };
+        assert_eq!(
+            serde_json::to_string(&tabbed).unwrap(),
+            r#"{"x":0,"y":1,"w":6,"h":4,"tab":"t_a"}"#
+        );
+        let parsed = parse_layout(r#"{"c1":{"x":0,"y":0,"w":4,"h":2,"tab":"t_a"}}"#);
+        assert_eq!(parsed["c1"].tab.as_deref(), Some("t_a"));
+    }
+
+    #[test]
+    fn a_board_row_read_without_the_new_columns_has_no_tabs_and_no_phone_layout() {
+        let row = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({ "id": "b_1", "name": "N", "layout_json": "{}" });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v.as_object().unwrap().clone()
+        };
+        let old = row_to_board(&row(serde_json::json!({})));
+        assert!(old.tabs.is_none() && old.phone_layout.is_none());
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("tabs").is_none() && json.get("phoneLayout").is_none());
+        let empty = row_to_board(&row(
+            serde_json::json!({ "tabs_json": "[]", "phone_layout_json": "[]" }),
+        ));
+        assert!(empty.tabs.is_none() && empty.phone_layout.is_none());
+        let new = row_to_board(&row(serde_json::json!({
+            "tabs_json": r#"[{"id":"t_a","title":"Overview"}]"#,
+            "phone_layout_json": r#"[{"id":"c1","h":5}]"#,
+        })));
+        assert_eq!(new.tabs.unwrap()[0].title, "Overview");
+        assert_eq!(new.phone_layout.unwrap()[0].h, 5);
+        // A damaged column reads as none, not as a failed board.
+        let bad = row_to_board(&row(serde_json::json!({ "tabs_json": "nope" })));
+        assert!(bad.tabs.is_none());
+    }
+
+    /// `BI-17` part A (D6): a row from before the columns reads as following
+    /// the console, and the theme and font read back and serialise.
+    #[test]
+    fn a_boards_theme_and_font_read_back_and_an_old_row_has_neither() {
+        let row = |extra: Value| {
+            let mut v = serde_json::json!({ "id": "b_1", "name": "N", "layout_json": "{}" });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v.as_object().unwrap().clone()
+        };
+        let old = row_to_board(&row(serde_json::json!({})));
+        assert!(old.theme.is_none() && old.font.is_none());
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("theme").is_none() && json.get("font").is_none());
+        let empty = row_to_board(&row(serde_json::json!({ "theme": "", "font": "" })));
+        assert!(empty.theme.is_none() && empty.font.is_none());
+        let set = row_to_board(&row(
+            serde_json::json!({ "theme": "dark", "font": "inter" }),
+        ));
+        assert_eq!(set.theme.as_deref(), Some("dark"));
+        assert_eq!(set.font.as_deref(), Some("inter"));
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(
+            (json["theme"].as_str(), json["font"].as_str()),
+            (Some("dark"), Some("inter"))
+        );
+    }
+
+    /// `BI-4` part B (D7): the rule reads back, a row from before the column
+    /// has none, a text that is not a rule reads as "always fresh" (fail
+    /// closed), and the column is in both the read and the trash-keep lists.
+    #[test]
+    fn a_boards_cache_rule_reads_back_and_the_column_is_kept_through_the_trash() {
+        use crate::cache_rule::CacheRule;
+        let row = |extra: Value| {
+            let mut v = serde_json::json!({ "id": "b_1", "name": "N", "layout_json": "{}" });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v.as_object().unwrap().clone()
+        };
+        assert_eq!(row_to_board(&row(serde_json::json!({}))).cache, None);
+        assert_eq!(
+            row_to_board(&row(serde_json::json!({ "cache_json": "" }))).cache,
+            None
+        );
+        let set = row_to_board(&row(serde_json::json!({
+            "cache_json": CacheRule::Minutes(15).to_stored()
+        })));
+        assert_eq!(set.cache, Some(CacheRule::Minutes(15)));
+        assert_eq!(
+            serde_json::to_value(&set).unwrap()["cache"],
+            serde_json::json!({ "mode": "minutes", "minutes": 15 })
+        );
+        let broken = row_to_board(&row(
+            serde_json::json!({ "cache_json": "{\"mode\":\"x\"}" }),
+        ));
+        assert_eq!(broken.cache, Some(CacheRule::Fresh));
+        assert!(BOARD_COLS.contains("cache_json") && BOARD_KEEP_COLS.contains("cache_json"));
+    }
+
+    fn stored(id: &str, board: &str) -> StoredChartSpec {
+        let mut s = StoredChartSpec::for_test(ChartKind::Bar, "m", "d", &["v"], "SELECT 1".into());
+        s.spec.id = id.to_owned();
+        s.board = board.to_owned();
+        s.def.board = Some(board.to_owned());
+        s
+    }
+
+    fn tile(tab: Option<&str>) -> TileBox {
+        TileBox {
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 4,
+            tab: tab.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_duplicate_re_keys_the_layout_and_the_phone_layout_and_keeps_the_tabs() {
+        let mut layout = LayoutMap::new();
+        layout.insert("c1".to_owned(), tile(Some("t_a")));
+        layout.insert("c2".to_owned(), tile(Some("t_b")));
+        layout.insert("gone".to_owned(), tile(Some("t_a")));
+        let src = Board {
+            layout: Some(layout),
+            tabs: Some(vec![crate::layout::Tab {
+                id: "t_a".to_owned(),
+                title: "A".to_owned(),
+            }]),
+            phone_layout: Some(vec![
+                crate::layout::PhoneTile {
+                    id: "c2".to_owned(),
+                    h: 7,
+                },
+                crate::layout::PhoneTile {
+                    id: "gone".to_owned(),
+                    h: 3,
+                },
+                crate::layout::PhoneTile {
+                    id: "c1".to_owned(),
+                    h: 5,
+                },
+            ]),
+            ..shell_board("b_src")
+        };
+        let mut n = 0;
+        let plan = plan_duplicate(
+            &src,
+            vec![stored("c1", "b_src"), stored("c2", "b_src")],
+            Vec::new(),
+            "b_new",
+            || {
+                n += 1;
+                format!("u_{n}")
+            },
+        );
+        assert_eq!(plan.charts.len(), 2);
+        assert!(plan.charts.iter().all(|c| c.board == "b_new"));
+        assert!(
+            plan.charts
+                .iter()
+                .all(|c| c.def.board.as_deref() == Some("b_new"))
+        );
+        // c1 -> u_1, c2 -> u_2; the tile whose chart is gone is dropped.
+        assert_eq!(plan.layout.len(), 2);
+        assert_eq!(plan.layout["u_1"].tab.as_deref(), Some("t_a"));
+        assert_eq!(plan.layout["u_2"].tab.as_deref(), Some("t_b"));
+        // The reading order of the phone layout is kept.
+        let phone: Vec<(&str, i32)> = plan
+            .phone_layout
+            .iter()
+            .map(|t| (t.id.as_str(), t.h))
+            .collect();
+        assert_eq!(phone, [("u_2", 7), ("u_1", 5)]);
+    }
+
+    #[test]
+    fn the_built_in_tiles_become_saved_charts_that_run_their_fixed_statement() {
+        let spec = ChartSpec {
+            id: "kpi_total".to_owned(),
+            title: "Total".to_owned(),
+            subtitle: None,
+            kind: ChartKind::Kpi,
+            mart: "mart_x".to_owned(),
+            sql_source: None,
+            sql: "SELECT sum(v) AS v FROM serving.mart_x".to_owned(),
+            x: String::new(),
+            y: ChartY::Single("v".to_owned()),
+            series: None,
+            map: None,
+            lat: None,
+            lon: None,
+            format: Some(NumFmt::Int),
+            span: Some(1),
+            text: None,
+            caption: Some("visitors".to_owned()),
+            target: None,
+            click: None,
+        };
+        let chart = builtin_as_chart(spec, "b_new", "Ann");
+        assert_eq!(chart.board, "b_new");
+        assert_eq!(chart.created_by.as_deref(), Some("Ann"));
+        // No mart in the definition is what makes the builder serve the
+        // fixed statement as written.
+        assert_eq!(chart.def.mart, "");
+        let sql = crate::builder::sql_with_filters(
+            &chart,
+            &[],
+            &[FilterDef::in_values("kab", vec!["a".to_owned()])],
+            &HashMap::<String, crate::builder::RelationColumns>::new(),
+            &crate::builder::ReadContext::new(&DEFAULT_TIME),
+        );
+        assert_eq!(sql, "SELECT sum(v) AS v FROM serving.mart_x");
+        let mut n = 0;
+        let src = Board {
+            name: "Main".to_owned(),
+            ..shell_board(DEFAULT_BOARD_ID)
+        };
+        let plan = plan_duplicate(
+            &src,
+            Vec::new(),
+            vec![("kpi_total".to_owned(), chart)],
+            "b_new",
+            || {
+                n += 1;
+                format!("u_{n}")
+            },
+        );
+        assert_eq!(plan.charts[0].spec.id, "u_1");
+    }
+
+    // ── BI-16 part B: progress, histogram, bullet, image and web ────────
+
+    fn save_b(extra: &serde_json::Value) -> Result<StoredChartSpec, BiError> {
+        save_b_with(extra, &DEFAULT_TIME)
+    }
+
+    fn save_b_with(
+        extra: &serde_json::Value,
+        time: &TimeContext,
+    ) -> Result<StoredChartSpec, BiError> {
+        let cols = source_columns(&[
+            ("place", "String"),
+            ("visitors", "UInt64"),
+            ("target", "UInt64"),
+            ("price", "Float64"),
+        ]);
+        let mut base = serde_json::json!({"title": "t"});
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let input: ChartInput = serde_json::from_value(base).unwrap();
+        super::spec_from_inline_sql(
+            &input,
+            InlineSql {
+                sql: "SELECT place, visitors, target, price FROM serving.mart_x",
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+            time,
+        )
+    }
+
+    fn refused_b(extra: &serde_json::Value) -> String {
+        match save_b(extra) {
+            Err(BiError::Validation(why)) => why,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_progress_bar_is_saved_as_a_single_row_and_keeps_its_goal() {
+        let fixed = save_b(&serde_json::json!({
+            "kind": "progress", "measures": ["visitors"], "goal": 1_000_000
+        }))
+        .unwrap();
+        assert_eq!(fixed.spec.y, ChartY::Single("v".to_owned()));
+        assert!(
+            fixed
+                .spec
+                .sql
+                .starts_with("SELECT round(sum(visitors), 6) AS v FROM")
+        );
+        assert_eq!(
+            fixed.def.types.goal,
+            Some(crate::types_b::Goal::Fixed(1_000_000.0))
+        );
+        let value = save_b(&serde_json::json!({
+            "kind": "progress", "measures": ["visitors", "target"],
+            "goal": {"measure": "target"}
+        }))
+        .unwrap();
+        assert_eq!(
+            value.spec.y,
+            ChartY::Multi(vec!["v".to_owned(), "g".to_owned()])
+        );
+        assert!(
+            value
+                .spec
+                .sql
+                .starts_with("SELECT __m0 AS v, __m1 AS g FROM")
+        );
+        assert_eq!(value.def.measures.len(), 2);
+        // A goal that is a column the source does not have is the measure check.
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "progress", "measures": ["visitors", "nope"], "goal": {"measure": "nope"}
+            }))
+            .contains("measure")
+        );
+    }
+
+    #[test]
+    fn fields_for_another_kind_are_refused_at_save_not_stored_and_ignored() {
+        assert_eq!(
+            refused_b(&serde_json::json!({
+                "kind": "bar", "dimension": "place", "measures": ["visitors"], "goal": 5
+            })),
+            "goal is only for a progress bar and a bullet graph."
+        );
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "bullet", "dimension": "place", "measures": ["visitors"],
+                "bands": [1, 2, 3, 4]
+            }))
+            .contains("1 to 3 bands")
+        );
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "bullet", "dimension": "place", "measures": ["visitors"], "bands": [3, 2]
+            }))
+            .contains("must go up")
+        );
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "histogram", "dimension": "price", "histogram": {"count": 101}
+            }))
+            .contains("1 to 100 ranges")
+        );
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "histogram", "dimension": "price", "histogram": {"count": 5, "width": 2}
+            }))
+            .contains("not both")
+        );
+    }
+
+    #[test]
+    fn a_bullet_without_a_category_is_one_row_and_with_one_it_is_a_grouped_chart() {
+        let one = save_b(&serde_json::json!({
+            "kind": "bullet", "measures": ["visitors"], "goal": 10, "bands": [5, 15]
+        }))
+        .unwrap();
+        assert_eq!(one.spec.y, ChartY::Single("v".to_owned()));
+        let by_place = save_b(&serde_json::json!({
+            "kind": "bullet", "dimension": "place", "measures": ["visitors", "target"],
+            "goal": {"measure": "target"}, "bands": [5, 15]
+        }))
+        .unwrap();
+        assert_eq!(
+            by_place.spec.y,
+            ChartY::Multi(vec!["visitors".to_owned(), "target".to_owned()])
+        );
+        assert!(
+            by_place.spec.sql.contains("GROUP BY place"),
+            "{}",
+            by_place.spec.sql
+        );
+        assert_eq!(by_place.def.types.bands, Some(vec![5.0, 15.0]));
+        // No sort, no own aggregate on these kinds.
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "bullet", "dimension": "place",
+                "measures": [{"column": "visitors", "aggregate": "avg"}]
+            }))
+            .contains("takes the chart's aggregate")
+        );
+    }
+
+    #[test]
+    fn a_histogram_over_a_sql_source_needs_a_width_and_a_number_column() {
+        let ok = save_b(&serde_json::json!({
+            "kind": "histogram", "dimension": "price", "histogram": {"width": 10}
+        }))
+        .unwrap();
+        assert_eq!(ok.spec.x, "price");
+        assert_eq!(ok.spec.y, ChartY::Single("__count".to_owned()));
+        assert!(
+            ok.spec.sql.contains("count() AS __count"),
+            "{}",
+            ok.spec.sql
+        );
+        assert!(
+            refused_b(&serde_json::json!({"kind": "histogram", "dimension": "price"}))
+                .contains("choose a width")
+        );
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "histogram", "dimension": "place", "histogram": {"width": 10}
+            }))
+            .contains("not a number column")
+        );
+        assert!(refused_b(&serde_json::json!({
+            "kind": "histogram", "dimension": "price", "grain": "month", "histogram": {"width": 10}
+        }))
+        .contains("cannot group dates"));
+    }
+
+    fn sites_time() -> TimeContext {
+        TimeContext::default().with_content_sites(vec!["https://img.example".to_owned()])
+    }
+
+    #[test]
+    fn an_image_or_web_card_is_saved_only_for_an_address_on_an_allowed_site() {
+        let card = |kind: &str, url: &str| serde_json::json!({"kind": kind, "url": url, "alt": if kind == "image" {"A logo"} else {""}});
+        let time = sites_time();
+        let image = save_b_with(&card("image", "https://img.example/logo.png"), &time).unwrap();
+        assert_eq!(image.spec.sql, "");
+        assert_eq!(
+            image.def.types.url.as_deref(),
+            Some("https://img.example/logo.png")
+        );
+        assert_eq!(image.def.types.alt.as_deref(), Some("A logo"));
+        let mut web = card("web", "https://img.example/status");
+        web.as_object_mut().unwrap().remove("alt");
+        let web = save_b_with(&web, &time).unwrap();
+        assert_eq!(web.def.types.alt, None);
+        for bad in [
+            "https://other.example/logo.png",
+            "http://img.example/logo.png",
+            "https://img.example@evil.example/logo.png",
+            "javascript:alert(1)",
+        ] {
+            let Err(BiError::Validation(why)) = save_b_with(&card("image", bad), &time) else {
+                panic!("{bad} was saved");
+            };
+            assert_eq!(why, crate::types_b::CONTENT_SITE_REFUSED);
+            assert!(!why.contains(bad), "{why}");
+        }
+        // With no site on the list (the default context) nothing is saved.
+        assert!(save_b(&card("image", "https://img.example/logo.png")).is_err());
+        // An image tile takes no filter or click.
+        let mut filtered = card("image", "https://img.example/logo.png");
+        filtered["filters"] = serde_json::json!([{"column": "place", "values": ["a"]}]);
+        assert!(save_b_with(&filtered, &time).is_err());
+        let mut clicked = card("image", "https://img.example/logo.png");
+        clicked["click"] = serde_json::json!({"kind": "url", "url": "https://img.example/{value}"});
+        assert!(save_b_with(&clicked, &time).is_err());
+    }
+
+    // ── freezing a board's layout before a chart is rewritten ───────────
+
+    /// A `ClickHouse` stand-in for one board: serves its row (when it has
+    /// one) and its live charts in list order, takes every write, and fails
+    /// the board's write when told to.
+    struct FreezeCh {
+        board: Option<serde_json::Value>,
+        charts: Vec<&'static str>,
+        fail_board_write: bool,
+    }
+    impl wiremock::Respond for FreezeCh {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let sql = String::from_utf8_lossy(&request.body);
+            let rows = |data: Vec<serde_json::Value>| {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "meta": [], "data": data, "rows": data.len()
+                }))
+            };
+            if sql.starts_with("INSERT INTO console.bi_board ") && self.fail_board_write {
+                return ResponseTemplate::new(500).set_body_string("planted-upstream-text");
+            }
+            if sql.contains("FROM console.bi_board FINAL") {
+                return rows(self.board.iter().cloned().collect());
+            }
+            if sql.contains("FROM console.bi_chart FINAL") {
+                return rows(
+                    self.charts
+                        .iter()
+                        .map(|id| {
+                            serde_json::json!({
+                                "id": id,
+                                "spec_json": serde_json::json!({
+                                    "spec": {
+                                        "id": id, "title": "t", "kind": "bar",
+                                        "mart": "mart_x", "sql": "SELECT 1",
+                                        "x": "a", "y": "b",
+                                    },
+                                    "hasYear": false,
+                                })
+                                .to_string(),
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            if sql.starts_with("SELECT") {
+                return rows(Vec::new());
+            }
+            ResponseTemplate::new(200).set_body_string("Ok.\n")
+        }
+    }
+
+    /// The row `FROM console.bi_board` serves for board `b_1`.
+    fn board_row(layout_json: &str, tabs_json: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "b_1", "name": "Sales", "description": "Monthly", "created_by": "Ann",
+            "layout_json": layout_json,
+            "filters_json": "[]", "public_token": "", "embed_enabled": 0,
+            "folder_id": "", "refresh_seconds": 0, "grain": "",
+            "params_json": "[]", "tabs_json": tabs_json, "phone_layout_json": "[]",
+            "theme": "dark", "font": "", "cache_json": "", "owner_id": "",
+            "created_at": "2026-10-22 00:00:00",
+        })
+    }
+
+    /// Run [`freeze_board_layout`] on `board_id` against `stand_in`, and
+    /// return its result with the statements that were written.
+    async fn freeze_against(
+        stand_in: FreezeCh,
+        board_id: &str,
+    ) -> (Result<(), BiError>, Vec<String>) {
+        let _lock = TEST_DDL_LOCK.lock().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stand_in)
+            .mount(&server)
+            .await;
+        let result = freeze_board_layout(&client(&server.uri()), board_id).await;
+        let written = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|sql| sql.starts_with("INSERT"))
+            .collect();
+        (result, written)
+    }
+
+    /// Three tiles nobody has placed are drawn in list order, and a rewrite
+    /// of the middle one would send it last. The freeze gives each a box in
+    /// that order and carries everything else of the board unchanged.
+    #[tokio::test]
+    async fn the_freeze_gives_every_unboxed_tile_a_box_in_list_order() {
+        let (result, written) = freeze_against(
+            FreezeCh {
+                board: Some(board_row("{}", "[]")),
+                charts: vec!["c_a", "c_b", "c_c"],
+                fail_board_write: false,
+            },
+            "b_1",
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(written.len(), 1, "{written:#?}");
+        let row = &written[0];
+        assert!(row.starts_with("INSERT INTO console.bi_board "), "{row}");
+        assert!(
+            row.contains(
+                r#"'{"c_a":{"x":0,"y":0,"w":6,"h":6},"c_b":{"x":6,"y":0,"w":6,"h":6},"c_c":{"x":0,"y":6,"w":6,"h":6}}'"#
+            ),
+            "{row}"
+        );
+        // Only the layout changes: the name, the description, the author and
+        // the theme are written back as they were.
+        for kept in ["'b_1'", "'Sales'", "'Monthly'", "'Ann'", "'dark'"] {
+            assert!(row.contains(kept), "{kept} missing from {row}");
+        }
+    }
+
+    /// A board whose tiles all have a box has nothing to freeze, so it is not
+    /// written: a write would be a version of the board for no change.
+    #[tokio::test]
+    async fn the_freeze_writes_nothing_when_every_tile_has_a_box() {
+        let layout = r#"{"c_b":{"x":0,"y":0,"w":12,"h":6},"c_a":{"x":0,"y":6,"w":6,"h":6}}"#;
+        let (result, written) = freeze_against(
+            FreezeCh {
+                board: Some(board_row(layout, "[]")),
+                charts: vec!["c_a", "c_b"],
+                fail_board_write: false,
+            },
+            "b_1",
+        )
+        .await;
+        result.unwrap();
+        assert!(written.is_empty(), "{written:#?}");
+    }
+
+    /// A board with no live row (deleted, or never there) is not made by a
+    /// chart update: the freeze leaves it and does not fail.
+    #[tokio::test]
+    async fn the_freeze_leaves_a_board_with_no_row_alone() {
+        let (result, written) = freeze_against(
+            FreezeCh {
+                board: None,
+                charts: vec!["c_a"],
+                fail_board_write: false,
+            },
+            "b_gone",
+        )
+        .await;
+        result.unwrap();
+        assert!(written.is_empty(), "{written:#?}");
+    }
+
+    /// The built-in board has no row until something about it is first
+    /// saved, and a chart saved with no board is on it. A blank board id
+    /// names it, so those charts are frozen on its shell row.
+    #[tokio::test]
+    async fn a_blank_board_is_the_built_in_board_and_is_frozen_on_its_shell() {
+        let (result, written) = freeze_against(
+            FreezeCh {
+                board: None,
+                charts: vec!["c_a", "c_b"],
+                fail_board_write: false,
+            },
+            "",
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(written.len(), 1, "{written:#?}");
+        assert!(
+            written[0].contains("VALUES ('default', 'Dashboard',"),
+            "{}",
+            written[0]
+        );
+        assert!(
+            written[0]
+                .contains(r#"'{"c_a":{"x":0,"y":0,"w":6,"h":6},"c_b":{"x":6,"y":0,"w":6,"h":6}}'"#),
+            "{}",
+            written[0]
+        );
+    }
+
+    /// On a tabbed board the frozen tiles sit on the first tab, where the page
+    /// draws a tile with none, and the tabs are written back as they were.
+    #[tokio::test]
+    async fn the_freeze_keeps_the_tabs_and_boxes_on_the_first_tab() {
+        let tabs = r#"[{"id":"t_1","title":"Main"},{"id":"t_2","title":"More"}]"#;
+        let (result, written) = freeze_against(
+            FreezeCh {
+                board: Some(board_row("{}", tabs)),
+                charts: vec!["c_a", "c_b"],
+                fail_board_write: false,
+            },
+            "b_1",
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(written.len(), 1, "{written:#?}");
+        assert!(written[0].contains(tabs), "{}", written[0]);
+        assert!(
+            written[0].contains(
+                r#"'{"c_a":{"x":0,"y":0,"w":6,"h":6,"tab":"t_1"},"c_b":{"x":6,"y":0,"w":6,"h":6,"tab":"t_1"}}'"#
+            ),
+            "{}",
+            written[0]
+        );
+    }
+
+    /// A failed write of the board is an error, so the caller can stop before
+    /// it touches the chart.
+    #[tokio::test]
+    async fn a_failed_board_write_fails_the_freeze() {
+        let (result, written) = freeze_against(
+            FreezeCh {
+                board: Some(board_row("{}", "[]")),
+                charts: vec!["c_a"],
+                fail_board_write: true,
+            },
+            "b_1",
+        )
+        .await;
+        assert!(matches!(result, Err(BiError::Clickhouse(_))), "{result:?}");
+        assert_eq!(written.len(), 1, "{written:#?}");
     }
 }

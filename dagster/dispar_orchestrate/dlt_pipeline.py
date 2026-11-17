@@ -27,10 +27,14 @@ this dlt pipeline's own working directory.
 This must run **inside the compose network** — Lakekeeper's `/v1/config`
 response includes the server's own canonical catalog URI
 (`LAKEKEEPER__BASE_URI`), which pyiceberg's `RestCatalog` honors and uses
-for every subsequent call. If `LAKEKEEPER__BASE_URI` is a host-facing
-address (`http://localhost:8181`, `docker-compose.yml`'s default), a
-catalog client running outside the compose network hangs/times out
-resolving that address's Docker-internal counterpart, or vice versa. The
+for every subsequent call (and so does the Rust client
+`iceberg-catalog-rest` the API itself uses). The compose default for that
+URI is the in-network name `http://lakekeeper:8181` (REL-19 review R1) —
+the address a client inside the network can reach. A client OUTSIDE the
+compose network — a `pyiceberg` run on the host, the host-side form of the
+G1 test — hangs or times out resolving that address's Docker-internal
+counterpart, and needs the host mapping
+(`LAKEKEEPER_BASE_URI=http://localhost:8181`) instead. The
 `g3a-test-runner` compose service (see `docker-compose.yml`) — like
 `g1-test-runner` before it — runs this pipeline as a container attached
 to the compose network, with `LAKEKEEPER_BASE_URI` set to the
@@ -61,6 +65,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from dagster import Failure
 from dlt.sources.sql_database import sql_database
 
 from dispar_orchestrate import schema_observer, ssrf_guard
@@ -70,6 +75,23 @@ from dispar_orchestrate.adapters.sink import LoadPlan, SinkConfig, load_via_sink
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name, "").strip()
     return value if value else default
+
+
+def _required_env(name: str) -> str:
+    """Read `name`, failing the run when it is unset or empty.
+
+    `SEC-37`: this module used to fall back to the literal `rustfsadmin` for
+    the two S3 credentials. A credential written into the code is one an
+    operator never chose (`AGENTS.md` rule 5), and compose always sets these
+    two on `dagster-code-location` now, so a missing value is a
+    misconfiguration: name the variable and fail the run (`Failure` for a
+    config problem, so the retry policy does not burn attempts on it),
+    rather than dial someone's object store with a guessed key.
+    """
+    value = _env(name, "")
+    if not value:
+        raise Failure(f"{name} must be set (SEC-37: no default credentials in code)")
+    return value
 
 
 @dataclass(frozen=True)
@@ -109,12 +131,16 @@ class BronzeIngestConfig:
     # warehouse bucket's `bronze/` prefix, so it does not need root. Read
     # the connector-scoped names instead (`CONNECTOR_S3_ACCESS_KEY`/
     # `CONNECTOR_S3_SECRET_KEY` — see docker-compose.yml's
-    # `dagster-code-location` env block for why these still default to
-    # the RustFS root key today: this stack's RustFS version has no
+    # `dagster-code-location` env block, where compose points them at the
+    # RustFS root key because this stack's RustFS version has no
     # non-proprietary-admin-API way to mint a narrower S3 identity, and
     # this project's locked decision is "plain S3 API only, never a
     # store's proprietary admin call" — see the `rustfs` service's own
-    # comment in docker-compose.yml). A deployment that CAN provision a
+    # comment in docker-compose.yml). `SEC-37`: the fallback that used to
+    # live HERE (`_env(..., "rustfsadmin")`) is gone — the two vars are
+    # required (`_required_env`), so a run outside compose cannot silently
+    # dial the object store with a credential written in the repository.
+    # A deployment that CAN provision a
     # least-privilege RustFS/S3 identity only needs to point these two
     # vars at it; no code change here.
     rustfs_access_key: str
@@ -152,8 +178,8 @@ class BronzeIngestConfig:
             ),
             lakekeeper_warehouse=_env("LAKEKEEPER_WAREHOUSE", "default"),
             rustfs_endpoint=_env("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000"),
-            rustfs_access_key=_env("CONNECTOR_S3_ACCESS_KEY", "rustfsadmin"),
-            rustfs_secret_key=_env("CONNECTOR_S3_SECRET_KEY", "rustfsadmin"),
+            rustfs_access_key=_required_env("CONNECTOR_S3_ACCESS_KEY"),
+            rustfs_secret_key=_required_env("CONNECTOR_S3_SECRET_KEY"),
             warehouse_bucket=_env("LAKEHOUSE_WAREHOUSE_BUCKET", "lakehouse-warehouse"),
             lakekeeper_token=lakekeeper_token,
         )
@@ -228,6 +254,7 @@ def run_bronze_ingest(
     plan: LoadPlan = LoadPlan(),
     *,
     gate: Callable[[schema_observer.ReflectedTable], schema_observer.Decision] | None = None,
+    author: str = "",
 ) -> dict[str, Any]:
     """Run the dlt pipeline once: build the Postgres `sql_database` source
     (SSRF-checked and `hostaddr`-pinned per WS3 item 20, the rest
@@ -239,6 +266,12 @@ def run_bronze_ingest(
     Dagster op in `assets.py`) to attach as metadata and pass on to Bronze
     catalog registration. `plan` is the load mode (`adapters/sink.py`'s
     "Load modes"); the default appends, as this function always did.
+
+    `author` is the run's label, recorded on the commits this load makes as
+    `rantai.author` through `SinkConfig.author` (`DATA-52`, review round 1 R2):
+    the PostgreSQL connector's own load was the one sink path that recorded no
+    author while the documents said a connector's replace and append name their
+    run. Empty when the caller has no run context, which records none.
 
     # Errors
 
@@ -317,7 +350,7 @@ def run_bronze_ingest(
     # `resource.add_map(_stamp_ingested_at)` here, which meant the column
     # only existed on the ONE code path (this one) that remembered to add
     # it.
-    result = load_via_sink(source, cfg.bronze_table_name, SinkConfig.from_bronze_ingest_config(cfg), plan)
+    result = load_via_sink(source, cfg.bronze_table_name, SinkConfig.from_bronze_ingest_config(cfg, author=author), plan)
     if result.has_failed_jobs:
         # `load_info_str` (`str(load_info)`) can contain a file path --
         # fine in a raised exception that stays server-side (this op is

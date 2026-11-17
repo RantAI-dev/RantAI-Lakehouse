@@ -1,0 +1,1688 @@
+# Data roadmap Phase 4: connector breadth (master plan)
+
+| | |
+| --- | --- |
+| Planner and reviewer | Claude Opus (`AGENTS.md`). Developer: a non-Opus agent |
+| Date | 2026-10-19 |
+| Roadmap | "Data Build Roadmap", phase 4 "Connector breadth": `SRC-3`, `SRC-4` |
+| Base | `origin/main` at `ee8589c3`. Every anchor below was read there |
+| Branch | `feat/data-phase-4-connectors`, worktree `/home/hv/lakehouse-phase4-connectors`, draft PR #214. One branch, one PR for the phase |
+| Spec | `docs/core/specs/src-3.md` |
+| Feature page | `docs/core/features/business-app-connectors.md`: fifteen decisions, signed 2026-10-19 (every default; decision 3 corrected to the spec's "OAuth where offered" before signing) |
+| `SRC-4` | **Not in this plan.** Blocked by `SEC-14` (part B waits for `SEC-41`, which waits for `REL-9`). It gets its own plan on this branch once `SEC-14` merges (product owner, 2026-10-19) |
+| Migrations | `0095`, `0096` and `0097` (added at the slice 1 review) reserved by this plan (free on main and in every open branch's plan on 2026-10-19: #106 holds 0078–0083, BI phases 3–4 0085–0088, data phase 3 0090–0094) |
+
+## 1. Scope
+
+`SRC-3`: Databricks' ten generally available SaaS connectors (Salesforce,
+ServiceNow, Workday Reports, Google Analytics 4, HubSpot, Zendesk,
+Confluence, Dynamics 365, NetSuite, SharePoint), each with sign-in, object
+listing, object and column choice, incremental loads, schema-change
+handling, failure alerts and a gate (spec "Each connector" row). `DEC-9`:
+dlt verified sources for Salesforce, HubSpot, Zendesk, Google Analytics;
+dlt's `rest_api` source for the other six.
+
+Spec targets not met, reported on the feature page: the second wave, Workday
+incremental, and real-account proof for Workday and NetSuite.
+
+## 2. What exists (read at `ee8589c3`, not run)
+
+`A` = `rust/crates/lakehouse-api/src`, `S` = `rust/crates/lakehouse-store/src`,
+`D` = `dagster/dispar_orchestrate`.
+
+- **Types are rows, adapters are strings.** `connector_type`
+  (`rust/migrations/0035_connector_type.sql:10-37`, widened in
+  `0043_ingest_tier2_adapters.sql:69-87`) with CHECKs on `adapter` in both
+  `connector_type` and `connector` (`0033:15`). The adapter string is
+  switched on in about fifteen places: Rust `Dial` (`A/ingest_spec.rs:473-557`),
+  `secret_field_names` (`:1791-1822`), `target_identity` (`:621-756`),
+  load modes (`:1134-1405`, incremental refused for non-SQL at `:1390`),
+  column choice (`:1461`), probe dispatch (`A/connector_probe.rs:288-312`),
+  listing dispatch (`A/connector_listing.rs:1082-1136`), OAuth `app_of`
+  (`A/routes/connector_oauth.rs:89-110`, REST only), SSRF save checks
+  (`A/routes/connectors.rs:3341-3376`, `:3394+`), the assistant tool enum
+  (`A/routes/ai/registry.rs:1189,1200`); Python `_ADAPTERS` and the
+  per-adapter arms (`D/ingest_factory.py:290-297`, `:795-845`), `_load_plan`
+  (`:399`), `secret_map.py`, `discover.py:_reader_for` (`:703-711`); console
+  `ADAPTER_META` (`src/features/connectors/connector-type-picker.tsx:40-58`),
+  `credentialSlotsFor` (`connector-form-parts.tsx:113-150`), dial forms
+  (`:255`, `dial-forms/*`), `table-finder.tsx:36,54`,
+  `connector-review.tsx:72`, `hostFromDial` (`connector-form-parts.tsx:49`),
+  contracts (`src/services/contracts/connectors.ts:685-694`, `:761-768`).
+- **REST adapter.** `D/adapters/rest.py`, hand-written, five auth kinds, three
+  paging shapes, rule Z5 at `:10-21`: no URL from a response body or header
+  is dialled. `AuthSession` refreshes OAuth tokens and reports a rotated
+  refresh token (`:387`).
+- **Load path.** `run_ingest` → `_run_one_object` (`D/ingest_factory.py:664-877`):
+  secrets resolve (`:728`), the load runs inside
+  `ssrf_guard.pinned_resolution(host, …)` (`:851-856`), sink
+  `D/adapters/sink.py:load_via_sink` (`:823`); `_apply_cursor` (`:690-722`)
+  accepts only an `IncrementalResourceWrapper`. Non-SQL schema changes are
+  observed after the load (`D/ingest_factory.py:406-447`). Retries
+  `_fail_or_retry` (`:1131-1180`).
+- **OAuth sign-in** (`SRC-12`): per-connector `RestAuth::Oauth2AuthorizationCode`
+  (`A/ingest_spec.rs:199-217`), PKCE, `client_secret_post` only
+  (`A/routes/connector_oauth.rs:31-34`), migration `0080`. Gate `g6-oauth`
+  mocks the provider (`ops/g6/src12_oauth_test.py:103-168`).
+- **SSRF.** Rust `resolve_checked` (`A/connector_probe.rs:1200-1213`),
+  `pinned_http_client` (`:915-937`); Python `D/ssrf_guard.py`
+  (`resolve_checked` `:137`, `pinned_resolution` `:187`, `checking_resolver`
+  `:244`).
+- **Gates.** SRC-9 lint `ops/lint/check_connector_gate_coverage.py` replays
+  `connector_type` statements against `ops/gates/coverage.json`; its parser
+  accepts only `INSERT … (name, adapter, supported, docs_url) VALUES (…)`
+  and `UPDATE … SET supported/adapter/unsupported_reason WHERE name = '…'`.
+  `g6-ingest-other` measured 14m53s–18m36s against the signed 20-minute
+  budget (`docs/plans/SRC-9-RESULT.md:40`): no room, so a new job.
+- **Python deps.** `dagster/pyproject.toml`: exact pins, `dlt[...]==1.30.0`;
+  no vendored code; no pip audit; product licence AGPL-3.0-or-later.
+
+## 3. Facts from outside the repo (2026-10-19)
+
+Sources: github.com/dlt-hub/verified-sources (sources/salesforce, hubspot,
+zendesk, google_analytics; issues and PRs #285, #659, #662, #692);
+github.com/dlt-hub/dlt at tag 1.30.0 (`dlt/sources/rest_api/config_setup.py`,
+`dlt/sources/helpers/rest_client/auth.py`, `paginators.py`); Databricks
+Lakeflow Connect SaaS overview and release notes 2025–2026; the vendors' API
+documentation (ServiceNow Table API, Confluence REST v2, Dataverse Web API
+paging and change tracking, NetSuite REST/SuiteQL, Microsoft Graph delta,
+Salesforce SOAP API end of life). Anything marked *verify* is checked by the
+developer in the task named, before code depends on it (section 8).
+
+- Verified sources install by copying (`dlt init`); Apache-2.0; no package.
+  Salesforce: `simple-salesforce`, no `primary_key` (upstream PR #692),
+  standard objects only (#285); HubSpot: full re-read (#662), private-app
+  token only; Zendesk: duplicate report (#659); Google Analytics: GA4 Data
+  API (`BetaAnalyticsDataClient`), service account or OAuth.
+- dlt 1.30.0 `rest_api`: paginators `json_link`, `header_link`,
+  `header_cursor`, `cursor`, `offset`, `page_number`, `single_page`; auth
+  `bearer`, `api_key`, `http_basic`, `oauth2_client_credentials`; custom auth
+  subclasses `AuthConfigBase`. No authorisation-code/refresh auth, no
+  delta-link state.
+- Vendor shapes: ServiceNow `Link` header + `sys_updated_on`; Workday RaaS
+  one response, no change filter; Confluence v2 cursor in `_links.next`;
+  Dataverse `@odata.nextLink`, `modifiedon`, change tracking; NetSuite
+  SuiteQL POST with `offset`/`hasMore`; Graph `@odata.nextLink` and delta.
+- Salesforce SOAP `login()` retired Summer '27 (decision 4).
+
+## 4. Architecture decisions (planner)
+
+- **AD1. One new adapter, `saas`, with a `vendor` field.** Not ten adapters:
+  the fifteen switch sites gain one arm each, and the vendor is dispatched
+  inside the SaaS code. `Dial::Saas { vendor, account, objects, auth }`,
+  where `account` holds the vendor's per-customer host part (Zendesk
+  subdomain, ServiceNow instance, Dataverse org URL, NetSuite account id,
+  Workday host and tenant, Confluence site) and is validated per vendor
+  against the vendor's host pattern. The connector type rows are ten
+  `connector_type` rows with `adapter = 'saas'`.
+- **AD2. Vendor hosts are built, never typed.** The API and token hosts
+  come from a per-vendor table in code (`saas_vendors` in Rust and Python,
+  one list each, compared by a test in each language against a shared JSON
+  fixture). The user supplies only the `account` part. `target_identity`
+  for `saas` is the vendor plus `account` (SEC-14 part A: changing either
+  needs every credential again).
+- **AD3. The link rule replaces Z5 for `saas` only** (decision 8). A
+  `SaasSession` (Python, on `requests`) dials a URL from a response only if
+  its scheme, host and port equal the request's (or, for Salesforce's
+  `instance_url`, the host ends in `.salesforce.com` or `.force.com`, and
+  then becomes the session's host), and every host goes through
+  `ssrf_guard.resolve_checked` and is pinned. No redirects. `rest.py` keeps
+  Z5 unchanged.
+- **AD4. Verified-source code is vendored** (decision 1) under
+  `D/saas/vendored/<source>/` from one pinned upstream commit, with
+  `UPSTREAM.md` naming the commit and listing each local change with its
+  reason, and the Apache-2.0 licence file. Our fixes are separate commits.
+  Their HTTP goes through `SaasSession` (Salesforce: `simple-salesforce`
+  accepts a `session`; HubSpot and Zendesk use dlt's client, given our
+  session; GA4: the client's REST transport, *verify*, because gRPC resolves
+  outside `getaddrinfo` and so outside the SSRF guard).
+- **AD5. The six others are `rest_api` configs** in `D/saas/vendors/<vendor>.py`,
+  each with its own custom `AuthConfigBase` where dlt has none (OAuth
+  refresh, reused from `rest.py`'s `AuthSession`; NetSuite certificate JWT),
+  and its own delta-link state where the vendor uses one (Graph, Dataverse
+  change tracking: dlt resource state).
+- **AD6. Incremental and column choice widen to `saas`.** Rust load-mode
+  validation and `supports_column_choice`, Python `_load_plan` and
+  `sink._apply_cursor` accept `saas` objects that declare a cursor; each
+  vendor module declares per object `cursor`, `primary_key`, `deletes`
+  (decision 7) and `full_reason` when no cursor exists (decision 6; the
+  connector page shows it).
+- **AD7. Schema changes before the load** (decision 9) for vendors that
+  describe fields: each such vendor module implements `describe(object)`,
+  called in the same place SQL sources are observed before the load. The
+  others keep the after-load path.
+- **AD8. OAuth sign-in for `saas`** reuses `SRC-12`'s routes and storage;
+  the authorise and token URLs come from the vendor table, not the user.
+  The token request gains `client_secret_basic` for vendors that need it
+  (decision 3: extend, not drop).
+- **AD9. One gate job, `g6-saas`,** with one mock server (`ops/g6/saas_stub.py`,
+  stdlib only, as `rest_stub.py`) serving every vendor's routes on its own
+  path prefix: sign-in, listing, paging by the vendor's own shape, a cursor
+  filter, a delete, a 429 with `Retry-After`, a changed field. Budget: the
+  signed 20 minutes.
+- **AD10. Types stay unsupported until the end.** Migration `0095` adds the
+  ten rows with `supported = false` and a reason; migration `0096`, in the
+  last slice, flips the eight with a passing gate and a real-account row
+  possible, and adds their `coverage.json` entries in the same commit.
+  Workday and NetSuite stay unsupported (decision 10).
+
+## 5. Slices (one branch, one PR)
+
+| Slice | Content | Migration |
+| --- | --- | --- |
+| 1 | The `saas` adapter end to end with no vendor: types, dial, identity, secrets, probe arm, OAuth presets, listing dispatch, load path, incremental and column choice widened, console picker and form shell, gate job skeleton | `0095` |
+| 2 | HubSpot, Zendesk (vendored; HubSpot made incremental, Zendesk duplicates fixed) | none |
+| 3 | Salesforce (vendored; primary key, custom objects, deletes), GA4 (vendored; REST transport) | none |
+| 4 | ServiceNow, Confluence (`rest_api`) | none |
+| 5 | SharePoint, Dynamics 365 (`rest_api`, Entra, delta state) | none |
+| 6 | Workday, NetSuite (`rest_api`; stay unsupported) | none |
+| 7 | Flip to supported, docs, measurement | `0096` |
+
+Rust work sits in slice 1 and 7 ("Keep build time down"); slices 2–6 are
+Python, mocks and console, plus at most a vendor-table row in Rust each.
+
+## 6. Tasks
+
+One task per commit. Scoped checks per commit; the full block once per
+slice before its handoff. Machine limits: no `cargo test` on this machine
+(CI is the first run); `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target`,
+`CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`; run bun tests per directory.
+
+### Slice 1: the `saas` adapter
+
+- **T1.1 Migration `0095_saas_connector_types.sql`.** Widen both adapter
+  CHECKs to include `saas`; insert the ten types, `supported = false`, with
+  `unsupported_reason` "Being built (SRC-3)". Statements in the shapes the
+  SRC-9 lint parses; if a CHECK change is outside its grammar, extend the
+  lint in the same commit, with a test. *Check:* `python3
+  ops/lint/check_connector_gate_coverage.py` passes; the lint test passes.
+- **T1.2 Rust vendor table and dial.** `A/saas_vendors.rs`: per vendor the
+  host pattern for `account`, API and token URL builders, OAuth authorise
+  and revocation URLs, scopes, client authentication method, secret slots.
+  `Dial::Saas` parse and validation, `secret_field_names`, `target_identity`
+  (AD2), `check_dial_ssrf` arm. Shared fixture
+  `ops/fixtures/saas_vendors.json` compared by a unit test. *Check:* unit
+  tests: each vendor's `account` accepts a good value and refuses a host
+  outside the pattern, userinfo, a port, `http`; identity changes with
+  `account`; secrets are `SecretValue`.
+- **T1.3 Load modes and column choice.** Widen `:1390` and `:1461` to `saas`
+  objects with a declared cursor. *Check:* unit tests both ways (a `saas`
+  object without a cursor still refuses incremental, with the message).
+- **T1.4 Probe arm.** `connector_probe.rs` `saas` arm: the vendor's "who am
+  I" call through `pinned_http_client` after `resolve_checked`, credentials
+  read only after the address check; fixed-class messages; an
+  authorisation-code connector with no refresh token answers
+  `not_testable_with` as today. *Check:* wiremock tests for ok, 401, 403,
+  429, redirect refused; `tests/sec11_guard.rs` passes.
+- **T1.5 OAuth presets.** `connector_oauth.rs` accepts `saas`, taking URLs
+  and scopes from the vendor table; add `client_secret_basic`. *Check:*
+  route tests for start and callback with a `saas` connector; a vendor URL
+  cannot be overridden from the dial.
+- **T1.6 Listing dispatch.** `connector_listing.rs`: `saas` →
+  `Dispatch::Orchestrator`. *Check:* unit test.
+- **T1.7 Routes and policy.** Every new or widened route in `POLICY_TABLE`
+  and both ways in `tests/route_auth.rs` (none expected beyond widening).
+  The assistant tool enum gains `saas`; regenerate
+  `tests/fixtures/tool_schemas.json`. *Check:* `route_auth`, tool schema
+  test.
+- **T1.8 Python SaaS core.** `D/saas/session.py` (`SaasSession`, AD3:
+  same-origin links, the Salesforce host rule, `resolve_checked` + pinning,
+  no redirects, `Retry-After` up to a bound then a classified failure),
+  `D/saas/vendors/__init__.py` (vendor registry mirroring the fixture),
+  `D/saas/objects.py` (per-object `cursor`, `primary_key`, `deletes`,
+  `full_reason`), `secret_map.py` arm. *Check:* pytest, no network: a link
+  to another host stops the run; a Salesforce host outside the suffixes
+  stops it; a blocked address stops it before any credential is sent;
+  429 then 200 succeeds; 429 past the bound fails as `rate_limited`.
+- **T1.9 Load path.** `ingest_factory.py`: `saas` arm in `_run_one_object`,
+  `_load_plan` and `_ADAPTERS`; `sink._apply_cursor` accepts a `saas`
+  resource; before-load `describe` hook (AD7); `ingest_errors.classify`
+  gains `sign_in_refused`, `permission_missing`, `rate_limited` for `saas`.
+  *Check:* pytest with a fake vendor: incremental second run reads only the
+  newer rows; merge on the primary key leaves no duplicate; a left-out
+  column is absent; a describe change triggers the connector's rule.
+- **T1.10 Discovery.** `discover.py`: `saas` reader calling the vendor
+  module's `list_objects`. *Check:* pytest.
+- **T1.11 Console.** Picker category "Business apps"; a dial form per vendor
+  driven by the vendor fixture (only `account` and the sign-in choice);
+  `credentialSlotsFor`; the connector page lists objects with
+  "incremental" or "re-read in full: <reason>". Brand marks only where the
+  current Simple Icons release publishes them (rule in `brand-marks.ts:21-29`).
+  *Check:* `bun run typecheck`, lint, tests in `src/features/connectors`.
+- **T1.12 Gate skeleton.** `ops/g6/saas_stub.py`, `Dockerfile.saas_stub`,
+  compose profile `g6-saas`, `ops/g6/g6_saas_test.py`, CI job `g6-saas` in
+  `ci.yml`, `ci-required`, `scripts/ci/required_gate.sh` and its test,
+  `docs/CI.md`. With no vendor it asserts the ten types are listed as not
+  supported. *Check:* the job passes in CI; time recorded.
+
+### Slices 2–6: one vendor per task group
+
+For each vendor, in decision 12's order, these tasks (vendored or
+`rest_api` as AD4/AD5 say):
+
+- **Vn.1 Code.** Vendored: copy at the pinned commit (`UPSTREAM.md`,
+  licence), one commit unchanged; then each fix its own commit (HubSpot
+  incremental by `hs_lastmodifieddate` through the search API; Zendesk
+  duplicates; Salesforce `primary_key = Id`, custom objects via `describe`,
+  `IsDeleted` through `queryAll`; GA4 REST transport). `rest_api`: the
+  config, auth class, paging, cursor, delta state. Exact pins added to
+  `dagster/pyproject.toml` with a dated note and the licence of each new
+  library (MIT, Apache-2.0, BSD only; anything else stops and is reported).
+- **Vn.2 Objects.** `list_objects`, `describe` where AD7 applies, per-object
+  declarations (decisions 5, 6, 7).
+- **Vn.3 Sign-in.** Vendor table row (Rust and Python, fixture), both ways
+  of decision 3, probe "who am I".
+- **Vn.4 Mock and gate step.** The vendor's routes in `saas_stub.py`
+  behaving as the vendor (its paging shape, its error bodies, a 429, a
+  changed field, a delete where it reports deletes); `g6_saas_test.py`
+  steps connect, discover, load, reload (incremental), schema change,
+  revoked sign-in.
+- *Check per vendor:* pytest for the vendor module with recorded responses
+  (no network); the gate's steps for the vendor pass in CI.
+
+Slice 6 note: Workday's object is a report URL the user names (owner and
+report), read with `single_page`; the page says it is re-read in full.
+
+### Slice 7: supported, docs, measurement
+
+- **T7.1 Migration `0096_saas_connectors_supported.sql`** flips the eight
+  (not Workday, NetSuite) to `supported = true` with the guarded `UPDATE`
+  shape; `coverage.json` entries with `gate: "g6-saas"` and all steps
+  `real`, in the same commit. *Check:* SRC-9 lint.
+- **T7.2 Measure.** `docs/plans/SRC-3-RESULT.md`: the `g6-saas` job time
+  from three CI runs against the 20-minute budget; per vendor the rows and
+  pages the gate loaded; what was not measured (real accounts).
+- **T7.3 Docs.** `PRODUCT.md` (`:113`, `:115`, `:216`, `:351`),
+  `competitive-comparison.md` (`:431`, `:433`, `:440`), feature pages
+  `connector-gates.md`, `connectors-that-work.md`,
+  `table-discovery-every-source.md`, `credentials-done-properly.md`
+  (OAuth limits), `load-modes.md`, `source-schema-changes.md`;
+  `user-guide.md:59`; README connection-test list; `coverage.json` `_about`;
+  `NOTICE` (vendored Apache-2.0 code); `CHANGELOG.md`; BACKLOG `SRC-3`
+  Building with #214 and the Dates row; new backlog items for the second
+  wave by demand and anything found.
+
+## 7. PR
+
+Draft #214 from the first commit. CI on every push. Browser check by the
+product owner once at the end on a QA instance (screens, the mock vendors
+cannot be signed into there; real accounts per decision 11 for the
+acceptance checklist). Merging is others' job.
+
+## 8. Verify, do not assume
+
+Each before the code that depends on it; a false one stops the task and is
+reported here:
+
+1. GA4's `BetaAnalyticsDataClient` runs with the REST transport and its
+   HTTP goes through `getaddrinfo` (before Vn.1 of GA4).
+2. `simple-salesforce` accepts our `requests.Session` for every call it
+   makes, including Bulk API 1.0 (slice 3).
+3. dlt 1.30.0's `rest_api` `header_link` and `json_link` hand the next URL
+   to a session we control, so AD3 applies (slice 1, T1.8).
+4. dlt's Iceberg merge strategy used by our sink (`upsert`) works with the
+   vendor primary keys, and `delete-insert` is not needed (T1.9).
+5. The SRC-9 lint grammar covers the CHECK widening (T1.1).
+6. dlt resource state survives a failed run for delta links (slice 5).
+7. Each new library's licence (Vn.1).
+
+## 9. Out of scope
+
+`SRC-4`; the second wave; writing back; SharePoint and Confluence files;
+GA4 raw events; a no-code builder (decision 14); changing `rest.py`'s
+rule Z5.
+
+## 10. Rules for the whole phase
+
+`AGENTS.md` in full. In particular: secrets only as `SecretValue` and
+through the allowlisted resolver; no vendor error text in a response;
+fixed vendor hosts in code, never from the user; no real account names,
+hosts or tokens in code, fixtures or docs (rule 12); cite this plan's
+decisions (`SRC-3 decision N`, `AD-N`) at the code that carries them.
+
+## 11. Handoff
+
+(Developer, per slice: commits, the exact commands with their counts, what
+was not verified and why.)
+
+### Handoff: slice 1 (developer, 2026-10-19)
+
+Commits, in order (branch `feat/data-phase-4-connectors`, base `2ea0f377`):
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T1.1 | `832a5ed9` | SRC-3 feat(migrations): saas adapter and the ten business-app connector types, unsupported |
+| T1.2 | `d9a7d72f` | SRC-3 feat(store): saas vendor table and Dial::Saas |
+| T1.3 | `52d2a4a2` | SRC-3 feat(store): incremental loads and column choice for saas objects |
+| T1.4 | `c0ea41d0` | SRC-3 feat(api): connection test for saas connectors |
+| T1.5 | `2443e156` | SRC-3 feat(api): OAuth sign-in for saas connectors, with client_secret_basic |
+| T1.6 | `e3b9d2b4` | SRC-3 test(api): saas listing and column preview go to the orchestrator |
+| T1.7 | `fabbe751` | SRC-3 feat(ai): the assistant's connector tools know the saas adapter |
+| T1.8 | `2e97023c` | SRC-3 feat(dagster): SaasSession, vendor registry and object declarations |
+| fix (PR #214 CI) | `1988a26f` | SRC-3 test(store): connector_type tests know the ten saas types |
+| T1.9 | `34120026` | SRC-3 feat(dagster): the saas load path, with a describe hook and incremental loads |
+| T1.10 (Rust half) | `8d9d601d` | SRC-3 feat(store): discovery lists a business-app object with how it loads |
+| T1.10 | `1e19ae75` | SRC-3 feat(dagster): discovery reads a saas connector through its vendor module |
+| T1.11 | `00393bd2` | SRC-3 feat(frontend): business apps in the connector picker and forms |
+| T1.12 | `c2e7a263` | SRC-3 ci(gate): the g6-saas job skeleton and the mock vendor server |
+
+Commands run on the final tree, with counts:
+
+- `cd rust && cargo fmt --check`: clean.
+- `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets --all-features -- -D warnings` (shared `CARGO_TARGET_DIR`, `-j 2`, crate sources touched first): finished, 0 warnings. (Only these two crates changed Rust.)
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, loader tests included, venv `~/.cache/rantai-dagster-venv`, dlt 1.30.0): **1746 passed, 0 failed** (16m08s).
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: all OK; `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: OK.
+- `bun run typecheck`: 8 errors, all `Cannot find module 'three'` / its follow-on under `src/features/landing/scene` (the checkout has no `node_modules` of its own; it uses the main checkout's through a symlink that is not committed, and that install lacks `three`); 0 errors anywhere else. `bun run lint`: 0 errors, 6 warnings, none in files of this slice.
+- `bun test src/features/connectors`: 338 pass, 0 fail. `bun test src/lib/connectors`: 45 pass, 1 skip, 0 fail. `bun test src/services`: 85 pass, 0 fail.
+- `bash scripts/ci/tests/test_required_gate.sh`: 52 passed, 0 failed.
+- `docker compose --profile g6-saas config --quiet` (with the g6 override) and `--profile '*' config --quiet`: OK (fake `.env` values).
+
+**Not verified, and why**
+
+- **No Rust test was run** (`cargo test` is forbidden on this machine). Every Rust unit and integration test added or changed (`saas_vendors.rs`, `ingest_spec.rs` saas tests, `connector_probe/saas.rs`, `routes/connector_oauth.rs`, `connector_oauth.rs`, `tests/connector_oauth_flow.rs`, `tests/connector_discovery.rs`, `tests/connector_type.rs`, `tool_schemas_snapshot_is_byte_identical`) compiled under clippy `--all-targets` and was read, but did not run. `tests/fixtures/tool_schemas.json` was edited by hand to what the registry should print (two strings, one enum value), not regenerated. PR #214 CI's first run of T1.1 to T1.4 found the three `connector_type.rs` failures fixed in `1988a26f`; nothing of T1.5 onward has run in CI yet.
+- **The `g6-saas` job and `g6_saas_test.py` have not run.** The job is copied from `g6-discovery-scale` and `g6-oauth`; the stub was started locally and answers `/health` and 404; the gate script was not executed against an API.
+- **The Rust and Python account rules are separate code**, compared only through the vendor table fixture and each side's own tests; the shared fixture covers the table, not the account-validation functions. The near-miss lists in both languages' tests are the same on purpose.
+- **Brand marks were not added** (T1.11): the current Simple Icons release could not be checked from this machine, which `brand-marks.ts:21-29` requires. All ten types show the generic icon.
+- Nothing was shown in a browser.
+
+**Plan items decided or found false (section 8)**
+
+- Item 3 (dlt `rest_api` links): true by reading dlt 1.30.0; `RESTClient` takes a caller-supplied session and paginators set `request.url` to the next link, so a `Session.send` override can apply AD3. Not run with a vendor (slice 4).
+- Item 4 (upsert merge on vendor keys, `_apply_cursor`): verified by running, in `test_adapters_saas.py` against a local Iceberg catalog with a real dlt resource: the second incremental run read only the newer rows, the merge left no duplicate, and `sink._apply_cursor` accepted the saas resource, so `sink.py` is unchanged.
+- Item 5 (SRC-9 lint grammar): true; `0095` is in the shapes the lint replays and the lint needed no change.
+- Items 1, 2, 6, 7: not reached in slice 1.
+
+**Plan mismatches found (the planner decides)**
+
+1. **Paths.** `ingest_spec.rs` is in `rust/crates/lakehouse-store/src`, not `lakehouse-api`. Because `Dial::parse` validates the account against the vendor table and the API crate depends on the store, `saas_vendors.rs` is in the store too (T1.2 said `A/saas_vendors.rs`).
+2. **T1.9 asks `ingest_errors.classify` to gain `permission_missing` and `rate_limited`.** The run-report classes are a closed list enforced by `connector_run.rs` and by `CHECK connector_run_attempt_class_check` (`0072`); two new classes need a migration, and `0095`/`0096` are taken. Provisional mapping, in the code and the commit: `SaasSignInRefused` and `SaasPermissionMissing` classify as `sign_in_refused` (not retried), `SaasRateLimited` as `source_busy` (retried). Decision 7 of the feature page ("a permission is missing", "the vendor limits the rate" in plain words) is therefore NOT met for run reports until the classes exist. Discovery already has `no_permission`, and uses it.
+3. **T1.10 and T1.11 assume the discovery result can list a business-app object and say how it loads.** `ObjectKind` is closed and `ListedObject` denies unknown fields, so a saas listing would have been refused. Added `ObjectKind::Object` and an optional `load` text (`8d9d601d`, additive, validated). This is Rust work outside the task text; revert it if the planner wants another carrier.
+4. **`connector_type.rs` tests (`1988a26f`).** `unsupported_rows_have_no_adapter` guards "an unsupported type without a `Dial::parse` shape has no adapter"; the exceptions are named (`0062` Sheets, `0066` the two CDC types) because those types keep their adapter so existing connectors open in the edit page. The ten saas types are the same case, so they were added to the named list (not a wildcard), the count became 26, and a new test pins adapter `saas` plus the reason for each. AD10 is unchanged. If the planner prefers `adapter = NULL` until `0096`, `0095` must change instead (not applied, so no deployed database has it).
+5. **Confluence.** With browser sign-in the Atlassian API host is `api.atlassian.com/ex/confluence/<cloud id>`, not `<site>.atlassian.net`. The table row uses the site host (right for an API token); slice 4 must add the cloud-id step.
+6. **Dynamics and SharePoint client credentials need a Microsoft tenant id**, which no slot or dial field carries yet; slice 5.
+7. **The vendor scopes and revocation addresses in the table are from the developer's knowledge of each vendor's documentation, not checked against it from this machine** (no network). Slices 2 to 6 check each when the vendor is built.
+
+**Other**
+
+- `rest.py` changed only to add `client_secret_basic` to the token request (AD8); a `rest` connector's request is unchanged (a `rest` test failed while `headers=` was always passed; fixed to pass it only when asked).
+- Not changed: `rest.py`'s rule Z5, `sink.py`, `POLICY_TABLE` and `tests/route_auth.rs` (no route was added or widened).
+- `src/features/connectors/connector-ingest-panel.test.tsx` has one expected sentence updated with the copy it checks ("SQL sources and business apps only").
+
+
+### Handoff: slice 1 fix round (developer, 2026-10-19)
+
+- **BLOCKER 1** fixed in `5f811fa6` (SRC-3 fix(runs): permission_missing and rate_limited are run-report classes): migration `0097_connector_run_attempt_saas_classes.sql` (DROP and ADD of `connector_run_attempt_class_check`, a statement shape no lint reads); `connector_run::ErrorClass::{PermissionMissing, RateLimited}` with fixed texts, `RateLimited` transient and `PermissionMissing` not; `ingest_errors` (`PERMISSION_MISSING`, `RATE_LIMITED`, `RETRIED_CLASSES` includes the second; `SaasPermissionMissing` and `SaasRateLimited` classify to them, `SaasSignInRefused` stays `sign_in_refused`); console contract and wording (`permission_missing`, `rate_limited`, and "Retries are used up" for a rate limit). The retry loop reads `classify().retried`, so the run's own delays apply to `rate_limited` with no change to `_fail_or_retry`. Discovery is unchanged (it has `no_permission` already).
+  - Run: `cargo fmt --check` clean; `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings` 0 warnings; pytest `test_ingest_errors.py`, `test_adapters_saas.py`, `test_ingest_run_reports.py`, `test_ingest_retries.py`, `test_discover.py`, `test_saas_session.py`: 214 passed; `bun test src/features/connectors/connector-ingest-panel.test.tsx`: 85 pass, 0 fail; `bun run lint` 0 errors; typecheck 0 errors outside `features/landing/scene`; `check_connector_gate_coverage.py` OK; no duplicate migration numbers.
+  - **Not verified:** the new Rust test `the_two_saas_classes_are_stored_worded_and_retried_only_for_the_rate_limit` (DB round trip, and that a made-up word is still refused by the CHECK) compiled but did not run; nor did `0097` itself against a database.
+- **SHOULD-FIX 2** not changed, and *not verified*: the repository's generator is the ignored Rust test `routes::ai::registry::tests::write_tool_schema_fixture` (`cargo test -p lakehouse-api --lib write_tool_schema_fixture -- --ignored`), a `cargo test` run that this machine may not do. The hand edit stays (one enum value, one description string, both in `registry.rs` and in the fixture); `tool_schemas_snapshot_is_byte_identical` in CI is the check. If it fails, run the generator on a machine that can and commit the difference.
+
+### Handoff: slice 2 (developer, 2026-10-19)
+
+HubSpot, then Zendesk (V-HubSpot.1 to .4, V-Zendesk.1 to .4), one task per commit, in
+that order. Base: `dc3373ae` (the slice 1 fix round).
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| V-HubSpot.1 | `62c21ac3` | HubSpot verified source, copied unchanged |
+| V-HubSpot.1 | `3e4fda0e` | `SaasSession` can POST a search request |
+| V-HubSpot.1 | `1feaee7b` | vendored HubSpot reads only through `SaasSession` (local change 1) |
+| V-HubSpot.1 | `f0f8ab7a` | HubSpot loads incrementally by last-modified time through the search API (local change 2) |
+| V-HubSpot.2 | `00700ef5` | HubSpot objects, properties-API describe and reads |
+| V-HubSpot.3 | `87a919bb` | HubSpot sign-in, both ways, and the checked vendor row (scopes) |
+| V-HubSpot.4 | `9472fc0b` | mock HubSpot and the HubSpot steps of `g6-saas` |
+| V-Zendesk.1 | `0a51a40a` | Zendesk verified source, copied unchanged |
+| V-Zendesk.1 | `2d735595` | vendored Zendesk without Talk and Chat (local change 1) |
+| V-Zendesk.1 | `1dabfe4b` | vendored Zendesk reads only through `SaasSession` (local change 2) |
+| V-Zendesk.1 | `6bf27c37` | the duplicate of upstream #659 found and fixed (local change 3) |
+| V-Zendesk.2 | `659d7979` | Zendesk objects, incremental reads and deletes |
+| V-Zendesk.3 | `2510b78b` | Zendesk email + API token sign-in; browser sign-in blocked (below) |
+| V-Zendesk.4 | `1a810245` | mock Zendesk and the Zendesk steps of `g6-saas` |
+
+Both sources are copied from `dlt-hub/verified-sources` at one commit,
+`3957506893a7da821dbcc6acd51c7ca4475d1f53` (2026-07-03), into
+`dagster/dispar_orchestrate/saas/vendored/{hubspot,zendesk}/`, each with `UPSTREAM.md`
+(repo, commit, date, every local change with its reason) and the Apache-2.0 licence.
+The copy is its own commit and byte-identical. No new Python library: both sources use
+only `dlt` (pinned) and the standard library, so no pin, note or licence entry was added
+to `dagster/pyproject.toml`. `NOTICE` is not touched (slice 7, T7.3).
+
+**What was found, per vendor**
+
+- *The vendored code can be given our session* (the stop condition): both sources fetch
+  through `dlt.sources.helpers.requests` in a few functions (`helpers.py`;
+  `ZendeskAPIClient.get_pages`). Local change 1 of each replaces that by
+  `SaasSession.get_json` (the `api_key` / credentials parameters became the session; a
+  test fails if a vendored module imports an HTTP library). `SaasSession` gained
+  `post_json` for HubSpot's search, with the same address, link, redirect and 429 rules.
+- *HubSpot incremental* (`helpers.search_data_since`): the CRM search API, `GTE` on
+  `hs_lastmodifieddate` (`lastmodifieddate` for contacts), ascending, `after` paging. PR
+  #662 was read, not copied; differences, each for a limit HubSpot documents
+  (developers.hubspot.com/docs/api/crm/search): the 10,000-result cap restarts from the
+  newest time seen and raises `SearchOutOfBoundsException` (the module then reads the
+  object in full) when 10,000 records share one instant; properties beyond the
+  3,000-character body are batch-read by id; a 60 s lag before the cursor because HubSpot
+  says an update can take "a few moments" to be searchable. First run lists, later runs search.
+- *HubSpot deletes (decision 7)*: HubSpot's documentation says archived records "won't
+  appear in any search results"; the archived listing (`archived=true`) is a separate full
+  read. So no HubSpot object claims `deletes`, and a record archived at HubSpot stays in Bronze
+  until a full reload. The feature page's "Limits" list (deletes only for Salesforce,
+  Zendesk, SharePoint, Dynamics) is therefore right and needs no change.
+- *HubSpot describe (decision 9)*: the properties API, before the load; `None` for owners and
+  pipelines, which have no such API (the adapter and discovery take the after-load path).
+- *Zendesk duplicate (#659), cause*: `ticket_table` read the time-based export; such a page
+  ends at the `generated_timestamp` of its last item and the next page starts AT that time,
+  so the tickets sharing it are sent again (Zendesk documents it). In `ticket_events`
+  (`append` + primary key) the repeat is a stored row. *Fix*: tickets and users use the
+  cursor-based export (no repeat within an export); ticket events and organizations have only
+  the time-based one, so `get_pages(distinct_by=...)` drops an item with an already-seen
+  `id` + `created_at` / `updated_at`, Zendesk's own documented rule. The test shows
+  `[1, 2, 3, 3, 4, 5, 5, 6]` on the vendor's time-based endpoint and `[1, 2, 3, 4, 5, 6]` after.
+- *Zendesk deletes*: a deleted ticket stays in the export with `status = "deleted"`; only
+  tickets say `deletes` (the row is marked, not removed: Zendesk scrubs content after 30 days
+  and drops the record 90 days after a permanent deletion).
+- *Zendesk objects*: tickets, users, organizations, ticket events, ticket metric events
+  incremental; the verified source's other Support objects (31 in all) re-read in full with
+  the reason on the page. Custom fields are not pivoted (a pivot names columns after titles an
+  admin can rename and needs the source's state); `tags` and `custom_fields` are one JSON text.
+- *Vendor-table rows checked against vendor documentation (review item 5)*, URLs in the commit
+  bodies of `87a919bb` (HubSpot) and `2510b78b` (Zendesk). HubSpot's scopes were incomplete
+  (only `crm.objects.*.read` and `tickets`); corrected in Rust, the fixture, Python and the
+  console to add `crm.objects.quotes.read`, `crm.schemas.{companies,contacts,deals,quotes}.read`,
+  `e-commerce` and `oauth`. The scope names were read on HubSpot's reference pages; which
+  endpoint needs which is read from those pages, not tried on an account.
+
+**Plan mismatches found (the planner decides)**
+
+1. **Zendesk's browser sign-in cannot work with SRC-12's token request.** `POST /oauth/tokens`
+   "must be formatted as JSON" (developer.zendesk.com/api-reference/ticketing/oauth/grant_type_tokens/);
+   the product's token request (Rust `connector_oauth::token_request` for the callback and the
+   probe, `rest._token_request` in Python) is form-encoded, and the vendor table's `clientAuth`
+   (`post` / `basic`) cannot say "JSON". Zendesk's refresh token also rotates (handled by the
+   existing rotated-token report). Not built, as instructed: the fix is a third method
+   (`post_json`) in three Rust call sites (`routes/connector_oauth.rs`, `connector_oauth.rs`,
+   `connector_probe/saas.rs`), `rest._token_request`, the fixture, the Python and Rust tables and
+   the console mirror, which this machine cannot test (no `cargo test`). The email + API token way
+   is built. A strict `xfail` test (`test_the_browser_sign_in_sends_zendesks_token_request_as_json`)
+   records the gap and turns red when it is fixed; the gate logs "NOT RUN" with the reason.
+   Decision 3 ("extended for that vendor, not dropped") needs the planner to schedule that Rust work.
+2. **The vendor hosts are fixed, so a gate cannot point a vendor at the mock.** Added
+   `rebase_for_gate` (`saas/vendors/__init__.py`): a gate-only `SAAS_GATE_ORIGINS` that does nothing
+   unless `CONNECTOR_OAUTH_ALLOW_HTTP=true`, names the vendor, and holds a bare `http(s)://host:port`
+   (tested, falls back to the real host on anything else). It goes round "hosts come only from the
+   table" (AD2), so it is commented as such at the site; the planner should confirm that is acceptable.
+   The mock gives each vendor its own port and serves the vendor's real paths.
+3. **Gate and unsupported types.** Nothing refused a connector of an unsupported type (the API
+   lists and creates them; the SRC-9 lint reads migrations only). The vendor steps do not create a
+   connector at all: they drive the vendor module and `SaasSession` in the runner (the Dagster image)
+   against the mock. So the gate proves the vendor code over HTTP; it does not go through the API's
+   connector routes (the Rust connection test has wiremock tests) or the Iceberg sink (pytest `loader`
+   tests do that). The API step still asserts the ten types are `supported: false`.
+4. **Small changes outside the task text, all in Python:** the registry now imports a vendor module
+   by path on first use (`MODULE_PATHS`; the "no module" tests use NetSuite); `describe` may answer
+   `None` (adapter and discovery handle it); `ObjectDecl`/adapter unchanged otherwise.
+5. **HubSpot API version.** The code uses `/crm/v3/...` as the vendored source does. HubSpot's current
+   documentation shows date-versioned paths (`/crm/objects/2026-09/...`) and I did not find a sunset
+   date for `v3`; not verified.
+
+**Commands run, with counts**
+
+- `cd dagster && ~/.cache/rantai-dagster-venv/bin/python -m pytest dispar_orchestrate -q` (whole suite,
+  loader tests included, on the final tree): **1795 passed, 1 xfailed, 0 failed** (16m23s). The one
+  xfail is the strict Zendesk browser sign-in test above. New files: `test_saas_vendored_hubspot.py` (8),
+  `test_saas_hubspot.py` (15), `test_saas_vendored_zendesk.py` (7), `test_saas_zendesk.py` (15 + 1 xfail);
+  `test_saas_session.py` +1, `test_saas_vendors.py` +1, `test_adapters_saas.py` +1, `test_discover.py` +1.
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`,
+  `check_connector_gate_coverage.py`: all OK; `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: 23 tests OK.
+- The gate's vendor steps, run for real against the stub (`python3 ops/g6/saas_stub.py` on this machine,
+  then `python g6_saas_test.py --vendors-only` with the checkout's `dispar_orchestrate` first on
+  `PYTHONPATH`): 15 `[saas]` lines then `PASS (11 s)` (HubSpot 7 lines, Zendesk 8 lines, one of them the
+  recorded "NOT RUN").
+- The stub image built and run: `docker build -f ops/g6/Dockerfile.saas_stub` then `docker run`; `/health`
+  answered `{"status": "ok", "vendors": ["hubspot", "zendesk"]}` and a HubSpot route answered 200.
+- `docker compose --env-file <fake values> -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+  --profile g6-saas config --quiet`: OK (the runner now carries the two gate-only switches).
+- `bun test src/lib/connectors`: 45 pass, 1 skip, 0 fail. `bun test src/features/connectors`: 339 pass, 0 fail.
+  `bun x eslint src/lib/connectors/saas-vendors.ts`: clean. `bash scripts/ci/tests/test_required_gate.sh`: 52 passed.
+- `cd rust && cargo fmt --check`: clean.
+
+**Not verified, and why**
+
+- **No Rust was compiled or tested.** The only Rust change is the HubSpot scope list in
+  `lakehouse-store/src/saas_vendors.rs` (a string array). `cargo clippy -p lakehouse-store` did not run:
+  another session had `cargo test` running and `df -h /` showed 6.2 GB free (below the 8 GB rule). `cargo fmt --check`
+  passed. The Rust vendor-table test that compares with `ops/fixtures/saas_vendors.json` (CI) is the check that the
+  Rust and the fixture scopes agree; the Python (`test_saas_vendors.py`) and console (`saas-vendors.test.ts`)
+  comparisons passed.
+- **The `g6-saas` job in CI has not run** with these steps: the steps ran against the stub on this machine, not in the
+  compose stack with the API, and its time against the 20-minute budget is unmeasured.
+- **No real HubSpot or Zendesk account** (decision 11): every vendor shape is from the vendor's documentation, modelled in
+  the mock. In particular the exact scope-to-endpoint mapping for HubSpot, that Zendesk's cursor export accepts
+  `per_page`, and Zendesk's behaviour when more items share one timestamp than a page holds, are from documentation
+  and not tried.
+- **Zendesk browser sign-in** and the HubSpot revoke call (`DELETE /oauth/v1/refresh-tokens/{token}`, not RFC 7009) are
+  not exercised; the table keeps no revocation address for either.
+- The unit tests of the Rust `Dial::Saas` account rules and the probe are unchanged and were not run.
+- Nothing was shown in a browser.
+
+### Handoff: slice 2 fix round (developer, 2026-10-21)
+
+Findings of the slice 2 review (commit `95199be0`), one commit each, in the order asked
+(Python, console and compose first; Rust last). Disk was below 8 GB all round, so **no cargo
+build, check, clippy or test ran**; the Rust was written and checked with `cargo fmt --check` only.
+
+| Finding | Commit | Subject |
+| --- | --- | --- |
+| SHOULD-FIX 6, SHOULD-FIX 7 | `f5964d7f` | HubSpot v3 note in `UPSTREAM.md`; the connector page says a deleted Zendesk ticket stays with `status = deleted` and HubSpot reports no deletes |
+| BLOCKER 3 | `f3e0668c` | Zendesk browser sign-in through `client_secret_post_json` (table value `post_json`) in Rust, Python, fixture, console; the xfail is a real test; the gate's Zendesk sign-in step runs against a mock `/oauth/tokens` that wants JSON and rotates the refresh token |
+| SHOULD-FIX 5 (Rust half) | `af60d493` | `connector_oauth::gate_rebase`: the API's saas probe, save-time address check and sign-in callback use the gate-only mock origin, under the same switch, with a test |
+| BLOCKER 4 (prerequisite) | `4afd8a24` | the API's connection test learns Zendesk's email + API token (Basic with `<email>/token`); without it the real `connect` step answered "not testable" |
+| BLOCKER 4 | `c427ddf0` | `g6-saas` through the product, once for both vendors |
+
+- **SHOULD-FIX 5, Python half**: already in `slice 2` (`test_the_gate_rebase_does_nothing_unless_the_gate_only_switch_and_the_vendor_are_named`:
+  switch off, switch not exactly `true`, other vendor, seven odd values); the Rust twin test is
+  `the_gate_rebase_is_ignored_unless_the_gate_only_switch_is_on_and_the_vendor_named`.
+- **BLOCKER 3 detail**: the new method is serialised `post_json` (like `post`, `basic`); the Rust arms are the
+  callback exchange, the probe's refresh and `revoke_request`; `rest._token_request(as_json=...)` is used when the
+  row says `post_json`. Zendesk is the only vendor on it (a Rust test and a Python test say so). Cited:
+  developer.zendesk.com/api-reference/ticketing/oauth/grant_type_tokens/.
+- **BLOCKER 4 detail**: `PRODUCT_VENDORS` in `ops/g6/g6_saas_test.py` holds one entry per vendor (HubSpot, Zendesk);
+  `step_product` does create (API), connection test, discovery (list and preview through the orchestrator), load
+  (`ingest_job` into Bronze, read back through ClickHouse), reload (changed, new and deleted/archived records, merged on
+  the key, no duplicate) and a revoked sign-in (API test and run fail, none of the mock's words). The vendor-level steps
+  stay. To let the product reach the mock: `ops/g6/docker-compose.g6-saas.override.yml` (this job only) sets
+  `CONNECTOR_OAUTH_ALLOW_HTTP` and `SAAS_GATE_ORIGINS` on `lakehouse-api` and `dagster-code-location`; the
+  runner gets ClickHouse, Dagster and the credential volume; the CI job now runs `--profile dagster` with the four
+  Dagster services and a 25-minute cut-off (as `g6-ingest-other`). `docs/CI.md` describes it.
+
+**Commands run, with counts**
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, once, final tree): **1797 passed, 0 failed**
+  (15m57s; the strict xfail is gone).
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: OK.
+- `bun test src/lib/connectors`: 45 pass, 1 skip, 0 fail. `bun test src/features/connectors`: 339 pass, 0 fail.
+- `bash scripts/ci/tests/test_required_gate.sh`: 52 passed. `python3 -c yaml.safe_load` of `ci.yml`: parses.
+- `docker compose --env-file <fake values> -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f
+  ops/g6/docker-compose.g6-saas.override.yml --profile g6-saas --profile dagster config --quiet`: OK.
+- The vendor-level gate steps against the local stub (`g6_saas_test.py --vendors-only`): `PASS`, including the Zendesk
+  browser sign-in with a JSON token request and a rotated refresh token.
+- `cd rust && cargo fmt --check`: clean.
+
+**Not verified, and why**
+- **All Rust of this round** (`PostJson` in `saas_vendors.rs`, `token_request_json`/`post_fields`, the callback, probe and
+  revoke arms, `gate_rebase`, the Zendesk Basic probe and the three new Rust tests): formatted, **not compiled, not tested**.
+  CI compiles and runs them. The existing probe test for "a pair is not testable" was moved from Zendesk to ServiceNow
+  because Zendesk's pair is now tested.
+- **The product steps of the gate and the whole `g6-saas` job have never run** (no docker stack on this machine now);
+  its time against the 20-minute budget is unmeasured. Things CI may show that I could not: whether
+  `POST .../ingest/run` accepts a connector of a type that is `supported = false` (the review says creation is not
+  refused; the run was not checked), the exact JSON field names ClickHouse returns for the Bronze columns, and whether the
+  Zendesk `custom_fields`/`due_at` columns load. If the job cannot fit 20 minutes it will say so in the summary.
+- **Browser sign-in through the product** (the API's callback exchange and refresh with the stored refresh token) is not
+  exercised: it needs a browser, and a `file:` secret cannot hold a rotated refresh token. The Rust tests and the
+  vendor-level steps cover the token request itself.
+- Nothing was shown in a browser.
+
+### Handoff: slice 3 (developer, 2026-10-21)
+
+Salesforce, then Google Analytics 4 (V-Salesforce.1 to .4, V-GA4.1 to .4), one task per commit,
+in that order. Base: `45bb3c42`. Disk was below 8 GB, so **no cargo build, check, clippy or test
+ran and no image was built**; the Rust was written and checked with `cargo fmt --check` only.
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| V-Salesforce.1 | `ec8d5a76` | Salesforce verified source, copied unchanged |
+| V-Salesforce.1 | `32f6c383` | reads only through `SaasSession`; no `simple-salesforce`, no password sign-in (local change 1) |
+| V-Salesforce.1 | `dc0e2617` | `Id` is the primary key of every resource (local change 2, upstream #692) |
+| V-Salesforce.1 | `89623e8d` | deleted records through `queryAll`; cursor `>=` (local change 3) |
+| V-Salesforce.2 | `06af7bd5` | `queried_fields` exposed (local change 4, no behaviour change) |
+| V-Salesforce.2 | `dcafb5c0` | objects (custom ones too), incremental, deletes, describe |
+| V-Salesforce.3 | `07cdde7f` | browser sign-in; `instance_url` adopted through `adopt_origin`; whoami moved |
+| V-Salesforce.4 | `a3d2ebcd` | mock Salesforce and the Salesforce steps of `g6-saas` |
+| V-GA4.1 | `59d57872` | Google Analytics verified source, copied unchanged |
+| V-GA4.1 | `493a5003` | REST endpoints through `SaasSession`; no Google client (local change 1) |
+| V-GA4.1 | `f9d9e110` | merge on the dimensions, lookback, no empty-range request (local change 2) |
+| V-GA4.2 | `ea1fcc9a` | reports as objects, incremental by the date dimension, `ObjectDecl.lag_seconds` |
+| V-GA4.3 | `2dabb179` | browser sign-in and service-account key; the Google row fixed (`access_type=offline`) |
+| V-GA4.4 | `05560cfa` | mock GA4 and the GA4 steps of `g6-saas` |
+
+Both sources are copied from `dlt-hub/verified-sources` at `3957506893a7da821dbcc6acd51c7ca4475d1f53`
+into `saas/vendored/{salesforce,google_analytics}/`, each with `UPSTREAM.md` and the Apache-2.0 licence,
+the copy its own commit. **No new Python library**, so no pin, note or licence entry in `pyproject.toml`
+(`cryptography==50.0.2` was already pinned and signs the GA4 assertion).
+
+**Plan section 8, verified**
+
+- *Item 2 (`simple-salesforce`)*: true for the library, false for our purpose. In 1.12.10 (Apache-2.0) every call,
+  Bulk API included, is `session.request` through `call_salesforce`, so it accepts a `requests.Session`. But that is
+  a plain `requests` session (redirects followed, no address check, no pinning, no bounded 429 wait), and Bulk 1.0 is
+  XML/CSV job traffic that `SaasSession` (JSON) cannot carry. **Chosen**: replace the library's HTTP with `SaasSession`
+  calls (REST describe, REST `query` / `queryAll` paged by `nextRecordsUrl`, same origin); the library is not added.
+- *Item 1 (`google-analytics-data`)*: 0.23.3 (Apache-2.0) has a REST transport on `google.auth.transport.requests.AuthorizedSession`,
+  so its HTTP does go through `getaddrinfo` (the gRPC one does not). But it is Google's own session (redirects, no address check
+  before the credential, own token refresh) and the package requires `google-api-core`, `google-auth`, `grpcio`, `proto-plus`,
+  `protobuf`. **Chosen**: `runReport` and `getMetadata` through `SaasSession.post_json` / `get_json`; nothing added.
+  The wheel was read, never run.
+
+**What was found, per vendor**
+
+- *Salesforce object model*: describe-global lists the queryable sObjects (custom `Foo__c` included, decision 5); `SystemModstamp` is
+  the cursor where the object has it, `IsDeleted` makes it read through `queryAll` (marked, not removed; a purged record is not reported);
+  describe answers the exact list the load selects. Objects without a modstamp are re-read in full with the reason.
+  Decision 3/4: Salesforce has **no integration credential** (the page's second-way list does not name it) and the SOAP sign-in is not offered.
+- *Upstream defects fixed in the copy*: no primary key (#692); `>` on the cursor lost same-millisecond records; the SOQL spliced the cursor
+  text; blob fields in a batch query; Bulk API fallback (gone).
+- *`instance_url` (AD3)*: `open_session` asks the first token for a vendor that names `adopt_suffixes` (Salesforce only) and adopts the
+  returned host through `SaasSession.adopt_origin` and the `.salesforce.com` / `.force.com` rule before any read. A refused sign-in
+  therefore surfaces at open for Salesforce, at the first read for the others. `adopt_origin(as_origin=)` lets the gate dial its mock after the
+  real host passed the same rule.
+- *GA4 objects*: a report is `label = dimension, dimension | metric, metric` (the dial's `objects` and the source object's name); the time
+  dimension is the cursor, the dimensions the key. Columns are typed from `getMetadata` before the load.
+- *GA4 upstream defects fixed*: `append` with no key (rerun stored twice); the last days (Google: "Data processing can take 24-48 hours") never
+  re-read; a start after yesterday asked Google for an empty range. Now `merge` on the dimensions, a 3-day lookback moved to the start of a week/month/year
+  for coarse time dimensions, and no request for an empty range.
+- *Found by a loader test*: `sink._apply_cursor` replaced the resource's own `dlt.sources.incremental(...)` and so **dropped any lag**; dlt then
+  filtered out the re-read rows. `ObjectDecl.lag_seconds` (new, default 0) reaches dlt's `incremental(lag=)` through `adapters/saas.py`, and
+  `_apply_cursor` keeps it from `resource.cursor_lag_seconds` (absent for `sql_database`: unchanged). This is a small edit in shared code
+  (`adapters/sink.py`); the whole `test_sink*.py` and `test_adapters_saas.py` suites pass with it.
+- *Vendor rows checked against official documentation* (URLs in the commit bodies): **GA4**: addresses, scope, revocation and PKCE confirmed;
+  **the row was wrong**: Google returns a refresh token only with `access_type=offline` (and again only with `prompt=consent`), so the authorise
+  address now carries both, in Rust, fixture, Python and console. Service-account assertion (RS256, claims, one hour) confirmed.
+  **Salesforce**: `developer.salesforce.com` answered 403 and `help.salesforce.com` serves an empty script shell to this machine, so the
+  addresses, scopes `api refresh_token` and `client_secret_post` are **not re-verified** (kept as slice 1 wrote them). The whoami moved from
+  `/services/oauth2/userinfo` (an identity-scope endpoint, scopes `id`/`openid` that the row does not request; also not verified in the docs)
+  to `/services/data/v62.0/limits` (needs only `api`) in all four places. The acceptance row `SRC-3-AC1` on a real org is the check.
+
+**Plan mismatches / decisions for the planner**
+
+1. **Salesforce's API quota is HTTP 403 `REQUEST_LIMIT_EXCEEDED`**, as far as the developer knows (not verified: docs unreadable). `SaasSession`
+   maps 403 to `SaasPermissionMissing`, so an exhausted quota would be reported as "permission missing" and not "the vendor limited the rate"
+   (decision 13). The mock uses the generic 429 + `Retry-After`, as AD9 asks. Needs a decision (a Salesforce-specific body check in the session).
+2. **No console field defines a GA4 report.** The dial form holds `account` and the sign-in only; `dial.objects` is where reports live, and nothing
+   in the console writes it. Rust accepts the field. A GA4 connector cannot be set up from the UI until a form field exists (not in Vn.1 to Vn.4).
+3. **The API's connection test cannot present a service-account key** (the probe answers `supported: false`, as for any non-token integration
+   credential). A load reports whether it worked. Rust probe work was out of the constraints of this slice.
+4. **A Salesforce query longer than 12,000 characters** (an sObject with very many fields) is a fixed failure: the query travels in the GET address
+   (Salesforce refuses beyond 16,384 bytes) and `SaasSession` has no POST-for-query. Column choice does not shorten it (it is applied after the read).
+5. **GA4's "yesterday" is UTC**, as upstream had it, while Google's `dateRanges` are in the property's time zone.
+6. Salesforce API version is the constant `62.0` (`settings.API_VERSION`, also in the whoami path); not checked against Salesforce's retirement list.
+7. `rest.AuthSession` gained an `instance_url` attribute (set from a token answer; a `rest` connector never reads it).
+
+**Commands run, with counts**
+
+- `cd dagster && ~/.cache/rantai-dagster-venv/bin/python -m pytest dispar_orchestrate -q` (whole suite, once, on the final tree, loader tests
+  included): **1882 passed, 0 failed** (16m33s); the slice 2 baseline was 1797. New files: `test_saas_vendored_salesforce.py` (15),
+  `test_saas_salesforce.py` (23 cases), `test_saas_vendored_google_analytics.py` (16), `test_saas_ga4.py` (30 cases);
+  `test_saas_session.py` +1.
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: all OK;
+  `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: 23 tests OK.
+- The gate's vendor steps against the local stub (`python3 ops/g6/saas_stub.py`, then `g6_saas_test.py --vendors-only`, the checkout's
+  `dispar_orchestrate` first on `PYTHONPATH`): 32 `[saas]` lines, `PASS (22 s)` (HubSpot 7, Zendesk 8, Salesforce 8, GA4 8). The stub answers `/health` with
+  hubspot, salesforce, zendesk (and ga4).
+- `bun test src/lib/connectors`: 45 pass, 1 skip, 0 fail. `bun test src/features/connectors`: 339 pass, 0 fail.
+  `bash scripts/ci/tests/test_required_gate.sh`: 52 passed.
+- `docker compose --env-file <fake values> -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g6/docker-compose.g6-saas.override.yml
+  --profile g6-saas --profile dagster config --quiet`: OK.
+- `cd rust && cargo fmt --check`: clean.
+
+**Not verified, and why**
+
+- **All Rust of this slice** (two strings in `lakehouse-store/src/saas_vendors.rs`: Salesforce's whoami path and Google's authorise address): formatted,
+  **not compiled, not tested**. The CI test that compares the Rust table with `ops/fixtures/saas_vendors.json` is the check; the Python
+  (`test_saas_vendors.py`, plus the two vendors' row tests) and console (`saas-vendors.test.ts`) comparisons passed.
+- **The product steps of `g6-saas` for Salesforce and GA4 have never run** (no docker stack here), nor has the job's time against the 20 minutes. What CI
+  may show that I could not: whether the API accepts an OAuth connector whose client secret and refresh token are `file:` secrets created through the
+  generic `credential` slots (`secret_key` / `token`), whether `PUT .../ingest-spec` accepts the GA4 report text as a source-object name, whether the Rust
+  probe reaches the mock for the Salesforce `limits` path and GA4 `metadata` path (`gate_rebase`), and the ClickHouse column names (`id`, `name`,
+  `is_deleted`, `sessions_integer`, `date`) and the JSON type of a Bool column.
+- **No real Salesforce org or GA4 property** (decision 11): every shape is from the documentation I could read (GA4) or from the library and my knowledge
+  (Salesforce), modelled in the mocks.
+- **Salesforce's official documentation** (see above) and its quota status code.
+- The GA4 gRPC/REST transport claim was read in the wheel, not run (the package is not installed).
+- Nothing was shown in a browser.
+
+### Handoff: slice 3 fix round (developer, 2026-10-21)
+
+Findings of the slice 3 review (commit `0e04656d`), one commit each. No cargo build, check, clippy or test ran and no image
+was built (disk 2.3 to 5 GB free); the Rust was written and checked with `cargo fmt --check` only.
+
+| Finding | Commit | Subject |
+| --- | --- | --- |
+| BLOCKER 8 | `9ebf45e5` | Salesforce's 403 `REQUEST_LIMIT_EXCEEDED` is `rate_limited`, not retried in the run |
+| SHOULD-FIX 11 | `d6242106` | GA4 reads up to `yesterday` in the property's time zone |
+| SHOULD-FIX 12 | `82346962` | Salesforce and GA4 limits on the connector page |
+| BLOCKER 9 | `47488264` | the GA4 report editor in the console, fields through discovery |
+| BLOCKER 10 | `57b41000` | the API's connection test of GA4's service-account key; the key in the GA4 product steps |
+
+- **BLOCKER 8**: a vendor module may name `is_quota_exhausted(body)`; `SaasSession` gives it the 403 body and raises
+  `SaasQuotaExhausted` (a `SaasRateLimited`), which `ingest_errors.classify` reports as `rate_limited` with `retried=False`
+  (a per-24-hours quota is not waited out in minutes). Any other 403 is still `SaasPermissionMissing`. Salesforce's limits page
+  stays unreadable from this machine (HTTP 403), so the code `REQUEST_LIMIT_EXCEEDED` is the reviewer's and the developer's;
+  `SRC-3-AC1` on a real org is the proof. Mock route `quota`, vendor-level gate step "salesforce quota".
+- **SHOULD-FIX 11**: no Admin API call was needed. The Data API's `DateRange` reference says `yesterday`, `today` and `NdaysAgo`
+  are "inferred based on the property's reporting time zone", so the request's end is the term `yesterday` (same host, same scope,
+  no stored time zone). No wider lookback and no stated limit were needed; the connector page says the dates are in the property's zone.
+- **SHOULD-FIX 12**: "Limits to tell a customer" states the Salesforce query-length failure, API version 62.0, the recycle-bin purge
+  and the daily limit not retried the same day, and GA4's three re-read days.
+- **BLOCKER 9**: the report editor is `ga4-report-editor.tsx`, shown on the connector's tables card for a GA4 connector in place of
+  "Add by name". The fields come through discovery: `POST .../discovery/list` with `schema: "fields"` reaches the orchestrator, whose
+  saas reader calls the vendor module's `list_fields` (GA4: `getMetadata`, names only) and answers objects of kind `dimension` and `metric`
+  (two new `ObjectKind` variants in Rust and in the contract). The date dimension is always included and shown as the cursor; a chosen
+  time dimension is the cursor instead. The report text (`label = dims | metrics`, `src/lib/connectors/ga4-report.ts`, the server's
+  `parse_report` is the authority) is saved into `dial.objects` and ticked as an `incremental_dedup` object keyed by its dimensions.
+  The GA4 product step also lists the fields through discovery.
+- **BLOCKER 10**: `service_account_access` in `connector_probe/saas.rs`: the key file is resolved after the address check, the key stays a
+  `SecretValue`, the RS256 assertion is signed with the workspace `jsonwebtoken` 11 (no new crate; `aud` is the vendor table's token address,
+  never the key file's `token_uri`), and the exchange goes through `connector_oauth::token_request`. A file that is not a key is a fixed message.
+  `g6-saas` has a second GA4 product entry, `ga4-key`, with a key made for the step and verified by the mock's RS256 check.
+
+**Commands run, with counts**
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, once, final tree; `df -h /` showed 2.3 GB, above the 2 GB rule):
+  **1886 passed, 0 failed** (16m38s); slice 3 baseline 1882.
+- `python3 ops/lint/check_intra_package_imports.py` and `check_connector_gate_coverage.py`: OK.
+- `bun test src/lib/connectors`: 49 pass; `bun test src/features/connectors`: 348 pass (new: `ga4-report-editor.test.tsx` 6,
+  `ga4-ingest-panel.test.tsx` 3, `ga4-report.test.ts` 4); `bun test src/services`: 85 pass; `bun run typecheck`: no error outside
+  `features/landing/scene`; `bun run lint`: 0 errors.
+- Gate vendor steps against the local stub after BLOCKER 8 and SHOULD-FIX 11: `PASS (22 s)`.
+- `cd rust && cargo fmt --check`: clean.
+
+**Not verified**
+- **All Rust**: the two `ObjectKind` variants and the whole of `service_account_access` with its two tests (the signed assertion decoded with the public
+  half; a non-key file) are formatted, not compiled, not run. In particular the `jsonwebtoken` 11 calls (`EncodingKey::from_rsa_pem`,
+  `encode`, `Validation::set_audience`, `DecodingKey::from_rsa_pem`) and the `rsa` 0.9 dev-dependency in the test follow the existing
+  `routes/auth.rs` test but were not compiled.
+- The new `ga4-key` and discovery-fields product steps, and the whole `g6-saas` job, did not run (no docker stack).
+- The report editor was not shown in a browser.
+- Salesforce's own documentation, still unreadable from this machine.
+
+### Handoff: slice 4 (developer, 2026-10-21)
+
+ServiceNow, then Confluence (Vn.1 to Vn.4), base `7ddb2be8`. Disk was 2.2 to 2.3 GB: **no cargo build, check,
+clippy or test ran and no image was built**; Rust was checked with `cargo fmt --check` only.
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| V-ServiceNow.1 | `df7544f9` | Table API through `SaasSession`, `Link` header paging, `sys_updated_on` cursor, client credentials; `SaasSession.get_json_with_next` |
+| V-ServiceNow.2 | `fab36244` | objects (suggested + by name), declaration from a sample record, describe via `sys_dictionary` |
+| V-ServiceNow.3 + Confluence row | `35c632f3` | vendor-table rows (fixture, Rust, Python, console), probe for ServiceNow client credentials and Confluence Basic |
+| V-ServiceNow.4 | `95de67b7` | mock ServiceNow, vendor-level and product gate steps |
+| V-Confluence.1 to .3 (Python) | `db3757f1` | objects, cursor paging, newest-first incremental, both sign-ins, gateway cloud id (`AccountParts.base_path`, `oauth.apiBase`) |
+| V-Confluence.4 | `12f0f9cf` | mock Confluence, vendor-level and product gate steps (`max_reads`) |
+| docs | `34371707` | limits on the feature page, `docs/CI.md` |
+
+**Choice asked for (plan section 8 item 3).** Both vendors call their endpoints through `SaasSession` directly (as slice 3),
+not a dlt `rest_api` source: dlt's `RESTClient` takes a `requests.Session`, but the address check and pinning before each request,
+credentials only after it, no redirects, the bounded `Retry-After` and the same-origin link rule are in `SaasSession._send`. The records go to the usual dlt resource. No library added.
+
+**Found against the vendors' documentation (URLs in the commit bodies)**
+- *Confluence row was wrong in four ways*: the token endpoint takes JSON (`clientAuth` -> `post_json`); the authorise address needs `audience=api.atlassian.com&prompt=consent`; `read:blogpost:confluence` does not exist (v2 OpenAPI scopes are `read:space|page|comment:confluence`; blog posts use `read:page`); a browser token is accepted only at `api.atlassian.com/ex/confluence/{cloudId}`. The last is a new optional `oauth.apiBase` in the table (fixed host, AD2); the cloud id comes from `accessible-resources`, matched to the site address, validated as a UUID, stored in the new `AccountParts.base_path`. The rotating refresh token uses the existing report path (tested).
+- *ServiceNow row*: addresses and the client-credentials grant (form body) confirmed; revocation is `GET oauth_revoke_token.do?token=`, not RFC 7009, so the table's revocation address is dropped (as Zendesk's).
+- *Confluence incremental (decision 6)*: `/pages`, `/blogposts` and both comment lists sort by `-modified-date` (OpenAPI `PageSortOrder`, `BlogPostSortOrder`, `CommentSortOrder`), so the read walks newest first and stops at the first record older than the cursor; sound because the order is by the cursor's own field. Spaces have no sort/filter by time and are re-read in full.
+- *ServiceNow paging*: by the `Link` header, not offset, because `sysparm_limit` is applied before the access check (a short page is not the last). 
+- *Loader test finding*: dlt cannot apply a lag to a string cursor (`IncrementalCursorInvalidCoercion`), so both vendors load their change time as a timestamp.
+
+**Plan mismatches / decisions for the planner**
+1. **ServiceNow date literal time zone**: the Table API page does not say whether a date in `sysparm_query` is UTC or the user's zone; the cursor therefore lags one day (`LAG_SECONDS`) and the merge removes repeats. Confluence's 300 s lag is our margin, not a documented figure. Both on the feature page.
+2. **No deletes claimed** for either (decision 7): `sys_audit_delete` was not tried (access unknown); Confluence's trashed content just drops out of the listing.
+3. **ServiceNow describe** needs read access to `sys_dictionary`/`sys_db_object`; with 403 it answers `None` (after-load path). Unknown whether ordinary integration roles can read them.
+4. **API connection test for Confluence browser sign-in is `supported: false`** ("not testable", nothing sent): it would need the cloud-id request in Rust. The browser way is proved at vendor level only; the product steps use email + API token. Rust work to add if the planner wants it.
+5. **ServiceNow user + password** (named in the brief as an alternative) is not built: the signed page (decision 3) names client credentials for ServiceNow, and the table's integration slots are `clientId`/`clientSecret`.
+6. `integration_auth` now receives `parts=` (GA4 ignores it). `AccountParts` gained `base_path`. `get_json_with_next` is new on the session.
+7. Which form Atlassian sends for `_links.next` behind the gateway (with or without the `/ex/confluence/<id>` prefix) was not observed; both handled and tested, the mock models the prefix-less one.
+8. Confluence bodies (storage format) are loaded for pages, blog posts and comments; attachments are not.
+9. The `35c632f3` commit holds the ServiceNow row work and the Confluence row work together (same files).
+
+**Commands run, with counts**
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, once, final tree, loader tests included; `df -h /` 2.3 GB before): **1942 passed, 0 failed** (16m49s; slice 3 baseline 1886). New: `test_saas_servicenow.py` 30, `test_saas_confluence.py` 17, `test_saas_session.py` +4.
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: OK; `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: OK.
+- `bun test src/lib/connectors`: 49 pass, 1 skip, 0 fail. `bun test src/features/connectors`: 348 pass, 0 fail. (`bun run typecheck`/`lint` not re-run: only `saas-vendors.ts` changed, one optional field.) `bash scripts/ci/tests/test_required_gate.sh`: 52 passed.
+- Gate vendor-level steps against the local stub (`PORT=18999 python3 ops/g6/saas_stub.py`, then `g6_saas_test.py --vendors-only`, checkout on `PYTHONPATH`): `PASS (32 s)`, six vendors.
+- `cd rust && cargo fmt --check`: clean.
+
+**Not verified, and why**
+- **All Rust** (the `OauthPreset.api_base` field and the table rows; the probe's ServiceNow client-credentials exchange, Confluence Basic, the "not testable" arm; four new unit tests and the changed ones): formatted, **not compiled, not tested**. The tests that compare the Rust table with the fixture (`the_table_equals_the_shared_fixture`, serde `skip_serializing_if` for `apiBase`) run in CI.
+- **The product steps of `g6-saas` for ServiceNow and Confluence, and the job's time**, did not run (no docker stack). CI may show: the API's connection test reaching the mock for `/oauth_token.do` and `/wiki/api/v2/spaces` through `gate_rebase`, the Bronze column names (`sys_id`, `modified_at`), whether `incremental_dedup` accepts `modified_at`/`sys_updated_on` timestamps, and the `max_reads` count of 2.
+- **No real ServiceNow instance or Atlassian site** (decision 11): every shape is from the documentation pages read, modelled in the mocks and fakes. Not tried: the dictionary tables, `sys_audit_delete`, the client-credentials grant's set-up, Atlassian's PKCE handling (the product sends PKCE; Atlassian's page does not mention it), the `_links.next` form.
+- Pages not readable from here: none for the points above; ServiceNow's release pages disagree on the revoke prerequisites (noted in the commit).
+- Nothing was shown in a browser; no console change beyond the table copy (the connector form for Confluence/ServiceNow comes from the table).
+
+### Handoff: slice 4 fix round (developer, 2026-10-21)
+
+`BLOCKER 13` fixed in one commit (the Confluence browser sign-in in the API's connection test). **Disk fell to 524 MB
+during this round (below the 1 GB stop line), so the whole suite and any further run were not done; the work is
+committed and stops there.** No cargo build, check, clippy or test ran; `cargo fmt --check` clean.
+
+- Rust `connector_probe/saas.rs`: for a browser sign-in whose vendor row has `oauth.api_base` (Confluence only) the
+  request carries `lookup_url` (the table's fixed gateway host + `/oauth/token/accessible-resources`) and a who-am-i
+  address with a placeholder where the cloud id goes. After the token refresh (JSON token request, rotated refresh token
+  handed back whatever the outcome) the site list is read with the same pinned client, the site whose address is
+  `<account>.atlassian.net` with a Confluence scope is picked, its id must be a lower-case UUID (`is_uuid`), and the
+  who-am-i goes to `api.atlassian.com/ex/confluence/<id>/...`. Fixed texts only (no site: "reaches no Confluence site by
+  this connector's name"; 401/403/429/redirect as the other probes). The old "not testable" arm and its test are removed.
+  New unit tests: success with the rotated token, no site / Jira-only grant / non-UUID id (no who-am-i request sent),
+  401/403/429 at the gateway, `is_uuid`.
+- Gate: product entry `confluence-browser` in `PRODUCT_VENDORS` (create, test, discovery, load, reload with `max_reads`,
+  revoked). The mock gained `rotate` (default on; the entry turns it off because a `file:` secret cannot take Atlassian's
+  rotated refresh token; the vendor-level step still proves the rotation). Vendor-level steps re-run against the local stub:
+  `PASS (33 s)`.
+- Feature page: the limit about the untestable browser sign-in is replaced.
+
+**Not verified:** all of the new Rust (formatted only); the new product entry (no docker stack); the whole dagster suite and
+bun were not re-run (no Python/console code changed besides the gate script and mock).
+
+### Handoff: slice 5 (developer, 2026-10-21)
+
+SharePoint, then Dynamics 365 (Vn.1 to Vn.4), base `60909de3`, through `SaasSession` (section 8 item 3, as slices 3 and 4).
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| finding | `4985070c` | the Confluence cloud id is matched with `\Z`, not `$` (a trailing newline passed) |
+| V-SharePoint.3 / V-Dynamics.3 (rows) | `54329ef9` | Microsoft tenant in the account (Rust, Python, fixture, console), `integration.scope`, shared `saas/client_credentials.py` |
+| V-SharePoint.1, .2 | `ecc2e60a` | Graph delta feed, link in dlt state, deletes marked, 410 resync; `uses_state` in `adapters/saas.py` |
+| V-SharePoint.3 / V-Dynamics.3 (probe) | `d48a26a7` | the API's connection test of both Microsoft ways for both vendors |
+| V-SharePoint.4 | `b4b12362` | mock SharePoint + Entra, vendor-level and product steps |
+| V-Dynamics.1, .2 | `98084720` | Dataverse tables, describe, change tracking with the link in state, `modifiedon` fallback; `SaasSession.get_json(headers=)` |
+| V-Dynamics.1 | `a389dd03` | request headers never replace the credential (test) |
+| V-Dynamics.4 | `c1f4751d` | mock Dynamics 365, vendor-level and product steps |
+| docs | `152a7c1d` | limits on the feature page, `docs/CI.md` |
+
+**Found against Microsoft's documentation (read 2026-10-21; URLs in the commit bodies)**
+- Tenant "in GUID or domain-name format", `scope=<resource>/.default`, no refresh token for client credentials; the v2 platform has **no RFC 7009 revocation endpoint** (both rows have `revocationUrl: null`; slice 1's tables also had null, nothing else needed); the refresh token is replaced on every refresh (existing report path). The rows used `/organizations/`, which does not serve a single-tenant app: now `{tenant}`.
+- **The tenant is part of the account** (`contoso/<tenant>`, `<org>.crm4.dynamics.com/<tenant>`), GUID or domain (two labels, a letter in the last; no `common`/`organizations`/`consumers`, path, port, userinfo), same rule in Rust and Python with the same near-miss lists. Host stays the fixed `login.microsoftonline.com` (AD2).
+- Graph: plain `GET /sites` is **application-only**, so site discovery uses `GET /sites?search=*` (not read, not tried). Scope `Sites.Read.All`, delegated and application (same permission for list-item delta). A deleted list item is `{"id", "deleted": {"state": "deleted"}}`, not `@removed`. 410 carries a `Location` that is not followed; the token-less delta restarts.
+- Dataverse: tracking takes no `$filter/$orderby/$expand/$top`; deletes are `$deletedEntity` rows; changes are kept 7 days by default and the expiry status is **not documented** (any 4xx on the saved link is taken as a resync); `EntityDefinitions` is unpaged; paging needs the same `odata.maxpagesize` on every page.
+
+**Plan section 8 item 6 verified by running** (real dlt + Iceberg, `Lab`): the delta link survives (a) a feed failing halfway, (b) a run that extracted and normalised everything and died before its load (`sink._abort_pending` restores the state; the next run asks from the last committed link and loses no change), for both vendors; a 410 / stale link reloads every row and continues.
+
+**Plan mismatches and decisions for the planner**
+1. **Resync cannot learn deletes made while the link was stale** (Graph's advice is to compare with local state; the sink cannot). Stated on the feature page. Not built: a full-refresh path.
+2. **SharePoint object names are ids** (`<site id>/<list id>`): `ObjectDecl` and the discovery contract carry no display label. Adding one is Rust work (`ListedObject` denies unknown fields). Sites to read: found by search (first 100) or named in `dial.objects`; **there is no console control to name sites**.
+3. **Dynamics 365 without change tracking cannot see deletes** (page says so); enabling tracking on the table fixes it.
+4. SharePoint has no `describe` (decision 9 does not list it).
+5. A deleted row keeps only its key, `is_deleted` and the time seen as the cursor (SharePoint `modified_at`, Dynamics `modifiedon`); upsert nulls its other columns.
+6. Shared edits: `SaasSession.get_json(headers=)`; `adapters/saas.py` passes `state=` to a module with `uses_state`; ServiceNow's client-credentials function moved to `saas/client_credentials.py` (re-exported; its tests unchanged).
+7. Rows changed in the shared table: `integration.scope` (fixture, Rust, Python, console type) and `account.kind` `label_tenant` / `dataverse_host_tenant`. Existing SharePoint/Dynamics accounts without a tenant no longer validate (the types are `supported = false`, nothing deployed).
+8. Target identity compares the tenant as written (case-sensitive): a case change asks for credentials again; harmless.
+
+**Commands run, with counts**
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, once, final tree, loader tests included): **2065 passed, 0 failed** (17m38s; slice 4 baseline 1942). New: `test_saas_sharepoint.py` 34, `test_saas_dynamics365.py` 39, `test_saas_vendors.py` +~140 parametrised cases, `test_saas_session.py` +1.
+- `cd rust && cargo fmt --check`: clean. `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo clippy -p lakehouse-store -p lakehouse-api --all-targets --all-features -- -D warnings`: finished, 0 warnings (4m26s).
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: OK; `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: 23 OK.
+- `bun test src/lib/connectors`: 49 pass, 1 skip; `src/features/connectors`: 348 pass; `src/services`: 99 pass; `bun run typecheck`: 8 errors, all `features/landing/scene` (as before); `bun run lint`: 0 errors, 6 warnings. `bash scripts/ci/tests/test_required_gate.sh`: 52 passed; `ci.yml` parses.
+- Vendor-level gate steps against a local `python ops/g6/saas_stub.py` (`g6_saas_test.py --vendors-only`): SharePoint PASS and Dynamics PASS (the whole run `PASS (42 s)`, eight vendors).
+
+**Not verified, and why**
+- **All new Rust tests did not run** (`cargo test` is forbidden here): the tenant rules, the oauth route test, and the five probe wiremock tests compiled under clippy `--all-targets` only. The fixture-equals-table test is the CI check for the Rust table.
+- **The product steps of `g6-saas`** (four new entries: `sharepoint`, `sharepoint-browser`, `dynamics365`, `dynamics365-browser`) and the job's time against 20 minutes never ran (no docker stack). CI may show: the API accepting an object name with commas and `/` in `ingest-spec`, `gate_rebase` reaching the Entra path, Bronze column names (`field_title`, `is_deleted`), and the added time (about 8 product entries now).
+- **No real tenant or environment** (decision 11): `sites?search=*`, the `list` facet, delta `fields`, the `EntityDefinitions` `$expand` on the list, `IsValidForRead`, the Dataverse expired-token status, `user_impersonation` and `WhoAmI` (not re-read) are from documentation or knowledge, modelled in mocks.
+- Nothing shown in a browser; the account label change (tenant) is text only.
+- Docker images not built, compose not re-rendered (no compose file changed).
+
+### Handoff: slice 5 fix round (developer, 2026-10-21)
+
+`BLOCKER 14` (SharePoint: pick sites, show names), one commit per logical part. **The root disk filled to 41 MB free
+(from 45 GB earlier in the day, not by this work) before the end-of-round passes, so clippy and the whole dagster
+suite did NOT run; see "Not verified".**
+
+| Part | Commit | Subject |
+| --- | --- | --- |
+| carrier | `9756a0f1` | `ListedObject.label` (bounded like a name), `ObjectKind::Site`, contract, `ObjectDecl.label`, orchestrator answers (a search also matches the label) |
+| module | `9ab74d53` | SharePoint `list_fields` (the sites, `kind: site`, name = id, label = title), lists labelled `Site / List`, picked sites titled one by one |
+| console | `b2aa7abd` | `SharepointSitePicker`, `TableFinder` shows labels / filters on them / hands them on, `labelTarget`, panel saves picks into `dial.objects` |
+| gate | `c4a22475` | mock site-by-id and list `displayName`; vendor-level and product checks of the label and the site list |
+| docs | `48769749` | feature page |
+
+- The carrier is additive (`label` skipped when absent; `deny_unknown_fields` unchanged). The ingest spec still keys the
+  object by `name` (`<site id>/<list id>`); only the default Bronze table name comes from the label
+  (`intranet_team_site_tasks`), so renaming a list or site at SharePoint changes neither the key nor an existing table.
+  Two lists with the same label would get the same default target; the existing "Another table already lands here"
+  check asks the person to rename one.
+- Picks are the dial's `objects` (site ids) and take effect when the tables are saved, because discovery lists the lists of
+  the SAVED sites; the picker says so. A saved selection shows the ids until the finder has listed again (the label map is
+  per visit).
+- Vendor text (titles) is cleaned to short printable labels before it reaches the API's bounds, so a control character in
+  a title cannot make a whole listing fail validation.
+
+**Commands run, with counts**
+- `bun test src/features/connectors`: 355 pass, 0 fail (new: `sharepoint-ingest-panel.test.tsx` 4, `table-finder.test.tsx` +2, `connector-ingest-panel.test.tsx` +1). `bun run lint`: 0 errors, 6 warnings. `bun run typecheck`: no error outside `features/landing/scene`.
+- `pytest dispar_orchestrate/test_saas_sharepoint.py dispar_orchestrate/test_discover.py`: 98 passed (SharePoint 37 incl. the loader tests).
+- Gate vendor-level steps against the local stub: `PASS (43 s)`.
+- `cd rust && cargo fmt --check`: clean.
+
+**Not verified, and why**
+- **`cargo clippy -p lakehouse-store -p lakehouse-api --all-targets --all-features -- -D warnings` did not run** after the Rust of this round (the `label` field, `ObjectKind::Site`, validation, two struct literals, the new store test cases): the disk was full. The edit is small and `cargo fmt --check` is clean, but it is not compiled.
+- **The whole dagster suite did not run** after this round (touched tests only, above). Baseline before the round: 2065 passed.
+- The new Rust store test cases did not run (no `cargo test`).
+- The product steps of `g6-saas` (the label and site-list checks added to the two SharePoint entries) did not run.
+- Nothing shown in a browser.
+
+**Addendum (PR #216 CI rust test).** Eight older probe tests panicked because my test helper `request()` (slice 5, `d48a26a7`)
+validated the account `"acme"` for every vendor; HubSpot, GA4, Workday and NetSuite never accept it. Fixed in the test helper only
+(`sample_account` names every vendor's valid form; the validation is unchanged, rule 2); no other Rust test builds a vendor account
+(grep). Run with the coordinator's permission once the disk had recovered (22 GB free, no other cargo):
+`CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p lakehouse-api --lib connector_probe::saas`:
+**23 passed, 0 failed**, including the five Microsoft tests. That run compiled the Rust of BLOCKER 14 for `lakehouse-api` and
+`lakehouse-store` (non-test code), but clippy was still not run and the store's `tests/connector_discovery.rs` cases did not run.
+No product entry was added in this round (the `g6-saas` job is at 16m17s of 20).
+
+### Handoff: slice 6 (developer, 2026-10-21)
+
+Task 0, Task 1 (the gate split, AD9 amended), then Workday and NetSuite (Vn.1 to Vn.4), base `cdfd1821`. Both stay
+`supported = false` (decision 10). Disk 26 to 27 GB free and no other cargo, so clippy ran and the two permitted
+`cargo test` filters ran.
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| 0 | `667194a7` | backtick `SharePoint` (`connector_discovery.rs:271,:298`) and two more in `connector_probe/saas.rs` (PR #216 CI clippy) |
+| 1 | `49c8a609` | `g6-saas-a` / `g6-saas-b`, `SAAS_GATE_VENDORS`, `ci-required`, `required_gate.sh` + test, `docs/CI.md` |
+| V-Workday.3 (row) | `6193e12d` | Workday's client authenticates in the Basic header (fixture, Rust, Python, console) |
+| V-Workday.1, .2 | `a75b7f3b` | `workday.py` (report, `Report_Entry`, always in full); `ObjectDecl` without a key when in full; `SaasSession(request_timeout)`, `post_json(headers=)` |
+| V-NetSuite.1 to .3 (Python) | `5a440ba8` | `netsuite.py` (SuiteQL, paging, `PS256`/`ES256` assertion); `integration_auth(dial=)` |
+| V-Workday.3, V-NetSuite.3 (Rust) | `62bce1b3` | the API's connection test of both vendors' ways; `SaasDial.certificate_id` |
+| V-Workday.4, V-NetSuite.4 | `37502dd5` | the two mocks (ports 8109, 8110), vendor-level steps, four product entries |
+| console | `e944bba9` | Workday report owner/name fields, NetSuite certificate id, Workday user label |
+| docs | `aafb78e2` | feature page limits, `docs/CI.md` |
+
+**Task 1.** Two jobs on the same scripts, selected by `SAAS_GATE_VENDORS` (env, or `--vendors=` argument; empty means all, an
+id the mock does not serve fails the run): `g6-saas-a` (HubSpot, Zendesk, Salesforce, GA4, ServiceNow), `g6-saas-b` (Confluence,
+SharePoint, Dynamics 365, Workday, NetSuite), names "Rust · SRC-3 business-app connectors (A)" and "(B)", own compose
+projects, both in `ci-required` and `required_gate.sh` (`G6_SAAS_A_RESULT`, `G6_SAAS_B_RESULT`). The runner service passes the variable
+(`docker-compose.g6.override.yml`). No step was removed. Estimated, NOT measured: job A runs 6 product entries (13 before), job B
+10 entries; the job that took 16m17s on `7a8af090` had 13 entries. If B nears 20 minutes in CI, say so; do not cut steps.
+
+**Vendor rows checked against official documentation (2026-10-21)**
+- *NetSuite*, Oracle pages: authorise address, `rest_webservices` scope and PKCE (`section_158081944642`); token address and "client credentials in the
+  HTTP Authorization header", Basic (`section_160855590788`, `section_158082518856`); the client-credentials assertion, header `PS256` + `kid`,
+  claims `iss`/`scope`/`aud`/`iat`/`exp`, `aud` = the token address (`section_0312092247`); SuiteQL `POST`, `Prefer: transient` "a required header parameter",
+  `limit`/`offset`, `count`/`offset`/`totalResults` (`section_157909186990`); sandbox host form (`1234567_SB1` is `1234567-sb1`,
+  `section_1498251763`, read through a search summary). **Not confirmed**: the revocation address (no page read names it), the who-am-i
+  path `/services/rest/record/v1/employee?limit=1` (the REST record page was not read; an integration role may lack employee access), the
+  `hasMore` rules beyond the examples, and the 100,000-row limit (a search summary of a third-party page).
+- *Workday*: docs.workday.com answers a script shell and community.workday.com redirects to a sign-in, so **no Workday page was
+  readable**. Used: Databricks' source setup page (docs.databricks.com/gcp/ingestion/lakeflow-connect/workday/workday-reports/source-setup:
+  API client for integrations, non-expiring refresh token, copy the JSON URL with `format=json`), knowledgelib.io/business/erp-integration/
+  workday-raas-integration/2026 (third party: the URL form, `Report_Entry`, no paging, 30 minutes, `user@tenant`) and Fivetran's RaaS guide
+  (Basic allowed instead of OAuth). The token address (`/ccx/oauth2/<tenant>/token`) is the table's slice 1 value, unconfirmed.
+  The row changed from `post` to `basic` for the client authentication from the developer's knowledge of Workday's OAuth setup: **not verified**.
+
+**Mismatches and decisions for the planner**
+1. **Decision 9 is not met for NetSuite.** The decision lists NetSuite as a vendor that describes its fields before the load. SuiteQL's columns are
+   not the REST record properties (`metadata-catalog` describes the latter) and no call that lists a SuiteQL table's columns was found in the pages read,
+   so NetSuite has no `describe`; a changed column is seen after the load. Stated on the feature page, in the module and in the gate. Needs a decision (a Records Catalog call, if there is one).
+2. **`SaasDial.certificate_id` (new, optional, NetSuite integration only).** NetSuite's assertion needs the certificate ID (`kid`), which is neither of the two secret
+   fields in the row nor in the plan. It is a dial field (Rust, contract, console), a plain name, not part of the target identity. The alternative was a third
+   secret slot, which the connector's two-slot credential cannot hold.
+3. **NetSuite does not take `RS256`.** The brief said RS256/PS256 per NetSuite's documentation; Oracle's page shows `PS256` and certificate-dependent `ES256`, so RSA keys sign `PS256`
+   and P-256 keys `ES256` (Rust and Python); other keys are a fixed rejected setting.
+4. **Workday's who-am-i is running the first named report** (the table has none, `whoami: null`, fixture unchanged), reading the status only, with a 60 s wait instead of 5 s.
+   It costs the customer's tenant one report run per test; with no report named the test answers "not testable". Said on the page.
+5. **Small shared edits**: `ObjectDecl` may have an empty key when it is re-read in full (a report row has no id); `SaasSession(request_timeout=)` and the module attribute
+   `request_timeout_seconds` (Workday 600 s, NetSuite 120 s; the default 30 s fails most reports); `post_json(headers=)`; `integration_auth(dial=)`.
+6. **Workday's host rule accepts one label under `workday.com` / `myworkday.com`** (slice 1). Hosts such as `services1.wd503.myworkday.com`, which the developer
+   believes exist, would be refused; not checked (the documentation is unreadable). Change the rule in four places if that is wrong.
+7. **NetSuite's cursor** is a derived `modified_at` (`TO_CHAR(lastmodifieddate, ...)`), because a SuiteQL answer shows dates in the user's format; a record with no change time gets
+   the epoch in that column only. A table is read by key when it has no change time (offset 0, so the 100,000-row limit does not apply); an incremental read starts again from the
+   last change time before the offset reaches 90,000 and stops with a plain message if more rows share one time.
+8. The brief's "RS256/PS256 ... `jsonwebtoken` in Rust for the probe": done for `PS256`/`ES256`; `jsonwebtoken` `ES256` uses `from_ec_pem` (PKCS#8); an EC key in another PEM form is refused (not tested in Rust; Python tests both).
+
+**Commands run, with counts**
+- `cd rust && cargo fmt --check`: clean. `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo clippy -p lakehouse-store -p lakehouse-api --all-targets --all-features -- -D warnings`:
+  finished, 0 warnings (after Task 0, and again on the final Rust tree).
+- `cargo test -p lakehouse-api --lib connector_probe::saas`: **29 passed, 0 failed** (seven new, one removed: Workday Basic and the named report, a refused Workday user, the report path rule, no report named, the NetSuite `PS256` assertion verified with the public half, a missing certificate id or unusable key, and a walk of the table's integration shapes that replaces the old "not one token" test).
+  `cargo test -p lakehouse-store --lib saas_vendors`: **13 passed, 0 failed** (includes the fixture comparison with the Workday row).
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, once, final tree): **2123 passed, 0 failed** (17m20s; slice 5 baseline 2065). New: `test_saas_workday.py` 26 (one `loader`), `test_saas_netsuite.py` 29 (one `loader`), `test_saas_session.py` +1, three tests that used NetSuite as "no module" now remove it from the registry.
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: OK; `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: OK.
+- `bun test src/features/connectors`: 361 pass, 0 fail; `bun test src/lib/connectors`: 52 pass, 1 skip, 0 fail; `bun test src/services`: 99 pass, 0 fail; `bun run lint`: 0 errors, 6 warnings (none in these files); `bun run typecheck`: no error outside `features/landing/scene`.
+- `bash scripts/ci/tests/test_required_gate.sh`: 56 passed (52 + 4 new); `ci.yml` parses; `docker compose --env-file <fake values> -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g6/docker-compose.g6-saas.override.yml --profile g6-saas --profile dagster config --quiet` (with `SAAS_GATE_VENDORS` set): OK; `--profile '*' config --quiet`: OK.
+- Gate vendor-level steps against a local `python ops/g6/saas_stub.py` (`g6_saas_test.py --vendors-only`): `SAAS_GATE_VENDORS=workday,netsuite` PASS (12 s); the five vendors of job B PASS (27 s); the five of job A PASS. The mock checks the NetSuite `PS256` signature for real (stdlib RSASSA-PSS).
+
+**Not verified, and why**
+- **The two jobs in CI and the product steps** (four new entries, and the changed `step_product`) never ran: no docker stack here. CI may show: the API accepting `certificateId` and a `workday` report name with a slash in `ingest-spec`, the API's Workday test reaching the mock through `gate_rebase`, Bronze column names (`employee_id`, `name`, `modified_at`), and whether `replace` loads of a saas object are accepted. Each job's time against 20 minutes is unmeasured (estimates above).
+- **New Rust tests in `ingest_spec.rs`** (`certificateId`, Workday dial) compiled under clippy but did not run: only the two permitted filters were run.
+- **Every Workday and NetSuite wire detail** is the developer's model of documentation (see "checked" above): the `Report_Entry` shape, Workday's token request, SuiteQL's `TO_CHAR`/`TO_TIMESTAMP`/`customer.*`, `lastmodifieddate` as a column of the tables, the time zone of the filter, NetSuite's assertion lifetime (600 s here; Oracle's page shows 120 s and states no maximum). No real account (decision 10).
+- The new console fields were not shown in a browser.
+- Docker images were not built.
+
+### Handoff: slice 6 fix round (developer, 2026-10-21)
+
+- `SHOULD-FIX 15` fixed in the commit "Workday hosts may have one to three labels": Rust table (`is_workday_prefix`) and Python mirror accept one to three labels before
+  `.workday.com` / `.myworkday.com`, each validated as a label; the suffixes are unchanged (fixture and console hold only them, so neither changed; the console does not
+  validate the host). Tests both ways in Rust and Python (accepted: `wd2-impl-services1.workday.com`, `services1.wd503.myworkday.com`, three labels with a mixed-case host
+  lower-cased; refused: four labels, empty label, hyphen-led label, another suffix). Still not checked against Workday's pages.
+- Connector page: now says Workday's connection test runs the first named report once at the vendor (one report run in the customer's tenant per test).
+- Run: `cargo fmt` clean; `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets --all-features -- -D warnings` 0 warnings; `cargo test -p lakehouse-store --lib saas_vendors`:
+  **14 passed**; `pytest dispar_orchestrate/test_saas_vendors.py dispar_orchestrate/test_saas_workday.py`: **242 passed**. The whole dagster suite and bun were not re-run (only the Python
+  account rule and its tests changed). Not pushed.
+
+### Handoff: slice 7 (developer, 2026-10-21)
+
+Base `933de5e8` (CI 39/39 green). Disk 26 GB free, no other cargo, 8 GB RAM available, so clippy and the one permitted `cargo test` ran. Not pushed.
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T7.1 | `fcc489c3` | `0096_saas_connectors_supported.sql`, eight `coverage.json` entries and `_about`, `connector_type.rs`, the lint's real-migrations test, the gate's first step |
+| T7.1 | `846fe1cd` | the gate's create log line no longer says "a type that is not supported yet" |
+| T7.2 | `c54f6aff` | `docs/plans/SRC-3-RESULT.md` |
+| brand marks | `4e30d85d` | Confluence, Google Analytics, HubSpot, Zendesk (Simple Icons 16.35.0) |
+| T7.3 | `4a1163a4` | PRODUCT, comparison, feature pages, user guide, README, NOTICE, CHANGELOG, BACKLOG |
+
+**T7.1.** `0096` flips Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365 and SharePoint with the guarded `UPDATE ... WHERE name AND adapter = 'saas' AND supported = false` (reason set to `NULL`), and rewrites the reason of Workday Reports and NetSuite to "Built and tested against a mock; waits for a test on a real account (SRC-3)." The registry entries use `gate: "g6-saas"` (one gate, two jobs, as `g6` is for its two jobs; the registry "names gates, not jobs"), all four steps `real`; each entry's `notes.all` names job A or B. `connector_type.rs`: the exception list is now five names (Google Sheets, the two CDC types, Workday Reports, NetSuite); the old 0095 test became "ten listed, eight supported without a reason, two unsupported with a reason that says `real account`". `g6_saas_test.py` `step_types_are_listed` asserted all ten unsupported and would have failed in CI after `0096`; it now asserts the same split (not in the plan's T7.1 text; found by grep).
+
+**T7.2.** Only one completed run has the split jobs: 39597521529 on `933de5e8`: A 7m18s (script 338 s), B 13m23s (script 716 s). The two earlier completed runs have the unsplit job (14m45s on `81ec8621`, 16m17s on `7a8af090`); the run between was cancelled. The RESULT says so; the split rests on one run. Per-vendor lines were read from the two job logs (`gh api .../actions/jobs/<id>/logs`, 2 calls plus the run list and 4 `run view`). The rate-limit notice appeared on the last call; no gh call was made after it.
+
+**Brand marks.** Simple Icons latest is 16.35.0 (jsDelivr). Its data file lists Confluence, Google Analytics, HubSpot, Salesforce and Zendesk, but `icons/salesforce.svg` is not in the release (404 and absent from the file list), so Salesforce got no mark; ServiceNow, Workday, Dynamics 365, NetSuite and SharePoint are in neither. Path data of the four added marks was compared with the fetched files. Contrast against the dark chip, same method as the first eight (reproduced Kafka 1.10 and MongoDB 4.60): Confluence 1.05 and Zendesk 1.13 are drawn in the foreground in dark; Google Analytics 4.76 and HubSpot 5.76 are not.
+
+**Commands run, with counts**
+- `cd rust && cargo fmt --check`: clean. `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo clippy -p lakehouse-store --all-targets -- -D warnings`: finished, 0 warnings.
+- `cargo test -p lakehouse-store --test connector_type` (same env): **7 passed, 0 failed** (a testcontainers Postgres applied every migration including `0096`).
+- `python3 ops/lint/check_connector_gate_coverage.py`: OK, 19 supported types, 0 waived. `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: 23 tests OK. `check_intra_package_imports.py`, `check_bare_iceberg_count.py`: OK.
+- `bun test src/lib/connectors`: 54 pass, 1 skip, 0 fail. `bun test src/features/connectors`: 361 pass, 0 fail. `bun run lint`: 0 errors, 6 warnings (none in these files).
+
+**Mismatches and decisions for the planner**
+1. The plan says `gate: "g6-saas"`, the brief said "the job each is proven in": both are in the entry (gate name, job in the note).
+2. The Sources page header (`connectors-page.tsx:145`) still names no business apps; that is console code, so not changed. Written as part of `SRC-29`, and `connectors-that-work.md` says so.
+3. PRODUCT.md's other rows around the ones I edited are stale from before this phase (for example "Connect to common databases"); I changed only the SaaS lines, its header date is unchanged.
+4. Feature page `business-app-connectors.md`: status now says #216; the "Limits" intro line ("To be confirmed when the plan is built") was replaced since the limits are built.
+
+**Backlog IDs added** (all in the right section, ready-to-start list updated): `SRC-26` second wave by demand (Idea, P3); `SRC-27` Workday and NetSuite on real accounts (Todo, P2, in Next); `SRC-28` NetSuite before-load schema changes (decision 9); `SRC-29` header text and brand marks for six types; `SRC-30` vendor shapes from unreadable documentation (HubSpot API versions, Salesforce quota code, Atlassian PKCE, Dataverse, ServiceNow revoke); `SRC-31` gate gaps (browser sign-in through the product, volume, shared account-rule fixture). `SRC-3` stays Building with #216; no Dates change.
+
+**Not verified, and why**
+- The new gate step `step_types_are_listed` and the whole `g6-saas-a` / `g6-saas-b` jobs after `0096`: no docker stack here; CI decides. Also not run: other Rust tests that might assume the ten types are unsupported (grep found none; only `connector_type.rs` ran), the dagster suite, `bun run typecheck`, `bun test src/services`.
+- `0096` ran only through `connector_type.rs` and the lint's replay, not through the whole store suite.
+- The brand marks were not seen in a browser or the dark theme (contrast is computed, not looked at).
+- The docs state what the gates logged; none of it was tried on a real account.
+- Docs wording on Zendesk/Confluence `post_json` and Workday/NetSuite Basic client authentication is from `ops/fixtures/saas_vendors.json`; the schema-change line for after-load vendors under "Pause" follows decision 9 ("as for other API sources today") and was not re-checked in the code.
+
+### Handoff: slice 7 fix round (developer, 2026-10-21)
+
+- `SHOULD-FIX 16` fixed: the Sources page description now reads "Databases, change capture, object storage, files, REST APIs, message topics and business apps. Data enters the platform here before processing." (`connectors-page.tsx`, its test, comment citing the finding). The header text was removed from `SRC-29` (brand marks for six types remain) and from the limits of `connectors-that-work.md`; its checklist row 8 now expects business apps named and no federation.
+- Run: `bun test src/features/connectors`: 361 pass, 0 fail; `bun run lint`: 0 errors, 6 warnings (none in these files). Not shown in a browser. Not pushed.
+
+## 12. Review
+
+### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
+
+Read: the migration, the vendor table, `SaasSession`, the probe's order
+(address check before any credential), the developer's five reported
+mismatches. CI on `c0ea41d0` (T1.1–T1.4): 35 of 37 checks green; the three
+`connector_type.rs` failures are fixed in `1988a26f`. The rest of the slice
+has its first CI run on the push of this review.
+
+Decisions on the reported mismatches:
+
+1. **Run-report classes (T1.9).** `BLOCKER 1`: decision 13 asks for "the
+   vendor limited the rate" and the page's item 7 for a plain message when
+   a permission is missing; mapping them to `source_busy` and
+   `sign_in_refused` does not say that. Add migration `0097` (reserved
+   here) widening the run-report class CHECK of `0072` with
+   `permission_missing` (not retried) and `rate_limited` (retried as
+   `source_busy` is), the Rust enum and its fixed texts, the Python classes,
+   and the console's wording; tests both ways.
+2. **`ObjectKind::Object` and the `load` text** (`8d9d601d`): accepted, an
+   additive, validated carrier; the plan's T1.10 is read to include it.
+3. **`connector_type.rs`:** accepted. The ten types join the named
+   exceptions as Sheets and the CDC types did, for the same reason (an
+   existing connector opens in its edit page); no wildcard; AD10 unchanged.
+4. **`saas_vendors.rs` in `lakehouse-store`:** accepted (that is where
+   `ingest_spec.rs` lives).
+5. **Confluence cloud id, Microsoft tenant id, scopes and revocation
+   addresses:** each vendor's slice checks its row against the vendor's
+   documentation and records the source in the commit (Vn.3).
+
+`SHOULD-FIX 2`: `tests/fixtures/tool_schemas.json` was edited by hand;
+regenerate it with the repository's generator and commit any difference.
+
+Not verified by the developer and still open: every Rust test (CI),
+the `g6-saas` job (CI), a browser look (end of phase), brand marks
+(slice 7, against the current Simple Icons release).
+
+After the fix round: CI on `dc3373ae` green, 38 of 38 checks (the hand-edited
+`tool_schemas.json` passes the byte-identical snapshot, so `SHOULD-FIX 2` is
+closed; `0097` and its test pass).
+
+### Review of slice 2 (planner, 2026-10-19, head `9df9103a`)
+
+Read: the handoff, `UPSTREAM.md` of both copies, the Zendesk duplicate fix
+and its test, the HubSpot search cursor, the gate override. CI on this head
+runs with the push of this review.
+
+- `BLOCKER 3` (Zendesk browser sign-in). Decision 3 says a sign-in that
+  `SRC-12` cannot serve as it stands is extended, not dropped. Add a third
+  client authentication, `client_secret_post_json` (client id and secret in
+  a JSON body), to the vendor table, the Rust token, refresh and probe
+  calls, Python `rest._token_request`, the fixture and the console mirror;
+  Zendesk's row uses it; remove the strict `xfail`; the gate's sign-in step
+  runs. Cite the Zendesk documentation page in the commit.
+- `BLOCKER 4` (the gate proves the vendor code, not the product). AD9 and
+  the SRC-9 registry ask for connect, discover, load and reload steps that
+  are `real`, which means through the product: create the connector through
+  the API (the type being unsupported does not refuse it, as the developer
+  found), the API's connection test, discovery through the orchestrator,
+  a load and an incremental reload through `ingest_job` into Bronze
+  Iceberg, checked by reading the table. Build this once for both vendors
+  so later slices add only their steps; keep the vendor-only steps. The job
+  needs the Dagster services, so record its time; if it cannot fit the
+  20-minute budget, report it rather than cutting steps.
+- Gate host override (`rebase_for_gate`): accepted, because it only acts
+  under the existing gate-only switch `CONNECTOR_OAUTH_ALLOW_HTTP=true`,
+  names a vendor and takes a bare origin. `SHOULD-FIX 5`: a test that it is
+  ignored when the switch is off, and the Rust side gets the same rule
+  under the same switch (the API's probe and sign-in must reach the mock
+  for `BLOCKER 4`), with the same test.
+- HubSpot `/crm/v3/` paths: accepted for now; `SHOULD-FIX 6`: record in
+  `UPSTREAM.md` that the date-versioned API exists and v3 has no announced
+  end date as of 2026-10-19, with the page read.
+- Registry by path and `describe` answering `None`: accepted.
+- HubSpot deletes not claimed, Zendesk deletes marked not removed: matches
+  decision 7 ("applied where the vendor reports deletes"); the connector
+  page must say a deleted Zendesk ticket stays with `status = deleted`.
+  `SHOULD-FIX 7` if the page text does not say so today.
+
+Slice 2 closed (planner, 2026-10-21). PR moved to #216 (opened as the data
+roadmap's account; #214 closed, same branch). CI on `901bbe3a`: 36 of 38
+green. The `g6-saas` job passed in about 4 minutes, with every product step
+for HubSpot and Zendesk real (create, connect, discover, load into Bronze
+read back through ClickHouse, incremental reload with no duplicate, revoked
+sign-in) and every vendor step. The two red checks are `cargo audit` and
+`cargo deny` on RUSTSEC-2026-0381/0382/0383 (`rustls-webpki`,
+`webpki-roots`, `webpki-root-certs`), published after main's last Security
+run; `Cargo.lock` is identical to main's, so main is red on them too. Not
+caused by this PR and not ours to fix (another team's dependency work); it
+needs a backlog item from that team before this PR can merge, because a PR
+touching dependencies may not merge with a dependency check red, and this
+one does not touch them.
+
+### Review of slice 3 (planner, 2026-10-21, head `a583fc96`)
+
+Read: the handoff, both `UPSTREAM.md`, the Salesforce query and `queryAll`
+path, the GA4 REST calls, the `_apply_cursor` lag change, the Google
+authorise address. Plan section 8 items 1 and 2 answered by the developer:
+both libraries could be given a session, but neither under `SaasSession`'s
+rules (redirects, pinning, `Retry-After`); calling the vendors' REST
+endpoints through `SaasSession` and adding neither library is the right
+choice under AD3 and is accepted. The `instance_url` adoption goes through
+`adopt_origin` only: accepted. The Google `access_type=offline` and
+`prompt=consent` fix: accepted (without it no load could run). The shared
+`_apply_cursor` lag (`ObjectDecl.lag_seconds`): accepted, `sql_database`
+resources unchanged and their tests pass.
+
+- `BLOCKER 8` (decision 13). Salesforce reports an exhausted API quota as
+  HTTP 403 with `errorCode` `REQUEST_LIMIT_EXCEEDED`; `SaasSession` reads
+  every 403 as a missing permission. Give a vendor module a way to classify
+  a 403 body (Salesforce: that code → `SaasRateLimited`, not retried within
+  the run since the quota is per 24 hours, run class `rate_limited`), with a
+  mock route and a vendor-level gate step. Cite the Salesforce limits page
+  if it can be read; otherwise say so.
+- `BLOCKER 9` (spec "table and column choice", `SRC-3-AC3`). A GA4
+  connector cannot be set up in the console: there is no way to define a
+  report. Add the report editor to the GA4 form: name, dimensions and
+  metrics chosen from the property's `getMetadata` (through discovery, not
+  typed blind), the date dimension fixed as the cursor; saved into
+  `dial.objects` as the API already accepts. Tests for the form.
+- `BLOCKER 10` (decision 3, `SRC-3-AC1`). The API's connection test answers
+  `supported: false` for GA4's service-account key, one of the two signed
+  ways. Implement the JWT-bearer exchange in the probe with the workspace's
+  `jsonwebtoken` (RS256, already a dependency of `lakehouse-api`; no new
+  crate), the key as a `SecretValue`; add the service-account way to the
+  GA4 product steps of `g6-saas`.
+- `SHOULD-FIX 11`. GA4's "yesterday" is computed in UTC while GA4 dates are
+  in the property's time zone: read the property's time zone (Admin API
+  `properties.get`, scope already granted? check) and use it; if that needs
+  a scope the row does not ask for, keep UTC, widen the lookback by one day
+  and state the limit on the connector page.
+- `SHOULD-FIX 12`. The connector page states the two Salesforce limits
+  (an object whose query exceeds the address length fails with a fixed
+  message; API version 62.0) under "Limits to tell a customer".
+- Salesforce row not checked against the vendor's documentation (pages
+  refused from this machine): recorded; `SRC-3-AC1` on a real org is the
+  proof. The "who am I" path `/services/data/v62.0/limits` is accepted.
+
+### Review of slice 4 (planner, 2026-10-21, head `7dc268ff`)
+
+Before it: CI on `7ddb2be8` (main merged, #106 and SEC-46) green, 38 of 38.
+
+Read: the handoff, the two vendor modules, the vendor rows (fixture), the
+`get_json_with_next` link handling, the Confluence cloud-id path. Accepted:
+calling both vendors through `SaasSession` rather than a dlt `rest_api`
+source (plan section 8 item 3: dlt's client could take a session, but not
+one carrying `SaasSession`'s rules; same reasoning as slice 3); the four
+Confluence row corrections and the ServiceNow revocation removal, each with
+its documentation; ServiceNow's sign-in ways as the signed page names them
+(browser sign-in and client credentials; user + password is not on the
+corrected decision 3); `Link` paging; the one-day and 300-second lags as
+margins, stated as ours; newest-first Confluence reads stopping at the
+cursor (sound because the sort field is the cursor); no deletes claimed.
+
+- `BLOCKER 13` (decision 3, `SRC-3-AC1`). The API's connection test answers
+  `supported: false` for Confluence's browser sign-in, one of the two signed
+  ways (same finding as `BLOCKER 10` for GA4). Add the `accessible-resources`
+  call to the Rust probe after the token refresh: match the site, validate
+  the cloud id as a UUID, then "who am I" on the fixed gateway host from
+  the vendor table; add a product step for the browser way.
+- Not verified and open for CI: the Rust of this slice, the two vendors'
+  product steps, and the job time.
+
+### Review of slice 5 (planner, 2026-10-21, head `f851a806`)
+
+Before it: CI on `60909de3` green, 38 of 38; the six vendors' product steps
+pass, the Confluence browser sign-in included (the fix: a refresh token the
+provider repeats is not a rotation, RFC 6749 section 6).
+
+Read: the handoff, the tenant rule, the SharePoint delta and the Dynamics
+change-tracking paths, the state handling. Plan section 8 item 6 answered by
+running (the delta link survives a failed run and a run that died before
+loading; a 410 resyncs): accepted. Accepted as stated limits on the page:
+deletes missed while a link was stale (until a full reload), Dynamics tables
+without change tracking see no deletes, SharePoint has no `describe` (not on
+decision 9's list), any 4xx on a saved Dataverse link resyncs. The tenant
+becoming part of the account: accepted (the types are not supported yet, so
+no deployed connector breaks). The Confluence `\Z` fix: accepted.
+
+- `BLOCKER 14` (decision 5: "SharePoint: the lists of the sites the user
+  picks"; `SRC-3-AC2`/`AC3`). Objects are `<site id>/<list id>` with no
+  label, and nothing lets the user pick sites: with none named the first
+  100 found by search are listed. Add a display label to a listed object
+  (the discovery carrier, Rust and contract, additive like `ObjectKind`
+  before), a site picker on the SharePoint form fed by discovery
+  (`/sites?search=`), the lists shown as "site / list" names, and the
+  loaded table named from the labels (stable when renamed: keep the ids in
+  the source-object key). Tests for the form and the carrier.
+- Not verified and open for CI: the new Rust tests, the four new product
+  entries, the job time (now about eight product entries).
+
+### Planner addendum before slice 6 (2026-10-21): the gate budget
+
+The `g6-saas` job took 16m17s on `7a8af090` with eight vendors (about 65–88
+s of product steps each, plus the stack bring-up), against the signed 20
+minutes per connector gate job (`connector-gates.md`). Workday and NetSuite
+would push it past the budget. **AD9 is amended**: slice 6 splits the gate
+into two CI jobs that run in parallel on the same scripts, selected by a
+vendor list: `g6-saas-a` (HubSpot, Zendesk, Salesforce, GA4, ServiceNow) and
+`g6-saas-b` (Confluence, SharePoint, Dynamics 365, Workday, NetSuite). Both
+are in `ci-required` and `scripts/ci/required_gate.sh` (with its test),
+`docs/CI.md`, and slice 7's `coverage.json` names the job each type is
+proven in. No step is removed to fit the budget.
+
+### Review of slice 6 (planner, 2026-10-21, head `26ada479`)
+
+Read: the handoff, the gate split, both vendor modules, the probe arms, the
+NetSuite assertion, the Workday host rule. Accepted: the split exactly as
+amended AD9 (both jobs required, no step removed); PS256/ES256 for NetSuite
+per Oracle's page; the optional `certificateId` (NetSuite's `kid`, not part
+of the identity); per-vendor request timeouts; empty keys for objects read
+in full; the Workday connection test running the first named report (the
+connector page must say a test runs one report at the vendor).
+
+- **Decision 9 not met for NetSuite** (no SuiteQL column listing exists):
+  reported, not lowered. NetSuite's schema changes are seen after the load,
+  stated on the page; it is listed under "Spec targets this feature does not
+  meet" as well, and told to the product owner. NetSuite stays unsupported
+  (decision 10), so nothing ships with it.
+- `SHOULD-FIX 15`. The Workday host rule accepts one label under
+  `workday.com` or `myworkday.com`; Workday tenants are also reached on
+  multi-label hosts under those domains. Accept up to three DNS labels
+  under the two fixed suffixes, each label validated, never another suffix;
+  tests both ways. (Unverified against Workday's own pages, which are not
+  readable from here; `SRC-3-AC1` on a real tenant decides.)
+- Not verified and open for CI: the two gate jobs and their times, the four
+  new product entries, the `ingest_spec.rs` tests.
+
+### Review of slice 7 (planner, 2026-10-21, head `9b0a749b`)
+
+Before it: CI on `933de5e8` green, 39 of 39; job A 7m18s, job B 13m23s.
+
+Read: `0096` (guarded updates, eight types; Workday and NetSuite keep a
+reason), `coverage.json`, the lint count (19 supported), the RESULT (it
+says the split rests on one run), the brand-mark choices (only marks
+Simple Icons publishes today: four), the backlog rows `SRC-26` to `SRC-31`.
+Accepted: the gate's first step now expecting eight supported and two not;
+`gate: "g6-saas"` with the job named in each entry's note.
+
+- `SHOULD-FIX 16`. The Sources page header (`connectors-page.tsx`) still
+  names no business apps while eight are now supported. It is a one-line
+  console change in this feature's scope, not a follow-up: change it here
+  and take that part out of `SRC-29` (the six missing brand marks stay).
+- After CI is green on the fix: the product owner's browser check on a QA
+  instance (picker, the ten forms, the GA4 report editor, the SharePoint
+  site picker, a connector page's incremental/full notes). Real-account
+  rows of the checklist wait for decision 11's accounts.
+
+### Final review before merge (reviewer, 2026-10-23, head `f85913d3` with `main` merged)
+
+A second reviewer (Claude Opus, kleopasevan's side) read the whole PR
+before merge, with four read-only passes (SaaS HTTP and SSRF, Rust,
+load path, console/gates/docs); every BLOCKER below was re-checked by the
+reviewer. `BLOCKER 17` was reproduced: a test on the existing SharePoint
+fixtures with a real Iceberg load fails 2 of 2 (an edit made during run 1
+and a change after a delete are both lost). The SSRF layer holds: no link
+from a vendor answer reaches another origin, every dial is checked and
+pinned before any credential, redirects are off, the gate override is
+inert unless `CONNECTOR_OAUTH_ALLOW_HTTP == "true"`. Rust, migrations,
+`POLICY_TABLE`, secrets, rule 12 and the vendored licences are clean.
+
+**Verdict: not ready to merge. 3 BLOCKERs.**
+
+- `BLOCKER 17` (decision 6/7, `SRC-3-AC4`; principle 2). Delta-link reads
+  go through dlt's cursor filter. `adapters/saas.py` wraps every
+  incremental object in `dlt.sources.incremental(decl.cursor, …)`, but
+  SharePoint (`saas/vendors/sharepoint.py`, cursor `modified_at`, no lag)
+  and Dynamics 365 change tracking (`dynamics365.py`, 300 s lag) ignore
+  `since` and replay the saved delta link. dlt then drops every row whose
+  cursor is below the previous run's highest value, while the link moves
+  past it: an item edited during run 1 after its page was read, or any
+  change stamped below a delete's `now()` stamp (orchestrator clock), is
+  lost with nothing reported. Fix: an object read from a delta link is not
+  filtered by the cursor (a vendor declaration says so, for example
+  `ObjectDecl.delta = True`, and the adapter builds that resource without
+  `dlt.sources.incremental`, merging on the key); the delete stamp no
+  longer matters then. Tests: the two cases above for SharePoint and the
+  same two for Dynamics, each failing before the fix.
+- `BLOCKER 18` (decision 6: "merge on the vendor's id"; `SRC-3-AC4` "no
+  duplicate"). Plain `incremental` (append) is accepted for `saas`:
+  `adapters/saas.py` checks only `incrementalKey`, the Rust load-mode
+  validation and the console offer it, `sink.py` maps it to `append`. Every
+  changed record becomes a second row, and with a lag (GA4 3 days,
+  ServiceNow/NetSuite a day, Dynamics/Confluence 5 minutes) dlt turns
+  boundary de-duplication off, so unchanged rows repeat every run. With
+  `incremental_dedup` the key comes from `obj.primaryKey` and is never
+  compared with `decl.primary_key` (a GA4 report saved with
+  `primaryKey: ["date"]` collapses all countries into one row a day). Fix:
+  for `saas`, refuse plain `incremental` (Rust validation with a fixed
+  message, Python `UnsupportedLoadMode`, console not offering it) and
+  refuse a `primaryKey` that differs from the vendor's declared key (Python
+  at load; Rust where the declared key is known, otherwise Python only, and
+  say so). Tests both ways in each language.
+- `BLOCKER 19` (AD9, `coverage.json` marks reload `real`; principle 2).
+  The product reload step proves nothing about incremental for Salesforce
+  and Zendesk: `g6_saas_test.py` counts the reload as incremental when one
+  logged request contains a marker, but `saas_stub_salesforce.py` and
+  `saas_stub_zendesk.py` log only the path, and the markers (`queryAll`;
+  `incremental`, `cursor`) match a full read too. A product that forgot the
+  cursor on run 2 passes (the merge hides it). Fix: both stubs log the query
+  string; the markers are the cursor filter itself (Salesforce
+  `WHERE SystemModstamp >=` with a non-initial value; Zendesk a non-zero
+  `start_time`); check every other vendor's marker the same way (it must be
+  absent from the first run's requests and present in the reload's). The
+  revoked sign-in product step also asserts the run's class is
+  `sign_in_refused`, not only that it failed.
+
+SHOULD-FIX
+
+- `SHOULD-FIX 20` (rule 2). `scripts/ci/tests/test_required_gate.sh`:
+  "Skipped discovery scale gate blocks rust PR" now also sets
+  `G6_SAAS_A_RESULT=skipped G6_SAAS_B_RESULT=skipped`, so it would pass if
+  discovery-scale were removed from `required_gate.sh`. Restore the single
+  variable (the SaaS skips have their own cases).
+- `SHOULD-FIX 21`. HubSpot searches from `since - 60 s` (`hubspot.py`) but
+  declares no `lag_seconds`, so dlt discards the margin's rows: declare
+  `lag_seconds = SEARCH_LAG_SECONDS` and drop the hand-made floor, as GA4.
+- `SHOULD-FIX 22`. GA4: a week/month/year report re-reads from the period
+  start, but the 3-day lag drops the previous period's row, so it is never
+  revised; make the lag at least the period plus 3 days for those grains
+  (or refuse those grains and say so). And the report editor allows 20
+  names in total (`src/lib/connectors/ga4-report.ts`, `ga4.py`), while the
+  Data API `runReport` takes at most 9 dimensions and 10 metrics: check
+  that against Google's page and validate the two separately on both
+  sides, citing the page in the commit (or say it could not be read).
+- `SHOULD-FIX 23`. `saas/session.py`: `_origin_of` lets `urlparse`'s
+  `ValueError` escape (NFKC-changing host, broken IPv6 literal), which is
+  classed `setting_rejected` and carries vendor text into the Dagster
+  failure description: raise `SsrfBlocked` with fixed text, `from None`.
+  `Retry-After: nan` passes the bound (`math.isfinite`). A 2xx answer that
+  is not JSON (`requests.JSONDecodeError`) is classed `setting_rejected`;
+  give it a fixed `SaasBadAnswer` (or similar) classed `source_busy`.
+  Tests for each.
+- `SHOULD-FIX 24`. A saved delta link is not tied to its object
+  (SharePoint replays `state["delta_link"]` with no check of site/list;
+  Dynamics checks `$select` only): store the object name with the link and
+  treat a mismatch as no saved link. Test.
+- `SHOULD-FIX 25` (Rust). `connector_oauth.rs` `revoke_stored_token` does
+  not apply the gate override, so under the gate a revocation would post
+  the stub's tokens to the real vendor host: apply `gate_rebase` as the
+  exchange does. NetSuite `auth.type = integration` without
+  `certificateId` is accepted at save and fails only at the test: refuse
+  it in `validate_saas_dial_post_parse`. `saas_target_identity` ignores
+  `auth.type`, so switching sign-in method keeps the stored refs in their
+  slots and sends a secret in another role: include `auth.type` in the
+  identity (credentials are asked again), with the test that asserted the
+  opposite changed and the reason in the commit.
+- `SHOULD-FIX 26` (docs, rule 1). `ops/g6/g6_saas_test.py` module
+  docstring still describes slice 1 (no vendor, all unsupported, not
+  through the API). `DEC-9` row in `BACKLOG.md`, `specs/src-3.md` and
+  `business-app-connectors.md` say the six non-vendored vendors use dlt's
+  `rest_api`; they call `SaasSession` directly (accepted at the slice 3/4
+  reviews): correct the text and say why. `BACKLOG.md` `SRC-3` row says
+  follow-ups `SRC-26` to `SRC-30`; `SRC-31` exists. `coverage.json` notes
+  say discovery "previews one" for Zendesk, whose preview is an honest
+  `not_supported`.
+
+Not a finding: SharePoint list labels live in component state, so after
+a reload a saved list shows its ids until "Find objects" runs; add it to
+`SRC-29`.
+
+Each fix cites its number at the site and in the commit (rule 13); each
+new test fails without its fix. Then the full verification block once,
+and a Handoff below.
+
+### Handoff: final review fix round (developer, 2026-10-23)
+
+Fixes for the "Final review before merge" findings, one finding per commit, on
+`feat/data-phase-4-connectors` with `main` merged in. Every new test was run
+against the source reverted (or with the checked line removed) first and failed
+there, then passed with the fix.
+
+| Commit | Finding | Subject |
+| --- | --- | --- |
+| `aa07bdd7` | BLOCKER 17 | fix(dagster): a delta-link read is merged, not filtered by the cursor |
+| `39dda8be` | BLOCKER 18 | fix: a business app merges on its key, never plain incremental |
+| `7ad32332` | BLOCKER 19 | fix(gate): prove the reload asked from the cursor, not from the start |
+| `4a8bcbca` | SHOULD-FIX 20 | test(ci): the skipped discovery-scale case checks one variable |
+| `a2d040f0` | SHOULD-FIX 21 | fix(dagster): HubSpot declares the search lag instead of stepping back by hand |
+| `8cf298ef` | SHOULD-FIX 22 | fix(dagster,frontend): GA4 period lag and the API's own report limits |
+| `b262d448` | SHOULD-FIX 23 | fix(dagster): fixed failures for an undecodable host, a bad Retry-After and a bad body |
+| `d612215c` | SHOULD-FIX 24 | fix(dagster): a saved delta link is tied to the object it belongs to |
+| `5127dd29` | SHOULD-FIX 25 | fix(api,store,frontend): revocation under the gate, NetSuite's certificate, sign-in in the identity |
+| `1c88b555` | SHOULD-FIX 26 | docs: the gate docstring, DEC-9's build, the follow-up range and the Zendesk note |
+
+Commands run on the final tree, with counts:
+
+- `cd rust && cargo fmt --check`: clean.
+- `cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings`: 0 warnings.
+- `cargo-locked test -j 2 -p lakehouse-store`: **731 passed, 0 failed** across its
+  31 test binaries.
+- `cargo-locked test -j 2 -p lakehouse-api --lib a_saas_sign_out_is_rebased`: 1 passed.
+- `cargo-locked test -j 2 -p lakehouse-api --test connector_oauth_flow signing_out_revokes_at_the_provider_and_removes_the_token`: 1 passed (a database was available).
+- Scoped checks per commit: `cargo test -p lakehouse-store` filtered to
+  `saas_dial_tests`, `saas_objects_take_incremental` and
+  `the_saas_target_identity` (all passed); `cargo clippy -p lakehouse-store` and
+  `-p lakehouse-api --all-targets -- -D warnings` (0 warnings).
+- `cd dagster && python -m pytest dispar_orchestrate -q`: **2140 passed, 33
+  subtests passed, 0 failed** (16m59s).
+- `bun run typecheck`: 0 errors. `bun run lint`: 0 errors, 9 warnings (all
+  pre-existing, none in the files touched).
+- `bun test src/features/connectors/`: **362 pass, 0 fail**. `bun test
+  src/lib/connectors/`: **54 pass, 1 skip, 0 fail**.
+- `python3 ops/lint/check_intra_package_imports.py`,
+  `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: OK (19
+  supported types covered, 0 waived).
+- `bash scripts/ci/tests/test_required_gate.sh`: **56 passed, 0 failed**.
+- `python3 -m py_compile ops/g6/g6_saas_test.py ops/g6/saas_stub_salesforce.py
+  ops/g6/saas_stub_zendesk.py`: OK.
+
+**Not verified, and why**
+
+- **The `g6-saas` gate has not run.** It needs the docker stack, which this
+  machine does not run for this task; only the three edited files compile, and
+  no unit test of the stubs exists. CI decides whether BLOCKER 19's checks pass
+  on the mock (the marker-absence rule for every vendor, the Zendesk value
+  comparison, the revoked run's `sign_in_refused` class).
+- **The full Rust workspace test suite has not run** (the reviewer runs it).
+  Only `-p lakehouse-store` in full and the two `lakehouse-api` cases above did.
+- **A `saas` sign-out under the gate origin has no end-to-end test.** The
+  rebased URL is unit-tested (`revocation_url`), and the existing `rest`
+  sign-out flow test passes; the gate's own job does not sign out, and a
+  flow test would need the process-wide `SAAS_GATE_ORIGINS` variable (the
+  suite deliberately avoids `std::env::set_var`). The call site is one line
+  and the test fails when that helper is a no-op.
+- **BLOCKER 19 changed the shared gate script's log capture** (an extra
+  `clear_log` before the first load). This is reviewed by reading it; CI is
+  the first run.
+- Nothing was shown in a browser, and no vendor account was used.
+
+**Decisions taken where the review left a choice**
+
+- SHOULD-FIX 22: the dimensions/metrics limits were read from Google on
+  2026-10-23 — the v1beta discovery document on `RunReportRequest` (9
+  dimensions, 10 metrics) and the "Create a report" guide (9 dimensions). The
+  period lag covers the grain's own length plus the 3-day lookback.
+- SHOULD-FIX 25: the test that asserted a sign-in-kind change was not a
+  re-point now asserts it is, as the finding says; the reason is in the test
+  and the commit.
+- BLOCKER 18: the Rust side can only refuse plain `incremental`; the
+  `primaryKey`-vs-vendor-key check is Python only because the declared keys
+  live in the Python vendor modules, as the finding allows.
+
+### Final review, round 2 (reviewer, 2026-10-23, head `16fd7a89`)
+
+Read every fix commit (`aa07bdd7` to `1c88b555`) against its finding.
+BLOCKERs 17 and 18 and SHOULD-FIX 20 to 26 are fixed as asked: accepted.
+The reviewer's own full run on the pre-fix head merged with `main`
+(`00565f9d`): fmt and clippy clean; Rust 133 binaries, 6,971 passed, 297
+failed, all in the `lakehouse-api` lib binary and all "Connection reset"
+in sqlx's test-database setup (the shared test Postgres); that binary
+re-run alone: 2,440 passed, 0 failed. Typecheck clean; console 2,587
+passed; Dagster 2,124 passed; Python lints, compose config and gitleaks
+OK. The fix round is re-run after round 2.
+
+- `BLOCKER 19` is not closed. `g6_saas_test.py` sets
+  `"list_marker": "/pages"` (a string) for Confluence, and the check does
+  `any(m in line for m in list_marker)`, which iterates the string's
+  characters: every request with a `/` counts, so `max_reads` and
+  `first_reads_more_than_reload` compare all requests, not page reads.
+  Fix: make it a tuple (`("/pages",)`), and make the code refuse a bare
+  string (normalise or assert a tuple) so the same slip cannot come back.
+  Cite `BLOCKER 19 (round 2)`.
+
+### Handoff: final review round 2 (developer, 2026-10-23)
+
+One commit, one task: `bdb1d359` — `fix(g6): Confluence's read markers are
+tuples, and the gate refuses a bare string` (BLOCKER 19, round 2).
+
+What changed:
+
+- `ops/g6/g6_saas_test.py`: both Confluence entries (the API-token one and
+  `confluence-browser`) now set `"list_marker": ("/pages",)`. A new
+  `_markers(spec, key)` returns `spec[key]` as a tuple, `()` when absent,
+  and raises `SaasGateFailure` on a bare string (not normalised to a
+  one-element tuple: the gate fails loudly rather than pass on nothing).
+  `reads_marker`, `full_read_marker` and `list_marker` are all read through
+  it, so the character-by-character iteration cannot come back. The three
+  call sites and both spec entries carry the
+  `PR #216 final review BLOCKER 19 (round 2)` citation and the reason.
+- `ops/g6/test_saas_gate_markers.py` (new): six unittest cases, no network
+  and no docker — the helper's absent/tuple/string cases, all three marker
+  keys of every entry are tuples of strings, and both Confluence entries
+  match a page request but not `POST /api/v1/connectors/4/test`.
+
+Commands run, with results:
+
+- `python3 -m py_compile ops/g6/g6_saas_test.py
+  ops/g6/test_saas_gate_markers.py`: OK.
+- `python3 -m unittest discover -s ops/g6 -p 'test_*.py'`: **6 tests, 0
+  failures, 0 errors**.
+- Mutation check: with `"list_marker": "/pages"` put back by hand, the same
+  discover run gives **2 failures + 2 errors** (the tuple assertion and the
+  helper call); restored, 6 pass. The old string form counts
+  `POST /api/v1/connectors/4/test` as a page read, the tuple form does not.
+- Type sweep of every `PRODUCT_VENDORS` value: `list_marker`,
+  `reads_marker` and `full_read_marker` are the only marker lists and are
+  now `tuple` in all 16 entries; `cursor_value` is still a regex string by
+  design (used with `re.findall`), `columns`/`order`/`text`/`key` are SQL
+  fragments or scalars, and the remaining iterables are `set`/`list`/
+  callables as before.
+
+Not verified, and why:
+
+- **The `g6-saas` gate has not run.** It needs the docker stack, which this
+  task does not start; only the script and its unit test were run. CI
+  decides whether the changed read counts hold against the mock (both
+  Confluence entries must now see fewer page requests on the reload than
+  on the first run, at most 2).
+- **The new unit test is not discovered by CI.** It imports the gate module,
+  which imports `requests`, and the `repo-lints` job installs no
+  third-party packages; the test docstring says to run it with
+  `python3 -m unittest discover -s ops/g6 -p 'test_*.py'`. Wiring it in
+  needs a `pip install` step in that job, which this fix deliberately does
+  not add.
+
+### Final review, round 3 (reviewer, 2026-10-23, head `4d72e816`)
+
+CI on `4d72e816`: 36 of 39 pass. `g6-saas-b` fails in its SharePoint
+vendor step: `g6_saas_test.py:820` and `:838` still read
+`state["delta_link"]` as a string, but `SHOULD-FIX 24` (`d612215c`) now
+stores `{"link": …, "object": …}` there (`AttributeError: 'dict' object
+has no attribute 'endswith'`). `SRC-11 connector operations` also fails
+(auto-disable timeout), as it did on #212, a tokio patch bump; it passes on
+`main`'s last two runs, so it is re-run, not fixed here.
+
+- `BLOCKER 19 (round 3)` (the gate is the proof of this PR). Read the link
+  as `state["delta_link"]["link"]` at both lines and assert
+  `state["delta_link"]["object"]` is the loaded list, so the gate also
+  proves `SHOULD-FIX 24`. Grep the gate and the stubs for any other reader
+  of a state shape the fix round changed.
+
+### Handoff: final review round 3 (developer, 2026-10-23)
+
+One commit, one finding: `f1243720` — `fix(g6): the SharePoint gate reads the
+saved delta link as link + object` (BLOCKER 19, round 3; also proves
+SHOULD-FIX 24).
+
+What changed:
+
+- `ops/g6/g6_saas_test.py`: a new `_saved_delta_link(state, object_name)`
+  raises a named `SaasGateFailure` when `state["delta_link"]` is not a dict
+  with a non-empty `"link"` string (never the CI's `AttributeError`), and
+  requires `"object"` to be the list the step loaded. Both SharePoint sites —
+  the first load (`token=v5`) and the 410 resync (`token=v9`) — call it with
+  `SP_OBJECT`, so the gate also asserts the object tie SHOULD-FIX 24 added.
+  The citation `PR #216 final review BLOCKER 19 (round 3)` is at both sites
+  and in the helper docstring; the mismatch message names SHOULD-FIX 24.
+- `ops/g6/test_saas_gate_saved_delta_link.py` (new): six unittest cases, no
+  network and no docker — the valid shape, the pre-fix bare string (named
+  failure, not `AttributeError`), a missing key, a dict without a link string,
+  and a link saved for another list.
+
+Sweep of the gate and the stubs, as asked: the only other state reader is
+Dynamics 365's `state["delta"]["link"]` (`g6_saas_test.py:990`), which is right
+against `dynamics365.py` (`_tracked` stores `{"link", "select", "object"}`);
+no gate or stub sends plain `"incremental"` as a saas `loadMode` (the product
+step sends `incremental_dedup`, Workday `replace`); GA4's `decl.lag_seconds`
+and the BLOCKER 19 marker tuples are unchanged by round 3; no stub reads dlt
+state at all.
+
+Commands run, with results:
+
+- `python3 -m py_compile ops/g6/g6_saas_test.py
+  ops/g6/test_saas_gate_saved_delta_link.py`: OK.
+- `python3 -m unittest discover -s ops/g6 -p 'test_*.py'`: **12 tests, 0
+  failures, 0 errors** (6 marker tests from round 2, 6 new).
+- Without docker: `/home/shiro/rantai/venv-bld3/bin/python
+  /tmp/opencode/sp_gate_state_check.py` (scratch, not committed) ran
+  `sharepoint.read` over the dagster suite's fake Graph: it produced
+  `{"delta_link": {"link": ".../delta?token=v5", "object": <SP_OBJECT>}}`,
+  `_saved_delta_link` returned the link, the pre-fix expression on that same
+  state raised `AttributeError: 'dict' object has no attribute 'endswith'`,
+  and a link saved for another list was refused with the SHOULD-FIX 24
+  message.
+- `cd dagster && python -m pytest dispar_orchestrate/test_saas_sharepoint.py
+  -q`: **39 passed, 0 failed** (223 warnings), 20.35s — the module's own
+  tests for both state shapes (first run, later run, other object, resync).
+
+Not verified, and why:
+
+- **The `g6-saas` gate has not run.** It needs the docker stack, which this
+  task does not start; the read path is exercised above only against the
+  fake Graph and the unit tests. CI decides whether `g6-saas-b`'s SharePoint
+  step now passes.
+- **The new unit test is not discovered by CI** for the same reason as round
+  2's: it imports the gate module, which imports `requests`, and the
+  `repo-lints` job installs no third-party packages. It is run by the command
+  above.

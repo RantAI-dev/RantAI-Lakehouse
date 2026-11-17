@@ -201,7 +201,7 @@ mod tests {
     fn parse_accepts_commas_and_whitespace_and_ignores_blanks() {
         let nets = parse_cidrs(" 10.0.0.0/8,192.168.18.205  fd00::/8 ,").unwrap();
         assert_eq!(nets.len(), 3);
-        assert!(parse_cidrs("").unwrap().is_empty());
+        assert_eq!(parse_cidrs("").unwrap(), [] as [ipnet::IpNet; 0]);
     }
 
     #[test]

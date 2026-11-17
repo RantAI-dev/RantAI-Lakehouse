@@ -32,7 +32,8 @@ use crate::error::ApiRejection;
 /// Fields a client may filter on. Every entry is a key the asset objects
 /// `catalog::list_body` emits can carry; `tags` only exists on an asset
 /// someone annotated, and reads as an empty list on the others
-/// ([`ARRAY_FIELDS`]).
+/// ([`ARRAY_FIELDS`]). `certification` (`DATA-12`) likewise exists only on
+/// an asset with a mark and reads as empty on the others.
 pub const FILTERABLE_FIELDS: &[&str] = &[
     "id",
     "name",
@@ -53,6 +54,7 @@ pub const FILTERABLE_FIELDS: &[&str] = &[
     "lastUpdated",
     "health",
     "residency",
+    "certification",
     "tags",
 ];
 
@@ -84,6 +86,7 @@ pub const SORTABLE_FIELDS: &[&str] = &[
     "lastUpdated",
     "health",
     "residency",
+    "certification",
 ];
 
 /// Fields a client may group by. Restricted to the low-cardinality
@@ -100,6 +103,7 @@ pub const GROUPABLE_FIELDS: &[&str] = &[
     "engine",
     "health",
     "residency",
+    "certification",
 ];
 
 /// How multiple filters combine.
@@ -331,11 +335,28 @@ fn matches_filter(asset: &Value, filter: &Filter) -> bool {
 /// nothing: a list has no order. An asset without the field is an empty
 /// list, so a negative filter keeps it, as it does for a missing scalar.
 fn matches_array_filter(asset: &Value, filter: &Filter) -> bool {
-    let entries: Vec<&str> = asset
+    let mut entries: Vec<String> = asset
         .get(filter.id.as_str())
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
         .unwrap_or_default();
+    // `DATA-12` part 2: the Tags filter reads the governed pairs too, as
+    // `key: value` entries, so `iLike finance` finds a table tagged
+    // `data_domain: finance` and `isEmpty` is true only for a table with
+    // neither kind. The same text the search indexes.
+    if filter.id == "tags" {
+        entries.extend(
+            super::catalog_search::governed_pairs(asset)
+                .into_iter()
+                .map(|(key, value)| format!("{key}: {value}")),
+        );
+    }
     let first = filter.values.first().map_or("", String::as_str);
     let any = |positive: &str| {
         entries.iter().any(|entry| match positive {
@@ -379,18 +400,24 @@ fn compare_op(asset: &Value, field: &str, operator: &str, operand: &str) -> bool
 
 /// Combine `filters` with `join`. No filters means no filtering, for
 /// either operator — an empty `or` must not reject every row.
-pub fn apply_filters(assets: &[Value], filters: &[Filter], join: JoinOperator) -> Vec<Value> {
+///
+/// The rows that match are kept, in their order, and the rows that do not
+/// are dropped.
+///
+/// `DATA-41` D6: the rows are filtered in place, and with no filters
+/// nothing is touched at all. This used to return a copy of every row,
+/// and the caller threw that copy away when there was nothing to filter:
+/// on a catalog of 10,000 tables a search copied the whole catalog for
+/// nothing, which was about 150 ms of every request to
+/// `GET /api/catalog/query?search=` (`docs/plans/DATA-11-RESULT.md`).
+pub fn apply_filters(assets: &mut Vec<Value>, filters: &[Filter], join: JoinOperator) {
     if filters.is_empty() {
-        return assets.to_vec();
+        return;
     }
-    assets
-        .iter()
-        .filter(|asset| match join {
-            JoinOperator::And => filters.iter().all(|f| matches_filter(asset, f)),
-            JoinOperator::Or => filters.iter().any(|f| matches_filter(asset, f)),
-        })
-        .cloned()
-        .collect()
+    assets.retain(|asset| match join {
+        JoinOperator::And => filters.iter().all(|f| matches_filter(asset, f)),
+        JoinOperator::Or => filters.iter().any(|f| matches_filter(asset, f)),
+    });
 }
 
 /// Multi-column sort, applied left to right, with `id` as a final
@@ -584,12 +611,22 @@ mod tests {
         }
     }
 
+    /// The rows that match `filters`.
+    ///
+    /// `DATA-41` D6: [`apply_filters`] filters the rows in place, so this
+    /// helper owns them and hands back the ones that matched.
+    fn filter_rows(assets: Vec<Value>, filters: &[Filter], join: JoinOperator) -> Vec<Value> {
+        let mut rows = assets;
+        apply_filters(&mut rows, filters, join);
+        rows
+    }
+
     // --- filter operators -------------------------------------------
 
     #[test]
     fn eq_ignores_case_and_ne_includes_missing_fields() {
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("layer", "eq", &["silver"])],
             JoinOperator::And,
         );
@@ -597,8 +634,8 @@ mod tests {
 
         // `dim_negara` has no `owner` key at all; `ne` must still return it,
         // otherwise a negative filter quietly hides incomplete rows.
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("owner", "ne", &["Dinas Ekraf"])],
             JoinOperator::And,
         );
@@ -619,8 +656,8 @@ mod tests {
     }
 
     fn tag_hits(operator: &str, values: &[&str]) -> Vec<String> {
-        apply_filters(
-            &tagged(),
+        filter_rows(
+            tagged(),
             &[filter("tags", operator, values)],
             JoinOperator::And,
         )
@@ -661,11 +698,38 @@ mod tests {
     }
 
     #[test]
+    fn the_tags_filter_reads_governed_pairs_as_key_colon_value() {
+        let assets = vec![
+            json!({ "id": "a", "governedTags": { "data_domain": "finance" } }),
+            json!({ "id": "b", "tags": ["pii"] }),
+            json!({ "id": "c" }),
+        ];
+        let hits = |operator: &str, values: &[&str]| -> Vec<String> {
+            filter_rows(
+                assets.clone(),
+                &[filter("tags", operator, values)],
+                JoinOperator::And,
+            )
+            .iter()
+            .filter_map(|a| a["id"].as_str().map(str::to_owned))
+            .collect()
+        };
+        assert_eq!(hits("iLike", &["finance"]), vec!["a"]);
+        assert_eq!(hits("iLike", &["data_domain"]), vec!["a"]);
+        assert_eq!(hits("eq", &["data_domain: Finance"]), vec!["a"]);
+        assert_eq!(hits("isNotEmpty", &[]), vec!["a", "b"]);
+        assert_eq!(hits("notILike", &["finance"]), vec!["b", "c"]);
+    }
+
+    #[test]
     fn tags_ordering_operators_match_nothing() {
         for operator in ["lt", "lte", "gt", "gte"] {
             assert!(tag_hits(operator, &["m"]).is_empty(), "{operator}");
         }
-        assert!(tag_hits("isBetween", &["a", "z"]).is_empty());
+        assert_eq!(
+            tag_hits("isBetween", &["a", "z"]),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -677,6 +741,47 @@ mod tests {
         ] {
             assert!(matches!(err.0, ApiError::BadRequest(_)));
         }
+    }
+
+    /// `DATA-12` F5: `certification` filters (`eq`, `inArray`), sorts and
+    /// groups; a row without a mark falls under the empty group.
+    #[test]
+    fn certification_filters_sorts_and_groups() {
+        let rows = vec![
+            json!({ "id": "a", "certification": "deprecated" }),
+            json!({ "id": "b" }),
+            json!({ "id": "c", "certification": "certified" }),
+            json!({ "id": "d", "certification": "certified" }),
+        ];
+        let certified = filter_rows(
+            rows.clone(),
+            &[filter("certification", "eq", &["certified"])],
+            JoinOperator::And,
+        );
+        assert_eq!(ids(&certified), vec!["c", "d"]);
+        let marked = filter_rows(
+            rows.clone(),
+            &[filter(
+                "certification",
+                "inArray",
+                &["certified", "deprecated"],
+            )],
+            JoinOperator::And,
+        );
+        assert_eq!(ids(&marked), vec!["a", "c", "d"]);
+
+        assert!(parse_sort(Some(r#"[{"id":"certification","desc":false}]"#)).is_ok());
+        let mut sorted = rows.clone();
+        apply_sort(
+            &mut sorted,
+            &parse_sort(Some(r#"[{"id":"certification","desc":false}]"#)).unwrap(),
+        );
+        assert_eq!(ids(&sorted), vec!["b", "c", "d", "a"]);
+
+        assert!(parse_group_by(Some("certification")).is_ok());
+        let (_, groups) = apply_grouping(&rows, "certification");
+        let counts: Vec<(&str, usize)> = groups.iter().map(|g| (g.id.as_str(), g.count)).collect();
+        assert_eq!(counts, vec![("deprecated", 1), ("—", 1), ("certified", 2)]);
     }
 
     #[test]
@@ -691,8 +796,8 @@ mod tests {
 
     #[test]
     fn is_empty_covers_both_missing_and_blank() {
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("owner", "isEmpty", &[])],
             JoinOperator::And,
         );
@@ -701,8 +806,8 @@ mod tests {
 
     #[test]
     fn in_array_matches_any_listed_value() {
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("tier", "inArray", &["gold", "bronze"])],
             JoinOperator::And,
         );
@@ -714,8 +819,8 @@ mod tests {
     fn numeric_operators_compare_as_numbers_not_strings() {
         // Lexicographically "900" > "20000"; numerically it is not. This is
         // the case that catches a string-comparison regression.
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("sizeBytes", "gt", &["1000"])],
             JoinOperator::And,
         );
@@ -724,8 +829,8 @@ mod tests {
 
     #[test]
     fn is_between_is_inclusive_at_both_ends() {
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("sizeBytes", "isBetween", &["900", "1024"])],
             JoinOperator::And,
         );
@@ -736,12 +841,12 @@ mod tests {
     fn unknown_operator_matches_nothing_rather_than_everything() {
         // Failing open would widen the result set — the wrong direction for
         // a governed catalog.
-        let hits = apply_filters(
-            &fixture(),
+        let hits = filter_rows(
+            fixture(),
             &[filter("layer", "bogusOperator", &["Silver"])],
             JoinOperator::And,
         );
-        assert!(hits.is_empty());
+        assert_eq!(hits, [] as [serde_json::Value; 0]);
     }
 
     // --- join operator ----------------------------------------------
@@ -753,20 +858,43 @@ mod tests {
             filter("tier", "eq", &["gold"]),
         ];
         assert_eq!(
-            ids(&apply_filters(&fixture(), &filters, JoinOperator::And)),
+            ids(&filter_rows(fixture(), &filters, JoinOperator::And)),
             vec!["silver.mart_wisman"]
         );
-        assert_eq!(
-            apply_filters(&fixture(), &filters, JoinOperator::Or).len(),
-            3
-        );
+        assert_eq!(filter_rows(fixture(), &filters, JoinOperator::Or).len(), 3);
     }
 
     #[test]
     fn empty_filter_list_is_a_no_op_for_both_join_operators() {
         // An empty `or` must not reject every row.
-        assert_eq!(apply_filters(&fixture(), &[], JoinOperator::Or).len(), 4);
-        assert_eq!(apply_filters(&fixture(), &[], JoinOperator::And).len(), 4);
+        assert_eq!(filter_rows(fixture(), &[], JoinOperator::Or).len(), 4);
+        assert_eq!(filter_rows(fixture(), &[], JoinOperator::And).len(), 4);
+    }
+
+    // `DATA-41` D6`: the rows are filtered in place, so the caller's own
+    // rows are the ones that are kept, and a call with no filters copies
+    // nothing.
+    #[test]
+    fn the_filters_are_applied_to_the_rows_the_caller_holds() {
+        let mut rows = fixture();
+        apply_filters(
+            &mut rows,
+            &[filter("layer", "eq", &["silver"])],
+            JoinOperator::And,
+        );
+        assert_eq!(ids(&rows), vec!["silver.mart_wisman", "silver.dim_negara"]);
+
+        let mut untouched = fixture();
+        apply_filters(&mut untouched, &[], JoinOperator::Or);
+        assert_eq!(
+            ids(&untouched),
+            vec![
+                "silver.mart_wisman",
+                "bronze.event_2026",
+                "silver.dim_negara",
+                "gold.restoran",
+            ]
+        );
     }
 
     #[test]
@@ -919,7 +1047,7 @@ mod tests {
     fn paginate_past_the_end_is_empty_not_an_error() {
         // How infinite scroll terminates: the client stops once a page
         // comes back shorter than `pageSize`.
-        assert!(paginate(&fixture(), 99, 50).is_empty());
+        assert_eq!(paginate(&fixture(), 99, 50), [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -1022,8 +1150,8 @@ mod tests {
         // runs before this pipeline (DATA-11 F1), so this test starts at the
         // filter and its expected answer is unchanged.
         let assets = fixture();
-        let mut filtered = apply_filters(
-            &assets,
+        let mut filtered = filter_rows(
+            assets,
             &[filter("tier", "inArray", &["gold", "silver"])],
             JoinOperator::And,
         );

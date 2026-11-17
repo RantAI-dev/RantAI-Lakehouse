@@ -19,11 +19,24 @@ export type Policy = {
   version: number
   owner: string
   updatedAt: string
+  // Whether the policy engine can enforce this row (SEC-61): true only when
+  // its `conditions` parse into the structured clause the read-time engine
+  // applies (roles, a table, and a mask or row filter). Required — every
+  // policy response carries it. Independent of `status`: a `ready` policy
+  // with `enforceable: false` masks nothing and filters no rows, so the
+  // console shows it as "Not enforced", not "Enforced".
+  enforceable: boolean
   // Raw, still-unparsed `conditions` JSON string (WS7 item A2). Absent for
   // a legacy policy authored before conditions were structured. A legacy
   // value may be free-text prose rather than JSON — never assume it parses
   // and never crash the policy list page on a `JSON.parse` failure.
   conditions?: string
+  // The catalog asset id of the table the policy governs (WEB-3 S3a-D1),
+  // resolved by the API from `conditions.table`: a Silver/Serving table is
+  // its own id, a Bronze table is its registry slug. Absent when the
+  // conditions do not parse or name no table the catalog addresses — show
+  // the table as plain text then, never a link to an invented page.
+  assetId?: string
 }
 
 export type ClassificationRule = {
@@ -59,6 +72,85 @@ export type QualityRule = {
   hint?: string | null
 }
 
+/** The kind of finding a quality incident records (`DATA-14`). */
+export type QualityIncidentKind = "check" | "volume_anomaly" | "freshness_anomaly" | string
+
+/**
+ * One quality incident (`GET /api/governance/quality/incidents`): a failed
+ * run of an authored rule, or a learned volume or freshness anomaly. It stays
+ * `open` until a person resolves it with a reason.
+ */
+export type QualityIncident = {
+  id: string
+  /** The table, lower-cased (`silver.orders`). */
+  asset: string
+  /** The rule that failed; `null` for an anomaly. */
+  ruleId: string | null
+  /** The rule's name while it still exists. */
+  ruleName: string | null
+  kind: QualityIncidentKind
+  openedAt: string
+  /** When a run or a pass last found it still broken. */
+  lastSeenAt: string
+  detail: string
+  // PR #106 review R1 SHOULD-FIX DATA-14 3 / D2
+  status: "open" | "stale" | "resolved" | string
+  resolvedAt: string | null
+  resolvedBy: string | null
+  resolution: string | null
+}
+
+/** Which incidents to list; open by default. */
+export type QualityIncidentFilter = { status?: "open" | "resolved" | "all"; asset?: string }
+
+/** When a table's rules run (`PUT /api/governance/quality/schedules/{asset}`). */
+export type QualitySchedule = {
+  asset: string
+  mode: "on_load" | "interval" | string
+  /** Minutes between runs; the backstop for `on_load`. 60 to 1440. */
+  intervalMinutes: number
+  updatedBy: string | null
+  updatedAt: string
+}
+
+export type QualitySchedules = {
+  schedules: QualitySchedule[]
+  /** The interval of a table with no schedule. */
+  defaultIntervalMinutes: number
+}
+
+export type SetQualityScheduleInput =
+  | { mode: "interval"; intervalMinutes: number }
+  | { mode: "on_load"; intervalMinutes?: number }
+
+/**
+ * Whether a table's anomalies are being raised yet
+ * (`GET /api/governance/quality/learning/{asset}`). `message` is the
+ * sentence to show while it is still learning, `null` once it has learned.
+ */
+export type QualityLearning = {
+  asset: string
+  learned: boolean
+  days: number
+  loads: number
+  requiredDays: number
+  requiredLoads: number
+  message: string | null
+  firstLoadAt: string | null
+  lastLoadAt: string | null
+}
+
+/** One recorded run of a rule (`GET /api/governance/quality/{id}/runs`). */
+export type QualityRunRecord = {
+  status: CheckStatus
+  value: string
+  /** A person's display name, `schedule` or `load`. */
+  runBy: string
+  at: string
+  /** What the rule said when it ran; `null` for a run from before it was kept. */
+  threshold: string | null
+}
+
 /** What one run of a rule found (`routes::quality::run_rule`). */
 export type QualityRunResult = {
   id: string
@@ -76,11 +168,84 @@ export type LineageEdge = {
   evidence?: string
 }
 
+/** One end of a column mapping; `null` when the statement did not let us name it. */
+export type ColumnEnd = { table: string | null; column: string | null }
+
+/**
+ * One recorded step from a source column to the column built from it
+ * (`DATA-13`). `partial` is true when the statement could not be fully
+ * traced; `reason` then says why, and `from` may be empty.
+ */
+export type ColumnMapping = {
+  from: ColumnEnd
+  to: { table: string; column: string }
+  /** `copy` (a bare or renamed column), `cast`, `expression` or `unknown`. */
+  transform: "copy" | "cast" | "expression" | "unknown" | string
+  partial: boolean
+  reason: string | null
+  /** What recorded it: an authored pipeline run, a Silver/Gold build from the query log, or a saved dashboard SQL source. */
+  producer: { kind: "pipeline" | "build" | "sql_source" | string; ref: string }
+  recordedAt: string
+  /** Distance from the column asked about; 1 is directly adjacent. */
+  hop: number
+}
+
+/** A saved chart that reads a column downstream of the one asked about. */
+export type ColumnChart = {
+  chartId: string
+  chartTitle: string
+  dashboardId: string
+  dashboardTitle: string
+}
+
+/** `GET /api/governance/lineage/columns`. */
+export type ColumnLineage = {
+  supported: boolean
+  table: string
+  column: string
+  direction: "up" | "down" | string
+  mappings: ColumnMapping[]
+  /** How long column lineage is kept, and how far back this answer's records go. */
+  retention: { days: number; oldestRecordedAt: string | null }
+  /** What this answer leaves out and why (tenant and catalog rules). */
+  coverage?: string[]
+  /** Downstream only, for a caller with `dashboard:read`. */
+  charts?: ColumnChart[]
+  /** Downstream only: the caller may not list dashboards. */
+  chartsHidden?: boolean
+  /** Downstream only: the charts could not be read just now. */
+  chartsUnavailable?: boolean
+}
+
+/**
+ * One chart that reads a table (`BI-14` plan D5): directly, or through a SQL
+ * source or a metric (`via`). Same names as `ColumnChart`, plus how it reads it.
+ */
+export type UsedByChart = ColumnChart & { via: "direct" | "sql_source" | "metric" | string }
+
+/**
+ * `GET /api/governance/lineage/used-by?table=` (`BI-14` plan D5, `lineage:read`):
+ * the charts the caller may see that read a table, up to 200, and how many more
+ * exist that the caller may not see (never named). **Not on the server yet**
+ * (T3 of the BI-14 plan); the field names are the console's choice and are the
+ * contract for T3.
+ */
+export type UsedBy = {
+  supported: boolean
+  table: string
+  charts: UsedByChart[]
+  /** Charts the caller cannot see ("and 3 more you do not have access to"). */
+  hiddenCount: number
+  /** True when more than 200 charts matched and only the first 200 are listed. */
+  truncated?: boolean
+}
+
 export type LineageGraph = {
   focus: string
   nodes: { id: string; label: string; kind: string }[]
   edges: LineageEdge[]
-  columnMappings: { source: string; target: string; transform: string }[]
+  /** The recorded column mappings that touch the focus table. */
+  columnMappings: ColumnMapping[]
   /** False when the build has no lineage capture; `reason` says why. */
   supported: boolean
   reason?: string
@@ -106,6 +271,53 @@ export type AuditEvent = {
   estimatedCost?: number
   actualCost?: number
   approvalId?: string
+  /**
+   * One sentence on what the action did, set by `routes::governance` for a
+   * catalog grant or revoke ("Granted query:read to Name <email> until
+   * 2026-12-06"); absent for other actions (QA LH-DATA-15-03 F1, plan D9).
+   */
+  detail?: string
+}
+
+/**
+ * What the audit search narrows by (`GET /api/governance/audit/events`, `GOV-1`).
+ * Every field is optional and an empty one means no filter. `actor` is a
+ * principal id; `action` is the whole action, or a family when it ends in
+ * `.` (`dashboard.`); `outcome` is a stored outcome (`allowed`, `executed`,
+ * `refused`, `needs_confirmation`, `needs_approval`, `approved`, `rejected`,
+ * `failed`); `from` is inclusive and `to` exclusive, both RFC 3339. `limit` is
+ * 1 to 500 (the server's default is 100); `cursor` is the `nextCursor` of the
+ * page before. The export takes the same filters and ignores `limit` and
+ * `cursor`.
+ */
+export type AuditSearchQuery = {
+  actor?: string
+  action?: string
+  resourceKind?: string
+  resourceId?: string
+  outcome?: "allowed" | "executed" | "refused" | "needs_confirmation" | "needs_approval" | "approved" | "rejected" | "failed" | string
+  from?: string
+  to?: string
+  limit?: number
+  cursor?: string
+}
+
+/** One page of the audit search, newest first; `nextCursor` is `null` on the last page. */
+export type AuditPage = {
+  events: AuditEvent[]
+  nextCursor: string | null
+}
+
+/**
+ * The audit trail as a CSV file. The server holds at most the newest 100,000
+ * events in one file; when more match it says so, and `total` is how many did.
+ */
+export type AuditExport = {
+  blob: Blob
+  fileName: string
+  truncated: boolean
+  /** How many events matched, known only when the file was cut. */
+  total: number | null
 }
 
 export type CreatePolicyInput = {
@@ -117,6 +329,23 @@ export type CreatePolicyInput = {
   conditions?: string
   activate?: boolean
   owner?: string
+}
+
+/**
+ * The functions, operators and forms a row filter accepts
+ * (`GET /api/governance/row-filter-grammar`, `WEB-8` S2 D8; forms added by
+ * S2 review round 1, S2). The server builds this from the constants its
+ * validator checks against (the forms are its match arms, held by the
+ * route's test), so the console's help line cannot drift from what a save
+ * will accept; never hard-code a copy here.
+ */
+export type RowFilterGrammar = {
+  /** Function names, as the validator spells them. */
+  functions: string[]
+  /** Operator tokens, as the validator spells them. */
+  operators: string[]
+  /** Expression forms, as the validator spells them (`LIKE`, `BETWEEN`, …). */
+  forms: string[]
 }
 
 export type CreateQualityRuleInput = {
@@ -162,7 +391,7 @@ export type MaintenanceRun = {
 /**
  * One row of `GET /api/governance/replication` — a point-in-time snapshot
  * of one Postgres logical-replication slot backing a CDC connector
- * (Debezium Server, P5). `status` is `"ok" | "warning" | "critical"`,
+ * (Debezium on Kafka Connect, `SRC-4`). `status` is `"ok" | "warning" | "critical"`,
  * computed in `dagster/dispar_orchestrate/replication_metrics.py` from WAL
  * retention thresholds and whether the slot is still `active` — an
  * inactive slot is flagged `critical` regardless of byte thresholds,
@@ -191,10 +420,39 @@ export type DatasetSla = {
 
 export interface GovernanceService {
   listPolicies(signal?: AbortSignal): Promise<Policy[]>
-  listClassifications(signal?: AbortSignal): Promise<ClassificationRule[]>
+  /**
+   * The functions and operators a row filter accepts; needs `policy:read`.
+   * A failed read must leave the console with no help line, never a guessed
+   * list.
+   */
+  getRowFilterGrammar(signal?: AbortSignal): Promise<RowFilterGrammar>
   listQuality(signal?: AbortSignal): Promise<QualityRule[]>
   getLineage(focusId: string, signal?: AbortSignal): Promise<LineageGraph>
-  listAudit(signal?: AbortSignal): Promise<AuditEvent[]>
+  /**
+   * The columns a column comes from (`up`) or the columns and saved charts
+   * built from it (`down`); needs `lineage:read`, and charts need
+   * `dashboard:read`.
+   */
+  /** The charts that read a table (`BI-14` plan D5); needs `lineage:read`. */
+  getUsedBy(table: string, signal?: AbortSignal): Promise<UsedBy>
+  getColumnLineage(
+    table: string,
+    column: string,
+    direction: "up" | "down",
+    signal?: AbortSignal
+  ): Promise<ColumnLineage>
+  /**
+   * Search the audit trail on the server, of any age, newest first
+   * (`GET /api/governance/audit/events`); needs `audit:read`.
+   */
+  searchAudit(query: AuditSearchQuery, signal?: AbortSignal): Promise<AuditPage>
+  /** One audit event by id, or `null` when no event has it; needs `audit:read`. */
+  getAuditEvent(id: string, signal?: AbortSignal): Promise<AuditEvent | null>
+  /**
+   * The events a search picks as a CSV file (`GET /api/governance/audit/export.csv`);
+   * needs `audit:read`. The caller saves `blob`.
+   */
+  exportAuditCsv(query: AuditSearchQuery, signal?: AbortSignal): Promise<AuditExport>
   /** Bronze Iceberg maintenance runs (P4/P6) — `GET /api/governance/maintenance`. */
   listMaintenanceRuns(signal?: AbortSignal): Promise<MaintenanceRun[]>
   /** CDC replication slot health (P5/P6) — `GET /api/governance/replication`. */
@@ -215,15 +473,47 @@ export interface GovernanceService {
   runQualityRule(id: string, signal?: AbortSignal): Promise<QualityRunResult>
   /**
    * Rewrite an authored rule; needs `governance:write`. Changing its table
-   * or threshold clears the results recorded for it.
+   * or threshold leaves it without a result until it runs again; the runs it
+   * had stay in its history.
    */
   updateQualityRule(
     id: string,
     input: UpdateQualityRuleInput,
     signal?: AbortSignal
   ): Promise<QualityRule>
-  /** Remove an authored rule and its recorded runs; needs `governance:write`. */
+  /**
+   * Remove an authored rule and its recorded runs; needs `governance:write`.
+   * Its open incidents are resolved as "rule deleted".
+   */
   deleteQualityRule(id: string, signal?: AbortSignal): Promise<void>
+  /** The last 50 runs of a rule, newest first, with the threshold each ran with. */
+  listQualityRuns(id: string, signal?: AbortSignal): Promise<QualityRunRecord[]>
+  /** Quality incidents, newest first (open by default). */
+  listQualityIncidents(
+    filter?: QualityIncidentFilter,
+    signal?: AbortSignal
+  ): Promise<QualityIncident[]>
+  /** Resolve an open incident with a reason; needs `governance:write`. */
+  resolveQualityIncident(
+    id: string,
+    resolution: string,
+    signal?: AbortSignal
+  ): Promise<QualityIncident>
+  /** Every table's schedule; a table not listed runs every default interval. */
+  listQualitySchedules(signal?: AbortSignal): Promise<QualitySchedules>
+  /** Run a table's rules on every load, or every N minutes; needs `governance:write`. */
+  setQualitySchedule(
+    asset: string,
+    input: SetQualityScheduleInput,
+    signal?: AbortSignal
+  ): Promise<QualitySchedule>
+  /**
+   * Put a table back on the default schedule (WEB-3 S3a-D3); needs
+   * `governance:write`. `listQualitySchedules` then carries no row for it.
+   */
+  resetQualitySchedule(asset: string, signal?: AbortSignal): Promise<void>
+  /** Whether a table's volume and freshness anomalies are being raised yet. */
+  getQualityLearning(asset: string, signal?: AbortSignal): Promise<QualityLearning>
   createClassificationRule(
     input: CreateClassificationRuleInput,
     signal?: AbortSignal

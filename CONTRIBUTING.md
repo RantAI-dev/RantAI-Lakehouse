@@ -16,7 +16,7 @@ how to run tests, commit conventions, and what to expect from a PR review.
 - Rust toolchain matching `rust/rust-toolchain.toml` (installed
   automatically by `rustup` when you run any `cargo` command inside `rust/`)
 - Docker (for Postgres/ClickHouse/Dagster locally — see
-  [README.md](README.md#quickstart) for the full stack)
+  [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the full stack)
 
 ## Dev setup
 
@@ -29,7 +29,8 @@ cd rust
 cargo build
 ```
 
-See [README.md](README.md) for environment variables and how to bring up
+See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for environment variables and
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for how to bring up
 the full stack (Postgres, ClickHouse, Dagster) with Docker.
 
 ## Code standard
@@ -47,8 +48,10 @@ Frontend:
 bun run typecheck   # tsc --noEmit
 bun run lint        # eslint
 bun run test         # bun test src/lib
-bun --bun next build # production build
+bun run build       # production build
 ```
+
+`bun run build` runs `next build` under Node (Node 20.9 or newer must be installed). It runs under Node because Bun's Turbopack runtime fails with "Expected CommonJS module to have a function wrapper" (`REL-8`, PR #170 review round 1, SHOULD-FIX 2).
 
 Backend (from `rust/`):
 

@@ -1,11 +1,11 @@
 import { redirect } from "next/navigation"
 
 /**
- * The Iceberg table list moved into Table Maintenance: the per-table
- * maintenance policy was the only thing this page did that no other page
- * did, so it now sits next to the maintenance runs it drives. Old links
- * and bookmarks land there instead of 404ing.
+ * The Iceberg table list is gone (`WEB-3` S2-D2): a table is reached from
+ * its asset page in the Catalog, and its maintenance runs are a section of
+ * System status. Old links and bookmarks land on the Catalog. A table's own
+ * page (`/lakehouse/tables/{namespace}/{table}`) is unchanged.
  */
 export default function LegacyRedirect() {
-  redirect("/governance/maintenance")
+  redirect("/catalog")
 }

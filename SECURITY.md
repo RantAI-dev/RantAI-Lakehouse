@@ -13,10 +13,10 @@ to open a private advisory. This notifies maintainers directly and does
 not disclose the report publicly, and it does not require you to have an
 email address for the project.
 
-*(Optional, not yet set up: the maintaining org may add a monitored
-security-contact email address here in the future. None is published today
-— do not send reports to a guessed address such as `security@rantai.dev`;
-it is not confirmed to be monitored.)*
+**Email:** `evan@rantai.dev` is monitored for security reports (set by the
+product owner on 2026-10-30, `SEC-7`). Use it if you cannot use GitHub's
+private reporting. Do not send reports to a guessed address such as
+`security@rantai.dev`; only the address above is monitored.
 
 Please include:
 
@@ -95,7 +95,7 @@ details:
 
 This project has known, intentional limitations that are **not** considered
 vulnerabilities to report (they're already tracked as accepted risk — see
-the "Status / Known limitations" section of [README.md](README.md)):
+[docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md)):
 
 - Login throttling covers password login only. OIDC/SSO login has no
   rate limiting beyond logging.

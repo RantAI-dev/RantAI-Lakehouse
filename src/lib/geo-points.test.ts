@@ -96,3 +96,15 @@ test("a column that only contains the letters is not a coordinate", () => {
 test("tooltip text is escaped for HTML", () => {
   assert.equal(escapeHtml(`<b onclick="x">Tom & 'Jerry'</b>`), "&lt;b onclick=&quot;x&quot;&gt;Tom &amp; &#39;Jerry&#39;&lt;/b&gt;")
 })
+
+test("a grid cell is labelled with the number of points it holds", () => {
+  const set = toPoints(
+    [{ lat: 0.5, lon: 100.5, v: 10, cell_points: 3 }, { lat: 1.5, lon: 101.5, v: 4, cell_points: 1 }],
+    { lat: "lat", lon: "lon", value: "v" },
+    5000,
+  )
+  assert.deepEqual(set.points.map((p) => p.label), ["3 points", "1 point"])
+  // A label column still wins, and a row without a cell count has none.
+  assert.equal(toPoints([{ lat: 0, lon: 0, v: 1, n: "x", cell_points: 2 }], { lat: "lat", lon: "lon", value: "v", label: "n" }, 5000).points[0].label, "x")
+  assert.equal(toPoints([{ lat: 0, lon: 0, v: 1 }], { lat: "lat", lon: "lon", value: "v" }, 5000).points[0].label, "")
+})

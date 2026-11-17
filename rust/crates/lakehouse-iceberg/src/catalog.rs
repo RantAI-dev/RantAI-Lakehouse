@@ -45,7 +45,7 @@ use iceberg::writer::file_writer::location_generator::{
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriterBuilder, base_writer::data_file_writer};
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
 };
@@ -355,6 +355,35 @@ impl IcebergClient {
         let ident = TableIdent::new(namespace, sanitized);
         let table = self.catalog.load_table(&ident).await?;
         Ok(GoldTable { table })
+    }
+
+    /// Loads an existing Gold export table by mart name, or `None` when the
+    /// catalog says the table does not exist (`DATA-49`, QA `LH-DATA-1-01`).
+    ///
+    /// The kind is read off the raw [`iceberg::Error`] before
+    /// [`IcebergError`]'s conversion keeps only its `Display`; the REST client
+    /// gives [`ErrorKind::TableNotFound`] for the catalog's 404. Every other
+    /// failure is still an error: a catalog that refuses the caller must not
+    /// read as "never published".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IcebergError::Catalog`] if the catalog call fails for any
+    /// reason other than "table not found", and [`IcebergError::Bronze`] if
+    /// the mart name or namespace cannot be built.
+    pub async fn load_gold_table_if_exists(
+        &self,
+        mart_name: &str,
+    ) -> Result<Option<GoldTable>, IcebergError> {
+        let namespace = gold::gold_namespace().map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let sanitized =
+            gold::sanitize_mart_name(mart_name).map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let ident = TableIdent::new(namespace, sanitized);
+        match self.catalog.load_table(&ident).await {
+            Ok(table) => Ok(Some(GoldTable { table })),
+            Err(err) if err.kind() == ErrorKind::TableNotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Creates the Gold table if it does not already exist, or loads it if

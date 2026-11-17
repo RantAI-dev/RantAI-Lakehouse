@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+lakehouse-notify = { path = "../lakehouse-notify", features = ["test-support"] }
 wiremock = { workspace = true }
 tokio = { workspace = true }
 

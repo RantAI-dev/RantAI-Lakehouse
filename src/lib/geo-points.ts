@@ -56,7 +56,10 @@ export function toPoints(
       dropped += 1
       continue
     }
-    points.push({ lat, lon, value, label: cols.label ? String(r[cols.label] ?? "") : "" })
+    // BI-10: a grid cell has no label of its own; it says how many points it holds.
+    const inCell = toNumber(r.cell_points)
+    const cellLabel = Number.isFinite(inCell) ? `${inCell.toLocaleString("en-US")} ${inCell === 1 ? "point" : "points"}` : ""
+    points.push({ lat, lon, value, label: cols.label ? String(r[cols.label] ?? "") : cellLabel })
   }
   return { points, dropped, capped: rows.length === limit }
 }

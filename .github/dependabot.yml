@@ -6,9 +6,32 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    # OPS-24 follow-up (product owner, 2026-11-13): Dependabot does not
+    # rebase its own pull requests when `main` moves. Each rebase started a
+    # full CI run (42 jobs) on the same 20 runner slots every other pull
+    # request waits for; with about nine Dependabot pull requests open, every
+    # merge to `main` queued nine runs nobody was reading. A Dependabot pull
+    # request now runs CI when it is opened, and once more when a person
+    # updates it before merging.
+    rebase-strategy: "disabled"
     groups:
+      # arrow and parquet must move with the iceberg crate: iceberg 0.10.1
+      # pins arrow 58, so arrow 60 alone fails to compile with two arrow
+      # versions in the graph (#139, #140, #142). One group keeps them in one
+      # pull request; it goes green when iceberg supports the new arrow
+      # (backlog REL-7). Listed before the patch/minor group so it wins.
+      arrow-parquet-iceberg:
+        patterns: ["arrow*", "parquet", "iceberg*"]
       cargo-patch-and-minor:
         update-types: ["patch", "minor"]
+    # aes-gcm stays on the 0.10 line the iceberg crate already brings in
+    # (rust/Cargo.toml says why: no second AEAD stack in the graph). 0.11
+    # alone adds aes-gcm 0.11, aes 0.9 and hybrid-array next to iceberg's
+    # 0.10.3 and deprecates `Nonce::from_slice` (#213, closed 2026-10-23).
+    # Remove this entry when iceberg moves to aes-gcm 0.11 (REL-7).
+    ignore:
+      - dependency-name: "aes-gcm"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     commit-message:
       prefix: "chore(deps)"
 
@@ -18,9 +41,27 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    # OPS-24 follow-up (product owner, 2026-11-13): Dependabot does not
+    # rebase its own pull requests when `main` moves. Each rebase started a
+    # full CI run (42 jobs) on the same 20 runner slots every other pull
+    # request waits for; with about nine Dependabot pull requests open, every
+    # merge to `main` queued nine runs nobody was reading. A Dependabot pull
+    # request now runs CI when it is opened, and once more when a person
+    # updates it before merging.
+    rebase-strategy: "disabled"
     groups:
       npm-patch-and-minor:
         update-types: ["patch", "minor"]
+    # Major versions that need a planned migration, not a lockfile bump
+    # (dependabot triage 2026-10-14). Each has a backlog item; remove the
+    # entry when that item is planned.
+    ignore:
+      - dependency-name: "typescript"          # REL-4
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "eslint"              # REL-5
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@tanstack/react-table"  # REL-6
+        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: "chore(deps)"
 
@@ -30,5 +71,13 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    # OPS-24 follow-up (product owner, 2026-11-13): Dependabot does not
+    # rebase its own pull requests when `main` moves. Each rebase started a
+    # full CI run (42 jobs) on the same 20 runner slots every other pull
+    # request waits for; with about nine Dependabot pull requests open, every
+    # merge to `main` queued nine runs nobody was reading. A Dependabot pull
+    # request now runs CI when it is opened, and once more when a person
+    # updates it before merging.
+    rebase-strategy: "disabled"
     commit-message:
       prefix: "chore(ci)"

@@ -7,6 +7,7 @@
 | Also involves | Build |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
+| Blocked by | Nothing open (was: BLD-3, shipped) |
 
 ## Why
 
@@ -15,6 +16,12 @@ An uploaded table cannot be the source of a pipeline, so it never reaches Silver
 ## What users get
 
 An uploaded table becomes a Silver or Gold table and appears on a dashboard, like any other table.
+
+## Decisions (product owner, 2026-10-14)
+
+- Planned and built in the Build lane (planner/reviewer and its developers),
+  not the Data stream, because it shares the pipeline source path `BLD-3`
+  changes.
 
 ## Target specs
 

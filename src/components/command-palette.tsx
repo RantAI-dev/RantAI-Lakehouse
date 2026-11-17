@@ -6,13 +6,24 @@ import { useRouter } from "next/navigation";
 import { usePathname } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
-  Search, Sparkles, BarChart3, LayoutGrid, Plus, Download, Moon, Sun, Clock, Database,
+  Search, Sparkles, BarChart3, LayoutGrid, Plus, Download, Moon, Sun, Clock, Database, Star,
 } from "lucide-react";
-import { NAV_GROUPS, pageTitleFor } from "@/components/app-shell/nav-config";
-import { assetService } from "@/services";
+import { NAV_GROUPS, pageTitleFor, canOpen } from "@/components/app-shell/nav-config";
+import { useAuth } from "@/features/auth/auth-provider";
+import { CertificationBadge } from "@/components/patterns/status-badge";
+import { assetService, dashboardService } from "@/services";
 import { isServiceError } from "@/services/errors";
 import type { Asset } from "@/services/contracts/assets";
-import { capPaletteAssetResults, matchedOnLabel } from "@/lib/palette-search";
+import type { ShortcutItem } from "@/services/contracts/dashboards";
+import { itemHref } from "@/lib/dashboard-organise";
+import {
+  ASSET_VALUE_PREFIX,
+  PALETTE_ASSET_RESULT_LIMIT,
+  PALETTE_SEARCH_MAX_CHARS,
+  capPaletteAssetResults,
+  makePaletteFilter,
+  paletteAssetLines,
+} from "@/lib/palette-search";
 
 /** Debounce, in ms, before a typed search term reaches `assetService`
  * (WS2 §13). */
@@ -25,6 +36,8 @@ const CATALOG_SEARCH_DEBOUNCE_MS = 250;
  * scores zero for any typed word and, with equal scores keeping their order,
  * stays after the assets (DATA-11 review SHOULD-FIX 6). */
 const SEE_ALL_VALUE = "\u2192";
+
+const assetItemValue = (a: Asset) => `${ASSET_VALUE_PREFIX}${a.id} ${a.name}`;
 
 const OPEN_EVENT = "rantai:open-command";
 /** Call from anywhere (e.g. the navbar search box) to open the palette. */
@@ -62,16 +75,41 @@ export function CommandPalette() {
   const [recents, setRecents] = React.useState<Recent[]>([]);
   const [search, setSearch] = React.useState("");
   const [assetResults, setAssetResults] = React.useState<Asset[]>([]);
+  // How many tables matched in all (`DATA-41` D3, `DATA-54`). 0 when there is
+  // no term, on a failed search and without `catalog:read`: there is nothing
+  // more to say then.
+  const [assetTotal, setAssetTotal] = React.useState(0);
   // A failed search is said out loud (principle 2); an empty list would
   // read as "nothing matches".
   // The line to show for it: a refusal, a `supported: false` reason, or the
   // outage text (DATA-11 review SHOULD-FIX 4). Null when the search worked.
   const [searchFailed, setSearchFailed] = React.useState<string | null>(null);
+  // BI-18 part C, part 2: dashboards and charts by name for a typed term; the
+  // caller's favourites and recent dashboards when nothing is typed.
+  const [dashHits, setDashHits] = React.useState<ShortcutItem[]>([]);
+  const [dashFavourites, setDashFavourites] = React.useState<ShortcutItem[]>([]);
+  const [dashRecent, setDashRecent] = React.useState<ShortcutItem[]>([]);
+  // QA `LH-DATA-11-15` F2 (`DATA-54`): the line to show when the dashboard
+  // search answered with a failure; null when it answered. A refusal of the
+  // text is not an outage.
+  const [dashFailed, setDashFailed] = React.useState<string | null>(null);
+  // BI-18 part C review fix (SHOULD-FIX) R12: the two server searches are
+  // answering. "No results." is only said once both have answered and every
+  // group, local and server, is empty; until then it says "Searching…".
+  const [assetsPending, setAssetsPending] = React.useState(false);
+  const [dashPending, setDashPending] = React.useState(false);
   const router = useRouter();
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
+  // ADM-13 review round 1, S5: useAuth() with no fail-open path
+  const { hasPermission } = useAuth();
 
-  const groups = NAV_GROUPS;
+  const groups = React.useMemo(() => {
+    return NAV_GROUPS.map((g) => ({
+      ...g,
+      items: g.items.filter((it) => canOpen(it.href, hasPermission)),
+    })).filter((g) => g.items.length > 0);
+  }, [hasPermission]);
 
   // Server-side catalog search behind the "Catalog assets" group (WS2 §13).
   // Debounced 250ms and abortable on every keystroke so a slow
@@ -80,27 +118,38 @@ export function CommandPalette() {
   // aborted or whose debounce timer never fired. A failed request shows
   // "Catalog search is unavailable", not a spinner that never resolves and
   // not an empty list (DATA-11 T2).
+  // ADM-13 review round 1, S5: do not send search without catalog:read.
   React.useEffect(() => {
     const term = search.trim();
-    if (!term) {
+    if (!term || !hasPermission("catalog:read")) {
       setAssetResults([]);
+      setAssetTotal(0);
       setSearchFailed(null);
+      setAssetsPending(false);
       return;
     }
+    setAssetsPending(true);
     let cancelled = false;
     const controller = new AbortController();
     const timer = setTimeout(() => {
       assetService
-        .listAssets({ search: term }, controller.signal)
-        .then((assets) => {
+        // `DATA-41` D3: the server is asked for what the box shows, so a
+        // catalog of ten thousand tables is not sent to throw all but
+        // eight away. `capPaletteAssetResults` stays as the second guard.
+        .searchAssets(term, PALETTE_ASSET_RESULT_LIMIT, controller.signal)
+        .then(({ assets, total }) => {
           if (cancelled) return;
           setSearchFailed(null);
           setAssetResults(capPaletteAssetResults(assets));
+          setAssetTotal(total);
+          setAssetsPending(false);
         })
         .catch((err: unknown) => {
           if (cancelled) return;
           setAssetResults([]);
+          setAssetTotal(0);
           setSearchFailed(failureLine(err));
+          setAssetsPending(false);
         });
     }, CATALOG_SEARCH_DEBOUNCE_MS);
     return () => {
@@ -108,7 +157,65 @@ export function CommandPalette() {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [search]);
+  }, [search, hasPermission]);
+
+  // Dashboards and charts, by name (BI-18 part C, part 2). The server decides
+  // who may see what, so a private draft or a deleted item is never in the
+  // answer; a caller without `dashboard:read` gets a refusal and sees no group.
+  // Debounced like the catalog search, and abortable for the same reason.
+  // ADM-13 review round 1, S5: do not send search without dashboard:read.
+  React.useEffect(() => {
+    if (!open) return;
+    const term = search.trim();
+    if (!hasPermission("dashboard:read")) {
+      setDashHits([]);
+      setDashFavourites([]);
+      setDashRecent([]);
+      setDashPending(false);
+      setDashFailed(null);
+      return;
+    }
+    let cancelled = false;
+    const controller = new AbortController();
+    setDashPending(Boolean(term));
+    const timer = setTimeout(() => {
+      const work = term
+        ? dashboardService.searchItems(term, controller.signal).then((hits) => ({ hits, favourites: [] as ShortcutItem[], recent: [] as ShortcutItem[] }))
+        : dashboardService.shortcuts(controller.signal).then((s) => ({ hits: [] as ShortcutItem[], ...s }));
+      work
+        .then((found) => {
+          if (cancelled) return;
+          setDashFailed(null);
+          setDashHits(found.hits.slice(0, 8));
+          setDashFavourites(found.favourites.slice(0, 5));
+          // A favourite is not listed again under Recent (as on the dashboard list).
+          const starred = new Set(found.favourites.map((f) => `${f.kind}:${f.id}`));
+          setDashRecent(found.recent.filter((r) => !starred.has(`${r.kind}:${r.id}`)).slice(0, 5));
+          setDashPending(false);
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setDashHits([]);
+          setDashFavourites([]);
+          setDashRecent([]);
+          setDashFailed(
+            isServiceError(err)
+              ? err.code === "permission_denied"
+                ? null
+                : err.code === "invalid_request"
+                  ? `Shorten the search: dashboards and charts are searched with at most ${PALETTE_SEARCH_MAX_CHARS} characters.`
+                  : "Dashboard search is unavailable"
+              : "Dashboard search is unavailable"
+          );
+          setDashPending(false);
+        });
+    }, CATALOG_SEARCH_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [open, search, hasPermission]);
 
   // Open via ⌘K / Ctrl+K, and via an event from the navbar search box.
   React.useEffect(() => {
@@ -143,6 +250,12 @@ export function CommandPalette() {
     } catch { /* ignore */ }
   }, [pathname]);
 
+  // QA LH-DATA-11-06: one score for every asset row keeps the server's order.
+  const paletteFilter = React.useMemo(
+    () => makePaletteFilter(assetResults.map((a) => assetItemValue(a))),
+    [assetResults],
+  );
+
   const go = (href: string) => { setOpen(false); router.push(href); };
   const run = (fn: () => void) => { setOpen(false); fn(); };
 
@@ -151,6 +264,7 @@ export function CommandPalette() {
       open={open}
       onOpenChange={setOpen}
       label="Command Palette"
+      filter={paletteFilter}
       contentClassName="fixed left-1/2 top-[18%] z-[100] w-[min(92vw,560px)] -translate-x-1/2 overflow-hidden rounded-xl border border-border bg-popover shadow-2xl"
       overlayClassName="fixed inset-0 z-[99] bg-black/40 backdrop-blur-sm"
     >
@@ -158,10 +272,11 @@ export function CommandPalette() {
         <Search className="size-4 shrink-0 text-muted-foreground" />
         <Command.Input
           autoFocus
-          placeholder="Search pages, actions, or catalog assets…"
+          placeholder="Search pages, actions, dashboards or catalog assets…"
           className="h-11 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           value={search}
           onValueChange={setSearch}
+          maxLength={PALETTE_SEARCH_MAX_CHARS}
         />
         <kbd className="hidden rounded border border-border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground sm:block">esc</kbd>
       </div>
@@ -169,7 +284,10 @@ export function CommandPalette() {
       <Command.List className="max-h-[54vh] overflow-y-auto p-1.5">
         {/* Not while the server has results: they are force-mounted, so
             cmdk's own count would say "No results." under them. */}
-        {assetResults.length === 0 ? (
+        {search.trim() && (assetsPending || dashPending) ? (
+          <div className="px-3 py-2 text-sm text-muted-foreground">Searching…</div>
+        ) : null}
+        {assetResults.length === 0 && dashHits.length === 0 && !assetsPending && !dashPending ? (
           <Command.Empty className="px-3 py-6 text-center text-sm text-muted-foreground">
             No results.
           </Command.Empty>
@@ -179,20 +297,61 @@ export function CommandPalette() {
             {searchFailed}
           </div>
         ) : null}
+        {dashFailed && search.trim() ? (
+          <div role="alert" className="px-3 py-2 text-sm text-muted-foreground">
+            {dashFailed}
+          </div>
+        ) : null}
+
+        {/* Dashboards and charts by name. forceMount: the server already
+            decided these match, so cmdk's own filter must not hide them. */}
+        {dashHits.length ? (
+          <Command.Group forceMount heading="Dashboards and charts" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+            {dashHits.map((h) => (
+              <PaletteItem
+                key={`${h.kind}:${h.id}`}
+                forceMount
+                icon={h.kind === "board" ? LayoutGrid : BarChart3}
+                label={h.name}
+                detail={h.kind === "chart" && h.boardName ? `on ${h.boardName}` : null}
+                value={`dashitem ${h.kind} ${h.id} ${h.name}`}
+                onSelect={() => go(itemHref(h))}
+              />
+            ))}
+          </Command.Group>
+        ) : null}
+        {!search.trim() && dashFavourites.length ? (
+          <Command.Group heading="Favourites" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+            {dashFavourites.map((h) => (
+              <PaletteItem key={`${h.kind}:${h.id}`} icon={Star} label={h.name} detail={h.kind === "chart" && h.boardName ? `on ${h.boardName}` : null} value={`favourite ${h.kind} ${h.id} ${h.name}`} onSelect={() => go(itemHref(h))} />
+            ))}
+          </Command.Group>
+        ) : null}
+        {!search.trim() && dashRecent.length ? (
+          <Command.Group heading="Recent dashboards" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+            {dashRecent.map((h) => (
+              <PaletteItem key={`${h.kind}:${h.id}`} icon={Clock} label={h.name} detail={h.kind === "chart" && h.boardName ? `on ${h.boardName}` : null} value={`recent dashboard ${h.kind} ${h.id} ${h.name}`} onSelect={() => go(itemHref(h))} />
+            ))}
+          </Command.Group>
+        ) : null}
 
         {/* Quick actions */}
         <Command.Group heading="Quick actions" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
-          <PaletteItem icon={Sparkles} label="Ask / build via AI Copilot" value="ai copilot chat ask build" onSelect={() => go("/")} />
-          {/* "Open Dashboards" sengaja menuju `/dashboards`: itu penerus yang
-              membawa ke board terakhir, jadi label ini menepati janjinya.
-              Mengelola daftarnya adalah tujuan lain, maka barisnya sendiri. */}
-          <PaletteItem icon={BarChart3} label="Open Dashboards" value="dashboards visualization chart" onSelect={() => go("/dashboards")} />
-          {/* Membuat chart dilakukan DI ATAS sebuah dashboard, bukan di
-              ruang kosong — jadi barisan ini sengaja menuju penerus yang
-              sama, lalu kanvasnya yang menyediakan tombol tambah tile. */}
-          <PaletteItem icon={Plus} label="Add a chart to a dashboard" value="new chart add tile dashboard" onSelect={() => go("/dashboards")} />
-          <PaletteItem icon={LayoutGrid} label="Browse all dashboards" value="dashboards list manage browse rename share" onSelect={() => go("/dashboards/browse")} />
-          <PaletteItem icon={Download} label="Export dashboard (YAML)" value="export yaml dashboard" onSelect={() => run(() => window.open("/api/dashboard/export", "_blank"))} />
+          {(hasPermission("assistant:use") || hasPermission("assistant:ask")) && (
+            <PaletteItem icon={Sparkles} label="Ask / build via AI Copilot" value="ai copilot chat ask build" onSelect={() => go("/")} />
+          )}
+          {hasPermission("dashboard:read") && (
+            <PaletteItem icon={BarChart3} label="Open Dashboards" value="dashboards visualization chart" onSelect={() => go("/dashboards")} />
+          )}
+          {hasPermission("dashboard:write") && (
+            <PaletteItem icon={Plus} label="Add a chart to a dashboard" value="new chart add tile dashboard" onSelect={() => go("/dashboards")} />
+          )}
+          {hasPermission("dashboard:read") && (
+            <PaletteItem icon={LayoutGrid} label="Browse all dashboards" value="dashboards list manage browse rename share" onSelect={() => go("/dashboards/browse")} />
+          )}
+          {hasPermission("dashboard:read") && (
+            <PaletteItem icon={Download} label="Export dashboard (YAML)" value="export yaml dashboard" onSelect={() => run(() => window.open("/api/dashboard/export", "_blank"))} />
+          )}
           <PaletteItem
             icon={resolvedTheme === "dark" ? Sun : Moon}
             label={`Change theme (${resolvedTheme === "dark" ? "light" : "dark"})`}
@@ -216,23 +375,37 @@ export function CommandPalette() {
             filter must not hide them (DATA-11 F6). */}
         {assetResults.length ? (
           <Command.Group forceMount heading="Catalog assets" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
-            {assetResults.map((a) => (
-              <PaletteItem
-                key={a.id}
-                forceMount
-                icon={Database}
-                label={a.name}
-                detail={matchedOnLabel(a.matchedOn)}
-                value={`asset ${a.id} ${a.name}`}
-                onSelect={() => go(`/data/assets/${a.id}`)}
-              />
-            ))}
+            {assetResults.map((a) => {
+              // QA `LH-DATA-11-01` F1 (`DATA-54`): the result names the table
+              // by its physical name under the friendly name.
+              const lines = paletteAssetLines(a);
+              return (
+                <PaletteItem
+                  key={a.id}
+                  forceMount
+                  icon={Database}
+                  label={a.name}
+                  badge={<CertificationBadge certification={a.certification} />}
+                  path={lines.path}
+                  detail={lines.reason}
+                  value={assetItemValue(a)}
+                  onSelect={() => go(`/data/assets/${a.id}`)}
+                />
+              );
+            })}
+            {/* QA `LH-DATA-11-02` (`DATA-54`): the box shows eight tables; when
+                more matched, it says so rather than looking complete. */}
+            {assetTotal > assetResults.length ? (
+              <div className="px-2.5 py-1.5 text-xs text-muted-foreground">
+                Showing {assetResults.length} of {assetTotal}: refine the search
+              </div>
+            ) : null}
             <PaletteItem
               forceMount
               icon={Search}
               label="See all results"
               value={SEE_ALL_VALUE}
-              onSelect={() => go(`/data?search=${encodeURIComponent(search.trim())}`)}
+              onSelect={() => go(`/catalog?search=${encodeURIComponent(search.trim())}`)}
             />
           </Command.Group>
         ) : null}
@@ -255,10 +428,14 @@ export function CommandPalette() {
 }
 
 function PaletteItem({
-  icon: Icon, label, detail, value, forceMount, onSelect,
+  icon: Icon, label, badge, path, detail, value, forceMount, onSelect,
 }: {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
+  /** Shown after the label (a certified / deprecated mark). */
+  badge?: React.ReactNode;
+  /** The table's physical name, in monospace, before the reason. */
+  path?: string | null;
   /** A second, smaller line under the label. */
   detail?: string | null;
   value: string;
@@ -274,8 +451,17 @@ function PaletteItem({
     >
       <Icon className="size-4 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1">
-        <span className="block truncate">{label}</span>
-        {detail ? <span className="block truncate text-xs text-muted-foreground">{detail}</span> : null}
+        <span className="flex items-center gap-1.5">
+          <span className="truncate">{label}</span>
+          {badge}
+        </span>
+        {path || detail ? (
+          <span className="block truncate text-xs text-muted-foreground">
+            {path ? <span className="font-mono">{path}</span> : null}
+            {path && detail ? " · " : null}
+            {detail ? <span>{detail}</span> : null}
+          </span>
+        ) : null}
       </span>
     </Command.Item>
   );

@@ -23,7 +23,7 @@ import { useDataTable } from "@/hooks/use-data-table"
 import { filterDataClientSide } from "@/lib/data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { isOwnAccessRequest } from "@/lib/access-requests"
+import { isOwnRequest, selfApprovalTooltip } from "@/lib/access-requests"
 import { withNotify } from "@/lib/notify"
 import { formatCost, formatRelativeTime } from "@/lib/format"
 import { agentService, assetService } from "@/services"
@@ -62,10 +62,22 @@ function ApprovalDrawerContent({
       <div className="flex flex-wrap items-center gap-2">
         {statusCell(selected, decidedGrants)}
         {selected.status === "pending" && selfApproval ? (
-          <span title="You requested this access; a different Governance Admin must decide it">
+          // SEC-57: the requester may not decide their own request, so
+          // BOTH buttons are disabled — the API refuses an approve and a
+          // reject alike (`routes::agents::refuse_own_request`). The
+          // wrapper carries the reason, because a disabled button does not
+          // show its own tooltip.
+          <span
+            className="flex items-center gap-2"
+            title={selfApprovalTooltip(selected.kind)}
+          >
             <Button size="sm" disabled>
               <CheckIcon data-icon="inline-start" />
               Approve
+            </Button>
+            <Button size="sm" variant="outline" disabled>
+              <XIcon data-icon="inline-start" />
+              Reject
             </Button>
           </span>
         ) : null}
@@ -100,17 +112,10 @@ function ApprovalDrawerContent({
           ...(selected.kind === "access"
             ? []
             : [
-                {
-                  label: "Agent",
-                  value: (
-                    <Link
-                      href={`/agents/employees/${selected.employeeId}`}
-                      className="text-primary hover:underline"
-                    >
-                      {selected.employeeName}
-                    </Link>
-                  ),
-                },
+                // WEB-3 D7: the employee detail page was removed, so the
+                // agent's name is plain text. The run id below keeps its
+                // link to `/agents/runs/[runId]` (D3).
+                { label: "Agent", value: selected.employeeName },
               ]),
           {
             label: "Run",
@@ -237,13 +242,7 @@ export function ApprovalsPage() {
     withNotify(
       { success: "Decision recorded", error: "Failed to record decision" },
       (signal, id: string, dec: "approved" | "rejected", cmt: string | undefined) => {
-        // `decideAccessRequest` is optional on `AssetService` only so the
-        // dead `mock/assets.ts` fixture still satisfies the interface —
-        // see that contract's own doc comment. Fail closed rather than
-        // silently no-op if that assumption is ever wrong.
-        if (!assetService.decideAccessRequest) {
-          return Promise.reject(new Error("This deployment cannot decide access requests."))
-        }
+        // PR #106 review R2 SHOULD-FIX 6: decideAccessRequest is required on AssetService
         return assetService.decideAccessRequest(id, dec, cmt, signal)
       }
     )
@@ -252,7 +251,7 @@ export function ApprovalsPage() {
   const decideError = decideToolCall.error ?? decideAccess.error
 
   const selfApprovalOf = React.useCallback(
-    (item: ApprovalItem) => user !== null && isOwnAccessRequest(item, user.id),
+    (item: ApprovalItem) => user !== null && isOwnRequest(item, user.id),
     [user]
   )
 
@@ -300,7 +299,7 @@ export function ApprovalsPage() {
     manualPagination: false,
     manualSorting: false,
     manualFiltering: true,
-    persistKey: "/agents/approvals",
+    persistKey: "/governance/approvals",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
@@ -357,14 +356,10 @@ export function ApprovalsPage() {
         <ErrorState error={state.error} onRetry={state.reload} />
       ) : null}
       {state.status === "success" && data.length === 0 ? (
+        // WEB-3 D7: no "View agent runs" action — the runs list was removed.
         <EmptyState
           title="No approvals"
-          description="A request lands here whenever a run — from the copilot chat, Run now, or a schedule — hits a high-risk (WriteHigh) tool call, or a catalog viewer requests a permission they don't hold. Nothing is waiting on you right now."
-          action={
-            <Button size="sm" variant="outline" render={<Link href="/agents/runs" />}>
-              View agent runs
-            </Button>
-          }
+          description="A request lands here whenever a run — from an AI Copilot chat, Run now, or a schedule — hits a high-risk (WriteHigh) tool call, or a catalog viewer requests a permission they don't hold. Nothing is waiting on you right now."
         />
       ) : null}
       {state.status === "success" && data.length > 0 ? (

@@ -26,11 +26,14 @@ The asset page matches Databricks' table page.
 | Usage | 7 days: number of queries, number of people, average time, and the viewer's own last 5 queries. Dashboard reads are not counted | 30 days: queries, frequent users, frequent queries, tables joined with it, column popularity |
 | Access | An Access tab shows the viewer's own access, sets classification, and adds masking and row-filter policies. A user can request access; approval is in the approvals inbox and gives a 30-day permission that is not limited to this table. No direct grant, and nothing revokes a grant | Grant and revoke from the asset, for users with the right to manage access |
 | Restore | Not available | Restore a dropped table within the retention window *(proposed: 7 days)* |
+| Drop | Nothing in the console drops a table: deleting an uploaded file keeps its table, and Query Studio is read-only (QA `LH-DATA-15-06`, `TC-1731`, 2026-11-06) | A table made by a file upload is dropped from its page, with the 7-day restore (product owner 2026-11-12, `DEC-21`). Tables made by a connector or a pipeline are not dropped from the console. Who may drop *(proposed: `governance:write`, the permission that restores)* |
 | History | Iceberg tables list their versions with time, operation and row counts, each with a link to query it. No author. ClickHouse tables keep no versions | Table versions with time, operation and author |
 
 ## Benchmark
 
 Databricks Catalog Explorer: sample data about 1,000 rows, Insights over 30 days (frequent users, queries, joined tables), Permissions tab, history, UNDROP.
+
+Dropping and undropping: the comparison's "Undrop a table" row says Databricks has it and Snowflake has it in SQL only (`reference/competitive-comparison.md`, Data matrix). That document gives no number for how long either keeps a dropped table, so the 7 days are the product owner's number (`DEC-21`), not a competitor's.
 
 ## Acceptance checklist
 
@@ -40,6 +43,7 @@ Run on a running console by the product owner. A step not performed is never a p
 - `DATA-15-AC2` Usage covers 30 days
 - `DATA-15-AC3` A dropped table is restored from its page within 7 days
 - `DATA-15-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `DATA-15-AC10` to `DATA-15-AC16` A table made by an upload is dropped from its page and restored there within 7 days; every other table is refused (`DATA-55`; the rows are on the feature page)
 
 ## Not included
 

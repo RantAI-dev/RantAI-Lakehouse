@@ -1,8 +1,9 @@
-"use client"
+import { redirect } from "next/navigation"
 
-import { IngestionPage } from "@/features/governance/ingestion-page"
-
-/** Thin App Router page for IngestionPage. */
-export default function Page() {
-  return <IngestionPage />
+/**
+ * Legacy route compatibility redirect (`WEB-3` S2-D2): Ingestion (CDC) is a section of
+ * System status now.
+ */
+export default function LegacyRedirect() {
+  redirect("/health#change-capture")
 }

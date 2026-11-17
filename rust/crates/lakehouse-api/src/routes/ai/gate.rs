@@ -18,12 +18,12 @@
 //!
 //! | Role | Loses copilot access to | Keeps |
 //! | --- | --- | --- |
-//! | Analyst (`query:read, catalog:read, lineage:read`) | `describe_mart`, `list_charts`, `list_boards`, `suggest_dashboard` (need `dashboard:read`); `create_chart`/`update_chart`/`create_board`/`delete_chart` (need `dashboard:write`) | `run_sql`, `list_datasets`, `describe_dataset`, `get_lineage` |
+//! | Analyst (`query:read, catalog:read, lineage:read`) | `describe_mart`, `list_charts`, `list_boards`, `suggest_dashboard`, `set_board_view_filters` (need `dashboard:read`); `create_chart`/`update_chart`/`create_board`/`delete_chart`/`rename_board`/`delete_board`/`arrange_board`/`move_chart`/`save_board_filters` (need `dashboard:write`) | `run_sql`, `list_datasets`, `describe_dataset`, `get_lineage` |
 //! | Data Scientist (`query:read, feature:write, notebook:run`) | same dashboard tools as Analyst | `run_sql`, `list_datasets`, `describe_dataset` |
 //! | Approver (`agent:approve, policy:review`) | all dashboard tools; also `run_sql`/`list_datasets`/etc (no `query:read`/`catalog:read`) | — |
 //! | Governance Admin (`policy:*, residency:*, audit:read`) | all dashboard tools; data tools too (no `query:read`/`catalog:read`/`lineage:read`) | — |
 //! | Data Engineer (`pipeline:*, catalog:write, connector:manage`) | all dashboard tools | `trigger_lakehouse_build`, `get_build_status` (`pipeline:*`) |
-//! | Dashboard Viewer (`dashboard:read`) | dashboard **writes** only | `describe_mart`, `list_charts`, `list_boards`, `suggest_dashboard` |
+//! | Dashboard Viewer (`dashboard:read`) | dashboard **writes** only (incl. the five new write tools) | `describe_mart`, `list_charts`, `list_boards`, `suggest_dashboard`, `set_board_view_filters` |
 //! | Platform Admin (`*:*`) | nothing | everything |
 //!
 //! This is **correct** — it matches exactly what each role can already do
@@ -51,6 +51,7 @@ use lakehouse_auth::PermissionSet;
 use lakehouse_store::PgPool;
 use lakehouse_store::agents::{self as store_agents, NewApprovalRequest};
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 use super::registry::{Risk, ToolSpec};
 
@@ -127,10 +128,61 @@ pub fn is_write_high_pending(value: &Value) -> bool {
 fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
+        // BI-18 part C, part 2: a deleted chart goes to the trash, not away.
         "delete_chart" => format!(
-            "Menghapus chart {} dari dashboard secara permanen.",
+            "Memindahkan chart {} dari dashboard ke tempat sampah; bisa dipulihkan selama 30 hari.",
             s("id")
         ),
+        "delete_calculated_field" => format!("Menghapus kolom hitung {} secara permanen.", s("id")),
+        // BI-18 part C, part 2: a deleted board and its charts go to the
+        // trash, not away.
+        "delete_board" => format!(
+            "Memindahkan board {} berikut seluruh chart di dalamnya ke tempat sampah; bisa dipulihkan selama 30 hari.",
+            s("id")
+        ),
+        "delete_metric" => format!("Menghapus metrik {} secara permanen.", s("id")),
+        "create_report_subscription" | "update_report_subscription" => {
+            let others = args
+                .get("recipients")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let outside: Vec<&str> = args
+                .get("recipients")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.get("email").and_then(Value::as_str))
+                .collect();
+            let verb = if spec.name == "create_report_subscription" {
+                "Mengirim laporan terjadwal dashboard"
+            } else {
+                "Mengubah laporan terjadwal"
+            };
+            format!(
+                "{verb} {} ke {others} penerima selain peminta (alamat luar: {}). Penerima melihat data sesuai hak akses peminta, bukan hak Anda.",
+                if s("board").is_empty() {
+                    s("id")
+                } else {
+                    s("board")
+                },
+                if outside.is_empty() {
+                    "tidak ada".to_owned()
+                } else {
+                    outside.join(", ")
+                }
+            )
+        }
+        "delete_report_subscription" => {
+            format!("Menghapus laporan terjadwal {} secara permanen.", s("id"))
+        }
+        "delete_tab" => format!(
+            "Menghapus tab {} dari dashboard {}; chart di dalamnya pindah ke tab pertama.",
+            s("tab"),
+            s("board")
+        ),
+        // BI-26 slice 2 D9: the two WriteHigh embed tools. The first says who
+        // can reach the dashboard after it, the second what a viewer may change.
+        "enable_embed" | "set_embed_filter_modes" => embed_write_high_reason(spec.name, args),
         "run_bronze_maintenance" => "Menjalankan maintenance Bronze: menghapus file data/manifest \
             Iceberg yatim secara permanen (bukan dry run)."
             .to_owned(),
@@ -145,11 +197,100 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     }
 }
 
-/// Fixed Indonesian risk statement stored on every `WriteHigh` approval —
-/// there is exactly one `WriteHigh` tool today (`delete_chart`); a future
-/// one gets this same generic statement unless refined.
+/// The two `WriteHigh` embed tools' sentences (`BI-26` slice 2 D9): the sites
+/// `enable_embed` adds and who can then reach the dashboard, and each column
+/// `set_embed_filter_modes` sets with what an embed's viewer may change. Split
+/// out of [`reason_for_write_high`] to keep its match within the line limit.
+fn embed_write_high_reason(name: &str, args: &Map<String, Value>) -> String {
+    let board = args
+        .get("board")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if name == "enable_embed" {
+        let sites: Vec<&str> = args
+            .get("sites")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        return format!(
+            "Menjadikan dashboard {board} bisa disematkan di situs {}. Siapa pun yang servernya menandatangani token untuk situs itu dapat menampilkan dashboard ini sebagai peran penonton tetap.",
+            if sites.is_empty() {
+                "(belum ada situs)".to_owned()
+            } else {
+                sites.join(", ")
+            }
+        );
+    }
+    let modes: Vec<String> = args
+        .get("modes")
+        .and_then(Value::as_object)
+        .map(|modes| {
+            modes
+                .iter()
+                .map(|(column, mode)| format!("{} {}", column, mode.as_str().unwrap_or("?")))
+                .collect()
+        })
+        .unwrap_or_default();
+    format!(
+        "Mengatur mode filter embed dashboard {board}: {}. Filter editable dapat diubah oleh penonton embed.",
+        if modes.is_empty() {
+            "(belum ada filter)".to_owned()
+        } else {
+            modes.join(", ")
+        }
+    )
+}
+
+/// The generic Indonesian risk statement stored on a `WriteHigh` approval: it
+/// tells the reader the action cannot be undone once executed.
+///
+/// Today it is the sentence [`risk_for_write_high`] gives every `WriteHigh`
+/// tool except `delete_chart` and `delete_board` — a deleted chart and a
+/// deleted board go to the trash and can be restored, so they get
+/// [`WRITE_HIGH_RISK_TRASHED_CHART`] and [`WRITE_HIGH_RISK_TRASHED_BOARD`]
+/// instead; [`risk_for_write_high`] picks between the three sentences
+/// (`AI-1`).
 const WRITE_HIGH_RISK: &str =
     "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan.";
+
+/// The risk statement for `delete_chart`: the chart is not gone, it is in the
+/// trash and can be restored, so the generic sentence would contradict the
+/// reason on the very same approval card (`AI-1`).
+///
+/// The `30` is the trash's retention, `lakehouse_bi::trash::RETENTION_DAYS`
+/// (30 days). It is a literal because [`risk_for_write_high`] returns a
+/// `&'static str` and a `u32` cannot be interpolated into one; the approval
+/// stores the sentence as it stands (`NewApprovalRequest.risk` is a `&str`).
+/// The constant is named here so the two are changed together.
+const WRITE_HIGH_RISK_TRASHED_CHART: &str = "Tindakan berisiko tinggi (WriteHigh): chart masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
+
+/// The risk statement for `delete_board`: the board and its charts are not
+/// gone, they are in the trash and can be restored, so the generic sentence
+/// would contradict the reason on the very same approval card (`AI-1`).
+///
+/// The `30` is the trash's retention, `lakehouse_bi::trash::RETENTION_DAYS`
+/// (30 days). It is a literal because [`risk_for_write_high`] returns a
+/// `&'static str` and a `u32` cannot be interpolated into one; the approval
+/// stores the sentence as it stands (`NewApprovalRequest.risk` is a `&str`).
+/// The constant is named here so the two are changed together.
+const WRITE_HIGH_RISK_TRASHED_BOARD: &str = "Tindakan berisiko tinggi (WriteHigh): board dan chart-nya masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
+
+/// The risk sentence stored on a `WriteHigh` approval, chosen per tool.
+///
+/// One sentence for every tool hid the mismatch: `delete_chart` and
+/// `delete_board` go to the trash and stay restorable, so the generic
+/// "tidak dapat dibatalkan" sentence contradicted the reason line on the
+/// same card (`AI-1`). Every other `WriteHigh` tool keeps [`WRITE_HIGH_RISK`]
+/// word for word.
+fn risk_for_write_high(spec: &ToolSpec) -> &'static str {
+    match spec.name {
+        "delete_chart" => WRITE_HIGH_RISK_TRASHED_CHART,
+        "delete_board" => WRITE_HIGH_RISK_TRASHED_BOARD,
+        _ => WRITE_HIGH_RISK,
+    }
+}
 
 /// T0.5: the real approvals-inbox flow for a [`Risk::WriteHigh`] call that
 /// [`decide`] has already flagged with [`write_high_pending_marker`] (mode
@@ -167,6 +308,15 @@ const WRITE_HIGH_RISK: &str =
 /// is returned and NOTHING is created — there is nowhere durable to put an
 /// approval a human could later see and act on, so silently allowing the
 /// call through would be worse than refusing it.
+///
+/// `requested_by` is the human who ASKED for the call, when a person did
+/// (`SEC-57`): the signed-in principal's `app_user.id` for the chat loop
+/// and `POST /api/ai/tool`. It is written to
+/// `approval_item.requested_by_user_id` so the API can refuse the requester
+/// deciding their own request (`routes::agents::refuse_own_request`).
+/// `None` when no human asked — a service identity, or a call with no
+/// principal at all. The column's foreign key points at `app_user`, so a
+/// service identity's id must never be written there.
 pub async fn create_write_high_approval(
     pg: Option<&PgPool>,
     actor: &str,
@@ -174,6 +324,7 @@ pub async fn create_write_high_approval(
     raw_args: &Map<String, Value>,
     redacted_args: &Value,
     resource_id: Option<&str>,
+    requested_by: Option<Uuid>,
 ) -> Value {
     let Some(pool) = pg else {
         return json!({
@@ -188,8 +339,9 @@ pub async fn create_write_high_approval(
         actor,
         resource: resource_id,
         reason: &reason,
-        risk: WRITE_HIGH_RISK,
+        risk: risk_for_write_high(spec),
         redacted_args,
+        requested_by,
     };
     match store_agents::create_pending_approval(pool, req).await {
         Ok(created) => json!({
@@ -214,6 +366,40 @@ pub async fn create_write_high_approval(
     }
 }
 
+/// The `trigger_pipeline` arm of [`summary_for`], split out because it is
+/// the only arm that inspects a nested argument rather than reading a flat
+/// key. F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
+/// f2-tenant-scope-and-run-config.md` Part D): the pre-F2.9 gate had no
+/// `trigger_pipeline` arm, so the user confirmed a call without seeing WHICH
+/// pipeline the copilot was about to run, or whether it carried a `runConfig`
+/// override (the latter being the operationally interesting half, because a
+/// non-default config is what elevates the tool's risk to `WriteHigh` — see
+/// [`effective_risk`]).
+///
+/// The format follows the same Indonesian one-liner shape every other
+/// `WriteLow` arm produces, with the pipeline id and the top-level keys of
+/// `runConfig` when one was supplied. Listing the KEYS (not the values)
+/// matches [`crate::routes::pipelines::record_pipeline_audit`]'s own
+/// `configKeys` audit shape, so the chat confirmation and the audit row agree
+/// on what the run actually carried.
+fn pipeline_summary(args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let pipeline_id = s("id");
+    match args.get("runConfig") {
+        Some(Value::Object(map)) => {
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            let keys_part = if keys.is_empty() {
+                "tanpa kunci konfigurasi".to_owned()
+            } else {
+                format!("dengan runConfig ({})", keys.join(", "))
+            };
+            format!("Menjalankan pipeline {pipeline_id} {keys_part}.")
+        }
+        _ => format!("Menjalankan pipeline {pipeline_id} dengan konfigurasi bawaan."),
+    }
+}
+
 /// A short, deterministic Indonesian sentence describing exactly what a
 /// [`Risk::WriteLow`] tool call is about to do, generated from the tool
 /// name and its (not yet stripped of `confirmed`) arguments — NEVER from
@@ -227,44 +413,144 @@ pub async fn create_write_high_approval(
 /// `WriteHigh`-elevation call ([`effective_risk`]) only fires when
 /// `runConfig` is present, and a model confirming a call without
 /// seeing those keys would be confirming in the dark.
+/// The confirmation line of the two formatting tools (`BI-17` part A), apart from
+/// [`summary_for`] to keep that match under clippy's line limit.
+fn look_summary(name: &str, args: &Map<String, Value>) -> String {
+    let get = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let or_same = |key: &str| {
+        let v = get(key);
+        if v.is_empty() { "tetap" } else { v }
+    };
+    if name == "format_chart" {
+        return format!(
+            "Mengubah tampilan chart {} (format, warna, sumbu, garis acuan).",
+            get("chart")
+        );
+    }
+    if name == "set_cache_rule" {
+        let rule = match (get("rule"), args.get("minutes").and_then(Value::as_i64)) {
+            ("minutes", Some(n)) => format!("diingat {n} menit"),
+            ("fresh", _) => "selalu segar".to_owned(),
+            _ => "ikut aturan di atasnya".to_owned(),
+        };
+        let (kind, id) = if get("chart").is_empty() {
+            ("dashboard", get("board"))
+        } else {
+            ("chart", get("chart"))
+        };
+        return format!("Mengatur seberapa lama hasil {kind} {id} diingat ({rule}).");
+    }
+    format!(
+        "Mengatur tema dan font dashboard {} (tema: {}, font: {}).",
+        get("board"),
+        or_same("theme"),
+        or_same("font")
+    )
+}
+
+/// The confirmation sentence of `arrange_board` and `save_board_filters`.
+/// Split out of [`summary_for`] when the board tools of main met phase 3's tab
+/// and look tools there and took it over the line limit (merge of main into
+/// phase 3).
+fn board_layout_summary(name: &str, args: &Map<String, Value>) -> String {
+    let board = args.get("board").and_then(Value::as_str).unwrap_or("");
+    if name == "arrange_board" {
+        let n = args
+            .get("tiles")
+            .and_then(Value::as_object)
+            .map_or(0, Map::len);
+        return format!(
+            "Menata ulang {n} tile pada board {board} (grid 12 kolom, hanya tile yang disebut berubah)."
+        );
+    }
+    let n = args
+        .get("filters")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    format!("Menyimpan {n} filter sebagai default board {board} untuk semua pengguna.")
+}
+
+/// The confirmation sentence of the report tools (`RPT-1`): what is scheduled
+/// and, in words, that it goes to the person alone (anything else is an approval).
+fn report_summary(name: &str, args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let when = args
+        .get("schedule")
+        .and_then(|v| v.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("jadwal yang sama");
+    if name == "create_report_subscription" {
+        format!(
+            "Menjadwalkan laporan dashboard {} ({when}) lewat email ke Anda sendiri.",
+            s("board")
+        )
+    } else {
+        format!(
+            "Mengubah laporan terjadwal {} (tanpa penerima baru; penerima yang ada tetap atau berkurang).",
+            s("id")
+        )
+    }
+}
+
+/// The confirmation sentence of the two alert tools (`BI-37` D5): what is
+/// watched — a chart, a metric or a mart aggregate — the condition and the
+/// threshold when there is one, and where the message goes. Before this, both
+/// fell to the generic fallback and a chart alert's card named neither the
+/// chart nor the condition.
+fn alert_summary(name: &str, args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let number = || {
+        args.get("threshold")
+            .and_then(Value::as_f64)
+            .map_or_else(|| "-".to_owned(), |t| t.to_string())
+    };
+    let verb = if name == "create_alert_rule" {
+        "Membuat"
+    } else {
+        "Mengubah"
+    };
+    let watched = if !s("chart").is_empty() {
+        let series = if s("series").is_empty() {
+            String::new()
+        } else {
+            format!(" seri \"{}\"", s("series"))
+        };
+        let rule = match s("condition") {
+            "any_rows" => "bila chart menampilkan baris".to_owned(),
+            "below" => format!("bila nilainya di bawah {}", number()),
+            _ => format!("bila nilainya di atas {}", number()),
+        };
+        format!("chart {}{series}, {rule}", s("chart"))
+    } else if !s("metric").is_empty() {
+        format!("metrik {} ({} {})", s("metric"), s("op"), number())
+    } else if !s("mart").is_empty() {
+        format!("{} {} {} ({})", s("mart"), s("measure"), s("agg"), s("op"))
+    } else {
+        format!("dashboard {}", s("board"))
+    };
+    let channel = if s("channel") == "email" {
+        "email"
+    } else {
+        "webhook"
+    };
+    let target = if s("target").is_empty() {
+        "alamat Anda".to_owned()
+    } else {
+        s("target").to_owned()
+    };
+    format!(
+        "{verb} aturan alert \"{}\" pada {watched}, lewat {channel} ke {target}.",
+        s("name")
+    )
+}
+
 fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
         "trigger_lakehouse_build" => {
             "Menjalankan build ulang lakehouse (Bronze → Silver → Gold).".to_owned()
         }
-        "trigger_pipeline" => {
-            // F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
-            // f2-tenant-scope-and-run-config.md` Part D): the pre-F2.9
-            // gate had no `trigger_pipeline` arm, so the user confirmed
-            // a call without seeing WHICH pipeline the copilot was
-            // about to run, or whether it carried a `runConfig`
-            // override (the latter being the operationally interesting
-            // half, because a non-default config is what elevates the
-            // tool's risk to `WriteHigh` — see [`effective_risk`]).
-            //
-            // The summary's format follows the same Indonesian one-liner
-            // shape every other `WriteLow` arm produces, with the
-            // pipeline id and the top-level keys of `runConfig` when
-            // one was supplied. Listing the KEYS (not the values)
-            // matches [`crate::routes::pipelines::record_pipeline_audit`]'s
-            // own `configKeys` audit shape, so the chat confirmation and
-            // the audit row agree on what the run actually carried.
-            let pipeline_id = s("id");
-            match args.get("runConfig") {
-                Some(Value::Object(map)) => {
-                    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
-                    keys.sort_unstable();
-                    let keys_part = if keys.is_empty() {
-                        "tanpa kunci konfigurasi".to_owned()
-                    } else {
-                        format!("dengan runConfig ({})", keys.join(", "))
-                    };
-                    format!("Menjalankan pipeline {pipeline_id} {keys_part}.")
-                }
-                _ => format!("Menjalankan pipeline {pipeline_id} dengan konfigurasi bawaan."),
-            }
-        }
+        "trigger_pipeline" => pipeline_summary(args),
         "create_chart" => {
             // A chart reads either a mart or a dashboard SQL source; name
             // whichever one the call actually uses.
@@ -285,7 +571,72 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("title"),
             s("kind")
         ),
+        "format_chart" | "set_dashboard_theme" | "set_cache_rule" => look_summary(spec.name, args),
         "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
+        "create_tab" => format!(
+            "Menambah tab \"{}\" pada dashboard {}.",
+            s("title"),
+            s("board")
+        ),
+        "rename_tab" => format!(
+            "Mengganti nama tab {} pada dashboard {} menjadi \"{}\".",
+            s("tab"),
+            s("board"),
+            s("title")
+        ),
+        "move_charts_to_tab" => format!(
+            "Memindahkan chart ke tab {} pada dashboard {}.",
+            s("tab"),
+            s("board")
+        ),
+        "move_tab" => format!("Mengubah urutan tab pada dashboard {}.", s("board")),
+        "rename_board" => format!(
+            "Mengganti nama board {} menjadi \"{}\".",
+            s("id"),
+            s("name")
+        ),
+        "arrange_board" | "save_board_filters" => board_layout_summary(spec.name, args),
+        "move_chart" => format!("Memindahkan chart {} ke board {}.", s("id"), s("board")),
+        // BI-26 slice 2 D9: the Confirm card's text for the one embed write
+        // that only narrows access.
+        "withdraw_embed_tokens" => format!(
+            "Menarik semua token embed dashboard {}; token yang ditandatangani sebelum sekarang tidak berlaku lagi.",
+            s("board")
+        ),
+        "create_report_subscription" | "update_report_subscription" => {
+            report_summary(spec.name, args)
+        }
+        "create_alert_rule" | "update_alert_rule" => alert_summary(spec.name, args),
+        "create_calculated_field" => format!(
+            "Membuat kolom hitung \"{}\" = {} (pada {}).",
+            s("name"),
+            s("formula"),
+            if s("sqlSource").is_empty() {
+                format!("mart {}", s("mart"))
+            } else {
+                format!("SQL source {}", s("sqlSource"))
+            }
+        ),
+        "update_calculated_field" => format!(
+            "Mengubah rumus kolom hitung {} menjadi {}.",
+            s("id"),
+            s("formula")
+        ),
+        "create_metric" => format!(
+            "Membuat metrik \"{}\" = {} (pada {}).",
+            s("name"),
+            s("formula"),
+            if s("sqlSource").is_empty() {
+                format!("mart {}", s("mart"))
+            } else {
+                format!("SQL source {}", s("sqlSource"))
+            }
+        ),
+        "update_metric" => format!(
+            "Mengubah metrik {} menjadi {}; semua chart yang memakainya ikut berubah.",
+            s("id"),
+            s("formula")
+        ),
         _ => format!(
             "{} is ready: the user confirms it with the Confirm button under this message. This is not an approval and does not go to Approvals.",
             spec.name
@@ -302,6 +653,10 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
 pub fn strip_confirmed(args: &Map<String, Value>) -> Map<String, Value> {
     let mut out = args.clone();
     out.remove("confirmed");
+    // `ownerId` is written only by the server, into the stored arguments of an
+    // approval (`tools::reports::approval_args`, `RPT-1`); a model must not be
+    // able to name the person a report is made as.
+    out.remove("ownerId");
     out
 }
 
@@ -379,12 +734,58 @@ pub fn outcome_of(refusal: &Value) -> &'static str {
 ///   [`create_write_high_approval`] (T0.5). This is deliberately NOT the
 ///   same as executing, and NOT the `WriteLow` confirmation path — a
 ///   `WriteHigh` call must never slip through by carrying `confirmed: true`.
+#[cfg(test)]
 #[must_use]
 pub fn decide(
     is_build: bool,
     perms: Option<&PermissionSet>,
     spec: &ToolSpec,
     args: &Map<String, Value>,
+) -> Option<Value> {
+    decide_with(is_build, perms, spec, args, None, None)
+}
+
+/// The permission half of [`decide_with`], for `BI-37` D10: the global
+/// permission, or — for a tool on `registry::DASHBOARD_SCOPED` — the caller's
+/// own level `reach` on the dashboard the call acts on. `reach` is a fact the
+/// server worked out before the gate (`tools::dashboard_reach`), never
+/// something the model can set. A tool not on the list keeps the plain check,
+/// so nothing else is widened.
+#[must_use]
+pub fn permission_granted(
+    spec: &ToolSpec,
+    perms: Option<&PermissionSet>,
+    reach: Option<lakehouse_bi::access::Level>,
+) -> bool {
+    if spec.permission.is_empty() {
+        return true;
+    }
+    // ADM-13 (D6), ADM-13 review round 1, S2: use shared assistant_reads helper
+    // for query:read / catalog:read stand-in when holding assistant:ask.
+    if spec.risk == Risk::Read && super::assistant_reads(perms, spec.permission) {
+        return true;
+    }
+    if perms.is_some_and(|p| p.has(spec.permission)) {
+        return true;
+    }
+    super::registry::reach_offers(spec.name, spec.permission, reach)
+}
+
+/// [`decide`] with a fact the server worked out about the call, which the
+/// model cannot see or set. `RPT-1` review fix (BLOCKER) R2: for
+/// `update_report_subscription`, `audience_needs_approval` says whether the
+/// recipients the call leaves in place include anyone but the requester and the
+/// call does more than narrow them (`tools::report_audience`, loaded before the
+/// gate at every dispatch site). `None`: not worked out, the arguments alone
+/// decide.
+#[must_use]
+pub fn decide_with(
+    is_build: bool,
+    perms: Option<&PermissionSet>,
+    spec: &ToolSpec,
+    args: &Map<String, Value>,
+    audience_needs_approval: Option<bool>,
+    reach: Option<lakehouse_bi::access::Level>,
 ) -> Option<Value> {
     // F2.9 (PR #59 review): the Ask-mode / permission gates check the
     // STATIC risk (a Read tool must never refuse in Ask mode regardless
@@ -394,15 +795,12 @@ pub fn decide(
     // of the `WriteLow` confirmation path. Ask mode is intentionally
     // unaffected: a non-Read call is refused in Ask mode whether the
     // tool is `WriteLow` or `WriteHigh` in this call.
-    let effective = effective_risk(spec, args);
+    let effective = effective_risk_with(spec, args, audience_needs_approval);
     if !is_build && effective != Risk::Read {
         return Some(ask_mode_refusal(spec.name));
     }
-    if !spec.permission.is_empty() {
-        let granted = perms.is_some_and(|p| p.has(spec.permission));
-        if !granted {
-            return Some(permission_refusal(spec.name, spec.permission));
-        }
+    if !permission_granted(spec, perms, reach) {
+        return Some(permission_refusal(spec.name, spec.permission));
     }
     match effective {
         Risk::Read => None,
@@ -440,10 +838,46 @@ pub fn decide(
 /// `pub` because the `decide` / `decide_by_name` arms in this module
 /// consult it directly, and the tests in `mod tests` pin both
 /// directions (with / without `runConfig`).
+#[cfg(test)]
 #[must_use]
 pub fn effective_risk(spec: &ToolSpec, args: &Map<String, Value>) -> Risk {
+    effective_risk_with(spec, args, None)
+}
+
+/// [`effective_risk`] with the server-side audience fact of [`decide_with`].
+#[must_use]
+pub fn effective_risk_with(
+    spec: &ToolSpec,
+    args: &Map<String, Value>,
+    audience_needs_approval: Option<bool>,
+) -> Risk {
     if spec.name == "trigger_pipeline" && matches!(args.get("runConfig"), Some(Value::Object(_))) {
         return Risk::WriteHigh;
+    }
+    // RPT-1 / AI-10 (feature decision 10; product owner, 2026-10-17): a report
+    // that goes only to the person asking is a confirmation; naming any other
+    // recipient emails someone else, so that call waits for a human's approval.
+    // Per call, not per tool, like `trigger_pipeline` above. A list that only
+    // holds the empty array names nobody.
+    let names_others = args
+        .get("recipients")
+        .and_then(Value::as_array)
+        .is_some_and(|others| !others.is_empty());
+    match (spec.name, audience_needs_approval) {
+        // RPT-1 review fix (BLOCKER) R2: an update is judged by who ends up
+        // receiving it, which the server looked up (the stored list when the
+        // call names none), not by the recipients it names: a new chart sent to
+        // a stored outside list is an approval; pausing or removing a recipient
+        // is a Confirm.
+        ("update_report_subscription", Some(needs)) => {
+            if needs {
+                return Risk::WriteHigh;
+            }
+        }
+        ("create_report_subscription" | "update_report_subscription", _) if names_others => {
+            return Risk::WriteHigh;
+        }
+        _ => {}
     }
     spec.risk
 }
@@ -457,9 +891,11 @@ pub fn decide_by_name(
     perms: Option<&PermissionSet>,
     tool_name: &str,
     args: &Map<String, Value>,
+    audience_needs_approval: Option<bool>,
+    reach: Option<lakehouse_bi::access::Level>,
 ) -> Option<Value> {
     let spec = super::registry::find(tool_name)?;
-    decide(is_build, perms, spec, args)
+    decide_with(is_build, perms, spec, args, audience_needs_approval, reach)
 }
 
 #[cfg(test)]
@@ -481,6 +917,9 @@ mod tests {
         "create_board",
     ];
 
+    /// BI-17 part A / AI-8: the two formatting tools are `WriteLow` like `update_chart`.
+    const FORMAT_TOOLS: [&str; 3] = ["format_chart", "set_dashboard_theme", "set_cache_rule"];
+
     /// A `PermissionSet` granting everything (`*:*`) — Platform Admin.
     fn admin_perms() -> PermissionSet {
         PermissionSet::parse("*:*")
@@ -493,6 +932,75 @@ mod tests {
 
     fn spec(name: &str) -> &'static registry::ToolSpec {
         registry::find(name).expect("registered tool")
+    }
+
+    /// BI-17 part A / AI-8: the formatting tools wait for the chat's confirmation, do not execute
+    /// without it, are refused to a user without `dashboard:write`, and (being `WriteLow`) need no approval.
+    /// RPT-1 review fix (BLOCKER) R2: the audience fact, not the named
+    /// recipients, decides an update; creating still goes by what it names.
+    #[test]
+    fn a_report_update_is_judged_by_the_servers_audience_fact_when_there_is_one() {
+        let update = spec("update_report_subscription");
+        let create = spec("create_report_subscription");
+        let none = no_args();
+        assert_eq!(
+            effective_risk_with(update, &none, Some(true)),
+            Risk::WriteHigh
+        );
+        assert_eq!(
+            effective_risk_with(update, &none, Some(false)),
+            Risk::WriteLow
+        );
+        // Without the fact the arguments decide, as before.
+        assert_eq!(effective_risk_with(update, &none, None), Risk::WriteLow);
+        let mut named = Map::new();
+        named.insert("recipients".to_owned(), json!([{ "email": "a@b.example" }]));
+        assert_eq!(effective_risk_with(update, &named, None), Risk::WriteHigh);
+        // The fact says narrowing: naming a subset is a Confirm.
+        assert_eq!(
+            effective_risk_with(update, &named, Some(false)),
+            Risk::WriteLow
+        );
+        assert_eq!(
+            effective_risk_with(create, &named, Some(false)),
+            Risk::WriteHigh
+        );
+        assert_eq!(effective_risk_with(create, &none, None), Risk::WriteLow);
+    }
+
+    #[test]
+    fn the_formatting_tools_need_confirmation_and_dashboard_write() {
+        let admin = admin_perms();
+        let editor = PermissionSet::parse("dashboard:read, dashboard:write");
+        let reader = PermissionSet::parse("dashboard:read");
+        for name in FORMAT_TOOLS {
+            let mut args = Map::new();
+            args.insert("chart".to_owned(), json!("c1"));
+            args.insert("board".to_owned(), json!("b1"));
+            let pending =
+                decide(true, Some(&editor), spec(name), &args).expect("must wait for confirmation");
+            assert_eq!(pending["needs_confirmation"], json!(true), "{name}");
+            assert!(
+                pending["summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("c1") || s.contains("b1")),
+                "{name}"
+            );
+            assert_eq!(
+                decide(true, Some(&admin), spec(name), &confirmed_args()),
+                None,
+                "{name}"
+            );
+            let refused =
+                decide(true, Some(&reader), spec(name), &confirmed_args()).expect("refused");
+            assert!(
+                refused.get("needs_confirmation").is_none() && refused.get("error").is_some(),
+                "{name}: {refused}"
+            );
+            let ask = decide(false, Some(&admin), spec(name), &confirmed_args())
+                .expect("refused in ask mode");
+            assert!(ask.get("error").is_some(), "{name}");
+        }
     }
 
     #[test]
@@ -623,6 +1131,34 @@ mod tests {
         assert!(summary.contains("Kunjungan Harian"));
         assert!(summary.contains("bar"));
         assert!(summary.contains("mart_wisman"));
+    }
+
+    /// The card the person confirms shows this sentence. The model reads the
+    /// chart's definition from its own `definition` key, so the sentence must
+    /// not change with it: a change here is a change to the card.
+    #[test]
+    fn the_create_chart_card_summary_keeps_its_exact_text() {
+        let perms = admin_perms();
+        let mut args = Map::new();
+        args.insert("title".to_owned(), json!("Kunjungan Harian"));
+        args.insert("kind".to_owned(), json!("bar"));
+        args.insert("mart".to_owned(), json!("mart_wisman"));
+        args.insert("dimension".to_owned(), json!("provinsi"));
+        args.insert("limit".to_owned(), json!(10));
+        let result =
+            decide(true, Some(&perms), spec("create_chart"), &args).expect("must not execute");
+        assert_eq!(
+            result["summary"],
+            json!("Membuat chart baru \"Kunjungan Harian\" (bar) dari mart mart_wisman.")
+        );
+        args.remove("mart");
+        args.insert("sqlSource".to_owned(), json!("s_1"));
+        let result =
+            decide(true, Some(&perms), spec("create_chart"), &args).expect("must not execute");
+        assert_eq!(
+            result["summary"],
+            json!("Membuat chart baru \"Kunjungan Harian\" (bar) dari SQL source s_1.")
+        );
     }
 
     /// F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
@@ -781,6 +1317,74 @@ mod tests {
         assert!(pending.get("needs_confirmation").is_none());
     }
 
+    /// The card a person reads before approving a chart deletion must not
+    /// contradict its own reason sentence: a deleted chart goes to the trash
+    /// and can be restored, so the risk line says so instead of claiming the
+    /// action cannot be undone (`AI-1`).
+    ///
+    /// **Planned**: giving `delete_chart` the generic [`WRITE_HIGH_RISK`]
+    /// sentence makes this test fail.
+    #[test]
+    fn a_deleted_chart_says_it_can_be_restored_for_thirty_days() {
+        let risk = risk_for_write_high(spec("delete_chart"));
+        assert_eq!(
+            risk,
+            "Tindakan berisiko tinggi (WriteHigh): chart masuk tempat sampah dan bisa dipulihkan selama 30 hari."
+        );
+        assert!(
+            !risk.contains("tidak dapat dibatalkan"),
+            "the card must not say the action cannot be undone: {risk}"
+        );
+        assert!(risk.contains("30 hari"), "{risk}");
+    }
+
+    /// The card a person reads before approving a board deletion must not
+    /// contradict its own reason sentence: a deleted board and its charts go
+    /// to the trash and can be restored, so the risk line says so instead of
+    /// claiming the action cannot be undone (`AI-1`).
+    #[test]
+    fn a_deleted_board_says_it_can_be_restored_for_thirty_days() {
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("b1"));
+        let risk = risk_for_write_high(spec("delete_board"));
+        assert_eq!(
+            risk,
+            "Tindakan berisiko tinggi (WriteHigh): board dan chart-nya masuk tempat sampah dan bisa dipulihkan selama 30 hari."
+        );
+        let reason = reason_for_write_high(spec("delete_board"), &args);
+        assert!(
+            reason.contains("b1"),
+            "the reason must name the board: {reason}"
+        );
+        assert!(reason.contains("30 hari"), "{reason}");
+        for sentence in [risk, reason.as_str()] {
+            assert!(
+                !sentence.contains("permanen"),
+                "the card must not say the board is permanent: {sentence}"
+            );
+            assert!(
+                !sentence.contains("tidak dapat dibatalkan"),
+                "the card must not say the action cannot be undone: {sentence}"
+            );
+        }
+    }
+
+    /// Every other `WriteHigh` tool keeps today's sentence, word for word
+    /// (`AI-1`).
+    ///
+    /// `delete_calculated_field` and `delete_metric` are permanent: they
+    /// tombstone their row (`is_deleted = 1`), and nothing brings it back.
+    #[test]
+    fn the_other_write_high_tools_keep_the_generic_risk_sentence() {
+        for name in ["delete_calculated_field", "delete_metric"] {
+            assert_eq!(
+                risk_for_write_high(spec(name)),
+                "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan.",
+                "{name}"
+            );
+        }
+    }
+
     /// A non-write tool is never refused for ask-mode reasons, in either
     /// mode, for a principal with every permission.
     #[test]
@@ -802,11 +1406,11 @@ mod tests {
     #[test]
     fn unregistered_tool_is_never_refused() {
         assert_eq!(
-            decide_by_name(false, None, "not_a_real_tool", &no_args()),
+            decide_by_name(false, None, "not_a_real_tool", &no_args(), None, None),
             None
         );
         assert_eq!(
-            decide_by_name(true, None, "not_a_real_tool", &no_args()),
+            decide_by_name(true, None, "not_a_real_tool", &no_args(), None, None),
             None
         );
     }
@@ -865,13 +1469,13 @@ mod tests {
         assert_eq!(refused["required"], json!("dashboard:read"));
     }
 
-    /// A tool with an empty `permission` (`get_quality`: no narrower route
+    /// A tool with an empty `permission` (`get_query_limits`: no narrower route
     /// permission than `RequiresAuth`) is allowed for any authenticated
     /// principal, even one with no grants at all.
     #[test]
     fn empty_permission_tool_is_allowed_for_any_authenticated_principal() {
         let perms = PermissionSet::default();
-        let empty_perm_spec = spec("get_quality");
+        let empty_perm_spec = spec("get_query_limits");
         assert_eq!(empty_perm_spec.permission, "");
         assert_eq!(
             decide(true, Some(&perms), empty_perm_spec, &no_args()),
@@ -897,6 +1501,82 @@ mod tests {
             .expect("an Analyst must not be able to create a chart via the copilot");
         assert_eq!(refused["reason"], json!("permission"));
         assert_eq!(refused["required"], json!("dashboard:write"));
+    }
+
+    /// SEC-9-AC2: the assistant's two SQL tools need the same `query:read`
+    /// Query Studio's route needs, and the refusal names it. `decide` is the
+    /// only thing between a signed-in caller and the tool body, so a refusal
+    /// here is a refusal before any engine is contacted.
+    #[test]
+    fn the_sql_tools_are_refused_without_query_read_and_name_the_permission() {
+        let without = [
+            PermissionSet::default(),
+            PermissionSet::parse("catalog:read"),
+        ];
+        for tool in ["run_sql", "run_saved_query"] {
+            for perms in &without {
+                let refused = decide_by_name(true, Some(perms), tool, &no_args(), None, None)
+                    .unwrap_or_else(|| panic!("{tool} must be refused without query:read"));
+                assert_eq!(refused["reason"], json!("permission"), "{tool}");
+                assert_eq!(refused["required"], json!("query:read"), "{tool}");
+            }
+            assert_eq!(
+                decide_by_name(
+                    true,
+                    Some(&PermissionSet::parse("query:read")),
+                    tool,
+                    &no_args(),
+                    None,
+                    None
+                ),
+                None,
+                "{tool} must be allowed with query:read"
+            );
+        }
+    }
+
+    /// ADM-13 (D6): `run_sql` is granted to `assistant:ask` without `query:read`.
+    /// A principal with only `assistant:use` and no `query:read` is still refused `run_sql`.
+    /// A principal with neither is still refused `run_sql`.
+    #[test]
+    fn run_sql_is_granted_to_assistant_ask_and_refused_to_assistant_use_alone() {
+        let ask = PermissionSet::parse("assistant:ask");
+        assert_eq!(
+            decide_by_name(false, Some(&ask), "run_sql", &no_args(), None, None),
+            None,
+            "run_sql must be granted to assistant:ask"
+        );
+
+        let use_only = PermissionSet::parse("assistant:use");
+        let refused_use = decide_by_name(false, Some(&use_only), "run_sql", &no_args(), None, None)
+            .expect("assistant:use alone must be refused run_sql without query:read");
+        assert_eq!(refused_use["reason"], json!("permission"));
+        assert_eq!(refused_use["required"], json!("query:read"));
+
+        let neither = PermissionSet::default();
+        let refused_neither =
+            decide_by_name(false, Some(&neither), "run_sql", &no_args(), None, None)
+                .expect("principal with neither must be refused run_sql");
+        assert_eq!(refused_neither["reason"], json!("permission"));
+        assert_eq!(refused_neither["required"], json!("query:read"));
+    }
+
+    /// ADM-13 (D6): a write tool call in ask mode (or forced to ask mode
+    /// for an `AskOnly` principal) is refused with the Ask-mode message.
+    #[test]
+    fn write_tool_in_ask_mode_is_refused_with_ask_mode_message() {
+        let ask = PermissionSet::parse("assistant:ask");
+        let refused = decide_by_name(false, Some(&ask), "create_chart", &no_args(), None, None)
+            .expect("write tool in ask mode must be refused");
+        assert_eq!(refused, ask_mode_refusal("create_chart"));
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Ask mode cannot run a tool that changes anything"),
+            "refusal error must mention Ask mode: {:?}",
+            refused["error"]
+        );
     }
 
     /// SEC-23 (F3): the copilot was a second way to add a governance rule
@@ -944,7 +1624,10 @@ mod tests {
     /// behaves like "authenticated, no grants", not like Ask mode.
     #[test]
     fn absent_principal_is_allowed_empty_permission_tool() {
-        assert_eq!(decide(true, None, spec("get_quality"), &no_args()), None);
+        assert_eq!(
+            decide(true, None, spec("get_query_limits"), &no_args()),
+            None
+        );
     }
 
     /// [`strip_confirmed`] removes only the `confirmed` key, leaving every
@@ -986,5 +1669,84 @@ mod tests {
         let pending = decide(true, Some(&perms), spec("delete_chart"), &confirmed_args())
             .expect("must be pending approval");
         assert!(is_write_high_pending(&pending));
+    }
+
+    /// `BI-37` D10: a listed dashboard tool accepts the caller's own level on
+    /// the dashboard in place of `dashboard:read`/`dashboard:write`, and still
+    /// refuses the cheaper level than the tool asks for.
+    #[test]
+    fn a_listed_dashboard_tool_accepts_the_callers_level_on_that_dashboard() {
+        use lakehouse_bi::access::Level;
+        let analyst = PermissionSet::parse("query:read");
+        let read = spec("export_chart");
+        let refused = decide_with(true, Some(&analyst), read, &no_args(), None, None)
+            .expect("must be refused without the permission or a level");
+        assert_eq!(refused["required"], json!("dashboard:read"));
+        assert_eq!(
+            decide_with(
+                true,
+                Some(&analyst),
+                read,
+                &no_args(),
+                None,
+                Some(Level::View)
+            ),
+            None,
+            "view on the dashboard is what reading its chart needs"
+        );
+
+        let write = spec("create_chart");
+        let refused = decide_with(
+            true,
+            Some(&analyst),
+            write,
+            &confirmed_args(),
+            None,
+            Some(Level::View),
+        )
+        .expect("a viewer may not create a chart");
+        assert_eq!(refused["required"], json!("dashboard:write"));
+        assert_eq!(
+            decide_with(
+                true,
+                Some(&analyst),
+                write,
+                &confirmed_args(),
+                None,
+                Some(Level::Edit)
+            ),
+            None,
+            "edit on the dashboard is what changing it needs"
+        );
+    }
+
+    /// `BI-37` D10: a level never widens a tool outside the list, so the gate's
+    /// plain check stays exactly as it was for every other tool.
+    #[test]
+    fn a_level_never_widens_a_tool_outside_the_list() {
+        use lakehouse_bi::access::Level;
+        let analyst = PermissionSet::parse("query:read");
+        for name in [
+            "delete_calculated_field",
+            "create_report_subscription",
+            "list_maps",
+        ] {
+            let refused = decide_with(
+                true,
+                Some(&analyst),
+                spec(name),
+                &confirmed_args(),
+                None,
+                Some(Level::Manage),
+            )
+            .unwrap_or_else(|| panic!("{name} must stay refused"));
+            assert_eq!(refused["reason"], json!("permission"), "{name}");
+        }
+        // A tool that has no dashboard permission at all is untouched too.
+        assert_eq!(
+            decide(true, Some(&analyst), spec("run_sql"), &no_args()),
+            None,
+            "query:read is enough for run_sql, as before"
+        );
     }
 }

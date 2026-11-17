@@ -15,41 +15,114 @@
      (`GET /api/gold/export/{mart}`) and assert its row count matches what
      was seeded — proving the whole ClickHouse -> Rust -> Lakekeeper ->
      Iceberg -> Rust round trip, with matching counts.
+  5. DATA-5 / ADR 0016 — the OUTSIDE reader: create a service identity
+     with the `iceberg:read` scope, rotate it once for its key, and read
+     the published table through the API's door (`/api/iceberg`) with
+     `pyiceberg` — a real Iceberg REST client, not a hand-rolled request.
+     The row count must match what was seeded, a write must be refused
+     403, another namespace must be refused 403, and the consumers route
+     must list the tool with one read. The same read also proves DATA-48:
+     the mart carries one decimal column per Parquet storage form
+     (`Decimal(9, 0)` as INT32, `Decimal(12, 2)` as INT64, `Decimal(38,
+     10)` as a fixed-length byte array), and every value pyiceberg reads
+     from the published table equals what ClickHouse holds.
 
 Same `g1-test-runner`/`g3a-test-runner` shape: run inside the compose
 network (`gold-export-test-runner` in `docker-compose.yml`), plain
-`requests`, no dependency on the Rust/Python application code it verifies.
+`requests` over the API's own HTTP surface — plus `pyiceberg` for the
+outside reader, a THIRD-PARTY Iceberg client the API knows nothing
+about, which is the point: the door is proven against the client it
+exists for. No dependency on the Rust/Python application code it
+verifies.
+
+The outside-reading steps need `OUTSIDE_S3_ENDPOINT` on `lakehouse-api`
+(the published storage address). The runner is INSIDE the compose
+network, so the published address is the in-network one
+(`http://rustfs:9000`); the endpoint REWRITE itself is covered by the
+Rust unit test (`routes::iceberg_door`'s `rewrite_endpoint`).
 """
 
 from __future__ import annotations
 
+import decimal
 import os
 import random
 import sys
 import time
+import uuid
 
 import requests
+import boto3
+import pyarrow as pa
+from pyiceberg.catalog import load_catalog
+from pyiceberg.exceptions import ForbiddenError
 
 CH_URL = os.environ.get("CH_URL", "http://clickhouse:8123")
 CH_USER = os.environ.get("CH_USER", "default")
 CH_PASSWORD = os.environ.get("CH_PASSWORD", "")
 API_URL = os.environ.get("LAKEHOUSE_API_URL", "http://lakehouse-api:8080")
+DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graphql")
+RUSTFS_ENDPOINT = os.environ.get("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000")
+class GoldExportFailure(Exception):
+    pass
+
+
+# DATA-2 review BLOCKER 2: credentials passed via env (no default in docker-compose.yml)
+S3_ACCESS_KEY = os.environ.get("CONNECTOR_S3_ACCESS_KEY", "").strip()
+S3_SECRET_KEY = os.environ.get("CONNECTOR_S3_SECRET_KEY", "").strip()
+if not S3_ACCESS_KEY or not S3_SECRET_KEY:
+    raise GoldExportFailure(
+        "set CONNECTOR_S3_ACCESS_KEY and CONNECTOR_S3_SECRET_KEY: the gate has no default credential (DATA-2 review BLOCKER 2)"
+    )
+
+S3_BUCKET = os.environ.get("LAKEHOUSE_WAREHOUSE_BUCKET", "lakehouse-warehouse")
 LAKEKEEPER_BASE_URI = os.environ.get("LAKEKEEPER_BASE_URI", "http://lakekeeper:8181")
 LAKEKEEPER_WAREHOUSE = os.environ.get("LAKEKEEPER_WAREHOUSE", "default")
 GOLD_SOURCE_SCHEMA = os.environ.get("GOLD_SOURCE_SCHEMA", "serving")
 GOLD_EXPORT_RUN_TOKEN = os.environ.get("GOLD_EXPORT_RUN_TOKEN", "")
 MART_NAME = os.environ.get("GOLD_MART_NAME", "gold_export_smoke")
 ROW_COUNT = int(os.environ.get("GOLD_EXPORT_ROW_COUNT", "7"))
-AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "ci@example.com")
-AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "ci-password-not-real-123")
+# DATA-48 (QA LH-DATA-1-51): one decimal column per Parquet storage form —
+# `Decimal(9, 0)` is written as INT32, `Decimal(12, 2)` as INT64 and
+# `Decimal(38, 10)` as a fixed-length byte array — so the gate proves every
+# form survives the round trip. Row `i` takes entry `i % 7`, and each value
+# is written as decimal text through `toDecimal*`, so no value passes
+# through a float on the way in either.
+DECIMAL_UNITS = ["-999999999", "0", "1", "999999999", "-1", "42", "7"]
+DECIMAL_NET_AMOUNTS = [
+    "-1234567890.12",
+    "0",
+    "0.01",
+    "-0.01",
+    "9999999999.99",
+    "12.50",
+    "-0.50",
+]
+DECIMAL_FEES = [
+    None,
+    "-1234567890123456789012345678.0123456789",
+    "0.0000000001",
+    "9999999999999999999999999999.9999999999",
+    "0",
+    "-0.0000000001",
+    "1",
+]
+# DATA-5 (ADR 0016): the outside tool's service identity. The name
+# carries a random suffix because this test may run more than once
+# against the same deployment (a service identity's name is its natural
+# key, and a taken name is a 409), and the id — not the name — is what
+# the consumers route is checked against.
+OUTSIDE_TOOL_NAME = f"gold-export-outside-tool-{uuid.uuid4().hex[:8]}"
+AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "").strip()
+AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "").strip()
+if not AUTH_EMAIL or not AUTH_PASSWORD:
+    raise GoldExportFailure(
+        "set AUTH_BOOTSTRAP_EMAIL and AUTH_BOOTSTRAP_PASSWORD: the gate has no default credential (DATA-2 review BLOCKER 2)"
+    )
 
 API = requests.Session()
 if GOLD_EXPORT_RUN_TOKEN:
     API.headers["x-run-token"] = GOLD_EXPORT_RUN_TOKEN
-
-
-class GoldExportFailure(Exception):
-    pass
 
 
 def _wait_for(name: str, check, timeout_s: int, interval_s: float = 2.0) -> None:
@@ -128,7 +201,8 @@ def step_login() -> None:
 
 def step_seed_gold_mart() -> None:
     """A real Gold aggregate mart shape: `region`/`total_sales`/
-    `order_count`/`updated_at` — one MergeTree table, ordinary (non-
+    `order_count`/`updated_at`, plus the three decimal columns of DATA-48
+    (`units`, `net_amount`, `fee`) — one MergeTree table, ordinary (non-
     Iceberg) `ClickHouse`, exactly the kind of `serving.*` table ADR 0010
     is exporting."""
     ch_query(f"CREATE DATABASE IF NOT EXISTS {GOLD_SOURCE_SCHEMA}")
@@ -136,7 +210,9 @@ def step_seed_gold_mart() -> None:
     ch_query(
         f"CREATE TABLE {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` ("
         "region String, total_sales Float64, order_count UInt64, "
-        "updated_at DateTime"
+        "updated_at DateTime, "
+        "units Decimal(9, 0), net_amount Decimal(12, 2), "
+        "fee Nullable(Decimal(38, 10))"
         ") ENGINE = MergeTree ORDER BY region"
     )
     rows = []
@@ -144,10 +220,21 @@ def step_seed_gold_mart() -> None:
         region = f"region-{i}"
         total_sales = round(random.uniform(100.0, 9999.0), 2)
         order_count = random.randint(1, 500)
-        rows.append(f"('{region}', {total_sales}, {order_count}, now())")
+        # The three storage forms, one entry of each list per row. The values
+        # are decimal TEXT converted by ClickHouse, never a Python float.
+        entry = i % len(DECIMAL_UNITS)
+        units = f"toDecimal32('{DECIMAL_UNITS[entry]}', 0)"
+        net_amount = f"toDecimal64('{DECIMAL_NET_AMOUNTS[entry]}', 2)"
+        fee_text = DECIMAL_FEES[entry]
+        fee = "NULL" if fee_text is None else f"toDecimal128('{fee_text}', 10)"
+        rows.append(
+            f"('{region}', {total_sales}, {order_count}, now(), "
+            f"{units}, {net_amount}, {fee})"
+        )
     ch_query(
         f"INSERT INTO {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` "
-        f"(region, total_sales, order_count, updated_at) VALUES {', '.join(rows)}"
+        f"(region, total_sales, order_count, updated_at, units, net_amount, fee) "
+        f"VALUES {', '.join(rows)}"
     )
     # Qualified with a WHERE, per R11 (`ops/lint/check_bare_iceberg_count.py`)
     # — not that this table is Iceberg at all (it's MergeTree, R11 doesn't
@@ -178,21 +265,7 @@ def step_trigger_export() -> dict:
     return body
 
 
-def step_verify_lakekeeper_metadata_directly() -> None:
-    """Independent proof, bypassing `lakehouse-api` entirely: ask
-    Lakekeeper's own REST catalog for the table and confirm
-    `format-version: 2` straight from its metadata — not merely trusting
-    `lakehouse-api`'s self-reported `formatVersion` field.
-
-    The Iceberg REST spec's table paths are prefixed by a server-assigned
-    `prefix` (Lakekeeper uses the warehouse's internal id, not its human
-    name) — resolved here the same way `docker-compose.yml`'s
-    `lakekeeper-authz-init` resolves `wh_id`, via the Management API's
-    `GET /management/v1/warehouse` list, using the `admin` principal
-    (control-plane bypass, per ADR 0011 — this is a metadata lookup, not a
-    data read/write). The actual table load below authenticates as
-    `gold-export`, the granted principal, not `admin`.
-    """
+def _load_lakekeeper_metadata(mart_name: str) -> dict:
     tokens_dir = os.environ.get("LAKEKEEPER_TOKENS_DIR", "/tokens")
     with open(f"{tokens_dir}/admin.jwt", encoding="utf-8") as f:
         admin_token = f.read().strip()
@@ -214,13 +287,47 @@ def step_verify_lakekeeper_metadata_directly() -> None:
         raise GoldExportFailure(f"warehouse {LAKEKEEPER_WAREHOUSE!r} not found: {warehouses.json()}")
 
     load = requests.get(
-        f"{LAKEKEEPER_BASE_URI}/catalog/v1/{wh_id}/namespaces/gold/tables/{MART_NAME}",
+        f"{LAKEKEEPER_BASE_URI}/catalog/v1/{wh_id}/namespaces/gold/tables/{mart_name}",
         headers={"Authorization": f"Bearer {export_token}"},
         timeout=10,
     )
     if not load.ok:
         raise GoldExportFailure(f"Lakekeeper loadTable failed: {load.status_code} {load.text}")
-    metadata = load.json().get("metadata", {})
+    return load.json().get("metadata", {})
+
+
+def get_s3_parquet_files(mart_name: str) -> list[str]:
+    metadata = _load_lakekeeper_metadata(mart_name)
+    location = metadata.get("location", "")
+    if not location:
+        raise GoldExportFailure(f"missing location in table metadata: {metadata}")
+    location_path = location.split("://", 1)[1] if "://" in location else location
+    bucket, _, key_prefix = location_path.partition("/")
+    bucket_name = bucket or S3_BUCKET
+    prefix = f"{key_prefix.strip('/')}/data/"
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=RUSTFS_ENDPOINT,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
+        region_name="us-east-1",
+    )
+    paginator = s3.get_paginator("list_objects_v2")
+    files: list[str] = []
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith(".parquet"):
+                files.append(key)
+    return sorted(files)
+
+
+def step_verify_lakekeeper_metadata_directly() -> None:
+    """Independent proof, bypassing `lakehouse-api` entirely: ask
+    Lakekeeper's own REST catalog for the table and confirm
+    `format-version: 2` straight from its metadata — not merely trusting
+    `lakehouse-api`'s self-reported `formatVersion` field."""
+    metadata = _load_lakekeeper_metadata(MART_NAME)
     format_version = metadata.get("format-version")
     if format_version != 2:
         raise GoldExportFailure(f"Lakekeeper table metadata format-version: wanted 2, got {format_version}")
@@ -282,19 +389,408 @@ def step_history_lists_this_run() -> None:
     print(f"[gold-export] history shows {len(runs)} run(s), latest: {latest}")
 
 
-def step_consumers_route_is_honest_about_being_unsupported() -> None:
-    """WS6: no code exists yet that correlates a Gold mart against
-    `Trino`'s query history (`routes::gold::consumers`'s own doc comment)
-    — this must be a clear `supported: false`, never a guessed count."""
+def step_create_outside_tool() -> tuple[str, str]:
+    """DATA-5 (ADR 0016): an outside tool is a service identity with the
+    `iceberg:read` scope. Creating it issues no credential (the contract
+    has no field for a secret), so the test ROTATES it once and keeps the
+    raw key — the one and only time the API hands it out."""
+    created = API.post(
+        f"{API_URL}/api/identity/service-identities",
+        json={
+            "name": OUTSIDE_TOOL_NAME,
+            "scopes": ["iceberg:read"],
+            "environment": "production",
+        },
+        timeout=30,
+    )
+    if created.status_code != 201:
+        raise GoldExportFailure(
+            f"creating the outside tool's service identity failed: "
+            f"{created.status_code} {created.text}"
+        )
+    identity_id = created.json().get("id")
+    if not identity_id:
+        raise GoldExportFailure(
+            f"the created service identity carries no id: {created.json()}"
+        )
+
+    rotated = API.post(
+        f"{API_URL}/api/identity/service-identities/{identity_id}/rotate",
+        timeout=30,
+    )
+    if not rotated.ok:
+        raise GoldExportFailure(
+            f"rotating the outside tool's credential failed: "
+            f"{rotated.status_code} {rotated.text}"
+        )
+    key = rotated.json().get("secret")
+    if not key:
+        raise GoldExportFailure(
+            f"the rotation returned no key: {rotated.json()}"
+        )
+    print(
+        f"[gold-export] outside tool {OUTSIDE_TOOL_NAME} ({identity_id}) "
+        "has its key (iceberg:read)"
+    )
+    return identity_id, key
+
+
+def _outside_catalog(key: str):
+    """The outside tool's view of the catalog: the API's DOOR
+    (`/api/iceberg`), never Lakekeeper's own port.
+
+    `pyiceberg`'s REST catalog is a real Iceberg client, so this step
+    proves that a standard client can read a published Gold table through
+    the API — the thing ADR 0016 exists for. The warehouse is passed by
+    NAME; the door answers the client's config call with the warehouse's
+    own prefix (its id), which the client then uses in every path.
+    """
+    return load_catalog(
+        "rest",
+        uri=f"{API_URL}/api/iceberg",
+        token=key,
+        warehouse=LAKEKEEPER_WAREHOUSE,
+    )
+
+
+def _clickhouse_decimal_values() -> dict[str, tuple]:
+    """The mart's three decimal columns as `decimal.Decimal`, keyed by
+    `region`, read as TEXT from `ClickHouse` — a TabSeparated `\\N` is a
+    NULL."""
+    raw = ch_query(
+        f"SELECT region, toString(units), toString(net_amount), toString(fee) "
+        f"FROM {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` ORDER BY region FORMAT TabSeparated"
+    )
+    held: dict[str, tuple] = {}
+    for line in raw.splitlines():
+        if not line:
+            continue
+        region, units, net_amount, fee = line.split("\t")
+        held[region] = (
+            decimal.Decimal(units),
+            decimal.Decimal(net_amount),
+            None if fee == "\\N" else decimal.Decimal(fee),
+        )
+    return held
+
+
+def step_outside_tool_reads_the_published_table(key: str) -> None:
+    """The outside tool reads the published table through the door and
+    sees exactly the rows that were seeded — the whole point of DATA-5:
+    outside reading works, and the rows are the same ones the console
+    exports.
+
+    DATA-48 (QA `LH-DATA-1-51`): from the SAME one load and one scan (the
+    consumers step counts exactly one read), the three decimal columns are
+    checked too — their Arrow types, and every value against what
+    `ClickHouse` holds. That is the proof the published decimals are exact,
+    in each of the three Parquet storage forms.
+    """
+    catalog = _outside_catalog(key)
+    table = catalog.load_table(("gold", MART_NAME))
+    published = table.scan().to_arrow()
+    rows = published.num_rows
+    if rows != ROW_COUNT:
+        raise GoldExportFailure(
+            f"the outside tool read {rows} rows through the door, "
+            f"expected {ROW_COUNT}"
+        )
+
+    for name, expected_type in [
+        ("units", pa.decimal128(9, 0)),
+        ("net_amount", pa.decimal128(12, 2)),
+        ("fee", pa.decimal128(38, 10)),
+    ]:
+        actual_type = published.schema.field(name).type
+        if actual_type != expected_type:
+            raise GoldExportFailure(
+                f"gold.{MART_NAME}.{name} reads back as {actual_type}, "
+                f"expected {expected_type}"
+            )
+
+    by_region = {
+        row["region"]: (row["units"], row["net_amount"], row["fee"])
+        for row in published.to_pylist()
+    }
+    held = _clickhouse_decimal_values()
+    if set(by_region) != set(held):
+        raise GoldExportFailure(
+            "the published regions differ from ClickHouse's: "
+            f"published {sorted(by_region)}, held {sorted(held)}"
+        )
+    for region, held_values in held.items():
+        if by_region[region] != held_values:
+            raise GoldExportFailure(
+                f"gold.{MART_NAME} region {region} reads back as {by_region[region]}, "
+                f"ClickHouse holds {held_values}"
+            )
+
+    print(
+        f"[gold-export] the outside tool read {rows} rows of gold.{MART_NAME} "
+        "through the door, and the three decimal columns match ClickHouse exactly"
+    )
+
+
+def step_the_door_refuses_a_write_and_another_namespace(key: str) -> None:
+    """The door reads: a write is refused 403, and a table in another
+    namespace is refused 403 (ADR 0016 point 2). Neither reaches the
+    catalog."""
+    catalog = _outside_catalog(key)
+    schema = pa.schema([pa.field("region", pa.string(), nullable=False)])
+
+    try:
+        catalog.create_table(("gold", f"{MART_NAME}_written_by_a_tool"), schema)
+    except ForbiddenError as exc:
+        print(f"[gold-export] the door refused a write: {exc}")
+    else:
+        raise GoldExportFailure(
+            "the door accepted a create_table in gold: a write must be refused"
+        )
+
+    try:
+        catalog.load_table(("bronze", MART_NAME))
+    except ForbiddenError as exc:
+        print(f"[gold-export] the door refused another namespace: {exc}")
+    else:
+        raise GoldExportFailure(
+            "the door served a table outside gold: only the gold namespace is served"
+        )
+
+
+def step_consumers_route_lists_the_outside_tool(identity_id: str) -> None:
+    """DATA-5: the count is the API's own. The consumers route lists the
+    tool that read the published table, with its reads and its last read.
+
+    The not-set-up case ("Not measured", never a count of zero) is
+    covered by the Rust integration test
+    (`tests/iceberg_door.rs`'s
+    `the_gold_consumers_route_reports_not_measured_when_outside_reading_is_off`):
+    this stack has outside reading ON, which is the only state in which
+    there is a count to list."""
     resp = API.get(f"{API_URL}/api/gold/export/{MART_NAME}/consumers", timeout=30)
     if not resp.ok:
         raise GoldExportFailure(f"GET .../consumers failed: {resp.status_code} {resp.text}")
     body = resp.json()
-    if body.get("supported") is not False:
-        raise GoldExportFailure(f"expected supported: false (no Trino client yet), got {body}")
-    if body.get("consumers") is not None:
-        raise GoldExportFailure(f"expected consumers: null when unsupported, got {body}")
-    print(f"[gold-export] consumers route honestly reports unsupported: {body.get('reason')}")
+    if body.get("supported") is not True:
+        raise GoldExportFailure(f"expected supported: true, got {body}")
+    if body.get("windowDays") != 7:
+        raise GoldExportFailure(f"expected windowDays: 7, got {body}")
+    consumers = body.get("consumers") or []
+    mine = [c for c in consumers if c.get("identityId") == identity_id]
+    if len(mine) != 1:
+        raise GoldExportFailure(
+            f"expected exactly one entry for the outside tool {identity_id}, "
+            f"got {consumers}"
+        )
+    entry = mine[0]
+    if entry.get("reads") != 1:
+        raise GoldExportFailure(f"expected reads == 1, got {entry}")
+    if not entry.get("name"):
+        raise GoldExportFailure(f"expected the tool's name, got {entry}")
+    if not entry.get("lastReadAt"):
+        raise GoldExportFailure(f"expected the tool's last read, got {entry}")
+    print(f"[gold-export] the consumers route lists the outside tool: {entry}")
+
+
+def step_optimize_final_with_if_changed_skips() -> None:
+    """DATA-10: OPTIMIZE TABLE FINAL changes modification_time on MergeTree
+    parts but does not change table contents. Calling export with ?ifChanged=true
+    must skip."""
+    ch_query(f"OPTIMIZE TABLE {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` FINAL")
+    resp = API.post(f"{API_URL}/api/gold/export/{MART_NAME}?ifChanged=true", timeout=30)
+    if not resp.ok:
+        raise GoldExportFailure(f"POST ?ifChanged=true after OPTIMIZE failed: {resp.status_code} {resp.text}")
+    body = resp.json()
+    print(f"[gold-export] ifChanged after OPTIMIZE FINAL: {body}")
+    if body.get("skipped") is not True:
+        raise GoldExportFailure(f"expected skipped: true after OPTIMIZE FINAL, got {body}")
+
+
+def step_exchange_tables_same_rows_with_if_changed_skips() -> None:
+    """DATA-10: Rewriting the mart with identical rows via staging and EXCHANGE TABLES
+    changes all part files and modification times, but content fingerprint remains identical.
+    Calling export with ?ifChanged=true must skip."""
+    staging_mart = f"{MART_NAME}_staging"
+    ch_query(f"DROP TABLE IF EXISTS {GOLD_SOURCE_SCHEMA}.`{staging_mart}`")
+    ch_query(
+        f"CREATE TABLE {GOLD_SOURCE_SCHEMA}.`{staging_mart}` AS {GOLD_SOURCE_SCHEMA}.`{MART_NAME}`"
+    )
+    ch_query(
+        f"INSERT INTO {GOLD_SOURCE_SCHEMA}.`{staging_mart}` "
+        f"SELECT * FROM {GOLD_SOURCE_SCHEMA}.`{MART_NAME}`"
+    )
+    ch_query(
+        f"EXCHANGE TABLES {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` AND {GOLD_SOURCE_SCHEMA}.`{staging_mart}`"
+    )
+    ch_query(f"DROP TABLE IF EXISTS {GOLD_SOURCE_SCHEMA}.`{staging_mart}`")
+
+    resp = API.post(f"{API_URL}/api/gold/export/{MART_NAME}?ifChanged=true", timeout=30)
+    if not resp.ok:
+        raise GoldExportFailure(f"POST ?ifChanged=true after EXCHANGE TABLES failed: {resp.status_code} {resp.text}")
+    body = resp.json()
+    print(f"[gold-export] ifChanged after EXCHANGE TABLES: {body}")
+    if body.get("skipped") is not True:
+        raise GoldExportFailure(f"expected skipped: true after EXCHANGE TABLES, got {body}")
+
+
+def step_insert_row_with_if_changed_exports() -> None:
+    """DATA-10: Inserting a single new row changes the content fingerprint.
+    Calling export with ?ifChanged=true must export instead of skipping."""
+    ch_query(
+        f"INSERT INTO {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` (region, total_sales, order_count, updated_at) "
+        "VALUES ('region-new-row', 123.45, 99, now())"
+    )
+    resp = API.post(f"{API_URL}/api/gold/export/{MART_NAME}?ifChanged=true", timeout=30)
+    if not resp.ok:
+        raise GoldExportFailure(f"POST ?ifChanged=true after insert failed: {resp.status_code} {resp.text}")
+    body = resp.json()
+    print(f"[gold-export] ifChanged after insert row: {body}")
+    if body.get("skipped") is True:
+        raise GoldExportFailure(f"expected export after INSERT, but was skipped: {body}")
+    expected_rows = ROW_COUNT + 1
+    if body.get("rowsExported") != expected_rows:
+        raise GoldExportFailure(
+            f"rowsExported mismatch after insert: wanted {expected_rows}, got {body.get('rowsExported')}"
+        )
+
+
+def step_job_export_9_copies_and_trim_to_7() -> None:
+    """DATA-2 (T5): publish 9 changed copies through the job path:
+    1. Wait for Dagster webserver.
+    2. Enable publication for MART_NAME via PUT /api/gold/export/{mart}/publication.
+    3. In 9 cycles, mutate mart rows in ClickHouse, trigger gold_export_job via
+       POST /api/pipelines/gold_export_job/trigger, and poll Dagster GraphQL DAGSTER_URL
+       until run status is SUCCESS.
+    4. Assertions after 9 cycles:
+       - 7 copies remain (the newest 7).
+       - Query S3 object store: assert exactly 7 parquet files remain and no removed
+         copies' files exist.
+       - Assert publication detail GET /api/gold/export/{mart}/publication returns trim
+         with copiesKept: 7, status: "success", and non-null oldestKeptExportedAt.
+    """
+    print("[gold-export] waiting for Dagster webserver...")
+    _wait_for(
+        "dagster-webserver",
+        lambda: requests.get(DAGSTER_URL.replace("/graphql", "/server_info"), timeout=5).status_code == 200,
+        60,
+    )
+
+    # 1. Enable publication for MART_NAME
+    pub_resp = API.put(
+        f"{API_URL}/api/gold/export/{MART_NAME}/publication",
+        json={"enabled": True},
+        timeout=10,
+    )
+    if not pub_resp.ok:
+        raise GoldExportFailure(
+            f"PUT /api/gold/export/{MART_NAME}/publication failed: {pub_resp.status_code} {pub_resp.text}"
+        )
+    pub_body = pub_resp.json()
+    if pub_body.get("enabled") is not True:
+        raise GoldExportFailure(f"expected publication enabled: true, got {pub_body}")
+    print(f"[gold-export] publication enabled for {MART_NAME}")
+
+    # Track baseline files and cycle-added files
+    baseline_files = set(get_s3_parquet_files(MART_NAME))
+    cycle_files: dict[int, str] = {}
+    known_files = set(baseline_files)
+
+    query = (
+        "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename "
+        "... on Run { status } } }"
+    )
+
+    for cycle in range(1, 10):
+        # Mutate mart rows in ClickHouse so ifChanged exports a new copy
+        ch_query(
+            f"INSERT INTO {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` "
+            f"(region, total_sales, order_count, updated_at) "
+            f"VALUES ('region-job-c{cycle}', {2000.0 + cycle}, {cycle * 5}, now())"
+        )
+
+        # Trigger gold_export_job via lakehouse-api
+        trig_resp = API.post(f"{API_URL}/api/pipelines/gold_export_job/trigger", timeout=10)
+        if not trig_resp.ok:
+            raise GoldExportFailure(
+                f"POST /api/pipelines/gold_export_job/trigger failed (cycle {cycle}): "
+                f"{trig_resp.status_code} {trig_resp.text}"
+            )
+        run_id = trig_resp.json().get("id")
+        if not run_id:
+            raise GoldExportFailure(f"missing run id in trigger response: {trig_resp.json()}")
+
+        def check_run() -> bool:
+            r = requests.post(DAGSTER_URL, json={"query": query, "variables": {"rid": run_id}}, timeout=10)
+            r.raise_for_status()
+            st = r.json().get("data", {}).get("pipelineRunOrError", {}).get("status")
+            print(f"[gold-export] cycle {cycle} run {run_id} status={st}")
+            if st == "FAILURE":
+                raise GoldExportFailure(f"cycle {cycle} run {run_id} FAILED")
+            return st == "SUCCESS"
+
+        _wait_for(f"gold_export_job cycle {cycle} run {run_id} SUCCESS", check_run, 90, interval_s=2.0)
+
+        current_files = get_s3_parquet_files(MART_NAME)
+        new_files = [f for f in current_files if f not in known_files]
+        if new_files:
+            cycle_files[cycle] = new_files[-1]
+            known_files.add(new_files[-1])
+        print(f"[gold-export] cycle {cycle} done: {len(current_files)} parquet files present in S3")
+
+    # Assertions after 9 cycles:
+    final_files = get_s3_parquet_files(MART_NAME)
+    print(f"[gold-export] final parquet files ({len(final_files)}): {final_files}")
+    if len(final_files) != 7:
+        raise GoldExportFailure(
+            f"expected exactly 7 parquet files in S3 after 9 cycles and trim, got {len(final_files)}: {final_files}"
+        )
+
+    # Prove removed copies' files no longer exist in S3
+    for f in baseline_files:
+        if f in final_files:
+            raise GoldExportFailure(f"baseline parquet file {f} was not removed from S3!")
+    if 1 in cycle_files:
+        c1_file = cycle_files[1]
+        if c1_file in final_files:
+            raise GoldExportFailure(f"cycle 1 parquet file {c1_file} was not removed from S3!")
+        print(f"[gold-export] verified cycle 1 file {c1_file} is absent from S3")
+    if 2 in cycle_files:
+        c2_file = cycle_files[2]
+        if c2_file in final_files:
+            raise GoldExportFailure(f"cycle 2 parquet file {c2_file} was not removed from S3!")
+        print(f"[gold-export] verified cycle 2 file {c2_file} is absent from S3")
+
+    # Assert 7 copies remain via ClickHouse DataLakeCatalog query
+    ch_copies_raw = ch_query(
+        f"SELECT count(DISTINCT _exported_at) FROM icecat_gold_export.`gold.{MART_NAME}` WHERE 1 FORMAT TabSeparated"
+    ).strip()
+    if int(ch_copies_raw) != 7:
+        raise GoldExportFailure(
+            f"expected 7 distinct copies in gold.{MART_NAME}, got {ch_copies_raw}"
+        )
+    print(f"[gold-export] confirmed 7 distinct copies in icecat_gold_export.gold.{MART_NAME}")
+
+    # Assert publication detail GET /api/gold/export/{mart}/publication
+    detail_resp = API.get(f"{API_URL}/api/gold/export/{MART_NAME}/publication", timeout=10)
+    if not detail_resp.ok:
+        raise GoldExportFailure(
+            f"GET /api/gold/export/{MART_NAME}/publication failed: {detail_resp.status_code} {detail_resp.text}"
+        )
+    detail = detail_resp.json()
+    print(f"[gold-export] publication detail: {detail}")
+    trim = detail.get("trim")
+    if not trim:
+        raise GoldExportFailure(f"expected trim object in publication detail, got null/missing in: {detail}")
+    if trim.get("copiesKept") != 7:
+        raise GoldExportFailure(f"expected trim.copiesKept == 7, got {trim.get('copiesKept')}")
+    if trim.get("status") != "success":
+        raise GoldExportFailure(f"expected trim.status == 'success', got {trim.get('status')}")
+    if not trim.get("oldestKeptExportedAt"):
+        raise GoldExportFailure(f"expected non-null trim.oldestKeptExportedAt, got {trim.get('oldestKeptExportedAt')}")
+    print(
+        f"[gold-export] publication detail confirms trim: copiesKept={trim.get('copiesKept')}, "
+        f"oldestKeptExportedAt={trim.get('oldestKeptExportedAt')}, status={trim.get('status')}"
+    )
 
 
 def main() -> int:
@@ -307,7 +803,17 @@ def main() -> int:
         step_read_back_via_api()
         step_read_back_reports_snapshot_fields()
         step_history_lists_this_run()
-        step_consumers_route_is_honest_about_being_unsupported()
+        # DATA-5 (ADR 0016): the outside reader. Before the DATA-10
+        # steps, so the published table still holds exactly the seeded
+        # rows and the read count is exactly one.
+        tool_id, tool_key = step_create_outside_tool()
+        step_outside_tool_reads_the_published_table(tool_key)
+        step_the_door_refuses_a_write_and_another_namespace(tool_key)
+        step_consumers_route_lists_the_outside_tool(tool_id)
+        step_optimize_final_with_if_changed_skips()
+        step_exchange_tables_same_rows_with_if_changed_skips()
+        step_insert_row_with_if_changed_exports()
+        step_job_export_9_copies_and_trim_to_7()
     except GoldExportFailure as exc:
         print(f"[gold-export] FAILED: {exc}", file=sys.stderr)
         return 1

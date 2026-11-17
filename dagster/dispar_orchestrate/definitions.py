@@ -15,12 +15,15 @@ from dispar_orchestrate.assets import bronze_ingest_job
 from dispar_orchestrate.authored_factory import (
     authored_dependency_sensors,
     authored_jobs,
+    authored_lag_sensors,
     authored_schedules,
 )
 from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_job,
     capacity_snapshot_schedule,
 )
+from dispar_orchestrate.cdc_apply import cdc_apply_job, cdc_apply_sensor
+from dispar_orchestrate.discover import discover_job
 from dispar_orchestrate.file_ingest import file_ingest_job
 from dispar_orchestrate.gold_export import (
     gold_export_after_authored_sensor,
@@ -78,7 +81,7 @@ from dispar_orchestrate.replication_metrics import (
 # also launchable on demand from the Dagster UI, same as before.
 # `agent_run_job`'s own schedules are no longer permanently empty: with
 # `AGENT_RUN_TOKEN` set (see `lakehouse-api::main::bootstrap_agent_run_service`
-# and this repo's `.env.example`), `agent_run_schedules` holds one entry
+# and docs/CONFIGURATION.md), `agent_run_schedules` holds one entry
 # per scheduled employee; with it unset, `agent_run_schedules` is `[]` and
 # `agent_run_job` stays launchable on demand only, exactly like
 # `gold_export_job`.
@@ -89,6 +92,12 @@ from dispar_orchestrate.replication_metrics import (
 # `POST /api/uploads/{id}/ingest`, with a run config naming the file, so it
 # has no schedule and no sensor: there is no such thing as "the" uploaded
 # file to run it on.
+#
+# `discover_job` (SRC-13, docs/superpowers/plans/2026-10-15-src-13-table-discovery.md)
+# lists what a MongoDB, Kafka, SFTP or Oracle source holds, and previews the
+# columns of one object (also a REST endpoint), for the console's table picker. It
+# is launched only by `POST /api/connectors/{id}/discovery/{kind}` and posts its
+# answer back to the API; it has no schedule and no sensor, and it never loads.
 defs = Definitions(
     jobs=[
         bronze_ingest_job,
@@ -99,7 +108,10 @@ defs = Definitions(
         alerts_run_job,
         capacity_snapshot_job,
         ingest_job,
+        # SRC-4 slice 2: writes a change-capture connector's topics to Bronze.
+        cdc_apply_job,
         file_ingest_job,
+        discover_job,
         *authored_jobs,
     ],
     schedules=[
@@ -116,6 +128,8 @@ defs = Definitions(
         # lakehouse-api, so a schedule saved in the console needs no reload --
         # see `ingest_factory.py`'s "Schedules" section.
         ingest_schedule_sensor,
+        # SRC-4 slice 2: starts cdc_apply_job for a connector with changes to apply.
+        cdc_apply_sensor,
         pipeline_run_failed_sensor,
         pipeline_run_finished_sensor,
         gold_export_after_authored_sensor,
@@ -128,5 +142,8 @@ defs = Definitions(
         # module doc for the ALL-semantics and run_key = upstream run id
         # design choices.
         *authored_dependency_sensors,
+        # BLD-2 D6: one lag sensor per authored pipeline with a time-based target lag
+        # (named authored__<safe_id>_lag, running every 30 seconds).
+        *authored_lag_sensors,
     ],
 )

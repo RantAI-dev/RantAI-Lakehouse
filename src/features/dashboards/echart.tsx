@@ -2,7 +2,9 @@
 
 import * as React from "react";
 import * as echarts from "echarts";
+import type { ChartHit } from "@/lib/chart-click";
 import { readView, withView } from "@/lib/geo-view";
+import { useRenderMode } from "./render-mode";
 
 /**
  * A thin Apache ECharts wrapper for React 19 — no echarts-for-react, for
@@ -19,8 +21,13 @@ export function EChart({
 }: {
   option: echarts.EChartsOption;
   height?: number | string;
-  /** Click a data point (bar/slice/etc.) → drill/cross-filter. `pos` = screen coordinates. */
-  onDataClick?: (name: string, pos: { x: number; y: number }) => void;
+  /**
+   * Click a data point (bar/slice/region/day/node…) → drill/cross-filter.
+   * `pos` = screen coordinates. The whole hit is passed on, not just its
+   * name: a calendar day has none, and a box's name is a label (BI-18·B,
+   * lib/chart-click.ts maps each kind).
+   */
+  onDataClick?: (hit: ChartHit, pos: { x: number; y: number }) => void;
   /**
    * Maps only: when `option` changes (a data refresh, a theme switch) carry
    * the map's current pan and zoom over instead of letting `setOption` reset
@@ -40,40 +47,62 @@ export function EChart({
   const chartCbRef = React.useRef(onChart);
   React.useEffect(() => { chartCbRef.current = onChart; }, [onChart]);
   const hasOption = React.useRef(false);
+  // BI-1: under the PDF print view the chart draws without animation and
+  // tells the view when it has drawn (see `render-mode.tsx`).
+  const renderMode = useRenderMode();
 
   React.useEffect(() => {
     if (!elRef.current) return;
     const chart = echarts.init(elRef.current, undefined, { renderer: "canvas" });
     chartRef.current = chart;
+    let reported = false;
+    if (renderMode) {
+      renderMode.chartMounted();
+      chart.on("finished", () => {
+        if (reported) return;
+        reported = true;
+        renderMode.chartFinished();
+      });
+    }
     chartCbRef.current?.(chart);
     chart.on("click", (p: unknown) => {
-      const o = p as { name?: string; event?: { event?: MouseEvent } };
-      const name = o?.name;
-      if (name && clickRef.current) {
-        const ev = o.event?.event;
-        clickRef.current(name, { x: ev?.clientX ?? 0, y: ev?.clientY ?? 0 });
-      }
+      const o = p as {
+        name?: string; value?: unknown; dataIndex?: number; seriesType?: string; dataType?: string; seriesIndex?: number;
+        treePathInfo?: { name?: string }[]; event?: { event?: MouseEvent };
+      };
+      if (!clickRef.current) return;
+      const ev = o.event?.event;
+      clickRef.current(
+        {
+          name: o.name ?? "", value: o.value, dataIndex: o.dataIndex, seriesType: o.seriesType, dataType: o.dataType, seriesIndex: o.seriesIndex,
+          treePathInfo: o.treePathInfo?.map((t) => ({ name: t.name ?? "" })),
+        },
+        { x: ev?.clientX ?? 0, y: ev?.clientY ?? 0 },
+      );
     });
     const ro = new ResizeObserver(() => chart.resize());
     ro.observe(elRef.current);
     return () => {
       ro.disconnect();
+      // A chart removed before it finished must not hold the print view back.
+      if (renderMode && !reported) renderMode.chartFinished();
       chartCbRef.current?.(null);
       chart.dispose();
       chartRef.current = null;
       hasOption.current = false;
     };
-  }, []);
+  }, [renderMode]);
 
   React.useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
     // The first option has no view to keep (getOption would be empty).
-    const next = keepView && hasOption.current ? withView(option, readView(chart.getOption())) : option;
+    const base = keepView && hasOption.current ? withView(option, readView(chart.getOption())) : option;
+    const next = renderMode ? { ...base, animation: false } : base;
     // notMerge=true so theme/option changes are clean (no stacking of old series).
     chart.setOption(next, true);
     hasOption.current = true;
-  }, [option, keepView]);
+  }, [option, keepView, renderMode]);
 
   return <div ref={elRef} style={{ width: "100%", height, cursor: onDataClick ? "pointer" : "default" }} />;
 }

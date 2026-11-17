@@ -65,7 +65,12 @@ use lakehouse_core::secret::{SecretError, SecretResolver};
 /// Every probe in this module is bounded by this timeout, matching
 /// `DgClient::is_alive`'s existing 3 s bound — one dead service must never
 /// stall `probe_all`'s `tokio::join!`.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+///
+/// Also the bound [`crate::readiness`]'s readiness checks use: a readiness
+/// route is polled (by `docker compose`'s health check, by an updater
+/// waiting for a new version), so it must answer in about the same time as
+/// this one. One bound, one place (AGENTS.md rule 4).
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// One service's health, as this probe set can honestly report it.
 #[derive(Debug, Clone, Serialize)]

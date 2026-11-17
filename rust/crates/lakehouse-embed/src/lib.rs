@@ -7,33 +7,85 @@
 //! locked filters (the viewer can't change them). No external JWT library
 //! is used — matching the TypeScript, which hand-rolls the same
 //! three-segment `header.payload.signature` format with `crypto`.
+//!
+//! # `SEC-12`: the secret is configuration, never generated
+//!
+//! This crate used to read or invent the signing secret and keep it as
+//! plain text in `console.app_kv` when `EMBED_SECRET` was unset. That path
+//! is gone: the secret comes from configuration only (`Config::embed_secret`)
+//! and an unset secret means signed embedding is unavailable. An existing
+//! `embed_secret` row is no longer read; the operator removes it.
+//!
+//! # `SEC-12`: a token always expires
+//!
+//! Before `SEC-12` a token without `exp` was valid forever, so one copied
+//! from a page source worked for good. [`verify_embed`] now refuses a token
+//! unless it carries both `exp` and `iat` (Unix seconds), its lifetime
+//! (`exp - iat`) is at most the configured maximum, `iat` is not in the
+//! future and `exp` is not in the past, each with
+//! [`CLOCK_TOLERANCE_SECONDS`] of tolerance for a clock difference between
+//! the customer's server and ours. There is no grace setting: an old token
+//! is refused at once.
+//!
+//! The signature is checked first, before any claim is read, so an
+//! unsigned or forged payload never reaches the claim checks. Callers map
+//! every [`TokenError`] to one fixed message so a caller cannot tell which
+//! check failed; the variant exists for tests and the log.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, KeyInit, Mac};
-use lakehouse_clickhouse::{ChClient, ChError};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
-use tokio::sync::Mutex;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// The dashboard resource an embed token grants access to, mirroring the
-/// TypeScript's `{ dashboard?: string }`.
+/// The resource an embed token grants access to, mirroring the TypeScript's
+/// `{ dashboard?: string }` and, since `BI-26` (plan D1), `chart`: a token
+/// names a dashboard or one chart, never both and never neither
+/// ([`EmbedResource::target`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbedResource {
     /// The dashboard slug/id being embedded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dashboard: Option<String>,
+    /// The id of the one chart being embedded (`BI-26`). The server finds the
+    /// chart's dashboard itself; the token cannot name another chart's data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chart: Option<String>,
 }
 
-/// Claims carried by a signed embed token, mirroring the TypeScript's
-/// `EmbedClaims` type exactly: `{ resource?, params?, exp? }`.
+/// What a token names, once it has been checked to name exactly one thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedTarget<'a> {
+    /// A whole dashboard.
+    Dashboard(&'a str),
+    /// One chart (`BI-26`).
+    Chart(&'a str),
+}
+
+impl EmbedResource {
+    /// What the token names, or `None` when it names nothing, both a dashboard
+    /// and a chart, or an empty id. `None` is a refusal, never a default
+    /// (`BI-26` plan D1, fail closed): a token that names both could be read as
+    /// either, and a chart token must not be turned into a dashboard.
+    #[must_use]
+    pub fn target(&self) -> Option<EmbedTarget<'_>> {
+        let dashboard = self.dashboard.as_deref().filter(|d| !d.is_empty());
+        let chart = self.chart.as_deref().filter(|c| !c.is_empty());
+        match (dashboard, chart) {
+            (Some(d), None) => Some(EmbedTarget::Dashboard(d)),
+            (None, Some(c)) => Some(EmbedTarget::Chart(c)),
+            _ => None,
+        }
+    }
+}
+
+/// Claims carried by a signed embed token: the TypeScript's
+/// `{ resource?, params?, exp? }` plus `iat` and `jti` (`SEC-12`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EmbedClaims {
     /// The dashboard resource this token grants access to.
@@ -44,9 +96,60 @@ pub struct EmbedClaims {
     /// `Record<string, string | string[]>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<HashMap<String, Value>>,
-    /// Unix-seconds expiry. `None` means the token never expires.
+    /// Unix-seconds expiry. Required by [`verify_embed`] (`SEC-12`); an
+    /// `Option` only so a token can be built without one in a test.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exp: Option<f64>,
+    /// Unix-seconds issue time. Required by [`verify_embed`] (`SEC-12`):
+    /// "withdraw all tokens" compares it with the instant of the
+    /// withdrawal, and the lifetime limit is `exp - iat`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iat: Option<f64>,
+    /// Optional token id (1 to 128 characters of `[A-Za-z0-9._-]`). A token
+    /// that carries one can be withdrawn on its own; one without cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
+}
+
+/// The longest lifetime (`exp - iat`) accepted when no setting overrides
+/// it: 24 hours (`SEC-12`, signed by the product owner).
+pub const DEFAULT_MAX_LIFETIME_SECONDS: u64 = 86_400;
+
+/// How far a customer's clock may differ from ours, in seconds, before a
+/// token's `iat` counts as "in the future" or its `exp` as "in the past".
+pub const CLOCK_TOLERANCE_SECONDS: f64 = 60.0;
+
+/// The longest `jti` accepted, in characters.
+pub const MAX_JTI_CHARS: usize = 128;
+
+/// Why [`verify_embed`] refused a token. For tests and the log only: a
+/// response never says which check failed (`SEC-12`, one fixed message).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TokenError {
+    /// Not three `.`-separated segments, or a segment that does not decode.
+    #[error("token is malformed")]
+    Malformed,
+    /// The signature does not match. Reported before any claim is read.
+    #[error("signature does not match")]
+    BadSignature,
+    /// `exp` is missing or not a number.
+    #[error("exp is missing or not a number")]
+    MissingExp,
+    /// `iat` is missing or not a number.
+    #[error("iat is missing or not a number")]
+    MissingIat,
+    /// `exp` is in the past beyond the clock tolerance.
+    #[error("token has expired")]
+    Expired,
+    /// `iat` is in the future beyond the clock tolerance.
+    #[error("token was issued in the future")]
+    IssuedInFuture,
+    /// `exp - iat` is negative or longer than the maximum lifetime.
+    #[error("token lifetime is not within the allowed maximum")]
+    Lifetime,
+    /// `jti` is present but is not 1 to 128 characters of `[A-Za-z0-9._-]`.
+    #[error("jti is malformed")]
+    BadJti,
 }
 
 /// Base64url-encode (no padding), matching the TypeScript's hand-rolled
@@ -92,43 +195,226 @@ pub fn sign_embed(claims: &EmbedClaims, secret: &str) -> String {
     format!("{data}.{sig}")
 }
 
-/// Verify a token's signature and expiry, matching `verifyEmbed`. Returns
-/// the claims when valid, `None` otherwise.
-///
-/// Every rejection path in the TypeScript is reproduced:
-/// - wrong number of `.`-separated segments (not exactly 3),
-/// - an undecodable signature segment,
-/// - a signature that doesn't match (checked in constant time via
-///   [`Mac::verify_slice`], matching `crypto.timingSafeEqual`),
-/// - an undecodable/unparsable payload segment,
-/// - a numeric `exp` that is in the past.
-#[must_use]
-pub fn verify_embed(token: &str, secret: &str) -> Option<EmbedClaims> {
+/// The payload of `token` once its signature checks out under `key`, before
+/// any claim is read (`SEC-12`): three segments, a decodable signature, a
+/// constant-time comparison, then the payload parsed. Shared by
+/// [`verify_embed`] and [`verify_render`], so the order of those checks has
+/// one copy.
+fn open_signed(token: &str, key: &str) -> Result<Value, TokenError> {
     let parts: Vec<&str> = token.split('.').collect();
     let [header, payload, sig] = parts.as_slice() else {
-        return None;
+        return Err(TokenError::Malformed);
     };
     let data = format!("{header}.{payload}");
-    let given = from_b64url(sig).ok()?;
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).ok()?;
+    let given = from_b64url(sig).map_err(|_| TokenError::Malformed)?;
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key.as_bytes())
+        .map_err(|_| TokenError::BadSignature)?;
     mac.update(data.as_bytes());
-    // Constant-time comparison, matching `crypto.timingSafeEqual`. A
-    // length mismatch is also rejected by `verify_slice` (constant-time
-    // itself doesn't require equal lengths to be checked separately here,
-    // unlike the TS which checks `given.length !== expected.length`
-    // first — `verify_slice` folds both checks into one call).
-    mac.verify_slice(&given).ok()?;
+    // Constant-time comparison, matching `crypto.timingSafeEqual`.
+    // `verify_slice` folds the length check into the same call.
+    mac.verify_slice(&given)
+        .map_err(|_| TokenError::BadSignature)?;
+    let payload_bytes = from_b64url(payload).map_err(|_| TokenError::Malformed)?;
+    serde_json::from_slice(&payload_bytes).map_err(|_| TokenError::Malformed)
+}
 
-    let payload_bytes = from_b64url(payload).ok()?;
-    let claims: EmbedClaims = serde_json::from_slice(&payload_bytes).ok()?;
+/// Verify a token's signature and claims (`SEC-12`). Returns the claims when
+/// the token is acceptable at `now_unix_seconds`.
+///
+/// The checks run in this order and stop at the first failure:
+/// 1. three segments and a decodable signature ([`TokenError::Malformed`]);
+/// 2. the signature, compared in constant time ([`Mac::verify_slice`]),
+///    before the payload is looked at ([`TokenError::BadSignature`]);
+/// 3. the payload parses ([`TokenError::Malformed`]);
+/// 4. `exp` and `iat` are numbers ([`TokenError::MissingExp`],
+///    [`TokenError::MissingIat`]);
+/// 5. `0 <= exp - iat <= max_lifetime_seconds` ([`TokenError::Lifetime`]);
+///    a lifetime exactly at the maximum is accepted;
+/// 6. `iat <= now + 60` ([`TokenError::IssuedInFuture`]) and
+///    `exp >= now - 60` ([`TokenError::Expired`]);
+/// 7. `jti`, when present, is well formed ([`TokenError::BadJti`]).
+///
+/// `now_unix_seconds` is a parameter, not read here, so tests need no
+/// sleeping; callers pass [`unix_now`].
+///
+/// # Errors
+///
+/// A [`TokenError`] naming the first check that failed.
+pub fn verify_embed(
+    token: &str,
+    secret: &str,
+    max_lifetime_seconds: u64,
+    now_unix_seconds: f64,
+) -> Result<EmbedClaims, TokenError> {
+    let raw = open_signed(token, secret)?;
+    // `exp` and `iat` are read from the raw value so a string or null is
+    // reported as missing, not as a payload that failed to parse.
+    let exp = finite_number(&raw, "exp").ok_or(TokenError::MissingExp)?;
+    let iat = finite_number(&raw, "iat").ok_or(TokenError::MissingIat)?;
+    let claims: EmbedClaims = serde_json::from_value(raw).map_err(|_| TokenError::Malformed)?;
 
-    if let Some(exp) = claims.exp {
-        let now_ms = now_unix_millis();
-        if exp * 1000.0 < now_ms {
-            return None;
-        }
+    let lifetime = exp - iat;
+    if lifetime < 0.0 || lifetime > seconds_as_f64(max_lifetime_seconds) {
+        return Err(TokenError::Lifetime);
     }
-    Some(claims)
+    if iat > now_unix_seconds + CLOCK_TOLERANCE_SECONDS {
+        return Err(TokenError::IssuedInFuture);
+    }
+    if exp < now_unix_seconds - CLOCK_TOLERANCE_SECONDS {
+        return Err(TokenError::Expired);
+    }
+    if let Some(jti) = &claims.jti
+        && !is_valid_jti(jti)
+    {
+        return Err(TokenError::BadJti);
+    }
+    Ok(claims)
+}
+
+// ── render tokens (BI-1, plan decision D2) ────────────────────────────────
+
+/// The audience of a render token.
+pub const RENDER_AUDIENCE: &str = "render";
+
+/// How long a render token lives: 2 minutes (feature decision 2). Not
+/// configurable: the token is minted and spent inside one PDF request, and a
+/// longer life would only be more time to misuse a copy.
+pub const RENDER_LIFETIME_SECONDS: u64 = 120;
+
+/// What the PDF renderer is allowed to read, and as whom (`BI-1`, D2).
+///
+/// The renderer is a headless browser that opens the console's print view with
+/// this token in the address. It names one dashboard, one person and the
+/// filter and parameter values the person had on screen, so the token is good
+/// for that and nothing else, for two minutes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RenderClaims {
+    /// Always [`RENDER_AUDIENCE`]; a token with another audience is refused.
+    #[serde(default)]
+    pub aud: String,
+    /// The dashboard to print.
+    pub board: String,
+    /// `BI-19` part D (plan D13): set for a chart's image. The token is then
+    /// good for this one chart of `board` and for nothing else on it: the data
+    /// route (`routes::render`) answers with that chart only, and refuses the
+    /// token when the person can no longer see it. Absent for a dashboard PDF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chart: Option<String>,
+    /// The person who asked (`app_user.id`): the data is read as them.
+    pub principal: String,
+    /// The dashboard's filters, as the JSON list `GET /api/dashboard` takes in
+    /// `filters` (one encoding, the page's own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<String>,
+    /// The parameter values, as the JSON object `GET /api/dashboard` takes in `params`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<String>,
+    /// The grain switch, as `GET /api/dashboard` takes it in `grain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grain: Option<String>,
+    /// `a4` or `letter`.
+    pub paper: String,
+    /// `portrait` or `landscape`.
+    pub orientation: String,
+    /// Unix-seconds expiry.
+    #[serde(default)]
+    pub exp: f64,
+    /// Unix-seconds issue time.
+    #[serde(default)]
+    pub iat: f64,
+    /// A unique id for the log.
+    pub jti: String,
+}
+
+/// When a render token issued at `iat` expires.
+#[must_use]
+pub fn render_expiry(iat: f64) -> f64 {
+    iat + seconds_as_f64(RENDER_LIFETIME_SECONDS)
+}
+
+/// Sign `claims` as a render token under `secret`, the server-only
+/// `RENDER_TOKEN_SECRET` (BI-1 review fix (BLOCKER) R1: it is not `EMBED_SECRET`
+/// and not derived from it, because the embedding customer holds that one and
+/// a render token reads as any person it names).
+/// Returns an empty string only if the HMAC key cannot be set up, which no
+/// key length causes (see [`sign_embed`]).
+#[must_use]
+pub fn sign_render(claims: &RenderClaims, secret: &str) -> String {
+    let header = b64url_json(&serde_json::json!({ "alg": "HS256", "typ": "JWT" }))
+        .unwrap_or_else(|_| "e30".to_owned());
+    let payload = b64url_json(claims).unwrap_or_else(|_| "e30".to_owned());
+    let data = format!("{header}.{payload}");
+    let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()) else {
+        return String::new();
+    };
+    mac.update(data.as_bytes());
+    format!("{data}.{}", b64url(&mac.finalize().into_bytes()))
+}
+
+/// Verify a render token at `now_unix_seconds`: the signature first, then the
+/// audience, the lifetime (at most [`RENDER_LIFETIME_SECONDS`]), the clock
+/// window (as [`verify_embed`]) and the `jti`.
+///
+/// # Errors
+///
+/// A [`TokenError`] naming the first check that failed; a caller answers with
+/// one fixed message.
+pub fn verify_render(
+    token: &str,
+    secret: &str,
+    now_unix_seconds: f64,
+) -> Result<RenderClaims, TokenError> {
+    let raw = open_signed(token, secret)?;
+    let exp = finite_number(&raw, "exp").ok_or(TokenError::MissingExp)?;
+    let iat = finite_number(&raw, "iat").ok_or(TokenError::MissingIat)?;
+    let claims: RenderClaims = serde_json::from_value(raw).map_err(|_| TokenError::Malformed)?;
+    if claims.aud != RENDER_AUDIENCE {
+        return Err(TokenError::Malformed);
+    }
+    let lifetime = exp - iat;
+    if lifetime < 0.0 || lifetime > seconds_as_f64(RENDER_LIFETIME_SECONDS) {
+        return Err(TokenError::Lifetime);
+    }
+    if iat > now_unix_seconds + CLOCK_TOLERANCE_SECONDS {
+        return Err(TokenError::IssuedInFuture);
+    }
+    if exp < now_unix_seconds - CLOCK_TOLERANCE_SECONDS {
+        return Err(TokenError::Expired);
+    }
+    if !is_valid_jti(&claims.jti) {
+        return Err(TokenError::BadJti);
+    }
+    Ok(claims)
+}
+
+/// Whether `jti` is 1 to [`MAX_JTI_CHARS`] characters of `[A-Za-z0-9._-]`.
+#[must_use]
+pub fn is_valid_jti(jti: &str) -> bool {
+    !jti.is_empty()
+        && jti.chars().count() <= MAX_JTI_CHARS
+        && jti
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn finite_number(raw: &Value, key: &str) -> Option<f64> {
+    raw.get(key)
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite())
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a lifetime limit in seconds; a u64 above 2^53 seconds is far beyond any real limit"
+)]
+fn seconds_as_f64(seconds: u64) -> f64 {
+    seconds as f64
+}
+
+/// The current time in Unix seconds, for passing to [`verify_embed`].
+#[must_use]
+pub fn unix_now() -> f64 {
+    now_unix_millis() / 1000.0
 }
 
 /// `Date.now()` — current Unix time in milliseconds.
@@ -144,296 +430,388 @@ fn now_unix_millis() -> f64 {
         .map_or(0.0, |d| d.as_millis() as f64)
 }
 
-/// 32 random bytes, lower-hex encoded, matching
-/// `crypto.randomBytes(32).toString("hex")`.
-fn generate_hex_secret() -> String {
-    use std::fmt::Write as _;
-
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().fold(String::with_capacity(64), |mut acc, b| {
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
-}
-
-/// SQL that creates the `console.app_kv` table if it doesn't already
-/// exist, matching `ensureKv` in the TypeScript.
-const CREATE_APP_KV_TABLE: &str = "CREATE TABLE IF NOT EXISTS console.app_kv (\
-       k String, v String, updated_at DateTime DEFAULT now()\
-     ) ENGINE = ReplacingMergeTree(updated_at) ORDER BY k";
-
-/// Resolves and caches the embedding secret, matching `getEmbedSecret`.
-///
-/// Preference order: an explicit `EMBED_SECRET` (config); otherwise
-/// read/generate a secret persisted in `console.app_kv` (a
-/// `ReplacingMergeTree` keyed on `k`), cached in-process afterward so
-/// repeated calls don't re-hit `ClickHouse`.
-pub struct EmbedSecretResolver {
-    /// `EMBED_SECRET` from config, when set — always preferred, and never
-    /// touches `ClickHouse` when present.
-    env_secret: Option<String>,
-    ch: Arc<ChClient>,
-    /// In-process cache of a `ClickHouse`-backed secret, matching the
-    /// TypeScript module-level `let secretCache: string | null = null`.
-    cache: Mutex<Option<String>>,
-}
-
-impl EmbedSecretResolver {
-    /// Build a resolver. `env_secret` should be `Config::embed_secret`;
-    /// `ch` is used only when `env_secret` is `None`.
-    #[must_use]
-    pub fn new(env_secret: Option<String>, ch: Arc<ChClient>) -> Self {
-        Self {
-            env_secret,
-            ch,
-            cache: Mutex::new(None),
-        }
-    }
-
-    /// Resolve the embedding secret.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ChError`] if `ClickHouse` is unreachable or rejects the
-    /// `CREATE`/`SELECT`/`INSERT` statements used to read or persist a
-    /// generated secret. Never fails when `env_secret` is set.
-    pub async fn get_embed_secret(&self) -> Result<String, ChError> {
-        if let Some(secret) = &self.env_secret {
-            return Ok(secret.clone());
-        }
-        {
-            let cached = self.cache.lock().await;
-            if let Some(secret) = cached.as_ref() {
-                return Ok(secret.clone());
-            }
-        }
-
-        self.ch
-            .exec("CREATE DATABASE IF NOT EXISTS console", None)
-            .await?;
-        self.ch.exec(CREATE_APP_KV_TABLE, None).await?;
-
-        let rows = self
-            .ch
-            .rows(
-                "SELECT v FROM console.app_kv FINAL WHERE k='embed_secret' LIMIT 1",
-                None,
-            )
-            .await?;
-        if let Some(existing) = rows
-            .first()
-            .and_then(|r| r.get("v"))
-            .and_then(Value::as_str)
-        {
-            let secret = existing.to_owned();
-            *self.cache.lock().await = Some(secret.clone());
-            return Ok(secret);
-        }
-
-        let generated = generate_hex_secret();
-        self.ch
-            .exec(
-                &format!(
-                    "INSERT INTO console.app_kv (k, v) VALUES ('embed_secret', '{generated}')"
-                ),
-                None,
-            )
-            .await?;
-        *self.cache.lock().await = Some(generated.clone());
-        Ok(generated)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use serde_json::json;
-    use wiremock::matchers::{body_string_contains, method};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
     use super::*;
+    use serde_json::json;
+    use std::fmt::Write;
 
-    fn claims_with_exp(exp_offset_secs: f64) -> EmbedClaims {
+    const SECRET: &str = "s3cret";
+    /// A fixed "now" so no test reads the clock or sleeps.
+    const NOW: f64 = 1_800_000_000.0;
+    const MAX: u64 = 86_400;
+
+    fn claims(iat: f64, exp: f64) -> EmbedClaims {
         EmbedClaims {
             resource: Some(EmbedResource {
+                chart: None,
                 dashboard: Some("b_test".to_owned()),
             }),
             params: Some(HashMap::from([("tenant".to_owned(), json!("dispar-dki"))])),
-            exp: Some(now_unix_millis() / 1000.0 + exp_offset_secs),
+            exp: Some(exp),
+            iat: Some(iat),
+            jti: None,
         }
+    }
+
+    /// Signs an arbitrary payload, so a test can build a token that
+    /// `sign_embed` would never produce (a string `exp`, no `iat`).
+    fn sign_payload(payload: &Value) -> String {
+        let header = b64url_json(&json!({ "alg": "HS256", "typ": "JWT" })).unwrap();
+        let data = format!("{header}.{}", b64url_json(payload).unwrap());
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(SECRET.as_bytes()).unwrap();
+        mac.update(data.as_bytes());
+        format!("{data}.{}", b64url(&mac.finalize().into_bytes()))
+    }
+
+    fn verify(token: &str) -> Result<EmbedClaims, TokenError> {
+        verify_embed(token, SECRET, MAX, NOW)
     }
 
     #[test]
     fn round_trips_claims() {
-        let claims = claims_with_exp(3600.0);
-        let token = sign_embed(&claims, "s3cret");
-        let verified = verify_embed(&token, "s3cret").expect("valid token");
-        assert_eq!(verified, claims);
+        let claims = claims(NOW, NOW + 3600.0);
+        let token = sign_embed(&claims, SECRET);
+        assert_eq!(verify(&token), Ok(claims));
     }
 
     #[test]
     fn rejects_wrong_secret() {
-        let claims = claims_with_exp(3600.0);
-        let token = sign_embed(&claims, "s3cret");
-        assert!(verify_embed(&token, "wrong-secret").is_none());
+        let token = sign_embed(&claims(NOW, NOW + 3600.0), SECRET);
+        assert_eq!(
+            verify_embed(&token, "wrong-secret", MAX, NOW),
+            Err(TokenError::BadSignature)
+        );
     }
 
     #[test]
     fn rejects_wrong_segment_count() {
-        assert!(verify_embed("only.two", "s3cret").is_none());
-        assert!(verify_embed("a.b.c.d", "s3cret").is_none());
-        assert!(verify_embed("nodots", "s3cret").is_none());
+        assert_eq!(verify("only.two"), Err(TokenError::Malformed));
+        assert_eq!(verify("a.b.c.d"), Err(TokenError::Malformed));
+        assert_eq!(verify("nodots"), Err(TokenError::Malformed));
     }
 
     #[test]
-    fn rejects_expired() {
-        let claims = claims_with_exp(-10.0);
-        let token = sign_embed(&claims, "s3cret");
-        assert!(verify_embed(&token, "s3cret").is_none());
+    fn a_wrong_signature_is_refused_before_any_claim_is_read() {
+        // The payload has no `exp` and no `iat`, which would be refused on
+        // its own, but the signature is wrong: that is what must be
+        // reported, proving the claims were never looked at.
+        let token = sign_payload(&json!({ "resource": { "dashboard": "b_test" } }));
+        let parts: Vec<&str> = token.split('.').collect();
+        let forged = format!("{}.{}.{}", parts[0], parts[1], b64url(b"not-the-signature"));
+        assert_eq!(verify(&forged), Err(TokenError::BadSignature));
     }
 
     #[test]
-    fn accepts_far_future_expiry() {
-        let claims = claims_with_exp(3600.0 * 24.0 * 365.0 * 10.0);
-        let token = sign_embed(&claims, "s3cret");
-        assert!(verify_embed(&token, "s3cret").is_some());
+    fn rejects_a_token_with_no_exp() {
+        // `SEC-12`: this used to be accepted ("a token without exp never
+        // expires"); that was the bug.
+        let token = sign_payload(&json!({ "iat": NOW, "resource": { "dashboard": "b" } }));
+        assert_eq!(verify(&token), Err(TokenError::MissingExp));
     }
 
     #[test]
-    fn accepts_no_expiry() {
-        let claims = EmbedClaims {
-            resource: Some(EmbedResource {
-                dashboard: Some("b_no_exp".to_owned()),
-            }),
-            params: None,
-            exp: None,
+    fn rejects_a_token_with_no_iat() {
+        let token = sign_payload(&json!({ "exp": NOW + 60.0 }));
+        assert_eq!(verify(&token), Err(TokenError::MissingIat));
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_exp_or_iat() {
+        let exp = sign_payload(&json!({ "iat": NOW, "exp": "soon" }));
+        assert_eq!(verify(&exp), Err(TokenError::MissingExp));
+        let iat = sign_payload(&json!({ "iat": null, "exp": NOW + 60.0 }));
+        assert_eq!(verify(&iat), Err(TokenError::MissingIat));
+        let boolean = sign_payload(&json!({ "iat": true, "exp": NOW + 60.0 }));
+        assert_eq!(verify(&boolean), Err(TokenError::MissingIat));
+    }
+
+    #[test]
+    fn rejects_an_expired_token_but_allows_sixty_seconds_of_clock_difference() {
+        let at = |exp: f64| sign_embed(&claims(exp - 600.0, exp), SECRET);
+        // Expired 61 s ago: refused. Expired exactly 60 s ago: still accepted.
+        assert_eq!(verify(&at(NOW - 61.0)), Err(TokenError::Expired));
+        assert!(verify(&at(NOW - 60.0)).is_ok());
+        assert!(verify(&at(NOW + 1.0)).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_token_issued_in_the_future_but_allows_sixty_seconds_of_clock_difference() {
+        let at = |iat: f64| sign_embed(&claims(iat, iat + 600.0), SECRET);
+        assert_eq!(verify(&at(NOW + 61.0)), Err(TokenError::IssuedInFuture));
+        assert!(verify(&at(NOW + 60.0)).is_ok());
+        assert!(verify(&at(NOW - 5.0)).is_ok());
+    }
+
+    #[test]
+    fn a_lifetime_exactly_at_the_maximum_is_accepted_and_one_second_more_is_not() {
+        let at = |lifetime: f64| sign_embed(&claims(NOW, NOW + lifetime), SECRET);
+        assert!(verify(&at(86_400.0)).is_ok());
+        assert_eq!(verify(&at(86_401.0)), Err(TokenError::Lifetime));
+        // The limit is a parameter, not a constant.
+        assert_eq!(
+            verify_embed(&at(3601.0), SECRET, 3600, NOW),
+            Err(TokenError::Lifetime)
+        );
+        assert!(verify_embed(&at(3600.0), SECRET, 3600, NOW).is_ok());
+    }
+
+    #[test]
+    fn a_token_that_expires_before_it_was_issued_is_refused() {
+        let token = sign_embed(&claims(NOW, NOW - 10.0), SECRET);
+        assert_eq!(verify(&token), Err(TokenError::Lifetime));
+    }
+
+    #[test]
+    fn a_ten_year_token_is_refused() {
+        // Replaces `accepts_far_future_expiry`, which pinned the bug.
+        let token = sign_embed(&claims(NOW, NOW + 3600.0 * 24.0 * 365.0 * 10.0), SECRET);
+        assert_eq!(verify(&token), Err(TokenError::Lifetime));
+    }
+
+    #[test]
+    fn jti_is_optional_but_must_be_well_formed() {
+        let with = |jti: &str| {
+            let mut c = claims(NOW, NOW + 600.0);
+            c.jti = Some(jti.to_owned());
+            sign_embed(&c, SECRET)
         };
-        let token = sign_embed(&claims, "s3cret");
-        assert_eq!(verify_embed(&token, "s3cret"), Some(claims));
+        assert_eq!(
+            verify(&with("a.B_c-1")).map(|c| c.jti),
+            Ok(Some("a.B_c-1".to_owned()))
+        );
+        assert!(verify(&with(&"x".repeat(128))).is_ok());
+        for bad in [
+            "",
+            "has space",
+            "slash/inside",
+            "uni\u{e9}",
+            &"x".repeat(129),
+        ] {
+            assert_eq!(verify(&with(bad)), Err(TokenError::BadJti), "{bad:?}");
+        }
+        let no_jti = sign_embed(&claims(NOW, NOW + 600.0), SECRET);
+        assert_eq!(verify(&no_jti).map(|c| c.jti), Ok(None));
+        // A jti that is not a string does not parse as a token at all.
+        let numeric = sign_payload(&json!({ "iat": NOW, "exp": NOW + 60.0, "jti": 7 }));
+        assert_eq!(verify(&numeric), Err(TokenError::Malformed));
     }
 
     #[test]
     fn rejects_tampered_payload() {
-        let claims = claims_with_exp(3600.0);
-        let token = sign_embed(&claims, "s3cret");
+        let claims = claims(NOW, NOW + 3600.0);
+        let token = sign_embed(&claims, SECRET);
         let parts: Vec<&str> = token.split('.').collect();
         let tampered_claims = EmbedClaims {
             resource: Some(EmbedResource {
+                chart: None,
                 dashboard: Some("b_evil".to_owned()),
             }),
             ..claims
         };
         let tampered_payload = b64url_json(&tampered_claims).unwrap();
         let tampered = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
-        assert!(verify_embed(&tampered, "s3cret").is_none());
+        assert_eq!(verify(&tampered), Err(TokenError::BadSignature));
     }
 
     #[test]
     fn rejects_tampered_signature() {
-        let claims = claims_with_exp(3600.0);
-        let token = sign_embed(&claims, "s3cret");
+        let token = sign_embed(&claims(NOW, NOW + 3600.0), SECRET);
         let parts: Vec<&str> = token.split('.').collect();
         // Flip the signature to something else decodable but wrong.
         let bogus_sig = b64url(b"not-the-real-signature-bytes!!!!");
         let tampered = format!("{}.{}.{}", parts[0], parts[1], bogus_sig);
-        assert!(verify_embed(&tampered, "s3cret").is_none());
+        assert_eq!(verify(&tampered), Err(TokenError::BadSignature));
+    }
+
+    /// BI-1 review fix (BLOCKER) R1: the render key is its own server-only
+    /// secret, never `EMBED_SECRET` (the customer's) or a key derived from it.
+    const RENDER_SECRET: &str = "render-only-secret";
+
+    fn render_claims(iat: f64, exp: f64) -> RenderClaims {
+        RenderClaims {
+            aud: RENDER_AUDIENCE.to_owned(),
+            board: "b_test".to_owned(),
+            chart: None,
+            principal: "7d1e1c52-2f6b-4f3a-9c58-0c5d1d3f9a11".to_owned(),
+            filters: Some(r#"[{"column":"region","values":["north"]}]"#.to_owned()),
+            params: Some(r#"{"p":1}"#.to_owned()),
+            grain: None,
+            paper: "a4".to_owned(),
+            orientation: "landscape".to_owned(),
+            exp,
+            iat,
+            jti: "r-1".to_owned(),
+        }
     }
 
     #[test]
-    fn get_embed_secret_prefers_env_secret_without_touching_clickhouse() {
-        let ch = Arc::new(ChClient::new(
-            "http://127.0.0.1:1".to_owned(), // unreachable — proves CH is never called
-            "default".to_owned(),
-            String::new(),
-        ));
-        let resolver = EmbedSecretResolver::new(Some("env-secret".to_owned()), ch);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let secret = rt.block_on(resolver.get_embed_secret()).unwrap();
-        assert_eq!(secret, "env-secret");
+    fn a_render_token_round_trips_and_lives_two_minutes() {
+        let claims = render_claims(NOW, NOW + 120.0);
+        let token = sign_render(&claims, RENDER_SECRET);
+        assert_eq!(verify_render(&token, RENDER_SECRET, NOW), Ok(claims));
+        let long = sign_render(&render_claims(NOW, NOW + 121.0), RENDER_SECRET);
+        assert_eq!(
+            verify_render(&long, RENDER_SECRET, NOW),
+            Err(TokenError::Lifetime)
+        );
     }
 
-    #[tokio::test]
-    async fn get_embed_secret_reads_existing_kv_row() {
-        let server = MockServer::start().await;
-        // CREATE DATABASE / CREATE TABLE (exec — plain body, no FORMAT JSON).
-        Mock::given(method("POST"))
-            .and(body_string_contains("CREATE DATABASE"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("Ok.\n"))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(body_string_contains("CREATE TABLE"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("Ok.\n"))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(body_string_contains("SELECT v FROM console.app_kv"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"{"meta":[{"name":"v","type":"String"}],"data":[{"v":"stored-secret"}],"rows":1}"#,
-            ))
-            .mount(&server)
-            .await;
-
-        let ch = Arc::new(ChClient::new(
-            server.uri(),
-            "default".to_owned(),
-            String::new(),
-        ));
-        let resolver = EmbedSecretResolver::new(None, ch);
-        let secret = resolver.get_embed_secret().await.unwrap();
-        assert_eq!(secret, "stored-secret");
-
-        // Second call is served from cache — no new mocks needed, and the
-        // formerly-mounted mocks would panic if hit unexpectedly-often only
-        // in `.expect()`-style verifiers, so instead just check the value
-        // is the same without adding fresh expectations.
-        let secret_again = resolver.get_embed_secret().await.unwrap();
-        assert_eq!(secret_again, "stored-secret");
+    #[test]
+    fn an_embed_token_is_not_a_render_token_and_the_reverse() {
+        let embed = sign_embed(&claims(NOW, NOW + 60.0), SECRET);
+        assert_eq!(
+            verify_render(&embed, RENDER_SECRET, NOW),
+            Err(TokenError::BadSignature)
+        );
+        let render = sign_render(&render_claims(NOW, NOW + 60.0), RENDER_SECRET);
+        assert_eq!(verify(&render), Err(TokenError::BadSignature));
     }
 
-    #[tokio::test]
-    async fn get_embed_secret_generates_and_persists_when_absent() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(body_string_contains("CREATE DATABASE"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("Ok.\n"))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(body_string_contains("CREATE TABLE"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("Ok.\n"))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(body_string_contains("SELECT v FROM console.app_kv"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(
-                    r#"{"meta":[{"name":"v","type":"String"}],"data":[],"rows":0}"#,
-                ),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(body_string_contains("INSERT INTO console.app_kv"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("Ok.\n"))
-            .mount(&server)
-            .await;
+    /// R1: whoever holds `EMBED_SECRET` (the embedding customer) cannot mint a
+    /// render token, signing the render claims with it directly or with the key
+    /// the first version derived from it.
+    #[test]
+    fn a_token_signed_with_the_embed_secret_or_a_key_derived_from_it_is_refused() {
+        let claims = render_claims(NOW, NOW + 60.0);
+        assert_eq!(
+            verify_render(&sign_render(&claims, SECRET), RENDER_SECRET, NOW),
+            Err(TokenError::BadSignature)
+        );
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(SECRET.as_bytes()).unwrap();
+        mac.update(b"lakehouse/render-token/v1");
+        let mut derived = String::new();
+        for byte in mac.finalize().into_bytes() {
+            write!(derived, "{byte:02x}").unwrap();
+        }
+        assert_eq!(
+            verify_render(&sign_render(&claims, &derived), RENDER_SECRET, NOW),
+            Err(TokenError::BadSignature)
+        );
+        let forged = sign_payload(&serde_json::to_value(&claims).unwrap());
+        assert_eq!(
+            verify_render(&forged, RENDER_SECRET, NOW),
+            Err(TokenError::BadSignature)
+        );
+    }
 
-        let ch = Arc::new(ChClient::new(
-            server.uri(),
-            "default".to_owned(),
-            String::new(),
-        ));
-        let resolver = EmbedSecretResolver::new(None, ch);
-        let secret = resolver.get_embed_secret().await.unwrap();
-        // 32 bytes -> 64 lowercase hex characters.
-        assert_eq!(secret.len(), 64);
-        assert!(
-            secret
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    #[test]
+    fn an_expired_or_future_or_wrong_audience_render_token_is_refused() {
+        let at = |iat: f64, exp: f64| sign_render(&render_claims(iat, exp), RENDER_SECRET);
+        assert_eq!(
+            verify_render(&at(NOW - 400.0, NOW - 280.0), RENDER_SECRET, NOW),
+            Err(TokenError::Expired)
+        );
+        assert_eq!(
+            verify_render(&at(NOW + 400.0, NOW + 500.0), RENDER_SECRET, NOW),
+            Err(TokenError::IssuedInFuture)
+        );
+        let mut other = render_claims(NOW, NOW + 60.0);
+        other.aud = "embed".to_owned();
+        assert_eq!(
+            verify_render(&sign_render(&other, RENDER_SECRET), RENDER_SECRET, NOW),
+            Err(TokenError::Malformed)
+        );
+        let mut bad_jti = render_claims(NOW, NOW + 60.0);
+        bad_jti.jti = "has space".to_owned();
+        assert_eq!(
+            verify_render(&sign_render(&bad_jti, RENDER_SECRET), RENDER_SECRET, NOW),
+            Err(TokenError::BadJti)
+        );
+        assert_eq!(
+            verify_render(
+                &sign_render(&render_claims(NOW, NOW + 60.0), "other"),
+                RENDER_SECRET,
+                NOW
+            ),
+            Err(TokenError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn a_tampered_render_payload_is_refused() {
+        let token = sign_render(&render_claims(NOW, NOW + 60.0), RENDER_SECRET);
+        let parts: Vec<&str> = token.split('.').collect();
+        let mut evil = render_claims(NOW, NOW + 60.0);
+        evil.board = "b_evil".to_owned();
+        let tampered = format!("{}.{}.{}", parts[0], b64url_json(&evil).unwrap(), parts[2]);
+        assert_eq!(
+            verify_render(&tampered, RENDER_SECRET, NOW),
+            Err(TokenError::BadSignature)
+        );
+    }
+
+    /// `BI-26` plan D1: a token names a dashboard or one chart, never both and
+    /// never neither, and an empty id names nothing.
+    #[test]
+    fn a_token_names_exactly_one_of_a_dashboard_and_a_chart() {
+        let res = |dashboard: Option<&str>, chart: Option<&str>| EmbedResource {
+            dashboard: dashboard.map(str::to_owned),
+            chart: chart.map(str::to_owned),
+        };
+        assert_eq!(
+            res(Some("b_1"), None).target(),
+            Some(EmbedTarget::Dashboard("b_1"))
+        );
+        assert_eq!(
+            res(None, Some("u_1")).target(),
+            Some(EmbedTarget::Chart("u_1"))
+        );
+        assert_eq!(res(Some("b_1"), Some("u_1")).target(), None, "both");
+        assert_eq!(res(None, None).target(), None, "neither");
+        assert_eq!(res(Some(""), None).target(), None);
+        assert_eq!(res(None, Some("")).target(), None);
+        assert_eq!(
+            res(Some(""), Some("u_1")).target(),
+            Some(EmbedTarget::Chart("u_1")),
+            "an empty id is not a claim"
+        );
+    }
+
+    #[test]
+    fn a_chart_token_signs_and_verifies_with_its_chart_id() {
+        let claims = EmbedClaims {
+            resource: Some(EmbedResource {
+                dashboard: None,
+                chart: Some("u_abc".to_owned()),
+            }),
+            exp: Some(NOW + 600.0),
+            iat: Some(NOW),
+            ..EmbedClaims::default()
+        };
+        let verified = verify_embed(&sign_embed(&claims, SECRET), SECRET, 86_400, NOW).unwrap();
+        assert_eq!(
+            verified.resource.unwrap().target(),
+            Some(EmbedTarget::Chart("u_abc"))
+        );
+    }
+
+    /// `BI-26` feature decision 10: a token cannot name a role or a person. The
+    /// claims type has no such field, so a signed `role` or `sub` is dropped on
+    /// the way in; the read always uses the fixed viewer role
+    /// (`EMBED_VIEWER_ROLE` in `lakehouse-api`).
+    #[test]
+    fn a_role_or_person_claim_in_a_signed_token_is_ignored() {
+        let payload = serde_json::json!({
+            "resource": { "dashboard": "b_1" }, "exp": NOW + 600.0, "iat": NOW,
+            "role": "Platform Admin", "sub": "00000000-0000-0000-0000-000000000001"
+        });
+        let data = format!(
+            "{}.{}",
+            b64url_json(&serde_json::json!({ "alg": "HS256", "typ": "JWT" })).unwrap(),
+            b64url_json(&payload).unwrap()
+        );
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(SECRET.as_bytes()).unwrap();
+        mac.update(data.as_bytes());
+        let token = format!("{data}.{}", b64url(&mac.finalize().into_bytes()));
+        let claims = verify_embed(&token, SECRET, 86_400, NOW).unwrap();
+        let echoed = serde_json::to_value(&claims).unwrap();
+        assert!(echoed.get("role").is_none() && echoed.get("sub").is_none());
+        assert_eq!(
+            claims.resource.unwrap().target(),
+            Some(EmbedTarget::Dashboard("b_1"))
         );
     }
 }

@@ -155,6 +155,24 @@ pub fn stats_from_summary(summary: &Summary) -> TableStats {
     }
 }
 
+/// The snapshot summary key the product's own `pyiceberg` commits write the
+/// author under (`dagster/dispar_orchestrate/adapters/history.py`
+/// `AUTHOR_PROPERTY`): the run that made the commit, e.g.
+/// `connector conn-x, run 1a2b`, or who started a file upload, e.g.
+/// `Rina Wijaya (file upload)` (`DATA-52`). A merge load is `dlt`'s own write
+/// and records none.
+pub const AUTHOR_SUMMARY_KEY: &str = "rantai.author";
+
+/// The recorded author of a snapshot, if it has one. An empty value is no
+/// author.
+fn author_of(summary: &Summary) -> Option<String> {
+    summary
+        .additional_properties
+        .get(AUTHOR_SUMMARY_KEY)
+        .filter(|a| !a.trim().is_empty())
+        .cloned()
+}
+
 fn parse_u64(summary: &Summary, key: &str) -> Option<u64> {
     summary.additional_properties.get(key)?.parse().ok()
 }
@@ -285,6 +303,10 @@ pub struct SnapshotDetail {
     /// snapshot, kept here per-snapshot since `total_bytes` has no
     /// dedicated field above.
     pub stats: TableStats,
+    /// Who made the commit, from the summary key [`AUTHOR_SUMMARY_KEY`]
+    /// where the product recorded it (`DATA-15` F5); `None` where it did not
+    /// (a load written through `dlt` records none), never a guess.
+    pub author: Option<String>,
 }
 
 /// Full detail for one table: schema, partition spec, properties, snapshot
@@ -375,6 +397,7 @@ pub async fn load_table_detail(
                     total_records: parse_u64(s.summary(), "total-records"),
                     total_data_files: parse_u64(s.summary(), "total-data-files"),
                     stats: stats_from_summary(s.summary()),
+                    author: author_of(s.summary()),
                 })
                 .collect();
             // `TableMetadata::snapshots()` iterates a map keyed by snapshot
@@ -435,6 +458,19 @@ mod tests {
         assert_eq!(stats.file_count, None);
         assert_eq!(stats.record_count, None);
         assert_eq!(stats.total_bytes, None);
+    }
+
+    /// `DATA-15` F5: the author is the summary key `rantai.author`; a summary
+    /// without it, or with an empty value, has none.
+    #[test]
+    fn a_snapshot_author_is_read_from_the_summary_key_or_is_none() {
+        let with = summary_with(&[("rantai.author", "connector conn-x, run 1a2b")]);
+        assert_eq!(
+            author_of(&with).as_deref(),
+            Some("connector conn-x, run 1a2b")
+        );
+        assert_eq!(author_of(&summary_with(&[])), None);
+        assert_eq!(author_of(&summary_with(&[("rantai.author", "  ")])), None);
     }
 
     #[test]
@@ -832,6 +868,50 @@ mod tests {
 
             assert_eq!(warehouses.len(), 1);
             assert!(warehouses[0].reachable);
+        }
+        /// `DATA-49` (QA `LH-DATA-1-01`): a Gold table the catalog does not have
+        /// is `None`, not an error — "never published" is a state the console
+        /// shows, and a 404 must not read as a failed request.
+        #[tokio::test]
+        async fn a_gold_table_the_catalog_does_not_have_loads_as_none() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/namespaces/gold/tables/never"))
+                .respond_with(ResponseTemplate::new(404).set_body_string(
+                    r#"{"error":{"message":"not found","type":"NoSuchTableException","code":404}}"#,
+                ))
+                .mount(&server)
+                .await;
+            let client = connect(&server).await;
+
+            let table = client
+                .load_gold_table_if_exists("never")
+                .await
+                .expect("a missing table is not an error");
+
+            assert!(table.is_none());
+        }
+
+        /// The other direction: a catalog that refuses the caller (401) is still
+        /// an error, so a broken credential never reads as "never published".
+        #[tokio::test]
+        async fn a_catalog_that_refuses_the_caller_is_still_an_error_for_a_gold_table() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/namespaces/gold/tables/never"))
+                .respond_with(ResponseTemplate::new(401).set_body_string(
+                    r#"{"error":{"message":"unauthorized","type":"NotAuthorizedException","code":401}}"#,
+                ))
+                .mount(&server)
+                .await;
+            let client = connect(&server).await;
+
+            let err = client
+                .load_gold_table_if_exists("never")
+                .await
+                .expect_err("a refusal must stay an error");
+
+            assert!(matches!(err, IcebergError::Catalog(_)), "{err}");
         }
     }
 }

@@ -12,7 +12,7 @@
 //!
 //! It also answers who uses the asset: the saved queries and dashboards
 //! whose SQL reads it ([`dependents`]) and the queries run against it in
-//! the last week ([`usage`]). Nothing records which tables a query
+//! the last 30 days ([`usage`]). Nothing records which tables a query
 //! touched, so both parse the SQL itself with the same table resolver the
 //! policy rewrite uses, and count a query only when it really reads the
 //! table — not when the name merely appears in it.
@@ -20,15 +20,17 @@
 //! No lookup here can fail the detail page: a store or `ClickHouse` error
 //! is logged and reads as "none", like the sample and the parts stats.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use lakehouse_auth::Principal;
+use lakehouse_store::PgPool;
 use lakehouse_store::governance::{self as store, ClassificationRule, Policy, QualityRule};
 use lakehouse_store::queries::HistoryMention;
 use serde_json::{Map, Value, json};
 use sqlparser::dialect::{ClickHouseDialect, GenericDialect};
 
 use crate::policy_engine::PolicyCondition;
+use crate::routes::dashboard_access::viewer_for;
 use crate::routes::governance::observed_quality;
 use crate::routes::quality::{LatestRun, latest_runs, threshold_hint};
 use crate::state::AppState;
@@ -202,7 +204,30 @@ pub(crate) async fn dependents(
     if principal.has("query:read")
         && let Some(pg) = state.pg.as_deref()
     {
-        match lakehouse_store::queries::list_saved(pg).await {
+        // `SEC-20`: the saved queries listed here are the caller's
+        // tenant's, and the rows that belong to no tenant when that
+        // tenant owns the shared catalog. The dependents list resolves
+        // its own scope: the catalog route has no `X-Tenant` header to
+        // pass, so the tenant is the caller's first one. A scope that
+        // cannot be resolved lists no saved query — the list fails
+        // closed.
+        let scope = match crate::routes::query::saved_query_scope(
+            state,
+            principal,
+            &axum::http::HeaderMap::new(),
+        )
+        .await
+        {
+            Ok(scope) => scope,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "catalog detail: the saved query scope could not be resolved"
+                );
+                lakehouse_store::queries::SavedQueryScope::None
+            }
+        };
+        match lakehouse_store::queries::list_saved(pg, scope).await {
             Ok(saved) => out.extend(
                 saved
                     .iter()
@@ -213,14 +238,28 @@ pub(crate) async fn dependents(
         }
     }
     if principal.has("dashboard:read") {
-        out.extend(dashboard_dependents(state, tables).await);
+        // BI-19 part B1: through the caller's rules, so a dashboard restricted
+        // to other people is not named here either. If the rules cannot be
+        // read the list is left out, never shown unfiltered.
+        match viewer_for(state, principal).await {
+            Ok(viewer) => out.extend(dashboard_dependents(state, tables, &viewer).await),
+            Err(_unreadable) => {
+                tracing::warn!("catalog detail: dashboard dependents unavailable");
+            }
+        }
     }
     out
 }
 
-async fn dashboard_dependents(state: &AppState, tables: &[String]) -> Vec<Value> {
+async fn dashboard_dependents(
+    state: &AppState,
+    tables: &[String],
+    viewer: &lakehouse_bi::access::Viewer,
+) -> Vec<Value> {
     let ch = &state.clickhouse;
-    let charts = match lakehouse_bi::store::list_stored_charts(ch).await {
+    // BI-18 part C, part 2: a dashboard in somebody's personal space is not
+    // listed as reading the table.
+    let charts = match lakehouse_bi::store::list_stored_charts(ch, viewer).await {
         Ok(charts) => charts,
         Err(err) => {
             tracing::warn!(?err, "catalog detail: dashboard charts unavailable");
@@ -251,7 +290,7 @@ async fn dashboard_dependents(state: &AppState, tables: &[String]) -> Vec<Value>
     if boards.is_empty() {
         return Vec::new();
     }
-    let names: HashMap<String, String> = match lakehouse_bi::store::list_boards(ch).await {
+    let names: HashMap<String, String> = match lakehouse_bi::store::list_boards(ch, viewer).await {
         Ok(list) => list.into_iter().map(|b| (b.id, b.name)).collect(),
         Err(err) => {
             tracing::warn!(?err, "catalog detail: dashboard names unavailable");
@@ -274,59 +313,283 @@ async fn dashboard_dependents(state: &AppState, tables: &[String]) -> Vec<Value>
 /// The board every deployment has, with no row in `console.bi_board`.
 const DEFAULT_BOARD: &str = "default";
 
-/// The window [`usage`] looks back over.
-pub(crate) const USAGE_DAYS: i32 = 7;
+/// The window the asset page's [`usage`] looks back over (`DATA-15` F2,
+/// the spec's "30 days").
+pub(crate) const ASSET_USAGE_DAYS: i32 = 30;
+/// The window the search ranking's [`use_by_asset`] looks back over. It
+/// kept the 7 days it always had when the asset page went to 30, so
+/// `DATA-11`'s ranking does not change.
+pub(crate) const USE_RANKING_DAYS: i32 = 7;
 /// How many of the caller's own recent queries [`usage`] returns.
 const RECENT_QUERIES: usize = 5;
+/// Rows in each of the frequent-users / frequent-queries / joined-tables
+/// lists.
+const TOP_LIST: usize = 10;
+/// Rows in the column-popularity list.
+const TOP_COLUMNS: usize = 20;
+/// What a person is called when their row is gone or their name is blank (`DATA-52`,
+/// QA `LH-DATA-12-01` F3, `TC-1730`): one label, and one row, for every such person.
+/// The id is never shown: it is not a name.
+const UNKNOWN_USER: &str = "Unknown user";
 
-/// `usage` (queries, distinct people and average latency over the last
-/// seven days) and `recentQueries` from the rows that really read one of
-/// `tables`.
+/// The `n` biggest entries of `counts`, biggest first; equal counts are
+/// ordered by `tie` so the list does not shuffle between requests.
+fn top<K: Clone, T: Ord>(
+    counts: &HashMap<K, u32>,
+    n: usize,
+    tie: impl Fn(&K) -> T,
+) -> Vec<(K, u32)> {
+    let mut all: Vec<(K, u32)> = counts.iter().map(|(k, c)| (k.clone(), *c)).collect();
+    all.sort_by(|(ka, ca), (kb, cb)| cb.cmp(ca).then_with(|| tie(ka).cmp(&tie(kb))));
+    all.truncate(n);
+    all
+}
+
+/// A history row that really reads the asset, with every table it reads.
+type Read<'a> = (&'a HistoryMention, Vec<String>);
+
+/// Who ran a query, for the `users` count: the user id where the history has one,
+/// else the name. A count of distinct ids, so a person is counted once over every
+/// spelling of their name.
+fn person_key(m: &HistoryMention) -> String {
+    m.owner_id
+        .map_or_else(|| m.user_name.clone(), |id| id.to_string())
+}
+
+/// The person a history row belongs to, if it names an id: `owner_id`, else a
+/// `user_name` that is one (`DATA-52`: rows older than the ids hold a name, and the
+/// id is what `X-Trino-User` is derived from, so it is what a row of a person is).
+fn person_id(m: &HistoryMention) -> Option<uuid::Uuid> {
+    m.owner_id
+        .or_else(|| uuid::Uuid::parse_str(m.user_name.trim()).ok())
+}
+
+/// The row key and the name shown for a person (`DATA-52`): an id with a name is
+/// shown by it; an id with no user, or with a blank name, is [`UNKNOWN_USER`] and all
+/// such people share one row; a `user_name` that is not an id is shown as stored.
+fn person(m: &HistoryMention, names: &HashMap<uuid::Uuid, String>) -> (String, String) {
+    match person_id(m) {
+        Some(id) => match names.get(&id) {
+            Some(name) => (id.to_string(), name.clone()),
+            None => (UNKNOWN_USER.to_owned(), UNKNOWN_USER.to_owned()),
+        },
+        None => (m.user_name.clone(), m.user_name.clone()),
+    }
+}
+
+/// Queries per person, most active first, by the names of the people who ran them
+/// (`DATA-15` F2, renamed `DATA-52`).
+fn frequent_users(reads: &[Read<'_>], names: &HashMap<uuid::Uuid, String>) -> Vec<Value> {
+    let mut by_person: HashMap<String, u32> = HashMap::new();
+    let mut name_of: HashMap<String, String> = HashMap::new();
+    for (m, _) in reads {
+        let (key, name) = person(m, names);
+        *by_person.entry(key.clone()).or_insert(0) += 1;
+        name_of.entry(key).or_insert(name);
+    }
+    top(&by_person, TOP_LIST, |k| name_of[k].clone())
+        .into_iter()
+        .map(|(key, queries)| json!({ "name": name_of[&key], "queries": queries }))
+        .collect()
+}
+
+/// Runs per literal-free form, and how many reads could not be given one
+/// (`DATA-15` F2). Rows are newest first, so the first `at` kept for a form
+/// is its latest run.
+// PR #106 review R1 BLOCKER 6
+fn frequent_queries(reads: &[Read<'_>], known: &HashSet<String>) -> (Vec<Value>, u32) {
+    let mut by_form: HashMap<String, (u32, String)> = HashMap::new();
+    let mut unparsed = 0_u32;
+    for (m, names) in reads {
+        if m.status != "completed" {
+            continue;
+        }
+        let mut stmt_known = known.clone();
+        for name in names {
+            stmt_known.insert(name.to_ascii_lowercase());
+            stmt_known.insert(bare_name(name).to_ascii_lowercase());
+            for part in name.split('.') {
+                stmt_known.insert(part.to_ascii_lowercase());
+            }
+        }
+        if crate::sql_rewrite::has_unknown_quoted_identifier(&m.sql, &stmt_known) {
+            continue;
+        }
+        let form = crate::sql_rewrite::literal_free_form(&m.sql, &ClickHouseDialect {})
+            .or_else(|| crate::sql_rewrite::literal_free_form(&m.sql, &GenericDialect {}));
+        match form {
+            Some(form) => by_form.entry(form).or_insert((0, m.at.clone())).0 += 1,
+            None => unparsed += 1,
+        }
+    }
+    let counts: HashMap<String, u32> = by_form.iter().map(|(f, (n, _))| (f.clone(), *n)).collect();
+    let list = top(&counts, TOP_LIST, Clone::clone)
+        .into_iter()
+        .map(|(sql, runs)| json!({ "sql": sql, "runs": runs, "lastAt": by_form[&sql].1 }))
+        .collect();
+    (list, unparsed)
+}
+
+/// The other tables read in the same statement as the asset, once per
+/// statement however often it names them; `assetId` is filled in by
+/// [`usage`] (`DATA-15` F2).
+fn joined_tables(reads: &[Read<'_>], tables: &[String]) -> Vec<Value> {
+    let mut joined: HashMap<String, u32> = HashMap::new();
+    for (_, names) in reads {
+        for name in names.iter().filter(|n| !is_one_of(n, tables)) {
+            *joined.entry(name.clone()).or_insert(0) += 1;
+        }
+    }
+    top(&joined, TOP_LIST, Clone::clone)
+        .into_iter()
+        .map(|(table, queries)| json!({ "table": table, "assetId": Value::Null, "queries": queries }))
+        .collect()
+}
+
+/// Statements that read this table alone count each of its `columns` they
+/// name once; the second value is how many statements were left out for
+/// reading several tables (`DATA-15` F2).
+fn column_popularity(
+    reads: &[Read<'_>],
+    tables: &[String],
+    columns: &[String],
+) -> (Vec<Value>, u32) {
+    let real: HashMap<String, &String> = columns.iter().map(|c| (c.to_lowercase(), c)).collect();
+    let mut by_column: HashMap<String, u32> = HashMap::new();
+    let mut skipped = 0_u32;
+    for (m, names) in reads {
+        if !names.iter().all(|n| is_one_of(n, tables)) {
+            skipped += 1;
+            continue;
+        }
+        let used = crate::sql_rewrite::identifiers_used(&m.sql, &ClickHouseDialect {})
+            .or_else(|| crate::sql_rewrite::identifiers_used(&m.sql, &GenericDialect {}));
+        for ident in used.iter().flatten() {
+            if let Some(column) = real.get(ident) {
+                *by_column.entry((*column).clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let list = top(&by_column, TOP_COLUMNS, Clone::clone)
+        .into_iter()
+        .map(|(name, queries)| json!({ "name": name, "queries": queries }))
+        .collect();
+    (list, skipped)
+}
+
+/// The asset page's `usage` (queries, distinct people, average latency,
+/// frequent users, frequent queries, joined tables and column popularity,
+/// over [`ASSET_USAGE_DAYS`] days) and `recentQueries`, from the rows that
+/// really read one of `tables`.
 ///
 /// The counts cover everyone's queries; the query text does not. SQL can
 /// carry literals — a customer id, a name — so `recentQueries` lists only
-/// the caller's own. Latency averages completed runs only: a query that
+/// the caller's own, and `frequentQueries` lists everyone's only in its
+/// literal-free form (`sql_rewrite::literal_free_form`), grouped by that
+/// form. A query that does not parse is left out of `frequentQueries` and
+/// counted in `unparsed`: showing its text raw would be the leak the form
+/// exists to prevent. Latency averages completed runs only: a query that
 /// failed or was blocked took no time to answer.
+///
+/// `columns` are the table's column names. A column is counted only from
+/// statements that read this table and nothing else: in a join, a bare
+/// column name cannot be assigned to one of the tables, so those statements
+/// are left out of `columns` and counted in `columnsNote`. The
+/// `assetId` of each joined table is filled in by [`usage`], which can
+/// look the catalog up; here it is `null`.
+///
+/// `truncated` is true when the history read came back full, so older
+/// queries of the window are not in the figures (`basedOn` says how many
+/// rows were read).
 fn summarize_usage(
     mentions: &[HistoryMention],
     tables: &[String],
+    columns: &[String],
     caller: uuid::Uuid,
+    truncated: bool,
+    names: &HashMap<uuid::Uuid, String>,
 ) -> (Value, Vec<Value>) {
-    let reads: Vec<&HistoryMention> = mentions
+    // Each mention that really reads one of `tables`, with every table it
+    // reads. The parse is the expensive part: skip it when no table's own
+    // name even appears in the text.
+    let reads: Vec<Read<'_>> = mentions
         .iter()
-        .filter(|m| reads_any(&m.sql, tables))
-        .collect();
-    let people: std::collections::HashSet<String> = reads
-        .iter()
-        .map(|m| {
-            m.owner_id
-                .map_or_else(|| m.user_name.clone(), |id| id.to_string())
+        .filter_map(|m| {
+            let lower = m.sql.to_lowercase();
+            if !tables
+                .iter()
+                .any(|t| lower.contains(&bare_name(t).to_lowercase()))
+            {
+                return None;
+            }
+            let names = referenced(&m.sql)?;
+            names
+                .iter()
+                .any(|name| is_one_of(name, tables))
+                .then_some((m, names))
         })
         .collect();
+    let people: std::collections::HashSet<String> =
+        reads.iter().map(|(m, _)| person_key(m)).collect();
     let completed: Vec<i64> = reads
         .iter()
-        .filter(|m| m.status == "completed")
-        .map(|m| m.duration_ms)
+        .filter(|(m, _)| m.status == "completed")
+        .map(|(m, _)| m.duration_ms)
         .collect();
     let avg_ms = if completed.is_empty() {
         0
     } else {
         completed.iter().sum::<i64>() / i64::try_from(completed.len()).unwrap_or(1)
     };
+
+    let mut known: HashSet<String> = HashSet::new();
+    for t in tables {
+        known.insert(t.to_ascii_lowercase());
+        known.insert(bare_name(t).to_ascii_lowercase());
+        for part in t.split('.') {
+            known.insert(part.to_ascii_lowercase());
+        }
+    }
+    for col in columns {
+        known.insert(col.to_ascii_lowercase());
+    }
+
+    let frequent_users = frequent_users(&reads, names);
+    // PR #106 review R1 BLOCKER 6
+    let (frequent_queries, unparsed) = frequent_queries(&reads, &known);
+    let joined_tables = joined_tables(&reads, tables);
+    let (column_list, skipped) = column_popularity(&reads, tables, columns);
+    let columns_note = format!(
+        "Counted from the queries that read only this table. {skipped} quer{} that read several \
+         tables are not counted, because a column name in a join cannot be assigned to one of \
+         them. A name used as an alias counts as the column it shares a name with.",
+        if skipped == 1 { "y" } else { "ies" }
+    );
+
     let usage = json!({
-        "queries7d": reads.len(),
-        "users7d": people.len(),
+        "days": ASSET_USAGE_DAYS,
+        "queries": reads.len(),
+        "users": people.len(),
         "avgLatencyMs": avg_ms,
+        "basedOn": mentions.len(),
+        "truncated": truncated,
+        "frequentUsers": frequent_users,
+        "frequentQueries": frequent_queries,
+        "unparsed": unparsed,
+        "joinedTables": joined_tables,
+        "columns": column_list,
+        "columnsNote": columns_note,
     });
     let recent = reads
         .iter()
+        .map(|(m, _)| *m)
         .filter(|m| m.owner_id == Some(caller))
         .take(RECENT_QUERIES)
         .map(|m| {
             json!({
                 "id": m.id,
                 "sql": m.sql,
-                "user": m.user_name,
+                "user": person(m, names).1,
                 "at": m.at,
                 "status": m.status,
                 "auditEventId": m.audit_event_id,
@@ -336,20 +599,197 @@ fn summarize_usage(
     (usage, recent)
 }
 
+/// The catalog asset id of each table key in `keys` that is one, lower-cased
+/// key to id (`DATA-15` F2, "tables joined with it" link to their pages).
+/// A `silver.`/`serving.` table is its own asset, found in
+/// `system.tables` so the id has the table's real case; a `bronze.<table>`
+/// is the dataset whose registry row names that table. Both are one read
+/// each; a failed read gives no ids (the table is listed without a link),
+/// never an error.
+async fn asset_ids_of(state: &AppState, keys: &[String]) -> HashMap<String, String> {
+    use crate::routes::support::str_col;
+    use lakehouse_core::ident::SqlLiteral;
+
+    let literals = |parts: Vec<String>| {
+        parts
+            .iter()
+            .map(|p| SqlLiteral::from(p.as_str()).to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut out = HashMap::new();
+    let served: Vec<String> = keys
+        .iter()
+        .filter(|k| k.starts_with("silver.") || k.starts_with("serving."))
+        .map(|k| k.to_lowercase())
+        .collect();
+    if !served.is_empty() {
+        let sql = format!(
+            "SELECT database, name FROM system.tables WHERE database IN ('silver','serving') \
+             AND lower(concat(database, '.', name)) IN ({})",
+            literals(served)
+        );
+        match state.clickhouse.rows(&sql, None).await {
+            Ok(rows) => {
+                for row in &rows {
+                    let id = format!("{}.{}", str_col(row, "database"), str_col(row, "name"));
+                    out.insert(id.to_lowercase(), id);
+                }
+            }
+            Err(err) => tracing::warn!(?err, "catalog usage: joined tables not resolved"),
+        }
+    }
+    let bronze: Vec<String> = keys
+        .iter()
+        .filter_map(|k| k.strip_prefix("bronze."))
+        .map(str::to_lowercase)
+        .collect();
+    if !bronze.is_empty() {
+        let list = literals(bronze);
+        let sql = format!(
+            "SELECT slug, table_name FROM lake.`bronze_meta.dataset_sync` \
+               WHERE lower(table_name) IN ({list}) \
+             UNION ALL SELECT slug, table_name FROM lake.`bronze_meta_sec.dataset_sync` \
+               WHERE lower(table_name) IN ({list})"
+        );
+        match state.clickhouse.rows(&sql, None).await {
+            Ok(rows) => {
+                for row in &rows {
+                    out.insert(
+                        format!("bronze.{}", str_col(row, "table_name")).to_lowercase(),
+                        str_col(row, "slug").to_owned(),
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(?err, "catalog usage: joined datasets not resolved"),
+        }
+    }
+    out
+}
+
+/// The display name of every person a history read mentions (`DATA-52`), one read
+/// for all of them (`lakehouse_store::dashboard_access::user_names_in_tenants`).
+/// Names that are blank are left out, so such a person is [`UNKNOWN_USER`], and
+/// so is every id of a person who shares no tenant with the caller.
+///
+/// Review round 1 R1: a name is resolved only for a person who shares a tenant
+/// with the caller. The history the usage is built from has no tenant column,
+/// so it can mention a person of another tenant (a refused statement is
+/// recorded with `owner_id`, `routes/query.rs`), and a member of this tenant
+/// must not be shown that person's name.
+///
+/// Review round 1 R3: a service token's queries are recorded with its
+/// `service_identity.id`, which is in no `app_user` row, so a second read
+/// (`dashboard_access::service_names`) answers for the ids the first one left
+/// out: a live service identity is shown by its own name, never merged into the
+/// row of deleted people. `service_identity` has no tenant column, so there is
+/// no tenant to narrow that read by; a service credential belongs to the
+/// deployment, not to a tenant.
+///
+/// No `Result`: a failed lookup logs a warning and answers names for the caller
+/// only. The names are decoration, and a lookup that fails must not turn the page's
+/// usage into "not measured".
+async fn people_names(
+    pg: &PgPool,
+    mentions: &[HistoryMention],
+    caller: &Principal,
+) -> HashMap<uuid::Uuid, String> {
+    let ids: Vec<uuid::Uuid> = mentions
+        .iter()
+        .filter_map(person_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut names: HashMap<uuid::Uuid, String> = if ids.is_empty() {
+        HashMap::new()
+    } else {
+        match lakehouse_store::dashboard_access::user_names_in_tenants(pg, &ids, &caller.tenant_ids)
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|(_, name, _)| !name.trim().is_empty())
+                .map(|(id, name, _)| (id, name))
+                .collect(),
+            Err(err) => {
+                tracing::warn!(?err, "catalog usage: user names unavailable");
+                HashMap::new()
+            }
+        }
+    };
+    let rest: Vec<uuid::Uuid> = ids
+        .iter()
+        .filter(|id| !names.contains_key(id))
+        .copied()
+        .collect();
+    if !rest.is_empty() {
+        match lakehouse_store::dashboard_access::service_names(pg, &rest).await {
+            Ok(rows) => {
+                for (id, name) in rows {
+                    if !name.trim().is_empty() {
+                        names.insert(id, name);
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(?err, "catalog usage: service names unavailable"),
+        }
+    }
+    // The caller is always named: their own name is the one this server holds without
+    // a read, and it keeps their own row readable when the lookup above failed. A blank
+    // name is not inserted, so that person is "Unknown user" like anyone else with none.
+    if !names.contains_key(&caller.id.uuid()) && !caller.display_name.trim().is_empty() {
+        names.insert(caller.id.uuid(), caller.display_name.clone());
+    }
+    names
+}
+
 /// [`summarize_usage`] over the query history. `usage` is `null` — "not
 /// measured" — only when the history cannot be read at all; a table nobody
-/// queried this week is a measured zero.
+/// queried this month is a measured zero.
 pub(crate) async fn usage(
     state: &AppState,
     principal: &Principal,
     tables: &[String],
+    columns: &[String],
 ) -> (Value, Vec<Value>) {
     let Some(pg) = state.pg.as_deref() else {
         return (Value::Null, Vec::new());
     };
     let needles: Vec<String> = tables.iter().map(|t| bare_name(t).to_owned()).collect();
-    match lakehouse_store::queries::history_mentioning(pg, USAGE_DAYS, &needles).await {
-        Ok(mentions) => summarize_usage(&mentions, tables, principal.id.uuid()),
+    match lakehouse_store::queries::history_mentioning(pg, ASSET_USAGE_DAYS, &needles).await {
+        Ok(mentions) => {
+            let truncated = i64::try_from(mentions.len())
+                .is_ok_and(|n| n >= lakehouse_store::queries::HISTORY_MENTION_LIMIT);
+            let names = people_names(pg, &mentions, principal).await;
+            let (mut usage, recent) = summarize_usage(
+                &mentions,
+                tables,
+                columns,
+                principal.id.uuid(),
+                truncated,
+                &names,
+            );
+            let keys: Vec<String> = usage["joinedTables"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t["table"].as_str().map(str::to_owned))
+                .collect();
+            if !keys.is_empty() {
+                let ids = asset_ids_of(state, &keys).await;
+                if let Some(list) = usage["joinedTables"].as_array_mut() {
+                    for entry in list {
+                        let id = entry["table"]
+                            .as_str()
+                            .and_then(|t| ids.get(&t.to_lowercase()));
+                        if let Some(id) = id {
+                            entry["assetId"] = json!(id);
+                        }
+                    }
+                }
+            }
+            (usage, recent)
+        }
         Err(err) => {
             tracing::warn!(?err, "catalog detail: query history unavailable");
             (Value::Null, Vec::new())
@@ -363,7 +803,7 @@ pub(crate) async fn usage(
 /// assets match.
 const USE_RANKING_ROWS: i64 = 5000;
 
-/// Queries per asset id over the last [`USAGE_DAYS`] days, for the search
+/// Queries per asset id over the last [`USE_RANKING_DAYS`] days, for the search
 /// copy's tie-break. Without Postgres, or when the history cannot be read,
 /// every count is 0 and a warning is logged: ranking is then by relevance
 /// alone, not an error (`DATA-11` D4).
@@ -375,7 +815,7 @@ pub(crate) async fn use_by_asset(
     let Some(pg) = state.pg.as_deref() else {
         return HashMap::new();
     };
-    match lakehouse_store::queries::history_recent(pg, USAGE_DAYS, USE_RANKING_ROWS).await {
+    match lakehouse_store::queries::history_recent(pg, USE_RANKING_DAYS, USE_RANKING_ROWS).await {
         Ok(sqls) => use_counts(
             &sqls,
             &use_keys(
@@ -397,24 +837,66 @@ pub(crate) async fn use_by_asset(
 /// How many audit events an asset's Change history shows.
 const CHANGE_HISTORY_LIMIT: i64 = 50;
 
+/// The history line of a certified / deprecated mark action (`DATA-12` F6).
+/// The note's text is not in it: the history says that a mark was set, not
+/// what the person wrote.
+fn mark_summary<'a>(action: &str, arg: impl Fn(&str) -> Option<&'a str>) -> String {
+    match action {
+        "catalog.certify" => "Marked certified".to_owned(),
+        "catalog.deprecate" => arg("replacementAssetId").map_or_else(
+            || "Marked deprecated".to_owned(),
+            |replacement| format!("Marked deprecated: use {replacement}"),
+        ),
+        _ => match arg("was") {
+            Some(was @ ("certified" | "deprecated")) => format!("Removed the {was} mark"),
+            _ => "Removed the certified / deprecated mark".to_owned(),
+        },
+    }
+}
+
+/// The history line of a grant or revoke made from the asset's page
+/// (`DATA-15` F3): the permission, the grantee, and for a grant the day it
+/// ends (the day, not the instant). The actor is the entry's own `actor`, so
+/// the history names both people.
+pub(super) fn grant_summary<'a>(action: &str, arg: impl Fn(&str) -> Option<&'a str>) -> String {
+    let permission = arg("permission").unwrap_or("a permission");
+    let grantee = arg("grantee").unwrap_or("a user");
+    if action == "catalog.grant" {
+        let until = arg("expiresAt").map_or("its expiry", |at| at.get(..10).unwrap_or(at));
+        format!("Granted {permission} to {grantee} until {until}")
+    } else {
+        format!("Revoked {permission} from {grantee}")
+    }
+}
+
+// PR #106 review R1 SHOULD-FIX DATA-12 3: format governedTags as "governed tags"
+fn annotate_summary(args: &Value) -> String {
+    let fields: Vec<&str> = args
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|f| {
+            f.iter()
+                .filter_map(Value::as_str)
+                .map(|name| match name {
+                    "governedTags" => "governed tags",
+                    other => other,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if fields.is_empty() {
+        "Edited the asset's details".to_owned()
+    } else {
+        format!("Edited {}", fields.join(", "))
+    }
+}
+
 /// One audit event about a catalog asset, as a `changeHistory` entry: who,
 /// when, and one line saying what they did.
 fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
     let arg = |key: &str| event.args.get(key).and_then(Value::as_str);
     let summary = match event.action.as_str() {
-        "catalog.annotate" => {
-            let fields: Vec<&str> = event
-                .args
-                .get("fields")
-                .and_then(Value::as_array)
-                .map(|f| f.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
-            if fields.is_empty() {
-                "Edited the asset's details".to_owned()
-            } else {
-                format!("Edited {}", fields.join(", "))
-            }
-        }
+        "catalog.annotate" => annotate_summary(&event.args),
         "catalog.access_request" => arg("permission").map_or_else(
             || "Requested access".to_owned(),
             |permission| format!("Requested {permission}"),
@@ -429,6 +911,10 @@ fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
             arg("column").map_or_else(|| "the asset".to_owned(), |c| format!("column {c}")),
             arg("classification").unwrap_or("unspecified"),
         ),
+        "catalog.certify" | "catalog.deprecate" | "catalog.uncertify" => {
+            mark_summary(event.action.as_str(), arg)
+        }
+        "catalog.grant" | "catalog.revoke" => grant_summary(event.action.as_str(), arg),
         "catalog.sla_remove" => "Removed the freshness target".to_owned(),
         "catalog.sla_set" => event
             .args
@@ -707,7 +1193,15 @@ impl QualityIndex {
                 self.rules
                     .iter()
                     .filter(|r| is_one_of(&r.asset, names))
-                    .map(|r| rule_check(r, self.runs.get(&r.id))),
+                    // DATA-14 (F2): an older run of an edited rule is history,
+                    // not this rule's result.
+                    .map(|r| {
+                        let run = self
+                            .runs
+                            .get(&r.id)
+                            .filter(|run| run.describes(&r.asset, &r.threshold));
+                        rule_check(r, run)
+                    }),
             )
             .collect()
     }
@@ -1013,6 +1507,8 @@ mod tests {
             status: "failed".to_owned(),
             value: "3 repeated values in 50 rows".to_owned(),
             at: "2026-10-01T09:00:00Z".to_owned(),
+            asset: rule.asset.clone(),
+            threshold: rule.threshold.clone(),
         };
         let ran = rule_check(&rule, Some(&run));
         assert_eq!(ran["status"], "failed");
@@ -1194,6 +1690,18 @@ mod tests {
         }
     }
 
+    fn columns(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    /// What `people_names` would answer for these `(id, name)` pairs.
+    fn named(pairs: &[(uuid::Uuid, &str)]) -> HashMap<uuid::Uuid, String> {
+        pairs
+            .iter()
+            .map(|(id, name)| (*id, (*name).to_owned()))
+            .collect()
+    }
+
     /// Counts cover everyone who really read the table; the query text
     /// shown back is only the caller's own.
     #[test]
@@ -1218,24 +1726,399 @@ mod tests {
                 50,
             ),
         ];
-        let (usage, recent) = summarize_usage(&mentions, &tables(&["silver.orders"]), me);
-        assert_eq!(usage["queries7d"], 3);
-        assert_eq!(usage["users7d"], 2);
+        // `DATA-52`: the caller's own row is shown by the name of the person, never by
+        // the id the history stores.
+        let names = named(&[(me, "Rina Wijaya")]);
+        let (usage, recent) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &[],
+            me,
+            false,
+            &names,
+        );
+        // `DATA-15` F2: the keys were `queries7d` / `users7d`; the window is
+        // 30 days now and the keys say no number of days.
+        assert_eq!(usage["days"], 30);
+        assert_eq!(usage["queries"], 3);
+        assert_eq!(usage["users"], 2);
         // The failed run's nine seconds are not a latency.
         assert_eq!(usage["avgLatencyMs"], 200);
+        assert_eq!(usage["basedOn"], 4);
+        assert_eq!(usage["truncated"], false);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0]["id"], "q1");
+        assert_eq!(recent[0]["user"], "Rina Wijaya");
         assert_eq!(recent[0]["auditEventId"], "audit-q1");
     }
 
     /// A table nobody queried is a measured zero, not "not measured".
     #[test]
     fn usage_of_an_unqueried_table_is_zero() {
-        let (usage, recent) =
-            summarize_usage(&[], &tables(&["silver.orders"]), uuid::Uuid::from_u128(1));
-        assert_eq!(usage["queries7d"], 0);
+        let (usage, recent) = summarize_usage(
+            &[],
+            &tables(&["silver.orders"]),
+            &[],
+            uuid::Uuid::from_u128(1),
+            false,
+            &HashMap::new(),
+        );
+        assert_eq!(usage["queries"], 0);
         assert_eq!(usage["avgLatencyMs"], 0);
-        assert!(recent.is_empty());
+        assert_eq!(usage["frequentUsers"], json!([]));
+        assert_eq!(usage["frequentQueries"], json!([]));
+        assert_eq!(recent, [] as [serde_json::Value; 0]);
+    }
+
+    /// `DATA-15` F2: queries that differ only in their literals are one
+    /// frequent query, and no literal reaches the answer.
+    #[test]
+    fn frequent_queries_group_by_literal_free_form_and_show_no_literal() {
+        let (me, other) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let mentions = [
+            mention(
+                "q1",
+                "SELECT id FROM silver.orders WHERE name = 'Rina' AND n IN (1, 2)",
+                other,
+                "completed",
+                10,
+            ),
+            mention(
+                "q2",
+                "SELECT id FROM silver.orders WHERE name = 'Budi' AND n IN (3, 4)",
+                me,
+                "completed",
+                10,
+            ),
+            mention(
+                "q3",
+                "SELECT count() FROM silver.orders",
+                me,
+                "completed",
+                10,
+            ),
+        ];
+        let (usage, _) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &[],
+            me,
+            false,
+            &HashMap::new(),
+        );
+        let frequent = usage["frequentQueries"].as_array().expect("a list");
+        assert_eq!(frequent.len(), 2);
+        assert_eq!(
+            frequent[0]["sql"],
+            "SELECT id FROM silver.orders WHERE name = ? AND n IN (?, ?)"
+        );
+        assert_eq!(frequent[0]["runs"], 2);
+        assert_eq!(frequent[0]["lastAt"], "2026-10-01T08:00:00Z");
+        let text = usage["frequentQueries"].to_string();
+        assert!(!text.contains("Rina") && !text.contains("Budi"));
+        assert_eq!(usage["unparsed"], 0);
+    }
+
+    // PR #106 review R1 BLOCKER 6
+    #[test]
+    fn frequent_queries_counts_only_completed_and_drops_unknown_quoted_identifiers() {
+        let caller = uuid::Uuid::from_u128(1);
+        let mentions = [
+            // A failed query must NOT be counted in frequent queries
+            mention(
+                "q-failed",
+                "SELECT id FROM silver.orders WHERE email = 'failed@corp.example'",
+                caller,
+                "failed",
+                10,
+            ),
+            // A query with a quoted identifier that is not a known table or column must be dropped
+            mention(
+                "q-quoted-literal",
+                r#"SELECT id FROM silver.orders WHERE email = "jane@corp.example""#,
+                caller,
+                "completed",
+                10,
+            ),
+            // A valid completed query with known column
+            mention(
+                "q-ok",
+                "SELECT id FROM silver.orders WHERE id = 100",
+                caller,
+                "completed",
+                10,
+            ),
+        ];
+        let (usage, _) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &["id".to_owned(), "email".to_owned()],
+            caller,
+            false,
+            &HashMap::new(),
+        );
+        let frequent = usage["frequentQueries"].as_array().expect("a list");
+        assert_eq!(frequent.len(), 1);
+        assert_eq!(
+            frequent[0]["sql"],
+            "SELECT id FROM silver.orders WHERE id = ?"
+        );
+        let text = usage["frequentQueries"].to_string();
+        assert!(!text.contains("jane@corp.example"));
+        assert!(!text.contains("failed@corp.example"));
+    }
+
+    /// `DATA-15` F2, `DATA-52`: frequent users are counted per person, most active
+    /// first, and shown by the name the user table holds for their id -- not by the
+    /// text the history recorded with the query.
+    #[test]
+    fn frequent_users_are_named_from_the_user_table_and_ranked_by_their_queries() {
+        let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let mut quiet = mention("q1", "SELECT * FROM silver.orders", a, "completed", 1);
+        quiet.user_name = "quiet.old-handle".to_owned();
+        let mut busy_1 = mention("q2", "SELECT * FROM silver.orders", b, "completed", 1);
+        busy_1.user_name = "busy.old-handle".to_owned();
+        let busy_2 = busy_1.clone();
+        let names = named(&[(a, "Quiet"), (b, "Busy")]);
+        let (usage, _) = summarize_usage(
+            &[quiet, busy_1, busy_2],
+            &tables(&["silver.orders"]),
+            &[],
+            a,
+            false,
+            &names,
+        );
+        assert_eq!(
+            usage["frequentUsers"],
+            json!([{"name": "Busy", "queries": 2}, {"name": "Quiet", "queries": 1}])
+        );
+    }
+
+    /// `DATA-52` (QA `LH-DATA-12-01` F3, `TC-1730`): a person whose row is gone is
+    /// "Unknown user", all such people share one row, and no id appears anywhere in
+    /// the answer.
+    #[test]
+    fn a_person_who_no_longer_exists_is_unknown_user_and_never_an_id() {
+        let (me, gone, also_gone) = (
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        );
+        let mut mine = mention("q1", "SELECT * FROM silver.orders", me, "completed", 1);
+        mine.user_name = me.to_string();
+        let mut theirs_1 = mention("q2", "SELECT * FROM silver.orders", gone, "completed", 1);
+        theirs_1.user_name = gone.to_string();
+        let mut theirs_2 = mention(
+            "q3",
+            "SELECT * FROM silver.orders",
+            also_gone,
+            "completed",
+            1,
+        );
+        theirs_2.user_name = also_gone.to_string();
+        let names = named(&[(me, "Rina Wijaya")]);
+        let (usage, recent) = summarize_usage(
+            &[mine, theirs_1, theirs_2],
+            &tables(&["silver.orders"]),
+            &[],
+            me,
+            false,
+            &names,
+        );
+        assert_eq!(
+            usage["frequentUsers"],
+            json!([
+                {"name": "Unknown user", "queries": 2},
+                {"name": "Rina Wijaya", "queries": 1}
+            ])
+        );
+        // Distinct ids, as before: the two deleted people are two people.
+        assert_eq!(usage["users"], 3);
+        let text = usage.to_string();
+        for id in [me, gone, also_gone] {
+            assert!(
+                !text.contains(&id.to_string()),
+                "the id {id} reached the answer"
+            );
+        }
+        assert!(!json!(recent).to_string().contains(&me.to_string()));
+    }
+
+    /// `DATA-52`, review round 1 R3: a service identity's id has a name of its own, so
+    /// its queries get its own row and never the "Unknown user" row of deleted people.
+    #[test]
+    fn a_service_identity_is_named_and_not_merged_with_deleted_people() {
+        let (me, service, gone) = (
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        );
+        let mentions = [
+            mention("q1", "SELECT * FROM silver.orders", me, "completed", 1),
+            mention("q2", "SELECT * FROM silver.orders", service, "completed", 1),
+            mention("q3", "SELECT * FROM silver.orders", service, "completed", 1),
+            mention("q4", "SELECT * FROM silver.orders", gone, "completed", 1),
+        ];
+        // What `people_names` answers: the person, the service identity and not the
+        // deleted id.
+        let names = named(&[(me, "Rina Wijaya"), (service, "svc-reporting")]);
+        let (usage, _) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &[],
+            me,
+            false,
+            &names,
+        );
+        assert_eq!(
+            usage["frequentUsers"],
+            json!([
+                {"name": "svc-reporting", "queries": 2},
+                {"name": "Rina Wijaya", "queries": 1},
+                {"name": "Unknown user", "queries": 1}
+            ])
+        );
+    }
+
+    /// `DATA-52`: a row with no owner id is named by the id its `user_name` holds (a row
+    /// from before the ids) when that id has a name, and as stored when it is not an id.
+    #[test]
+    fn a_row_without_an_owner_is_named_by_the_id_in_its_user_name_or_shown_as_stored() {
+        let person_id = uuid::Uuid::from_u128(7);
+        let mut by_id = mention(
+            "q1",
+            "SELECT * FROM silver.orders",
+            person_id,
+            "completed",
+            1,
+        );
+        by_id.owner_id = None;
+        by_id.user_name = person_id.to_string();
+        let mut anonymous = mention(
+            "q2",
+            "SELECT * FROM silver.orders",
+            person_id,
+            "completed",
+            1,
+        );
+        anonymous.owner_id = None;
+        anonymous.user_name = "anonymous".to_owned();
+        let names = named(&[(person_id, "Rina Wijaya")]);
+        let (usage, _) = summarize_usage(
+            &[by_id, anonymous],
+            &tables(&["silver.orders"]),
+            &[],
+            person_id,
+            false,
+            &names,
+        );
+        assert_eq!(
+            usage["frequentUsers"],
+            json!([
+                {"name": "Rina Wijaya", "queries": 1},
+                {"name": "anonymous", "queries": 1}
+            ])
+        );
+    }
+
+    /// `DATA-15` F2: a join adds the other table to `joinedTables`, once
+    /// per statement, and adds nothing to the column counts.
+    #[test]
+    fn a_join_lists_the_other_table_and_counts_no_column() {
+        let me = uuid::Uuid::from_u128(1);
+        let mentions = [mention(
+            "q1",
+            "SELECT o.amount FROM silver.orders o JOIN silver.customers c ON c.id = o.cid \
+             JOIN silver.customers d ON d.id = o.cid",
+            me,
+            "completed",
+            10,
+        )];
+        let (usage, _) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &columns(&["amount", "cid"]),
+            me,
+            false,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            usage["joinedTables"],
+            json!([{"table": "silver.customers", "assetId": null, "queries": 1}])
+        );
+        assert_eq!(usage["columns"], json!([]));
+        assert!(
+            usage["columnsNote"]
+                .as_str()
+                .is_some_and(|n| n.contains("1 query that read several tables"))
+        );
+    }
+
+    /// `DATA-15` F2: a statement that reads this table alone counts each
+    /// of its columns once, however often the statement names it.
+    #[test]
+    fn a_single_table_statement_counts_each_column_once() {
+        let me = uuid::Uuid::from_u128(1);
+        let mentions = [
+            mention(
+                "q1",
+                "SELECT amount, amount + 1 FROM silver.orders WHERE amount > 5 ORDER BY id",
+                me,
+                "completed",
+                10,
+            ),
+            mention(
+                "q2",
+                "SELECT o.Amount FROM silver.orders o",
+                me,
+                "completed",
+                10,
+            ),
+        ];
+        let (usage, _) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &columns(&["amount", "id", "city"]),
+            me,
+            false,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            usage["columns"],
+            json!([{"name": "amount", "queries": 2}, {"name": "id", "queries": 1}])
+        );
+    }
+
+    /// `DATA-15` F2: `truncated` is the caller's word that the history read
+    /// came back full; `basedOn` is the rows read.
+    #[test]
+    fn a_full_history_read_is_reported_as_truncated() {
+        let me = uuid::Uuid::from_u128(1);
+        let mentions = [mention(
+            "q1",
+            "SELECT * FROM silver.orders",
+            me,
+            "completed",
+            1,
+        )];
+        let (usage, _) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &[],
+            me,
+            true,
+            &HashMap::new(),
+        );
+        assert_eq!(usage["truncated"], true);
+        assert_eq!(usage["basedOn"], 1);
+    }
+
+    /// `DATA-15` F2: the asset page looks back 30 days, the search ranking
+    /// keeps its 7.
+    #[test]
+    fn the_asset_page_and_the_ranking_have_their_own_windows() {
+        assert_eq!(ASSET_USAGE_DAYS, 30);
+        assert_eq!(USE_RANKING_DAYS, 7);
     }
 
     fn audit_event(action: &str, args: Value) -> lakehouse_store::audit::AuditEvent {
@@ -1255,6 +2138,42 @@ mod tests {
             approval_id: None,
             session_id: None,
         }
+    }
+
+    /// `DATA-15` F3: the history names both people (the actor, and the
+    /// grantee in the sentence), the permission and the day a grant ends.
+    #[test]
+    fn change_entries_name_a_grant_and_a_revoke_with_both_people() {
+        let grant = change_entry(&audit_event(
+            "catalog.grant",
+            json!({
+                "permission": "query:read",
+                "grantee": "Bayu",
+                "expiresAt": "2026-11-15T08:00:00.000Z",
+            }),
+        ));
+        assert_eq!(grant["actor"], "Rina");
+        assert_eq!(
+            grant["summary"],
+            "Granted query:read to Bayu until 2026-11-15"
+        );
+
+        let revoke = change_entry(&audit_event(
+            "catalog.revoke",
+            json!({ "permission": "query:read", "grantee": "Bayu" }),
+        ));
+        assert_eq!(revoke["actor"], "Rina");
+        assert_eq!(revoke["summary"], "Revoked query:read from Bayu");
+    }
+
+    // PR #106 review R1 SHOULD-FIX DATA-12 3
+    #[test]
+    fn change_entries_format_governed_tags_in_plain_words() {
+        let gov_edit = change_entry(&audit_event(
+            "catalog.annotate",
+            json!({ "fields": ["description", "governedTags"] }),
+        ));
+        assert_eq!(gov_edit["summary"], "Edited description, governed tags");
     }
 
     /// The history line says what was done in plain words, from the
@@ -1392,6 +2311,47 @@ mod tests {
         }
     }
 
+    /// `DATA-12` F6: each mark action has its sentence, and the note's text
+    /// is never part of it.
+    #[test]
+    fn change_entries_say_what_mark_was_set_or_removed() {
+        for (action, args, summary) in [
+            ("catalog.certify", json!({}), "Marked certified"),
+            (
+                "catalog.deprecate",
+                json!({ "note": "Superseded by the monthly mart", "replacementAssetId": null }),
+                "Marked deprecated",
+            ),
+            (
+                "catalog.deprecate",
+                json!({ "note": "Superseded by the monthly mart", "replacementAssetId": "silver.orders_v2" }),
+                "Marked deprecated: use silver.orders_v2",
+            ),
+            (
+                "catalog.uncertify",
+                json!({ "was": "certified" }),
+                "Removed the certified mark",
+            ),
+            (
+                "catalog.uncertify",
+                json!({ "was": "deprecated" }),
+                "Removed the deprecated mark",
+            ),
+            (
+                "catalog.uncertify",
+                json!({}),
+                "Removed the certified / deprecated mark",
+            ),
+        ] {
+            let entry = change_entry(&audit_event(action, args));
+            assert_eq!(entry["summary"], summary, "{action}");
+            assert!(
+                !entry["summary"].as_str().unwrap().contains("Superseded"),
+                "the note's text must not be in the history line"
+            );
+        }
+    }
+
     fn rule(asset: &str, column: Option<&str>, level: &str) -> ClassificationRule {
         ClassificationRule {
             id: format!("c-{asset}-{column:?}-{level}"),
@@ -1411,7 +2371,10 @@ mod tests {
         let c = classify(&other, &tables(&["silver.orders"]));
         assert_eq!(c.level, "internal");
         assert!(!c.from_rule);
-        assert!(c.columns.is_empty());
+        assert_eq!(
+            c.columns,
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     /// The newest rule wins, so a mistake is fixed by adding the right
@@ -1526,5 +2489,232 @@ mod tests {
         assert_eq!(check["status"], "failed");
         assert_eq!(check["lastRun"], "2026-09-30 01:00:00");
         assert_eq!(check["origin"], "observed");
+    }
+
+    /// `people_names` over a real Postgres (review round 1 R1 and R4): the read
+    /// `usage` makes, not a hand-made map.
+    mod names {
+        // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+        // testcontainer bootstrap runs for this test binary.
+        use lakehouse_auth::PrincipalId;
+        use lakehouse_test_support as _;
+        use uuid::Uuid;
+
+        use super::*;
+
+        fn principal(id: Uuid, tenants: &[Uuid], name: &str) -> Principal {
+            Principal {
+                id: PrincipalId::User(id),
+                tenant_ids: tenants.to_vec(),
+                display_name: name.to_owned(),
+                permissions: lakehouse_auth::PermissionSet::parse(""),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            }
+        }
+
+        async fn person(pool: &PgPool, name: &str) -> Uuid {
+            let clean = name.replace(' ', ".").to_lowercase();
+            sqlx::query_scalar(
+                "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+            )
+            .bind(name)
+            .bind(format!("{clean}@example.test"))
+            .bind(format!("{clean}@example.test"))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        async fn tenant(pool: &PgPool, slug: &str) -> Uuid {
+            sqlx::query_scalar(
+                "INSERT INTO tenant (name, slug, plan, residency) \
+                 VALUES ($1, $1, 'team', 'eu') RETURNING id",
+            )
+            .bind(slug)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        async fn in_tenant(pool: &PgPool, user: Uuid, tenant: Uuid) {
+            sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+                .bind(user)
+                .bind(tenant)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+
+        fn mentioned(id: &str, owner: Uuid) -> HistoryMention {
+            HistoryMention {
+                id: id.to_owned(),
+                sql: "SELECT * FROM silver.orders".to_owned(),
+                user_name: owner.to_string(),
+                owner_id: Some(owner),
+                at: "2026-10-01T08:00:00Z".to_owned(),
+                status: "completed".to_owned(),
+                duration_ms: 10,
+                audit_event_id: None,
+            }
+        }
+
+        /// Review round 1 R1: the name of a person of another tenant is never
+        /// answered, so their row is "Unknown user" and their name is nowhere in
+        /// the usage; the person who shares the caller's tenant is named.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_name_of_another_tenants_person_never_reaches_the_usage(pool: PgPool) {
+            let here = tenant(&pool, "acme").await;
+            let elsewhere = tenant(&pool, "globex").await;
+            let me = person(&pool, "rina").await;
+            let ours = person(&pool, "ann ours").await;
+            let theirs = person(&pool, "bob theirs").await;
+            in_tenant(&pool, me, here).await;
+            in_tenant(&pool, ours, here).await;
+            in_tenant(&pool, theirs, elsewhere).await;
+
+            let mentions = [
+                mentioned("q1", ours),
+                mentioned("q2", theirs),
+                mentioned("q3", theirs),
+            ];
+            let caller = principal(me, &[here], "rina");
+            let names = people_names(&pool, &mentions, &caller).await;
+            assert_eq!(names.get(&ours).map(String::as_str), Some("ann ours"));
+            assert!(!names.contains_key(&theirs));
+
+            let (usage, _) = summarize_usage(
+                &mentions,
+                &tables(&["silver.orders"]),
+                &[],
+                me,
+                false,
+                &names,
+            );
+            assert_eq!(
+                usage["frequentUsers"],
+                json!([
+                    {"name": "Unknown user", "queries": 2},
+                    {"name": "ann ours", "queries": 1}
+                ])
+            );
+            assert!(!usage.to_string().contains("bob theirs"));
+        }
+
+        /// Review round 1 R3: a service identity's id is in no `app_user` row, and the
+        /// second read names it, so an existing caller is not reported as a person who
+        /// no longer exists nor merged into their row.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_service_identity_is_shown_by_its_own_name(pool: PgPool) {
+            let here = tenant(&pool, "acme").await;
+            let me = person(&pool, "rina").await;
+            in_tenant(&pool, me, here).await;
+            let service: Uuid = sqlx::query_scalar(
+                "INSERT INTO service_identity (name, environment, expires_at) \
+                 VALUES ('svc-reporting', 'test', now() + interval '1 day') RETURNING id",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            // A person whose row is gone: only an id is left in the history.
+            let gone = Uuid::new_v4();
+
+            let mentions = [mentioned("q1", service), mentioned("q2", gone)];
+            let caller = principal(me, &[here], "rina");
+            let names = people_names(&pool, &mentions, &caller).await;
+            assert_eq!(
+                names.get(&service).map(String::as_str),
+                Some("svc-reporting")
+            );
+            assert!(!names.contains_key(&gone));
+
+            let (usage, _) = summarize_usage(
+                &mentions,
+                &tables(&["silver.orders"]),
+                &[],
+                me,
+                false,
+                &names,
+            );
+            assert_eq!(
+                usage["frequentUsers"],
+                json!([
+                    {"name": "Unknown user", "queries": 1},
+                    {"name": "svc-reporting", "queries": 1}
+                ])
+            );
+        }
+
+        fn state_for(pool: &PgPool) -> AppState {
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            AppState::new(crate::config::Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        async fn ran(pool: &PgPool, id: &str, owner: Uuid) {
+            sqlx::query(
+                "INSERT INTO query_history \
+                   (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
+                    workload_class, engine, owner_id) \
+                 VALUES ($1, 'SELECT * FROM silver.orders', $2, 'completed', 10, 0, 0, \
+                         'hot-analytics', 'trino', $3)",
+            )
+            .bind(id)
+            .bind(owner.to_string())
+            .bind(owner)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        /// Review round 1 R4: the whole path — `usage` asks `people_names`, which asks the
+        /// store. A named person and the caller are named, a blank name and an id with no
+        /// row are "Unknown user", and a lookup that cannot run names only the caller.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn the_asset_usage_names_people_through_the_read_not_a_hand_made_map(pool: PgPool) {
+            let here = tenant(&pool, "acme").await;
+            let me = person(&pool, "Rina Wijaya").await;
+            let named = person(&pool, "Ann Ours").await;
+            let blank = person(&pool, "").await;
+            in_tenant(&pool, me, here).await;
+            in_tenant(&pool, named, here).await;
+            in_tenant(&pool, blank, here).await;
+            // An id with no `app_user` row: a person who was deleted.
+            let gone = Uuid::new_v4();
+            for (id, owner) in [("q1", me), ("q2", named), ("q3", blank), ("q4", gone)] {
+                ran(&pool, id, owner).await;
+            }
+
+            let caller = principal(me, &[here], "Rina Wijaya");
+            let state = state_for(&pool);
+            let (usage, _) = usage(&state, &caller, &tables(&["silver.orders"]), &[]).await;
+
+            assert_eq!(
+                usage["frequentUsers"],
+                json!([
+                    {"name": "Unknown user", "queries": 2},
+                    {"name": "Ann Ours", "queries": 1},
+                    {"name": "Rina Wijaya", "queries": 1}
+                ])
+            );
+            assert!(!usage.to_string().contains(&blank.to_string()));
+
+            // The lookup cannot run (the pool is closed): the caller is still named, and
+            // nobody else is, rather than the whole usage becoming "not measured".
+            pool.close().await;
+            let names = people_names(&pool, &[mentioned("q1", named)], &caller).await;
+            assert_eq!(names, HashMap::from([(me, "Rina Wijaya".to_owned())]));
+        }
     }
 }

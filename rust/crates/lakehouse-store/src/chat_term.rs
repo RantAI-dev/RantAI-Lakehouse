@@ -104,9 +104,10 @@ fn check_length(field: &str, value: &str, max: usize) -> Result<(), StoreError> 
 ///
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_for_owner(pool: &PgPool, owner: &str) -> Result<Vec<ChatTerm>, StoreError> {
-    let rows: Vec<TermRow> = sqlx::query_as(&format!(
+    // safe: only the constant `COLUMNS` is formatted in; values are bound.
+    let rows: Vec<TermRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM chat_term WHERE owner = $1 ORDER BY updated_at DESC, term"
-    ))
+    )))
     .bind(owner)
     .fetch_all(pool)
     .await?;
@@ -154,7 +155,8 @@ pub async fn upsert(
         .bind(owner)
         .execute(&mut *tx)
         .await?;
-    let row: Option<TermRow> = sqlx::query_as(&format!(
+    // safe: only the constant `COLUMNS` is formatted in; values are bound.
+    let row: Option<TermRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO chat_term (owner, term, meaning, question, updated_at) \
          SELECT $1, lower(btrim($2)), $3, $4, now() \
          WHERE (SELECT count(*) FROM chat_term WHERE owner = $1) < $5 \
@@ -164,7 +166,7 @@ pub async fn upsert(
             question = EXCLUDED.question, \
             updated_at = now() \
          RETURNING {COLUMNS}"
-    ))
+    )))
     .bind(owner)
     .bind(&term)
     .bind(meaning)

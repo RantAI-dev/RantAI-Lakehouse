@@ -1,13 +1,16 @@
 "use client"
 
+import { governedPairLabels } from "@/features/catalog/governed-tags"
+
 import type { ReactNode } from "react"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
-import { Pill, StatusBadge } from "@/components/patterns/status-badge"
+import { CertificationBadge, Pill, StatusBadge } from "@/components/patterns/status-badge"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Skeleton } from "@/components/ui/skeleton"
+import { DeprecationNotice } from "@/features/catalog/asset-certification"
 import type { ActionState } from "@/hooks/use-service"
 import { formatBytes, formatCost } from "@/lib/format"
-import { ENGINE_CATEGORY_LABEL, WORKLOAD_CLASS_LABEL } from "@/lib/status"
+import { queryEngineLabel, WORKLOAD_CLASS_LABEL } from "@/lib/status"
 import type { QueryEstimate, QueryPlanStage } from "@/services/contracts/queries"
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
@@ -16,6 +19,64 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
       <dt className="shrink-0 text-muted-foreground">{label}</dt>
       <dd className="text-right">{children}</dd>
     </div>
+  )
+}
+
+/**
+ * The tables a query reads, each with its certification mark (`DATA-12`
+ * part 3), and a warning under the list for each deprecated one. A deprecated
+ * table still runs: the warning names it and what to use instead, and never
+ * blocks the query. `marks` is absent when no source is marked.
+ */
+function SourcesList({
+  sources,
+  marks,
+}: {
+  sources: string[]
+  marks: QueryEstimate["sourceMarks"]
+}) {
+  return (
+    <>
+      <ul className="space-y-0.5">
+        {sources.map((source) => {
+          const mark = marks?.[source]
+          const governed = governedPairLabels(mark?.governedTags)
+          const tags = mark?.tags ?? []
+          return (
+            <li key={source} className="font-mono text-xs flex items-center flex-wrap gap-1">
+              <span>{source}</span>
+              {/* PR #106 review R1 BLOCKER 2: mark, governed tags, free tags */}
+              <CertificationBadge
+                certification={mark?.certification}
+                className="align-middle font-sans"
+              />
+              {governed.map((pair) => (
+                <Pill key={`governed:${pair}`} tone="info" className="align-middle font-sans text-[10px]">
+                  {pair}
+                </Pill>
+              ))}
+              {tags.map((tag) => (
+                <Pill key={tag} tone="neutral" className="align-middle font-sans text-[10px]">
+                  {tag}
+                </Pill>
+              ))}
+            </li>
+          )
+        })}
+      </ul>
+      <div className="mt-2 space-y-1.5">
+        {sources.map((source) => {
+          const mark = marks?.[source]
+          if (mark?.certification !== "deprecated") return null
+          return (
+            <div key={source} className="text-left">
+              <span className="sr-only">{source}</span>
+              <DeprecationNotice asset={mark} />
+            </div>
+          )
+        })}
+      </div>
+    </>
   )
 }
 
@@ -65,22 +126,52 @@ export function QueryPlanPanel({ plan }: { plan: QueryPlanStage[] | null }) {
 export function QueryTransparencyPanel({
   state,
   estimatable,
+  estimateSupported = true,
+  waitingFor = null,
   onRetry,
 }: {
   state: ActionState<QueryEstimate>
   /** Whether the editor holds a statement worth estimating. */
   estimatable?: boolean
+  /**
+   * Whether the open tab's engine has an estimate at all. Only ClickHouse
+   * does: the server's `EXPLAIN ESTIMATE` has no Trino counterpart, so a Trino
+   * tab never asks and the panel says so (LH-QS-4-08).
+   */
+  estimateSupported?: boolean
+  /**
+   * The first parameter the estimate waits for, or `null`. The panel names it
+   * in the spelling of the run's refusal (QS-5-AC14).
+   */
+  waitingFor?: string | null
   onRetry: () => void
 }) {
+  if (!estimateSupported) {
+    // Every other state is about an estimate this tab cannot have, so none
+    // of them is shown: a leftover refusal or error would blame the query
+    // for something the engine simply does not do.
+    return (
+      <SectionCard
+        title="Execution transparency"
+        description="Pre-run estimate. Engine categories stay product-neutral."
+      >
+        <p className="text-sm text-muted-foreground">No pre-run estimate for Trino queries.</p>
+      </SectionCard>
+    )
+  }
   return (
     <SectionCard
       title="Execution transparency"
-      description="Pre-run estimate. Engine categories stay product-neutral."
+      description="Pre-run estimate."
     >
       {/* An empty editor gets no estimate and says so, rather than
           reporting a confident "0 B · 1.00 cu · Fresh · 0 s" about
-          nothing. */}
-      {state.status === "idle" || estimatable === false ? (
+          nothing. A statement that waits for a parameter names it. */}
+      {waitingFor !== null ? (
+        <p className="text-sm text-muted-foreground">
+          {`Fill in {{${waitingFor}}} for a pre-run estimate.`}
+        </p>
+      ) : state.status === "idle" || estimatable === false ? (
         <p className="text-sm text-muted-foreground">
           Type SQL for a pre-run estimate.
         </p>
@@ -104,10 +195,24 @@ export function QueryTransparencyPanel({
           <Skeleton className="h-4 w-5/6" />
         </div>
       ) : null}
-      {/* A query ClickHouse cannot even plan has no estimate — and its
-          reason (unknown column, missing table) is the most useful thing
+      {/* QA LH-QS-4-08 (QS-6), decision 7: a Trino statement has no pre-run
+          estimate. The server says so in a fixed sentence; the panel names
+          the engine and shows no source and no error, because nothing was
+          sent and nothing was read. */}
+      {state.data?.supported === false && estimatable !== false ? (
+        <div className="space-y-2 text-sm">
+          <p className="text-sm font-medium">No pre-run estimate</p>
+          <p className="text-muted-foreground">{state.data.reason}</p>
+          <dl className="space-y-2">
+            <Row label="Engine">{queryEngineLabel(state.data.queryEngine ?? "")}</Row>
+          </dl>
+        </div>
+      ) : null}
+      {/* A query ClickHouse cannot even plan has no estimate. Its reason is
+          the server's fixed sentence and reference id (the engine's text is
+          logged under that reference, `SEC-11`). It is the most useful thing
           on this panel, so it is shown instead of a row of zeros. */}
-      {state.data?.error && estimatable !== false ? (
+      {state.data?.error && state.data.supported !== false && estimatable !== false ? (
         <div className="space-y-1">
           <p className="text-sm font-medium">This query cannot be planned</p>
           <p className="font-mono text-xs leading-relaxed text-muted-foreground">
@@ -115,7 +220,7 @@ export function QueryTransparencyPanel({
           </p>
         </div>
       ) : null}
-      {state.data && !state.data.error && estimatable !== false ? (
+      {state.data && !state.data.error && state.data.supported !== false && estimatable !== false ? (
         <dl
           className={
             state.status === "pending"
@@ -131,8 +236,12 @@ export function QueryTransparencyPanel({
               ? `${formatCost(state.data.estimatedCostMin)}–${formatCost(state.data.estimatedCostMax)}`
               : "—"}
           </Row>
-          <Row label="Workload">{WORKLOAD_CLASS_LABEL[state.data.workloadClass]}</Row>
-          <Row label="Engine">{ENGINE_CATEGORY_LABEL[state.data.engine]}</Row>
+          <Row label="Workload">
+            {state.data.workloadClass ? WORKLOAD_CLASS_LABEL[state.data.workloadClass] : "—"}
+          </Row>
+          <Row label="Engine">
+            {queryEngineLabel(state.data.queryEngine ?? "clickhouse")}
+          </Row>
           <Row label="Cache">
             {/* Null means nobody asked the cache, which is not the same as
                 "not eligible" — saying either would be a guess. */}
@@ -170,13 +279,7 @@ export function QueryTransparencyPanel({
           <div>
             <dt className="text-muted-foreground">Sources</dt>
             <dd className="mt-1">
-              <ul className="space-y-0.5">
-                {state.data.sources.map((s) => (
-                  <li key={s} className="font-mono text-xs">
-                    {s}
-                  </li>
-                ))}
-              </ul>
+              <SourcesList sources={state.data.sources} marks={state.data.sourceMarks} />
             </dd>
           </div>
           <QueryPlanPanel plan={state.data.plan} />

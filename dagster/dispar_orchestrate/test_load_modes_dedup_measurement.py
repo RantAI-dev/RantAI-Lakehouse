@@ -33,7 +33,7 @@ import pytest
 from dlt.common.destination.exceptions import DestinationTerminalException
 from dlt.pipeline.exceptions import PipelineStepFailed
 from dlt.pipeline.pipeline import Pipeline
-from pyiceberg.table import Table
+from pyiceberg.table import Table, Transaction
 
 from dispar_orchestrate.adapters import sink as sink_module
 from dispar_orchestrate.test_load_modes_measurement import (  # noqa: F401 -- `lab` and `items_db` are fixtures
@@ -60,6 +60,17 @@ class _Failure:
     def __init__(self, monkeypatch: pytest.MonkeyPatch, owner: type, name: str, from_call: int = 1) -> None:
         self.calls = 0
         self.active = True
+        if owner is Table and name in ("append", "overwrite"):
+            # PR #186 review BLOCKER 6: the write of a `replace` or `append` is now staged in
+            # one `pyiceberg` transaction (`adapters/iceberg_stream.py`), and `Table.append`
+            # and `Table.overwrite` are only a transaction around the same two calls, so the
+            # failure is injected where both paths meet.
+            # `DATA-36`: the groups of a load are written into ONE snapshot producer
+            # (`adapters/iceberg_snapshot.py`), so neither `Transaction.append` nor
+            # `Transaction.overwrite` is called any more; the paths meet now in the one call
+            # that opens the producer of the load's one snapshot. The failure it injects is
+            # the same.
+            owner, name = Transaction, "update_snapshot"
         original = getattr(owner, name)
 
         def wrapper(*args: Any, **kwargs: Any) -> Any:

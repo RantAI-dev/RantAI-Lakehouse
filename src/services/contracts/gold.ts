@@ -2,8 +2,8 @@
  * Gold export surface — mirrors `routes::gold` exactly
  * (`rust/crates/lakehouse-api/src/routes/gold.rs`): marts (via
  * `GET /api/dashboard/fields`), the last export read back straight from
- * Iceberg, a manual "Export now" trigger, export run history, and a
- * best-effort consumers count.
+ * Iceberg, a manual "Export now" trigger, export run history, and the
+ * count of outside tools that read the published table (DATA-5).
  */
 import type { Measured } from "@/lib/measured"
 
@@ -26,15 +26,20 @@ export type GoldExportResult = {
 /**
  * `GET /api/gold/export/{mart}` response — the Gold Iceberg table read
  * straight back through `iceberg-rust`, independent of whatever the last
- * `POST` claimed. 500s when the table has never been exported; the client
- * classifies that as `ServiceError` for the page to render as "Never
- * exported" rather than a generic error.
+ * `POST` claimed.
+ *
+ * A mart never published answers 200 with `published: false` and every other
+ * fact `null` (`DATA-49`, D11): "no export yet" is a normal state, not an
+ * error, so the console reads it from this field. A failed request is a
+ * failure and is shown as one, never as "Never exported".
  */
 export type GoldReadBack = {
   namespace: string
   table: string
-  formatVersion: number
-  rowsInIceberg: number
+  /** Whether the catalog holds this mart's published table at all. */
+  published: boolean
+  formatVersion: number | null
+  rowsInIceberg: number | null
   snapshotId: Measured
   exportedAt: string | null
 }
@@ -61,17 +66,41 @@ export type GoldExportRun = {
 }
 
 /**
- * `GET /api/gold/export/{mart}/consumers` response. This route ships as
- * an honest stub (no Trino query-history correlation exists yet — see
- * `routes::gold::consumers`'s doc comment): always `supported: false` with
- * a `reason` explaining why, never a silently-empty `consumers` list,
- * which would read as "this mart has zero consumers" — a different, false
- * claim.
+ * One outside tool that read a published Gold mart through the API's
+ * Iceberg door (`GET /api/gold/export/{mart}/consumers`, DATA-5 D7).
+ *
+ * `name` is the identity's name at the time of the read, so a tool that
+ * was later deleted keeps its past reads readable under the name it had
+ * (ADR 0016, point 5). `reads` is the number of table loads counted over
+ * the route's window; `lastReadAt` is when the last one happened.
+ */
+export type GoldConsumer = {
+  identityId: string
+  name: string
+  reads: number
+  lastReadAt: string
+}
+
+/**
+ * `GET /api/gold/export/{mart}/consumers` response (DATA-5 D7/D9).
+ *
+ * The route reports one of two honest shapes, and never a third:
+ * - `supported: true` with `consumers` listing every tool that read the
+ *   mart in the window (`windowDays`, 7 today);
+ * - `supported: false` with `consumers: null` and a `reason` naming what
+ *   is missing — outside reading is off until an operator publishes
+ *   storage at `OUTSIDE_S3_ENDPOINT` (D4).
+ *
+ * An empty `consumers` list means "nobody read it", which is a measured
+ * zero. `consumers: null` with `supported: true` is not a shape the API
+ * emits; the console renders it as unknown rather than as a zero, so a
+ * broken contract never reads as "no readers".
  */
 export type GoldConsumers = {
   mart: string
-  consumers: unknown[] | null
   supported: boolean
+  windowDays?: number
+  consumers: GoldConsumer[] | null
   reason?: string
 }
 
@@ -81,13 +110,42 @@ export type GoldConsumers = {
  * `lastExportedAt` are RFC 3339 strings (UTC, seconds granularity) or
  * `null` when not measurable.
  */
+/**
+ * Trim summary for a published Gold mart (DATA-2 D6).
+ * From the newest `console.gold_trim_run` row; `null` means never trimmed.
+ */
+export type GoldTrimSummary = {
+  status: "success" | "failed" | "nothing_to_trim" | string
+  copiesKept: number | null
+  oldestKeptExportedAt: string | null
+  finishedAt: string
+  reason: string | null
+}
+
+/**
+ * The mart's newest export run, when it FAILED (`DATA-49`). `failedAt` is when
+ * that run started, RFC 3339, or `null` when it cannot be read; `reason` is the
+ * sentence the API stored for it — the same one the failed response carried.
+ */
+export type GoldPublicationFailure = {
+  failedAt: string | null
+  reason: string
+}
+
 export type GoldPublication = {
   mart: string
   enabled: boolean
   updatedAt: string | null
   lastChangedAt: string | null
   lastExportedAt: string | null
+  changedSinceExport: boolean | null
+  /**
+   * `null` unless the mart's newest run failed, whatever the last successful
+   * publish says (`DATA-49`, `publication_body` in `routes/gold.rs`).
+   */
+  lastFailure: GoldPublicationFailure | null
   canEdit: boolean
+  trim?: GoldTrimSummary | null
 }
 
 export interface GoldService {

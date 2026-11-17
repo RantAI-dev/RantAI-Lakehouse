@@ -7,6 +7,30 @@
 @import "../../design-system/globals.css";
 
 /*
+ * BI-17 part A (D6): a dashboard fixed to the light theme inside a dark
+ * console. `design-system/tokens/colors.css` gives `.theme-light` the light
+ * tokens (one definition, not a copy); this stops the `dark:` variants of
+ * Tailwind from matching just because an ancestor, the console's <html>, is
+ * dark.
+ */
+@custom-variant dark (&:is(.dark *):not(:is(.theme-light *)));
+
+/*
+ * WEB-9 D1: tell the browser which theme it is in. Without this, a native
+ * control it draws itself — the list of a `<select>`, a date picker, a
+ * scrollbar — comes out in the browser's light colours while the page's text
+ * is light, so only the highlighted row of a dropdown can be read. A
+ * dashboard fixed to the light theme (BI-17 D6) is light in its own subtree.
+ */
+.dark {
+  color-scheme: dark;
+}
+
+.theme-light {
+  color-scheme: light;
+}
+
+/*
  * Tailwind v4 wraps every `hover:` (and so `group-hover:`) in
  * `@media (hover: hover)`, so browsers that report no hover capability,
  * such as touchscreen laptops and some Linux or remote-desktop setups, get
@@ -153,6 +177,8 @@
     min-height: 0 !important;
   }
   .dash-canvas > .dash-canvas-grid { display: none !important; } /* garis grid */
+  /* BI-1: each tab of the PDF print view after the first starts a new page. */
+  .render-tab-break { break-before: page; }
   .dash-tile {
     position: static !important;
     left: auto !important; top: auto !important;
@@ -161,6 +187,29 @@
     break-inside: avoid;
     box-shadow: none !important;
   }
+}
+
+/* BI-53 (QA LH-BI-1-01 F1, LH-BI-6-22, LH-BI-6-23): a chart is a canvas sized
+   when it is created, and the print rules above only apply under @media print,
+   so a chart created before print media is in force is the width of the screen
+   layout — half of its card, or wider than the card and cut at its edge. The
+   print view is therefore stacked in every medium, not only under @media print.
+   These two rules repeat the print rules above (`.dash-canvas` and `.dash-tile`)
+   and must stay the same as them; the browser's own Print of the dashboard page
+   still uses those. */
+[data-render-view] .dash-canvas {
+  position: static !important;
+  height: auto !important;
+  min-height: 0 !important;
+}
+[data-render-view] .dash-tile {
+  position: static !important;
+  left: auto !important; top: auto !important;
+  width: 100% !important; height: 360px !important;
+  margin: 0 0 12px 0 !important;
+  break-inside: avoid;
+  box-shadow: none !important;
+  transition: none !important;
 }
 
 /* Pipeline detail: the vitals strip's staggered entrance. */

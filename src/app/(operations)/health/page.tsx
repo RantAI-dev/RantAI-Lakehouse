@@ -1,11 +1,12 @@
 "use client"
 
-import { OverviewPage } from "@/features/overview/overview-page"
+import { SystemStatusPage } from "@/features/overview/system-status-page"
 
 /**
- * Thin App Router page for OverviewPage. The platform dashboard moved here
- * from `/` when Home became the AI-first landing page.
+ * Thin App Router page for System status (`WEB-3` S2-D2). The address
+ * stays `/health`; Services, Capacity, Ingestion (CDC) and Table
+ * Maintenance redirect to its sections.
  */
 export default function Page() {
-  return <OverviewPage />
+  return <SystemStatusPage />
 }

@@ -6,8 +6,8 @@ row. At code-load time this module reads `GET /api/pipelines/runnable`
 (every `ready` or `paused` authored pipeline, with its definition, across
 all tenants) and builds, per pipeline:
 
-* an `authored__<id>` job that reads its source, applies its `transforms`,
-  and writes its target (item E3, below);
+* an `authored__<id>` job that asks the API for the statement its stored
+  definition compiles to, runs it, and writes its target (item E3, below);
 * an `authored__<id>_schedule` when the pipeline's schedule is a five-field
   cron. `default_status` is RUNNING for a `ready` pipeline and STOPPED for a
   `paused` one: the schedule the author set is meant to fire, and one that
@@ -24,7 +24,24 @@ all tenants) and builds, per pipeline:
   keeps the sensor's RUNNING/STOPPED state across a code-location
   reload, so the `paused` branch has to skip the sensor AND the API
   `authored_status` route has to stop the stored sensor next to the
-  schedule (F1.2).
+  schedule (F1.2);
+* an `authored__<id>_lag` sensor when the pipeline has a time-based target lag
+  (`targetLag.kind == 'lag'`) AND its status is `ready` (BLD-2 D3/D6). A target lag
+  replaces both the cron schedule and the dependency `_after` sensor while set (D3).
+  The sensor evaluates `POST /api/pipelines/runnable/{id}/lag-check` every 30 seconds
+  (`minimum_interval_seconds=30`), balancing responsive freshness for pipelines with short
+  targets (down to 1 minute; BLD-2 review R3 BLOCKER 3) against the database cost of querying input snapshot tokens
+  and ClickHouse content fingerprints across authored pipelines (D6).
+
+   Two upstreams are per-table rather than per-job: `file_ingest_job` loads
+   ONE uploaded file into ONE Bronze table per run, and `ingest_job` loads
+   EVERY selected object of ONE connector into Bronze per run while being
+   the SAME job for every connector. A pipeline that names either counts
+   only the SUCCESS runs that loaded ITS source table (DATA-19 / D1, BLD-4
+   / D1); a load of another table is a run of a different chain. See
+   `_latest_record_for_table` and `_latest_record_for_ingest_table` for how
+   each job's loaded table is read, and the plan
+   `docs/superpowers/plans/2026-10-15-bld-4-ingest-upstream-filter.md`.
 
 The API asks the webserver to reload this code location whenever a
 pipeline becomes ready, is edited, paused, resumed or deleted
@@ -44,18 +61,47 @@ location, answering (3).
 
 Authenticates the same way `agent_runs.py`/`gold_export.py` do: a bearer
 token from `PIPELINE_RUN_TOKEN`.
+
+# Reading a Bronze source
+
+A Bronze table is Iceberg in Lakekeeper, not a ClickHouse database: this
+stack's ClickHouse has `serving`, `silver` and `lake` only. The API names
+that read when it compiles the pipeline (`pipeline_compile.rs`), and this
+module attaches `allow_database_iceberg = 1` to every statement whose
+compiled text reads it — the `readsIceberg` flag `_compiled_sql` gets back
+from the API decides. `_reading` carries the detail.
+
+BLD-1 part 1 / D14: this module no longer builds SQL. It asks the API for
+the statement (`POST /api/pipelines/runnable/{id}/compile`) and runs it.
+
+The database that names it is the API's own `ICEBERG_QUERY_DB`
+(`icecat_api` in compose), because the API's policy rewriter only recognises
+a governed table under that name — a pipeline read through any other database
+was never rewritten at all (BLD-1 / D5).
+
+# Reading as the pipeline's author
+
+BLD-1 part 1 / D4 and D14: the API compiles the pipeline's stored definition
+and rewrites it as its recorded author (`pipeline_definition.run_as`), and
+only the text it returns reaches ClickHouse. A pipeline with no recorded
+author, or one whose author has been deactivated, is refused with a fixed
+message (409) that no retry can fix; a refused definition or construct is
+refused the same way (422). A transport failure still propagates, because
+that IS retryable and used to be.
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
+from urllib.parse import quote
 
 import requests
 from dagster import (
+    AssetKey,
     AssetMaterialization,
-DagsterRunStatus,
+    DagsterRunStatus,
     DefaultScheduleStatus,
     DefaultSensorStatus,
     Failure,
@@ -68,10 +114,12 @@ DagsterRunStatus,
     job,
     op,
     run_status_sensor,
+    sensor,
 )
 
-from dispar_orchestrate import authored_transforms, op_metadata
+from dispar_orchestrate import op_metadata
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, _ch_query_json
+from dispar_orchestrate.file_ingest import JOB_NAME as FILE_INGEST_JOB
 
 
 def _env(name: str, default: str) -> str:
@@ -83,6 +131,9 @@ def _env(name: str, default: str) -> str:
 class AuthoredPipelineConfig:
     api_url: str
     run_token: str
+    # BLD-1 part 1 / D14: there is no catalog-database setting here any more.
+    # The API owns `ICEBERG_QUERY_DB` — it compiles a Bronze input through it
+    # and answers `readsIceberg`, which is all this module needs.
 
     @classmethod
     def from_env(cls) -> "AuthoredPipelineConfig":
@@ -195,13 +246,23 @@ FBIC_UNSUPPORTED_REASON = (
     "build-status only) and policy.rs's POLICY_TABLE"
 )
 
-CONNECTOR_SOURCE_UNSUPPORTED_REASON = (
-    "connector-sourced authored pipelines are not executed by this build: WS4 "
-    "item E3 implements the direct ClickHouse-zone-to-ClickHouse-zone read/"
-    "write path only. Wiring WS3's four adapters.*.build_source modules "
-    "(sql/files/rest/sheets) plus secret resolution and a bulk ClickHouse "
-    "load is real, separate integration work this task does not fake with an "
-    "empty or partial read -- reported here as an honest run failure instead."
+BRONZE_TARGET_REFUSED_REASON = (
+    "a pipeline cannot write to bronze; bronze is written by ingestion"
+)
+
+# BLD-7 / decision 3 + `DEC-15`: a pipeline's `connectorId` says where its
+# data came from, never that the run should read the source again. The API
+# refuses a connector on anything but one of that connector's Bronze tables
+# on create/update, so a row that still names another zone predates that
+# rule (or reached the table another way). Such a row is refused here with
+# a fixed message that says what to edit: reading the zone it stores would
+# be the second, direct read path `DEC-15` rules out, and running it
+# silently would hide the mismatch.
+CONNECTOR_SOURCE_NOT_BRONZE_REASON = (
+    "this pipeline names a connector but its source zone is not bronze: a "
+    "pipeline made from a connector reads one of that connector's Bronze "
+    "tables. Edit the pipeline: choose bronze and one of the connector's "
+    "tables, or clear its connector."
 )
 
 
@@ -222,82 +283,194 @@ def _dagster_safe_name(raw: str) -> str:
 
 
 def _is_safe_ch_identifier(name: str) -> bool:
-    """Defense in depth for a zone/table name pulled out of a stored
+    """Defense in depth for a name pulled out of a stored
     `pipeline_definition` row before it is interpolated into a ClickHouse
-    statement -- the same non-trust-by-default posture
-    `authored_transforms.py` takes for a transform string, applied here to
-    the four identifier fields this module itself builds SQL from
-    (`source_zone`/`source_table`/`target_zone`/`target_table` are
-    validated server-side at `POST /api/pipelines` time, but this op
-    re-checks rather than assuming that validation can never be bypassed by
-    a future/older API version)."""
+    statement — the three fields this module still formats itself (`the
+    source zone`, which the connector rule reads, and `target_zone`/
+    `target_table`). They are validated server-side at `POST /api/pipelines`
+    time, but this op re-checks rather than assuming that validation can
+    never be bypassed by a future/older API version. The source table is not
+    here: it is a `SELECT` the API compiled (BLD-1 part 1 / D14)."""
     return bool(name) and not name[0].isdigit() and all(c.isascii() and (c.isalnum() or c == "_") for c in name)
 
 
-def _build_select_sql(source: str, transforms: list[authored_transforms.Transform]) -> str:
-    """Compose the whole `transforms` list into ONE `SELECT ... FROM
-    source [WHERE ...] [ORDER BY ... LIMIT 1 BY ...]` statement -- see
-    this task's plan doc: a `Dedupe` becomes an `ORDER BY` clause paired
-    with `LIMIT BY` executed server-side in ClickHouse; `Filter`/`Cast`/
-    `Rename`/`Select` compose into the column list and `WHERE` clause.
-    Every `Filter` clause is rendered through
-    `authored_transforms.render_clickhouse` directly (item E2's actual
-    function, never a re-derivation of its literal-escaping)."""
-    columns: list[str] | None = None
-    renames: dict[str, str] = {}
-    casts: dict[str, str] = {}
-    filters: list[str] = []
-    dedupe_key: str | None = None
+# ── Reading a Bronze source: BLD-3 / D1, D2 + BLD-1 part 1 / D14 ─────
 
-    for t in transforms:
-        if isinstance(t, authored_transforms.Select):
-            columns = list(t.columns)
-        elif isinstance(t, authored_transforms.Rename):
-            renames[t.from_col] = t.to_col
-        elif isinstance(t, authored_transforms.Cast):
-            casts[t.column] = t.target_type
-        elif isinstance(t, authored_transforms.Filter):
-            filters.append(authored_transforms.render_clickhouse(t))
-        elif isinstance(t, authored_transforms.Dedupe):
-            dedupe_key = t.key
-        else:  # unreachable -- authored_transforms.Transform is a closed union
-            raise AuthoredJobError(f"unrenderable transform: {t!r}")
+# Bronze is not a ClickHouse database on this stack: `scripts/seed-clickhouse.sql`
+# creates `serving`, `silver` and `lake` only. A Bronze table is Iceberg in
+# Lakekeeper and is readable from ClickHouse ONLY through a
+# `DataLakeCatalog` database, where the table's name is the catalog's own
+# flat `bronze.<table>` (ADR 0004) -- `` <catalog db>.`bronze.<table>` ``.
+# The API names that read (it owns `ICEBERG_QUERY_DB` and the rewriter that
+# must recognise the table), and tells this module with `readsIceberg`
+# whether the compiled statement reads it.
 
-    if columns is None:
-        select_cols = "*"
-    else:
-        rendered = []
-        for c in columns:
-            expr = f"CAST({c} AS {casts[c]})" if c in casts else c
-            if c in renames:
-                expr = f"{expr} AS {renames[c]}"
-            rendered.append(expr)
-        select_cols = ", ".join(rendered)
-
-    sql = f"SELECT {select_cols} FROM {source}"
-    if filters:
-        sql += " WHERE " + " AND ".join(filters)
-    if dedupe_key:
-        sql += f" ORDER BY {dedupe_key} LIMIT 1 BY {dedupe_key}"
-    return sql
+# Every statement that READS the catalog database needs this setting;
+# ClickHouse refuses an Iceberg read without it. `maintenance.py` sends it
+# on `SHOW TABLES` (`SETTINGS allow_database_iceberg=1`) and on its own
+# `CREATE DATABASE ... DataLakeCatalog`, which is the precedent this
+# module follows. It is attached per statement rather than as a session
+# setting because `_ch_exec` is a stateless `requests.post` per statement:
+# there is no session to set it on.
+ICEBERG_READ_SETTINGS = "allow_database_iceberg = 1"
 
 
-def _ensure_target_table(target: ClickHouseTarget, target_zone: str, target_table: str, select_sql: str) -> None:
+def _reading(reads_iceberg: bool, statement: str) -> str:
+    """`statement`, plus `SETTINGS allow_database_iceberg = 1` when it
+    reads the catalog database (D2). ClickHouse reads `SETTINGS` as the
+    last clause of the `SELECT` it belongs to, so this is appended to the
+    WHOLE statement -- after its `LIMIT 0`, after its `FORMAT`, never in
+    the middle of a `FROM`."""
+    if not reads_iceberg:
+        return statement
+    return f"{statement} SETTINGS {ICEBERG_READ_SETTINGS}"
+
+
+# The API's answer to "I will not compile or run this for you, and asking
+# again will not change my mind":
+#   409 the pipeline has no author to read as (BLD-1 / D2), that author is
+#       gone, or it belongs to no tenant;
+#   404 a table the author's roles do not include (`GOV-7`; the run route
+#       answers the same 404 Query Studio does, and review R1-S2 made it a
+#       refusal here — it used to be retried);
+#   422 the stored definition does not compile, or the rewrite refused it.
+# Each carries a FIXED message written in this repository
+# (`policy_engine::enforcement_error_message`, D2's own string, the
+# definition's `steps[i]: ...`), which is why `_compiled_sql` can put it in
+# an op failure without leaking anything: there is no upstream text in it.
+_ENFORCE_REFUSAL_STATUSES = (404, 409, 422)
+
+# Fallback when the API refuses but its body carries no `error` string. A
+# fixed message of our own, never the raw body: an unexpected body is
+# exactly the case where its text is least trustworthy.
+_ENFORCE_REFUSAL_FALLBACK = (
+    "the lakehouse API refused to compile this pipeline's query; "
+    "see the API logs for the reason"
+)
+
+# Fixed text for a 2xx whose body is not the `{ "sql": ..., "readsIceberg":
+# ... }` shape the route documents. Retrying the identical request cannot repair a response
+# shape, so this is a refusal rather than a transient failure -- but it is
+# OURS, not the API's, and it says nothing about what came back.
+_ENFORCE_BAD_BODY = (
+    "the lakehouse API returned an unreadable compile response for "
+    "this pipeline's query"
+)
+
+
+class AuthoredEnforceRefused(RuntimeError):
+    """The API refused a pipeline's `SELECT` in a way no retry can fix.
+
+    A `RuntimeError` subclass, like [`AuthoredJobError`], so `_op_for_pipeline`
+    wraps it in `Failure(allow_retries=False)` instead of spending the retry
+    policy on a decision that will be identical on every attempt.
+    """
+
+
+def _refusal_message(resp: requests.Response) -> str:
+    """The API's own fixed refusal text, or a fixed fallback of ours.
+
+    Never echoes an arbitrary body: `error` is used only when it is a
+    non-empty string, and everything else falls back. The body of a
+    refusal is classified text by construction (every `ApiError` variant
+    carries a message the API chose), which is what makes it safe to put
+    in an op failure description at all.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return _ENFORCE_REFUSAL_FALLBACK
+    if isinstance(body, dict):
+        message = body.get("error")
+        if isinstance(message, str) and message.strip():
+            return message
+    return _ENFORCE_REFUSAL_FALLBACK
+
+
+def _compiled_sql(cfg: AuthoredPipelineConfig, pipeline_id: str) -> tuple[str, bool]:
+    """What to RUN for this pipeline, and whether it reads Bronze: the API's
+    compile of the stored definition, rewritten as the pipeline's recorded
+    author, or [`AuthoredEnforceRefused`].
+
+    This is BLD-1 part 1 / D4, D8 and D14's whole point. The API owns the
+    definition compiler and the policy rewrite (the same masking and
+    row-filter rewrite Query Studio, dashboards, alerts and the Gold export
+    apply), and the returned text -- never anything this module composes --
+    is what `_write_clickhouse_table` writes into the `CREATE TABLE ... AS`,
+    the staging `INSERT` and every other statement that reads the source, so a
+    pipeline cannot be used to copy a masked column into a Silver table in
+    clear (`GOV-4`). `readsIceberg` says whether that text reads the catalog
+    database, which decides `allow_database_iceberg` (`_reading`).
+
+    # Errors
+
+    [`AuthoredEnforceRefused`] when the API refuses (409/422) or answers with
+    a body that is not `{ "sql": ..., "readsIceberg": ... }` -- neither of
+    which a retry changes, so the op fails without retrying.
+
+    `requests.RequestException` propagates UNWRAPPED, and the op retries: an
+    unreachable API, a timeout or a 5xx are the infrastructure failures the
+    retry policy exists for.
+    """
+    resp = requests.post(
+        f"{cfg.api_url}/api/pipelines/runnable/{quote(pipeline_id, safe='')}/compile",
+        headers=_headers(cfg),
+        timeout=60,
+    )
+    if resp.status_code in _ENFORCE_REFUSAL_STATUSES:
+        raise AuthoredEnforceRefused(_refusal_message(resp))
+    # Any other non-2xx (401 a token that is not the run identity, 404 a
+    # pipeline that vanished without a reload, 5xx) raises here and is
+    # retried, as before this call existed.
+    resp.raise_for_status()
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise AuthoredEnforceRefused(_ENFORCE_BAD_BODY) from exc
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("sql"), str)
+        or not isinstance(body.get("readsIceberg"), bool)
+    ):
+        raise AuthoredEnforceRefused(_ENFORCE_BAD_BODY)
+    return body["sql"], body["readsIceberg"]
+
+
+def _ensure_target_table(
+    target: ClickHouseTarget,
+    target_zone: str,
+    target_table: str,
+    select_sql: str,
+    reads_iceberg: bool,
+) -> None:
     """Schema-on-write for an authored pipeline's target: create the
     database and (if it does not already exist) the table, inferring
     columns from `select_sql` via ClickHouse's own `CREATE TABLE ... AS
     SELECT ...` (`LIMIT 0` so this never inserts rows itself -- inserting
     is `_write_clickhouse_table`'s job, run every time this job runs, not
-    only on first creation)."""
+    only on first creation).
+
+    `SELECT ... AS ... LIMIT 0` is the FIRST statement that may read a Bronze
+    source, so it carries the read setting when it does (`_reading`); the
+    `CREATE DATABASE` above it writes only and never carries one."""
     _ch_exec(target, f"CREATE DATABASE IF NOT EXISTS {target_zone}")
     _ch_exec(
         target,
-        f"CREATE TABLE IF NOT EXISTS {target_zone}.`{target_table}` "
-        f"ENGINE = MergeTree ORDER BY tuple() AS {select_sql} LIMIT 0",
+        _reading(
+            reads_iceberg,
+            f"CREATE TABLE IF NOT EXISTS {target_zone}.`{target_table}` "
+            f"ENGINE = MergeTree ORDER BY tuple() AS {select_sql} LIMIT 0",
+        ),
     )
 
 
-def _write_clickhouse_table(target: ClickHouseTarget, target_zone: str, target_table: str, select_sql: str) -> int:
+def _write_clickhouse_table(
+    target: ClickHouseTarget,
+    target_zone: str,
+    target_table: str,
+    select_sql: str,
+    reads_iceberg: bool,
+) -> int:
     """REPLACE `target_zone.target_table` with `select_sql`'s rows,
     atomically, and return the REAL row-count DELTA between before and
     after the swap -- what the caller records as rows written -- not
@@ -332,7 +505,7 @@ def _write_clickhouse_table(target: ClickHouseTarget, target_zone: str, target_t
     run is retryable because no committed write happened to the live
     target.
     """
-    _ensure_target_table(target, target_zone, target_table, select_sql)
+    _ensure_target_table(target, target_zone, target_table, select_sql, reads_iceberg)
     staging_table = f"__staging_{target_table}"
     # Idempotency under retry: drop any staging table left behind from
     # a prior attempt that failed between `INSERT INTO staging` and
@@ -341,11 +514,17 @@ def _write_clickhouse_table(target: ClickHouseTarget, target_zone: str, target_t
     _ch_exec(target, f"DROP TABLE IF EXISTS {target_zone}.`{staging_table}`")
     _ch_exec(
         target,
-        f"CREATE TABLE {target_zone}.`{staging_table}` "
-        f"ENGINE = MergeTree ORDER BY tuple() AS {select_sql} LIMIT 0",
+        _reading(
+            reads_iceberg,
+            f"CREATE TABLE {target_zone}.`{staging_table}` "
+            f"ENGINE = MergeTree ORDER BY tuple() AS {select_sql} LIMIT 0",
+        ),
     )
     before = _ch_query_json(target, f"SELECT count() AS n FROM {target_zone}.`{target_table}`")
-    _ch_exec(target, f"INSERT INTO {target_zone}.`{staging_table}` {select_sql}")
+    _ch_exec(
+        target,
+        _reading(reads_iceberg, f"INSERT INTO {target_zone}.`{staging_table}` {select_sql}"),
+    )
     # ClickHouse `EXCHANGE TABLES` is the atomic-swap primitive: both
     # tables must exist in the same database, and the swap is a single
     # mutation step (no transactional gap where readers see a
@@ -387,18 +566,23 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
         retry_policy=per_pipeline_retry,
         tags=op_metadata.source_metadata(
             "dispar_orchestrate/authored_factory.py::_op_for_pipeline",
-            reads=[f"ClickHouse {definition.get('sourceZone')}.{definition.get('sourceTable')}"],
+            reads=[
+                ", ".join(
+                    f"ClickHouse {i.get('zone')}.{i.get('table')}"
+                    for i in definition.get("inputs", [])
+                )
+                or f"ClickHouse {definition.get('sourceZone')}.{definition.get('sourceTable')}"
+            ],
             writes=[f"ClickHouse {definition.get('targetZone')}.{definition.get('targetTable')}"],
         ),
     )
     def _run(context) -> dict[str, Any]:
-        # PART D boundary: config-shaped failures raised by the
-        # transform-grammar port (`TransformError`, a `ValueError`
-        # subclass) and by this module's own authored-pipeline guard
-        # (`AuthoredJobError`, a `RuntimeError` subclass) are wrapped in
-        # `Failure(allow_retries=False)` here so `DEFAULT_RETRY_POLICY`
-        # does not burn 60s on a config that will not change between
-        # attempts. `SchemaDriftError` from `bronze_catalog.py` does
+        # PART D boundary: config-shaped failures raised by this module's
+        # own authored-pipeline guard (`AuthoredJobError`, a `RuntimeError`
+        # subclass) are wrapped in `Failure(allow_retries=False)` here so
+        # `DEFAULT_RETRY_POLICY` does not burn 60s on a config that will not
+        # change between attempts. The transform grammar is the API's now
+        # (BLD-1 part 1 / D14), so there is no `TransformError` to catch. `SchemaDriftError` from `bronze_catalog.py` does
         # NOT reach this body (the `_ensure_target_table` path uses
         # `_ch_exec` directly, not `_assert_or_create_all`), so it is
         # not in the wrap tuple -- a SchemaDriftError raised elsewhere
@@ -408,22 +592,24 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
         # not in this tuple and propagate retryably, as the retry
         # policy intends.
         try:
-            transforms = [
-                authored_transforms.parse_transform(t)
-                for t in definition.get("transforms", [])
-            ]
-
-            connector_id = definition.get("connectorId")
-            if connector_id:
-                raise AuthoredJobError(CONNECTOR_SOURCE_UNSUPPORTED_REASON)
-
             source_zone = definition["sourceZone"]
-            source_table = definition["sourceTable"]
+            # BLD-7 / decision 3: a connector means the data came from that
+            # connector's Bronze table, and the run reads `sourceZone.
+            # sourceTable` exactly as any other Bronze pipeline does. A row
+            # whose connector sits on a non-Bronze source cannot run: there
+            # is no direct source read (`DEC-15`). Kept deliberately narrow
+            # so every row the API accepts today keeps running unchanged.
+            if definition.get("connectorId") and source_zone != "bronze":
+                raise AuthoredJobError(CONNECTOR_SOURCE_NOT_BRONZE_REASON)
+
             target_zone = definition["targetZone"]
             target_table = definition["targetTable"]
+            # BLD-1 part 1 / D14: this module formats the target itself, so it
+            # checks the two names it interpolates. The source is a
+            # `SELECT` the API compiled, so there is no source identifier here
+            # to format.
             for ident, field in (
                 (source_zone, "sourceZone"),
-                (source_table, "sourceTable"),
                 (target_zone, "targetZone"),
                 (target_table, "targetTable"),
             ):
@@ -431,16 +617,44 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
                     raise AuthoredJobError(
                         f"unsafe ClickHouse identifier in {field!r}: {ident!r}"
                     )
-        except (authored_transforms.TransformError, AuthoredJobError) as exc:
+            # BLD-3 / D4: Bronze is written by ingestion, never by a
+            # pipeline. Accepting a `bronze` target here would run
+            # `CREATE DATABASE IF NOT EXISTS bronze` in ClickHouse and
+            # fill a MergeTree table that is not Bronze (it is not
+            # Iceberg, it is not in the catalog, nothing reads it) --
+            # a silent wrong answer. Refused here, in the API on
+            # create/update/restore and in the assistant's
+            # `create_pipeline` schema, with this same wording. A stored
+            # pipeline that predates the refusal now fails its run with
+            # this message instead of writing somewhere meaningless.
+            if target_zone == "bronze":
+                raise AuthoredJobError(BRONZE_TARGET_REFUSED_REASON)
+        except AuthoredJobError as exc:
             raise Failure(
                 description=f"authored pipeline {pipeline['id']!r} config rejected: {exc}",
                 allow_retries=False,
             ) from exc
 
         ch = ClickHouseTarget.from_env()
-        source = f"{source_zone}.`{source_table}`"
-        select_sql = _build_select_sql(source, transforms)
-        written = _write_clickhouse_table(ch, target_zone, target_table, select_sql)
+        cfg = AuthoredPipelineConfig.from_env()
+        # BLD-1 part 1 / D4 and D14: this module builds no SQL. The API
+        # compiles the stored definition and rewrites it as the pipeline's
+        # recorded author; only that text is written, and `readsIceberg`
+        # decides whether every statement that reads it carries the catalog
+        # database's setting. A refusal (no author, or a definition the rules
+        # refuse) is not retried: the same pipeline asked again minutes later
+        # gets the same answer. A transport failure propagates, so it stays
+        # retryable exactly as it always was.
+        try:
+            compiled_sql, reads_iceberg = _compiled_sql(cfg, pipeline["id"])
+        except AuthoredEnforceRefused as exc:
+            raise Failure(
+                description=f"authored pipeline {pipeline['id']!r} refused: {exc}",
+                allow_retries=False,
+            ) from exc
+        written = _write_clickhouse_table(
+            ch, target_zone, target_table, compiled_sql, reads_iceberg
+        )
 
         if definition.get("fbicEnabled"):
             context.log.info(FBIC_UNSUPPORTED_REASON)
@@ -479,6 +693,10 @@ def build_authored_schedule(pipeline: dict[str, Any], authored_job: Any) -> Sche
     `"On demand"`, ...) or its cron is one Dagster refuses. A refused cron
     is logged and skipped rather than raised: one bad row must not take
     down every job in this code location."""
+    # BLD-2 D3: A target lag (either kind) replaces the cron schedule while it is set.
+    # The schedule string stays stored, so clearing the target lag restores the schedule (AC8).
+    if pipeline.get("targetLag") is not None:
+        return None
     cron = pipeline.get("schedule")
     if not _is_five_field_cron(cron):
         return None
@@ -601,6 +819,207 @@ def _upstream_job_selector(upstream_id: str) -> JobSelector:
     )
 
 
+# ── BLD-4 / D1 + DATA-19 / D1: a load triggers only the pipelines it fed ──
+
+# Where a load's run config says which table it wrote:
+# `ops.ingest_uploaded_file.config.bronze_table_name`, exactly the shape
+# `routes::uploads::run_config` launches `file_ingest_job` with. The op
+# NAME is the key, not the job name, so a rename of the job would not
+# silently change the filter into a match-nothing one.
+FILE_INGEST_OP_CONFIG = ("ops", "ingest_uploaded_file", "config", "bronze_table_name")
+
+# The other per-table upstream: `ingest_factory.py`'s ONE static job, named
+# `ingest_job` (`ingest_factory.ingest_job`), which every connector's load
+# runs through (`{"ops": {"run_ingest": {"config": {"connector_id": ...}}}}`
+# from `routes/connectors.rs`, plus an optional `object`/`action` for a run
+# of one table). There is no `JOB_NAME` constant in `ingest_factory` to
+# import -- `file_ingest.JOB_NAME` is the one that exists -- so the name
+# lives here, and `TestIngestUpstreamIsFilteredByTable` pins it against
+# `ingest_factory.ingest_job.name` so a rename there cannot silently turn
+# this filter into a match-nothing one.
+INGEST_JOB = "ingest_job"
+
+
+@dataclass(frozen=True)
+class _PerTableUpstream:
+    """How one per-table upstream loads Bronze, in the words a `SkipReason`
+    needs for it (D4).
+
+    The two upstreams do not load a table the same way, so the reason for
+    "this chain cannot be triggered" and for "the chain is waiting" is
+    written once here per job rather than duplicated at the two skip sites.
+    `loads` names what the job writes, `trigger` what one run of it is
+    called, and `window` what the scan window counts.
+    """
+
+    loads: str
+    trigger: str
+    window: str
+
+
+_PER_TABLE_UPSTREAMS: dict[str, _PerTableUpstream] = {
+    FILE_INGEST_JOB: _PerTableUpstream(
+        loads="loads uploaded files into bronze tables",
+        trigger="upload",
+        window="runs",
+    ),
+    INGEST_JOB: _PerTableUpstream(
+        loads="loads every selected object of one connector into bronze tables",
+        trigger="connector load",
+        window="loads",
+    ),
+}
+
+# How many recent loads one tick looks at when it has to find the newest
+# one that loaded THIS pipeline's table -- for `file_ingest_job` the newest
+# SUCCESS runs, for `ingest_job` the newest materializations of the one
+# Bronze asset key. ONE window, not one per job (`AGENTS.md` rule 4): two
+# constants with the same value drift. It is bounded for the same reason
+# `MAX_DEPENDS_ON` is: a per-tick scan over an unbounded history would grow
+# with every load anyone ever made. It is a window, not a cap on what
+# triggers the chain -- a table whose newest load is older than the window
+# simply waits for its next load, and the SkipReason says exactly that.
+PER_TABLE_UPSTREAM_SCAN_LIMIT = 20
+
+
+def _bronze_asset_key(table: str) -> AssetKey:
+    """The asset key `ingest_factory` logs for a Bronze table.
+
+    `AssetMaterialization(asset_key="bronze.<target>")` parses the string
+    the way `AssetKey.__init__` does -- on the PERIOD -- so it is the
+    TWO-component key `["bronze", "<target>"]`, not the one-component
+    `["bronze.<target>"]`. Proven against the real classes in
+    `TestIngestMaterializationKeyTest`; building the one-component key here
+    would match nothing and every chain would wait forever, which is the
+    failure this docstring exists to prevent.
+    """
+    return AssetKey(["bronze", table])
+
+
+def _run_config_value(run: Any, path: tuple[str, ...]) -> str | None:
+    """The string at `path` inside a run's `run_config`, or `None`.
+
+    `DagsterRun.run_config` is the run's RESOLVED config, so a launch's
+    `{"ops": {"ingest_uploaded_file": {"config": {...}}}}` comes back with
+    the same shape and its op entries merged with the op's own defaults --
+    which is why the launch needs no extra tag for this to be readable
+    (`DATA-19` plan D1). Anything that is not that shape -- a run launched
+    without a config, a config whose shape Dagster rewrote -- answers
+    `None`, and the caller treats that as "this run is not about our
+    table", never as a match.
+    """
+    value: Any = getattr(run, "run_config", None)
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    return value if isinstance(value, str) and value else None
+
+
+def _latest_record_for_table(records: Sequence[Any], table: str) -> Any | None:
+    """The newest of `records` whose run loaded `table`, or `None`.
+
+    `instance.get_run_records` returns the run storage's default order --
+    the `runs.id` column descending, an autoincrement integer, so newest
+    first on every storage this build runs on -- and this is the first
+    match. An empty `table` matches nothing: a pipeline whose source zone
+    is not `bronze` has no Bronze table to filter on, and fail-closed
+    here means its chain waits with an honest reason instead of firing on
+    every upload of every table.
+    """
+    if not table:
+        return None
+    for record in records:
+        if _run_config_value(record.dagster_run, FILE_INGEST_OP_CONFIG) == table:
+            return record
+    return None
+
+
+def _per_table_upstream_skip(
+    upstream_id: str, bronze_table: str | None, source_label: str
+) -> str:
+    """D4: why a per-table upstream is not fresh for THIS pipeline, in words
+    that name the table (the same discipline `DATA-19`'s reasons follow).
+
+    Two causes, and they are not the same fact: the pipeline reads no Bronze
+    table at all, so this job can never trigger it; or the job has not
+    loaded the pipeline's own table inside the scan window, so what happened
+    was a load of some OTHER table. Naming the table is what makes the
+    second one legible -- "waiting on ingest_job" alone reads as "no load has
+    run yet" when the real answer is "other tables' loads have, twice".
+    """
+    upstream = _PER_TABLE_UPSTREAMS[upstream_id]
+    if not bronze_table:
+        return (
+            f"upstream {upstream_id!r} {upstream.loads} and this pipeline reads "
+            f"{source_label}, so no {upstream.trigger} can trigger it"
+        )
+    return (
+        f"upstream {upstream_id!r} has no SUCCESS run that loaded {bronze_table!r} in its "
+        f"last {PER_TABLE_UPSTREAM_SCAN_LIMIT} {upstream.window}; a load of another "
+        "table never triggers this pipeline"
+    )
+
+
+def _latest_record_for_ingest_table(instance: Any, table: str) -> Any | None:
+    """The newest SUCCESS run of `ingest_job` that materialized `table`, or
+    `None` (BLD-4 / D1).
+
+    `ingest_job` is ONE job for every connector and loads EVERY selected
+    object of that connector in one run, so its run config names the
+    `connector_id` and not the tables (`DATA-19`'s config filter does not
+    carry over). What DOES name the table is the materialization each loaded
+    object logs inside the run that loaded it --
+    `ingest_factory.ingest_source_object`'s `AssetMaterialization(asset_key=f"bronze.
+    {target}")`, where `target` is `obj['target']`.
+
+    Two bounded calls, joined on `run_id` -- neither one alone can answer the
+    question (verified in the plan's section 5.1):
+
+    1. `instance.fetch_materializations` on the one asset key, newest first.
+       It filters by asset key only: `AssetRecordsFilter` has no `job_name`
+       and no status, and the per-event `get_event_records` twin is
+       deprecated in `dagster==1.13.20` ("Use fetch_materializations
+       instead").
+    2. `instance.get_run_records` keyed on the materializations' `run_ids`
+       with `statuses=[DagsterRunStatus.SUCCESS]` (BLD-4 review R1 BLOCKER 1),
+       which is where the RUN's status and `end_time` live. A materialization
+       logged by a step whose run later FAILED is still in the event log --
+       the log is append-only per step -- so the event alone is NOT evidence
+       of a load this chain may follow; only the run's own record is.
+
+    An empty `table` matches nothing: a pipeline whose source zone is not
+    `bronze` has no Bronze table to filter on, and fail-closed here means its
+    chain waits with an honest reason instead of firing on every connector
+    load in the deployment.
+    """
+    if not table:
+        return None
+    materializations = instance.fetch_materializations(
+        _bronze_asset_key(table), limit=PER_TABLE_UPSTREAM_SCAN_LIMIT
+    )
+    if not materializations.records:
+        return None
+    # BLD-4 review R1 BLOCKER 1: key the run lookup on the materializations
+    # so loads of other tables do not push this table's run out of the window.
+    success_records = instance.get_run_records(
+        filters=RunsFilter(
+            run_ids=[m.run_id for m in materializations.records],
+            statuses=[DagsterRunStatus.SUCCESS],
+        ),
+        limit=PER_TABLE_UPSTREAM_SCAN_LIMIT,
+    )
+    # The run records are the run-side of the join: one dict lookup per
+    # materialization, no per-run instance call.
+    success_by_run_id = {record.dagster_run.run_id: record for record in success_records}
+    # `fetch_materializations` is newest first, so the first record whose run
+    # SUCCEEDED is the newest load of this table the chain may follow.
+    for materialization in materializations.records:
+        if materialization.run_id in success_by_run_id:
+            return success_by_run_id[materialization.run_id]
+    return None
+
+
 def build_authored_dependency_sensor(
     pipeline: dict[str, Any], authored_job: Any
 ) -> Any | None:
@@ -637,7 +1056,20 @@ def build_authored_dependency_sensor(
     `AutomationTarget.from_coercible`, which only handles
     `JobDefinition`/`UnresolvedAssetJobDefinition` (not selectors).
     Verified against dagster 1.13.20's `run_status_sensor` signature.
+
+    TWO upstreams are per-table, so the freshness walk filters them
+    (`DATA-19` / D1 and `BLD-4` / D1): a pipeline counts only the SUCCESS
+    runs that loaded ITS source table, and a load of any other table never
+    triggers it. `file_ingest_job` writes ONE table per run and reads it from
+    the run's config; `ingest_job` writes EVERY selected object of ONE
+    connector per run and reads it from the materialization that run logged
+    (`_latest_record_for_ingest_table`). Everything else keeps the
+    unfiltered rule above, byte for byte.
     """
+    # BLD-2 D3: A target lag (either kind) replaces the dependency (_after) sensor while it is set.
+    # The dependsOn list stays stored, so clearing the target lag restores the chain sensor (AC8).
+    if pipeline.get("targetLag") is not None:
+        return None
     depends_on = pipeline.get("dependsOn") or []
     if not depends_on:
         return None
@@ -657,6 +1089,28 @@ def build_authored_dependency_sensor(
     monitored = [_upstream_job_selector(dep) for dep in depends_on]
     downstream_safe = _dagster_safe_name(pipeline["id"])
     upstream_ids = list(depends_on)
+    # BLD-4 / D1 + DATA-19 / D1: the Bronze table whose load may trigger
+    # THIS pipeline, and `None` for every other shape. A `file_ingest_job` or
+    # `ingest_job` upstream only ever means "run me again when this table is
+    # loaded", and only a `bronze` source names such a table -- the zone a
+    # load writes (`routes::uploads::run_config`,
+    # `ingest_factory.py`'s `bronze.<target>` materialization). A pipeline
+    # whose source is `silver`/`gold`/... has no Bronze table to match, so
+    # its filtered upstream matches nothing and the chain waits with a
+    # reason rather than firing on every load. The API refuses that
+    # combination on create/update/restore
+    # (`routes::authored_pipelines`'s per-table upstream validator, the
+    # `DATA-19` one `file_ingest_job` introduced); this is the same rule
+    # applied to a stored row that predates it.
+    definition = pipeline.get("definition") or {}
+    source_zone = definition.get("sourceZone")
+    source_table = definition.get("sourceTable")
+    bronze_table = source_table if source_zone == "bronze" else None
+    source_label = (
+        f"{source_zone}.{source_table}"
+        if source_zone and source_table
+        else "a source that names no bronze table"
+    )
 
     @run_status_sensor(
         run_status=DagsterRunStatus.SUCCESS,
@@ -686,11 +1140,21 @@ def build_authored_dependency_sensor(
         # the latest run has not started yet) -- never "no comparison
         # point", which was the buggy "first-success fires the chain"
         # behaviour the old code shipped.
-        downstream_runs = context.instance.get_runs(
+        # Why RECORDS and not runs (`DATA-19` gate finding): in Dagster
+        # 1.13.20 a run's times live on the storage record
+        # (`RunRecord.start_time` / `.end_time`), NOT on the `DagsterRun`
+        # that `instance.get_runs` returns -- `DagsterRun.__new__` takes
+        # no `start_time` at all. Reading it off the run raised
+        # `AttributeError: 'DagsterRun' object has no attribute
+        # 'start_time'` on EVERY tick of a real chain, so the chain never
+        # fired; `ops/g9`'s step 10 is what caught it, from the sensor
+        # tick's own FAILURE. `R3 plan 2a`'s unit tests could not: their
+        # stub defined the attributes the storage no longer puts there.
+        downstream_records = context.instance.get_run_records(
             filters=RunsFilter(job_name=f"authored__{downstream_safe}"),
             limit=1,
         )
-        latest_downstream = downstream_runs[0] if downstream_runs else None
+        latest_downstream = downstream_records[0] if downstream_records else None
         # F1.3 (#57): "downstream has a queued run" is the
         # `latest_downstream is not None and latest_downstream.start_time
         # is None` branch -- the chain's previous launch is still in
@@ -698,7 +1162,7 @@ def build_authored_dependency_sensor(
         # queued run actually starts (and beats its upstream checks).
         if latest_downstream is not None and latest_downstream.start_time is None:
             yield SkipReason(
-                f"downstream has a queued run ({latest_downstream.run_id}); "
+                f"downstream has a queued run ({latest_downstream.dagster_run.run_id}); "
                 "skip until it starts so we do not double-launch"
             )
             return
@@ -734,28 +1198,59 @@ def build_authored_dependency_sensor(
                 if upstream_id.startswith("pl-")
                 else upstream_id
             )
-            upstream_runs = context.instance.get_runs(
-                filters=RunsFilter(
-                    job_name=upstream_job_name,
-                    statuses=[DagsterRunStatus.SUCCESS],
-                ),
-                limit=1,
-            )
-            latest = upstream_runs[0] if upstream_runs else None
+            # DATA-19 / D1 + BLD-4 / D1: two upstreams are per-TABLE, so
+            # their newest run is not enough -- the newest run THAT LOADED
+            # THIS PIPELINE'S TABLE is. `file_ingest_job` is one table per
+            # run and reads it from the run config; `ingest_job` is one
+            # connector per run and reads it from the run's own
+            # materialization. Everything else asks for one run exactly as
+            # before.
+            if upstream_id == INGEST_JOB:
+                latest = _latest_record_for_ingest_table(
+                    context.instance, bronze_table or ""
+                )
+            else:
+                filtered = upstream_id == FILE_INGEST_JOB
+                upstream_records = context.instance.get_run_records(
+                    filters=RunsFilter(
+                        job_name=upstream_job_name,
+                        statuses=[DagsterRunStatus.SUCCESS],
+                    ),
+                    limit=PER_TABLE_UPSTREAM_SCAN_LIMIT if filtered else 1,
+                )
+                latest = (
+                    _latest_record_for_table(upstream_records, bronze_table or "")
+                    if filtered
+                    else (upstream_records[0] if upstream_records else None)
+                )
             if latest is None or latest.end_time is None:
+                if upstream_id in _PER_TABLE_UPSTREAMS:
+                    yield SkipReason(
+                        _per_table_upstream_skip(upstream_id, bronze_table, source_label)
+                    )
+                    return
                 yield SkipReason(
                     f"upstream {upstream_id!r} has never had a SUCCESS run; "
                     f"this upstream run ({upstream_run.run_id}) is not enough"
                 )
                 return
             if latest.end_time <= (downstream_start or 0.0):
+                if upstream_id in _PER_TABLE_UPSTREAMS and bronze_table:
+                    # BLD-4 review R1 SHOULD-FIX 1: name the table in the stale anchor reason
+                    yield SkipReason(
+                        f"upstream {upstream_id!r} has no SUCCESS run that loaded "
+                        f"{bronze_table!r} after the downstream's most-recent "
+                        f"start ({downstream_start}); this upstream run "
+                        f"({upstream_run.run_id}) is stale"
+                    )
+                    return
                 yield SkipReason(
                     f"upstream {upstream_id!r} has no SUCCESS run after the "
                     f"downstream's most-recent start ({downstream_start}); "
                     f"this upstream run ({upstream_run.run_id}) is stale"
                 )
                 return
-            latest_success_ids.append(latest.run_id)
+            latest_success_ids.append(latest.dagster_run.run_id)
         # ALL upstreams have a fresh SUCCESS run -> one RunRequest,
         # keyed on the SORTED tuple of those upstream run ids. The
         # `run_key` is a string the daemon dedups, so two ticks that
@@ -767,9 +1262,240 @@ def build_authored_dependency_sensor(
     return _dependency_sensor
 
 
+def lag_sensor_name(pipeline_id: str) -> str:
+    """BLD-2 review R1 SHOULD-FIX 14: build the sensor name with the same helper as the factory."""
+    safe_id = _dagster_safe_name(pipeline_id)
+    return f"authored__{safe_id}_lag"
+
+
+def build_authored_lag_sensor(
+    pipeline: dict[str, Any],
+    authored_job: Any,
+    allowed_jobs: list[Any] | None = None,
+    cfg: AuthoredPipelineConfig | None = None,
+) -> Any | None:
+    """BLD-2 D6: one sensor per authored pipeline with a time-based target lag
+    (`targetLag.kind == 'lag'`). Downstream lag pipelines (`targetLag.kind == 'downstream'`)
+    do not poll: their refresh is requested when an upstream pipeline's check runs.
+
+    A `paused` pipeline gets no sensor at all (as with the dependency sensor, F1.2 #57):
+    the orchestrator preserves a sensor's RUNNING state across reloads, so a paused
+    pipeline must not continue checking lag in the background.
+
+    `minimum_interval_seconds=30`: checks run at most every 30 seconds to balance
+    freshness responsiveness for short lag targets against the query cost of input tokens
+    and ClickHouse content fingerprints across authored pipelines.
+    """
+    target_lag = pipeline.get("targetLag")
+    if not isinstance(target_lag, dict) or target_lag.get("kind") != "lag":
+        return None
+
+    if pipeline.get("status") == "paused":
+        return None
+
+    pipeline_id = pipeline.get("id", "")
+    sensor_name = lag_sensor_name(pipeline_id)
+
+    # BLD-2 review R1 BLOCKER 2: give the sensor every job it may name
+    jobs_to_attach = list(allowed_jobs) if allowed_jobs else [authored_job]
+    if authored_job not in jobs_to_attach:
+        jobs_to_attach.insert(0, authored_job)
+    allowed_job_names = {j.name for j in jobs_to_attach}
+
+    @sensor(
+        name=sensor_name,
+        jobs=jobs_to_attach,
+        minimum_interval_seconds=30,
+        default_status=DefaultSensorStatus.RUNNING,
+    )
+    def _lag_sensor(context: Any) -> Any:
+        cfg_ = cfg or AuthoredPipelineConfig.from_env()
+        if not cfg_.run_token:
+            # BLD-2 review R2 SHOULD-FIX 12: log once why no checks happen when run token unset
+            cursor = getattr(context, "cursor", None)
+            if cursor != "token_unset_warned":
+                context.log.warning(
+                    f"Target lag check for pipeline {pipeline_id!r}: DISPAR_RUN_TOKEN is unset; no lag checks will run"
+                )
+                if hasattr(context, "update_cursor"):
+                    context.update_cursor("token_unset_warned")
+            return None
+
+        url = f"{cfg_.api_url}/api/pipelines/runnable/{pipeline_id}/lag-check"
+        try:
+            resp = requests.post(
+                url,
+                headers=_headers(cfg_),
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            # D6: transport error is skipped for this tick (next tick asks again); never raises.
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r} transport failure ({exc}); skipping tick"
+            )
+            return None
+
+        if 400 <= resp.status_code < 500:
+            # D6: 4xx is logged and skipped
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r} returned {resp.status_code} ({resp.text}); skipping tick"
+            )
+            return None
+
+        if resp.status_code >= 500:
+            # D6: 5xx is skipped for this tick
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r} returned server error {resp.status_code}; skipping tick"
+            )
+            return None
+
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r} returned non-JSON response ({exc}); skipping tick"
+            )
+            return None
+
+        decision = body.get("decision")
+        if decision == "run":
+            # BLD-2 review R1 BLOCKER 2: use body['jobName'] and validate against allowed jobs
+            run_key = body.get("runKey")
+            target_job_name = body.get("jobName")
+            if not run_key:
+                context.log.warning(
+                    f"Target lag check for pipeline {pipeline_id!r} returned decision 'run' without runKey; skipping tick"
+                )
+                return None
+            if not target_job_name or target_job_name not in allowed_job_names:
+                context.log.warning(
+                    f"Target lag check for pipeline {pipeline_id!r} returned unexpected jobName {target_job_name!r} "
+                    f"(allowed: {sorted(allowed_job_names)}); skipping tick"
+                )
+                return None
+            yield RunRequest(run_key=run_key, job_name=target_job_name)
+
+    return _lag_sensor
+
+
+def _pipeline_target(p: dict[str, Any]) -> str:
+    if p.get("target"):
+        return str(p["target"])
+    defn = p.get("definition") or {}
+    zone = defn.get("targetZone") or p.get("targetZone") or p.get("target_zone") or ""
+    table = defn.get("targetTable") or p.get("targetTable") or p.get("target_table") or ""
+    if zone and table:
+        return f"{zone}.{table}"
+    return ""
+
+
+def _pipeline_sources(p: dict[str, Any]) -> list[str]:
+    """Every table a pipeline reads (BLD-1 part 1 / D11, review R1-B7).
+
+    `definition.inputs` is the shape; a payload that predates it (or a stored
+    row the backfill never reached) falls back to `source`, then to
+    `sourceZone`/`sourceTable` — the same fallback the store's own
+    `input_tables_of` makes. A pipeline with two inputs must be watched at
+    both: the lag sensor below attaches a downstream pipeline that produces
+    the SECOND one too, or that pipeline never runs.
+    """
+    defn = p.get("definition") or {}
+    tables = [
+        f"{i.get('zone')}.{i.get('table')}"
+        for i in (defn.get("inputs") or [])
+        if isinstance(i, dict) and i.get("zone") and i.get("table")
+    ]
+    if tables:
+        return tables
+    if p.get("source"):
+        return [str(p["source"])]
+    zone = defn.get("sourceZone") or p.get("sourceZone") or p.get("source_zone") or ""
+    table = defn.get("sourceTable") or p.get("sourceTable") or p.get("source_table") or ""
+    if zone and table:
+        return [f"{zone}.{table}"]
+    return []
+
+
+def _pipeline_tenant(p: dict[str, Any]) -> str | None:
+    t = p.get("tenantId") or p.get("tenant_id")
+    return str(t) if t is not None else None
+
+
+def _pipeline_depends_on(p: dict[str, Any]) -> list[str]:
+    deps = p.get("dependsOn") or p.get("depends_on") or []
+    return [str(d) for d in deps]
+
+
+def build_authored_lag_sensors(
+    pipeline_jobs: list[tuple[dict[str, Any], Any]],
+    cfg: AuthoredPipelineConfig | None = None,
+) -> list[Any]:
+    """One lag sensor per authored pipeline with a time-based target lag.
+    BLD-2 review R2 SHOULD-FIX 7: attach only jobs of downstream pipelines this pipeline actually reads
+    (direct source/dependsOn or recursive chain in the same tenant).
+
+    BLD-2 review R3 SHOULD-FIX 8: the tenant comes from the runnable payload's
+    `tenantId` (`RunnablePipeline.tenant_id`). BLD-2 review R4 SHOULD-FIX 2
+    sharpens it to the R3 decision: an unassigned pipeline's tenant is None
+    and NULL links nothing, so a reading pipeline with no tenant matches no
+    downstream at all — two unassigned pipelines are not a same-tenant
+    pair, they are two pipelines without a sharing rule.
+
+    Not attached: a downstream pipeline that P reads ONLY through the target
+    table of a pipeline in P's `dependsOn` (an edge the API's chain walk
+    follows, this one does not). If the API ever answers with such a U, the
+    sensor fails closed with an "unexpected jobName" skip rather than running
+    a job outside its allowed list.
+    """
+    sensors: list[Any] = []
+    for pipeline, authored_job in pipeline_jobs:
+        target_lag = pipeline.get("targetLag")
+        if not isinstance(target_lag, dict) or target_lag.get("kind") != "lag":
+            continue
+
+        # Find downstream pipelines read by this pipeline (direct or transitive in same tenant)
+        visited_ids: set[str] = set()
+        queue = [pipeline]
+        while queue:
+            curr = queue.pop(0)
+            curr_tenant = _pipeline_tenant(curr)
+            # BLD-2 review R4 SHOULD-FIX 2: a tenant-less reading pipeline
+            # links nothing — per R3, NULL tenant matches no membership, so
+            # two unassigned pipelines never share a lag sensor.
+            if curr_tenant is None:
+                continue
+            curr_sources = _pipeline_sources(curr)
+            curr_deps = set(_pipeline_depends_on(curr))
+            for other_p, other_j in pipeline_jobs:
+                other_id = other_p.get("id", "")
+                if not other_id or other_id in visited_ids or other_id == pipeline.get("id"):
+                    continue
+                other_lag = other_p.get("targetLag")
+                if not isinstance(other_lag, dict) or other_lag.get("kind") != "downstream":
+                    continue
+                if _pipeline_tenant(other_p) != curr_tenant:
+                    continue
+                other_target = _pipeline_target(other_p)
+                if (other_target and other_target in curr_sources) or (
+                    other_id in curr_deps
+                ):
+                    visited_ids.add(other_id)
+                    queue.append(other_p)
+
+        allowed = [authored_job] + [
+            j for other_p, j in pipeline_jobs
+            if other_p.get("id") in visited_ids and j.name != authored_job.name
+        ]
+        sensor_ = build_authored_lag_sensor(pipeline, authored_job, allowed_jobs=allowed, cfg=cfg)
+        if sensor_ is not None:
+            sensors.append(sensor_)
+    return sensors
+
+
 # Built at Dagster code-load time, same pattern `agent_run_schedules`
 # (`agent_runs.py`) uses -- see `_fetch_authored_pipelines`'s doc comment
 # for every way this degrades to empty lists without raising.
+#
 # Three plain assignments rather than tuple unpacking, so
 # `ops/lint/check_intra_package_imports.py` (which reads module-level
 # names statically) sees all four names `definitions.py` imports.
@@ -778,3 +1504,4 @@ authored_jobs = _authored_jobs_and_schedules_and_deps[0]
 authored_schedules = _authored_jobs_and_schedules_and_deps[1]
 _authored_pipeline_jobs = _authored_jobs_and_schedules_and_deps[2]
 authored_dependency_sensors = build_authored_dependency_sensors(_authored_pipeline_jobs)
+authored_lag_sensors = build_authored_lag_sensors(_authored_pipeline_jobs)

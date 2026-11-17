@@ -3,32 +3,33 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lakehouse_auth::openfga::LakekeeperAdminClient;
 use lakehouse_auth::throttle::ThrottlePolicy;
 use lakehouse_auth::{
-    LocalPasswordAuthenticator, OidcAuthenticator, OidcConfig, Secret, ServiceTokenAuthenticator,
-    SessionAuthenticator,
+    LocalPasswordAuthenticator, Secret, ServiceTokenAuthenticator, SessionAuthenticator,
 };
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::secret::{
     AllowlistedSecretResolver, DynSecretResolver, EnvSecretResolver, FileSecretResolver,
-    SecretError, SecretResolver, SecretValue,
+    SecretError, SecretFailure, SecretResolver, SecretValue,
 };
 use lakehouse_dagster::DgClient;
-use lakehouse_embed::EmbedSecretResolver;
 use lakehouse_iceberg::IcebergClient;
-use lakehouse_llm::LlmClient;
 use lakehouse_store::PgPool;
 use lakehouse_trino::{TrinoClient, TrinoConfig};
-use time::Duration;
 use tokio::sync::RwLock;
 
 use crate::bronze_stats_cache::BronzeStatsCache;
 use crate::catalog_search_cache::SearchSnapshotCache;
 use crate::config::Config;
-use crate::connector_secret_store::ConnectorSecretStore;
+use crate::connector_secret_store::{ConnectorSecretStore, SharedKeyring};
 use crate::gold_lock::MartLocks;
+use crate::secret_crypto::{CryptoError, Keyring, MANAGED_FILE_PREFIX};
+use crate::secret_manager::{ManagerResolver, SecretManagerKind, SecretManagerSettings};
+use crate::upload_convert::ConversionRunner;
+use crate::upload_limits::ReceiveLimiter;
 
 /// The three [`lakehouse_auth::Authenticator`]s this service configures,
 /// bundled together so [`AppState::auth`] can stay a single `Option` field
@@ -51,13 +52,39 @@ pub struct AuthState {
     pub session: Arc<SessionAuthenticator>,
     /// Verifies the opaque `Authorization: Bearer` service token.
     pub service: Arc<ServiceTokenAuthenticator>,
-    /// Verifies a `JWT` `Authorization: Bearer` id token against a
-    /// configured `OIDC` provider's `JWKS` (Task 3.5). `None` when
-    /// `OIDC_ISSUER`/`OIDC_CLIENT_ID` are not both set — see
-    /// [`AppState::new`]. When `None`, `crate::auth`'s bearer dispatch
-    /// simply never tries the `OIDC` path, which is exactly what "OIDC
-    /// unconfigured behaves like today" requires.
-    pub oidc: Option<Arc<OidcAuthenticator>>,
+}
+
+/// What a process has learned about its application database since it
+/// started (`OPS-4`, `GOV-1`).
+///
+/// One struct behind one `Arc`, not one field per fact: a new field in
+/// [`AppState`] grows every future that holds a copy of the state, and
+/// `routes::ai::chat` and its streaming twin already sit at clippy's
+/// 16384-byte limit for a future (`large_futures`, in the unit-test build,
+/// whose [`AppState`] also carries the two test seams), so one more pointer
+/// there is a lint failure in a file the assistant's team owns.
+#[derive(Debug, Default)]
+pub struct DatabaseStatus {
+    /// Whether the start-up step has confirmed the application database is
+    /// usable at this build's schema version (`OPS-4`, `main::
+    /// bring_database_up`). Starts `false`: nothing has proven the schema
+    /// yet, so `GET /health` reports the database as unavailable until
+    /// migrations applied or a later retry succeeded (fail closed,
+    /// AGENTS.md principle 3).
+    ///
+    /// Not a live probe: this is the last answer the start-up step or its
+    /// retry loop gave, so a database lost AFTER boot keeps answering
+    /// `ok` here until the process restarts. A per-request probe would
+    /// have to be a bounded `SELECT 1` on its own short timeout — `GET
+    /// /health` is polled by the ops gates, and a probe that waits on a
+    /// dead database's default 30 s acquire timeout would stall them.
+    /// `docs/OPERATIONS.md` records that limit.
+    pub ready: AtomicBool,
+    /// How many audit rows could not be written since this process started
+    /// (`GOV-1`, feature page Decision 4): the change they record stood, the
+    /// row did not. Counted by [`crate::audit_coverage::record_best_effort`];
+    /// it starts at zero on every start and says nothing about earlier runs.
+    pub audit_write_failures: AtomicU64,
 }
 
 /// State shared across all route handlers.
@@ -76,10 +103,18 @@ pub struct AppState {
     pub clickhouse: Arc<ChClient>,
     /// `Dagster` GraphQL client.
     pub dagster: Arc<DgClient>,
-    /// Resolves and caches the signed-embedding (`JWT`) secret.
-    pub embed_secret: Arc<EmbedSecretResolver>,
     /// `OpenAI`-compatible chat-completions client.
-    pub llm: Arc<LlmClient>,
+    ///
+    /// Swappable (`ADM-9`): the resolver in `crate::runtime_settings`
+    /// rebuilds it when the effective provider settings change, so a save in
+    /// the console takes effect on the next message with no restart. A
+    /// `RwLock` over an `Arc`, so a reader takes the client out and never
+    /// holds the lock across a model call.
+    pub llm: Arc<RwLock<Arc<crate::runtime_settings::AssistantClient>>>,
+    /// Swappable `OIDC` authenticator (`ADM-12` plan D4): a save in the console
+    /// takes effect on the next sign-in with no restart. Cached beside its
+    /// effective settings and cleared on save.
+    pub oidc: Arc<RwLock<Option<crate::runtime_settings::SwappableOidc>>>,
     /// Phase 2 OLTP pool (`lakehouse-store`).
     ///
     /// `Option`, not a bare `Arc<PgPool>`: `lakehouse_store::connect_lazy`
@@ -92,6 +127,12 @@ pub struct AppState {
     /// see `routes::identity::pool`, the first (and so far only) reader of
     /// this field.
     pub pg: Option<Arc<PgPool>>,
+    /// What this process knows about its application database since it
+    /// started: whether the start-up step confirmed the schema
+    /// ([`DatabaseStatus::ready`]) and how many audit rows could not be
+    /// written ([`DatabaseStatus::audit_write_failures`]). Shared across
+    /// clones.
+    pub db_status: Arc<DatabaseStatus>,
     /// Resolves a connector's `secretRef` to an actual credential value —
     /// [`crate::connector_probe`]'s only source of one, per ADR 0002 (see
     /// its "Restricting connector secretRefs" addendum). **Deliberately
@@ -162,6 +203,15 @@ pub struct AppState {
     /// `services` tile or `/api/ops/services` read past the window always
     /// re-probes. `None` until the first read.
     pub health_cache: crate::health::HealthCache,
+    /// 2 s cache for `readiness::ready_body` — the PUBLIC
+    /// `GET /health/ready` route reuses one probe for every caller inside
+    /// the window, so a loop of anonymous requests cannot turn into a
+    /// Postgres query, a `ClickHouse` query and a Lakekeeper call each.
+    /// `None` until the first read. See [`crate::readiness`]'s module doc
+    /// comment for why the window is this short.
+    ///
+    /// (REL-2 S1 review SHOULD-FIX 1.)
+    pub readiness_cache: crate::readiness::ReadyCache,
     /// The allowlist [`crate::pipeline_source::build_allowlist`] walked
     /// ONCE at startup from `PIPELINE_SOURCE_DIR` (default
     /// `/opt/pipeline-src/dispar_orchestrate` — `rust/Dockerfile`'s `COPY
@@ -200,11 +250,78 @@ pub struct AppState {
     /// field carried while nothing read it yet is removed now that a
     /// reader exists.
     pub lakekeeper_admin: Option<Arc<LakekeeperAdminClient>>,
-    /// Login-throttle policy resolved from config — shared (via
-    /// [`Arc`]) across every clone of [`AppState`] so the login
-    /// handler reads it without copying.
-    pub throttle_policy: Arc<ThrottlePolicy>,
+    /// Counts the files being received by `POST /api/uploads` (`SEC-17`),
+    /// per user and in total. Shared across clones; always populated.
+    pub upload_receive: ReceiveLimiter,
+    /// Starts the child process that reads an uploaded workbook or a
+    /// Parquet file (`SEC-22` D3). The API never parses such a file in its
+    /// own process: a file that asks for more memory than the machine has
+    /// would end the API for every tenant, and `catch_unwind` cannot catch
+    /// that. Shared across clones; always populated.
+    pub conversion_runner: ConversionRunner,
+    /// At most [`PDF_AT_ONCE`] PDFs are made at once per process (`BI-1` D5,
+    /// feature decision 5); a third request waits for a slot. Shared across
+    /// clones.
+    pub pdf_slots: Arc<tokio::sync::Semaphore>,
+    /// At most `TILE_CONCURRENCY_MAX` (default 24) dashboard tiles are
+    /// computed at once per process, across every request (`BI-4` part A,
+    /// plan D2); a request also caps itself at 6. Shared across clones.
+    pub tile_slots: Arc<tokio::sync::Semaphore>,
+    /// Remembered dashboard results (`BI-4` part B), at most
+    /// `RESULT_CACHE_MAX_MB` (default 256) per process; 0 remembers nothing.
+    /// Read once, when the state is built. Shared across clones.
+    pub result_cache: Arc<crate::result_cache::ResultCache>,
+    /// The 30-second memo of the query limits (`BI-5` plan D2), so a
+    /// dashboard does not read Postgres per tile. Shared across clones.
+    pub query_limits: crate::query_limits::QueryLimitsMemo,
+    /// The 30-second memo of the saved email settings (`ADM-7` plan D3), so
+    /// an alert or a scheduled report does not read Postgres per send. The
+    /// email `PUT` clears it on this process. Shared across clones.
+    pub email_settings_cache: Arc<crate::runtime_settings::EmailSettingsCache>,
+    /// The 30-second memo of the saved sign-in limits (`ADM-8` plan D3), so
+    /// a sign-in does not read Postgres per try. The sign-in `PUT` clears it
+    /// on this process. Shared across clones.
+    pub sign_in_settings_cache: Arc<
+        crate::runtime_settings::SettingsCache<lakehouse_store::sign_in_settings::SignInSettings>,
+    >,
+    /// The 30-second memo of the saved assistant settings (`ADM-9` plan D3),
+    /// so an assistant message does not read Postgres per round. The
+    /// assistant `PUT` clears it on this process. Shared across clones.
+    pub assistant_settings_cache: Arc<
+        crate::runtime_settings::SettingsCache<
+            lakehouse_store::assistant_settings::AssistantSettings,
+        >,
+    >,
+    /// The 30-second memo of the saved SSO settings (`ADM-12` plan D1/D3),
+    /// so a request does not read Postgres per check. The SSO `PUT` clears it
+    /// on this process. Shared across clones.
+    pub sso_settings_cache: Arc<crate::runtime_settings::SsoSettingsCache>,
+    /// How often each caller may ask for a test email (`ADM-7` plan D10).
+    /// Shared across clones.
+    pub email_test_limiter: Arc<crate::runtime_settings::TestEmailLimiter>,
+    /// Test seam for the alert webhook sender (merge of `SEC-10` into the
+    /// `SRC-17` delivery tests): those tests deliver to a `wiremock`
+    /// listener on loopback, which the real address policy refuses by
+    /// design and no setting can open. Compiled only for this crate's tests,
+    /// so a service build has no way to swap the policy.
+    #[cfg(test)]
+    pub webhook_sender_override: Option<lakehouse_notify::WebhookSender>,
+    /// Test seam for the console-set SSO connection's HTTP client
+    /// (`ADM-12` review round 1, B1): a sign-in test has to reach a mock
+    /// provider at an `https://` address, and nothing in a deployment can
+    /// tell `reqwest` to trust a certificate minted for one test (the
+    /// `rustls` client trusts `webpki` roots only). The test supplies a
+    /// client that trusts its own CA; the `https://` and `resolve_checked`
+    /// address checks still run on every URL, and the pins are the only
+    /// thing this replaces. Compiled only for this crate's tests, so a
+    /// service build has no way to set it.
+    #[cfg(test)]
+    pub sso_http_override: Option<reqwest::Client>,
 }
+
+/// PDFs made at once per API process (`BI-1` D5). Chromium is heavy, and the
+/// Gotenberg container has 1 GiB; a third request waits its turn.
+pub const PDF_AT_ONCE: usize = 2;
 
 /// Build the admin-scoped [`LakekeeperAdminClient`] from the token file at
 /// `token_path`, or `None` when this deployment has no usable admin token.
@@ -390,17 +507,68 @@ struct ConnectorSecretResolver {
     /// Where `file:/run/secrets/...` refs are read from
     /// (`Config::connector_secrets_dir`).
     dir: std::path::PathBuf,
+    /// Opens the managed files (`SRC-12` decision 4); operator `file:`s and
+    /// `env:` values are not sealed and never go through it.
+    keyring: SharedKeyring,
+    /// The installation's secret manager, when `SECRET_MANAGER` names one
+    /// (`SRC-12` part B). A manager scheme with none configured is
+    /// unsupported here; the allowlist already refuses it before this point.
+    manager: Option<ManagerResolver>,
 }
 
 impl ConnectorSecretResolver {
-    fn new(env: EnvSecretResolver, dir: &std::path::Path) -> Self {
+    fn new(
+        env: EnvSecretResolver,
+        dir: &std::path::Path,
+        keyring: SharedKeyring,
+        manager: Option<ManagerResolver>,
+    ) -> Self {
         Self {
+            manager,
             env,
             // A fixed base directory, never caller-supplied — see
             // `FileSecretResolver`'s doc comment for why that matters.
             file: FileSecretResolver::new(dir),
             dir: dir.to_path_buf(),
+            keyring,
         }
+    }
+
+    /// A `managed` credential: read through the same confined file reader,
+    /// then opened with the key. The seal is bound to the file NAME the ref
+    /// gives, not to whatever a symlink resolves to.
+    ///
+    /// Fails closed: no key, a wrong key, a file that is not a seal (a
+    /// plain file the start-up pass has not sealed yet) all resolve to
+    /// nothing, with a fixed log line (decision 12) naming the ref, never a
+    /// key or a byte of the file.
+    fn resolve_managed(
+        &self,
+        secret_ref: &str,
+        file_name: &str,
+    ) -> Result<SecretValue, SecretError> {
+        let failed = |failure: SecretFailure| SecretError::Failed {
+            secret_ref: secret_ref.to_owned(),
+            failure,
+        };
+        let bytes = self.file.read_confined(&self.located(secret_ref))?;
+        let keyring: &Keyring = self.keyring.as_deref().map_err(|err| {
+            tracing::warn!(secret_ref, "{err}");
+            failed(SecretFailure::KeyUnavailable)
+        })?;
+        let opened = keyring.open(file_name, &bytes).map_err(|err| {
+            tracing::warn!(secret_ref, "{err}");
+            // `SRC-12 review 1 SHOULD-FIX 1`: say which of the three it is
+            // instead of "resolved to nothing".
+            failed(match err {
+                CryptoError::WrongKey => SecretFailure::WrongKey,
+                CryptoError::KeyMissing | CryptoError::KeyInvalid => SecretFailure::KeyUnavailable,
+                CryptoError::Unreadable | CryptoError::SealFailed => SecretFailure::UnreadableFile,
+            })
+        })?;
+        let text = String::from_utf8(opened.plaintext)
+            .map_err(|_| failed(SecretFailure::UnreadableFile))?;
+        Ok(SecretValue::new(text.trim().to_owned()))
     }
 
     /// `secret_ref` with its `/run/secrets/` path moved to [`Self::dir`]
@@ -427,7 +595,20 @@ impl SecretResolver for ConnectorSecretResolver {
         if secret_ref.starts_with(lakehouse_core::secret::ENV_SECRET_REF_PREFIX) {
             self.env.resolve(secret_ref).await
         } else if secret_ref.starts_with(lakehouse_core::secret::FILE_SECRET_REF_PREFIX) {
-            self.file.resolve(&self.located(secret_ref)).await
+            match secret_ref.rsplit('/').next() {
+                Some(name) if name.starts_with(MANAGED_FILE_PREFIX) => {
+                    self.resolve_managed(secret_ref, name)
+                }
+                _ => self.file.resolve(&self.located(secret_ref)).await,
+            }
+        } else if SecretManagerKind::of_ref(secret_ref).is_some() {
+            match &self.manager {
+                Some(manager) => manager.resolve(secret_ref).await,
+                None => Err(SecretError::UnsupportedRef {
+                    secret_ref: secret_ref.to_owned(),
+                    resolver: "secret-manager",
+                }),
+            }
         } else {
             Err(SecretError::UnsupportedRef {
                 secret_ref: secret_ref.to_owned(),
@@ -449,83 +630,154 @@ impl SecretResolver for ConnectorSecretResolver {
 fn connector_secret_resolver(
     env: EnvSecretResolver,
     dir: &std::path::Path,
+    keyring: SharedKeyring,
+    settings: &SecretManagerSettings,
 ) -> Arc<dyn DynSecretResolver> {
     Arc::new(AllowlistedSecretResolver::new(
-        ConnectorSecretResolver::new(env, dir),
-        CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
-            .iter()
-            .map(|s| (*s).to_owned()),
+        ConnectorSecretResolver::new(env, dir, keyring, ManagerResolver::from_settings(settings)),
+        connector_allowed_patterns(settings.kind),
         "connector-allowlist",
     ))
 }
 
+/// `SRC-12` decision 4: one keyring for the store (seals) and the resolver
+/// (opens), built once by [`AppState::new`]. A missing or malformed key is
+/// kept as its error, not dropped: `main` refuses to start on it, and any
+/// credential read or write names the setting.
+fn connector_secrets_keyring(config: &Config) -> SharedKeyring {
+    Keyring::from_values(
+        config.connector_secrets_key.as_deref(),
+        config.connector_secrets_key_previous.as_deref(),
+    )
+    .map(Arc::new)
+}
+
+/// `SRC-12 review B1 BLOCKER 1`: with a secret manager set and no allowed
+/// prefix, no reference is accepted (fail closed); say so once at start-up.
+fn warn_if_no_reference_prefixes(settings: &SecretManagerSettings) {
+    if settings.kind.is_some() && settings.allowed_prefixes.is_empty() {
+        tracing::warn!(
+            "SECRET_MANAGER is set but SECRET_MANAGER_ALLOWED_PREFIXES is empty: this \
+             installation allows no secret-manager references until the operator sets it"
+        );
+    }
+}
+
+/// The allowlist for an installation whose secret manager is `manager`
+/// (`SRC-12` part B, decision 1): the fixed credential-suffix patterns
+/// above, plus the one scheme of the configured manager — and none when
+/// `SECRET_MANAGER` is unset, so a `vault:` reference cannot even be named
+/// where Vault is not set up. Which strings under that scheme are real
+/// references is [`crate::secret_manager::refs`]'s grammar, checked when
+/// the reference is read and when it is saved.
+///
+/// `dagster/dispar_orchestrate/secret_manager.py`'s `allowed_patterns` is
+/// the twin; `tests/fixtures/secret_manager_refs.json` is the list both
+/// test suites check.
+#[must_use]
+pub(crate) fn connector_allowed_patterns(manager: Option<SecretManagerKind>) -> Vec<String> {
+    CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
+        .iter()
+        .map(|pattern| (*pattern).to_owned())
+        .chain(manager.map(SecretManagerKind::allowed_pattern))
+        .collect()
+}
+
 /// Translate [`Config`]'s flat `oidc_*` env-derived fields into
 /// [`lakehouse_auth::OidcConfig`], or `None` if `OIDC` is not configured.
+#[cfg(test)]
+pub(crate) fn oidc_config(config: &Config) -> Option<lakehouse_auth::OidcConfig> {
+    let sso = crate::runtime_settings::resolve_sso(config, None, None);
+    sso.is_configured().then(|| sso.to_oidc_config())
+}
+
+/// The Phase 2 Postgres pool, or `None` when there is nothing to connect to.
 ///
-/// `OIDC` is considered configured only when BOTH `OIDC_ISSUER` and
-/// `OIDC_CLIENT_ID` are set — see [`Config::oidc_issuer`]'s doc comment.
-/// This is the one place that decision is made; every other piece of this
-/// module and `crate::auth` just reacts to [`AuthState::oidc`] being
-/// present or absent.
-fn oidc_config(config: &Config) -> Option<OidcConfig> {
-    let issuer = config.oidc_issuer.as_ref()?;
-    let client_id = config.oidc_client_id.as_ref()?;
-    let jwks_url = config
-        .oidc_jwks_url
-        .clone()
-        .unwrap_or_else(|| format!("{}/.well-known/jwks.json", issuer.trim_end_matches('/')));
-    Some(OidcConfig {
-        issuer: issuer.clone(),
-        client_id: client_id.clone(),
-        provider_name: config.oidc_provider_name.clone(),
-        jwks_url,
-        jit_provisioning: config.oidc_jit_provisioning,
-        role_map: config.oidc_role_map.clone(),
-        groups_claim: config.oidc_groups_claim.clone(),
-        clock_skew_seconds: config.oidc_clock_skew_seconds,
-    })
+/// `SEC-37`: [`Config::database_url`] has no default, so unset (empty) means
+/// "no Postgres pool" outright — never a made-up localhost DSN holding a
+/// credential written in the repository. `main` logs its own warning for the
+/// `None` case and every Phase 2 route answers 503. `connect_lazy` performs
+/// no I/O, so this never blocks on Postgres being down; a malformed URL is
+/// logged and degrades the same way.
+fn postgres_pool(config: &Config) -> Option<Arc<PgPool>> {
+    if config.database_url.is_empty() {
+        return None;
+    }
+    match lakehouse_store::connect_lazy(&config.database_url) {
+        Ok(pool) => Some(Arc::new(pool)),
+        Err(err) => {
+            tracing::warn!(%err, "DATABASE_URL is not a valid Postgres connection string; Phase 2 routes will report the database as unavailable");
+            None
+        }
+    }
 }
 
 impl AppState {
+    /// The login-throttle policy in effect (`SEC-5`): the environment's
+    /// numbers, else the console's saved ones, else the code defaults
+    /// (`ADM-8` plan D12).
+    ///
+    /// A method, not a field: the numbers may now come from the console,
+    /// and a save there must reach the next sign-in without a restart. The
+    /// resolver reads the saved row through its 30-second cache, so this
+    /// costs a lock, not a query, on the common path.
+    pub async fn throttle_policy(&self) -> ThrottlePolicy {
+        crate::runtime_settings::sign_in(self)
+            .await
+            .throttle_policy()
+    }
+
+    /// A state with no database at all: for the unit tests that run a
+    /// statement against a mock `ClickHouse` and ask the unrestricted
+    /// tenant gate (`SEC-50` slice 2 T1).
+    ///
+    /// The gate that reaches everything without a database is the
+    /// unrestricted one (`routes::query::StatementGate::unrestricted`), so
+    /// a test that is about the runner and not about the gate needs no
+    /// deployment.
+    #[cfg(test)]
+    #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "an empty environment has no failure mode: every setting of \
+                  `Config` has a default, so `from_map` cannot fail here"
+    )]
+    pub(crate) fn without_a_database() -> Self {
+        AppState::new(
+            Config::from_map(&std::collections::HashMap::new()).expect("a config with no pool"),
+        )
+    }
+
     /// Build application state from a resolved [`Config`].
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one struct literal naming every shared handle, a line per \
+                  field; `tile_slots` (BI-4 part A), `result_cache` (part B), `query_limits` (BI-5) and \
+                  `readiness_cache` (REL-2 S1 review SHOULD-FIX 1) are \
+                  the lines that took it from 100 to 103"
+    )]
     pub fn new(config: Config) -> Self {
-        let clickhouse = ChClient::new(
+        let clickhouse = Arc::new(ChClient::new(
             config.ch_url.clone(),
             config.ch_user.clone(),
             config.ch_password.clone(),
-        );
+        ));
         let dagster = DgClient::with_repository(
             config.dagster_url.clone(),
             config.dagster_repo.clone(),
             config.dagster_location.clone(),
         );
-        let clickhouse = Arc::new(clickhouse);
-        let embed_secret =
-            EmbedSecretResolver::new(config.embed_secret.clone(), clickhouse.clone());
-        let llm = LlmClient::new(
-            config.llm_url.clone(),
-            config.llm_model.clone(),
-            config.llm_key.clone(),
-        );
         // `connect_lazy` performs no I/O, so this never blocks on, or fails
         // because of, Postgres being down — see the field doc comment and
-        // `lakehouse_store::connect_lazy`'s. It can only fail on a
-        // malformed `DATABASE_URL`, which is logged and degrades to `None`
-        // rather than aborting startup.
-        let pg = match lakehouse_store::connect_lazy(&config.database_url) {
-            Ok(pool) => Some(Arc::new(pool)),
-            Err(err) => {
-                tracing::warn!(%err, "DATABASE_URL is not a valid Postgres connection string; Phase 2 routes will report the database as unavailable");
-                None
-            }
-        };
+        // `lakehouse_store::connect_lazy`'s; a malformed URL is logged and
+        // degrades to `None` rather than aborting startup. See
+        // [`postgres_pool`] for the `SEC-37` "unset means no pool" rule.
+        let pg = postgres_pool(&config);
         let auth = pg.as_ref().map(|pool| AuthState {
             local: Arc::new(LocalPasswordAuthenticator::new((**pool).clone())),
             session: Arc::new(SessionAuthenticator::new((**pool).clone())),
             service: Arc::new(ServiceTokenAuthenticator::new((**pool).clone())),
-            oidc: oidc_config(&config)
-                .map(|oidc_config| Arc::new(OidcAuthenticator::new(oidc_config, (**pool).clone()))),
         });
         // `TrinoConfig::new` supplies the documented `max_rows`/`paging_cap`
         // defaults; only `base_url` and `max_rows` are overridden from
@@ -577,23 +829,64 @@ impl AppState {
         )
         .map(Arc::new);
         let secrets_dir = config.connector_secrets_dir.clone();
-        let throttle_policy = ThrottlePolicy {
-            max_failures: config.login_max_failures,
-            window: Duration::seconds(i64::from(config.login_failure_window_secs)),
-            lockout: Duration::seconds(i64::from(config.login_lockout_secs)),
-        };
+        let secret_manager = config.secret_manager.clone();
+        warn_if_no_reference_prefixes(&secret_manager);
+        let secrets_keyring = connector_secrets_keyring(&config);
+        // `ADM-9`: the secret store is built before the assistant client,
+        // because the store's keyring opens the console's saved key.
+        let connector_secret_store = Arc::new(ConnectorSecretStore::new(
+            secrets_dir.clone(),
+            secrets_keyring.clone(),
+        ));
+        // The assistant client is swappable, and the resolver rebuilds it
+        // when the effective provider settings change. The client this
+        // process starts with is built from the environment's values (there
+        // is no saved row at start-up).
+        let llm = crate::runtime_settings::initial_assistant_client(
+            &config,
+            connector_secret_store.keyring().ok(),
+        );
+        // `ADM-12` D4/D10: the SSO runtime is built on the first request
+        // that needs it, by `runtime_settings::sso_runtime`, because the
+        // checks it makes (the issuer's address, the provider's discovery
+        // document) need the resolved config and the pool this constructor
+        // is still assembling.
+        let initial_oidc: Option<crate::runtime_settings::SwappableOidc> = None;
+        let upload_receive = ReceiveLimiter::new(
+            config.upload_max_concurrent_per_user,
+            config.upload_max_concurrent,
+        );
+        // `SEC-22` D3: the child is this binary, started again as
+        // `inspect-upload`. `current_exe` is where it is in a deployment; a
+        // build that cannot say where it is has no child, and every
+        // conversion answers "the file could not be converted" with the
+        // reason in the log.
+        let conversion_runner = ConversionRunner::new(
+            std::env::current_exe().unwrap_or_else(|err| {
+                tracing::warn!(
+                    %err,
+                    "the API cannot say where its own binary is; an uploaded workbook or Parquet file cannot be read"
+                );
+                PathBuf::new()
+            }),
+            config.upload_max_conversions as usize,
+            u64::from(config.upload_convert_memory_mb),
+        );
         Self {
             config: Arc::new(config),
             clickhouse,
             dagster: Arc::new(dagster),
-            embed_secret: Arc::new(embed_secret),
-            llm: Arc::new(llm),
+            llm: Arc::new(RwLock::new(llm)),
+            oidc: Arc::new(RwLock::new(initial_oidc)),
             pg,
+            db_status: Arc::new(DatabaseStatus::default()),
             connector_secret_resolver: connector_secret_resolver(
                 EnvSecretResolver::new(),
                 &secrets_dir,
+                secrets_keyring,
+                &secret_manager,
             ),
-            connector_secret_store: Arc::new(ConnectorSecretStore::new(secrets_dir)),
+            connector_secret_store,
             auth,
             gold_export_locks: MartLocks::default(),
             iceberg: Arc::new(RwLock::new(None)),
@@ -601,11 +894,89 @@ impl AppState {
             catalog_search_cache: Arc::new(SearchSnapshotCache::new()),
             trino: Arc::new(trino),
             health_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            readiness_cache: Arc::new(tokio::sync::Mutex::new(None)),
             pipeline_source_allowlist: Arc::new(pipeline_source_allowlist),
             policy_decision_latencies: PolicyDecisionLatencies::default(),
             lakekeeper_admin,
-            throttle_policy: Arc::new(throttle_policy),
+            upload_receive,
+            conversion_runner,
+            pdf_slots: Arc::new(tokio::sync::Semaphore::new(PDF_AT_ONCE)),
+            tile_slots: Arc::new(crate::tile_pool::slots_from_env()),
+            result_cache: Arc::new(crate::result_cache::ResultCache::new(
+                crate::result_cache::max_mb_from(
+                    std::env::var("RESULT_CACHE_MAX_MB").ok().as_deref(),
+                ),
+            )),
+            query_limits: crate::query_limits::QueryLimitsMemo::default(),
+            email_settings_cache: crate::runtime_settings::email_cache(),
+            sign_in_settings_cache: crate::runtime_settings::sign_in_cache(),
+            assistant_settings_cache: crate::runtime_settings::assistant_cache(),
+            sso_settings_cache: crate::runtime_settings::sso_cache(),
+            email_test_limiter: Arc::new(crate::runtime_settings::TestEmailLimiter::new()),
+            #[cfg(test)]
+            webhook_sender_override: None,
+            #[cfg(test)]
+            sso_http_override: None,
         }
+    }
+
+    /// The webhook sender for alert deliveries that have no request of their
+    /// own to take a policy from: [`crate::webhook_guard::sender`] over this
+    /// state's config (`SEC-10`), or the test override.
+    #[must_use]
+    pub fn webhook_sender(&self) -> lakehouse_notify::WebhookSender {
+        #[cfg(test)]
+        if let Some(sender) = &self.webhook_sender_override {
+            return sender.clone();
+        }
+        crate::webhook_guard::sender(&self.config)
+    }
+
+    /// The HTTP client a console-set SSO connection dials through
+    /// (`ADM-12` review round 1, B1): the test override when one is set, else
+    /// `None`, and the runtime builds its own pinned client. Compiled out
+    /// of every non-test build with the field it reads.
+    #[must_use]
+    pub fn sso_http_client(&self) -> Option<reqwest::Client> {
+        #[cfg(test)]
+        if let Some(client) = &self.sso_http_override {
+            return Some(client.clone());
+        }
+        #[cfg(not(test))]
+        let _ = self;
+        None
+    }
+
+    /// The audit rows that could not be written since this process started
+    /// (`GOV-1`, see [`DatabaseStatus::audit_write_failures`]).
+    #[must_use]
+    pub fn audit_write_failure_count(&self) -> u64 {
+        self.db_status.audit_write_failures.load(Ordering::Relaxed)
+    }
+
+    /// Counts one audit row that could not be written
+    /// ([`crate::audit_coverage::record_best_effort`] is the caller).
+    pub(crate) fn count_audit_write_failure(&self) {
+        self.db_status
+            .audit_write_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether `GET /health` should report the application database as
+    /// usable (`OPS-4`): no pool is never ready, and a pool is ready only
+    /// after [`Self::mark_database_ready`].
+    #[must_use]
+    pub fn database_ready(&self) -> bool {
+        self.pg.is_some() && self.db_status.ready.load(Ordering::Relaxed)
+    }
+
+    /// Records that the start-up step confirmed the application database's
+    /// schema is at this build's version (`OPS-4`). Set once, from `main::
+    /// bring_database_up` or its retry loop; nothing clears it, since the
+    /// only way to lose the database after that is a per-request failure
+    /// this flag deliberately does not track (see [`DatabaseStatus::ready`]).
+    pub fn mark_database_ready(&self) {
+        self.db_status.ready.store(true, Ordering::Relaxed);
     }
 }
 
@@ -618,19 +989,111 @@ mod tests {
 
     use super::*;
 
+    /// A valid 32-byte key for these tests; not a secret.
+    fn test_keyring() -> SharedKeyring {
+        use base64::Engine as _;
+        let key = base64::engine::general_purpose::STANDARD.encode([4_u8; 32]);
+        Keyring::from_values(Some(&key), None).map(Arc::new)
+    }
+
     /// `CONNECTOR_SECRETS_DIR`: a `file:/run/secrets/...` ref is read from
     /// wherever the API keeps the files, while the ref itself (what Dagster
     /// reads, inside its container) keeps naming `/run/secrets`.
     #[tokio::test]
     async fn connector_secrets_are_read_from_the_configured_directory() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("connector_managed_conn_x_password"), "pw\n").unwrap();
-        let resolver = ConnectorSecretResolver::new(EnvSecretResolver::new(), dir.path());
+        // An operator's file (`connector_conn_…`), plain by design (D10).
+        std::fs::write(dir.path().join("connector_conn_x_password"), "pw\n").unwrap();
+        let resolver = ConnectorSecretResolver::new(
+            EnvSecretResolver::new(),
+            dir.path(),
+            test_keyring(),
+            None,
+        );
+        let value = resolver
+            .resolve("file:/run/secrets/connector_conn_x_password")
+            .await
+            .unwrap();
+        assert_eq!(value.expose_secret(), "pw");
+    }
+
+    /// `SRC-12` decision 4: a managed file is read as a seal. The same file
+    /// under the wrong key, with no key, or copied to another name resolves
+    /// to nothing (fail closed), and a plain file under a managed name is
+    /// refused rather than read as text.
+    #[tokio::test]
+    async fn a_managed_credential_is_opened_and_every_other_reading_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "connector_managed_conn_x_password";
+        let sealed = test_keyring().unwrap().seal(name, b"pw").unwrap();
+        std::fs::write(dir.path().join(name), &sealed).unwrap();
+        std::fs::write(
+            dir.path().join("connector_managed_conn_y_password"),
+            &sealed,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("connector_managed_conn_z_password"),
+            "plain",
+        )
+        .unwrap();
+
+        let resolver = ConnectorSecretResolver::new(
+            EnvSecretResolver::new(),
+            dir.path(),
+            test_keyring(),
+            None,
+        );
         let value = resolver
             .resolve("file:/run/secrets/connector_managed_conn_x_password")
             .await
             .unwrap();
         assert_eq!(value.expose_secret(), "pw");
+        // `SRC-12 review 1 SHOULD-FIX 1`: each refusal says why.
+        for (refused, expected) in [
+            (
+                "file:/run/secrets/connector_managed_conn_y_password",
+                SecretFailure::WrongKey,
+            ),
+            (
+                "file:/run/secrets/connector_managed_conn_z_password",
+                SecretFailure::UnreadableFile,
+            ),
+        ] {
+            match resolver.resolve(refused).await {
+                Err(SecretError::Failed { failure, .. }) => {
+                    assert_eq!(failure, expected, "{refused}");
+                }
+                other => panic!("{refused}: {other:?}"),
+            }
+        }
+
+        for (keyring, expected) in [
+            (
+                Err(crate::secret_crypto::CryptoError::KeyMissing),
+                SecretFailure::KeyUnavailable,
+            ),
+            (
+                Keyring::from_values(
+                    Some(&{
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD.encode([8_u8; 32])
+                    }),
+                    None,
+                )
+                .map(Arc::new),
+                SecretFailure::WrongKey,
+            ),
+        ] {
+            let resolver =
+                ConnectorSecretResolver::new(EnvSecretResolver::new(), dir.path(), keyring, None);
+            let err = resolver
+                .resolve("file:/run/secrets/connector_managed_conn_x_password")
+                .await
+                .unwrap_err();
+            // The user-facing text is the fixed one, with no ref in it.
+            assert_eq!(err.to_string(), expected.to_string());
+        }
     }
 
     /// The default directory leaves every ref exactly as written.
@@ -639,6 +1102,8 @@ mod tests {
         let resolver = ConnectorSecretResolver::new(
             EnvSecretResolver::new(),
             std::path::Path::new(CONNECTOR_SECRETS_DIR),
+            test_keyring(),
+            None,
         );
         let secret_ref = "file:/run/secrets/connector_managed_conn_x_password";
         assert_eq!(resolver.located(secret_ref), secret_ref);
@@ -676,22 +1141,22 @@ mod tests {
         assert_eq!(latencies.p95_ms(), Some(1.0));
     }
 
-    /// The boot-behavior guarantee this module exists to provide: building
-    /// `AppState` never blocks on, or fails because of, Postgres being
-    /// unreachable — the default `DATABASE_URL` points at `localhost:5432`,
-    /// which is not running in this test process, and `AppState::new` must
-    /// still return synchronously with a populated `pg` pool.
+    /// The `SEC-37` boot guarantee: an unset `DATABASE_URL` means "no
+    /// Postgres pool", not a made-up localhost DSN built from a credential
+    /// written in the repository. `AppState::new` must return synchronously
+    /// with `pg: None` — the same state the malformed-URL case below
+    /// reaches — and `main` turns that into its "no Postgres pool
+    /// configured" warning.
     ///
-    /// `#[tokio::test]` (not plain `#[test]`), even though `AppState::new`
-    /// itself is synchronous: `sqlx`'s lazy pool sets up an idle-connection
-    /// reaper against the ambient Tokio runtime as part of construction, so
-    /// it needs one present — exactly the situation it runs in for real,
-    /// since `main` only ever calls this from inside `#[tokio::main]`.
+    /// `#[tokio::test]` (not plain `#[test]`), matching the malformed-URL
+    /// test below and the only way `main` ever calls `AppState::new` (from
+    /// inside `#[tokio::main]`).
     #[tokio::test]
-    async fn app_state_boots_with_default_database_url_and_no_live_postgres() {
+    async fn app_state_has_no_pool_when_database_url_is_unset() {
         let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.database_url, "");
         let state = AppState::new(cfg);
-        assert!(state.pg.is_some());
+        assert!(state.pg.is_none());
     }
 
     /// The one failure mode `connect_lazy` actually has: a `DATABASE_URL`
@@ -728,6 +1193,8 @@ mod tests {
         let resolver = super::connector_secret_resolver(
             lakehouse_core::secret::EnvSecretResolver::with_map(HashMap::new()),
             std::path::Path::new(CONNECTOR_SECRETS_DIR),
+            test_keyring(),
+            &SecretManagerSettings::default(),
         );
 
         for admitted in [
@@ -803,6 +1270,92 @@ mod tests {
                 "http://lakekeeper.invalid:8181"
             )
             .is_some()
+        );
+    }
+
+    /// `SRC-12` part B, decision 1: both allowlists admit only the
+    /// configured manager's scheme, and only when `SECRET_MANAGER` is set.
+    /// The list is the one the orchestrator's tests read
+    /// (`tests/fixtures/secret_manager_refs.json`), so the two cannot drift.
+    #[test]
+    fn the_allowlist_admits_only_the_configured_managers_scheme() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/secret_manager_refs.json"))
+                .unwrap();
+        let admits = |manager: Option<SecretManagerKind>, secret_ref: &str| {
+            connector_allowed_patterns(manager)
+                .iter()
+                .any(|pattern| lakehouse_core::secret::pattern_matches(pattern, secret_ref))
+        };
+        for secret_ref in fixture["base_allowed"].as_array().unwrap() {
+            for manager in [None, Some(SecretManagerKind::Vault)] {
+                assert!(admits(manager, secret_ref.as_str().unwrap()));
+            }
+        }
+        for secret_ref in fixture["base_refused"].as_array().unwrap() {
+            for manager in SecretManagerKind::ALL.map(Some) {
+                assert!(!admits(manager, secret_ref.as_str().unwrap()));
+            }
+        }
+        let cases = fixture["allowlist"].as_array().unwrap();
+        assert!(cases.len() >= 14);
+        for case in cases {
+            let manager = case["setting"]
+                .as_str()
+                .map(|name| SecretManagerKind::from_setting(name).unwrap());
+            let secret_ref = case["ref"].as_str().unwrap();
+            assert_eq!(
+                admits(manager, secret_ref),
+                case["allowed"].as_bool().unwrap(),
+                "{manager:?} {secret_ref}"
+            );
+        }
+    }
+
+    /// With no client for the configured manager, or none configured, a
+    /// reference of a manager scheme is unsupported, never an empty value.
+    #[tokio::test]
+    async fn a_manager_reference_without_a_manager_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = ConnectorSecretResolver::new(
+            EnvSecretResolver::new(),
+            dir.path(),
+            test_keyring(),
+            None,
+        );
+        assert!(matches!(
+            resolver.resolve("vault:secret/a#k").await,
+            Err(SecretError::UnsupportedRef { .. })
+        ));
+    }
+
+    /// `SEC-38`: an operator-set `OIDC_JWKS_URL` is passed through exactly
+    /// as given (and then no discovery request is ever made), while an
+    /// unset one now leaves the address to the provider's discovery
+    /// document instead of deriving the old
+    /// `{issuer}/.well-known/jwks.json` path.
+    #[test]
+    fn oidc_config_keeps_an_explicit_jwks_url_and_otherwise_leaves_discovery_to_the_client() {
+        let mut env = HashMap::new();
+        env.insert(
+            "OIDC_ISSUER".to_owned(),
+            "https://issuer.example".to_owned(),
+        );
+        env.insert("OIDC_CLIENT_ID".to_owned(), "client-1".to_owned());
+
+        let discovery = oidc_config(&Config::from_map(&env).expect("a valid test Config"))
+            .expect("OIDC_ISSUER and OIDC_CLIENT_ID are both set");
+        assert_eq!(discovery.jwks_url, None);
+
+        env.insert(
+            "OIDC_JWKS_URL".to_owned(),
+            "https://keys.example/tenant/keys".to_owned(),
+        );
+        let explicit = oidc_config(&Config::from_map(&env).expect("a valid test Config"))
+            .expect("OIDC_ISSUER and OIDC_CLIENT_ID are both set");
+        assert_eq!(
+            explicit.jwks_url.as_deref(),
+            Some("https://keys.example/tenant/keys")
         );
     }
 }

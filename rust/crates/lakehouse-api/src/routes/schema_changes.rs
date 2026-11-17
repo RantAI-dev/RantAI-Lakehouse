@@ -43,7 +43,6 @@ use axum::extract::{Path, State};
 use lakehouse_alerts::AlertKind;
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
-use lakehouse_store::audit as store_audit;
 use lakehouse_store::connectors as store_connectors;
 use lakehouse_store::ingest_spec::{dedup_keys, default_bronze_target};
 use lakehouse_store::schema_change::{
@@ -56,6 +55,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::connectors::{connector_audit_event, parse_body, pool};
@@ -212,7 +212,7 @@ pub struct ApproveResponse {
 
 /// A name that is not blank, short and free of control characters, so it
 /// can sit in an alert text and a log line as it is.
-fn check_name(what: &str, value: &str, max: usize) -> Result<(), ApiError> {
+pub(super) fn check_name(what: &str, value: &str, max: usize) -> Result<(), ApiError> {
     if value.trim().is_empty() {
         return Err(ApiError::BadRequest(format!("{what} must not be blank")));
     }
@@ -302,15 +302,16 @@ fn shape_for_phase(
 }
 
 /// `ingest:read` is also a user's permission; only the orchestrator (or an
-/// unrestricted administrator) reports what a source looks like.
-fn require_orchestrator(principal: &Principal) -> Result<(), ApiError> {
+/// unrestricted administrator) reports what a source looks like, or how a run
+/// went (`routes::connector_runs`, `SRC-11`, which reuses this guard).
+pub(super) fn require_orchestrator(principal: &Principal) -> Result<(), ApiError> {
     if matches!(principal.id, PrincipalId::Service(_))
         || crate::routes::catalog::is_unrestricted(principal)
     {
         return Ok(());
     }
     Err(ApiError::PermissionDenied(
-        "only the orchestrator's service identity reports source schemas".to_owned(),
+        "only the orchestrator's service identity files this report".to_owned(),
     ))
 }
 
@@ -385,6 +386,11 @@ pub async fn observe(
         })
         .await?;
     tx.commit().await?;
+    // `SRC-4` slice 2: a pause the policy just set stops the worker's connector
+    // too (best effort, see `cdc_lifecycle`).
+    if decision.pause_connector {
+        crate::cdc_lifecycle::sync_pause_state(&state, &id).await;
+    }
 
     announce(
         &state,
@@ -692,6 +698,9 @@ pub async fn approve(
             return Err(ApiError::Conflict(KEY_COLUMN_REMOVED.to_owned()).into());
         }
     };
+    if approval.pause_lifted {
+        crate::cdc_lifecycle::sync_pause_state(&state, &id).await;
+    }
     // Counts and the table name only: never a column value, never source data.
     let event = connector_audit_event(
         &principal,
@@ -704,9 +713,7 @@ pub async fn approve(
         }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.schema_change.approve audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(ApiJson(ApproveResponse {
         object: req.object,
         approved: approval.approved,
@@ -825,7 +832,10 @@ mod tests {
         );
         assert_eq!(observed.columns.len(), 2);
         assert_eq!(observed.primary_key, vec!["id".to_owned()]);
-        assert!(lakehouse_store::schema_diff::diff(Some(&previous), &observed).is_empty());
+        assert_eq!(
+            lakehouse_store::schema_diff::diff(Some(&previous), &observed),
+            [] as [lakehouse_store::schema_diff::Change; 0]
+        );
         let before = shape_for_phase(
             Phase::BeforeLoad,
             Some(&previous),
@@ -914,7 +924,10 @@ mod tests {
             format!("{}/graphql", dagster.uri()),
         );
         env.insert("CH_URL".to_owned(), ch.uri());
-        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        // The webhook mock listens on loopback, which the real address
+        // policy refuses (`SEC-10`); the policy has its own tests.
+        state.webhook_sender_override = Some(lakehouse_notify::MappedResolver::new().into_sender());
         let data: Vec<Value> = rules
             .iter()
             .map(|(id, kind, connector)| {

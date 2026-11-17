@@ -5,6 +5,7 @@ import Link from "next/link"
 import { ChevronRight, ExternalLink } from "lucide-react"
 import { cn } from "@/lib/utils"
 import type { LineageGraph } from "@/services/contracts/governance"
+import { tableKeyAssetHref } from "@/lib/table-key-href"
 
 export type LineageNode = LineageGraph["nodes"][number]
 
@@ -18,6 +19,11 @@ export const KIND_LABEL: Record<string, string> = {
   gold: "Gold",
   iceberg: "Iceberg",
   pipeline: "Pipeline",
+  // BI-14 (plan D5): the lineage page also draws the charts, SQL sources and metrics that read a table.
+  chart: "Chart",
+  sql_source: "SQL source",
+  metric: "Metric",
+  upload: "Upload",
 }
 
 /** An id's kind prefix and the rest: `table:silver.orders` is `["table", "silver.orders"]`. */
@@ -61,7 +67,7 @@ export function nodeHref(node: LineageNode): string | null {
     case "dataset":
       return `/data/assets/${ref}`
     case "table":
-      return rest.startsWith("silver.") || rest.startsWith("serving.") ? `/data/assets/${ref}` : null
+      return tableKeyAssetHref(rest)
     default:
       return null
   }

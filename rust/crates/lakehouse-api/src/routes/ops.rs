@@ -23,7 +23,7 @@ use serde_json::{Map, Value, json};
 
 use crate::health;
 use crate::json::ApiJson;
-use crate::routes::support::{js_error, num_or_zero, str_col};
+use crate::routes::support::{num_or_zero, str_col, upstream_message};
 use crate::state::AppState;
 use crate::tenant::{TENANT_ID, TENANT_SITE};
 use lakehouse_dagster::DgError;
@@ -76,7 +76,7 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
             // `{ error: String(e) }` at 503.
             Err(err) => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response(),
         },
@@ -296,7 +296,7 @@ fn started_at_from_ms_column(p: &Map<String, Value>) -> Option<String> {
 }
 
 fn workload_row(index: usize, p: &Map<String, Value>) -> Value {
-    let elapsed_secs = str_col(p, "elapsed").parse::<f64>().unwrap_or(0.0);
+    let elapsed_secs = str_col(p, "elapsed_s").parse::<f64>().unwrap_or(0.0);
     let started_at = started_at_from_ms_column(p);
     json!({
         "id": format!("w-{index}"),
@@ -320,7 +320,12 @@ fn workload_row(index: usize, p: &Map<String, Value>) -> Value {
 async fn workloads(ch: &ChClient) -> Result<Value, OpsError> {
     let procs = ch
         .rows(
-            "SELECT user, toString(elapsed) elapsed, substring(query,1,80) query,
+            // The computed column is named `elapsed_s`, not `elapsed`: an
+            // alias shadows the column it names, so `elapsed * 1000` in the
+            // same statement multiplied the alias's `String` by a `UInt16`
+            // and the engine refused the whole statement (error 43) —
+            // which the route turned into a 503 for every caller.
+            "SELECT user, toString(elapsed) AS elapsed_s, substring(query,1,80) query,
                   toString(toUnixTimestamp64Milli(now64(3)) - toInt64(elapsed * 1000)) started_ms
          FROM system.processes WHERE query NOT LIKE '%system.processes%' LIMIT 50",
             None,
@@ -376,7 +381,13 @@ async fn services(state: &AppState) -> Result<Value, OpsError> {
         .iter()
         .map(|h| platform_service_row(h, deps_for(h.id)))
         .collect();
-    Ok(json!({ "services": services }))
+    // `GOV-1` Decision 4: the audit rows this process could not write, shown
+    // on the Operations page beside the probes. It rides on this answer so the
+    // console makes no second request, and it counts since the start.
+    Ok(json!({
+        "services": services,
+        "auditWriteFailures": state.audit_write_failure_count(),
+    }))
 }
 
 /// `Math.round((Number(p.elapsed) || 0) * 1000)`.
@@ -406,13 +417,70 @@ fn elapsed_ms(elapsed_secs: f64) -> i64 {
 // `KILL QUERY` statement server-side; it is never serialized back to the
 // client.
 
-/// Build `KILL QUERY WHERE query_id = '<escaped>'` for `query_id`.
+/// Which queries a `KILL QUERY` ends. One builder for both callers (rule 4):
+/// the Operations cancel names one query by its exact id, and Stop
+/// (`POST /api/query/cancel`, `BI-5` plan D5) names every query of one run of
+/// the caller.
+pub(crate) enum KillTarget<'a> {
+    /// The query with exactly this id.
+    Exact(&'a str),
+    /// Every query whose id starts `<principal uuid>:<run id>:`. Built only
+    /// by [`KillTarget::own_run`], which takes the principal as a `Uuid` and
+    /// checks the run id is one, so the pattern cannot hold a `LIKE`
+    /// wildcard, a quote or anyone else's prefix.
+    OwnRun(String),
+    /// Every query whose id starts `<principal uuid>:`, that is every run of
+    /// the caller: the assistant's `stop_query` with no run named. Built only
+    /// by [`KillTarget::own_all`], from a `Uuid`.
+    OwnAll(String),
+}
+
+impl KillTarget<'_> {
+    /// The caller's own run: `None` unless `run_id` is a UUID.
+    pub(crate) fn own_run(principal: uuid::Uuid, run_id: &str) -> Option<KillTarget<'static>> {
+        let run = uuid::Uuid::parse_str(run_id.trim()).ok()?;
+        Some(KillTarget::OwnRun(format!("{principal}:{run}:%")))
+    }
+
+    /// All of the caller's own running queries (`stop_query` without a run).
+    pub(crate) fn own_all(principal: uuid::Uuid) -> KillTarget<'static> {
+        KillTarget::OwnAll(format!("{principal}:%"))
+    }
+
+    /// The `WHERE` condition that selects the target's queries.
+    fn condition(&self) -> String {
+        match self {
+            Self::Exact(id) => format!("query_id = {}", SqlLiteral::from(*id)),
+            Self::OwnRun(pattern) | Self::OwnAll(pattern) => {
+                format!("query_id LIKE {}", SqlLiteral::from(pattern.as_str()))
+            }
+        }
+    }
+
+    /// How many running queries the target selects right now.
+    pub(crate) fn count_sql(&self) -> String {
+        format!(
+            "SELECT count() AS n FROM system.processes WHERE {}",
+            self.condition()
+        )
+    }
+}
+
+/// Build the `KILL QUERY` for `target`. An exact id is killed as before; a
+/// person's run or runs are killed `ASYNC`, so the request answers without waiting for
+/// each query to wind down.
+///
 /// Extracted from [`cancel_workload_body`] purely so it can be unit tested
 /// (string construction only) without ever touching `ClickHouse` — see the
 /// module-level safety note in the Task 2.6 brief: no `KILL QUERY` may run
 /// against the live cluster during this work.
-fn kill_query_sql(query_id: &str) -> String {
-    format!("KILL QUERY WHERE query_id = {}", SqlLiteral::from(query_id))
+pub(crate) fn kill_query_sql(target: &KillTarget<'_>) -> String {
+    let asynchronous = !matches!(target, KillTarget::Exact(_));
+    format!(
+        "KILL QUERY WHERE {}{}",
+        target.condition(),
+        if asynchronous { " ASYNC" } else { "" }
+    )
 }
 
 /// `POST /api/ops/workloads/{id}/cancel` — kill the `ClickHouse` query
@@ -434,7 +502,7 @@ pub async fn cancel_workload(State(state): State<AppState>, Path(id): Path<Strin
             .into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -446,7 +514,10 @@ async fn cancel_workload_body(ch: &ChClient, id: &str) -> Result<Option<Value>, 
     };
     let procs = ch
         .rows(
-            "SELECT query_id, user, toString(elapsed) elapsed, substring(query,1,80) query,
+            // The same statement the workloads route runs, plus the
+            // `query_id`; the computed column is named `elapsed_s` for the
+            // same reason (an alias named `elapsed` shadows the column).
+            "SELECT query_id, user, toString(elapsed) AS elapsed_s, substring(query,1,80) query,
                   toString(toUnixTimestamp64Milli(now64(3)) - toInt64(elapsed * 1000)) started_ms
              FROM system.processes WHERE query NOT LIKE '%system.processes%' LIMIT 50",
             None,
@@ -459,8 +530,9 @@ async fn cancel_workload_body(ch: &ChClient, id: &str) -> Result<Option<Value>, 
     if query_id.is_empty() {
         return Ok(None);
     }
-    ch.exec(&kill_query_sql(query_id), None).await?;
-    let elapsed_secs = str_col(row, "elapsed").parse::<f64>().unwrap_or(0.0);
+    ch.exec(&kill_query_sql(&KillTarget::Exact(query_id)), None)
+        .await?;
+    let elapsed_secs = str_col(row, "elapsed_s").parse::<f64>().unwrap_or(0.0);
     Ok(Some(json!({
         "id": id,
         "principal": str_col(row, "user"),
@@ -790,6 +862,31 @@ mod tests {
         }
     }
 
+    /// `GOV-1` Decision 4: the Operations page shows how many audit rows could
+    /// not be written since the process started, as a sibling of `services`.
+    /// A state with no database fails every audit write, so one best-effort
+    /// write moves the counter from 0 to 1 and the response follows it.
+    #[tokio::test]
+    async fn services_reports_the_failed_audit_write_count() {
+        let state = AppState::without_a_database();
+        let body = services(&state).await.unwrap();
+        assert_eq!(body["auditWriteFailures"], 0);
+
+        crate::audit_coverage::record_best_effort(
+            &state,
+            lakehouse_store::audit::NewAuditEvent {
+                action: "saved_query.update".to_owned(),
+                outcome: "executed".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let body = services(&state).await.unwrap();
+        assert_eq!(body["auditWriteFailures"], 1);
+        assert!(body["services"].is_array(), "the rows stay as they were");
+    }
+
     #[test]
     fn observability_nulls_every_unmeasured_metric_and_drops_streaming_lag() {
         let v = observability_json(120, 0.002, None, None, None, None);
@@ -845,7 +942,9 @@ mod tests {
     fn workload_started_at_is_derived_from_elapsed_not_the_request_time() {
         let mut row = Map::new();
         row.insert("user".to_owned(), Value::String("alice".to_owned()));
-        row.insert("elapsed".to_owned(), Value::String("1.5".to_owned()));
+        // The column the statement names is `elapsed_s` (`elapsed` is the
+        // column it is computed from, and an alias cannot shadow it).
+        row.insert("elapsed_s".to_owned(), Value::String("1.5".to_owned()));
         // `started_ms` is what `now64() - elapsed*1000` would produce on
         // the server; the epoch millisecond for 2026-08-27T04:00:10.075Z.
         row.insert(
@@ -857,13 +956,15 @@ mod tests {
         assert_eq!(v["engine"], "hot-store");
         assert!(v["class"].is_null());
         assert!(v["estimatedCost"].is_null());
+        // The elapsed time is read from the column the statement names.
+        assert_eq!(v["elapsedMs"], 1500);
     }
 
     #[test]
     fn workload_started_at_is_null_when_started_ms_does_not_parse() {
         let mut row = Map::new();
         row.insert("user".to_owned(), Value::String("bob".to_owned()));
-        row.insert("elapsed".to_owned(), Value::String("0.2".to_owned()));
+        row.insert("elapsed_s".to_owned(), Value::String("0.2".to_owned()));
         row.insert("started_ms".to_owned(), Value::String(String::new()));
         let v = workload_row(1, &row);
         assert!(
@@ -916,7 +1017,7 @@ mod tests {
     #[test]
     fn kill_query_sql_targets_the_exact_query_id() {
         assert_eq!(
-            kill_query_sql("abcd-1234"),
+            kill_query_sql(&KillTarget::Exact("abcd-1234")),
             "KILL QUERY WHERE query_id = 'abcd-1234'"
         );
     }
@@ -928,9 +1029,40 @@ mod tests {
         // same escaping discipline as `lineage_body`'s `SqlLiteral` usage
         // applies here.
         assert_eq!(
-            kill_query_sql("o'brien"),
+            kill_query_sql(&KillTarget::Exact("o'brien")),
             "KILL QUERY WHERE query_id = 'o''brien'"
         );
+    }
+
+    #[test]
+    fn a_runs_queries_are_killed_by_the_callers_own_prefix_and_async() {
+        let me = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let target =
+            KillTarget::own_run(me, "22222222-2222-4222-8222-222222222222").expect("a uuid");
+        assert_eq!(
+            kill_query_sql(&target),
+            "KILL QUERY WHERE query_id LIKE \
+             '11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222:%' ASYNC"
+        );
+        assert_eq!(
+            target.count_sql(),
+            "SELECT count() AS n FROM system.processes WHERE query_id LIKE \
+             '11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222:%'"
+        );
+    }
+
+    #[test]
+    fn a_run_id_that_is_not_a_uuid_builds_no_statement() {
+        let me = uuid::Uuid::nil();
+        for bad in [
+            "",
+            "%",
+            "x' OR '1'='1",
+            "2222:%",
+            "22222222-2222-4222-8222-22222222222%",
+        ] {
+            assert!(KillTarget::own_run(me, bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

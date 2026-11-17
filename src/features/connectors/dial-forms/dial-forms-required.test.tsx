@@ -1,5 +1,5 @@
 import * as React from "react"
-import { fireEvent, render, screen, within } from "@testing-library/react"
+import { render, screen, within } from "@testing-library/react"
 import { describe, expect, it, mock } from "bun:test"
 
 import type { KafkaDial, MongoDial, RestDial, SheetsDial } from "@/services/contracts/connectors"
@@ -39,12 +39,14 @@ describe("dial form required indicators (UX-1)", () => {
     expect(screen.getByText(/Required/)).toBeDefined()
   })
 
-  it("marks CDC slot and publication but not the optional server id", () => {
+  it("marks CDC slot and publication and leaves the driver-specific server id unmarked", () => {
+    // The current CDC form only renders slot/publication for PostgreSQL;
+    // other drivers have their own optional setting, never a server id.
     render(<CdcDialForm value={null} onChange={mock()} />)
     expect(isMarked("Replication slot name")).toBe(true)
     expect(isMarked("Publication name")).toBe(true)
     expect(screen.getByLabelText("Replication slot name").getAttribute("aria-required")).toBe("true")
-    expect(hasNoMarker("Server id (optional)")).toBe(true)
+    expect(screen.queryByLabelText("Server id (optional)")).toBeNull()
   })
 
   it("makes the Oracle TLS DN conditional on a TLS sslMode", () => {
@@ -54,7 +56,9 @@ describe("dial form required indicators (UX-1)", () => {
     })
     const { rerender } = render(<OracleDialForm {...props(null)} />)
     expect(hasNoMarker(/TLS server certificate DN/)).toBe(true)
-    rerender(<OracleDialForm {...props("require")} />)
+    // `require` is Oracle's native network encryption with no DN check; the
+    // server only demands a DN for a mode that verifies the certificate.
+    rerender(<OracleDialForm {...props("verify-ca")} />)
     expect(isMarked(/TLS server certificate DN/)).toBe(true)
     expect(screen.getByLabelText(/TLS server certificate DN/).getAttribute("aria-required")).toBe("true")
     rerender(<OracleDialForm {...props("disable")} />)
@@ -62,31 +66,41 @@ describe("dial form required indicators (UX-1)", () => {
   })
 
   it("marks only the auth/pagination field selected by their modes", () => {
-    function RestHarness() {
-      const [value, setValue] = React.useState<RestDial | null>(null)
-      return <RestDialForm value={value} onChange={setValue} />
+    // The current form uses the console's SelectField, not a native select;
+    // render each mode explicitly so the conditional markers are asserted
+    // against the values the form itself branches on.
+    const base: RestDial = {
+      baseUrl: "https://api.example.com",
+      auth: { type: "api_key", header: "" },
+      pagination: { type: "none" },
+      endpoints: [{ path: "", recordsPath: null }],
     }
-    render(<RestHarness />)
-    // Defaults: api_key header and no pagination fields.
+    const first = render(<RestDialForm value={base} onChange={mock()} />)
     expect(isMarked("Header name")).toBe(true)
-    expect(screen.queryByLabelText("Token URL")).toBeNull()
-    expect(screen.queryByLabelText("Page query parameter")).toBeNull()
+    expect(first.container.querySelector("#rest-dial-auth-token-url")).toBeNull()
+    expect(first.container.querySelector("#rest-dial-pagination-param")).toBeNull()
     expect(isMarked("Path")).toBe(true)
     expect(hasNoMarker("Records path (optional)")).toBe(true)
+    first.unmount()
 
-    fireEvent.change(screen.getByLabelText("Auth type"), { target: { value: "oauth2_client_credentials" } })
-    expect(screen.queryByLabelText("Header name")).toBeNull()
+    const oauth = render(<RestDialForm value={{ ...base, auth: { type: "oauth2_client_credentials", tokenUrl: "" } }} onChange={mock()} />)
+    expect(oauth.container.querySelector("#rest-dial-auth-header")).toBeNull()
     expect(isMarked("Token URL")).toBe(true)
+    oauth.unmount()
 
-    fireEvent.change(screen.getByLabelText("Auth type"), { target: { value: "bearer" } })
-    expect(screen.queryByLabelText("Token URL")).toBeNull()
-    expect(screen.queryByLabelText("Header name")).toBeNull()
+    const bearer = render(<RestDialForm value={{ ...base, auth: { type: "bearer" } }} onChange={mock()} />)
+    expect(bearer.container.querySelector("#rest-dial-auth-token-url")).toBeNull()
+    expect(bearer.container.querySelector("#rest-dial-auth-header")).toBeNull()
+    bearer.unmount()
 
-    fireEvent.change(screen.getByLabelText("Pagination"), { target: { value: "cursor" } })
+    const cursor = render(<RestDialForm value={{ ...base, pagination: { type: "cursor", cursorField: "" } }} onChange={mock()} />)
     expect(isMarked("Cursor field (JSON path)")).toBe(true)
-    fireEvent.change(screen.getByLabelText("Pagination"), { target: { value: "page" } })
-    expect(screen.queryByLabelText("Cursor field (JSON path)")).toBeNull()
+    cursor.unmount()
+
+    const page = render(<RestDialForm value={{ ...base, pagination: { type: "page", param: "" } }} onChange={mock()} />)
+    expect(page.container.querySelector("#rest-dial-pagination-cursor-field")).toBeNull()
     expect(isMarked("Page query parameter")).toBe(true)
+    page.unmount()
   })
 
   it("marks the files bucket but not the optional/defaulted or Test-only fields", () => {

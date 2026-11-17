@@ -4,15 +4,21 @@ import type { LakehouseSnapshot } from "@/services/contracts/lakehouse"
 
 /**
  * Query Studio's snapshot picker (WS2 §4) and the asset page's snapshot
- * links both write the same thing: the ClickHouse query setting
- * `iceberg_snapshot_id`. `DATA-16` F5/F6: the picker used to write Trino's
- * `FOR VERSION AS OF`, which the API cannot parse and refuses for every
- * user; one function now writes the pin, per engine, so the two callers
- * cannot drift apart.
+ * links both write the same thing: the pin that holds a query at one
+ * version of a table. `DATA-16` F5/F6: the picker used to write Trino's
+ * `FOR VERSION AS OF`, which the API could not parse and refused for
+ * every user; one function now writes the pin, per engine, so the two
+ * callers cannot drift apart.
  *
- * The setting is query-wide: it applies to every Iceberg table the query
- * reads (`DATA-16` F7), which is why the picker no longer names a table in
- * the SQL.
+ * On ClickHouse the pin is the query-wide setting `iceberg_snapshot_id`:
+ * it applies to every Iceberg table the query reads (`DATA-16` F7), which
+ * is why the picker does not name a table in the SQL.
+ *
+ * On Trino a version belongs to ONE table (`DATA-21` D5), so the pin is
+ * written on that table's own reference — `FROM bronze.orders FOR VERSION
+ * AS OF 123`. `tableRef` is the reference the caller picked
+ * (`namespace.table`); a statement that does not read it cannot be pinned,
+ * and `null` says so.
  *
  * `snapshotId` is kept a string end to end and never passed through
  * `Number`/`parseInt`/arithmetic: Iceberg snapshot ids routinely exceed
@@ -21,11 +27,19 @@ import type { LakehouseSnapshot } from "@/services/contracts/lakehouse"
  * digits are never silently rounded. It is also checked to be digits only,
  * because it is interpolated into SQL.
  *
- * Returns `null` for any engine but ClickHouse (Trino time travel is
- * `DATA-21`) and for an id that is not a plain number.
+ * Returns `null` for an engine that has no pin (an engine other than
+ * ClickHouse or Trino), for an id that is not a plain number, and on Trino
+ * for a statement that does not read the table the caller picked.
  */
-export function pinSnapshot(sql: string, engine: string, snapshotId: string): string | null {
-  if (engine !== "clickhouse" || !/^\d+$/.test(snapshotId)) return null
+export function pinSnapshot(
+  sql: string,
+  engine: string,
+  snapshotId: string,
+  tableRef?: string
+): string | null {
+  if (!/^\d+$/.test(snapshotId)) return null
+  if (engine === "trino") return pinSnapshotOnTrino(sql, snapshotId, tableRef)
+  if (engine !== "clickhouse") return null
   const setting = `iceberg_snapshot_id = ${snapshotId}`
 
   const clause = lastTopLevelSettings(sql)
@@ -53,6 +67,52 @@ export function pinSnapshot(sql: string, engine: string, snapshotId: string): st
   }
   const kept = items.filter((it) => it !== "" && !/^iceberg_snapshot_id\s*=/i.test(it))
   return `${head}SETTINGS ${[...kept, setting].join(", ")}`
+}
+
+/**
+ * The Trino pin: `FOR VERSION AS OF <id>` written after the table's own
+ * reference in the statement (`DATA-21` D5). An earlier pin on the same
+ * table is REPLACED, not stacked — the same rule the ClickHouse form
+ * follows, and what the user expects when they pick another version.
+ *
+ * The reference is matched on identifier boundaries, so `bronze.orders`
+ * matches inside a catalog-qualified `iceberg.bronze.orders` and never
+ * matches a longer name that shares its prefix (`bronze.orders_archive`).
+ * Each part may be double-quoted (`"bronze"."orders"`), the way `Trino`
+ * writes a quoted identifier.
+ */
+function pinSnapshotOnTrino(
+  sql: string,
+  snapshotId: string,
+  tableRef: string | undefined
+): string | null {
+  if (!tableRef) return null
+  const parts = tableRef.split(".").map((part) => {
+    const escaped = part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    return `"?${escaped}"?`
+  })
+  const pattern = new RegExp(`(?<!\\w)${parts.join("\\s*\\.\\s*")}(?!\\w)`, "g")
+  // The same statement with its comments and quoted runs blanked: a
+  // reference inside one of them is not a table the query reads.
+  const noise = blank(sql, true)
+
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(sql)) !== null) {
+    // A match that starts inside a blanked run is inside a comment, a
+    // literal or a quoted identifier — the ClickHouse-style
+    // `` `bronze.orders` `` name is one of those. A match that STARTS
+    // with a quote is the `Trino` form itself, so it is kept.
+    if (noise[match.index] !== sql[match.index] && sql[match.index] !== '"') continue
+    const end = match.index + match[0].length
+    const rest = sql.slice(end)
+    const pinned = /^\s*FOR\s+VERSION\s+AS\s+OF\s+\d+/i.exec(rest)
+    if (pinned) {
+      const after = rest.slice(pinned[0].length)
+      return `${sql.slice(0, end)} FOR VERSION AS OF ${snapshotId}${after}`
+    }
+    return `${sql.slice(0, end)} FOR VERSION AS OF ${snapshotId}${rest}`
+  }
+  return null
 }
 
 /**

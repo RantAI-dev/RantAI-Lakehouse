@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { Button } from "@/components/ui/button"
 import { useAuth } from "@/features/auth/auth-provider"
@@ -12,6 +13,31 @@ import { governanceService } from "@/services"
 export type PolicyChange = "enforced" | "stopped" | "deleted"
 
 type Action = "enforce" | "stop" | "delete"
+
+/**
+ * Why a policy cannot be enforced, in one sentence (`SEC-61`). Said on the
+ * disabled Enforce / Stop enforcing buttons and in the drawer: the engine
+ * applies only a structured `conditions` clause, so switching a policy
+ * written as text on changes nothing.
+ */
+export const POLICY_NOT_ENFORCEABLE =
+  "This policy is written as text, so it masks nothing and filters no rows. Add the rule on the table's Access tab, where it is enforced, then delete this one."
+
+/**
+ * The drawer's line for a policy the engine cannot enforce (`SEC-61`),
+ * above its actions: says plainly that it does nothing, and links to the
+ * catalog, where the table's Access tab writes a rule the engine applies.
+ */
+export function PolicyNotEnforceableNotice() {
+  return (
+    <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+      {POLICY_NOT_ENFORCEABLE}{" "}
+      <Link href="/catalog" className="font-medium underline underline-offset-2">
+        Open the catalog
+      </Link>
+    </p>
+  )
+}
 
 /**
  * What the confirmation says before each action. Stopping or deleting an
@@ -58,12 +84,17 @@ export function policyConfirmation(action: Action, policy: { name: string; statu
  * Enforce / stop enforcing / delete for one policy, each behind a
  * confirmation that says what it changes. Renders nothing for someone
  * without `policy:write`.
+ *
+ * Enforce and Stop enforcing are disabled when the engine cannot enforce
+ * the policy (`SEC-61`): switching such a policy on changes nothing, and
+ * the button says why instead of pretending otherwise. Delete stays, since
+ * removing a policy that enforces nothing is the honest next step.
  */
 export function PolicyActions({
   policy,
   onChanged,
 }: {
-  policy: { id: string; name: string; status: string }
+  policy: { id: string; name: string; status: string; enforceable: boolean }
   onChanged: (change: PolicyChange) => void
 }) {
   const { hasPermission } = useAuth()
@@ -92,7 +123,13 @@ export function PolicyActions({
 
   return (
     <>
-      <Button size="sm" variant="outline" onClick={() => setAsking(enforced ? "stop" : "enforce")}>
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={!policy.enforceable}
+        title={policy.enforceable ? undefined : POLICY_NOT_ENFORCEABLE}
+        onClick={() => setAsking(enforced ? "stop" : "enforce")}
+      >
         {enforced ? "Stop enforcing" : "Enforce"}
       </Button>
       <Button

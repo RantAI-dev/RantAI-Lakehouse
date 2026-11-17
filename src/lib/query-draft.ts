@@ -5,12 +5,85 @@
  * private scratchpad, not something to put in a shareable address — and
  * read through a parser that never trusts what it finds there, since a
  * stale or hand-edited entry must not break the page.
+ *
+ * The draft is a set of query tabs now: each keeps its own name, SQL and
+ * engine, and the browser keeps the active one. The single draft that came
+ * before is read as one tab, so the first read after this change finds the
+ * query that was there and nothing else.
+ *
+ * Whose draft it is: one person's, in one tenant (`QS-8`, `LH-QS-1-04` F1).
+ * The key is built by [`queryDraftKey`] from the signed-in person and their
+ * active tenant, so the next person on the same browser reads their own tabs
+ * and never this one's. Signing out clears nothing: the entry stays under its
+ * owner's key for their next sign-in on that browser. Before `QS-8` every
+ * person shared one entry ([`LEGACY_QUERY_DRAFT_KEY`]); its owner is unknown,
+ * so it is dropped rather than migrated ([`dropLegacyDraft`]).
  */
 
-export const QUERY_DRAFT_KEY = "rantai-lakehouse:query-studio-draft"
+import type { QueryEngine, QueryParamDef, QueryParamValue } from "@/services/contracts/queries"
+import { parseDefinitions, parseValues } from "@/lib/query-params"
+
+/**
+ * The key every person on a browser shared before `QS-8`. Nothing reads it:
+ * whose tabs it holds cannot be known, so it is removed on the first load
+ * (`dropLegacyDraft`) instead of being handed to whoever signs in next.
+ */
+export const LEGACY_QUERY_DRAFT_KEY = "rantai-lakehouse:query-studio-draft"
+
+/**
+ * The key one person's draft lives under: the person and their active tenant
+ * (`QS-8`, decision 12). `-` stands in for no active tenant, which is a real
+ * state for a person who belongs to none; a person's key never collides with
+ * another person's or another tenant's.
+ */
+export function queryDraftKey(userId: string, tenantId: string | null | undefined): string {
+  return `${LEGACY_QUERY_DRAFT_KEY}:${userId}:${tenantId || "-"}`
+}
+
+/**
+ * How many query tabs one browser keeps. A browser that could hold more
+ * would lose them to a quota nobody asked for; the limit is the number the
+ * feature page tells a customer about.
+ */
+export const MAX_QUERY_TABS = 20
 
 export type QueryDraft = {
   sql: string
+  question: string
+  tab: "nl" | "sql"
+}
+
+/** One query tab: what it is called, what it holds and what it runs on. */
+export type QueryTab = {
+  id: string
+  name: string
+  sql: string
+  engine: QueryEngine
+  /**
+   * The definitions of the tab's `{{name}}` parameters (`QS-5`). A name that
+   * leaves the SQL keeps its definition until the tab is closed or saved,
+   * so a cut and paste does not lose it.
+   */
+  parameters: QueryParamDef[]
+  /** The value each parameter has right now, by name. Not what a save stores: that is the default. */
+  values: Record<string, QueryParamValue>
+  /**
+   * The saved query this tab came from, when it came from one (`QS-3` C4).
+   * Absent for a tab that holds a query nobody saved.
+   */
+  savedId?: string
+  /**
+   * The level the caller held on that saved query when the tab was opened.
+   * It decides whether "Save" changes that query or makes a copy of it.
+   */
+  level?: string
+}
+
+/** The tabs as they are kept in the browser. */
+export type QueryTabs = {
+  tabs: QueryTab[]
+  activeId: string
+  /** The natural-language question and which of the two editors is open, as today. */
   question: string
   tab: "nl" | "sql"
 }
@@ -36,28 +109,175 @@ export function parseDraft(raw: string | null): QueryDraft | null {
   }
 }
 
+function isEngine(value: unknown): value is QueryEngine {
+  return value === "clickhouse" || value === "trino"
+}
+
+/** A tab as it is stored, or `null` when a field is missing or wrong. */
+function parseTab(value: unknown): QueryTab | null {
+  if (typeof value !== "object" || value === null) return null
+  const tab = value as Partial<QueryTab>
+  if (typeof tab.id !== "string" || !tab.id.trim()) return null
+  if (typeof tab.name !== "string") return null
+  if (typeof tab.sql !== "string") return null
+  if (!isEngine(tab.engine)) return null
+  // A tab stored before parameters existed has neither field and gets none.
+  // A malformed definition or value is dropped on its own: it must not take
+  // the tab, and the SQL in it, along.
+  const parameters = parseDefinitions(tab.parameters)
+  const parsed: QueryTab = {
+    id: tab.id,
+    name: tab.name,
+    sql: tab.sql,
+    engine: tab.engine,
+    parameters,
+    values: parseValues(tab.values, parameters),
+  }
+  // A tab that came from a saved query keeps its id and the caller's level:
+  // they say what "Save" may do with the query. A draft written before this
+  // change has neither and stays usable, and a field that is not one of
+  // ours is left out rather than guessed at.
+  if (typeof tab.savedId === "string" && tab.savedId.trim()) parsed.savedId = tab.savedId
+  if (typeof tab.level === "string") parsed.level = tab.level
+  return parsed
+}
+
 /**
- * Read the draft. Every access is guarded: storage throws in a private
- * window and is simply absent during server rendering.
+ * The tabs in `raw`, or `null` when there is nothing usable to restore.
+ *
+ * Two shapes are read. The current one holds a list of tabs and the id of
+ * the active one; a tab that is missing a field, that repeats an id or
+ * that is past the limit of 20 is dropped rather than repaired, because a
+ * hand-edited entry must not decide what the editor shows. The shape that
+ * came before held one draft and no tabs: it is read as one tab, so the
+ * query that was open is still there after this change.
  */
-export function readDraft(): QueryDraft | null {
+export function parseTabs(raw: string | null): QueryTabs | null {
+  if (!raw) return null
+  let parsed: unknown
   try {
-    return parseDraft(window.localStorage.getItem(QUERY_DRAFT_KEY))
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (typeof parsed !== "object" || parsed === null) return null
+  const stored = parsed as {
+    tabs?: unknown
+    activeId?: unknown
+    question?: unknown
+    tab?: unknown
+    sql?: unknown
+  }
+  const question = typeof stored.question === "string" ? stored.question : ""
+  const editor = stored.tab === "sql" ? "sql" : "nl"
+
+  if (Array.isArray(stored.tabs)) {
+    const kept: QueryTab[] = []
+    const ids = new Set<string>()
+    for (const entry of stored.tabs) {
+      if (kept.length >= MAX_QUERY_TABS) break
+      const tab = parseTab(entry)
+      if (!tab || ids.has(tab.id)) continue
+      ids.add(tab.id)
+      kept.push(tab)
+    }
+    if (kept.length === 0) return null
+    const activeId =
+      typeof stored.activeId === "string" && ids.has(stored.activeId)
+        ? stored.activeId
+        : kept[0].id
+    return { tabs: kept, activeId, question, tab: editor }
+  }
+
+  // The shape that came before: one draft, no tabs. It becomes one tab.
+  const sql = typeof stored.sql === "string" ? stored.sql : ""
+  if (!sql.trim() && !question.trim()) return null
+  return {
+    tabs: [
+      {
+        id: "tab-1",
+        name: "Query 1",
+        sql,
+        engine: "clickhouse",
+        parameters: [],
+        values: {},
+      },
+    ],
+    activeId: "tab-1",
+    question,
+    tab: editor,
+  }
+}
+
+/**
+ * Read the tabs stored under `key`. Every access is guarded, like
+ * `parseTabs`: storage throws in a private window and is simply absent
+ * during server rendering.
+ */
+export function readTabs(key: string): QueryTabs | null {
+  try {
+    return parseTabs(window.localStorage.getItem(key))
   } catch {
     return null
   }
 }
 
-/** Store the draft, or clear it when there is nothing left to keep. */
-export function writeDraft(draft: QueryDraft): void {
+/**
+ * Store the tabs under `key`, the owner's own entry (`QS-8`). A tab keeps no
+ * result: only what the person wrote.
+ */
+export function writeTabs(key: string, tabs: QueryTabs): void {
   try {
-    if (!draft.sql.trim() && !draft.question.trim()) {
-      window.localStorage.removeItem(QUERY_DRAFT_KEY)
-      return
-    }
-    window.localStorage.setItem(QUERY_DRAFT_KEY, JSON.stringify(draft))
+    window.localStorage.setItem(key, JSON.stringify(tabs))
   } catch {
     // A draft that cannot be saved is a lost convenience, not an error
     // worth interrupting anyone over.
   }
+}
+
+/**
+ * Remove the entry every person shared before `QS-8` (`QS-8`, decision 12).
+ *
+ * It is dropped, not migrated: nothing on this browser says whose tabs it
+ * holds, and handing them to whoever signs in next is the bug `QS-8`
+ * answers. Guarded like the reads: a private window has no storage to
+ * remove from.
+ */
+export function dropLegacyDraft(): void {
+  try {
+    window.localStorage.removeItem(LEGACY_QUERY_DRAFT_KEY)
+  } catch {
+    // Nothing to clean in a browser that refuses storage.
+  }
+}
+
+/**
+ * Point a stored tab at the saved query a save produced (`WEB-7` D5).
+ *
+ * The save happens on its own page now, so the editor is unmounted while it
+ * runs and cannot update the tab itself, as it did when the save was a sheet
+ * over it. Without this the tab still names the query it was opened from: a
+ * copy just made would be offered "Save as new" again, and a change would be
+ * offered a change of the query it already changed. The tab is written here
+ * after the server answers; a draft that cannot be written leaves the
+ * editor's button as it was, and nothing else changes.
+ *
+ * `key` is the owner's draft key: the tab belongs to the person who saved.
+ */
+export function rememberSavedTab(
+  key: string,
+  tabId: string,
+  savedId: string,
+  level: string | undefined
+): void {
+  const stored = readTabs(key)
+  if (!stored) return
+  writeTabs(key, {
+    ...stored,
+    tabs: stored.tabs.map((tab) =>
+      tab.id === tabId
+        ? { ...tab, savedId, ...(typeof level === "string" ? { level } : {}) }
+        : tab
+    ),
+  })
 }

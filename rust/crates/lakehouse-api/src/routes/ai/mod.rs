@@ -22,7 +22,7 @@
 pub(in crate::routes) mod audit;
 mod citations;
 mod data_map;
-mod gate;
+pub(in crate::routes) mod gate;
 mod prompt;
 pub(in crate::routes) mod registry;
 pub(crate) mod semantic;
@@ -46,6 +46,7 @@ use serde_json::{Map, Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upstream_error;
 
 // ── POST /api/ai/build-status ───────────────────────────────────────────
 
@@ -89,7 +90,17 @@ pub async fn build_status(
             .into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": err.to_string(), "status": "unknown", "steps": [] })),
+            ApiJson({
+                let mut body = upstream_error::report(
+                    &upstream_error::SERVICE,
+                    upstream_error::Class::Unavailable,
+                    &err,
+                )
+                .to_json();
+                body["status"] = json!("unknown");
+                body["steps"] = json!([]);
+                body
+            }),
         )
             .into_response(),
     }
@@ -99,9 +110,129 @@ pub async fn build_status(
 
 const MAX_ITER: u32 = 8;
 
+/// The key a tool's result carries the browser's copy of an engine failure
+/// under.
+///
+/// Owner rule LH-QS-2-08 (owner 2026-11-12): an engine failure reaches a
+/// person as a fixed sentence and a reference, never as the engine's own
+/// text. The model still reads the engine's trimmed diagnosis (SEC-11, the
+/// query-author exception, product owner 2026-10-10), so a tool hands back
+/// BOTH copies: the diagnosis in `error` (the model's copy) and the fixed
+/// sentence in this key (the browser's copy).
+///
+/// Every caller that hands a tool's result to a model or to a browser takes
+/// this key out first: the model gets the result without it, and the browser
+/// gets the same result with `error` replaced by the key's text. So the key
+/// reaches neither of them, and the name is not part of the wire contract:
+/// no client reads it. The chat loop splits the two copies itself, with
+/// [`take_browser_error`] and [`browser_copy`], for its trace. The other
+/// three callers go through [`split_tool_result`]: `POST /api/ai/tool`'s
+/// answer, an agent run's step, and an agent run's approval outcome.
+pub(in crate::routes) const BROWSER_ERROR_KEY: &str = "_browserError";
+
+/// Puts a tool's browser copy of an engine failure next to its error, in
+/// the one key only the server reads ([`BROWSER_ERROR_KEY`]).
+pub(in crate::routes) fn with_browser_error(mut result: Value, browser: &str) -> Value {
+    if let Value::Object(map) = &mut result {
+        map.insert(
+            BROWSER_ERROR_KEY.to_owned(),
+            Value::String(browser.to_owned()),
+        );
+    }
+    result
+}
+
+/// Takes the browser's copy of a tool's failure out of the tool's result:
+/// the key is removed and the text returned, so the chat loop can show it
+/// to the person while the model's copy stays with the model.
+fn take_browser_error(result: Value) -> (Value, Option<String>) {
+    let mut map = match result {
+        Value::Object(map) => map,
+        other => return (other, None),
+    };
+    let browser = map
+        .remove(BROWSER_ERROR_KEY)
+        .and_then(|value| value.as_str().map(str::to_owned));
+    (Value::Object(map), browser)
+}
+
+/// Splits a tool's result into the two copies a caller hands out: the
+/// model's copy and the browser's copy (LH-QS-2-08, owner 2026-11-12).
+///
+/// The model's copy is the result without [`BROWSER_ERROR_KEY`], so `error`
+/// keeps the engine's trimmed diagnosis. The browser's copy is the same
+/// result with `error` replaced by the fixed sentence and the reference
+/// ([`browser_copy`]). A result with no browser text (a success, or a
+/// failure whose message is already fixed) has one copy: both are the
+/// result as the tool returned it.
+///
+/// A caller that shows a tool's result to a person uses the browser's copy,
+/// and a caller that feeds it to the model uses the model's. No caller keeps
+/// the server-only key in what it hands out. The chat loop does not call
+/// this function: it splits the copies with [`take_browser_error`] and
+/// [`browser_copy`].
+pub(in crate::routes) fn split_tool_result(result: Value) -> (Value, Value) {
+    let (model, browser) = take_browser_error(result);
+    let shown = match browser {
+        Some(text) => browser_copy(&model, &text),
+        None => model.clone(),
+    };
+    (model, shown)
+}
+
+/// The browser's copy of a tool's failure: the tool's result with its
+/// `error` replaced by the fixed sentence and the reference.
+fn browser_copy(result: &Value, browser: &str) -> Value {
+    let mut result = result.clone();
+    if let Value::Object(map) = &mut result {
+        map.insert("error".to_owned(), Value::String(browser.to_owned()));
+    }
+    result
+}
+
 /// What a late `ask_user` gets back (plan 14). The model reads it on its
 /// next round, so it asks the model to answer with the reading it used.
-const LATE_ASK_REFUSAL: &str = "ask_user must come before any query in a turn. Answer now with the reading you used, and say which reading it is.";
+/// The wording forbids the three defects staging QA saw in the model's
+/// reply: an apology or a mention of the refusal, a closing question in
+/// plain text, and a reply in another language.
+const LATE_ASK_REFUSAL: &str = "ask_user is refused: a turn may ask only before \
+it runs a query, and this turn has run one. Do not apologise and do not \
+mention this refusal. Answer now from the results above with the reading \
+you used, and say in one sentence which reading it is. Do not end with a \
+question: if another reading is possible, name it as a statement. Reply in \
+the language of the user's question.";
+
+/// The tools whose success makes a later `ask_user` late (`AI-17`,
+/// 2026-11-10): they are the only registered tools that return data rows,
+/// so their success means the turn has answered from data — the refusal's
+/// own words, "runs a query". A lookup that only finds which metrics or
+/// tables exist (`list_metrics`, `describe_metric`, `list_datasets`) is not
+/// that, and since the prompt sends the model to those lookups first
+/// (`AI-7`), counting them would take the ask away exactly when the model
+/// obeys the prompt.
+const QUERY_TOOLS: [&str; 3] = ["run_sql", "query_metric", "run_saved_query"];
+
+/// Whether an `ask_user` made now is a late ask: the turn has run a query
+/// (a tool from [`QUERY_TOOLS`]) that succeeded, and the step just before
+/// this call is not a failed call to another tool. A refusal or tool error
+/// says the call cannot be built as
+/// asked, so asking the person is the honest next step (for example which
+/// column to bin), even after a query. Only another tool's failure opens the
+/// way: a failed `ask_user` (a rejected ask) is not one; otherwise a rejected ask
+/// would let a second ask through after a query. The late-ask rule itself
+/// (#125, #208) stays for every other case.
+fn ask_is_late(tool_trace: &[Value]) -> bool {
+    let previous_call_failed = tool_trace.last().is_some_and(|step| {
+        step["tool"].as_str() != Some(registry::ASK_USER) && step["ok"].as_bool() == Some(false)
+    });
+    !previous_call_failed
+        && tool_trace.iter().any(|step| {
+            step["tool"]
+                .as_str()
+                .is_some_and(|tool| QUERY_TOOLS.contains(&tool))
+                && step["ok"].as_bool() == Some(true)
+        })
+}
 
 /// What a call gets back when the console's allowlist did not offer the tool
 /// (plan 17). The model reads it on its next round, so it is told to answer
@@ -203,6 +334,13 @@ struct PreparedChat {
     /// to a tool outside `tools` is refused at dispatch (plan 17); a chat
     /// with no allowlist dispatches as before.
     allowlisted: bool,
+    /// The request's latest user message, exactly as [`prompt::closing`] saw
+    /// it (the mode note is appended to the copy in `messages` later, and
+    /// the loop's pushed messages are nudges and repair requests, not the
+    /// question). `AI-17`: the script gate on the final answer reads this,
+    /// so what the loop pushes mid-turn cannot change which questions are
+    /// checked.
+    latest_user: String,
 }
 
 /// Hard cap on the page context a client may add to the system prompt, in
@@ -305,9 +443,98 @@ async fn users_terms(
         })
 }
 
+/// ADM-13 (D6): What level of access the principal has to the assistant.
+///
+/// Decided once per request from the principal:
+/// `Full` if holding `assistant:use`, else `AskOnly` if holding `assistant:ask`.
+/// (The route policy layer already rejected callers holding neither with 403).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantAccess {
+    /// Full access: ask and build mode, write tools available.
+    Full,
+    /// Ask-only access: only `Risk::Read` tools, forced Ask mode.
+    AskOnly,
+}
+
+impl AssistantAccess {
+    /// Decide assistant access from a principal.
+    // ADM-13 review round 1, S2: delegates to from_perms (one match helper).
+    #[must_use]
+    pub fn from_principal(principal: Option<&Principal>) -> Self {
+        Self::from_perms(principal.map(|p| &p.permissions))
+    }
+
+    /// Decide assistant access from a permission set.
+    #[must_use]
+    pub fn from_perms(perms: Option<&lakehouse_auth::PermissionSet>) -> Self {
+        match perms {
+            Some(p) if p.has("assistant:use") => Self::Full,
+            Some(p) if p.has("assistant:ask") => Self::AskOnly,
+            // ADM-13 review round 1, S2: A caller with neither permission
+            // defaults to Full because the route gate already refused
+            // unauthenticated/unauthorized callers (RequiresAnyPermission(["assistant:use", "assistant:ask"]));
+            // headless runs (e.g. agents.rs) pass through here unchanged.
+            _ => Self::Full,
+        }
+    }
+
+    /// True if the caller is restricted to Ask-only mode.
+    #[must_use]
+    pub fn is_ask_only(self) -> bool {
+        self == Self::AskOnly
+    }
+}
+
+/// ADM-13 (D6), ADM-13 review round 1, S2: Checks whether `perms` has read permission
+/// `perm` directly, or — for `query:read` and `catalog:read` — via `assistant:ask`.
+/// Single helper used across gate.rs, registry.rs, and `data_map_access` in ai/mod.rs.
+#[must_use]
+pub fn assistant_reads(perms: Option<&lakehouse_auth::PermissionSet>, perm: &str) -> bool {
+    let Some(p) = perms else {
+        return false;
+    };
+    if p.has(perm) {
+        return true;
+    }
+    (perm == "query:read" || perm == "catalog:read") && p.has("assistant:ask")
+}
+
+/// What the DATA MAP may show a caller (`SEC-24`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapAccess {
+    /// No map: the caller may not read the catalog.
+    None,
+    /// Tables and columns only: no column ranges and no sample values.
+    WithoutSamples,
+    /// The whole map.
+    Full,
+}
+
+/// What the DATA MAP may show `principal`, from its permissions alone. The
+/// map lists the catalog's tables, so it needs `catalog:read`, the
+/// permission of `/api/catalog`. Its column ranges come from
+/// `/api/catalog/{id}/profile` and its sample values from
+/// `/api/catalog/{id}/sample`. Both routes need `query:read`, so the ranges
+/// and samples need it too.
+/// `Principal::has` honours wildcards, so a `*:*` holder gets the full map.
+/// ADM-13 (D6): `assistant:ask` counts as `catalog:read` + `query:read` here.
+fn data_map_access(principal: Option<&Principal>) -> MapAccess {
+    let perms = principal.map(|p| &p.permissions);
+    if assistant_reads(perms, "catalog:read") && assistant_reads(perms, "query:read") {
+        MapAccess::Full
+    } else if assistant_reads(perms, "catalog:read") {
+        MapAccess::WithoutSamples
+    } else {
+        MapAccess::None
+    }
+}
+
 /// The system prompt: the rules for the mode, the rules for asking (when
 /// `AI_ASK_BACK` is on and `asking`, that is, `ask_user` is in the chat's
-/// tool list), the DATA MAP (when the caller may read the shared catalog),
+/// tool list), the DATA MAP (when the caller may read the shared catalog:
+/// the map follows `catalog:read`, the permission of `/api/catalog`, and its
+/// column ranges and sample values follow `query:read`, the permission of
+/// `/api/catalog/{id}/profile` and `/api/catalog/{id}/sample`, `SEC-24`),
 /// the caller's own words (when `AI_ASK_BACK` is on), the page the user is
 /// on, and the reply-language line last.
 ///
@@ -336,7 +563,13 @@ async fn system_prompt(
     // carries sample values, so it follows the catalog route's own rule
     // (`catalog::catalog_tenant_refusal`): a caller that route refuses gets
     // no map, and one it cannot evaluate gets none either (fail closed).
+    //
+    // The permission is checked first (`SEC-24`): `/api/ai/chat` needs only a
+    // signed-in user, so without this a Dashboard Viewer would read the
+    // tables and samples that the catalog routes refuse it.
+    let access = data_map_access(principal);
     let refusal = match principal {
+        Some(_) if access == MapAccess::None => Some("reading the data map needs catalog:read"),
         Some(p) => crate::routes::catalog::catalog_tenant_refusal(state, p, headers)
             .await
             .unwrap_or(Some("the shared-catalog rule could not be evaluated")),
@@ -352,12 +585,50 @@ async fn system_prompt(
             } else {
                 std::collections::HashSet::new()
             };
+            // A caller without `query:read` gets `None` here, which drops
+            // every range and sample (`data_map` lists tables and columns
+            // only) and skips the shared cache, so such a caller costs one
+            // rebuild of the map per turn.
+            let withheld = if access == MapAccess::Full {
+                withheld.as_ref()
+            } else {
+                None
+            };
+            // `GOV-7` D6: the map is built for the caller's table access
+            // BEFORE anything reaches the model. A store that cannot say
+            // which roles may read what hides every table (fail closed) —
+            // the map still renders, with none of its tables in it.
+            let access = match principal {
+                Some(principal) => {
+                    crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names)
+                        .await
+                        .unwrap_or_else(|_| {
+                            crate::table_access::TableAccess::Listed(
+                                std::collections::HashSet::new(),
+                                std::collections::HashSet::new(),
+                            )
+                        })
+                }
+                None => crate::table_access::TableAccess::All,
+            };
+            // `SEC-20`, plan 97: the closing line of the map names registry
+            // datasets, which another tenant's upload is one of. The reach is
+            // the request's own (`X-Tenant`); a reach that cannot be resolved
+            // covers nothing.
+            let reach = match principal {
+                Some(principal) => tools::data::RegistryReach::of(state, principal, headers)
+                    .await
+                    .unwrap_or_else(|_| tools::data::RegistryReach::nothing(state)),
+                None => tools::data::RegistryReach::nothing(state),
+            };
             data_map::data_map(
                 &state.clickhouse,
-                withheld.as_ref(),
+                withheld,
                 &notes,
                 &query_words,
                 state.config.ai_relevant_tables,
+                &access,
+                Some(&reach),
             )
             .await
         }
@@ -410,17 +681,24 @@ fn without_tool_in_explain(tools: Vec<Value>, newest_user: Option<&str>) -> Vec<
         .collect()
 }
 
-/// Validates the body and assembles the system prompt, history and the tool
-/// list for this principal and mode. A bad body is a ready 400 response.
-async fn prepare_chat(
+/// R30: the note for a person who cannot change dashboards goes before the
+/// closing language line, which stays last.
+fn with_permission_note(
     state: &AppState,
-    principal: Option<&Principal>,
-    headers: &axum::http::HeaderMap,
-    parsed: ChatBody,
-) -> Result<PreparedChat, Response> {
-    let perms = principal.map(|p| &p.permissions);
-    let history: Vec<LlmMessage> = parsed
-        .messages
+    sys: String,
+    perms: Option<&lakehouse_auth::PermissionSet>,
+    recent_user: &[&str],
+) -> String {
+    let closing = prompt::closing(
+        recent_user.last().copied().unwrap_or_default(),
+        state.config.ai_default_reply_language,
+    );
+    prompt::with_permission_note(sys, perms, &closing)
+}
+
+/// The user and assistant turns of a request as model messages.
+fn history_of(messages: &[IncomingMessage]) -> Vec<LlmMessage> {
+    messages
         .iter()
         .filter(|m| m.role == "user" || m.role == "assistant")
         .map(|m| LlmMessage {
@@ -434,7 +712,29 @@ async fn prepare_chat(
             tool_call_id: None,
             name: None,
         })
-        .collect();
+        .collect()
+}
+
+/// Validates the body and assembles the system prompt, history and the tool
+/// list for this principal and mode. A bad body is a ready 400 response.
+///
+/// Clippy 1.98 taught `result_large_err` to look at `async fn`s
+/// (rust-clippy#17130), which surfaced this signature: the `Err` is a ready
+/// `Response` the handler returns verbatim. Boxing it would change that
+/// contract and every call site for an allocation only on the error path,
+/// so the signature stays (REL-9, decision D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the handler returns verbatim; boxing it would change this contract and every call site, for no gain on the success path"
+)]
+async fn prepare_chat(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &axum::http::HeaderMap,
+    parsed: ChatBody,
+) -> Result<PreparedChat, Response> {
+    let perms = principal.map(|p| &p.permissions);
+    let history = history_of(&parsed.messages);
     if history.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -442,20 +742,24 @@ async fn prepare_chat(
         )
             .into_response());
     }
-
-    let is_build = parsed.mode.as_deref() == Some("build");
+    let access = AssistantAccess::from_principal(principal);
+    let is_build = !access.is_ask_only() && parsed.mode.as_deref() == Some("build");
     let recent_user: Vec<&str> = parsed
         .messages
         .iter()
         .filter(|m| m.role == "user")
         .map(|m| m.content.as_str())
         .collect();
-    let relevant = prompt::select_tools(&recent_user);
+    let relevant = prompt::select_tools(&recent_user, is_build);
     let allow: Option<std::collections::HashSet<String>> = parsed
         .tools
         .filter(|t| !t.is_empty())
         .map(|t| t.into_iter().collect());
-    let tools: Vec<Value> = registry::tool_schemas_for(perms)
+    // BI-37 D10: a person who holds only a rule on a dashboard is offered the
+    // dashboard tools their level covers, so their best level anywhere is
+    // worked out once for the list.
+    let anywhere = tools::dashboard_anywhere(state, principal).await;
+    let mut tools: Vec<Value> = registry::tool_schemas_for(perms, anywhere)
         .into_iter()
         .filter(|t| {
             let name = t["function"]["name"].as_str().unwrap_or("");
@@ -475,15 +779,38 @@ async fn prepare_chat(
                 return false;
             }
             if let Some(allow) = &allow {
-                // An explicit allowlist from the console's Tools menu is
-                // the user's own choice and wins over the per-turn
-                // selection.
-                return allow.contains(name);
+                // The console's Tools menu is an UPPER BOUND, not a
+                // replacement (`AI-15`): the tools the person allowed are
+                // the ones that may be offered, and the per-turn selection
+                // still decides which of them this turn needs. The
+                // console's list holds nearly every tool, so offering it
+                // whole is larger than a 32k context. A tool outside the
+                // list is never offered, so the person's choice keeps its
+                // meaning.
+                if !allow.contains(name) {
+                    return false;
+                }
+                // `propose_sql` is the SQL-help tool of Query Studio: it is
+                // in no domain and not in `ALWAYS`, so the bound above
+                // would leave it unreachable and the SQL-help flow
+                // (`AI-12`) would break. It stays reachable when the client
+                // names it, as before; the `AI_SQL_HELP` switch above
+                // still decides whether it is offered at all.
+                if name == registry::PROPOSE_SQL {
+                    return true;
+                }
+                return relevant.contains(name);
             }
             relevant.contains(name)
         })
         .collect();
-
+    // The offered list is ordered (`AI-15`): the tools every turn has,
+    // then the chart tools every build turn has, then the rest, each group
+    // in the registry's own order. The sort is stable, so the order inside
+    // a group is the registry's. Two build turns from the same principal
+    // and page therefore share the whole list up to the first extra tool,
+    // and with it the model's cached prompt.
+    tools.sort_by_key(|t| prompt::group_of(t["function"]["name"].as_str().unwrap_or("")));
     // The rules for asking are written only for a chat that can ask: one
     // whose tool list holds `ask_user`. The SQL help rules follow the same
     // rule for `propose_sql`.
@@ -507,7 +834,7 @@ async fn prepare_chat(
         sql_help,
     )
     .await;
-
+    let sys = with_permission_note(state, sys, perms, &recent_user);
     let mut messages = vec![LlmMessage {
         role: LlmMessageRole::System,
         content: Some(sys),
@@ -516,11 +843,25 @@ async fn prepare_chat(
         name: None,
     }];
     messages.extend(history);
+    // The newest user message names the mode for this turn. `recent_user`
+    // above is read from the request, so the language line is unaffected.
+    if let Some(last_user) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == LlmMessageRole::User)
+        && let Some(content) = last_user.content.as_mut()
+    {
+        content.push_str("\n\n");
+        content.push_str(prompt::mode_note(is_build));
+    }
     Ok(PreparedChat {
         messages,
         tools,
         is_build,
         allowlisted: allow.is_some(),
+        // The same message `system_prompt` read for the closing line: the
+        // latest user message of the request, before any loop message.
+        latest_user: recent_user.last().copied().unwrap_or_default().to_owned(),
     })
 }
 
@@ -585,14 +926,9 @@ const RETRY_DELAYS: [std::time::Duration; 2] = [
 fn is_transient(err: &lakehouse_llm::LlmError) -> bool {
     match err {
         lakehouse_llm::LlmError::Transport(_) => true,
-        lakehouse_llm::LlmError::Api(msg) => {
-            let status: u16 = msg
-                .strip_prefix("LLM ")
-                .and_then(|rest| rest.split(':').next())
-                .and_then(|code| code.trim().parse().ok())
-                .unwrap_or(0);
-            status == 408 || status == 429 || (500..=599).contains(&status)
-        }
+        lakehouse_llm::LlmError::Api(_) => err
+            .status()
+            .is_some_and(|status| status == 408 || status == 429 || (500..=599).contains(&status)),
     }
 }
 
@@ -618,9 +954,13 @@ async fn model_round_once(
     tools: &[Value],
     progress: Progress<'_>,
 ) -> Result<LlmMessage, lakehouse_llm::LlmError> {
+    // `ADM-9`: the client comes from the resolver, which rebuilds it when
+    // the effective provider settings change — so a save in the console
+    // takes effect on this message.
+    let assistant = crate::runtime_settings::assistant(state).await;
     if progress.is_none() {
-        return state
-            .llm
+        return assistant
+            .client
             .chat_with_tools(messages, tools, round_options())
             .await;
     }
@@ -628,8 +968,8 @@ async fn model_round_once(
         ("<minimax:tool_call>", "</minimax:tool_call>"),
         ("<invoke ", "</invoke>"),
     ]);
-    state
-        .llm
+    assistant
+        .client
         .chat_with_tools_streamed(messages, tools, round_options(), |piece| match piece {
             StreamPiece::Text(text) => {
                 let visible = tool_xml.push(text);
@@ -640,6 +980,89 @@ async fn model_round_once(
             }
         })
         .await
+}
+
+/// `AI-17` decision 2: the one request for a rewrite that both answer paths
+/// of [`run_chat`] push when an answer to a Latin-script question holds a
+/// CJK character ([`prompt::contains_cjk`]). It names no language: the model
+/// is told to match the question's own.
+const CJK_REWRITE_REQUEST: &str = "Write your answer again in the language of my question, with the same content and no Chinese, Japanese or Korean characters.";
+
+/// What [`cjk_rewrite_round`] decided.
+enum CjkRewrite {
+    /// A usable rewrite: non-empty and free of CJK characters.
+    Clean(String),
+    /// The rewrite was empty or still held a CJK character; the caller keeps
+    /// its first answer.
+    Discarded,
+    /// The streaming client has gone; the caller ends the turn as "stopped".
+    ClientGone,
+}
+
+/// `AI-17` decisions 1-2: one tool-free rewrite round for an answer to a
+/// Latin-script question that holds a CJK character. Sends a `status`
+/// event (a streaming client clears its draft on one, or the rewrite's
+/// deltas would be appended to the CJK text; `AI-17` review fix
+/// (SHOULD-FIX 2), the pattern of the citation repair's `verifying`), pushes
+/// [`CJK_REWRITE_REQUEST`] after the answer it asks about, which the caller
+/// has already pushed as the last message of `messages` (the loop pushes
+/// every round's message; the budget-exhausted path pushes its final one
+/// for this; `AI-17` review fix round 2 (BLOCKER)), asks the model once with
+/// no tools (the
+/// iteration budget's final-answer round is the pattern), and cleans the
+/// reply the way an answer is cleaned on the normal path, since a clean
+/// rewrite becomes that path's answer.
+///
+/// A clean rewrite stays in `messages` with its request, as the model's own
+/// message without any tool call (the round offered no tools, so a call in
+/// the reply has no result to follow it; `AI-17` review fix round 2), so a
+/// later round (the citation repair) sees the answer it is
+/// asked to repair. A discarded one is removed together with its request,
+/// which leaves `messages` as it was and keeps the roles alternating for
+/// that later round (`AI-17` review fix (BLOCKER 1)). A discarded rewrite is
+/// logged with `build_run_id` (the runId of a build tool result this turn,
+/// `none` when there is none), never with the answer text.
+///
+/// # Errors
+/// The model round's own failure, verbatim: the caller's 503 path handles it
+/// like any other round's.
+async fn cjk_rewrite_round(
+    state: &AppState,
+    messages: &mut Vec<LlmMessage>,
+    progress: Progress<'_>,
+    build_run_id: Option<&str>,
+) -> Result<CjkRewrite, lakehouse_llm::LlmError> {
+    if !report(progress, json!({ "type": "status", "phase": "thinking" })) {
+        return Ok(CjkRewrite::ClientGone);
+    }
+    let before = messages.len();
+    messages.push(LlmMessage {
+        role: LlmMessageRole::User,
+        content: Some(CJK_REWRITE_REQUEST.to_owned()),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    });
+    let mut rewrite = model_round(state, messages, &[], progress).await?;
+    let cleaned = strip_repair_preamble(&strip_tool_xml(rewrite.content.as_deref().unwrap_or("")));
+    let discard_reason = if cleaned.trim().is_empty() {
+        Some("came back empty")
+    } else if prompt::contains_cjk(&cleaned) {
+        Some("still held a CJK character")
+    } else {
+        None
+    };
+    if let Some(reason) = discard_reason {
+        messages.truncate(before);
+        tracing::warn!(
+            "the rewrite of an answer to a Latin-script question {reason}; the first answer is kept (build run id: {})",
+            build_run_id.unwrap_or("none")
+        );
+        return Ok(CjkRewrite::Discarded);
+    }
+    rewrite.tool_calls = None;
+    messages.push(rewrite);
+    Ok(CjkRewrite::Clean(cleaned))
 }
 
 /// The agentic loop: ask the model, run the tools it calls (through
@@ -664,12 +1087,18 @@ async fn run_chat(
         tools,
         is_build,
         allowlisted,
+        latest_user,
     } = run;
     let mut tool_trace: Vec<Value> = Vec::new();
     let mut build_run_id: Option<String> = None;
     let mut chart_created = false;
     let mut repaired = false;
     let mut nudged = false;
+    // `AI-17`: set when this turn's one rewrite has been spent, used or
+    // discarded. The normal path can re-enter its answer block (the empty
+    // answer nudge, the citation repair), and the budget-exhausted path
+    // reads the flag too, so a turn never asks for a second rewrite.
+    let mut cjk_rewritten = false;
     // The conversation so far, which the citation check accepts as
     // evidence (`citations::Evidence`): the system prompt, whose DATA MAP
     // row counts, ranges and distinct counts were read from the data
@@ -730,6 +1159,37 @@ async fn run_chat(
                 });
                 continue;
             }
+            // `AI-17` decisions 1-4: an answer to a Latin-script question
+            // must not carry a CJK character, whatever the prompt said. One
+            // tool-free rewrite is asked for here, before the citation
+            // check; a clean rewrite replaces the answer, and a rewrite
+            // that is not clean keeps the first (logged with the build run
+            // id, never the text). `cjk_rewritten` holds the loop to one rewrite per
+            // turn however often the nudge and the citation repair re-enter
+            // this block.
+            let answer = if !cjk_rewritten
+                && prompt::is_latin_script(&latest_user)
+                && prompt::contains_cjk(&answer)
+            {
+                cjk_rewritten = true;
+                match cjk_rewrite_round(state, &mut messages, progress, build_run_id.as_deref())
+                    .await?
+                {
+                    CjkRewrite::Clean(rewrite) => rewrite,
+                    CjkRewrite::Discarded => answer,
+                    CjkRewrite::ClientGone => {
+                        return Ok(chat_response_body(
+                            "",
+                            &tool_trace,
+                            build_run_id.as_deref(),
+                            chart_created,
+                            Some("stopped"),
+                        ));
+                    }
+                }
+            } else {
+                answer
+            };
             let annotated = citations::annotate_answer_in(&answer, &tool_trace, &conversation);
             let (numbers, omitted) = citations::flagged(&annotated);
             if !repaired && (!numbers.is_empty() || omitted) {
@@ -782,16 +1242,20 @@ async fn run_chat(
                     Some("stopped"),
                 ));
             }
-            let args: Map<String, Value> =
-                serde_json::from_str(&call.function.arguments).unwrap_or_default();
+            // `confirmed` is the console Confirm button's signal, sent only
+            // through `POST /api/ai/tool`; a model may not send it (backlog
+            // AI-18, ADR 0012 Decision 3). It is stripped here, before the
+            // gate, so the gate, the audit record and `run_tool` never see it.
+            let args = gate::strip_confirmed(
+                &serde_json::from_str::<Map<String, Value>>(&call.function.arguments)
+                    .unwrap_or_default(),
+            );
             // plan 14: an ask after any tool that ran in this turn is refused
-            // before the gate. The prompt asks the model to ask first; this
-            // is the check that holds when it does not.
-            let late_ask = call.function.name == registry::ASK_USER
-                && tool_trace.iter().any(|step| {
-                    step["tool"].as_str() != Some(registry::ASK_USER)
-                        && step["ok"].as_bool() == Some(true)
-                });
+            // before the gate, unless the step just before it was another
+            // tool's failed call (see `ask_is_late`). The prompt asks the
+            // model to ask first; this is the check that holds when it does
+            // not.
+            let late_ask = call.function.name == registry::ASK_USER && ask_is_late(&tool_trace);
             // D3: `ask` mode filters non-Read tools, and permission
             // filters tools the principal lacks, out of the schema
             // ADVERTISED to the model (above, building `tools`), but that
@@ -806,7 +1270,12 @@ async fn run_chat(
             // have the call silently dropped) so it can tell the user
             // instead of assuming a write (or a read it wasn't allowed)
             // it never got.
-            let gate_result = gate::decide_by_name(is_build, perms, &call.function.name, &args);
+            // RPT-1 review fix (BLOCKER) R2: who an update leaves receiving the
+            // report is looked up here, before the gate, and given to it as a
+            // server-side fact.
+            let (audience, reach) = gate_facts(state, principal, &call.function.name, &args).await;
+            let gate_result =
+                gate::decide_by_name(is_build, perms, &call.function.name, &args, audience, reach);
             // plan 17: with an allowlist, the tools the console named are the
             // only ones a call may reach. The check is against the offered
             // list, not the request's strings, so a tool the switch removed,
@@ -825,50 +1294,46 @@ async fn run_chat(
                     };
                     let (_, resource_id) =
                         audit::resource_for(&call.function.name, &args, &json!({}));
-                    let redacted = audit::redact(&Value::Object(args.clone()));
-                    let actor =
-                        principal.map_or_else(|| "unknown".to_owned(), |p| p.display_name.clone());
-                    let approval_result = gate::create_write_high_approval(
-                        state.pg.as_deref(),
-                        &actor,
-                        spec,
-                        &args,
-                        &redacted,
-                        resource_id.as_deref(),
-                    )
-                    .await;
-                    let (run_id, approval_id) = if approval_result
-                        .get("needs_approval")
-                        .and_then(Value::as_bool)
-                        == Some(true)
-                    {
-                        (
-                            approval_result["run_id"].as_str().map(str::to_owned),
-                            approval_result["approval_id"].as_str().map(str::to_owned),
-                        )
-                    } else {
-                        (None, None)
-                    };
-                    let outcome = if run_id.is_some() {
-                        "needs_approval"
-                    } else {
-                        "failed"
-                    };
-                    (approval_result, outcome, run_id, approval_id)
+                    // BI-26 slice 2 D4: the requester is checked before an
+                    // approval exists, so a call that could never run does not
+                    // ask anyone to approve it.
+                    approval_outcome(state, principal, spec, &args, resource_id.as_deref()).await
                 } else {
                     let outcome = gate::outcome_of(&refusal);
-                    (refusal, outcome, None, None)
+                    if outcome == "needs_confirmation" {
+                        match tools::check_draft(
+                            state,
+                            principal,
+                            &call.function.name,
+                            &args,
+                            refusal,
+                        )
+                        .await
+                        {
+                            Ok(draft) => (draft, outcome, None, None),
+                            Err(error) => (error, "failed", None, None),
+                        }
+                    } else {
+                        (refusal, outcome, None, None)
+                    }
                 }
             } else if not_offered {
                 let error = not_offered_refusal(&call.function.name);
                 (json!({ "error": error }), "failed", None, None)
             } else {
-                let clean_args = gate::strip_confirmed(&args);
-                let result =
-                    tools::run_tool(state, principal, &call.function.name, &clean_args).await;
+                let result = tools::run_tool(state, principal, &call.function.name, &args).await;
                 let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
                 (result, if ok { "executed" } else { "failed" }, None, None)
             };
+            // LH-QS-2-08 (owner 2026-11-12): a tool that failed on an
+            // engine statement hands back two copies — the model's copy
+            // (the engine's trimmed diagnosis, so the model can correct its
+            // SQL) and the browser's copy (a fixed sentence and the same
+            // reference). The browser's copy is taken out HERE, before
+            // either copy is built, so the key reaches neither the model nor
+            // the browser; the trace carries the browser's copy and the
+            // model carries its own.
+            let (result, browser_error) = take_browser_error(result);
             let (resource_kind, resource_id) =
                 audit::resource_for(&call.function.name, &args, &result);
             audit::record(
@@ -886,8 +1351,11 @@ async fn run_chat(
             )
             .await;
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
+            let trace_result = browser_error
+                .as_deref()
+                .map_or_else(|| result.clone(), |text| browser_copy(&result, text));
             tool_trace.push(json!({
-                "tool": call.function.name, "args": args, "ok": ok, "result": result,
+                "tool": call.function.name, "args": args, "ok": ok, "result": trace_result,
             }));
             // plan 14: an accepted ask ends the turn. The question is the
             // reply, so the reader sees it above the option buttons; calls
@@ -968,15 +1436,60 @@ async fn run_chat(
         tool_call_id: None,
         name: None,
     });
-    let final_msg = model_round(state, &messages, &[], progress).await?;
+    let mut final_msg = model_round(state, &messages, &[], progress).await?;
+    // `AI-17` review fix round 2 (BLOCKER): the final answer joins the
+    // conversation, as the loop does for every round, so a rewrite request
+    // follows the answer it asks about and not the "Give your final answer
+    // now" request. Nothing reads `messages` after this except that
+    // rewrite, so pushing without a condition changes nothing else. The
+    // round offered no tools, so a call in the reply is dropped for the same
+    // reason as in `cjk_rewrite_round`.
+    final_msg.tool_calls = None;
+    let final_answer = final_msg.content.clone().unwrap_or_default();
+    messages.push(final_msg);
+    // An empty last answer is never the reply: a model that spent every round
+    // on refused calls came back with nothing, and the person saw nothing. The
+    // fixed text skips the citation check on purpose, since it has no claim to
+    // cite. `chat_response_body` still runs `take_next_step` on it, which
+    // leaves it whole because the text has no `NEXT:` line of its own.
+    if final_answer.trim().is_empty() {
+        return Ok(chat_response_body(
+            &unfinished_reply(&tool_trace),
+            &tool_trace,
+            build_run_id.as_deref(),
+            chart_created,
+            Some("tool-call limit reached"),
+        ));
+    }
     // WS7 item F2: the iteration-budget-exhausted final answer is checked
     // the same way as the normal return path — a model that runs out of
     // tool-calling turns is not exempt from citation checking.
-    let annotated = citations::annotate_answer_in(
-        &final_msg.content.unwrap_or_default(),
-        &tool_trace,
-        &conversation,
-    );
+    // `AI-17`: the same one-rewrite check as the normal return path, before
+    // the citation check. The flag is read here so a turn that already spent
+    // its rewrite inside the loop gets no second one; this path runs once by
+    // construction, so it only ever uses a rewrite the loop left unspent and
+    // does not set the flag itself.
+    let final_answer = if !cjk_rewritten
+        && prompt::is_latin_script(&latest_user)
+        && prompt::contains_cjk(&final_answer)
+    {
+        match cjk_rewrite_round(state, &mut messages, progress, build_run_id.as_deref()).await? {
+            CjkRewrite::Clean(rewrite) => rewrite,
+            CjkRewrite::Discarded => final_answer,
+            CjkRewrite::ClientGone => {
+                return Ok(chat_response_body(
+                    "",
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    Some("stopped"),
+                ));
+            }
+        }
+    } else {
+        final_answer
+    };
+    let annotated = citations::annotate_answer_in(&final_answer, &tool_trace, &conversation);
     Ok(chat_response_body(
         &annotated,
         &tool_trace,
@@ -984,6 +1497,38 @@ async fn run_chat(
         chart_created,
         Some("tool-call limit reached"),
     ))
+}
+
+/// How much of a tool's refusal [`unfinished_reply`] repeats.
+const REFUSAL_MAX_CHARS: usize = 200;
+
+/// The reply of a turn that used every round and ended with an empty answer:
+/// it says the request was not finished, and names the last tool a call of
+/// which was refused, with the refusal cut to [`REFUSAL_MAX_CHARS`]. Fixed
+/// text, never a claim that something was done.
+///
+/// A step counts as refused when its result has an `error` key, the same test
+/// the loop uses to set `ok`. The text is the tool's own refusal (the
+/// server's sentence about the model's arguments), never an upstream error's:
+/// the tools classify those before they return. An `error` that is not a
+/// string reads as "no reason given".
+fn unfinished_reply(tool_trace: &[Value]) -> String {
+    let refused = tool_trace.iter().rev().find_map(|step| {
+        let refusal = step["result"].get("error")?;
+        Some((
+            step["tool"].as_str()?,
+            refusal.as_str().unwrap_or("no reason given"),
+        ))
+    });
+    match refused {
+        Some((refused_tool, refusal)) => {
+            let refusal: String = refusal.chars().take(REFUSAL_MAX_CHARS).collect();
+            format!(
+                "The request was not finished: the assistant ran out of steps before it could answer. The last call a tool refused was `{refused_tool}`: {refusal}"
+            )
+        }
+        None => "The request was not finished: the assistant ran out of steps before it could answer, and no tool refused a call. Check what exists before asking again.".to_owned(),
+    }
 }
 
 /// Drops a narrated preamble before a `Final answer:` line. After a repair
@@ -1052,7 +1597,13 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let (mut writer, reader) = tokio::io::duplex(16 * 1024);
 
-    tokio::spawn(async move {
+    // BI-5 review B2: the chat's tools (`run_sql`, `stop_query`) run in this
+    // spawned task, which does not inherit the request's task-local run. Without
+    // the run below they would use the compiled-in limits, a nil principal and
+    // a query id nobody's Stop can match. The run is taken here, in the
+    // request's task, and handed to the spawned one.
+    let query_run = crate::query_limits::QueryRun::current_or_detached();
+    tokio::spawn(crate::query_limits::scope(query_run, async move {
         let last = match run_chat(&state, principal.as_ref(), run, Some(&tx)).await {
             Ok(body) => json!({ "type": "done", "body": body }),
             Err(err) => json!({
@@ -1062,7 +1613,7 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
             }),
         };
         let _ = tx.send(last);
-    });
+    }));
     // Dropping `rx` when a write fails (client gone) makes the loop's next
     // `report` return false.
     tokio::spawn(async move {
@@ -1080,7 +1631,15 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
     (
         [
             (axum::http::header::CONTENT_TYPE, "application/x-ndjson"),
-            (axum::http::header::CACHE_CONTROL, "no-cache"),
+            // AI-24 D8: a reverse proxy in front of the API buffers a
+            // proxied response by default, which would hold the whole
+            // answer until the model finished. nginx honours this header,
+            // and `no-transform` asks any proxy not to re-encode the body.
+            (axum::http::header::CACHE_CONTROL, "no-cache, no-transform"),
+            (
+                axum::http::HeaderName::from_static("x-accel-buffering"),
+                "no",
+            ),
         ],
         axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
     )
@@ -1116,6 +1675,23 @@ struct ToolCallBody {
 /// moment ago is `args["confirmed"] == true`, which is precisely the
 /// signal a `WriteLow` call needs to actually execute (see [`gate::decide`]).
 ///
+/// The two facts the gate needs about a call, worked out on the server before it
+/// decides (`RPT-1` review fix (BLOCKER) R2 and `BI-37` D10): `audience` says
+/// whether a report update leaves anyone but the requester receiving it, and
+/// `reach` is the caller's own level on the dashboard a listed tool acts on.
+/// Neither is ever read from the arguments the model sent.
+async fn gate_facts(
+    state: &AppState,
+    principal: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> (Option<bool>, Option<lakehouse_bi::access::Level>) {
+    (
+        tools::report_audience(state, principal, name, args).await,
+        tools::dashboard_reach(state, principal, name, args).await,
+    )
+}
+
 /// # Errors
 ///
 /// Returns 400 for an unparseable body or an unregistered `tool` name.
@@ -1142,47 +1718,37 @@ pub async fn tool_call(
         )
             .into_response();
     };
-    let is_build = parsed.mode.as_deref() == Some("build");
+    let caller = principal.as_ref().map(|Extension(p)| p);
+    let access = AssistantAccess::from_principal(caller);
+    let is_build = !access.is_ask_only() && parsed.mode.as_deref() == Some("build");
 
-    let gate_result = gate::decide(is_build, perms, spec, &parsed.args);
+    // The two facts the gate needs beyond the arguments (see `gate_facts`).
+    let (audience, reach) = gate_facts(&state, caller, &parsed.tool, &parsed.args).await;
+    let gate_result = gate::decide_with(is_build, perms, spec, &parsed.args, audience, reach);
     let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
         if gate::is_write_high_pending(&refusal) {
             let (_, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &json!({}));
-            let redacted = audit::redact(&Value::Object(parsed.args.clone()));
-            let actor = principal.as_ref().map_or_else(
-                || "unknown".to_owned(),
-                |Extension(p)| p.display_name.clone(),
-            );
-            let approval_result = gate::create_write_high_approval(
-                state.pg.as_deref(),
-                &actor,
+            // BI-26 slice 2 D4: the requester is checked before an approval
+            // exists, so a call that could never run writes no approval row.
+            approval_outcome(
+                &state,
+                principal.as_ref().map(|Extension(p)| p),
                 spec,
                 &parsed.args,
-                &redacted,
                 resource_id.as_deref(),
             )
-            .await;
-            let (run_id, approval_id) = if approval_result
-                .get("needs_approval")
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
-                (
-                    approval_result["run_id"].as_str().map(str::to_owned),
-                    approval_result["approval_id"].as_str().map(str::to_owned),
-                )
-            } else {
-                (None, None)
-            };
-            let outcome = if run_id.is_some() {
-                "needs_approval"
-            } else {
-                "failed"
-            };
-            (approval_result, outcome, run_id, approval_id)
+            .await
         } else {
             let outcome = gate::outcome_of(&refusal);
-            (refusal, outcome, None, None)
+            if outcome == "needs_confirmation" {
+                match tools::check_draft(&state, caller, &parsed.tool, &parsed.args, refusal).await
+                {
+                    Ok(draft) => (draft, outcome, None, None),
+                    Err(error) => (error, "failed", None, None),
+                }
+            } else {
+                (refusal, outcome, None, None)
+            }
         }
     } else {
         let clean_args = gate::strip_confirmed(&parsed.args);
@@ -1196,6 +1762,12 @@ pub async fn tool_call(
         let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
         (result, if ok { "executed" } else { "failed" }, None, None)
     };
+    // LH-QS-2-08 (owner 2026-11-12): this route answers a browser caller, so
+    // the answer carries the browser's copy of an engine failure (a fixed
+    // sentence and a reference), never the engine's own text. Only a model
+    // reads the diagnosis (the chat loop's or an agent run's), and it does
+    // not come through here.
+    let (result, shown) = split_tool_result(result);
     let (resource_kind, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &result);
     audit::record(
         state.pg.as_deref(),
@@ -1214,9 +1786,83 @@ pub async fn tool_call(
 
     (
         StatusCode::OK,
-        ApiJson(json!({ "tool": parsed.tool, "outcome": outcome, "result": result })),
+        ApiJson(json!({ "tool": parsed.tool, "outcome": outcome, "result": shown })),
     )
         .into_response()
+}
+
+/// The `WriteHigh` arm both dispatch sites run: the requester's own checks
+/// first (`BI-26` slice 2 D4), then the approval. A failed check is the tool
+/// result and no approval row is written.
+async fn approval_outcome(
+    state: &AppState,
+    principal: Option<&Principal>,
+    spec: &registry::ToolSpec,
+    args: &Map<String, Value>,
+    resource_id: Option<&str>,
+) -> (Value, &'static str, Option<String>, Option<String>) {
+    if let Err(error) = tools::check_before_approval(state, principal, spec.name, args).await {
+        return (error, "failed", None, None);
+    }
+    let approval_result = request_approval(state, principal, spec, args, resource_id).await;
+    let (run_id, approval_id) = if approval_result
+        .get("needs_approval")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        (
+            approval_result["run_id"].as_str().map(str::to_owned),
+            approval_result["approval_id"].as_str().map(str::to_owned),
+        )
+    } else {
+        (None, None)
+    };
+    let outcome = if run_id.is_some() {
+        "needs_approval"
+    } else {
+        "failed"
+    };
+    (approval_result, outcome, run_id, approval_id)
+}
+
+/// Create the approval for a `WriteHigh` call that [`gate::decide`] flagged, and
+/// return what the model and the console see. The one copy for the chat loop and
+/// `POST /api/ai/tool`.
+///
+/// `RPT-1`: the report tools check the requester's rights now, before any
+/// approval exists, and carry the requester into the stored arguments
+/// (`ownerId`, see `tools::approval_args`); every other tool's arguments are
+/// stored as they are. A refusal is returned instead of an approval.
+async fn request_approval(
+    state: &AppState,
+    principal: Option<&Principal>,
+    spec: &registry::ToolSpec,
+    args: &Map<String, Value>,
+    resource_id: Option<&str>,
+) -> Value {
+    let actor = principal.map_or_else(|| "unknown".to_owned(), |p| p.display_name.clone());
+    match tools::approval_args(state, principal, spec.name, args).await {
+        Ok(stored) => {
+            let redacted = audit::redact(&Value::Object(stored.clone()));
+            gate::create_write_high_approval(
+                state.pg.as_deref(),
+                &actor,
+                spec,
+                &stored,
+                &redacted,
+                resource_id,
+                // SEC-57: the approval records the HUMAN who asked for it,
+                // so the API can refuse them deciding their own request
+                // (`routes::agents::refuse_own_request`). `None` for a
+                // service identity and for a call with no principal at
+                // all: `approval_item.requested_by_user_id` points at
+                // `app_user`, and no human asked in those cases.
+                principal.and_then(Principal::user_id),
+            )
+            .await
+        }
+        Err(refusal) => refusal,
+    }
 }
 
 /// Builds the `/api/ai/chat` response body, matching the TypeScript's
@@ -1232,6 +1878,7 @@ fn chat_response_body(
     chart_created: bool,
     note: Option<&str>,
 ) -> Value {
+    let (answer, next_step) = take_next_step(answer, tool_trace);
     let mut body = Map::new();
     body.insert("answer".to_owned(), json!(answer));
     body.insert("toolTrace".to_owned(), json!(tool_trace));
@@ -1242,7 +1889,44 @@ fn chat_response_body(
     if let Some(note) = note {
         body.insert("note".to_owned(), json!(note));
     }
+    if let Some(step) = next_step {
+        body.insert("nextStep".to_owned(), json!(step));
+    }
     Value::Object(body)
+}
+
+/// The `NEXT:` line the model ends a turn with when the request still has
+/// steps left (`AI-15`). The console sends the step back as a message
+/// ("Confirmed and saved: ...; Continue: ...") once the person has confirmed
+/// the draft, so a request that needs two dependent writes finishes in one
+/// conversation instead of stopping at the first draft.
+///
+/// Only the last non-empty line counts, and only when the turn really has a
+/// pending confirmation: a `NEXT:` line in the middle of an answer is the
+/// model's own text and stays where it is.
+fn take_next_step(answer: &str, tool_trace: &[Value]) -> (String, Option<String>) {
+    let pending = tool_trace
+        .iter()
+        .any(|step| step["result"]["needs_confirmation"].as_bool() == Some(true));
+    if !pending {
+        return (answer.to_owned(), None);
+    }
+    let Some(last) = answer.lines().rfind(|l| !l.trim().is_empty()) else {
+        return (answer.to_owned(), None);
+    };
+    let Some(step) = last.trim().strip_prefix("NEXT:") else {
+        return (answer.to_owned(), None);
+    };
+    let step = step.trim();
+    if step.is_empty() {
+        return (answer.to_owned(), None);
+    }
+    // The answer keeps everything before the line, without the blank line
+    // the line left behind.
+    let Some(at) = answer.rfind(last) else {
+        return (answer.to_owned(), None);
+    };
+    (answer[..at].trim_end().to_owned(), Some(step.to_owned()))
 }
 
 fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {
@@ -1261,26 +1945,34 @@ fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {
 /// which `lakehouse-llm` formatted itself (`LLM <status>: …`), and the full
 /// error is logged.
 fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
-    tracing::warn!(%err, "LLM call failed");
     match err {
         lakehouse_llm::LlmError::Transport(_) => {
             "The AI service could not be reached. Try again later.".to_owned()
         }
-        lakehouse_llm::LlmError::Api(msg) => msg
-            .strip_prefix("LLM ")
-            .and_then(|rest| rest.split(':').next())
-            .and_then(|code| code.trim().parse::<u16>().ok())
-            .map_or_else(
-                || "The AI service returned an error. Try again later.".to_owned(),
-                |code| format!("The AI service returned an error (HTTP {code}). Try again later."),
-            ),
+        lakehouse_llm::LlmError::Api(_) => err.status().map_or_else(
+            || "The AI service returned an error. Try again later.".to_owned(),
+            |code| format!("The AI service returned an error (HTTP {code}). Try again later."),
+        ),
     }
 }
 
 /// The fixed 503 body for a Copilot LLM failure.
 fn llm_unavailable_body(err: &lakehouse_llm::LlmError) -> Value {
+    // SEC-11: the provider's text is logged under a reference the user can
+    // quote (`errorId`), not shown.
+    let class = match err {
+        lakehouse_llm::LlmError::Transport(_) => upstream_error::Class::Unavailable,
+        lakehouse_llm::LlmError::Api(_) => upstream_error::Class::Failed,
+    };
+    let failure = upstream_error::report(&upstream_error::MODEL, class, err);
     json!({
-        "error": "AI Copilot is unavailable",
+        // AI-23 (product owner 2026-11-02): one sentence for an unavailable
+        // assistant. The console renders this field verbatim when the body
+        // carries no `detail` (it prefers `detail`), so it is a complete
+        // sentence with its full stop — the same one a headless run's step
+        // shows.
+        "error": "AI Copilot is unavailable.",
+        "errorId": failure.reference(),
         "detail": llm_error_detail(err),
         "hint": "Check LLM_URL, LLM_MODEL and LLM_KEY on the API service.",
     })
@@ -1459,10 +2151,19 @@ fn owner_key(principal: &Principal) -> String {
     principal.id.uuid().to_string()
 }
 
+/// A `500` for a failed chat-session read or write. The session store is
+/// `ClickHouse`; its text goes to the log under the reference (SEC-11).
 fn internal(err: &impl std::fmt::Display) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        ApiJson(json!({ "error": err.to_string() })),
+        ApiJson(
+            upstream_error::report(
+                &upstream_error::DATABASE,
+                upstream_error::Class::Failed,
+                err,
+            )
+            .to_json(),
+        ),
     )
         .into_response()
 }
@@ -1656,6 +2357,66 @@ async fn session_detail(
     })))
 }
 
+/// The largest conversation body `sessions_save` stores. `ClickHouse` has no
+/// row-size limit of its own; this keeps one long conversation from being
+/// written back whole on every message.
+const MESSAGES_MAX_BYTES: usize = 200_000;
+
+/// The conversation body to store, at most `max` bytes.
+///
+/// `AI-24` D4: over the cap the bulk goes first, oldest message first. Each
+/// tool step keeps `tool`, `ok` and `args`, and its `result` — most of a long
+/// conversation's bytes — is replaced by `resultDropped: true` (the message's
+/// `reasoning` goes with it) until the body fits. That keeps the steps of the
+/// conversations people come back to, which the old trim dropped whole. Only
+/// when dropping the bulk is still not enough does the old trim apply
+/// (`role`, `content`, `buildRunId`, `chartCreated` only).
+fn fit_messages(messages: &[Value], max: usize) -> String {
+    let full = serde_json::to_string(messages).unwrap_or_else(|_| "[]".to_owned());
+    if full.len() <= max {
+        return full;
+    }
+    let mut kept = messages.to_vec();
+    for index in 0..kept.len() {
+        // Scoped so the mutable borrow ends before the body is measured.
+        let changed = {
+            let Some(obj) = kept[index].as_object_mut() else {
+                continue;
+            };
+            let mut changed = obj.remove("reasoning").is_some();
+            if let Some(Value::Array(tools)) = obj.get_mut("tools") {
+                for step in tools {
+                    let Some(step) = step.as_object_mut() else {
+                        continue;
+                    };
+                    if step.remove("result").is_some() {
+                        step.insert("resultDropped".to_owned(), Value::Bool(true));
+                        changed = true;
+                    }
+                }
+            }
+            changed
+        };
+        if !changed {
+            continue;
+        }
+        let body = serde_json::to_string(&kept).unwrap_or_else(|_| "[]".to_owned());
+        if body.len() <= max {
+            return body;
+        }
+    }
+    let trimmed: Vec<Value> = messages
+        .iter()
+        .map(|m| {
+            json!({
+                "role": m.get("role"), "content": m.get("content"),
+                "buildRunId": m.get("buildRunId"), "chartCreated": m.get("chartCreated"),
+            })
+        })
+        .collect();
+    serde_json::to_string(&trimmed).unwrap_or_else(|_| "[]".to_owned())
+}
+
 /// `POST /api/ai/sessions` request body.
 #[derive(Debug, Default, Deserialize)]
 struct SaveSessionBody {
@@ -1739,7 +2500,7 @@ pub async fn sessions_save(
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
 
     let requested = parsed
         .id
@@ -1748,7 +2509,7 @@ pub async fn sessions_save(
         Some(id) => {
             let row = session_row(ch, &owner, id)
                 .await
-                .map_err(|err| ApiError::Internal(err.to_string()))?;
+                .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
             // Never overwrite someone else's session under its id.
             Some(row.ok_or_else(|| ApiError::NotFound("sesi tidak ditemukan".to_owned()))?)
         }
@@ -1770,19 +2531,7 @@ pub async fn sessions_save(
         derive_title(&messages)
     };
 
-    let mut json_body = serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_owned());
-    if json_body.len() > 200_000 {
-        let trimmed: Vec<Value> = messages
-            .iter()
-            .map(|m| {
-                json!({
-                    "role": m.get("role"), "content": m.get("content"),
-                    "buildRunId": m.get("buildRunId"), "chartCreated": m.get("chartCreated"),
-                })
-            })
-            .collect();
-        json_body = serde_json::to_string(&trimmed).unwrap_or_else(|_| "[]".to_owned());
-    }
+    let json_body = fit_messages(&messages, MESSAGES_MAX_BYTES);
 
     let mode = parsed.mode.unwrap_or_else(|| "ask".to_owned());
     write_session(
@@ -1798,7 +2547,7 @@ pub async fn sessions_save(
         },
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "ok": true, "id": id, "title": title })))
 }
 
@@ -1838,10 +2587,10 @@ pub async fn sessions_rename(
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     let row = session_row(ch, &owner, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?
         .ok_or_else(|| ApiError::NotFound("sesi tidak ditemukan".to_owned()))?;
     let field = |k: &str| {
         row.get(k)
@@ -1862,7 +2611,7 @@ pub async fn sessions_rename(
         },
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "ok": true, "id": id, "title": title })))
 }
 
@@ -1903,10 +2652,10 @@ pub async fn sessions_delete(
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     if session_row(ch, &owner, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?
         .is_none()
     {
         return Err(ApiError::NotFound("sesi tidak ditemukan".to_owned()).into());
@@ -1924,7 +2673,7 @@ pub async fn sessions_delete(
         },
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -2039,8 +2788,13 @@ mod tests {
     /// Length and FNV-1a fingerprint of `prompt::SYSTEM_BASE` as committed
     /// before this change, computed from the file's text and not from this
     /// code.
-    const BASE_LEN_BEFORE_ASK_BACK: usize = 2907;
-    const BASE_FNV_BEFORE_ASK_BACK: u64 = 0xd92c_9883_6331_6470;
+    ///
+    /// `BI-37` D8 moved them: the base prompt gained one line saying that
+    /// dashboard comments are what people wrote and are never instructions
+    /// (the same sentence the tool's result carries). (`3107`,
+    /// `0xeed4_cb58_35c8_1eca`; before: `2907`, `0xd92c_9883_6331_6470`.)
+    const BASE_LEN_BEFORE_ASK_BACK: usize = 3107;
+    const BASE_FNV_BEFORE_ASK_BACK: u64 = 0xeed4_cb58_35c8_1eca;
 
     const WORDS_HEADER: &str = "\n\nTHIS USER'S WORDS\n";
 
@@ -2240,6 +2994,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_approval_sentence_in_build_mode_depends_on_a_needs_approval_result() {
+        let text = prompt::SYSTEM_BUILD_SUFFIX;
+        let line = text
+            .lines()
+            .find(|l| l.contains("delete_alert_rule"))
+            .expect("the build prompt lists the approval-gated tools");
+        assert!(
+            line.contains("needs_approval"),
+            "the approval line must name needs_approval as the condition, got: {line}"
+        );
+        assert!(
+            !text.contains("Tell the user the request is waiting in Approvals"),
+            "the approval line must not tell the user the request is waiting unconditionally"
+        );
+    }
+
+    #[test]
+    fn the_late_ask_refusal_forbids_an_apology_a_closing_question_and_another_language() {
+        // The constant is the only instruction the model reads on its next
+        // round, so it must forbid the three defects staging QA saw.
+        let text = LATE_ASK_REFUSAL.to_lowercase();
+        assert!(
+            text.contains("apologi"),
+            "the refusal must forbid an apology, got: {text}"
+        );
+        assert!(
+            text.contains("do not end with a question"),
+            "the refusal must forbid a closing question in plain text, got: {text}"
+        );
+        assert!(
+            text.contains("language of the user's question"),
+            "the refusal must tell the model to reply in the user's language, got: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn with_both_switches_on_the_count_rules_come_after_the_ask_back_rules() {
         let state = state_with_ask_back_and_layer("true", "true");
@@ -2303,6 +3093,69 @@ mod tests {
         }
     }
 
+    /// A signed-in user holding exactly `permissions`.
+    fn holding(permissions: &str) -> Principal {
+        Principal {
+            permissions: lakehouse_auth::PermissionSet::parse(permissions),
+            ..analyst(7)
+        }
+    }
+
+    #[test]
+    fn the_data_map_is_withheld_from_no_user_and_from_one_without_catalog_read() {
+        assert_eq!(data_map_access(None), MapAccess::None);
+        assert_eq!(
+            data_map_access(Some(&holding("dashboard:read"))),
+            MapAccess::None
+        );
+        // `query:read` alone does not open the map: the catalog route needs
+        // `catalog:read` for the tables themselves.
+        assert_eq!(
+            data_map_access(Some(&holding("query:read"))),
+            MapAccess::None
+        );
+        assert_eq!(data_map_access(Some(&holding(""))), MapAccess::None);
+    }
+
+    #[test]
+    fn catalog_read_alone_gets_the_map_without_samples() {
+        assert_eq!(
+            data_map_access(Some(&holding("catalog:read"))),
+            MapAccess::WithoutSamples
+        );
+    }
+
+    #[test]
+    fn catalog_read_with_query_read_and_a_wildcard_holder_get_the_full_map() {
+        assert_eq!(
+            data_map_access(Some(&holding("catalog:read, query:read"))),
+            MapAccess::Full
+        );
+        assert_eq!(data_map_access(Some(&holding("*:*"))), MapAccess::Full);
+    }
+
+    #[tokio::test]
+    async fn the_prompt_of_a_user_without_catalog_read_names_the_permission_and_lists_no_table() {
+        let state = state_with_ask_back_and_layer("false", "false");
+        let headers = axum::http::HeaderMap::new();
+        let who = holding("dashboard:read");
+        let text = system_prompt(
+            &state,
+            Some(&who),
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
+        assert!(
+            text.contains("DATA MAP\n(withheld: reading the data map needs catalog:read)"),
+            "{text}"
+        );
+    }
+
     fn chat_body(tools: Option<&[&str]>) -> ChatBody {
         ChatBody {
             tools: tools.map(|t| t.iter().map(|n| (*n).to_owned()).collect()),
@@ -2332,6 +3185,160 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// The message list the model receives after the system message: the
+    /// history `prepare_chat` built, with the request's own messages.
+    fn history_of(messages: &[(&str, &str)]) -> ChatBody {
+        ChatBody {
+            messages: messages
+                .iter()
+                .map(|(role, content)| IncomingMessage {
+                    role: (*role).to_owned(),
+                    content: (*content).to_owned(),
+                })
+                .collect(),
+            ..ChatBody::default()
+        }
+    }
+
+    /// The last user message the model is sent, and the assistant message
+    /// that came before it, as text.
+    async fn sent_to_model(state: &AppState, body: ChatBody, mode: Option<&str>) -> Vec<String> {
+        let who = analyst(1);
+        let body = ChatBody {
+            mode: mode.map(str::to_owned),
+            ..body
+        };
+        let prepared = prepare_chat(state, Some(&who), &axum::http::HeaderMap::new(), body)
+            .await
+            .map_err(|_| "a valid body")
+            .expect("a prepared chat");
+        prepared
+            .messages
+            .iter()
+            .skip(1)
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect()
+    }
+
+    const ASK_MODE_REPLY: &str = "I am in ASK mode and cannot change anything.";
+
+    #[tokio::test]
+    async fn a_switch_to_build_is_stated_in_the_newest_message() {
+        let body = history_of(&[
+            ("user", "Make a chart."),
+            ("assistant", ASK_MODE_REPLY),
+            ("user", "Yes, make it now."),
+        ]);
+        let sent = sent_to_model(&state_with_ask_back("false"), body, Some("build")).await;
+        let note = prompt::mode_note(true);
+        assert_eq!(sent[0], "Make a chart.");
+        assert_eq!(
+            sent[1], ASK_MODE_REPLY,
+            "the assistant message is unchanged"
+        );
+        assert_eq!(sent[2], format!("Yes, make it now.\n\n{note}"));
+    }
+
+    #[tokio::test]
+    async fn a_switch_to_ask_is_stated_in_the_newest_message() {
+        let body = history_of(&[
+            ("user", "Make a chart."),
+            ("assistant", "Done."),
+            ("user", "Now only read."),
+        ]);
+        let sent = sent_to_model(&state_with_ask_back("false"), body, Some("ask")).await;
+        let note = prompt::mode_note(false);
+        assert_eq!(sent[1], "Done.");
+        assert_eq!(sent[2], format!("Now only read.\n\n{note}"));
+    }
+
+    #[tokio::test]
+    async fn the_reply_language_does_not_move_with_the_mode_note() {
+        // The newest message is Indonesian. The language line is read from the
+        // request, so the note in the history must not change it.
+        let state = state_with_ask_back("false");
+        let who = analyst(1);
+        let headers = axum::http::HeaderMap::new();
+        let question = "Tolong buat grafik penjualan per wilayah sekarang.";
+        let body = |mode: &str| {
+            let mut b = history_of(&[("user", question)]);
+            b.mode = Some(mode.to_owned());
+            b
+        };
+        let build = prepare_chat(&state, Some(&who), &headers, body("build"))
+            .await
+            .map_err(|_| "a valid body")
+            .expect("a prepared chat");
+        let system = build.messages[0].content.clone().unwrap_or_default();
+        let lang = prompt::closing(question, None);
+        assert!(
+            system.ends_with(&lang),
+            "the language line is unchanged in build mode: {system}"
+        );
+        assert!(lang.contains("Indonesian"), "{lang}");
+    }
+
+    /// BI-18 part C review fix (SHOULD-FIX) R30: the chat of a person who cannot
+    /// change dashboards says why the tools are withheld, ahead of the language
+    /// line; a person who can gets no such sentence.
+    #[tokio::test]
+    async fn a_chat_without_dashboard_write_says_the_tools_are_withheld_for_permissions() {
+        let state = state_with_ask_back("false");
+        let headers = axum::http::HeaderMap::new();
+        let system = |who: Principal| {
+            let state = state.clone();
+            let headers = headers.clone();
+            async move {
+                let chat = prepare_chat(
+                    &state,
+                    Some(&who),
+                    &headers,
+                    history_of(&[("user", "Move the map charts to a new tab.")]),
+                )
+                .await
+                .map_err(|_| "a valid body")
+                .expect("a prepared chat");
+                chat.messages[0].content.clone().unwrap_or_default()
+            }
+        };
+        let viewer = system(analyst(1)).await;
+        assert!(
+            viewer.contains(
+                "Your account does not have the dashboard:write permission, so it cannot change dashboards; ask an editor or an administrator."
+            ),
+            "{viewer}"
+        );
+        assert!(
+            viewer.find(
+                "Your account does not have the dashboard:write permission, so it cannot change dashboards"
+            ) < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
+            "the sentence comes before the language line"
+        );
+        let mut editor = analyst(2);
+        editor.permissions = lakehouse_auth::PermissionSet::parse("dashboard:write, query:read");
+        assert!(!system(editor).await.contains(
+            "does not have the dashboard:write permission, so it cannot change dashboards"
+        ));
+    }
+
+    #[tokio::test]
+    async fn only_the_newest_message_gets_a_mode_note() {
+        // The console never sends a note back, but the input allows one in an
+        // earlier message: the new note goes on the newest message only.
+        let earlier = format!("Earlier question.\n\n{}", prompt::mode_note(false));
+        let body = history_of(&[
+            ("user", &earlier),
+            ("assistant", "Answer."),
+            ("user", "Newest question."),
+        ]);
+        let sent = sent_to_model(&state_with_ask_back("false"), body, Some("build")).await;
+        assert_eq!(sent[0], earlier, "the earlier note is not added to again");
+        assert_eq!(
+            sent[2],
+            format!("Newest question.\n\n{}", prompt::mode_note(true))
+        );
     }
 
     #[tokio::test]
@@ -2605,6 +3612,7 @@ mod tests {
         let text = body.to_string();
         assert!(!text.contains("1016"), "{text}");
         assert!(!text.contains("upstream-secret-detail"), "{text}");
+        assert!(body["errorId"].is_string(), "{text}");
         assert_eq!(
             body["detail"],
             "The AI service returned an error (HTTP 530). Try again later."
@@ -2743,6 +3751,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_unfinished_reply_names_the_last_refused_tool_and_cuts_its_refusal_to_200_characters() {
+        let trace = vec![
+            json!({ "tool": "list_boards", "ok": false, "result": { "error": "an older refusal" } }),
+            json!({ "tool": "create_chart", "ok": false, "result": { "error": "x".repeat(250) } }),
+            json!({ "tool": "list_charts", "ok": true, "result": { "charts": [] } }),
+        ];
+        let reply = unfinished_reply(&trace);
+        assert!(reply.contains("`create_chart`"), "{reply}");
+        assert!(!reply.contains("older refusal"), "{reply}");
+        assert!(reply.ends_with(&"x".repeat(200)), "{reply}");
+        assert!(!reply.contains(&"x".repeat(201)), "{reply}");
+    }
+
+    #[test]
+    fn the_unfinished_reply_reads_an_error_that_is_not_a_string_as_no_reason_given() {
+        let trace = vec![
+            json!({ "tool": "create_chart", "ok": false, "result": { "error": { "code": 7 } } }),
+        ];
+        let reply = unfinished_reply(&trace);
+        assert!(reply.contains("`create_chart`: no reason given"), "{reply}");
+    }
+
     /// D4 regression: `buildRunId` must be omitted from the response body
     /// when absent, matching the TS's `JSON.stringify` dropping an
     /// `undefined`-valued key — a bare `Option<String>` field in a `json!`
@@ -2826,5 +3857,119 @@ mod tests {
     #[test]
     fn esc_doubles_backslashes_and_quotes() {
         assert_eq!(esc("O'Brien\\x"), "O''Brien\\\\x");
+    }
+
+    /// One message with one tool step whose result carries `bytes` of text.
+    fn bulky_message(role: &str, bytes: usize) -> Value {
+        json!({
+            "role": role,
+            "content": "A short line about the numbers.",
+            "reasoning": "I looked at the catalog first.",
+            "tools": [{
+                "tool": "run_sql",
+                "args": { "sql": "SELECT count() FROM serving.mart_x" },
+                "ok": true,
+                "result": { "columns": [{ "name": "n" }], "rows": [{ "n": 5 }],
+                            "padding": "x".repeat(bytes) },
+            }],
+        })
+    }
+
+    #[test]
+    fn a_long_conversation_keeps_every_steps_tool_and_ok() {
+        let messages: Vec<Value> = (0..6).map(|_| bulky_message("assistant", 60_000)).collect();
+        assert!(
+            serde_json::to_string(&messages).unwrap().len() > 300_000,
+            "the fixture is over the cap to begin with"
+        );
+
+        let body = fit_messages(&messages, MESSAGES_MAX_BYTES);
+        assert!(body.len() <= MESSAGES_MAX_BYTES, "{} bytes", body.len());
+        let kept: Vec<Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(kept.len(), messages.len(), "no message is dropped");
+        for message in &kept {
+            let step = &message["tools"][0];
+            assert_eq!(step["tool"], "run_sql", "every step keeps its tool");
+            assert_eq!(step["ok"], true, "every step keeps its outcome");
+            assert!(step["args"]["sql"].is_string(), "and its arguments");
+            assert!(step.get("reasoning").is_none(), "reasoning goes first");
+        }
+    }
+
+    #[test]
+    fn the_newest_messages_of_a_long_conversation_keep_their_result() {
+        let messages: Vec<Value> = (0..6).map(|_| bulky_message("assistant", 60_000)).collect();
+
+        let kept: Vec<Value> =
+            serde_json::from_str(&fit_messages(&messages, MESSAGES_MAX_BYTES)).unwrap();
+        let last = &kept[kept.len() - 1]["tools"][0];
+        assert!(
+            last["result"]["padding"]
+                .as_str()
+                .is_some_and(|p| p.len() == 60_000),
+            "the newest message keeps its result: {last}"
+        );
+        assert!(last.get("resultDropped").is_none());
+        let first = &kept[0]["tools"][0];
+        assert_eq!(first["resultDropped"], true);
+        assert!(first.get("result").is_none());
+    }
+
+    #[test]
+    fn a_conversation_of_plain_text_over_the_cap_falls_back_to_the_old_trim() {
+        // No tools and no reasoning: there is no bulk to drop, so the body
+        // gets the old trim (`role`, `content`, `buildRunId`, `chartCreated`).
+        // The trim cannot shrink `content`, so text alone over the cap stays
+        // over it — the behaviour before AI-24, kept as D4 says.
+        let messages: Vec<Value> = (0..4)
+            .map(|_| json!({ "role": "user", "content": "y".repeat(80_000) }))
+            .collect();
+        assert!(serde_json::to_string(&messages).unwrap().len() > 300_000);
+
+        let kept: Vec<Value> =
+            serde_json::from_str(&fit_messages(&messages, MESSAGES_MAX_BYTES)).unwrap();
+        assert_eq!(kept.len(), 4);
+        for message in &kept {
+            let keys: Vec<&str> = message
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keys, ["role", "content", "buildRunId", "chartCreated"]);
+        }
+    }
+
+    #[test]
+    fn a_body_under_the_cap_is_byte_for_byte_unchanged() {
+        let messages = vec![bulky_message("user", 10), bulky_message("assistant", 100)];
+        assert_eq!(
+            fit_messages(&messages, MESSAGES_MAX_BYTES),
+            serde_json::to_string(&messages).unwrap()
+        );
+    }
+
+    /// ADM-13 (D6): `data_map_access` gives `Full` to `assistant:ask`.
+    #[test]
+    fn data_map_access_gives_full_to_assistant_ask() {
+        use lakehouse_auth::Principal;
+
+        let ask_only = holding("assistant:ask");
+        assert_eq!(data_map_access(Some(&ask_only)), MapAccess::Full);
+
+        let use_only = holding("assistant:use");
+        assert_eq!(data_map_access(Some(&use_only)), MapAccess::None);
+
+        let none: Option<&Principal> = None;
+        assert_eq!(data_map_access(none), MapAccess::None);
+
+        let catalog_only = holding("catalog:read");
+        assert_eq!(
+            data_map_access(Some(&catalog_only)),
+            MapAccess::WithoutSamples
+        );
+
+        let full_perms = holding("catalog:read, query:read");
+        assert_eq!(data_map_access(Some(&full_perms)), MapAccess::Full);
     }
 }

@@ -1,0 +1,366 @@
+"""`SaasSession`: every HTTP request of a business-app read (`SRC-3` AD3,
+decisions 8 and 13).
+
+# The link rule (replaces rule Z5 for `saas` only)
+
+`adapters/rest.py` never dials a URL taken from a response (its rule Z5). The
+vendors of `SRC-3` page by returning the next URL (Salesforce, Graph,
+Dataverse, ServiceNow, Zendesk, Confluence), so this session follows one, under
+a stricter rule than "any":
+
+1. A target is a path on the session's origin, or an absolute URL whose
+   scheme, host AND port equal the origin's. Anything else raises
+   `ssrf_guard.SsrfBlocked` (classified `address_refused`, not retried), whose
+   message does not carry the link.
+2. The one exception is Salesforce's `instance_url` (returned after sign-in):
+   `adopt_origin` accepts an `https` host that ends in one of the suffixes the
+   vendor module names (`.salesforce.com`, `.force.com`) and makes it the
+   session's origin from then on.
+3. EVERY host, the origin's and an adopted one, goes through
+   `ssrf_guard.resolve_checked` before the request, and the request runs inside
+   `ssrf_guard.pinned_resolution`, so it dials the address that was checked.
+4. The authentication headers are asked for AFTER the address check, so a
+   blocked address makes no credential leave this process.
+5. No redirect is followed. A 3xx is a refusal (`SsrfBlocked`).
+
+`rest.py` keeps rule Z5 unchanged; this module is not used by it.
+
+# Rate limits (decision 13)
+
+A 429 is waited out: the `Retry-After` header (whole seconds) when it is within
+`max_retry_after`, else a doubling back-off from one second, for at most
+`max_attempts` requests. A `Retry-After` beyond the bound, or the last attempt
+still answered with 429, raises `SaasRateLimited`; the run fails and the data
+read so far is never reported as complete. The wait is `time.sleep` by default
+and injectable.
+
+# What never leaves
+
+401 raises `SaasSignInRefused`, 403 `SaasPermissionMissing` (or `SaasQuotaExhausted` when the
+vendor module recognises a used-up quota in the body: Salesforce), 429 past the bound
+`SaasRateLimited`, and a success status whose body is not JSON `SaasBadAnswer` (retried as
+`source_busy`); any other error status raises `requests.HTTPError` (its
+status is what `ingest_errors` reads). None of the messages holds the vendor's
+words, the URL or a header.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import re
+import time
+from typing import Any, Callable
+from urllib.parse import urlparse
+
+import requests
+
+from dispar_orchestrate import ssrf_guard
+
+logger = logging.getLogger(__name__)
+
+_REQUEST_TIMEOUT_SECONDS = 30
+DEFAULT_MAX_ATTEMPTS = 4
+DEFAULT_MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+class SaasSignInRefused(Exception):
+    """The vendor refused the credential (HTTP 401). Not retried: the same
+    answer would come back. The connector page offers Sign in again."""
+
+    def __init__(self) -> None:
+        super().__init__("the vendor refused the sign-in")
+
+
+class SaasPermissionMissing(Exception):
+    """The vendor accepted the credential but the account may not read what was
+    asked (HTTP 403). Not retried."""
+
+    def __init__(self) -> None:
+        super().__init__("the vendor account lacks a permission the connector needs")
+
+
+class SaasRateLimited(Exception):
+    """The vendor limited the rate and still did after the bounded waits
+    (decision 13). Classified `rate_limited` (`ingest_errors`), which the run retries."""
+
+    def __init__(self) -> None:
+        super().__init__("the vendor limited the rate of requests")
+
+
+class SaasQuotaExhausted(SaasRateLimited):
+    """The vendor's API quota for the period is used up (Salesforce answers HTTP 403
+    `REQUEST_LIMIT_EXCEEDED`; slice 3 review BLOCKER 8, decision 13). Classified
+    `rate_limited` like its parent, but NOT retried within the run: the quota is per 24
+    hours, so waiting the run's minutes would only spend more requests."""
+
+
+class SaasBadAnswer(Exception):
+    """The vendor answered a success status with a body this connector cannot read as JSON
+    (`requests.JSONDecodeError`; final review SHOULD-FIX 23). Classified `source_busy` and
+    retried: the vendor was broken, not the connector's setting, and its body is never read
+    out into the message."""
+
+    def __init__(self) -> None:
+        super().__init__("the vendor answered in a form this connector does not read")
+
+
+def _allow_http() -> bool:
+    """The gate-only switch (`CONNECTOR_OAUTH_ALLOW_HTTP=true`, default off),
+    the same one `adapters/rest.py` and the API read: the acceptance gate's own
+    mock vendor speaks `http`. A real installation never sets it."""
+    return os.environ.get("CONNECTOR_OAUTH_ALLOW_HTTP", "").strip() == "true"
+
+
+def _origin_of(url: str) -> tuple[str, str, int]:
+    """`(scheme, host, port)` of `url`, lower-cased, with the scheme's default
+    port filled in.
+
+    # Errors
+
+    `ssrf_guard.SsrfBlocked` for a URL with no host, with userinfo, with a scheme other
+    than `https` (`http` only under the gate-only switch), or for a netloc `urlparse`
+    cannot decode (an NFKC-changing character, a broken IPv6 literal; final review
+    SHOULD-FIX 23: the fixed text, never `urlparse`'s, which quotes the host).
+    """
+    try:
+        parsed = urlparse(url)
+        # `.hostname` decodes the netloc too and raises the same `ValueError` (Python 3.12).
+        hostname = parsed.hostname
+    except ValueError:
+        raise ssrf_guard.SsrfBlocked("a business-app address must be a plain host") from None
+    scheme = parsed.scheme.lower()
+    if scheme != "https" and not (scheme == "http" and _allow_http()):
+        raise ssrf_guard.SsrfBlocked("a business-app request must use https")
+    if not hostname or parsed.username is not None or parsed.password is not None:
+        raise ssrf_guard.SsrfBlocked("a business-app address must be a plain host")
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ssrf_guard.SsrfBlocked("a business-app address has an invalid port") from None
+    return scheme, hostname.lower(), port or (443 if scheme == "https" else 80)
+
+
+def _real_get(url: str, *, headers: dict, params: dict | None, timeout: float) -> Any:
+    return requests.get(url, headers=headers, params=params, timeout=timeout, allow_redirects=False)
+
+
+def _real_post(url: str, *, headers: dict, json: Any, timeout: float) -> Any:
+    return requests.post(url, headers=headers, json=json, timeout=timeout, allow_redirects=False)
+
+
+_LINK_NEXT = re.compile(r'<([^>]*)>\s*;[^,]*?\brel\s*=\s*"?next"?', re.IGNORECASE)
+
+
+def _next_link(headers: Any) -> str | None:
+    """The `rel="next"` target of an RFC 8288 `Link` header, or `None`."""
+    raw = (headers or {}).get("Link") or (headers or {}).get("link")
+    found = _LINK_NEXT.search(raw) if isinstance(raw, str) else None
+    return found.group(1) if found else None
+
+
+class SaasSession:
+    """One vendor's HTTP reads under the link and rate-limit rules above.
+
+    `auth_headers` returns the headers of the next request; it is called once
+    per request, after the address was checked. `refresh_auth`, when given,
+    forgets the access token so the next call of `auth_headers` gets a new one;
+    it is called once when a request is answered 401.
+    """
+
+    def __init__(
+        self,
+        origin_url: str,
+        auth_headers: Callable[[], dict],
+        *,
+        adopt_suffixes: tuple[str, ...] = (),
+        http_get: Callable[..., Any] | None = None,
+        http_post: Callable[..., Any] | None = None,
+        refresh_auth: Callable[[], None] | None = None,
+        resolve_checked: Callable[..., ssrf_guard.ResolvedAddress] = ssrf_guard.resolve_checked,
+        forbidden_is_quota: Callable[[Any], bool] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        request_timeout: float = _REQUEST_TIMEOUT_SECONDS,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        max_retry_after: float = DEFAULT_MAX_RETRY_AFTER_SECONDS,
+    ) -> None:
+        self._origin = _origin_of(origin_url)
+        self._auth_headers = auth_headers
+        self._adopt_suffixes = adopt_suffixes
+        self._refresh_auth = refresh_auth
+        self._http_get = http_get or _real_get
+        self._http_post = http_post or _real_post
+        self._resolve_checked = resolve_checked
+        self._forbidden_is_quota = forbidden_is_quota
+        self._sleep = sleep
+        # A vendor module may name a longer wait for a vendor that builds its answer on request
+        # (Workday runs the report before it answers, `request_timeout_seconds`).
+        self._timeout = request_timeout
+        self._max_attempts = max(1, max_attempts)
+        self._max_retry_after = max_retry_after
+
+    @property
+    def origin(self) -> str:
+        scheme, host, port = self._origin
+        default = 443 if scheme == "https" else 80
+        return f"{scheme}://{host}" if port == default else f"{scheme}://{host}:{port}"
+
+    def adopt_origin(self, url: str, *, as_origin: str | None = None) -> None:
+        """Make the host a vendor returned after sign-in the session's origin
+        (Salesforce `instance_url`), when it is an `https` host ending in one
+        of the suffixes the vendor module named.
+
+        `as_origin` is for the acceptance gate only: `url` is checked by the rule
+        as always, then the session dials `as_origin` (the gate's mock vendor, from
+        `vendors.rebase_for_gate`, which is `url` itself unless the gate-only switch
+        is on) in its place.
+
+        # Errors
+
+        `ssrf_guard.SsrfBlocked` for any other host.
+        """
+        scheme, host, port = _origin_of(url)
+        if scheme != "https" or port != 443 or not any(host.endswith(s) and host != s.lstrip(".") for s in self._adopt_suffixes):
+            raise ssrf_guard.SsrfBlocked("the vendor returned a host this connector does not accept")
+        self._origin = _origin_of(as_origin) if as_origin else (scheme, host, port)
+
+    def _target(self, target: str) -> str:
+        if target.startswith("//"):
+            raise ssrf_guard.SsrfBlocked("a link in a vendor answer pointed to another host; not followed")
+        if target.startswith("/"):
+            return self.origin + target
+        if _origin_of(target) != self._origin:
+            raise ssrf_guard.SsrfBlocked("a link in a vendor answer pointed to another host; not followed")
+        return target
+
+    def _answers_quota(self, response: Any) -> bool:
+        """Whether the vendor module says this 403 body is a used-up quota. The body is
+        read, never repeated."""
+        try:
+            body = response.json()
+        except ValueError:
+            return False
+        return bool(self._forbidden_is_quota(body))  # type: ignore[misc]
+
+    def _wait_for(self, response: Any, attempt: int) -> float:
+        raw = getattr(response, "headers", {}).get("Retry-After")
+        try:
+            seconds = float(raw) if raw is not None else float(2**attempt)
+        except (TypeError, ValueError):
+            seconds = float(2**attempt)
+        # Final review SHOULD-FIX 23: `nan` and `inf` are neither < 0 nor > the bound, so they
+        # passed and `sleep` got a value it cannot honour. Both are past the bound.
+        if not math.isfinite(seconds) or seconds < 0 or seconds > self._max_retry_after:
+            raise SaasRateLimited()
+        return seconds
+
+    def get_json(self, target: str, params: dict | None = None, *, headers: dict | None = None) -> Any:
+        """GET `target` (a path on the origin, or a same-origin link from an
+        earlier answer) and return its JSON. `headers` are request headers that are not
+        credentials (Dataverse's `Prefer: odata.maxpagesize=...`, slice 5); the session's
+        own authentication headers win over a name they share.
+
+        # Errors
+
+        See `_send`: the same for `post_json`.
+        """
+        return self._send("GET", target, params, None, extra_headers=headers)
+
+    def get_json_with_next(self, target: str, params: dict | None = None) -> tuple[Any, str | None]:
+        """Like `get_json`, and the `rel="next"` target of the answer's `Link` header, or
+        `None` (ServiceNow pages by that header; a page can hold fewer records than its
+        limit because the access check runs after the limit, so a short page does not
+        end the read). The target is only handed back: `get_json` applies the same-origin
+        rule when it is followed.
+
+        # Errors
+
+        See `_send`.
+        """
+        body, link = self._send("GET", target, params, None, with_link=True)
+        return body, link
+
+    def post_json(self, target: str, body: Any, *, headers: dict | None = None) -> Any:
+        """POST `body` as JSON to `target` (same rules as `get_json`) and return
+        the answer's JSON. For the vendors whose change filter is a search
+        request and not a query string (HubSpot's CRM search, `SRC-3` V-HubSpot.1;
+        NetSuite's SuiteQL, slice 6, which also needs `Prefer: transient`, so `headers`
+        are request headers that are not credentials, as for `get_json`).
+        The request is a read: a vendor module posts only to a search or query endpoint.
+
+        # Errors
+
+        See `_send`.
+        """
+        return self._send("POST", target, None, body, extra_headers=headers)
+
+    def _body(self, response: Any) -> Any:
+        """The JSON body of a success answer. A body that is not JSON is the fixed
+        `SaasBadAnswer` (final review SHOULD-FIX 23), not `requests.JSONDecodeError` (a
+        `ValueError`, which `ingest_errors` classed as a rejected setting); the vendor's
+        text is never read out."""
+        try:
+            return response.json()
+        except ValueError:
+            raise SaasBadAnswer() from None
+
+    def _send(
+        self,
+        method: str,
+        target: str,
+        params: dict | None,
+        body: Any,
+        *,
+        with_link: bool = False,
+        extra_headers: dict | None = None,
+    ) -> Any:
+        """One request under the link, address and rate-limit rules.
+
+        # Errors
+
+        `ssrf_guard.SsrfBlocked` (another host, a blocked address, a redirect),
+        `SaasSignInRefused`, `SaasPermissionMissing`, `SaasRateLimited`,
+        `requests.HTTPError` for another error status, and whatever `requests`
+        raises for a connection or timeout failure.
+        """
+        url = self._target(target)
+        _scheme, host, port = _origin_of(url)
+        refreshed = False
+        attempt = 0
+        while True:
+            resolved = self._resolve_checked(host, port)
+            headers = {**(extra_headers or {}), **self._auth_headers()}
+            with ssrf_guard.pinned_resolution(host, resolved):
+                if method == "POST":
+                    response = self._http_post(url, headers=headers, json=body, timeout=self._timeout)
+                else:
+                    response = self._http_get(url, headers=headers, params=params, timeout=self._timeout)
+            status = response.status_code
+            if 300 <= status < 400:
+                raise ssrf_guard.SsrfBlocked("the vendor answered with a redirect; not followed")
+            if status == 401:
+                # An access token can expire between requests: ask for a new
+                # one once. A second 401 is the credential, not the token.
+                if self._refresh_auth is not None and not refreshed:
+                    refreshed = True
+                    self._refresh_auth()
+                    continue
+                raise SaasSignInRefused()
+            if status == 403:
+                if self._forbidden_is_quota is not None and self._answers_quota(response):
+                    raise SaasQuotaExhausted()
+                raise SaasPermissionMissing()
+            if status == 429:
+                if attempt + 1 >= self._max_attempts:
+                    raise SaasRateLimited()
+                wait = self._wait_for(response, attempt)
+                logger.info("a vendor limited the rate; waiting %.0f s (attempt %d of %d)", wait, attempt + 1, self._max_attempts)
+                self._sleep(wait)
+                attempt += 1
+                continue
+            if status >= 400:
+                raise requests.HTTPError(f"HTTP {status}", response=response)
+            if with_link:
+                return self._body(response), _next_link(getattr(response, "headers", None))
+            return self._body(response)

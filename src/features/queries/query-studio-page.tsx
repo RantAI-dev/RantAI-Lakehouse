@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { useRouter } from "next/navigation"
 
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState } from "@/components/patterns/page-states"
@@ -8,38 +9,89 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { HistoryQuickList, SavedQuickList } from "./query-context-lists"
 import { NaturalLanguagePanel } from "./nl-panel"
 import { QueryResultsSection } from "./query-results-section"
+import { QueryResultTabs } from "./query-result-tabs"
 import { QueryStudioTabs } from "./query-studio-tabs"
+import { writeSaveQueryDraft, writeSaveSourceDraft } from "./save-draft"
 import { ExplainCard, FixCard, FixWithAiButton } from "./sql-help-card"
 import { IcebergTimeTravelControls } from "./time-travel-controls"
 import { QueryTransparencyPanel } from "./query-transparency-panel"
-import { SaveQuerySheet } from "./save-query-sheet"
-import { SaveSqlSourceSheet } from "./save-sql-source-sheet"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useCopilot } from "@/features/copilot/use-copilot"
 import { summarizeQuery } from "@/lib/page-context-summary"
+import { queryDraftKey } from "@/lib/query-draft"
+import { SchemaBrowser } from "./schema-browser"
+import { QueryTabBar } from "./query-tab-bar"
 import { SqlPanel } from "./sql-panel"
 import { useQueryStudio } from "./use-query-studio"
 
 /** Query Studio: natural-language ↔ SQL workspace with execution transparency. */
 export function QueryStudioPage() {
+  const { user, activeTenantId } = useAuth()
+  // QA LH-QS-1-04 (QS-8): the draft belongs to one person in one tenant.
+  const draftKey = user ? queryDraftKey(user.id, activeTenantId) : null
+  // A different owner gets a new workspace. The first key is not a change:
+  // the session may answer after the page has mounted.
+  const [generation, setGeneration] = React.useState(0)
+  const ownerRef = React.useRef<string | null>(null)
+  React.useEffect(() => {
+    if (draftKey === null) return
+    if (ownerRef.current !== null && ownerRef.current !== draftKey) setGeneration((g) => g + 1)
+    ownerRef.current = draftKey
+  }, [draftKey])
+  // `key` remounts the workspace, so the old one flushes its tabs under its
+  // own key as it unmounts and the new one starts from its owner's entry.
+  return <QueryStudioWorkspace key={generation} draftKey={draftKey} />
+}
+
+/** One owner's workspace: the layout below, over one draft key. */
+function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
   // All the state lives in the hook; this file is the layout.
-  const studio = useQueryStudio()
-  const [saveOpen, setSaveOpen] = React.useState(false)
-  const [sourceOpen, setSourceOpen] = React.useState(false)
+  const studio = useQueryStudio(draftKey)
+  const router = useRouter()
+  const [schemaOpen, setSchemaOpen] = React.useState(false)
   const { hasPermission } = useAuth()
   const canAuthorSources = hasPermission("dashboard:sql")
+
+  /**
+   * `WEB-7` D5: saving is its own page now, so the statement it would save
+   * is written to `sessionStorage` first (`save-draft.ts`) and the editor
+   * travels with it. The editor keeps its text across the trip through its
+   * own `localStorage` draft (`lib/query-draft.ts`), which is flushed when
+   * this page unmounts (`useDebouncedCallback` flushes on unmount), so
+   * Cancel or Save returns to the same SQL.
+   */
+  function openSavePage() {
+    writeSaveQueryDraft({
+      sql: studio.targetStatement?.text ?? "",
+      parameters: studio.saveParameters,
+      mode: studio.saveTarget.mode,
+      savedId: studio.saveTarget.savedId,
+      tabId: studio.activeTabId,
+    })
+    router.push("/query-studio/save")
+  }
+
+  function openSaveSourcePage() {
+    writeSaveSourceDraft({ sql: studio.targetStatement?.text ?? "" })
+    router.push("/query-studio/save-source")
+  }
+
 
   // Page-aware Copilot (plan §6): the SQL being written and the first rows
   // of its last result. Deferred so typing is not slowed by re-sending the
   // context on every keystroke.
   const { setPageContext } = useCopilot()
   const deferredSql = React.useDeferredValue(studio.sql)
-  const lastResult = studio.runAct.data
+  // The rows on screen are the open statement's own: a statement that
+  // never ran shows nothing, and the assistant reads the same rows the
+  // person sees.
+  const openRun = studio.activeRun
+  const lastResult = openRun?.status === "done" ? openRun.result : null
   React.useEffect(() => {
     setPageContext({
       key: "query",
       title: "Write and run SQL",
-      hint: "Ask about this query or its result, or have Copilot write SQL.",
+      hint: "Ask about this query or its result, or have AI Copilot write SQL.",
       suggest: {
         ask: ["Explain this query", "What does this result show?", "Why might this query be slow?"],
         build: ["Turn this into a chart on a dashboard"],
@@ -57,6 +109,16 @@ export function QueryStudioPage() {
         title="Query Studio"
         description="Ask questions or write SQL, then run it against the hot analytical store."
       />
+      {/* A `?saved=` link that names a query the caller may not see opens no
+          tab: the studio says so instead of an empty editor (`QS-3` C5). */}
+      {studio.savedLinkError ? (
+        <p
+          role="alert"
+          className="rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+        >
+          {studio.savedLinkError}
+        </p>
+      ) : null}
       <QueryStudioTabs />
       <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
         <div className="min-w-0 space-y-4">
@@ -72,11 +134,30 @@ export function QueryStudioPage() {
               <NaturalLanguagePanel studio={studio} />
             </TabsContent>
             <TabsContent value="sql" className="mt-3 space-y-3">
-              <SqlPanel
-                studio={studio}
-                onSave={() => setSaveOpen(true)}
-                onSaveAsSource={canAuthorSources ? () => setSourceOpen(true) : undefined}
-              />
+              {/* The query tabs sit inside the SQL tab, above the editor:
+                  the natural-language and SQL choice stays as it was. */}
+              <QueryTabBar studio={studio} />
+              {/* The browser sits beside the editor and never replaces it:
+                  whatever the catalog answers, the editor keeps its width
+                  and stays usable. */}
+              <div
+                className={
+                  schemaOpen ? "grid gap-3 lg:grid-cols-[minmax(0,1fr)_300px]" : undefined
+                }
+              >
+                <div className="min-w-0">
+                  <SqlPanel
+                    studio={studio}
+                    onSave={openSavePage}
+                    onSaveAsSource={canAuthorSources ? openSaveSourcePage : undefined}
+                    onToggleSchema={() => setSchemaOpen((open) => !open)}
+                    schemaOpen={schemaOpen}
+                  />
+                </div>
+                {schemaOpen ? (
+                  <SchemaBrowser studio={studio} onClose={() => setSchemaOpen(false)} />
+                ) : null}
+              </div>
               {/*
                * Iceberg time travel: pins one version of the raw tables
                * through a query setting. Shown whatever the engine, and
@@ -90,24 +171,6 @@ export function QueryStudioPage() {
               />
             </TabsContent>
           </Tabs>
-          {studio.runAct.status === "error" ? (
-            <div className="space-y-2">
-              <ErrorState
-                error={studio.runAct.error}
-                onRetry={() => void studio.runQuery()}
-              />
-              {/*
-               * Fix with AI works for ClickHouse only: the check that makes a
-               * proposal safe to show runs as EXPLAIN PLAN, which Trino lacks.
-               * Plan 16 lifts this. The reason is the button's title.
-               */}
-              <FixWithAiButton
-                engine={studio.engine}
-                busy={studio.fix.busy}
-                onFix={() => void studio.fix.run(studio.runAct.error?.message ?? "")}
-              />
-            </div>
-          ) : null}
           {studio.explain.error ? (
             <ErrorState error={studio.explain.error} />
           ) : studio.explain.result !== null ? (
@@ -118,19 +181,62 @@ export function QueryStudioPage() {
           ) : studio.fix.result ? (
             <FixCard
               outcome={studio.fix.result}
-              editorSql={studio.sql}
+              editorSql={studio.fix.statement?.text ?? studio.sql}
               onAccept={studio.fix.accept}
               onReject={studio.fix.reject}
             />
           ) : null}
-          {studio.runAct.data ? (
-            <QueryResultsSection result={studio.runAct.data} />
+          {/* The result of a run: one tab per statement, and the outcome of
+              the statement that is open on it. */}
+          {studio.activeRuns.length > 1 ? <QueryResultTabs studio={studio} /> : null}
+          {openRun?.status === "done" ? (
+            <QueryResultsSection
+              result={openRun.result}
+              runId={openRun.runId}
+              downloadBusy={studio.download.busy}
+              onDownload={(format) =>
+                studio.download.start(openRun.result.id, format, openRun.runId)
+              }
+            />
+          ) : null}
+          {openRun?.status === "error" ? (
+            <div className="space-y-2">
+              <ErrorState
+                error={openRun.error}
+                onRetry={() => void studio.runQuery()}
+              />
+              {/*
+               * Fix with AI works for ClickHouse only: the check that makes a
+               * proposal safe to show runs as EXPLAIN PLAN, which Trino lacks.
+               * Plan 16 lifts this. The reason is the button's title.
+               */}
+              <FixWithAiButton
+                engine={studio.engine}
+                busy={studio.fix.busy}
+                onFix={() => void studio.fix.run(openRun.error.message, openRun.statement)}
+              />
+            </div>
+          ) : null}
+          {openRun?.status === "not-run" ? (
+            <p className="text-sm text-muted-foreground">
+              {/* QA LH-QS-4-10: a statement the person stopped is not one a failure skipped. */}
+              {openRun.reason === "stopped"
+                ? "Stopped: you stopped the run before this statement finished."
+                : "Not run: the batch stopped at the failure before this statement."}
+            </p>
+          ) : null}
+          {openRun?.status === "pending" || openRun?.status === "running" ? (
+            <p className="text-sm text-muted-foreground" role="status">
+              Running…
+            </p>
           ) : null}
         </div>
         <div className="space-y-3">
           <QueryTransparencyPanel
             state={studio.estimateAct}
             estimatable={studio.estimatable}
+            estimateSupported={studio.estimateSupported}
+            waitingFor={studio.estimateWaitsFor}
             onRetry={studio.reEstimate}
           />
           <SavedQuickList state={studio.savedState} onLoadSql={studio.loadSql} />
@@ -140,18 +246,6 @@ export function QueryStudioPage() {
           />
         </div>
       </div>
-
-      <SaveQuerySheet
-        open={saveOpen}
-        onOpenChange={setSaveOpen}
-        sql={studio.sql}
-        saving={studio.saveAct.status === "pending"}
-        error={studio.saveAct.error?.message ?? null}
-        onSave={studio.save}
-      />
-      {canAuthorSources ? (
-        <SaveSqlSourceSheet open={sourceOpen} onOpenChange={setSourceOpen} sql={studio.sql} />
-      ) : null}
     </div>
   )
 }

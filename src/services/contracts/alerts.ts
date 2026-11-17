@@ -14,11 +14,11 @@
  * `<namespace>.<table>` target and the backend clears
  * `measure`/`agg`/`threshold`/`board` for that kind (WS5 item E3).
  */
-export type AlertRuleKind = "alert" | "digest" | "freshness" | string
+export type AlertRuleKind = "alert" | "digest" | "freshness" | "pipeline_behind_target" | string
 
 /**
- * The six rule kinds for connector and upload loads (`SRC-7`). The first five
- * are scoped to one connector id, or `*` for all connectors (an administrator
+ * The seven rule kinds for connector and upload loads (`SRC-7`, and `connector_lag`
+ * of `SRC-4`). The first six are scoped to one connector id, or `*` for all connectors (an administrator
  * who sees every tenant only; never for `connector_success`); `upload_failure`
  * is always scoped to every upload and sends no connector.
  */
@@ -28,10 +28,19 @@ export const LOAD_ALERT_KINDS = [
   "connector_disabled",
   "connector_schema_change",
   "connector_success",
+  "connector_lag",
   "upload_failure",
 ] as const
 
 export type LoadAlertKind = (typeof LOAD_ALERT_KINDS)[number]
+
+/**
+ * The rule kind for an opened quality incident (`DATA-14`): a failed check, or
+ * a learned volume or freshness anomaly. Scoped to one table or `*` by `asset`;
+ * saved only by an administrator who sees every tenant, because its message
+ * names tables and rules of any tenant.
+ */
+export const QUALITY_ALERT_KIND = "quality_incident" as const
 
 /** Mirrors `AlertChannel` (`#[serde(rename_all = "lowercase")]`). */
 export type AlertChannel = "webhook" | "email" | string
@@ -51,12 +60,34 @@ export type AlertRule = {
   type: AlertRuleKind
   mart?: string
   measure?: string
+  /**
+   * BI-2: the name of a metric this rule watches, in place of `mart`, `measure`
+   * and `agg`. It is evaluated with the fixed viewer role every rule uses, not
+   * with its author's access. Omitted when the rule watches a column.
+   */
+  metric?: string
   agg: string
   op: AlertOp
   threshold: number
   board?: string
   channel: AlertChannel
-  target: string
+  /**
+   * Where the rule sends: a webhook URL or an e-mail address. Left out of the
+   * wire body, with `targetHidden: true`, when the caller may not manage the
+   * rule (`DEC-16`, QA `LH-SRC-7-04`, `SRC-42`); the list then says "Webhook"
+   * or "E-mail" instead.
+   */
+  target?: string
+  /** `true` when the API withheld `target` from this caller (`DEC-16`); never present otherwise. */
+  targetHidden?: boolean
+  /**
+   * The latest delivery of a "run succeeded" rule (`SRC-40`, QA `TC-1695`),
+   * read from `alert_rule_delivery`: a success opens no incident, so its
+   * outcome is kept on the rule instead. `at` is ISO 8601; `reason` is one of
+   * the API's fixed sentences and present only when `delivered` is `false`.
+   * Absent when no delivery was ever attempted.
+   */
+  lastDelivery?: { at: string; delivered: boolean; reason?: string }
   enabled: boolean
   createdAt?: string
   /**
@@ -72,7 +103,43 @@ export type AlertRule = {
    * `pipeline`.
    */
   connector?: string
+  /**
+   * A table (`silver.orders`) or `*` for every table, on a `quality_incident`
+   * rule (`DATA-14`). Omitted from the wire body when unset, like `connector`.
+   */
+  asset?: string
+  /** Pipeline id or `*` for pipeline rules. */
+  pipeline?: string
+  /**
+   * `BI-19` part C: the chart a chart alert watches. Omitted for a rule that
+   * watches a mart column or a metric.
+   */
+  chart?: string
+  /** The series of a line, bar or combo chart whose latest point is read. */
+  series?: string
+  /** The dashboard filters the chart is read with (the shape the dashboard takes). */
+  filters?: unknown[]
+  /** `above`, `below` or `any_rows` on a chart alert; absent on a legacy rule. */
+  condition?: AlertCondition | string
+  /**
+   * The person the rule reads its data as (`BI-39` D1: every threshold rule,
+   * chart or not). Absent on a rule saved before alerts had owners, which
+   * keeps the Dashboard Viewer role until it is saved again (`BI-39` D4).
+   */
+  ownerId?: string
+  /**
+   * `BI-39` D8: the watched chart's title and its dashboard's id and name, read
+   * live when the list is answered. All three are absent together when the
+   * caller cannot see the chart any more (never stored, so a rename shows at
+   * once and a chart they lost access to stops naming itself).
+   */
+  chartTitle?: string
+  dashboardId?: string
+  dashboardTitle?: string
 }
+
+/** The conditions of a chart alert (`BI-19` D12). */
+export type AlertCondition = "above" | "below" | "any_rows"
 
 /**
  * Body accepted by `POST`/`PUT /api/alerts`, mirroring `AlertRuleInput`.
@@ -86,6 +153,7 @@ export type SaveAlertRuleInput = {
   type?: string
   mart?: string
   measure?: string
+  metric?: string
   agg?: string
   op?: string
   threshold?: number
@@ -96,6 +164,14 @@ export type SaveAlertRuleInput = {
   severity?: string
   /** Connector id or `*`; see [`AlertRule.connector`]. */
   connector?: string
+  /** Table or `*`; see [`AlertRule.asset`]. */
+  asset?: string
+  pipeline?: string
+  /** `BI-19` part C: see [`AlertRule.chart`]. */
+  chart?: string
+  series?: string
+  filters?: unknown[]
+  condition?: string
 }
 
 /** Body of `GET /api/alerts/status`. */
@@ -124,6 +200,8 @@ export type AlertRunResult = {
   value?: number
   delivered?: AlertDeliverResult
   skipped?: string
+  /** `BI-19` D11: the value is back under the line and the recovery was sent. */
+  recovered?: boolean
 }
 
 export interface AlertRuleService {
@@ -132,8 +210,13 @@ export interface AlertRuleService {
   createRule(input: SaveAlertRuleInput, signal?: AbortSignal): Promise<AlertRule>
   updateRule(rule: SaveAlertRuleInput & { id: string }, signal?: AbortSignal): Promise<AlertRule>
   deleteRule(id: string, signal?: AbortSignal): Promise<void>
-  runRules(
-    id: string | undefined,
+  /**
+   * `BI-40` D1: run one rule now, as a test. There is no "run every rule"
+   * form: the whole tick belongs to the scheduler (`POST /api/alerts/run`,
+   * which a person's session cannot call).
+   */
+  testRule(
+    id: string,
     signal?: AbortSignal
   ): Promise<{ ran: number; results: AlertRunResult[] }>
 }

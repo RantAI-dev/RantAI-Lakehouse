@@ -5,8 +5,18 @@
 //! interchangeable: JavaScript's `??` falls back only when the variable is
 //! `undefined` (an explicitly-set empty string is preserved), while `||`
 //! also falls back on the empty string. [`Config::llm_key`] is the one field
-//! in this module that uses `||` semantics — see
-//! `src/services/clients/llm.ts:10`. Every other field uses `??` semantics.
+//! that uses `||` semantics — see `src/services/clients/llm.ts:10`. Every
+//! other field uses `??` semantics.
+//!
+//! Four fields are `||` fields too, on purpose (`ADM-9 review R6`):
+//! [`Config::llm_url`], [`Config::llm_model`], [`Config::smtp_port`] and
+//! [`Config::smtp_from`] read an EMPTY value as "not set", so the code's own
+//! default applies and the environment does not own the field. The reason is
+//! the deployment: `docker-compose.yml` passes these four to the API as empty
+//! strings when the operator set none, and a value that reads as a value
+//! made the console's own fields read-only on every compose installation.
+//! An empty address is no address, an empty port is no port and an empty
+//! `From` is no sender — none of the three is worth keeping.
 //!
 //! Sources ported (see doc comments on each field for the exact line):
 //! `src/services/clients/clickhouse.ts`, `src/services/clients/dagster.ts`,
@@ -20,15 +30,46 @@
 use std::collections::HashMap;
 
 use lakehouse_core::ident::Ident;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use thiserror::Error;
 use uuid::Uuid;
+
+/// Stack size of every thread of the API's tokio runtime (workers and
+/// `spawn_blocking` threads), set in `main`.
+///
+/// phase 2 catch-up with main (sqlparser 0.63): the SQL rewrite parses and
+/// visits the statements the chart builders produce, and `sqlparser`'s
+/// recursive descent costs stack in proportion to subquery nesting. A binned
+/// breakdown with "Other" needs about 0.5 MiB in a release build but about
+/// 2.1 MiB in a debug one (`cargo run`, the dev stack), which is more than
+/// tokio's default 2 MiB: whether it overflowed depended on where
+/// `sqlparser`'s own stack checks fell, not on a bound. 8 MiB (the size of a
+/// Linux main thread) leaves a margin of roughly 3x over the debug figure and
+/// 15x over release. Stack is reserved as address space and committed only as
+/// used, so the cost is nil for threads that never recurse deeply.
+pub const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// The provider address the assistant uses when neither the environment's
+/// `LLM_URL` nor the console's saved row names one (`ADM-9`).
+///
+/// The code's own default, kept here so the resolver and the config resolve
+/// to the same address: the console's Assistant tab may set the address, and
+/// the deployment's own files may name one, but the value neither of them
+/// names is this one.
+pub const DEFAULT_LLM_URL: &str = "https://api.minimax.io/v1";
+
+/// The model the assistant uses when neither the environment's `LLM_MODEL`
+/// nor the console's saved row names one (`ADM-9`).
+pub const DEFAULT_LLM_MODEL: &str = "MiniMax-M3";
 
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
 ///
 /// Only `PORT`, `CATALOG_TENANT_ID`, `AI_DEFAULT_REPLY_LANGUAGE`,
-/// `AI_SEMANTIC_LAYER`, `AI_ASK_BACK` and `AI_RELEVANT_TABLES` can fail
-/// resolution. `PORT` is load-bearing and Rust-only (the TypeScript
+/// `AI_SEMANTIC_LAYER`, `AI_ASK_BACK`, `AI_RELEVANT_TABLES`, `AI_SQL_HELP`,
+/// `CONNECTOR_TYPED_CREDENTIALS`, `EMBED_TOKEN_MAX_LIFETIME_SECONDS`,
+/// `CONNECTOR_TLS_CA_FILE` and `SMTP_CA_FILE` can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
 /// backend runs under Next.js and never binds a port itself), so an
 /// unparseable value refusing to boot is the correct, Rust-specific failure
 /// mode. `SMTP_PORT` deliberately has no equivalent error variant —
@@ -55,6 +96,26 @@ pub enum ConfigError {
     /// would quietly refuse the hosts the operator meant to allow.
     #[error("CONNECTOR_PROBE_ALLOWED_CIDRS: {0}")]
     MalformedAllowedCidrs(String),
+    /// `UPLOAD_MAX_CONCURRENT_PER_USER` or `UPLOAD_MAX_CONCURRENT` is set but
+    /// is not a whole number of 1 or more (`SEC-17`).
+    ///
+    /// Fails config resolution, unlike the login-throttle numbers: a limit
+    /// that silently fell back to its default would leave an operator who
+    /// meant to tighten it believing it holds (fail closed). Holds the
+    /// variable's name and the value as given.
+    #[error("{0} must be a whole number of 1 or more, got {1:?}")]
+    InvalidUploadLimit(&'static str, String),
+    /// `WEBHOOK_ALLOWED_CIDRS` holds an entry that is not a network or an
+    /// address (`SEC-10`). Fails config resolution for the same reason
+    /// [`ConfigError::MalformedAllowedCidrs`] does: a dropped entry would
+    /// quietly keep refusing the internal webhook target the operator listed.
+    #[error("WEBHOOK_ALLOWED_CIDRS: {0}")]
+    MalformedWebhookAllowedCidrs(String),
+    /// `SECRET_MANAGER` or the settings of the manager it names are unusable
+    /// (`SRC-12` part B). Fails config resolution: an operator who named a
+    /// manager must not get an installation that quietly has none.
+    #[error("{0}")]
+    SecretManager(#[from] crate::secret_manager::SettingsError),
     /// `AI_DEFAULT_REPLY_LANGUAGE` was set to something other than `"id"` or
     /// `"en"`.
     ///
@@ -99,6 +160,54 @@ pub enum ConfigError {
         "AI_RELEVANT_TABLES must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}"
     )]
     UnsupportedAiRelevantTables(String),
+    /// `CONNECTOR_TYPED_CREDENTIALS` was set to something other than `"true"`
+    /// or `"false"` (`SRC-12` decision 2).
+    ///
+    /// Fails config resolution for the same reason as
+    /// [`Self::UnsupportedAiSemanticLayer`]: a typo such as `"no"` would keep
+    /// typed credentials on for an operator who meant to turn them off.
+    #[error(
+        "CONNECTOR_TYPED_CREDENTIALS must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}"
+    )]
+    UnsupportedConnectorTypedCredentials(String),
+    /// `EMBED_TOKEN_MAX_LIFETIME_SECONDS` was set to something that is not a
+    /// positive whole number (`SEC-12`).
+    ///
+    /// Fails config resolution rather than falling back to the default: a
+    /// typo such as `"24h"` would quietly keep the 24-hour limit for an
+    /// operator who meant a shorter one, and `0` or a negative number would
+    /// refuse every token with nothing in the logs to explain it.
+    #[error(
+        "EMBED_TOKEN_MAX_LIFETIME_SECONDS must be a positive whole number of seconds (unset or empty means 86400), got {0:?}"
+    )]
+    InvalidEmbedTokenMaxLifetime(String),
+    /// `CONNECTOR_TLS_CA_FILE` names a path that cannot be read as a file
+    /// (`SEC-14` part B, D5). Fails config resolution rather than falling back
+    /// to Trust On First Use: an operator who set a CA meant the connector
+    /// dials to verify the server against it, and an unreadable path would
+    /// otherwise silently keep the trust-everything posture with nothing in
+    /// the logs to explain it.
+    #[error("CONNECTOR_TLS_CA_FILE must name a readable file, cannot read {0:?}")]
+    UnreadableConnectorTlsCaFile(std::path::PathBuf),
+    /// A set `CONNECTOR_TLS_CA_FILE` contains no valid PEM certificate. We refuse
+    /// start-up rather than discovering on the first connector dial that the CA
+    /// file cannot be used (SEC-14B review round 1, SHOULD-FIX 6).
+    #[error("CONNECTOR_TLS_CA_FILE must contain at least one PEM certificate, found none in {0:?}")]
+    EmptyConnectorTlsCaFile(std::path::PathBuf),
+    /// `SMTP_CA_FILE` names a path that cannot be read as a file
+    /// (`SEC-56` D5). Fails config resolution for the same reason
+    /// [`ConfigError::UnreadableConnectorTlsCaFile`] does: an operator who
+    /// set a CA meant the mail relay's certificate to be verified against
+    /// it, and an unreadable path would otherwise be discovered on the
+    /// first send — as "the mail server could not be reached", which says
+    /// nothing about the file that is wrong.
+    #[error("SMTP_CA_FILE must name a readable file, cannot read {0:?}")]
+    UnreadableSmtpCaFile(std::path::PathBuf),
+    /// A set `SMTP_CA_FILE` contains no valid PEM certificate. We refuse
+    /// start-up rather than discovering on the first send that the CA
+    /// bundle cannot be used (`SEC-56` D5).
+    #[error("SMTP_CA_FILE must contain at least one PEM certificate, found none in {0:?}")]
+    EmptySmtpCaFile(std::path::PathBuf),
 }
 
 /// The language the copilot answers in when the user's message is too short
@@ -173,6 +282,20 @@ pub struct Config {
     /// `connector_probe_allow_internal_hosts`. Empty by default. See
     /// [`crate::internal_hosts`] for what the list can never open.
     pub connector_probe_allowed_cidrs: Vec<ipnet::IpNet>,
+    /// Internal networks alert webhooks may call (`WEBHOOK_ALLOWED_CIDRS`,
+    /// `SEC-10`), in the same format as `connector_probe_allowed_cidrs` and
+    /// with the same limits (the list never opens loopback, link-local,
+    /// multicast or `0/8`; see [`crate::internal_hosts`]). A separate
+    /// setting, not the connector one: what a connector may dial says
+    /// nothing about where an alert author may send data, and there is
+    /// deliberately no "allow every internal address" switch for webhooks.
+    /// Empty by default.
+    pub webhook_allowed_cidrs: Vec<ipnet::IpNet>,
+    /// Test-only: lets webhook tests reach a `wiremock` listener on
+    /// loopback, which no deployment setting can open. `WEBHOOK_TEST_ALLOW_ALL`
+    /// is read only when compiled for tests (`cfg!(test)`), so in a service
+    /// build this is always `false` whatever the environment says.
+    pub webhook_test_allow_all: bool,
     /// Where connector credential files physically live
     /// (`CONNECTOR_SECRETS_DIR`, default `/run/secrets`). Refs always say
     /// `file:/run/secrets/...`, the path Dagster reads inside its own
@@ -180,19 +303,83 @@ pub struct Config {
     /// them — e.g. when it runs outside Docker, where `/run/secrets` does
     /// not exist and every stored credential would fail with a 503.
     pub connector_secrets_dir: std::path::PathBuf,
-    /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
-    /// connector is wanted. Default `false`; `true` only for the exact string
-    /// `"true"`.
+    /// The installation key managed connector credentials are sealed with
+    /// (`CONNECTOR_SECRETS_KEY`: 32 random bytes, base64; `SRC-12` decision
+    /// 4). `None` when unset: the config still resolves (many tests and
+    /// tools do not touch credentials), but `main` refuses to start without
+    /// it and the credential store refuses every write.
+    pub connector_secrets_key: Option<String>,
+    /// The key being retired during a key change
+    /// (`CONNECTOR_SECRETS_KEY_PREVIOUS`; decision 5). It opens files, it
+    /// never seals.
+    pub connector_secrets_key_previous: Option<String>,
+    /// CA certificate (PEM) connector dials verify the database server
+    /// against (`CONNECTOR_TLS_CA_FILE`; `SEC-14` part B, D5 as amended).
+    /// `None` when unset or empty: a connector dial still requires TLS but
+    /// takes the server's certificate on trust (`require`, D5). Set to a path
+    /// that cannot be read, start-up fails
+    /// ([`ConfigError::UnreadableConnectorTlsCaFile`]) — never a silent
+    /// fall-back to the trust-everything posture.
+    pub connector_tls_ca_file: Option<std::path::PathBuf>,
+    /// The CA certificates the SMTP relay's own certificate may chain to
+    /// (`SMTP_CA_FILE`; `SEC-56` D1/D6).
     ///
-    /// It names an extension point, not a working feature: this build ships
-    /// no Oracle `LogMiner` property template, so `GET
-    /// /api/connectors/{id}/debezium-properties` refuses every Oracle-driver
-    /// connector in both states and only its explanation changes. `LogMiner`
-    /// capture also needs `ARCHIVELOG` mode and supplemental logging on the
-    /// source database, which the batch sql adapter (`adapters/oracle.py`,
-    /// read-only `SELECT`) neither assumes nor configures. See
-    /// `docs/adr/0008-initial-snapshot-backfill.md`.
-    pub oracle_cdc_logminer_enabled: bool,
+    /// `None` when unset or empty: the mail sender trusts the built-in
+    /// roots only, exactly as it did before this setting existed (D1). The
+    /// bundle's CAs are ADDED to those roots, never put in their place
+    /// (D2), and the hostname check stays on (D3). The bundle is read once,
+    /// here, and kept in memory: the send path does no file I/O (D6).
+    pub smtp_ca: Option<lakehouse_notify::SmtpCaBundle>,
+    /// The path `SMTP_CA_FILE` named, kept for the [`std::fmt::Debug`]
+    /// output: the bundle itself prints its count and nothing else
+    /// (`SEC-56` D9), and an operator reading a start-up log wants the
+    /// path, not a count.
+    pub smtp_ca_file: Option<std::path::PathBuf>,
+    /// The installation's secret manager and how to sign in to it
+    /// (`SECRET_MANAGER` and its manager's variables; `SRC-12` part B). The
+    /// sign-in settings are secrets: this field's `Debug` prints the manager
+    /// only.
+    pub secret_manager: crate::secret_manager::SecretManagerSettings,
+    /// Whether a user may type a credential value (`CONNECTOR_TYPED_CREDENTIALS`,
+    /// default on; only the exact word `false` turns it off). Off leaves
+    /// "reference a secret in the secret manager" as the only way to give a
+    /// connector a credential (`SRC-12` decision 2).
+    pub connector_typed_credentials: bool,
+    /// The address of this product's own OAuth callback as the provider and the
+    /// person's browser reach it (`CONNECTOR_OAUTH_REDIRECT_URI`, for example
+    /// `https://console.example.com/api/connectors/oauth/callback`; `SRC-12`
+    /// part C). Operator-set, never taken from a request (the same open-redirect
+    /// reasoning as `oidc_redirect_uri`). Unset: starting an OAuth sign-in is
+    /// refused with a message that names this setting. It is also the address the
+    /// connector form shows, to be copied into the provider's app settings.
+    pub connector_oauth_redirect_uri: Option<String>,
+    /// Gate-only switch (`CONNECTOR_OAUTH_ALLOW_HTTP`, default off; only the exact
+    /// word `true` turns it on): admit `http://` token, revocation and sign-in
+    /// addresses of an `OAuth2` connector. Every address the product dials for
+    /// `OAuth2` carries a client secret or a refresh token, so `https` is the
+    /// rule; this exists so the acceptance gate (`ops/g6`) can run its own
+    /// provider on a private network without a certificate. Never set it on a
+    /// real installation. The address check (`resolve_checked`) applies either way.
+    pub connector_oauth_allow_http: bool,
+    /// Where the API reaches `Kafka Connect`'s REST API (`KAFKA_CONNECT_URL`,
+    /// `SRC-4` slice 2, ADR 0016). `None` when unset or blank: a change-capture
+    /// connector then answers `supported: false` with a fixed sentence instead
+    /// of dialing a guessed address (fail closed). Operator-set, never taken
+    /// from a request; the address is internal to the deployment's network.
+    pub kafka_connect_url: Option<String>,
+    /// The broker's address as `Kafka Connect` reaches it (`CDC_KAFKA_BOOTSTRAP`,
+    /// the variable the code location's applier reads too; `SRC-4` slice 3,
+    /// decision S3-b). A `MySQL` or `SQL Server` connector keeps its schema
+    /// history in a topic on this broker and cannot start without it; unset, such
+    /// a connector answers the same fixed "not configured" sentence as an unset
+    /// `KAFKA_CONNECT_URL`. `PostgreSQL` does not need it.
+    pub cdc_kafka_bootstrap: Option<String>,
+    /// The directory the API writes each change-capture connector's source
+    /// password into (`CDC_SECRETS_DIR`, `SRC-4` decision S2-a). Default
+    /// `/run/cdc-secrets`, the `tmpfs` volume `docker-compose.yml` mounts here
+    /// and read-only in `kafka-connect` at the SAME path, because the connector
+    /// JSON names the file by this path. Set it only in a test.
+    pub cdc_secrets_dir: String,
     /// `ClickHouse` HTTP interface URL. Default
     /// `"http://localhost:18123"` (`clickhouse.ts:11`, `??`).
     pub ch_url: String,
@@ -214,19 +401,67 @@ pub struct Config {
     pub dagster_location: String,
     /// LLM chat-completions base URL. Default
     /// `"https://api.minimax.io/v1"` (`llm.ts:7`, `??`).
+    ///
+    /// An EMPTY `LLM_URL` is "not set": the default applies, and the
+    /// environment does not own the address (`ADM-9 review R6`), so the
+    /// console may set one.
     pub llm_url: String,
+    /// Whether `LLM_URL` was set and non-empty. `llm_url` is the
+    /// environment's value or the code default, so it alone cannot tell an
+    /// operator who set `LLM_URL` from one who never set it; the
+    /// console-settings resolver (`ADM-9`) needs exactly that to answer a
+    /// field's `source` and refuse a console write over an environment
+    /// value (`ADM-9 review R4`, the same rule as
+    /// [`Config::smtp_port_from_env`]).
+    pub llm_url_from_env: bool,
     /// LLM model name. Default `"MiniMax-M3"` (`llm.ts:8`, `??`).
+    ///
+    /// An EMPTY `LLM_MODEL` is "not set", like [`Config::llm_url`]
+    /// (`ADM-9 review R6`).
     pub llm_model: String,
+    /// Whether `LLM_MODEL` was set and non-empty — the model half of
+    /// [`Config::llm_url_from_env`] (`ADM-9 review R4`).
+    pub llm_model_from_env: bool,
     /// LLM API key: `LLM_KEY`, falling back to `MINIMAX_API_KEY`, falling
     /// back to `""` (`llm.ts:10`, `||` — an explicitly *empty* `LLM_KEY`
     /// also falls through to `MINIMAX_API_KEY`, unlike every other field
     /// here).
     pub llm_key: String,
-    /// Embed JWT signing secret. `None` when unset (mirrors the truthy
-    /// check `if (process.env.EMBED_SECRET)` at `embed-jwt.ts:37`; the
-    /// TypeScript then falls back to a generated, `ClickHouse`-persisted
-    /// secret, which is out of scope for this chassis).
+    /// Embed JWT signing secret. `None` when unset or empty (truthy check).
+    /// `SEC-12`: this is the ONLY source. No secret is generated or stored
+    /// any more (the TypeScript and the earlier Rust fell back to a
+    /// plain-text `console.app_kv` row); `None` means signed embedding is
+    /// unavailable and says so, while the API still starts.
     pub embed_secret: Option<String>,
+    /// Base URL of the Gotenberg container that makes PDFs (`GOTENBERG_URL`,
+    /// `BI-1` D1/D5). `None` when unset or empty. Operator configuration,
+    /// never taken from a request.
+    pub gotenberg_url: Option<String>,
+    /// The key render tokens are signed with (`RENDER_TOKEN_SECRET`, `BI-1`
+    /// review fix (BLOCKER) R1). Server-only and independent of every other
+    /// secret: `EMBED_SECRET` is held by the embedding customer, and a render
+    /// token reads as whichever person it names. `None` when unset or empty:
+    /// PDF export is then not set up (fail closed).
+    pub render_token_secret: Option<lakehouse_core::secret::SecretValue>,
+    /// The console's address as the Gotenberg container reaches it
+    /// (`CONSOLE_INTERNAL_URL`, e.g. `http://lakehouse-frontend:3000`): the
+    /// print view lives at `<this>/render/dashboard/<token>`. `None` when
+    /// unset or empty. PDF export needs this, `GOTENBERG_URL` and
+    /// `RENDER_TOKEN_SECRET` (the render token's key); any one missing means "PDF
+    /// export is not set up on this deployment" (feature decision 6).
+    pub console_internal_url: Option<String>,
+    /// The console's address as people open it (`CONSOLE_PUBLIC_URL`, e.g.
+    /// `https://lakehouse.example.com`): the link in a scheduled report's email
+    /// (`RPT-1`) is `<this>/dashboards/<id>`. Operator configuration, never
+    /// taken from a request (a header the caller controls would put a link of
+    /// their choosing in an email to others). `None` when unset, empty or not an
+    /// `http(s)` address: the email then has no link and says nothing about one.
+    pub console_public_url: Option<String>,
+    /// The longest lifetime (`exp - iat`) a signed embed token may have, in
+    /// seconds (`SEC-12`). `EMBED_TOKEN_MAX_LIFETIME_SECONDS`; default
+    /// 86400. A value that is not a positive integer fails start-up
+    /// ([`ConfigError::InvalidEmbedTokenMaxLifetime`]).
+    pub embed_token_max_lifetime_seconds: u64,
     /// Shared token required to call `/api/alerts/run`. `None` when unset,
     /// meaning the endpoint requires no auth (`alerts/run/route.ts:16-19`,
     /// truthy check).
@@ -243,7 +478,18 @@ pub struct Config {
     /// cutover a stray `SMTP_PORT=` must not take the whole process down;
     /// `PORT` (below) is the one field that legitimately still hard-fails,
     /// since it is Rust-only and load-bearing.
+    ///
+    /// An EMPTY `SMTP_PORT` is "not set" and NOT a bad value
+    /// (`ADM-9 review R6`): the default applies and nothing is logged — a
+    /// warning would name a value the operator never chose.
     pub smtp_port: u16,
+    /// Whether `SMTP_PORT` was set and non-empty (and parsed). `smtp_port`
+    /// is the parsed value or the 587 default, so it alone cannot tell an
+    /// operator who set `SMTP_PORT=587` from one who never set it; the
+    /// console-settings resolver (`ADM-7`) needs exactly that to answer a
+    /// field's `source` and refuse a console write over an environment
+    /// value.
+    pub smtp_port_from_env: bool,
     /// Whether to use implicit TLS: the *effective* value nodemailer would
     /// use, matching `notify.ts:40` in full —
     /// `SMTP_SECURE === "true" || port === 465`, not just the raw env var.
@@ -264,7 +510,17 @@ pub struct Config {
     /// SMTP `From` header. `SMTP_FROM`, falling back to `SMTP_USER`,
     /// falling back to `"rantai-lake@localhost"` (`notify.ts:44`, `??`
     /// chain).
+    ///
+    /// An EMPTY value at any step of the chain is "not set" at that step
+    /// (`ADM-9 review R6`): an empty `From` is no sender, and no mail
+    /// server accepts one.
     pub smtp_from: String,
+    /// Whether `SMTP_FROM` was set and non-empty. `smtp_from` is the
+    /// fallback-chain result, so it alone cannot tell `SMTP_FROM` from the
+    /// `SMTP_USER`/literal fallback; the console-settings resolver (`ADM-7`)
+    /// needs that to answer `from`'s `source` (the `From` address is its own
+    /// console field, independent of the auth `SMTP_USER`).
+    pub smtp_from_from_env: bool,
     /// Port this service listens on. Default `8080`. Not derived from the
     /// TypeScript (which runs under Next.js), specific to this Rust
     /// service.
@@ -303,22 +559,24 @@ pub struct Config {
     /// This application's client id as registered with the `OIDC`
     /// provider. `None` when unset.
     pub oidc_client_id: Option<String>,
-    /// `OIDC` client secret. `None` when unset. Reserved for a future
-    /// authorization-code exchange (a login-UI concern, out of this task's
-    /// scope) — `lakehouse_auth::oidc::OidcAuthenticator` verifies already-
-    /// issued bearer tokens against the provider's public JWKS and needs no
-    /// shared secret to do that, so this field is parsed (and kept out of
-    /// `Debug`) but not currently read by anything.
+    /// `OIDC` client secret. `None` when unset. Sent during authorization-code
+    /// exchange at `routes/auth.rs` (`oidc_callback`) when configured. Kept
+    /// out of `Debug`.
     pub oidc_client_secret: Option<String>,
     /// A short, operator-chosen label for the configured provider (e.g.
     /// `"okta"`, `"entra"`). Combined with `"oidc:"` to form
     /// `auth_identity.provider`. Default `"default"`.
     pub oidc_provider_name: String,
+    /// Whether `OIDC_PROVIDER_NAME` was set and non-empty in the environment.
+    pub oidc_provider_name_from_env: bool,
     /// Explicit override for the JWKS endpoint URL. `None` when unset, in
-    /// which case `crate::state::AppState::new` derives
-    /// `"{issuer}/.well-known/jwks.json"` — the conventional `OIDC`
-    /// discovery-document location every provider this crate documents
-    /// (Okta, Entra, Google, Keycloak) publishes at.
+    /// which case `SEC-38` applies: the address is the `jwks_uri` from the
+    /// provider's discovery document
+    /// (`{issuer}/.well-known/openid-configuration`), read on the first
+    /// key lookup and cached with the key set. Set this only when a
+    /// provider's discovery document is unavailable or names a key set
+    /// this deployment cannot reach; an explicit value is used exactly as
+    /// given and no discovery request is made.
     pub oidc_jwks_url: Option<String>,
     /// Whether an unrecognized `OIDC` subject is allowed to provision a new
     /// `app_user`. Default `false` — see
@@ -326,14 +584,28 @@ pub struct Config {
     /// for why the default matters. `true` only when `OIDC_JIT_PROVISIONING`
     /// is exactly `"true"`.
     pub oidc_jit_provisioning: bool,
+    /// Whether `OIDC_JIT_PROVISIONING` was set and non-empty in the environment.
+    pub oidc_jit_provisioning_from_env: bool,
+    /// Whether this provider's emails are trusted even when the token does
+    /// not carry `email_verified: true` (`SEC-65` D3). Default `false` —
+    /// the safe value the task establishes. `true` only when
+    /// `OIDC_TRUST_EMAIL` is exactly `"true"` (`AGENTS.md`: booleans from
+    /// the environment are parsed that way).
+    pub oidc_trust_email: bool,
+    /// Whether `OIDC_TRUST_EMAIL` was set and non-empty in the environment.
+    pub oidc_trust_email_from_env: bool,
     /// Maps an `OIDC` group/role claim value to a local `role.name`, parsed
     /// from `OIDC_ROLE_MAP` (e.g.
     /// `"lakehouse-admins=Platform Admin,analysts=Analyst"`). Empty when
     /// unset. See [`parse_role_map`].
     pub oidc_role_map: HashMap<String, String>,
+    /// Whether `OIDC_ROLE_MAP` was set and non-empty in the environment.
+    pub oidc_role_map_from_env: bool,
     /// Which claim in an `OIDC` token carries the caller's groups/roles.
     /// Default `"groups"`.
     pub oidc_groups_claim: String,
+    /// Whether `OIDC_GROUPS_CLAIM` was set and non-empty in the environment.
+    pub oidc_groups_claim_from_env: bool,
     /// Clock-skew tolerance (seconds) `OIDC` token validation applies to
     /// `exp`/`nbf`. Default `60`. An unparseable value falls back to the
     /// default (like [`Self::smtp_port`], not load-bearing enough to fail
@@ -428,15 +700,22 @@ pub struct Config {
     /// [`Self::rustfs_access_key_secret_ref`].
     pub rustfs_secret_key_secret_ref: Option<String>,
     /// Postgres connection string for Phase 2 OLTP storage (`lakehouse-store`).
-    /// Default `"postgres://lakehouse:lakehouse@localhost:5432/lakehouse"`
-    /// (`??` semantics, like every other URL field here). Rust/Phase-2-only:
-    /// no TypeScript equivalent exists, since Phase 1 never wrote to
-    /// persistent storage. An unreachable or misconfigured Postgres is
-    /// deliberately NOT a boot-time failure — see the doc comment on
-    /// `lakehouse_store::connect_lazy` — so, unlike `port`, this field has
-    /// no dedicated [`ConfigError`] variant either; whatever string is here
-    /// is handed to `connect_lazy` as-is and any problem with it surfaces
-    /// lazily, at first use, as an ordinary request-time error.
+    /// **No default** (`SEC-37`): unset (or empty) is `""`, which
+    /// [`crate::state::AppState::new`] turns into "no Postgres pool" — the
+    /// state `main` already handles with a warning and every Phase 2 route
+    /// answers 503 for. It used to default to a `localhost:5432` DSN whose
+    /// user and password were both written in the repository — a default
+    /// credential (`AGENTS.md` rule 5); compose always sets `DATABASE_URL`
+    /// (built from the must-set `POSTGRES_PASSWORD`), so only a run outside
+    /// compose can reach the unset state. Rust/Phase-2-only: no TypeScript
+    /// equivalent exists, since Phase 1 never wrote to persistent storage.
+    /// An unreachable or
+    /// misconfigured Postgres is deliberately NOT a boot-time failure — see
+    /// the doc comment on `lakehouse_store::connect_lazy` — so, unlike
+    /// `port`, this field has no dedicated [`ConfigError`] variant either;
+    /// whatever non-empty string is here is handed to `connect_lazy` as-is
+    /// and any problem with it surfaces lazily, at first use, as an ordinary
+    /// request-time error.
     pub database_url: String,
     /// ADR 0010/0011 — path to a file holding the `gold-export` Lakekeeper
     /// principal's pre-minted static bearer token (`iceberg-catalog-rest`'s
@@ -446,7 +725,7 @@ pub struct Config {
     /// minted at compose bring-up by `ops/oidc-mock` onto a shared volume
     /// (`lakehouse_oidc_tokens`) every writer in this stack already reads
     /// directly from disk the same way (`docker-compose.yml`'s
-    /// `g1-test-runner`, `debezium-server`, `trino`, ...) — there is no
+    /// `g1-test-runner`, `trino`, ...; SRC-4 S2 review SHOULD-FIX 2) — there is no
     /// static value to put behind an `env:` `secretRef` ahead of time.
     /// Always set to a default path — `/tokens/gold-export.jwt`, matching
     /// where `docker-compose.yml`'s `lakehouse-api` service mounts the
@@ -490,6 +769,32 @@ pub struct Config {
     /// with an empty-string token that would only surface as a confusing
     /// 401 from Lakekeeper later.
     pub lakekeeper_admin_token_file: String,
+    /// DATA-5 / ADR 0016 point 4 — the storage address an operator
+    /// PUBLISHES for outside readers.
+    ///
+    /// `Lakekeeper` vends the deployment's own internal name
+    /// (`http://rustfs:9000`), which resolves only inside the deployment,
+    /// so the API's door (`routes::iceberg_door`) swaps it for this one in
+    /// a table-load and a credentials response. `None` when unset, and
+    /// unset means OUTSIDE READING IS OFF: every door route answers 503
+    /// naming this setting, and the console says "Not measured" with that
+    /// reason — never a count of zero, and never a vended address an
+    /// outside tool cannot reach.
+    ///
+    /// Not a secret: it is an address, not a credential.
+    pub outside_s3_endpoint: Option<String>,
+    /// DATA-5 / ADR 0016 point 3 — path to a file holding the
+    /// `outside-readers` Lakekeeper principal's pre-minted static bearer
+    /// token: the identity the door forwards an outside tool's catalog
+    /// call under (the tool's own key never reaches `Lakekeeper`).
+    ///
+    /// Same "always a default path, never `None`-when-unset" shape, and
+    /// the same shared reader, as
+    /// [`Self::lakekeeper_gold_export_token_file`] and
+    /// [`Self::lakekeeper_read_token_file`] (AGENTS rule 4: no second
+    /// reader). An empty value means the setting is unset, which the door
+    /// reports as "not set up" (503) rather than trying to read it.
+    pub lakekeeper_outside_read_token_file: String,
     /// S3-compatible endpoint `POST /api/identity/tenants` creates tenant
     /// Lakekeeper warehouses against. `None` when unset.
     ///
@@ -694,7 +999,7 @@ pub struct Config {
     pub catalog_tenant_id: Option<Uuid>,
     /// Language the copilot replies in when the latest chat message is too
     /// short for `routes::ai::prompt::reply_language` to detect one
-    /// (`Jelaskan chart ini`, `2024?`). `None` when unset or empty: the
+    /// (`total revenue`, `2024?`). `None` when unset or empty: the
     /// prompt's wording is then unchanged from before the setting existed
     /// (the Latin-script line keeps its English fallback, a message with no
     /// letters gets none). A detected language always wins over this
@@ -751,6 +1056,98 @@ pub struct Config {
     /// task deletes them. Zero, negative, or unparseable values fall back
     /// to the default (30).
     pub auth_retention_days: u32,
+    /// Whether the environment names [`Self::login_max_failures`] with a
+    /// whole number of 1 or more (`ADM-8`).
+    ///
+    /// The flag, not the value: the console may not change a setting the
+    /// environment owns (plan D1), and the value alone cannot say whether
+    /// the environment named it or the code default supplied it. An
+    /// unparseable value does not count — the operator's value is invalid,
+    /// the code default is in effect, and the console is free to set a real
+    /// one (the same rule as [`Self::smtp_port_from_env`]).
+    pub login_max_failures_from_env: bool,
+    /// Whether the environment names
+    /// [`Self::login_failure_window_secs`] with a whole number of 1 or more
+    /// (`ADM-8`). See [`Self::login_max_failures_from_env`].
+    pub login_failure_window_secs_from_env: bool,
+    /// Whether the environment names [`Self::login_lockout_secs`] with a
+    /// whole number of 1 or more (`ADM-8`). See
+    /// [`Self::login_max_failures_from_env`].
+    pub login_lockout_secs_from_env: bool,
+    /// Whether the environment names [`Self::auth_retention_days`] with a
+    /// whole number of 1 or more (`ADM-8`). See
+    /// [`Self::login_max_failures_from_env`].
+    pub auth_retention_days_from_env: bool,
+    /// Whether the environment names
+    /// [`Self::embed_token_max_lifetime_seconds`] with a whole number of 1
+    /// or more (`ADM-8`). See [`Self::login_max_failures_from_env`].
+    pub embed_token_max_lifetime_from_env: bool,
+    /// Files one user may have being received, and loads one user may have
+    /// running, at once: `UPLOAD_MAX_CONCURRENT_PER_USER`, default 4
+    /// (`SEC-17`). A value that is not a whole number of 1 or more fails
+    /// config resolution ([`ConfigError::InvalidUploadLimit`]).
+    pub upload_max_concurrent_per_user: u32,
+    /// The same, for the whole installation: `UPLOAD_MAX_CONCURRENT`,
+    /// default 16 (`SEC-17`).
+    pub upload_max_concurrent: u32,
+    /// Large loads that may run at once in the whole installation: loads
+    /// whose files total more than 512 MiB (`DATA-37` decision D1).
+    /// `UPLOAD_MAX_CONCURRENT_LARGE`, default 2 (decision D2). Two are
+    /// about 4.4 GiB of job memory, which leaves room for the stack on the
+    /// 16 GiB minimum host, and the stack's own idle memory is not
+    /// measured. A value that is not a whole number of 1 or more fails
+    /// config resolution ([`ConfigError::InvalidUploadLimit`]).
+    pub upload_max_concurrent_large: u32,
+    /// How many files may be READ at once per API process: the workbook and
+    /// Parquet files an upload converts, each read by a child process
+    /// (`SEC-22` D3). `UPLOAD_MAX_CONVERSIONS`, default 2. A request that
+    /// arrives when every slot is taken is refused at once (429), not
+    /// queued. A value that is not a whole number of 1 or more fails config
+    /// resolution ([`ConfigError::InvalidUploadLimit`]).
+    pub upload_max_conversions: u32,
+    /// The memory limit the child that reads an uploaded file sets for
+    /// itself: `UPLOAD_CONVERT_MEMORY_MB`, default 1280 MiB. The number is
+    /// the measured peak of the largest allowed workbook times 1.5, rounded
+    /// up to 128 MiB (`SEC-22` D7; the measurement is in
+    /// `ops/g9/sec22_measure.py` and its numbers in
+    /// `docs/plans/SEC-22-RESULT.md`). A value that is not a whole number of
+    /// 1 or more fails config resolution
+    /// ([`ConfigError::InvalidUploadLimit`]).
+    pub upload_convert_memory_mb: u32,
+    /// Hours after which an upload session whose pieces never all arrived
+    /// is aborted and removed: `UPLOAD_SESSION_TTL_HOURS`, default 24
+    /// (`DATA-17`, decision 8 of the feature page, *proposed* and signed by
+    /// default). A value that is not a whole number of 1 or more fails config
+    /// resolution ([`ConfigError::InvalidUploadLimit`]). Read by the hourly
+    /// sweep (`upload_sweep`); the compose file does not pass it through yet,
+    /// so a container runs with the default.
+    pub upload_session_ttl_hours: u32,
+    /// Failed connector runs in a row at which the connector is paused and
+    /// `connector_disabled` is raised (`SRC-11` decision D3), from
+    /// `CONNECTOR_AUTO_DISABLE_AFTER`. Zero, negative, or unparseable values
+    /// fall back to the default (30,
+    /// `lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER`). The gate
+    /// lowers it for its own job and says so; it is not a per-connector
+    /// setting.
+    pub connector_auto_disable_after: i32,
+    /// How long one connector run may run before the API stops treating it as
+    /// going (`SRC-39`, QA `TC-1702`): `INGEST_RUN_MAX_RUNTIME_SECONDS`,
+    /// default 21600 (six hours). The run route cancels a run older than this
+    /// plus its grace, records it as failed with `timed_out`, and lets the
+    /// next run start; the orchestrator's own run monitoring enforces the
+    /// same number through the `dagster/max_runtime` tag. Zero, negative, or
+    /// unparseable values keep the default.
+    pub ingest_run_max_runtime_seconds: u32,
+    /// How long a connector run the orchestrator has taken off its queue may
+    /// take to start before the API stops holding the connector for it
+    /// (`SRC-39`, QA `TC-1702`): `INGEST_RUN_START_TIMEOUT_SECONDS`, default
+    /// 600 (ten minutes). A run still waiting in the orchestrator's queue is
+    /// judged by [`Config::ingest_run_max_runtime_seconds`] instead
+    /// (`review round 1, R1`): its run monitoring never ends a queued run.
+    /// It MUST equal `start_timeout_seconds` in `dagster/dagster.yaml`:
+    /// whoever changes one changes both. Zero, negative, or unparseable
+    /// values keep the default.
+    pub ingest_run_start_timeout_seconds: u32,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -776,11 +1173,24 @@ impl std::fmt::Debug for Config {
             .field("dagster_repo", &self.dagster_repo)
             .field("dagster_location", &self.dagster_location)
             .field("llm_url", &self.llm_url)
+            .field("llm_url_from_env", &self.llm_url_from_env)
             .field("llm_model", &self.llm_model)
+            .field("llm_model_from_env", &self.llm_model_from_env)
             .field("llm_key", &REDACTED)
             .field(
                 "embed_secret",
                 &self.embed_secret.as_ref().map(|_| REDACTED),
+            )
+            .field(
+                "render_token_secret",
+                &self.render_token_secret.as_ref().map(|_| REDACTED),
+            )
+            .field("gotenberg_url", &self.gotenberg_url)
+            .field("console_internal_url", &self.console_internal_url)
+            .field("console_public_url", &self.console_public_url)
+            .field(
+                "embed_token_max_lifetime_seconds",
+                &self.embed_token_max_lifetime_seconds,
             )
             .field(
                 "alerts_run_token",
@@ -788,12 +1198,19 @@ impl std::fmt::Debug for Config {
             )
             .field("smtp_host", &self.smtp_host)
             .field("smtp_port", &self.smtp_port)
+            .field("smtp_port_from_env", &self.smtp_port_from_env)
             .field("smtp_secure", &self.smtp_secure)
             .field("smtp_user", &self.smtp_user)
             .field("smtp_pass", &REDACTED)
             .field("smtp_from", &self.smtp_from)
+            .field("smtp_from_from_env", &self.smtp_from_from_env)
             .field("lakekeeper_catalog_uri", &self.lakekeeper_catalog_uri)
             .field("lakekeeper_warehouse", &self.lakekeeper_warehouse)
+            .field("outside_s3_endpoint", &self.outside_s3_endpoint)
+            .field(
+                "lakekeeper_outside_read_token_file",
+                &self.lakekeeper_outside_read_token_file,
+            )
             .field("iceberg_query_db", &self.iceberg_query_db)
             .field("lakekeeper_base_url", &self.lakekeeper_base_url)
             .field(
@@ -831,10 +1248,25 @@ impl std::fmt::Debug for Config {
                 &self.oidc_client_secret.as_ref().map(|_| REDACTED),
             )
             .field("oidc_provider_name", &self.oidc_provider_name)
+            .field(
+                "oidc_provider_name_from_env",
+                &self.oidc_provider_name_from_env,
+            )
             .field("oidc_jwks_url", &self.oidc_jwks_url)
             .field("oidc_jit_provisioning", &self.oidc_jit_provisioning)
+            .field(
+                "oidc_jit_provisioning_from_env",
+                &self.oidc_jit_provisioning_from_env,
+            )
+            .field("oidc_trust_email", &self.oidc_trust_email)
+            .field("oidc_trust_email_from_env", &self.oidc_trust_email_from_env)
             .field("oidc_role_map", &self.oidc_role_map)
+            .field("oidc_role_map_from_env", &self.oidc_role_map_from_env)
             .field("oidc_groups_claim", &self.oidc_groups_claim)
+            .field(
+                "oidc_groups_claim_from_env",
+                &self.oidc_groups_claim_from_env,
+            )
             .field(
                 "connector_probe_allow_internal_hosts",
                 &self.connector_probe_allow_internal_hosts,
@@ -843,11 +1275,39 @@ impl std::fmt::Debug for Config {
                 "connector_probe_allowed_cidrs",
                 &self.connector_probe_allowed_cidrs,
             )
+            .field("webhook_allowed_cidrs", &self.webhook_allowed_cidrs)
+            .field("webhook_test_allow_all", &self.webhook_test_allow_all)
             .field("connector_secrets_dir", &self.connector_secrets_dir)
             .field(
-                "oracle_cdc_logminer_enabled",
-                &self.oracle_cdc_logminer_enabled,
+                "connector_secrets_key",
+                &self.connector_secrets_key.as_ref().map(|_| REDACTED),
             )
+            .field(
+                "connector_secrets_key_previous",
+                &self
+                    .connector_secrets_key_previous
+                    .as_ref()
+                    .map(|_| REDACTED),
+            )
+            .field("connector_tls_ca_file", &self.connector_tls_ca_file)
+            .field("smtp_ca_file", &self.smtp_ca_file)
+            .field("smtp_ca", &self.smtp_ca)
+            .field("secret_manager", &self.secret_manager)
+            .field(
+                "connector_typed_credentials",
+                &self.connector_typed_credentials,
+            )
+            .field(
+                "connector_oauth_redirect_uri",
+                &self.connector_oauth_redirect_uri,
+            )
+            .field(
+                "connector_oauth_allow_http",
+                &self.connector_oauth_allow_http,
+            )
+            .field("kafka_connect_url", &self.kafka_connect_url)
+            .field("cdc_kafka_bootstrap", &self.cdc_kafka_bootstrap)
+            .field("cdc_secrets_dir", &self.cdc_secrets_dir)
             .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
             .field("oidc_authorize_url", &self.oidc_authorize_url)
             .field("oidc_token_url", &self.oidc_token_url)
@@ -938,9 +1398,53 @@ impl std::fmt::Debug for Config {
             .field("ai_relevant_tables", &self.ai_relevant_tables)
             .field("git_sha", &self.git_sha)
             .field("login_max_failures", &self.login_max_failures)
+            .field(
+                "login_max_failures_from_env",
+                &self.login_max_failures_from_env,
+            )
             .field("login_failure_window_secs", &self.login_failure_window_secs)
+            .field(
+                "login_failure_window_secs_from_env",
+                &self.login_failure_window_secs_from_env,
+            )
             .field("login_lockout_secs", &self.login_lockout_secs)
+            .field(
+                "login_lockout_secs_from_env",
+                &self.login_lockout_secs_from_env,
+            )
             .field("auth_retention_days", &self.auth_retention_days)
+            .field(
+                "auth_retention_days_from_env",
+                &self.auth_retention_days_from_env,
+            )
+            .field(
+                "embed_token_max_lifetime_from_env",
+                &self.embed_token_max_lifetime_from_env,
+            )
+            .field(
+                "upload_max_concurrent_per_user",
+                &self.upload_max_concurrent_per_user,
+            )
+            .field("upload_max_concurrent", &self.upload_max_concurrent)
+            .field(
+                "upload_max_concurrent_large",
+                &self.upload_max_concurrent_large,
+            )
+            .field("upload_max_conversions", &self.upload_max_conversions)
+            .field("upload_convert_memory_mb", &self.upload_convert_memory_mb)
+            .field("upload_session_ttl_hours", &self.upload_session_ttl_hours)
+            .field(
+                "connector_auto_disable_after",
+                &self.connector_auto_disable_after,
+            )
+            .field(
+                "ingest_run_max_runtime_seconds",
+                &self.ingest_run_max_runtime_seconds,
+            )
+            .field(
+                "ingest_run_start_timeout_seconds",
+                &self.ingest_run_start_timeout_seconds,
+            )
             .finish()
     }
 }
@@ -996,6 +1500,202 @@ fn parse_positive_u32_or_default(env: &HashMap<String, String>, key: &str, defau
         .unwrap_or(default)
 }
 
+/// Reads one of the two run limits of `SRC-39` (QA `TC-1702`; `review round
+/// 1, R9`).
+///
+/// The same rule the orchestrator's `RunLimitSettings.from_env` applies
+/// (`dagster/dispar_orchestrate/ingest_factory.py`): surrounding spaces
+/// trimmed, ASCII digits only, a value from 1 to `u32::MAX`. It is not
+/// [`parse_positive_u32_or_default`]: that one accepts a leading `+` and
+/// rejects a padded number, so `"86_400"` or `" 900 "` would be read one way
+/// here and another there, and the API would cancel a run the orchestrator
+/// still believes in.
+///
+/// A value that cannot be read keeps `default`, with a warning that names the
+/// variable and never the value (the orchestrator's own rule; the API used to
+/// fall back without a word). An empty value is unset — the normal case in
+/// compose, which passes `${X:-}` — and warns about nothing.
+fn parse_run_limit(env: &HashMap<String, String>, key: &str, default: u32) -> u32 {
+    let Some(raw) = env.get(key) else {
+        return default;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default;
+    }
+    if trimmed.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(value) = trimmed.parse::<u32>()
+        && value > 0
+    {
+        return value;
+    }
+    tracing::warn!(
+        variable = key,
+        "a run limit is not a whole number of seconds of 1 or more; using the default"
+    );
+    default
+}
+
+/// Whether the environment names `key` with a whole number of 1 or more
+/// (`ADM-8`): a setting the environment owns is read-only in the console, and
+/// the value alone cannot say whether the environment named it or the code
+/// default supplied it.
+///
+/// The same rule as [`parse_positive_u32_or_default`]: an unparseable value
+/// does not count, because the operator's value is invalid and the code
+/// default is in effect.
+fn env_sets_positive_u32(env: &HashMap<String, String>, key: &str) -> bool {
+    env.get(key)
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .is_some_and(|value| u32::try_from(value).is_ok())
+}
+
+/// Whether the environment names `key` with a whole number of 1 or more
+/// (`ADM-8`), for a setting counted in seconds as a `u64`. See
+/// [`env_sets_positive_u32`].
+fn env_sets_positive_u64(env: &HashMap<String, String>, key: &str) -> bool {
+    env.get(key)
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .is_some_and(|value| value > 0)
+}
+
+/// Parses `key` as a whole number of 1 or more, `default` when unset or
+/// empty (see [`truthy`]). Anything else is an error: see
+/// [`ConfigError::InvalidUploadLimit`]. Used by the two `SEC-17` upload limits.
+fn parse_limit(
+    env: &HashMap<String, String>,
+    key: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    match truthy(env, key) {
+        None => Ok(default),
+        Some(raw) => raw
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or(ConfigError::InvalidUploadLimit(key, raw)),
+    }
+}
+
+/// `EMBED_TOKEN_MAX_LIFETIME_SECONDS` (`SEC-12`): unset or empty is the
+/// 24-hour default; anything else must be a positive whole number.
+fn parse_embed_token_max_lifetime(env: &HashMap<String, String>) -> Result<u64, ConfigError> {
+    match truthy(env, "EMBED_TOKEN_MAX_LIFETIME_SECONDS") {
+        None => Ok(lakehouse_embed::DEFAULT_MAX_LIFETIME_SECONDS),
+        Some(raw) => raw
+            .parse::<u64>()
+            .ok()
+            .filter(|v| *v > 0)
+            .ok_or(ConfigError::InvalidEmbedTokenMaxLifetime(raw)),
+    }
+}
+
+/// What is wrong with a CA file a setting named (`SEC-56` D5).
+///
+/// Each setting maps this to its OWN [`ConfigError`] variant, so the
+/// message names the setting that is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaFileProblemKind {
+    /// The path cannot be read as a file (it is missing, or it is a
+    /// directory).
+    Unreadable,
+    /// The file holds no PEM certificate.
+    Empty,
+}
+
+/// A CA file a setting named, and what is wrong with it (`SEC-56` D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaFileProblem {
+    /// The path the setting named.
+    path: std::path::PathBuf,
+    /// What is wrong with it.
+    kind: CaFileProblemKind,
+}
+
+/// Read the CA file a setting names, if it names one (`SEC-56` D5).
+///
+/// ONE helper for every setting that points at a CA file, so the checks
+/// are the same everywhere: a set path that cannot be read, or that holds
+/// no PEM certificate, stops the API at start rather than being discovered
+/// on the first dial or the first send. An unset or empty setting is
+/// "no CA file" — the same truthy rule every other setting uses.
+///
+/// The bytes are returned with the path, so a caller that needs the
+/// certificates (`SMTP_CA_FILE`) does not read the file a second time.
+fn parse_ca_file(
+    env: &HashMap<String, String>,
+    variable: &str,
+) -> Result<Option<(std::path::PathBuf, Vec<u8>)>, CaFileProblem> {
+    let Some(raw) = truthy(env, variable) else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(raw);
+    // `read` (not `File::open`) so a directory, which opens but cannot be
+    // read as a certificate, is caught here too.
+    let bytes = std::fs::read(&path).map_err(|_| CaFileProblem {
+        path: path.clone(),
+        kind: CaFileProblemKind::Unreadable,
+    })?;
+    let mut count = 0usize;
+    for certificate in CertificateDer::pem_slice_iter(&bytes) {
+        certificate.map_err(|_| CaFileProblem {
+            path: path.clone(),
+            kind: CaFileProblemKind::Empty,
+        })?;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(CaFileProblem {
+            path,
+            kind: CaFileProblemKind::Empty,
+        });
+    }
+    Ok(Some((path, bytes)))
+}
+
+/// `CONNECTOR_TLS_CA_FILE` (`SEC-14` part B, D5): unset or empty is "no CA,
+/// require TLS only"; a set path is read now so an unreadable one stops the
+/// API at start rather than on the first connector dial.
+fn parse_connector_tls_ca_file(
+    env: &HashMap<String, String>,
+) -> Result<Option<std::path::PathBuf>, ConfigError> {
+    match parse_ca_file(env, "CONNECTOR_TLS_CA_FILE") {
+        Ok(None) => Ok(None),
+        Ok(Some((path, _bytes))) => Ok(Some(path)),
+        Err(problem) => Err(match problem.kind {
+            CaFileProblemKind::Unreadable => {
+                ConfigError::UnreadableConnectorTlsCaFile(problem.path)
+            }
+            CaFileProblemKind::Empty => ConfigError::EmptyConnectorTlsCaFile(problem.path),
+        }),
+    }
+}
+
+/// `SMTP_CA_FILE` (`SEC-56` D1/D5/D6): unset or empty is "no bundle", and
+/// the sender behaves exactly as it did before the setting existed. A set
+/// path is read now, and the certificates are kept in memory, so the send
+/// path does no file I/O and a replaced file takes effect at the next
+/// restart.
+fn parse_smtp_ca_file(
+    env: &HashMap<String, String>,
+) -> Result<Option<(std::path::PathBuf, lakehouse_notify::SmtpCaBundle)>, ConfigError> {
+    let Some((path, bytes)) =
+        parse_ca_file(env, "SMTP_CA_FILE").map_err(|problem| match problem.kind {
+            CaFileProblemKind::Unreadable => ConfigError::UnreadableSmtpCaFile(problem.path),
+            CaFileProblemKind::Empty => ConfigError::EmptySmtpCaFile(problem.path),
+        })?
+    else {
+        return Ok(None);
+    };
+    // The file was validated above with the same PEM parser, so this can
+    // only fail if the file changed between the two reads; it is reported
+    // as an empty bundle rather than ignored.
+    let bundle = lakehouse_notify::SmtpCaBundle::from_pem(&bytes)
+        .map_err(|_| ConfigError::EmptySmtpCaFile(path.clone()))?;
+    Ok(Some((path, bundle)))
+}
+
 /// Parse `OIDC_ROLE_MAP`'s `"group1=Role One,group2=Role Two"` format into
 /// a lookup from external group name to local `role.name`. A malformed
 /// entry (no `=`, or an empty group/role name) is skipped rather than
@@ -1041,6 +1741,14 @@ impl Config {
     /// - [`ConfigError::UnsupportedAiRelevantTables`], if
     ///   `AI_RELEVANT_TABLES` is set and non-empty but is neither `true`
     ///   nor `false`.
+    /// - [`ConfigError::InvalidUploadLimit`], if
+    ///   `UPLOAD_MAX_CONCURRENT_PER_USER`, `UPLOAD_MAX_CONCURRENT`,
+    ///   `UPLOAD_MAX_CONVERSIONS`, `UPLOAD_CONVERT_MEMORY_MB` or
+    ///   `UPLOAD_SESSION_TTL_HOURS` is set and non-empty but is not a whole number of 1 or more.
+    /// - [`ConfigError::UnreadableSmtpCaFile`] or
+    ///   [`ConfigError::EmptySmtpCaFile`], if `SMTP_CA_FILE` is set and
+    ///   non-empty but names a file that cannot be read, or one that holds
+    ///   no PEM certificate (`SEC-56` D5).
     ///
     /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
     #[allow(
@@ -1052,7 +1760,13 @@ impl Config {
                   crossing the 100-line lint threshold)"
     )]
     pub fn from_map(env: &HashMap<String, String>) -> Result<Self, ConfigError> {
-        let smtp_port = match env.get("SMTP_PORT") {
+        // `SMTP_PORT`: an empty value is "not set", not a bad value
+        // (`ADM-9 review R6`). Compose passes the variable as an empty
+        // string when the operator set none, and an empty port is no
+        // port: the code's own 587 applies, with no warning — a warning
+        // would name a value the operator never chose. A value that IS set
+        // and unparseable still warns and falls back to 587, as before.
+        let smtp_port = match truthy(env, "SMTP_PORT") {
             Some(raw) => raw.parse::<u16>().unwrap_or_else(|_| {
                 tracing::warn!(
                     smtp_port = %raw,
@@ -1062,6 +1776,18 @@ impl Config {
             }),
             None => 587,
         };
+        // `SMTP_PORT` set, non-empty and parseable — the console may not
+        // override it (`ADM-7` D1). An unparseable `SMTP_PORT` does not
+        // count: the operator's value is invalid, and `smtp_port` already
+        // fell back to 587, so the console is free to set a real port. An
+        // EMPTY one does not count either (`ADM-9 review R6`): it is not
+        // set at all.
+        let smtp_port_from_env = env
+            .get("SMTP_PORT")
+            .is_some_and(|raw| !raw.is_empty() && raw.parse::<u16>().is_ok());
+        // `SMTP_FROM` set and non-empty — the one env value the `From` field
+        // owns; the `SMTP_USER`/literal fallback is not it.
+        let smtp_from_from_env = env.get("SMTP_FROM").is_some_and(|raw| !raw.is_empty());
         let port = match env.get("PORT") {
             Some(raw) => raw
                 .parse::<u16>()
@@ -1075,14 +1801,37 @@ impl Config {
             .or_else(|| truthy(env, "MINIMAX_API_KEY"))
             .unwrap_or_default();
 
-        // SMTP_FROM ?? SMTP_USER ?? "rantai-lake@localhost" — a `??` chain,
-        // so an explicitly empty SMTP_FROM is preserved and does NOT fall
-        // through to SMTP_USER.
-        let smtp_from = env.get("SMTP_FROM").cloned().unwrap_or_else(|| {
-            env.get("SMTP_USER")
-                .cloned()
-                .unwrap_or_else(|| "rantai-lake@localhost".to_owned())
-        });
+        // `LLM_URL` and `LLM_MODEL` set and non-empty: the environment owns
+        // that field, so the console shows it read-only and a save that
+        // sends it is refused (`ADM-9 review R4`). The same rule as
+        // `SMTP_PORT`: the value alone cannot tell an operator who set it
+        // from one who never did. An EMPTY value is "not set"
+        // (`ADM-9 review R6`): compose passes both as empty strings when
+        // the operator set none, and an empty address or model is no
+        // address or model at all.
+        let llm_url_from_env = env.get("LLM_URL").is_some_and(|raw| !raw.is_empty());
+        let llm_model_from_env = env.get("LLM_MODEL").is_some_and(|raw| !raw.is_empty());
+
+        // `SMTP_FROM` → `SMTP_USER` → "rantai-lake@localhost", with an EMPTY
+        // value meaning "not set" at every step (`ADM-9 review R6`):
+        // compose passes `SMTP_FROM` as an empty string when the operator
+        // set none, and an empty `From` is no sender — the old behaviour
+        // kept it as an empty address and sent mail with no sender.
+        let smtp_from = truthy(env, "SMTP_FROM")
+            .or_else(|| truthy(env, "SMTP_USER"))
+            .unwrap_or_else(|| "rantai-lake@localhost".to_owned());
+
+        // `CONNECTOR_TLS_CA_FILE`: read the file now so an unreadable path
+        // stops the API at start, not on the first connector dial (T1).
+        let connector_tls_ca_file = parse_connector_tls_ca_file(env)?;
+
+        // `SMTP_CA_FILE`: the same rule, the same checks, its own error
+        // variants so the message names its own setting (`SEC-56` D5). The
+        // bundle is kept in memory: the send path does no file I/O (D6).
+        let (smtp_ca_file, smtp_ca) = match parse_smtp_ca_file(env)? {
+            Some((path, bundle)) => (Some(path), Some(bundle)),
+            None => (None, None),
+        };
 
         Ok(Self {
             ch_url: or_default(env, "CH_URL", "http://localhost:18123"),
@@ -1091,18 +1840,37 @@ impl Config {
             dagster_url: or_default(env, "DAGSTER_URL", "http://localhost:13030/graphql"),
             dagster_repo: or_default(env, "DAGSTER_REPO", "__repository__"),
             dagster_location: or_default(env, "DAGSTER_LOCATION", "dispar_orchestrate.definitions"),
-            llm_url: or_default(env, "LLM_URL", "https://api.minimax.io/v1"),
-            llm_model: or_default(env, "LLM_MODEL", "MiniMax-M3"),
+            // `ADM-9 review R6`: an empty value is "not set", so the code's
+            // own default applies (an empty `LLM_URL` used to build a
+            // client with no address at all).
+            llm_url: truthy(env, "LLM_URL").unwrap_or_else(|| DEFAULT_LLM_URL.to_owned()),
+            llm_url_from_env,
+            llm_model: truthy(env, "LLM_MODEL").unwrap_or_else(|| DEFAULT_LLM_MODEL.to_owned()),
+            llm_model_from_env,
             llm_key,
             embed_secret: truthy(env, "EMBED_SECRET"),
+            render_token_secret: truthy(env, "RENDER_TOKEN_SECRET")
+                .map(lakehouse_core::secret::SecretValue::new),
+            gotenberg_url: truthy(env, "GOTENBERG_URL"),
+            console_internal_url: truthy(env, "CONSOLE_INTERNAL_URL"),
+            console_public_url: truthy(env, "CONSOLE_PUBLIC_URL")
+                .map(|url| url.trim_end_matches('/').to_owned())
+                .filter(|url| url.starts_with("https://") || url.starts_with("http://")),
+            embed_token_max_lifetime_seconds: parse_embed_token_max_lifetime(env)?,
+            embed_token_max_lifetime_from_env: env_sets_positive_u64(
+                env,
+                "EMBED_TOKEN_MAX_LIFETIME_SECONDS",
+            ),
             alerts_run_token: truthy(env, "ALERTS_RUN_TOKEN"),
             smtp_host: truthy(env, "SMTP_HOST"),
             smtp_port,
+            smtp_port_from_env,
             // notify.ts:40 in full: `SMTP_SECURE === "true" || port === 465`.
             smtp_secure: env.get("SMTP_SECURE").is_some_and(|v| v == "true") || smtp_port == 465,
             smtp_user: truthy(env, "SMTP_USER"),
             smtp_pass: or_default(env, "SMTP_PASS", ""),
             smtp_from,
+            smtp_from_from_env,
             port,
             is_dev: env
                 .get("APP_ENV")
@@ -1113,13 +1881,21 @@ impl Config {
             oidc_issuer: truthy(env, "OIDC_ISSUER"),
             oidc_client_id: truthy(env, "OIDC_CLIENT_ID"),
             oidc_client_secret: truthy(env, "OIDC_CLIENT_SECRET"),
-            oidc_provider_name: or_default(env, "OIDC_PROVIDER_NAME", "default"),
+            oidc_provider_name: truthy(env, "OIDC_PROVIDER_NAME")
+                .unwrap_or_else(|| "default".to_owned()),
+            oidc_provider_name_from_env: truthy(env, "OIDC_PROVIDER_NAME").is_some(),
             oidc_jwks_url: truthy(env, "OIDC_JWKS_URL"),
             oidc_jit_provisioning: env
                 .get("OIDC_JIT_PROVISIONING")
                 .is_some_and(|v| v == "true"),
+            oidc_jit_provisioning_from_env: truthy(env, "OIDC_JIT_PROVISIONING").is_some(),
+            oidc_trust_email: env.get("OIDC_TRUST_EMAIL").is_some_and(|v| v == "true"),
+            oidc_trust_email_from_env: truthy(env, "OIDC_TRUST_EMAIL").is_some(),
             oidc_role_map: parse_role_map(env.get("OIDC_ROLE_MAP").map_or("", String::as_str)),
-            oidc_groups_claim: or_default(env, "OIDC_GROUPS_CLAIM", "groups"),
+            oidc_role_map_from_env: truthy(env, "OIDC_ROLE_MAP").is_some(),
+            oidc_groups_claim: truthy(env, "OIDC_GROUPS_CLAIM")
+                .unwrap_or_else(|| "groups".to_owned()),
+            oidc_groups_claim_from_env: truthy(env, "OIDC_GROUPS_CLAIM").is_some(),
             connector_probe_allow_internal_hosts: env
                 .get("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS")
                 .is_some_and(|v| v == "true"),
@@ -1128,13 +1904,40 @@ impl Config {
                     .map_or("", String::as_str),
             )
             .map_err(ConfigError::MalformedAllowedCidrs)?,
+            webhook_allowed_cidrs: crate::internal_hosts::parse_cidrs(
+                env.get("WEBHOOK_ALLOWED_CIDRS").map_or("", String::as_str),
+            )
+            .map_err(ConfigError::MalformedWebhookAllowedCidrs)?,
+            webhook_test_allow_all: cfg!(test)
+                && env
+                    .get("WEBHOOK_TEST_ALLOW_ALL")
+                    .is_some_and(|v| v == "true"),
             connector_secrets_dir: truthy(env, "CONNECTOR_SECRETS_DIR").map_or_else(
                 || std::path::PathBuf::from(crate::state::CONNECTOR_SECRETS_DIR),
                 std::path::PathBuf::from,
             ),
-            oracle_cdc_logminer_enabled: env
-                .get("ORACLE_CDC_LOGMINER_ENABLED")
+            connector_secrets_key: truthy(env, "CONNECTOR_SECRETS_KEY"),
+            connector_secrets_key_previous: truthy(env, "CONNECTOR_SECRETS_KEY_PREVIOUS"),
+            connector_tls_ca_file,
+            smtp_ca,
+            smtp_ca_file,
+            secret_manager: crate::secret_manager::SecretManagerSettings::from_map(env)?,
+            connector_typed_credentials: parse_switch(
+                env,
+                "CONNECTOR_TYPED_CREDENTIALS",
+                ConfigError::UnsupportedConnectorTypedCredentials,
+            )?,
+            connector_oauth_redirect_uri: truthy(env, "CONNECTOR_OAUTH_REDIRECT_URI"),
+            connector_oauth_allow_http: env
+                .get("CONNECTOR_OAUTH_ALLOW_HTTP")
                 .is_some_and(|v| v == "true"),
+            kafka_connect_url: truthy(env, "KAFKA_CONNECT_URL"),
+            cdc_kafka_bootstrap: truthy(env, "CDC_KAFKA_BOOTSTRAP"),
+            cdc_secrets_dir: or_default(
+                env,
+                "CDC_SECRETS_DIR",
+                lakehouse_store::cdc::CDC_SECRETS_DIR,
+            ),
             oidc_clock_skew_seconds: env
                 .get("OIDC_CLOCK_SKEW_SECONDS")
                 .and_then(|v| v.parse::<u64>().ok())
@@ -1160,11 +1963,7 @@ impl Config {
             ),
             rustfs_access_key_secret_ref: truthy(env, "RUSTFS_ACCESS_KEY_SECRET_REF"),
             rustfs_secret_key_secret_ref: truthy(env, "RUSTFS_SECRET_KEY_SECRET_REF"),
-            database_url: or_default(
-                env,
-                "DATABASE_URL",
-                "postgres://lakehouse:lakehouse@localhost:5432/lakehouse",
-            ),
+            database_url: or_default(env, "DATABASE_URL", ""),
             lakekeeper_gold_export_token_file: or_default(
                 env,
                 "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
@@ -1179,6 +1978,12 @@ impl Config {
                 env,
                 "LAKEKEEPER_ADMIN_TOKEN_FILE",
                 "/tokens/admin.jwt",
+            ),
+            outside_s3_endpoint: truthy(env, "OUTSIDE_S3_ENDPOINT"),
+            lakekeeper_outside_read_token_file: or_default(
+                env,
+                "LAKEKEEPER_OUTSIDE_READ_TOKEN_FILE",
+                "/tokens/outside-readers.jwt",
             ),
             tenant_warehouse_s3_endpoint: truthy(env, "TENANT_WAREHOUSE_S3_ENDPOINT"),
             tenant_warehouse_s3_bucket: or_default(
@@ -1253,13 +2058,46 @@ impl Config {
             )?,
             git_sha: or_default(env, "GIT_SHA", "unknown"),
             login_max_failures: parse_positive_u32_or_default(env, "LOGIN_MAX_FAILURES", 5),
+            login_max_failures_from_env: env_sets_positive_u32(env, "LOGIN_MAX_FAILURES"),
             login_failure_window_secs: parse_positive_u32_or_default(
                 env,
                 "LOGIN_FAILURE_WINDOW_SECS",
                 900,
             ),
+            login_failure_window_secs_from_env: env_sets_positive_u32(
+                env,
+                "LOGIN_FAILURE_WINDOW_SECS",
+            ),
             login_lockout_secs: parse_positive_u32_or_default(env, "LOGIN_LOCKOUT_SECS", 300),
+            login_lockout_secs_from_env: env_sets_positive_u32(env, "LOGIN_LOCKOUT_SECS"),
             auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
+            auth_retention_days_from_env: env_sets_positive_u32(env, "AUTH_RETENTION_DAYS"),
+            upload_max_concurrent_per_user: parse_limit(env, "UPLOAD_MAX_CONCURRENT_PER_USER", 4)?,
+            upload_max_concurrent: parse_limit(env, "UPLOAD_MAX_CONCURRENT", 16)?,
+            upload_max_concurrent_large: parse_limit(env, "UPLOAD_MAX_CONCURRENT_LARGE", 2)?,
+            upload_max_conversions: parse_limit(env, "UPLOAD_MAX_CONVERSIONS", 2)?,
+            upload_convert_memory_mb: parse_limit(
+                env,
+                "UPLOAD_CONVERT_MEMORY_MB",
+                crate::upload_convert::DEFAULT_MEMORY_MIB,
+            )?,
+            upload_session_ttl_hours: parse_limit(env, "UPLOAD_SESSION_TTL_HOURS", 24)?,
+            connector_auto_disable_after: i32::try_from(parse_positive_u32_or_default(
+                env,
+                "CONNECTOR_AUTO_DISABLE_AFTER",
+                30,
+            ))
+            .unwrap_or(lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER),
+            ingest_run_max_runtime_seconds: parse_run_limit(
+                env,
+                "INGEST_RUN_MAX_RUNTIME_SECONDS",
+                21_600,
+            ),
+            ingest_run_start_timeout_seconds: parse_run_limit(
+                env,
+                "INGEST_RUN_START_TIMEOUT_SECONDS",
+                600,
+            ),
         })
     }
 
@@ -1281,6 +2119,39 @@ impl Config {
         crate::internal_hosts::InternalHosts {
             allow_all: self.connector_probe_allow_internal_hosts,
             allowed: self.connector_probe_allowed_cidrs.clone(),
+        }
+    }
+
+    /// What an `OAuth2` connector may dial (`SRC-12` part C): `https` only,
+    /// unless the gate-only switch admits `http`.
+    #[must_use]
+    pub fn oauth_settings(&self) -> crate::connector_oauth::OAuthSettings {
+        crate::connector_oauth::OAuthSettings {
+            allow_http: self.connector_oauth_allow_http,
+        }
+    }
+
+    /// The CA a connector dial verifies the database server against
+    /// (`CONNECTOR_TLS_CA_FILE`; `SEC-14` part B, D5/D6). `None` is D5's
+    /// `require` posture: TLS is still required, the server certificate is
+    /// trusted as-is.
+    ///
+    /// Every connector dial takes this and never reads the field directly,
+    /// so "which CA does a dial verify against" is one accessor rather than
+    /// a setting read at six call sites.
+    #[must_use]
+    pub fn connector_tls_ca(&self) -> Option<&std::path::Path> {
+        self.connector_tls_ca_file.as_deref()
+    }
+
+    /// The internal addresses an alert webhook may call (`SEC-10`): only the
+    /// listed networks, never "all" (see
+    /// [`Config::webhook_allowed_cidrs`]).
+    #[must_use]
+    pub fn webhook_internal_hosts(&self) -> crate::internal_hosts::InternalHosts {
+        crate::internal_hosts::InternalHosts {
+            allow_all: self.webhook_test_allow_all,
+            allowed: self.webhook_allowed_cidrs.clone(),
         }
     }
 }
@@ -1318,6 +2189,7 @@ mod tests {
             ("CH_PASSWORD", "s3cret-ch-pass"),
             ("LLM_KEY", "s3cret-llm-key"),
             ("EMBED_SECRET", "s3cret-embed"),
+            ("RENDER_TOKEN_SECRET", "s3cret-render"),
             ("ALERTS_RUN_TOKEN", "s3cret-alerts-token"),
             ("SMTP_PASS", "s3cret-smtp-pass"),
             ("AGENT_RUN_TOKEN", "s3cret-agent-run-token"),
@@ -1336,6 +2208,7 @@ mod tests {
             "s3cret-ch-pass",
             "s3cret-llm-key",
             "s3cret-embed",
+            "s3cret-render",
             "s3cret-alerts-token",
             "s3cret-smtp-pass",
             "s3cret-agent-run-token",
@@ -1364,6 +2237,11 @@ mod tests {
         assert_eq!(cfg.llm_model, "MiniMax-M3");
         assert_eq!(cfg.llm_key, "");
         assert_eq!(cfg.embed_secret, None);
+        assert_eq!(cfg.gotenberg_url, None);
+        assert!(cfg.render_token_secret.is_none());
+        assert_eq!(cfg.console_internal_url, None);
+        assert_eq!(cfg.console_public_url, None);
+        assert_eq!(cfg.embed_token_max_lifetime_seconds, 86_400);
         assert_eq!(cfg.alerts_run_token, None);
         assert_eq!(cfg.smtp_host, None);
         assert_eq!(cfg.smtp_port, 587);
@@ -1371,10 +2249,12 @@ mod tests {
         assert_eq!(cfg.smtp_user, None);
         assert_eq!(cfg.smtp_pass, "");
         assert_eq!(cfg.smtp_from, "rantai-lake@localhost");
-        assert_eq!(
-            cfg.database_url,
-            "postgres://lakehouse:lakehouse@localhost:5432/lakehouse"
-        );
+        // `SEC-37`: no default credentials in code. Unset `DATABASE_URL` is
+        // an empty string, and means exactly "no Postgres pool" — the same
+        // state a malformed URL already degrades to, handled by `main`'s own
+        // warning. It must NOT be turned into a made-up localhost DSN with a
+        // known password.
+        assert_eq!(cfg.database_url, "");
         assert_eq!(cfg.lakekeeper_catalog_uri, "http://localhost:8181/catalog");
         assert_eq!(cfg.lakekeeper_warehouse, "default");
         assert_eq!(cfg.iceberg_query_db, None);
@@ -1420,8 +2300,6 @@ mod tests {
         assert_eq!(cfg.trino_max_rows, 10_000);
         // Safe-by-default: SSRF blocking is ON unless explicitly disabled.
         assert!(!cfg.connector_probe_allow_internal_hosts);
-        // Oracle CDC via Debezium LogMiner is off by default.
-        assert!(!cfg.oracle_cdc_logminer_enabled);
     }
 
     /// Isolated from `defaults_match_typescript_fallbacks` so `cargo test
@@ -1584,6 +2462,66 @@ mod tests {
         assert_eq!(cfg.gold_export_batch_size, 20_000);
     }
 
+    /// `SRC-11` decision D3: 30 failed runs in a row unless the gate (or an
+    /// operator) sets another positive number; garbage keeps the default.
+    #[test]
+    fn connector_auto_disable_after_defaults_to_thirty_and_ignores_garbage() {
+        let default = lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER;
+        assert_eq!(default, 30);
+        assert_eq!(
+            Config::from_map(&map(&[]))
+                .unwrap()
+                .connector_auto_disable_after,
+            default
+        );
+        for bad in ["0", "-3", "many", ""] {
+            let cfg = Config::from_map(&map(&[("CONNECTOR_AUTO_DISABLE_AFTER", bad)])).unwrap();
+            assert_eq!(cfg.connector_auto_disable_after, default, "{bad:?}");
+        }
+        let cfg = Config::from_map(&map(&[("CONNECTOR_AUTO_DISABLE_AFTER", "4")])).unwrap();
+        assert_eq!(cfg.connector_auto_disable_after, 4);
+    }
+
+    /// `SRC-39` (QA `TC-1702`): six hours a run may run, ten minutes a run
+    /// the orchestrator launched may take to start; a value that is not a
+    /// whole number of 1 or more keeps the default.
+    ///
+    /// `review round 1, R9`: the orchestrator reads the same setting by the
+    /// same rule, so `"86_400"` (which `int()` would take), a number above
+    /// `u32::MAX` and a padded value are all decided here as they are there:
+    /// `" 900 "` is 900, `"86_400"` and `"4294967296"` keep the default.
+    #[test]
+    fn the_run_limits_default_to_six_hours_and_ten_minutes_and_ignore_garbage() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 21_600);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 600);
+        for bad in ["0", "-3", "many", "", "86_400", "4294967296", "+900", "1.5"] {
+            let cfg = Config::from_map(&map(&[
+                ("INGEST_RUN_MAX_RUNTIME_SECONDS", bad),
+                ("INGEST_RUN_START_TIMEOUT_SECONDS", bad),
+            ]))
+            .unwrap();
+            assert_eq!(cfg.ingest_run_max_runtime_seconds, 21_600, "{bad:?}");
+            assert_eq!(cfg.ingest_run_start_timeout_seconds, 600, "{bad:?}");
+        }
+        let cfg = Config::from_map(&map(&[
+            ("INGEST_RUN_MAX_RUNTIME_SECONDS", "900"),
+            ("INGEST_RUN_START_TIMEOUT_SECONDS", "120"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 900);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 120);
+        // `review round 1, R9`: both services trim, so a padded value is read,
+        // not thrown away.
+        let cfg = Config::from_map(&map(&[
+            ("INGEST_RUN_MAX_RUNTIME_SECONDS", " 900 "),
+            ("INGEST_RUN_START_TIMEOUT_SECONDS", " 120 "),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 900);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 120);
+    }
+
     /// The compose stack's documented opt-out — only the literal string
     /// `"true"` flips the default, matching every other boolean flag in
     /// this config (`OIDC_JIT_PROVISIONING`, `SMTP_SECURE`).
@@ -1603,7 +2541,7 @@ mod tests {
     #[test]
     fn connector_probe_allowed_cidrs_parses_the_list_and_refuses_a_bad_entry() {
         let cfg = Config::from_map(&map(&[])).unwrap();
-        assert!(cfg.connector_probe_allowed_cidrs.is_empty());
+        assert_eq!(cfg.connector_probe_allowed_cidrs, [] as [ipnet::IpNet; 0]);
         assert_eq!(
             cfg.connector_internal_hosts(),
             crate::internal_hosts::InternalHosts::NONE
@@ -1624,41 +2562,80 @@ mod tests {
         assert!(matches!(err, ConfigError::MalformedAllowedCidrs(_)));
     }
 
-    /// The `ORACLE_CDC_LOGMINER_ENABLED` flag defaults to `false`: an unset
-    /// variable must never read as a request for a capability this build
-    /// has not validated.
+    /// `SEC-10`: the webhook allowlist is empty by default, parsed at start,
+    /// opens exactly the listed hosts and no other, never reaches loopback or
+    /// the metadata address, is independent of the connector list, and a
+    /// malformed entry refuses to boot rather than being ignored.
     #[test]
-    fn oracle_cdc_logminer_enabled_defaults_to_false() {
-        let cfg = Config::from_map(&HashMap::new()).unwrap();
-        assert!(!cfg.oracle_cdc_logminer_enabled);
+    fn webhook_allowed_cidrs_allow_exactly_the_listed_hosts_and_refuse_a_bad_entry() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert_eq!(cfg.webhook_allowed_cidrs, [] as [ipnet::IpNet; 0]);
+        assert!(
+            !cfg.webhook_internal_hosts()
+                .permits(&"192.168.18.205".parse().unwrap())
+        );
+
+        let cfg = Config::from_map(&map(&[(
+            "WEBHOOK_ALLOWED_CIDRS",
+            "192.168.18.205, 10.1.0.0/16",
+        )]))
+        .unwrap();
+        let hosts = cfg.webhook_internal_hosts();
+        assert!(!hosts.allow_all);
+        assert!(hosts.permits(&"192.168.18.205".parse().unwrap()));
+        assert!(!hosts.permits(&"192.168.18.206".parse().unwrap()));
+        assert!(hosts.permits(&"10.1.7.7".parse().unwrap()));
+        assert!(!hosts.permits(&"10.2.0.1".parse().unwrap()));
+        assert!(!hosts.permits(&"127.0.0.1".parse().unwrap()));
+        assert!(!hosts.permits(&"169.254.169.254".parse().unwrap()));
+
+        // The connector setting does not leak into webhooks, or back.
+        let cfg = Config::from_map(&map(&[
+            ("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "true"),
+            ("CONNECTOR_PROBE_ALLOWED_CIDRS", "192.168.18.0/24"),
+        ]))
+        .unwrap();
+        assert!(
+            !cfg.webhook_internal_hosts()
+                .permits(&"192.168.18.205".parse().unwrap())
+        );
+
+        let err = Config::from_map(&map(&[("WEBHOOK_ALLOWED_CIDRS", "lan")])).unwrap_err();
+        assert!(matches!(err, ConfigError::MalformedWebhookAllowedCidrs(_)));
     }
 
-    /// The codebase's boolean-parsing rule is exact
-    /// `== "true"`, mirroring `connector_probe_allow_internal_hosts` and
-    /// `oidc_jit_provisioning` — `TRUE`, `1`, `yes`, `on`, and any other
-    /// non-`"true"` string MUST NOT flip the flag on. This is the rule
-    /// AGENTS.md mandates, re-asserted here for the new field so a future
-    /// widening (e.g. `is_some_and` accepting truthy strings) fails this
-    /// test rather than silently extending the gate.
+    /// `KAFKA_CONNECT_URL` is unset by default, and a blank value is unset too:
+    /// the API never dials a guessed address (`SRC-4` decision S2-b).
     #[test]
-    fn oracle_cdc_logminer_enabled_reads_the_true_string_only() {
-        let cfg = Config::from_map(&map(&[("ORACLE_CDC_LOGMINER_ENABLED", "true")])).unwrap();
-        assert!(cfg.oracle_cdc_logminer_enabled);
+    fn kafka_connect_url_is_unset_by_default_and_blank_counts_as_unset() {
+        assert_eq!(
+            Config::from_map(&HashMap::new()).unwrap().kafka_connect_url,
+            None
+        );
+        let cfg = Config::from_map(&map(&[("KAFKA_CONNECT_URL", "")])).unwrap();
+        assert_eq!(cfg.kafka_connect_url, None);
+        let cfg =
+            Config::from_map(&map(&[("KAFKA_CONNECT_URL", "http://kafka-connect:8083")])).unwrap();
+        assert_eq!(
+            cfg.kafka_connect_url.as_deref(),
+            Some("http://kafka-connect:8083")
+        );
+    }
 
-        for bad in ["TRUE", "True", "1", "yes", "on", "enabled", " "] {
-            let cfg = Config::from_map(&map(&[("ORACLE_CDC_LOGMINER_ENABLED", bad)])).unwrap();
-            assert!(
-                !cfg.oracle_cdc_logminer_enabled,
-                "ORACLE_CDC_LOGMINER_ENABLED={bad:?} must not enable the flag"
-            );
-        }
-
-        // And the unset case (omitted entirely from the env map) also
-        // does not enable the flag — redundant with the `defaults_...`
-        // test, but cheap and reads as a self-contained "the gate stays
-        // closed for every non-`true` value" assertion.
-        let cfg = Config::from_map(&HashMap::new()).unwrap();
-        assert!(!cfg.oracle_cdc_logminer_enabled);
+    /// `CDC_KAFKA_BOOTSTRAP` is unset by default and blank counts as unset: a
+    /// `MySQL` or `SQL Server` connector then answers "not configured".
+    #[test]
+    fn cdc_kafka_bootstrap_is_unset_by_default_and_blank_counts_as_unset() {
+        assert_eq!(
+            Config::from_map(&HashMap::new())
+                .unwrap()
+                .cdc_kafka_bootstrap,
+            None
+        );
+        let cfg = Config::from_map(&map(&[("CDC_KAFKA_BOOTSTRAP", "")])).unwrap();
+        assert_eq!(cfg.cdc_kafka_bootstrap, None);
+        let cfg = Config::from_map(&map(&[("CDC_KAFKA_BOOTSTRAP", "kafka:9092")])).unwrap();
+        assert_eq!(cfg.cdc_kafka_bootstrap.as_deref(), Some("kafka:9092"));
     }
 
     #[test]
@@ -1824,6 +2801,90 @@ mod tests {
         assert_eq!(cfg.smtp_from, "bot@example.com");
     }
 
+    /// `ADM-9 review R6`: an EMPTY value means "not set" for the four
+    /// variables `docker-compose.yml` hands to the API — `LLM_URL`,
+    /// `LLM_MODEL`, `SMTP_PORT` and `SMTP_FROM`. Compose passes them as
+    /// empty strings when the operator set none, and a value that read as
+    /// a value made the console's own fields read-only on every compose
+    /// installation.
+    ///
+    /// Each of the four was wrong on its own terms before the fix, which is
+    /// why the empty value cannot simply be kept: an empty `LLM_URL` built
+    /// a client with no address, an empty `LLM_MODEL` named no model, and
+    /// an empty `SMTP_FROM` was kept as an empty `From` — mail sent with no
+    /// sender, which no mail server accepts.
+    #[test]
+    fn an_empty_llm_url_is_unset_and_the_default_applies() {
+        let env = map(&[("LLM_URL", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.llm_url, DEFAULT_LLM_URL);
+        // The environment says nothing about the address, so the console
+        // owns it.
+        assert!(!cfg.llm_url_from_env);
+    }
+
+    /// The model half of the same rule (`ADM-9 review R6`).
+    #[test]
+    fn an_empty_llm_model_is_unset_and_the_default_applies() {
+        let env = map(&[("LLM_MODEL", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.llm_model, DEFAULT_LLM_MODEL);
+        assert!(!cfg.llm_model_from_env);
+    }
+
+    /// An empty `SMTP_PORT` is "not set", not a bad value
+    /// (`ADM-9 review R6`): the default applies, no warning is logged (a
+    /// warning would name a value the operator never chose), and the
+    /// environment does not own the port, so the console may set one.
+    ///
+    /// The old behaviour treated the empty value as an unparseable one and
+    /// logged a warning naming it — an operator who set nothing was told
+    /// their own deployment had a bad port.
+    #[test]
+    fn an_empty_smtp_port_is_unset_and_the_default_applies() {
+        let env = map(&[("SMTP_PORT", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_port, 587);
+        assert!(!cfg.smtp_port_from_env);
+    }
+
+    /// An empty `SMTP_FROM` is no sender: it falls through to `SMTP_USER`,
+    /// and to the literal when there is no account either (`ADM-9 review
+    /// R6`).
+    #[test]
+    fn an_empty_smtp_from_falls_through_to_smtp_user_then_the_literal() {
+        let env = map(&[("SMTP_FROM", ""), ("SMTP_USER", "bot@example.com")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_from, "bot@example.com");
+        assert!(!cfg.smtp_from_from_env);
+
+        let env = map(&[("SMTP_FROM", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_from, "rantai-lake@localhost");
+        assert!(!cfg.smtp_from_from_env);
+    }
+
+    /// The four together, the way compose hands them over: present, empty,
+    /// and therefore unset (`ADM-9 review R6`).
+    #[test]
+    fn the_four_empty_values_compose_passes_are_all_unset() {
+        let env = map(&[
+            ("LLM_URL", ""),
+            ("LLM_MODEL", ""),
+            ("SMTP_PORT", ""),
+            ("SMTP_FROM", ""),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.llm_url, DEFAULT_LLM_URL);
+        assert_eq!(cfg.llm_model, DEFAULT_LLM_MODEL);
+        assert_eq!(cfg.smtp_port, 587);
+        assert_eq!(cfg.smtp_from, "rantai-lake@localhost");
+        assert!(!cfg.llm_url_from_env);
+        assert!(!cfg.llm_model_from_env);
+        assert!(!cfg.smtp_port_from_env);
+        assert!(!cfg.smtp_from_from_env);
+    }
+
     #[test]
     fn smtp_secure_requires_exact_string_true() {
         let env = map(&[("SMTP_SECURE", "TRUE")]);
@@ -1859,15 +2920,9 @@ mod tests {
         assert_eq!(cfg.smtp_port, 587);
     }
 
-    #[test]
-    fn empty_smtp_port_falls_back_to_default_instead_of_erroring() {
-        let env = map(&[("SMTP_PORT", "")]);
-        let cfg = Config::from_map(&env).unwrap();
-        assert_eq!(cfg.smtp_port, 587);
-    }
-
     /// A wildly out-of-range value (`u16::MAX` + 1) also falls back rather
-    /// than erroring, exactly like the empty/non-numeric cases above.
+    /// than erroring, exactly like the non-numeric case above. It is a
+    /// value the operator DID set, so it still warns.
     #[test]
     fn out_of_range_smtp_port_falls_back_to_default_instead_of_erroring() {
         let env = map(&[("SMTP_PORT", "70000")]);
@@ -2098,6 +3153,54 @@ mod tests {
         assert!(message.contains("\"false\""), "{message}");
     }
 
+    /// `SRC-12` decision 2: typing a credential value is on unless the
+    /// operator says exactly `false`, and a typo is refused at start-up.
+    #[test]
+    fn typed_credentials_are_on_unless_the_operator_says_false() {
+        for unset in [None, Some(""), Some("true")] {
+            let env = unset.map_or_else(HashMap::new, |v| {
+                HashMap::from([("CONNECTOR_TYPED_CREDENTIALS".to_owned(), v.to_owned())])
+            });
+            assert!(Config::from_map(&env).unwrap().connector_typed_credentials);
+        }
+        let off = HashMap::from([("CONNECTOR_TYPED_CREDENTIALS".to_owned(), "false".to_owned())]);
+        assert!(!Config::from_map(&off).unwrap().connector_typed_credentials);
+        let typo = HashMap::from([("CONNECTOR_TYPED_CREDENTIALS".to_owned(), "no".to_owned())]);
+        assert_eq!(
+            Config::from_map(&typo).unwrap_err(),
+            ConfigError::UnsupportedConnectorTypedCredentials("no".to_owned())
+        );
+    }
+
+    /// `SRC-12` part C: the callback address is the operator's; the gate-only
+    /// `http` switch is off unless the operator says exactly `true`.
+    #[test]
+    fn the_oauth_callback_is_the_operators_and_http_is_off_unless_exactly_true() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.connector_oauth_redirect_uri, None);
+        assert!(!cfg.connector_oauth_allow_http);
+        for off in ["", "TRUE", "1", "yes", "false"] {
+            let env = HashMap::from([("CONNECTOR_OAUTH_ALLOW_HTTP".to_owned(), off.to_owned())]);
+            assert!(
+                !Config::from_map(&env).unwrap().connector_oauth_allow_http,
+                "{off:?} must not turn it on"
+            );
+        }
+        let on = HashMap::from([
+            ("CONNECTOR_OAUTH_ALLOW_HTTP".to_owned(), "true".to_owned()),
+            (
+                "CONNECTOR_OAUTH_REDIRECT_URI".to_owned(),
+                "https://console.example.com/api/connectors/oauth/callback".to_owned(),
+            ),
+        ]);
+        let cfg = Config::from_map(&on).unwrap();
+        assert!(cfg.connector_oauth_allow_http);
+        assert_eq!(
+            cfg.connector_oauth_redirect_uri.as_deref(),
+            Some("https://console.example.com/api/connectors/oauth/callback")
+        );
+    }
+
     fn env_with(key: &str, value: &str) -> HashMap<String, String> {
         HashMap::from([(key.to_owned(), value.to_owned())])
     }
@@ -2123,6 +3226,186 @@ mod tests {
     fn ask_back_setting_false_means_off() {
         let cfg = Config::from_map(&env_with("AI_ASK_BACK", "false")).unwrap();
         assert!(!cfg.ai_ask_back);
+    }
+
+    #[test]
+    fn the_embed_token_lifetime_limit_defaults_to_24_hours_and_can_be_set() {
+        for unset in [None, Some("")] {
+            let env = unset.map_or_else(HashMap::new, |v| {
+                env_with("EMBED_TOKEN_MAX_LIFETIME_SECONDS", v)
+            });
+            let cfg = Config::from_map(&env).unwrap();
+            assert_eq!(cfg.embed_token_max_lifetime_seconds, 86_400);
+        }
+        let cfg = Config::from_map(&env_with("EMBED_TOKEN_MAX_LIFETIME_SECONDS", "3600")).unwrap();
+        assert_eq!(cfg.embed_token_max_lifetime_seconds, 3600);
+    }
+
+    #[test]
+    fn an_embed_token_lifetime_limit_that_is_not_a_positive_integer_stops_the_api() {
+        // `SEC-12`: not a silent fallback to the default.
+        for bad in ["24h", "0", "-5", "1.5", " 60"] {
+            let err = Config::from_map(&env_with("EMBED_TOKEN_MAX_LIFETIME_SECONDS", bad))
+                .expect_err("only a positive whole number is accepted");
+            assert_eq!(
+                err,
+                ConfigError::InvalidEmbedTokenMaxLifetime(bad.to_owned())
+            );
+        }
+    }
+
+    /// `SEC-14` part B (D5): unset or empty means "no CA, require TLS only";
+    /// a readable file is kept as the path a dial verifies the server against.
+    #[test]
+    fn a_connector_tls_ca_file_is_absent_by_default_and_kept_when_readable() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.connector_tls_ca_file, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = crate::tls_proxy::pem_certificate(certified.cert.der());
+        std::fs::write(&ca, cert).unwrap();
+        let env = env_with("CONNECTOR_TLS_CA_FILE", ca.to_str().unwrap());
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.connector_tls_ca_file.as_deref(), Some(ca.as_path()));
+
+        // Empty is unset, exactly like every other truthy setting.
+        let cfg = Config::from_map(&env_with("CONNECTOR_TLS_CA_FILE", "")).unwrap();
+        assert_eq!(cfg.connector_tls_ca_file, None);
+    }
+
+    /// `SEC-14` T1: a set path that cannot be read stops the API at start with
+    /// a message naming the variable, never a silent fall back to trusting
+    /// every server certificate.
+    #[test]
+    fn an_unreadable_connector_tls_ca_file_stops_the_api() {
+        for path in [
+            std::path::PathBuf::from("/nonexistent/rantai/ca.pem"),
+            // A directory: opens but is not a readable certificate file.
+            std::path::PathBuf::from("/"),
+        ] {
+            let env = env_with("CONNECTOR_TLS_CA_FILE", path.to_str().unwrap());
+            let err = Config::from_map(&env).expect_err("an unreadable path must fail start-up");
+            assert_eq!(err, ConfigError::UnreadableConnectorTlsCaFile(path));
+            assert!(
+                err.to_string().contains("CONNECTOR_TLS_CA_FILE"),
+                "the message must name the variable: {err}"
+            );
+        }
+    }
+
+    /// `SEC-14` part B, SHOULD-FIX 6: a set path that contains no PEM certificate
+    /// stops the API at start with a message naming the variable, never a silent fall
+    /// back to discovering it on the first connector dial.
+    #[test]
+    fn an_empty_connector_tls_ca_file_stops_the_api() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        // File is empty (0 bytes, no PEM certificate)
+        let env = env_with("CONNECTOR_TLS_CA_FILE", temp.path().to_str().unwrap());
+        let err = Config::from_map(&env).expect_err("an empty CA file must fail start-up");
+        assert_eq!(
+            err,
+            ConfigError::EmptyConnectorTlsCaFile(temp.path().to_path_buf())
+        );
+        assert!(
+            err.to_string().contains("CONNECTOR_TLS_CA_FILE"),
+            "the message must name the variable: {err}"
+        );
+
+        // File has non-PEM text
+        std::fs::write(temp.path(), "this is not a pem certificate\n").unwrap();
+        let err = Config::from_map(&env).expect_err("a non-PEM CA file must fail start-up");
+        assert_eq!(
+            err,
+            ConfigError::EmptyConnectorTlsCaFile(temp.path().to_path_buf())
+        );
+        assert!(
+            err.to_string().contains("CONNECTOR_TLS_CA_FILE"),
+            "the message must name the variable: {err}"
+        );
+    }
+
+    /// A PEM certificate minted for the test (`SEC-56` D8: nothing is
+    /// committed to this repository).
+    fn a_minted_certificate() -> String {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["relay.example.com".to_string()]).unwrap();
+        crate::tls_proxy::pem_certificate(certified.cert.der())
+    }
+
+    /// `SEC-56` D1/D6: unset or empty means "no bundle", and the sender
+    /// behaves exactly as it did before the setting existed.
+    #[test]
+    fn an_smtp_ca_file_is_absent_by_default_and_empty_means_absent() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.smtp_ca, None);
+        assert_eq!(cfg.smtp_ca_file, None);
+
+        let cfg = Config::from_map(&env_with("SMTP_CA_FILE", "")).unwrap();
+        assert_eq!(cfg.smtp_ca, None);
+        assert_eq!(cfg.smtp_ca_file, None);
+    }
+
+    /// `SEC-56` D2/D6: a readable bundle is kept in memory, and the path
+    /// is kept beside it for the `Debug` output.
+    #[test]
+    fn a_readable_smtp_ca_file_is_read_into_a_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        let mut pem = a_minted_certificate();
+        pem.push_str(&a_minted_certificate());
+        std::fs::write(&ca, pem).unwrap();
+
+        let env = env_with("SMTP_CA_FILE", ca.to_str().unwrap());
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_ca_file.as_deref(), Some(ca.as_path()));
+        let bundle = cfg.smtp_ca.as_ref().expect("the bundle is read");
+        assert_eq!(bundle.len(), 2);
+    }
+
+    /// `SEC-56` D5: a set path that cannot be read stops the API at start
+    /// with a message naming the variable — never a silent fall back to
+    /// trusting every certificate.
+    #[test]
+    fn an_unreadable_smtp_ca_file_stops_the_api() {
+        for path in [
+            std::path::PathBuf::from("/nonexistent/rantai/smtp-ca.pem"),
+            // A directory: opens but is not a readable certificate file.
+            std::path::PathBuf::from("/"),
+        ] {
+            let env = env_with("SMTP_CA_FILE", path.to_str().unwrap());
+            let err = Config::from_map(&env).expect_err("an unreadable path must fail start-up");
+            assert_eq!(err, ConfigError::UnreadableSmtpCaFile(path));
+            assert!(
+                err.to_string().contains("SMTP_CA_FILE"),
+                "the message must name the variable: {err}"
+            );
+        }
+    }
+
+    /// `SEC-56` D5: a set path that holds no PEM certificate stops the API
+    /// at start, with a message naming the variable.
+    #[test]
+    fn an_empty_smtp_ca_file_stops_the_api() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        // The file is empty (0 bytes, no PEM certificate).
+        let env = env_with("SMTP_CA_FILE", temp.path().to_str().unwrap());
+        let err = Config::from_map(&env).expect_err("an empty CA file must fail start-up");
+        assert_eq!(err, ConfigError::EmptySmtpCaFile(temp.path().to_path_buf()));
+        assert!(
+            err.to_string().contains("SMTP_CA_FILE"),
+            "the message must name the variable: {err}"
+        );
+
+        // The file has non-PEM text.
+        std::fs::write(temp.path(), "this is not a pem certificate\n").unwrap();
+        let err = Config::from_map(&env).expect_err("a non-PEM CA file must fail start-up");
+        assert_eq!(err, ConfigError::EmptySmtpCaFile(temp.path().to_path_buf()));
+        assert!(
+            err.to_string().contains("SMTP_CA_FILE"),
+            "the message must name the variable: {err}"
+        );
     }
 
     #[test]
@@ -2202,5 +3485,174 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("\"true\""), "{message}");
         assert!(message.contains("\"false\""), "{message}");
+    }
+
+    // ── SEC-17: upload limits ───────────────────────────────────────────
+
+    #[test]
+    fn the_upload_limits_default_to_4_per_user_and_16_in_total() {
+        for env in [HashMap::new(), env_with("UPLOAD_MAX_CONCURRENT", "")] {
+            let cfg = Config::from_map(&env).unwrap();
+            assert_eq!(cfg.upload_max_concurrent_per_user, 4);
+            assert_eq!(cfg.upload_max_concurrent, 16);
+        }
+    }
+
+    #[test]
+    fn the_upload_limits_are_read_from_their_variables() {
+        let mut env = env_with("UPLOAD_MAX_CONCURRENT_PER_USER", "2");
+        env.insert("UPLOAD_MAX_CONCURRENT".to_owned(), "9".to_owned());
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.upload_max_concurrent_per_user, 2);
+        assert_eq!(cfg.upload_max_concurrent, 9);
+    }
+
+    #[test]
+    fn an_upload_limit_that_is_not_a_whole_number_of_one_or_more_is_refused() {
+        for bad in ["0", "-1", "abc", "2.5", " 3"] {
+            let err = Config::from_map(&env_with("UPLOAD_MAX_CONCURRENT_PER_USER", bad))
+                .expect_err("a bad limit must stop start-up, not fall back to the default");
+            assert_eq!(
+                err,
+                ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT_PER_USER", bad.to_owned())
+            );
+        }
+        let err = Config::from_map(&env_with("UPLOAD_MAX_CONCURRENT", "0")).expect_err("zero");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT", _)
+        ));
+    }
+
+    // ── DATA-37: the limit on large loads ─────────────────────────────────
+
+    #[test]
+    fn the_large_load_limit_defaults_to_two_and_is_read_from_its_variable() {
+        for env in [HashMap::new(), env_with("UPLOAD_MAX_CONCURRENT_LARGE", "")] {
+            let cfg = Config::from_map(&env).unwrap();
+            assert_eq!(cfg.upload_max_concurrent_large, 2);
+        }
+        let cfg = Config::from_map(&env_with("UPLOAD_MAX_CONCURRENT_LARGE", "3")).unwrap();
+        assert_eq!(cfg.upload_max_concurrent_large, 3);
+    }
+
+    #[test]
+    fn a_large_load_limit_that_is_not_a_whole_number_of_one_or_more_is_refused() {
+        for bad in ["0", "-1", "abc", "2.5", " 3"] {
+            let err = Config::from_map(&env_with("UPLOAD_MAX_CONCURRENT_LARGE", bad))
+                .expect_err("a bad limit must stop start-up, not fall back to the default");
+            assert_eq!(
+                err,
+                ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT_LARGE", bad.to_owned())
+            );
+        }
+    }
+
+    // ── SEC-22: the limits of the child that reads an uploaded file ─────
+
+    #[test]
+    fn the_conversion_limits_default_to_two_conversions_and_the_measured_peak() {
+        for env in [
+            HashMap::new(),
+            env_with("UPLOAD_MAX_CONVERSIONS", ""),
+            env_with("UPLOAD_CONVERT_MEMORY_MB", ""),
+        ] {
+            let cfg = Config::from_map(&env).unwrap();
+            assert_eq!(cfg.upload_max_conversions, 2);
+            assert_eq!(
+                cfg.upload_convert_memory_mb,
+                crate::upload_convert::DEFAULT_MEMORY_MIB
+            );
+        }
+    }
+
+    #[test]
+    fn the_conversion_limits_are_read_from_their_variables() {
+        let mut env = env_with("UPLOAD_MAX_CONVERSIONS", "4");
+        env.insert("UPLOAD_CONVERT_MEMORY_MB".to_owned(), "256".to_owned());
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.upload_max_conversions, 4);
+        assert_eq!(cfg.upload_convert_memory_mb, 256);
+    }
+
+    #[test]
+    fn a_conversion_limit_that_is_not_a_whole_number_of_one_or_more_is_refused() {
+        for (name, bad) in [
+            ("UPLOAD_MAX_CONVERSIONS", "0"),
+            ("UPLOAD_CONVERT_MEMORY_MB", "0"),
+            ("UPLOAD_MAX_CONVERSIONS", "abc"),
+            ("UPLOAD_CONVERT_MEMORY_MB", "-1"),
+        ] {
+            let err = Config::from_map(&env_with(name, bad))
+                .expect_err("a bad limit must stop start-up, not fall back to the default");
+            assert_eq!(
+                err,
+                ConfigError::InvalidUploadLimit(name, bad.to_owned()),
+                "{name}"
+            );
+        }
+    }
+
+    /// `BI-1` D1: the PDF renderer's two addresses are plain configuration;
+    /// empty is unset, so a compose default of `""` means "not set up".
+    #[test]
+    fn the_pdf_renderer_addresses_are_read_and_empty_means_unset() {
+        let mut env = HashMap::new();
+        env.insert(
+            "GOTENBERG_URL".to_owned(),
+            "http://gotenberg:3000".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_INTERNAL_URL".to_owned(),
+            "http://lakehouse-frontend:3000".to_owned(),
+        );
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.gotenberg_url.as_deref(), Some("http://gotenberg:3000"));
+        assert_eq!(
+            cfg.console_internal_url.as_deref(),
+            Some("http://lakehouse-frontend:3000")
+        );
+        env.insert("CONSOLE_INTERNAL_URL".to_owned(), String::new());
+        let blank = Config::from_map(&env).unwrap();
+        assert_eq!(blank.console_internal_url, None);
+    }
+
+    /// `RPT-1`: the console's public address is plain configuration; empty, a
+    /// non-`http(s)` value and a trailing slash are handled so a link built
+    /// from it is never `javascript:` or `//`.
+    #[test]
+    fn the_console_public_address_is_read_trimmed_and_must_be_http() {
+        let with = |value: &str| {
+            let mut env = HashMap::new();
+            env.insert("CONSOLE_PUBLIC_URL".to_owned(), value.to_owned());
+            Config::from_map(&env).unwrap().console_public_url
+        };
+        assert_eq!(
+            with("https://lakehouse.example.com/").as_deref(),
+            Some("https://lakehouse.example.com")
+        );
+        assert_eq!(with("").as_deref(), None);
+        assert_eq!(with("javascript:alert(1)").as_deref(), None);
+        assert_eq!(with("lakehouse.example.com").as_deref(), None);
+    }
+
+    #[test]
+    fn the_upload_session_lifetime_defaults_to_24_hours_and_a_bad_value_is_refused() {
+        assert_eq!(
+            Config::from_map(&HashMap::new())
+                .unwrap()
+                .upload_session_ttl_hours,
+            24
+        );
+        let cfg = Config::from_map(&env_with("UPLOAD_SESSION_TTL_HOURS", "6")).unwrap();
+        assert_eq!(cfg.upload_session_ttl_hours, 6);
+        for bad in ["0", "-1", "abc"] {
+            let err = Config::from_map(&env_with("UPLOAD_SESSION_TTL_HOURS", bad))
+                .expect_err("a bad lifetime must stop start-up");
+            assert_eq!(
+                err,
+                ConfigError::InvalidUploadLimit("UPLOAD_SESSION_TTL_HOURS", bad.to_owned())
+            );
+        }
     }
 }

@@ -50,6 +50,26 @@ repository and is called out here for transparency; it remains accurate and
 non-conflicting after the project's relicense to AGPL-3.0-or-later.
 
 --------------------------------------------------------------------------------
+dlt-hub/verified-sources (Apache-2.0) — vendored Python source
+--------------------------------------------------------------------------------
+
+Four business-app connectors (`SRC-3`) include source code copied from
+https://github.com/dlt-hub/verified-sources, commit
+`3957506893a7da821dbcc6acd51c7ca4475d1f53`, under the Apache License,
+Version 2.0 (copyright 2023 The Contributors):
+
+- `sources/google_analytics/`, `sources/hubspot/`, `sources/zendesk/` and
+  `sources/salesforce/`, in `dagster/dispar_orchestrate/saas/vendored/<name>/`.
+
+Each directory keeps the upstream `LICENSE` file and an `UPSTREAM.md` that
+names the commit and lists every change made here, with its reason. The
+changed files carry this project's modifications (HTTP through the product's
+address-checked session, merge keys, look-back windows, and similar); they
+are not the upstream files. The Apache-2.0 terms apply to the copied code;
+the project's own code remains AGPL-3.0-or-later. Apache-2.0 is compatible
+with AGPL-3.0-or-later.
+
+--------------------------------------------------------------------------------
 Full dependency license texts
 --------------------------------------------------------------------------------
 

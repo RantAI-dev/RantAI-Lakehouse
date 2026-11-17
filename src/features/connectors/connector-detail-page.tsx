@@ -11,6 +11,7 @@ import {
   InfoIcon,
   LayoutGridIcon,
   PlugZapIcon,
+  RadioIcon,
   type LucideIcon,
 } from "lucide-react"
 import { keepStripInView, LineTabsList, type LineTab } from "@/components/patterns/line-tabs"
@@ -21,25 +22,36 @@ import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent } from "@/components/ui/tabs"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { SECRET_MANAGER_LABEL, type SecretManager } from "@/lib/connectors/secret-reference"
+import { runConnectionTest } from "@/lib/connectors/run-connection-test"
 import { TEST_OUTCOME_TOAST, testOutcome, type TestOutcome } from "@/lib/connectors/test-result"
 import { formatDateTime, formatRelativeTime } from "@/lib/format"
 import { notifyError, notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
 import type { ConnectorDetail, ConnectorTestResult } from "@/services/contracts/connectors"
+import { ConnectorChangeCapturePanel } from "./connector-change-capture-panel"
 import { ConnectorDeleteDialog } from "./connector-delete-dialog"
+import { ReplicationSlotHealth } from "@/features/governance/replication-slot-health"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
+import { ConnectorOAuthPanel, oauthSignIn } from "./connector-oauth-panel"
 import { ConnectorOverview } from "./connector-overview"
 import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
 import { ConnectorSchemaChangesPanel } from "./connector-schema-changes-panel"
+import { ConnectorSetupChecks } from "./connector-setup-checks"
 import { DIRECTION_LABEL } from "./connectors-columns"
+import { usesNoCredential } from "./connector-form-parts"
 
-type ConnectorTab = "overview" | "ingest" | "schema" | "tests"
+type ConnectorTab = "overview" | "ingest" | "capture" | "schema" | "tests"
 
-/** The four tabs, in order. `?tab=` names any but the first. */
+/**
+ * The tabs, in order. `?tab=` names any but the first. "Change capture" is only for a connector that captures
+ * changes (`SRC-4` decision S4-g); `parseTab` and the strip leave it out for every other.
+ */
 const TABS: { value: ConnectorTab; label: string; icon: LucideIcon }[] = [
   { value: "overview", label: "Overview", icon: LayoutGridIcon },
   { value: "ingest", label: "Ingest", icon: DatabaseIcon },
+  { value: "capture", label: "Change capture", icon: RadioIcon },
   { value: "schema", label: "Schema changes", icon: GitCompareArrowsIcon },
   { value: "tests", label: "Connection tests", icon: PlugZapIcon },
 ]
@@ -49,18 +61,64 @@ function parseTab(raw: string | null): ConnectorTab {
 }
 
 /**
+ * How the credential is held, in words (`SRC-12` decision 10). An
+ * environment variable is read when the API and the orchestrator start, so
+ * the page says a restart is needed after changing one.
+ */
+function credentialFact(source: ConnectorDetail["credentialSource"]): string {
+  switch (source) {
+    case "managed":
+      return "Stored by lakehouse, encrypted"
+    case "env":
+      return "Environment variable on the server (a restart is needed after a change)"
+    case "file":
+      return "File on the server"
+    case "reference":
+      return "Reference to a secret in the secret manager (read at every use, never copied)"
+    default:
+      return "Provisioned on the server"
+  }
+}
+
+/**
+ * What the connector's credential fact can say (`SRC-41` D15, QA
+ * `LH-SRC-6-39`): `none` when the connection reads no credential at all
+ * (Kafka with auth `none` is created with `source: "managed"` and no value, so
+ * `credentialSource` alone read "Stored by lakehouse, encrypted" while the
+ * review step said "No credential is stored"), `unknown` while the ingest spec
+ * is still loading (a dash, not a claim it may have to take back), and
+ * `stored` otherwise — a read that failed included, which keeps today's fact.
+ */
+type CredentialState = "none" | "unknown" | "stored"
+
+/**
  * The row of facts under the title, the asset page's `MetadataList` with the
  * connector's own: who it belongs to, how its credential is held and when it
  * was last tested. The type (the description) and the environment (a pill by
  * the name) are already in the header and are not repeated here (reviewer
  * SHOULD-FIX R1).
  */
-function connectorFacts(c: ConnectorDetail): MetadataItem[] {
+function connectorFacts(
+  c: ConnectorDetail,
+  secretManager: SecretManager | null,
+  credential: CredentialState
+): MetadataItem[] {
   return [
     { label: "Tenant", value: c.tenant || "Unassigned" },
     { label: "Residency", value: c.residency || "—" },
     { label: "Owner", value: c.owner || "—" },
-    { label: "Credential", value: c.credentialManaged ? "Stored by lakehouse" : "Provisioned on the server" },
+    {
+      label: "Credential",
+      value:
+        credential === "none"
+          ? "None: this connection authenticates with none"
+          : credential === "unknown"
+            ? "—"
+            : credentialFact(c.credentialSource),
+    },
+    // `SRC-12` part B: which secret manager this installation reads from, when
+    // the operator set one up.
+    ...(secretManager ? [{ label: "Secret manager", value: SECRET_MANAGER_LABEL[secretManager] }] : []),
     {
       label: "Last test",
       value:
@@ -105,15 +163,18 @@ function TestNotice({ result }: { result: ConnectorTestResult }) {
   const { label, icon: Icon, box, accent } = NOTICE[outcome]
   const latency = outcome !== "unsupported" && result.latencyMs !== null ? ` · ${result.latencyMs} ms` : ""
   return (
-    <div role="status" className={cn("flex items-start gap-2 rounded-lg border px-3 py-2", box)}>
-      <Icon className={cn("mt-0.5 size-4 shrink-0", accent)} aria-hidden />
-      <p className="min-w-0 text-sm">
-        <span className={cn("font-medium", accent)}>{label}</span>
-        <span className="ml-2 break-words text-foreground">
-          {result.message}
-          {latency}
-        </span>
-      </p>
+    <div className="flex flex-col gap-2">
+      <div role="status" className={cn("flex items-start gap-2 rounded-lg border px-3 py-2", box)}>
+        <Icon className={cn("mt-0.5 size-4 shrink-0", accent)} aria-hidden />
+        <p className="min-w-0 text-sm">
+          <span className={cn("font-medium", accent)}>{label}</span>
+          <span className="ml-2 break-words text-foreground">
+            {result.message}
+            {latency}
+          </span>
+        </p>
+      </div>
+      {result.setupChecks && result.setupChecks.length > 0 ? <ConnectorSetupChecks checks={result.setupChecks} /> : null}
     </div>
   )
 }
@@ -178,7 +239,7 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   }
   const testAction = useServiceAction(async (signal, connectorId: string) => {
     try {
-      const result = await connectorService.testConnection(connectorId, signal)
+      const result = await runConnectionTest(connectorService, connectorId, signal)
       // A cancelled request is not an answer; announce nothing for it.
       if (!signal.aborted) announceTest(result)
       return result
@@ -193,6 +254,25 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   // The latest test, for the red count on the Connection tests tab. Reloaded
   // after a test of this page; `keepDataOnReload` so the count does not blink
   // out while it is asked again.
+  // What this installation offers for a credential. A failed read only means
+  // the "Secret manager" fact is left out; nothing else on the page needs it.
+  const credentialSettings = useService((s) => connectorService.getCredentialSettings(s), [])
+  // Only a connector that signs in with OAuth shows the Sign in panel
+  // (`SRC-12` part C); its ingest spec says which one that is.
+  const ingestSpec = useService((s) => connectorService.getIngestSpec(id, s), [id])
+  const oauth = ingestSpec.status === "success" ? oauthSignIn(ingestSpec.data) : null
+  // A connector that captures changes shows the Change capture tab (`SRC-4` S4-g) and, on
+  // its Overview tab, its own Postgres replication slot (`WEB-3` S2-D3). Both read this one
+  // predicate so a connector cannot show one and not the other (rule 4); the spec may say
+  // "cdc" in either field, and the API sets the two together. Decided by the spec the page
+  // already loads, so a connector that does not capture changes asks for nothing more.
+  const capturesChanges =
+    ingestSpec.status === "success" &&
+    (ingestSpec.data.adapter === "cdc" || ingestSpec.data.ingestMode === "cdc")
+  // A link to the Change capture tab for any other connector lands on the overview once
+  // the spec has said so.
+  const shownTab: ConnectorTab =
+    tab === "capture" && ingestSpec.status === "success" && !capturesChanges ? "overview" : tab
   const latestProbe = useService((s) => connectorService.listProbeHistory(id, 1, s), [id], {
     keepDataOnReload: true,
   })
@@ -253,10 +333,14 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   const counts: Record<ConnectorTab, LineTab["count"]> = {
     overview: null,
     ingest: savedTables === null ? null : { count: savedTables },
+    capture: null,
     schema: waiting.groups > 0 ? { count: waiting.groups, tone: "warning" } : null,
     tests: latest && !latest.ok ? { count: 1, tone: "danger" } : null,
   }
-  const stripTabs: LineTab[] = TABS.map((t) => ({ ...t, count: counts[t.value] }))
+  const stripTabs: LineTab[] = TABS.filter((t) => t.value !== "capture" || capturesChanges).map((t) => ({
+    ...t,
+    count: counts[t.value],
+  }))
 
   return (
     <div className="flex flex-col gap-3">
@@ -324,22 +408,50 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
           </>
         }
       />
-      <MetadataList density="compact" columns={3} items={connectorFacts(c)} />
+      <MetadataList
+        density="compact"
+        columns={3}
+        items={connectorFacts(
+          c,
+          credentialSettings.status === "success" ? credentialSettings.data.secretManager : null,
+          // The spec says whether the connection reads a credential; until it
+          // has answered, the fact makes no claim (D15).
+          ingestSpec.status === "loading"
+            ? "unknown"
+            : ingestSpec.status === "success" &&
+                usesNoCredential(ingestSpec.data.adapter ?? null, ingestSpec.data.dial)
+              ? "none"
+              : "stored"
+        )}
+      />
       <ConnectorDeleteDialog
         connector={c}
         dependents={c.dependentPipelines}
         open={deleteOpen}
         onOpenChange={setDeleteOpen}
         onDeleted={() => router.push("/connectors")}
+        oauth={oauth}
       />
+      {oauth ? <ConnectorOAuthPanel connectorId={id} onChanged={state.reload} /> : null}
       {testAction.data ? <TestNotice result={testAction.data} /> : null}
       <div ref={tabsRootRef}>
-        <Tabs value={tab} onValueChange={(v) => selectTab(v as ConnectorTab)} className="gap-3">
-          <LineTabsList tabs={stripTabs} active={tab} />
+        <Tabs value={shownTab} onValueChange={(v) => selectTab(v as ConnectorTab)} className="gap-3">
+          <LineTabsList tabs={stripTabs} active={shownTab} />
           <TabsContent value="overview">
             {/* Remounted on every visit (and after a test), so it never
                 shows a schedule or a run from before a change elsewhere. */}
-            <ConnectorOverview key={historyKey} detail={c} onOpenTab={selectTab} />
+            <div className="flex flex-col gap-3">
+              <ConnectorOverview key={historyKey} detail={c} onOpenTab={selectTab} />
+              {capturesChanges ? (
+                <ReplicationSlotHealth
+                  connectorId={id}
+                  title="Replication slot"
+                  description="This connector's Postgres replication slot as last checked (every 15 minutes). A disconnected slot is critical whatever its size: it keeps WAL on the source database."
+                  emptyLine="No replication-slot reading for this connector yet. The check runs every 15 minutes once the connector is streaming."
+                  refreshKey={historyKey}
+                />
+              ) : null}
+            </div>
           </TabsContent>
           <TabsContent value="ingest" keepMounted>
             <ConnectorIngestPanel
@@ -349,8 +461,14 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
               onTableCount={setSavedTables}
               pausedReason={c.pausedReason}
               waitingTables={waiting.tables}
+              onResumed={state.reload}
             />
           </TabsContent>
+          {capturesChanges ? (
+            <TabsContent value="capture">
+              <ConnectorChangeCapturePanel connectorId={id} pausedReason={c.pausedReason} onChanged={state.reload} />
+            </TabsContent>
+          ) : null}
           <TabsContent value="schema" keepMounted>
             <ConnectorSchemaChangesPanel
               connectorId={id}

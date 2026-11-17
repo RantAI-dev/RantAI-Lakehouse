@@ -22,8 +22,11 @@ use lakehouse_test_support as _;
 use lakehouse_store::connector_type::list_connector_types;
 use sqlx::PgPool;
 
-/// `0035` seeds exactly sixteen connector types: ten `supported = true`
-/// rows with a named `adapter`, and six `supported = false` roadmap rows.
+/// `0035` seeds sixteen connector types: ten `supported = true` rows with a
+/// named `adapter`, and six `supported = false` roadmap rows. `0095` (`SRC-3`
+/// T1.1) adds the ten business-app types, so there are twenty-six; `0096`
+/// (T7.1) flips eight of them and adds none; `0125` (`SRC-4` slice 5) adds
+/// `MongoDB CDC` and `0126` (slice 6) `Oracle CDC`, so there are twenty-eight.
 #[sqlx::test(migrations = "../../migrations")]
 async fn seeds_sixteen_connector_types(pool: PgPool) -> sqlx::Result<()> {
     let types = list_connector_types(&pool)
@@ -31,21 +34,48 @@ async fn seeds_sixteen_connector_types(pool: PgPool) -> sqlx::Result<()> {
         .expect("list_connector_types should succeed");
     assert_eq!(
         types.len(),
-        16,
-        "expected 16 seeded connector types, got {types:?}"
+        28,
+        "expected 28 seeded connector types, got {types:?}"
     );
     Ok(())
 }
 
-/// The unsupported types that carry a reason and keep an adapter.
-const TYPES_WITH_REASON_AND_ADAPTER: [&str; 3] = ["Google Sheets", "MySQL CDC", "SQL Server CDC"];
+/// The ten business-app types of `0095` (`SRC-3` T1.1, AD10): unsupported
+/// until the last slice (`0096` flips eight, see `SAAS_STILL_UNSUPPORTED`),
+/// with a reason, and with `adapter = 'saas'` from the
+/// start, for the reason `0062` gives for Google Sheets: `Dial::parse` already
+/// has their shape, and a connector created with one must open in the edit
+/// page, which resolves the dial form from the adapter. Named, like the rest.
+const SAAS_TYPES: [&str; 10] = [
+    "Salesforce",
+    "ServiceNow",
+    "Workday Reports",
+    "Google Analytics 4",
+    "HubSpot",
+    "Zendesk",
+    "Confluence",
+    "Dynamics 365",
+    "NetSuite",
+    "SharePoint",
+];
+
+/// The two `saas` types `0096` (`SRC-3` T7.1, decision 10) leaves
+/// unsupported: built and gate-tested against mocks, waiting for a test on a
+/// real account.
+const SAAS_STILL_UNSUPPORTED: [&str; 2] = ["Workday Reports", "NetSuite"];
+
+/// The unsupported types that carry a reason and keep an adapter: Google Sheets
+/// and the two `saas` types above. The other eight `saas` types are supported
+/// after `0096` and carry no reason; `MySQL CDC` and `SQL Server CDC` are
+/// supported again after `0123` (`SRC-4` slice 3) and carry none either.
+const TYPES_WITH_REASON_AND_ADAPTER: [&str; 3] = ["Google Sheets", "Workday Reports", "NetSuite"];
 
 /// Every `supported = false` row other than the three that keep an adapter
 /// has `adapter = NULL` — there is no `Dial::parse` shape yet for a type this
-/// build cannot dial. Google Sheets (`SRC-6` F5, `0062`) and `MySQL` CDC / SQL
-/// Server CDC (`SRC-9` decision 8, `0066`) keep their adapter so existing
-/// connectors still open. The list follows decision 8; it is named, not
-/// loosened for other rows.
+/// build cannot dial. Google Sheets (`SRC-6` F5, `0062`) and the two
+/// still-unsupported `saas` types (`0095`, `0096`)
+/// keep their adapter so existing connectors still open. The list is named,
+/// not loosened for other rows.
 #[sqlx::test(migrations = "../../migrations")]
 async fn unsupported_rows_have_no_adapter(pool: PgPool) -> sqlx::Result<()> {
     let types = list_connector_types(&pool)
@@ -104,45 +134,76 @@ async fn google_sheets_is_listed_as_unsupported_with_a_reason(pool: PgPool) -> s
     Ok(())
 }
 
-/// `0066` (`SRC-9` decision 8): `MySQL` CDC and `SQL Server` CDC are listed,
-/// unsupported, with a reason, and keep their `cdc` adapter.
+/// `0123` (`SRC-4` slice 3): `MySQL` CDC and `SQL Server` CDC are supported
+/// again, keep their `cdc` adapter and carry no reason.
 #[sqlx::test(migrations = "../../migrations")]
-async fn mysql_and_sql_server_cdc_are_listed_as_unsupported_with_a_reason(
+async fn mysql_and_sql_server_cdc_are_supported_again_after_0121(pool: PgPool) -> sqlx::Result<()> {
+    let types = list_connector_types(&pool)
+        .await
+        .expect("list_connector_types should succeed");
+    for name in ["MySQL CDC", "SQL Server CDC"] {
+        let found = types
+            .iter()
+            .find(|t| t.name == name)
+            .expect("the type must stay listed");
+        assert!(found.supported, "{found:?}");
+        assert_eq!(found.adapter.as_deref(), Some("cdc"), "{found:?}");
+        assert_eq!(found.unsupported_reason, None, "{found:?}");
+    }
+    Ok(())
+}
+
+/// `0125` (`SRC-4` slice 5): `MongoDB CDC` is a supported `cdc` type of its own, beside
+/// the batch `MongoDB` type, which keeps its `mongodb` adapter.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mongodb_cdc_is_a_supported_cdc_type_beside_the_batch_mongodb_type(
     pool: PgPool,
 ) -> sqlx::Result<()> {
     let types = list_connector_types(&pool)
         .await
         .expect("list_connector_types should succeed");
-    for (name, reason) in [
-        (
-            "MySQL CDC",
-            "Change capture for MySQL is not built yet: this build can only prepare it for PostgreSQL.",
-        ),
-        (
-            "SQL Server CDC",
-            "Change capture for SQL Server is not built yet: this build can only prepare it for PostgreSQL.",
-        ),
-    ] {
-        let found = types
-            .iter()
-            .find(|t| t.name == name)
-            .expect("the type must stay listed");
-        assert!(!found.supported, "{found:?}");
-        assert_eq!(found.adapter.as_deref(), Some("cdc"), "{found:?}");
-        assert_eq!(
-            found.unsupported_reason.as_deref(),
-            Some(reason),
-            "{found:?}"
-        );
-    }
+    let cdc = types
+        .iter()
+        .find(|t| t.name == "MongoDB CDC")
+        .expect("MongoDB CDC must be listed");
+    assert!(cdc.supported, "{cdc:?}");
+    assert_eq!(cdc.adapter.as_deref(), Some("cdc"), "{cdc:?}");
+    assert_eq!(cdc.unsupported_reason, None, "{cdc:?}");
+    let batch = types
+        .iter()
+        .find(|t| t.name == "MongoDB")
+        .expect("the batch MongoDB type must stay listed");
+    assert_eq!(batch.adapter.as_deref(), Some("mongodb"), "{batch:?}");
     Ok(())
 }
 
-/// `0062` and `0066`: only Google Sheets, `MySQL` CDC and `SQL Server` CDC carry
-/// a reason; the other roadmap rows keep the generic "Not available yet" in
-/// the console, and supported rows have none.
+/// `0126` (`SRC-4` slice 6): `Oracle CDC` is a supported `cdc` type of its own, beside
+/// the batch `Oracle` type, which keeps its `sql` adapter.
 #[sqlx::test(migrations = "../../migrations")]
-async fn only_the_three_named_types_have_an_unsupported_reason(pool: PgPool) -> sqlx::Result<()> {
+async fn oracle_cdc_is_its_own_supported_cdc_type_after_0124(pool: PgPool) -> sqlx::Result<()> {
+    let types = list_connector_types(&pool)
+        .await
+        .expect("list_connector_types should succeed");
+    let cdc = types
+        .iter()
+        .find(|t| t.name == "Oracle CDC")
+        .expect("Oracle CDC must be listed");
+    assert!(cdc.supported, "{cdc:?}");
+    assert_eq!(cdc.adapter.as_deref(), Some("cdc"), "{cdc:?}");
+    assert_eq!(cdc.unsupported_reason, None, "{cdc:?}");
+    let batch = types
+        .iter()
+        .find(|t| t.name == "Oracle")
+        .expect("the batch Oracle type must stay listed");
+    assert_eq!(batch.adapter.as_deref(), Some("sql"), "{batch:?}");
+    Ok(())
+}
+
+/// `0062` and `0096`: only Google Sheets and the two still-unsupported `saas`
+/// types carry a reason; the other roadmap rows keep the
+/// generic "Not available yet" in the console, and supported rows have none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_the_named_types_have_an_unsupported_reason(pool: PgPool) -> sqlx::Result<()> {
     let types = list_connector_types(&pool)
         .await
         .expect("list_connector_types should succeed");
@@ -154,6 +215,35 @@ async fn only_the_three_named_types_have_an_unsupported_reason(pool: PgPool) -> 
             connector_type.unsupported_reason.is_none(),
             "{connector_type:?} must have no unsupported_reason"
         );
+    }
+    Ok(())
+}
+
+/// `0095` and `0096` (`SRC-3` T1.1, T7.1, AD10): the ten business-app types are
+/// listed with the `saas` adapter; the eight with a passing gate are supported
+/// and carry no reason, Workday Reports and `NetSuite` (decision 10) stay
+/// unsupported with a reason that says they wait for a real account.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ten_business_app_types_are_listed_and_eight_are_supported(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let types = list_connector_types(&pool)
+        .await
+        .expect("list_connector_types should succeed");
+    for name in SAAS_TYPES {
+        let found = types
+            .iter()
+            .find(|t| t.name == name)
+            .expect("the type must be listed");
+        assert_eq!(found.adapter.as_deref(), Some("saas"), "{found:?}");
+        if SAAS_STILL_UNSUPPORTED.contains(&name) {
+            assert!(!found.supported, "{found:?}");
+            let reason = found.unsupported_reason.as_deref().unwrap_or_default();
+            assert!(reason.contains("real account"), "{found:?}");
+        } else {
+            assert!(found.supported, "{found:?}");
+            assert!(found.unsupported_reason.is_none(), "{found:?}");
+        }
     }
     Ok(())
 }

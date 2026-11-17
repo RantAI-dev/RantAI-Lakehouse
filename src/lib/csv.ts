@@ -7,12 +7,43 @@
  */
 
 /**
+ * SEC-17: a cell whose first character is one of these is a formula to a
+ * spreadsheet (a tab or a carriage return because some programs skip them
+ * before looking), so data one person loaded would run on the machine of the
+ * person who opens the export.
+ */
+const FORMULA_START = /^[=+\-@\t\r]/
+
+/**
+ * SEC-17: a plain number is never a formula, so `-5` and `+3.2e4` stay
+ * numbers. Decided on the cell's text alone: `-1+1` is not a number.
+ * `$` without the `m` flag matches only at the very end, so a number with a
+ * line break after it is not plain, as in the Rust twin of this rule
+ * (`needs_apostrophe` in `rust/crates/lakehouse-api/src/csv_safe.rs`).
+ */
+const PLAIN_NUMBER = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/
+
+/**
+ * SEC-17: puts `'` in front of a cell that would start a formula. It goes on
+ * before the quoting, so it ends up inside the quotes. The price is that a
+ * program reading the export back gets `'=A1`, not `=A1`.
+ */
+function neutralizeFormula(value: string): string {
+  return FORMULA_START.test(value) && !PLAIN_NUMBER.test(value)
+    ? `'${value}`
+    : value
+}
+
+/**
  * Membungkus satu sel bila mengandung karakter yang bisa merusak struktur.
  *
  * Aturan RFC 4180: sel yang memuat koma, tanda kutip ganda, CR, atau LF harus
  * dibungkus tanda kutip ganda, dan setiap tanda kutip di dalamnya digandakan.
+ * Sebelum itu, sel yang diawali karakter rumus diberi apostrof di depan
+ * (SEC-17), untuk header dan isi sama.
  */
-function escapeCell(value: string): string {
+function escapeCell(raw: string): string {
+  const value = neutralizeFormula(raw)
   if (!/[",\r\n]/.test(value)) return value
   return `"${value.replace(/"/g, '""')}"`
 }
@@ -33,6 +64,40 @@ export function toCsv(
   const header = columns.map(escapeCell).join(",")
   const body = rows.map((row) =>
     columns.map((c) => escapeCell(row[c] ?? "")).join(",")
+  )
+  return [header, ...body].join("\r\n")
+}
+
+/**
+ * One field of a tab-separated line.
+ *
+ * The same SEC-17 formula guard as the comma one, in the same place, so a
+ * file that leaves the browser cannot carry a formula to the spreadsheet that
+ * opens it. The quoting follows RFC 4180 with the tab as the separator: a
+ * field is quoted when it holds a tab, a carriage return, a line feed or a
+ * double quote, and the double quote inside it is doubled.
+ */
+function escapeTsvCell(raw: string): string {
+  const value = neutralizeFormula(raw)
+  if (!/[\t\r\n"]/.test(value)) return value
+  return `"${value.replace(/"/g, '""')}"`
+}
+
+/**
+ * The tab-separated twin of `toCsv`: the header row first, the rows in the
+ * order they came in, CRLF line ends, and a null or undefined cell written
+ * as an empty cell rather than as the words "null".
+ *
+ * It lives beside `toCsv` so the formula guard stays in one place: a second
+ * copy of that rule is a second chance to get it wrong.
+ */
+export function toTsv(
+  columns: string[],
+  rows: Record<string, string | null | undefined>[]
+): string {
+  const header = columns.map(escapeTsvCell).join("\t")
+  const body = rows.map((row) =>
+    columns.map((c) => escapeTsvCell(row[c] ?? "")).join("\t")
   )
   return [header, ...body].join("\r\n")
 }

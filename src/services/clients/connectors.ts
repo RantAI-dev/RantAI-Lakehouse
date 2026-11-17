@@ -3,29 +3,36 @@ import type {
   ApproveSchemaChangeResponse,
   Connector,
   ConnectorDetail,
+  ConnectorRunList,
+  ConnectorRunLog,
   ConnectorService,
   ConnectorTestResult,
   ConnectorType,
   CreateConnectorInput,
   CreateConnectorResponse,
-  DebeziumProperties,
-  DiscoverResult,
+  ChangeCaptureState,
+  LagLimitResponse,
+  DiscoveryAnswer,
   IngestibleConnector,
-  IngestJobRun,
-  IngestRun,
   IngestRunResult,
   IngestSpec,
   IngestSpecInput,
+  OAuthSignOut,
+  OAuthStart,
+  OAuthStatus,
   ProbeHistoryResponse,
+  PauseConnectorResponse,
+  ResumeConnectorResponse,
   RotateConnectorSecretRequest,
   RotateConnectorSecretResponse,
   SchemaChangeList,
+  CredentialSettings,
   SetConnectorCredentialRequest,
   SetConnectorCredentialResponse,
   UpdateConnectorInput,
 } from "../contracts/connectors";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
  * ConnectorService is real — connector definitions (source/sink) go through
@@ -52,6 +59,9 @@ async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await apiFetch(url, init);
   const json = await res.json();
   if (!res.ok) {
+    // QA LH-DATA-9-20 (WEB-11): Sources said "Request could not be processed" for a missing permission.
+    const denied = deniedFor(res.status, json);
+    if (denied) throw denied;
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
     throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
   }
@@ -67,6 +77,8 @@ async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Pr
   });
   const json = await res.json();
   if (!res.ok) {
+    const denied = deniedFor(res.status, json);
+    if (denied) throw denied;
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
     throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
   }
@@ -88,6 +100,8 @@ async function sendJson<T>(
   // `PUT .../tenant` answers 204 with no body.
   const json = res.status === 204 ? null : await res.json().catch(() => null);
   if (!res.ok) {
+    const denied = deniedFor(res.status, json);
+    if (denied) throw denied;
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
     throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
   }
@@ -120,32 +134,82 @@ export const postgresConnectorService: ConnectorService = {
   listTypes(signal) {
     return getJson<ConnectorType[]>("/api/connectors/types", { signal });
   },
+  getCredentialSettings(signal) {
+    return getJson<CredentialSettings>("/api/connectors/credential-settings", { signal });
+  },
+  getOAuthStatus(id, signal) {
+    return getJson<OAuthStatus>(`/api/connectors/${encodeURIComponent(id)}/oauth`, { signal });
+  },
+  startOAuth(id, signal) {
+    return postJson<OAuthStart>(`/api/connectors/${encodeURIComponent(id)}/oauth/start`, undefined, signal);
+  },
+  signOutOAuth(id, signal) {
+    return postJson<OAuthSignOut>(`/api/connectors/${encodeURIComponent(id)}/oauth/sign-out`, undefined, signal);
+  },
   listIngestible(signal) {
     return getJson<IngestibleConnector[]>("/api/connectors/ingestible", { signal });
   },
-  discoverConnector(id, schema, signal) {
-    return postJson<DiscoverResult>(
-      `/api/connectors/${encodeURIComponent(id)}/discover?schema=${encodeURIComponent(schema)}`,
-      undefined,
+  startDiscovery(id, kind, request, signal) {
+    return postJson<DiscoveryAnswer>(
+      `/api/connectors/${encodeURIComponent(id)}/discovery/${kind}`,
+      request,
       signal
     );
+  },
+  getDiscovery(id, kind, signal) {
+    return getJson<DiscoveryAnswer>(`/api/connectors/${encodeURIComponent(id)}/discovery/${kind}`, { signal });
   },
   runIngest(id, signal, table) {
     return postJson<IngestRunResult>(`/api/connectors/${encodeURIComponent(id)}/ingest/run`, table, signal);
   },
-  listIngestRuns(connectorId, signal) {
-    return getJson<IngestRun[]>(
-      `/api/governance/ingest-runs?connectorId=${encodeURIComponent(connectorId)}`,
+  listConnectorRuns(connectorId, signal) {
+    return getJson<ConnectorRunList>(`/api/connectors/${encodeURIComponent(connectorId)}/runs`, { signal });
+  },
+  getConnectorRunLog(connectorId, runId, signal) {
+    return getJson<ConnectorRunLog>(
+      `/api/connectors/${encodeURIComponent(connectorId)}/runs/${encodeURIComponent(runId)}/log`,
       { signal }
     );
   },
-  listIngestJobRuns(connectorId, signal) {
-    return getJson<IngestJobRun[]>(`/api/connectors/${encodeURIComponent(connectorId)}/ingest/runs`, { signal });
-  },
-  getDebeziumProperties(id, table, signal) {
-    return getJson<DebeziumProperties>(
-      `/api/connectors/${encodeURIComponent(id)}/debezium-properties?table=${encodeURIComponent(table)}`,
+  async downloadConnectorRunLog(connectorId, runId, signal) {
+    const res = await apiFetch(
+      `/api/connectors/${encodeURIComponent(connectorId)}/runs/${encodeURIComponent(runId)}/log?format=text`,
       { signal }
+    );
+    if (!res.ok) {
+      const json = await res.json().catch(() => null);
+      const denied = deniedFor(res.status, json);
+      if (denied) throw denied;
+      const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
+      throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
+    }
+    return res.text();
+  },
+  resumeConnector(connectorId, signal) {
+    return postJson<ResumeConnectorResponse>(
+      `/api/connectors/${encodeURIComponent(connectorId)}/resume`,
+      undefined,
+      signal
+    );
+  },
+  pauseConnector(connectorId, signal) {
+    return postJson<PauseConnectorResponse>(
+      `/api/connectors/${encodeURIComponent(connectorId)}/pause`,
+      undefined,
+      signal
+    );
+  },
+  getChangeCapture(connectorId, signal) {
+    return getJson<ChangeCaptureState>(
+      `/api/connectors/${encodeURIComponent(connectorId)}/change-capture`,
+      { signal }
+    );
+  },
+  setLagLimit(connectorId, minutes, signal) {
+    return putJson<LagLimitResponse>(
+      `/api/connectors/${encodeURIComponent(connectorId)}/lag-limit`,
+      { minutes },
+      signal
     );
   },
   listProbeHistory(id, limit, signal) {
@@ -190,16 +254,16 @@ export const postgresConnectorService: ConnectorService = {
     });
     if (!res.ok) {
       const json = await res.json().catch(() => null);
+      const denied = deniedFor(res.status, json);
+      if (denied) throw denied;
       // A 409 (pipelines still depend on it, or a CDC slot could not be
       // dropped) keeps its status on the error; the message says which.
       const kind =
         res.status === 404
           ? "not_found"
-          : res.status === 401 || res.status === 403
-            ? "permission_denied"
-            : res.status >= 500
-              ? "unavailable"
-              : "invalid_request";
+          : res.status >= 500
+            ? "unavailable"
+            : "invalid_request";
       throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
     }
   },

@@ -6,6 +6,7 @@ import {
   ArrowLeftRightIcon,
   ArrowUpFromLineIcon,
   CheckIcon,
+  CloudIcon,
   DatabaseIcon,
   ExternalLinkIcon,
   GitCompareArrowsIcon,
@@ -26,13 +27,14 @@ import { brandMarkForTypeName } from "@/lib/connectors/brand-marks"
 import type { Connector, ConnectorType, IngestAdapter } from "@/services/contracts/connectors"
 import { cn } from "@/lib/utils"
 
-type Category = "database" | "cdc" | "files" | "apps" | "soon"
+type Category = "database" | "cdc" | "files" | "apps" | "business" | "soon"
 
 const CATEGORIES: { id: Category; label: string; description: string }[] = [
   { id: "database", label: "Databases", description: "Read tables or collections in batches, on demand or on a schedule." },
   { id: "cdc", label: "Change data capture", description: "Stream every insert, update and delete as it happens." },
   { id: "files", label: "Files and storage", description: "Pick up CSV files from a bucket or a remote directory." },
   { id: "apps", label: "APIs and streams", description: "Pull from HTTP endpoints, spreadsheets or message topics." },
+  { id: "business", label: "Business apps", description: "Pull objects from CRM, support, analytics, finance and document systems." },
   { id: "soon", label: "Coming soon", description: "Listed so you know they are planned. They cannot be created yet." },
 ]
 
@@ -46,9 +48,16 @@ const ADAPTER_META: Record<IngestAdapter, { category: Category; icon: LucideIcon
   rest: { category: "apps", icon: GlobeIcon, blurb: "Paginated JSON endpoints" },
   sheets: { category: "apps", icon: SheetIcon, blurb: "Rows from a Google Sheets tab" },
   kafka: { category: "apps", icon: RadioTowerIcon, blurb: "Micro-batches from topics" },
+  saas: { category: "business", icon: CloudIcon, blurb: "Objects of a business app, signed in to the vendor" },
 }
 
 function metaFor(type: ConnectorType) {
+  if (!type.supported && type.adapter === "saas") {
+    // SRC-3 AD10: listed under Business apps from the start, disabled, with the
+    // reason, until its gate passes (a type that is still being built is not
+    // "coming soon" in the sense of the roadmap rows).
+    return { category: "business" as const, icon: CloudIcon, blurb: type.unsupportedReason ?? "Not available yet" }
+  }
   if (!type.supported || !type.adapter) {
     // SRC-6 F5: the API says why (e.g. Google Sheets has no verified sign-in);
     // the generic text is only for roadmap rows that have no specific reason.

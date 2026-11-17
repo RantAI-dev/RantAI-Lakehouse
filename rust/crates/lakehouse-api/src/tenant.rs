@@ -124,10 +124,10 @@ pub static NAMESPACE_META: LazyLock<HashMap<String, NamespaceMeta>> = LazyLock::
     })
     .collect();
 
-    // Nested `if let` rather than a let-chain: kept deliberately so this stays
-    // compilable on the workspace MSRV (`rust-version = "1.88"`), even though
-    // the release image builds on the 1.96.1 toolchain pinned in
-    // `rust-toolchain.toml`.
+    // Nested `if let` rather than a let-chain: the workspace floor
+    // (`rust-version = "1.99"`) does allow an edition-2024 let-chain, so
+    // this is the readability this code was written with, not a portability
+    // constraint.
     if let Ok(raw) = std::env::var("CATALOG_NAMESPACE_META") {
         let parsed = serde_json::from_str::<HashMap<String, HashMap<String, String>>>(&raw)
             .unwrap_or_default();

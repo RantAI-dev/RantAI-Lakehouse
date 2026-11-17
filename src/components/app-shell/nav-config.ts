@@ -1,15 +1,10 @@
 import {
-  Activity,
   BarChart3,
   BellRing,
   Boxes,
-  Bot,
   Building2,
-  CircleGauge,
   ClipboardCheck,
   Database,
-  DatabaseZap,
-  FileSearch,
   FileText,
   GitBranch,
   HeartPulse,
@@ -19,17 +14,12 @@ import {
   KeyRound,
   Library,
   ListChecks,
-  LogIn,
-  MonitorSmartphone,
   Plug,
   SearchCode,
-  Server,
   Settings,
+  SlidersHorizontal,
   ShieldCheck,
-  Tags,
   Users,
-  Waypoints,
-  Wrench,
   type LucideIcon,
 } from "lucide-react"
 
@@ -44,13 +34,8 @@ export type NavItem = {
    * expanded sidebar.
    */
   action?: { title: string; href: string; icon: LucideIcon }
-  /**
-   * `true` when the page still runs on mock data (not wired to a real
-   * service yet). Hidden from the sidebar unless
-   * `NEXT_PUBLIC_SHOW_PREVIEW="1"`. Remove this flag once the page's
-   * service is real.
-   */
-  preview?: boolean
+  /** Permissions required to open this nav entry (any-of). Empty means any authenticated user. */
+  requires: readonly string[]
 }
 
 export type NavGroup = {
@@ -64,23 +49,6 @@ export type NavGroup = {
    * flag only affects the first impression.
    */
   defaultOpen?: boolean
-  /**
-   * DERIVED, never hand-written. Set by `visibleNavGroups()` when EVERY
-   * item in a group is still `preview` — the group still renders
-   * (disabled, "Soon" badge) instead of vanishing without a trace.
-   */
-  comingSoon?: boolean
-  /**
-   * DERIVED. `true` when some of a group's items are hidden as preview.
-   *
-   * Used by the sidebar to choose a label. A group genuinely declared
-   * with 1 item (e.g. "AI" → "AI Copilot") uses that item's title, since
-   * it is more descriptive. But a group that BECAME 1 item through
-   * filtering must keep its group label — otherwise "Administration"
-   * would rename itself to "Settings" just because its other four pages
-   * are still mock.
-   */
-  partiallyHidden?: boolean
 }
 
 /**
@@ -99,25 +67,39 @@ export type NavGroup = {
  *   people spend their time, not a sub-page of Data.
  * - Data: where data lives and how it is read (catalog, queries).
  * - Build: author and operate data movement and outbound exports.
- * - Governance: the rules applied to the data (policies, quality, lineage).
+ * - Governance: the rules applied to the data (policies, quality) and the
+ *   human approval queue. Lineage is still a page, but it is reached from a
+ *   table, chart, pipeline or run rather than the sidebar (`WEB-3` D8).
  * - Monitoring: whether the platform is healthy, and what happened — the
  *   old "Overview" dashboard lives here as Health, next to alerts and the
  *   audit trail, instead of being the landing page.
- * - Intelligence: digital employees and their runs. Still `preview`: they
- *   have not been proven end-to-end, so the group renders as "Soon" rather
- *   than as working pages. Their approvals inbox is under Governance.
- * - Administration: identity and workspace configuration.
+ * - Administration: identity and workspace configuration. Sign-in (SSO)
+ *   lives inside Settings (`WEB-3` D6).
  */
 export const NAV_GROUPS: NavGroup[] = [
   {
     label: "Home",
     icon: Home,
-    items: [{ title: "Home", href: "/", icon: Home }],
+    items: [
+      {
+        title: "Home",
+        href: "/",
+        icon: Home,
+        requires: ["assistant:use", "assistant:ask"],
+      },
+    ],
   },
   {
     label: "History",
     icon: History,
-    items: [{ title: "History", href: "/copilot/history", icon: History }],
+    items: [
+      {
+        title: "History",
+        href: "/copilot/history",
+        icon: History,
+        requires: ["assistant:use", "assistant:ask"],
+      },
+    ],
   },
   {
     label: "Dashboards",
@@ -131,6 +113,7 @@ export const NAV_GROUPS: NavGroup[] = [
         // the resolver); the icon opens the list, where dashboards and
         // their folders are managed.
         action: { title: "Browse all dashboards", href: "/dashboards/browse", icon: LayoutGrid },
+        requires: ["dashboard:read"],
       },
     ],
   },
@@ -139,126 +122,73 @@ export const NAV_GROUPS: NavGroup[] = [
     icon: Database,
     defaultOpen: true,
     items: [
-      { title: "Catalog", href: "/catalog", icon: Library },
-      { title: "Data Explorer", href: "/data", icon: Database },
-      { title: "Query Studio", href: "/query-studio", icon: SearchCode },
-      { title: "Sources", href: "/connectors", icon: Plug },
+      { title: "Catalog", href: "/catalog", icon: Library, requires: ["catalog:read"] },
+      { title: "Query Studio", href: "/query-studio", icon: SearchCode, requires: ["query:read"] },
+      { title: "Sources", href: "/connectors", icon: Plug, requires: ["connector:manage"] },
     ],
   },
   {
     label: "Build",
     icon: GitBranch,
     items: [
-      { title: "Pipelines", href: "/pipelines", icon: GitBranch },
+      { title: "Pipelines", href: "/pipelines", icon: GitBranch, requires: ["pipeline:read"] },
     ],
   },
   {
     label: "Governance",
     icon: ShieldCheck,
     items: [
-      { title: "Policies", href: "/governance/policies", icon: ShieldCheck },
-      {
-        title: "Classification & Masking",
-        href: "/governance/classification",
-        icon: Tags,
-      },
+      // WEB-3 S3-D3, S3-D6: a column's sensitivity and masks are set on the
+      // column (a table's Schema tab), and Tag keys is a section of Settings;
+      // their old addresses redirect. S3-D4: Policies is "Access rules", at
+      // the same address.
+      // ADM-13 review round 1, S4: policy:read only
+      { title: "Access rules", href: "/governance/policies", icon: ShieldCheck, requires: ["policy:read"] },
       {
         title: "Data Quality",
         href: "/governance/data-quality",
         icon: ListChecks,
+        requires: ["governance:read"],
       },
-      { title: "Lineage", href: "/lineage", icon: Waypoints },
-      // Not under Intelligence: Copilot's destructive tools and data access
-      // requests queue here, so it must stay reachable while the digital
-      // employee pages are hidden.
-      { title: "Approvals", href: "/agents/approvals", icon: ClipboardCheck },
+      // Copilot's destructive tools and catalog access requests queue here.
+      { title: "Approvals", href: "/governance/approvals", icon: ClipboardCheck, requires: ["access:approve", "agent:approve"] },
     ],
   },
   {
     label: "Monitoring",
     icon: HeartPulse,
     items: [
-      { title: "Health", href: "/health", icon: HeartPulse },
-      { title: "Alerts", href: "/alerts", icon: BellRing },
-      { title: "Audit Log", href: "/audit", icon: FileText },
-      { title: "Activity", href: "/activity", icon: Activity },
-      { title: "Workloads", href: "/workloads", icon: CircleGauge },
-      { title: "Observability", href: "/observability", icon: FileSearch },
-      { title: "Services", href: "/services", icon: Server },
-      { title: "Capacity", href: "/lakehouse/capacity", icon: BarChart3 },
-      // Also holds the Iceberg table list that used to be "Tables" under
-      // Data: next to Data Explorer it read as a duplicate, and its only
-      // unique job, the per-table maintenance policy, belongs here.
-      {
-        title: "Table Maintenance",
-        href: "/governance/maintenance",
-        icon: Wrench,
-      },
-      {
-        title: "Ingestion (CDC)",
-        href: "/governance/ingestion",
-        icon: DatabaseZap,
-      },
-    ],
-  },
-  {
-    label: "Intelligence",
-    icon: Bot,
-    items: [
-      {
-        title: "Digital Employees",
-        href: "/agents/employees",
-        icon: Bot,
-        preview: true,
-      },
-      { title: "Agent Runs", href: "/agents/runs", icon: History, preview: true },
+      // WEB-3 S2-D2: Services, Capacity, Ingestion (CDC) and Table
+      // Maintenance are sections of System status; their old addresses
+      // redirect to `/health#<section>`.
+      { title: "System status", href: "/health", icon: HeartPulse, requires: ["ops:read"] },
+      { title: "Alerts", href: "/alerts", icon: BellRing, requires: ["alert:read", "alert:write"] },
+      // GOV-1 Decision 9: the API answers 403 on `GET /api/governance/audit`
+      // without `audit:read`, so the menu follows it (every role holds
+      // `governance:read`, only Governance Admin holds `audit:read`).
+      { title: "Audit Log", href: "/audit", icon: FileText, requires: ["audit:read"] },
     ],
   },
   {
     label: "Administration",
     icon: Settings,
     items: [
-      { title: "Users", href: "/admin/users", icon: Users },
-      { title: "Teams & Roles", href: "/admin/roles", icon: Building2 },
-      { title: "Tenants", href: "/admin/tenants", icon: Boxes },
+      { title: "Users", href: "/admin/users", icon: Users, requires: ["identity:read"] },
+      // WEB-3 S3-D8: the page holds roles only, so it is named for them.
+      { title: "Roles", href: "/admin/roles", icon: Building2, requires: ["identity:read"] },
+      { title: "Tenants", href: "/admin/tenants", icon: Boxes, requires: ["identity:read"] },
       {
         title: "Service Identities",
         href: "/admin/service-identities",
         icon: KeyRound,
+        requires: ["identity:read"],
       },
-      { title: "SSO", href: "/admin/sso", icon: LogIn },
-      { title: "Sessions", href: "/admin/sessions", icon: MonitorSmartphone },
+      // WEB-3 S3-D6, S3-D7: Sessions is a tab of Users and Maps a section
+      // of Settings; their old addresses redirect.
+      { title: "Settings", href: "/admin/settings", icon: SlidersHorizontal, requires: ["settings:write", "identity:read"] },
     ],
   },
 ]
-
-/**
- * Whether preview (mock) items are shown. Default is NO; set
- * `NEXT_PUBLIC_SHOW_PREVIEW="1"` to bring back every mock page.
- */
-export const SHOW_PREVIEW = process.env.NEXT_PUBLIC_SHOW_PREVIEW === "1"
-
-/**
- * Nav groups shown in the sidebar, with `preview` items filtered out
- * unless SHOW_PREVIEW is on.
- *
- * A group whose items are ALL preview is not dropped, only flagged
- * `comingSoon` and still rendered (disabled, "Soon" badge). It used to
- * vanish entirely — a section with several pages and none of them ever
- * shown left the product map in this config out of sync with what the
- * user actually saw, with no hint anything was missing.
- */
-export function visibleNavGroups(): NavGroup[] {
-  if (SHOW_PREVIEW) return NAV_GROUPS
-  return NAV_GROUPS.map((g) => {
-    const items = g.items.filter((it) => !it.preview)
-    return items.length > 0
-      ? { ...g, items, partiallyHidden: items.length < g.items.length }
-      : // The preview items are kept so the flyout/label still has
-        // content to show; `comingSoon` is what prevents navigating to them.
-        { ...g, comingSoon: true }
-  })
-}
 
 /** Flat list of every sidebar nav item, used for active-state and command search. */
 export const ALL_NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)
@@ -286,8 +216,8 @@ const SECONDARY_ROUTES: { title: string; href: string }[] = [
   // One conversation with Copilot. Not a sidebar entry: it is opened from
   // Home (a new one) or from History (an old one).
   { title: "Conversation", href: "/copilot" },
-  // Table detail pages, opened from Table Maintenance or an asset's
-  // Snapshots tab. Their nav entry was removed, so without this the
+  // Table detail pages, opened from System status's maintenance runs or
+  // an asset's Snapshots tab. Their nav entry was removed, so without this the
   // title would fall back to the product name.
   { title: "Iceberg Table", href: "/lakehouse/tables" },
 ]
@@ -336,3 +266,163 @@ export function pageTitleFor(pathname: string): string {
   ])
   return match?.title ?? "Rantai Lake"
 }
+
+export type RouteAccessEntry = {
+  pattern: string
+  requires: readonly string[]
+}
+
+/**
+ * Access map covering every non-public, non-redirect page in src/app.
+ * Gated by requires (any-of permissions). An empty array means any signed-in user.
+ * Verified against src/app/** /page.tsx and permissions.json by nav-config.test.ts.
+ */
+export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
+  // Home and AI
+  { pattern: "/", requires: ["assistant:use", "assistant:ask"] },
+  { pattern: "/copilot", requires: ["assistant:use", "assistant:ask"] },
+  { pattern: "/copilot/history", requires: ["assistant:use", "assistant:ask"] },
+
+  // Dashboards
+  { pattern: "/dashboards", requires: ["dashboard:read"] },
+  { pattern: "/dashboards/browse", requires: ["dashboard:read"] },
+  { pattern: "/dashboards/metrics", requires: ["dashboard:read"] },
+  { pattern: "/dashboards/[id]", requires: ["dashboard:read"] },
+  // WEB-7 D6: the chart builder's pages. `POST`/`PUT /api/dashboard/specs`
+  // are `RequiresAuth` with the level resolved in the handler
+  // (`policy.rs`), and a person can hold edit on one dashboard through a
+  // rule without `dashboard:write`; so the entry opens to any signed-in
+  // person and the page says "You don't have access" below edit.
+  { pattern: "/dashboards/[id]/charts/new", requires: [] },
+  { pattern: "/dashboards/[id]/charts/[chartId]/edit", requires: [] },
+
+  // Data & Catalog
+  { pattern: "/catalog", requires: ["catalog:read"] },
+  // QA LH-DATA-15-03 F2 (GOV-11, DEC-20): a `query:read` grant made from a
+  // table opens that table's page, so the route needs `catalog:read` OR
+  // `query:read`; the API decides which table (a grant on A opens A and not
+  // B). The sidebar entry and `/catalog` stay `catalog:read`.
+  { pattern: "/data/assets/[assetId]", requires: ["catalog:read", "query:read"] },
+  { pattern: "/lakehouse/tables/[namespace]/[table]", requires: ["catalog:read"] },
+  // ADM-13 review round 1, S4: gold-exports requires [] (any signed-in user, RequiresAuth on GET)
+  { pattern: "/gold-exports", requires: [] },
+
+  // Query Studio
+  { pattern: "/query-studio", requires: ["query:read"] },
+  // WEB-7 D2/D5: the save forms left the editor. Both take the permission
+  // their submit route takes: `POST /api/query/saved` is `query:read`
+  // (`policy.rs:475`), and `POST /api/dashboard/sources` is `dashboard:sql`
+  // (`policy.rs:680`), the same grant the editor's button is shown for.
+  { pattern: "/query-studio/save", requires: ["query:read"] },
+  { pattern: "/query-studio/save-source", requires: ["dashboard:sql"] },
+  { pattern: "/query-studio/saved", requires: ["query:read"] },
+  { pattern: "/query-studio/history", requires: ["query:read"] },
+
+  // Sources / Connectors
+  { pattern: "/connectors", requires: ["connector:manage"] },
+  { pattern: "/connectors/create", requires: ["connector:manage"] },
+  { pattern: "/connectors/upload", requires: ["connector:manage"] },
+  { pattern: "/connectors/[id]", requires: ["connector:manage"] },
+  { pattern: "/connectors/[id]/edit", requires: ["connector:manage"] },
+
+  // Build / Pipelines
+  { pattern: "/pipelines", requires: ["pipeline:read"] },
+  // ADM-13 review round 1, S4: pipeline:write only
+  { pattern: "/pipelines/create", requires: ["pipeline:write"] },
+  { pattern: "/pipelines/[pipelineId]", requires: ["pipeline:read"] },
+  { pattern: "/pipelines/[pipelineId]/edit", requires: ["pipeline:write"] },
+
+  // Governance
+  // ADM-13 review round 1, S4: policy:read only
+  { pattern: "/governance/policies", requires: ["policy:read"] },
+  { pattern: "/governance/data-quality", requires: ["governance:read"] },
+  // WEB-7 D2: adding a rule is the `governance:write` the API takes
+  // (`POST /api/governance/quality`).
+  { pattern: "/governance/data-quality/rules/new", requires: ["governance:write"] },
+  { pattern: "/governance/approvals", requires: ["access:approve", "agent:approve"] },
+  // GOV-1 Decision 9: same permission as the API's audit list.
+  { pattern: "/audit", requires: ["audit:read"] },
+  { pattern: "/lineage", requires: ["lineage:read"] },
+
+  // Monitoring
+  { pattern: "/health", requires: ["ops:read"] },
+  { pattern: "/alerts", requires: ["alert:read", "alert:write"] },
+  // WEB-7 D2/D7: the rule form left the list's dialog. `POST`/`PUT
+  // /api/alerts` are `RequiresAuth` with the handler deciding (an owner's own
+  // chart alert needs no `alert:write`, `policy.rs:424`); this page builds the
+  // non-chart rules the list shows, whose writes take `alert:write`.
+  { pattern: "/alerts/rules/new", requires: ["alert:write"] },
+  { pattern: "/alerts/rules/[id]/edit", requires: ["alert:write"] },
+
+  // Intelligence / Agents
+  // ADM-13 review round 1, S4: agent runs requires [] (any signed-in user, RequiresAuth on GET)
+  { pattern: "/agents/runs/[runId]", requires: [] },
+
+  // Administration
+  { pattern: "/admin/users", requires: ["identity:read"] },
+  // WEB-7 D2: the forms that left the side panel. Each takes the permission
+  // its submit route takes (POST/PUT identity writes are `identity:write`,
+  // `policy.rs`), so a person who may open the list but not write cannot
+  // reach the form.
+  { pattern: "/admin/users/invite", requires: ["identity:write"] },
+  { pattern: "/admin/roles", requires: ["identity:read"] },
+  { pattern: "/admin/roles/new", requires: ["identity:write"] },
+  { pattern: "/admin/roles/[id]/edit", requires: ["identity:write"] },
+  { pattern: "/admin/tenants", requires: ["identity:read"] },
+  { pattern: "/admin/tenants/new", requires: ["identity:write"] },
+  { pattern: "/admin/service-identities", requires: ["identity:read"] },
+  { pattern: "/admin/service-identities/new", requires: ["identity:write"] },
+  { pattern: "/admin/settings", requires: ["settings:write", "identity:read"] },
+  // Tag keys are a Settings section; defining or changing one is the
+  // governance write the API route takes (`POST`/`PUT /api/governance/tag-keys`).
+  { pattern: "/admin/settings/tag-keys/new", requires: ["governance:write"] },
+  { pattern: "/admin/settings/tag-keys/[key]/edit", requires: ["governance:write"] },
+  { pattern: "/account/change-password", requires: [] },
+]
+
+/**
+ * Checks if a route pattern matches a given runtime pathname.
+ * Handles exact matches as well as Next.js dynamic segments like `[id]`.
+ */
+export function routeMatches(pattern: string, pathname: string): boolean {
+  const normPath = pathname.split("?")[0].replace(/\/+$/, "") || "/"
+  const normPattern = pattern.replace(/\/+$/, "") || "/"
+  if (normPattern === normPath) return true
+  const patternParts = normPattern.split("/")
+  const pathParts = normPath.split("/")
+  if (patternParts.length !== pathParts.length) return false
+  return patternParts.every((part, i) => {
+    if (part.startsWith("[") && part.endsWith("]")) {
+      return pathParts[i].length > 0
+    }
+    return part === pathParts[i]
+  })
+}
+
+/**
+ * ADM-13 (D7): Fail-closed access check for pathnames against ROUTE_ACCESS.
+ * Unlisted paths return false.
+ * A path with empty `requires` is open to any authenticated user.
+ * Otherwise, returns true if the user holds at least one required permission.
+ */
+export function canOpen(
+  pathname: string,
+  hasPermission: (perm: string) => boolean
+): boolean {
+  const normPath = pathname.split("?")[0].replace(/\/+$/, "") || "/"
+  // Exact match wins over parameterized match
+  const match =
+    ROUTE_ACCESS.find((entry) => entry.pattern === normPath) ??
+    ROUTE_ACCESS.find((entry) => routeMatches(entry.pattern, normPath))
+
+  if (!match) {
+    return false // Fail closed: unlisted routes return false
+  }
+
+  if (match.requires.length === 0) {
+    return true // Any signed-in user
+  }
+
+  return match.requires.some((perm) => hasPermission(perm))
+}
+

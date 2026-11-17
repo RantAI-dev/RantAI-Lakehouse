@@ -95,6 +95,29 @@ impl ReexecutionStrategy {
     }
 }
 
+/// The `terminatePolicy` a `terminateRun` mutation asks for. A closed enum
+/// with a `graphql()` word, like [`ReexecutionStrategy`], so the policy word
+/// is a constant of this crate and never caller text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminatePolicy {
+    /// `Dagster` shuts the run down cleanly; what an operator's own cancel
+    /// asks for.
+    Safe,
+    /// Stop the worker if it is still there, then mark the run cancelled at
+    /// once. The only policy `Dagster` honours for a run that never started
+    /// or whose worker is gone (`QA TC-1702`, `SRC-39`).
+    MarkCanceledNow,
+}
+
+impl TerminatePolicy {
+    const fn graphql(self) -> &'static str {
+        match self {
+            Self::Safe => "SAFE_TERMINATE",
+            Self::MarkCanceledNow => "MARK_AS_CANCELED_IMMEDIATELY",
+        }
+    }
+}
+
 /// A `Dagster` run together with the run config it was launched with, as
 /// returned by `runsOrError { results { runConfig } }` — for a caller that
 /// needs to tell apart runs of one shared job by their config (every
@@ -113,6 +136,10 @@ pub struct DgConfiguredRun {
     /// Unix seconds the run ended, or `None` if it hasn't finished yet.
     #[serde(default)]
     pub end_time: Option<f64>,
+    /// Unix seconds the run was created (queued). The only time a run that
+    /// never started has (`QA TC-1702`, `SRC-39`).
+    #[serde(default)]
+    pub creation_time: Option<f64>,
     /// The run config, as `Dagster` returns it (a JSON object).
     #[serde(default)]
     pub run_config: Value,
@@ -172,7 +199,21 @@ pub enum DgError {
     /// logger) can still record the real cause/URL server-side.
     #[error("fetch failed")]
     Transport(#[source] reqwest::Error),
-    /// `Dagster` responded with a non-2xx status or a GraphQL error.
+    /// `Dagster` answered with a non-2xx HTTP status, carrying that status
+    /// code.
+    ///
+    /// Typed rather than folded into [`DgError::Server`] because the number
+    /// is the whole point: a `5xx` is an orchestrator that answered without
+    /// being able to serve (worth retrying), a `4xx` is one that refused this
+    /// request (retrying gets the same refusal), and a caller cannot tell
+    /// them apart from the text alone without parsing `"Dagster HTTP 500"`
+    /// back out (`PR #105 review SHOULD-FIX 5`). The `Display` is the same
+    /// `"Dagster HTTP {n}"` the pre-typed code produced, so a log line reads
+    /// exactly as it did before.
+    #[error("Dagster HTTP {0}")]
+    Status(u16),
+    /// `Dagster` responded with a GraphQL error, or with a response this
+    /// client could not read (a body that is not `JSON`, a missing field).
     ///
     /// When the failure is a GraphQL `errors` array, the message is the
     /// `JSON.stringify`-equivalent of that array, truncated to 300
@@ -206,6 +247,16 @@ struct GqlResponse<T> {
     data: Option<T>,
     #[serde(default)]
     errors: Option<Value>,
+}
+
+/// BLD-2: `pipelineRunsOrError(filter: {runKeys: …})`. Separate from
+/// [`RunsOrErrorData`] because the field name (`pipelineRunsOrError` vs
+/// `runsOrError`) is what distinguishes the run-key lookup from the
+/// name-filtered list.
+#[derive(Debug, Deserialize)]
+struct PipelineRunsOrErrorData {
+    #[serde(rename = "pipelineRunsOrError")]
+    runs_or_error: RunsOrError,
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,6 +334,10 @@ struct LaunchRunResult {
     message: Option<String>,
     #[serde(default)]
     errors: Option<Vec<LaunchRunError>>,
+    /// `PythonError.className`: the Python exception class, selected only
+    /// by the launch mutations that can meet a code location still loading.
+    #[serde(default, rename = "className")]
+    class_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -722,6 +777,14 @@ pub struct LaunchOutcome {
     /// layer reads the variant to pick a status code and a fixed,
     /// classified response body.
     pub failure: Option<LaunchFailure>,
+    /// Whether the failure is Dagster saying the job (or the code location
+    /// that holds it) is not loaded yet: the typed `PipelineNotFoundError`
+    /// result, or a `PythonError` whose `className` is
+    /// `DagsterUserCodeUnreachableError`. Decided from those typed fields
+    /// only, never from upstream text (none is carried), so a caller may answer a
+    /// retryable "not ready" without ever reading upstream prose
+    /// (`PR #105 CI fix`, `SEC-11`).
+    pub job_not_loaded: bool,
 }
 
 /// Typed classification of a Dagster mutation refusal. The variant
@@ -921,8 +984,12 @@ fn launch_outcome_from(r: LaunchRunResult) -> LaunchOutcome {
         return LaunchOutcome {
             run_id: Some(run.run_id),
             failure: None,
+            job_not_loaded: false,
         };
     }
+    // Typed fields only (`__typename`, `className`): `PR #105 CI fix`.
+    let job_not_loaded = r.typename == JOB_NOT_LOADED_TYPENAME
+        || r.class_name.as_deref() == Some(CODE_LOCATION_UNREACHABLE_CLASS);
     let failure = classify_launch_failure(&r.typename);
     let detail = r
         .message
@@ -947,6 +1014,7 @@ fn launch_outcome_from(r: LaunchRunResult) -> LaunchOutcome {
     LaunchOutcome {
         run_id: None,
         failure: Some(failure),
+        job_not_loaded,
     }
 }
 
@@ -960,6 +1028,15 @@ fn classify_launch_failure(typename: &str) -> LaunchFailure {
         LaunchFailure::Refused
     }
 }
+
+/// `__typename` of the `launchRun` result when the selector names a job the
+/// loaded repository does not have, which is also what a code location that
+/// is still (re)loading looks like from outside.
+const JOB_NOT_LOADED_TYPENAME: &str = "PipelineNotFoundError";
+
+/// `PythonError.className` Dagster reports when the user-code server (the
+/// code location's gRPC process) cannot be reached, as during a reload.
+const CODE_LOCATION_UNREACHABLE_CLASS: &str = "DagsterUserCodeUnreachableError";
 
 /// HTTP client for `Dagster`'s GraphQL endpoint.
 pub struct DgClient {
@@ -1004,9 +1081,9 @@ impl DgClient {
     ///
     /// # Errors
     ///
-    /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when `Dagster` responds with a non-2xx status or
-    /// a GraphQL `errors` array.
+    /// Returns [`DgError::Transport`] on a network-level failure,
+    /// [`DgError::Status`] when `Dagster` responds with a non-2xx status, or
+    /// [`DgError::Server`] when it answers with a GraphQL `errors` array.
     pub async fn list_runs(&self, limit: u32) -> Result<Vec<DgRun>, DgError> {
         // F1.5 (PR #55/#56 review BLOCKER): `limit` is caller-supplied, so
         // it travels as a GraphQL variable — every value crossing the
@@ -1076,6 +1153,58 @@ impl DgClient {
         Ok(data.runs_or_error.results.unwrap_or_default())
     }
 
+    /// The most recent run carrying `run_key` as its `dagster/run_key` tag.
+    ///
+    /// BLD-2's lag check stores the run key it asked Dagster to use and
+    /// asks this on the next check to learn whether that run has landed
+    /// (plan D5). Filtering on `dagster/run_key` in `PipelineRunsFilter.tags`
+    /// — a server-side tag filter — rather than paging recent runs and
+    /// scanning their tags client-side: the run being looked for may be older
+    /// than any page limit the route would be willing to fetch, and the answer is
+    /// "this exact run key", not "the newest run whose tags happen to
+    /// match".
+    ///
+    /// `Ok(None)` when no run carries that key — including the case where
+    /// the orchestrator has not created it yet, which the caller treats as
+    /// "the request is still outstanding" rather than as a failure (fail
+    /// closed: a second run for the same change is worse than waiting one
+    /// tick).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DgError::Transport`] on a network-level failure,
+    /// [`DgError::Status`] when `Dagster` answers with a non-2xx status, or
+    /// [`DgError::Server`] when the response body isn't valid `JSON` or
+    /// carries a GraphQL `errors` array.
+    pub async fn find_run_by_run_key(&self, run_key: &str) -> Result<Option<DgRun>, DgError> {
+        let query = "query($filter: RunsFilter) { pipelineRunsOrError(\
+                      filter: $filter) { __typename \
+                      ... on Runs { results { runId jobName status startTime endTime \
+                      creationTime parentRunId rootRunId tags { key value } } } } }";
+        let data: PipelineRunsOrErrorData = self
+            .execute(
+                query,
+                Some(json!({
+                    "filter": {
+                        "tags": [{ "key": "dagster/run_key", "value": run_key }]
+                    }
+                })),
+            )
+            .await?;
+        Ok(data.runs_or_error.results.and_then(|mut runs| {
+            // Most recent first, so if more than one run carries the key the
+            // answer is the run created last (BLD-2 review R3 SHOULD-FIX 4:
+            // not a claim about what Dagster allows).
+            // BLD-2 review R1 SHOULD-FIX 11: order by creationTime, not startTime
+            runs.sort_by(|a, b| {
+                b.creation_time
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.creation_time.unwrap_or(0.0))
+            });
+            runs.into_iter().next()
+        }))
+    }
+
     /// [`DgClient::list_runs_for_job`], with each run's config — see
     /// [`DgConfiguredRun`]. Most recent first.
     ///
@@ -1091,7 +1220,7 @@ impl DgClient {
         // same caller contract, as `list_runs_for_job` above.
         let query = format!(
             "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
-             __typename ... on Runs {{ results {{ runId status startTime endTime runConfig }} }} \
+             __typename ... on Runs {{ results {{ runId status startTime endTime creationTime runConfig }} }} \
              }} }}"
         );
         let data: ConfiguredRunsOrErrorData = self.execute(&query, None).await?;
@@ -1128,7 +1257,7 @@ impl DgClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            return Err(DgError::Server(format!("Dagster HTTP {}", status.as_u16())));
+            return Err(DgError::Status(status.as_u16()));
         }
         let parsed: Value =
             serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
@@ -1258,11 +1387,12 @@ impl DgClient {
     ///
     /// # Errors
     ///
-    /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when `Dagster` responds with a non-2xx status,
-    /// a GraphQL `errors` array, or `pipelineOrError.__typename` is not
-    /// `Pipeline` (e.g. `PipelineNotFoundError` — the job doesn't exist in
-    /// this repository/location).
+    /// Returns [`DgError::Transport`] on a network-level failure,
+    /// [`DgError::Status`] when `Dagster` responds with a non-2xx status, or
+    /// [`DgError::Server`] when it answers with a GraphQL `errors` array, or
+    /// when `pipelineOrError.__typename` is not `Pipeline` (e.g.
+    /// `PipelineNotFoundError` — the job doesn't exist in this
+    /// repository/location).
     pub async fn job_graph(&self, job_name: &str) -> Result<JobGraph, DgError> {
         let query = "query($sel: PipelineSelector!) { pipelineOrError(params: $sel) { \
                       __typename ... on Pipeline { solidHandles { solid { name \
@@ -1318,15 +1448,15 @@ impl DgClient {
     ///
     /// # Errors
     ///
-    /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when `Dagster` responds with a non-2xx status or
-    /// a GraphQL `errors` array.
+    /// Returns [`DgError::Transport`] on a network-level failure,
+    /// [`DgError::Status`] when `Dagster` responds with a non-2xx status, or
+    /// [`DgError::Server`] when it answers with a GraphQL `errors` array.
     pub async fn launch_run(&self, job_name: &str) -> Result<LaunchOutcome, DgError> {
         let query = "mutation($sel: JobOrPipelineSelector!) { \
                       launchRun(executionParams: { selector: $sel, mode: \"default\" }) { \
                       __typename \
                       ... on LaunchRunSuccess { run { runId } } \
-                      ... on PythonError { message } \
+                      ... on PythonError { message className } \
                       ... on RunConfigValidationInvalid { errors { message } } \
                       } }";
         let variables = json!({
@@ -1359,22 +1489,57 @@ impl DgClient {
     /// Same as [`DgClient::launch_run`]: a GraphQL-level launch failure
     /// (a bad job name, a `RunConfigValidationInvalid`) comes back as
     /// `Ok(LaunchOutcome { run_id: None, error: Some(msg) })`, NOT `Err`
-    /// — only a transport failure or a malformed GraphQL response is
-    /// [`DgError::Transport`]/[`DgError::Server`].
+    /// — only a transport failure, a non-2xx status or a malformed GraphQL
+    /// response is [`DgError::Transport`]/[`DgError::Status`]/
+    /// [`DgError::Server`].
     pub async fn launch_run_with_config(
         &self,
         job_name: &str,
         run_config: &Value,
     ) -> Result<LaunchOutcome, DgError> {
-        let query = "mutation($sel: JobOrPipelineSelector!, $cfg: RunConfigData!) { \
+        self.launch_run_with_config_and_tags(job_name, run_config, &[])
+            .await
+    }
+
+    /// [`DgClient::launch_run_with_config`] with run tags (`SRC-11` review 1
+    /// SHOULD-FIX 1: the API tags a person's launch `lakehouse/trigger: user`,
+    /// which the orchestrator's run report reads). `tags` go in
+    /// `ExecutionParams.executionMetadata.tags` (`[ExecutionTag!]`, each a
+    /// `{ key, value }`). With no tags the request is exactly the one
+    /// [`DgClient::launch_run_with_config`] always sent, so its other callers
+    /// are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`DgClient::launch_run_with_config`].
+    pub async fn launch_run_with_config_and_tags(
+        &self,
+        job_name: &str,
+        run_config: &Value,
+        tags: &[(&str, &str)],
+    ) -> Result<LaunchOutcome, DgError> {
+        let tagged = !tags.is_empty();
+        let query = if tagged {
+            "mutation($sel: JobOrPipelineSelector!, $cfg: RunConfigData!, \
+                      $tags: [ExecutionTag!]!) { \
                       launchRun(executionParams: { selector: $sel, mode: \"default\", \
-                      runConfigData: $cfg }) { \
+                      runConfigData: $cfg, executionMetadata: { tags: $tags } }) { \
                       __typename \
                       ... on LaunchRunSuccess { run { runId } } \
                       ... on PythonError { message } \
                       ... on RunConfigValidationInvalid { errors { message } } \
-                      } }";
-        let variables = json!({
+                      } }"
+        } else {
+            "mutation($sel: JobOrPipelineSelector!, $cfg: RunConfigData!) { \
+                      launchRun(executionParams: { selector: $sel, mode: \"default\", \
+                      runConfigData: $cfg }) { \
+                      __typename \
+                      ... on LaunchRunSuccess { run { runId } } \
+                      ... on PythonError { message className } \
+                      ... on RunConfigValidationInvalid { errors { message } } \
+                      } }"
+        };
+        let mut variables = json!({
             "sel": {
                 "repositoryName": self.repo,
                 "repositoryLocationName": self.location,
@@ -1382,6 +1547,12 @@ impl DgClient {
             },
             "cfg": run_config,
         });
+        if tagged {
+            variables["tags"] = tags
+                .iter()
+                .map(|(key, value)| json!({ "key": key, "value": value }))
+                .collect();
+        }
         let data: LaunchRunData = self.execute(query, Some(variables)).await?;
         Ok(launch_outcome_from(data.launch_run))
     }
@@ -1550,15 +1721,47 @@ impl DgClient {
     ///
     /// See [`DgClient::launch_run`].
     pub async fn terminate_run(&self, run_id: &str) -> Result<LaunchOutcome, DgError> {
-        let query = "mutation($runId: String!) { \
-                      terminateRun(runId: $runId, terminatePolicy: SAFE_TERMINATE) { \
-                      __typename \
-                      ... on TerminateRunSuccess { run { runId } } \
-                      ... on TerminateRunFailure { message } \
-                      ... on PythonError { message } \
-                      } }";
+        self.terminate_with(run_id, TerminatePolicy::Safe).await
+    }
+
+    /// Cancel a run that is past its limit for good: stop its worker if it
+    /// is still there, then mark the run cancelled at once
+    /// (`MARK_AS_CANCELED_IMMEDIATELY`). Right for a run whose connector is
+    /// locked by it — a run that never started, or whose worker died
+    /// (`QA TC-1702`, `SRC-39`, decision D10). `SAFE_TERMINATE` is refused
+    /// by `Dagster` for exactly those runs.
+    ///
+    /// Like [`DgClient::terminate_run`], a typed `Dagster`-side failure is
+    /// reported through `Ok(LaunchOutcome { failure: Some(..), .. })`, and
+    /// the upstream message is logged here, never put in the outcome.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn cancel_run_now(&self, run_id: &str) -> Result<LaunchOutcome, DgError> {
+        self.terminate_with(run_id, TerminatePolicy::MarkCanceledNow)
+            .await
+    }
+
+    /// The one body of `terminateRun`: the policy word is the only thing the
+    /// two callers change.
+    async fn terminate_with(
+        &self,
+        run_id: &str,
+        policy: TerminatePolicy,
+    ) -> Result<LaunchOutcome, DgError> {
+        let query = format!(
+            "mutation($runId: String!) {{ \
+             terminateRun(runId: $runId, terminatePolicy: {}) {{ \
+             __typename \
+             ... on TerminateRunSuccess {{ run {{ runId }} }} \
+             ... on TerminateRunFailure {{ message }} \
+             ... on PythonError {{ message }} \
+             }} }}",
+            policy.graphql()
+        );
         let data: TerminateRunData = self
-            .execute(query, Some(json!({ "runId": run_id })))
+            .execute(&query, Some(json!({ "runId": run_id })))
             .await?;
         let r = data.terminate_run;
         if r.typename == "TerminateRunSuccess"
@@ -1567,6 +1770,7 @@ impl DgClient {
             return Ok(LaunchOutcome {
                 run_id: Some(run.run_id),
                 failure: None,
+                job_not_loaded: false,
             });
         }
         let failure = classify_launch_failure(&r.typename);
@@ -1582,6 +1786,7 @@ impl DgClient {
         Ok(LaunchOutcome {
             run_id: None,
             failure: Some(failure),
+            job_not_loaded: false,
         })
     }
 
@@ -1695,6 +1900,7 @@ impl DgClient {
             return Ok(LaunchOutcome {
                 run_id: None,
                 failure: Some(LaunchFailure::NotFound),
+                job_not_loaded: false,
             });
         }
         let pipeline_name = parent
@@ -2080,7 +2286,10 @@ impl DgClient {
     /// # Errors
     ///
     /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when the response body isn't valid `JSON`.
+    /// [`DgError::Server`] when the response body isn't valid `JSON`. The
+    /// HTTP status is not inspected here — the body is read whatever it is —
+    /// so a non-2xx answer is a `Server` error when it does not parse and
+    /// whatever the body says otherwise. (PR #201 review F SHOULD-FIX 6.)
     pub async fn pipeline_run_pipeline_name(
         &self,
         run_id: &str,
@@ -2121,7 +2330,10 @@ impl DgClient {
     /// # Errors
     ///
     /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when the response body isn't valid `JSON`.
+    /// [`DgError::Server`] when the response body isn't valid `JSON`. The
+    /// HTTP status is not inspected here — the body is read whatever it is —
+    /// so a non-2xx answer is a `Server` error when it does not parse and
+    /// whatever the body says otherwise. (PR #201 review F SHOULD-FIX 6.)
     pub async fn pipeline_run_status(
         &self,
         run_id: &str,
@@ -2195,7 +2407,10 @@ impl DgClient {
     /// # Errors
     ///
     /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when the response body isn't valid `JSON`.
+    /// [`DgError::Server`] when the response body isn't valid `JSON`. The
+    /// HTTP status is not inspected here — the body is read whatever it is —
+    /// so a non-2xx answer is a `Server` error when it does not parse and
+    /// whatever the body says otherwise. (PR #201 review F SHOULD-FIX 6.)
     pub async fn run_steps(&self, run_id: &str) -> Result<Vec<RunStep>, DgError> {
         let query = "query($rid:ID!){ runOrError(runId:$rid){ __typename \
                       ... on Run { stepStats { stepKey status startTime endTime \
@@ -2234,7 +2449,10 @@ impl DgClient {
     /// # Errors
     ///
     /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when the response body isn't valid `JSON`.
+    /// [`DgError::Server`] when the response body isn't valid `JSON`. The
+    /// HTTP status is not inspected here — the body is read whatever it is —
+    /// so a non-2xx answer is a `Server` error when it does not parse and
+    /// whatever the body says otherwise. (PR #201 review F SHOULD-FIX 6.)
     pub async fn run_config(&self, run_id: &str) -> Result<Option<Value>, DgError> {
         let query = "query($rid:ID!){ runOrError(runId:$rid){ __typename \
                       ... on Run { runConfig } } }";
@@ -2270,7 +2488,8 @@ impl DgClient {
     ///
     /// # Errors
     ///
-    /// Returns [`DgError::Transport`] on a network-level failure, or
+    /// Returns [`DgError::Transport`] on a network-level failure,
+    /// [`DgError::Status`] when `Dagster` answers with a non-2xx status, or
     /// [`DgError::Server`] when the response body isn't valid `JSON` or
     /// `logsForRun.__typename` isn't `EventConnection` (`RunNotFoundError`,
     /// `PythonError`).
@@ -2291,7 +2510,7 @@ impl DgClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            return Err(DgError::Server(format!("Dagster HTTP {}", status.as_u16())));
+            return Err(DgError::Status(status.as_u16()));
         }
         let parsed: Value =
             serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
@@ -2361,7 +2580,7 @@ impl DgClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            return Err(DgError::Server(format!("Dagster HTTP {}", status.as_u16())));
+            return Err(DgError::Status(status.as_u16()));
         }
         let parsed: GqlResponse<T> =
             serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
@@ -2967,6 +3186,27 @@ mod tests {
         assert!(!rendered.contains(&addr.port().to_string()), "{rendered}");
     }
 
+    /// `PR #105 review SHOULD-FIX 5`: a non-2xx is typed, not folded into
+    /// `DgError::Server`, so a caller can retry a `5xx` without parsing the
+    /// message. The `Display` is unchanged (`"Dagster HTTP {n}"`), which is
+    /// what every log line and string comparison from before the variant
+    /// still sees.
+    #[tokio::test]
+    async fn a_non_2xx_answer_is_a_typed_status_with_the_same_display() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let err = client.list_runs(25).await.unwrap_err();
+
+        assert!(matches!(err, DgError::Status(503)), "got {err:?}");
+        assert_eq!(err.to_string(), "Dagster HTTP 503");
+    }
+
     #[tokio::test]
     async fn launch_run_success_returns_run_id() {
         let server = MockServer::start().await;
@@ -3018,6 +3258,43 @@ mod tests {
         assert!(outcome.failure.is_none());
     }
 
+    /// `SRC-11` review 1 SHOULD-FIX 1: tags go in
+    /// `executionMetadata.tags` as `{ key, value }` objects, and the mutation
+    /// declares `$tags: [ExecutionTag!]!`.
+    #[tokio::test]
+    async fn launch_run_with_config_and_tags_sends_the_tags_as_execution_metadata() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let run_config = json!({"ops": {"run_ingest": {"config": {"connector_id": "conn-a"}}}});
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("$tags: [ExecutionTag!]!"))
+            .and(body_string_contains("executionMetadata: { tags: $tags }"))
+            .and(body_partial_json(json!({
+                "variables": {
+                    "cfg": run_config,
+                    "tags": [{ "key": "lakehouse/trigger", "value": "user" }]
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "run-789" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .launch_run_with_config_and_tags(
+                "ingest_job",
+                &run_config,
+                &[("lakehouse/trigger", "user")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("run-789"));
+    }
+
     /// A GraphQL-level failure (`RunConfigValidationInvalid`) must still
     /// come back as `Ok(LaunchOutcome { error: Some(_) })`, the same
     /// non-`Err` shape [`launch_run_python_error_returns_error_not_err`]
@@ -3062,6 +3339,55 @@ mod tests {
         assert!(outcome.run_id.is_none());
         // F2.7: upstream "boom" is logged, not surfaced.
         assert_eq!(outcome.failure, Some(LaunchFailure::Refused));
+    }
+
+    /// `PR #105 CI fix`: "the job is not loaded yet" is read from Dagster's
+    /// typed fields (`__typename`, `PythonError.className`), and nothing
+    /// else is mistaken for it, whatever its message says.
+    #[tokio::test]
+    async fn launch_run_with_config_flags_a_job_that_is_not_loaded_from_typed_fields_only() {
+        let cases = [
+            (json!({ "__typename": "PipelineNotFoundError" }), true),
+            (
+                json!({ "__typename": "PythonError", "message": "x",
+                        "className": "DagsterUserCodeUnreachableError" }),
+                true,
+            ),
+            // The words alone are not the signal.
+            (
+                json!({ "__typename": "PythonError",
+                        "message": "PipelineNotFoundError: job not found",
+                        "className": "ValueError" }),
+                false,
+            ),
+            (
+                json!({ "__typename": "PythonError", "message": "boom" }),
+                false,
+            ),
+            (
+                json!({ "__typename": "RunConfigValidationInvalid",
+                        "errors": [ { "message": "bad" } ] }),
+                false,
+            ),
+        ];
+        for (launch_run, expected) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/graphql"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "data": { "launchRun": launch_run } })),
+                )
+                .mount(&server)
+                .await;
+            let client = DgClient::new(format!("{}/graphql", server.uri()));
+            let outcome = client
+                .launch_run_with_config("ingest_job", &json!({}))
+                .await
+                .unwrap();
+            assert!(outcome.run_id.is_none());
+            assert_eq!(outcome.job_not_loaded, expected, "{launch_run}");
+        }
     }
 
     #[tokio::test]
@@ -3397,8 +3723,8 @@ mod tests {
     /// variables object containing the value. If the implementation
     /// regresses to `format!`, the body won't include the constant
     /// substring, no mock matches, wiremock returns 404, the client
-    /// surfaces `DgError::Server("Dagster HTTP 404")`, and the `unwrap`
-    /// here fails — that's the mutation-evidence red.
+    /// surfaces `DgError::Status(404)`, and the `unwrap` here fails — that's
+    /// the mutation-evidence red.
     #[tokio::test]
     async fn list_runs_for_job_job_name_travels_as_a_graphql_variable() {
         use wiremock::matchers::{body_partial_json, body_string_contains};
@@ -3704,6 +4030,40 @@ mod tests {
         );
     }
 
+    /// QA `TC-1702` (`SRC-39`): a run that never started has no start time,
+    /// so `creationTime` is the only time the route can judge it by.
+    #[tokio::test]
+    async fn list_runs_for_job_with_config_returns_when_each_run_was_created() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            // `review round 1, R5`: the field is pinned on the QUERY, not on
+            // the answer. Without this the fixtures still carried
+            // `creationTime` while the query no longer asked for it, and the
+            // never-started path of the run route would switch itself off
+            // unnoticed.
+            .and(body_string_contains("creationTime"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [
+                    { "runId": "r1", "status": "STARTED", "startTime": null,
+                      "creationTime": 4.0, "runConfig": {} },
+                    { "runId": "r0", "status": "QUEUED", "runConfig": {} }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let runs = client
+            .list_runs_for_job_with_config("ingest_job", 50)
+            .await
+            .unwrap();
+        assert_eq!(runs[0].creation_time, Some(4.0));
+        assert_eq!(runs[1].creation_time, None);
+    }
+
     #[tokio::test]
     async fn list_jobs_with_schedules_attaches_matching_schedule_only() {
         let server = MockServer::start().await;
@@ -3729,6 +4089,66 @@ mod tests {
         assert_eq!(refresh.schedules[0].schedule_state.status, "RUNNING");
         let other = jobs.iter().find(|j| j.name == "other_job").unwrap();
         assert!(other.schedules.is_empty());
+    }
+
+    /// BLD-2: the lag check looks a requested run up by its `runKey`.
+    /// BLD-2 review R1 SHOULD-FIX 11 / R2 SHOULD-FIX 5: tags filter and ordered by creationTime
+    /// (differing creationTime and startTime prove ordering is by creationTime, not startTime).
+    #[tokio::test]
+    async fn find_run_by_run_key_sends_the_key_as_a_variable_and_returns_the_newest() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_partial_json(
+                json!({ "variables": { "filter": { "tags": [{ "key": "dagster/run_key", "value": "lag:pl-x:abc" }] } } }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunsOrError": { "__typename": "Runs", "results": [
+                    // BLD-2 review R3 SHOULD-FIX 4: the older-created run STARTS
+                    // after the newer one, so sorting by startTime would pick it.
+                    { "runId": "old", "jobName": "authored__pl-x", "status": "SUCCESS",
+                      "startTime": 1000.0, "endTime": 1040.0, "creationTime": 100.0 },
+                    { "runId": "new", "jobName": "authored__pl-x", "status": "STARTED",
+                      "startTime": 950.0, "creationTime": 900.0 }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let run = client
+            .find_run_by_run_key("lag:pl-x:abc")
+            .await
+            .unwrap()
+            .expect("a run carries that key");
+        assert_eq!(run.run_id, "new");
+        assert_eq!(run.status, "STARTED");
+        assert_eq!(run.start_time, Some(950.0));
+    }
+
+    /// No run with that key is the orchestrator's normal "not created
+    /// yet" answer, and the caller treats it as "still outstanding" rather
+    /// than as an error (see [`DgClient::find_run_by_run_key`]).
+    #[tokio::test]
+    async fn find_run_by_run_key_is_none_when_no_run_carries_the_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunsOrError": { "__typename": "Runs", "results": [] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        assert!(
+            client
+                .find_run_by_run_key("lag:pl-x:abc")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3875,6 +4295,51 @@ mod tests {
         assert_eq!(outcome.failure, Some(LaunchFailure::Refused));
     }
 
+    /// QA `TC-1702` (`SRC-39`): the forced policy is what the run route uses
+    /// for a run past its limit — `SAFE_TERMINATE` is refused for a run that
+    /// never started or whose worker is gone.
+    #[tokio::test]
+    async fn cancel_run_now_asks_for_the_run_to_be_marked_cancelled_at_once() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("MARK_AS_CANCELED_IMMEDIATELY"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "terminateRun": { "__typename": "TerminateRunSuccess",
+                    "run": { "runId": "r1" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client.cancel_run_now("r1").await.unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("r1"));
+        assert!(outcome.failure.is_none());
+    }
+
+    /// The existing operator-facing cancel keeps the clean shutdown.
+    #[tokio::test]
+    async fn terminate_run_still_asks_for_a_safe_termination() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("SAFE_TERMINATE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "terminateRun": { "__typename": "TerminateRunSuccess",
+                    "run": { "runId": "r1" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client.terminate_run("r1").await.unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("r1"));
+    }
+
     #[tokio::test]
     async fn launch_reexecution_success_returns_new_run_id() {
         let server = MockServer::start().await;
@@ -3928,7 +4393,10 @@ mod tests {
             "error text must not be carried"
         );
         // A schedule that does not exist has no ticks, not an error.
-        assert!(schedule_ticks_from(&json!({ "__typename": "ScheduleNotFoundError" })).is_empty());
+        assert_eq!(
+            schedule_ticks_from(&json!({ "__typename": "ScheduleNotFoundError" })),
+            [] as [ScheduleTick; 0]
+        );
     }
 
     /// R3 plan 2a BLOCKER regression: `sensor_ticks` selects
@@ -3964,7 +4432,10 @@ mod tests {
             "Dagster error text must not be carried in the response"
         );
         // A sensor that does not exist has no ticks, not an error.
-        assert!(sensor_ticks_from(&json!({ "__typename": "SensorNotFoundError" })).is_empty());
+        assert_eq!(
+            sensor_ticks_from(&json!({ "__typename": "SensorNotFoundError" })),
+            [] as [ScheduleTick; 0]
+        );
     }
 
     #[tokio::test]
@@ -4572,7 +5043,10 @@ mod tests {
                 "ClickHouse lake.y".to_owned()
             ]
         );
-        assert!(metadata_lines(&entries, "reads").is_empty());
+        assert_eq!(
+            metadata_lines(&entries, "reads"),
+            [] as [std::string::String; 0]
+        );
     }
 
     /// An op reporting metadata with none of the three recognized labels

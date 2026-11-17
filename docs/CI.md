@@ -1,23 +1,30 @@
 # CI/CD
 
-This repo's CI is split into four workflows under `.github/workflows/`:
+This repo's CI is split into workflows under `.github/workflows/`:
 
 - **`ci.yml`** — change-scoped fast feedback and acceptance testing. Begins with
   a change scope detector (`changes`) and unconditional repo lints (`repo-lints`),
   runs selective frontend/Dagster/Rust/acceptance jobs based on modified paths,
-  and gates merges with a single summary gate (`ci-required`).
+  builds the `lakehouse-api` and Dagster images once (`images`) for the jobs
+  that need them, and gates merges with a single summary gate (`ci-required`).
 - **`security.yml`** — `cargo audit`, `cargo deny check all`, a working-tree
   `gitleaks` scan, GitHub's `dependency-review-action` on PRs, and a
-  full-git-history `history-scan` job, which is currently **RED for a real
-  reason** (see below) and is deliberately excluded from required checks.
-- **`docker.yml`** — builds `rust/Dockerfile`, boots the container, and
-  asserts `/health` returns 200. A GHCR push job exists but is gated on tag
-  pushes and is currently inert (no registry login configured).
+  full-git-history `history-scan` job, which reports only findings outside
+  the `.gitleaksignore` baseline (see below) and is deliberately excluded from
+  required checks.
+- **`release.yml`** — the release pipeline (REL-2 S2). On a `v*` tag push it
+  builds, signs and packages a release; on a pull request that touches the
+  pipeline, or on demand, it runs the same pipeline as a dry run against a
+  throwaway registry and a throwaway key. See "Release pipeline" below.
 - **`coverage.yml`** — `cargo llvm-cov` (lcov, uploaded as a workflow
   artifact) and a CycloneDX SBOM per crate (also uploaded as an artifact,
-  for Phase 6's release attachment). Runs on `push` to `main` and manual dispatch
-  only to avoid spending ~30 runner minutes per PR run when no PR checks consume
-  the artifact.
+  for Phase 6's release attachment). Runs on a `push` to `main` that changes a file
+  the Rust tests read, and on manual dispatch; never on a pull request, which would
+  spend ~30 runner minutes per PR run when no PR check consumes the artifact.
+- **`security-all-branches.yml`** — daily scheduled (`cron: '17 3 * * *'`) and manual
+  dispatch scan of all git branches using `gitleaks` (`--log-opts="--all"`).
+  Deliberately separate from pull-request checks so findings on one branch do
+  not block unrelated PRs (SEC-36, D2).
 
 ## Change Scopes and the Single Gate (`ci-required`)
 
@@ -26,44 +33,407 @@ To reduce CI feedback latency on targeted changes (such as docs-only or frontend
 
 | Scope | Triggered By |
 |---|---|
-| `rust` | `rust/**`, `src/lib/dashboard-specs.ts`, `docker-compose.yml` |
+| `rust` | `rust/**`, `src/lib/dashboard-specs.ts`, `docker-compose.yml`, `.env.example`, `ops/release/release.pub`, `ops/release/fixtures/**`, `public/geo/**` (the last three are compiled in by `include_bytes!`/`include_str!`, `OPS-24` R5) |
 | `frontend` | `src/**`, `public/**`, `package.json`, `bun.lock`, `bunfig.toml`, `tsconfig.json`, `next.config.ts`, `eslint.config.mjs`, `postcss.config.mjs`, `components.json`, `Dockerfile.frontend` |
 | `dagster` | `dagster/**` |
 | `stack` | `docker-compose.yml`, `ops/**` (except `ops/fixtures/**`), `scripts/**` (except `scripts/ci/**`), `.env.example` |
 | `docs_only` | True when every changed file is under `docs/**`, `GTM/**`, or is a root `*.md`, `LICENSE` or `NOTICE` |
 | `all` | `.github/**`, `ops/fixtures/**`, `scripts/ci/**`, an unreadable base SHA, or any file unclassified by the rules above (fails safe) |
 
-On a `push` to `main`, all jobs run unconditionally.
+The same script also writes the gate groups the run selected: `gates_storage`,
+`gates_pipelines`, `gates_cdc`, `gates_ingest`, `gates_saas`, `gates_secrets`,
+`gates_alerts`, `gates_upload`, `gates_governance` and `gate_groups` (`OPS-25`;
+see "Gates by path" below).
+
+A `push` to `main` follows the same scopes as a pull request (`OPS-24` D1): the diff
+is the push's own (`github.event.before` to the pushed commit). Every push has its own
+run and none waits for another (D2). One full run starts every night at 19:23 UTC and
+can be started by hand (`workflow_dispatch`): it has no base commit, and `ci-required`
+requires every job on both events whatever the scope says (D3, `OPS-24` R3). Setting the
+repository variable `CI_PUSH_FULL` to **exactly `true`, lower case** makes every push run
+everything again; any other value (`TRUE`, `1`, `yes`) is a `::warning::` in the log and
+does nothing, because the comparison happens in `detect_change_scope.sh` and nowhere else
+(`OPS-24` R4). The same push's run then also turns the push proof off, from that script's
+`push_full` output.
+
+### A push that repeats a passed pull request
+
+A push whose diff was already tested by a pull request does not run that test again
+(`OPS-24` D4–D6). `scripts/ci/detect_push_proof.sh`, run by `changes`, calls a push
+**proven** when all of the following hold for the pushed commit `H`:
+
+1. the event is `push`, and the push's scope needs the Rust tests or the acceptance
+   jobs (otherwise there is nothing to skip);
+2. a pull-request head `P` is found: `H`'s second parent when `H` is a merge commit;
+   otherwise the head of the one merged pull request whose `merge_commit_sha` is `H`
+   and whose base is `main`, read from the API, fetched as `refs/pull/<n>/head` and
+   checked to be that exact commit (most merges here are squash merges, so the
+   merge-commit rule alone would miss most pushes);
+3. `H`'s first parent is an ancestor of `P`: the branch held `main`'s tip when it was
+   merged, so the run that tested `P` tested `H`'s tree;
+4. `H`'s tree equals `P`'s tree;
+5. the most recently completed `ci-required` check run on `P`, made by GitHub Actions,
+   is a success, and none is still running;
+6. in that same check suite, the job that stands for each group the push needs
+   succeeded: `Rust · fmt` for the Rust group, `Images · build lakehouse-api + dagster
+   once` for the acceptance group. The gate script makes a group all-or-nothing, so
+   one job of the group plus a green `ci-required` proves the group, which closes the
+   case where the pull-request run had a narrower scope than the push.
+
+Anything else is **not proven** — an error, an empty answer, a failed API call, an
+unexpected value — and then every job in scope runs, as before. A proven push still
+runs `changes`, `repo-lints`, the console and Dagster unit jobs when in scope, `fmt`,
+`clippy`, `build`, `msrv`, `images` and one leg of `test` in its cheapest form: it
+restores the cache and compiles (`cargo nextest run --no-run`) only when the restore
+was not an exact hit. It skips the nextest runs, the doctest step, the test-count
+check, the 25 gate jobs and `image-smoke`. `images` keeps running because it is the
+only writer of the image layer cache the pull requests read.
+
+**The accepted limit of this proof (`OPS-24` D4, R6c).** Condition 5 reads the
+`ci-required` check run of the head commit `P`, and a head's checks are reported for
+whatever base that run was made against. So a head whose green `ci-required` came from a
+run against another base — a pull request retargeted after it passed, or a stack branch
+whose checks were made against its parent branch rather than `main` — satisfies condition
+5 without its run having tested the tree against `main`'s tip. Conditions 3 and 4 still
+prove that the *code* is the code that was tested; what they cannot prove is that the
+run's merge base was `main`. The nightly run (D3) runs every job on `main` every night, so
+a gap of that kind is closed within a day. Retargeting a pull request does not by itself
+start a new run (the `pull_request` trigger names no `edited` type), so the fresh run
+against the new base comes with the next push to the branch. A future fix could compare
+the run's base SHA, which the check-run payload does not carry.
+
+`ci-required` treats the skipped jobs as follows (`OPS-24` D6):
+
+| Jobs | "skipped" is accepted when |
+|---|---|
+| `changes`, `repo-lints` | never |
+| `verify` | neither `frontend` nor `all` |
+| `fmt`, `clippy`, `build`, `msrv`, `test` | neither `rust` nor `all` (a proven push does not excuse them) |
+| `dagster-unit-tests`, `dagster-loader-tests` | neither `dagster` nor `all` |
+| `images` | none of `rust`, `dagster`, `stack`, `all` (a proven push does not excuse it) |
+| the 25 gate jobs and `image-smoke` | none of `rust`, `dagster`, `stack`, `all` (a gate job's own group narrows this further, see "Gates by path" below); **or** the event is `push` and the push is proven |
+
+| Result | Required | Not required |
+|---|---|---|
+| `success` | pass | pass |
+| `skipped` (or empty) | **fail** | pass |
+| `failure`, `cancelled` | **fail** | **fail** |
+| anything else | **fail** | **fail** |
+
+The proof is read on the event `push` only: on a pull request, a scheduled run or a
+manual run it is ignored, and `ci-required` gates exactly as it does without it. The
+nightly run of D3 and `CI_PUSH_FULL=true` are the backstops that still run every
+gate.
+
+### Gates by path (`OPS-25`)
+
+A pull request runs only the acceptance gates its changed files can affect. The 25 gate
+jobs are arranged in nine groups, and a group runs only when a file that can change what
+it exercises changes:
+
+| Group | Jobs | What they exercise |
+|---|---|---|
+| `storage` | `g1-rustfs`, `g2-seaweedfs` | `g1_lakekeeper`, tenant provisioning on SeaweedFS |
+| `pipelines` | `g3a-dagster`, `g3-maintenance`, `gold-export` | Dagster + dlt Bronze ingest, the authored pipelines, maintenance, Gold export |
+| `cdc` | `g4-cdc`, `g4-mysql`, `g4-mongo`, `g4-oracle`, `g4-mssql` | change capture through Kafka Connect |
+| `ingest` | `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g6-ops`, `g6-discovery-scale` | batch connectors, connector operations, discovery at scale |
+| `saas` | `g6-saas-a`, `g6-saas-b` | business-app connectors against the vendor stubs |
+| `secrets` | `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g10-sso` | credentials at rest, Vault/AWS, OAuth sign-in, Keycloak SSO |
+| `alerts` | `g6-alerts` | alert delivery |
+| `upload` | `g9-upload` | file upload |
+| `governance` | `g8-governance`, `g8-time-travel` | masking and time travel on Trino and ClickHouse |
+
+`images` and `image-smoke` are not in a group: their condition is unchanged, so a
+console-only pull request still builds both images and proves `/health` starts.
+
+`scripts/ci/gate_paths.txt` is the one place this is written. A `group` line lists a
+group's jobs; a `path <pattern> <groups>` line names the files that select it, with
+`<groups>` a comma list, `all` (every group) or `none` (no gate). Patterns are bash
+globs, where `*` also matches `/`, and **the first matching line wins**, so the specific
+lines come before the catch-alls. `scripts/ci/detect_change_scope.sh` reads the map
+once, writes `gates_<group>` for each group and `gate_groups` (`none`, or the selected
+groups between commas, `,cdc,`), and each gate's `if:` keeps today's scope condition and
+appends its own `gates_<group>`. An unmapped file, a missing or unreadable map, and the
+label below select every group: unknown means everything, and a map that names a group
+that does not exist turns `changes` red.
+
+**Shared paths select every group.** One binary (`cargo build -p lakehouse-api`) serves
+every gate, and 21 of the 25 gates create connectors, run pipelines and read back
+through the router and the shared routes, so `docker-compose.yml`, `.env.example`,
+`.github/*`, `scripts/*`, `rust/migrations/*`, `rust/Cargo.toml`, `rust/Cargo.lock`,
+every crate's `Cargo.toml` and every `src/` module not named in the map, `rust/Dockerfile`,
+`rust/entrypoint.api.sh`, `rust/rust-toolchain.toml`, `dagster/Dockerfile`,
+`dagster/pyproject.toml`, `dagster/dagster.yaml`, `definitions.py` and every Dagster
+module not named in the map, `ops/fixtures/*`, `ops/gates/*`, `ops/oidc-mock/*`,
+`ops/smtp-ca/*`, `ops/backups/*`, `ops/init-env.sh`, and any other `ops/*` or `rust/*`
+path select all nine groups. Inside the API that includes `lib.rs`, `main.rs`,
+`state.rs`, `config.rs`, `policy.rs` (`POLICY_TABLE`), `policy_engine.rs`,
+`sql_rewrite.rs`, `routes/mod.rs` (the router), `routes/support.rs`, `routes/auth.rs`,
+`routes/identity.rs`, `routes/connectors.rs`, `routes/pipelines.rs`, `routes/query.rs`,
+`routes/governance.rs` and `upstream_error.rs`.
+
+**`none` is explicit and narrow.** A path selects no group only when no gate can load
+it: integration tests and benches (except G1's own `g1_lakekeeper` test, which is the
+`storage` gate), the parity corpus, `lakehouse-test-support` (a dev-dependency),
+`lakehousectl` (not in any image), the assistant (`routes/ai/*`, `lakehouse-llm`, the
+store's `chat_term.rs`, `assistant_settings.rs` and `knowledge.rs`), Dagster's unit
+tests, `ops/lint`, `ops/release`, `ops/ai_eval`, `ops/bench`, `ops/geo`, `ops/demo`,
+`ops/forecast`, and the console (`src/*`, `public/*`, its config files,
+`Dockerfile.frontend`; `images` builds the API and Dagster only). Two console paths are
+the exception: `src/lib/dashboard-specs.ts` and `public/geo/*` are compiled into
+`lakehouse-bi`, so they select `governance,alerts`.
+
+**The label `ci:all-gates`.** Adding that label to a pull request selects every group
+and sets `stack=true`, so `images` runs too. Only a boolean crosses into the script
+(`ALL_GATES_LABEL`), never any label text, and the script compares it to exactly `true`;
+labels are in the event payload, so no new permission is needed. It takes effect on the
+next push to the pull request (or a close and reopen): no `labeled` trigger is added,
+because any label event would start a run and cancel the one in progress. Whether
+"Re-run jobs" sees a label added after the original event is *not verified*: push.
+
+**What a skipped gate means (`ci-required`, `OPS-25` D7).** `required_gate.sh` reads
+`gate_groups` and the map's `group` lines:
+
+| Scope | The job's group | Required |
+|---|---|---|
+| no acceptance scope (§`ci-required` above) | any | no |
+| acceptance scope, `all=true`, or the nightly/manual run | any | yes |
+| acceptance scope, a pull request or an unproven push | in `gate_groups` | yes |
+| acceptance scope, a pull request or an unproven push | not in it, and `gate_groups` is `none` or well formed | no |
+| acceptance scope | `gate_groups` unset, empty or malformed, or the job has no `group` line | **yes** (fail closed) |
+
+`images` stays required by the acceptance scope and `image-smoke` by the unproven scope
+(the two lines are unchanged). A gate that failed or was cancelled is red whatever the
+selection says.
+
+**Pushes** follow the same map: a proven push skips every gate as before, and an
+unproven push runs the gates of the groups its own diff selects.
+
+The owner accepted on 2026-11-13 that `main` may occasionally be red until the nightly
+run catches a gate that a pull request did not run.
+
 
 Downstream jobs execute according to scope:
-- **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.
+- **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, every file compiled into Rust from outside `rust/` setting the `rust` scope (`OPS-24` R5), every Rust test file being declared in a test binary (`OPS-32`, `scripts/ci/check_test_modules.sh`), connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.
 - **`verify`**: Runs if `frontend` or `all` is true.
 - **`dagster-unit-tests`**: Runs if `dagster` or `all` is true. Runs the tests not marked `loader` (`-m "not loader"`).
 - **`dagster-loader-tests`**: Same condition. Runs the tests marked `loader` (`-m loader`): a real `dlt` pipeline against a local Iceberg table. Split from the job above because together they took 13m52s of a 15-minute limit (PR #115).
-- **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true.
-- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
+- **`g6-credentials`** (`SRC-12` part A, `ops/g6/src12_credentials_test.py`): checks that `docker compose config` refuses an empty `CONNECTOR_SECRETS_KEY` and names it; starts the `g6-ops` stack with `ops/g6/docker-compose.src12.override.yml` (the writable credentials volume the other g6 gates replace); types a MySQL credential through the API and checks the stored file is a seal (version byte, not the plain value, owner-only) and that the connector tests and loads; runs `lakehouse-api rotate-secrets-key` with a new key (old key as `CONNECTOR_SECRETS_KEY_PREVIOUS`), drops the old key, recreates the API and the code location, and checks the file changed and the connector still tests and loads. Its own job so the slowest connector gate stays under 20 minutes; the first CI runs are its measurement. Not run against a real stack before it reached CI.
+- **`g6-secret-managers`** (`SRC-12` part B, `ops/g6/src12_managers_test.py`): starts the `g6-ops` stack with `ops/g6/docker-compose.src12.override.yml` and `ops/g6/docker-compose.src12-managers.override.yml`, which adds Vault's official development server (`vault-g6`) and a `moto` server (`moto-g6`), both pinned and CI-only. The gate runs twice, once per manager, because an installation has one: with `SECRET_MANAGER=vault`, then (after `.env` is switched and the API and the code location recreated) with `SECRET_MANAGER=aws`. Each run stores a MySQL source password in the manager, refuses a reference to nothing (422, fixed words, none of the manager's) and another manager's scheme (400), saves a reference through `PUT .../credential` (read once, connection tested), checks the credentials volume holds no file and no copy, tests and loads through the reference, changes the secret in the manager to a wrong value (the next test and run fail), restores it (the next run succeeds, appends). Google Secret Manager and Azure Key Vault have no local stand-in: they are covered by unit tests against recorded responses (`secret_manager/gcp.rs`, `azure.rs`, `test_secret_manager_gcp.py`, `..._azure.py`) and were not run against the real services. Its own job: the bring-up of `g6-credentials` is 12 to 14 minutes and the two together would pass its 25; the first CI runs are its measurement. Not run against a real stack before it reached CI; the image tags (`hashicorp/vault:1.18.5`, `motoserver/moto:5.0.9`) were not pulled where this was written.
+- **`g6-oauth`** (`SRC-12` part C, `ops/g6/src12_oauth_test.py`): starts the same stack as `g6-ops` with `ops/g6/docker-compose.src12.override.yml` (the writable credentials volume and the runner's read-only view of it), and the CI-only `.env` sets the gate-only `CONNECTOR_OAUTH_ALLOW_HTTP=true` and `CONNECTOR_OAUTH_REDIRECT_URI=http://lakehouse-api:8080/api/connectors/oauth/callback`. The provider is a thread of the gate's runner: an authorize endpoint that approves at once and redirects with a code, a token endpoint that checks the PKCE verifier, issues 5-second access tokens and rotates the refresh token (honouring only the latest), a revocation endpoint, and a REST API whose pages answer 2 seconds late and require the bearer token. Steps: the client secret is saved before any sign-in (unverified, sealed); the gate signs in as a browser would (S256, random state, redirect to the product's callback with its own session); a load of 5 rows outlives one access token (at least two refresh grants are counted at the provider); the rotated refresh token is sealed in place (the file changed, still no clear text) and a second load after the first access token expired succeeds (the run record says so, the provider counted a refresh-token grant for it, the sealed token changed again; the table is loaded by `replace`, so rows are not the proof); the connection test refreshes and passes twice; a wrong and a replayed `state` are refused with the fixed page and never reach the provider; a refresh token the provider no longer honours fails one attempt as `sign_in_refused` with none of the provider's words in the log, and signing in again restores loading; signing out and deleting the connector each call the revocation address with the stored token and remove the files. Its own job, 25 minutes; the first CI runs are its measurement. Not run against a real stack before it reached CI.
+- **`g6-saas-a`** and **`g6-saas-b`** (`SRC-3` AD9 amended before slice 6, `ops/g6/g6_saas_test.py`): the gate of the business-app (`saas`) connectors is two jobs that run in parallel on the same scripts, each given the vendors it owns by `SAAS_GATE_VENDORS` (comma separated vendor ids, or `--vendors=`; empty means every vendor, as in a local run). `g6-saas-a` owns HubSpot, Zendesk, Salesforce, Google Analytics 4 and ServiceNow; `g6-saas-b` owns Confluence, SharePoint, Dynamics 365, Workday and NetSuite. One job with eight vendors took 16m17s of the signed 20 minutes (`7a8af090`), so ten would not fit; no step was removed to make them fit, and each job has its own compose project (`saasagci`, `saasbgci`). Both are in `ci-required` and `scripts/ci/required_gate.sh` (`G6_SAAS_A_RESULT`, `G6_SAAS_B_RESULT`), and `coverage.json` (slice 7) names the job each type is proven in. The rest of this entry describes what either job runs for its vendors. It is a gate in jobs of their own so that no existing connector gate grows (`g6-ingest-other` measured 14m53s to 18m36s of its 20 minutes, `docs/plans/SRC-9-RESULT.md`). One mock vendor server (`ops/g6/saas_stub.py`, stdlib only, service `saas-stub-g6`, profile `g6-saas`) answers for every vendor on the vendor's own port (the vendor's real paths, `VENDOR_PORTS` in the stub; `GET /health` and the `/__admin/<vendor>` state controls on 8080). **Through the product (slice 2 review BLOCKER 4):** the job runs the Dagster stack as `g6-ingest-other` does (`--profile dagster`: API, `dagster-code-location`, `dagster-webserver`, `dagster-daemon`, ClickHouse and the catalog as dependencies) with `ops/g6/docker-compose.g6-saas.override.yml` layered on `docker-compose.g6.override.yml`; that file turns on, for the API and the code location only, the gate-only `CONNECTOR_OAUTH_ALLOW_HTTP` and `SAAS_GATE_ORIGINS` (vendor id to the mock's origin; a no-op without the switch, in Rust and in Python, both tested) so that the product dials the mock. For every vendor in `PRODUCT_VENDORS` the gate: creates the connector through the API (a type that is `supported = false` is not refused) and saves its ingest spec; runs the API's connection test (passes, names the account, repeats none of the mock's words); lists the objects through the orchestrator (the object says it loads incrementally) and previews it (HubSpot's properties API, Zendesk honestly `not_supported`); loads with `ingest_job` into Bronze Iceberg and reads the rows back through ClickHouse; changes the vendor, reloads, and reads back the merged table (no key twice; Zendesk's deleted ticket says `status = deleted`; HubSpot's archived deal stays because HubSpot reports no deletes); revokes the sign-in and checks the API's test and a run fail without the vendor's words. The browser sign-in has no browser here, so it stays a vendor-level step, and the vendor-level steps (the vendor module and `SaasSession` run in the runner against the mock) stay as well: HubSpot connect with the private-app token and the browser sign-in, discover, load, reload through search, a new property in describe, a 429 with `Retry-After` waited out and one that never lifts, a revoked token and refresh token; Zendesk connect with an email and API token and with the browser sign-in (the token request is JSON and the refresh token rotates), the mock's time-based export repeating tickets at page boundaries (upstream #659) and the connector reading each once, a cursor reload with a changed, a new and a deleted ticket, a new field, rate limits, a forbidden and a revoked sign-in. `--vendors-only` runs the vendor-level steps with no API against a local `python ops/g6/saas_stub.py` (set `PORT` if 8080 is taken). The API steps first assert the ten types are `supported: false`. ServiceNow (client credentials; Table API paged by the `Link` header; the dictionary describes the table) and Confluence (email + API token for the product steps; the browser sign-in behind Atlassian's gateway, with its cloud id, at vendor level; a reload that must stop near the cursor, `max_reads`) joined in slice 4. SharePoint (Graph delta feed, its link kept in dlt state; a delete marked; a 410 Gone resync at vendor level and in the dlt-state pytest) and Dynamics 365 (an untracked table filtered by `modifiedon`, a tracked table read by its change-tracking delta link) joined in slice 5; each has a product entry for client credentials and one for the browser sign-in's connection test and load, with Entra's token endpoint in the mock at the customer's tenant. Workday (a report read once and replaced; Basic for the integration user, the refresh grant with the client in the Basic header) and NetSuite (SuiteQL pages by `offset` and `hasMore`; the certificate way, whose PS256 assertion the mock verifies with the public key the gate registers, and the browser sign-in) joined in slice 6, each with a vendor-level run and two product entries in `g6-saas-b`; both are models of documentation that could not be run against a real account. Each later vendor adds an entry to `PRODUCT_VENDORS`, its mock and its vendor-level steps in its own slice, and the types stay `supported = false` until slice 7. Budget: the signed 20 minutes per job (each job's cut-off is 25, as `g6-ingest-other`'s); the first CI runs are its measurement and the job summary has each vendor's product steps time.
+- **`g6-discovery-scale`** (`SRC-13` decisions D9 and D12, `ops/g6/src13_discovery_scale_test.py`): creates a PostgreSQL schema of 10,000 tables in the stack's own database, lists it through `POST /api/connectors/conn-pg-lakehouse/discovery/list`, searches one table by part of its name, previews it, and prints each call's seconds on `[src13]` lines that are copied to the job summary. **Fails if the listing takes more than 120 seconds** (the feature page's "10,000 tables in 2 minutes", D9) or does not return exactly the 10,000 names. The stack is the API and its PostgreSQL only (with ClickHouse and `oidc-mock`, which the API depends on): no Dagster, because the API lists PostgreSQL itself. Its own job, so no existing connector gate grows past its 20 minutes (the type-by-type `discover` steps of `g6-ingest`, `g6-ingest-other`, `g4-cdc` and `g6-oracle` are quick calls, and the ones the orchestrator answers run after the loads). Estimated 8 to 12 minutes; the first CI runs are its measurement. The measured seconds are for a CI runner against a local PostgreSQL, not a customer's database. Not run against a real stack before it reached CI.
+- **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true. The `test` job runs `cargo nextest run --workspace` across three partitions (`--partition count:N/3`, `REL-20`) plus `cargo test --doc` for doctests; local developers may keep `cargo test`. The integration tests are one binary per crate (`tests/it.rs`, `OPS-32`), so the job links 28 test binaries instead of 193; measurements in `docs/plans/OPS-32-RESULT.md`.
+- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g4-mysql`, `g4-mssql`, `g4-mongo`, `g4-oracle`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `g6-saas-a`, `g6-saas-b`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true **and** the job's gate group was selected ("Gates by path").
+- **`images` and `image-smoke`**: Same condition as the acceptance jobs; see "Images: built once per run" below.
 
-At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run. Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
+`ci.yml` runs with `permissions: contents: read` for the whole workflow, which is the
+token a fork PR is given. One job asks for more, and only to read: `changes` adds
+`checks: read` and `pull-requests: read`, which `scripts/ci/detect_push_proof.sh` uses
+on a push to `main` to read the merged pull request's check runs (`OPS-24` D7). On a
+pull request the script returns before any API call.
+
+At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run, except the acceptance jobs and the test runs of a push proven to repeat a passed pull request (above). Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
+
+## Images: built once per run
+
+Before CI-SPEED-PLAN PR 2, the acceptance jobs that start the stack (six when it was written;
+eleven with the gates `main` has added since) and the Docker workflow each built the
+`lakehouse-api` image from source (a release build of about 515 crates), and most of those
+jobs built the Dagster image as well. Now:
+
+- The **`images`** job builds both images once and uploads each as a workflow artifact
+  (`image-lakehouse-api`, `image-lakehouse-dagster`): `docker buildx` with
+  `outputs: type=docker`, compressed with `zstd`, one-day retention, no second
+  compression by the artifact service. It prints each archive's size in the log.
+- Each consumer (`g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g4-mysql`, `g4-mssql`, `g4-mongo`, `g4-oracle`, `g6-ingest`, `g6-ingest-other`,
+  `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `g6-saas-a`, `g6-saas-b`, `gold-export`, `g8-governance`, `g8-time-travel`,
+  `image-smoke`) `needs: [changes, images]`, downloads the artifact(s) it
+  uses, `docker load`s them, and starts the stack with `up -d --no-build`. `gold-export`,
+  `g8-governance` and `image-smoke` only use the API image and download only that one.
+  A missing image therefore fails the job, it never triggers a silent rebuild. The test
+  runner commands are unchanged.
+- `docker-compose.yml` names the images: `lakehouse-api` is
+  `${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}` and every service built from
+  `./dagster` is `${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}`. CI sets both
+  variables to `…:ci` tags in the job `env:`. The `build:` blocks stay, so local
+  `docker compose up --build` is unchanged. The Dagster-built services (the five in
+  `docker-compose.yml` plus `g6-oracle-test-runner`, `g6-alerts-test-runner`, `g6-ops-test-runner`, `src13-scale-test-runner` and `g6-saas-test-runner` (both SaaS jobs) in the
+  `ops/g6` overrides) must keep identical `build:` blocks (same `args:`), because a build of
+  any one retags the image they all use. A new service built from `./dagster` needs the same
+  `image:` key, or `docker compose run` builds the whole Dagster image again.
+- Two small fixture images are **not** shared: `oidc-mock` (every stack that starts
+  `lakehouse-api`) and `rest-stub-g6` (only `g6-ingest-other`, profile `g6-other`) and `saas-stub-g6` (only the two `g6-saas-*` jobs, profile `g6-saas`). Each
+  acceptance job builds the ones its stack needs with an explicit `docker compose … build` (same `-p`, `-f` and
+  `--profile` flags as its `up`) just before `up --no-build`, which would otherwise fail on
+  a service that has a `build:` block and no local image.
+- `g1-rustfs` and `g2-seaweedfs` do not use these artifacts: they never built the API image.
+- `GIT_SHA` is left unset in CI, so both images are built with `GIT_SHA=unknown` as before.
+  `ARG GIT_SHA` sits near the top of `dagster/Dockerfile`; a per-commit value would invalidate
+  every layer below it.
+- **`image-smoke`** is the `/health` smoke test that used to be `docker.yml`'s
+  `build-and-smoke-test`: it runs the shared API image standalone (no Postgres or
+  ClickHouse) and asserts `/health` returns 200. `ci-required` covers it, so it is no
+  longer a separate required check (see branch protection below).
+- If `images` fails, every job that needs it is skipped. `ci-required` treats `images`
+  and each consumer as required whenever the acceptance jobs are, so that still turns the
+  gate red (covered by `scripts/ci/tests/test_required_gate.sh`).
+
+### `rust/Dockerfile` and `CARGO_TARGET_DIR`
+
+The Dockerfile has a tools base (`sqlx-cli` and `cargo-chef`, both pinned and installed above
+every `COPY` of repo files), a planner (`cargo chef prepare`), and a builder that compiles the
+dependencies from `recipe.json` alone (`cargo chef cook --release --locked -p lakehouse-api`)
+before copying the sources. The dependency layer changes only when `Cargo.lock` or a
+`Cargo.toml` does.
+
+One build argument serves two audiences. `CARGO_TARGET_DIR` defaults to `/build/target`, the
+BuildKit cache mount: a local rebuild keeps compiled dependencies in the mount, exactly as
+before. A cache mount is not stored by the GitHub Actions layer cache, so CI passes
+`CARGO_TARGET_DIR=/build/target-layer`, a path outside every mount: `cook`'s output then lands
+in the image layer and can be restored from the cache. The mount stays at `/build/target` on
+both steps either way.
+
+## Caches
+
+The repository's Actions cache is capped at 10 GB and was at 9.9 GB when PR 2 was written
+(2026-10-09). Two rules keep PRs from filling it:
+
+- **Image layer cache** (`type=gha`, scopes `api-image` and `dagster-image`): read on every
+  run, **written only on `push` to `main`** (`mode=max`). A cache written by a PR can only be
+  read by that PR, so letting PRs write only evicts `main`'s entries. `docker.yml`'s tag build
+  reads `api-image` and writes nothing.
+- **`Swatinem/rust-cache`**: every step in `ci.yml` has `save-if: github.ref ==
+  'refs/heads/main'`. PRs restore `main`'s cache and do not store their own (PR #88 stored a
+  980 MB copy of `build`'s). The `fmt` job has no cache step at all: `cargo fmt --check`
+  compiles nothing.
+- On a proven push the cache writers still run: `clippy`, `build`, `msrv`, one leg of
+  `test` (it compiles only when its cache is not current) and `images`.
+
+If `images` is cold on `main` more often than on a Cargo.lock change, the cache is being
+evicted: reduce what `rust-cache` stores before anything else (CI-SPEED-PLAN §9).
+
+## Runners
+
+Two repository variables, both unset by default, decide whether work may run on a
+self-hosted CI worker (`OPS-24` D10, D11). With both unset the workflows are exactly as
+they were: every job runs on `ubuntu-latest`.
+
+| Variable | What it moves | Default |
+|---|---|---|
+| `CI_WORKER_COMPILE` | the four small Rust jobs: `fmt`, `clippy`, `build`, `msrv` | unset, hosted |
+| `CI_COVERAGE_ON_WORKER` | the `coverage` job of `coverage.yml` | unset, hosted |
+
+Both are read by `scripts/ci/select_runner.sh` and compared there, **exactly `true`,
+lower case** (`OPS-24` R4). `TRUE`, `1` or `yes` leaves every job hosted, because the
+workflows pass the raw value to the script and never compare it themselves — a GitHub
+expression's `==` on strings ignores case, so two comparisons could disagree.
+
+The labels are fixed in the repository, not read from a variable:
+`scripts/ci/select_runner.sh` holds `["self-hosted","lakehouse-ci"]` as a constant. A job
+is only offered to a runner that carries every label, so no variable value can reach
+another machine — the staging runner carries `self-hosted, Linux, X64, staging` and never
+`lakehouse-ci`.
+
+The first step of every job that can run self-hosted is "Refuse a self-hosted runner that
+is not the CI worker": it fails unless the runner's own environment holds
+`LAKEHOUSE_CI_WORKER=1`. It runs **before** `actions/checkout`, whose `git clean -ffdx`
+would delete the file that marker lives in on another machine. That is the second line of
+defence; the label is the first.
+
+**A fork's pull request always gets `ubuntu-latest`.** `select_runner.sh` decides from the
+event and `github.event.pull_request.head.repo.full_name`, and has a self-test. The honest
+limit: this protects an unmodified workflow. A fork can edit the workflow in its own pull
+request; only the repository setting that requires approval for external contributors
+stops that, and it is the owner's to set.
+
+**The worker's target directory.** `scripts/ci/worker_prepare.sh` (self-hosted steps only)
+prints the machine's facts, then gives cargo `$HOME/.cache/lakehouse-ci/target/<runner>`,
+one directory per runner registration, exported as `CARGO_TARGET_DIR`. Its size is
+bounded: `CI_WORKER_TARGET_MAX_GB` (5 to 500, default 40) is the limit; over it, files not
+read for three days are deleted, and if that is not enough the directory itself is
+recreated empty. That is the only place a file outside the workspace is deleted on a
+self-hosted runner, and it is the runner's own cache — never `cargo clean`, never on every
+run. `CI_WORKER_CARGO_JOBS` (1 to 64) becomes `CARGO_BUILD_JOBS`.
+
+**A machine below this size must not get a job a pull request requires:** 24 hardware
+threads or more, 48 GB of RAM or more (12 GB per runner instance), four runner instances,
+always on. That is what keeps utilisation under 0.7 at the measured peak and finishes a
+burst of five runs within today's eight minutes. A machine that can sleep blocks every
+pull request that waits for it, for up to 24 hours.
+
+**Before either variable is set, the owner checks these, in order** (`OPS-24` §3c, R11):
+
+1. Settings, Actions, General: "Require approval for all external contributors". A
+   contributor with one merged pull request can otherwise run an edited workflow that
+   names the worker's labels; whoever approves a fork's run reads its `.github/` and
+   `scripts/ci/` diff first.
+2. The CI worker's runner `.env` holds `LAKEHOUSE_CI_WORKER=1`. The staging runner's does
+   not, and the staging runner never gets the label `lakehouse-ci`.
+3. The runner's user has no `sudo`. It is in the `docker` group only if Coverage runs
+   there (Docker access is root on that machine): then `CI_WORKER_COMPILE` stays unset, so
+   that no pull request's code runs beside Docker.
+4. Nothing that user can read is a secret (keys, tokens, other checkouts).
+5. Optional: a runner registered at organisation level in a group limited to this
+   repository; not needed for D11.
+
+Then, for the first machine: leave `CI_WORKER_COMPILE` unset. Set
+`CI_COVERAGE_ON_WORKER=true` and `CI_WORKER_CARGO_JOBS=4`, start "Coverage & SBOM" by
+hand, and read the "Prepare the CI worker" step (cores, memory, disk, mount options) and
+the job's time. If the job is killed for memory or passes 90 minutes, unset the variable:
+the next run is on a hosted runner.
+
+**The cost of turning `CI_WORKER_COMPILE` on:** `main` no longer writes the hosted caches
+of `clippy`, `build` and `msrv` (those steps are guarded to a hosted runner), so a fork's
+pull request compiles them cold. That is why the switch is off by default.
+
+**Coverage on the worker (`CI_COVERAGE_ON_WORKER`).** `coverage.yml`'s `coverage` job can
+run on the CI worker when the variable is exactly `true`. It qualifies because nothing
+reads its result — it is not a required check and no workflow names its artifacts — and
+because the workflow has no `pull_request` trigger, so only `main`'s code reaches the
+worker through it. It is chosen only for `refs/heads/main` (`OPS-24` R10): a manual
+dispatch of another branch runs hosted, decided by `select_runner.sh` in the workflow's
+own `choose` job. It needs Docker (testcontainers) and 44 to 55 job-minutes on a hosted
+runner. When the worker is offline the run waits; `coverage.yml`'s concurrency rule allows
+one running and one waiting run and a newer push replaces the waiting one, so nothing
+piles up, and GitHub fails a job no runner took within 24 hours. Nothing waits for it, so
+that is acceptable. The job removes the containers it started — only those carrying
+`org.testcontainers.managed-by=testcontainers` and absent from its note, and nothing at
+all when that note is missing — and keeps the labelled reusable Postgres; the `sbom` job
+of the same workflow stays hosted, because 34 seconds have nothing to gain.
+
+What may run on the worker, and what may not (`OPS-24` D11):
+
+| Candidate | Read by anything? | Needs | Verdict |
+|---|---|---|---|
+| `coverage.yml`, job `coverage` | no (not a required check, no artifact consumer) | Docker (testcontainers), 44 to 55 min on 4 vCPU | **qualifies**, behind `CI_COVERAGE_ON_WORKER`, default hosted |
+| `coverage.yml`, job `sbom` | no | 34 s | stays hosted: nothing to gain |
+| `catalog-search-bench.yml` | its numbers are published as "on a GitHub runner" | a stack, up to 180 min | no: a different machine changes the numbers |
+| `g9-upload-large.yml` | same (`DATA-17-RESULT.md`) | reads container memory, 2 GiB files | no: same reason |
+| `security-all-branches.yml` | people | minutes, 03:17 UTC | no: about 2 job-minutes a day, off peak |
+| the nightly run | people | 42 jobs | no: the gates would collide on one machine, and the night has free hosted runners |
 
 ## MSRV
 
-`rust/Cargo.toml`'s `rust-version` is `1.88`, not the edition-2024 floor of
-`1.85`. This was verified empirically, not assumed: building `--locked`
-against 1.85.0 fails because `testcontainers`/`testcontainers-modules`
-require rustc 1.88, `time`/`time-core`/`time-macros` require 1.88.0,
-`etcetera` requires 1.87.0, and `ferroid` requires 1.85.1. Building against
-1.88.0 succeeds.
+`rust/Cargo.toml`'s `rust-version` is `1.99` (REL-9, product-owner decision
+D1, 2026-10-17), the same release as the `rust-toolchain.toml` pin. The
+floor is deliberately not a dependency's minimum: `sqlx` 0.9 — which
+`SEC-41` needs — requires rustc 1.94, so a held-over lower promise could
+not be kept, and the owner moved pin and floor to the latest stable
+together. The MSRV stays proven, not assumed: the CI `msrv` job runs
+`cargo +1.99.0 check --workspace --all-targets --locked` in `rust/`, one
+patch below the pin.
 
-In CI, the `msrv` job runs a dedicated `cargo check --workspace --all-targets --locked`
-under toolchain `1.88.0` to verify compatibility without duplicating test run
-times, while the full test suite runs under `stable`.
+The `+1.99.0` is load-bearing. `rust-toolchain.toml` beats anything a
+checkout action installs as the *default* toolchain (rustup precedence:
+command-line `+` spec > `RUSTUP_TOOLCHAIN` env > `rust-toolchain.toml` >
+default), so a plain `cargo check` in a job that installs `1.99.0` would
+compile the workspace on the pin instead of the floor — which is what the
+old job did. The same precedence means CI's `fmt`/`clippy`/`build`/`test`
+jobs, which install `stable`, actually build with the pin; local dev does
+too, so one compiler everywhere.
 
-`rust-toolchain.toml` pins `1.96.1` — intentionally newer than the MSRV. That
-file is what CI's `fmt`/`clippy`/`build` jobs and local dev actually build
-with; the MSRV check job exists specifically to catch MSRV regressions that the
-day-to-day toolchain wouldn't.
-
-## `history-scan`: currently RED, and correctly so
+## `history-scan`: baselined, red only on a new finding
 
 A Phase 1 audit found a real internal LLM API key leaked in git history, on 2 commits
 reachable from both `main` and `feat/rust-backend`, together with two
@@ -73,42 +443,61 @@ here — see the rule definitions in `.gitleaks.toml`.
 **gitleaks' default ruleset does not match either pattern.** Scanned with
 defaults, `history-scan` came back green — a false negative. That is worse
 than no scan at all: it tells a reviewer history is clean when it is not.
-
 `.gitleaks.toml` therefore adds two custom rules (`rantai-llm-node-api-key`,
-`rantai-internal-lan-host`) matching the key prefix and host range. With
-them, the scan reports the truth:
+`rantai-internal-lan-host`) matching the key prefix and host range.
 
-```
-$ gitleaks detect --config .gitleaks.toml
-leaks found: 6
-  rantai-llm-node-api-key: 1
-  rantai-internal-lan-host: 5
-```
+With those rules and the default ones, the scan of `main` at `a13e5ea`
+(CI job 115776111835) reported 15 findings; a scan that reaches the root
+commit `6c3a7ff` reports four more hits for the same addresses, so 19
+entries are baselined. The product owner confirmed on
+2026-10-14 that every real secret among them is rotated, and a history
+rewrite would break every open branch, so they are **baselined, not
+rewritten** (SEC-1, plan
+[`2026-10-14-sec-1-gitleaks-baseline.md`](superpowers/plans/2026-10-14-sec-1-gitleaks-baseline.md)).
+`.gitleaksignore` at the repository root lists each one by its exact
+fingerprint (commit, file, rule, line):
 
-**This job is expected to fail until the history is rewritten.** Clearing it
-requires `git filter-repo` (or equivalent) plus a force-push, which rewrites
-published history — a human decision that has deliberately not been taken.
-The leaked key should also be rotated at its source, independently of any
-rewrite; removing it from git does not un-leak it.
+| Baselined | What | Why it may be ignored |
+| --- | --- | --- |
+| 7 lines of `.env.staging` in `1d2c45c` | Staging tokens and secret | Rotated; SEC-13 (#130) moves them to repository secrets `STAGING_*` |
+| `llm.ts:9` in `8ac6ee2` | Internal LLM node key | Rotated |
+| 5 `rantai-internal-lan-host` hits in `8ac6ee2`, `c5954ca`, `7075682` (2), `27d1e2b`, and the same 4 files in the root commit `6c3a7ff` (an ancestor of `main`) | Private LAN addresses in old commits | Not secrets; none of those files holds them today |
+| `test_schema_observer.py:26` in `31ec837` | Test token literal | False positive; the literal is gone since #129 |
+| `src11_connector_operations_test.py:576` in `4ae1bcd` | `password=matrix.CONNECTOR_MYSQL_PASSWORD` on `feat/phase-1-rest` (#144) | False positive: a reference to a CI fixture constant (surfaced when scanning all branches) |
 
-The working-tree `gitleaks` job uses the same config and **is** green, because
-the key is no longer present in any tracked file (the file that held it was
-deleted during the Rust port). `.env.local` does contain live values and is
-flagged on a local scan, but it is gitignored and never checked out in CI.
+Because the entries are full fingerprints, they match nothing else: the same
+secret in a new commit, or any new secret, is **not** baselined and turns
+`history-scan` red. A red run is therefore a new finding. Rotate the secret
+first; only then decide whether it may be added to `.gitleaksignore` (with a
+comment saying why, the date, and the item ID).
+
+`.gitleaks.toml` also allowlists, by exact literal, the three non-secret
+`CONNECTOR_SECRETS_KEY` values `SRC-12` needs: the CI `.env` key (base64 of the
+32 characters `ci-connector-key-not-real-000000`), the shared test vector's
+key and the API integration tests' key. Every CI job that starts the stack
+writes that CI key into its `.env`, because `docker-compose.yml` refuses to be
+read without `CONNECTOR_SECRETS_KEY`; a new job that runs `docker compose`
+needs the same line.
+
+`.gitleaksignore` is read from `--source` (and the working directory);
+blank lines and full-line `#` comments are skipped (gitleaks v8.30.1,
+`detect/detect.go`, `AddGitleaksIgnore`).
+
+The working-tree `gitleaks` job uses the same config and is a separate
+check. `.env.local` does contain live values and is flagged on a local scan,
+but it is gitignored and never checked out in CI.
 
 `history-scan` stays a **separate job**, not folded into the working-tree
 `gitleaks` job and not wrapped in `continue-on-error`, precisely so that
 whichever way it goes (red or green) is independently visible in the
 Actions UI on every run, rather than being averaged into another job's
 status. It is **excluded from required status checks** (see below) so that
-if a future run does turn red — a real regression, a rule update, or new
-evidence — that alone cannot silently block a merge; a human needs to look
-at it.
+a red run — a real regression, a rule update, or new evidence — cannot
+silently block a merge; a human needs to look at it.
 
-If the Phase 1 leak is confirmed for real (e.g. by locating the exact commit
-by other means), resolving it requires:
+Removing the leaked values from history itself would still require:
 
-1. Rotating the exposed key at the provider.
+1. Rotating the exposed key at the provider (done for the findings above).
 2. Rewriting history (`git filter-repo` or BFG) to purge the blob from every
    affected commit.
 3. Force-pushing every affected ref, which invalidates every existing clone
@@ -117,22 +506,201 @@ by other means), resolving it requires:
 That is a destructive, cross-cutting, and irreversible-for-clones operation,
 deliberately not undertaken as a side effect of a CI-hardening pass — it
 needs a human to explicitly decide to take it on and coordinate with anyone
-holding a local clone.
+holding a local clone. The baseline makes it unnecessary for keeping the
+scan useful.
+
+### Scan scope on PRs and `main` vs. the daily all-branch scan (`SEC-36`)
+
+Historically, `history-scan` fetched all remote branches and invoked `gitleaks`
+with no `--log-opts`, causing `gitleaks` to pass `--all` to `git log` and
+scan every ref in the repository. A test value or secret pushed on an
+unrelated feature branch (such as #144) turned the check red on `main` and
+on every open PR.
+
+Under `SEC-36` (decisions D1–D2):
+
+- **In `security.yml` (`history-scan`)**: on pushes to `main` and on pull
+  requests, `gitleaks detect` runs with `--log-opts="HEAD"` (D1). On a push
+  to `main`, this scans `main`'s history; on a pull request, `actions/checkout`
+  checks out `refs/pull/<n>/merge`, so it scans `main` plus the pull request's
+  commits. It does not scan unrelated branches, making the scan independent
+  of what other refs exist or are fetched.
+- **In `security-all-branches.yml`**: a dedicated daily workflow (`cron: '17 3 * * *'`
+  and `workflow_dispatch`) fetches all remote branches and runs
+  `gitleaks detect --log-opts="--all"` (D2). This runs as a scheduled job,
+  deliberately not as a pull-request check, so a finding on one branch
+  never blocks an unrelated PR.
+- **When the daily all-branch run turns red**: it means at least one branch
+  in the repository carries an un-baselined finding. The owner of that branch
+  must fix it: by rotating the secret, replacing the literal with a synthetic
+  value that does not match the rule, or baselining it in `.gitleaksignore`
+  with an exact fingerprint and justification.
+
+Note on merge commits: `gitleaks` uses `git log -p -U0` under the hood. Git
+by default skips diffs for merge commits in `git log -p` unless `-c`, `--cc`,
+or `-m` is specified. Consequently, conflict resolutions introduced in merge
+commits are not diffed by `gitleaks` (this was true before `SEC-36` and
+remains true).
+
 
 ## Docker
 
-`docker.yml` builds the image and runs it standalone (no Postgres/ClickHouse
-containers), because `lakehouse-api` is designed to boot and serve its
-DB-independent routes — including `/health` — without either dependency
-(`entrypoint.api.sh` skips migrations when `DATABASE_URL` is unset; see
-`lakehouse_store::connect_lazy`'s doc comment). That's a real smoke test of
-the container's own boot path, not a substitute for `docker compose up`
+`image-smoke` runs the image standalone (no Postgres/ClickHouse containers), because
+`lakehouse-api` is designed to boot and serve its DB-independent routes — including
+`/health` — without either dependency (`entrypoint.api.sh` skips migrations when
+`DATABASE_URL` is unset; see `lakehouse_store::connect_lazy`'s doc comment). That's a real
+smoke test of the container's own boot path, not a substitute for `docker compose up`
 against the full stack.
 
-The `push-ghcr` job is gated on `startsWith(github.ref, 'refs/tags/')` and,
-even when that condition is met, does not actually push anywhere — there is
-no `docker/login-action` step and no registry credential configured. Wiring
-up real publishing is an explicit, separate decision for a later phase.
+The build that used to live here — `docker.yml`, which built `rust/Dockerfile` on a tag
+push and never published anything — is now the release pipeline below. It builds the same
+image, with the same build arguments, and then does the rest.
+
+## Release pipeline
+
+`release.yml` builds, signs and packages a release (REL-2 S2). One file holds the whole
+release, and everything else is checked through it: `release.json`, the release manifest,
+signed with the release key. The signature is a **Sigstore bundle**,
+`release.json.sigstore.json`: cosign v3 writes the signature and the manifest's digest into
+one JSON file, and that is what `lakehousectl` reads (REL-2 S2 D3a).
+
+| Trigger | What runs |
+|---|---|
+| `push` of a `v*` tag | The real release: the four images go to `ghcr.io/rantai-dev`, the manifest is signed with the release key, and a **draft** GitHub Release is created |
+| `workflow_dispatch` | The dry run |
+| `pull_request` on `.github/workflows/release.yml`, `ops/release/**`, `Dockerfile.frontend`, `.dockerignore`, `rust/Dockerfile`, `dagster/Dockerfile`, `ops/oidc-mock/**` | The dry run |
+
+The real job never runs for a pull request: it is gated on a tag push, and it is the only
+job in this repository that can see the release key.
+
+### The dry run
+
+The dry run is the whole pipeline with two things changed, so that a change to the pipeline
+can be proved before it can cut a release:
+
+- its images go to a `registry:2` service container of the job, so the digests it records
+  are real digests of a real registry;
+- its key is generated in the job, in the runner's working directory, and thrown away
+  with the job: the file leaves the working directory with the step that generated it,
+  and the PEM travels on as that step's output. It reaches the three steps that sign,
+  and no other step — the same shape as the real job, where the release key comes
+  from the `release` environment's secrets (REL-2 S2 review round 4 SHOULD-FIX 1).
+  It is never the release key and it never leaves the runner.
+
+Nothing is published. The bundle, the manifest, its Sigstore bundle, the rendered Compose
+file, the installer and the SBOMs are uploaded as a workflow artifact (`release-dry-run`),
+and the run's summary prints the bundle's size — the number the release notes quote.
+The dry run also SPLITS the bundle into parts and joins them back (REL-7 D4), and fails
+unless the joined file matches the checksum `make_bundle.sh` wrote: the release attaches
+parts, so a split that does not round-trip is a release nobody can install.
+
+### The installer
+
+Both jobs build `lakehousectl` — the operator's install and update tool (REL-2 S3) — as a
+**static** binary for `x86_64-unknown-linux-musl`, so it runs on a host that has nothing but
+a Linux kernel: that is the air-gapped host. The binary joins the offline bundle and the
+release's assets, and the signed manifest names its checksum, so the bundle's copy is the
+file the release published.
+
+The build is **without** the `test-key` feature: a release build verifies a manifest against
+the release key compiled into it and against no other. The feature exists for the CI dry
+run's own proof, whose bundle is signed with the throwaway key the job generates — and that
+proof builds its own binary with the feature, in the proof's own job.
+
+### The real release
+
+The real job runs in the `release` **environment**, so the owner's approval (a required
+reviewer on that environment) stands between the tag and the signing key. The key is a
+secret of that environment and of no other:
+
+| Secret | What it is |
+|---|---|
+| `COSIGN_PRIVATE_KEY` | the cosign private key PEM (ECDSA P-256) |
+| `COSIGN_PASSWORD` | the password that opens it, if the key is encrypted |
+
+The secret holds the private key as the PEM text — what `cosign generate-key-pair`
+writes — and `env://` reads it as it is: not base64 of it, and not a path to a file
+(REL-2 S2 review BLOCKER 1).
+
+The public key is committed at `ops/release/release.pub`, and it is the one
+`lakehousectl` compiles in — so a signature made in this pipeline verifies on an air-gapped
+host with nothing but the key and the manifest. The pipeline verifies every signature it
+makes before it publishes anything: each image with `cosign sign`, the manifest with
+`cosign sign-blob` and then `cosign verify-blob` against the committed public key.
+
+**Nothing is uploaded to the public transparency log (Rekor), in either job** (REL-2 S2
+D3a). The dry run would publish throwaway entries signed with a key that is thrown away
+with the job, and the manifest's signature has to verify on an air-gapped host, where no log
+is reachable. The mechanism is cosign v3's `--tlog-upload=false`, which v3 accepts only
+together with `--use-signing-config=false`: on its own, v3 refuses the flag, because the
+signing config it would otherwise use names the public log service ("`--tlog-upload=false`
+is not supported with --signing-config or --use-signing-config`"). With both flags cosign
+signs from the key alone, contacts no log and no timestamp service, and writes a bundle
+that carries the signature and the digest and nothing else. The verification right after
+signing therefore skips the log check (`--insecure-ignore-tlog`) and runs offline
+(`--offline`).
+
+The images carry the same consequence: their signatures are in the registry, with no log
+entry, so an operator verifying one by hand passes `--insecure-ignore-tlog` too —
+`cosign verify --key ops/release/release.pub --insecure-ignore-tlog <image>@<digest>`. The
+key is what the check is about; the log was never the identity here, because the images are
+signed with the release key and not with a keyless identity.
+
+cosign v3 prints `--tlog-upload has been deprecated, prefer using a signing-config file with
+no transparency log services`. The flag still works, so the pipeline keeps it and the
+proxy-logged proof stands; replacing it with a `--signing-config` file is left for when the
+flag is removed (REL-2 S2 review round 5).
+
+The release is created as a **draft**. The product owner publishes it.
+
+### The one manual step after the first real release
+
+GHCR packages are private by default, so after the first real release the four published
+images have to be made public — or the operators have to be given read access another way.
+The documented way is the package's own page:
+
+1. open <https://github.com/orgs/RantAI-dev/packages> (or the package's page);
+2. for each of `rantai-lakehouse-api`, `rantai-lakehouse-console`,
+   `rantai-lakehouse-dagster` and `rantai-lakehouse-oidc-mock`: **Package settings** →
+   **Change visibility** → **Public**.
+
+Until that is done, `docker pull ghcr.io/rantai-dev/rantai-lakehouse-api:<version>` answers
+`401` for an operator who is not logged in to GHCR.
+
+### What the pipeline runs, in order
+
+1. `ops/release/check_version.py` — the tag, `package.json`, the API crate's
+   `Cargo.toml` and the changelog must name the same version;
+2. the four images are built and pushed (`lakehouse-api`, the Dagster image, `oidc-mock`,
+   the console), each by digest;
+3. each image is signed with cosign, and a CycloneDX SBOM is written for it and attested
+   to it;
+4. the release's Compose file is RENDERED from the template
+   (`ops/release/render_compose.py`): every image the repository builds names the
+   published image at its digest, and the gate and test services are gone;
+5. the THIRD-PARTY images the rendered file runs (Postgres, ClickHouse, Lakekeeper,
+   OpenFGA, RustFS, Gotenberg, the init images, and the `trino`, `seaweedfs` and
+   `backups` profiles) are pulled by digest, and a CycloneDX SBOM is written for each of
+   them with the same syft the SBOM action installs. They are **not** signed: we cannot
+   sign another project's image in its own registry, so their integrity comes from the
+   digest in the signed manifest (`ops/release/compose_images.py` says which images are
+   whose);
+6. `ops/release/make_manifest.py` writes `release.json` — the version, every image's
+   digest (ours from the published digests, the third-party ones from the rendered
+   Compose file), the Compose file's checksum, and the upgrade path;
+7. the manifest is signed into `release.json.sigstore.json` and the bundle verified at once,
+   offline;
+8. `ops/release/make_bundle.sh` writes the offline bundle and prints its size;
+9. the bundle is split into parts of at most 1900 MiB — GitHub refuses a release asset
+   of 2 GiB or more (REL-7 D1) — and the parts are attached to the draft release, with
+   their checksums in `SHA256SUMS` and the whole file's `.sha256` beside them; the
+   operator joins them in name order (`docs/OPERATIONS.md`, REL-7 D2);
+10. the release is created as a draft, or a draft that already exists for the tag is
+    written into (`gh release upload --clobber`), so the job can be re-run (REL-7 D5).
+    A published release is never rewritten.
+
+The tooling is under `ops/release/`, and its own tests run in the `Repo lints` job of
+`ci.yml` (`python -m pytest ops/release`) and at the start of both pipeline jobs.
 
 ## Dependency review: now works, verified on a real PR
 
@@ -154,14 +722,14 @@ PRs (e.g. one that actually touches a manifest with a diff for it to
 evaluate) before being promoted to required in the branch-protection command
 below.
 
-## Recommended branch protection (attempted, blocked — apply manually)
+## Branch protection on `main` (applied 2026-10-30)
 
-An attempt was made to set this via `gh api` during the public-release
-hardening pass; it was blocked by a permission classifier even though the
-acting account has org-admin rights. Rather than fight that, here is the
-exact command an owner can run themselves, and the reasoning behind each
-choice, so it can be applied (or adjusted) in one step instead of clicking
-through the UI.
+Applied on 2026-10-30 with the command below, at the product owner's
+request (`REL-1`). The repository is public, so GitHub's free plan allows
+it. An earlier attempt during the public-release hardening pass had been
+blocked by a permission classifier. Check what is live with
+`gh api repos/RantAI-dev/RantAI-Lakehouse/branches/main/protection`; when a
+required job is renamed, run the command again with the new name.
 
 ```sh
 gh api \
@@ -174,7 +742,6 @@ gh api \
   -f 'required_status_checks[checks][][context]=cargo audit (advisories)' \
   -f 'required_status_checks[checks][][context]=cargo deny check (all)' \
   -f 'required_status_checks[checks][][context]=gitleaks (working tree)' \
-  -f 'required_status_checks[checks][][context]=Build lakehouse-api image · smoke test /health' \
   -F 'enforce_admins=false' \
   -F 'required_pull_request_reviews=null' \
   -F 'restrictions=null' \
@@ -183,22 +750,27 @@ gh api \
 ```
 
 The check names above reflect the real `name:` values from
-`.github/workflows/{ci,security,docker}.yml` as of this writing — not
+`.github/workflows/{ci,security}.yml` as of this writing — not
 guessed. `ci-required` consolidates and enforces all scope-dependent tests
-in `ci.yml`. If a workflow's job names change, this list needs to be updated to
+in `ci.yml`, including the image build and `/health` smoke test
+(`images`, `image-smoke`). The check `Build lakehouse-api image · smoke test
+/health` that used to be listed here no longer reports on PRs (it lived in
+`docker.yml`, which was tag-only, and `docker.yml` is now the release
+pipeline), so it must NOT be required: a required check that never reports
+blocks every merge under `strict` mode. If a workflow's job names change, this list needs to be updated to
 match, or `strict` mode will block merges on a check that no longer reports.
 
 Why each choice:
 
 - **Required checks are the honest-green ones only.** `ci-required` (enforcing
   all scope-required CI jobs), `Repo lints`, `cargo audit`, `cargo deny`,
-  `gitleaks (working tree)`, and the Docker smoke test are the jobs that
-  are expected to actually pass on a healthy `main`.
-- **`gitleaks (full git history)` is deliberately NOT in this list.** It is
-  expected to stay red (see "Known exposure" in
-  [SECURITY.md](../SECURITY.md) and the `history-scan`/history section
-  above). Requiring it would either block every future merge forever, or
-  pressure someone into silencing a real finding — neither is acceptable.
+  and `gitleaks (working tree)` are the jobs that are expected to actually pass
+  on a healthy `main`.
+- **`gitleaks (full git history)` is deliberately NOT in this list.** It now
+  reports only findings outside the `.gitleaksignore` baseline (see
+  [SECURITY.md](../SECURITY.md) "Known exposure" and the `history-scan`
+  section above). Requiring it would let one new finding block every merge,
+  or pressure someone into baselining a real one — neither is acceptable.
   It stays present and visible in the Actions UI, not gating.
 - **`Dependency review (PR only)` is also NOT in this list**, even though
   it can now pass on a public repo (GHAS dependency review is free for

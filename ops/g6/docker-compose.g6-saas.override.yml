@@ -1,0 +1,29 @@
+# ops/g6/docker-compose.g6-saas.override.yml -- SRC-3 `g6-saas` gate only.
+#
+# Layered AFTER ops/g6/docker-compose.g6.override.yml (which already opens the internal-host
+# switches for the gate's fixtures and mounts the `g6_secrets` credential volume):
+#   docker compose -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
+#     -f ops/g6/docker-compose.g6-saas.override.yml --profile g6-saas --profile dagster ...
+#
+# Why a file of its own: a vendor's hosts are fixed in the vendor table and a person cannot point
+# a connector elsewhere (SRC-3 AD2). To prove the product against a mock vendor server the gate
+# uses two GATE-ONLY switches on the two services that dial a vendor, the API (connection test,
+# save-time address check, sign-in) and the Dagster code location (discovery, loads):
+#
+#   CONNECTOR_OAUTH_ALLOW_HTTP=true   the existing gate-only switch for plain `http` OAuth mocks
+#   SAAS_GATE_ORIGINS                 vendor id -> the mock's origin, one port per vendor
+#                                     (`ops/g6/saas_stub.py: VENDOR_PORTS`)
+#
+# `SAAS_GATE_ORIGINS` does nothing without the switch (Rust `connector_oauth::gate_rebase`,
+# Python `saas.vendors.rebase_for_gate`, both tested). Neither is set by the main compose file or
+# by any other gate; a real installation sets neither. Layering this file in the other g6 jobs
+# would change their OAuth behaviour, which is why it is separate.
+services:
+  lakehouse-api:
+    environment:
+      CONNECTOR_OAUTH_ALLOW_HTTP: "true"
+      SAAS_GATE_ORIGINS: '{"hubspot":"http://saas-stub-g6:8101","zendesk":"http://saas-stub-g6:8102","salesforce":"http://saas-stub-g6:8103","ga4":"http://saas-stub-g6:8104","servicenow":"http://saas-stub-g6:8105","confluence":"http://saas-stub-g6:8106","sharepoint":"http://saas-stub-g6:8107","dynamics365":"http://saas-stub-g6:8108","workday":"http://saas-stub-g6:8109","netsuite":"http://saas-stub-g6:8110"}'
+  dagster-code-location:
+    environment:
+      CONNECTOR_OAUTH_ALLOW_HTTP: "true"
+      SAAS_GATE_ORIGINS: '{"hubspot":"http://saas-stub-g6:8101","zendesk":"http://saas-stub-g6:8102","salesforce":"http://saas-stub-g6:8103","ga4":"http://saas-stub-g6:8104","servicenow":"http://saas-stub-g6:8105","confluence":"http://saas-stub-g6:8106","sharepoint":"http://saas-stub-g6:8107","dynamics365":"http://saas-stub-g6:8108","workday":"http://saas-stub-g6:8109","netsuite":"http://saas-stub-g6:8110"}'

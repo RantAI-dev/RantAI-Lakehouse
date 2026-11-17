@@ -6,6 +6,10 @@
  * Kept out of the pages themselves so the three-state rendering rule
  * (pending / approved-with-expiry / rejected must never be conflated) and
  * the self-approval disable condition are each testable without a DOM.
+ *
+ * `SEC-57` widened the self-approval condition: it used to cover an
+ * access request only, and now covers a tool call too — the person who
+ * asked for an approval may not decide it, whichever kind it is.
  */
 
 import type { ApprovalStatus } from "./status"
@@ -52,9 +56,13 @@ export function accessGrantState(
 }
 
 /**
- * The fields of an `ApprovalItem` the self-approval check actually reads.
+ * The fields of an `ApprovalItem` the self-approval rule reads.
  * Kept narrow (rather than the whole contract type) so this module has no
  * dependency on `@/services/contracts/agents`.
+ *
+ * `kind` is carried because the sentence that explains WHY the decision
+ * buttons are disabled is per kind — not because the rule itself looks at
+ * it.
  */
 export type SelfApprovalCandidate = {
   kind: "tool_call" | "access"
@@ -64,22 +72,35 @@ export type SelfApprovalCandidate = {
 
 /**
  * True exactly when deciding this row would be a self-approval the
- * backend refuses with 403 (`routes::catalog::decide_access_request`,
- * WS7 item E3) — a `kind = "access"` row, still `pending`, whose
- * `requestedByUserId` is the signed-in user. This client-side check is
- * belt-and-suspenders, never the security boundary: the server-side
- * refusal in `decide_access_request` is what actually enforces it.
+ * backend refuses with 403 (`routes::agents::refuse_own_request`,
+ * `SEC-57`) — a still-`pending` row, of EITHER kind, whose
+ * `requestedByUserId` is the signed-in user.
+ *
+ * The rule used to cover a `kind = "access"` row only (the catalog
+ * access-request rule, WS7 item E3). `SEC-57` extends it to a tool call:
+ * the person whose chat asked for a high-risk action may not approve it
+ * either, and the API refuses both kinds with the same check. This
+ * client-side check is belt-and-suspenders, never the security boundary:
+ * the server-side refusal is what actually enforces it.
  *
  * Excludes already-decided rows: the decide button is not offered at all
  * once a request is no longer pending, so the disable reason would never
  * apply there.
  */
-export function isOwnAccessRequest(approval: SelfApprovalCandidate, currentUserId: string): boolean {
-  return (
-    approval.kind === "access" &&
-    approval.status === "pending" &&
-    approval.requestedByUserId === currentUserId
-  )
+export function isOwnRequest(approval: SelfApprovalCandidate, currentUserId: string): boolean {
+  return approval.status === "pending" && approval.requestedByUserId === currentUserId
+}
+
+/**
+ * Why the decision buttons are disabled on a row the signed-in user
+ * requested themselves — one sentence per kind (`SEC-57`). The access
+ * request is decided by somebody else; so is a tool call, and its
+ * sentence says "approve" because that is what the button says.
+ */
+export function selfApprovalTooltip(kind: "tool_call" | "access"): string {
+  return kind === "access"
+    ? "You requested this access; someone else must decide it"
+    : "You asked for this action; someone else must approve it"
 }
 
 /**

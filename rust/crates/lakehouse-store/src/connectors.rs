@@ -174,6 +174,13 @@ pub struct ConnectorDetail {
     /// boolean derived from the ref on read — the ref itself is still never
     /// returned (module doc comment, guarantee 1).
     pub credential_managed: bool,
+    /// How the primary credential is held: `managed` (sealed on the
+    /// credentials volume, `SRC-12`), `env` (an operator's environment
+    /// variable, read at start-up) or `file` (an operator's file). `None` for
+    /// a reference of any other scheme. `SRC-12` decision 10: the connector
+    /// page names it and, for `env`, says a restart is needed after a
+    /// change. A scheme only, never the reference or the value.
+    pub credential_source: Option<CredentialSource>,
     /// The primary credential's kind (password, access key, …), read from
     /// its ref's suffix so the edit page asks for the right thing. `None`
     /// for a ref whose name does not end in a known suffix (e.g. a
@@ -365,7 +372,8 @@ pub async fn list_connectors(
          WHERE ($1::uuid IS NULL OR tenant_id = $1) \
          ORDER BY created_at DESC"
     );
-    let rows: Vec<ConnectorRow> = sqlx::query_as(&sql)
+    // safe: only the constant `CONNECTOR_COLUMNS` is formatted in; values are bound.
+    let rows: Vec<ConnectorRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(filter.tenant_id)
         .fetch_all(pool)
         .await?;
@@ -393,6 +401,23 @@ pub async fn connector_in_tenants(
     .bind(tenant_ids)
     .fetch_one(pool)
     .await?)
+}
+
+/// The tenant a connector belongs to, or `None` for an unknown id or a
+/// connector with no tenant. Read by the secret-reference check
+/// (`SRC-12 review B1 BLOCKER 1`), which expands `{tenant}` in the operator's
+/// allowed prefixes with it.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn connector_tenant_id(pool: &PgPool, id: &str) -> Result<Option<Uuid>, StoreError> {
+    let row: Option<Option<Uuid>> =
+        sqlx::query_scalar("SELECT tenant_id FROM connector WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.flatten())
 }
 
 /// Which of `ids` are connectors of one of `tenant_ids`: [`connector_in_tenants`]
@@ -471,11 +496,16 @@ pub async fn assign_tenant(pool: &PgPool, id: &str, tenant_id: Uuid) -> Result<(
 /// Returns [`StoreError::Database`] if a query fails.
 pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDetail>, StoreError> {
     let sql = format!("SELECT {CONNECTOR_COLUMNS} FROM connector WHERE id = $1");
-    let row: Option<ConnectorRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    // safe: only the constant `CONNECTOR_COLUMNS` is formatted in; values are bound.
+    let row: Option<ConnectorRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     let Some(row) = row else {
         return Ok(None);
     };
     let credential_managed = is_managed_secret_ref(&row.secret_ref);
+    let credential_source = credential_source_of_ref(&row.secret_ref);
     let credential_kind = credential_kind_of_ref(&row.secret_ref);
     // Not in `CONNECTOR_COLUMNS` (list rows never need it); read here only
     // to report its KIND — the ref itself is never returned.
@@ -503,6 +533,7 @@ pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDe
     Ok(Some(ConnectorDetail {
         audit_event_id,
         credential_managed,
+        credential_source,
         credential_kind,
         credential_secondary_kind,
         residency,
@@ -574,7 +605,19 @@ pub enum CredentialSource {
     /// one: every id begins `conn-`, so a `File` name always begins
     /// `connector_conn_`.
     Managed,
+    /// A reference to a secret in the installation's secret manager
+    /// (`SRC-12` part B): `vault:…`, `aws-sm:…`, `gcp-sm:…` or `azure-kv:…`.
+    /// Only the reference is stored; the product reads the value from the
+    /// manager at every use. Never derived from a connector id (the user
+    /// names the place), so it is set only by `PUT …/credential`, and
+    /// [`derive_secret_ref`] has no real name to give it.
+    Reference,
 }
+
+/// The schemes of the secret-manager references ([`CredentialSource::Reference`]).
+/// `lakehouse-api`'s `SecretManagerKind::scheme` is the authority and a test
+/// there asserts this list equals it; this crate cannot depend on it.
+pub const MANAGER_REF_SCHEMES: [&str; 4] = ["vault:", "aws-sm:", "gcp-sm:", "azure-kv:"];
 
 /// The fixed prefix every [`CredentialSource::Managed`] ref starts with —
 /// see that variant's doc comment.
@@ -587,6 +630,26 @@ pub const MANAGED_SECRET_REF_PREFIX: &str = "file:/run/secrets/connector_managed
 #[must_use]
 pub fn is_managed_secret_ref(secret_ref: &str) -> bool {
     secret_ref.starts_with(MANAGED_SECRET_REF_PREFIX)
+}
+
+/// How a reference NAME says its credential is held (`SRC-12` decision 10).
+/// A pure predicate over the name, like [`is_managed_secret_ref`].
+#[must_use]
+pub fn credential_source_of_ref(secret_ref: &str) -> Option<CredentialSource> {
+    if is_managed_secret_ref(secret_ref) {
+        Some(CredentialSource::Managed)
+    } else if secret_ref.starts_with("env:") {
+        Some(CredentialSource::Env)
+    } else if secret_ref.starts_with("file:") {
+        Some(CredentialSource::File)
+    } else if MANAGER_REF_SCHEMES
+        .iter()
+        .any(|scheme| secret_ref.starts_with(scheme))
+    {
+        Some(CredentialSource::Reference)
+    } else {
+        None
+    }
 }
 
 /// The credential kind a reference NAME ends in, e.g.
@@ -722,7 +785,12 @@ pub fn derive_secret_ref(id: &str, source: CredentialSource, kind: CredentialKin
             let key = id.to_ascii_uppercase().replace('-', "_");
             format!("env:CONNECTOR_{key}_{}", kind.suffix())
         }
-        CredentialSource::File => {
+        // A reference is what the user names, not something derived from the
+        // id, so it has no real name to give: callers refuse that source
+        // before asking (`create`, `rotate_secret`). If one ever did not, it
+        // gets the operator-file name of the slot, which nothing provisions:
+        // a read fails closed (not found) and never reads a wrong secret.
+        CredentialSource::File | CredentialSource::Reference => {
             let key = id.replace('-', "_");
             format!(
                 "file:/run/secrets/connector_{key}_{}",
@@ -833,7 +901,8 @@ pub async fn create_connector(
          VALUES ($1, $2, $3, $4, 'unknown', $5, $6, $7, $8, $9, $10, $11, $12) \
          RETURNING {CONNECTOR_COLUMNS}"
     );
-    let row: ConnectorRow = sqlx::query_as(&sql)
+    // safe: only the constant `CONNECTOR_COLUMNS` is formatted in; values are bound.
+    let row: ConnectorRow = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&id)
         .bind(&input.name)
         .bind(&input.kind)
@@ -885,6 +954,65 @@ pub struct ConnectorTestResult {
     /// an unsupported type was never actually dialed, so no test time was
     /// stamped — see [`record_test_result`].
     pub tested_at: Option<String>,
+    /// `true` only for a test launched in the orchestrator that has not
+    /// finished (`SRC-4` T1.1): nothing was dialled yet, so `ok` is `false`
+    /// without being a failure, and the result is read from
+    /// `GET /api/connectors/{id}/discovery/test` and the probe history.
+    /// Left out of the JSON otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+    /// For a change-capture connector (`SRC-4` decision S4-f): what the source
+    /// must have switched on, read with fixed statements. Empty, and left out of
+    /// the JSON, for every other connector. Never decides `ok`: a connector can
+    /// be saved whatever these say.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub setup_checks: Vec<SetupCheck>,
+}
+
+/// How one setting a change-capture source needs came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SetupStatus {
+    /// The setting is as change capture needs it.
+    Ok,
+    /// It is not; `command` says how to set it.
+    Missing,
+    /// It could not be read (usually a permission); nothing is claimed.
+    Unchecked,
+}
+
+/// One setting a change-capture source needs (`SRC-4` decision S4-f). Every
+/// word is chosen by this build from a fixed table; none is text from the
+/// server, so none can leak one (principle 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupCheck {
+    /// The setting's name, as the person would look for it.
+    pub setting: String,
+    /// How it came out.
+    pub status: SetupStatus,
+    /// A fixed sentence about the result.
+    pub message: String,
+    /// The statement or line that sets it; present for `missing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+impl ConnectorTestResult {
+    /// The answer of a test launched in the orchestrator: supported, not
+    /// passed, no latency, no time (nothing has run), `message` saying so.
+    #[must_use]
+    pub fn pending(message: &str) -> Self {
+        Self {
+            ok: false,
+            supported: true,
+            latency_ms: None,
+            message: message.to_owned(),
+            tested_at: None,
+            pending: true,
+            setup_checks: Vec::new(),
+        }
+    }
 }
 
 /// Fetch the connectivity-relevant fields (`type`, `host`, `secret_ref`,
@@ -1306,6 +1434,16 @@ async fn save_ingest_spec_in(
     // the tables that just left it are cleared in the same transaction.
     let removed = removed_object_names(&stored_objects, &spec.source_objects);
     crate::schema_change::clear_removed_tables_in(tx, id, &removed).await?;
+    // `SRC-11` D10: the columns left out of a table that keeps its rows are
+    // marked inactive, and a column ticked again is cleared, in the same
+    // transaction as the spec that says so.
+    crate::schema_change::sync_excluded_columns_in(
+        tx,
+        id,
+        &crate::ingest_spec::inactive_exclusions(&spec.source_objects),
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
     Ok(ingest_spec_from_row(row))
 }
 
@@ -1324,6 +1462,38 @@ fn removed_object_names(before: &serde_json::Value, after: &serde_json::Value) -
     names(before)
         .into_iter()
         .filter(|name| !kept.contains(name))
+        .collect()
+}
+
+/// One string field of a stored `source_objects` entry, or `None` when the
+/// entry is not an object or the field is absent/null/non-string.
+///
+/// One reader for the many places that ask a `source_objects` entry for a
+/// name or a target (`BLD-7` decision 2 asks this module for a connector's
+/// ingest targets rather than parsing the JSON a second time, `AGENTS.md`
+/// rule 4).
+fn source_object_text(object: &serde_json::Value, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The Bronze table (`source_objects[].target`) of every object a connector
+/// ingests, in the stored order.
+///
+/// `BLD-7` decision 2: a pipeline that names a connector may read only one
+/// of these tables, because they are the ones that connector's ingest job
+/// actually writes. A connector with no ingest spec yet, or whose
+/// `source_objects` is not an array, has no targets — the caller reports
+/// that honestly instead of inventing a table.
+#[must_use]
+pub fn ingest_targets(source_objects: &serde_json::Value) -> Vec<String> {
+    source_objects
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|object| source_object_text(object, "target"))
         .collect()
 }
 
@@ -1399,12 +1569,7 @@ pub(crate) async fn append_source_objects_in(
             "the connector's source objects are not a list".to_owned(),
         ));
     };
-    let text = |object: &serde_json::Value, key: &str| -> Option<String> {
-        object
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    };
+    let text = source_object_text;
     let mut names: std::collections::HashSet<String> =
         objects.iter().filter_map(|o| text(o, "name")).collect();
     let mut targets: std::collections::HashSet<String> =
@@ -1520,6 +1685,8 @@ pub async fn record_test_result(
         latency_ms,
         message: message.to_owned(),
         tested_at: iso_opt(tested_at),
+        pending: false,
+        setup_checks: Vec::new(),
     })
 }
 
@@ -1528,26 +1695,95 @@ pub async fn record_test_result(
 /// the store's health rule and the API's alert trigger, so they cannot drift.
 pub const REPEATED_FAILURE_STREAK: i32 = 3;
 
+/// Failed runs in a row at which a connector is paused (`SRC-11` decision D3,
+/// Airbyte's threshold). The API reads `CONNECTOR_AUTO_DISABLE_AFTER` and
+/// passes the value to [`record_run_once`]; this is the default.
+pub const DEFAULT_AUTO_DISABLE_AFTER: i32 = 30;
+
+/// The words of the pause an auto-disable sets, either side of the number
+/// (`SRC-11` decision D3: "Paused after 30 failed runs in a row"). The number
+/// comes from the setting, so [`is_auto_disable_pause_reason`] recognises the
+/// pause by its shape, not by one number: a pause set when the setting was 30
+/// is still resumable after the setting was changed.
+const AUTO_DISABLE_REASON_HEAD: &str = "Paused after ";
+const AUTO_DISABLE_REASON_TAIL: &str = " failed runs in a row";
+
+/// The `paused_reason` an auto-disable after `after` failed runs writes.
+#[must_use]
+pub fn auto_disable_pause_reason(after: i32) -> String {
+    format!("{AUTO_DISABLE_REASON_HEAD}{after}{AUTO_DISABLE_REASON_TAIL}")
+}
+
+/// Whether `reason` is a pause written by an auto-disable, and so the only
+/// pause [`resume_connector`] lifts (`SRC-11` decision D4). A pause set by
+/// the schema-change policy ([`crate::schema_change::SCHEMA_CHANGE_PAUSE_REASON`])
+/// or by anything else is not.
+#[must_use]
+pub fn is_auto_disable_pause_reason(reason: &str) -> bool {
+    reason
+        .strip_prefix(AUTO_DISABLE_REASON_HEAD)
+        .and_then(|rest| rest.strip_suffix(AUTO_DISABLE_REASON_TAIL))
+        .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// What [`record_run_result`] leaves on the connector row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunHealth {
-    /// `"healthy"` after a success, `"degraded"` for 1 or 2 failures in a
-    /// row, `"unhealthy"` from [`REPEATED_FAILURE_STREAK`].
+    /// `"healthy"` after a counted success, `"degraded"` for 1 or 2 failures in
+    /// a row, `"unhealthy"` from [`REPEATED_FAILURE_STREAK`]. A late report
+    /// (`SRC-32`) leaves it as it was.
     pub health: String,
-    /// Failed runs since the last success, after this result.
+    /// Failed runs since the last counted success, after this result. A late
+    /// report (`SRC-32`) leaves it as it was.
     pub failure_streak: i32,
 }
 
 /// The statement behind [`record_run_result`] and [`record_run_once`]: one
 /// `UPDATE ... RETURNING` for the run facts, the streak and the health.
+///
+/// # A report that arrives out of order (`SRC-32`)
+///
+/// The failure and the success of a connector's runs come from two
+/// independent sensors, so one report can arrive after a report for a later
+/// run. A report is **late** when the connector has already counted a run of
+/// the *other* outcome that ended strictly later: a success is late when
+/// `last_run_failure_at > $3`, a failure when `last_run_success_at > $3`.
+/// `NULL` never makes a report late; equal times are not late.
+///
+/// A late report changes neither `failure_streak` nor `health`, because the
+/// run it describes ended before the one the connector's state describes: a
+/// success reported after a later failure cannot set the count of a run that
+/// already ended back to 0 (`SRC-32`, the `g6-ops` sequence in which the
+/// connector never paused). It still records its own run, and the recorded
+/// time only moves forward: `GREATEST` keeps an older report of the same
+/// outcome from moving `last_run_success_at`/`last_run_failure_at` back.
+///
+/// The third column says whether this report counted, which is what keeps a
+/// late failure from pausing the connector (`SRC-11` D3 in
+/// [`record_run_once`]). In Postgres every right-hand side of `SET` reads the
+/// row's old values, so all the `CASE`s above judge one snapshot; `RETURNING`
+/// reads the new row, where this statement leaves the other outcome's
+/// timestamp untouched, so it judges the same snapshot.
 const RECORD_RUN_SQL: &str = "UPDATE connector SET \
-                 last_run_success_at = CASE WHEN $2 THEN $3 ELSE last_run_success_at END, \
-                 last_run_failure_at = CASE WHEN $2 THEN last_run_failure_at ELSE $3 END, \
-                 failure_streak = CASE WHEN $2 THEN 0 ELSE failure_streak + 1 END, \
-                 health = CASE WHEN $2 THEN 'healthy' \
-                               WHEN failure_streak + 1 >= $4 THEN 'unhealthy' \
-                               ELSE 'degraded' END \
-               WHERE id = $1 RETURNING health, failure_streak";
+                 last_run_success_at = CASE WHEN $2 \
+                   THEN GREATEST(last_run_success_at, $3) ELSE last_run_success_at END, \
+                 last_run_failure_at = CASE WHEN $2 \
+                   THEN last_run_failure_at ELSE GREATEST(last_run_failure_at, $3) END, \
+                 failure_streak = CASE \
+                   WHEN $2 AND last_run_failure_at > $3 THEN failure_streak \
+                   WHEN $2 THEN 0 \
+                   WHEN last_run_success_at > $3 THEN failure_streak \
+                   ELSE failure_streak + 1 END, \
+                 health = CASE \
+                   WHEN $2 AND last_run_failure_at > $3 THEN health \
+                   WHEN $2 THEN 'healthy' \
+                   WHEN last_run_success_at > $3 THEN health \
+                   WHEN failure_streak + 1 >= $4 THEN 'unhealthy' \
+                   ELSE 'degraded' END \
+               WHERE id = $1 \
+               RETURNING health, failure_streak, \
+                 CASE WHEN $2 THEN last_run_failure_at IS NULL OR last_run_failure_at <= $3 \
+                      ELSE last_run_success_at IS NULL OR last_run_success_at <= $3 END";
 
 /// What [`record_run_once`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1556,9 +1792,19 @@ pub struct RunRecord {
     /// that was already counted (nothing was changed).
     pub first_seen: bool,
     /// The connector's failure streak right after THIS run was counted: the
-    /// value of the first report, also returned to its retries. `None` only
-    /// for a run counted before `0069` kept it.
+    /// value of the first report, also returned to its retries. `None` when
+    /// the run counted no failure of its own: a run counted before `0069`
+    /// kept the streak, and a late report (`SRC-32` review round 1,
+    /// BLOCKER 1), whose run ended before the state the connector's streak
+    /// describes, so it must not raise "3 in a row" for failures it did not
+    /// produce. A late success is `None` for the same reason.
     pub failure_streak: Option<i32>,
+    /// `true` when THIS run's failure paused the connector (`SRC-11` D3): the
+    /// streak reached the auto-disable threshold and nothing had paused the
+    /// connector yet. Also `true` for a retry of that run's report, which is
+    /// what lets the retry deliver `connector_disabled` once after a rule-store
+    /// failure (the same reason the streak is kept per run).
+    pub auto_disabled: bool,
 }
 
 /// Count one real run on the connector exactly once, and remember the streak
@@ -1574,6 +1820,32 @@ pub struct RunRecord {
 /// `kind` is the dedupe kind of the outcome (`"failure"` or `"success"`,
 /// `routes::load_alerts::Outcome::event_kind`).
 ///
+/// # A report that arrives late (`SRC-32`)
+///
+/// A report whose run ended before a counted run of the other outcome changes
+/// neither the streak nor the health ([`RECORD_RUN_SQL`] says how "late" is
+/// decided): the connector's state describes its latest run, so a success
+/// reported after a later failure must not clear the count that failure
+/// started. A late report produced none of the count it would have read, so
+/// its dedupe row keeps `failure_streak = NULL` and its answer (and its
+/// retry's) is `None` (`SRC-32` review round 1, BLOCKER 1): reading the
+/// connector's streak into the row would make the API raise "3 in a row" for
+/// a run that ended before those failures. The run's own run time still moves
+/// forward, and the retry of that report answers the same way.
+///
+/// # Auto-disable (`SRC-11` decision D3)
+///
+/// A counted failed run that brings the streak to `auto_disable_after` or more
+/// pauses the connector, in the same transaction as the count, with
+/// [`auto_disable_pause_reason`]. A late failure never pauses: the streak it
+/// reads is the one a later run already reached. It pauses once: a connector that is already
+/// paused (by the schema-change policy, say) keeps its pause and its reason,
+/// and the run is not reported as having disabled it. When this run did pause
+/// it, a dedupe row `(run_id, "auto_disabled")` is written with it, so
+/// [`RunRecord::auto_disabled`] is the same answer for the run's retries and
+/// the caller raises `connector_disabled` exactly once. A success resets the
+/// streak, as before; it never lifts a pause.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::NotFound`] if `id` does not name a connector (the
@@ -1586,6 +1858,7 @@ pub async fn record_run_once(
     kind: &str,
     succeeded: bool,
     at: OffsetDateTime,
+    auto_disable_after: i32,
 ) -> Result<RunRecord, StoreError> {
     let mut tx = pool.begin().await?;
     let inserted: Option<(String,)> = sqlx::query_as(
@@ -1607,36 +1880,207 @@ pub async fn record_run_once(
         .bind(kind)
         .fetch_optional(&mut *tx)
         .await?;
+        let auto_disabled: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pipeline_run_event \
+             WHERE run_id = $1 AND kind = $2)",
+        )
+        .bind(run_id)
+        .bind(AUTO_DISABLED_KIND)
+        .fetch_one(&mut *tx)
+        .await?;
         tx.commit().await?;
         return Ok(RunRecord {
             first_seen: false,
             failure_streak: stored.and_then(|(streak,)| streak),
+            auto_disabled,
         });
     }
-    let row: Option<(String, i32)> = sqlx::query_as(RECORD_RUN_SQL)
+    let row: Option<(String, i32, bool)> = sqlx::query_as(RECORD_RUN_SQL)
         .bind(id)
         .bind(succeeded)
         .bind(at)
         .bind(REPEATED_FAILURE_STREAK)
         .fetch_optional(&mut *tx)
         .await?;
-    let Some((_health, failure_streak)) = row else {
+    let Some((_health, failure_streak, counted)) = row else {
         // Dropping `tx` rolls the dedupe row back with it.
         return Err(StoreError::NotFound);
     };
+    // `SRC-32` review round 1, BLOCKER 1: a late report counted no failure,
+    // so its dedupe row keeps `NULL` instead of the connector's streak. The
+    // retry path above reads this column, and `routes::load_alerts` raises
+    // `connector_repeated_failure` off it: a run that ended before the
+    // failures that make up the streak must not raise "3 in a row" for them,
+    // on the first report or on a retry.
+    let counted_streak = counted.then_some(failure_streak);
     sqlx::query(
         "UPDATE pipeline_run_event SET failure_streak = $3 WHERE run_id = $1 AND kind = $2",
     )
     .bind(run_id)
     .bind(kind)
-    .bind(failure_streak)
+    .bind(counted_streak)
     .execute(&mut *tx)
     .await?;
+    // `SRC-11` D3: the pause and its dedupe row are part of counting the run.
+    // `paused_at IS NULL` makes it pause once, and leave another pause alone.
+    // `counted` keeps a late report (`SRC-32`) from pausing: the streak it
+    // reads is the one a later run already reached.
+    let mut auto_disabled = false;
+    if counted && !succeeded && failure_streak >= auto_disable_after {
+        let paused: Option<(String,)> = sqlx::query_as(
+            "UPDATE connector SET paused_reason = $2, paused_at = $3 \
+             WHERE id = $1 AND paused_at IS NULL RETURNING id",
+        )
+        .bind(id)
+        .bind(auto_disable_pause_reason(auto_disable_after))
+        .bind(at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if paused.is_some() {
+            sqlx::query(
+                "INSERT INTO pipeline_run_event (run_id, pipeline_id, kind) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(run_id)
+            .bind(format!("connector:{id}"))
+            .bind(AUTO_DISABLED_KIND)
+            .execute(&mut *tx)
+            .await?;
+            auto_disabled = true;
+        }
+    }
     tx.commit().await?;
     Ok(RunRecord {
         first_seen: true,
-        failure_streak: Some(failure_streak),
+        failure_streak: counted_streak,
+        auto_disabled,
     })
+}
+
+/// The `pipeline_run_event.kind` of the row that records that a run's failure
+/// paused the connector (`SRC-11` decision D3). Not one of the outcome kinds
+/// (`failure`, `success`, `*_alerted`, `slow`, `volume_drop`).
+const AUTO_DISABLED_KIND: &str = "auto_disabled";
+
+/// The `paused_reason` a person's pause writes (`SRC-4` decision S2-e), a fixed
+/// sentence like the other two reasons. [`resume_connector`] lifts it.
+pub const PERSON_PAUSE_REASON: &str = "Paused by a person";
+
+/// Whether `reason` is the pause a person set with [`pause_connector`].
+#[must_use]
+pub fn is_person_pause_reason(reason: &str) -> bool {
+    reason == PERSON_PAUSE_REASON
+}
+
+/// What [`pause_connector`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseOutcome {
+    /// The connector is paused now, with [`PERSON_PAUSE_REASON`].
+    Paused,
+    /// It was paused already (for this or another reason); nothing changed.
+    AlreadyPaused,
+}
+
+/// Pause a connector on a person's request (`SRC-4` decision S2-e): it runs
+/// nothing until [`resume_connector`] lifts the pause. A pause that is already
+/// there, whatever its reason, is left as it is, so a schema-change pause is not
+/// relabelled.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `id` does not name a connector, or
+/// [`StoreError::Database`] on any other failure.
+pub async fn pause_connector(pool: &PgPool, id: &str) -> Result<PauseOutcome, StoreError> {
+    let paused: Option<(String,)> = sqlx::query_as(
+        "UPDATE connector SET paused_reason = $2, paused_at = now() \
+         WHERE id = $1 AND paused_at IS NULL RETURNING id",
+    )
+    .bind(id)
+    .bind(PERSON_PAUSE_REASON)
+    .fetch_optional(pool)
+    .await?;
+    if paused.is_some() {
+        return Ok(PauseOutcome::Paused);
+    }
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM connector WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_some() {
+        Ok(PauseOutcome::AlreadyPaused)
+    } else {
+        Err(StoreError::NotFound)
+    }
+}
+
+/// What [`resume_connector`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    /// The auto-disable pause (or a person's) was lifted and the failure streak
+    /// is 0.
+    Resumed,
+    /// The connector is not paused; nothing changed.
+    NotPaused,
+    /// The connector is paused for another reason (the schema-change policy,
+    /// for one); nothing changed.
+    PausedForAnotherReason,
+}
+
+/// Resume a connector that an auto-disable paused (`SRC-11` decision D4) or a
+/// person paused (`SRC-4` decision S2-e): lift the pause, set the failure streak
+/// back to 0 (so it gets the full number of tries again) and its health to
+/// `unknown` until its next run says. Only a pause [`is_auto_disable_pause_reason`]
+/// or [`is_person_pause_reason`] recognises is lifted; a schema-change pause is
+/// lifted by approving the change (`SRC-8`).
+///
+/// The row is locked while the reason is read, so a pause set a moment later
+/// by something else is not lifted by mistake.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `id` does not name a connector, or
+/// [`StoreError::Database`] on any other failure.
+pub async fn resume_connector(pool: &PgPool, id: &str) -> Result<ResumeOutcome, StoreError> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(Option<String>, Option<OffsetDateTime>)> =
+        sqlx::query_as("SELECT paused_reason, paused_at FROM connector WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((reason, paused_at)) = row else {
+        return Err(StoreError::NotFound);
+    };
+    if paused_at.is_none() {
+        return Ok(ResumeOutcome::NotPaused);
+    }
+    // `SRC-4` decision S2-e: a person's own pause is lifted by the same route.
+    let Some(reason) =
+        reason.filter(|r| is_auto_disable_pause_reason(r) || is_person_pause_reason(r))
+    else {
+        return Ok(ResumeOutcome::PausedForAnotherReason);
+    };
+    sqlx::query(
+        "UPDATE connector SET paused_reason = NULL, paused_at = NULL, failure_streak = 0, \
+           health = 'unknown' \
+         WHERE id = $1 AND paused_reason = $2",
+    )
+    .bind(id)
+    .bind(&reason)
+    .execute(&mut *tx)
+    .await?;
+    // Slice 4 review SHOULD-FIX 3: a person's pause is not lag. No report counts as "up to
+    // date" while the capture is paused, so without this a pause longer than the lag limit
+    // would alert as soon as the connector runs again. After a resume the lag counts from the
+    // resume; changes made during the pause show as backlog until they are applied.
+    sqlx::query(
+        "UPDATE connector_capture_table SET caught_up_at = GREATEST(caught_up_at, now()) \
+         WHERE connector_id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(ResumeOutcome::Resumed)
 }
 
 /// Record the outcome of one real run (not a manual test) on the connector:
@@ -1645,6 +2089,12 @@ pub async fn record_run_once(
 /// streak 0. Failure: streak + 1, `degraded` below
 /// [`REPEATED_FAILURE_STREAK`], `unhealthy` from it. `at` is the caller's
 /// run-end time; nothing is stamped that was not reported.
+///
+/// A report whose run ended before a counted run of the other outcome changes
+/// neither the streak nor the health, and moves its own run time forward only
+/// ([`RECORD_RUN_SQL`], `SRC-32`): the answer describes the connector's latest
+/// run, so a late success does not read as `"healthy"` on a connector whose
+/// later run failed.
 ///
 /// This function counts every call. The run report does not use it directly:
 /// it goes through [`record_run_once`], which dedupes the run in the same
@@ -1660,14 +2110,14 @@ pub async fn record_run_result(
     succeeded: bool,
     at: OffsetDateTime,
 ) -> Result<RunHealth, StoreError> {
-    let row: Option<(String, i32)> = sqlx::query_as(RECORD_RUN_SQL)
+    let row: Option<(String, i32, bool)> = sqlx::query_as(RECORD_RUN_SQL)
         .bind(id)
         .bind(succeeded)
         .bind(at)
         .bind(REPEATED_FAILURE_STREAK)
         .fetch_optional(pool)
         .await?;
-    let Some((health, failure_streak)) = row else {
+    let Some((health, failure_streak, _counted)) = row else {
         return Err(StoreError::NotFound);
     };
     Ok(RunHealth {
@@ -1938,17 +2388,46 @@ type IngestibleConnectorRow = (
 /// factory and `run_ingest` op both read from, via
 /// `GET /api/connectors/ingestible`.
 ///
+/// Every tenant's rows, and the unassigned ones: only for the service
+/// identity and an unrestricted principal (`SEC-16`). A tenant-scoped
+/// caller goes through [`list_ingestible_connectors_for_tenant`].
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_ingestible_connectors(
     pool: &PgPool,
 ) -> Result<Vec<IngestibleConnector>, StoreError> {
+    list_ingestible(pool, None).await
+}
+
+/// The ingest-spec connectors of one tenant (`SEC-16`): the same rows as
+/// [`list_ingestible_connectors`] narrowed in SQL to `tenant_id = $1`. A
+/// connector with no tenant never matches (`NULL = $1` is never true), so
+/// it is visible only to the unscoped list. `tenant_id` is bound.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_ingestible_connectors_for_tenant(
+    pool: &PgPool,
+    tenant_id: Uuid,
+) -> Result<Vec<IngestibleConnector>, StoreError> {
+    list_ingestible(pool, Some(tenant_id)).await
+}
+
+/// Shared body of the two public lists; `None` means unscoped.
+async fn list_ingestible(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+) -> Result<Vec<IngestibleConnector>, StoreError> {
     let rows: Vec<IngestibleConnectorRow> = sqlx::query_as(
         "SELECT id, adapter, ingest_mode, dial, source_objects, schedule_cron, secret_ref, \
          secret_ref_secondary, paused_at IS NOT NULL, schema_change_policy FROM connector \
-         WHERE adapter IS NOT NULL",
+         WHERE adapter IS NOT NULL \
+         AND ($1::uuid IS NULL OR tenant_id = $1)",
     )
+    .bind(tenant_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -2019,6 +2498,30 @@ pub async fn any_connector_targets(pool: &PgPool, table: &str) -> Result<bool, S
         "SELECT EXISTS (SELECT 1 FROM connector \
          WHERE source_objects @> jsonb_build_array(jsonb_build_object('target', $1::text)))",
     )
+    .bind(table)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// [`any_connector_targets`] narrowed to the connectors of one tenant
+/// (`SEC-16`): an upload may learn that a connector blocks a name only when
+/// that connector is its own tenant's; another tenant's connector must not
+/// be distinguishable from any other reason a name is taken. Same
+/// containment match, `table` and `tenant_id` bound.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn any_connector_of_tenant_targets(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    table: &str,
+) -> Result<bool, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM connector WHERE tenant_id = $1 \
+         AND source_objects @> jsonb_build_array(jsonb_build_object('target', $2::text)))",
+    )
+    .bind(tenant_id)
     .bind(table)
     .fetch_one(pool)
     .await?)
@@ -2184,7 +2687,8 @@ pub async fn update_connector(
            schema_change_policy = COALESCE($7, schema_change_policy) \
          WHERE id = $1 RETURNING {CONNECTOR_COLUMNS}"
     );
-    let row: Option<ConnectorRow> = sqlx::query_as(&sql)
+    // safe: only the constant `CONNECTOR_COLUMNS` is formatted in; values are bound.
+    let row: Option<ConnectorRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(input.name.as_deref())
         .bind(input.direction.as_deref())
@@ -2277,8 +2781,10 @@ mod tests {
         let before = serde_json::json!([{"name": "a.t"}, {"name": "b.t"}, {"nope": 1}]);
         let after = serde_json::json!([{"name": "b.t"}, {"name": "c.t"}]);
         assert_eq!(super::removed_object_names(&before, &after), ["a.t"]);
-        assert!(super::removed_object_names(&before, &before).is_empty());
-        assert!(super::removed_object_names(&serde_json::Value::Null, &after).is_empty());
+        let unchanged = super::removed_object_names(&before, &before);
+        assert!(unchanged.is_empty(), "{unchanged:?}");
+        let from_null = super::removed_object_names(&serde_json::Value::Null, &after);
+        assert!(from_null.is_empty(), "{from_null:?}");
     }
 
     #[test]
@@ -2364,6 +2870,7 @@ mod tests {
             // fabricate.
             audit_event_id: Some(format!("audit-{}", Uuid::new_v4())),
             credential_managed: true,
+            credential_source: Some(CredentialSource::Managed),
             credential_kind: Some(CredentialKind::Password),
             credential_secondary_kind: None,
             residency: "in-region".to_owned(),
@@ -2378,6 +2885,10 @@ mod tests {
         assert_eq!(
             value.get("credentialManaged"),
             Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            value.get("credentialSource"),
+            Some(&serde_json::Value::String("managed".to_owned()))
         );
     }
 
@@ -2524,6 +3035,26 @@ mod tests {
         }
         // The seeded, deployment-owned refs are never managed.
         assert!(!is_managed_secret_ref("env:CONNECTOR_PG_PASSWORD"));
+        // SRC-12 decision 10: the scheme the connector page names.
+        assert_eq!(
+            credential_source_of_ref("env:CONNECTOR_PG_PASSWORD"),
+            Some(CredentialSource::Env)
+        );
+        assert_eq!(
+            credential_source_of_ref("file:/run/secrets/connector_conn_x_password"),
+            Some(CredentialSource::File)
+        );
+        assert_eq!(
+            credential_source_of_ref("file:/run/secrets/connector_managed_conn_x_password"),
+            Some(CredentialSource::Managed)
+        );
+        // `SRC-12` part B: a secret-manager reference is its own kind (this
+        // asserted `None` before the references existed).
+        assert_eq!(
+            credential_source_of_ref("vault:secret/x#k"),
+            Some(CredentialSource::Reference)
+        );
+        assert_eq!(credential_source_of_ref("consul:secret/x"), None);
         assert!(!is_managed_secret_ref(
             "file:/run/secrets/connector_pg_password"
         ));

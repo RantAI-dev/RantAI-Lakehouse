@@ -5,7 +5,7 @@
 | Module | Data (Catalog) |
 | Backlog | `DATA-11` |
 | Spec | `docs/core/specs/data-11.md` (one *(proposed)* number, signed under Decisions 1) |
-| Status | Decisions signed 2026-10-09. In Acceptance: merged in #98 on 2026-10-09; rows 10, 11, 13 and 14 not run (`DATA-24`) |
+| Status | Released (accepted 2026-10-23, with two exceptions: rows 5 and 14). Decisions signed 2026-10-09; merged in #98 on 2026-10-09 |
 | Plan | `docs/superpowers/plans/2026-10-09-data-11-catalog-search.md` |
 
 ## Problem
@@ -36,7 +36,7 @@ at `c338862` on 2026-10-09; evidence is in the plan, section 2.
 ## Not included
 
 - A certification filter. Certification does not exist yet; the filter comes
-  with `DATA-12`. **Waits for `DATA-12`.**
+  with `DATA-12`. **Blocked by `DATA-12`.**
 - Tags with a key and a value. Tags are single words until `DATA-12`; search
   matches them as they are.
 - Hiding single tables from single users. The product has no per-table
@@ -58,7 +58,7 @@ All eight defaults signed by the product owner on 2026-10-09 ("run as proposed")
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
 | 1 | Speed target *(proposed)*. No competitor publishes a number. | Results within 500 ms for a catalog of 10,000 tables, measured and written to `docs/plans/DATA-11-RESULT.md`. If the measurement misses it, that is reported, not hidden. | 2026-10-09 |
-| 2 | How fresh search is. Searching 10,000 tables and their columns from scratch on every keystroke cannot meet Decision 1, so search reads a copy of the catalog that is refreshed on a timer. | The copy is at most 30 seconds old. A table created by a load can take up to 30 seconds to appear in search. An edit made in the console (description, tags, owner) shows at once. The Data Explorer list with an empty search box stays live, as today. | 2026-10-09 |
+| 2 | How fresh search is. Searching 10,000 tables and their columns from scratch on every keystroke cannot meet Decision 1, so search reads a copy of the catalog that is refreshed on a timer. | The copy is at most 30 seconds old. A table created by a load can take up to 30 seconds to appear in search. An edit made in the console (description, tags, owner) shows at once. The Data Explorer list with an empty search box stays live, as today. Since `DATA-38` (2026-11-01): when the copy is older than 30 seconds, the search is answered from it at once and the copy is rebuilt in the background, so nobody waits for the rebuild. A copy that cannot be rebuilt is not served for longer than five minutes. | 2026-10-09; `DATA-38` changed the mechanism on 2026-11-01 |
 | 3 | How forgiving a typo is. | One wrong, missing, extra or swapped letter, in a word of four letters or more. Shorter words must match exactly. | 2026-10-09 |
 | 4 | What "ranked by use" means. | Relevance decides the order. Between two equally good matches, the table read by more queries in the last 7 days comes first. This is the count the asset page already shows; it covers Query Studio and assistant queries, not dashboard reads. | 2026-10-09 |
 | 5 | The spec says "only assets the user may see appear". The product has no per-table visibility: whoever may open the catalog sees every table in it. | Search shows exactly what the Data Explorer list shows to the same user, never more. Hiding single tables from single users is not built here; it becomes a backlog item of its own. | 2026-10-09 |
@@ -66,15 +66,33 @@ All eight defaults signed by the product owner on 2026-10-09 ("run as proposed")
 | 7 | How many tables the ⌘K box lists. | Eight, as today, with a row "See all results" that opens the Data Explorer with the same words. | 2026-10-09 |
 | 8 | Phones. The search box in the top bar is hidden on narrow screens and ⌘K needs a keyboard. | Left as it is. On a phone, search from the Data Explorer page. | 2026-10-09 |
 
+`DATA-38` (2026-11-01) changed how decision 2 keeps the 30 seconds, not
+what it promises: the copy is still rebuilt every 30 seconds, and a search
+still answers from a copy that is at most that old. What changed is that the
+rebuild runs in the background instead of under the person who is searching,
+and that a copy which cannot be rebuilt is dropped after five minutes rather
+than served.
+
 ## Limits to tell a customer
 
-- Search covers table names, ids, namespaces, owners, descriptions, tags,
-  column names and column descriptions. It does not search the data inside
-  tables.
+- Search covers table names (the name shown and the physical `schema.table`
+  name), namespaces, owners, descriptions, tags, column names and column
+  descriptions. It does not search the data inside tables, and it does not
+  search a Bronze table's internal registry id (`DATA-54`, 2026-11-12;
+  *proposed, not yet signed*).
 - A table loaded for the first time can take up to 30 seconds to appear in
   search.
+- A search is never delayed by the copy's rebuild: the copy is refreshed in
+  the background, and the search that finds it too old is answered from it
+  at once (`DATA-38`).
 - A typo is forgiven only in words of four letters or more, one letter per
   word.
+- A typed word with no letter or digit (`_`, `%`) is ignored; a search made
+  only of such words finds nothing (`DATA-54`).
+- The ⌘K box lists eight tables. When more matched it says "Showing 8 of N:
+  refine the search". It takes at most 100 characters.
+- A result found through its description shows up to 80 characters of the
+  description around the word. A column's description is named, not quoted.
 - Everyone who may open the catalog finds every table in it. Search does not
   hide single tables from single users.
 - There is no certification filter until certification exists.
@@ -91,33 +109,48 @@ A step not performed is never Pass. Steps needing a terminal are marked
 | 2 | Type a column name that is in no table name | Every table with that column is listed, each saying "column <name>" | Pass 2026-10-09 |
 | 3 | Type a tag that is in no table name | The tagged tables are listed, each saying "tag <name>" | Pass 2026-10-09 |
 | 4 | Type two words of a table's description in the opposite order | The table is listed | Pass 2026-10-09 |
-| 5 | Type `revnue` where a table or column is named `revenue` | It is found, and the result shows it is an approximate match | Pass 2026-10-09 |
+| 5 | Type `revnue` where a table, a column or a tag is named `revenue` | It is found, and the result shows it is an approximate match — also when only the table's name matched (`DATA-32`) | Pass 2026-10-09 (a column or a tag); Fail 2026-10-23 (the name only), fixed in code by `DATA-32` 2026-11-01, not re-run |
 | 6 | Type the same words in the Data Explorer search box | The same tables, in the same order | Pass 2026-10-09 |
 | 7 | In the ⌘K box, choose "See all results" | The Data Explorer opens with the words filled in | Pass 2026-10-09 |
 | 8 | In the Data Explorer, filter by owner, then by tag, then by layer | Each filter narrows the list; together they combine | Pass 2026-10-09 |
 | 9 | Edit a table's tags, then search the new tag straight away | The table is found | Pass 2026-10-09 |
-| 10 | Sign in as a user without `catalog:read`; press ⌘K and type a table name | No tables are listed; the Data Explorer says access is missing | Not run |
-| 11 | On a deployment with two tenants and `CATALOG_TENANT_ID` set, search as a member of the other tenant | No tables are listed, and the Data Explorer shows the reason | Not run |
+| 10 | Sign in as a user without `catalog:read`; press ⌘K and type a table name | No tables are listed; the Data Explorer says access is missing | Pass 2026-10-23 (product owner) |
+| 11 | On a deployment with two tenants and `CATALOG_TENANT_ID` set, search as a member of the other tenant | No tables are listed, and the Data Explorer shows the reason | Pass 2026-10-23 (product owner) |
 | 12 | Type words that match nothing | "No results", not an error and not every table | Pass 2026-10-09 |
-| 13 | (operator) Stop ClickHouse; search | A plain "catalog unavailable" message, with no server text in it | Not run |
-| 14 | (operator) Read `docs/plans/DATA-11-RESULT.md` | It gives the measured time for 10,000 tables, the command that produced it, and whether 500 ms was met | Not run |
+| 13 | (operator) Stop ClickHouse; search | A plain "catalog unavailable" message, with no server text in it | Pass 2026-10-23 (product owner) |
+| 14 | (operator) Read `docs/plans/DATA-11-RESULT.md` | It gives the measured time for 10,000 tables, the command that produced it, and whether 500 ms was met | Measured 2026-11-01 (`DATA-11-RESULT.md`, run 41267430494): median 489/326 ms meets 500 ms; p95 about 755 ms and the first search after the copy expires (about 7.2 s) do not. Follow-up `DATA-38` |
 
-**Accepted by:** __________ **Date:** ______ **Build:** ______
+**Accepted by:** product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 The product owner checked rows 1 to 9 and 12 on 2026-10-09, on a separate
 instance of branch `feat/data-11-catalog-search` at `a020540` (29 assets),
-and reported them passed. Not yet accepted: rows 10, 11, 13 and 14 were not
-run.
+and reported them passed. On 2026-10-23 the product owner ran the checklist
+for acceptance and accepted it, with two exceptions found in a pre-check the
+same day: rows 5 and 14, below. Rows 10, 11 and 13, not run before, are
+marked Pass on that date.
 
 Exceptions, each with an owner and a date:
 
-- Row 14, the speed measurement on 10,000 tables: not run; needs a
-  throwaway stack outside the build machine. Owner: planner.
-- Rows 10, 11 and 13: need a second user, a second tenant and a stopped
-  ClickHouse. Owner: product owner, on staging.
+- Row 5, a typo that matches only a table's name: the result got no
+  "approximate match" label, while a column or tag typo did. Cause, by
+  reading: `matchedOn` was null when the name was the best field
+  (`rust/crates/lakehouse-api/src/routes/catalog_search.rs`). Fixed in code
+  by `DATA-32` (2026-11-01): the server reports `matchedOn.field: "name"`
+  with `approximate: true`, and the console says "approximate match".
+  Owner: product owner, to re-run row 5 and close the exception. Date:
+  2026-10-23. Follow-up: `DATA-32`.
+- Row 14, the speed measurement on 10,000 tables: measured on 2026-11-01
+  (`docs/plans/DATA-11-RESULT.md`, run 41267430494). The median meets 500 ms;
+  p95 (about 755 ms) and the first search after the copy expires (about 7.2 s)
+  do not. Owner: product owner. Date: 2026-10-23. Follow-up: `DATA-38`.
 
 ## After acceptance
 
-- [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` item moved to Done; follow-ups added
+- [x] `PRODUCT.md` section 2 and 3 updated
+- [x] `BACKLOG.md` item moved to Done; follow-ups added
 - [ ] `CHANGELOG.md` entry a customer can read
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- Very long or special-character input never gives an error page, and special characters do not match everything.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

@@ -21,7 +21,8 @@
 //! # How a term is read
 //!
 //! The term is lower-cased and split on whitespace; at most [`MAX_WORDS`]
-//! words are used. Every word must match the asset somewhere, in any order.
+//! words are used, and a word with no letter or digit is dropped before that
+//! cap. Every word must match the asset somewhere, in any order.
 //! A word matches a field when the field contains it (exact) or, for a word
 //! of [`MIN_APPROX_CHARS`] or more characters, when one token of the field
 //! is one edit away from it (approximate; `DATA-11` D3). A typed word with
@@ -34,9 +35,40 @@
 //! `SHOULD-FIX 8`): `northwind customer` finds `Northwind Orders` through
 //! its column `customer_id`, and the first word alone (the name) would leave
 //! the reader with no reason. When every word's best field is the name there
-//! is no `matchedOn`: the name is already on screen.
+//! is no `matchedOn`: the name is already on screen. The value of
+//! `matchedOn` is the tag, the column, the table key or — for a description
+//! — a piece of the description around the matched word
+//! (`LH-DATA-11-04`, `DATA-54`).
+//!
+//! A typed word with no letter or digit (`_`, `%`, `--`) names nothing: it
+//! is not a filter but punctuation, so it is dropped before the matching. A
+//! term made only of such words therefore finds nothing rather than
+//! everything that holds the character (`LH-DATA-11-05`, `DATA-54`).
+//!
+//! `DATA-32` D1 is the one exception to that last rule. When no field
+//! explains the hit and a word matched the name only approximately (`revnue`
+//! for `Revenue`), the name is the reason, with `approximate: true`: a
+//! reader who typed a typo must be told that a typo was forgiven, or the
+//! result looks like a false positive. An exact name match still carries no
+//! reason.
+//!
+//! # The prepared index (`DATA-41` D2)
+//!
+//! The index ([`SearchIndex`]) is built once, with the search copy
+//! (`DATA-11` D2), and holds every asset's candidates already lower-cased
+//! and tokenised. A search reads it and allocates nothing per candidate.
+//!
+//! Before this, every search rebuilt the candidates of every asset: about
+//! 450,000 lower-cased strings and a `Vec<char>` per token on a catalog of
+//! 10,000 tables, which was most of the time a search took
+//! (`docs/plans/DATA-11-RESULT.md`, 2026-11-01). The matching rules are
+//! unchanged — the tests below are the proof — and the same text on many
+//! assets (a column name on thousands of tables) is prepared once and
+//! shared, so the index costs memory in proportion to the catalog's
+//! distinct texts, not to its assets.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
@@ -48,12 +80,22 @@ const MAX_WORDS: usize = 8;
 /// one edit on three letters reaches too many unrelated words.
 const MIN_APPROX_CHARS: usize = 4;
 
+/// How many characters of a description a `matchedOn` value carries
+/// (`LH-DATA-11-04`, `DATA-54`). A description can be a paragraph; the
+/// reader needs the words around the match, not the paragraph.
+const SNIPPET_MAX_CHARS: usize = 80;
+
+/// How many of those characters may precede the matched word, when the
+/// description is long enough to cut (`LH-DATA-11-04`, `DATA-54`). The word
+/// stays in view rather than at the very start of the piece.
+const SNIPPET_LEAD_CHARS: usize = 20;
+
 /// Weight of a word that equals the whole name.
 const SCORE_NAME_WHOLE: u32 = 120;
 /// Exact / approximate weight of a hit in the name.
 const SCORE_NAME: (u32, u32) = (100, 50);
-/// Exact / approximate weight of a hit in the id or the namespace.
-const SCORE_ID_NAMESPACE: (u32, u32) = (80, 40);
+/// Exact / approximate weight of a hit in the table key or the namespace.
+const SCORE_TABLE_NAMESPACE: (u32, u32) = (80, 40);
 /// Exact / approximate weight of a hit in a tag.
 const SCORE_TAG: (u32, u32) = (70, 35);
 /// Exact / approximate weight of a hit in a column name.
@@ -76,7 +118,7 @@ pub type UsageIndex = HashMap<String, u32>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
     Name,
-    Id,
+    Table,
     Namespace,
     Tag,
     Column,
@@ -90,7 +132,7 @@ impl Field {
     const fn weights(self) -> (u32, u32) {
         match self {
             Self::Name => SCORE_NAME,
-            Self::Id | Self::Namespace => SCORE_ID_NAMESPACE,
+            Self::Table | Self::Namespace => SCORE_TABLE_NAMESPACE,
             Self::Tag => SCORE_TAG,
             Self::Column => SCORE_COLUMN,
             Self::Owner => SCORE_OWNER,
@@ -99,12 +141,14 @@ impl Field {
         }
     }
 
-    /// The `matchedOn.field` spelling; `None` for the name, which is never
-    /// reported because the name is already on screen.
+    /// The `matchedOn.field` spelling; `None` for the name, which is not
+    /// reported as a reason of its own because the name is already on
+    /// screen. A name that forgave a typo is reported by the search itself,
+    /// as `"name"` (`DATA-32` D1).
     const fn reported(self) -> Option<&'static str> {
         match self {
             Self::Name => None,
-            Self::Id => Some("id"),
+            Self::Table => Some("table"),
             Self::Namespace => Some("namespace"),
             Self::Tag => Some("tag"),
             Self::Column => Some("column"),
@@ -115,13 +159,183 @@ impl Field {
     }
 }
 
+/// One text, prepared once (`DATA-41` D2): its lower-cased form and its
+/// tokens (the runs of letters and digits).
+///
+/// The tokens are what the approximate match compares against, so they are
+/// computed here rather than per candidate per search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedText {
+    /// The text, lower-cased: what a word is looked up in.
+    lower: String,
+    /// The runs of letters and digits in `lower`.
+    tokens: Vec<Vec<char>>,
+}
+
 /// One piece of text of one asset a word can match.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Candidate {
     field: Field,
-    lower: String,
-    /// What `matchedOn.value` shows: the tag or the column name, empty for
-    /// the rest.
+    /// The text, prepared: lower-cased and tokenised (`DATA-41` D2).
+    text: Arc<PreparedText>,
+    /// What `matchedOn.value` shows: the tag, the column name or the table
+    /// key. A description's value is built from the asset when the answer is
+    /// written (`LH-DATA-11-04`), so it is empty here.
     shown: String,
+}
+
+/// The texts one index build prepared, keyed by their lower-cased form.
+///
+/// The same column name is on thousands of tables and the same word is in
+/// thousands of descriptions, so a text is prepared once and shared
+/// (`DATA-41` D2): the index costs memory in proportion to the catalog's
+/// distinct texts, not to its assets.
+type PreparedTexts = HashMap<String, Arc<PreparedText>>;
+
+/// The lower-cased, tokenised form of `text`, prepared once per build.
+fn prepare(text: &str, prepared: &mut PreparedTexts) -> Arc<PreparedText> {
+    let lower = text.to_lowercase();
+    if let Some(found) = prepared.get(&lower) {
+        return Arc::clone(found);
+    }
+    let tokens = tokens(&lower).map(|t| t.chars().collect()).collect();
+    let prepared_text = Arc::new(PreparedText { lower, tokens });
+    prepared.insert(prepared_text.lower.clone(), Arc::clone(&prepared_text));
+    prepared_text
+}
+
+/// One asset's candidates, in the order [`best_hit`] prefers them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexEntry {
+    /// The asset's id: the usage lookup and the tie-break of the ranking.
+    id: String,
+    /// Every text of this asset a word can match.
+    candidates: Vec<Candidate>,
+}
+
+/// The prepared search index (`DATA-41` D2): the assets of the search copy
+/// and, per asset, the texts a word can match, already lower-cased and
+/// tokenised.
+///
+/// Built once, with the copy ([`crate::catalog_search_cache`]), and read by
+/// every search. The matching rules are the ones this module has always
+/// had; only where the work happens changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchIndex {
+    /// The asset rows, in the order the copy holds them.
+    assets: Vec<Value>,
+    /// Per asset: its id and its candidates, in the same order.
+    entries: Vec<IndexEntry>,
+}
+
+impl SearchIndex {
+    /// Prepares the index over `assets`, which it takes over.
+    ///
+    /// `columns` are the column names and descriptions per asset id, as
+    /// the search copy holds them.
+    #[must_use]
+    pub fn build(assets: Vec<Value>, columns: &ColumnIndex) -> Self {
+        let mut prepared: PreparedTexts = HashMap::new();
+        let entries = assets
+            .iter()
+            .map(|asset| IndexEntry {
+                id: text_of(asset, "id").to_owned(),
+                candidates: candidates(asset, columns, &mut prepared),
+            })
+            .collect();
+        Self { assets, entries }
+    }
+
+    /// The asset rows, in the order the copy holds them.
+    #[must_use]
+    pub fn assets(&self) -> &[Value] {
+        &self.assets
+    }
+}
+
+/// The candidates of one asset, in the order [`best_hit`] prefers them.
+///
+/// The order is the one this module has always used: name, table key,
+/// namespace, owner, description, the tags, the governed pairs, then the
+/// columns (each name, then its description). Of equal hits the first in
+/// this order stays, so the order is part of the answer.
+fn candidates(
+    asset: &Value,
+    columns: &ColumnIndex,
+    prepared: &mut PreparedTexts,
+) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    let name = text_of(asset, "name");
+    if !name.is_empty() {
+        out.push(Candidate {
+            field: Field::Name,
+            text: prepare(name, prepared),
+            shown: String::new(),
+        });
+    }
+    // QA `LH-DATA-11-05` (`DATA-54`): the id of a Bronze row is a registry
+    // slug and the id of a Silver or Gold row is its table, so the table key
+    // is what a person types and what the reason line shows. It takes the
+    // place the id had in the order.
+    if let Some(table_key) = super::catalog::asset_table_key(asset) {
+        out.push(Candidate {
+            field: Field::Table,
+            text: prepare(table_key, prepared),
+            shown: table_key.to_owned(),
+        });
+    }
+    for (field, key) in [
+        (Field::Namespace, "namespace"),
+        (Field::Owner, "owner"),
+        (Field::Description, "description"),
+    ] {
+        let text = text_of(asset, key);
+        if !text.is_empty() {
+            out.push(Candidate {
+                field,
+                text: prepare(text, prepared),
+                shown: String::new(),
+            });
+        }
+    }
+    if let Some(tags) = asset.get("tags").and_then(Value::as_array) {
+        for tag in tags.iter().filter_map(Value::as_str) {
+            out.push(Candidate {
+                field: Field::Tag,
+                text: prepare(tag, prepared),
+                shown: tag.to_owned(),
+            });
+        }
+    }
+    // `DATA-12` part 2: a governed pair is indexed as the text `key: value`,
+    // so a word finds it by the key, the value or the pair, and the reason
+    // line reads `data_domain: finance`. It is a tag for ranking and for
+    // `matchedOn.field`, which stays `"tag"`.
+    for (key, value) in governed_pairs(asset) {
+        let pair = format!("{key}: {value}");
+        out.push(Candidate {
+            field: Field::Tag,
+            text: prepare(&pair, prepared),
+            shown: pair,
+        });
+    }
+    if let Some(cols) = columns.get(text_of(asset, "id")) {
+        for (name, description) in cols {
+            out.push(Candidate {
+                field: Field::Column,
+                text: prepare(name, prepared),
+                shown: name.clone(),
+            });
+            if !description.is_empty() {
+                out.push(Candidate {
+                    field: Field::ColumnDescription,
+                    text: prepare(description, prepared),
+                    shown: String::new(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The best field one word found.
@@ -132,52 +346,123 @@ struct Hit {
     approximate: bool,
 }
 
+/// Why an asset matched, as the caller is told.
+enum Reason<'a> {
+    /// A field that explains the hit (`DATA-11`): the reader sees which
+    /// field matched and whether a typo was forgiven. The typed word is kept
+    /// for a description match, whose reason carries a piece of the
+    /// description (`LH-DATA-11-04`).
+    Field(Hit, &'a str),
+    /// The name forgave a typo and no field explains the hit (`DATA-32` D1):
+    /// the name is on screen already, so the reader is told only that the
+    /// match was approximate.
+    NameTypo,
+}
+
+/// The `(key, value)` pairs of an asset's `governedTags` object
+/// (`DATA-12` part 2); empty for an asset without it.
+pub fn governed_pairs(asset: &Value) -> Vec<(&str, &str)> {
+    asset
+        .get("governedTags")
+        .and_then(Value::as_object)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|(k, v)| Some((k.as_str(), v.as_str()?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn text_of<'a>(asset: &'a Value, key: &str) -> &'a str {
     asset.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
-fn candidates(asset: &Value, columns: &ColumnIndex) -> Vec<Candidate> {
-    let mut out = Vec::new();
-    let mut plain = |field: Field, text: &str| {
-        if !text.is_empty() {
-            out.push(Candidate {
-                field,
-                lower: text.to_lowercase(),
-                shown: String::new(),
-            });
+/// A printable piece of `description` around the first occurrence of `word`
+/// (`LH-DATA-11-04`, `DATA-54`): at most [`SNIPPET_MAX_CHARS`] characters on
+/// one line, with `…` where it is cut.
+///
+/// The text is made one line first, because a description may hold line
+/// breaks and tabs that a one-line result row would show as a broken line.
+/// The search is by `char`, never by byte, so a multi-byte letter is never
+/// cut in half. Where the piece starts is [`found_position`]'s answer, so a
+/// forgiven typo still shows the word it forgave (review round 1 R10).
+fn description_snippet(description: &str, word: &str) -> String {
+    let line: String = description
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let chars: Vec<char> = line.chars().collect();
+    // One lower-case character per character, so an index in `lower` is the
+    // same index in `chars` (`char::to_lowercase` can expand, so its first
+    // character is taken).
+    let lower: Vec<char> = chars
+        .iter()
+        .map(|&c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+    let position = found_position(&lower, word);
+    let start = position.saturating_sub(SNIPPET_LEAD_CHARS);
+    let end = (start + SNIPPET_MAX_CHARS).min(chars.len());
+    let mut snippet = String::new();
+    if start > 0 {
+        snippet.push('…');
+    }
+    snippet.extend(&chars[start..end]);
+    if end < chars.len() {
+        snippet.push('…');
+    }
+    snippet
+}
+
+/// Where the piece of a description starts, in `lower` (the description
+/// lower-cased, one character per character): the word as typed when it is
+/// there, else the first place one of its parts is, else the first token
+/// within one edit of a part, and only then the beginning.
+///
+/// The approximate match forgives a typo, and a word may match its parts
+/// (`rev-enue`), so the word as typed need not be in the text at all; starting
+/// at the beginning then showed a piece without the word that matched
+/// (review round 1 R10, decision "no position is position 0").
+fn found_position(lower: &[char], word: &str) -> usize {
+    let found = |needle: &[char]| -> Option<usize> {
+        if needle.is_empty() || needle.len() > lower.len() {
+            return None;
         }
+        lower.windows(needle.len()).position(|w| w == needle)
     };
-    plain(Field::Name, text_of(asset, "name"));
-    plain(Field::Id, text_of(asset, "id"));
-    plain(Field::Namespace, text_of(asset, "namespace"));
-    plain(Field::Owner, text_of(asset, "owner"));
-    plain(Field::Description, text_of(asset, "description"));
-    if let Some(tags) = asset.get("tags").and_then(Value::as_array) {
-        for tag in tags.iter().filter_map(Value::as_str) {
-            out.push(Candidate {
-                field: Field::Tag,
-                lower: tag.to_lowercase(),
-                shown: tag.to_owned(),
-            });
+    let needle: Vec<char> = word.chars().collect();
+    if needle.is_empty() {
+        return 0;
+    }
+    if let Some(at) = found(&needle) {
+        return at;
+    }
+    let parts: Vec<Vec<char>> = tokens(word).map(|t| t.chars().collect()).collect();
+    if let Some(at) = parts.iter().filter_map(|part| found(part)).min() {
+        return at;
+    }
+    // No part is there as typed either: the first token one edit from a part
+    // is the word the approximate match forgave.
+    let mut at = 0;
+    while at < lower.len() {
+        if !lower[at].is_alphanumeric() {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < lower.len() && lower[at].is_alphanumeric() {
+            at += 1;
+        }
+        if parts
+            .iter()
+            .any(|part| within_one_edit(&lower[start..at], part))
+        {
+            return start;
         }
     }
-    if let Some(cols) = columns.get(text_of(asset, "id")) {
-        for (name, description) in cols {
-            out.push(Candidate {
-                field: Field::Column,
-                lower: name.to_lowercase(),
-                shown: name.clone(),
-            });
-            if !description.is_empty() {
-                out.push(Candidate {
-                    field: Field::ColumnDescription,
-                    lower: description.to_lowercase(),
-                    shown: String::new(),
-                });
-            }
-        }
-    }
-    out
+    0
 }
 
 /// The field's tokens: runs of letters and digits.
@@ -212,7 +497,39 @@ fn within_one_edit(a: &[char], b: &[char]) -> bool {
         && short[first + 2..] == long[first + 2..]
 }
 
-/// Whether `word`, not contained in `field` as typed, matches it
+/// One word of the term, prepared once per search: the word itself and its
+/// parts (the runs of letters and digits), each with its characters.
+///
+/// The characters are prepared here so the approximate match allocates
+/// nothing per candidate (`DATA-41` D2).
+struct Word<'a> {
+    /// The word, lower-cased: what the fields are looked up in.
+    text: &'a str,
+    /// The word's parts, each with its characters.
+    parts: Vec<WordPart<'a>>,
+}
+
+/// One part of a word: its text and its characters.
+struct WordPart<'a> {
+    text: &'a str,
+    chars: Vec<char>,
+}
+
+impl<'a> Word<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            parts: tokens(text)
+                .map(|t| WordPart {
+                    text: t,
+                    chars: t.chars().collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Whether `word`, not contained in `text` as typed, matches it
 /// approximately.
 ///
 /// `DATA-11` review `SHOULD-FIX 1`: the typed word is split the way fields are
@@ -226,20 +543,19 @@ fn within_one_edit(a: &[char], b: &[char]) -> bool {
 /// edit. `None` is no match; `Some(false)` is every part contained in the
 /// field (`id_customer` in `customer_id`: right letters, wrong order), which
 /// is not a typo and must not be shown as one; `Some(true)` is a typo.
-fn approximately_in(word: &str, field: &str) -> Option<bool> {
+///
+/// `DATA-41` D2: the field's tokens are already prepared in the index, so
+/// this allocates nothing.
+fn approximately_in(word: &Word, text: &PreparedText) -> Option<bool> {
     let mut any = false;
     let mut edited = false;
-    for part in tokens(word) {
+    for part in &word.parts {
         any = true;
-        if field.contains(part) {
+        if text.lower.contains(part.text) {
             continue;
         }
-        let part_chars: Vec<char> = part.chars().collect();
-        if part_chars.len() < MIN_APPROX_CHARS
-            || !tokens(field).any(|t| {
-                let t: Vec<char> = t.chars().collect();
-                within_one_edit(&t, &part_chars)
-            })
+        if part.chars.len() < MIN_APPROX_CHARS
+            || !text.tokens.iter().any(|t| within_one_edit(t, &part.chars))
         {
             return None;
         }
@@ -248,11 +564,11 @@ fn approximately_in(word: &str, field: &str) -> Option<bool> {
     any.then_some(edited)
 }
 
-fn best_hit(word: &str, candidates: &[Candidate]) -> Option<Hit> {
+fn best_hit(word: &Word, candidates: &[Candidate]) -> Option<Hit> {
     let mut best: Option<Hit> = None;
     for c in candidates {
-        let (score, approximate) = if c.lower.contains(word) {
-            let whole = c.field == Field::Name && c.lower == word;
+        let (score, approximate) = if c.text.lower.contains(word.text) {
+            let whole = c.field == Field::Name && c.text.lower == word.text;
             (
                 if whole {
                     SCORE_NAME_WHOLE
@@ -261,7 +577,7 @@ fn best_hit(word: &str, candidates: &[Candidate]) -> Option<Hit> {
                 },
                 false,
             )
-        } else if let Some(edited) = approximately_in(word, &c.lower) {
+        } else if let Some(edited) = approximately_in(word, &c.text) {
             // The approximate weight either way (the order was wrong or a
             // letter was); only a letter makes the hit "approximate".
             (c.field.weights().1, edited)
@@ -281,35 +597,85 @@ fn best_hit(word: &str, candidates: &[Candidate]) -> Option<Hit> {
     best
 }
 
-/// Rank `assets` for `term`; see the module doc for how the term is read.
+/// What a search found: the assets that matched, and how many matched.
+///
+/// `DATA-41` D3: the assets are the best matches, and the count says how
+/// many matched in all, so a caller that asked for a few of them still
+/// knows how many there are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchOutcome {
+    /// The matching assets, in rank order. At most the limit the caller
+    /// asked for.
+    pub assets: Vec<Value>,
+    /// How many assets matched, including the ones the limit cut off.
+    pub total: usize,
+}
+
+/// Rank the assets that match `term`.
 ///
 /// An empty or all-whitespace term returns every asset in input order with
 /// no `matchedOn`. Otherwise only assets matching every word are returned,
 /// ordered by score descending, then use descending, then `id` ascending,
 /// each with `matchedOn` set for the best field of the first word, in typed
 /// order, whose best field is not the name (omitted when every word's best
-/// field is the name; `DATA-11` review `SHOULD-FIX 8`). `usage` is
-/// `DATA-11` D4.
+/// field is the name; `DATA-11` review `SHOULD-FIX 8`). `matchedOn.value` is
+/// the tag, the column, the table key, or a piece of the description around
+/// the matched word (`LH-DATA-11-04`, `DATA-54`). `usage` is `DATA-11` D4.
+///
+/// `DATA-32` D1: when no field explains the hit and a word matched the name
+/// only approximately, `matchedOn` is the name with `approximate: true`.
+///
+/// `DATA-41` D2: the index is the prepared one, so a search allocates
+/// nothing per candidate.
+///
+/// `DATA-41` D3: `limit` caps how many assets are returned. The cap is
+/// applied AFTER the ranking, so the assets that are returned are the best
+/// ones, and `total` says how many matched in all.
 pub fn search(
-    assets: &[Value],
-    columns: &ColumnIndex,
+    index: &SearchIndex,
     usage: &UsageIndex,
     term: &str,
-) -> Vec<Value> {
+    limit: Option<usize>,
+) -> SearchOutcome {
     let lowered = term.to_lowercase();
-    let words: Vec<&str> = lowered.split_whitespace().take(MAX_WORDS).collect();
+    // A blank term is not a filter: every asset comes back, in input order
+    // (`DATA-11`).
+    if lowered.split_whitespace().next().is_none() {
+        let total = index.assets.len();
+        let assets = match limit {
+            Some(cap) => index.assets.iter().take(cap).cloned().collect(),
+            None => index.assets.clone(),
+        };
+        return SearchOutcome { assets, total };
+    }
+    // QA `LH-DATA-11-05` (`DATA-54`): a word with no letter or digit
+    // (`_`, `%`, `--`) names nothing, and it used to be found as typed in
+    // every id and column that holds the character; QA-1 decision "special
+    // characters do not match everything". Such a word is dropped, and a
+    // term made only of them finds nothing.
+    let words: Vec<Word> = lowered
+        .split_whitespace()
+        .map(Word::new)
+        .filter(|w| !w.parts.is_empty())
+        .take(MAX_WORDS)
+        .collect();
     if words.is_empty() {
-        return assets.to_vec();
+        return SearchOutcome {
+            assets: Vec::new(),
+            total: 0,
+        };
     }
 
-    let mut ranked: Vec<(u32, u32, &Value, Option<Hit>)> = Vec::new();
-    for asset in assets {
-        let cands = candidates(asset, columns);
+    // `(score, use, id, position in the index, reason)`: the id is the
+    // tie-break of the ranking, the position is where the asset is.
+    let mut ranked: Vec<(u32, u32, &str, usize, Option<Reason<'_>>)> = Vec::new();
+    for (position, entry) in index.entries.iter().enumerate() {
         let mut total = 0_u32;
         let mut reason = None;
+        let mut name_typo = false;
         let mut all = true;
         for word in &words {
-            let Some(hit) = best_hit(word, &cands) else {
+            let Some(hit) = best_hit(word, &entry.candidates) else {
                 all = false;
                 break;
             };
@@ -317,25 +683,47 @@ pub fn search(
             // `DATA-11` review `SHOULD-FIX 8`: not the first word as such but
             // the first one the name does not already explain.
             if reason.is_none() && hit.field.reported().is_some() {
-                reason = Some(hit);
+                reason = Some(Reason::Field(hit, word.text));
+            } else if !name_typo && hit.field == Field::Name && hit.approximate {
+                // `DATA-32` D1: the name forgave a typo. It is the reason
+                // only when no field explains the hit, so it is kept aside;
+                // the name has no reported field, so the branch above never
+                // takes it.
+                name_typo = true;
             }
         }
         if all {
-            let used = usage.get(text_of(asset, "id")).copied().unwrap_or(0);
-            ranked.push((total, used, asset, reason));
+            let used = usage.get(&entry.id).copied().unwrap_or(0);
+            // `DATA-32` D1: a field that explains the hit wins; the name that
+            // forgave a typo is the reason only when there is none.
+            let reason = reason.or(name_typo.then_some(Reason::NameTypo));
+            ranked.push((total, used, entry.id.as_str(), position, reason));
         }
     }
-    ranked.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then(b.1.cmp(&a.1))
-            .then_with(|| text_of(a.2, "id").cmp(text_of(b.2, "id")))
-    });
-    ranked
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then_with(|| a.2.cmp(b.2)));
+    let total = ranked.len();
+    let assets = ranked
         .into_iter()
-        .map(|(_, _, asset, hit)| {
-            let mut asset = asset.clone();
-            let reported =
-                hit.and_then(|h| h.field.reported().map(|f| (f, h.shown, h.approximate)));
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|(_, _, _, position, reason)| {
+            let mut asset = index.assets[position].clone();
+            // QA `LH-DATA-11-04` (`DATA-54`): a description reason carries a
+            // piece of the description, so the reader sees the words that
+            // matched, not only that something did. The value is built from
+            // the asset before it is borrowed mutably below.
+            let reported = reason.and_then(|r| match r {
+                Reason::Field(hit, word) => hit.field.reported().map(|f| {
+                    let value = if hit.field == Field::Description {
+                        description_snippet(text_of(&asset, "description"), word)
+                    } else {
+                        hit.shown
+                    };
+                    (f, value, hit.approximate)
+                }),
+                // `DATA-32` D1: the name forgave a typo and nothing else
+                // explains the hit, so the name is the reason.
+                Reason::NameTypo => Some(("name", String::new(), true)),
+            });
             if let (Some((field, value, approximate)), Some(o)) = (reported, asset.as_object_mut())
             {
                 o.insert(
@@ -345,7 +733,8 @@ pub fn search(
             }
             asset
         })
-        .collect()
+        .collect();
+    SearchOutcome { assets, total }
 }
 
 #[cfg(test)]
@@ -358,8 +747,20 @@ mod tests {
         assets.iter().filter_map(|a| a["id"].as_str()).collect()
     }
 
+    /// The prepared index of `assets` and `columns` (`DATA-41` D2): what a
+    /// search reads.
+    fn index(assets: &[Value], columns: &ColumnIndex) -> SearchIndex {
+        SearchIndex::build(assets.to_vec(), columns)
+    }
+
     fn find(assets: &[Value], term: &str) -> Vec<Value> {
-        search(assets, &ColumnIndex::new(), &UsageIndex::new(), term)
+        search(
+            &index(assets, &ColumnIndex::new()),
+            &UsageIndex::new(),
+            term,
+            None,
+        )
+        .assets
     }
 
     fn orders_and_users() -> Vec<Value> {
@@ -392,6 +793,24 @@ mod tests {
                 "description": "Agregat restoran",
             }),
         ]
+    }
+
+    /// `DATA-12` part 2: a governed tag is found by its value alone, its key
+    /// alone and the whole pair, and the reason line shows the pair.
+    #[test]
+    fn a_governed_tag_finds_its_table_by_value_key_or_pair() {
+        let mut assets = orders_and_users();
+        assets[1]["governedTags"] = json!({ "data_domain": "finance" });
+        for term in ["finance", "data_domain", "data_domain: finance"] {
+            let hits = find(&assets, term);
+            assert_eq!(ids(&hits), vec!["bronze.users"], "{term}");
+            assert_eq!(
+                hits[0]["matchedOn"],
+                json!({ "field": "tag", "value": "data_domain: finance", "approximate": false }),
+                "{term}"
+            );
+        }
+        assert_eq!(find(&assets, "revenue"), [] as [serde_json::Value; 0]);
     }
 
     // Carried over from `filter_assets_by_query_*` in `catalog.rs`
@@ -492,7 +911,10 @@ mod tests {
     #[test]
     fn a_word_that_matches_nothing_excludes_the_asset_even_when_another_word_matches() {
         let assets = explorer_fixture();
-        assert!(find(&assets, "restoran zzzzzz").is_empty());
+        assert_eq!(
+            find(&assets, "restoran zzzzzz"),
+            [] as [serde_json::Value; 0]
+        );
         assert_eq!(
             ids(&find(&assets, "restoran agregat")),
             vec!["gold.restoran"]
@@ -517,8 +939,100 @@ mod tests {
         let hit = &find(&assets, "revnue")[0];
         assert_eq!(
             hit["matchedOn"],
-            json!({ "field": "description", "value": "", "approximate": true })
+            json!({ "field": "description", "value": "revenue by month", "approximate": true })
         );
+    }
+
+    // QA `LH-DATA-11-04` (`DATA-54`): a description match carries the words
+    // around the matched word, on one line, with `…` where it is cut.
+    #[test]
+    fn a_description_match_carries_the_text_around_the_word() {
+        let mut long = "a".repeat(200);
+        long.replace_range(117..127, "  revenue  ");
+        let assets = vec![json!({ "id": "silver.long", "name": "Long", "description": long })];
+        let hit = &find(&assets, "revenue")[0];
+        let value = hit["matchedOn"]["value"].as_str().unwrap();
+        assert_eq!(hit["matchedOn"]["field"], "description");
+        assert!(value.contains("revenue"), "{value}");
+        assert!(value.starts_with('…'), "{value}");
+        assert!(value.ends_with('…'), "{value}");
+        assert!(value.chars().count() <= 82, "{value}");
+
+        let assets = vec![json!({
+            "id": "silver.monthly", "name": "Monthly",
+            "description": "Monthly\n  revenue\tby region"
+        })];
+        assert_eq!(
+            find(&assets, "revenue")[0]["matchedOn"],
+            json!({ "field": "description", "value": "Monthly revenue by region", "approximate": false })
+        );
+        // The typo was forgiven; the piece still holds the word it forgave,
+        // which is the whole line when the line is short.
+        let typo = &find(&assets, "revnue")[0];
+        assert_eq!(typo["matchedOn"]["approximate"], true);
+        assert_eq!(typo["matchedOn"]["value"], "Monthly revenue by region");
+
+        // Review round 1 R10: in a long description the forgiven word is at
+        // character 120, so the piece starts around it, not at position 0.
+        let long = |word: &str| {
+            format!(
+                "{} {word} {}",
+                vec!["a"; 60].join(" "),
+                vec!["b"; 40].join(" ")
+            )
+        };
+        let assets =
+            vec![json!({ "id": "silver.typo", "name": "Typo", "description": long("revenue") })];
+        let typo = &find(&assets, "revnue")[0];
+        assert_eq!(typo["matchedOn"]["approximate"], true);
+        let value = typo["matchedOn"]["value"].as_str().unwrap();
+        assert!(value.contains("revenue"), "{value}");
+        assert!(value.starts_with('…'), "{value}");
+
+        // A word matched by its parts (`rev-enue`, not approximate) starts at
+        // the first part, not at the beginning either.
+        let assets =
+            vec![json!({ "id": "silver.parts", "name": "Parts", "description": long("revenue") })];
+        let parts = &find(&assets, "rev-enue")[0];
+        assert_eq!(parts["matchedOn"]["approximate"], false);
+        let value = parts["matchedOn"]["value"].as_str().unwrap();
+        assert!(value.contains("revenue"), "{value}");
+        assert!(value.starts_with('…'), "{value}");
+    }
+
+    // QA `LH-DATA-11-04` (`DATA-54`): the piece is cut by character, never by
+    // byte, and a word that is not found (or no word) starts at the beginning.
+    // Review round 1 R5: the first case never cut (it is shorter than the
+    // piece), so the cases below cut inside multi-byte text on both sides —
+    // a byte slice would panic on either of them.
+    #[test]
+    fn the_snippet_never_cuts_inside_a_character() {
+        assert!(
+            description_snippet("Umsatz nach Übersee für Österreich", "übersee")
+                .contains("Übersee")
+        );
+
+        let d = format!("{} Übersee {}", "é".repeat(60), "ö".repeat(60));
+        let piece = description_snippet(&d, "übersee");
+        assert!(piece.contains("Übersee"), "{piece}");
+        assert!(piece.starts_with('…'), "{piece}");
+        assert!(piece.ends_with('…'), "{piece}");
+        assert!(piece.chars().count() <= 82, "{piece}");
+
+        // A word in a script without spaces is a word: the CJK description
+        // holds `収益` at character 100 and the piece is built around it.
+        let cjk = format!("{}収益{}", "表".repeat(100), "表".repeat(100));
+        let assets = vec![json!({ "id": "silver.cjk", "name": "Cjk", "description": cjk })];
+        let hit = &find(&assets, "収益")[0];
+        assert_eq!(hit["matchedOn"]["field"], "description", "{hit}");
+        let value = hit["matchedOn"]["value"].as_str().unwrap();
+        assert!(value.contains("収益"), "{value}");
+        assert!(value.starts_with('…'), "{value}");
+        assert!(value.ends_with('…'), "{value}");
+        assert!(value.chars().count() <= 82, "{value}");
+
+        assert_eq!(description_snippet("", "x"), "");
+        assert_eq!(description_snippet("abc", ""), "abc");
     }
 
     #[test]
@@ -526,8 +1040,8 @@ mod tests {
         let assets = revenue();
         // Under 4 characters, and `rev` is the name besides: the typed word
         // must not be matched approximately against "rev".
-        assert!(find(&assets, "rvn").is_empty());
-        assert!(find(&assets, "ravanue").is_empty());
+        assert_eq!(find(&assets, "rvn"), [] as [serde_json::Value; 0]);
+        assert_eq!(find(&assets, "ravanue"), [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -542,7 +1056,13 @@ mod tests {
             vec![("customer_id".to_owned(), String::new())],
         )]
         .into();
-        let hit = search(&assets, &columns, &UsageIndex::new(), "custmer_id");
+        let hit = search(
+            &index(&assets, &columns),
+            &UsageIndex::new(),
+            "custmer_id",
+            None,
+        )
+        .assets;
         assert_eq!(ids(&hit), ["silver.other"]);
         assert_eq!(
             hit[0]["matchedOn"],
@@ -550,9 +1070,18 @@ mod tests {
         );
         assert_eq!(find(&assets, "silver.ordrs").len(), 1);
         // `xx` is under 4 characters and is not in the column: no match.
-        assert!(search(&assets, &columns, &UsageIndex::new(), "custmer_xx").is_empty());
+        assert_eq!(
+            search(
+                &index(&assets, &columns),
+                &UsageIndex::new(),
+                "custmer_xx",
+                None,
+            )
+            .assets,
+            [] as [serde_json::Value; 0]
+        );
         // No letter or digit: nothing to match.
-        assert!(find(&assets, "___").is_empty());
+        assert_eq!(find(&assets, "___"), [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -576,19 +1105,31 @@ mod tests {
             ),
         ]
         .into();
-        let hits = search(&assets, &columns, &UsageIndex::new(), "id_customer");
+        let hits = search(
+            &index(&assets, &columns),
+            &UsageIndex::new(),
+            "id_customer",
+            None,
+        )
+        .assets;
         assert_eq!(ids(&hits), ["silver.exact", "silver.swapped"]);
         assert_eq!(
             hits[1]["matchedOn"],
             json!({ "field": "column", "value": "customer_id", "approximate": false })
         );
         // A real typo is still flagged.
-        let typo = search(&assets, &columns, &UsageIndex::new(), "custmer_id");
+        let typo = search(
+            &index(&assets, &columns),
+            &UsageIndex::new(),
+            "custmer_id",
+            None,
+        )
+        .assets;
         assert!(
             typo.iter()
                 .all(|h| h["matchedOn"]["approximate"] == json!(true))
         );
-        assert!(!typo.is_empty());
+        assert_ne!(typo, [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -601,7 +1142,13 @@ mod tests {
             "silver.sales".to_owned(),
             vec![("revenue_amount".to_owned(), String::new())],
         )]);
-        let hits = search(&assets, &columns, &UsageIndex::new(), "revenue_amount");
+        let hits = search(
+            &index(&assets, &columns),
+            &UsageIndex::new(),
+            "revenue_amount",
+            None,
+        )
+        .assets;
         assert_eq!(ids(&hits), vec!["silver.sales"]);
         assert_eq!(
             hits[0]["matchedOn"],
@@ -620,7 +1167,8 @@ mod tests {
             "c.three".to_owned(),
             vec![("c1".to_owned(), "Amount invoiced".to_owned())],
         )]);
-        let by = |term: &str| search(&assets, &columns, &UsageIndex::new(), term);
+        let by =
+            |term: &str| search(&index(&assets, &columns), &UsageIndex::new(), term, None).assets;
         let owner = by("finance");
         assert_eq!(ids(&owner), vec!["a.one"]);
         assert_eq!(owner[0]["matchedOn"]["field"], "owner");
@@ -645,7 +1193,7 @@ mod tests {
         ];
         let columns: ColumnIndex =
             HashMap::from([("c".to_owned(), vec![("sales".to_owned(), String::new())])]);
-        let hits = search(&assets, &columns, &UsageIndex::new(), "sales");
+        let hits = search(&index(&assets, &columns), &UsageIndex::new(), "sales", None).assets;
         assert_eq!(ids(&hits), vec!["n", "t", "c", "d"]);
         // The name is on screen already, so it is never given as the reason.
         assert!(hits[0].get("matchedOn").is_none());
@@ -678,7 +1226,7 @@ mod tests {
             json!({ "id": "x.c", "name": "C", "tags": ["sales"] }),
         ];
         let usage: UsageIndex = HashMap::from([("x.c".to_owned(), 9), ("x.b".to_owned(), 2)]);
-        let hits = search(&assets, &ColumnIndex::new(), &usage, "sales");
+        let hits = search(&index(&assets, &ColumnIndex::new()), &usage, "sales", None).assets;
         assert_eq!(ids(&hits), vec!["x.c", "x.b", "x.a"]);
     }
 
@@ -691,7 +1239,7 @@ mod tests {
             find(&assets, "one two three four five six seven eight nine").len(),
             1
         );
-        assert!(find(&assets, "nine").is_empty());
+        assert_eq!(find(&assets, "nine"), [] as [serde_json::Value; 0]);
     }
 
     // `DATA-11` review `SHOULD-FIX 8` changed this test (rule 2: the rule it
@@ -722,7 +1270,13 @@ mod tests {
         let assets = vec![json!({
             "id": "bronze.northwind_orders", "name": "Northwind Orders"
         })];
-        let hits = search(&assets, &columns, &UsageIndex::new(), "northwind customer");
+        let hits = search(
+            &index(&assets, &columns),
+            &UsageIndex::new(),
+            "northwind customer",
+            None,
+        )
+        .assets;
         assert_eq!(
             hits[0]["matchedOn"],
             json!({ "field": "column", "value": "customer_id", "approximate": false })
@@ -737,6 +1291,29 @@ mod tests {
         })];
         let hits = find(&assets, "northwind customer");
         assert_eq!(hits.len(), 1);
+        assert!(hits[0].get("matchedOn").is_none());
+    }
+
+    // `DATA-32` D1: the name forgave the typo and nothing else explains the
+    // hit, so the name is the reason and it says the match was approximate.
+    #[test]
+    fn a_typo_that_only_the_name_forgives_is_reported_as_an_approximate_name_match() {
+        let assets = vec![json!({ "id": "silver.revenue", "name": "Revenue" })];
+        let hits = find(&assets, "revnue");
+        assert_eq!(ids(&hits), vec!["silver.revenue"]);
+        assert_eq!(
+            hits[0]["matchedOn"],
+            json!({ "field": "name", "value": "", "approximate": true })
+        );
+    }
+
+    // `DATA-32` D1: an exact name match is still no reason; the name is on
+    // screen already.
+    #[test]
+    fn an_exact_name_match_still_has_no_reason() {
+        let assets = vec![json!({ "id": "silver.revenue", "name": "Revenue" })];
+        let hits = find(&assets, "revenue");
+        assert_eq!(ids(&hits), vec!["silver.revenue"]);
         assert!(hits[0].get("matchedOn").is_none());
     }
 
@@ -758,5 +1335,151 @@ mod tests {
         assert!(!edit("abcd", "badc"));
         assert!(!edit("abcd", "ab"));
         assert!(!edit("abcd", "axyd"));
+    }
+
+    // `DATA-41` D2: the index is prepared once, with the copy, so a search
+    // allocates nothing per candidate. The two facts that make that true
+    // are pinned here: a text is prepared once and shared by every asset
+    // that carries it (the same column name is on thousands of tables),
+    // and the prepared text is already lower-cased and tokenised.
+    #[test]
+    fn the_index_prepares_each_text_once_and_shares_it() {
+        let assets = vec![
+            json!({ "id": "silver.a", "name": "Revenue" }),
+            json!({ "id": "silver.b", "name": "REVENUE" }),
+        ];
+        let index = index(&assets, &ColumnIndex::new());
+        let first = &index.entries[0].candidates[0];
+        let second = &index.entries[1].candidates[0];
+        assert!(Arc::ptr_eq(&first.text, &second.text));
+        assert_eq!(first.text.lower, "revenue");
+        assert_eq!(
+            first.text.tokens,
+            vec![vec!['r', 'e', 'v', 'e', 'n', 'u', 'e']]
+        );
+    }
+
+    // `DATA-41` D2: the index is built from the assets and the columns, and
+    // a search over it answers exactly as the same search over the assets
+    // did before the index existed.
+    #[test]
+    fn the_index_answers_the_same_as_the_assets_it_was_built_from() {
+        let assets = explorer_fixture();
+        let columns: ColumnIndex = HashMap::from([(
+            "silver.mart_wisman".to_owned(),
+            vec![("revenue_amount".to_owned(), "Amount invoiced".to_owned())],
+        )]);
+        let hits = search(
+            &index(&assets, &columns),
+            &UsageIndex::new(),
+            "revenue_amount",
+            None,
+        )
+        .assets;
+        assert_eq!(ids(&hits), vec!["silver.mart_wisman"]);
+        assert_eq!(
+            hits[0]["matchedOn"],
+            json!({ "field": "column", "value": "revenue_amount", "approximate": false })
+        );
+    }
+
+    // `DATA-41` D3: the limit is applied AFTER the ranking, so the assets
+    // that come back are the best ones, and the count says how many
+    // matched in all.
+    #[test]
+    fn a_limit_takes_the_best_matches_and_the_count_says_how_many_matched() {
+        let assets = vec![
+            json!({ "id": "a", "name": "Revenue" }),
+            json!({ "id": "b", "name": "Ledger", "description": "revenue by month" }),
+            json!({ "id": "c", "name": "Orders", "description": "revenue by month" }),
+        ];
+        let outcome = search(
+            &index(&assets, &ColumnIndex::new()),
+            &UsageIndex::new(),
+            "revenue",
+            Some(2),
+        );
+        // The name that IS the word comes first; the two descriptions tie
+        // and are ordered by id.
+        assert_eq!(ids(&outcome.assets), vec!["a", "b"]);
+        assert_eq!(
+            outcome.total, 3,
+            "every match is counted, not only the ones returned"
+        );
+    }
+
+    // `DATA-41` D3: without a limit the answer is every match, in the same
+    // order, and the count is the number of them.
+    #[test]
+    fn without_a_limit_every_match_is_returned() {
+        let assets = vec![
+            json!({ "id": "a", "name": "Revenue" }),
+            json!({ "id": "b", "name": "Ledger", "description": "revenue by month" }),
+        ];
+        let outcome = search(
+            &index(&assets, &ColumnIndex::new()),
+            &UsageIndex::new(),
+            "revenue",
+            None,
+        );
+        assert_eq!(ids(&outcome.assets), vec!["a", "b"]);
+        assert_eq!(outcome.total, 2);
+    }
+
+    // QA `LH-DATA-11-05` (`DATA-54`): the search reads a row's table key, not
+    // its id. A Bronze row's id is a registry slug nobody types, and a
+    // Silver or Gold row's id is its table, so the two agree there.
+    #[test]
+    fn a_table_is_found_by_its_physical_name_and_a_bronze_slug_is_not_searched() {
+        let assets = vec![
+            json!({
+                "id": "zq-registry-slug", "name": "Orders",
+                "tableKey": "bronze.northwind_orders"
+            }),
+            json!({ "id": "silver.dim_negara", "name": "Dim Negara" }),
+        ];
+        assert_eq!(find(&assets, "zq"), [] as [serde_json::Value; 0]);
+        let bronze = find(&assets, "northwind_orders");
+        assert_eq!(ids(&bronze), vec!["zq-registry-slug"]);
+        assert_eq!(
+            bronze[0]["matchedOn"],
+            json!({
+                "field": "table", "value": "bronze.northwind_orders", "approximate": false
+            })
+        );
+        let silver = find(&assets, "silver.dim_negara");
+        assert_eq!(ids(&silver), vec!["silver.dim_negara"]);
+        assert_eq!(
+            silver[0]["matchedOn"],
+            json!({
+                "field": "table", "value": "silver.dim_negara", "approximate": false
+            })
+        );
+    }
+
+    // QA `LH-DATA-11-05` (`DATA-54`): `_` used to be looked up as typed in
+    // every id and column that holds an underscore, so it found almost every
+    // table. A word with no letter or digit names nothing and is dropped; a
+    // term made only of such words finds nothing.
+    #[test]
+    fn a_word_with_no_letter_or_digit_is_dropped_and_alone_finds_nothing() {
+        let assets = vec![
+            json!({ "id": "silver.dim_customer", "name": "Dim Customer" }),
+            json!({ "id": "silver.rev_month", "name": "Rev", "description": "50% of revenue" }),
+        ];
+        let columns: ColumnIndex = [(
+            "silver.dim_customer".to_owned(),
+            vec![("customer_id".to_owned(), String::new())],
+        )]
+        .into();
+        let index = index(&assets, &columns);
+        let by = |term: &str| search(&index, &UsageIndex::new(), term, None);
+        for term in ["_", "%", "- _", "."] {
+            let outcome = by(term);
+            assert_eq!(outcome.assets, [] as [serde_json::Value; 0], "{term}");
+            assert_eq!(outcome.total, 0, "{term}");
+        }
+        assert_eq!(ids(&by("rev _").assets), vec!["silver.rev_month"]);
+        assert_eq!(ids(&by("").assets), ids(&assets));
     }
 }

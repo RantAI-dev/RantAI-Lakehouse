@@ -4,7 +4,15 @@ import * as React from "react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { RequiredLegend } from "@/components/patterns/required-legend"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import type { SqlDial } from "@/services/contracts/connectors"
+import { ORACLE_SSL_MODES, SSL_MODE_DEFAULT, sslModeChoices, sslModeFromChoice } from "./ssl-modes"
 
 /**
  * `dial` for the `Oracle` connector type — the same `sql` adapter/
@@ -13,9 +21,9 @@ import type { SqlDial } from "@/services/contracts/connectors"
  * value — `ingest_spec.rs`). Kept as its own form, not a `SqlDialForm`
  * prop, for two Oracle-only facts `SqlDialForm` has no field for:
  *
- * - This build cannot run Oracle CDC in either state of
- *   `ORACLE_CDC_LOGMINER_ENABLED` — batch only, stated here so a user
- *   configuring an Oracle connector sees it before creating one.
+ * - This form is the batch type's. Change capture from Oracle is the `Oracle CDC`
+ *   type, with its own dial (`CdcDialForm`: container database, PDB, native
+ *   network encryption; `SRC-4` slice 6).
  * - `sslServerCertDn` is OPERATOR-TYPED, never derived from `host` — a
  *   bare `CN=<hostname>` would not match a real certificate's full DN
  *   (`SqlDial::ssl_server_cert_dn`'s doc comment).
@@ -46,6 +54,8 @@ export function OracleDialForm({
   function set<K extends keyof SqlDial>(key: K, v: SqlDial[K]) {
     onChange({ ...dial, [key]: v, driver: "oracle" })
   }
+  const choices = sslModeChoices(ORACLE_SSL_MODES, dial.sslMode ?? null)
+  const currentMode = choices.find((mode) => mode.value === (dial.sslMode ?? SSL_MODE_DEFAULT))
   return (
     <div className="grid gap-3">
       {/* UX-1-R7: opt out when a parent step already explains the marker. */}
@@ -100,12 +110,25 @@ export function OracleDialForm({
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="oracle-dial-ssl-mode">SSL mode (optional)</Label>
-          <Input
-            id="oracle-dial-ssl-mode"
-            value={dial.sslMode ?? ""}
-            onChange={(e) => set("sslMode", e.target.value === "" ? null : e.target.value)}
-            autoComplete="off"
-          />
+          {/* WEB-8 D8: the two modes the Oracle adapter accepts, plus
+              "Default" (no mode sent) — a stored `null` is a real state
+              (plaintext, no DN check), so it stays selectable rather than
+              being read as "disable". */}
+          <Select
+            value={dial.sslMode ?? SSL_MODE_DEFAULT}
+            onValueChange={(next) => set("sslMode", sslModeFromChoice(next ?? SSL_MODE_DEFAULT))}
+          >
+            <SelectTrigger id="oracle-dial-ssl-mode" aria-label="SSL mode (optional)" className="w-full">
+              <SelectValue>{currentMode?.label ?? "Default (no mode sent)"}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {choices.map((mode) => (
+                <SelectItem key={mode.value} value={mode.value}>
+                  {mode.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="oracle-dial-ssl-server-cert-dn" required={tlsRequired}>

@@ -61,6 +61,17 @@ export const PAUSED_APPROVE_NOTE = "This connector is paused. Approve the change
 export const PAUSED_NOTHING_TO_APPROVE_NOTE =
   "This connector is paused, but there is nothing here to approve. To resume it, choose a policy other than Pause under 'When the source changes' and save."
 
+/**
+ * Why a column is inactive, in the console's words (`SRC-11` decision 10). `excluded` is the user's own
+ * choice in the table picker, not a change at the source; any other reason a newer API adds reads as plain
+ * "inactive" rather than as a guess.
+ */
+export function inactiveReasonLabel(reason: string): string {
+  if (reason === "excluded") return "left out by you"
+  if (reason === "removed_at_source") return "removed at the source"
+  return "inactive"
+}
+
 const KIND_LABEL: Record<string, string> = {
   column_added: "Column added",
   column_removed: "Column removed",
@@ -347,6 +358,24 @@ export function ConnectorSchemaChangesPanel({
             </>
           )}
         </SectionCard>
+        {data && data.inactiveColumns.length > 0 ? (
+          <SectionCard size="sm" title="Inactive columns">
+            <ul className="divide-y divide-border rounded-md border border-border">
+              {data.inactiveColumns.map((i) => (
+                <li key={`${i.objectName}-${i.columnName}`} className="px-3 py-2 text-sm">
+                  <div className="flex flex-wrap items-baseline gap-x-2">
+                    <span className="font-mono text-xs">{i.objectName}</span>
+                    <code className="font-mono text-xs">{i.columnName}</code>
+                    <span className="text-xs text-muted-foreground">{inactiveReasonLabel(i.reason)}</span>
+                    <span className="ml-auto text-xs text-muted-foreground">
+                      since {formatDateTime(i.inactiveSince)}
+                    </span>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </SectionCard>
+        ) : null}
         <SectionCard size="sm" title="Recent changes">
           {list.status !== "success" ? (
             <p className="text-sm text-muted-foreground">

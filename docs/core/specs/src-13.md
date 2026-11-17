@@ -6,6 +6,7 @@
 | Module | Data |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
+| Blocked by | `SEC-36` (#144 merge) |
 
 ## Why
 

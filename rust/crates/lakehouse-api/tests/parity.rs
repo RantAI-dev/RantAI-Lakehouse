@@ -284,8 +284,7 @@ fn is_globally_volatile_key(key: &str) -> bool {
 /// exactly — a shape-based rule is what lets those coexist safely.
 fn looks_like_generated_id(s: &str) -> bool {
     if let Some(rest) = s.strip_prefix("q-")
-        && rest.len() >= 10
-        && rest.bytes().all(|b| b.is_ascii_digit())
+        && (is_old_query_run_id(rest) || is_new_query_run_id(rest))
     {
         return true;
     }
@@ -295,6 +294,26 @@ fn looks_like_generated_id(s: &str) -> bool {
             .iter()
             .zip([8, 4, 4, 4, 12])
             .all(|(p, want_len)| p.len() == want_len && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The query-run id a row recorded before the id changed carries:
+/// `q-<epoch-ms>`, the epoch milliseconds and nothing else.
+fn is_old_query_run_id(rest: &str) -> bool {
+    rest.len() >= 10 && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The query-run id a row recorded now carries: `q-<epoch-ms>-<32 lowercase
+/// hex>`, the uuid's simple form beside the epoch milliseconds. The uuid
+/// makes two runs in the same millisecond two rows.
+fn is_new_query_run_id(rest: &str) -> bool {
+    let Some((epoch, suffix)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    is_old_query_run_id(epoch)
+        && suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// `capture.ts`'s `REDACTED_MARKER` shape (`^<redacted:\d+>$`) — a value the

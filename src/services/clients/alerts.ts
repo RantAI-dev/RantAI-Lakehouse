@@ -6,12 +6,13 @@ import type {
   SaveAlertRuleInput,
 } from "../contracts/alerts";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
- * AlertRuleService over `/api/alerts` (rule CRUD) and `/api/alerts/run`
- * (evaluate). WS1 task 1.15: this client (and its contract) did not exist
- * before — the feature fetched `/api/alerts` directly with no `res.ok`
+ * AlertRuleService over `/api/alerts` (rule CRUD) and `/api/alerts/test`
+ * (`testRule`, one rule at a time: `BI-40` D1; the scheduler's
+ * `/api/alerts/run` is not a person's door). WS1 task 1.15: this client (and
+ * its contract) did not exist before — the feature fetched `/api/alerts` directly with no `res.ok`
  * check, so a dead API rendered as an empty rule list. Every method here
  * throws a `ServiceError` carrying the server's `{ error }` message on a
  * non-OK response, classified the same way `clickhouseOverviewService`
@@ -26,14 +27,15 @@ async function request<T>(
   const res = await apiFetch(url, init);
   const json = await res.json();
   if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json);
+    if (denied) throw denied;
     const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500 || res.status === 503
-            ? "unavailable"
-            : "invalid_request";
+      res.status === 404
+        ? "not_found"
+        : res.status >= 500 || res.status === 503
+          ? "unavailable"
+          : "invalid_request";
     throw new ServiceError(kind, json?.error ?? fallbackMessage);
   }
   return json as T;
@@ -92,12 +94,23 @@ export const clickhouseAlertRuleService: AlertRuleService = {
       "Rule could not be deleted"
     );
   },
-  async runRules(id, signal) {
-    const q = id ? `?id=${encodeURIComponent(id)}` : "";
-    return request<{ ran: number; results: AlertRunResult[] }>(
-      `/api/alerts/run${q}`,
-      { method: "POST", signal },
-      "Rules could not be run"
-    );
+  async testRule(id, signal) {
+    try {
+      return await request<{ ran: number; results: AlertRunResult[] }>(
+        `/api/alerts/test?id=${encodeURIComponent(id)}`,
+        { method: "POST", signal },
+        "Rule could not be tested"
+      );
+    } catch (err) {
+      // `BI-40` D2 gives this route's refusal as the `alert:write` permission
+      // (`permission_denied: alert:write`); the console says it in words a
+      // person can act on. A 404 keeps the server's own sentence
+      // ("alert rule not found."), which is the same whether the rule is gone
+      // or simply not theirs to see.
+      if (err instanceof ServiceError && err.code === "permission_denied") {
+        throw new ServiceError("permission_denied", "You can test only the alerts you manage.");
+      }
+      throw err;
+    }
   },
 };

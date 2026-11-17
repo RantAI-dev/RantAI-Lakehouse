@@ -90,9 +90,10 @@ const COLUMNS: &str =
 ///
 /// Returns [`StoreError::Database`] on any query failure.
 pub async fn list_all(pool: &PgPool) -> Result<Vec<SemanticEntry>, StoreError> {
-    let rows: Vec<EntryRow> = sqlx::query_as(&format!(
+    // safe: only the constant `COLUMNS` is formatted in; values are bound.
+    let rows: Vec<EntryRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM semantic_entry ORDER BY asset, column_name"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(SemanticEntry::from).collect())
@@ -104,9 +105,10 @@ pub async fn list_all(pool: &PgPool) -> Result<Vec<SemanticEntry>, StoreError> {
 ///
 /// Returns [`StoreError::Database`] on any query failure.
 pub async fn list_for_asset(pool: &PgPool, asset: &str) -> Result<Vec<SemanticEntry>, StoreError> {
-    let rows: Vec<EntryRow> = sqlx::query_as(&format!(
+    // safe: only the constant `COLUMNS` is formatted in; values are bound.
+    let rows: Vec<EntryRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM semantic_entry WHERE asset = $1 ORDER BY column_name"
-    ))
+    )))
     .bind(asset)
     .fetch_all(pool)
     .await?;

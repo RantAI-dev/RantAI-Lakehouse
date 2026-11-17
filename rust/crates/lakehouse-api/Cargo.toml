@@ -1,9 +1,15 @@
 [package]
 name = "lakehouse-api"
-version = "0.1.0"
+version = "0.2.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# OPS-32: the integration tests are the explicit `[[test]]` targets below, not
+# one crate per file. `tests/it.rs` declares every file in `tests/` as a module
+# and links `lakehouse-api` once instead of 119 times; a file that is neither a
+# `[[test]]` path nor declared in a root does not run at all, which
+# `scripts/ci/check_test_modules.sh` fails the build for.
+autotests = false
 
 [lib]
 name = "lakehouse_api"
@@ -12,6 +18,31 @@ path = "src/lib.rs"
 [[bin]]
 name = "lakehouse-api"
 path = "src/main.rs"
+
+# OPS-32: every integration test module, in one binary.
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
+# SEC-22: re-runs itself with `--exact` and a bare test name under `ulimit -v`
+# 512 MiB, so it must stay a small binary that does not link the Postgres
+# testcontainer bootstrap its child would have to start.
+[[test]]
+name = "hostile_uploads"
+path = "tests/hostile_uploads.rs"
+
+# Installs a global `tracing` subscriber, as `report_runner` in `it` does, and
+# one process can hold only one (`cargo test`/`cargo llvm-cov` run a binary's
+# tests in one process).
+[[test]]
+name = "identity_password"
+path = "tests/identity_password.rs"
+
+# Opt-in parity tooling that mints a token against the operator's own
+# `DATABASE_URL`; the test-support bootstrap in `it` would overwrite it.
+[[test]]
+name = "parity"
+path = "tests/parity.rs"
 
 [dependencies]
 lakehouse-core = { path = "../lakehouse-core" }
@@ -29,7 +60,16 @@ lakehouse-auth = { path = "../lakehouse-auth" }
 # cookie's payload is base64url-encoded JSON — both need these directly,
 # not routed through `lakehouse-auth::token` (whose hashing is SHA-256 of a
 # bearer token for storage, a different job).
+# `secret_manager::aws`: the SigV4 signer's HMAC-SHA256 (already in the
+# workspace for `lakehouse-embed`; written here instead of the AWS SDK).
+hmac = { workspace = true }
+# `secret_manager::gcp`: signs the service account's RS256 JWT for the
+# documented token exchange (already a workspace dependency, `aws_lc_rs`
+# backend since SEC-51, as `lakehouse-auth` uses it); moved here from the
+# dev-dependencies it was only in so far.
+jsonwebtoken = { workspace = true }
 sha2 = { workspace = true }
+moka = { workspace = true }
 base64 = { workspace = true }
 # Builds the IdP authorize-endpoint redirect URL with `Url::query_pairs_mut`
 # rather than hand-formatting a query string — see the workspace `Cargo.toml`
@@ -58,17 +98,21 @@ lakehouse-iceberg = { path = "../lakehouse-iceberg" }
 # which `lakehouse-iceberg` does not re-export.
 iceberg = "=0.10.1"
 rand = { workspace = true }
+aes-gcm = { workspace = true }
 axum = { workspace = true }
 # `sync` (Mutex/OnceCell/Barrier): explicit here, not left to incidental
 # workspace feature unification, because `gold_lock::MartLocks`
 # (`tokio::sync::Mutex`/`OwnedMutexGuard`) and its tests
 # (`tokio::sync::Barrier`) need it directly, and this crate should compile
 # correctly on its own, not only as part of the whole-workspace build.
+# `process`: the child that reads an uploaded workbook or a Parquet file
+# (`upload_convert`, `SEC-22`) is a process of this binary, started with
+# `tokio::process::Command`.
 # `time`: `crate::bounded::run_with_budget` (WS2 §4) needs
 # `tokio::time::{timeout_at, Instant, sleep}` to bound per-table/per-namespace
 # Lakekeeper calls. `io-util`: `tokio::io::duplex` backs `routes::ai::stream_chat`'s
 # NDJSON progress pipe for `POST /api/ai/chat` (`stream: true`).
-tokio = { workspace = true, features = ["sync", "time", "io-util"] }
+tokio = { workspace = true, features = ["sync", "time", "io-util", "process"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 reqwest = { workspace = true }
@@ -88,21 +132,24 @@ croner.workspace = true
 # list, WHERE, nested subquery) without hand-rolling an exhaustive
 # `Expr` match that a future sqlparser variant could silently bypass.
 sqlparser = { workspace = true, features = ["visitor"] }
-# `croner` 2.x always pulls in `chrono` as its own non-optional datetime
-# backend (see `rust/Cargo.toml`'s comment on the `croner` entry); this
+# `croner` pulls in `chrono` as its datetime backend through its default
+# `chrono` feature (see `rust/Cargo.toml`'s comment on the `croner` entry); this
 # crate needs `chrono` itself as a direct dependency too, for
 # `crate::next_run::next_run_at`'s own `chrono::DateTime::from_timestamp`
 # round trip -- `chrono` was already in `rust/Cargo.lock` as a TRANSITIVE
 # dependency of something else in the tree, but this is the first direct
 # use of it in this crate (WS4 item G2).
 chrono = "0.4"
+# BI-4 B review P-B1: the calendar day in the report time zone (the same
+# workspace `jiff` and bundled database `lakehouse-store` already uses).
+jiff = { workspace = true }
 # Reads `.xls` and `.xlsx` for the file upload (`upload_workbook`, ADR 0014,
 # amendment of 2026-10-07). MIT; it adds `atoi_simd`, `codepage`,
 # `debug_unsafe`, `fast-float2`, `typed-path`, `zip` and `zopfli` to the
 # lockfile, each MIT or Apache-2.0, all in `deny.toml`'s allow list. No
 # features: dates are rendered from its date components, so its `chrono`
 # feature is not needed.
-calamine = "0.36"
+calamine = "0.38"
 uuid = { workspace = true }
 sqlx = { workspace = true }
 # `connector_probe`'s real S3-compatible connectivity test — same crate,
@@ -124,10 +171,30 @@ arrow-schema = "58"
 # licence); declared here because the upload's reader is the API's own, not
 # routed through the Iceberg crate.
 parquet = "58"
+# `DATA-17` slice 4 (plan AD8): the preview reads the Avro, gzip and zip files an upload may
+# be (`upload_formats`). All three are already in `Cargo.lock` through other crates, at
+# the versions below and with the features the build already unifies, so the lockfile
+# gains no crate. `apache-avro` is the crate `iceberg` uses for its manifests;
+# its default features are off here because codecs are not ours to choose (the preview
+# accepts the `null` and `deflate` codecs the job's `fastavro` reads without extras);
+# `zip` has `deflate` as `calamine` already enables it; `flate2` reads the gzip prefix.
+apache-avro = { version = "0.21", default-features = false }
+flate2 = "1.1"
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 # 0.13, not 0.12: SEC-8 — tiberius 0.12 pulls rustls 0.21 ->
 # rustls-webpki 0.101.7 (RUSTSEC-2026-0098/0099/0104, no fixed 0.101.x);
 # the 0.13 line is on rustls 0.23 -> webpki 0.103.15, all three fixed.
 tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "chrono"] }
+# SEC-14 part B (`pg_probe`): the Postgres connection test speaks the wire
+# protocol itself, so it can refuse every authentication method but
+# SCRAM-SHA-256, and always upgrades to TLS before the startup packet. See
+# the workspace `Cargo.toml` entries for what each crate is and why it is
+# here.
+postgres-protocol = { workspace = true }
+fallible-iterator = { workspace = true }
+bytes = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
 # `tiberius::Client::connect` takes a Tokio-`AsyncRead`/`AsyncWrite`
 # stream wrapped for the `futures`-crate traits tiberius itself uses
 # (tiberius's own doc comment, `src/lib.rs`'s "Connecting with Tokio"
@@ -142,12 +209,43 @@ tokio-util = { workspace = true, features = ["compat", "io"] }
 # (one copy in `Cargo.lock`); no TLS provider of its own beyond the `rustls`
 # feature `object_store`'s `aws` feature already turns on for it.
 reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
+# `SRC-13` (D2): `connector_listing` walks `object_store`'s `list` stream so a
+# bucket listing can stop at its bound instead of collecting every key.
+# `futures` 0.3 is already in `Cargo.lock` (`lakehouse-iceberg` depends on it),
+# so this adds no package; only this crate's dependency list in the lockfile.
+futures = "0.3"
+# `SEC-22`: the child process that reads an uploaded workbook or a Parquet
+# file (`upload_convert`) sets its own `RLIMIT_DATA` and `RLIMIT_CPU` with
+# `nix`, so the memory a crafted file can ask for is the child's and never
+# the API's. The crate was already in `Cargo.lock` (0.31.3) through other
+# crates, so the lockfile gains no package; only the `resource` feature and
+# this dependency list change. MIT.
+nix = { workspace = true }
+# `BI-1` D6: the .xlsx writer. Pinned exactly (a download format must not change
+# under a routine update); `constant_memory` mode keeps a million-row export off
+# the heap. MIT OR Apache-2.0; `cargo deny check` and `cargo audit` pass with it
+# (plan 2026-10-17-bi-1-export.md, section 5).
+# 0.102.0 (2026-10-29): `RUSTSEC-2026-0429` (`zip` 8.6.0: `ZipArchive::extract`
+# aborts the process on a symlink entry with a large declared size) came in
+# through this crate's own `zip` 8.6.0, and 0.102.0 is the release that asks
+# for `zip` 9, so `zip` 8.6.0 leaves the tree instead of being ignored
+# (plan `docs/superpowers/plans/2026-11-02-deps-rust-xlsxwriter-0102.md` D1).
+# The pin stays exact: a routine `cargo update` must not change the download
+# format.
+rust_xlsxwriter = { version = "=0.102.0", features = ["constant_memory"] }
 
 [dev-dependencies]
+# `BI-1` T2: the export tests open the .xlsx they wrote to read its cells and
+# styles. Same version and features as `calamine` and `rust_xlsxwriter` already
+# ask for, so the lockfile gains no package.
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 uuid = { workspace = true }
 lakehouse-test-support = { path = "../lakehouse-test-support" }
+# `AppState::webhook_sender_override`: tests that deliver to a loopback
+# `wiremock` listener need a resolver that approves it (`SEC-10` merge).
+lakehouse-notify = { path = "../lakehouse-notify", features = ["test-support"] }
 # connector_probe.rs's own tests (`PanicIfCalledResolver`) implement
 # `lakehouse_core::secret::DynSecretResolver` directly -- that trait is
 # `#[async_trait::async_trait]` at its definition site
@@ -155,8 +253,11 @@ lakehouse-test-support = { path = "../lakehouse-test-support" }
 async-trait = { workspace = true }
 # `#[tokio::test(start_paused = true)]` for `bounded::run_with_budget`'s
 # deterministic budget/timeout tests (WS2 §4) — a real `sleep` would make
-# those tests slow and, at the margins, flaky.
-tokio = { workspace = true, features = ["test-util"] }
+# those tests slow and, at the margins, flaky. `net`/`io-util` are for
+# `tests/sec41_verify_ca.rs`'s TLS terminator (a loopback `TcpListener` and
+# `copy_bidirectional`), which is the only thing in this crate's tests that
+# needs a socket of its own.
+tokio = { workspace = true, features = ["test-util", "net", "io-util"] }
 # `tests/gold_publication.rs` (DATA-1) proves the per-mart publication
 # routes' ClickHouse-backed halves (404 for an unknown mart, skip-when-
 # unchanged for `?ifChanged=true`) against a REAL `ClickHouse` — the same
@@ -175,14 +276,41 @@ testcontainers-modules = { version = "0.15", features = ["clickhouse"] }
 # `oidc_callback` calls `OidcAuthenticator::authenticate_with_nonce`
 # against a `wiremock` `/jwks` + `/token` pair, the same
 # harness shape `lakehouse-auth/tests/oidc.rs` already uses for that
-# authenticator directly — `jsonwebtoken` is already a workspace
-# dependency (root `Cargo.toml`); `rsa` is not (it is a direct dependency
-# of `lakehouse-auth` only), so it is added here directly too, pinned to
-# the same "0.9" `lakehouse-auth/Cargo.toml` already uses.
-jsonwebtoken = { workspace = true }
+# authenticator directly — `jsonwebtoken` is a normal dependency now (see
+# above, `SRC-12` part B4); `rsa` is not a workspace dependency (it is a
+# direct dependency of `lakehouse-auth` only), so it is added here directly
+# too, pinned to the same "0.9" `lakehouse-auth/Cargo.toml` already uses.
+# `secret_manager::gcp`'s tests also generate a service-account key with it.
 rsa = "0.9"
 
+# `SEC-14` part B (dev-only): the TLS-terminating proxy in front of the
+# shared test `Postgres` (`src/tls_proxy.rs`) needs a server certificate,
+# and a test can only get one by generating it -- no certificate is
+# committed to this repository (gitleaks reads a committed private key as a
+# leak). `ring` and no `crypto` defaults, matching the workspace's one
+# rustls provider story (the workspace `rustls` entry); MIT OR Apache-2.0.
+# `SEC-41` decision 7 / AC1: `tests/sec41_verify_ca.rs` puts a TLS
+# terminator in front of the shared test Postgres (answer `SSLRequest` with
+# `S`, then rustls, then forward bytes) and needs a certificate chain per
+# test. No certificate is committed to this repository: `.gitleaksignore`'s
+# history (SEC-36) reads a committed private key as a leak, so the chain is
+# minted at test time. `rcgen` with `ring` and no `crypto`/`pem` defaults,
+# matching this workspace's one rustls provider story (the `rustls` feature
+# `sqlx-core` turns on); MIT OR Apache-2.0. 0.14 compiles no crate the lock
+# did not already carry -- `ring`, `time` and `rustls-pki-types` are in it,
+# and `yasna` moves 0.5.2 -> 0.6.0 -- but it does add entries for the
+# optional `x509-parser` 0.18.1 (with its tree) and `bit-vec` 0.9.1, plus a
+# second `nom` (7.1.3 beside 8.0.0). None of those is built: `rcgen` and
+# `yasna` only name them weakly (`x509-parser?/verify`, `bit-vec?/std`).
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+
 tempfile = { workspace = true }
+# The terminator's own TLS server side, and the provider named explicitly so
+# it does not depend on which rustls consumer set the process default first.
+# Both are already in `Cargo.lock` (through `reqwest`/`object_store`/
+# `sqlx-core`); these are the first DIRECT uses here.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
 [lints]
 workspace = true

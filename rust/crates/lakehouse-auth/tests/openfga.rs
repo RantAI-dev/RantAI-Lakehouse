@@ -19,7 +19,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use lakehouse_auth::Secret;
-use lakehouse_auth::openfga::{LakekeeperAdminClient, OpenfgaError, TenantWarehouseStorage};
+use lakehouse_auth::openfga::{
+    DeletedTableLookup, LakekeeperAdminClient, OpenfgaError, TenantWarehouseStorage,
+};
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -51,8 +53,14 @@ async fn ensure_warehouse_reuses_an_existing_warehouse_by_name_instead_of_recrea
         .expect(1)
         .mount(&server)
         .await;
-    // No POST mock registered at all — if the client tried to create,
-    // wiremock's unmatched-request panic on drop catches it.
+    // The only POST is the soft-delete profile (`DATA-15` F4); a POST to
+    // `/management/v1/warehouse` would be a create and would 404 here.
+    Mock::given(method("POST"))
+        .and(path("/management/v1/warehouse/wh-existing/delete-profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
     let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
     let id = client
         .ensure_warehouse("tenant-acme", "lakehouse-warehouse/acme/", &test_storage())
@@ -98,6 +106,16 @@ async fn ensure_warehouse_creates_when_no_warehouse_with_that_name_exists() {
             }
         })))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({"warehouse-id": "wh-new"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // `DATA-15` F4: the new warehouse is made soft-delete (7 days).
+    Mock::given(method("POST"))
+        .and(path("/management/v1/warehouse/wh-new/delete-profile"))
+        .and(body_json(json!({
+            "delete-profile": {"type": "soft", "expiration-seconds": 604_800}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&server)
         .await;
@@ -161,7 +179,7 @@ async fn ensure_warehouse_classifies_a_5xx_as_server() {
 }
 
 #[tokio::test]
-async fn grant_machine_principals_sends_the_five_fixed_grants_lakekeeper_authz_init_sends() {
+async fn grant_machine_principals_sends_the_four_fixed_grants_lakekeeper_authz_init_sends() {
     let server = MockServer::start().await;
     // Matches `docker-compose.yml`'s `lakekeeper-authz-init` `grant()`
     // calls exactly (principal, verb set, and the `oidc~<principal>`
@@ -170,7 +188,6 @@ async fn grant_machine_principals_sends_the_five_fixed_grants_lakekeeper_authz_i
     // test, not just a production tenant-provisioning run.
     let expected_grants: &[(&str, &[&str])] = &[
         ("rust-iceberg", &["create", "modify", "select"]),
-        ("debezium", &["create", "modify", "select"]),
         ("dlt", &["create", "modify", "select"]),
         ("clickhouse-reader", &["select", "modify"]),
         ("trino", &["select", "modify"]),
@@ -220,4 +237,326 @@ async fn grant_machine_principals_fails_on_an_unexpected_status() {
         .await;
     let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
     assert!(client.grant_machine_principals("wh-1").await.is_err());
+}
+
+/// `DATA-15` F4: a warehouse that cannot be put on soft delete is an error,
+/// not a silent hard-delete warehouse.
+#[tokio::test]
+async fn a_refused_soft_delete_profile_fails_the_provisioning_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "warehouses": [{"id": "wh-existing", "name": "tenant-acme"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/management/v1/warehouse/wh-existing/delete-profile"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let err = client
+        .ensure_warehouse("tenant-acme", "lakehouse-warehouse/acme/", &test_storage())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, OpenfgaError::Rejected), "{err:?}");
+}
+
+fn deleted(id: &str, name: &str, ns: &[&str], typ: &str, at: &str) -> serde_json::Value {
+    json!({
+        "id": id, "name": name, "namespace": ns, "typ": typ,
+        "warehouse-id": "wh-1",
+        "created-at": "2026-10-01T00:00:00Z",
+        "deleted-at": at,
+        "expiration-date": "2026-10-23T00:00:00Z"
+    })
+}
+
+/// `DATA-15` F4: the deleted-tabulars list is read page by page, only a
+/// *table* of that namespace and name matches, and the newest drop wins.
+#[tokio::test]
+async fn find_deleted_table_pages_matches_exactly_and_picks_the_newest_drop() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .and(wiremock::matchers::query_param("pageToken", "p2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tabulars": [deleted("t-new", "orders", &["bronze"], "table", "2026-10-16T09:00:00Z")]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tabulars": [
+                deleted("t-old", "orders", &["bronze"], "table", "2026-10-10T09:00:00Z"),
+                deleted("t-view", "orders", &["bronze"], "view", "2026-10-15T09:00:00Z"),
+                deleted("t-other-ns", "orders", &["silver"], "table", "2026-10-15T09:00:00Z"),
+                deleted("t-other", "orders_archive", &["bronze"], "table", "2026-10-15T09:00:00Z")
+            ],
+            "next-page-token": "p2"
+        })))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let found = match client
+        .find_deleted_table("wh-1", "bronze", "orders")
+        .await
+        .unwrap()
+    {
+        DeletedTableLookup::Found(t) => t,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert_eq!(found.id, "t-new");
+    assert_eq!(found.expires_at, "2026-10-23T00:00:00Z");
+    assert_eq!(
+        client
+            .find_deleted_table("wh-1", "bronze", "nothing")
+            .await
+            .unwrap(),
+        DeletedTableLookup::None
+    );
+}
+
+// PR #106 review R1 SHOULD-FIX DATA-15 2
+#[tokio::test]
+async fn find_deleted_table_stops_after_20_pages_and_returns_could_not_tell() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tabulars": [],
+            "next-page-token": "more"
+        })))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let lookup = client
+        .find_deleted_table("wh-1", "bronze", "orders")
+        .await
+        .unwrap();
+    assert_eq!(lookup, DeletedTableLookup::CouldNotTell);
+}
+
+/// `DATA-15` F4: undrop sends the table's id as a `table` target.
+#[tokio::test]
+async fn undrop_table_sends_the_table_id_as_a_table_target() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .and(body_json(
+            json!({"targets": [{"id": "t-1", "type": "table"}]}),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    client.undrop_table("wh-1", "t-1").await.unwrap();
+}
+
+/// `DATA-55` D2: the drop is ONE `DELETE` to the warehouse's catalog path,
+/// with no query string (no `purgeRequested`: this is the soft delete), sent as
+/// the admin principal.
+#[tokio::test]
+async fn drop_table_sends_one_delete_to_that_warehouses_catalog_path_with_no_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/catalog/v1/wh-1/namespaces/bronze/tables/orders"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    assert!(
+        client.drop_table("wh-1", "bronze", "orders").await.unwrap(),
+        "a 204 means the catalog dropped the table"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let url = requests[0].url.clone();
+    assert!(
+        url.query().is_none(),
+        "a purge query would make the drop a hard delete: {url}"
+    );
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("Authorization")
+            .map(|v| v.to_str().unwrap()),
+        Some("Bearer admin-token")
+    );
+}
+
+/// `DATA-55` D2: a table the catalog does not hold is `Ok(false)`; every other
+/// refusal is classified, never carried as text.
+#[tokio::test]
+async fn drop_table_is_false_for_a_table_that_is_not_there_and_classifies_the_other_refusals() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/catalog/v1/wh-1/namespaces/bronze/tables/missing"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/catalog/v1/wh-1/namespaces/bronze/tables/refused"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/catalog/v1/wh-1/namespaces/bronze/tables/broken"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    assert!(
+        !client
+            .drop_table("wh-1", "bronze", "missing")
+            .await
+            .unwrap(),
+        "a 404 means there was no table to drop"
+    );
+    assert!(matches!(
+        client.drop_table("wh-1", "bronze", "refused").await,
+        Err(OpenfgaError::Rejected)
+    ));
+    assert!(matches!(
+        client.drop_table("wh-1", "bronze", "broken").await,
+        Err(OpenfgaError::Server)
+    ));
+}
+
+/// `DATA-55` D2: a name that is not a plain identifier would address another
+/// catalog path, so the client refuses it before building a request.
+#[tokio::test]
+async fn drop_table_sends_nothing_for_a_name_that_is_not_a_plain_identifier() {
+    let server = MockServer::start().await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    for table in ["orders/../x", "", "orders?purgeRequested=true"] {
+        assert!(
+            matches!(
+                client.drop_table("wh-1", "bronze", table).await,
+                Err(OpenfgaError::Rejected)
+            ),
+            "{table:?} must be refused"
+        );
+    }
+    assert!(
+        matches!(
+            client.drop_table("wh-1", "", "orders").await,
+            Err(OpenfgaError::Rejected)
+        ),
+        "an empty namespace is refused too"
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "nothing was sent"
+    );
+}
+
+/// `DATA-15` F4: a refused undrop is `Rejected`, and the warehouse lookup
+/// answers by name.
+#[tokio::test]
+async fn a_refused_undrop_is_rejected_and_a_warehouse_is_found_by_name() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .respond_with(ResponseTemplate::new(409))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "warehouses": [{"id": "wh-1", "name": "default"}]
+        })))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let err = client.undrop_table("wh-1", "t-1").await.unwrap_err();
+    assert!(matches!(err, OpenfgaError::Rejected), "{err:?}");
+    assert_eq!(
+        client
+            .find_warehouse_id("default")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("wh-1")
+    );
+    assert!(client.find_warehouse_id("other").await.unwrap().is_none());
+}
+
+/// DATA-5 / ADR 0016 point 3: the namespace-scoped grant. The
+/// `outside-readers` principal must be able to `select` in the `gold`
+/// namespace — and only there.
+///
+/// The assertion is on the exact request `Lakekeeper` receives (method,
+/// path, body), not merely that the call returned `Ok`: a grant that
+/// reached the catalog with the wrong relation, the wrong principal, or
+/// the warehouse-scoped path would leave the door unable to read
+/// anything, and only the request's shape proves that does not happen.
+#[tokio::test]
+async fn grant_namespace_select_sends_the_select_relation_for_that_namespace_only() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/permissions/namespace/ns-1/assignments",
+        ))
+        .and(body_json(json!({
+            "writes": [{ "type": "select", "user": "oidc~outside-readers" }]
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    client
+        .grant_namespace_select("ns-1", "outside-readers")
+        .await
+        .unwrap();
+}
+
+/// The grant is idempotent: `409` (an identical tuple already exists) is
+/// success, the same shape `grant_machine_principals` treats as one.
+#[tokio::test]
+async fn grant_namespace_select_treats_409_as_success() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/permissions/namespace/ns-1/assignments",
+        ))
+        .respond_with(ResponseTemplate::new(409))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    client
+        .grant_namespace_select("ns-1", "outside-readers")
+        .await
+        .unwrap();
+}
+
+/// A refused grant is classified: a `4xx` is `Rejected` (our request was
+/// refused — an unknown namespace, a principal the catalog does not
+/// know), a `5xx` is `Server`. Neither is swallowed.
+#[tokio::test]
+async fn a_refused_namespace_grant_is_classified_and_not_swallowed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/permissions/namespace/ns-1/assignments",
+        ))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let err = client
+        .grant_namespace_select("ns-1", "outside-readers")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, OpenfgaError::Rejected), "{err:?}");
 }

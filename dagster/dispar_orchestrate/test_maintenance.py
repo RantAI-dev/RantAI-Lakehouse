@@ -373,28 +373,77 @@ class ExpireSnapshotsResultTest(unittest.TestCase):
     """`_expire_snapshots_result` decides and (if requested) executes the
     `expire_snapshots` verb via Trino."""
 
-    def test_no_policy_keeps_todays_clickhouse_probe_reason_and_makes_no_trino_call(
+    def test_table_without_policy_expires_snapshots_older_than_seven_days(
         self,
     ) -> None:
-        with mock.patch.object(maintenance, "_trino_execute") as mocked:
+        with mock.patch.object(maintenance, "_trino_execute", return_value=[]) as mocked:
             skip, verb_run = maintenance._expire_snapshots_result(
                 _cfg(), "bronze", "orders", None, "Code: 48 ... transactional catalog",
                 datetime.now(timezone.utc), None,
             )
-        self.assertEqual(skip, "expire_snapshots (Code: 48 ... transactional catalog)")
-        self.assertIsNone(verb_run)
-        mocked.assert_not_called()
+        self.assertIsNone(skip)
+        self.assertIsNotNone(verb_run)
+        self.assertEqual(verb_run["outcome"], "applied")
+        self.assertEqual(
+            verb_run["detail"], "default retention 7d (no snapshotsToKeep policy)"
+        )
+        mocked.assert_called_once_with(
+            mock.ANY,
+            'ALTER TABLE iceberg.bronze."orders" EXECUTE expire_snapshots(retention_threshold => \x277d\x27)',
+        )
 
-    def test_a_policy_with_no_snapshots_to_keep_behaves_like_no_policy(self) -> None:
+    def test_table_without_policy_records_trino_unreachable_as_skipped(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoUnavailableError("trino unreachable: connection refused"),
+        ):
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg(), "bronze", "orders", None, "Code: 48 ... transactional catalog",
+                datetime.now(timezone.utc), None,
+            )
+        self.assertEqual(skip, "expire_snapshots/optimize skipped: trino unreachable")
+        self.assertIsNotNone(verb_run)
+        self.assertEqual(verb_run["outcome"], "skipped")
+        self.assertEqual(verb_run["detail"], "trino unreachable")
+
+    def test_table_without_policy_records_a_trino_refusal_as_refused(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            maintenance,
+            "_trino_execute",
+            side_effect=maintenance.TrinoQueryError("Query failed: retention shorter than min retention"),
+        ):
+            skip, verb_run = maintenance._expire_snapshots_result(
+                _cfg(), "bronze", "orders", None, "Code: 48 ... transactional catalog",
+                datetime.now(timezone.utc), None,
+            )
+        self.assertIsNotNone(skip)
+        self.assertIn("refused", skip or "")
+        self.assertIsNotNone(verb_run)
+        self.assertEqual(verb_run["outcome"], "refused")
+        self.assertEqual(verb_run["detail"], "Query failed: retention shorter than min retention")
+
+    def test_policy_with_no_snapshots_to_keep_uses_default_retention(self) -> None:
         policy = {"snapshotsToKeep": None, "compactSmallFiles": False, "schedule": None}
-        with mock.patch.object(maintenance, "_trino_execute") as mocked:
+        with mock.patch.object(maintenance, "_trino_execute", return_value=[]) as mocked:
             skip, verb_run = maintenance._expire_snapshots_result(
                 _cfg(), "bronze", "orders", policy, "ch probe reason",
                 datetime.now(timezone.utc), None,
             )
-        self.assertEqual(skip, "expire_snapshots (ch probe reason)")
-        self.assertIsNone(verb_run)
-        mocked.assert_not_called()
+        self.assertIsNone(skip)
+        self.assertIsNotNone(verb_run)
+        self.assertEqual(verb_run["outcome"], "applied")
+        self.assertEqual(
+            verb_run["detail"], "default retention 7d (no snapshotsToKeep policy)"
+        )
+        mocked.assert_called_once_with(
+            mock.ANY,
+            'ALTER TABLE iceberg.bronze."orders" EXECUTE expire_snapshots(retention_threshold => \x277d\x27)',
+        )
 
     def test_a_table_with_fewer_snapshots_than_the_keep_count_is_skipped(self) -> None:
         now = datetime(2026, 1, 10, tzinfo=timezone.utc)
@@ -433,7 +482,7 @@ class ExpireSnapshotsResultTest(unittest.TestCase):
         self.assertEqual(verb_run and verb_run["outcome"], "refused")
         self.assertEqual(mocked.call_count, 2)  # one read, one attempted ALTER — no retry
 
-    def test_a_successful_expiry_is_not_also_recorded_as_skipped(self) -> None:
+    def test_policy_with_snapshots_to_keep_still_uses_its_own_threshold(self) -> None:
         now = datetime(2026, 1, 10, tzinfo=timezone.utc)
         policy = {"snapshotsToKeep": 1, "schedule": None}
         rows = [["2026-01-09 23:59:00.000 UTC"], ["2026-01-01 00:00:00.000 UTC"]]
@@ -443,12 +492,17 @@ class ExpireSnapshotsResultTest(unittest.TestCase):
                 return rows
             return []
 
-        with mock.patch.object(maintenance, "_trino_execute", side_effect=fake_trino_execute):
+        with mock.patch.object(maintenance, "_trino_execute", side_effect=fake_trino_execute) as mocked:
             skip, verb_run = maintenance._expire_snapshots_result(
                 _cfg(), "bronze", "orders", policy, "unused", now, None
             )
         self.assertIsNone(skip)
         self.assertEqual(verb_run and verb_run["outcome"], "applied")
+        self.assertEqual(verb_run and verb_run["detail"], "retention_threshold=60s")
+        mocked.assert_called_with(
+            mock.ANY,
+            'ALTER TABLE iceberg.bronze."orders" EXECUTE expire_snapshots(retention_threshold => \x2760s\x27)',
+        )
 
     def test_trino_being_unreachable_is_a_degraded_skip_not_a_failure(self) -> None:
         policy = {"snapshotsToKeep": 1, "schedule": None}
@@ -555,16 +609,18 @@ class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
                 policy_fetch_error=None,
             )
 
-        mocked_trino.assert_called_once()
-        sql = mocked_trino.call_args.args[1]
-        self.assertIn("EXECUTE optimize", sql)
+        self.assertEqual(mocked_trino.call_count, 2)
+        sqls = [c.args[1] for c in mocked_trino.call_args_list]
+        self.assertTrue(any("EXECUTE expire_snapshots" in s for s in sqls))
+        self.assertTrue(any("EXECUTE optimize" in s for s in sqls))
         mocked_record_verb_run.assert_called_once()
         verb_runs = mocked_record_verb_run.call_args.kwargs["verb_runs"]
         self.assertEqual(
-            [v["verb"] for v in verb_runs if v["outcome"] == "applied"], ["optimize"]
+            [v["verb"] for v in verb_runs if v["outcome"] == "applied"],
+            ["expire_snapshots", "optimize"],
         )
 
-    def test_a_table_with_no_policy_row_makes_no_trino_call(self) -> None:
+    def test_table_with_no_policy_row_runs_default_snapshot_expiry_via_trino(self) -> None:
         with mock.patch.object(
             maintenance, "probe_expire_snapshots_skip", return_value="ch refuses"
         ), mock.patch.object(
@@ -577,7 +633,7 @@ class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
         ) as mocked_record_run, mock.patch.object(
             maintenance, "record_maintenance_verb_run"
         ) as mocked_record_verb_run, mock.patch.object(
-            maintenance, "_trino_execute"
+            maintenance, "_trino_execute", return_value=[]
         ) as mocked_trino:
             maintenance._run_maintenance_for_table(
                 cfg=maintenance.MaintenanceConfig.from_env(),
@@ -586,13 +642,19 @@ class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
                 policy_fetch_error=None,
             )
 
-        mocked_trino.assert_not_called()
-        mocked_record_verb_run.assert_not_called()
+        mocked_trino.assert_called_once_with(
+            mock.ANY,
+            'ALTER TABLE iceberg.bronze."orders" EXECUTE expire_snapshots(retention_threshold => \x277d\x27)',
+        )
+        mocked_record_verb_run.assert_called_once()
+        verb_runs = mocked_record_verb_run.call_args.kwargs["verb_runs"]
+        self.assertEqual(
+            [v["verb"] for v in verb_runs if v["outcome"] == "applied"], ["expire_snapshots"]
+        )
         skipped_verbs = mocked_record_run.call_args.kwargs["skipped_verbs"]
         self.assertEqual(
             skipped_verbs,
             [
-                "expire_snapshots (ch refuses)",
                 "OPTIMIZE (returns OK on 26.8 but does not bin-pack — not a "
                 "compaction remedy; Trino owns that, see ADR 0009)",
             ],

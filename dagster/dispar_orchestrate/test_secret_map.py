@@ -29,6 +29,11 @@ def test_rest_needs_fields_matching_its_auth_type() -> None:
         "clientId",
         "clientSecret",
     )
+    # SRC-12 part C: pinned against `ingest_spec::secret_field_names`.
+    assert secret_field_names("rest", "oauth2_authorization_code") == (
+        "clientSecret",
+        "refreshToken",
+    )
 
 
 def test_sheets_needs_a_service_account_json() -> None:

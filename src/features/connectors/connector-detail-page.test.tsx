@@ -70,6 +70,7 @@ const DETAIL = {
   dependentPipelines: [] as { id: string; name: string; kind: string }[],
   auditEventId: "evt-1",
   credentialManaged: true,
+  credentialSource: "managed",
   credentialKind: "password",
   credentialSecondaryKind: null,
   residency: "id-jakarta",
@@ -106,14 +107,14 @@ function stubFetch(
     calls.push({ url: target, method })
     const key = `${method} ${target}`
     if (overrides[key]) return overrides[key]()
+    if (key === "GET /api/connectors/credential-settings") return json({ secretManager: null, typedCredentials: true })
     if (key === "GET /api/connectors/conn-a") return json(detail)
     if (key === "GET /api/connectors/conn-a/ingest-spec") return json(SPEC)
     if (key.startsWith("GET /api/connectors/conn-a/probe-history")) {
       return json({ results: key.endsWith("?limit=1") ? probes.slice(0, 1) : probes })
     }
     if (key === "GET /api/connectors/conn-a/schema-changes") return json({ pending: [], recent: [], inactiveColumns: [] })
-    if (key === "GET /api/connectors/conn-a/ingest/runs") return json([])
-    if (key === "GET /api/governance/ingest-runs?connectorId=conn-a") return json([])
+    if (key === "GET /api/connectors/conn-a/runs") return json({ runs: [] })
     if (key === "POST /api/connectors/conn-a/test") {
       probes.unshift({ testedAt: "2026-10-05T01:00:00.000Z", ok: true, latencyMs: 5, message: "Connected via PostgreSQL" })
       return json({ ok: true, supported: true, latencyMs: 5, message: "Connected via PostgreSQL", testedAt: probes[0].testedAt })
@@ -202,6 +203,78 @@ describe("ConnectorDetailPage", () => {
     expect(selected("Ingest")).toBe("false")
     expect(selected("Connection tests")).toBe("false")
     expect(window.history.replaceState).not.toHaveBeenCalled()
+  })
+
+  /** `SRC-12` part B: a reference credential, and the secret manager the installation reads from. */
+  it("says the credential is a reference and names the secret manager, when one is set up", async () => {
+    stubFetch(
+      { "GET /api/connectors/credential-settings": () => json({ secretManager: "gcp", typedCredentials: true }) },
+      { ...DETAIL, credentialSource: "reference", credentialManaged: false }
+    )
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByRole("heading", { level: 1, name: "db demo" })
+    expect(await screen.findByText(/Reference to a secret in the secret manager/)).toBeDefined()
+    expect(await screen.findByText("Google Secret Manager")).toBeDefined()
+  })
+
+  it("leaves the secret manager fact out when none is set up", async () => {
+    stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByRole("heading", { level: 1, name: "db demo" })
+    await settle()
+    expect(screen.queryByText("Secret manager")).toBeNull()
+  })
+
+  /** `SRC-12` part C: a REST connector that signs in with OAuth gets the Sign in panel; no other connector does. */
+  const OAUTH_SPEC = {
+    ...SPEC,
+    adapter: "rest",
+    dial: {
+      baseUrl: "https://api.example.com",
+      auth: {
+        type: "oauth2_authorization_code",
+        clientId: "app-1",
+        authorizeUrl: "https://login.example.com/authorize",
+        tokenUrl: "https://login.example.com/token",
+        scopes: [],
+      },
+      pagination: { type: "none" },
+      endpoints: [{ path: "/items", recordsPath: null }],
+    },
+  }
+
+  it("shows the Sign in panel for a connector that signs in with OAuth, and asks for its status", async () => {
+    const { count } = stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(OAUTH_SPEC),
+      "GET /api/connectors/conn-a/oauth": () =>
+        json({ signedIn: false, callbackUrl: "https://console.test/api/connectors/oauth/callback", revocationConfigured: false }),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    expect(await screen.findByText("Not signed in")).toBeDefined()
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeDefined()
+    expect(count("GET /api/connectors/conn-a/oauth")).toBeGreaterThan(0)
+  })
+
+  it("shows no Sign in panel, and never asks for OAuth status, for any other connector", async () => {
+    const { count } = stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByRole("heading", { level: 1, name: "db demo" })
+    await settle()
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull()
+    expect(count("GET /api/connectors/conn-a/oauth")).toBe(0)
+  })
+
+  it("tells the person, before deleting an OAuth connector, whether the provider can be told", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(OAUTH_SPEC),
+      "GET /api/connectors/conn-a/oauth": () =>
+        json({ signedIn: true, callbackUrl: null, revocationConfigured: false }),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByText("Signed in")
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }))
+    const dialog = await screen.findByRole("dialog")
+    expect(within(dialog).getByText(/the token stays valid there until it expires/)).toBeDefined()
   })
 
   it("marks a paused connector in the header and holds Run now back with the reason", async () => {
@@ -377,7 +450,10 @@ describe("ConnectorDetailPage", () => {
     expect(fact("Tenant")).toBe("Acme Co")
     expect(fact("Residency")).toBe("id-jakarta")
     expect(fact("Owner")).toBe("admin")
-    expect(fact("Credential")).toBe("Stored by lakehouse")
+    // QA LH-SRC-6-39 (SRC-41 D15): the fact is "—" until the ingest spec has
+    // answered, so this one expectation waits for it (the expected text is
+    // unchanged; the page gained a loading state).
+    await waitFor(() => expect(fact("Credential")).toBe("Stored by lakehouse, encrypted"))
     expect(fact("Last test")).toBe("Never tested")
     // The type (the description) and the environment (a pill by the name) are
     // in the header already, so the row does not say them a second time.
@@ -401,6 +477,7 @@ describe("ConnectorDetailPage", () => {
         residency: "",
         owner: "",
         credentialManaged: false,
+        credentialSource: "env",
         lastTestAt: "2026-10-04T00:00:00.000Z",
       }
     )
@@ -411,7 +488,10 @@ describe("ConnectorDetailPage", () => {
     expect(fact("Tenant")?.textContent).toBe("Unassigned")
     expect(fact("Residency")?.textContent).toBe("—")
     expect(fact("Owner")?.textContent).toBe("—")
-    expect(fact("Credential")?.textContent).toBe("Provisioned on the server")
+    // SRC-12 decision 10: an environment variable says a restart is needed.
+    expect(fact("Credential")?.textContent).toBe(
+      "Environment variable on the server (a restart is needed after a change)"
+    )
     const lastTest = fact("Last test")
     expect(lastTest?.textContent).not.toBe("Never tested")
     expect(lastTest?.querySelector("[title]")?.getAttribute("title")).toMatch(/2026/)
@@ -575,6 +655,67 @@ describe("ConnectorDetailPage", () => {
     expect(screen.getByRole("link", { name: "ingest_demo" }).getAttribute("href")).toBe("/pipelines/pl-1")
   })
 
+  // WEB-3 S2-D3: a CDC connector shows its own replication slot's health,
+  // from the same component and API as System status.
+  describe("the replication slot of a CDC connector", () => {
+    const CDC_SPEC = {
+      ...SPEC,
+      adapter: "cdc",
+      ingestMode: "cdc",
+      dial: { ...SPEC.dial, slotName: "rantai_slot", publicationName: "rantai_pub" },
+    }
+    const slot = (connectorId: string, slotName: string, checkedAt: string, active: boolean) => ({
+      connectorId,
+      slotName,
+      checkedAt,
+      active,
+      walRetainedBytes: "1024",
+      confirmedFlushLagBytes: "0",
+      status: active ? "ok" : "critical",
+    })
+
+    it("shows this connector's slot as last checked, and no other connector's", async () => {
+      stubFetch({
+        "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+        "GET /api/governance/replication": () =>
+          json({
+            replicationSlots: [
+              slot("conn-a", "rantai_slot", "2026-11-04T10:00:00Z", false),
+              slot("conn-b", "other_slot", "2026-11-04T10:00:00Z", true),
+              slot("conn-a", "rantai_slot", "2026-11-04T09:45:00Z", true),
+            ],
+          }),
+      })
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+
+      expect(await screen.findByText("rantai_slot")).toBeDefined()
+      // The newest reading only: disconnected at 10:00, not connected at 09:45.
+      expect(screen.getAllByText("rantai_slot")).toHaveLength(1)
+      expect(screen.getByText("Disconnected")).toBeDefined()
+      expect(screen.queryByText("other_slot")).toBeNull()
+    })
+
+    it("says there is no reading yet, in one line, when the connector has none", async () => {
+      stubFetch({
+        "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+        "GET /api/governance/replication": () => json({ replicationSlots: [] }),
+      })
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+
+      expect(await screen.findByText(/No replication-slot reading for this connector yet/)).toBeDefined()
+    })
+
+    it("does not ask for slot health for a connector that is not CDC", async () => {
+      const { count } = stubFetch()
+      render(<ConnectorDetailPage connectorId="conn-a" />)
+      await screen.findByRole("button", { name: "Delete" })
+      await settle()
+
+      expect(count("GET /api/governance/replication")).toBe(0)
+      expect(screen.queryByText("Replication slot")).toBeNull()
+    })
+  })
+
   it("goes back to Sources after the connector is deleted", async () => {
     const { count } = stubFetch()
     render(<ConnectorDetailPage connectorId="conn-a" />)
@@ -586,5 +727,115 @@ describe("ConnectorDetailPage", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }))
     await waitFor(() => expect(pushed).toEqual(["/connectors"]))
     expect(count("DELETE /api/connectors/conn-a")).toBe(1)
+  })
+})
+
+/**
+ * `SRC-4` slice 4 (S4-g): a change-capture connector has a Change capture tab with its state, the lag of each
+ * table and the lag limit; any other connector has none. A connection test of such a connector lists what the
+ * source must have switched on, the missing settings first (S4-f).
+ */
+describe("ConnectorDetailPage change capture", () => {
+  const CDC_SPEC = { ...SPEC, adapter: "cdc", ingestMode: "cdc", sourceObjects: [{ name: "public.orders", target: "orders" }] }
+  const CAPTURE = {
+    supported: true,
+    state: "running",
+    lag: {
+      tables: [
+        { table: "public.orders", status: "behind", seconds: 125 },
+        { table: "public.items", status: "up_to_date" },
+      ],
+      worst: { table: "public.orders", seconds: 125 },
+      limitMinutes: 15,
+      alertOpen: false,
+    },
+  }
+
+  it("has a Change capture tab for a change-capture connector, between Ingest and Schema changes", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+      "GET /api/connectors/conn-a/change-capture": () => json(CAPTURE),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await settle()
+    await waitFor(() => expect(screen.getAllByRole("tab").map((t) => t.textContent ?? "")[2]).toBe("Change capture"))
+  })
+
+  it("has no Change capture tab for any other connector, and ?tab=capture lands on the Overview", async () => {
+    url.search = "tab=capture"
+    stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await settle()
+    expect(screen.queryByRole("tab", { name: "Change capture" })).toBeNull()
+    await waitFor(() => expect(selected("Overview")).toBe("true"))
+  })
+
+  it("opens the tab for ?tab=capture and words each table's lag", async () => {
+    url.search = "tab=capture"
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+      "GET /api/connectors/conn-a/change-capture": () => json(CAPTURE),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    expect(await screen.findByText("Behind by 2m")).toBeDefined()
+    expect(screen.getByText("Up to date")).toBeDefined()
+    expect(screen.getByText("Running")).toBeDefined()
+    expect((screen.getByLabelText("Alert after (minutes)") as HTMLInputElement).value).toBe("15")
+  })
+
+  it("lists the setup checks after a test, the missing one first with its command", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(CDC_SPEC),
+      "POST /api/connectors/conn-a/test": () =>
+        json({
+          ok: true,
+          supported: true,
+          latencyMs: 5,
+          message: "Connected via PostgreSQL",
+          testedAt: "2026-10-30T01:00:00.000Z",
+          setupChecks: [
+            { setting: "wal_level", status: "ok", message: "wal_level is logical." },
+            {
+              setting: "publication",
+              status: "missing",
+              message: "The publication named in the connector does not exist.",
+              command: 'CREATE PUBLICATION "orders_pub" FOR TABLE "public"."orders";',
+            },
+          ],
+        }),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
+    const section = await screen.findByRole("region", { name: "Source setup" })
+    const settings = within(section).getAllByRole("listitem").map((li) => li.textContent ?? "")
+    expect(settings[0]).toContain("publication")
+    expect(settings[1]).toContain("wal_level")
+    expect(within(section).getByText(/CREATE PUBLICATION/)).toBeDefined()
+    expect(within(section).getByText(/1 setting missing/)).toBeDefined()
+  })
+
+  it("shows no setup list for a test that sent none", async () => {
+    stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Test connection" }))
+    await screen.findByText("Connection test passed")
+    expect(screen.queryByRole("region", { name: "Source setup" })).toBeNull()
+  })
+})
+
+// QA LH-SRC-6-39 (SRC-41 D15): a connection that reads no credential says so,
+// instead of repeating where an absent credential would be stored.
+describe("a connector that authenticates with none (LH-SRC-6-39)", () => {
+  it("says None for a connector that authenticates with none", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () =>
+        json({ ...SPEC, adapter: "kafka", dial: { bootstrapServers: ["broker:9092"], auth: { type: "none" } } }),
+    })
+    const { container } = render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByRole("heading", { level: 1, name: "db demo" })
+    const facts = within(container.querySelector("dl") as HTMLElement)
+    const fact = (label: string) => facts.getByText(label).nextElementSibling?.textContent
+    await waitFor(() => expect(fact("Credential")).toBe("None: this connection authenticates with none"))
+    expect(facts.queryByText("Stored by lakehouse, encrypted")).toBeNull()
   })
 })

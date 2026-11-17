@@ -58,6 +58,13 @@ pub enum ApiError {
     /// The requested resource does not exist. Maps to HTTP 404.
     #[error("{0}")]
     NotFound(String),
+    /// The resource existed and its retention window has passed, so it can
+    /// no longer be recovered. Maps to HTTP 410. Used by the asset page's
+    /// restore of a dropped table (`DATA-15` F4), where "nothing to restore"
+    /// (404) and "it was here, and the 7 days are over" (410) are different
+    /// answers for the person reading them.
+    #[error("{0}")]
+    Gone(String),
     /// The request was well-formed but semantically invalid (e.g. a query
     /// that fails validation or execution). Maps to HTTP 422.
     #[error("{0}")]
@@ -87,6 +94,20 @@ pub enum ApiError {
     /// (500).
     #[error("{0}")]
     Unavailable(String),
+    /// A backing service this request needs answered, and the answer was
+    /// not usable: an upstream `HTTP 502`/`503`, a body that did not parse,
+    /// or a protocol-level refusal. Maps to HTTP 502.
+    ///
+    /// Distinct from [`Self::Unavailable`] on purpose: the orchestrator
+    /// (`upstream_error::orchestrator_unreachable`, `PR #105 review
+    /// SHOULD-FIX 5`) is reachable often enough that "did not answer" must
+    /// not read as "not there" — only a transport failure or a `5xx` status
+    /// earns the retryable `503` with a `code`, while an answer this service
+    /// cannot use (a GraphQL `errors` array, an unparseable body, a `4xx`)
+    /// is a `502` with no code, because repeating the request unchanged
+    /// produces the same answer.
+    #[error("{0}")]
+    BadGateway(String),
     /// An unexpected server-side failure. Maps to HTTP 500.
     #[error("{0}")]
     Internal(String),
@@ -101,6 +122,32 @@ pub enum ApiError {
         /// How many seconds until the caller should retry, as an integer.
         retry_after_secs: u64,
     },
+    /// A backing service this request needs is not ready yet, and the same
+    /// request is expected to succeed shortly (an orchestrator code location
+    /// still loading). Maps to HTTP 503, like [`Self::Unavailable`], but
+    /// carries a stable machine-readable `code` (rendered as the body's
+    /// `code` field) and a `Retry-After` hint, so a client or a gate can
+    /// retry on the code instead of matching message text
+    /// (`PR #105 CI fix`, `SEC-11`).
+    #[error("{message}")]
+    NotReady {
+        /// The fixed message shown to the caller.
+        message: String,
+        /// Stable identifier of the condition, e.g.
+        /// `orchestrator_job_not_loaded`. Part of the API contract.
+        code: &'static str,
+        /// How many seconds until the caller should retry.
+        retry_after_secs: u64,
+    },
+    /// A permission token the request ADDS that no check anywhere knows
+    /// (`WEB-8` D3). Maps to HTTP 400. Like [`Self::NotReady`]'s `code`,
+    /// the refused tokens are rendered as a structured body field beside
+    /// the fixed message — `{"error": "unknown permissions", "unknown":
+    /// ["…"]}` — so the console can name each one instead of parsing
+    /// prose. A token the role or identity already holds never lands
+    /// here: old roles keep their seeded-but-unchecked strings.
+    #[error("unknown permissions")]
+    UnknownPermissions(Vec<String>),
 }
 
 impl ApiError {
@@ -122,14 +169,16 @@ impl ApiError {
     #[must_use]
     pub const fn status(&self) -> u16 {
         match self {
-            Self::BadRequest(_) => 400,
+            Self::BadRequest(_) | Self::UnknownPermissions(_) => 400,
             Self::Unauthorized(_) => 401,
             Self::Forbidden | Self::PermissionDenied(_) => 403,
             Self::NotFound(_) => 404,
+            Self::Gone(_) => 410,
             Self::Unprocessable(_) => 422,
             Self::Conflict(_) => 409,
             Self::Internal(_) => 500,
-            Self::Unavailable(_) => 503,
+            Self::BadGateway(_) => 502,
+            Self::Unavailable(_) | Self::NotReady { .. } => 503,
             Self::TooManyRequests { .. } => 429,
         }
     }
@@ -138,6 +187,13 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_permissions_maps_to_400() {
+        let err = ApiError::UnknownPermissions(vec!["unknown:perm".to_owned()]);
+        assert_eq!(err.status(), 400);
+        assert_eq!(err.to_string(), "unknown permissions");
+    }
 
     #[test]
     fn bad_request_maps_to_400() {
@@ -177,6 +233,11 @@ mod tests {
     }
 
     #[test]
+    fn gone_maps_to_410() {
+        assert_eq!(ApiError::Gone("window passed".to_owned()).status(), 410);
+    }
+
+    #[test]
     fn not_found_maps_to_404() {
         assert_eq!(ApiError::NotFound("not_found".to_owned()).status(), 404);
     }
@@ -190,6 +251,27 @@ mod tests {
     fn unavailable_maps_to_503() {
         assert_eq!(
             ApiError::Unavailable("database is not available".to_owned()).status(),
+            503
+        );
+    }
+
+    #[test]
+    fn bad_gateway_maps_to_502() {
+        assert_eq!(
+            ApiError::BadGateway("upstream did not accept the request".to_owned()).status(),
+            502
+        );
+    }
+
+    #[test]
+    fn not_ready_maps_to_503() {
+        assert_eq!(
+            ApiError::NotReady {
+                message: "later".to_owned(),
+                code: "x",
+                retry_after_secs: 5,
+            }
+            .status(),
             503
         );
     }

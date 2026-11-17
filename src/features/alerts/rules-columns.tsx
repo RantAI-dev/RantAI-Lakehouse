@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import type { ColumnDef } from "@tanstack/react-table"
 import {
   Mail,
@@ -21,7 +22,10 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Switch } from "@/components/ui/switch"
 import { cn } from "@/lib/utils"
-import { LOAD_ALERT_KINDS, type AlertRule } from "@/services/contracts/alerts"
+import { displayColumn } from "@/lib/chart-joins"
+import { formatDateTime } from "@/lib/format"
+import { deliverySummary } from "@/features/overview/alert-delivery"
+import { LOAD_ALERT_KINDS, QUALITY_ALERT_KIND, type AlertRule } from "@/services/contracts/alerts"
 
 /**
  * `getRuleColumns` used to declare its own looser `Rule` type (every field
@@ -38,21 +42,110 @@ export const RULE_KIND_LABEL: Record<string, string> = {
   alert: "Threshold alert",
   digest: "Dashboard digest",
   freshness: "Dataset freshness",
+  pipeline_behind_target: "Pipeline behind target lag",
   connector_failure: "Connector run failed",
   connector_repeated_failure: "Connector failed 3 runs in a row",
   connector_disabled: "Connector disabled",
   connector_schema_change: "Connector schema changed",
   connector_success: "Connector run succeeded",
+  connector_lag: "Change capture behind its limit",
   upload_failure: "Upload failed",
+  quality_incident: "Quality incident opened",
 }
 
 export function ruleKindLabel(type: string): string {
   return RULE_KIND_LABEL[type] ?? type
 }
 
+/**
+ * What the Delivery cell says: the address when the API returned it, else
+ * "Webhook" or "E-mail" from the channel (`DEC-16`, QA `LH-SRC-7-04`,
+ * `SRC-42`). A hidden rule holds exactly one target, so no count is shown.
+ */
+export function deliveryLabel(rule: AlertRule): string {
+  if (rule.targetHidden === true) return rule.channel === "email" ? "E-mail" : "Webhook"
+  return rule.target ?? ""
+}
+
+/**
+ * The second line of the Delivery cell for a "run succeeded" rule (`SRC-40` D7,
+ * QA `TC-1695`): when it last sent, or when it last tried and that the message
+ * did not arrive, with `deliverySummary`'s words — the same the incident list
+ * uses. `null` when no delivery was recorded, so a rule that never sent shows
+ * no line at all.
+ */
+export function lastDeliveryLabel(rule: Pick<AlertRule, "lastDelivery">): string | null {
+  const delivery = rule.lastDelivery
+  if (!delivery) return null
+  if (delivery.delivered) return `Last sent ${formatDateTime(delivery.at)}`
+  const summary = deliverySummary({ delivered: false, deliveryReason: delivery.reason })
+  return `Last attempt ${formatDateTime(delivery.at)} · ${summary.text}`
+}
+
+/**
+ * Whether a rule is a chart alert (`BI-19` part C): the "Alert me..." dialog
+ * saves `type: "alert"` with a `chart` id and a `condition`, and no mart.
+ * BI-19 owner QA 2026-10-28, QA-9: the list used to read it as a column rule.
+ */
+export function isChartAlert(rule: Pick<AlertRule, "type" | "chart">): boolean {
+  return rule.type === "alert" && !!rule.chart
+}
+
+/** The type badge text of a rule: "Chart alert" for a chart alert, the kind's label otherwise. */
+export function ruleTypeLabel(rule: Pick<AlertRule, "type" | "chart">): string {
+  return isChartAlert(rule) ? "Chart alert" : ruleKindLabel(rule.type)
+}
+
+/**
+ * What a chart alert watches, in words: the chart and its dashboard when the
+ * list knows them, "Dashboard chart" when it does not (a chart the caller
+ * cannot see, or an older answer). `BI-39` D8: the two names are read live, so
+ * the text follows a rename and never states a chart the reader lost.
+ */
+export function chartAlertScope(
+  rule: Pick<AlertRule, "chartTitle" | "dashboardTitle">
+): string {
+  return rule.chartTitle && rule.dashboardTitle
+    ? `${rule.chartTitle} on ${rule.dashboardTitle}`
+    : "Dashboard chart"
+}
+
+/**
+ * The condition of a chart alert in words (`QA-9`): the scope, then what the
+ * number does.
+ */
+export function chartAlertCondition(
+  rule: Pick<AlertRule, "chartTitle" | "dashboardTitle" | "series" | "condition" | "threshold">
+): string {
+  const series = rule.series ? displayColumn(rule.series) : "the chart"
+  const what =
+    rule.condition === "above"
+      ? `${series} goes above ${rule.threshold}`
+      : rule.condition === "below"
+        ? `${series} goes below ${rule.threshold}`
+        : rule.condition === "any_rows"
+          ? "returns any rows"
+          : String(rule.condition ?? "")
+  return `${chartAlertScope(rule)} · ${what}`.trim()
+}
+
+/** Where the chart's name in the condition links to, when the list knows it. */
+export function chartAlertHref(
+  rule: Pick<AlertRule, "chartTitle" | "dashboardId">
+): string | null {
+  return rule.chartTitle && rule.dashboardId
+    ? `/dashboards/${encodeURIComponent(rule.dashboardId)}`
+    : null
+}
+
 /** Whether `type` is one of the `SRC-7` kinds for connector and upload loads. */
 export function isLoadAlertKind(type: string): boolean {
   return (LOAD_ALERT_KINDS as readonly string[]).includes(type)
+}
+
+/** Whether `type` is the quality incident kind (`DATA-14`). */
+export function isQualityAlertKind(type: string): boolean {
+  return type === QUALITY_ALERT_KIND
 }
 
 /**
@@ -62,9 +155,14 @@ export function isLoadAlertKind(type: string): boolean {
  * cannot list is not given a made-up name). `null` for every other kind.
  */
 export function ruleScope(
-  rule: Pick<AlertRule, "type" | "connector">,
+  rule: Pick<AlertRule, "type" | "connector"> & { asset?: string; pipeline?: string },
   connectors: readonly { id: string; name: string }[]
 ): string | null {
+  // A quality incident rule is scoped to a table, or to every table.
+  if (isQualityAlertKind(rule.type)) return rule.asset === "*" ? "All tables" : (rule.asset ?? null)
+  if (rule.type === "pipeline_behind_target") {
+    return !rule.pipeline || rule.pipeline === "*" ? "All pipelines" : rule.pipeline
+  }
   if (!isLoadAlertKind(rule.type)) return null
   if (rule.type === "upload_failure") return "Uploads"
   if (!rule.connector) return null
@@ -126,7 +224,7 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
                 : "bg-sky-500/10 text-sky-600 dark:text-sky-400"
             )}
           >
-            {ruleKindLabel(row.original.type)}
+            {ruleTypeLabel(row.original)}
           </span>
         )
       },
@@ -136,8 +234,32 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: "Condition / Board",
       cell: ({ row }) => {
         const r = row.original
+        if (isChartAlert(r)) {
+          const text = chartAlertCondition(r)
+          const href = chartAlertHref(r)
+          if (!href || !r.chartTitle) {
+            return <span className="text-sm text-muted-foreground">{text}</span>
+          }
+          // The title is the start of `chartAlertCondition`'s text, so the
+          // linked name and the rest read as one sentence.
+          return (
+            <span className="text-sm text-muted-foreground">
+              <Link href={href} className="text-primary hover:underline">
+                {r.chartTitle}
+              </Link>
+              {text.slice(r.chartTitle.length)}
+            </span>
+          )
+        }
+        if (r.type === "alert" && r.metric) {
+          return (
+            <span className="font-mono text-xs text-muted-foreground">
+              metric {r.metric} {r.op} {r.threshold}
+            </span>
+          )
+        }
         // A load rule has no mart, measure or board: its scope is the next column.
-        if (isLoadAlertKind(r.type)) {
+        if (isLoadAlertKind(r.type) || isQualityAlertKind(r.type)) {
           return <span className="text-sm text-muted-foreground">—</span>
         }
         if (r.type === "alert") {
@@ -165,15 +287,30 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: "Delivery",
       cell: ({ row }) => {
         const r = row.original
+        const last = lastDeliveryLabel(r)
         return (
-          <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-            {r.channel === "email" ? (
-              <Mail className="size-3.5 text-muted-foreground" />
-            ) : (
-              <Webhook className="size-3.5 text-muted-foreground" />
+          <div className="flex flex-col gap-0.5">
+            <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+              {r.channel === "email" ? (
+                <Mail className="size-3.5 text-muted-foreground" />
+              ) : (
+                <Webhook className="size-3.5 text-muted-foreground" />
+              )}
+              <span className="max-w-50 truncate">{deliveryLabel(r)}</span>
+            </span>
+            {last === null ? null : (
+              <span
+                className={cn(
+                  "block text-xs",
+                  r.lastDelivery?.delivered === false
+                    ? "text-destructive"
+                    : "text-muted-foreground"
+                )}
+              >
+                {last}
+              </span>
             )}
-            <span className="max-w-50 truncate">{r.target}</span>
-          </span>
+          </div>
         )
       },
     },
@@ -183,6 +320,19 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: "Status",
       cell: ({ row }) => {
         const r = row.original
+        // DEC-16 (QA LH-SRC-7-04, SRC-42): `targetHidden` is the API's own
+        // per-rule answer that this caller may not manage the rule, so the
+        // switch is not offered at all — only the state, as text (`SRC-40`
+        // D9, which replaces #485's D19 "shown but disabled"). Keying it on
+        // `alert:write` alone would take the switch from the owner of a chart
+        // alert, whom the API lets switch their own rule.
+        if (r.targetHidden === true) {
+          return (
+            <span className="text-xs text-muted-foreground">
+              {r.enabled ? "Active" : "Disabled"}
+            </span>
+          )
+        }
         return (
           <div className="flex items-center gap-2">
             <Switch
@@ -207,6 +357,9 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: () => <span className="sr-only">Actions</span>,
       cell: ({ row }) => {
         const r = row.original
+        // DEC-16 (QA LH-SRC-7-04, SRC-42): testing, editing and deleting are
+        // all refused by the API for a rule this caller may not manage.
+        if (r.targetHidden === true) return null
 
         return (
           <div className="flex items-center justify-end gap-1">

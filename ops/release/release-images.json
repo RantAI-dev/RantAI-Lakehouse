@@ -1,0 +1,11 @@
+{
+  "rantai-lakehouse-api": ["lakehouse-api"],
+  "rantai-lakehouse-console": ["console"],
+  "rantai-lakehouse-dagster": [
+    "dagster-code-location",
+    "dagster-webserver",
+    "dagster-daemon",
+    "backup-job"
+  ],
+  "rantai-lakehouse-oidc-mock": ["oidc-mock"]
+}

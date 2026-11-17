@@ -3,10 +3,10 @@
 //!
 //! `connector.dial` (`0033_connector_ingest_spec.sql`) is free-form
 //! `JSONB` at the column level, but never free-form at the application
-//! level: [`Dial::parse`] parses it into exactly one of eight
+//! level: [`Dial::parse`] parses it into exactly one of nine
 //! `#[serde(deny_unknown_fields, rename_all = "camelCase")]` structs,
 //! dispatched on the connector's own `adapter` column value. Every one of
-//! the eight structs rejects an unknown field, which is the property that
+//! the nine structs rejects an unknown field, which is the property that
 //! stops a credential (a `password`, an `apiSecret`) being smuggled into
 //! `dial` — a column the allowlisted `secretRef` resolver
 //! (`lakehouse_core::secret`, ADR 0002) never inspects.
@@ -85,13 +85,15 @@ pub struct SqlDial {
 
 /// The connection shape for a change-data-capture `cdc` adapter's `dial`.
 ///
-/// `slot_name`/`publication_name` are **required**, not `Option`: a `cdc`
-/// connector's replication slot/publication come from `dial` with no
-/// fallback, so a `cdc` dial missing either is a construction-time (400)
-/// error, not a later runtime surprise — see
-/// `docs/adr/0013-registry-driven-ingestion.md`'s "the same connection
-/// fields as `sql`, plus `slotName` and `publicationName` as **required**"
-/// decision.
+/// Which of `slot_name`, `publication_name` and `server_id` a dial carries
+/// depends on the driver (`SRC-4` slice 3, decision S3-a), checked by
+/// [`Dial::parse`] (`validate_cdc_dial_post_parse`), not by serde: `PostgreSQL`
+/// requires `slotName` and `publicationName` and refuses `serverId`; `MySQL`
+/// requires `serverId` and refuses the other two; `SQL Server` and `Oracle`
+/// refuse all three. `pdbName` is `Oracle`'s alone (slice 6, S6-b), and
+/// `Oracle` takes only the `disable` and `require` TLS modes (S6-c). A `cdc` dial that breaks this is a construction-time (400) error, not
+/// a later runtime surprise. ADR 0013's "required" is "required for
+/// `PostgreSQL`" (dated note there).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CdcDial {
@@ -108,13 +110,104 @@ pub struct CdcDial {
     /// A literal username, never a `secretRef`-shaped indirection — see
     /// [`SqlDial::user`].
     pub user: String,
-    /// The replication slot name, required with no fallback.
-    pub slot_name: String,
-    /// The publication name, required with no fallback.
-    pub publication_name: String,
-    /// An optional numeric server id, used by drivers (e.g. `MySQL`
-    /// binlog replication) that need one.
+    /// The replication slot name: required for `PostgreSQL` with no fallback,
+    /// refused for the other drivers.
+    #[serde(default)]
+    pub slot_name: Option<String>,
+    /// The publication name: required for `PostgreSQL` with no fallback,
+    /// refused for the other drivers.
+    #[serde(default)]
+    pub publication_name: Option<String>,
+    /// The `MySQL` binlog client's server id (1 to 4294967295): required for
+    /// `MySQL`, refused for the other drivers.
+    #[serde(default)]
     pub server_id: Option<u32>,
+    /// The pluggable database the Oracle change-capture connector reads
+    /// (`database.pdb.name`; `SRC-4` decision S6-b): `database` then names the
+    /// container database. Absent for a non-container Oracle database;
+    /// refused for the other drivers.
+    #[serde(default)]
+    pub pdb_name: Option<String>,
+    /// How the change-capture worker secures its connection to the source
+    /// (`SRC-4` decision S2-d). Absent means [`CdcSslMode::Require`]: a
+    /// stored credential is never dialed in plain text unless the person
+    /// chose `disable`, which the console shows as such (`SEC-14`'s rule).
+    #[serde(default)]
+    pub ssl_mode: CdcSslMode,
+}
+
+/// The TLS modes a change-capture `dial` may name: the four a person can
+/// choose, a closed set so a typo fails at parse time. Not `prefer` or
+/// `allow` (attempt TLS, fall back to plain text): those would dial a stored
+/// credential in the clear without anyone having said so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CdcSslMode {
+    /// No TLS. Only when the person chose it.
+    Disable,
+    /// Encrypt and take the server certificate as presented.
+    #[default]
+    Require,
+    /// Encrypt and verify the certificate chain.
+    VerifyCa,
+    /// Encrypt, verify the chain and that the certificate names the host.
+    VerifyFull,
+}
+
+impl CdcSslMode {
+    /// The value `Debezium`'s `database.sslmode` takes for this mode (the
+    /// same four words, `PostgreSQL` JDBC's own spelling).
+    #[must_use]
+    pub const fn as_debezium(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Require => "require",
+            Self::VerifyCa => "verify-ca",
+            Self::VerifyFull => "verify-full",
+        }
+    }
+}
+
+/// The only driver value a [`CdcMongoDial`] carries. A one-variant enum rather
+/// than a free string, so a typo fails at parse time like every other driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdcMongoDriver {
+    /// `MongoDB`.
+    Mongodb,
+}
+
+/// The connection shape for a `MongoDB` change-capture connector (`SRC-4`
+/// slice 5, decision S5-a): a `cdc` dial whose `driver` is `mongodb`.
+///
+/// It is its own shape and not a fifth [`SqlDriver`]: `MongoDB` is not SQL, and
+/// [`SqlDriver`] also feeds the batch `sql` adapter. [`Dial::parse`] reads
+/// `driver` first and parses this shape for `mongodb`, [`CdcDial`] for every
+/// other value.
+///
+/// `hosts` is the explicit seed list, each `host:port` checked by
+/// [`validate_hostname`] and, at save time, by the API's SSRF check, **every**
+/// entry (decision S5-b). There is no `mongodb+srv` and no free-form
+/// connection string: `deny_unknown_fields` refuses an `srvUri` or a `uri`.
+/// `replicaSet` is required because change streams need a replica set.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CdcMongoDial {
+    /// Always `mongodb`.
+    pub driver: CdcMongoDriver,
+    /// The explicit `host:port` seeds of the replica set.
+    pub hosts: Vec<String>,
+    /// The database to capture; also the authentication database.
+    pub database: String,
+    /// A literal username, never a `secretRef`-shaped indirection (see
+    /// [`SqlDial::user`]).
+    pub user: String,
+    /// The name of the replica set (`rs.status().set`): required.
+    pub replica_set: String,
+    /// How the change-capture worker secures its connection to the source;
+    /// absent means [`CdcSslMode::Require`] (as for [`CdcDial`]).
+    #[serde(default)]
+    pub ssl_mode: CdcSslMode,
 }
 
 /// A closed set of object-storage protocols a `files` adapter's `dial`
@@ -177,7 +270,43 @@ pub enum RestAuth {
     #[serde(rename = "oauth2_client_credentials")]
     Oauth2ClientCredentials {
         /// The token endpoint URL to exchange credentials at.
+        ///
+        /// `SRC-12` part C: the wire name is `tokenUrl`, the one the console
+        /// and `adapters/rest.py` use. The enum-level `rename_all` renames
+        /// variants, not the fields of a variant, so without this rename the
+        /// field only parsed as `token_url` and a dial written by the console
+        /// was refused. `token_url` stays accepted for a row written that way.
+        #[serde(rename = "tokenUrl", alias = "token_url")]
         token_url: String,
+    },
+    /// `OAuth2` authorization-code grant with PKCE (`S256`; `SRC-12` part C,
+    /// decision 6). A person signs in at the provider once; the refresh token
+    /// the provider returns is the connector's secondary credential (sealed,
+    /// part A) and the client secret its primary one (`secret_field_names`).
+    ///
+    /// Every address here is configuration, not a secret. `token_url` and
+    /// `revocation_url` are dialled by the product and receive the client
+    /// secret and the refresh token, so they are part of the target identity
+    /// ([`Dial::target_identity`]); `authorize_url` is only handed to the
+    /// person's browser.
+    #[serde(rename = "oauth2_authorization_code")]
+    Oauth2AuthorizationCode {
+        /// The app's client id (public by the protocol's definition).
+        #[serde(rename = "clientId")]
+        client_id: String,
+        /// The provider's sign-in page. Opened by the browser, never dialled
+        /// by the product.
+        #[serde(rename = "authorizeUrl")]
+        authorize_url: String,
+        /// The provider's token endpoint.
+        #[serde(rename = "tokenUrl")]
+        token_url: String,
+        /// The provider's revocation endpoint (RFC 7009), when it has one.
+        #[serde(rename = "revocationUrl", default)]
+        revocation_url: Option<String>,
+        /// The scopes asked for, each one a single token.
+        #[serde(default)]
+        scopes: Vec<String>,
     },
     /// HTTP Basic authentication.
     Basic,
@@ -193,6 +322,7 @@ impl RestAuth {
             RestAuth::ApiKey { .. } => "api_key",
             RestAuth::Bearer => "bearer",
             RestAuth::Oauth2ClientCredentials { .. } => "oauth2_client_credentials",
+            RestAuth::Oauth2AuthorizationCode { .. } => "oauth2_authorization_code",
             RestAuth::Basic => "basic",
         }
     }
@@ -426,6 +556,58 @@ impl SftpAuth {
     }
 }
 
+/// How a `saas` connector signs in (`SRC-3` decision 3), internally tagged
+/// on `type`.
+///
+/// Neither shape carries an address: the sign-in, token and revocation
+/// addresses come from the vendor table ([`crate::saas_vendors`], AD8), so a
+/// dial cannot send the client secret or the refresh token anywhere the
+/// table does not name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "type")]
+pub enum SaasAuth {
+    /// Sign-in in the browser: `OAuth2` authorisation code with PKCE
+    /// (`SRC-12`). The client secret and the refresh token are the
+    /// connector's two secrets.
+    #[serde(rename = "oauth2_authorization_code")]
+    Oauth2AuthorizationCode {
+        /// The app's client id (public by the protocol's definition).
+        #[serde(rename = "clientId")]
+        client_id: String,
+    },
+    /// The vendor's integration credential: its secret fields are named by
+    /// the vendor's table row. A vendor without one refuses this shape.
+    #[serde(rename = "integration")]
+    Integration,
+}
+
+/// The connection shape for a `saas` adapter's `dial` (`SRC-3`, plan AD1).
+///
+/// One adapter for the ten business-app vendors; `vendor` picks the row of
+/// [`crate::saas_vendors::SAAS_VENDORS`] and `account` is the one part of
+/// the vendor's address a person supplies (AD2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SaasDial {
+    /// The vendor's id in the table.
+    pub vendor: String,
+    /// The vendor's per-customer part of the address, in the shape the
+    /// vendor's [`crate::saas_vendors::AccountRule`] allows.
+    pub account: String,
+    /// The objects the person defined by name where the vendor has no
+    /// listing of them (reports, for example). Each name is data the
+    /// vendor module interprets, never an address.
+    #[serde(default)]
+    pub objects: Vec<String>,
+    /// How the connector signs in.
+    pub auth: SaasAuth,
+    /// `NetSuite` only (`SRC-3` slice 6): the id of the certificate uploaded in `NetSuite`'s "OAuth 2.0
+    /// Client Credentials (M2M) Setup", which goes into the signed assertion's `kid` header. It is a
+    /// name, not a secret and not a destination, so it is not part of the target identity.
+    #[serde(default)]
+    pub certificate_id: Option<String>,
+}
+
 /// A parsed `dial`, one variant per adapter.
 ///
 /// Never `#[serde(untagged)]` — see this module's doc comment. Constructed
@@ -438,6 +620,9 @@ pub enum Dial {
     Sql(SqlDial),
     /// A change-data-capture `cdc` adapter's dial.
     Cdc(CdcDial),
+    /// A `MongoDB` change-capture dial: a `cdc` adapter whose `driver` is
+    /// `mongodb` (`SRC-4` slice 5).
+    CdcMongo(CdcMongoDial),
     /// A `mongodb` adapter's dial.
     Mongo(MongoDial),
     /// A `kafka` adapter's dial.
@@ -450,6 +635,8 @@ pub enum Dial {
     Rest(RestDial),
     /// A `sheets` adapter's dial.
     Sheets(SheetsDial),
+    /// A `saas` adapter's dial (`SRC-3`).
+    Saas(SaasDial),
 }
 
 impl Dial {
@@ -466,7 +653,7 @@ impl Dial {
     /// # Errors
     ///
     /// Returns [`IngestSpecError::UnknownAdapter`] if `adapter` is not one
-    /// of `sql`/`cdc`/`mongodb`/`kafka`/`sftp`/`files`/`rest`/`sheets`,
+    /// of `sql`/`cdc`/`mongodb`/`kafka`/`sftp`/`files`/`rest`/`sheets`/`saas`,
     /// or [`IngestSpecError::InvalidDial`] if `raw` does not match the
     /// named adapter's shape (an unknown field, a missing required field,
     /// a hostname [`validate_hostname`] rejects, an Oracle TLS
@@ -480,9 +667,19 @@ impl Dial {
                 validate_sql_dial_post_parse(adapter, &dial)?;
                 Ok(Dial::Sql(dial))
             }
+            // `SRC-4` slice 5 (S5-a): `driver` decides the shape, as the
+            // adapter decides it one level up. Only the exact word `mongodb`
+            // takes the `MongoDB` shape; every other value, a typo included,
+            // is parsed (and refused) by `CdcDial`.
+            "cdc" if raw.get("driver").and_then(serde_json::Value::as_str) == Some("mongodb") => {
+                let dial: CdcMongoDial = parse_dial(adapter, raw)?;
+                validate_cdc_mongo_dial_post_parse(adapter, &dial)?;
+                Ok(Dial::CdcMongo(dial))
+            }
             "cdc" => {
                 let dial: CdcDial = parse_dial(adapter, raw)?;
                 check_hostname(adapter, "host", &dial.host)?;
+                validate_cdc_dial_post_parse(adapter, &dial)?;
                 Ok(Dial::Cdc(dial))
             }
             "mongodb" => {
@@ -507,8 +704,17 @@ impl Dial {
                 Ok(Dial::Sftp(dial))
             }
             "files" => Ok(Dial::Files(parse_dial(adapter, raw)?)),
-            "rest" => Ok(Dial::Rest(parse_dial(adapter, raw)?)),
+            "rest" => {
+                let dial: RestDial = parse_dial(adapter, raw)?;
+                validate_rest_dial_post_parse(adapter, &dial)?;
+                Ok(Dial::Rest(dial))
+            }
             "sheets" => Ok(Dial::Sheets(parse_dial(adapter, raw)?)),
+            "saas" => {
+                let dial: SaasDial = parse_dial(adapter, raw)?;
+                validate_saas_dial_post_parse(adapter, &dial)?;
+                Ok(Dial::Saas(dial))
+            }
             other => Err(IngestSpecError::UnknownAdapter {
                 adapter: other.to_owned(),
             }),
@@ -522,6 +728,16 @@ impl Dial {
     pub fn as_cdc(&self) -> Option<&CdcDial> {
         match self {
             Dial::Cdc(dial) => Some(dial),
+            _ => None,
+        }
+    }
+
+    /// A typed accessor for the `MongoDB` change-capture variant, the
+    /// counterpart of [`Dial::as_cdc`].
+    #[must_use]
+    pub fn as_cdc_mongo(&self) -> Option<&CdcMongoDial> {
+        match self {
+            Dial::CdcMongo(dial) => Some(dial),
             _ => None,
         }
     }
@@ -564,17 +780,36 @@ impl Dial {
         }
     }
 
+    /// The `saas` adapter's `auth_type` key: the browser sign-in's tag, or
+    /// the vendor's `integration:<id>` key. `None` for any other adapter
+    /// and for an unknown vendor or an integration credential the vendor
+    /// does not have ([`Dial::parse`] refuses both, so a parsed dial always
+    /// has a key).
+    #[must_use]
+    pub fn saas_auth_type(&self) -> Option<&'static str> {
+        let Dial::Saas(saas) = self else {
+            return None;
+        };
+        let vendor = crate::saas_vendors::vendor(&saas.vendor)?;
+        vendor.auth_type_key(matches!(
+            saas.auth,
+            SaasAuth::Oauth2AuthorizationCode { .. }
+        ))
+    }
+
     /// The `auth_type` key [`secret_field_names`] needs for THIS dial's
     /// adapter, whichever of [`Self::rest_auth_type`],
-    /// [`Self::kafka_auth_type`] or [`Self::sftp_auth_type`] applies (at
-    /// most one ever returns `Some`, since each matches a disjoint set of
-    /// `Dial` variants) — the single call [`crate::connectors::set_ingest_spec`]
-    /// makes instead of trying each accessor itself.
+    /// [`Self::kafka_auth_type`], [`Self::sftp_auth_type`] or
+    /// [`Self::saas_auth_type`] applies (at most one ever returns `Some`,
+    /// since each matches a disjoint set of `Dial` variants) — the single
+    /// call [`crate::connectors::set_ingest_spec`] makes instead of trying
+    /// each accessor itself.
     #[must_use]
     pub fn secret_map_auth_type(&self) -> Option<&'static str> {
         self.rest_auth_type()
             .or_else(|| self.kafka_auth_type())
             .or_else(|| self.sftp_auth_type())
+            .or_else(|| self.saas_auth_type())
     }
 
     /// Where this dial sends the connector's credential, as a comparable
@@ -586,12 +821,14 @@ impl Dial {
     /// | Adapter | Compared |
     /// | --- | --- |
     /// | `sql`, `cdc` | `driver`, `host`, `port`, `database` |
+    /// | `cdc` with `driver` `mongodb` | `hosts` (as a set), `database`, `replicaSet` |
     /// | `files` | `protocol`, `endpoint`, `bucket` |
     /// | `rest` | scheme, host and port of `baseUrl` |
     /// | `mongodb` | `hosts` (as a set), `database` |
     /// | `kafka` | `bootstrapServers` (as a set) |
     /// | `sftp` | `host`, `port`, `hostKeyFingerprint` |
     /// | `sheets` | nothing (fixed Google hosts) |
+    /// | `saas` | `vendor`, `account` (the vendor table builds every address from them, `SRC-3` AD2) |
     ///
     /// The adapter name is part of the identity, so `sql` to `cdc` on the
     /// same host is a re-point. A change of `user`, `sourceObjects`, the
@@ -632,6 +869,7 @@ impl Dial {
                     ("database", cdc.database.clone()),
                 ],
             ),
+            Dial::CdcMongo(mongo) => cdc_mongo_target_identity(mongo),
             Dial::Files(files) => TargetIdentity::new(
                 "files",
                 vec![
@@ -657,7 +895,33 @@ impl Dial {
                 ],
             ),
             Dial::Rest(rest) => {
-                TargetIdentity::new("rest", vec![("baseUrl", origin_key(&rest.base_url))])
+                let mut parts = vec![("baseUrl", origin_key(&rest.base_url))];
+                // `SRC-12` part C: the token and revocation addresses receive
+                // the client secret and the refresh token, so moving either to
+                // another host is a re-point exactly as moving `baseUrl` is
+                // (`SEC-14`). A client-credentials connector's `tokenUrl` was
+                // not compared before; it is now, for the same reason.
+                match &rest.auth {
+                    RestAuth::Oauth2ClientCredentials { token_url } => {
+                        parts.push(("tokenUrl", origin_key(token_url)));
+                    }
+                    RestAuth::Oauth2AuthorizationCode {
+                        token_url,
+                        revocation_url,
+                        ..
+                    } => {
+                        parts.push(("tokenUrl", origin_key(token_url)));
+                        parts.push((
+                            "revocationUrl",
+                            revocation_url
+                                .as_deref()
+                                .map(origin_key)
+                                .unwrap_or_default(),
+                        ));
+                    }
+                    RestAuth::ApiKey { .. } | RestAuth::Bearer | RestAuth::Basic => {}
+                }
+                TargetIdentity::new("rest", parts)
             }
             Dial::Mongo(mongo) => TargetIdentity::new(
                 "mongodb",
@@ -685,6 +949,7 @@ impl Dial {
                 ],
             ),
             Dial::Sheets(_) => TargetIdentity::new("sheets", Vec::new()),
+            Dial::Saas(saas) => saas_target_identity(saas),
         }
     }
 }
@@ -711,6 +976,50 @@ impl TargetIdentity {
     pub fn adapter(&self) -> &'static str {
         self.adapter
     }
+}
+
+/// The re-point identity of a `MongoDB` change-capture dial (`SRC-4` S5-a): the
+/// hosts as a set, the database and the replica set. A different replica set is a
+/// different cluster, so the stored credential must be supplied again.
+fn cdc_mongo_target_identity(mongo: &CdcMongoDial) -> TargetIdentity {
+    TargetIdentity::new(
+        "cdc",
+        vec![
+            ("driver", "mongodb".to_owned()),
+            ("hosts", host_port_set_key(&mongo.hosts)),
+            ("database", mongo.database.clone()),
+            ("replicaSet", mongo.replica_set.clone()),
+        ],
+    )
+}
+
+/// The target identity of a `saas` dial. `SRC-3` AD2: every address of a
+/// `saas` connector is built from the vendor row and `account`, so these two
+/// decide where the credential goes; the sign-in kind decides which secret
+/// occupies which slot. Changing any of the three needs every credential again
+/// (`SEC-14` part A; final review SHOULD-FIX 25: with the kind left out,
+/// switching sign-in kept the stored refs in their slots and sent a secret in
+/// another role). The vendor and the host part of the account compare
+/// case-insensitively, as host names do elsewhere in this module; the tenant
+/// after a `/` (Workday) is a name and compares as written.
+fn saas_target_identity(saas: &SaasDial) -> TargetIdentity {
+    let account = saas.account.trim();
+    let account = match account.split_once('/') {
+        Some((host, tenant)) => format!("{}/{tenant}", host.to_ascii_lowercase()),
+        None => account.to_ascii_lowercase(),
+    };
+    let auth_kind = match &saas.auth {
+        SaasAuth::Oauth2AuthorizationCode { .. } => "oauth2_authorization_code",
+        SaasAuth::Integration => "integration",
+    };
+    TargetIdentity::new(
+        "saas",
+        vec![
+            ("vendor", saas.vendor.trim().to_ascii_lowercase()),
+            ("account", account),
+            ("authType", auth_kind.to_owned()),
+        ],
+    )
 }
 
 /// Whether saving `new` over the stored `(stored_adapter, stored_dial)`
@@ -841,6 +1150,162 @@ fn parse_dial<T: for<'de> Deserialize<'de>>(
     })
 }
 
+/// The per-driver rule for a `cdc` dial's `slotName`, `publicationName` and
+/// `serverId` (`SRC-4` decision S3-a). Every refusal is one fixed sentence
+/// naming the field and the driver, never a value.
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] when a field the driver needs is
+/// missing, a field it does not use is present, or `serverId` is 0.
+fn validate_cdc_dial_post_parse(adapter: &str, dial: &CdcDial) -> Result<(), IngestSpecError> {
+    match cdc_dial_refusal(dial) {
+        None => Ok(()),
+        Some(message) => Err(IngestSpecError::InvalidDial {
+            adapter: adapter.to_owned(),
+            source: serde::de::Error::custom(message),
+        }),
+    }
+}
+
+const ONLY_POSTGRES_SLOT: &str = "slotName is only for a PostgreSQL change-capture connector";
+const ONLY_POSTGRES_PUBLICATION: &str =
+    "publicationName is only for a PostgreSQL change-capture connector";
+const ONLY_MYSQL_SERVER_ID: &str = "serverId is only for a MySQL change-capture connector";
+
+/// The first fixed sentence that refuses `dial`, or `None` (see
+/// [`validate_cdc_dial_post_parse`]). Split by driver so each rule stays short.
+fn cdc_dial_refusal(dial: &CdcDial) -> Option<&'static str> {
+    if dial.pdb_name.is_some() && dial.driver != SqlDriver::Oracle {
+        return Some("pdbName is only for an Oracle change-capture connector");
+    }
+    match dial.driver {
+        SqlDriver::Postgres => postgres_dial_refusal(dial),
+        SqlDriver::Mysql => mysql_dial_refusal(dial),
+        SqlDriver::Mssql => no_replication_names_refusal(dial),
+        SqlDriver::Oracle => {
+            no_replication_names_refusal(dial).or_else(|| oracle_dial_refusal(dial))
+        }
+    }
+}
+
+fn postgres_dial_refusal(dial: &CdcDial) -> Option<&'static str> {
+    if dial.slot_name.is_none() {
+        return Some("slotName is required for a PostgreSQL change-capture connector");
+    }
+    if dial.publication_name.is_none() {
+        return Some("publicationName is required for a PostgreSQL change-capture connector");
+    }
+    dial.server_id.is_some().then_some(ONLY_MYSQL_SERVER_ID)
+}
+
+fn mysql_dial_refusal(dial: &CdcDial) -> Option<&'static str> {
+    match dial.server_id {
+        None => return Some("serverId is required for a MySQL change-capture connector"),
+        Some(0) => return Some("serverId must be between 1 and 4294967295"),
+        Some(_) => {}
+    }
+    if dial.slot_name.is_some() {
+        return Some(ONLY_POSTGRES_SLOT);
+    }
+    dial.publication_name
+        .is_some()
+        .then_some(ONLY_POSTGRES_PUBLICATION)
+}
+
+/// `SQL Server` and `Oracle` use none of `slotName`, `publicationName`, `serverId`.
+fn no_replication_names_refusal(dial: &CdcDial) -> Option<&'static str> {
+    if dial.slot_name.is_some() {
+        return Some(ONLY_POSTGRES_SLOT);
+    }
+    if dial.publication_name.is_some() {
+        return Some(ONLY_POSTGRES_PUBLICATION);
+    }
+    dial.server_id.is_some().then_some(ONLY_MYSQL_SERVER_ID)
+}
+
+/// `Oracle`'s own rules (`SRC-4` decisions S6-b, S6-c).
+fn oracle_dial_refusal(dial: &CdcDial) -> Option<&'static str> {
+    if !is_oracle_service_name(&dial.database) {
+        return Some("database must be an Oracle name of letters, digits, '_', '.' or '-'");
+    }
+    if dial
+        .pdb_name
+        .as_deref()
+        .is_some_and(|pdb| !is_oracle_service_name(pdb))
+    {
+        return Some("pdbName must be an Oracle name of letters, digits, '_', '.' or '-'");
+    }
+    // S6-c: Oracle's JDBC driver does TLS only over TCPS with a Java trust store,
+    // which this build cannot set up (SRC-37), so a mode that promises certificate
+    // checking is refused, not approximated.
+    matches!(dial.ssl_mode, CdcSslMode::VerifyCa | CdcSslMode::VerifyFull).then_some(
+        "sslMode verify-ca and verify-full are not supported for an Oracle change-capture connector: use require (encrypted, server not authenticated) or disable",
+    )
+}
+
+/// The fixed refusal of a `MongoDB` change-capture dial with other than one host
+/// (`SRC-4` slice 5 review BLOCKER 1); the renderer refuses the same.
+pub const CDC_MONGO_ONE_HOST: &str =
+    "hosts must hold exactly one host:port: a MongoDB change-capture connector takes one host";
+
+/// The fixed refusal of a bad `replicaSet` (`SRC-4` slice 5 review SHOULD-FIX 1: one sentence,
+/// single spaces, tested by its exact text).
+pub const CDC_MONGO_REPLICA_SET: &str = "replicaSet must be 1 to 128 letters, digits, underscores, hyphens or dots: the name in the server's replica set configuration";
+
+/// The rule for a `MongoDB` change-capture dial's fields that serde cannot
+/// check (`SRC-4` decision S5-a). Every refusal is one fixed sentence naming
+/// the field, never a value. `database` and `replicaSet` are written into the
+/// connector's connection string and `collection.include.list`, so they are
+/// restricted to plain characters (no `,`, `.`, `/`, `?`, `&`, `=`, `@`).
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] for no host, a host that is not
+/// `host:port` with a port from 1 to 65535 or whose host [`validate_hostname`]
+/// rejects, an empty or implausible `database`, `replicaSet` or `user`.
+fn validate_cdc_mongo_dial_post_parse(
+    adapter: &str,
+    dial: &CdcMongoDial,
+) -> Result<(), IngestSpecError> {
+    let refuse = |message: &'static str| IngestSpecError::InvalidDial {
+        adapter: adapter.to_owned(),
+        source: serde::de::Error::custom(message),
+    };
+    // `SRC-4` slice 5 review BLOCKER 1 (S5-b): exactly one host. With several seeds the worker
+    // dials the member addresses the replica set reports, which nothing checks against the
+    // installation's address rules (not fail closed, AGENTS.md principle 3). The contract keeps
+    // `hosts` as a list so the shape can grow with a bounded check later.
+    if dial.hosts.len() != 1 {
+        return Err(refuse(CDC_MONGO_ONE_HOST));
+    }
+    for host_port in &dial.hosts {
+        let (host, port) = split_host_port(adapter, "hosts", host_port)?;
+        check_hostname(adapter, "hosts", host)?;
+        if !matches!(port.parse::<u16>(), Ok(1..=u16::MAX)) {
+            return Err(refuse("hosts entries need a port from 1 to 65535"));
+        }
+    }
+    let plain = |value: &str, extra: &[u8], max: usize| {
+        (1..=max).contains(&value.len())
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+    };
+    if !plain(&dial.database, b"_-", 63) {
+        return Err(refuse(
+            "database must be 1 to 63 letters, digits, underscores or hyphens",
+        ));
+    }
+    if !plain(&dial.replica_set, b"_-.", 128) {
+        return Err(refuse(CDC_MONGO_REPLICA_SET));
+    }
+    if dial.user.is_empty() {
+        return Err(refuse("user must not be empty"));
+    }
+    Ok(())
+}
+
 /// Check `host` via [`validate_hostname`], wrapping a rejection as
 /// [`IngestSpecError::InvalidDial`] under the same variant a
 /// `deny_unknown_fields` rejection already produces, so callers handle one
@@ -885,6 +1350,180 @@ fn split_host_port<'a>(
     }
 }
 
+/// The longest `OAuth2` address, client id or scope accepted.
+const MAX_OAUTH_FIELD_LEN: usize = 2048;
+/// The most scopes a dial may ask for.
+const MAX_OAUTH_SCOPES: usize = 50;
+
+/// Whether `value` is an `http(s)://` address with a host, no user name or
+/// password and no whitespace or control character. The scheme is not
+/// narrowed to `https` here: the store does not know the installation's
+/// settings. The API refuses `http` unless the operator's gate-only switch
+/// allows it (`routes::connectors::check_dial_ssrf`), and the orchestrator
+/// applies the same rule when it dials.
+fn is_plain_http_address(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty()
+        && !authority.contains('@')
+        && !value.chars().any(|c| c.is_control() || c.is_whitespace())
+        && value.len() <= MAX_OAUTH_FIELD_LEN
+}
+
+/// Post-deserialize validation for a [`RestDial`]: the `OAuth2` addresses and
+/// names serde cannot check (`SRC-12` part C).
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] for an `OAuth2` address that is
+/// not a plain `http(s)` address, an empty or oversized client id, or a scope
+/// that is not a single token.
+fn validate_rest_dial_post_parse(adapter: &str, dial: &RestDial) -> Result<(), IngestSpecError> {
+    let refuse = |message: &str| IngestSpecError::InvalidDial {
+        adapter: adapter.to_owned(),
+        source: serde::de::Error::custom(message.to_owned()),
+    };
+    match &dial.auth {
+        RestAuth::Oauth2ClientCredentials { token_url } => {
+            if !is_plain_http_address(token_url) {
+                return Err(refuse(
+                    "auth.tokenUrl must be an http(s):// address with a host and no user name or password",
+                ));
+            }
+        }
+        RestAuth::Oauth2AuthorizationCode {
+            client_id,
+            authorize_url,
+            token_url,
+            revocation_url,
+            scopes,
+        } => {
+            if client_id.trim().is_empty()
+                || client_id.len() > MAX_OAUTH_FIELD_LEN
+                || client_id.chars().any(char::is_control)
+            {
+                return Err(refuse("auth.clientId must be a non-empty name"));
+            }
+            for (field, value) in [
+                ("auth.authorizeUrl", Some(authorize_url)),
+                ("auth.tokenUrl", Some(token_url)),
+                ("auth.revocationUrl", revocation_url.as_ref()),
+            ] {
+                if value.is_some_and(|v| !is_plain_http_address(v)) {
+                    return Err(refuse(&format!(
+                        "{field} must be an http(s):// address with a host and no user name or password"
+                    )));
+                }
+            }
+            if scopes.len() > MAX_OAUTH_SCOPES
+                || scopes.iter().any(|scope| {
+                    scope.is_empty()
+                        || scope.len() > MAX_OAUTH_FIELD_LEN
+                        || scope
+                            .chars()
+                            .any(|c| c.is_control() || c.is_whitespace() || c == '"')
+                })
+            {
+                return Err(refuse(
+                    "auth.scopes must be a short list of single-word scopes",
+                ));
+            }
+        }
+        RestAuth::ApiKey { .. } | RestAuth::Bearer | RestAuth::Basic => {}
+    }
+    Ok(())
+}
+
+/// The most objects a `saas` dial may name.
+const MAX_SAAS_OBJECTS: usize = 200;
+/// The longest object name a `saas` dial may carry.
+const MAX_SAAS_OBJECT_NAME_LEN: usize = 256;
+
+/// Post-deserialize validation for a [`SaasDial`] (`SRC-3` AD1, AD2): the
+/// vendor is in the table, the account has the shape the vendor's host
+/// pattern allows, the sign-in is one the vendor offers, and the object
+/// names are plain text.
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] for an unknown vendor, an account
+/// outside the vendor's pattern, an integration credential the vendor does
+/// not offer (Salesforce: decision 4) or `NetSuite`'s without its
+/// `certificateId` (final review SHOULD-FIX 25), an empty or oversized
+/// client id, or an object name that is blank, long, repeated or has a
+/// control character.
+fn validate_saas_dial_post_parse(adapter: &str, dial: &SaasDial) -> Result<(), IngestSpecError> {
+    let refuse = |message: &str| IngestSpecError::InvalidDial {
+        adapter: adapter.to_owned(),
+        source: serde::de::Error::custom(message.to_owned()),
+    };
+    let Some(vendor) = crate::saas_vendors::vendor(&dial.vendor) else {
+        return Err(refuse("vendor is not one this build offers"));
+    };
+    // QA LH-SRC-3-11 (SRC-41): `InvalidAccount`'s own text already names
+    // the field ("account is not in the form this vendor uses"); prefixing it
+    // again doubled the word in the refusal the console showed.
+    vendor
+        .validate_account(&dial.account)
+        .map_err(|err| refuse(&err.to_string()))?;
+    match &dial.auth {
+        SaasAuth::Oauth2AuthorizationCode { client_id } => {
+            if client_id.trim().is_empty()
+                || client_id.len() > MAX_OAUTH_FIELD_LEN
+                || client_id.chars().any(char::is_control)
+            {
+                return Err(refuse("auth.clientId must be a non-empty name"));
+            }
+        }
+        SaasAuth::Integration => {
+            if vendor.integration.is_none() {
+                return Err(refuse(
+                    "this vendor does not offer an integration credential; sign in instead",
+                ));
+            }
+        }
+    }
+    if let Some(certificate_id) = &dial.certificate_id {
+        // Slice 6: only `NetSuite`'s client-credentials way has a certificate; the id goes into a
+        // JWT header, so it is a short plain name.
+        let plain = !certificate_id.is_empty()
+            && certificate_id.len() <= 128
+            && certificate_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if dial.vendor != "netsuite" || dial.auth != SaasAuth::Integration || !plain {
+            return Err(refuse(
+                "certificateId is only for NetSuite's integration credential and must be a plain name",
+            ));
+        }
+    } else if dial.vendor == "netsuite" && dial.auth == SaasAuth::Integration {
+        // PR #216 final review SHOULD-FIX 25: without it the signed assertion cannot name the
+        // certificate uploaded in NetSuite, and the connector failed only at its connection test.
+        return Err(refuse(
+            "NetSuite's integration credential needs certificateId: the id of the certificate uploaded in NetSuite",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if dial.objects.len() > MAX_SAAS_OBJECTS
+        || dial.objects.iter().any(|name| {
+            name.trim().is_empty()
+                || name.len() > MAX_SAAS_OBJECT_NAME_LEN
+                || name.chars().any(char::is_control)
+                || !seen.insert(name.as_str())
+        })
+    {
+        return Err(refuse(
+            "objects must be a short list of distinct, non-blank names without control characters",
+        ));
+    }
+    Ok(())
+}
+
 /// Post-deserialize application-level validation for an [`SqlDial`]:
 /// the rules serde cannot express declaratively.
 ///
@@ -919,6 +1558,20 @@ fn validate_sql_dial_post_parse(adapter: &str, dial: &SqlDial) -> Result<(), Ing
     }
 
     if dial.driver == SqlDriver::Oracle {
+        // SRC-4 slice 1 review SHOULD-FIX 3: the Oracle `database` is a service name, and a
+        // service name is an identifier. Letters, digits, `_`, `.` and `-` (the characters a
+        // domain-qualified service name such as `FREEPDB1` or `sales.example.com` uses) in
+        // 1 to 128 characters; the same rule is in `adapters/oracle.py`. The sentence is fixed
+        // and does not repeat the value.
+        if !is_oracle_service_name(&dial.database) {
+            return Err(IngestSpecError::InvalidDial {
+                adapter: adapter.to_owned(),
+                source: serde::de::Error::custom(
+                    "database must be an Oracle service name: 1 to 128 letters, digits, \
+                     underscores, dots or hyphens",
+                ),
+            });
+        }
         let tls_required = dial
             .ssl_mode
             .as_deref()
@@ -938,6 +1591,15 @@ fn validate_sql_dial_post_parse(adapter: &str, dial: &SqlDial) -> Result<(), Ing
     Ok(())
 }
 
+/// Whether `name` is an identifier fit to be an Oracle service name
+/// (`^[A-Za-z0-9_.-]{1,128}$`; SRC-4 slice 1 review SHOULD-FIX 3).
+fn is_oracle_service_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
 /// A `dial` failed to parse or validate.
 ///
 /// [`IngestSpecError::InvalidDial`] never echoes the raw `dial` JSON —
@@ -948,7 +1610,7 @@ fn validate_sql_dial_post_parse(adapter: &str, dial: &SqlDial) -> Result<(), Ing
 #[derive(Debug, thiserror::Error)]
 pub enum IngestSpecError {
     /// The connector's `adapter` column names a value not in the closed
-    /// `sql | cdc | mongodb | kafka | sftp | files | rest | sheets` set.
+    /// `sql | cdc | mongodb | kafka | sftp | files | rest | sheets | saas` set.
     #[error("unknown adapter {adapter:?}")]
     UnknownAdapter {
         /// The offending adapter value.
@@ -1036,6 +1698,13 @@ pub struct SourceObject {
     /// can hold on to a detected key while the user switches modes.
     #[serde(default)]
     pub primary_key: Option<Vec<String>>,
+    /// The columns of the source table the load leaves out (`SRC-11`
+    /// decisions D9 to D12). Stored as what is left OUT, not what is kept, so
+    /// a column that appears at the source later follows the connector's
+    /// schema-change policy instead of being left out silently. Absent or
+    /// empty: nothing is left out. See [`validate_excluded_columns`].
+    #[serde(default)]
+    pub excluded_columns: Option<Vec<String>>,
     /// The Bronze target this object lands at.
     pub target: String,
 }
@@ -1071,7 +1740,8 @@ pub enum InvalidLoadMode {
     /// `incremental` or `incremental_dedup` for an adapter the ingest job
     /// does not run it for.
     #[error(
-        "source object {name:?} asks for an incremental loadMode, which only SQL connectors support"
+        "source object {name:?} asks for an incremental loadMode, which only SQL and business-app \
+         connectors support"
     )]
     NotForAdapter {
         /// The source object's name.
@@ -1083,6 +1753,29 @@ pub enum InvalidLoadMode {
          column that marks new rows"
     )]
     NoCursor {
+        /// The source object's name.
+        name: String,
+    },
+    /// Plain `incremental` on a `saas` object (final review BLOCKER 18): the
+    /// mode appends, so a vendor record read again after a change becomes a
+    /// second row under the same vendor id. Only a mode that merges on a key
+    /// keeps the table one row per record (`SRC-3` decision 6).
+    #[error(
+        "source object {name:?} asks for loadMode incremental on a business-app connector, which \
+         adds a changed record as a second row; use incremental_dedup, which keeps one row per key"
+    )]
+    SaasNeedsMerge {
+        /// The source object's name.
+        name: String,
+    },
+    /// A load mode a change-capture connector does not run (`SRC-4` decision
+    /// S2-g): it keeps the current row per key (`incremental_dedup`, the
+    /// default) or every version (`history`), nothing else.
+    #[error(
+        "source object {name:?} has a loadMode that change capture does not run; use \
+         incremental_dedup (the current row per key) or history (every version)"
+    )]
+    NotForChangeCapture {
         /// The source object's name.
         name: String,
     },
@@ -1147,6 +1840,66 @@ fn key_is_usable(columns: &[serde_json::Value]) -> bool {
     })
 }
 
+/// An Oracle change-capture table that is not `SCHEMA.TABLE` of two Oracle
+/// identifiers in Oracle's own spelling (`SRC-4` slice 6, decision S10-c).
+/// Fixed text; it names the object the request itself sent.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "source object {name:?} is not an Oracle table: write it as SCHEMA.TABLE in upper case, \
+     letters, digits, '_' and '$'"
+)]
+pub struct InvalidOracleTable {
+    /// The offending source object's name.
+    pub name: String,
+}
+
+/// Whether `part` is an unquoted Oracle identifier as the data dictionary
+/// spells it: upper-case, starting with a letter, at most 128 characters.
+fn is_oracle_dictionary_name(part: &str) -> bool {
+    (1..=128).contains(&part.len())
+        && part.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'_' | b'$'))
+}
+
+/// An Oracle change-capture connector's tables are entered by hand (the
+/// orchestrator cannot list them with the connector's native encryption, S10-c),
+/// so each name is checked here as two identifiers in the spelling Debezium
+/// matches: Oracle stores unquoted names in upper case. Other sources are not
+/// checked here.
+///
+/// # Errors
+///
+/// [`InvalidOracleTable`] for the first object of an Oracle `cdc` dial whose
+/// name is not `SCHEMA.TABLE` of two such identifiers.
+pub fn validate_oracle_change_capture_tables(
+    dial: &Dial,
+    source_objects: &serde_json::Value,
+) -> Result<(), InvalidOracleTable> {
+    let Dial::Cdc(cdc) = dial else {
+        return Ok(());
+    };
+    if cdc.driver != SqlDriver::Oracle {
+        return Ok(());
+    }
+    for object in source_objects.as_array().into_iter().flatten() {
+        let name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let valid = name.split_once('.').is_some_and(|(schema, table)| {
+            is_oracle_dictionary_name(schema) && is_oracle_dictionary_name(table)
+        });
+        if !valid {
+            return Err(InvalidOracleTable {
+                name: name.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Check each source object's load mode, the one part of `sourceObjects`
 /// checked at save time: a mode the ingest job cannot run would otherwise
 /// surface only as a rejected run. Everything else in an object is left
@@ -1155,10 +1908,13 @@ fn key_is_usable(columns: &[serde_json::Value]) -> bool {
 /// # Errors
 ///
 /// Returns [`InvalidLoadMode`] for the first object with an unknown
-/// `loadMode`, with an incremental mode on a non-`sql` adapter or without a
-/// cursor column that is a plain name of sensible length, with a
-/// deduplicating mode and no `primaryKey`, or with a `primaryKey` that is
-/// not a usable key.
+/// `loadMode`, with an incremental mode on an adapter other than `sql` and `saas` or without a
+/// cursor column that is a plain name of sensible length, with plain `incremental` on a `saas`
+/// object (it appends; a business-app record must merge on its key, final review BLOCKER 18),
+/// with a deduplicating mode and no `primaryKey`, or with a `primaryKey` that is
+/// not a usable key. For `cdc` (`SRC-4` decision S2-g) only `incremental_dedup` (the
+/// default when no mode is given) and `history` are accepted, both with a key, and
+/// no cursor is asked for: [`InvalidLoadMode::NotForChangeCapture`] otherwise.
 pub fn validate_load_modes(
     adapter: &str,
     source_objects: &serde_json::Value,
@@ -1182,7 +1938,11 @@ pub fn validate_load_modes(
             Some(serde_json::Value::Array(columns)) if key_is_usable(columns) => true,
             Some(_) => return Err(InvalidLoadMode::BadKey { name }),
         };
+        // `SRC-4` decision S2-g: a change-capture object with no mode is the
+        // default, the current row per key, and so needs a key like any other.
+        let change_capture = adapter == "cdc";
         let mode = match object.get("loadMode") {
+            None | Some(serde_json::Value::Null) if change_capture => LoadMode::IncrementalDedup,
             None | Some(serde_json::Value::Null) => continue,
             Some(value) => match LoadMode::deserialize(value) {
                 Ok(mode) => mode,
@@ -1196,6 +1956,9 @@ pub fn validate_load_modes(
                 }
             },
         };
+        if change_capture && !matches!(mode, LoadMode::IncrementalDedup | LoadMode::History) {
+            return Err(InvalidLoadMode::NotForChangeCapture { name });
+        }
         if mode.needs_key() && !has_key {
             return Err(InvalidLoadMode::NoKey { name });
         }
@@ -1221,10 +1984,24 @@ pub fn validate_load_modes(
                 return Err(InvalidLoadMode::ReservedKeyColumn { name });
             }
         }
-        if !mode.is_incremental() {
+        // A change-capture `incremental_dedup` reads no cursor: the changes
+        // arrive in order, and the key merges them.
+        if !mode.is_incremental() || change_capture {
             continue;
         }
-        if adapter != "sql" {
+        // PR #216 final review BLOCKER 18: `incremental` appends, so every changed vendor record
+        // becomes a second row under the same id (and with a lag dlt's boundary de-duplication is
+        // off, so unchanged rows repeat too). A business-app object may only grow incrementally by
+        // merging on its key, which is `incremental_dedup`.
+        if adapter == "saas" && mode == LoadMode::Incremental {
+            return Err(InvalidLoadMode::SaasNeedsMerge { name });
+        }
+        // `SRC-3` AD6: a `saas` object may load incrementally too. Whether the
+        // vendor's API can filter that object by the cursor is declared per
+        // object in the orchestrator's vendor module (`saas/objects.py`); an
+        // object without a cursor there is saved without `incrementalKey`
+        // and so still stops at `NoCursor` below.
+        if !matches!(adapter, "sql" | "saas") {
             return Err(InvalidLoadMode::NotForAdapter { name });
         }
         let cursor = object
@@ -1239,6 +2016,200 @@ pub fn validate_load_modes(
         }
     }
     Ok(())
+}
+
+/// The most columns an object may leave out (`SRC-11`); generous for any
+/// table.
+const MAX_EXCLUDED_COLUMNS: usize = 2000;
+
+/// Why a source object's `excludedColumns` cannot be saved (`SRC-11`
+/// decisions D9 and D11). The route answers [`Self::BadList`] with 400 and the
+/// others with 422; every text is fixed, and names only the object and a
+/// column the request itself named.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidExcludedColumns {
+    /// Not a list of at most 2,000 distinct, non-blank column names of at
+    /// most 128 characters without control characters.
+    #[error(
+        "source object {name:?} has an excludedColumns that is not a list of distinct, \
+         non-blank column names of at most 128 characters without control characters"
+    )]
+    BadList {
+        /// The source object's name.
+        name: String,
+    },
+    /// The source cannot list its columns before loading (`SRC-11` decision
+    /// D9): only `PostgreSQL`, `MySQL`, `MariaDB` and SQL Server can.
+    #[error(
+        "source object {name:?} leaves columns out, which is not available for this source type"
+    )]
+    NotForSource {
+        /// The source object's name.
+        name: String,
+    },
+    /// A key column of a deduplicating or history table (`SRC-11` decision
+    /// D11): the table cannot identify its rows without it.
+    #[error("source object {name:?} cannot leave out {column:?}: it is part of the table's key")]
+    NamesKeyColumn {
+        /// The source object's name.
+        name: String,
+        /// The key column that was named.
+        column: String,
+    },
+    /// The cursor column of an incremental table (`SRC-11` decision D11): the
+    /// load cannot find new rows without it.
+    #[error("source object {name:?} cannot leave out {column:?}: it is the cursor column")]
+    NamesCursorColumn {
+        /// The source object's name.
+        name: String,
+        /// The cursor column that was named.
+        column: String,
+    },
+}
+
+/// Whether the dial's source can list its columns before loading, so that
+/// column choice is offered for it (`SRC-11` decision D9): the `sql` adapter
+/// with the `PostgreSQL`, `MySQL`/`MariaDB` or SQL Server driver, and the
+/// `saas` adapter (`SRC-3` AD6: each vendor module lists an object's fields
+/// before the load). Oracle follows with `SRC-13`; change-capture and every
+/// other adapter are out.
+#[must_use]
+pub const fn supports_column_choice(dial: &Dial) -> bool {
+    matches!(
+        dial,
+        Dial::Sql(SqlDial {
+            driver: SqlDriver::Postgres | SqlDriver::Mysql | SqlDriver::Mssql | SqlDriver::Oracle,
+            ..
+        }) | Dial::Saas(_)
+    )
+}
+
+/// `object`'s `excludedColumns` as names, `Ok(None)` when absent, null or
+/// empty (nothing left out).
+fn excluded_names(
+    object: &serde_json::Value,
+    name: &str,
+) -> Result<Option<Vec<String>>, InvalidExcludedColumns> {
+    let bad = || InvalidExcludedColumns::BadList {
+        name: name.to_owned(),
+    };
+    let list = match object.get("excludedColumns") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Array(list)) => list,
+        Some(_) => return Err(bad()),
+    };
+    if list.len() > MAX_EXCLUDED_COLUMNS {
+        return Err(bad());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::with_capacity(list.len());
+    for column in list {
+        let Some(column) = column.as_str() else {
+            return Err(bad());
+        };
+        if column.trim().is_empty()
+            || column.len() > MAX_PRIMARY_KEY_COLUMN_LEN
+            || column.chars().any(char::is_control)
+            || !seen.insert(column)
+        {
+            return Err(bad());
+        }
+        names.push(column.to_owned());
+    }
+    Ok((!names.is_empty()).then_some(names))
+}
+
+/// Check each source object's `excludedColumns` at save time (`SRC-11`
+/// decisions D9 to D11): well-formed, only for a source that can list its
+/// columns ([`supports_column_choice`]), and never naming a key column of a
+/// deduplicating or history table or the cursor column of an incremental one.
+///
+/// What this cannot check is that a named column exists: the columns are
+/// read from the source at load time, and a name the source does not have
+/// simply leaves nothing out.
+///
+/// # Errors
+///
+/// Returns [`InvalidExcludedColumns`] for the first object that breaks a rule.
+pub fn validate_excluded_columns(
+    dial: &Dial,
+    source_objects: &serde_json::Value,
+) -> Result<(), InvalidExcludedColumns> {
+    for object in source_objects.as_array().into_iter().flatten() {
+        let name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let Some(excluded) = excluded_names(object, name)? else {
+            continue;
+        };
+        if !supports_column_choice(dial) {
+            return Err(InvalidExcludedColumns::NotForSource {
+                name: name.to_owned(),
+            });
+        }
+        let mode = object
+            .get("loadMode")
+            .and_then(|value| LoadMode::deserialize(value).ok());
+        if mode.is_some_and(LoadMode::needs_key) {
+            let key = object
+                .get("primaryKey")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str);
+            for column in key {
+                if excluded.iter().any(|e| e == column) {
+                    return Err(InvalidExcludedColumns::NamesKeyColumn {
+                        name: name.to_owned(),
+                        column: column.to_owned(),
+                    });
+                }
+            }
+        }
+        if mode.is_some_and(LoadMode::is_incremental) {
+            let cursor = object
+                .get("incrementalKey")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if excluded.iter().any(|e| e == cursor) {
+                return Err(InvalidExcludedColumns::NamesCursorColumn {
+                    name: name.to_owned(),
+                    column: cursor.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `(object, column)` pairs that are to be marked inactive: the columns
+/// left out of a table that KEEPS its rows (`append`, `incremental`,
+/// `incremental_dedup`, `history`), where a left-out column stays in the
+/// Bronze table with no new values (`SRC-11` decision D10). In a table the
+/// next load replaces (`replace`, `replace_dedup`, or no mode) the column is
+/// gone after the load and nothing is marked. Lenient like [`dedup_keys`]:
+/// a stored spec has passed [`validate_excluded_columns`].
+#[must_use]
+pub fn inactive_exclusions(source_objects: &serde_json::Value) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for object in source_objects.as_array().into_iter().flatten() {
+        let Some(name) = object.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let keeps_rows = object
+            .get("loadMode")
+            .and_then(|value| LoadMode::deserialize(value).ok())
+            .is_some_and(|mode| !matches!(mode, LoadMode::Replace | LoadMode::ReplaceDedup));
+        if !keeps_rows {
+            continue;
+        }
+        let Ok(Some(excluded)) = excluded_names(object, name) else {
+            continue;
+        };
+        pairs.extend(excluded.into_iter().map(|column| (name.to_owned(), column)));
+    }
+    pairs
 }
 
 /// The key columns of every object whose stored load mode has a key (the
@@ -1423,8 +2394,9 @@ pub fn validate_hostname(field: &'static str, host: &str) -> Result<(), InvalidH
 /// matching Python-side change (the same discipline `column_gate.py` and
 /// `cdc.rs::NESTED_TYPE_MARKERS` already carry, X9).
 ///
-/// `auth_type` is consulted for `adapter == "rest"` (the `dial.auth.type`
-/// tag), `adapter == "kafka"` (`"none"` needs zero secret refs — a
+/// `auth_type` is consulted for `adapter == "saas"` (the key
+/// [`Dial::saas_auth_type`] builds from the vendor table), `adapter == "rest"`
+/// (the `dial.auth.type` tag), `adapter == "kafka"` (`"none"` needs zero secret refs — a
 /// `PLAINTEXT` broker has no credential at all — while `"sasl_plain"`
 /// needs two) and `adapter == "sftp"` (`"password"` vs. `"public_key"`
 /// select a different single field name, never a field COUNT, so both
@@ -1455,9 +2427,17 @@ pub fn secret_field_names(
         ("rest", Some("bearer")) => Some(&["token"]),
         ("rest", Some("basic")) => Some(&["username", "password"]),
         ("rest", Some("oauth2_client_credentials")) => Some(&["clientId", "clientSecret"]),
+        // `SRC-12` part C: the client id is configuration in the dial, so the
+        // two secrets are the client secret (primary, typed or referenced)
+        // and the refresh token (secondary, written by the sign-in callback).
+        ("rest", Some("oauth2_authorization_code")) => Some(&["clientSecret", "refreshToken"]),
         ("kafka", Some("none")) => Some(&[]),
         ("sftp", Some("public_key")) => Some(&["privateKey"]),
         ("sheets", _) => Some(&["serviceAccountJson"]),
+        // `SRC-3` AD2/AD8: a `saas` connector's slots come from the vendor
+        // table, keyed by `Dial::saas_auth_type` (the browser sign-in's two
+        // secrets, or the vendor's integration credential's fields).
+        ("saas", Some(auth_type)) => crate::saas_vendors::secret_fields_for(auth_type),
         _ => None,
     }
 }
@@ -1635,13 +2615,204 @@ mod tests {
     }
 
     #[test]
-    fn cdc_dial_requires_slot_and_publication_name() {
-        let json = serde_json::json!({
+    fn cdc_dial_fields_follow_the_driver() {
+        let base = |driver: &str| {
+            serde_json::json!({
+                "driver": driver, "host": "db.internal", "port": 5432,
+                "database": "orders", "user": "app_reader"
+            })
+        };
+        let refusal = |json: serde_json::Value| Dial::parse("cdc", &json).unwrap_err().to_string();
+        // PostgreSQL: both names required, no server id; stored rows parse unchanged.
+        assert!(refusal(base("postgres")).contains("slotName is required"));
+        let mut pg = base("postgres");
+        pg["slotName"] = serde_json::json!("s");
+        assert!(refusal(pg.clone()).contains("publicationName is required"));
+        pg["publicationName"] = serde_json::json!("p");
+        assert!(Dial::parse("cdc", &pg).is_ok());
+        pg["serverId"] = serde_json::json!(5);
+        assert!(refusal(pg).contains("serverId is only for a MySQL"));
+        // MySQL: a server id in 1..=4294967295, neither name.
+        assert!(refusal(base("mysql")).contains("serverId is required"));
+        let mut my = base("mysql");
+        my["serverId"] = serde_json::json!(0);
+        assert!(refusal(my.clone()).contains("between 1 and 4294967295"));
+        my["serverId"] = serde_json::json!(4_294_967_295_u64);
+        assert!(Dial::parse("cdc", &my).is_ok());
+        my["serverId"] = serde_json::json!(4_294_967_296_u64);
+        assert!(Dial::parse("cdc", &my).is_err());
+        my["serverId"] = serde_json::json!(7);
+        my["slotName"] = serde_json::json!("s");
+        assert!(refusal(my.clone()).contains("slotName is only for a PostgreSQL"));
+        my.as_object_mut().unwrap().remove("slotName");
+        my["publicationName"] = serde_json::json!("p");
+        assert!(refusal(my).contains("publicationName is only for a PostgreSQL"));
+        // SQL Server: none of the three.
+        assert!(Dial::parse("cdc", &base("mssql")).is_ok());
+        for (field, value) in [
+            ("slotName", serde_json::json!("s")),
+            ("publicationName", serde_json::json!("p")),
+            ("serverId", serde_json::json!(1)),
+        ] {
+            let mut ms = base("mssql");
+            ms[field] = value;
+            assert!(
+                Dial::parse("cdc", &ms).is_err(),
+                "{field} must be refused for SQL Server"
+            );
+        }
+    }
+
+    #[test]
+    fn cdc_dial_oracle_takes_a_pdb_name_and_only_two_tls_modes() {
+        let base = || {
+            serde_json::json!({
+                "driver": "oracle", "host": "db.internal", "port": 1521,
+                "database": "FREE", "user": "c##dbzuser"
+            })
+        };
+        let refusal = |json: serde_json::Value| Dial::parse("cdc", &json).unwrap_err().to_string();
+        // A non-container database: no pdbName.
+        assert!(Dial::parse("cdc", &base()).is_ok());
+        let mut with_pdb = base();
+        with_pdb["pdbName"] = serde_json::json!("FREEPDB1");
+        assert!(Dial::parse("cdc", &with_pdb).is_ok());
+        with_pdb["pdbName"] = serde_json::json!("FREE PDB; DROP");
+        assert!(refusal(with_pdb.clone()).contains("pdbName must be an Oracle name"));
+        // `pdbName` becomes the service name in the connect descriptor (`DESCRIPTION=(...SERVICE_NAME=...)`),
+        // so a descriptor metacharacter must never get that far (Amendment 12, S12-c).
+        for bad in [
+            "FREEPDB1)(HOST=evil",
+            "A=B",
+            "A B",
+            "(X)",
+            "FREE\tPDB",
+            "FREEPDB1)",
+        ] {
+            with_pdb["pdbName"] = serde_json::json!(bad);
+            assert!(
+                refusal(with_pdb.clone()).contains("pdbName must be an Oracle name"),
+                "{bad:?}"
+            );
+        }
+        let mut bad_db = base();
+        bad_db["database"] = serde_json::json!("FREE'");
+        assert!(refusal(bad_db).contains("database must be an Oracle name"));
+        // Oracle uses none of the three names.
+        for (field, value, text) in [
+            ("slotName", serde_json::json!("s"), "slotName is only for"),
+            (
+                "publicationName",
+                serde_json::json!("p"),
+                "publicationName is only for",
+            ),
+            ("serverId", serde_json::json!(1), "serverId is only for"),
+        ] {
+            let mut o = base();
+            o[field] = value;
+            assert!(refusal(o).contains(text), "{field}");
+        }
+        // pdbName is Oracle's alone.
+        for driver in ["postgres", "mysql", "mssql"] {
+            let mut d = base();
+            d["driver"] = serde_json::json!(driver);
+            d["pdbName"] = serde_json::json!("FREEPDB1");
+            if driver == "postgres" {
+                d["slotName"] = serde_json::json!("s");
+                d["publicationName"] = serde_json::json!("p");
+            }
+            if driver == "mysql" {
+                d["serverId"] = serde_json::json!(7);
+            }
+            assert!(
+                refusal(d).contains("pdbName is only for an Oracle"),
+                "{driver}"
+            );
+        }
+        // S6-c: require and disable only.
+        for word in ["disable", "require"] {
+            let mut o = base();
+            o["sslMode"] = serde_json::json!(word);
+            assert!(Dial::parse("cdc", &o).is_ok(), "{word}");
+        }
+        for word in ["verify-ca", "verify-full"] {
+            let mut o = base();
+            o["sslMode"] = serde_json::json!(word);
+            assert!(refusal(o).contains("not supported for an Oracle"), "{word}");
+        }
+    }
+
+    #[test]
+    fn oracle_change_capture_tables_are_two_upper_case_identifiers() {
+        let oracle = Dial::parse(
+            "cdc",
+            &serde_json::json!({
+                "driver": "oracle", "host": "db.internal", "port": 1521,
+                "database": "FREE", "user": "u"
+            }),
+        )
+        .unwrap();
+        let objects = |names: &[&str]| {
+            serde_json::Value::Array(
+                names
+                    .iter()
+                    .map(|n| serde_json::json!({"name": n, "target": "t"}))
+                    .collect(),
+            )
+        };
+        assert!(
+            validate_oracle_change_capture_tables(&oracle, &objects(&["SHOP.ORDERS", "A1.B_2$"]))
+                .is_ok()
+        );
+        for bad in [
+            "shop.orders",
+            "SHOP",
+            "SHOP.",
+            ".ORDERS",
+            "A.B.C",
+            "1A.B",
+            "SHOP.OR DERS",
+            "SHOP.ORD,ERS",
+            "SHOP.\"ORDERS\"",
+        ] {
+            let err = validate_oracle_change_capture_tables(&oracle, &objects(&["OK.OK", bad]))
+                .unwrap_err();
+            assert_eq!(err.name, bad);
+        }
+        // Other sources are not subject to the rule.
+        let pg = Dial::parse(
+            "cdc",
+            &serde_json::json!({
+                "driver": "postgres", "host": "db.internal", "port": 5432,
+                "database": "d", "user": "u", "slotName": "s", "publicationName": "p"
+            }),
+        )
+        .unwrap();
+        assert!(validate_oracle_change_capture_tables(&pg, &objects(&["public.orders"])).is_ok());
+    }
+
+    #[test]
+    fn cdc_dial_ssl_mode_defaults_to_require_and_names_a_closed_set() {
+        let mut json = serde_json::json!({
             "driver": "postgres", "host": "db.internal", "port": 5432,
-            "database": "orders", "user": "app_reader"
+            "database": "orders", "user": "app_reader",
+            "slotName": "orders_slot", "publicationName": "orders_pub"
         });
-        let err = serde_json::from_value::<CdcDial>(json).unwrap_err();
-        assert!(err.to_string().contains("missing field"));
+        let dial = serde_json::from_value::<CdcDial>(json.clone()).unwrap();
+        assert_eq!(dial.ssl_mode, CdcSslMode::Require);
+        for (word, mode) in [
+            ("disable", CdcSslMode::Disable),
+            ("require", CdcSslMode::Require),
+            ("verify-ca", CdcSslMode::VerifyCa),
+            ("verify-full", CdcSslMode::VerifyFull),
+        ] {
+            json["sslMode"] = serde_json::json!(word);
+            let dial = serde_json::from_value::<CdcDial>(json.clone()).unwrap();
+            assert_eq!(dial.ssl_mode, mode);
+            assert_eq!(dial.ssl_mode.as_debezium(), word);
+        }
+        json["sslMode"] = serde_json::json!("prefer");
+        assert!(serde_json::from_value::<CdcDial>(json).is_err());
     }
 
     #[test]
@@ -1735,7 +2906,7 @@ mod tests {
         });
         let dial = Dial::parse("cdc", &json).expect("valid cdc dial");
         assert_eq!(
-            dial.as_cdc().map(|cdc| cdc.slot_name.as_str()),
+            dial.as_cdc().and_then(|cdc| cdc.slot_name.as_deref()),
             Some("orders_slot")
         );
     }
@@ -1747,6 +2918,7 @@ mod tests {
             incremental_key: None,
             load_mode: None,
             primary_key: None,
+            excluded_columns: None,
             target: String::new(),
         };
         let err = object.validate().unwrap_err();
@@ -1760,6 +2932,7 @@ mod tests {
             incremental_key: Some("updated_at".to_owned()),
             load_mode: Some(LoadMode::Incremental),
             primary_key: None,
+            excluded_columns: None,
             target: "bronze.orders".to_owned(),
         };
         assert!(object.validate().is_ok());
@@ -1905,6 +3078,56 @@ mod tests {
             ),
             Err(InvalidLoadMode::NoKey { .. })
         ));
+    }
+
+    /// `SRC-4` decision S2-g: change capture runs the current row per key (the
+    /// default) and history, both need a key, neither asks for a cursor.
+    #[test]
+    fn validate_load_modes_for_change_capture_accepts_two_modes_with_a_key() {
+        let check =
+            |object: serde_json::Value| validate_load_modes("cdc", &serde_json::json!([object]));
+        for object in [
+            serde_json::json!({ "name": "a", "target": "a", "primaryKey": ["id"] }),
+            serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental_dedup",
+                "primaryKey": ["id"] }),
+            serde_json::json!({ "name": "a", "target": "a", "loadMode": "history",
+                "primaryKey": ["id"] }),
+        ] {
+            assert_eq!(check(object.clone()), Ok(()), "{object}");
+        }
+        for mode in ["replace", "append", "incremental", "replace_dedup"] {
+            assert!(
+                matches!(
+                    check(
+                        serde_json::json!({ "name": "a", "target": "a", "loadMode": mode,
+                        "incrementalKey": "u", "primaryKey": ["id"] })
+                    ),
+                    Err(InvalidLoadMode::NotForChangeCapture { .. })
+                ),
+                "{mode}"
+            );
+        }
+        // No key, with or without a stated mode, is refused.
+        for object in [
+            serde_json::json!({ "name": "a", "target": "a" }),
+            serde_json::json!({ "name": "a", "target": "a", "loadMode": "history" }),
+            serde_json::json!({ "name": "a", "target": "a", "loadMode": "incremental_dedup" }),
+        ] {
+            assert!(
+                matches!(check(object.clone()), Err(InvalidLoadMode::NoKey { .. })),
+                "{object}"
+            );
+        }
+        // History still takes no cursor.
+        assert!(matches!(
+            check(
+                serde_json::json!({ "name": "a", "target": "a", "loadMode": "history",
+                "incrementalKey": "u", "primaryKey": ["id"] })
+            ),
+            Err(InvalidLoadMode::HistoryHasCursor { .. })
+        ));
+        // An empty list of objects (nothing chosen yet) is still saved.
+        assert_eq!(validate_load_modes("cdc", &serde_json::json!([])), Ok(()));
     }
 
     #[test]
@@ -2301,6 +3524,36 @@ mod tests {
     }
 
     #[test]
+    fn dial_parse_accepts_an_oracle_service_name_that_is_an_identifier() {
+        // SRC-4 slice 1 review SHOULD-FIX 3.
+        for name in ["FREEPDB1", "ORCLPDB1", "sales.example.com", "g6_ingest-2"] {
+            let json = serde_json::json!({
+                "driver": "oracle", "host": "oracle.internal", "port": 1521,
+                "database": name, "user": "reader"
+            });
+            assert!(Dial::parse("sql", &json).is_ok(), "{name} must be accepted");
+        }
+    }
+
+    #[test]
+    fn dial_parse_refuses_an_oracle_service_name_that_is_not_an_identifier() {
+        // SRC-4 slice 1 review SHOULD-FIX 3: a fixed sentence, never the value.
+        let too_long = "A".repeat(129);
+        for name in ["a)(b", "a=b", "a b", "(a", "", too_long.as_str()] {
+            let json = serde_json::json!({
+                "driver": "oracle", "host": "oracle.internal", "port": 1521,
+                "database": name, "user": "reader"
+            });
+            let msg = Dial::parse("sql", &json).unwrap_err().to_string();
+            assert!(msg.contains("Oracle service name"), "{name:?}: {msg}");
+            assert!(
+                name.is_empty() || !msg.contains(name),
+                "the message must not repeat the value: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn dial_parse_refuses_oracle_tls_with_no_ssl_server_cert_dn() {
         let json = serde_json::json!({
             "driver": "oracle",
@@ -2456,7 +3709,10 @@ mod target_identity_tests {
 
     use serde_json::{Value, json};
 
-    use super::{Dial, is_repoint};
+    use super::{
+        Dial, InvalidExcludedColumns, InvalidLoadMode, SourceObject, inactive_exclusions,
+        is_repoint, supports_column_choice, validate_excluded_columns, validate_load_modes,
+    };
 
     fn parse(adapter: &str, dial: &Value) -> Dial {
         Dial::parse(adapter, dial).expect("a valid dial")
@@ -2515,6 +3771,11 @@ mod target_identity_tests {
         assert!(Dial::parse("sql", &missing).is_err());
     }
 
+    /// The target identity of a `cdc` dial is its driver, host, port and database, and nothing
+    /// else. `SRC-4` slice 3 (decision S3-a) makes `slotName`/`publicationName` PostgreSQL-only and
+    /// `serverId` MySQL-only, so this test's old fixture (a PostgreSQL dial given a `serverId` and
+    /// switched to `mysql` with slot names) is no longer a dial `Dial::parse` accepts. The intent is
+    /// unchanged: each field below is varied on a dial that is valid for its driver.
     #[test]
     fn a_cdc_dial_is_re_pointed_by_driver_host_port_or_database_only() {
         let base = json!({
@@ -2522,14 +3783,157 @@ mod target_identity_tests {
             "database": "orders", "user": "reader",
             "slotName": "slot_a", "publicationName": "pub_a"
         });
-        assert!(!same("cdc", &base, "driver", json!("mysql")));
         assert!(!same("cdc", &base, "host", json!("other.internal")));
         assert!(!same("cdc", &base, "port", json!(5433)));
         assert!(!same("cdc", &base, "database", json!("billing")));
         assert!(same("cdc", &base, "user", json!("someone_else")));
         assert!(same("cdc", &base, "slotName", json!("slot_b")));
         assert!(same("cdc", &base, "publicationName", json!("pub_b")));
-        assert!(same("cdc", &base, "serverId", json!(7)));
+        // The driver: the same host, port and database under another driver is another target.
+        let mysql = json!({
+            "driver": "mysql", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "reader", "serverId": 7
+        });
+        assert_ne!(
+            parse("cdc", &base).target_identity(),
+            parse("cdc", &mysql).target_identity()
+        );
+        // MySQL's server id is not part of the target.
+        assert!(same("cdc", &mysql, "serverId", json!(8)));
+    }
+
+    fn cdc_mongo() -> Value {
+        json!({
+            "driver": "mongodb",
+            "hosts": ["mongo-a.internal:27017"],
+            "database": "shop", "user": "reader", "replicaSet": "rs0"
+        })
+    }
+
+    /// `SRC-4` S5-a: the host, the database and the replica set are the target; the user, the TLS
+    /// mode and the case of the host are not.
+    #[test]
+    fn a_mongodb_cdc_dial_is_re_pointed_by_hosts_database_or_replica_set() {
+        let base = cdc_mongo();
+        assert!(!same(
+            "cdc",
+            &base,
+            "hosts",
+            json!(["mongo-a.internal:27018"])
+        ));
+        assert!(!same(
+            "cdc",
+            &base,
+            "hosts",
+            json!(["mongo-b.internal:27017"])
+        ));
+        assert!(!same("cdc", &base, "database", json!("billing")));
+        assert!(!same("cdc", &base, "replicaSet", json!("rs1")));
+        assert!(same("cdc", &base, "user", json!("someone_else")));
+        assert!(same("cdc", &base, "sslMode", json!("disable")));
+        assert!(same(
+            "cdc",
+            &base,
+            "hosts",
+            json!(["MONGO-A.internal:27017"])
+        ));
+        // A MongoDB target is never equal to a SQL one.
+        let postgres = json!({
+            "driver": "postgres", "host": "mongo-a.internal", "port": 27017,
+            "database": "shop", "user": "reader",
+            "slotName": "s", "publicationName": "p"
+        });
+        assert_ne!(
+            parse("cdc", &base).target_identity(),
+            parse("cdc", &postgres).target_identity()
+        );
+    }
+
+    #[test]
+    fn a_mongodb_cdc_dial_parses_to_its_own_variant_and_a_sql_one_does_not() {
+        assert!(matches!(
+            parse("cdc", &cdc_mongo()),
+            Dial::CdcMongo(ref dial) if dial.replica_set == "rs0" && dial.hosts.len() == 1
+        ));
+        assert!(parse("cdc", &cdc_mongo()).as_cdc().is_none());
+        assert!(parse("cdc", &cdc_mongo()).as_cdc_mongo().is_some());
+        let postgres = json!({
+            "driver": "postgres", "host": "db.internal", "port": 5432,
+            "database": "orders", "user": "reader",
+            "slotName": "s", "publicationName": "p"
+        });
+        assert!(parse("cdc", &postgres).as_cdc_mongo().is_none());
+    }
+
+    #[test]
+    fn a_mongodb_cdc_dial_refuses_what_it_does_not_know_or_cannot_dial_safely() {
+        let refused = |field: &str, value: Value| {
+            let mut dial = cdc_mongo();
+            dial[field] = value;
+            Dial::parse("cdc", &dial).is_err()
+        };
+        // The replica set is required, and plain characters only.
+        let mut without = cdc_mongo();
+        without.as_object_mut().unwrap().remove("replicaSet");
+        assert!(Dial::parse("cdc", &without).is_err());
+        assert!(refused("replicaSet", json!("")));
+        assert!(refused("replicaSet", json!("rs0&authSource=admin")));
+        // No connection string of the person's own, no SRV, no PostgreSQL fields.
+        for (field, value) in [
+            ("uri", json!("mongodb://x")),
+            ("srvUri", json!("mongodb+srv://x")),
+            ("slotName", json!("s")),
+            ("serverId", json!(7)),
+            ("host", json!("h")),
+        ] {
+            assert!(refused(field, value), "{field} must be refused");
+        }
+        // Hosts: at least one, each host:port with a valid host and port.
+        assert!(refused("hosts", json!([])));
+        assert!(refused("hosts", json!(["mongo-a.internal"])));
+        // SRC-4 slice 5 review BLOCKER 1: more than one host is refused, with the fixed sentence.
+        let two = json!(["mongo-a.internal:27017", "mongo-b.internal:27017"]);
+        assert!(refused("hosts", two.clone()));
+        let mut dial = cdc_mongo();
+        dial["hosts"] = two;
+        assert!(
+            Dial::parse("cdc", &dial)
+                .unwrap_err()
+                .to_string()
+                .contains(super::CDC_MONGO_ONE_HOST)
+        );
+        // SHOULD-FIX 1: the replicaSet sentence is one line with single spaces, exactly this text.
+        let mut dial = cdc_mongo();
+        dial["replicaSet"] = json!("rs0&x");
+        assert!(Dial::parse("cdc", &dial).unwrap_err().to_string().contains(
+            "replicaSet must be 1 to 128 letters, digits, underscores, hyphens or dots: the name in the server's replica set configuration"
+        ));
+        assert!(!super::CDC_MONGO_REPLICA_SET.contains("  "));
+        assert!(refused("hosts", json!(["mongo-a.internal:0"])));
+        assert!(refused("hosts", json!(["mongo-a.internal:70000"])));
+        assert!(refused("hosts", json!(["mongo{a}.internal:27017"])));
+        assert!(refused("hosts", json!(["bad;host:27017"])));
+        // Database and user.
+        assert!(refused("database", json!("")));
+        assert!(refused("database", json!("shop.orders")));
+        assert!(refused("database", json!("shop,other")));
+        assert!(refused("user", json!("")));
+        assert!(refused("sslMode", json!("prefer")));
+        // The driver word is exact: a different spelling is the SQL shape and fails there.
+        assert!(refused("driver", json!("Mongodb")));
+    }
+
+    #[test]
+    fn a_mongodb_cdc_dial_defaults_to_require_and_reads_every_mode() {
+        let Dial::CdcMongo(dial) = parse("cdc", &cdc_mongo()) else {
+            panic!("a MongoDB CDC dial");
+        };
+        assert_eq!(dial.ssl_mode, super::CdcSslMode::Require);
+        for mode in ["disable", "require", "verify-ca", "verify-full"] {
+            let mut json = cdc_mongo();
+            json["sslMode"] = json!(mode);
+            assert!(Dial::parse("cdc", &json).is_ok(), "{mode}");
+        }
     }
 
     #[test]
@@ -2886,5 +4290,609 @@ mod target_identity_tests {
             &with("sql", &stored, "host", json!("other.internal"))
         ));
         assert!(is_repoint(Some("sql"), &stored, &parse("rest", &rest())));
+    }
+
+    fn sql_dial_of(driver: &str) -> Dial {
+        Dial::parse(
+            "sql",
+            &serde_json::json!({
+                "driver": driver, "host": "db.internal", "port": 5432,
+                "database": "orders", "user": "app_reader"
+            }),
+        )
+        .expect("valid sql dial")
+    }
+
+    /// `SRC-11` D9 and `SRC-4` T1.2: column choice for the four SQL drivers
+    /// that list columns before loading (Oracle since `SRC-4`); a refusal for
+    /// change capture and the rest.
+    #[test]
+    fn excluded_columns_are_accepted_only_for_sources_that_list_their_columns() {
+        let objects = serde_json::json!([
+            { "name": "public.orders", "target": "orders", "excludedColumns": ["note"] }
+        ]);
+        for driver in ["postgres", "mysql", "mssql", "oracle"] {
+            assert_eq!(
+                validate_excluded_columns(&sql_dial_of(driver), &objects),
+                Ok(()),
+                "{driver}"
+            );
+        }
+        let refused = Err(InvalidExcludedColumns::NotForSource {
+            name: "public.orders".to_owned(),
+        });
+        let cdc = Dial::parse(
+            "cdc",
+            &serde_json::json!({
+                "driver": "postgres", "host": "db.internal", "port": 5432,
+                "database": "orders", "user": "app_reader",
+                "slotName": "orders_slot", "publicationName": "orders_pub"
+            }),
+        )
+        .expect("valid cdc dial");
+        assert_eq!(validate_excluded_columns(&cdc, &objects), refused);
+        assert!(supports_column_choice(&sql_dial_of("postgres")));
+        assert!(supports_column_choice(&sql_dial_of("oracle")));
+        assert!(!supports_column_choice(&cdc));
+    }
+
+    /// `SRC-3` T1.3, AD6: a `saas` object takes the deduplicating incremental
+    /// mode and column choice when it has a cursor; without one it is still
+    /// refused, with the same message as a SQL object. `rest` is still refused.
+    /// Final review BLOCKER 18: plain `incremental` is refused for `saas`
+    /// because it appends a changed record as a second row.
+    #[test]
+    fn saas_objects_take_incremental_loads_and_column_choice_only_with_a_cursor() {
+        let incremental = serde_json::json!([{
+            "name": "tickets", "target": "t", "loadMode": "incremental_dedup",
+            "incrementalKey": "updated_at", "primaryKey": ["id"]
+        }]);
+        assert_eq!(validate_load_modes("saas", &incremental), Ok(()));
+        let append_incremental = serde_json::json!([{
+            "name": "tickets", "target": "t", "loadMode": "incremental",
+            "incrementalKey": "updated_at", "primaryKey": ["id"]
+        }]);
+        assert_eq!(
+            validate_load_modes("saas", &append_incremental),
+            Err(InvalidLoadMode::SaasNeedsMerge {
+                name: "tickets".to_owned()
+            })
+        );
+        assert_eq!(
+            validate_load_modes("sql", &append_incremental),
+            Ok(()),
+            "a SQL source keeps plain incremental: the pushed-down query reads one row per row"
+        );
+        let no_cursor = serde_json::json!([{
+            "name": "tickets", "target": "t", "loadMode": "incremental_dedup", "primaryKey": ["id"]
+        }]);
+        assert_eq!(
+            validate_load_modes("saas", &no_cursor),
+            Err(InvalidLoadMode::NoCursor {
+                name: "tickets".to_owned()
+            })
+        );
+        assert!(matches!(
+            validate_load_modes("rest", &incremental),
+            Err(InvalidLoadMode::NotForAdapter { .. })
+        ));
+        let saas = Dial::parse(
+            "saas",
+            &serde_json::json!({
+                "vendor": "zendesk", "account": "acme",
+                "auth": {"type": "integration"}
+            }),
+        )
+        .expect("valid saas dial");
+        assert!(supports_column_choice(&saas));
+        let left_out = serde_json::json!([{
+            "name": "tickets", "target": "t", "excludedColumns": ["subject"]
+        }]);
+        assert_eq!(validate_excluded_columns(&saas, &left_out), Ok(()));
+        let cursor_left_out = serde_json::json!([{
+            "name": "tickets", "target": "t", "loadMode": "incremental",
+            "incrementalKey": "updated_at", "excludedColumns": ["updated_at"]
+        }]);
+        assert!(matches!(
+            validate_excluded_columns(&saas, &cursor_left_out),
+            Err(InvalidExcludedColumns::NamesCursorColumn { .. })
+        ));
+    }
+
+    /// An object that leaves nothing out is fine for every source: the field
+    /// absent, null and an empty list all mean "nothing".
+    #[test]
+    fn leaving_nothing_out_is_accepted_for_every_source() {
+        let objects = serde_json::json!([
+            { "name": "a", "target": "a" },
+            { "name": "b", "target": "b", "excludedColumns": null },
+            { "name": "c", "target": "c", "excludedColumns": [] },
+        ]);
+        assert_eq!(
+            validate_excluded_columns(&sql_dial_of("oracle"), &objects),
+            Ok(())
+        );
+        let inactive = inactive_exclusions(&objects);
+        assert!(inactive.is_empty(), "{inactive:?}");
+    }
+
+    /// `SRC-11` D11: a key column of a deduplicating or history table and the
+    /// cursor column cannot be left out; other columns can.
+    #[test]
+    fn excluded_columns_refuse_the_key_and_the_cursor() {
+        let dial = sql_dial_of("postgres");
+        let refuse = |object: serde_json::Value| {
+            validate_excluded_columns(&dial, &serde_json::json!([object]))
+        };
+        for mode in ["replace_dedup", "incremental_dedup", "history"] {
+            let mut object = serde_json::json!({
+                "name": "t", "target": "t", "loadMode": mode,
+                "primaryKey": ["id"], "excludedColumns": ["note", "id"]
+            });
+            if mode == "incremental_dedup" {
+                object["incrementalKey"] = serde_json::json!("updated_at");
+            }
+            assert_eq!(
+                refuse(object),
+                Err(InvalidExcludedColumns::NamesKeyColumn {
+                    name: "t".to_owned(),
+                    column: "id".to_owned()
+                }),
+                "{mode}"
+            );
+        }
+        assert_eq!(
+            refuse(serde_json::json!({
+                "name": "t", "target": "t", "loadMode": "incremental",
+                "incrementalKey": "updated_at", "excludedColumns": ["updated_at"]
+            })),
+            Err(InvalidExcludedColumns::NamesCursorColumn {
+                name: "t".to_owned(),
+                column: "updated_at".to_owned()
+            })
+        );
+        // A key is only a key in a mode that reads it: a plain replace may
+        // leave out the column the console remembered as a detected key.
+        assert_eq!(
+            refuse(serde_json::json!({
+                "name": "t", "target": "t", "loadMode": "replace",
+                "primaryKey": ["id"], "excludedColumns": ["id"]
+            })),
+            Ok(())
+        );
+        assert_eq!(
+            refuse(serde_json::json!({
+                "name": "t", "target": "t", "loadMode": "incremental",
+                "incrementalKey": "updated_at", "excludedColumns": ["note"]
+            })),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn excluded_columns_must_be_a_short_list_of_plain_distinct_names() {
+        let dial = sql_dial_of("mysql");
+        let long = "x".repeat(129);
+        let many: Vec<String> = (0..2001).map(|n| format!("c{n}")).collect();
+        for bad in [
+            serde_json::json!("note"),
+            serde_json::json!([1]),
+            serde_json::json!([""]),
+            serde_json::json!(["  "]),
+            serde_json::json!(["a", "a"]),
+            serde_json::json!(["a\nb"]),
+            serde_json::json!([long]),
+            serde_json::json!(many),
+        ] {
+            assert!(
+                matches!(
+                    validate_excluded_columns(
+                        &dial,
+                        &serde_json::json!([{ "name": "t", "target": "t", "excludedColumns": bad }])
+                    ),
+                    Err(InvalidExcludedColumns::BadList { .. })
+                ),
+                "{bad}"
+            );
+        }
+        // Names are compared as written: a case difference is two columns.
+        assert_eq!(
+            validate_excluded_columns(
+                &dial,
+                &serde_json::json!([{ "name": "t", "target": "t", "excludedColumns": ["a", "A"] }])
+            ),
+            Ok(())
+        );
+    }
+
+    /// `SRC-11` D10: only a table that keeps its rows gets the inactive mark.
+    #[test]
+    fn only_a_table_that_keeps_its_rows_marks_a_left_out_column_inactive() {
+        let objects = serde_json::json!([
+            { "name": "a", "target": "a", "loadMode": "append", "excludedColumns": ["x"] },
+            { "name": "b", "target": "b", "loadMode": "replace", "excludedColumns": ["x"] },
+            { "name": "c", "target": "c", "excludedColumns": ["x"] },
+            { "name": "d", "target": "d", "loadMode": "replace_dedup",
+              "primaryKey": ["id"], "excludedColumns": ["x"] },
+            { "name": "e", "target": "e", "loadMode": "history",
+              "primaryKey": ["id"], "excludedColumns": ["x", "y"] },
+            { "name": "f", "target": "f", "loadMode": "incremental_dedup",
+              "primaryKey": ["id"], "incrementalKey": "u", "excludedColumns": ["z"] },
+        ]);
+        assert_eq!(
+            inactive_exclusions(&objects),
+            vec![
+                ("a".to_owned(), "x".to_owned()),
+                ("e".to_owned(), "x".to_owned()),
+                ("e".to_owned(), "y".to_owned()),
+                ("f".to_owned(), "z".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn source_object_reads_excluded_columns_and_defaults_to_none() {
+        let with: SourceObject = serde_json::from_value(serde_json::json!({
+            "name": "public.orders", "target": "orders", "excludedColumns": ["note"]
+        }))
+        .expect("valid");
+        assert_eq!(with.excluded_columns, Some(vec!["note".to_owned()]));
+        let without: SourceObject = serde_json::from_value(
+            serde_json::json!({ "name": "public.orders", "target": "orders" }),
+        )
+        .expect("valid");
+        assert_eq!(without.excluded_columns, None);
+    }
+}
+
+/// `SRC-12` part C: the `OAuth2` dial shapes, their addresses, and what moves
+/// the target identity.
+#[cfg(test)]
+mod oauth_dial_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{Dial, RestAuth, secret_field_names};
+    use serde_json::{Value, json};
+
+    fn rest(auth: &Value) -> Value {
+        json!({
+            "baseUrl": "https://api.example.com",
+            "auth": auth,
+            "pagination": { "type": "none" },
+            "endpoints": [{ "path": "/items" }],
+        })
+    }
+
+    fn code_auth() -> Value {
+        json!({
+            "type": "oauth2_authorization_code",
+            "clientId": "app-1",
+            "authorizeUrl": "https://login.example.com/authorize",
+            "tokenUrl": "https://login.example.com/token",
+            "revocationUrl": "https://login.example.com/revoke",
+            "scopes": ["read", "offline_access"],
+        })
+    }
+
+    #[test]
+    fn an_authorization_code_dial_parses_with_its_camel_case_names() {
+        let Dial::Rest(dial) = Dial::parse("rest", &rest(&code_auth())).expect("valid") else {
+            panic!("a rest dial");
+        };
+        let RestAuth::Oauth2AuthorizationCode {
+            client_id,
+            revocation_url,
+            scopes,
+            ..
+        } = dial.auth
+        else {
+            panic!("an authorization-code auth");
+        };
+        assert_eq!(client_id, "app-1");
+        assert_eq!(
+            revocation_url.as_deref(),
+            Some("https://login.example.com/revoke")
+        );
+        assert_eq!(scopes, vec!["read", "offline_access"]);
+    }
+
+    #[test]
+    fn the_revocation_address_and_scopes_are_optional() {
+        let mut auth = code_auth();
+        auth.as_object_mut()
+            .expect("object")
+            .remove("revocationUrl");
+        auth.as_object_mut().expect("object").remove("scopes");
+        assert!(Dial::parse("rest", &rest(&auth)).is_ok());
+    }
+
+    #[test]
+    fn an_authorization_code_dial_needs_the_client_secret_and_the_refresh_token() {
+        assert_eq!(
+            secret_field_names("rest", Some("oauth2_authorization_code")),
+            Some(["clientSecret", "refreshToken"].as_slice())
+        );
+    }
+
+    #[test]
+    fn the_client_credentials_token_address_parses_under_the_name_the_console_sends() {
+        let auth = json!({ "type": "oauth2_client_credentials", "tokenUrl": "https://login.example.com/token" });
+        assert!(Dial::parse("rest", &rest(&auth)).is_ok());
+        // The name an earlier build accepted still parses.
+        let old = json!({ "type": "oauth2_client_credentials", "token_url": "https://login.example.com/token" });
+        assert!(Dial::parse("rest", &rest(&old)).is_ok());
+    }
+
+    #[test]
+    fn an_address_that_is_not_a_plain_http_address_is_refused() {
+        for bad in [
+            "javascript:alert(1)",
+            "ftp://login.example.com/token",
+            "https://user:pw@login.example.com/token",
+            "https://",
+            "https://login.example.com/to ken",
+            "login.example.com/token",
+        ] {
+            for field in ["authorizeUrl", "tokenUrl", "revocationUrl"] {
+                let mut auth = code_auth();
+                auth[field] = json!(bad);
+                assert!(
+                    Dial::parse("rest", &rest(&auth)).is_err(),
+                    "{field} = {bad:?} must be refused"
+                );
+            }
+        }
+        let cc = json!({ "type": "oauth2_client_credentials", "tokenUrl": "file:///etc/passwd" });
+        assert!(Dial::parse("rest", &rest(&cc)).is_err());
+    }
+
+    #[test]
+    fn an_empty_client_id_and_a_bad_scope_are_refused() {
+        let mut auth = code_auth();
+        auth["clientId"] = json!("  ");
+        assert!(Dial::parse("rest", &rest(&auth)).is_err());
+        for scope in ["", "two words", "quo\"te", "new\nline"] {
+            let mut auth = code_auth();
+            auth["scopes"] = json!([scope]);
+            assert!(
+                Dial::parse("rest", &rest(&auth)).is_err(),
+                "scope {scope:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_field_of_the_authorization_code_auth_is_refused() {
+        let mut auth = code_auth();
+        auth["clientSecret"] = json!("must-never-be-in-a-dial");
+        assert!(Dial::parse("rest", &rest(&auth)).is_err());
+    }
+
+    #[test]
+    fn moving_the_token_or_revocation_host_is_a_re_point_but_a_new_path_is_not() {
+        let identity = |auth: &Value| {
+            Dial::parse("rest", &rest(auth))
+                .expect("valid")
+                .target_identity()
+        };
+        let base = identity(&code_auth());
+
+        let mut other_token_host = code_auth();
+        other_token_host["tokenUrl"] = json!("https://evil.example.net/token");
+        assert_ne!(base, identity(&other_token_host));
+
+        let mut other_revocation_host = code_auth();
+        other_revocation_host["revocationUrl"] = json!("https://evil.example.net/revoke");
+        assert_ne!(base, identity(&other_revocation_host));
+
+        let mut no_revocation = code_auth();
+        no_revocation
+            .as_object_mut()
+            .expect("object")
+            .remove("revocationUrl");
+        assert_ne!(base, identity(&no_revocation));
+
+        let mut new_path = code_auth();
+        new_path["tokenUrl"] = json!("https://login.example.com/v2/token");
+        new_path["scopes"] = json!(["read"]);
+        new_path["authorizeUrl"] = json!("https://other.example.org/authorize");
+        assert_eq!(base, identity(&new_path));
+
+        let cc =
+            |url: &str| identity(&json!({ "type": "oauth2_client_credentials", "tokenUrl": url }));
+        assert_ne!(
+            cc("https://login.example.com/token"),
+            cc("https://evil.example.net/token")
+        );
+    }
+}
+
+#[cfg(test)]
+mod saas_dial_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn dial(vendor: &str, account: &str, auth: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"vendor": vendor, "account": account, "auth": auth})
+    }
+
+    fn oauth() -> serde_json::Value {
+        serde_json::json!({"type": "oauth2_authorization_code", "clientId": "app-id"})
+    }
+
+    fn integration() -> serde_json::Value {
+        serde_json::json!({"type": "integration"})
+    }
+
+    #[test]
+    fn a_saas_dial_parses_and_names_its_secret_slots_through_the_vendor_table() {
+        let parsed = Dial::parse("saas", &dial("zendesk", "acme", &oauth())).unwrap();
+        assert!(matches!(parsed, Dial::Saas(_)));
+        assert_eq!(
+            parsed.secret_map_auth_type(),
+            Some("oauth2_authorization_code")
+        );
+        assert_eq!(
+            secret_field_names("saas", parsed.secret_map_auth_type()),
+            Some(["clientSecret", "refreshToken"].as_slice())
+        );
+        let token = Dial::parse("saas", &dial("zendesk", "acme", &integration())).unwrap();
+        assert_eq!(token.secret_map_auth_type(), Some("integration:zendesk"));
+        assert_eq!(
+            secret_field_names("saas", token.secret_map_auth_type()),
+            Some(["email", "apiToken"].as_slice())
+        );
+        assert_eq!(secret_field_names("saas", Some("bearer")), None);
+        assert_eq!(secret_field_names("saas", None), None);
+    }
+
+    #[test]
+    fn a_saas_dial_refuses_an_unknown_vendor_and_a_credential_smuggled_into_it() {
+        assert!(Dial::parse("saas", &dial("nobody", "acme", &oauth())).is_err());
+        let mut with_secret = dial("zendesk", "acme", &oauth());
+        with_secret["password"] = serde_json::json!("hunter2");
+        assert!(Dial::parse("saas", &with_secret).is_err());
+        let mut with_url = dial("zendesk", "acme", &oauth());
+        with_url["auth"]["tokenUrl"] = serde_json::json!("https://evil.example.invalid/token");
+        assert!(Dial::parse("saas", &with_url).is_err());
+    }
+
+    #[test]
+    fn a_saas_dial_refuses_an_account_outside_the_vendors_host_pattern() {
+        for account in [
+            "evil.example.invalid",
+            "acme@evil",
+            "acme:8443",
+            "https://acme",
+            "http://acme",
+            "acme/path",
+        ] {
+            assert!(
+                Dial::parse("saas", &dial("zendesk", account, &oauth())).is_err(),
+                "{account}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_saas_account_names_the_field_once() {
+        // QA LH-SRC-3-11 (SRC-41): the refusal read "account: account is not
+        // in the form this vendor uses"; `InvalidAccount` already names the
+        // field, so it is carried as it is.
+        let err = Dial::parse("saas", &dial("dynamics365", "127.0.0.1", &oauth())).unwrap_err();
+        let IngestSpecError::InvalidDial { source, .. } = err else {
+            panic!("expected InvalidDial, got {err:?}");
+        };
+        assert_eq!(
+            source.to_string(),
+            "account is not in the form this vendor uses"
+        );
+    }
+
+    #[test]
+    fn salesforce_offers_no_integration_credential_and_a_blank_client_id_is_refused() {
+        // `SRC-3` decision 4: the password sign-in is not offered.
+        assert!(Dial::parse("saas", &dial("salesforce", "acme", &integration())).is_err());
+        let blank = serde_json::json!({"type": "oauth2_authorization_code", "clientId": " "});
+        assert!(Dial::parse("saas", &dial("salesforce", "acme", &blank)).is_err());
+    }
+
+    #[test]
+    fn saas_object_names_must_be_distinct_plain_text() {
+        let mut value = dial("ga4", "123456", &oauth());
+        value["objects"] = serde_json::json!(["report one", "report two"]);
+        assert!(Dial::parse("saas", &value).is_ok());
+        value["objects"] = serde_json::json!(["same", "same"]);
+        assert!(Dial::parse("saas", &value).is_err());
+        value["objects"] = serde_json::json!([" "]);
+        assert!(Dial::parse("saas", &value).is_err());
+        value["objects"] = serde_json::json!(["bad\nname"]);
+        assert!(Dial::parse("saas", &value).is_err());
+    }
+
+    /// `SRC-3` slice 6: `NetSuite`'s client-credentials way names the certificate uploaded in `NetSuite`
+    /// (the assertion's `kid`); no other vendor or sign-in has one, and it must be a plain name.
+    #[test]
+    fn a_certificate_id_is_for_netsuites_integration_credential_only_and_is_a_plain_name() {
+        let with = |vendor: &str, account: &str, auth: &serde_json::Value, id: &str| {
+            let mut value = dial(vendor, account, auth);
+            value["certificateId"] = serde_json::json!(id);
+            Dial::parse("saas", &value)
+        };
+        assert!(with("netsuite", "1234567_SB1", &integration(), "cert-1.A_b").is_ok());
+        for bad in ["", "a b", "a/b", "a\nb", &"x".repeat(129)] {
+            assert!(
+                with("netsuite", "1234567", &integration(), bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(with("netsuite", "1234567", &oauth(), "cert-1").is_err());
+        assert!(with("zendesk", "acme", &integration(), "cert-1").is_err());
+        // Final review SHOULD-FIX 25: the integration credential cannot be signed without the
+        // certificate id, so the save refuses it now rather than the connection test later.
+        assert!(Dial::parse("saas", &dial("netsuite", "1234567", &integration())).is_err());
+        assert!(Dial::parse("saas", &dial("netsuite", "1234567", &oauth())).is_ok());
+        // Not part of the target identity: it is a name, not a destination.
+        let a = with("netsuite", "1234567", &integration(), "cert-1").unwrap();
+        let b = with("netsuite", "1234567", &integration(), "cert-2").unwrap();
+        assert_eq!(a.target_identity(), b.target_identity());
+    }
+
+    #[test]
+    fn a_workday_dial_names_host_and_tenant_and_takes_the_integration_users_two_secrets() {
+        let parsed = Dial::parse(
+            "saas",
+            &dial(
+                "workday",
+                "wd2-impl-services1.workday.com/acme_tenant",
+                &integration(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            secret_field_names("saas", parsed.secret_map_auth_type()),
+            Some(["username", "password"].as_slice())
+        );
+        assert!(Dial::parse("saas", &dial("workday", "wd2.workday.com", &integration())).is_err());
+    }
+
+    #[test]
+    fn the_saas_target_identity_changes_with_the_vendor_the_account_or_the_sign_in_kind() {
+        let base = Dial::parse("saas", &dial("zendesk", "acme", &oauth())).unwrap();
+        let same_account_other_case =
+            Dial::parse("saas", &dial("zendesk", "ACME", &oauth())).unwrap();
+        assert_eq!(
+            base.target_identity(),
+            same_account_other_case.target_identity()
+        );
+        // Final review SHOULD-FIX 25: a different sign-in kind is a different role for the same
+        // stored slots, so the credentials must be asked again (this used to assert equality).
+        let other_auth = Dial::parse("saas", &dial("zendesk", "acme", &integration())).unwrap();
+        assert_ne!(base.target_identity(), other_auth.target_identity());
+        let mut renamed = dial("zendesk", "acme", &oauth());
+        renamed["objects"] = serde_json::json!(["tickets"]);
+        renamed["auth"]["clientId"] = serde_json::json!("another-app");
+        let renamed = Dial::parse("saas", &renamed).unwrap();
+        assert_eq!(base.target_identity(), renamed.target_identity());
+        let other_account = Dial::parse("saas", &dial("zendesk", "other", &oauth())).unwrap();
+        assert_ne!(base.target_identity(), other_account.target_identity());
+        let other_vendor = Dial::parse("saas", &dial("confluence", "acme", &oauth())).unwrap();
+        assert_ne!(base.target_identity(), other_vendor.target_identity());
+        assert!(is_repoint(
+            Some("saas"),
+            &dial("zendesk", "acme", &oauth()),
+            &other_account
+        ));
+        assert!(!is_repoint(
+            Some("saas"),
+            &dial("zendesk", "acme", &oauth()),
+            &renamed
+        ));
+        assert!(is_repoint(
+            Some("saas"),
+            &dial("zendesk", "acme", &oauth()),
+            &other_auth
+        ));
     }
 }

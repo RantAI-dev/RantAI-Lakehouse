@@ -2,7 +2,6 @@
  * Service registry — pages import from here, never from mock modules directly.
  * Swap `mock*` for HTTP/Flight adapters when backends are ready.
  */
-import { mockAssetService } from "./mock/assets"
 import { clickhouseQueryService } from "./clients/queries"
 import { clickhouseAssetService } from "./clients/assets"
 import { dagsterPipelineService } from "./clients/pipelines"
@@ -12,6 +11,10 @@ import { clickhouseGovernanceService } from "./clients/governance"
 import { postgresIdentityService } from "./clients/identity"
 import { postgresConnectorService } from "./clients/connectors"
 import { clickhouseDashboardService } from "./clients/dashboards"
+import { calcFieldService as calcFieldClientService } from "./clients/calc-fields"
+import { metricService as metricClientService } from "./clients/metrics"
+import { hierarchyService as hierarchyClientService } from "./clients/hierarchies"
+import { paramService as paramClientService } from "./clients/params"
 import { postgresAgentService } from "./clients/agents"
 import { clickhouseAlertRuleService } from "./clients/alerts"
 import { icebergLakehouseService } from "./clients/lakehouse"
@@ -19,8 +22,14 @@ import { goldService as goldClientService } from "./clients/gold"
 import { notificationsService as notificationsClientService } from "./clients/notifications"
 import { uploadService as uploadClientService } from "./clients/uploads"
 import { homeService as homeClientService } from "./clients/home"
+import { reportService as reportClientService } from "./clients/reports"
+import { settingsService as settingsClientService } from "./clients/settings"
+import { mapService as mapClientService } from "./clients/maps"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
+import { chatSessionService as chatSessionClientService } from "./clients/chat-sessions"
 import { semanticService as semanticClientService } from "./clients/semantic"
+import { tagKeysService as tagKeysClientService } from "./clients/tag-keys"
+import { httpVersionService } from "./clients/version"
 import * as authClient from "./clients/auth"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
@@ -28,7 +37,12 @@ import * as authClient from "./clients/auth"
 // has been deleted.
 export const overviewService = clickhouseOverviewService
 export const assetService = clickhouseAssetService
-void mockAssetService
+/**
+ * The catalog's list-row shape (`GOV-7` S2). The contract owns it, and it is
+ * exported here so a feature imports it from `@/services` rather than from
+ * the contract module (`GOV-7 S2 review 2 R2-S1`).
+ */
+export type { Asset } from "./contracts/assets"
 // Pipelines is now fully real — list/get/runs/trigger from Dagster,
 // create/generate from Postgres + LLM, cancel/retry/pause/resume are
 // real Dagster mutations. mock/pipelines.ts has been deleted.
@@ -38,21 +52,47 @@ export const pipelineService = dagsterPipelineService
 // the Rust backend (ClickHouse + Postgres + LLM).
 // mock/queries.ts has been deleted.
 export const queryService = clickhouseQueryService
-// Agents is now fully real — employees/tools/workflows/runs/approvals
-// live in Postgres (Task 2.9). There is no agent/tool execution runtime
-// (the contract never asked for one). mock/agents.ts has been deleted.
+// Agents is real — employee definitions, runs and approvals live in
+// Postgres (Task 2.9). WEB-3 slice 1 removed the employee/run-list methods
+// from the client (the pages are gone); run detail and approvals remain.
 export const agentService = postgresAgentService
 // Governance is now fully real — reads from ClickHouse/Dagster,
 // policies + create*Rule from Postgres. mock/governance.ts has been deleted.
 export const governanceService = clickhouseGovernanceService
-// Ops is now fully real — observability/usage/workloads/services from
-// ClickHouse+Dagster, cancelWorkload is a real KILL QUERY. mock/ops.ts
-// has been deleted.
+/**
+ * The row filter grammar the server's validator accepts (`WEB-8` S2 D8).
+ * The contract owns the shape, and it is exported here so a feature imports
+ * it from `@/services`.
+ */
+export type { RowFilterGrammar } from "./contracts/governance"
+// Ops is real — the service list from ClickHouse+Dagster. WEB-3 slice 1
+// removed the observability and workloads reads with their pages; the
+// backend routes stay registered (WEB-4 retires them).
 export const opsService = clickhouseOpsService
 // Identity is now real — users/roles/tenants/service identities live in
 // Postgres. Every contract method is served, so mock/identity.ts has been
 // deleted.
 export const identityService = postgresIdentityService
+/**
+ * The identity directory's shapes (ADM-4). The contract owns them, and
+ * they are exported here so a feature imports them from `@/services` and
+ * not from `services/contracts/identity` directly (`PR #199 review M
+ * SHOULD-FIX BI-16 7`).
+ */
+export type {
+  InviteUserInput,
+  InviteUserResponse,
+  Permission,
+  ResetPasswordResponse,
+  Role,
+  RoleTableAccess,
+  RoleTableGrant,
+  ServiceIdentity,
+  SetRoleTableAccessInput,
+  SetUserRolesInput,
+  Tenant,
+  User,
+} from "./contracts/identity"
 // Connectors is now real — connector definitions (CRUD + testConnection) live
 // in Postgres (Task 2.7). Credentials are NEVER stored or returned: only the
 // `secretRef` (a reference, e.g. "env:FOO"); see
@@ -65,6 +105,22 @@ export const connectorService = postgresConnectorService
 // itself still calls `/api/dashboard/*` directly for charts/layout/filters.
 // No mock ever existed for this service.
 export const dashboardService = clickhouseDashboardService
+/**
+ * The dashboard types the console's features use. They live in the contract
+ * (`services/contracts/dashboards`), not in a client, and are exported here so
+ * a feature imports them from `@/services` and not from a client
+ * (`PR #199 review M SHOULD-FIX BI-16 7`).
+ */
+export type {
+  AccessKind, AccessLevel, Board, BoardChart, BoardTab, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
+  ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, TileBox,
+} from "./contracts/dashboards"
+/** Calculated fields of a mart or SQL source (BI-8). */
+export const calcFieldService = calcFieldClientService
+/** Reusable metrics and segments (BI-2). */
+export const metricService = metricClientService
+export const hierarchyService = hierarchyClientService
+export const paramService = paramClientService
 // Alert rules (WS1 task 1.15) — CRUD + run over `console.alert_rule` in
 // ClickHouse, ported by `lakehouse_alerts`. No mock ever existed for this
 // service; the feature previously fetched `/api/alerts` directly with no
@@ -91,23 +147,106 @@ export const uploadService = uploadClientService
 // `/api/home/layout`; honest `supported: false` when no Postgres pool is
 // configured. No mock ever existed for this domain.
 export const homeService = homeClientService
+// The deployment's report time zone and first day of the week over
+// `/api/settings/reporting` (BI-9).
+export const settingsService = settingsClientService
+// Uploaded map boundaries over `/api/maps` (BI-16 part C2b). No mock ever existed.
+export const mapService = mapClientService
+// Scheduled reports by email (RPT-1) over `/api/reports/...`. No mock ever existed.
+export const reportService = reportClientService
+/**
+ * The reporting settings a caller sends (the report time zone, the first day
+ * of the week, the number locale, the company palette, the fonts and the
+ * content sites). The contract owns the shape, and it is exported here so a
+ * feature imports it from `@/services` (`PR #199 review M SHOULD-FIX BI-17 7`).
+ */
+export type { ReportingSettingsInput } from "./contracts/settings"
+/**
+ * The deployment's email settings (`ADM-7`): the mail server, the account
+ * and the console's public address, each with the source of its effective
+ * value, and the test email's answer. The contract owns the shapes, and
+ * they are exported here so a feature imports them from `@/services`.
+ */
+export type {
+  DeploymentFeature,
+  DeploymentSettings,
+  EmailSettings,
+  EmailSettingsInput,
+  EmailTestResult,
+  SecretSetting,
+  SettingField,
+  SettingSource,
+} from "./contracts/settings"
+/**
+ * The deployment's sign-in limits (`ADM-8`): the failed-login limit, the
+ * window, the lockout, the retention and the longest life of a signed embed
+ * link, each with the source of its effective value.
+ */
+export type { SignInSettings, SignInSettingsInput } from "./contracts/settings"
+/**
+ * The assistant's provider (`ADM-9`): the address, the model and the key,
+ * each with the source of its effective value, and the test's answer. The
+ * contract owns the shapes, and they are exported here so a feature imports
+ * them from `@/services`.
+ */
+export type {
+  AssistantSettings,
+  AssistantSettingsInput,
+  AssistantTestResult,
+} from "./contracts/settings"
+/**
+ * The deployment's SSO / OIDC settings (`ADM-12`): issuer, client ID, secret,
+ * provider name, groups claim, role map rows and JIT provisioning, each with
+ * its source, and test sign-in shapes.
+ */
+export type {
+  RoleMapRow,
+  SsoSettings,
+  SsoSettingsInput,
+  SsoTestResult,
+  SsoTestStartResult,
+} from "./contracts/settings"
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService
+// The AI Copilot's saved conversations (`/api/ai/sessions`): list, open,
+// save, rename and delete (AI-24). No mock ever existed for this domain.
+export const chatSessionService = chatSessionClientService
+/** The conversation shapes the Copilot feature reads from `@/services`. */
+export type {
+  ChatSession, ChatSessionPage, ChatSessionSaved, ChatSessionService, ChatSessionSummary,
+  ListChatSessionsQuery, SaveChatSessionInput,
+} from "./contracts/chat-sessions"
 // The semantic entries of a table and its columns (`/api/semantic/{asset}`):
 // the drafted meaning and role, and the person's confirmed corrections. No
 // mock ever existed.
 export const semanticService = semanticClientService
+// The governed tag keys and their allowed values (`/api/governance/tag-keys`,
+// `DATA-12` part 2). Free tags are not part of this.
+export const tagKeysService = tagKeysClientService
+// The server's own health answer (`/api/health` — the API's `/health`,
+// exposed through the console's rewrite), read for the version it runs so
+// the console can say when it and the server are not the same build
+// (REL-2 S1-T5). No mock ever existed for this domain.
+export const versionService = httpVersionService
+/**
+ * The server's health answer. The contract owns the shape, and it is
+ * exported here so a feature imports it from `@/services`.
+ */
+export type { ServerHealth } from "./contracts/version"
 // SSO admin page reads the live OIDC configuration
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and
 // `DELETE /api/auth/sessions/{id}`. Only `providers`,
-// `listSessions`, and `deleteSession` are registered — the other auth
-// methods (login/logout/me/change-password) stay imported directly by
-// `AuthProvider` and the login/change-password pages; see
+// `listSessions`, `deleteSession` and `passwordRules` are registered — the
+// other auth methods (login/logout/me/change-password) stay imported
+// directly by `AuthProvider` and the login/change-password pages; see
 // `services/clients/auth.ts`'s module doc comment for why the split.
 export const authService = {
   providers: authClient.providers,
   listSessions: authClient.listSessions,
   deleteSession: authClient.deleteSession,
+  // WEB-7: the invite form is its own page, and it states the lengths the
+  // server enforces; registering the read keeps the page on `@/services`.
+  passwordRules: authClient.passwordRules,
 }

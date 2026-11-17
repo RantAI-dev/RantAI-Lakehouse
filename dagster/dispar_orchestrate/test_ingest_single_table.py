@@ -109,7 +109,14 @@ def test_clear_empties_the_table_loads_nothing_and_records_cleared_with_zero_row
     cleared: list = []
     monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
     monkeypatch.setattr(f.sink_adapter, "clear_table", lambda target, config: cleared.append(target))
-    monkeypatch.setattr(f.sink_adapter.SinkConfig, "from_bronze_ingest_config", classmethod(lambda cls, c: object()))
+    # DATA-15 F5: `from_bronze_ingest_config` takes the run's author, so the stub does too; the
+    # clear's commit is recorded as made by the connector's run.
+    authors: list = []
+    monkeypatch.setattr(
+        f.sink_adapter.SinkConfig,
+        "from_bronze_ingest_config",
+        classmethod(lambda cls, c, author="": authors.append(author) or object()),
+    )
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_env", staticmethod(lambda: object()))
     monkeypatch.setattr(f.sink_adapter, "load_via_sink", lambda *a, **k: pytest.fail("a clear loads nothing"))
     # No secret is resolved and no source is dialled for a clear.
@@ -121,6 +128,7 @@ def test_clear_empties_the_table_loads_nothing_and_records_cleared_with_zero_row
 
     assert rows == 0
     assert cleared == ["orders"]
+    assert authors == [f"connector {_mysql_connector()['id']}, run run-1"]
     assert [(r["status"], r["rows"], r["object_name"], r["error"]) for r in recorded] == [
         ("cleared", 0, "shop.orders", "")
     ]
@@ -130,7 +138,9 @@ def test_clear_empties_the_table_loads_nothing_and_records_cleared_with_zero_row
 def test_a_clear_that_fails_records_failed_with_the_exception_type_only_and_reraises(monkeypatch) -> None:
     recorded: list = []
     monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
-    monkeypatch.setattr(f.sink_adapter.SinkConfig, "from_bronze_ingest_config", classmethod(lambda cls, c: object()))
+    monkeypatch.setattr(
+        f.sink_adapter.SinkConfig, "from_bronze_ingest_config", classmethod(lambda cls, c, author="": object())
+    )
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_env", staticmethod(lambda: object()))
 
     def boom(target, config):

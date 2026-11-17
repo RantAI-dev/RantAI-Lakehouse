@@ -70,22 +70,29 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray,
+    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatch,
+    StringArray, TimestampMicrosecondArray,
 };
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 use lakehouse_clickhouse::{ChClient, ChColumn, ChError};
+use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
-use lakehouse_iceberg::{GoldTable, IcebergClient, IcebergClientConfig, IcebergError, gold};
+use lakehouse_iceberg::{IcebergClient, IcebergClientConfig, IcebergError, gold};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use time::Date;
 use time::format_description::well_known::Iso8601;
 
+use crate::state::AppState;
+
 /// Errors exporting a Gold mart to Iceberg.
 #[derive(Debug, Error)]
 pub enum GoldExportError {
     /// Reading the source mart from `ClickHouse` failed.
+    ///
+    /// Its `Display` is for the log, never for a response or a stored row
+    /// (`DATA-49`, QA `LH-DATA-1-01`): `routes::gold`'s `From` impl classifies
+    /// it into fixed words and a reference first.
     #[error("reading Gold mart from ClickHouse failed: {0}")]
     ClickHouse(#[from] ChError),
     /// A `ClickHouse` column type has no supported Iceberg/Arrow mapping —
@@ -101,9 +108,18 @@ pub enum GoldExportError {
     },
     /// Building the Arrow batch from `ClickHouse` row data failed (a value
     /// did not parse as its declared column type).
+    ///
+    /// The text can hold a cell value and the Arrow or Iceberg library's own
+    /// words, so its `Display` is for the log, never for a response or a
+    /// stored row (`DATA-49`, QA `LH-DATA-1-01`): `routes::gold`'s `From` impl
+    /// classifies it into fixed words and a reference first.
     #[error("failed to build export batch: {0}")]
     Batch(String),
     /// The Iceberg catalog/write path failed.
+    ///
+    /// Its `Display` can hold catalog URLs and object keys, so it is for the
+    /// log, never for a response or a stored row (`DATA-49`, QA
+    /// `LH-DATA-1-01`): `routes::gold`'s `From` impl classifies it first.
     #[error("Iceberg export failed: {0}")]
     Iceberg(#[from] IcebergError),
     /// The source mart has more rows than `GOLD_EXPORT_MAX_ROWS` allows.
@@ -134,6 +150,24 @@ pub enum GoldExportError {
     /// any data is written to Iceberg at all.
     #[error("Gold export refused by the policy engine: {0}")]
     PolicyRefused(String),
+    /// `GOV-7` D5: the export reads a table the owner's roles do not
+    /// include. Carried as the answer itself, so the route returns the tenant
+    /// gate's own 404 and sentence (`D2`) instead of folding it into the 422
+    /// above.
+    #[error("{0}")]
+    PolicyTableRefused(ApiError),
+    /// `SEC-50`: the tenant gate refused the export before it read
+    /// anything. The gate's own error travels as it is, so the caller
+    /// sees the status the gate would have answered — a fixed sentence,
+    /// never an upstream text (`AGENTS.md` rule 4).
+    ///
+    /// No `#[from]`: a `From<ApiError>` on this variant would turn every
+    /// future `?` on an `ApiError` anywhere in this file into "tenant
+    /// gate refused" — a refusal the caller would read as the gate's own
+    /// sentence when it is something else entirely. The one gate call
+    /// wraps its error explicitly (`PR #281` review round 1, NIT).
+    #[error("{0}")]
+    TenantGateRefused(ApiError),
 }
 
 /// One column's resolved Iceberg + Arrow shape, plus enough to parse a
@@ -154,23 +188,103 @@ fn unwrap_nullable(ch_type: &str) -> (&str, bool) {
         .map_or((ch_type, false), |inner| (inner, true))
 }
 
+/// The most digits an Iceberg `decimal` holds (`iceberg::spec`'s
+/// `MAX_DECIMAL_PRECISION`): `Decimal128` is 16 bytes, and 38 digits is the
+/// largest base-10 precision that fits.
+const MAX_ICEBERG_DECIMAL_PRECISION: u32 = 38;
+
+/// The precision and scale of a `ClickHouse` decimal type name, or `None` when
+/// `base` is not one (`DATA-48`, QA `LH-DATA-1-51`).
+///
+/// Accepts `Decimal(P, S)`, `Decimal(P)` (scale 0) and the width aliases
+/// `Decimal32(S)` (9), `Decimal64(S)` (18), `Decimal128(S)` (38) and
+/// `Decimal256(S)` (76). Spaces around the numbers are trimmed, nothing else is
+/// lenient. A precision above [`MAX_ICEBERG_DECIMAL_PRECISION`] is an error
+/// here, before any row is read or written, because Iceberg cannot hold it and
+/// rounding would be a silent lie.
+fn ch_decimal(base: &str) -> Option<Result<(u32, u32), String>> {
+    let unreadable = || Some(Err("its precision and scale could not be read".to_owned()));
+    let (fixed_precision, args) = if let Some(rest) = base.strip_prefix("Decimal(") {
+        (None, rest.strip_suffix(')')?)
+    } else {
+        // The width aliases carry only the scale; their precision is fixed.
+        [
+            ("Decimal32(", 9_u32),
+            ("Decimal64(", 18),
+            ("Decimal128(", 38),
+            ("Decimal256(", 76),
+        ]
+        .into_iter()
+        .find_map(|(prefix, precision)| {
+            let args = base.strip_prefix(prefix)?.strip_suffix(')')?;
+            Some((Some(precision), args))
+        })?
+    };
+
+    let (precision, scale) = if let Some(precision) = fixed_precision {
+        let Ok(scale) = args.trim().parse::<u32>() else {
+            return unreadable();
+        };
+        (precision, scale)
+    } else {
+        let mut parts = args.split(',');
+        let (Some(precision), scale, None) = (parts.next(), parts.next(), parts.next()) else {
+            return unreadable();
+        };
+        let Ok(precision) = precision.trim().parse::<u32>() else {
+            return unreadable();
+        };
+        // `Decimal(P)` is scale 0; `Decimal(P, S)` names both.
+        let scale = match scale {
+            None => 0,
+            Some(scale) => {
+                let Ok(scale) = scale.trim().parse::<u32>() else {
+                    return unreadable();
+                };
+                scale
+            }
+        };
+        (precision, scale)
+    };
+
+    if precision == 0 || scale > precision {
+        return unreadable();
+    }
+    if precision > MAX_ICEBERG_DECIMAL_PRECISION {
+        return Some(Err(format!(
+            "open format (Iceberg) holds decimals of at most \
+             {MAX_ICEBERG_DECIMAL_PRECISION} digits, and this column has {precision}"
+        )));
+    }
+    Some(Ok((precision, scale)))
+}
+
 /// Maps one `ClickHouse` column to its Iceberg [`PrimitiveType`].
 ///
 /// Deliberately narrow: only the types a `serving.*` aggregate mart
 /// realistically carries (strings, integers, floats, booleans, dates,
-/// timestamps). Anything else — `Array(...)`, `Map(...)`, `Tuple(...)`,
-/// `AggregateFunction(...)`, `UUID`, `Decimal`, ... — is rejected with
+/// timestamps, decimals). Anything else — `Array(...)`, `Map(...)`, `Tuple(...)`,
+/// `AggregateFunction(...)`, `UUID`, ... — is rejected with
 /// [`GoldExportError::UnsupportedColumn`] rather than silently coerced to
 /// a string, so a mart with an unsupported column fails the export
 /// visibly instead of exporting corrupted data.
+///
+/// A `Decimal(P, S)` becomes an Iceberg `decimal(P, S)` of the same precision
+/// and scale (`DATA-48`, QA `LH-DATA-1-51`); a precision above 38 digits is
+/// refused, with a sentence naming the column and its type.
 ///
 /// # Errors
 ///
 /// Returns an error message (wrapped by the caller into
 /// [`GoldExportError::UnsupportedColumn`]) for any type not in the list
-/// above.
+/// above, and for a decimal whose precision and scale cannot be read or whose
+/// precision Iceberg cannot hold.
 fn ch_type_to_primitive(ch_type: &str) -> Result<(PrimitiveType, bool), String> {
     let (base, nullable) = unwrap_nullable(ch_type);
+    if let Some(decimal) = ch_decimal(base) {
+        let (precision, scale) = decimal?;
+        return Ok((PrimitiveType::Decimal { precision, scale }, nullable));
+    }
     let primitive = match base {
         "String" | "UUID" => PrimitiveType::String,
         s if s.starts_with("FixedString(") => PrimitiveType::String,
@@ -240,6 +354,89 @@ fn cell_as_str<'a>(row: &'a Map<String, Value>, name: &str) -> Option<&'a str> {
     match row.get(name) {
         Some(Value::String(s)) => Some(s.as_str()),
         _ => None,
+    }
+}
+
+/// The exact unscaled integer of a decimal's text, for a column of
+/// `precision`/`scale` (`DATA-48`, QA `LH-DATA-1-51`). Never a float.
+///
+/// The rules, in order:
+///
+/// 1. An optional leading `-`. Nothing else before the digits (no `+`, no
+///    spaces).
+/// 2. Digits, then optionally `.` and digits — a `.` with nothing after it is
+///    not a number. Nothing else (no exponent, no separators).
+/// 3. The fraction may be shorter than `scale` (`ClickHouse` drops trailing
+///    zeros by default): pad it on the right with `0`. A longer fraction is an
+///    error.
+/// 4. The unscaled value is the integer digits followed by the padded fraction,
+///    read as an `i128`, negated when there was a `-`. More than `precision`
+///    digits (after leading zeros) is an error.
+/// 5. A value that is not such a text is an error: nothing is rounded or
+///    coerced.
+fn decimal_text_to_unscaled(text: &str, precision: u32, scale: u32) -> Result<i128, String> {
+    let not_a_decimal = || format!("{text:?} is not a decimal number");
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (integer, fraction) = match digits.split_once('.') {
+        // A point with nothing after it is not a decimal number (D14 rule 2: digits,
+        // then optionally `.` and digits) — review round 1 R8; QA `LH-DATA-1-51`.
+        // `12.` used to pass as `12`, which is exact but not a shape ClickHouse prints.
+        Some((_, "")) => return Err(not_a_decimal()),
+        Some((integer, fraction)) => (integer, fraction),
+        None => (digits, ""),
+    };
+    if integer.is_empty()
+        || !integer.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(not_a_decimal());
+    }
+    if fraction.len() > scale as usize {
+        return Err(format!(
+            "{text:?} has more than {scale} fractional digits, so it cannot be stored exactly"
+        ));
+    }
+    let mut unscaled_text = format!("{integer}{fraction}");
+    unscaled_text.extend(std::iter::repeat_n('0', scale as usize - fraction.len()));
+    let significant = unscaled_text.trim_start_matches('0');
+    if significant.len() > precision as usize {
+        return Err(format!(
+            "{text:?} has more than {precision} digits, so it cannot be stored exactly"
+        ));
+    }
+    let unscaled = if significant.is_empty() {
+        0
+    } else {
+        unscaled_text
+            .parse::<i128>()
+            .map_err(|e| format!("{text:?} is not a decimal number: {e}"))?
+    };
+    Ok(if negative { -unscaled } else { unscaled })
+}
+
+/// One decimal cell, already projected as text by [`select_projection`].
+///
+/// A JSON `null` or a missing cell is `None` (an optional Iceberg field). A
+/// JSON string goes through [`decimal_text_to_unscaled`]; anything else — a
+/// JSON number included — is a [`GoldExportError::Batch`] naming the column, so
+/// a value that would need rounding fails the run instead of being coerced.
+fn cell_as_decimal(
+    row: &Map<String, Value>,
+    name: &str,
+    precision: u32,
+    scale: u32,
+) -> Result<Option<i128>, GoldExportError> {
+    match row.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => decimal_text_to_unscaled(s, precision, scale)
+            .map(Some)
+            .map_err(|reason| GoldExportError::Batch(format!("{name}: {reason}"))),
+        Some(other) => Err(GoldExportError::Batch(format!(
+            "{name}: expected a decimal as text, got {other}"
+        ))),
     }
 }
 
@@ -395,11 +592,19 @@ fn cell_as_u64(row: &Map<String, Value>, name: &str) -> Result<u64, GoldExportEr
 /// handled the same way: `toTimeZone` on a `NULL` `DateTime` still
 /// produces `NULL` (`ClickHouse`'s datetime functions are null-preserving
 /// over `Nullable` arguments), so no separate branch is needed.
+///
+/// A decimal is selected as `toString(col) AS col` (`DATA-48`, QA
+/// `LH-DATA-1-51`): `FORMAT JSON` would render it as a JSON number, and this
+/// crate's `serde_json` has no arbitrary precision, so the value would pass
+/// through a float. The text is converted exactly by
+/// [`decimal_text_to_unscaled`], and `toString` of a `NULL` is still `NULL`.
 fn select_projection(col: &ChColumn) -> String {
     let (base, _nullable) = unwrap_nullable(&col.ty);
     let quoted = format!("`{}`", col.name);
     if base == "DateTime" || base.starts_with("DateTime64(") || base.starts_with("DateTime(") {
         format!("toString(toTimeZone({quoted}, 'UTC')) AS {quoted}")
+    } else if ch_decimal(base).is_some() {
+        format!("toString({quoted}) AS {quoted}")
     } else {
         quoted
     }
@@ -439,6 +644,21 @@ fn order_by_clause(columns: &[ChColumn]) -> String {
         .map(|c| format!("`{}`", c.name))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The statement the export's row cap reads: `SELECT count() AS c FROM
+/// <mart>`.
+///
+/// It is also the statement the `SEC-50` gate checks, because it names
+/// the mart the export reads — one statement, one name, one gate, and
+/// the gate and the read can never drift apart.
+///
+/// `source_table` is the fully-qualified name the caller built (the
+/// schema, a dot, and the mart in backticks), so the statement names
+/// the same table the export reads.
+#[must_use]
+pub(crate) fn mart_count_sql(source_table: &str) -> String {
+    format!("SELECT count() AS c FROM {source_table}")
 }
 
 /// WS7 item D2: builds the exact same `SELECT`/`ORDER BY`/`LIMIT`/
@@ -483,15 +703,27 @@ pub(crate) async fn export_batch_sql(
     crate::policy_engine::rewrite_sql_for_roles(
         &batch_sql,
         &sqlparser::dialect::ClickHouseDialect {},
+        crate::sql_rewrite::Engine::ClickHouse,
         roles,
         placeholders,
         obligations,
     )
     .await
+    // GOV-7 D5: a table the owner's roles do not include answers the tenant
+    // gate's own 404 through the one mapping every caller uses; every other
+    // refusal keeps this variant's 422 with the fixed sentence.
     .map_err(|err| {
-        GoldExportError::PolicyRefused(
-            crate::policy_engine::enforcement_error_message(&err).to_owned(),
-        )
+        if matches!(
+            err,
+            crate::policy_engine::EnforcementError::TableNotReadable(_)
+                | crate::policy_engine::EnforcementError::Unresolvable
+        ) {
+            GoldExportError::PolicyTableRefused(crate::routes::support::enforcement_refusal(
+                &batch_sql, &err,
+            ))
+        } else {
+            GoldExportError::PolicyRefused(crate::policy_engine::enforcement_error_message(&err))
+        }
     })
 }
 
@@ -540,6 +772,33 @@ fn build_array(
                 .map(|r| cell_as_timestamp_micros(r, &plan.name))
                 .collect::<Result<Vec<_>, _>>()?;
             Arc::new(TimestampMicrosecondArray::from(values))
+        }
+        PrimitiveType::Decimal { precision, scale } => {
+            let values = rows
+                .iter()
+                .map(|r| cell_as_decimal(r, &plan.name, precision, scale))
+                .collect::<Result<Vec<_>, _>>()?;
+            let precision = u8::try_from(precision).map_err(|e| {
+                GoldExportError::Batch(format!(
+                    "{}: decimal precision does not fit in u8: {e}",
+                    plan.name
+                ))
+            })?;
+            let scale = i8::try_from(scale).map_err(|e| {
+                GoldExportError::Batch(format!(
+                    "{}: decimal scale does not fit in i8: {e}",
+                    plan.name
+                ))
+            })?;
+            let array = Decimal128Array::from(values)
+                .with_precision_and_scale(precision, scale)
+                .map_err(|e| {
+                    GoldExportError::Batch(format!(
+                        "{}: the decimal array could not be built: {e}",
+                        plan.name
+                    ))
+                })?;
+            Arc::new(array)
         }
         ref other => {
             return Err(GoldExportError::Batch(format!(
@@ -600,16 +859,35 @@ pub struct GoldExportResult {
 /// the first means earlier, already-masked/filtered batches were already
 /// appended to Iceberg (see [`export_batch_sql`]'s own doc comment on why
 /// this is re-checked per batch rather than assumed stable for the whole
-/// export).
+/// export); and [`GoldExportError::TenantGateRefused`] (`SEC-50`) is
+/// returned when the tenant gate refuses the export — before any row is
+/// read.
+///
+/// # Who the export acts as (`SEC-50` R4)
+///
+/// The `actor` says whose reach the gate measures the export against: a
+/// signed-in person as themselves, a job with no user (a service
+/// identity, the shared run token) as the tenant that owns the shared
+/// catalog. `routes::gold::gold_export_gate_actor` is the one place that
+/// decides.
+///
+/// `pub(crate)`, not `pub`: the actor type is `routes::query`'s
+/// `pub(crate)` `GateActor` (the plan's T1), and this function is called
+/// from inside this crate only -- the route and the copilot's tool.
 #[allow(
     clippy::too_many_arguments,
     reason = "WS7 item D2 added roles/placeholders/obligations to the existing six \
               ch/iceberg_config/source_table/mart_name/max_rows/batch_size parameters; \
-              grouping them into a struct would only move the same nine facts one \
-              level of indirection away from every call site, not reduce what a \
-              caller must supply"
+              SEC-50 added the state, which carries the gate's own answers \
+              (the deployment's tenants and CATALOG_TENANT_ID), and the actor, \
+              which says whose reach the gate measures the export against; grouping \
+              them into a struct would only move the same facts one level of \
+              indirection away from every call site, not reduce what a caller must \
+              supply"
 )]
-pub async fn export_mart(
+pub(crate) async fn export_mart(
+    state: &AppState,
+    actor: crate::routes::query::GateActor<'_>,
     ch: &ChClient,
     iceberg_config: &IcebergClientConfig,
     source_table: &str,
@@ -630,14 +908,34 @@ pub async fn export_mart(
     // knob" posture `Config::gold_export_batch_size` documents.
     let batch_size = batch_size.max(1);
 
+    // SEC-50: the export reads the SHARED catalog (`serving.*`, Silver,
+    // Gold), so the gate asks whose reach covers it: a signed-in person's
+    // own tenant, or the catalog's own tenant for a job with no user
+    // (R4, D3). The caller decides — `routes::gold::gold_export_gate_actor`
+    // is the one place that decides — and this gate is the SAME gate the
+    // route asks before the fingerprint, never a second copy of the reach
+    // logic (`AGENTS.md` rule 4).
+    //
+    // The gate runs BEFORE the first read of the mart — the row count
+    // below — so a deployment that holds several tenants and names no
+    // catalog tenant refuses the export before anything reaches
+    // `ClickHouse`.
+    let count_sql = mart_count_sql(source_table);
+    crate::routes::query::gate_statement(
+        state,
+        &count_sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        actor,
+    )
+    .await
+    .map_err(GoldExportError::TenantGateRefused)?;
+
     // Fix (1/3): the row cap is checked BEFORE any row data is read — a
     // mart already over the cap must never start streaming batches only
     // to be cut off midway (which would look, from the caller's
     // perspective, exactly like the silent truncation this cap exists to
     // prevent).
-    let count_result = ch
-        .query(&format!("SELECT count() AS c FROM {source_table}"), None)
-        .await?;
+    let count_result = ch.query(&count_sql, None).await?;
     let total_rows = match count_result.data.first() {
         Some(row) => cell_as_u64(row, "c")?,
         None => 0,
@@ -674,6 +972,11 @@ pub async fn export_mart(
     let mut table = client
         .create_or_load_gold_table(mart_name, domain_fields)
         .await?;
+    // ADR 0016 point 3: the `outside-readers` principal must be able to
+    // `select` in the `gold` namespace — and only there. The namespace
+    // exists now (the export just created or loaded its table in it),
+    // so the grant can be made.
+    grant_outside_readers_select(state, &client).await;
 
     let arrow_schema = Arc::new(
         iceberg::arrow::schema_to_arrow_schema(table.schema())
@@ -749,6 +1052,77 @@ pub async fn export_mart(
     })
 }
 
+/// ADR 0016 point 3: grant the `outside-readers` principal the `select`
+/// relation on the `gold` namespace — and only there.
+///
+/// The door (`routes::iceberg_door`) forwards an outside tool's catalog
+/// call under this principal, so without the grant the catalog itself
+/// refuses the read, even though the API's own path guard allowed it.
+/// The grant is NAMESPACE-scoped, which is the point: the catalog refuses
+/// anything outside `gold` even if the API had a bug (ADR 0016 point 3).
+/// It is the first namespace-scoped grant in this stack; every other
+/// grant here is warehouse-scoped.
+///
+/// # Why this does NOT fail the export
+///
+/// The export's own work — publishing the mart — is done by the time this
+/// runs. Failing the export because a DIFFERENT feature's setup did not
+/// work would report a failure that did not happen (the mart IS
+/// published), and it would break Gold export on every deployment that
+/// has no admin token and never wants outside reading. So a failure here
+/// is logged with its reason, and the next export tries again: the grant
+/// is idempotent, so a repaired deployment heals on its next export.
+///
+/// The tool's own read then fails honestly at the catalog if the grant
+/// never landed, which is the truthful answer for a door that was not
+/// set up.
+async fn grant_outside_readers_select(state: &AppState, client: &IcebergClient) {
+    let Some(admin) = state.lakekeeper_admin.as_deref() else {
+        tracing::warn!(
+            "no Lakekeeper admin token on this deployment: the outside-readers principal \
+             cannot be granted the gold namespace, so outside reading stays off"
+        );
+        return;
+    };
+    let namespace = match gold::gold_namespace() {
+        Ok(namespace) => namespace,
+        Err(err) => {
+            tracing::warn!(%err, "the gold namespace's name could not be built");
+            return;
+        }
+    };
+    // The catalog's own namespace load answers with the namespace's UUID
+    // in its properties — the id the namespace assignments endpoint
+    // wants (the namespace's NAME is not an id there).
+    let namespace = match client.as_catalog().get_namespace(&namespace).await {
+        Ok(namespace) => namespace,
+        Err(err) => {
+            tracing::warn!(%err, "the gold namespace could not be read from the catalog");
+            return;
+        }
+    };
+    let Some(namespace_id) = namespace.properties().get("namespace_id") else {
+        tracing::warn!(
+            "the catalog's gold namespace carries no namespace_id: the outside-readers \
+             principal cannot be granted the namespace, so outside reading stays off"
+        );
+        return;
+    };
+    if let Err(err) = admin
+        .grant_namespace_select(
+            namespace_id,
+            crate::routes::iceberg_door::OUTSIDE_READERS_PRINCIPAL,
+        )
+        .await
+    {
+        tracing::warn!(
+            %err,
+            "the outside-readers principal could not be granted select on the gold namespace; \
+             outside reading stays off until a later export grants it"
+        );
+    }
+}
+
 /// The result of reading a Gold table back through `iceberg-rust`,
 /// independent of whatever the last export claimed.
 pub struct GoldReadBack {
@@ -771,27 +1145,33 @@ pub struct GoldReadBack {
 /// currently visible — used by `routes::gold::read_back` to prove the
 /// export round trip without exposing the Gold data itself over the API.
 ///
+/// `Ok(None)` means the catalog says the table does not exist — a mart never
+/// published, which is a state and not an error (`DATA-49`, QA
+/// `LH-DATA-1-01`).
+///
 /// # Errors
 ///
-/// Returns [`GoldExportError::Iceberg`] if the table does not exist or the
-/// read fails.
+/// Returns [`GoldExportError::Iceberg`] if the catalog refuses or fails the
+/// call for any other reason, or if the read fails.
 pub async fn read_back_row_count(
     iceberg_config: &IcebergClientConfig,
     mart_name: &str,
-) -> Result<GoldReadBack, GoldExportError> {
+) -> Result<Option<GoldReadBack>, GoldExportError> {
     let client = IcebergClient::connect(iceberg_config).await?;
-    let table: GoldTable = client.load_gold_table(mart_name).await?;
+    let Some(table) = client.load_gold_table_if_exists(mart_name).await? else {
+        return Ok(None);
+    };
     let format_version = table.format_version() as u8;
     let snapshot_id = table.current_snapshot_id();
     let exported_at_ms = table.current_snapshot_timestamp_ms();
     let batches = table.read_all().await?;
     let rows = batches.iter().map(RecordBatch::num_rows).sum();
-    Ok(GoldReadBack {
+    Ok(Some(GoldReadBack {
         format_version,
         rows,
         snapshot_id,
         exported_at_ms,
-    })
+    }))
 }
 
 /// Builds an [`IcebergClientConfig`] for the Gold export path from
@@ -813,6 +1193,8 @@ pub fn iceberg_config(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use arrow_array::Array as _;
 
     use super::*;
 
@@ -841,6 +1223,177 @@ mod tests {
             name: name.to_owned(),
             ty: ty.to_owned(),
         }
+    }
+
+    // -- decimals in open format (DATA-48, QA LH-DATA-1-51) ----------------
+
+    #[test]
+    fn a_clickhouse_decimal_maps_to_an_iceberg_decimal_of_the_same_precision_and_scale() {
+        for (ch_type, precision, scale) in [
+            ("Decimal(12, 2)", 12, 2),
+            ("Decimal(38, 10)", 38, 10),
+            ("Decimal(9, 0)", 9, 0),
+            ("Decimal(10)", 10, 0),
+        ] {
+            let (primitive, nullable) =
+                ch_type_to_primitive(ch_type).unwrap_or_else(|e| panic!("{ch_type}: {e}"));
+            assert_eq!(
+                primitive,
+                PrimitiveType::Decimal { precision, scale },
+                "{ch_type}"
+            );
+            assert!(!nullable, "{ch_type} is not nullable");
+        }
+    }
+
+    #[test]
+    fn a_nullable_decimal_is_an_optional_decimal() {
+        let plan = plan_columns(&[ch_column("amount", "Nullable(Decimal(12, 2))")])
+            .expect("a nullable decimal plans");
+        let fields = plan_to_iceberg_fields(&plan);
+        assert!(!fields[0].required, "an optional Iceberg field");
+        assert_eq!(fields[0].field_type.to_string(), "decimal(12, 2)");
+    }
+
+    #[test]
+    fn the_decimal_aliases_map_to_their_fixed_precisions() {
+        for (ch_type, precision, scale) in [
+            ("Decimal32(2)", 9, 2),
+            ("Decimal64(4)", 18, 4),
+            ("Decimal128(10)", 38, 10),
+        ] {
+            let (primitive, _) = ch_type_to_primitive(ch_type).expect(ch_type);
+            assert_eq!(
+                primitive,
+                PrimitiveType::Decimal { precision, scale },
+                "{ch_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decimal_wider_than_38_digits_is_refused_and_the_sentence_names_the_column() {
+        for ch_type in ["Decimal(76, 10)", "Decimal256(10)"] {
+            let err = plan_columns(&[ch_column("big", ch_type)])
+                .err()
+                .unwrap_or_else(|| panic!("{ch_type} must be refused"));
+            assert!(
+                matches!(err, GoldExportError::UnsupportedColumn { .. }),
+                "{err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "column \"big\" has unsupported ClickHouse type \"{ch_type}\": \
+                     open format (Iceberg) holds decimals of at most 38 digits, \
+                     and this column has 76"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn select_projection_reads_a_decimal_as_text() {
+        assert_eq!(
+            select_projection(&ch_column("amount", "Decimal(12, 2)")),
+            "toString(`amount`) AS `amount`"
+        );
+        assert_eq!(
+            select_projection(&ch_column("amount", "Nullable(Decimal(12, 2))")),
+            "toString(`amount`) AS `amount`"
+        );
+    }
+
+    #[test]
+    fn decimal_text_becomes_the_exact_unscaled_integer() {
+        for (text, precision, scale, expected) in [
+            ("12.5", 12, 2, 1250_i128),
+            ("12.50", 12, 2, 1250),
+            ("-0.01", 12, 2, -1),
+            ("-0.5", 3, 1, -5),
+            ("0", 12, 2, 0),
+            ("123", 9, 0, 123),
+            (
+                "-1234567890123456789012345678.0123456789",
+                38,
+                10,
+                -12_345_678_901_234_567_890_123_456_780_123_456_789_i128,
+            ),
+            // Review round 1 R8: the largest value a decimal(38, 0) can hold, which
+            // must not be refused as "more than 38 digits".
+            (
+                "99999999999999999999999999999999999999",
+                38,
+                0,
+                10_i128.pow(38) - 1,
+            ),
+        ] {
+            assert_eq!(
+                decimal_text_to_unscaled(text, precision, scale),
+                Ok(expected),
+                "{text} at decimal({precision}, {scale})"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_text_that_is_not_an_exact_decimal_is_refused() {
+        for (text, precision, scale) in [
+            ("1.234", 12_u32, 2_u32),
+            ("1e5", 12, 2),
+            ("+1", 12, 2),
+            ("", 12, 2),
+            ("abc", 12, 2),
+            ("1,5", 12, 2),
+            (" 1", 12, 2),
+            ("1234567890123", 12, 0),
+            // Review round 1 R8: D14 rule 2 is digits, then optionally `.` AND digits
+            // — a point with nothing after it is not a decimal number, and neither is
+            // any of these shapes.
+            ("12.", 12, 2),
+            ("-", 12, 2),
+            (".", 12, 2),
+            (".5", 12, 2),
+            ("-.5", 12, 2),
+            ("--1", 12, 2),
+            ("1.2.3", 12, 2),
+            // 11 integer digits and 2 fraction digits are 13 for a precision of 12.
+            ("12345678901.5", 12, 2),
+        ] {
+            assert!(
+                decimal_text_to_unscaled(text, precision, scale).is_err(),
+                "{text:?} at decimal({precision}, {scale}) must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decimal_cell_that_arrives_as_a_json_number_is_refused() {
+        let row = row_with("amount", serde_json::json!(12.5));
+        let err = cell_as_decimal(&row, "amount", 12, 2)
+            .expect_err("a JSON number is not an exact decimal");
+        assert!(err.to_string().contains("amount"), "{err}");
+        assert!(matches!(err, GoldExportError::Batch(_)), "{err}");
+    }
+
+    #[test]
+    fn build_array_makes_a_decimal128_column_with_the_columns_precision_and_scale_and_keeps_nulls()
+    {
+        let plan = plan_columns(&[ch_column("amount", "Decimal(12, 2)")]).expect("a decimal plans");
+        let rows = vec![
+            row_with("amount", Value::String("12.50".to_owned())),
+            row_with("amount", Value::Null),
+            row_with("amount", Value::String("-0.01".to_owned())),
+        ];
+        let array = build_array(&plan[0], &rows).expect("the column builds");
+        assert_eq!(array.data_type().to_string(), "Decimal128(12, 2)");
+        let decimals = array
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("a Decimal128 array");
+        assert_eq!(decimals.value(0), 1250);
+        assert!(decimals.is_null(1));
+        assert_eq!(decimals.value(2), -1);
     }
 
     // -- select_projection: the actual fix for defect (3) ------------------
@@ -1005,6 +1558,93 @@ mod tests {
         assert!(message.contains("5000000") || message.contains("5_000_000"));
         assert!(message.contains("GOLD_EXPORT_MAX_ROWS"));
     }
+
+    /// The pool's own URL, for a state that reads it.
+    fn database_url_for(pool: &lakehouse_store::PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    /// `SEC-50` S5: `export_mart`'s OWN gate.
+    ///
+    /// The HTTP route gates before the fingerprint, so every test through
+    /// the route proves the ROUTE's gate and never this one — and the
+    /// copilot's tool calls `export_mart` directly, so this gate is the
+    /// only one it passes. A deployment with several tenants (the four
+    /// the seeded identity migration creates) and no `CATALOG_TENANT_ID`
+    /// has no tenant whose reach covers the shared catalog, so the export
+    /// is refused with D6's sentence — before anything reaches the
+    /// engine.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_job_with_no_catalog_tenant_is_refused_before_the_engine_is_asked(
+        pool: lakehouse_store::PgPool,
+    ) -> sqlx::Result<()> {
+        // A BARE mock server: wiremock's pooled one can be handed to
+        // another test, and then this test's request log would carry that
+        // test's requests.
+        let engine = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"meta": [], "data": [], "rows": 0})),
+            )
+            .mount(&engine)
+            .await;
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), engine.uri());
+        // NO `CATALOG_TENANT_ID`: that is the deployment this refusal is
+        // about.
+        let state = AppState::new(
+            crate::config::Config::from_map(&env).expect("a valid config from a map"),
+        );
+        let obligations = crate::policy_engine::PolicyEngineObligations::from_state(&state);
+
+        let outcome = export_mart(
+            &state,
+            crate::routes::query::GateActor::CatalogTenant,
+            &state.clickhouse,
+            &iceberg_config(
+                "http://127.0.0.1:1".to_owned(),
+                "warehouse".to_owned(),
+                None,
+            ),
+            "serving.gold_smoke",
+            "gold_smoke",
+            1_000,
+            100,
+            &[],
+            &crate::sql_rewrite::PlaceholderValues::none(),
+            &obligations,
+        )
+        .await;
+
+        let Err(err) = outcome else {
+            panic!("a deployment that names no catalog tenant must refuse the export");
+        };
+        assert_eq!(
+            err.to_string(),
+            crate::routes::query::JOB_NEEDS_CATALOG_TENANT
+        );
+        let requests = engine
+            .received_requests()
+            .await
+            .expect("the mock engine records requests");
+        assert!(
+            requests.is_empty(),
+            "the refusal precedes the engine: nothing may be asked: {requests:?}"
+        );
+        Ok(())
+    }
 }
 
 // ── WS7 item D2: `export_batch_sql` goes through the same
@@ -1056,8 +1696,8 @@ mod export_batch_sql_enforcement {
     /// no obligations check of any kind (`gold_export.rs`'s pre-D2
     /// `export_mart`, `LIMIT`/`OFFSET` loop). Quoted failure text
     /// (`cargo test -p lakehouse-api gold_export::export_batch_sql 2>&1 |
-    /// tail -40` against the pre-D2 module): `error[E0425]: cannot find
-    /// function \`export_batch_sql\` in this scope`.
+    /// tail -40` against the pre-D2 module): ``error[E0425]: cannot find
+    /// function `export_batch_sql` in this scope``.
     #[sqlx::test(migrations = "../../migrations")]
     async fn export_mart_rewrites_each_batch_query_for_the_triggering_principals_roles(
         pool: PgPool,

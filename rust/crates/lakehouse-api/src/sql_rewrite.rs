@@ -117,8 +117,15 @@ fn all_queries(stmt: &sqlparser::ast::Statement) -> Vec<Query> {
 /// which tables get substituted.
 pub fn referenced_tables(sql: &str, dialect: &dyn Dialect) -> Option<Vec<String>> {
     let statements = Parser::parse_sql(dialect, sql).ok()?;
+    Some(referenced_tables_of(&statements).into_iter().collect())
+}
+
+/// Every real table the queries in `statements` reference — the
+/// collection [`referenced_tables`] performs, over an already parsed
+/// statement list, so both share ONE collector (`AGENTS.md` rule 4).
+fn referenced_tables_of(statements: &[Statement]) -> HashSet<String> {
     let mut queries = Vec::new();
-    for stmt in &statements {
+    for stmt in statements {
         queries.extend(all_queries(stmt));
     }
     let ctes: HashSet<String> = queries
@@ -136,7 +143,352 @@ pub fn referenced_tables(sql: &str, dialect: &dyn Dialect) -> Option<Vec<String>
             }
         }
     }
-    Some(out.into_iter().collect())
+    out
+}
+
+/// What the tenant gate must check for a statement.
+///
+/// Either the tables the statement names — the gate checks each of them,
+/// whatever the statement's kind — or the fact that it lists objects
+/// without naming one table, which no table-level check can cover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateTargets {
+    /// The tables the statement names, canonicalised (see [`canonicalize`])
+    /// and sorted, so the same statement always hands the gate the same
+    /// list.
+    Tables(Vec<String>),
+    /// The statement lists objects (`SHOW TABLES`, `SHOW DATABASES`, ...)
+    /// without naming one table to gate.
+    ListsObjects,
+}
+
+/// The tables `sql` names, or that it lists objects without naming one
+/// table — what the tenant gate must check, from ONE parse.
+///
+/// A statement that names tables is gated table by table: a `SELECT`'s
+/// tables are the ones [`referenced_tables`] finds in it (the SAME
+/// collector, not a second one), a `DESCRIBE`/`DESC` gates the table it
+/// names, and a `SHOW COLUMNS FROM tbl` gates `tbl`. A statement that
+/// lists objects without naming one table names no table the gate could
+/// check, so it is reported as [`GateTargets::ListsObjects`] and the
+/// caller decides who may run it — never as "no tables", which would let
+/// it through unchecked.
+///
+/// Several statements in one input are gated as ONE: any statement that
+/// lists objects makes the whole input a listing (fail closed), otherwise
+/// the tables of every statement are unioned, so a table named by any
+/// statement is gated.
+///
+/// `None` means `sql` did not parse at all. The caller refuses such a
+/// statement anyway — the policy rewrite refuses it first — so the gate
+/// adds nothing to it.
+///
+/// # Which `Statement` variant each form becomes (sqlparser 0.63)
+///
+/// `ClickHouseDialect` and `GenericDialect` agree on every form below:
+/// - `DESCRIBE x` / `DESC x` become `Statement::ExplainTable { table_name, .. }`
+///   (`ast/mod.rs:4661-4674`). `ClickHouseDialect::describe_requires_table_keyword()`
+///   is `true` (`dialect/clickhouse.rs:50-52`), and both spellings parse
+///   anyway — the `TABLE` keyword is optional in the grammar.
+/// - `SHOW COLUMNS FROM tbl` / `FROM db.tbl` become
+///   `Statement::ShowColumns { show_options, .. }`, the named table at
+///   `show_options.show_in.parent_name` (`ast/mod.rs:4186-4193`,
+///   `:11064-11072`; the parser fills it in `parser/mod.rs:21051-21064`).
+/// - `SHOW TABLES [FROM db]` becomes `Statement::ShowTables { show_options, .. }`
+///   (`ast/mod.rs:4252-4265`): the database lands in the same
+///   `parent_name`, and it is a DATABASE, not a table to gate.
+/// - `SHOW DATABASES` / `SHOW SCHEMAS` become `Statement::ShowDatabases` /
+///   `Statement::ShowSchemas` (`ast/mod.rs:4208-4235`).
+/// - `EXPLAIN DESCRIBE x` does NOT parse at all (`parser/mod.rs:14480-14483`:
+///   "Explain must be root of the plan"), so it is a `None`.
+#[must_use]
+pub fn gate_targets(sql: &str, dialect: &dyn Dialect) -> Option<GateTargets> {
+    let statements = Parser::parse_sql(dialect, sql).ok()?;
+    let mut tables: HashSet<String> = HashSet::new();
+    for stmt in &statements {
+        match statement_gate_targets(stmt) {
+            GateTargets::Tables(named) => tables.extend(named),
+            // Fail closed: one statement that lists objects makes the
+            // whole input a listing, whatever the others name.
+            GateTargets::ListsObjects => return Some(GateTargets::ListsObjects),
+        }
+    }
+    // Sorted: the same statement must hand the gate the same list every
+    // time.
+    let mut tables: Vec<String> = tables.into_iter().collect();
+    tables.sort();
+    Some(GateTargets::Tables(tables))
+}
+
+/// What ONE statement means to the tenant gate — see [`gate_targets`].
+fn statement_gate_targets(stmt: &Statement) -> GateTargets {
+    match stmt {
+        // A query's tables are the ones `referenced_tables` finds in it.
+        Statement::Query(_) => GateTargets::Tables(
+            referenced_tables_of(std::slice::from_ref(stmt))
+                .into_iter()
+                .collect(),
+        ),
+        Statement::Explain { statement, .. } => statement_gate_targets(statement),
+        Statement::ExplainTable { table_name, .. } => {
+            GateTargets::Tables(vec![canonical_object_name(table_name)])
+        }
+        Statement::ShowColumns { show_options, .. } => {
+            if let Some(name) = show_columns_table(show_options) {
+                GateTargets::Tables(vec![canonical_object_name(name)])
+            } else {
+                GateTargets::ListsObjects
+            }
+        }
+        // Every other kind names no table the gate could check: it is a
+        // listing, never "no tables".
+        _ => GateTargets::ListsObjects,
+    }
+}
+
+/// The table a `SHOW COLUMNS` statement names, when it names one.
+///
+/// `SHOW COLUMNS FROM tbl` and `SHOW COLUMNS FROM db.tbl` name a table.
+/// `SHOW COLUMNS IN DATABASE db` and `IN SCHEMA db` name a database or a
+/// schema, and `SHOW COLUMNS` alone names nothing: the statement then
+/// lists the columns of every table it can see, so there is no table to
+/// gate and the caller must treat it as a listing.
+fn show_columns_table(show_options: &sqlparser::ast::ShowStatementOptions) -> Option<&ObjectName> {
+    let show_in = show_options.show_in.as_ref()?;
+    let name = show_in.parent_name.as_ref()?;
+    match &show_in.parent_type {
+        None | Some(sqlparser::ast::ShowStatementInParentType::Table) => Some(name),
+        // A DATABASE or a SCHEMA: the name is not a table.
+        _ => None,
+    }
+}
+
+/// Replaces every literal of a statement with a `?` placeholder.
+/// [`literal_free_form`].
+struct LiteralMasker;
+
+impl sqlparser::ast::VisitorMut for LiteralMasker {
+    type Break = Infallible;
+
+    fn pre_visit_value(
+        &mut self,
+        value: &mut sqlparser::ast::ValueWithSpan,
+    ) -> ControlFlow<Infallible> {
+        // `NULL` carries no information about a person; every other value
+        // (strings, numbers, booleans, dates) can.
+        if !matches!(value.value, sqlparser::ast::Value::Null) {
+            value.value = sqlparser::ast::Value::Placeholder("?".to_owned());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// `sql` with every literal replaced by `?`, printed back from its parse
+/// (`DATA-15` F2): `WHERE id = 42 AND name IN ('a', 'b')` becomes
+/// `WHERE id = ? AND name IN (?, ?)`, so two runs of one query that differ
+/// only in their values have one form, and the form can be shown to
+/// people who must not see the values (a customer id, a name). Comments
+/// are dropped by the parse. `None` when `sql` does not parse under
+/// `dialect`: the caller leaves that query out rather than show its text.
+#[must_use]
+pub fn literal_free_form(sql: &str, dialect: &dyn Dialect) -> Option<String> {
+    let mut statements = Parser::parse_sql(dialect, sql).ok()?;
+    for stmt in &mut statements {
+        let _: ControlFlow<Infallible> = sqlparser::ast::VisitMut::visit(stmt, &mut LiteralMasker);
+    }
+    Some(
+        statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// Collects the last part of every column-like identifier of a statement.
+/// [`identifiers_used`].
+struct IdentCollector {
+    found: HashSet<String>,
+}
+
+impl Visitor for IdentCollector {
+    type Break = Infallible;
+
+    fn pre_visit_expr(&mut self, expr: &sqlparser::ast::Expr) -> ControlFlow<Infallible> {
+        use sqlparser::ast::Expr;
+        match expr {
+            Expr::Identifier(ident) => {
+                self.found.insert(ident.value.to_ascii_lowercase());
+            }
+            Expr::CompoundIdentifier(parts) => {
+                if let Some(last) = parts.last() {
+                    self.found.insert(last.value.to_ascii_lowercase());
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Every identifier `sql` uses as an expression (a column, or an alias used
+/// like one), lower-cased and reduced to its last part, so `o.amount` is
+/// `amount` (`DATA-15` F2, column popularity). Table names are not
+/// expressions and are not included; a name in `USING (...)` is not an
+/// expression either and is missed. `None` when `sql` does not parse under
+/// `dialect`.
+#[must_use]
+pub fn identifiers_used(sql: &str, dialect: &dyn Dialect) -> Option<HashSet<String>> {
+    let statements = Parser::parse_sql(dialect, sql).ok()?;
+    let mut collector = IdentCollector {
+        found: HashSet::new(),
+    };
+    for stmt in &statements {
+        let _: ControlFlow<Infallible> = stmt.visit(&mut collector);
+    }
+    Some(collector.found)
+}
+
+/// What a statement reads or calls that its table names do not show
+/// (`BI-4` B review P-B1, P-S1). See [`reads_beyond_tables`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BeyondTables {
+    /// A clock or random function: the answer changes with no change to any
+    /// table (`now`, `today`, `rand*`, `generateUUID*`, ...).
+    pub clock_or_random: bool,
+    /// Data read through a name no `FROM`/`JOIN` factor carries: a
+    /// `dictGet*`/`joinGet*` call, or `IN <table>`.
+    pub outside_from: bool,
+}
+
+/// The functions whose value is not a function of the tables: lower-cased
+/// exact names; the `rand` and `generateuuid` families are matched by prefix
+/// in [`is_clock_or_random_function`].
+const CLOCK_FUNCTIONS: &[&str] = &[
+    "now",
+    "now64",
+    "nowinblock",
+    "nowinblock64",
+    "today",
+    "yesterday",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "localtime",
+    "localtimestamp",
+    "currentdate",
+    "uuid",
+    "uptime",
+];
+
+/// Whether `name` (any case, last segment) is a clock or random function.
+/// The prefixes keep a variant this list missed (`randCanonical`,
+/// `randomString`, `generateUUIDv4`, `generateSnowflakeID`) from slipping
+/// through; a false positive only shortens a result's life.
+fn is_clock_or_random_function(name: &str) -> bool {
+    let last = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
+    CLOCK_FUNCTIONS.contains(&last.as_str())
+        || last.starts_with("rand")
+        || last.starts_with("generateuuid")
+        || last.starts_with("generatesnowflake")
+}
+
+struct BeyondTablesFinder {
+    found: BeyondTables,
+}
+
+impl Visitor for BeyondTablesFinder {
+    type Break = Infallible;
+
+    fn pre_visit_expr(&mut self, expr: &sqlparser::ast::Expr) -> ControlFlow<Infallible> {
+        use sqlparser::ast::Expr;
+        match expr {
+            Expr::Function(f) => {
+                let name = f.name.to_string();
+                if is_clock_or_random_function(&name) {
+                    self.found.clock_or_random = true;
+                }
+                if is_dict_or_join_function(&name) {
+                    self.found.outside_from = true;
+                }
+            }
+            // `x IN tbl` names a table without a table factor; `x IN (a)` with
+            // a column is caught too, which only shortens a result's life.
+            Expr::InList { list, .. }
+                if matches!(
+                    list.as_slice(),
+                    [Expr::Identifier(_) | Expr::CompoundIdentifier(_)]
+                ) =>
+            {
+                self.found.outside_from = true;
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether `sql` calls a clock or random function, or reads data through a
+/// name no table factor carries (`dictGet*`/`joinGet*`, `IN <table>`), so the
+/// table fingerprint cannot vouch for its result. A statement that does not
+/// parse answers both `true` (nothing can be said, so nothing is trusted).
+#[must_use]
+pub fn reads_beyond_tables(sql: &str, dialect: &dyn Dialect) -> BeyondTables {
+    let Ok(statements) = Parser::parse_sql(dialect, sql) else {
+        return BeyondTables {
+            clock_or_random: true,
+            outside_from: true,
+        };
+    };
+    let mut finder = BeyondTablesFinder {
+        found: BeyondTables::default(),
+    };
+    for stmt in &statements {
+        let _: ControlFlow<Infallible> = stmt.visit(&mut finder);
+    }
+    finder.found
+}
+
+struct QuotedIdentChecker<'a, S> {
+    known: &'a HashSet<String, S>,
+    has_unknown: bool,
+}
+
+impl<S: std::hash::BuildHasher> Visitor for QuotedIdentChecker<'_, S> {
+    type Break = ();
+
+    fn pre_visit_ident(&mut self, ident: &sqlparser::ast::Ident) -> ControlFlow<Self::Break> {
+        if ident.quote_style.is_some() && !self.known.contains(&ident.value.to_ascii_lowercase()) {
+            self.has_unknown = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Checks whether `sql` contains any quoted identifier whose name is not in `known`.
+// PR #106 review R1 BLOCKER 6
+#[must_use]
+pub fn has_unknown_quoted_identifier<S: std::hash::BuildHasher>(
+    sql: &str,
+    known: &HashSet<String, S>,
+) -> bool {
+    use sqlparser::dialect::{ClickHouseDialect, GenericDialect};
+    let check = |dialect: &dyn Dialect| {
+        if let Ok(statements) = Parser::parse_sql(dialect, sql) {
+            let mut checker = QuotedIdentChecker {
+                known,
+                has_unknown: false,
+            };
+            for stmt in &statements {
+                if stmt.visit(&mut checker).is_break() {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    check(&ClickHouseDialect {}) || check(&GenericDialect {})
 }
 
 /// `query.body`'s own top-level `FROM` clause, unwrapping a
@@ -186,12 +538,7 @@ fn collect_table_factor_name(
             if args.is_some() {
                 return;
             }
-            let parts: Vec<String> = name
-                .0
-                .iter()
-                .filter_map(sqlparser::ast::ObjectNamePart::as_ident)
-                .map(|ident| ident.value.to_ascii_lowercase())
-                .collect();
+            let parts = object_name_parts(name);
             if parts.len() == 1 && ctes.contains(&parts[0]) {
                 return; // a CTE reference, not a real table
             }
@@ -226,13 +573,66 @@ fn collect_table_factor_name(
 /// on the other. Splitting can only ever make a name MORE likely to match
 /// a governed key, never less: a governed table whose real columns then
 /// cannot be resolved is refused (`UnprovableSubstitution`), not passed.
-fn canonicalize(parts: &[String]) -> String {
+pub(crate) fn canonicalize(parts: &[String]) -> String {
     let parts: Vec<&str> = parts.iter().flat_map(|p| p.split('.')).collect();
     match parts.len() {
         0 => String::new(),
         1 => parts[0].to_owned(),
         2 => parts.join("."),
         _ => parts[parts.len() - 2..].join("."),
+    }
+}
+
+/// `DATA-15` F2: the literal-free form of a query and the identifiers it
+/// uses, which the asset page's usage figures are built from.
+#[cfg(test)]
+mod usage_forms {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use sqlparser::dialect::ClickHouseDialect;
+
+    use super::{identifiers_used, literal_free_form};
+
+    #[test]
+    fn literals_of_every_kind_become_placeholders() {
+        let form = literal_free_form(
+            "SELECT * FROM silver.orders WHERE name = 'Rina' AND id = 42 AND city IN (1, 2)",
+            &ClickHouseDialect {},
+        )
+        .unwrap();
+        assert_eq!(
+            form,
+            "SELECT * FROM silver.orders WHERE name = ? AND id = ? AND city IN (?, ?)"
+        );
+        assert!(!form.contains("Rina") && !form.contains("42"));
+    }
+
+    #[test]
+    fn two_queries_that_differ_only_in_their_values_have_one_form() {
+        let a = literal_free_form("SELECT id FROM t WHERE x = 'a'", &ClickHouseDialect {});
+        let b = literal_free_form("SELECT id FROM t WHERE x = 'b'", &ClickHouseDialect {});
+        assert_eq!(a, b);
+        assert!(a.is_some());
+    }
+
+    #[test]
+    fn sql_that_does_not_parse_has_no_form() {
+        assert_eq!(
+            literal_free_form("orders, please", &ClickHouseDialect {}),
+            None
+        );
+    }
+
+    #[test]
+    fn identifiers_are_lowercased_and_reduced_to_their_last_part() {
+        let used = identifiers_used(
+            "SELECT o.Amount, id FROM silver.orders o WHERE o.status = 'x' ORDER BY id",
+            &ClickHouseDialect {},
+        )
+        .unwrap();
+        let mut used: Vec<String> = used.into_iter().collect();
+        used.sort();
+        assert_eq!(used, vec!["amount", "id", "status"]);
     }
 }
 
@@ -344,12 +744,514 @@ mod table_resolution {
     }
 }
 
+/// The tenant gate's view of a statement: the tables it names, or that it
+/// lists objects without naming one table.
+#[cfg(test)]
+mod gate_targets {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use sqlparser::dialect::{ClickHouseDialect, Dialect, GenericDialect};
+
+    use super::GateTargets;
+
+    /// The two dialects the API reads SQL with.
+    fn dialects() -> Vec<Box<dyn Dialect>> {
+        vec![Box::new(ClickHouseDialect {}), Box::new(GenericDialect {})]
+    }
+
+    #[test]
+    fn describe_parses_to_its_table_in_both_dialects() {
+        for sql in ["DESCRIBE bronze.orders", "DESC bronze.orders"] {
+            for dialect in dialects() {
+                assert_eq!(
+                    super::gate_targets(sql, dialect.as_ref()),
+                    Some(GateTargets::Tables(vec!["bronze.orders".to_owned()])),
+                    "sql={sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn show_columns_gates_the_table_it_names_in_both_dialects() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("SHOW COLUMNS FROM bronze.orders", dialect.as_ref()),
+                Some(GateTargets::Tables(vec!["bronze.orders".to_owned()]))
+            );
+        }
+    }
+
+    #[test]
+    fn show_columns_gates_an_unqualified_table_name_in_both_dialects() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("SHOW COLUMNS FROM orders", dialect.as_ref()),
+                Some(GateTargets::Tables(vec!["orders".to_owned()]))
+            );
+        }
+    }
+
+    #[test]
+    fn show_tables_and_show_databases_list_objects_without_naming_a_table() {
+        // The database of `SHOW TABLES FROM bronze` is not a table: a
+        // listing names no table the gate could check.
+        for sql in [
+            "SHOW TABLES",
+            "SHOW TABLES FROM bronze",
+            "SHOW DATABASES",
+            "SHOW SCHEMAS",
+        ] {
+            for dialect in dialects() {
+                assert_eq!(
+                    super::gate_targets(sql, dialect.as_ref()),
+                    Some(GateTargets::ListsObjects),
+                    "sql={sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_query_still_yields_its_referenced_tables() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("SELECT * FROM bronze.orders", dialect.as_ref()),
+                Some(GateTargets::Tables(vec!["bronze.orders".to_owned()]))
+            );
+            // A CTE's own name is not a table.
+            assert_eq!(
+                super::gate_targets(
+                    "WITH orders AS (SELECT 1) SELECT * FROM orders",
+                    dialect.as_ref()
+                ),
+                Some(GateTargets::Tables(vec![]))
+            );
+        }
+    }
+
+    #[test]
+    fn explain_recurses_into_the_statement_it_explains() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("EXPLAIN SELECT * FROM bronze.orders", dialect.as_ref()),
+                Some(GateTargets::Tables(vec!["bronze.orders".to_owned()]))
+            );
+        }
+    }
+
+    #[test]
+    fn explain_describe_does_not_parse_so_the_gate_sees_nothing() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("EXPLAIN DESCRIBE bronze.orders", dialect.as_ref()),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn two_statements_fail_closed_when_one_lists_objects() {
+        for dialect in dialects() {
+            assert_eq!(
+                super::gate_targets("SELECT 1; SHOW TABLES", dialect.as_ref()),
+                Some(GateTargets::ListsObjects)
+            );
+            assert_eq!(
+                super::gate_targets("SELECT * FROM a; SELECT * FROM b", dialect.as_ref()),
+                Some(GateTargets::Tables(vec!["a".to_owned(), "b".to_owned()]))
+            );
+        }
+    }
+
+    #[test]
+    fn sql_that_does_not_parse_has_no_gate_targets() {
+        for dialect in dialects() {
+            assert_eq!(super::gate_targets("SELECT !?", dialect.as_ref()), None);
+        }
+    }
+}
+
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident as SqlIdent, ObjectName,
-    ObjectNamePart, SelectItem, SetExpr, Statement, TableAlias, Value, ValueWithSpan,
+    BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentList, FunctionArguments, Ident as SqlIdent, ObjectName, ObjectNamePart,
+    SelectItem, SetExpr, Statement, TableAlias, TableVersion, UnaryOperator, Value, ValueWithSpan,
 };
+
+/// The engine a statement is written for.
+///
+/// `DATA-21` D1: ONE rewrite, engine-aware. The same obligations
+/// (the same mask, the same row filter) are written in the engine's own
+/// SQL, so the derived table a governed read is rewritten into runs on
+/// both engines:
+///
+/// - `ClickHouse`: backtick identifiers, `replaceRegexpOne(toString(..))`
+///   masking, `toString`/`toDate` row-filter functions.
+/// - `Trino`: double-quoted identifiers, a `CASE` masking form, and
+///   `CAST(.. AS varchar)`/`CAST(.. AS date)` row-filter functions.
+///
+/// The `ClickHouse` output is byte for byte what it was before this
+/// argument existed — many tests match its exact text — so every
+/// `ClickHouse` caller passes [`Engine::ClickHouse`] and gets the old
+/// string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// `ClickHouse`: the engine this module was written for.
+    ClickHouse,
+    /// `Trino`: the engine `DATA-21` added.
+    Trino,
+}
+
+impl Engine {
+    /// The engine a request names. Every name other than `"trino"` is
+    /// `ClickHouse` — the default the run route uses when the request
+    /// names no engine at all — so an unknown name can never reach the
+    /// `Trino` rewrite by accident.
+    #[must_use]
+    pub fn from_name(name: &str) -> Self {
+        if name == "trino" {
+            Self::Trino
+        } else {
+            Self::ClickHouse
+        }
+    }
+}
+
+/// `Trino`'s SQL dialect: `GenericDialect` with table versioning on.
+///
+/// `DATA-21` D2: `sqlparser` reads a table version (`VERSION AS OF 12`)
+/// only in a dialect whose `supports_table_versioning()` is true, and
+/// `GenericDialect`'s is not — so `Trino`'s own past-version clause
+/// could not be parsed at all. This newtype is `GenericDialect` in
+/// every other respect: every method it does not override below is the
+/// one `GenericDialect` uses, and [`Dialect::dialect`] answers
+/// `GenericDialect`'s own type id, so `sqlparser`'s own
+/// `dialect_of!(.. is GenericDialect)` checks keep answering what they
+/// answer today.
+///
+/// The one other override is the identifier quote: `Trino` quotes an
+/// identifier with `"`, and `GenericDialect` names none.
+///
+/// The delegation below is mechanical, and it is complete for
+/// `sqlparser` 0.63: a later `sqlparser` that gives `GenericDialect` a
+/// new override needs that name added here, or this dialect keeps the
+/// trait's default for it — the one thing a reader of this file has to
+/// check when the crate is upgraded.
+#[allow(
+    dead_code,
+    reason = "only the module's own tests read it until DATA-21 S1-T3 wires the \
+              route to it; the library target keeps it reachable"
+)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TrinoDialect {
+    inner: sqlparser::dialect::GenericDialect,
+}
+
+/// Writes the [`Dialect`] methods that only answer `true` or `false`
+/// and delegate to the wrapped [`sqlparser::dialect::GenericDialect`].
+macro_rules! delegate_to_generic {
+    ($($method:ident),* $(,)?) => {
+        $(
+            fn $method(&self) -> bool {
+                self.inner.$method()
+            }
+        )*
+    };
+}
+
+/// The same, for the methods that take the character they are asked
+/// about.
+macro_rules! delegate_char_to_generic {
+    ($($method:ident),* $(,)?) => {
+        $(
+            fn $method(&self, ch: char) -> bool {
+                self.inner.$method(ch)
+            }
+        )*
+    };
+}
+
+impl Dialect for TrinoDialect {
+    /// `GenericDialect`'s own type id, so `sqlparser`'s dialect checks
+    /// (`dialect_of!(.. is GenericDialect)`) answer exactly what they
+    /// answer for a `GenericDialect`.
+    fn dialect(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<sqlparser::dialect::GenericDialect>()
+    }
+
+    /// The one thing `DATA-21` D2 needs: a table version is read.
+    fn supports_table_versioning(&self) -> bool {
+        true
+    }
+
+    /// `Trino` quotes an identifier with `"`.
+    fn identifier_quote_style(&self, _identifier: &str) -> Option<char> {
+        Some('"')
+    }
+
+    delegate_char_to_generic!(
+        is_delimited_identifier_start,
+        is_identifier_start,
+        is_identifier_part,
+    );
+
+    delegate_to_generic!(
+        supports_unicode_string_literal,
+        supports_partition_by_after_order_by,
+        supports_array_join_syntax,
+        supports_group_by_expr,
+        supports_group_by_with_modifier,
+        supports_left_associative_joins_without_parens,
+        supports_connect_by,
+        supports_match_recognize,
+        supports_pipe_operator,
+        supports_start_transaction_modifier,
+        supports_window_function_null_treatment_arg,
+        supports_dictionary_syntax,
+        supports_window_clause_named_window_reference,
+        supports_parenthesized_set_variables,
+        supports_select_wildcard_except,
+        support_map_literal_syntax,
+        allow_extract_custom,
+        allow_extract_single_quotes,
+        supports_extract_comma_syntax,
+        supports_create_view_comment_syntax,
+        supports_parens_around_table_factor,
+        supports_values_as_table_factor,
+        supports_create_index_with_clause,
+        supports_explain_with_utility_options,
+        supports_exclude_constraint,
+        supports_limit_comma,
+        supports_update_order_by,
+        supports_from_first_select,
+        supports_projection_trailing_commas,
+        supports_asc_desc_in_column_definition,
+        supports_try_convert,
+        supports_bitwise_shift_operators,
+        supports_comment_on,
+        supports_load_extension,
+        supports_named_fn_args_with_assignment_operator,
+        supports_struct_literal,
+        supports_empty_projections,
+        supports_nested_comments,
+        supports_multiline_comment_hints,
+        supports_user_host_grantee,
+        supports_string_escape_constant,
+        supports_array_typedef_with_brackets,
+        supports_match_against,
+        supports_set_names,
+        supports_comma_separated_set_assignments,
+        supports_filter_during_aggregation,
+        supports_select_wildcard_exclude,
+        supports_data_type_signed_suffix,
+        supports_interval_options,
+        supports_quote_delimited_string,
+        supports_select_wildcard_replace,
+        supports_select_wildcard_ilike,
+        supports_select_wildcard_rename,
+        supports_optimize_table,
+        supports_install,
+        supports_detach,
+        supports_prewhere,
+        supports_with_fill,
+        supports_limit_by,
+        supports_interpolate,
+        supports_settings,
+        supports_select_format,
+        supports_comment_optimizer_hint,
+        supports_constraint_keyword_without_name,
+        supports_key_column_option,
+        supports_comma_separated_trim,
+        supports_cte_without_as,
+        supports_select_item_multi_column_alias,
+        supports_xml_expressions,
+        supports_aliased_function_args,
+    );
+}
+
+/// One past-version clause found in a statement.
+struct PastVersionClause {
+    /// The byte range of the `FOR` word in front of the clause, when
+    /// the statement wrote `Trino`'s own form.
+    for_range: Option<(usize, usize)>,
+    /// The byte offset where the clause's `VERSION` word starts.
+    version_start: usize,
+    /// The clause's own text — the version id.
+    id: String,
+}
+
+impl PastVersionClause {
+    /// Whether the clause names a version id — a plain integer, the only
+    /// thing `DATA-21` D2 accepts.
+    fn is_version_id(&self) -> bool {
+        !self.id.is_empty() && self.id.chars().all(|c| c.is_ascii_digit())
+    }
+}
+
+/// The statement as `sqlparser` reads it: `Trino`'s `FOR VERSION AS OF
+/// <id>` becomes the `VERSION AS OF <id>` form `sqlparser` parses
+/// (`DATA-21` D2).
+///
+/// The pass is a TOKEN pass, not a text search: the same words inside a
+/// string literal, a quoted identifier or a comment are not a clause.
+/// Only an integer version id is accepted — a clause that names
+/// anything else is refused here, before the statement is parsed.
+///
+/// # Errors
+/// [`RewriteError::InvalidPastVersion`] when a past-version clause does
+/// not name a version id.
+#[allow(
+    dead_code,
+    reason = "only the module's own tests read it until DATA-21 S1-T3 wires the \
+              route to it; the library target keeps it reachable"
+)]
+pub fn normalize_past_version_clause(sql: &str) -> Result<String, RewriteError> {
+    let clauses = past_version_clauses(sql);
+    if clauses.is_empty() {
+        return Ok(sql.to_owned());
+    }
+    if clauses.iter().any(|clause| !clause.is_version_id()) {
+        return Err(RewriteError::InvalidPastVersion);
+    }
+    let mut out = sql.to_owned();
+    // The clauses are removed from the last one backwards, so the
+    // offsets of the ones before it stay valid.
+    for clause in clauses.iter().rev() {
+        if let Some((for_start, _)) = clause.for_range {
+            // The `FOR` word and the space after it: what is left is
+            // the `VERSION AS OF <id>` the parser reads.
+            out.replace_range(for_start..clause.version_start, "");
+        }
+    }
+    Ok(out)
+}
+
+/// The statement as `Trino` reads it: the `VERSION AS OF <id>` form
+/// `sqlparser` prints becomes `FOR VERSION AS OF <id>` again
+/// (`DATA-21` D2).
+///
+/// A clause that does not name a version id is left alone — it never
+/// came from a version this module accepted, and `Trino` will say so.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "only the module's own tests read it until DATA-21 S1-T3 wires the \
+              route to it; the library target keeps it reachable"
+)]
+pub fn denormalize_past_version_clause(sql: &str) -> String {
+    let clauses = past_version_clauses(sql);
+    if clauses.is_empty() {
+        return sql.to_owned();
+    }
+    let mut out = sql.to_owned();
+    // The clauses are rewritten from the last one backwards, so the
+    // offsets of the ones before it stay valid.
+    for clause in clauses.iter().rev() {
+        if clause.for_range.is_none() && clause.is_version_id() {
+            out.insert_str(clause.version_start, "FOR ");
+        }
+    }
+    out
+}
+
+/// Every `VERSION AS OF <id>` run in `sql`, with the `FOR` word in front
+/// of it when the statement wrote `Trino`'s own form.
+///
+/// A tokenizer failure answers with no clause at all: the statement then
+/// does not parse either, and is refused further up — never guessed at.
+fn past_version_clauses(sql: &str) -> Vec<PastVersionClause> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
+
+    let Ok(tokens) =
+        Tokenizer::new(&sqlparser::dialect::GenericDialect {}, sql).tokenize_with_location()
+    else {
+        return Vec::new();
+    };
+    // Whitespace carries no meaning between the words; every other
+    // token (a comment, a comma) breaks a run of keywords.
+    let significant: Vec<&TokenWithSpan> = tokens
+        .iter()
+        .filter(|token| !matches!(token.token, Token::Whitespace(_)))
+        .collect();
+    let mut out = Vec::new();
+    for (index, token) in significant.iter().enumerate() {
+        if keyword_word(token).as_deref() != Some("VERSION") {
+            continue;
+        }
+        let Some(as_token) = significant.get(index + 1) else {
+            continue;
+        };
+        if keyword_word(as_token).as_deref() != Some("AS") {
+            continue;
+        }
+        let Some(of_token) = significant.get(index + 2) else {
+            continue;
+        };
+        if keyword_word(of_token).as_deref() != Some("OF") {
+            continue;
+        }
+        let Some(id_token) = significant.get(index + 3) else {
+            continue;
+        };
+        let Token::Number(id, _) = &id_token.token else {
+            continue;
+        };
+        let Some(version_start) = byte_offset_of(sql, &token.span.start) else {
+            continue;
+        };
+        let for_range = index.checked_sub(1).and_then(|before| {
+            let word = keyword_word(significant[before])?;
+            if word != "FOR" {
+                return None;
+            }
+            let start = byte_offset_of(sql, &significant[before].span.start)?;
+            let end = byte_offset_of(sql, &significant[before].span.end)?;
+            Some((start, end))
+        });
+        out.push(PastVersionClause {
+            for_range,
+            version_start,
+            id: id.clone(),
+        });
+    }
+    out
+}
+
+/// The upper-cased text of a keyword token — `None` for anything that
+/// is not an unquoted word, so a quoted identifier never reads as a
+/// keyword.
+fn keyword_word(token: &sqlparser::tokenizer::TokenWithSpan) -> Option<String> {
+    match &token.token {
+        sqlparser::tokenizer::Token::Word(word) if word.quote_style.is_none() => {
+            Some(word.value.to_ascii_uppercase())
+        }
+        _ => None,
+    }
+}
+
+/// The byte offset of a `sqlparser` [`sqlparser::tokenizer::Location`] —
+/// a line and a column, the column counted in characters from the line's
+/// start — in `sql`. `None` when the location is not in `sql` at all.
+fn byte_offset_of(sql: &str, location: &sqlparser::tokenizer::Location) -> Option<usize> {
+    let mut line_start = 0usize;
+    for _ in 1..location.line {
+        let newline = sql.get(line_start..)?.find('\n')?;
+        line_start += newline + 1;
+    }
+    let line = sql.get(line_start..)?;
+    let line = &line[..line.find('\n').unwrap_or(line.len())];
+    let column = usize::try_from(location.column.checked_sub(1)?).ok()?;
+    let mut offset = line_start;
+    for (index, ch) in line.chars().enumerate() {
+        if index == column {
+            return Some(offset);
+        }
+        offset += ch.len_utf8();
+    }
+    (column == line.chars().count()).then_some(offset)
+}
 
 /// Reasons this module refuses to rewrite a statement. Every variant is
 /// an explicit refusal, never a silent pass-through (WS7 plan, Hard
@@ -413,6 +1315,12 @@ pub enum RewriteError {
         /// The view's own canonical `"schema.table"` name.
         view: String,
     },
+    /// A past-version clause that does not name a version id —
+    /// `DATA-21` D2: only an integer snapshot id is accepted. `Trino`'s
+    /// own `FOR TIMESTAMP AS OF` names no id at all, and no engine has a
+    /// timestamp form.
+    #[error("a past version is selected by its version id")]
+    InvalidPastVersion,
 }
 
 /// Real column list + obligations for one governed table.
@@ -465,7 +1373,37 @@ pub const PRINCIPAL_TENANT_IDS_PLACEHOLDER: &str = "__principal_tenant_ids__";
 /// Functions a row filter may call. Anything else is refused — a row
 /// filter is a closed grammar, not general SQL (WS7 plan, Hard
 /// Requirement 2).
-const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "todate"];
+///
+/// `DATA-21` D1: the same names are read on both engines, but `Trino`
+/// spells two of them differently (`toString`/`toDate` become
+/// `CAST(.. AS varchar)`/`CAST(.. AS date)` — see
+/// [`translate_row_filter_for_trino`]). Every other function is refused
+/// on `Trino` too, with a message that names it.
+pub const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "todate"];
+
+/// Operator tokens a row filter may use, spelled as the filter writes them:
+/// the comparisons, `AND`/`OR`, the arithmetic of `+ - * / %`, and unary
+/// `NOT`. [`is_allowed_binary_operator`] and [`validate_unary_op`] both read
+/// this same list, and `GET /api/governance/row-filter-grammar` (`WEB-8` S2
+/// T8, D8) serves it, so the console's help line cannot drift from what the
+/// validator accepts. Not a second copy: this is the one definition the
+/// validator itself uses.
+pub const ALLOWED_ROW_FILTER_OPERATORS: &[&str] = &[
+    "=", "<>", "<", "<=", ">", ">=", "AND", "OR", "+", "-", "*", "/", "%", "NOT",
+];
+
+/// The other forms a row filter may take, spelled as the filter writes them
+/// (`WEB-8` S2 review round 1, S2). These are **shapes**, match arms in
+/// [`validate_expr_shape`] rather than a list it tests membership in — so
+/// this constant is not what makes them pass. It names them for
+/// `GET /api/governance/row-filter-grammar`, and that route's test feeds one
+/// filter per name back to [`validate_row_filter_expr`] on both
+/// [`Engine::ClickHouse`] and [`Engine::Trino`], which is what ties the list
+/// to the match arms. The forms here are the only ones beyond the operators'
+/// two comparisons: `NOT LIKE`, `NOT ILIKE`, `NOT BETWEEN` and `NOT IN`
+/// stay accepted through the same arms.
+pub const ALLOWED_ROW_FILTER_FORMS: &[&str] =
+    &["LIKE", "ILIKE", "BETWEEN", "IN", "IS NULL", "IS NOT NULL"];
 
 /// The one entry point WS7 item B6 calls. Parses `sql`, and for EVERY
 /// `TableFactor::Table` this module can reach — any `FROM`, any
@@ -477,6 +1415,11 @@ const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "t
 /// (including a CTE's own alias, never looked up — see
 /// [`referenced_tables`]'s own doc comment for why that is safe) is
 /// left completely untouched.
+///
+/// `engine` says which engine's SQL the derived table is written in
+/// (`DATA-21` D1): the same obligations, the engine's own identifiers
+/// and functions. `Engine::ClickHouse` produces byte for byte the text
+/// this function produced before the argument existed.
 ///
 /// After the mutating pass, this function re-checks: every table
 /// [`referenced_tables`] (an exhaustive, `Visit`-based read-only walk —
@@ -506,14 +1449,32 @@ const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "t
 pub fn substitute_governed_tables(
     sql: &str,
     dialect: &dyn Dialect,
+    engine: Engine,
     obligations: &HashMap<String, TableObligations>,
     placeholders: &PlaceholderValues,
 ) -> Result<String, RewriteError> {
     let mut statements = Parser::parse_sql(dialect, sql).map_err(|_| RewriteError::Unparseable)?;
     let touched = referenced_tables(sql, dialect).ok_or(RewriteError::Unparseable)?;
     let mut substituted = HashSet::new();
+    // `SEC` review finding from BI-18·A: the statement is re-serialised below
+    // with `Display`, which is not a faithful encoder for a literal in a
+    // backslash dialect (see `ReEncodeLiterals`). Re-encoding the literals
+    // the caller wrote, before anything else is inserted, makes a literal's
+    // value survive the rewrite unchanged.
+    if dialect.supports_string_literal_backslash_escape() {
+        for stmt in &mut statements {
+            let _ = sqlparser::ast::VisitMut::visit(stmt, &mut ReEncodeLiterals);
+        }
+    }
     for stmt in &mut statements {
-        substitute_in_statement(stmt, dialect, obligations, placeholders, &mut substituted)?;
+        substitute_in_statement(
+            stmt,
+            dialect,
+            engine,
+            obligations,
+            placeholders,
+            &mut substituted,
+        )?;
     }
     for table in &touched {
         if obligations.contains_key(table) && !substituted.contains(table) {
@@ -529,20 +1490,56 @@ pub fn substitute_governed_tables(
         .join("; "))
 }
 
+/// Re-encodes every single-quoted literal of the parsed caller statement
+/// into the form this dialect decodes back to the same value: `\\` for a
+/// backslash and `\'` for a quote.
+///
+/// `Display` on a string literal is not an encoder for a backslash dialect:
+/// it writes the decoded text back, doubling a quote only when it judges the
+/// quote "not already escaped" (a quote after a backslash, or next to
+/// another quote, is left alone), and never re-escapes a backslash. Handing
+/// it text in which every quote is already preceded by its own backslash
+/// makes that heuristic a no-op, so the output is exactly this encoding.
+struct ReEncodeLiterals;
+
+impl sqlparser::ast::VisitorMut for ReEncodeLiterals {
+    type Break = ();
+
+    fn post_visit_value(&mut self, value: &mut ValueWithSpan) -> std::ops::ControlFlow<()> {
+        if let Value::SingleQuotedString(text) = &mut value.value
+            && text.contains(['\\', '\''])
+        {
+            *text = text.replace('\\', "\\\\").replace('\'', "\\'");
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
 fn substitute_in_statement(
     stmt: &mut Statement,
     dialect: &dyn Dialect,
+    engine: Engine,
     obligations: &HashMap<String, TableObligations>,
     placeholders: &PlaceholderValues,
     substituted: &mut HashSet<String>,
 ) -> Result<(), RewriteError> {
     match stmt {
-        Statement::Query(query) => {
-            substitute_in_query(query, dialect, obligations, placeholders, substituted)
-        }
-        Statement::Explain { statement, .. } => {
-            substitute_in_statement(statement, dialect, obligations, placeholders, substituted)
-        }
+        Statement::Query(query) => substitute_in_query(
+            query,
+            dialect,
+            engine,
+            obligations,
+            placeholders,
+            substituted,
+        ),
+        Statement::Explain { statement, .. } => substitute_in_statement(
+            statement,
+            dialect,
+            engine,
+            obligations,
+            placeholders,
+            substituted,
+        ),
         // Every other statement kind is handled by WS7 item B5's refusal
         // rules, which run before this function is reached — see Task
         // B6's `enforce`.
@@ -553,6 +1550,7 @@ fn substitute_in_statement(
 fn substitute_in_query(
     query: &mut Query,
     dialect: &dyn Dialect,
+    engine: Engine,
     obligations: &HashMap<String, TableObligations>,
     placeholders: &PlaceholderValues,
     substituted: &mut HashSet<String>,
@@ -567,6 +1565,7 @@ fn substitute_in_query(
             substitute_in_query(
                 &mut cte.query,
                 dialect,
+                engine,
                 obligations,
                 placeholders,
                 substituted,
@@ -576,6 +1575,7 @@ fn substitute_in_query(
     substitute_in_set_expr(
         &mut query.body,
         dialect,
+        engine,
         obligations,
         placeholders,
         substituted,
@@ -585,6 +1585,7 @@ fn substitute_in_query(
 fn substitute_in_set_expr(
     expr: &mut SetExpr,
     dialect: &dyn Dialect,
+    engine: Engine,
     obligations: &HashMap<String, TableObligations>,
     placeholders: &PlaceholderValues,
     substituted: &mut HashSet<String>,
@@ -595,6 +1596,7 @@ fn substitute_in_set_expr(
                 substitute_table_factor(
                     &mut twj.relation,
                     dialect,
+                    engine,
                     obligations,
                     placeholders,
                     substituted,
@@ -603,6 +1605,7 @@ fn substitute_in_set_expr(
                     substitute_table_factor(
                         &mut join.relation,
                         dialect,
+                        engine,
                         obligations,
                         placeholders,
                         substituted,
@@ -610,23 +1613,63 @@ fn substitute_in_set_expr(
                 }
             }
             if let Some(selection) = &mut select.selection {
-                substitute_in_expr(selection, dialect, obligations, placeholders, substituted)?;
+                substitute_in_expr(
+                    selection,
+                    dialect,
+                    engine,
+                    obligations,
+                    placeholders,
+                    substituted,
+                )?;
             }
             if let Some(having) = &mut select.having {
-                substitute_in_expr(having, dialect, obligations, placeholders, substituted)?;
+                substitute_in_expr(
+                    having,
+                    dialect,
+                    engine,
+                    obligations,
+                    placeholders,
+                    substituted,
+                )?;
             }
             for item in &mut select.projection {
-                substitute_in_select_item(item, dialect, obligations, placeholders, substituted)?;
+                substitute_in_select_item(
+                    item,
+                    dialect,
+                    engine,
+                    obligations,
+                    placeholders,
+                    substituted,
+                )?;
             }
             Ok(())
         }
-        SetExpr::Query(inner) => {
-            substitute_in_query(inner, dialect, obligations, placeholders, substituted)
-        }
+        SetExpr::Query(inner) => substitute_in_query(
+            inner,
+            dialect,
+            engine,
+            obligations,
+            placeholders,
+            substituted,
+        ),
         SetExpr::SetOperation { left, right, .. } => {
             // Each UNION branch substituted independently.
-            substitute_in_set_expr(left, dialect, obligations, placeholders, substituted)?;
-            substitute_in_set_expr(right, dialect, obligations, placeholders, substituted)
+            substitute_in_set_expr(
+                left,
+                dialect,
+                engine,
+                obligations,
+                placeholders,
+                substituted,
+            )?;
+            substitute_in_set_expr(
+                right,
+                dialect,
+                engine,
+                obligations,
+                placeholders,
+                substituted,
+            )
         }
         SetExpr::Values(_)
         | SetExpr::Insert(_)
@@ -640,6 +1683,7 @@ fn substitute_in_set_expr(
 fn substitute_in_select_item(
     item: &mut SelectItem,
     dialect: &dyn Dialect,
+    engine: Engine,
     obligations: &HashMap<String, TableObligations>,
     placeholders: &PlaceholderValues,
     substituted: &mut HashSet<String>,
@@ -648,7 +1692,7 @@ fn substitute_in_select_item(
         SelectItem::UnnamedExpr(e)
         | SelectItem::ExprWithAlias { expr: e, .. }
         | SelectItem::ExprWithAliases { expr: e, .. } => {
-            substitute_in_expr(e, dialect, obligations, placeholders, substituted)
+            substitute_in_expr(e, dialect, engine, obligations, placeholders, substituted)
         }
         // A wildcard/qualified-wildcard selects from whatever the FROM
         // clause's own substitution already produced — no expression to
@@ -666,44 +1710,99 @@ fn substitute_in_select_item(
 /// out to be reachable only through a shape this function does not
 /// descend into, so an incomplete match here fails closed rather than
 /// silently under-protecting.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per expression position, each a short recursion; the engine \
+              argument widened every recursive call past rustfmt's one-line call \
+              width, and splitting the arms would scatter one rule (which \
+              positions hold a nested query) across several functions"
+)]
 fn substitute_in_expr(
     expr: &mut Expr,
     dialect: &dyn Dialect,
+    engine: Engine,
     obligations: &HashMap<String, TableObligations>,
     placeholders: &PlaceholderValues,
     substituted: &mut HashSet<String>,
 ) -> Result<(), RewriteError> {
     match expr {
         Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
-            substitute_in_query(q, dialect, obligations, placeholders, substituted)
+            substitute_in_query(q, dialect, engine, obligations, placeholders, substituted)
         }
         Expr::InSubquery {
             expr: inner,
             subquery,
             ..
         } => {
-            substitute_in_expr(inner, dialect, obligations, placeholders, substituted)?;
-            substitute_in_query(subquery, dialect, obligations, placeholders, substituted)
+            substitute_in_expr(
+                inner,
+                dialect,
+                engine,
+                obligations,
+                placeholders,
+                substituted,
+            )?;
+            substitute_in_query(
+                subquery,
+                dialect,
+                engine,
+                obligations,
+                placeholders,
+                substituted,
+            )
         }
         Expr::BinaryOp { left, right, .. } => {
-            substitute_in_expr(left, dialect, obligations, placeholders, substituted)?;
-            substitute_in_expr(right, dialect, obligations, placeholders, substituted)
+            substitute_in_expr(
+                left,
+                dialect,
+                engine,
+                obligations,
+                placeholders,
+                substituted,
+            )?;
+            substitute_in_expr(
+                right,
+                dialect,
+                engine,
+                obligations,
+                placeholders,
+                substituted,
+            )
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::Nested(inner)
         | Expr::IsNull(inner)
-        | Expr::IsNotNull(inner) => {
-            substitute_in_expr(inner, dialect, obligations, placeholders, substituted)
-        }
+        | Expr::IsNotNull(inner) => substitute_in_expr(
+            inner,
+            dialect,
+            engine,
+            obligations,
+            placeholders,
+            substituted,
+        ),
         Expr::Between {
             expr: inner,
             low,
             high,
             ..
         } => {
-            substitute_in_expr(inner, dialect, obligations, placeholders, substituted)?;
-            substitute_in_expr(low, dialect, obligations, placeholders, substituted)?;
-            substitute_in_expr(high, dialect, obligations, placeholders, substituted)
+            substitute_in_expr(
+                inner,
+                dialect,
+                engine,
+                obligations,
+                placeholders,
+                substituted,
+            )?;
+            substitute_in_expr(low, dialect, engine, obligations, placeholders, substituted)?;
+            substitute_in_expr(
+                high,
+                dialect,
+                engine,
+                obligations,
+                placeholders,
+                substituted,
+            )
         }
         Expr::Like {
             expr: inner,
@@ -715,20 +1814,48 @@ fn substitute_in_expr(
             pattern,
             ..
         } => {
-            substitute_in_expr(inner, dialect, obligations, placeholders, substituted)?;
-            substitute_in_expr(pattern, dialect, obligations, placeholders, substituted)
+            substitute_in_expr(
+                inner,
+                dialect,
+                engine,
+                obligations,
+                placeholders,
+                substituted,
+            )?;
+            substitute_in_expr(
+                pattern,
+                dialect,
+                engine,
+                obligations,
+                placeholders,
+                substituted,
+            )
         }
         Expr::InList {
             expr: inner, list, ..
         } => {
-            substitute_in_expr(inner, dialect, obligations, placeholders, substituted)?;
+            substitute_in_expr(
+                inner,
+                dialect,
+                engine,
+                obligations,
+                placeholders,
+                substituted,
+            )?;
             for item in list {
-                substitute_in_expr(item, dialect, obligations, placeholders, substituted)?;
+                substitute_in_expr(
+                    item,
+                    dialect,
+                    engine,
+                    obligations,
+                    placeholders,
+                    substituted,
+                )?;
             }
             Ok(())
         }
         Expr::Function(f) => {
-            substitute_in_function(f, dialect, obligations, placeholders, substituted)
+            substitute_in_function(f, dialect, engine, obligations, placeholders, substituted)
         }
         // A leaf (identifier, literal) or a composite this module does
         // not descend into — see this function's own doc comment on
@@ -740,6 +1867,7 @@ fn substitute_in_expr(
 fn substitute_in_function(
     f: &mut Function,
     dialect: &dyn Dialect,
+    engine: Engine,
     obligations: &HashMap<String, TableObligations>,
     placeholders: &PlaceholderValues,
     substituted: &mut HashSet<String>,
@@ -756,13 +1884,13 @@ fn substitute_in_function(
                     _ => None,
                 };
                 if let Some(e) = inner {
-                    substitute_in_expr(e, dialect, obligations, placeholders, substituted)?;
+                    substitute_in_expr(e, dialect, engine, obligations, placeholders, substituted)?;
                 }
             }
             Ok(())
         }
         FunctionArguments::Subquery(q) => {
-            substitute_in_query(q, dialect, obligations, placeholders, substituted)
+            substitute_in_query(q, dialect, engine, obligations, placeholders, substituted)
         }
         FunctionArguments::None => Ok(()),
     }
@@ -807,13 +1935,18 @@ fn derived_alias_ident(name: &ObjectName, dialect: &dyn Dialect) -> SqlIdent {
 fn substitute_table_factor(
     factor: &mut TableFactor,
     dialect: &dyn Dialect,
+    engine: Engine,
     obligations: &HashMap<String, TableObligations>,
     placeholders: &PlaceholderValues,
     substituted: &mut HashSet<String>,
 ) -> Result<(), RewriteError> {
     match factor {
         TableFactor::Table {
-            name, alias, args, ..
+            name,
+            alias,
+            args,
+            version,
+            ..
         } if args.is_none() => {
             let parts: Vec<String> = name
                 .0
@@ -823,6 +1956,15 @@ fn substitute_table_factor(
                 .collect();
             let canonical = canonicalize(&parts);
             let Some(obl) = obligations.get(&canonical) else {
+                // `DATA-21` D3: a table that is NOT governed keeps its
+                // own version, but `sqlparser` prints a version AFTER
+                // the alias and `Trino` reads it BEFORE — so a table
+                // that carries both becomes a derived table.
+                if engine == Engine::Trino
+                    && let (Some(alias), Some(version)) = (alias.clone(), version.clone())
+                {
+                    *factor = table_with_version_as_derived(name, &version, alias)?;
+                }
                 return Ok(());
             };
             let real_columns =
@@ -837,6 +1979,8 @@ fn substitute_table_factor(
                 &obl.mask,
                 obl.row_filter.as_deref(),
                 placeholders,
+                engine,
+                version.as_ref(),
             )?;
             let derived_stmts = Parser::parse_sql(dialect, &derived_sql).map_err(|_| {
                 RewriteError::UnprovableSubstitution {
@@ -873,15 +2017,21 @@ fn substitute_table_factor(
             substituted.insert(canonical);
             Ok(())
         }
-        TableFactor::Derived { subquery, .. } => {
-            substitute_in_query(subquery, dialect, obligations, placeholders, substituted)
-        }
+        TableFactor::Derived { subquery, .. } => substitute_in_query(
+            subquery,
+            dialect,
+            engine,
+            obligations,
+            placeholders,
+            substituted,
+        ),
         TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
             substitute_table_factor(
                 &mut table_with_joins.relation,
                 dialect,
+                engine,
                 obligations,
                 placeholders,
                 substituted,
@@ -890,6 +2040,7 @@ fn substitute_table_factor(
                 substitute_table_factor(
                     &mut join.relation,
                     dialect,
+                    engine,
                     obligations,
                     placeholders,
                     substituted,
@@ -925,13 +2076,36 @@ fn substitute_table_factor(
 /// through [`validate_row_filter_expr`] and re-serialized from ITS OWN
 /// parse (with placeholders expanded), never the raw authored string
 /// concatenated.
+///
+/// A `mask` entry never reaches the SQL as text. It is compared with
+/// `real_columns` (the table's own column names, each validated through
+/// `Ident`), and only the matching real column name is written, so an entry
+/// that is not a column adds nothing to the statement.
+///
+/// `engine` says which engine's SQL this text is (`DATA-21` D1). On
+/// `ClickHouse` the text is byte for byte what it always was. On `Trino`
+/// the identifiers are double-quoted and a masked column becomes
+/// `CASE WHEN "c" IS NULL THEN NULL ELSE '***' END AS "c"` — the same
+/// meaning as `ClickHouse`'s form, where `toString(NULL)` stays `NULL`.
+///
+/// `version` is the table's own past-version clause (`DATA-21` D3): it
+/// stays on the derived table's `FROM`, so the derived table reads the
+/// version the caller asked for. `ClickHouse` never has one — its
+/// dialect reads no table version, and its past version is a query-wide
+/// setting instead.
 fn build_masked_filtered_select(
     name: &ObjectName,
     real_columns: &[String],
     mask: &[String],
     filter: Option<&str>,
     placeholders: &PlaceholderValues,
+    engine: Engine,
+    version: Option<&TableVersion>,
 ) -> Result<String, RewriteError> {
+    let version_clause = match version {
+        Some(version) => format!(" {}", past_version_clause(version)?),
+        None => String::new(),
+    };
     let mut projections = Vec::with_capacity(real_columns.len());
     for col in real_columns {
         let safe = lakehouse_core::ident::Ident::new(col).map_err(|_| {
@@ -940,25 +2114,109 @@ fn build_masked_filtered_select(
             }
         })?;
         if mask.iter().any(|m| m.eq_ignore_ascii_case(col)) {
-            projections.push(format!(
-                "replaceRegexpOne(toString(`{safe}`), '(?s)^.*$', '***') AS `{safe}`"
-            ));
+            projections.push(match engine {
+                Engine::ClickHouse => {
+                    format!("replaceRegexpOne(toString(`{safe}`), '(?s)^.*$', '***') AS `{safe}`")
+                }
+                Engine::Trino => {
+                    format!("CASE WHEN \"{safe}\" IS NULL THEN NULL ELSE '***' END AS \"{safe}\"")
+                }
+            });
         } else {
-            projections.push(format!("`{safe}`"));
+            projections.push(match engine {
+                Engine::ClickHouse => format!("`{safe}`"),
+                Engine::Trino => format!("\"{safe}\""),
+            });
         }
     }
     let where_clause = match filter {
         Some(f) => {
-            let expr = validate_row_filter_expr(f, real_columns)?;
-            let expanded = expand_placeholders(&expr, placeholders)?;
+            let expr = validate_row_filter_expr(f, real_columns, engine)?;
+            let expanded = match engine {
+                Engine::ClickHouse => expand_placeholders(&expr, placeholders)?,
+                Engine::Trino => {
+                    // `Trino` spells two of the row filter's functions
+                    // differently, so the expanded expression is
+                    // TRANSLATED before it is written out — never passed
+                    // through as it was authored.
+                    let expanded = expand_expr(&expr, placeholders)?;
+                    translate_row_filter_for_trino(&expanded)?.to_string()
+                }
+            };
             format!(" WHERE {expanded}")
         }
         None => String::new(),
     };
     Ok(format!(
-        "SELECT {} FROM {name}{where_clause}",
+        "SELECT {} FROM {name}{version_clause}{where_clause}",
         projections.join(", ")
     ))
+}
+
+/// The past-version clause of a table factor, in the form `sqlparser`
+/// parses it (`DATA-21` D2/D3): `VERSION AS OF <id>`.
+///
+/// Only a version id — a plain integer — is accepted. `Trino`'s own
+/// `FOR TIMESTAMP AS OF` names no id at all, and no engine has a
+/// timestamp form, so it is refused rather than passed on.
+///
+/// # Errors
+/// [`RewriteError::InvalidPastVersion`] when the clause does not name a
+/// version id.
+fn past_version_clause(version: &TableVersion) -> Result<String, RewriteError> {
+    let TableVersion::VersionAsOf(expr) = version else {
+        return Err(RewriteError::InvalidPastVersion);
+    };
+    let Expr::Value(ValueWithSpan {
+        value: Value::Number(id, false),
+        ..
+    }) = expr
+    else {
+        return Err(RewriteError::InvalidPastVersion);
+    };
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+        return Err(RewriteError::InvalidPastVersion);
+    }
+    Ok(format!("VERSION AS OF {id}"))
+}
+
+/// A table that carries BOTH a past version and an alias, as a derived
+/// table: `(SELECT * FROM t VERSION AS OF 5) AS x`.
+///
+/// `DATA-21` D2/D3: `sqlparser` prints a table's version AFTER its
+/// alias (`FROM t AS x VERSION AS OF 5`), and `Trino` reads the version
+/// BEFORE the alias — so a table with both is printed as a derived
+/// table, which puts the version where `Trino` reads it. A governed
+/// table needs no such care: its own derived table carries the version
+/// and the alias separately.
+///
+/// # Errors
+/// [`RewriteError::UnprovableSubstitution`] when the derived table does
+/// not parse, and [`RewriteError::InvalidPastVersion`] when the version
+/// does not name a version id.
+fn table_with_version_as_derived(
+    name: &ObjectName,
+    version: &TableVersion,
+    alias: TableAlias,
+) -> Result<TableFactor, RewriteError> {
+    let clause = past_version_clause(version)?;
+    let sql = format!("SELECT * FROM {name} {clause}");
+    let statements = Parser::parse_sql(&TrinoDialect::default(), &sql).map_err(|_| {
+        RewriteError::UnprovableSubstitution {
+            table: name.to_string(),
+        }
+    })?;
+    let Some(Statement::Query(query)) = statements.into_iter().next() else {
+        return Err(RewriteError::UnprovableSubstitution {
+            table: name.to_string(),
+        });
+    };
+    Ok(TableFactor::Derived {
+        lateral: false,
+        subquery: query,
+        alias: Some(alias),
+        sample: None,
+    })
 }
 
 /// Parses `raw` as a standalone `Expr` (via `GenericDialect`, wrapping
@@ -969,9 +2227,57 @@ fn build_masked_filtered_select(
 /// [`ALLOWED_ROW_FILTER_FUNCTIONS`]; no subquery/`EXISTS`/anything else
 /// outside this narrow, explicitly allowed shape.
 ///
+/// `engine` says which engine's row filter this is (`DATA-21` D1): the
+/// allowed shapes are the same on both, but a function the engine has no
+/// spelling for is refused with a message that names it, so a
+/// `ClickHouse`-only function never reaches `Trino`.
+///
+/// The shape is deny by default for literals (SEC-32), and for calls,
+/// operators and qualifiers (SEC-43). A call is its name and a plain list of
+/// unnamed expressions, with no `FILTER`, `OVER`, `WITHIN GROUP`, second
+/// parameter list, null treatment, `DISTINCT` or clause inside the
+/// parentheses, or the ODBC `{fn ...}` form. A binary operator is a
+/// comparison, `AND`, `OR` or one of `+ - * / %`; a unary one is `NOT`, `-`
+/// or `+`. A column may have one unquoted table name before it. Before
+/// SEC-43 the walk did not look at these parts of a call, at an operator, or
+/// at the table name before a column.
+///
+/// A text value may not contain a backslash (SEC-32). This function parses
+/// with `GenericDialect`, which does not read a backslash as an escape, while
+/// `ClickHouse` reads `\'` as an escaped quote. The two parsers can then
+/// disagree on where a string ends. For `x = '\' OR 1=1 --'` the policy
+/// check sees the complete text `\`, then `OR 1=1`, then a `--` comment, so
+/// the filter is `x = '\' OR 1=1`. The validated filter is written back as
+/// `x = '\' OR 1 = 1`, and `ClickHouse` reads `\'` as an escaped quote and
+/// finds an unterminated string. Today that ends in an error, which fails
+/// closed. A crafted text could make both parsers accept the filter and read
+/// it differently, so the backslash is refused instead of relied on to fail.
+/// Only numbers, booleans, `NULL` and a plain single-quoted string are
+/// literals here. The `R'..'`, `N'..'`, `X'..'`, `E'..'` and `$$..$$` forms
+/// are refused too, because the two engines may read them differently.
+///
+/// The `ESCAPE` expression of `LIKE` and `ILIKE` is validated like any
+/// other child expression, so a backslash text, a subquery or a function off
+/// the allowlist is refused there too.
+///
+/// A unary `-` or `+` may not be followed by another `-` or `+`, and a text
+/// value may not contain a control character (SEC-44): `Display` writes a
+/// unary sign with no space before its operand, so the validated `x = - -1`
+/// would print `x = --1` and `--` starts a SQL line comment in `ClickHouse`;
+/// a control character inside a single-quoted string lets the text cross a
+/// line, so what the validator checked and what `ClickHouse` reads can
+/// differ. The two refusals share one goal: a checked filter must print as
+/// a checked filter. `LIKE`/`ILIKE` with an `ANY` pattern is refused for
+/// the same reason — the grammar admits many forms, only one pattern is
+/// intended here.
+///
 /// # Errors
 /// [`RewriteError::InvalidRowFilter`] naming the specific problem.
-pub fn validate_row_filter_expr(raw: &str, real_columns: &[String]) -> Result<Expr, RewriteError> {
+pub fn validate_row_filter_expr(
+    raw: &str,
+    real_columns: &[String],
+    engine: Engine,
+) -> Result<Expr, RewriteError> {
     let dialect = sqlparser::dialect::GenericDialect {};
     let mut parser =
         Parser::new(&dialect)
@@ -989,7 +2295,7 @@ pub fn validate_row_filter_expr(raw: &str, real_columns: &[String]) -> Result<Ex
             reason: "trailing input after the filter expression".to_owned(),
         });
     }
-    validate_expr_shape(&expr, real_columns)?;
+    validate_expr_shape(&expr, real_columns, engine)?;
     Ok(expr)
 }
 
@@ -1022,29 +2328,67 @@ fn validate_identifier(name: &str, real_columns: &[String]) -> Result<(), Rewrit
     }
 }
 
+/// Admits `NOT`, `-` and `+`; any other [`UnaryOperator`] is refused.
+/// Then SEC-44: a `-` or `+` over a `-` or `+` is refused, because
+/// `Display` writes a sign with no space before its operand, so the
+/// validated `x = - -1` would print `x = --1` and `--` starts a SQL
+/// line comment in `ClickHouse`. `NOT` writes with a space, so
+/// `NOT -x` is safe. The split from [`validate_expr_shape`] keeps that
+/// walk under the line-length budget.
+fn validate_unary_op(
+    op: UnaryOperator,
+    inner: &Expr,
+    real_columns: &[String],
+    engine: Engine,
+) -> Result<(), RewriteError> {
+    let Some(symbol) = unary_operator_symbol(op) else {
+        return Err(RewriteError::InvalidRowFilter {
+            reason: OPERATOR_REFUSAL.to_owned(),
+        });
+    };
+    if !ALLOWED_ROW_FILTER_OPERATORS.contains(&symbol) {
+        return Err(RewriteError::InvalidRowFilter {
+            reason: OPERATOR_REFUSAL.to_owned(),
+        });
+    }
+    if matches!(symbol, "-" | "+")
+        && matches!(
+            inner,
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus | UnaryOperator::Plus,
+                ..
+            }
+        )
+    {
+        return Err(RewriteError::InvalidRowFilter {
+            reason: SIGN_REFUSAL.to_owned(),
+        });
+    }
+    validate_expr_shape(inner, real_columns, engine)
+}
+
 /// Recursively rejects a subquery/`EXISTS`/disallowed function call;
 /// every bare `Expr::Identifier`/`Expr::CompoundIdentifier` must be a
 /// real column OR [`PRINCIPAL_ID_PLACEHOLDER`]; an `Expr::InList` whose
 /// `list` is exactly one [`PRINCIPAL_TENANT_IDS_PLACEHOLDER`] identifier
 /// is accepted as a unit — every OTHER appearance of that name is
 /// rejected by the ordinary identifier check.
-fn validate_expr_shape(expr: &Expr, real_columns: &[String]) -> Result<(), RewriteError> {
+fn validate_expr_shape(
+    expr: &Expr,
+    real_columns: &[String],
+    engine: Engine,
+) -> Result<(), RewriteError> {
     match expr {
         Expr::Identifier(ident) => validate_identifier(&ident.value, real_columns),
-        Expr::CompoundIdentifier(parts) => {
-            let last = parts.last().ok_or_else(|| RewriteError::InvalidRowFilter {
-                reason: "empty compound identifier".to_owned(),
-            })?;
-            validate_identifier(&last.value, real_columns)
-        }
-        Expr::Value(_) => Ok(()),
+        Expr::CompoundIdentifier(parts) => validate_compound_identifier(parts, real_columns),
+        Expr::Value(v) => validate_literal(&v.value),
         Expr::InList {
             expr: inner, list, ..
         } => {
             if is_sole_tenant_placeholder(list) {
-                validate_expr_shape(inner, real_columns)
+                validate_expr_shape(inner, real_columns, engine)
             } else {
-                validate_expr_shape(inner, real_columns)?;
+                validate_expr_shape(inner, real_columns, engine)?;
                 for item in list {
                     if is_tenant_placeholder(item) {
                         return Err(RewriteError::InvalidRowFilter {
@@ -1053,79 +2397,477 @@ fn validate_expr_shape(expr: &Expr, real_columns: &[String]) -> Result<(), Rewri
                             ),
                         });
                     }
-                    validate_expr_shape(item, real_columns)?;
+                    validate_expr_shape(item, real_columns, engine)?;
                 }
                 Ok(())
             }
         }
-        Expr::BinaryOp { left, right, .. } => {
-            validate_expr_shape(left, real_columns)?;
-            validate_expr_shape(right, real_columns)
+        // SEC-43: the operator was ignored, so `OPERATOR(pg_catalog.+)`, `||`,
+        // `XOR` and the bit and regex operators passed.
+        Expr::BinaryOp { left, op, right } => {
+            if !is_allowed_binary_operator(op) {
+                return Err(RewriteError::InvalidRowFilter {
+                    reason: OPERATOR_REFUSAL.to_owned(),
+                });
+            }
+            validate_expr_shape(left, real_columns, engine)?;
+            validate_expr_shape(right, real_columns, engine)
         }
-        Expr::UnaryOp { expr: inner, .. }
-        | Expr::Nested(inner)
-        | Expr::IsNull(inner)
-        | Expr::IsNotNull(inner) => validate_expr_shape(inner, real_columns),
+        Expr::UnaryOp { op, expr: inner } => {
+            validate_unary_op(*op, inner.as_ref(), real_columns, engine)
+        }
+        Expr::Nested(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            validate_expr_shape(inner, real_columns, engine)
+        }
         Expr::Between {
             expr: inner,
             low,
             high,
             ..
         } => {
-            validate_expr_shape(inner, real_columns)?;
-            validate_expr_shape(low, real_columns)?;
-            validate_expr_shape(high, real_columns)
+            validate_expr_shape(inner, real_columns, engine)?;
+            validate_expr_shape(low, real_columns, engine)?;
+            validate_expr_shape(high, real_columns, engine)
         }
         Expr::Like {
             expr: inner,
             pattern,
-            ..
+            negated: _,
+            any,
+            escape_char,
         }
         | Expr::ILike {
             expr: inner,
             pattern,
-            ..
+            negated: _,
+            any,
+            escape_char,
         } => {
-            validate_expr_shape(inner, real_columns)?;
-            validate_expr_shape(pattern, real_columns)
+            // SEC-44: `LIKE ... ANY` (the optional `ANY` keyword right
+            // after `LIKE`/`ILIKE`) admits a wider grammar than one
+            // pattern; the only intended form here is the simple one.
+            // Refused before the children are visited so a backslash text
+            // or a real column inside the pattern does not leak through
+            // when the whole node is the only rejection. Every field is
+            // named (no `..`) so a field a later `sqlparser` adds stops
+            // the build here until someone decides what it means. `negated`
+            // is the `NOT` flag and is discarded here (`negated: _`) — it is
+            // still named so a later field stops the build, but its value is
+            // irrelevant to the shape; `NOT LIKE` with one pattern stays
+            // accepted.
+            if *any {
+                return Err(RewriteError::InvalidRowFilter {
+                    reason: LIKE_ANY_REFUSAL.to_owned(),
+                });
+            }
+            validate_expr_shape(inner, real_columns, engine)?;
+            validate_expr_shape(pattern, real_columns, engine)?;
+            // SEC-32 review fix (BLOCKER): the escape is an expression too.
+            // Unvisited, it let a backslash text, a subquery or a function
+            // off the allowlist pass.
+            if let Some(escape) = escape_char {
+                validate_expr_shape(escape, real_columns, engine)?;
+            }
+            Ok(())
         }
-        Expr::Function(f) => validate_function_call(f, real_columns),
+        Expr::Function(f) => validate_function_call(f, real_columns, engine),
         _ => Err(RewriteError::InvalidRowFilter {
             reason: format!("unsupported row-filter expression: {expr}"),
         }),
     }
 }
 
-fn validate_function_call(f: &Function, real_columns: &[String]) -> Result<(), RewriteError> {
-    let name = f.name.to_string().to_ascii_lowercase();
+/// The binary operators a row filter may use (SEC-43): comparisons, `AND`,
+/// `OR` and the arithmetic of `+ - * / %`. Every other variant is refused,
+/// including the ones a later `sqlparser` adds. The accepted set is
+/// [`ALLOWED_ROW_FILTER_OPERATORS`], the one list `GET
+/// /api/governance/row-filter-grammar` serves.
+fn is_allowed_binary_operator(op: &BinaryOperator) -> bool {
+    binary_operator_symbol(op).is_some_and(|symbol| ALLOWED_ROW_FILTER_OPERATORS.contains(&symbol))
+}
+
+/// The token [`is_allowed_binary_operator`] checks `op` against, or `None`
+/// for a variant no row filter accepts. Listing every accepted variant here
+/// (and no other) keeps the spelling in [`ALLOWED_ROW_FILTER_OPERATORS`] the
+/// only place the list is written down.
+fn binary_operator_symbol(op: &BinaryOperator) -> Option<&'static str> {
+    match op {
+        BinaryOperator::Eq => Some("="),
+        BinaryOperator::NotEq => Some("<>"),
+        BinaryOperator::Lt => Some("<"),
+        BinaryOperator::LtEq => Some("<="),
+        BinaryOperator::Gt => Some(">"),
+        BinaryOperator::GtEq => Some(">="),
+        BinaryOperator::And => Some("AND"),
+        BinaryOperator::Or => Some("OR"),
+        BinaryOperator::Plus => Some("+"),
+        BinaryOperator::Minus => Some("-"),
+        BinaryOperator::Multiply => Some("*"),
+        BinaryOperator::Divide => Some("/"),
+        BinaryOperator::Modulo => Some("%"),
+        _ => None,
+    }
+}
+
+/// The token [`validate_unary_op`] checks `op` against, or `None` for a
+/// variant no row filter accepts.
+fn unary_operator_symbol(op: UnaryOperator) -> Option<&'static str> {
+    match op {
+        UnaryOperator::Not => Some("NOT"),
+        UnaryOperator::Minus => Some("-"),
+        UnaryOperator::Plus => Some("+"),
+        _ => None,
+    }
+}
+
+/// A column, with at most one plain table name before it (SEC-43). Only the
+/// last part was checked, and every part is written back as it came, so a
+/// quoted qualifier such as `"a\".x` reached `ClickHouse` unchecked. The
+/// qualifier only has to be a plain name; it is not compared with the
+/// table's name.
+fn validate_compound_identifier(
+    parts: &[SqlIdent],
+    real_columns: &[String],
+) -> Result<(), RewriteError> {
+    match parts {
+        [] => Err(RewriteError::InvalidRowFilter {
+            reason: "empty compound identifier".to_owned(),
+        }),
+        [column] => validate_identifier(&column.value, real_columns),
+        [qualifier, column] if is_plain_qualifier(qualifier) => {
+            validate_identifier(&column.value, real_columns)
+        }
+        _ => Err(RewriteError::InvalidRowFilter {
+            reason: QUALIFIER_REFUSAL.to_owned(),
+        }),
+    }
+}
+
+const PLAIN_CALL_REFUSAL: &str = "a function call in a row filter takes plain arguments only";
+const OPERATOR_REFUSAL: &str = "operator not allowed in a row filter";
+const QUALIFIER_REFUSAL: &str = "a column in a row filter may have one plain table name before it";
+// SEC-44 refusals: the validator refuses shapes that print differently
+// than checked (a unary sign produces `--`/`-` etc. with no space, a
+// control character lets string text cross a line, `LIKE ... ANY` opens
+// a wider grammar). Fixed texts so the policy engine can map every
+// `InvalidRowFilter` to its own caller's message without echoing the
+// filter.
+const SIGN_REFUSAL: &str = "a row filter may not put two signs in a row";
+const CONTROL_CHAR_REFUSAL: &str = "a text value in a row filter must be on one line";
+const LIKE_ANY_REFUSAL: &str = "a row filter accepts LIKE with one pattern only";
+
+/// Admits numbers, booleans, `NULL` and a plain single-quoted string with
+/// no backslash in its text. Every other [`Value`] variant is refused, so a
+/// variant a later `sqlparser` adds is refused too (SEC-32). The reasons
+/// are fixed texts: a refusal never echoes the literal.
+fn validate_literal(value: &Value) -> Result<(), RewriteError> {
+    match value {
+        Value::Number(..) | Value::Boolean(_) | Value::Null => Ok(()),
+        Value::SingleQuotedString(text) => {
+            if text.contains('\\') {
+                Err(RewriteError::InvalidRowFilter {
+                    reason: "a text value in a row filter cannot contain a backslash".to_owned(),
+                })
+            } else if text.chars().any(|c| c < '\u{20}' || c == '\u{7f}') {
+                // SEC-44: a control character (U+0000–U+001F here, plus
+                // DEL at U+007F) inside a single-quoted string lets the
+                // text cross a line — what the validator read and what
+                // `ClickHouse` reads can then differ. `char::is_control`
+                // covers U+0080–U+009F too; that range is ordinary
+                // text to `ClickHouse` and the plan's decision is the
+                // narrow set, so the comparison is written by hand.
+                Err(RewriteError::InvalidRowFilter {
+                    reason: CONTROL_CHAR_REFUSAL.to_owned(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err(RewriteError::InvalidRowFilter {
+            reason: "a row filter accepts plain 'text' values only".to_owned(),
+        }),
+    }
+}
+
+/// Admits a call to a function on [`ALLOWED_ROW_FILTER_FUNCTIONS`] and
+/// nothing else about it (SEC-43). `Function` and `FunctionArgumentList` are
+/// destructured with every field named and no `..`, so a field a later
+/// `sqlparser` adds stops the build here until someone decides what it
+/// means. Before, only `args` was visited: `FILTER (WHERE ...)` with a
+/// subquery, `OVER (...)`, `WITHIN GROUP`, a clause inside the parentheses,
+/// a second parameter list, `DISTINCT`, a null treatment and the ODBC
+/// `{fn ...}` form all passed unseen. The reasons are fixed texts, so a
+/// refusal never repeats the filter.
+fn validate_function_call(
+    f: &Function,
+    real_columns: &[String],
+    engine: Engine,
+) -> Result<(), RewriteError> {
+    let Function {
+        name,
+        uses_odbc_syntax,
+        parameters,
+        args,
+        within_group,
+        filter,
+        null_treatment,
+        over,
+    } = f;
+    let name = name.to_string().to_ascii_lowercase();
     if !ALLOWED_ROW_FILTER_FUNCTIONS.contains(&name.as_str()) {
         return Err(RewriteError::InvalidRowFilter {
-            reason: format!("function '{name}' is not allowed in a row filter"),
+            // `DATA-21` D1: on `Trino` a function the engine has no
+            // spelling for is refused with a message that NAMES it, so
+            // a `ClickHouse`-only function is never passed through.
+            reason: match engine {
+                Engine::ClickHouse => format!("function '{name}' is not allowed in a row filter"),
+                Engine::Trino => format!("function '{name}' is not available on Trino"),
+            },
         });
     }
-    match &f.args {
-        FunctionArguments::None => Ok(()),
-        FunctionArguments::Subquery(_) => Err(RewriteError::InvalidRowFilter {
-            reason: "a row filter may not contain a subquery".to_owned(),
-        }),
-        FunctionArguments::List(list) => {
-            for arg in &list.args {
-                match arg {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
-                    | FunctionArg::Named {
-                        arg: FunctionArgExpr::Expr(e),
-                        ..
-                    } => validate_expr_shape(e, real_columns)?,
-                    _ => {
-                        return Err(RewriteError::InvalidRowFilter {
-                            reason: "unsupported function argument in a row filter".to_owned(),
-                        });
-                    }
-                }
+    let refuse = || RewriteError::InvalidRowFilter {
+        reason: PLAIN_CALL_REFUSAL.to_owned(),
+    };
+    if *uses_odbc_syntax
+        || !matches!(parameters, FunctionArguments::None)
+        || !within_group.is_empty()
+        || filter.is_some()
+        || null_treatment.is_some()
+        || over.is_some()
+    {
+        return Err(refuse());
+    }
+    // A subquery passed as the sole argument without parentheses is refused
+    // here with the rest of the non-list forms.
+    let FunctionArguments::List(list) = args else {
+        return Err(refuse());
+    };
+    let FunctionArgumentList {
+        duplicate_treatment,
+        args,
+        clauses,
+    } = list;
+    if duplicate_treatment.is_some() || !clauses.is_empty() {
+        return Err(refuse());
+    }
+    for arg in args {
+        match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                validate_expr_shape(e, real_columns, engine)?;
             }
-            Ok(())
+            // None of the four allowed functions takes a named argument or
+            // a wildcard.
+            FunctionArg::Named { .. }
+            | FunctionArg::ExprNamed { .. }
+            | FunctionArg::Unnamed(
+                FunctionArgExpr::QualifiedWildcard(_)
+                | FunctionArgExpr::Wildcard
+                | FunctionArgExpr::WildcardWithOptions(_),
+            ) => return Err(refuse()),
         }
     }
+    Ok(())
+}
+
+/// Rewrites a validated row filter into `Trino`'s own spelling
+/// (`DATA-21` D1).
+///
+/// `toString(x)` becomes `CAST(x AS varchar)` and `toDate(x)` becomes
+/// `CAST(x AS date)` — the two functions a `ClickHouse` row filter may
+/// call that `Trino` spells differently. `lower` and `upper` are the
+/// same on both engines and are left alone. Every other function is
+/// refused with a fixed message that names it: a `ClickHouse`-only
+/// function is never passed through to `Trino` unchanged.
+///
+/// The tree is REBUILT from the validated expression, never edited in
+/// place and never re-read from the authored text, so the filter that
+/// reaches `Trino` is the filter this module checked.
+///
+/// # Errors
+/// [`RewriteError::InvalidRowFilter`] naming the function that has no
+/// `Trino` spelling.
+fn translate_row_filter_for_trino(expr: &Expr) -> Result<Expr, RewriteError> {
+    Ok(match expr {
+        // A leaf — an identifier, a compound identifier, a literal — is
+        // the same on both engines.
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => expr.clone(),
+        Expr::InList {
+            expr: inner,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(translate_row_filter_for_trino(inner)?),
+            list: list
+                .iter()
+                .map(translate_row_filter_for_trino)
+                .collect::<Result<Vec<_>, _>>()?,
+            negated: *negated,
+        },
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(translate_row_filter_for_trino(left)?),
+            op: op.clone(),
+            right: Box::new(translate_row_filter_for_trino(right)?),
+        },
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(translate_row_filter_for_trino(inner)?),
+        },
+        Expr::Nested(inner) => Expr::Nested(Box::new(translate_row_filter_for_trino(inner)?)),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(translate_row_filter_for_trino(inner)?)),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(translate_row_filter_for_trino(inner)?)),
+        Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => Expr::Between {
+            expr: Box::new(translate_row_filter_for_trino(inner)?),
+            negated: *negated,
+            low: Box::new(translate_row_filter_for_trino(low)?),
+            high: Box::new(translate_row_filter_for_trino(high)?),
+        },
+        Expr::Like {
+            negated,
+            any,
+            expr: inner,
+            pattern,
+            escape_char,
+        } => Expr::Like {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(translate_row_filter_for_trino(inner)?),
+            pattern: Box::new(translate_row_filter_for_trino(pattern)?),
+            escape_char: escape_char
+                .as_ref()
+                .map(|e| translate_row_filter_for_trino(e).map(Box::new))
+                .transpose()?,
+        },
+        Expr::ILike {
+            negated,
+            any,
+            expr: inner,
+            pattern,
+            escape_char,
+        } => Expr::ILike {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(translate_row_filter_for_trino(inner)?),
+            pattern: Box::new(translate_row_filter_for_trino(pattern)?),
+            escape_char: escape_char
+                .as_ref()
+                .map(|e| translate_row_filter_for_trino(e).map(Box::new))
+                .transpose()?,
+        },
+        Expr::Function(f) => trino_row_filter_function(f)?,
+        // A shape [`validate_expr_shape`] refuses, so it can never reach
+        // here; refused anyway, so a shape a later `sqlparser` adds is
+        // never passed through untranslated.
+        _ => {
+            return Err(RewriteError::InvalidRowFilter {
+                reason: format!("unsupported row-filter expression: {expr}"),
+            });
+        }
+    })
+}
+
+/// The `Trino` spelling of one row-filter function call (`DATA-21` D1):
+/// `toString`/`toDate` become `CAST`s, `lower`/`upper` are unchanged, and
+/// every other function is refused with a message that names it.
+///
+/// # Errors
+/// [`RewriteError::InvalidRowFilter`] naming the function that has no
+/// `Trino` spelling.
+fn trino_row_filter_function(f: &Function) -> Result<Expr, RewriteError> {
+    let name = f.name.to_string().to_ascii_lowercase();
+    match name.as_str() {
+        "tostring" => trino_cast(f, DataType::Varchar(None)),
+        "todate" => trino_cast(f, DataType::Date),
+        "lower" | "upper" => {
+            let mut translated = f.clone();
+            translated.args = trino_function_arguments(f)?;
+            Ok(Expr::Function(translated))
+        }
+        _ => Err(RewriteError::InvalidRowFilter {
+            reason: format!("function '{name}' is not available on Trino"),
+        }),
+    }
+}
+
+/// The `Trino` form of `toString(x)`/`toDate(x)`: a `CAST` of the one
+/// argument to the type the `ClickHouse` function returned.
+///
+/// # Errors
+/// [`RewriteError::InvalidRowFilter`] when the call does not have exactly
+/// one plain argument.
+fn trino_cast(f: &Function, data_type: DataType) -> Result<Expr, RewriteError> {
+    let FunctionArguments::List(list) = trino_function_arguments(f)? else {
+        return Err(RewriteError::InvalidRowFilter {
+            reason: PLAIN_CALL_REFUSAL.to_owned(),
+        });
+    };
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(inner))] = list.args.as_slice() else {
+        return Err(RewriteError::InvalidRowFilter {
+            reason: PLAIN_CALL_REFUSAL.to_owned(),
+        });
+    };
+    Ok(Expr::Cast {
+        kind: CastKind::Cast,
+        expr: Box::new(inner.clone()),
+        data_type,
+        format: None,
+    })
+}
+
+/// The arguments of a row-filter call, each translated into `Trino`'s
+/// form. A call with any other argument shape is refused — the same rule
+/// [`validate_function_call`] applies, so a translated filter is exactly
+/// as narrow as the checked one.
+///
+/// # Errors
+/// [`RewriteError::InvalidRowFilter`] when the call has a named argument,
+/// a wildcard, or a shape the validator refuses.
+fn trino_function_arguments(f: &Function) -> Result<FunctionArguments, RewriteError> {
+    let refuse = || RewriteError::InvalidRowFilter {
+        reason: PLAIN_CALL_REFUSAL.to_owned(),
+    };
+    let FunctionArguments::List(list) = &f.args else {
+        return Err(refuse());
+    };
+    let FunctionArgumentList {
+        duplicate_treatment,
+        args,
+        clauses,
+    } = list;
+    if duplicate_treatment.is_some() || !clauses.is_empty() {
+        return Err(refuse());
+    }
+    let mut translated = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => translated.push(
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(translate_row_filter_for_trino(e)?)),
+            ),
+            _ => return Err(refuse()),
+        }
+    }
+    Ok(FunctionArguments::List(FunctionArgumentList {
+        duplicate_treatment: None,
+        args: translated,
+        clauses: Vec::new(),
+    }))
+}
+
+/// One unquoted table name made of ASCII letters, digits and `_`, not
+/// starting with a digit. The qualifier is written back verbatim, so
+/// anything else (a quote, a backslash, a space, a non-ASCII letter) may be
+/// read differently by `ClickHouse` than by the parser used here.
+fn is_plain_qualifier(ident: &SqlIdent) -> bool {
+    let mut chars = ident.value.chars();
+    ident.quote_style.is_none()
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn string_literal_expr(value: &str) -> Expr {
@@ -1243,7 +2985,7 @@ fn expand_expr_rest(expr: &Expr, values: &PlaceholderValues) -> Result<Expr, Rew
             any: *any,
             expr: Box::new(expand_expr(inner, values)?),
             pattern: Box::new(expand_expr(pattern, values)?),
-            escape_char: escape_char.clone(),
+            escape_char: expand_escape(escape_char.as_deref(), values)?,
         }),
         Expr::ILike {
             negated,
@@ -1256,7 +2998,7 @@ fn expand_expr_rest(expr: &Expr, values: &PlaceholderValues) -> Result<Expr, Rew
             any: *any,
             expr: Box::new(expand_expr(inner, values)?),
             pattern: Box::new(expand_expr(pattern, values)?),
-            escape_char: escape_char.clone(),
+            escape_char: expand_escape(escape_char.as_deref(), values)?,
         }),
         // Every other shape (a plain identifier, a literal, an already
         // validated function call whose args contain no placeholder —
@@ -1264,6 +3006,15 @@ fn expand_expr_rest(expr: &Expr, values: &PlaceholderValues) -> Result<Expr, Rew
         // else reaches here) is returned unchanged.
         _ => Ok(expr.clone()),
     }
+}
+
+fn expand_escape(
+    escape: Option<&Expr>,
+    values: &PlaceholderValues,
+) -> Result<Option<Box<Expr>>, RewriteError> {
+    escape
+        .map(|e| expand_expr(e, values).map(Box::new))
+        .transpose()
 }
 
 fn expand_expr(expr: &Expr, values: &PlaceholderValues) -> Result<Expr, RewriteError> {
@@ -1293,7 +3044,9 @@ mod table_substitution {
     use sqlparser::dialect::ClickHouseDialect;
     use sqlparser::parser::Parser;
 
-    use super::{PlaceholderValues, RewriteError, TableObligations, substitute_governed_tables};
+    use super::{
+        Engine, PlaceholderValues, RewriteError, TableObligations, substitute_governed_tables,
+    };
 
     fn obligations() -> HashMap<String, TableObligations> {
         HashMap::from([(
@@ -1314,6 +3067,7 @@ mod table_substitution {
         substitute_governed_tables(
             sql,
             &ClickHouseDialect {},
+            Engine::ClickHouse,
             &obligations(),
             &PlaceholderValues::none(),
         )
@@ -1352,6 +3106,7 @@ mod table_substitution {
             let out = substitute_governed_tables(
                 sql,
                 &ClickHouseDialect {},
+                Engine::ClickHouse,
                 &obl,
                 &PlaceholderValues::none(),
             )
@@ -1451,7 +3206,7 @@ mod table_substitution {
         );
         let out = substitute_governed_tables(
             "SELECT email FROM silver.customers UNION ALL SELECT email FROM silver.customers_archive",
-            &ClickHouseDialect {},
+            &ClickHouseDialect {}, Engine::ClickHouse,
             &obl,
             &PlaceholderValues::none(),
         )
@@ -1503,11 +3258,344 @@ mod table_substitution {
         let err = substitute_governed_tables(
             "SELECT * FROM silver.customers",
             &ClickHouseDialect {},
+            Engine::ClickHouse,
             &obl,
             &PlaceholderValues::none(),
         )
         .unwrap_err();
         assert!(matches!(err, RewriteError::UnprovableSubstitution { .. }));
+    }
+}
+
+/// `DATA-21` D2/D3: `Trino`'s own past-version clause, and the version a
+/// governed read keeps.
+#[cfg(test)]
+mod trino_past_version {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use super::{
+        Engine, PlaceholderValues, RewriteError, TableObligations, TrinoDialect,
+        denormalize_past_version_clause, normalize_past_version_clause, substitute_governed_tables,
+    };
+
+    fn obligations() -> HashMap<String, TableObligations> {
+        HashMap::from([(
+            "silver.customers".to_owned(),
+            TableObligations {
+                mask: vec!["email".to_owned()],
+                row_filter: Some("tenant_id = 'tenant-a'".to_owned()),
+                real_columns: Some(vec![
+                    "id".to_owned(),
+                    "email".to_owned(),
+                    "tenant_id".to_owned(),
+                ]),
+            },
+        )])
+    }
+
+    #[test]
+    fn a_past_version_clause_round_trips() {
+        let sql = "SELECT * FROM iceberg.bronze.orders FOR VERSION AS OF 123";
+        let parsed = normalize_past_version_clause(sql).expect("a version id is accepted");
+        assert_eq!(
+            parsed,
+            "SELECT * FROM iceberg.bronze.orders VERSION AS OF 123"
+        );
+        assert_eq!(denormalize_past_version_clause(&parsed), sql);
+    }
+
+    /// `FOR TIMESTAMP AS OF` is refused on `Trino` — no engine has a
+    /// timestamp form — so the pass leaves it alone and the statement
+    /// does not parse.
+    #[test]
+    fn a_timestamp_past_version_clause_is_left_alone() {
+        let sql = "SELECT * FROM t FOR TIMESTAMP AS OF TIMESTAMP '2020-01-01 00:00:00 UTC'";
+        assert_eq!(
+            normalize_past_version_clause(sql).expect("no version id, no refusal"),
+            sql
+        );
+        assert_eq!(denormalize_past_version_clause(sql), sql);
+    }
+
+    #[test]
+    fn the_words_of_a_clause_inside_a_literal_are_not_a_clause() {
+        let sql = "SELECT 'FOR VERSION AS OF 1' AS s FROM t";
+        assert_eq!(
+            normalize_past_version_clause(sql).expect("no clause, no change"),
+            sql
+        );
+    }
+
+    /// Only an integer version id is accepted (`DATA-21` D2).
+    #[test]
+    fn a_version_that_is_not_an_id_is_refused() {
+        let err = normalize_past_version_clause("SELECT * FROM t FOR VERSION AS OF 1.5")
+            .expect_err("a version id is an integer");
+        assert!(matches!(err, RewriteError::InvalidPastVersion));
+    }
+
+    /// `DATA-21` D6: the policy still holds at a past version — the
+    /// derived table keeps the version AND the mask and the row filter.
+    #[test]
+    fn a_masked_table_at_a_past_version_keeps_both_the_version_and_the_mask() {
+        let out = substitute_governed_tables(
+            &normalize_past_version_clause("SELECT * FROM silver.customers FOR VERSION AS OF 5")
+                .expect("a version id is accepted"),
+            &TrinoDialect::default(),
+            Engine::Trino,
+            &obligations(),
+            &PlaceholderValues::none(),
+        )
+        .unwrap();
+        assert!(out.contains("VERSION AS OF 5"), "{out}");
+        assert!(
+            out.contains("CASE WHEN \"email\" IS NULL THEN NULL ELSE '***' END AS \"email\""),
+            "{out}"
+        );
+        assert!(out.contains("WHERE tenant_id = 'tenant-a'"), "{out}");
+        // The engine reads `Trino`'s own form again.
+        assert!(
+            denormalize_past_version_clause(&out).contains("FOR VERSION AS OF 5"),
+            "{out}"
+        );
+    }
+
+    /// A table that is not governed keeps its own version — and, with an
+    /// alias, becomes a derived table, because `sqlparser` prints a
+    /// version after the alias and `Trino` reads it before.
+    #[test]
+    fn an_ungoverned_table_at_a_past_version_keeps_its_version() {
+        let out = substitute_governed_tables(
+            &normalize_past_version_clause("SELECT * FROM silver.plain FOR VERSION AS OF 5")
+                .expect("a version id is accepted"),
+            &TrinoDialect::default(),
+            Engine::Trino,
+            &obligations(),
+            &PlaceholderValues::none(),
+        )
+        .unwrap();
+        assert!(out.contains("VERSION AS OF 5"), "{out}");
+        assert!(!out.contains("silver.plain AS"), "{out}");
+    }
+
+    #[test]
+    fn a_table_with_a_version_and_an_alias_becomes_a_derived_table() {
+        let out = substitute_governed_tables(
+            &normalize_past_version_clause(
+                "SELECT c.id FROM silver.plain FOR VERSION AS OF 5 AS c",
+            )
+            .expect("a version id is accepted"),
+            &TrinoDialect::default(),
+            Engine::Trino,
+            &obligations(),
+            &PlaceholderValues::none(),
+        )
+        .unwrap();
+        assert!(
+            out.contains("(SELECT * FROM silver.plain VERSION AS OF 5) AS c"),
+            "{out}"
+        );
+    }
+}
+
+/// `DATA-21` D1: the same obligations, written in `Trino`'s SQL.
+///
+/// Every test here is the TWIN of a test in
+/// [`table_substitution`]: the same statement, the same obligations, the
+/// `Trino` output instead of the `ClickHouse` one. The `ClickHouse`
+/// tests beside them are unchanged and still match their exact text —
+/// the `ClickHouse` output is byte for byte what it was before the
+/// engine argument existed.
+#[cfg(test)]
+mod trino_substitution {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    use super::{
+        Engine, PlaceholderValues, RewriteError, TableObligations, substitute_governed_tables,
+    };
+
+    fn obligations() -> HashMap<String, TableObligations> {
+        HashMap::from([(
+            "silver.customers".to_owned(),
+            TableObligations {
+                mask: vec!["email".to_owned()],
+                row_filter: Some("tenant_id = 'tenant-a'".to_owned()),
+                real_columns: Some(vec![
+                    "id".to_owned(),
+                    "email".to_owned(),
+                    "tenant_id".to_owned(),
+                ]),
+            },
+        )])
+    }
+
+    fn substituted(sql: &str) -> String {
+        substitute_governed_tables(
+            sql,
+            &GenericDialect {},
+            Engine::Trino,
+            &obligations(),
+            &PlaceholderValues::none(),
+        )
+        .unwrap()
+    }
+
+    /// The twin of [`table_substitution`]'s own `assert_only_wrapped_reads`:
+    /// the derived-table wrapper appears (proving substitution ran), the
+    /// mask is `Trino`'s own form, and the row filter is present — the
+    /// governed table is read exactly once, through the wrapper.
+    fn assert_only_wrapped_reads(sql: &str) {
+        let out = substituted(sql);
+        assert!(
+            out.contains("CASE WHEN \"email\" IS NULL THEN NULL ELSE '***' END AS \"email\""),
+            "{out}"
+        );
+        assert!(out.contains("WHERE tenant_id = 'tenant-a'"), "{out}");
+        assert!(
+            !out.contains("replaceRegexpOne"),
+            "a ClickHouse-only masking function reached Trino: {out}"
+        );
+        assert!(
+            !out.contains('`'),
+            "a ClickHouse-only identifier quote reached Trino: {out}"
+        );
+        Parser::parse_sql(&GenericDialect {}, &out)
+            .unwrap_or_else(|e| panic!("the rewrite does not parse ({e}): {out}"));
+    }
+
+    #[test]
+    fn a_masked_column_is_masked_in_trinos_own_form() {
+        assert_only_wrapped_reads("SELECT count() FROM silver.customers WHERE email LIKE 'a%'");
+    }
+
+    #[test]
+    fn a_join_on_a_masked_column_compares_only_masked_values() {
+        let out = substituted(
+            "SELECT o.id FROM silver.orders_enriched o JOIN silver.customers c ON c.email = o.customer_email",
+        );
+        assert!(
+            out.contains("CASE WHEN \"email\" IS NULL THEN NULL ELSE '***' END AS \"email\""),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_self_join_substitutes_both_occurrences_independently() {
+        let out = substituted(
+            "SELECT a.id FROM silver.customers a JOIN silver.customers b ON a.email = b.email",
+        );
+        assert_eq!(
+            out.matches("CASE WHEN \"email\" IS NULL THEN NULL ELSE '***' END AS \"email\"")
+                .count(),
+            2,
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_cte_over_the_table_is_substituted_inside_the_ctes_own_definition() {
+        assert_only_wrapped_reads("WITH x AS (SELECT * FROM silver.customers) SELECT * FROM x");
+    }
+
+    /// The `ClickHouse` output is byte for byte what it was before the
+    /// engine argument existed — the same obligations, the same text.
+    #[test]
+    fn the_clickhouse_output_is_unchanged() {
+        let out = substitute_governed_tables(
+            "SELECT * FROM silver.customers",
+            &sqlparser::dialect::ClickHouseDialect {},
+            Engine::ClickHouse,
+            &obligations(),
+            &PlaceholderValues::none(),
+        )
+        .unwrap();
+        assert!(
+            out.contains("replaceRegexpOne(toString(`email`), '(?s)^.*$', '***') AS `email`"),
+            "{out}"
+        );
+        assert!(out.contains("`id`"), "{out}");
+    }
+
+    /// `DATA-21` D1: `toString(x)` becomes `CAST(x AS varchar)` and
+    /// `toDate(x)` becomes `CAST(x AS date)`; `lower`/`upper` are the
+    /// same on both engines.
+    #[test]
+    fn a_row_filter_is_written_in_trinos_own_functions() {
+        let mut obl = obligations();
+        obl.get_mut("silver.customers").unwrap().real_columns = Some(vec![
+            "id".to_owned(),
+            "email".to_owned(),
+            "created".to_owned(),
+        ]);
+        obl.get_mut("silver.customers").unwrap().row_filter =
+            Some("lower(email) = toString(id) AND toDate(created) = toDate(id)".to_owned());
+        let out = substitute_governed_tables(
+            "SELECT * FROM silver.customers",
+            &GenericDialect {},
+            Engine::Trino,
+            &obl,
+            &PlaceholderValues::none(),
+        )
+        .unwrap();
+        assert!(out.contains("lower(email)"), "{out}");
+        assert!(out.contains("CAST(id AS VARCHAR)"), "{out}");
+        assert!(out.contains("CAST(created AS DATE)"), "{out}");
+        assert!(
+            !out.contains("toString") && !out.contains("toDate"),
+            "a ClickHouse-only row-filter function reached Trino: {out}"
+        );
+    }
+
+    /// `DATA-21` D1: a function `Trino` has no spelling for is refused
+    /// with a fixed message that NAMES it — never passed through.
+    #[test]
+    fn a_clickhouse_only_function_in_a_trino_policy_is_refused() {
+        let mut obl = obligations();
+        obl.get_mut("silver.customers").unwrap().row_filter =
+            Some("toDateTime(created) > 0".to_owned());
+        let err = substitute_governed_tables(
+            "SELECT * FROM silver.customers",
+            &GenericDialect {},
+            Engine::Trino,
+            &obl,
+            &PlaceholderValues::none(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, RewriteError::InvalidRowFilter { reason }
+                if reason.contains("todatetime")),
+            "{err:?}"
+        );
+    }
+
+    /// The `ClickHouse` refusal for the same policy is its own message —
+    /// the two engines do not share one rule for a function they spell
+    /// differently.
+    #[test]
+    fn the_same_policy_is_refused_on_clickhouse_with_its_own_message() {
+        let mut obl = obligations();
+        obl.get_mut("silver.customers").unwrap().row_filter =
+            Some("toDateTime(created) > 0".to_owned());
+        let err = substitute_governed_tables(
+            "SELECT * FROM silver.customers",
+            &sqlparser::dialect::ClickHouseDialect {},
+            Engine::ClickHouse,
+            &obl,
+            &PlaceholderValues::none(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, RewriteError::InvalidRowFilter { reason }
+                if reason.contains("not allowed in a row filter")),
+            "{err:?}"
+        );
     }
 }
 
@@ -1525,10 +3613,36 @@ mod table_substitution {
 mod row_filter {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use sqlparser::ast::Expr;
+    use sqlparser::ast::{Expr, Ident as SqlIdent, ObjectName, ObjectNamePart};
     use sqlparser::parser::Parser;
 
-    use super::{PlaceholderValues, RewriteError, expand_placeholders, validate_row_filter_expr};
+    use super::{
+        CONTROL_CHAR_REFUSAL, Engine, LIKE_ANY_REFUSAL, PlaceholderValues, RewriteError,
+        SIGN_REFUSAL, build_masked_filtered_select, expand_placeholders, validate_expr_shape,
+        validate_row_filter_expr,
+    };
+
+    const BACKSLASH_REASON: &str = "a text value in a row filter cannot contain a backslash";
+    const PLAIN_TEXT_REASON: &str = "a row filter accepts plain 'text' values only";
+    const PLAIN_CALL_REASON: &str = "a function call in a row filter takes plain arguments only";
+    const OPERATOR_REASON: &str = "operator not allowed in a row filter";
+    const QUALIFIER_REASON: &str =
+        "a column in a row filter may have one plain table name before it";
+    /// A word every refused filter below carries somewhere (in a literal, a
+    /// qualifier or a name), so the helper can prove a refusal reason never
+    /// echoes the filter text.
+    const MARKER: &str = "zebra";
+
+    fn invalid_reason(raw: &str, cols: &[String]) -> String {
+        match validate_row_filter_expr(raw, cols, Engine::ClickHouse).unwrap_err() {
+            RewriteError::InvalidRowFilter { reason } => reason,
+            other => panic!("expected InvalidRowFilter, got {other:?}"),
+        }
+    }
+
+    fn table_name() -> ObjectName {
+        ObjectName(vec![ObjectNamePart::Identifier(SqlIdent::new("t"))])
+    }
 
     fn parse_test_expr(raw: &str) -> Expr {
         let dialect = sqlparser::dialect::GenericDialect {};
@@ -1542,39 +3656,53 @@ mod row_filter {
     #[test]
     fn validate_row_filter_expr_accepts_a_simple_comparison_against_real_columns() {
         let cols = vec!["tenant_id".to_owned(), "tahun".to_owned()];
-        assert!(validate_row_filter_expr("tenant_id = 'tenant-a'", &cols).is_ok());
+        assert!(
+            validate_row_filter_expr("tenant_id = 'tenant-a'", &cols, Engine::ClickHouse).is_ok()
+        );
     }
 
     #[test]
     fn validate_row_filter_expr_rejects_an_unknown_column() {
         let cols = vec!["tenant_id".to_owned()];
-        let err = validate_row_filter_expr("secret_col = 1", &cols).unwrap_err();
+        let err =
+            validate_row_filter_expr("secret_col = 1", &cols, Engine::ClickHouse).unwrap_err();
         assert!(matches!(err, RewriteError::InvalidRowFilter { .. }));
     }
 
     #[test]
     fn validate_row_filter_expr_rejects_a_function_call_not_on_the_allowlist() {
         let cols = vec!["tenant_id".to_owned()];
-        let err = validate_row_filter_expr("tenant_id = (SELECT 1)", &cols).unwrap_err();
+        let err = validate_row_filter_expr("tenant_id = (SELECT 1)", &cols, Engine::ClickHouse)
+            .unwrap_err();
         assert!(matches!(err, RewriteError::InvalidRowFilter { .. }));
     }
 
     #[test]
     fn validate_row_filter_expr_rejects_garbage_that_is_not_an_expression_at_all() {
         let cols = vec!["tenant_id".to_owned()];
-        assert!(validate_row_filter_expr("; DROP TABLE t; --", &cols).is_err());
+        assert!(validate_row_filter_expr("; DROP TABLE t; --", &cols, Engine::ClickHouse).is_err());
     }
 
     #[test]
     fn validate_row_filter_expr_accepts_the_scalar_principal_placeholder_as_a_bare_identifier() {
         let cols = vec!["owner_id".to_owned()];
-        assert!(validate_row_filter_expr("owner_id = __principal_id__", &cols).is_ok());
+        assert!(
+            validate_row_filter_expr("owner_id = __principal_id__", &cols, Engine::ClickHouse)
+                .is_ok()
+        );
     }
 
     #[test]
     fn validate_row_filter_expr_accepts_the_list_placeholder_only_as_the_sole_in_list_element() {
         let cols = vec!["tenant_id".to_owned()];
-        assert!(validate_row_filter_expr("tenant_id IN (__principal_tenant_ids__)", &cols).is_ok());
+        assert!(
+            validate_row_filter_expr(
+                "tenant_id IN (__principal_tenant_ids__)",
+                &cols,
+                Engine::ClickHouse
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1583,17 +3711,718 @@ mod row_filter {
         // placeholder a well-defined scalar meaning, so this is
         // refused, not silently coerced to one element.
         let cols = vec!["tenant_id".to_owned()];
-        let err =
-            validate_row_filter_expr("tenant_id = __principal_tenant_ids__", &cols).unwrap_err();
+        let err = validate_row_filter_expr(
+            "tenant_id = __principal_tenant_ids__",
+            &cols,
+            Engine::ClickHouse,
+        )
+        .unwrap_err();
         assert!(matches!(err, RewriteError::InvalidRowFilter { .. }));
     }
 
     #[test]
     fn validate_row_filter_expr_rejects_the_list_placeholder_alongside_other_in_list_elements() {
         let cols = vec!["tenant_id".to_owned()];
-        let err = validate_row_filter_expr("tenant_id IN (__principal_tenant_ids__, 'x')", &cols)
-            .unwrap_err();
+        let err = validate_row_filter_expr(
+            "tenant_id IN (__principal_tenant_ids__, 'x')",
+            &cols,
+            Engine::ClickHouse,
+        )
+        .unwrap_err();
         assert!(matches!(err, RewriteError::InvalidRowFilter { .. }));
+    }
+
+    // SEC-32: the policy check parses a filter with `GenericDialect`, which
+    // does not read a backslash as an escape, while `ClickHouse` does. The
+    // two parsers can disagree on where a string ends, so a text value with
+    // a backslash is refused rather than re-encoded.
+    #[test]
+    fn validate_row_filter_expr_refuses_a_text_value_with_a_backslash() {
+        let cols = vec!["x".to_owned()];
+        assert_eq!(invalid_reason(r"x = 'a\\b'", &cols), BACKSLASH_REASON);
+    }
+
+    #[test]
+    fn a_filter_that_ends_a_string_with_a_backslash_is_refused_and_produces_no_sql() {
+        let cols = vec!["x".to_owned()];
+        let raw = r"x = '\' OR 1=1 --'";
+        assert_eq!(invalid_reason(raw, &cols), BACKSLASH_REASON);
+        let built = build_masked_filtered_select(
+            &table_name(),
+            &cols,
+            &[],
+            Some(raw),
+            &PlaceholderValues::none(),
+            Engine::ClickHouse,
+            None,
+        );
+        assert!(matches!(built, Err(RewriteError::InvalidRowFilter { .. })));
+    }
+
+    #[test]
+    fn validate_row_filter_expr_refuses_every_text_form_but_the_plain_single_quoted_one() {
+        let cols = vec!["x".to_owned()];
+        // All five parse under `GenericDialect` today, so each reaches the
+        // literal rule rather than being refused by the parse.
+        for raw in ["x = R'a'", "x = N'a'", "x = X'61'", "x = E'a'", "x = $$a$$"] {
+            assert_eq!(invalid_reason(raw, &cols), PLAIN_TEXT_REASON, "{raw}");
+        }
+    }
+
+    // SEC-32 review fix (BLOCKER): `LIKE ... ESCAPE <expr>` carries a child
+    // expression in `escape_char`. The shape walk used to skip it, so a
+    // backslash text, a subquery or an unknown column passed in that slot.
+    #[test]
+    fn a_like_escape_with_a_backslash_is_refused() {
+        let cols = vec!["x".to_owned()];
+        assert_eq!(
+            invalid_reason(r"x LIKE 'a' ESCAPE '\'", &cols),
+            BACKSLASH_REASON
+        );
+        assert_eq!(
+            invalid_reason(r"x NOT LIKE 'a' ESCAPE '\'", &cols),
+            BACKSLASH_REASON
+        );
+    }
+
+    #[test]
+    fn an_ilike_escape_with_a_backslash_is_refused() {
+        let cols = vec!["x".to_owned()];
+        assert_eq!(
+            invalid_reason(r"x ILIKE 'a' ESCAPE '\'", &cols),
+            BACKSLASH_REASON
+        );
+    }
+
+    #[test]
+    fn a_second_string_opened_after_a_backslash_escape_is_refused() {
+        // The policy check reads a `LIKE` with a one-backslash escape and a
+        // comparison against a long text. `ClickHouse` reads `\'` as an
+        // escaped quote, so the string boundaries differ. The backslash in
+        // the escape is the refusal reason.
+        let cols = vec!["x".to_owned()];
+        let raw = r"x LIKE 'a' ESCAPE '\' AND x = ' OR 1=1 OR x = '";
+        assert_eq!(invalid_reason(raw, &cols), BACKSLASH_REASON);
+        let built = build_masked_filtered_select(
+            &table_name(),
+            &cols,
+            &[],
+            Some(raw),
+            &PlaceholderValues::none(),
+            Engine::ClickHouse,
+            None,
+        );
+        assert!(matches!(built, Err(RewriteError::InvalidRowFilter { .. })));
+    }
+
+    #[test]
+    fn a_like_escape_with_a_plain_character_still_passes_and_expands_unchanged() {
+        let cols = vec!["x".to_owned()];
+        for raw in [
+            "x LIKE 'a' ESCAPE '!'",
+            "x ILIKE 'a' ESCAPE '!'",
+            "x NOT LIKE 'a%' ESCAPE '!'",
+            "x LIKE 'a'",
+        ] {
+            let expr = validate_row_filter_expr(raw, &cols, Engine::ClickHouse)
+                .unwrap_or_else(|e| panic!("{raw} was refused: {e:?}"));
+            assert_eq!(
+                expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn a_like_escape_holding_a_subquery_or_an_unknown_column_is_refused() {
+        let cols = vec!["x".to_owned()];
+        let reason = invalid_reason("x LIKE 'a' ESCAPE (SELECT 1)", &cols);
+        assert!(
+            reason.starts_with("unsupported row-filter expression"),
+            "{reason}"
+        );
+        let reason = invalid_reason("x ILIKE 'a' ESCAPE (SELECT 1)", &cols);
+        assert!(
+            reason.starts_with("unsupported row-filter expression"),
+            "{reason}"
+        );
+        let reason = invalid_reason("x LIKE 'a' ESCAPE secret_col", &cols);
+        assert!(reason.contains("is not a real column"), "{reason}");
+        let reason = invalid_reason("x LIKE 'a' ESCAPE sleep(1)", &cols);
+        assert!(
+            reason.contains("is not allowed in a row filter"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_like_escape_placeholder_is_expanded_not_left_as_an_identifier() {
+        let cols = vec!["x".to_owned()];
+        let values = PlaceholderValues {
+            principal_id: Some("u-1".to_owned()),
+            principal_tenant_ids: vec![],
+        };
+        let expr = validate_row_filter_expr(
+            "x LIKE 'a' ESCAPE __principal_id__",
+            &cols,
+            Engine::ClickHouse,
+        )
+        .unwrap();
+        assert_eq!(
+            expand_placeholders(&expr, &values).unwrap(),
+            "x LIKE 'a' ESCAPE 'u-1'"
+        );
+    }
+
+    #[test]
+    fn a_refusal_does_not_echo_the_literal() {
+        let cols = vec!["x".to_owned()];
+        let reason = invalid_reason(r"x = 'secret\\value'", &cols);
+        assert!(!reason.contains("secret"));
+        let reason = invalid_reason("x = N'secret'", &cols);
+        assert!(!reason.contains("secret"));
+    }
+
+    #[test]
+    fn a_plain_text_number_boolean_and_null_filter_still_passes_and_expands_unchanged() {
+        let cols = vec!["x".to_owned(), "flag".to_owned()];
+        let values = PlaceholderValues {
+            principal_id: Some("u-1".to_owned()),
+            principal_tenant_ids: vec![],
+        };
+        for (raw, expected) in [
+            ("x = 'plain'", "x = 'plain'"),
+            ("x = 'it''s'", "x = 'it''s'"),
+            ("x = 42", "x = 42"),
+            ("x > 1.5", "x > 1.5"),
+            ("flag = true", "flag = true"),
+            ("x IS NULL", "x IS NULL"),
+            ("x = NULL", "x = NULL"),
+            ("x IN ('a', 'b')", "x IN ('a', 'b')"),
+            ("x = __principal_id__", "x = 'u-1'"),
+        ] {
+            let expr = validate_row_filter_expr(raw, &cols, Engine::ClickHouse)
+                .unwrap_or_else(|e| panic!("{raw} was refused: {e:?}"));
+            assert_eq!(
+                expand_placeholders(&expr, &values).unwrap(),
+                expected,
+                "{raw}"
+            );
+        }
+    }
+
+    // Regression: passes on `main` already. A mask entry is compared with the
+    // table's real columns only and never reaches the SQL as text.
+    #[test]
+    fn a_mask_entry_that_is_not_a_column_adds_no_text_to_the_statement() {
+        let cols = vec!["x".to_owned(), "y".to_owned()];
+        let sql = build_masked_filtered_select(
+            &table_name(),
+            &cols,
+            &["x') OR 1=1 --".to_owned()],
+            None,
+            &PlaceholderValues::none(),
+            Engine::ClickHouse,
+            None,
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT `x`, `y` FROM t");
+    }
+
+    /// Asserts that `raw` is refused with exactly `expected` and that the
+    /// reason does not repeat any part of the filter.
+    fn assert_refused(raw: &str, expected: &str) {
+        assert!(raw.contains(MARKER), "{raw} carries no marker word");
+        let cols = vec!["x".to_owned(), "y".to_owned(), "t".to_owned()];
+        let reason = invalid_reason(raw, &cols);
+        assert_eq!(reason, expected, "{raw}");
+        assert!(!reason.contains(MARKER), "{raw}: reason echoes the filter");
+    }
+
+    // SEC-43 (follow-up of SEC-32): a function call is checked in every
+    // part. Each test below puts one part of `Function` outside the plain
+    // shape, with the same allowlisted name and a valid argument, so the
+    // only thing wrong with the call is that part.
+    #[test]
+    fn a_call_with_a_filter_clause_is_refused() {
+        assert_refused(
+            "lower(x) FILTER (WHERE x = 'zebra') = 'a'",
+            PLAIN_CALL_REASON,
+        );
+        // The subquery inside `FILTER` is never reached: the clause itself
+        // is refused first, with the same fixed text.
+        assert_refused(
+            "lower(x) FILTER (WHERE x IN (SELECT y FROM zebra)) = 'a'",
+            PLAIN_CALL_REASON,
+        );
+    }
+
+    #[test]
+    fn a_call_with_an_over_clause_is_refused() {
+        assert_refused(
+            "lower(x) OVER (PARTITION BY x) = 'zebra'",
+            PLAIN_CALL_REASON,
+        );
+    }
+
+    #[test]
+    fn a_call_with_a_within_group_clause_is_refused() {
+        assert_refused(
+            "lower(x) WITHIN GROUP (ORDER BY x) = 'zebra'",
+            PLAIN_CALL_REASON,
+        );
+    }
+
+    #[test]
+    fn a_call_with_a_null_treatment_after_the_arguments_is_refused() {
+        assert_refused("lower(x) IGNORE NULLS = 'zebra'", PLAIN_CALL_REASON);
+    }
+
+    #[test]
+    fn a_call_with_a_second_parameter_list_is_refused() {
+        assert_refused("lower(1)(x) = 'zebra'", PLAIN_CALL_REASON);
+    }
+
+    #[test]
+    fn a_call_in_the_odbc_form_is_refused() {
+        assert_refused("{fn lower(x)} = 'zebra'", PLAIN_CALL_REASON);
+    }
+
+    #[test]
+    fn a_call_with_a_named_argument_is_refused() {
+        assert_refused("lower(zebra => x) = 'a'", PLAIN_CALL_REASON);
+        assert_refused("lower(zebra := x) = 'a'", PLAIN_CALL_REASON);
+    }
+
+    #[test]
+    fn a_call_with_a_duplicate_treatment_is_refused() {
+        assert_refused("lower(DISTINCT x) = 'zebra'", PLAIN_CALL_REASON);
+        assert_refused("lower(ALL x) = 'zebra'", PLAIN_CALL_REASON);
+    }
+
+    #[test]
+    fn a_call_with_a_clause_inside_the_parentheses_is_refused() {
+        for raw in [
+            "lower(x ORDER BY x) = 'zebra'",
+            "lower(x LIMIT 1) = 'zebra'",
+            "lower(x IGNORE NULLS) = 'zebra'",
+            "lower(x WHERE x = 'zebra') = 'a'",
+        ] {
+            assert_refused(raw, PLAIN_CALL_REASON);
+        }
+    }
+
+    #[test]
+    fn a_call_with_a_wildcard_argument_is_refused_without_echoing_the_filter() {
+        // `lower(*)` was already refused; the reason now is the same fixed
+        // text as for every other argument that is not a plain expression.
+        assert_refused("lower(*) = 'zebra'", PLAIN_CALL_REASON);
+        assert_refused("lower(zebra.*) = 'a'", PLAIN_CALL_REASON);
+    }
+
+    // SEC-43: a binary operator is checked against a fixed list. These
+    // parse under `GenericDialect`; `x # 1` and `x DIV 2` do not parse, so
+    // the parser already refuses them.
+    #[test]
+    fn a_custom_operator_is_refused() {
+        assert_refused(
+            "x = 1 OPERATOR(pg_catalog.+) 2 AND x = 'zebra'",
+            OPERATOR_REASON,
+        );
+    }
+
+    #[test]
+    fn an_operator_outside_the_fixed_list_is_refused() {
+        for raw in [
+            "x || 'zebra' = 'b'",
+            "x XOR 'zebra'",
+            "x & 1 = 0 OR x = 'zebra'",
+            "x ^ 1 = 0 OR x = 'zebra'",
+            "x <=> 'zebra'",
+            "x ~ 'zebra'",
+            "x @> 'zebra'",
+            "x -> 'zebra'",
+        ] {
+            assert_refused(raw, OPERATOR_REASON);
+        }
+    }
+
+    #[test]
+    fn a_unary_operator_outside_not_minus_and_plus_is_refused() {
+        assert_refused("~x = 'zebra'", OPERATOR_REASON);
+    }
+
+    // SEC-43: a column may carry one plain table name before it. `!x`, `x!`,
+    // `|/x`, `[t].x` and `1t.x` do not reach the shape walk: the parser
+    // refuses them already.
+    #[test]
+    fn a_quoted_qualifier_is_refused() {
+        assert_refused("\"zebra\\\".x = 1", QUALIFIER_REASON);
+        assert_refused("\"zebra\".x = 1", QUALIFIER_REASON);
+        assert_refused("`zebra`.x = 1", QUALIFIER_REASON);
+    }
+
+    #[test]
+    fn a_column_with_two_names_before_it_is_refused() {
+        assert_refused("zebra.b.x = 1", QUALIFIER_REASON);
+    }
+
+    #[test]
+    fn a_qualifier_with_a_character_outside_ascii_letters_digits_and_underscore_is_refused() {
+        assert_refused("zebra\u{e9}.x = 1", QUALIFIER_REASON);
+    }
+
+    #[test]
+    fn a_qualifier_that_starts_with_a_digit_is_refused() {
+        // `GenericDialect` cannot parse `1zebra.x`, so the shape walk is
+        // given the node directly.
+        let expr = Expr::CompoundIdentifier(vec![SqlIdent::new("1zebra"), SqlIdent::new("x")]);
+        let err = validate_expr_shape(&expr, &["x".to_owned()], Engine::ClickHouse).unwrap_err();
+        match err {
+            RewriteError::InvalidRowFilter { reason } => assert_eq!(reason, QUALIFIER_REASON),
+            other => panic!("expected InvalidRowFilter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_call_operator_or_qualifier_produces_no_sql() {
+        let cols = vec!["x".to_owned()];
+        for raw in [
+            "lower(x) OVER (PARTITION BY x) = 'zebra'",
+            "x = 1 OPERATOR(pg_catalog.+) 2",
+            "\"zebra\\\".x = 1",
+        ] {
+            let built = build_masked_filtered_select(
+                &table_name(),
+                &cols,
+                &[],
+                Some(raw),
+                &PlaceholderValues::none(),
+                Engine::ClickHouse,
+                None,
+            );
+            assert!(
+                matches!(built, Err(RewriteError::InvalidRowFilter { .. })),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plain_calls_operators_and_qualifiers_still_pass_and_expand_unchanged() {
+        let cols = vec!["x".to_owned(), "y".to_owned()];
+        for (raw, expected) in [
+            ("lower(x) = 'a'", "lower(x) = 'a'"),
+            ("upper(x) = 'A'", "upper(x) = 'A'"),
+            ("tostring(x) = '1'", "tostring(x) = '1'"),
+            ("todate(x) > '2020-01-01'", "todate(x) > '2020-01-01'"),
+            ("t.x = 1", "t.x = 1"),
+            ("_a.x = 1", "_a.x = 1"),
+            ("x = 1 AND y <> 2", "x = 1 AND y <> 2"),
+            ("x != 1", "x <> 1"),
+            ("x <= 1 OR x < 0", "x <= 1 OR x < 0"),
+            ("NOT x = 1", "NOT x = 1"),
+            ("-x < 1", "-x < 1"),
+            ("+x = 1", "+x = 1"),
+            ("x + 1 > 2", "x + 1 > 2"),
+            ("x % 2 = 0", "x % 2 = 0"),
+            ("x * 2 / 4 >= 1", "x * 2 / 4 >= 1"),
+            ("x - 1 >= 0", "x - 1 >= 0"),
+        ] {
+            let expr = validate_row_filter_expr(raw, &cols, Engine::ClickHouse)
+                .unwrap_or_else(|e| panic!("{raw} was refused: {e:?}"));
+            assert_eq!(
+                expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+                expected,
+                "{raw}"
+            );
+        }
+    }
+
+    // SEC-44: `Display` writes a unary `-` or `+` with no space before its
+    // operand, so `x = - -1` (parsed) prints `x = --1` and `--` starts a
+    // SQL line comment. A control character inside a single-quoted string
+    // carries the string across a line, so a literal checked here can read
+    // differently in `ClickHouse`. The four accepted shapes below all
+    // expand to the SAME text the validator saw, so the checked filter and
+    // the running filter stay one expression.
+    #[test]
+    fn validate_row_filter_expr_accepts_and_expands_a_unary_minus_left_of_an_int_operand() {
+        let cols = vec!["x".to_owned()];
+        let expr = validate_row_filter_expr("x = -1", &cols, Engine::ClickHouse)
+            .unwrap_or_else(|e| panic!("x = -1 was refused: {e:?}"));
+        assert_eq!(
+            expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+            "x = -1"
+        );
+    }
+
+    #[test]
+    fn validate_row_filter_expr_accepts_and_expands_a_binary_minus_over_a_unary_minus() {
+        let cols = vec!["x".to_owned()];
+        let expr = validate_row_filter_expr("x - -1 > 0", &cols, Engine::ClickHouse)
+            .unwrap_or_else(|e| panic!("x - -1 > 0 was refused: {e:?}"));
+        assert_eq!(
+            expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+            "x - -1 > 0"
+        );
+    }
+
+    #[test]
+    fn validate_row_filter_expr_accepts_and_expands_not_over_a_signed_operand() {
+        // `NOT` writes with a space, so the printed text keeps the space
+        // that separates it from the inner sign and never produces `--`.
+        let cols = vec!["x".to_owned()];
+        let expr = validate_row_filter_expr("NOT -x = 1", &cols, Engine::ClickHouse)
+            .unwrap_or_else(|e| panic!("NOT -x = 1 was refused: {e:?}"));
+        assert_eq!(
+            expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+            "NOT -x = 1"
+        );
+    }
+
+    #[test]
+    fn validate_row_filter_expr_accepts_and_expands_like_with_one_pattern() {
+        let cols = vec!["x".to_owned()];
+        let expr = validate_row_filter_expr("x LIKE 'a%'", &cols, Engine::ClickHouse)
+            .unwrap_or_else(|e| panic!("x LIKE 'a%' was refused: {e:?}"));
+        assert_eq!(
+            expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+            "x LIKE 'a%'"
+        );
+        // `negated` is a flag distinct from `any`; today (and after this
+        // change) a `NOT LIKE` with one pattern stays accepted. The
+        // expansion keeps the `NOT` because `Display` prints it with a
+        // space.
+        let expr = validate_row_filter_expr("x NOT LIKE 'a%'", &cols, Engine::ClickHouse)
+            .unwrap_or_else(|e| panic!("x NOT LIKE 'a%' was refused: {e:?}"));
+        assert_eq!(
+            expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+            "x NOT LIKE 'a%'"
+        );
+    }
+
+    // SEC-44: every refusal below pins a fixed reason (no filter text, no
+    // marker word) so the reason stays stable and never echoes the filter.
+    // Note `policy_engine::refusal_message` maps the whole
+    // `InvalidRowFilter { .. }` VARIANT to one fixed caller message
+    // (`policy_engine.rs` matches `{ .. }`, ignoring the reason), so these
+    // fixed reason texts are for logs and tests, not a per-reason caller
+    // mapping. The constants live next to the other refusal strings
+    // (SIGN_REFUSAL, CONTROL_CHAR_REFUSAL, LIKE_ANY_REFUSAL) so the
+    // production text and the test pin the same source.
+
+    #[test]
+    fn validate_row_filter_expr_refuses_a_unary_minus_whose_operand_is_a_unary_minus() {
+        // The canonical case; the full sign-over-sign matrix (and the same
+        // `x = - -1` row) lives in the loop test below.
+        let cols = vec!["x".to_owned()];
+        assert_eq!(
+            invalid_reason("x = - -1", &cols),
+            SIGN_REFUSAL,
+            "raw must be refused with the fixed sign reason"
+        );
+    }
+
+    #[test]
+    fn validate_row_filter_expr_refuses_every_sign_over_sign_combination() {
+        // `x = - -1` parses to `BinaryOp(Eq, x, UnaryOp(Minus, UnaryOp(Minus, 1)))`
+        // — the outer sign has a sign operand, which `Display` writes as
+        // `--` (or `++`/`-+`/`+-`), and `--` starts a SQL line comment.
+        let cols = vec!["x".to_owned()];
+        for raw in ["x = - -1", "x = + +1", "x = -+1", "x = +-1"] {
+            assert_eq!(invalid_reason(raw, &cols), SIGN_REFUSAL, "{raw}");
+        }
+    }
+
+    #[test]
+    fn validate_row_filter_expr_refuses_a_text_value_with_a_raw_newline() {
+        // A control character (U+000A here) lets the text inside a single
+        // quoted string cross a line, so what the validator saw and what
+        // `ClickHouse` reads can differ — and a text containing `\n` can
+        // also carry the rest of the comment a leading `--` opened.
+        let cols = vec!["x".to_owned()];
+        let raw = "x = 'a\nb'";
+        assert_eq!(invalid_reason(raw, &cols), CONTROL_CHAR_REFUSAL);
+    }
+
+    #[test]
+    fn validate_row_filter_expr_refuses_a_text_value_with_a_tab_character() {
+        let cols = vec!["x".to_owned()];
+        let raw = "x = 'a\tb'";
+        assert_eq!(invalid_reason(raw, &cols), CONTROL_CHAR_REFUSAL);
+    }
+
+    /// Every row below carries the `any` flag and, verified by running the
+    /// pinned test, parses under `GenericDialect` — `sqlparser` 0.63 parses
+    /// `LIKE`/`ILIKE` as `any: parse_keyword(ANY)` followed by a general
+    /// subexpr pattern, so the paren forms become `Expr::Tuple` /
+    /// `Expr::Nested`, not a parse error. The `any` check returns before the
+    /// children are visited, so every parsed form carries the fixed
+    /// `LIKE_ANY_REFUSAL` reason. For `ANY 'a%'`, `ANY 'a'` and `ANY ('a')`
+    /// the pattern is otherwise valid (the no-`any` variant is accepted), so
+    /// `any: true` is the only shape outside the simple-`LIKE` allowlist. For
+    /// `ANY ('a', 'b')` the pattern is a tuple the shape walk would refuse on
+    /// its own, but the `any` check fires first. The plain-pattern row
+    /// (`ANY 'a%'`) is the row whose `any: true` is the only refusal trigger,
+    /// so it carries a dedicated test below.
+    const LIKE_ANY_TEST_CASES: &[(&str, &str)] = &[
+        ("x LIKE ANY 'a%'", "plain pattern"),
+        ("x ILIKE ANY 'a'", "plain pattern, case-insensitive"),
+        ("x LIKE ANY ('a', 'b')", "tuple pattern"),
+        ("x ILIKE ANY ('a')", "single-element paren pattern"),
+    ];
+
+    #[test]
+    fn validate_row_filter_expr_refuses_like_with_any_and_a_plain_pattern() {
+        // Isolates rule (3): with `ANY 'a%'`, the only shape outside the
+        // simple-`LIKE` allowlist is `any: true`. If the validator stops
+        // refusing `any`, this test alone fails — no other row could mask
+        // the regression.
+        let cols = vec!["x".to_owned()];
+        assert_eq!(invalid_reason("x LIKE ANY 'a%'", &cols), LIKE_ANY_REFUSAL);
+    }
+
+    #[test]
+    fn validate_row_filter_expr_refuses_ilike_with_any_and_a_plain_pattern() {
+        let cols = vec!["x".to_owned()];
+        assert_eq!(invalid_reason("x ILIKE ANY 'a'", &cols), LIKE_ANY_REFUSAL);
+    }
+
+    #[test]
+    fn validate_row_filter_expr_refuses_every_any_form_that_parses_under_generic_dialect() {
+        // Verified: every form in `LIKE_ANY_TEST_CASES` parses under
+        // `GenericDialect` and reaches the `any` check, so each is pinned to
+        // the fixed `LIKE_ANY_REFUSAL` reason. There is no parse-error row
+        // today; if a future form stops parsing it carries the parser's own
+        // message under `InvalidRowFilter` and must move to its own row that
+        // asserts only `InvalidRowFilter`, not this fixed text. The two
+        // plain-pattern rows are isolated further by the dedicated tests
+        // above.
+        let cols = vec!["x".to_owned()];
+        for (raw, _) in LIKE_ANY_TEST_CASES {
+            assert_eq!(
+                invalid_reason(raw, &cols),
+                LIKE_ANY_REFUSAL,
+                "{raw}: every parsed `LIKE ... ANY` form must carry the fixed reason"
+            );
+        }
+    }
+
+    /// Walks every accepted shape the test module exercises for this
+    /// validator, expanding each through `expand_placeholders`, and
+    /// asserts neither SQL comment opener (`--` or `/*`) appears OUTSIDE a
+    /// single-quoted string. The structural invariant the validator must
+    /// preserve: the SQL `ClickHouse` parses is the SQL the validator
+    /// checked. The accepted literal set already guarantees no `'` inside
+    /// a literal's text (a backslash is refused, a control character now
+    /// too), so toggling `in_string` on every `'` is a safe boundary
+    /// (doubled `''` toggles twice and the literal is still tracked to
+    /// the closing quote).
+    #[test]
+    fn expand_placeholders_never_prints_a_comment_opener_outside_a_string() {
+        fn assert_no_comment_opener(text: &str) {
+            let chars: Vec<char> = text.chars().collect();
+            let mut in_string = false;
+            for (i, c) in chars.iter().enumerate() {
+                if *c == '\'' {
+                    in_string = !in_string;
+                    continue;
+                }
+                if in_string {
+                    continue;
+                }
+                let next = chars.get(i + 1).copied().unwrap_or('\0');
+                if *c == '-' && next == '-' {
+                    panic!("found `--` outside a string in: {text}");
+                } else if *c == '/' && next == '*' {
+                    panic!("found `/*` outside a string in: {text}");
+                }
+            }
+        }
+
+        let v_none_a = PlaceholderValues::none();
+        let v_principal_only = PlaceholderValues {
+            principal_id: Some("u-1".to_owned()),
+            principal_tenant_ids: vec!["t-1".to_owned()],
+        };
+        // The four SEC-44-allowed expansion forms plus the shapes the
+        // pre-existing accepted tests exercise — one representative per
+        // shape, not the full table. Bound locals (not closures) keep the
+        // `&PlaceholderValues` references valid for the slice's lifetime.
+        let cols_ab = vec!["x".to_owned(), "y".to_owned()];
+        let cols_xf = vec!["x".to_owned(), "flag".to_owned()];
+        let cols_x = vec!["x".to_owned()];
+        let accepted: &[(&[String], &PlaceholderValues, &[&str])] = &[
+            (
+                &cols_x,
+                &v_none_a,
+                &[
+                    "x = -1",
+                    "x - -1 > 0",
+                    "NOT -x = 1",
+                    "x LIKE 'a%'",
+                    "x NOT LIKE 'a%'",
+                    "x = 'tenant-a'",
+                    "x IN (__principal_tenant_ids__)",
+                    "x = 'plain'",
+                    "x = 'it''s'",
+                    "x = 42",
+                    "x > 1.5",
+                    "x IS NULL",
+                    "x = NULL",
+                    "x IN ('a', 'b')",
+                ],
+            ),
+            (
+                &cols_xf,
+                &v_principal_only,
+                &[
+                    "flag = true",
+                    "x LIKE 'a' ESCAPE '!'",
+                    "x NOT LIKE 'a%' ESCAPE '!'",
+                    "x LIKE 'a' ESCAPE __principal_id__",
+                    "x = __principal_id__",
+                ],
+            ),
+            (
+                &cols_ab,
+                &v_none_a,
+                &[
+                    "lower(x) = 'a'",
+                    "upper(x) = 'A'",
+                    "tostring(x) = '1'",
+                    "todate(x) > '2020-01-01'",
+                    "t.x = 1",
+                    "_a.x = 1",
+                    "x = 1 AND y <> 2",
+                    "x != 1",
+                    "x <= 1 OR x < 0",
+                    "NOT x = 1",
+                    "-x < 1",
+                    "+x = 1",
+                    "x + 1 > 2",
+                    "x % 2 = 0",
+                    "x * 2 / 4 >= 1",
+                    "x - 1 >= 0",
+                ],
+            ),
+        ];
+
+        let mut saw = 0usize;
+        for (cols, values, raws) in accepted {
+            for raw in *raws {
+                let expr = validate_row_filter_expr(raw, cols, Engine::ClickHouse)
+                    .unwrap_or_else(|e| panic!("{raw} was refused: {e:?}"));
+                let out = expand_placeholders(&expr, values).unwrap();
+                assert_no_comment_opener(&out);
+                saw += 1;
+            }
+        }
+        assert!(
+            saw > 30,
+            "sweep should cover a useful slice of accepted forms, saw {saw}"
+        );
     }
 
     #[test]
@@ -1650,7 +4479,9 @@ mod refuses_unparseable_shapes {
 
     use sqlparser::dialect::ClickHouseDialect;
 
-    use super::{PlaceholderValues, REFUSED_UNPARSEABLE, RewriteError, substitute_governed_tables};
+    use super::{
+        Engine, PlaceholderValues, REFUSED_UNPARSEABLE, RewriteError, substitute_governed_tables,
+    };
 
     #[test]
     fn every_recorded_unparseable_class_is_refused_end_to_end() {
@@ -1658,6 +4489,7 @@ mod refuses_unparseable_shapes {
             let err = substitute_governed_tables(
                 sql,
                 &ClickHouseDialect {},
+                Engine::ClickHouse,
                 &HashMap::new(),
                 &PlaceholderValues::none(),
             )
@@ -1961,13 +4793,17 @@ mod default_expression_analysis {
 }
 
 fn canonical_object_name(name: &ObjectName) -> String {
-    let parts: Vec<String> = name
-        .0
+    canonicalize(&object_name_parts(name))
+}
+
+/// The parts of `name`, lower-cased — the ONE place an `ObjectName`
+/// becomes the strings [`canonicalize`] works on.
+fn object_name_parts(name: &ObjectName) -> Vec<String> {
+    name.0
         .iter()
         .filter_map(ObjectNamePart::as_ident)
         .map(|ident| ident.value.to_ascii_lowercase())
-        .collect();
-    canonicalize(&parts)
+        .collect()
 }
 
 /// Read-only classification pass, run via `sqlparser`'s own derived
@@ -2055,12 +4891,6 @@ pub fn classify_statement_for_principal(
 ///
 /// # Errors
 /// Same as [`classify_statement_for_principal`].
-#[allow(
-    dead_code,
-    reason = "no non-test caller exists yet in this commit (WS7 item B5); \
-              a future no-principal-context caller (or a test using it \
-              directly) is the first production caller"
-)]
 pub fn classify_statement(sql: &str, dialect: &dyn Dialect) -> Result<(), RewriteError> {
     classify_statement_for_principal(sql, dialect, &[], false)
 }
@@ -2553,6 +5383,10 @@ impl SystemTablesCatalog for NoViews {
 /// (`Statement::to_string()`'s own re-serialization), everything else
 /// is rewritten or refused.
 ///
+/// `engine` says which engine's SQL the rewrite is written in
+/// (`DATA-21` D1) and reaches [`substitute_governed_tables`], the step
+/// that writes the derived table's own text.
+///
 /// # Errors
 /// See [`classify_statement_for_principal`], [`classify_views`], and
 /// [`substitute_governed_tables`] — every error any of those three can
@@ -2560,6 +5394,7 @@ impl SystemTablesCatalog for NoViews {
 pub fn enforce(
     sql: &str,
     dialect: &dyn Dialect,
+    engine: Engine,
     principal_roles: &[String],
     placeholders: &PlaceholderValues,
     obligations_source: &dyn ObligationsSource,
@@ -2584,7 +5419,7 @@ pub fn enforce(
     }
     let obligated: HashSet<String> = obligations.keys().cloned().collect();
     classify_views(sql, dialect, views_catalog, &obligated)?;
-    substitute_governed_tables(sql, dialect, &obligations, placeholders)
+    substitute_governed_tables(sql, dialect, engine, &obligations, placeholders)
 }
 
 #[cfg(test)]
@@ -2594,7 +5429,8 @@ mod enforce_tests {
     use sqlparser::dialect::ClickHouseDialect;
 
     use super::{
-        NoViews, ObligationsSource, PlaceholderValues, RewriteError, TableObligations, enforce,
+        Engine, NoViews, ObligationsSource, PlaceholderValues, RewriteError, TableObligations,
+        enforce,
     };
 
     struct FakeObligations {
@@ -2615,12 +5451,127 @@ mod enforce_tests {
         }
     }
 
+    /// Every single-quoted literal of `sql`, as the dialect decodes it.
+    fn literal_values(sql: &str) -> Vec<String> {
+        struct Collect(Vec<String>);
+        impl sqlparser::ast::Visitor for Collect {
+            type Break = ();
+            fn post_visit_value(
+                &mut self,
+                v: &sqlparser::ast::ValueWithSpan,
+            ) -> std::ops::ControlFlow<()> {
+                if let sqlparser::ast::Value::SingleQuotedString(t) = &v.value {
+                    self.0.push(t.clone());
+                }
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+        let stmts = sqlparser::parser::Parser::parse_sql(&ClickHouseDialect {}, sql).unwrap();
+        let mut c = Collect(Vec::new());
+        for s in &stmts {
+            let _ = sqlparser::ast::Visit::visit(s, &mut c);
+        }
+        assert_eq!(stmts.len(), 1, "one statement in, one statement out: {sql}");
+        c.0
+    }
+
+    /// `SEC` review finding from BI-18·A: a literal's value survives the
+    /// rewrite unchanged, for every byte pattern in the table.
+    #[test]
+    fn a_literal_value_survives_the_rewrite_unchanged() {
+        use lakehouse_core::ident::SqlLiteral;
+        let bs = "\\";
+        let values: Vec<String> = vec![
+            bs.to_owned(),
+            format!("{bs}{bs}"),
+            format!("{bs}{bs}{bs}"),
+            "'".to_owned(),
+            "''".to_owned(),
+            format!("{bs}'"),
+            format!("'{bs}"),
+            format!("a{bs}"),
+            format!("{bs}a"),
+            format!("a{bs}b"),
+            format!("{bs}'{bs}"),
+            format!("a{bs}'b"),
+            format!("a'{bs}b"),
+            format!("x{bs}{bs}"),
+            format!("50%{bs}_x"),
+            format!("{bs}%"),
+            format!("{bs}_"),
+            "caf\u{e9} \u{65e5}\u{672c}".to_owned(),
+            format!("\u{65e5}{bs}"),
+            "a\nb\tc".to_owned(),
+            String::new(),
+        ];
+        let src = FakeObligations { any: false };
+        for v in &values {
+            let lit = SqlLiteral::from(v.clone()).to_string();
+            let sql = format!("SELECT a FROM serving.t WHERE c IN ({lit}, 'z') AND d = {lit}");
+            let out = enforce(
+                &sql,
+                &ClickHouseDialect {},
+                Engine::ClickHouse,
+                &[],
+                &PlaceholderValues::none(),
+                &src,
+                &NoViews,
+            )
+            .unwrap();
+            assert_eq!(
+                literal_values(&out),
+                vec![v.clone(), "z".to_owned(), v.clone()],
+                "value changed by the rewrite: in={sql} out={out}"
+            );
+            // Rewriting its own output is a fixed point: nothing drifts.
+            let again = enforce(
+                &out,
+                &ClickHouseDialect {},
+                Engine::ClickHouse,
+                &[],
+                &PlaceholderValues::none(),
+                &src,
+                &NoViews,
+            )
+            .unwrap();
+            assert_eq!(literal_values(&again), literal_values(&out));
+            assert_eq!(again, out);
+        }
+    }
+
+    /// The same guarantee when the statement is rewritten for a governed
+    /// table (the substitution path, not the pass-through one).
+    #[test]
+    fn a_literal_value_survives_a_governed_rewrite_unchanged() {
+        use lakehouse_core::ident::SqlLiteral;
+        let src = FakeObligations { any: true };
+        for v in ["\\", "a\\", "\\'", "\\\\'x", "50%\\_"] {
+            let lit = SqlLiteral::from(v).to_string();
+            let sql = format!("SELECT id FROM silver.customers WHERE id = {lit} AND email != 'q'");
+            let out = enforce(
+                &sql,
+                &ClickHouseDialect {},
+                Engine::ClickHouse,
+                &[],
+                &PlaceholderValues::none(),
+                &src,
+                &NoViews,
+            )
+            .unwrap();
+            assert!(out.contains("replaceRegexpOne"), "{out}");
+            let lits = literal_values(&out);
+            assert!(lits.contains(&v.to_owned()), "{out}");
+            assert!(lits.contains(&"q".to_owned()), "{out}");
+        }
+    }
+
     #[test]
     fn a_query_touching_no_governed_table_passes_through_unchanged() {
         let src = FakeObligations { any: true };
         let out = enforce(
             "SELECT 1",
             &ClickHouseDialect {},
+            Engine::ClickHouse,
             &[],
             &PlaceholderValues::none(),
             &src,
@@ -2645,6 +5596,7 @@ mod enforce_tests {
             let err = enforce(
                 "SELECT * FROM system.query_log",
                 &ClickHouseDialect {},
+                Engine::ClickHouse,
                 &roles,
                 &PlaceholderValues::none(),
                 &src,
@@ -2664,6 +5616,7 @@ mod enforce_tests {
         let out = enforce(
             "SELECT * FROM silver.customers",
             &ClickHouseDialect {},
+            Engine::ClickHouse,
             &[],
             &PlaceholderValues::none(),
             &src,
@@ -2681,6 +5634,7 @@ mod enforce_tests {
         let out = enforce(
             "SELECT email FROM icecat_silver.`silver.customers`",
             &ClickHouseDialect {},
+            Engine::ClickHouse,
             &[],
             &PlaceholderValues::none(),
             &src,
@@ -2720,6 +5674,7 @@ mod enforce_tests {
         let err = enforce(
             "SELECT * FROM icecat_maintenance.`bronze.orders`",
             &ClickHouseDialect {},
+            Engine::ClickHouse,
             &[],
             &PlaceholderValues::none(),
             &NoColumns,
@@ -2740,6 +5695,7 @@ mod enforce_tests {
         let out = enforce(
             sql,
             &ClickHouseDialect {},
+            Engine::ClickHouse,
             &[],
             &PlaceholderValues::none(),
             &src,
@@ -2757,6 +5713,7 @@ mod enforce_tests {
             enforce(
                 "SELECT * FROM url('h', 'CSV')",
                 &ClickHouseDialect {},
+                Engine::ClickHouse,
                 &[],
                 &PlaceholderValues::none(),
                 &src,
@@ -2773,6 +5730,7 @@ mod enforce_tests {
             enforce(
                 "SELECT ??? garbage",
                 &ClickHouseDialect {},
+                Engine::ClickHouse,
                 &[],
                 &PlaceholderValues::none(),
                 &src,
@@ -2789,6 +5747,7 @@ mod enforce_tests {
         let err = enforce(
             "SELECT dictGet('db.d', 'email', toUInt64(1))",
             &ClickHouseDialect {},
+            Engine::ClickHouse,
             &[],
             &PlaceholderValues::none(),
             &src,
@@ -2805,6 +5764,7 @@ mod enforce_tests {
             enforce(
                 "SELECT dictGet('db.d', 'label', toUInt64(1))",
                 &ClickHouseDialect {},
+                Engine::ClickHouse,
                 &[],
                 &PlaceholderValues::none(),
                 &src,

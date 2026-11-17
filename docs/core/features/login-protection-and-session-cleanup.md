@@ -68,6 +68,7 @@ an operator can change.
 - The first administrator account can be locked like any other.
 - The protection applies to password sign-in only.
 - Active service tokens never expire on their own.
+- A session's network address is not recorded: the API sits behind the console's own server and has no trusted source for it, so the Sessions page says "Not recorded". The browser is recorded as the browser named itself.
 
 ## Acceptance checklist
 
@@ -83,11 +84,11 @@ for the two marked steps.
 | 4 | Repeat steps 2–3 with an email that is not registered | Exactly the same messages as for the real account | |
 | 5 | Wait out the lock period. Sign in with the correct password | Works | |
 | 6 | Enter a wrong password 3 times, then the correct one, then a wrong one 3 more times | No lock: the correct login reset the count | |
-| 7 | As Platform Admin, open the Audit Log | An entry for the lock in step 3. It contains no email and no password | |
+| 7 | As Platform Admin, open the Audit Log | An entry for the lock in step 3, with the actor "Sign-in form" and the kind Service, not the assistant. It contains no email and no password | |
 | 8 | If single sign-on is configured: sign in through it while the account is locked | Works | |
 | 9 | (operator) Check the database for sessions that expired more than the retention period ago | None remain after the cleanup has run | |
 | 10 | (operator) Check the API log after start-up | A cleanup line with counts, and no error | |
-| 11 | As Platform Admin, open Administration → Sessions | Live sessions are listed as before | |
+| 11 | As Platform Admin, open Administration → Sessions | Live sessions are listed, each with the time it expires and the browser it was created from ("Not recorded" for a session older than this change) | |
 
 **Accepted** when 1–7 and 11 pass, and 8–10 pass or have an agreed
 exception.
@@ -101,3 +102,8 @@ Exceptions, each with an owner and a date:
 - [ ] `PRODUCT.md` section 2 and 3 updated
 - [ ] `BACKLOG.md`: `SEC-2` and `SEC-5` moved to Done
 - [ ] `CHANGELOG.md` entry a customer can read
+
+## QA-1 decisions (product owner, 2026-11-02)
+
+- A signed-out session's cookie is refused **at once**, and a revoked service token is refused **at once**. The 30-day cleanup only removes the rows; it is not what makes them stop working.
+- When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.

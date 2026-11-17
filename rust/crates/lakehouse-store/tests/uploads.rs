@@ -34,9 +34,17 @@ use std::borrow::Cow;
 use lakehouse_store::StoreError;
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::uploads::{
-    LoadMode, NewUpload, TableClaim, Upload, attach_run, claim_table, delete, find_by_sha256, get,
-    get_by_run_id, insert, list, mark_finished, mark_ingesting, table_being_loaded, table_claim,
-    table_claimed, upload_in_tenants,
+    ClaimFolder, ClaimedTable, LimitOutcome, LoadClaim, LoadLimits, LoadMode, MarkOutcome,
+    NewReceiving, NewTableDrop, NewUpload, TableClaim, Upload, UploadPart, attach_run, claim_table,
+    delete, dropped_table, find_by_sha256, forget_table_drop_at, get, get_by_run_id,
+    heal_table_drop, insert, list, list_claims, list_dropped_tables, loading_into,
+    loads_under_limits, mark_finished, mark_group_within_limits, mark_ingesting,
+    mark_ingesting_within_limits, record_table_drop, table_being_loaded, table_claim,
+    table_claimed, table_claims, upload_in_tenants,
+};
+use lakehouse_store::uploads::{
+    LARGE_LOAD_BYTES, count_receiving, find_by_parts_digest, finish_receiving, insert_receiving,
+    list_parts, record_bad_values, record_part, stale_receiving,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -124,6 +132,20 @@ async fn rows_with_id(pool: &PgPool, id: &str) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+/// `(table, upload that asked, file name while the upload is there)` of each
+/// claim [`list_claims`] returns, for one assertion per list.
+fn names(rows: &[ClaimedTable]) -> Vec<(&str, &str, Option<&str>)> {
+    rows.iter()
+        .map(|c| {
+            (
+                c.bronze_table.as_str(),
+                c.upload_id.as_str(),
+                c.original_filename.as_deref(),
+            )
+        })
+        .collect()
 }
 
 /// Claim `table` for `tenant_id` the way the ingest route does before it marks
@@ -937,6 +959,56 @@ async fn two_tenants_claiming_one_new_name_at_the_same_moment_one_wins(
     Ok(())
 }
 
+/// `table_claims` is `table_claim` for a whole listing in one read: the same
+/// answer for every name (nobody's, the asking tenant's, someone else's, a
+/// tenant that is gone's), and a name nobody holds is simply not in the map.
+#[sqlx::test(migrations = "../../migrations")]
+async fn table_claims_answers_what_table_claim_answers_for_every_name_in_one_read(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-batch-a").await;
+    let tenant_b = tenant(&pool, "uploads-batch-b").await;
+    let gone = tenant(&pool, "uploads-batch-gone").await;
+    claim(&pool, tenant_a, "a_raw", "up-a").await;
+    claim(&pool, tenant_b, "b_raw", "up-b").await;
+    claim(&pool, gone, "gone_raw", "up-gone").await;
+    sqlx::query("DELETE FROM tenant WHERE id = $1")
+        .bind(gone)
+        .execute(&pool)
+        .await?;
+    // A listing of 250 tables the asking tenant holds, beside the three above.
+    let mut names: Vec<String> = ["a_raw", "b_raw", "gone_raw", "free_raw"]
+        .map(str::to_owned)
+        .to_vec();
+    for n in 0..250 {
+        let name = format!("many_{n}");
+        claim(&pool, tenant_a, &name, &format!("up-many-{n}")).await;
+        names.push(name);
+    }
+
+    for asking in [tenant_a, tenant_b] {
+        let batch = table_claims(&pool, asking, &names).await.unwrap();
+        for name in &names {
+            let one = table_claim(&pool, asking, name).await.unwrap();
+            assert_eq!(
+                batch.get(name).copied().unwrap_or(TableClaim::Unclaimed),
+                one,
+                "{name} as {asking}"
+            );
+        }
+        assert!(
+            !batch.contains_key("free_raw"),
+            "a name nobody holds is not in the map"
+        );
+        assert_eq!(batch.len(), names.len() - 1);
+    }
+    assert!(
+        table_claims(&pool, tenant_a, &[]).await.unwrap().is_empty(),
+        "no names, no claims"
+    );
+    Ok(())
+}
+
 /// `table_claim` is the read the route makes before it asks the database to
 /// decide: nobody's, the asking tenant's, or someone else's. Reading claims
 /// nothing.
@@ -1512,7 +1584,9 @@ async fn migration_0058_applies_on_a_database_that_has_0057_and_no_rows(
     assert!(before.contains(&"tenant".to_owned()));
     assert!(!before.contains(&"tenant_id".to_owned()));
 
-    MIGRATOR.run(&pool).await.unwrap();
+    // Up to 0058 only: later migrations (`0090`, DATA-17) add their own
+    // columns, and this test pins what 0058 alone adds and drops.
+    migrations_up_to(58).run(&pool).await.unwrap();
 
     // Exactly what `0058` adds to `file_upload` and exactly what it drops. T5a
     // added a column here that T6a took out again (review finding B4); asking
@@ -1690,6 +1764,229 @@ fn load_mode_parses_exactly_the_two_lowercase_names_and_defaults_to_replace() {
     }
 }
 
+// ── SEC-17: load limits ──────────────────────────────────────────────────
+
+/// Add an upload recorded as uploaded by `uploaded_by`.
+async fn add_by(pool: &PgPool, id: &str, tenant_id: Uuid, uploaded_by: &str) -> Upload {
+    add(pool, id, tenant_id, "").await;
+    sqlx::query("UPDATE file_upload SET uploaded_by = $2 WHERE id = $1")
+        .bind(id)
+        .bind(uploaded_by)
+        .execute(pool)
+        .await
+        .unwrap();
+    get(pool, id).await.unwrap().unwrap()
+}
+
+async fn start_limited(pool: &PgPool, id: &str, limits: LoadLimits) -> MarkOutcome {
+    mark_ingesting_within_limits(
+        pool,
+        id,
+        &options(),
+        "limited_raw",
+        LoadMode::Replace,
+        limits,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+/// Four loads of one `uploaded_by` refuse a fifth; another `uploaded_by`
+/// passes; the refused row is untouched.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_fifth_load_of_one_uploader_is_refused_and_another_uploader_passes(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-limit-user").await;
+    let limits = LoadLimits {
+        per_user: 4,
+        total: 16,
+        large: 2,
+    };
+    for n in 0..5 {
+        add_by(&pool, &format!("up-mine-{n}"), tenant_a, "Ada").await;
+    }
+    add_by(&pool, "up-theirs", tenant_a, "Bob").await;
+
+    for n in 0..4 {
+        let outcome = start_limited(&pool, &format!("up-mine-{n}"), limits).await;
+        assert!(matches!(outcome, MarkOutcome::Marked(_)), "load {n}");
+    }
+    assert_eq!(
+        loads_under_limits(&pool, "up-mine-4", &[], limits)
+            .await
+            .unwrap(),
+        LimitOutcome::LimitReached
+    );
+    let fifth = start_limited(&pool, "up-mine-4", limits).await;
+    assert!(matches!(fifth, MarkOutcome::LimitReached));
+    assert_eq!(
+        get(&pool, "up-mine-4").await.unwrap().unwrap().status,
+        "uploaded",
+        "a refused load changes nothing"
+    );
+
+    assert_eq!(
+        loads_under_limits(&pool, "up-theirs", &[], limits)
+            .await
+            .unwrap(),
+        LimitOutcome::Under
+    );
+    let other = start_limited(&pool, "up-theirs", limits).await;
+    assert!(matches!(other, MarkOutcome::Marked(_)));
+    Ok(())
+}
+
+/// Sixteen loads in total refuse the next, whoever asks.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_seventeenth_load_in_total_is_refused(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-limit-total").await;
+    let limits = LoadLimits {
+        per_user: 4,
+        total: 16,
+        large: 2,
+    };
+    for n in 0..17 {
+        add_by(
+            &pool,
+            &format!("up-{n}"),
+            tenant_a,
+            &format!("User {}", n / 4),
+        )
+        .await;
+    }
+    for n in 0..16 {
+        let outcome = start_limited(&pool, &format!("up-{n}"), limits).await;
+        assert!(matches!(outcome, MarkOutcome::Marked(_)), "load {n}");
+    }
+    let last = start_limited(&pool, "up-16", limits).await;
+    assert!(matches!(last, MarkOutcome::LimitReached));
+    Ok(())
+}
+
+/// A load that has ended gives its place back.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_load_that_ended_no_longer_counts(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-limit-ended").await;
+    let limits = LoadLimits {
+        per_user: 1,
+        total: 16,
+        large: 2,
+    };
+    add_by(&pool, "up-1", tenant_a, "Ada").await;
+    add_by(&pool, "up-2", tenant_a, "Ada").await;
+    assert!(matches!(
+        start_limited(&pool, "up-1", limits).await,
+        MarkOutcome::Marked(_)
+    ));
+    assert!(matches!(
+        start_limited(&pool, "up-2", limits).await,
+        MarkOutcome::LimitReached
+    ));
+    mark_finished(&pool, "up-1", None, None, Some(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        start_limited(&pool, "up-2", limits).await,
+        MarkOutcome::Marked(_)
+    ));
+    Ok(())
+}
+
+/// A row that is already loading is `NotMarked`, as `mark_ingesting` answers
+/// `None`, and an unknown id the same.
+#[sqlx::test(migrations = "../../migrations")]
+async fn marking_a_loading_or_unknown_upload_changes_no_row(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-limit-notmarked").await;
+    let limits = LoadLimits {
+        per_user: 4,
+        total: 16,
+        large: 2,
+    };
+    add_by(&pool, "up-1", tenant_a, "Ada").await;
+    assert!(matches!(
+        start_limited(&pool, "up-1", limits).await,
+        MarkOutcome::Marked(_)
+    ));
+    assert!(matches!(
+        start_limited(&pool, "up-1", limits).await,
+        MarkOutcome::NotMarked
+    ));
+    assert!(matches!(
+        start_limited(&pool, "up-missing", limits).await,
+        MarkOutcome::NotMarked
+    ));
+    Ok(())
+}
+
+/// `SEC-17 review fix (SHOULD-FIX 1)`: a load that has been `ingesting` for
+/// more than 6 hours does not count, so dead loads in a neglected tenant
+/// cannot refuse everyone; fresh ones still do.
+#[sqlx::test(migrations = "../../migrations")]
+async fn loads_older_than_six_hours_do_not_count_against_the_limits(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-limit-stale").await;
+    let limits = LoadLimits {
+        per_user: 4,
+        total: 16,
+        large: 2,
+    };
+    for n in 0..16 {
+        let id = format!("up-old-{n}");
+        add_by(&pool, &id, tenant_a, &format!("User {}", n / 4)).await;
+        assert!(matches!(
+            start_limited(&pool, &id, limits).await,
+            MarkOutcome::Marked(_)
+        ));
+    }
+    add_by(&pool, "up-next", tenant_a, "Newcomer").await;
+    assert_eq!(
+        loads_under_limits(&pool, "up-next", &[], limits)
+            .await
+            .unwrap(),
+        LimitOutcome::LimitReached
+    );
+
+    // `updated_at` has no trigger (0057): a direct UPDATE sticks.
+    sqlx::query(
+        "UPDATE file_upload SET updated_at = now() - interval '7 hours' WHERE id LIKE 'up-old-%'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        loads_under_limits(&pool, "up-next", &[], limits)
+            .await
+            .unwrap(),
+        LimitOutcome::Under
+    );
+    assert!(matches!(
+        start_limited(&pool, "up-next", limits).await,
+        MarkOutcome::Marked(_)
+    ));
+
+    // Fresh again: five hours old still counts.
+    sqlx::query(
+        "UPDATE file_upload SET updated_at = now() - interval '5 hours' WHERE id LIKE 'up-old-%'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    add_by(&pool, "up-last", tenant_a, "Another").await;
+    assert_eq!(
+        loads_under_limits(&pool, "up-last", &[], limits)
+            .await
+            .unwrap(),
+        LimitOutcome::LimitReached
+    );
+    Ok(())
+}
+
+// ── SRC-7 F6: lookup an upload by its run id ─────────────────────────────
+
 /// `SRC-7` F6: the orchestrator reports a run, not an upload; the run id
 /// finds the upload that claimed it, and an unknown run finds none.
 #[sqlx::test(migrations = "../../migrations")]
@@ -1703,5 +2000,1538 @@ async fn get_by_run_id_finds_the_upload_of_a_run_or_none(pool: PgPool) -> sqlx::
     let found = get_by_run_id(&pool, "run-2").await.unwrap().unwrap();
     assert_eq!(found.id, "up-2");
     assert!(get_by_run_id(&pool, "run-none").await.unwrap().is_none());
+    Ok(())
+}
+
+/// DATA-19 / D5: `list_claims` is what the lineage graph reads, so it
+/// answers three questions at once — whose claims are visible, what the
+/// file name still is, and what a claim whose upload was deleted says.
+///
+/// The tenant rule is `ConnectorFilter`'s, the one every tenant-scoped
+/// read in this crate follows: `Some(t)` shows only `t`'s rows, so
+/// another tenant's claim is invisible and a claim whose tenant was
+/// deleted (`ON DELETE SET NULL`) belongs to nobody and is invisible to
+/// EVERY tenant-scoped caller (fail closed, never "showed to everybody");
+/// the unscoped `None` read shows every claim, both of those included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_claims_shows_only_the_caller_s_tenant_and_names_the_upload_when_it_is_there(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-claims-a").await;
+    let tenant_b = tenant(&pool, "uploads-claims-b").await;
+    add(&pool, "up-a", tenant_a, "").await;
+    add(&pool, "up-b", tenant_b, "").await;
+    add(&pool, "up-orphan", tenant_a, "").await;
+    claim(&pool, tenant_a, "a_raw", "up-a").await;
+    claim(&pool, tenant_b, "b_raw", "up-b").await;
+    claim(&pool, tenant_a, "orphan_raw", "up-orphan").await;
+    // A claim whose tenant is gone belongs to nobody.
+    sqlx::query("UPDATE upload_table_claim SET tenant_id = NULL WHERE bronze_table = 'b_raw'")
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        names(&list_claims(&pool, Some(tenant_a)).await.unwrap()),
+        vec![
+            ("a_raw", "up-a", Some("stock.csv")),
+            ("orphan_raw", "up-orphan", Some("stock.csv")),
+        ],
+        "a tenant-scoped read shows this tenant's claims and never another's"
+    );
+    assert!(
+        list_claims(&pool, Some(tenant_b)).await.unwrap().is_empty(),
+        "a claim whose tenant was deleted is nobody's claim"
+    );
+
+    // The unscoped read shows every claim, including both that a
+    // tenant-scoped caller cannot see.
+    assert_eq!(
+        names(&list_claims(&pool, None).await.unwrap()),
+        vec![
+            ("a_raw", "up-a", Some("stock.csv")),
+            ("b_raw", "up-b", Some("stock.csv")),
+            ("orphan_raw", "up-orphan", Some("stock.csv")),
+        ]
+    );
+
+    // A claim outlives the upload that made it: deleting the upload's row
+    // leaves the claim, and the name goes with it rather than a guess.
+    delete(&pool, "up-a").await.unwrap();
+    let after = list_claims(&pool, Some(tenant_a)).await.unwrap();
+    assert_eq!(
+        names(&after),
+        vec![
+            ("a_raw", "up-a", None),
+            ("orphan_raw", "up-orphan", Some("stock.csv")),
+        ],
+        "a deleted upload leaves its claim, with no file name to show"
+    );
+    Ok(())
+}
+
+// ── chunked uploads (DATA-17 T1.1, `0090_upload_parts.sql`) ─────────────
+
+/// Open a session of `tenant_id` the way the sessions route does.
+async fn open_session(pool: &PgPool, id: &str, tenant_id: Uuid) -> Upload {
+    let key = format!("uploads/{tenant_id}/{id}.csv");
+    insert_receiving(
+        pool,
+        &NewReceiving {
+            id,
+            original_filename: "big.csv",
+            storage_key: &key,
+            content_type: "text/csv",
+            declared_size: 20_000_000,
+            multipart_id: "mp-secret-id",
+            uploaded_by: "Test User",
+            tenant_id,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+fn part(number: i32, size: i64, etag: &str) -> UploadPart {
+    UploadPart {
+        part_number: number,
+        size_bytes: size,
+        etag: etag.to_owned(),
+        sha256: format!("sha-{number}-{etag}"),
+    }
+}
+
+/// A session is a `receiving` row with its declared size and multipart id;
+/// the multipart id and digest never reach the wire.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_session_is_a_receiving_row_whose_multipart_id_never_reaches_the_wire(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-session").await;
+    let row = open_session(&pool, "up-s1", tenant_a).await;
+    assert_eq!(row.status, "receiving");
+    assert_eq!(row.declared_size, Some(20_000_000));
+    assert_eq!(row.multipart_id.as_deref(), Some("mp-secret-id"));
+    assert_eq!(row.size_bytes, 0, "no byte is stored yet");
+
+    let wire = serde_json::to_value(&row).unwrap();
+    assert_eq!(wire["status"], "receiving");
+    assert_eq!(wire["declaredSize"], 20_000_000);
+    assert!(wire.get("multipartId").is_none(), "{wire}");
+    assert!(wire.get("multipart_id").is_none(), "{wire}");
+    assert!(wire.get("partsDigest").is_none(), "{wire}");
+    assert!(!wire.to_string().contains("mp-secret-id"));
+
+    // A file that arrived in one request has no declared size on the wire.
+    let plain = add(&pool, "up-plain", tenant_a, "").await;
+    assert_eq!(plain.declared_size, None);
+    assert!(
+        serde_json::to_value(&plain)
+            .unwrap()
+            .get("declaredSize")
+            .is_none()
+    );
+    // The tenant rule is the same as for any upload.
+    assert!(
+        upload_in_tenants(&pool, "up-s1", &[tenant_a])
+            .await
+            .unwrap()
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_database_refuses_a_session_declaring_no_bytes(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-session-zero").await;
+    let err = insert_receiving(
+        &pool,
+        &NewReceiving {
+            id: "up-zero",
+            original_filename: "empty.csv",
+            storage_key: "uploads/x/up-zero.csv",
+            content_type: "text/csv",
+            declared_size: 0,
+            multipart_id: "mp",
+            uploaded_by: "Test User",
+            tenant_id: tenant_a,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Database(_)), "{err:?}");
+    // And a repeated id is the usual conflict.
+    open_session(&pool, "up-dup", tenant_a).await;
+    let err = insert_receiving(
+        &pool,
+        &NewReceiving {
+            id: "up-dup",
+            original_filename: "big.csv",
+            storage_key: "uploads/x/other.csv",
+            content_type: "text/csv",
+            declared_size: 5,
+            multipart_id: "mp",
+            uploaded_by: "Test User",
+            tenant_id: tenant_a,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict), "{err:?}");
+    Ok(())
+}
+
+/// Pieces may arrive in any order; the list is by part number; a piece sent
+/// again replaces the earlier record instead of adding a second.
+#[sqlx::test(migrations = "../../migrations")]
+async fn pieces_are_listed_by_number_and_a_piece_sent_again_replaces_the_earlier_one(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-parts").await;
+    open_session(&pool, "up-p1", tenant_a).await;
+    assert_eq!(
+        list_parts(&pool, "up-p1").await.unwrap(),
+        Vec::<UploadPart>::new()
+    );
+
+    for p in [
+        part(3, 100, "c"),
+        part(1, 8_388_608, "a"),
+        part(2, 8_388_608, "b"),
+    ] {
+        assert!(record_part(&pool, "up-p1", &p).await.unwrap());
+    }
+    let listed = list_parts(&pool, "up-p1").await.unwrap();
+    assert_eq!(
+        listed.iter().map(|p| p.part_number).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+
+    // Part 2 again, with other bytes: one row, the last copy.
+    assert!(
+        record_part(&pool, "up-p1", &part(2, 8_388_608, "b2"))
+            .await
+            .unwrap()
+    );
+    let listed = list_parts(&pool, "up-p1").await.unwrap();
+    assert_eq!(listed.len(), 3);
+    assert_eq!(listed[1], part(2, 8_388_608, "b2"));
+    Ok(())
+}
+
+/// Only a `receiving` upload takes a piece, and the rows are bounded by the
+/// table's own checks.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_a_receiving_upload_takes_a_piece_and_the_table_bounds_the_numbers(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-parts-state").await;
+    add(&pool, "up-whole", tenant_a, "").await;
+    assert!(
+        !record_part(&pool, "up-whole", &part(1, 10, "a"))
+            .await
+            .unwrap(),
+        "an uploaded file takes no piece"
+    );
+    assert!(
+        !record_part(&pool, "up-missing", &part(1, 10, "a"))
+            .await
+            .unwrap()
+    );
+
+    open_session(&pool, "up-p2", tenant_a).await;
+    for bad in [part(0, 10, "a"), part(10_001, 10, "a"), part(1, 0, "a")] {
+        let err = record_part(&pool, "up-p2", &bad).await.unwrap_err();
+        assert!(matches!(err, StoreError::Database(_)), "{bad:?}: {err:?}");
+    }
+    assert!(
+        record_part(&pool, "up-p2", &part(10_000, 10, "z"))
+            .await
+            .unwrap()
+    );
+    Ok(())
+}
+
+/// Completing moves the row to `uploaded`, records what the store assembled,
+/// clears the multipart id and drops the piece records; it happens once.
+#[sqlx::test(migrations = "../../migrations")]
+async fn finishing_a_session_makes_an_uploaded_file_and_forgets_its_pieces(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-finish").await;
+    open_session(&pool, "up-f1", tenant_a).await;
+    record_part(&pool, "up-f1", &part(1, 10, "a"))
+        .await
+        .unwrap();
+
+    let digest = [7u8; 32];
+    let done = finish_receiving(&pool, "up-f1", 10, &digest)
+        .await
+        .unwrap()
+        .expect("a receiving upload finishes");
+    assert_eq!(done.status, "uploaded");
+    assert_eq!(done.size_bytes, 10);
+    assert_eq!(done.multipart_id, None);
+    assert_eq!(
+        done.sha256, "",
+        "no hash of the whole bytes exists, and none is made up"
+    );
+    assert_eq!(done.parts_digest.as_deref(), Some(&digest[..]));
+    assert_eq!(
+        list_parts(&pool, "up-f1").await.unwrap(),
+        Vec::<UploadPart>::new()
+    );
+    // A late piece is refused: the file is assembled.
+    assert!(
+        !record_part(&pool, "up-f1", &part(1, 10, "a"))
+            .await
+            .unwrap()
+    );
+    // And it finishes only once.
+    assert!(
+        finish_receiving(&pool, "up-f1", 10, &digest)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    Ok(())
+}
+
+/// Deleting a session removes its piece records with it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn deleting_a_session_removes_its_pieces(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-session-delete").await;
+    open_session(&pool, "up-d1", tenant_a).await;
+    record_part(&pool, "up-d1", &part(1, 10, "a"))
+        .await
+        .unwrap();
+    assert!(delete(&pool, "up-d1").await.unwrap());
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM file_upload_part")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(left, 0);
+    Ok(())
+}
+
+/// The sweep's query: only `receiving` rows, only past the age, oldest first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn stale_receiving_finds_only_old_unfinished_sessions_oldest_first(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-stale").await;
+    open_session(&pool, "up-new", tenant_a).await;
+    open_session(&pool, "up-old", tenant_a).await;
+    open_session(&pool, "up-older", tenant_a).await;
+    set_created_at(&pool, "up-old", 25).await;
+    set_created_at(&pool, "up-older", 48).await;
+    // An old file that is not a session is never swept.
+    add(&pool, "up-whole-old", tenant_a, "").await;
+    set_created_at(&pool, "up-whole-old", 100).await;
+
+    let stale = stale_receiving(&pool, 24, 100).await.unwrap();
+    assert_eq!(
+        stale.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+        ["up-older", "up-old"]
+    );
+    assert_eq!(stale[0].multipart_id.as_deref(), Some("mp-secret-id"));
+    assert_eq!(stale_receiving(&pool, 24, 1).await.unwrap().len(), 1);
+    assert!(stale_receiving(&pool, 72, 100).await.unwrap().is_empty());
+    Ok(())
+}
+
+/// The duplicate check for files never held whole: same tenant, same
+/// digest, never the asker.
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_by_parts_digest_sees_only_its_own_tenant_and_never_the_excluded_upload(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-digest-a").await;
+    let tenant_b = tenant(&pool, "uploads-digest-b").await;
+    let digest = [9u8; 32];
+    for (id, owner) in [
+        ("up-g1", tenant_a),
+        ("up-g2", tenant_a),
+        ("up-g3", tenant_b),
+    ] {
+        open_session(&pool, id, owner).await;
+        finish_receiving(&pool, id, 10, &digest)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let found = find_by_parts_digest(&pool, tenant_a, &digest, "up-g2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, "up-g1");
+    assert!(
+        find_by_parts_digest(&pool, tenant_a, &digest, "up-g1")
+            .await
+            .unwrap()
+            .is_some_and(|u| u.id == "up-g2")
+    );
+    assert!(
+        find_by_parts_digest(&pool, tenant_a, &[1u8; 32], "none")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    Ok(())
+}
+
+/// `0090` applies on a database that already holds an upload, leaves it as
+/// it was, and the new columns are NULL for it.
+#[sqlx::test(migrations = false)]
+async fn migration_0090_leaves_an_earlier_upload_as_it_was(pool: PgPool) -> sqlx::Result<()> {
+    migrations_up_to(84).run(&pool).await.unwrap();
+    let tenant_a = tenant(&pool, "uploads-0090").await;
+    // Raw SQL: `insert` returns the new columns, which do not exist yet.
+    sqlx::query(
+        "INSERT INTO file_upload (id, original_filename, storage_key, sha256, tenant_id) \
+         VALUES ('up-before', 'old.csv', 'uploads/before/up-before.csv', 'abc', $1)",
+    )
+    .bind(tenant_a)
+    .execute(&pool)
+    .await?;
+
+    MIGRATOR.run(&pool).await.unwrap();
+
+    let row = get(&pool, "up-before").await.unwrap().unwrap();
+    assert_eq!(row.status, "uploaded");
+    assert_eq!(row.sha256, "abc");
+    assert_eq!(row.declared_size, None);
+    assert_eq!(row.multipart_id, None);
+    assert_eq!(row.parts_digest, None);
+    assert_eq!(
+        table_columns(&pool, "file_upload_part").await,
+        [
+            "upload_id",
+            "part_number",
+            "size_bytes",
+            "etag",
+            "sha256",
+            "received_at"
+        ]
+    );
+    Ok(())
+}
+
+/// Phase 3 slice 1 review SHOULD-FIX 1: the count the session cap reads is of
+/// `receiving` rows of one uploader, and nothing else.
+#[sqlx::test(migrations = "../../migrations")]
+async fn count_receiving_counts_only_open_sessions_of_one_uploader(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-count").await;
+    assert_eq!(count_receiving(&pool, "Test User").await.unwrap(), 0);
+    open_session(&pool, "up-c1", tenant_a).await;
+    open_session(&pool, "up-c2", tenant_a).await;
+    add(&pool, "up-c3", tenant_a, "").await; // uploaded by "Test User", but not receiving
+    assert_eq!(count_receiving(&pool, "Test User").await.unwrap(), 2);
+    assert_eq!(count_receiving(&pool, "Someone Else").await.unwrap(), 0);
+    finish_receiving(&pool, "up-c1", 10, &[1u8; 32])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count_receiving(&pool, "Test User").await.unwrap(), 1);
+    Ok(())
+}
+
+/// DATA-18: the column list is written by the claim, shown on the wire as
+/// `columns`, kept with the report, and cleared by the next claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_column_list_belongs_to_the_load_that_was_told_it_and_the_next_claim_clears_it(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-columns").await;
+    add(&pool, "up-col", tenant_a, "").await;
+    let spec = json!([{ "source": "Qty", "name": "qty", "type": "integer" }]);
+    let limits = LoadLimits {
+        per_user: 5,
+        total: 5,
+        large: 2,
+    };
+
+    let MarkOutcome::Marked(loading) = mark_ingesting_within_limits(
+        &pool,
+        "up-col",
+        &options(),
+        "stock_raw",
+        LoadMode::Replace,
+        limits,
+        Some(&spec),
+        Some("null"),
+    )
+    .await
+    .unwrap() else {
+        panic!("the upload is loadable");
+    };
+    assert_eq!(loading.column_spec.as_ref().map(|j| &j.0), Some(&spec));
+    assert_eq!(loading.on_bad_value.as_deref(), Some("null"));
+    let wire = serde_json::to_value(&*loading).unwrap();
+    assert_eq!(wire["columns"], spec);
+    assert_eq!(wire["onBadValue"], "null");
+    assert!(wire.get("badValues").is_none());
+    attach_run(&pool, "up-col", "run-1").await.unwrap().unwrap();
+
+    let report = json!({ "count": 1, "byColumn": [{ "column": "qty", "count": 1 }], "rows": [] });
+    assert!(
+        record_bad_values(&pool, "up-col", "run-1", &report)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !record_bad_values(&pool, "up-col", "run-other", &report)
+            .await
+            .unwrap()
+    );
+    mark_finished(&pool, "up-col", Some("run-1"), None, Some(3))
+        .await
+        .unwrap()
+        .unwrap();
+    let done = get(&pool, "up-col").await.unwrap().unwrap();
+    assert_eq!(done.bad_values.as_ref().map(|j| &j.0), Some(&report));
+    assert_eq!(serde_json::to_value(&done).unwrap()["badValues"], report);
+    assert_eq!(
+        done.column_spec.as_ref().map(|j| &j.0),
+        Some(&spec),
+        "kept for Try again"
+    );
+
+    // The next claim starts from a clean slate, with or without a list.
+    start(
+        &pool,
+        "up-col",
+        "stock_raw",
+        LoadMode::Replace,
+        Some("run-2"),
+    )
+    .await;
+    let again = get(&pool, "up-col").await.unwrap().unwrap();
+    assert!(
+        again.column_spec.is_none() && again.on_bad_value.is_none() && again.bad_values.is_none()
+    );
+
+    // The database refuses any other word.
+    mark_finished(&pool, "up-col", Some("run-2"), None, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let refused = mark_ingesting_within_limits(
+        &pool,
+        "up-col",
+        &options(),
+        "stock_raw",
+        LoadMode::Replace,
+        limits,
+        Some(&spec),
+        Some("ignore"),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(StoreError::Database(_))),
+        "{refused:?}"
+    );
+    Ok(())
+}
+
+// ── several files, one load (DATA-17 slice 5, `0092_upload_loaded_with.sql`) ──
+
+/// Claim `id` with `also` as one load into `table`, under generous limits.
+async fn start_group(pool: &PgPool, id: &str, also: &[&str], table: &str) -> MarkOutcome {
+    start_group_within(
+        pool,
+        id,
+        also,
+        table,
+        LoadLimits {
+            per_user: 5,
+            total: 5,
+            large: 2,
+        },
+    )
+    .await
+}
+
+async fn start_group_within(
+    pool: &PgPool,
+    id: &str,
+    also: &[&str],
+    table: &str,
+    limits: LoadLimits,
+) -> MarkOutcome {
+    let also: Vec<String> = also.iter().map(|id| (*id).to_owned()).collect();
+    mark_group_within_limits(
+        pool,
+        id,
+        &also,
+        &LoadClaim {
+            parse_options: &options(),
+            bronze_table: table,
+            load_mode: LoadMode::Append,
+            column_spec: None,
+            on_bad_value: None,
+            folder: ClaimFolder::Keep,
+        },
+        limits,
+    )
+    .await
+    .unwrap()
+}
+
+/// `(status, loaded_with, run_id, error, row_count)` of each of `ids`, in order.
+async fn states(
+    pool: &PgPool,
+    ids: &[&str],
+) -> Vec<(
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+)> {
+    let mut rows = Vec::new();
+    for id in ids {
+        rows.push(
+            sqlx::query_as(
+                "SELECT status, loaded_with, run_id, error, row_count FROM file_upload WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        );
+    }
+    rows
+}
+
+/// The claim takes every file in one transaction: each is loading with the same table,
+/// mode and reading, the others point at the primary, and the primary alone has no pointer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_claim_marks_every_file_as_loading_and_points_the_others_at_the_primary(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-group-claim").await;
+    for id in ["up-1", "up-2", "up-3"] {
+        add(&pool, id, tenant_a, "").await;
+    }
+
+    let MarkOutcome::Marked(primary) =
+        start_group(&pool, "up-1", &["up-2", "up-3"], "stock_raw").await
+    else {
+        panic!("the group is loadable");
+    };
+    assert_eq!(primary.id, "up-1");
+    assert!(primary.loaded_with.is_none());
+    let rows = states(&pool, &["up-1", "up-2", "up-3"]).await;
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.0.as_str(), r.1.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("ingesting", None),
+            ("ingesting", Some("up-1")),
+            ("ingesting", Some("up-1"))
+        ]
+    );
+    let second = get(&pool, "up-2").await.unwrap().unwrap();
+    assert_eq!(second.bronze_table.as_deref(), Some("stock_raw"));
+    assert_eq!(second.load_mode.as_deref(), Some("append"));
+    assert_eq!(
+        second.parse_options.as_ref().map(|j| &j.0),
+        Some(&options())
+    );
+    assert_eq!(serde_json::to_value(&second).unwrap()["loadedWith"], "up-1");
+    assert!(
+        serde_json::to_value(&*primary)
+            .unwrap()
+            .get("loadedWith")
+            .is_none(),
+        "the primary has no pointer on the wire"
+    );
+    Ok(())
+}
+
+/// A load is one place against the limits however many files it holds: three files are
+/// one load, so a limit of one load per person is reached by a second load and not by the
+/// files of the first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_counts_as_one_load_against_the_limits(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-group-limit").await;
+    for id in ["up-1", "up-2", "up-3", "up-4"] {
+        add(&pool, id, tenant_a, "").await;
+    }
+    let one = LoadLimits {
+        per_user: 2,
+        total: 2,
+        large: 2,
+    };
+    assert!(matches!(
+        start_group_within(&pool, "up-1", &["up-2", "up-3"], "stock_raw", one).await,
+        MarkOutcome::Marked(_)
+    ));
+    assert_eq!(
+        loads_under_limits(&pool, "up-4", &[], one).await.unwrap(),
+        LimitOutcome::Under,
+        "three files are one load, not three"
+    );
+    assert!(matches!(
+        start_group_within(&pool, "up-4", &[], "other_raw", one).await,
+        MarkOutcome::Marked(_)
+    ));
+    let (all,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM file_upload WHERE status = 'ingesting' AND loaded_with IS NULL",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(all, 2);
+    assert_eq!(
+        loads_under_limits(&pool, "up-4", &[], one).await.unwrap(),
+        LimitOutcome::LimitReached,
+        "two loads are the limit"
+    );
+    Ok(())
+}
+
+/// A file that cannot be taken stops the whole claim and leaves every row as it was: one
+/// that is loading, one still being received, one that is gone, one of another tenant.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_claim_with_a_file_that_cannot_be_taken_changes_nothing(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-group-refused-a").await;
+    let tenant_b = tenant(&pool, "uploads-group-refused-b").await;
+    for id in ["up-1", "up-2", "up-busy"] {
+        add(&pool, id, tenant_a, "").await;
+    }
+    add(&pool, "up-other", tenant_b, "").await;
+    start(
+        &pool,
+        "up-busy",
+        "busy_raw",
+        LoadMode::Replace,
+        Some("run-0"),
+    )
+    .await;
+    insert_receiving(
+        &pool,
+        &NewReceiving {
+            id: "up-sess",
+            original_filename: "big.csv",
+            storage_key: "uploads/x/up-sess.csv",
+            content_type: "text/csv",
+            declared_size: 10,
+            multipart_id: "mp",
+            uploaded_by: "Test User",
+            tenant_id: tenant_a,
+        },
+    )
+    .await
+    .unwrap();
+
+    for other in ["up-busy", "up-sess", "up-gone", "up-other"] {
+        let outcome = start_group(&pool, "up-1", &["up-2", other], "stock_raw").await;
+        assert!(
+            matches!(outcome, MarkOutcome::GroupNotMarked),
+            "{other}: {outcome:?}"
+        );
+        let rows = states(&pool, &["up-1", "up-2"]).await;
+        assert!(
+            rows.iter().all(|r| r.0 == "uploaded" && r.1.is_none()),
+            "{other}: nothing was claimed: {rows:?}"
+        );
+    }
+    // The primary that is already loading is the old answer.
+    assert!(matches!(
+        start_group(&pool, "up-busy", &["up-2"], "stock_raw").await,
+        MarkOutcome::NotMarked
+    ));
+    assert_eq!(states(&pool, &["up-2"]).await[0].0, "uploaded");
+    Ok(())
+}
+
+/// Settling the primary settles the files that loaded with it, in the one transaction and
+/// with its reason; their own count is not measured and stays NULL, never 0.
+#[sqlx::test(migrations = "../../migrations")]
+async fn settling_the_primary_settles_the_files_that_loaded_with_it(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-group-settle").await;
+    for id in ["up-1", "up-2", "up-3", "up-4", "up-5"] {
+        add(&pool, id, tenant_a, "").await;
+    }
+    start_group(&pool, "up-1", &["up-2", "up-3"], "stock_raw").await;
+    attach_run(&pool, "up-1", "run-1").await.unwrap().unwrap();
+    // A group that is not this one is not touched.
+    start_group(&pool, "up-4", &["up-5"], "other_raw").await;
+    attach_run(&pool, "up-4", "run-4").await.unwrap().unwrap();
+
+    // A run the primary does not hold settles nothing.
+    assert!(
+        mark_finished(&pool, "up-1", Some("run-other"), None, Some(9))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(states(&pool, &["up-2"]).await[0].0, "ingesting");
+
+    let done = mark_finished(&pool, "up-1", Some("run-1"), None, Some(30))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((done.status.as_str(), done.rows), ("ingested", Some(30)));
+    let rows = states(&pool, &["up-2", "up-3", "up-5"]).await;
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "ingested".to_owned(),
+                Some("up-1".to_owned()),
+                None,
+                None,
+                None
+            ),
+            (
+                "ingested".to_owned(),
+                Some("up-1".to_owned()),
+                None,
+                None,
+                None
+            ),
+            (
+                "ingesting".to_owned(),
+                Some("up-4".to_owned()),
+                None,
+                None,
+                None
+            ),
+        ]
+    );
+
+    // A failure carries its reason to every file, and no count.
+    mark_finished(&pool, "up-4", Some("run-4"), Some("The load failed."), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        states(&pool, &["up-5"]).await[0],
+        (
+            "failed".to_owned(),
+            Some("up-4".to_owned()),
+            None,
+            Some("The load failed.".to_owned()),
+            None
+        )
+    );
+    Ok(())
+}
+
+/// A claim of a file, or of its primary, lets go of the files it led before; deleting a
+/// primary that finished leaves the others loose; a file that was a member can load alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_later_claim_lets_go_of_the_earlier_group_and_a_deleted_primary_leaves_no_pointer(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-group-release").await;
+    for id in ["up-1", "up-2", "up-3"] {
+        add(&pool, id, tenant_a, "").await;
+    }
+    start_group(&pool, "up-1", &["up-2", "up-3"], "stock_raw").await;
+    attach_run(&pool, "up-1", "run-1").await.unwrap().unwrap();
+    mark_finished(&pool, "up-1", Some("run-1"), None, Some(3))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The primary loads alone: the files it led are no longer its own.
+    start_group(&pool, "up-1", &[], "stock_raw").await;
+    let rows = states(&pool, &["up-1", "up-2", "up-3"]).await;
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.0.as_str(), r.1.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![("ingesting", None), ("ingested", None), ("ingested", None)]
+    );
+    attach_run(&pool, "up-1", "run-2").await.unwrap().unwrap();
+    mark_finished(&pool, "up-1", Some("run-2"), None, Some(1))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // A new group, then the primary goes: the others stay and lose the pointer.
+    start_group(&pool, "up-2", &["up-3"], "stock_raw").await;
+    attach_run(&pool, "up-2", "run-3").await.unwrap().unwrap();
+    mark_finished(&pool, "up-2", Some("run-3"), None, Some(2))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(states(&pool, &["up-3"]).await[0].1.as_deref(), Some("up-2"));
+    assert!(delete(&pool, "up-2").await.unwrap());
+    let kept = states(&pool, &["up-3"]).await;
+    assert_eq!(
+        (kept[0].0.as_str(), kept[0].1.as_deref()),
+        ("ingested", None)
+    );
+
+    // A member loads alone: the single-file claim clears the pointer too.
+    start_group(&pool, "up-1", &["up-3"], "stock_raw").await;
+    attach_run(&pool, "up-1", "run-4").await.unwrap().unwrap();
+    mark_finished(&pool, "up-1", Some("run-4"), None, Some(2))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(states(&pool, &["up-3"]).await[0].1.as_deref(), Some("up-1"));
+    start(&pool, "up-3", "stock_raw", LoadMode::Replace, Some("run-5")).await;
+    assert!(states(&pool, &["up-3"]).await[0].1.is_none());
+    Ok(())
+}
+
+/// Lineage says "<file> and N more" from this count: the files that loaded with the claim's
+/// upload, of the claim's own tenant, and only while they still point at it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_claims_counts_the_files_that_loaded_with_the_claiming_upload(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-group-lineage-a").await;
+    let tenant_b = tenant(&pool, "uploads-group-lineage-b").await;
+    for id in ["up-1", "up-2", "up-3", "up-solo"] {
+        add(&pool, id, tenant_a, "").await;
+    }
+    add(&pool, "up-b", tenant_b, "").await;
+    claim(&pool, tenant_a, "stock_raw", "up-1").await;
+    claim(&pool, tenant_a, "solo_raw", "up-solo").await;
+    start_group(&pool, "up-1", &["up-2", "up-3"], "stock_raw").await;
+    // A row of another tenant that says it loaded with up-1 is not counted, whatever it says.
+    sqlx::query("UPDATE file_upload SET loaded_with = 'up-1' WHERE id = 'up-b'")
+        .execute(&pool)
+        .await?;
+
+    let counts = |rows: Vec<ClaimedTable>| -> Vec<(String, i64)> {
+        rows.into_iter()
+            .map(|c| (c.bronze_table, c.also_loaded))
+            .collect()
+    };
+    assert_eq!(
+        counts(list_claims(&pool, Some(tenant_a)).await.unwrap()),
+        vec![("solo_raw".to_owned(), 0), ("stock_raw".to_owned(), 2)]
+    );
+    Ok(())
+}
+
+// ── DATA-37: the limit on large loads ─────────────────────────────────────
+
+/// An upload of `size_bytes`, recorded as uploaded by `uploaded_by`.
+async fn add_sized(
+    pool: &PgPool,
+    id: &str,
+    tenant_id: Uuid,
+    uploaded_by: &str,
+    size_bytes: i64,
+) -> Upload {
+    let key = format!("uploads/{tenant_id}/{id}.csv");
+    insert(
+        pool,
+        &NewUpload {
+            id,
+            original_filename: "stock.csv",
+            storage_key: &key,
+            content_type: "text/csv",
+            size_bytes,
+            sha256: "",
+            uploaded_by,
+            tenant_id,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// The size of a file that is one byte over the threshold of a large load
+/// (`DATA-37` decision D1): the threshold itself is not a large load.
+fn over_the_threshold() -> i64 {
+    LARGE_LOAD_BYTES + 1
+}
+
+/// `DATA-37` decisions D2 and D3: two large loads run at once and the third
+/// is refused with the large limit's own answer, and the refused load
+/// changes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_third_large_load_is_refused_with_the_large_limit_and_changes_nothing(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-large-third").await;
+    let limits = LoadLimits {
+        per_user: 4,
+        total: 16,
+        large: 2,
+    };
+    for id in ["up-big-1", "up-big-2", "up-big-3"] {
+        add_sized(&pool, id, tenant_a, "Ada", over_the_threshold()).await;
+    }
+    for id in ["up-big-1", "up-big-2"] {
+        assert!(
+            matches!(
+                start_limited(&pool, id, limits).await,
+                MarkOutcome::Marked(_)
+            ),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        loads_under_limits(&pool, "up-big-3", &[], limits)
+            .await
+            .unwrap(),
+        LimitOutcome::LargeLimitReached
+    );
+    let third = start_limited(&pool, "up-big-3", limits).await;
+    assert!(
+        matches!(&third, MarkOutcome::LargeLimitReached),
+        "{third:?}"
+    );
+    assert_eq!(
+        get(&pool, "up-big-3").await.unwrap().unwrap().status,
+        "uploaded",
+        "a refused load changes nothing"
+    );
+    Ok(())
+}
+
+/// `DATA-37` decision D3: a load that is not large never counts against the
+/// large limit and is never refused by it, whatever large loads run.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_small_load_is_not_refused_while_two_large_loads_run(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-large-small").await;
+    let limits = LoadLimits {
+        per_user: 4,
+        total: 16,
+        large: 2,
+    };
+    for id in ["up-big-1", "up-big-2"] {
+        add_sized(&pool, id, tenant_a, "Ada", over_the_threshold()).await;
+    }
+    add_sized(&pool, "up-small", tenant_a, "Ada", 1024).await;
+    for id in ["up-big-1", "up-big-2"] {
+        assert!(
+            matches!(
+                start_limited(&pool, id, limits).await,
+                MarkOutcome::Marked(_)
+            ),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        loads_under_limits(&pool, "up-small", &[], limits)
+            .await
+            .unwrap(),
+        LimitOutcome::Under
+    );
+    assert!(matches!(
+        start_limited(&pool, "up-small", limits).await,
+        MarkOutcome::Marked(_)
+    ));
+    Ok(())
+}
+
+/// `DATA-37` decision D1: the size of a load is the primary's own plus that
+/// of the files it carries, so two files under the threshold are a large load
+/// together. Each group is one large load, not two.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_load_of_several_files_is_large_by_its_total(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-large-group").await;
+    let limits = LoadLimits {
+        per_user: 4,
+        total: 16,
+        large: 2,
+    };
+    let half = LARGE_LOAD_BYTES / 2 + 1;
+    for id in ["up-1", "up-2", "up-3", "up-4", "up-5", "up-6"] {
+        add_sized(&pool, id, tenant_a, "Ada", half).await;
+    }
+    // Two groups of two files: each is one large load.
+    for (primary, other) in [("up-1", "up-2"), ("up-3", "up-4")] {
+        assert!(
+            matches!(
+                start_group_within(&pool, primary, &[other], "large_raw", limits).await,
+                MarkOutcome::Marked(_)
+            ),
+            "{primary}"
+        );
+    }
+    // A single file is not large, so it starts even now.
+    assert!(matches!(
+        start_limited(&pool, "up-5", limits).await,
+        MarkOutcome::Marked(_)
+    ));
+    // A third group is large by its total and is refused.
+    let refused = start_group_within(&pool, "up-6", &["up-1"], "other_raw", limits).await;
+    assert!(
+        matches!(&refused, MarkOutcome::LargeLimitReached),
+        "{refused:?}"
+    );
+    Ok(())
+}
+
+/// `DATA-37`: the large loads are counted in the same window as the other
+/// loads, so a load that has been running for more than six hours does not
+/// keep a large place taken.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_large_load_older_than_the_window_does_not_count(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-large-stale").await;
+    let limits = LoadLimits {
+        per_user: 4,
+        total: 16,
+        large: 2,
+    };
+    for id in ["up-big-1", "up-big-2", "up-big-3"] {
+        add_sized(&pool, id, tenant_a, "Ada", over_the_threshold()).await;
+    }
+    for id in ["up-big-1", "up-big-2"] {
+        assert!(
+            matches!(
+                start_limited(&pool, id, limits).await,
+                MarkOutcome::Marked(_)
+            ),
+            "{id}"
+        );
+    }
+    assert!(matches!(
+        start_limited(&pool, "up-big-3", limits).await,
+        MarkOutcome::LargeLimitReached
+    ));
+
+    // `updated_at` has no trigger (0057): a direct UPDATE sticks.
+    sqlx::query(
+        "UPDATE file_upload SET updated_at = now() - interval '7 hours' WHERE id = 'up-big-1'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        loads_under_limits(&pool, "up-big-3", &[], limits)
+            .await
+            .unwrap(),
+        LimitOutcome::Under
+    );
+    assert!(matches!(
+        start_limited(&pool, "up-big-3", limits).await,
+        MarkOutcome::Marked(_)
+    ));
+    Ok(())
+}
+
+/// A drop written as the drop route writes one (`DATA-55`).
+fn new_drop<'a>(
+    table: &'a str,
+    tenant_id: Uuid,
+    asset_id: &'a str,
+    dropped_by: &'a str,
+    row_count: Option<i64>,
+) -> NewTableDrop<'a> {
+    NewTableDrop {
+        bronze_table: table,
+        tenant_id,
+        asset_id,
+        dropped_by,
+        row_count,
+        kept_seconds: 604_800,
+    }
+}
+
+/// `DATA-55` D9: a second drop inside the window must not succeed, or it would
+/// name a second person on a drop they did not make. One statement is what
+/// makes the primary key the arbiter.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_drop_is_recorded_once_and_a_second_one_inside_the_window_is_not(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-once").await;
+    claim(&pool, tenant_a, "orders", "up-1").await;
+
+    let first = record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Ada Lovelace", Some(12)),
+    )
+    .await
+    .unwrap()
+    .expect("the first drop is recorded");
+    assert_eq!(first.bronze_table, "orders");
+    assert_eq!(first.tenant_id, Some(tenant_a));
+    assert_eq!(first.asset_id, "orders");
+    assert_eq!(first.dropped_by, "Ada Lovelace");
+    assert_eq!(first.row_count, Some(12));
+    assert_eq!(
+        (first.expires_at - first.dropped_at).whole_seconds(),
+        604_800,
+        "the window is the catalog's keep, written by the database clock"
+    );
+
+    let second = record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Grace Hopper", Some(99)),
+    )
+    .await
+    .unwrap();
+    assert!(second.is_none(), "a drop inside its window is refused");
+
+    let still = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    assert_eq!(
+        still.dropped_by, "Ada Lovelace",
+        "the refused drop changed nothing"
+    );
+    assert_eq!(still.row_count, Some(12));
+    Ok(())
+}
+
+/// `DATA-55` D10: after the window the name is free again, and the next drop
+/// replaces the stale row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_drop_whose_window_has_passed_no_longer_counts_and_the_next_one_replaces_it(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-expired").await;
+    claim(&pool, tenant_a, "orders", "up-1").await;
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Ada Lovelace", Some(12)),
+    )
+    .await
+    .unwrap()
+    .expect("the first drop is recorded");
+
+    sqlx::query(
+        "UPDATE upload_table_drop SET expires_at = now() - interval '1 second' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert!(
+        dropped_table(&pool, "orders").await.unwrap().is_none(),
+        "a row past its window no longer says the name is dropped"
+    );
+
+    let again = record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Grace Hopper", Some(3)),
+    )
+    .await
+    .unwrap()
+    .expect("the name is free after the window");
+    assert_eq!(again.dropped_by, "Grace Hopper");
+    assert_eq!(again.row_count, Some(3));
+    Ok(())
+}
+
+/// `DATA-55` review U1 (`DATA-55` D8): the removal a restore and a drop's own
+/// task use takes the record it read, and only that one. A record written for a
+/// different drop of the same name — the second drop's, after the first was past
+/// its window — stays: removing it would leave a dropped table with no record,
+/// which is the state this feature must never reach.
+#[sqlx::test(migrations = "../../migrations")]
+async fn forgetting_a_drop_removes_the_record_it_read_and_no_other(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-forget").await;
+    claim(&pool, tenant_a, "orders", "up-1").await;
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Ada Lovelace", None),
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+
+    let read = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    assert!(
+        forget_table_drop_at(&pool, "orders", read.dropped_at)
+            .await
+            .unwrap(),
+        "the record that was read is removed"
+    );
+    assert!(dropped_table(&pool, "orders").await.unwrap().is_none());
+    assert!(
+        !forget_table_drop_at(&pool, "orders", read.dropped_at)
+            .await
+            .unwrap(),
+        "there is no record left to remove"
+    );
+
+    // A second drop of the same name, written after `read`: only the
+    // `dropped_at` guard can keep it, and it must keep it.
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Grace Hopper", Some(2)),
+    )
+    .await
+    .unwrap()
+    .expect("the name is free again");
+    let second = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    assert!(
+        !forget_table_drop_at(&pool, "orders", read.dropped_at)
+            .await
+            .unwrap(),
+        "a different record of the same name is not removed"
+    );
+    let left = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    assert_eq!(
+        left.dropped_at, second.dropped_at,
+        "the record that was not read is the one left"
+    );
+    Ok(())
+}
+
+/// `DATA-55` review S1: healing a record is safe only once the drop it records
+/// cannot still be in flight, so the removal is guarded twice — by the record's
+/// own `dropped_at` and by a grace. A young record stays (its `DELETE` may still
+/// be on its way), an old one goes, and a record replaced since the read stays:
+/// the row the caller read is not the row it removes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn healing_a_drop_removes_only_a_record_older_than_the_grace_and_unchanged_since_it_was_read(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-heal").await;
+    claim(&pool, tenant_a, "orders", "up-1").await;
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Ada Lovelace", Some(1)),
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+
+    let young = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    assert!(
+        !heal_table_drop(&pool, "orders", young.dropped_at, 120)
+            .await
+            .unwrap(),
+        "a record younger than the grace is not removed: its drop may be in flight"
+    );
+    assert!(dropped_table(&pool, "orders").await.unwrap().is_some());
+
+    // Ten minutes is longer than any drop can be in flight (the route's
+    // `HEAL_GRACE` is two minutes).
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '10 minutes' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let old = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    assert!(
+        heal_table_drop(&pool, "orders", old.dropped_at, 120)
+            .await
+            .unwrap(),
+        "a record older than the grace is removed"
+    );
+    assert!(dropped_table(&pool, "orders").await.unwrap().is_none());
+
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Grace Hopper", Some(2)),
+    )
+    .await
+    .unwrap()
+    .expect("the name is free again");
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '10 minutes' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let read = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    // A different record of the same name, written after `read` and backdated
+    // past the grace: only the `dropped_at` guard can keep it.
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '20 minutes' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !heal_table_drop(&pool, "orders", read.dropped_at, 120)
+            .await
+            .unwrap(),
+        "a record replaced since the read is not removed"
+    );
+    assert!(
+        dropped_table(&pool, "orders").await.unwrap().is_some(),
+        "the record that was not read is the one left"
+    );
+    Ok(())
+}
+
+/// `DATA-55` D13: the list is the given tenants' unexpired drops, newest
+/// first, and an empty tenant list is nobody's rather than everyone's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_dropped_list_is_the_given_tenants_unexpired_drops_newest_first(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-list-a").await;
+    let tenant_b = tenant(&pool, "uploads-drop-list-b").await;
+    claim(&pool, tenant_a, "orders", "up-1").await;
+    claim(&pool, tenant_a, "stock", "up-2").await;
+    claim(&pool, tenant_b, "other", "up-3").await;
+
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Ada Lovelace", Some(1)),
+    )
+    .await
+    .unwrap()
+    .expect("orders is recorded");
+    record_table_drop(
+        &pool,
+        &new_drop("stock", tenant_a, "stock", "Ada Lovelace", None),
+    )
+    .await
+    .unwrap()
+    .expect("stock is recorded");
+    record_table_drop(
+        &pool,
+        &new_drop("other", tenant_b, "other", "Grace Hopper", Some(2)),
+    )
+    .await
+    .unwrap()
+    .expect("other is recorded");
+
+    // Explicit timestamps, so "newest first" is a fact of the test and not of
+    // how fast two statements ran.
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '2 hours' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '1 hour' \
+         WHERE bronze_table = 'stock'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let listed = list_dropped_tables(&pool, &[tenant_a, tenant_b], 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|r| r.bronze_table.as_str())
+            .collect::<Vec<_>>(),
+        vec!["other", "stock", "orders"],
+        "newest first (other was never backdated), and both tenants' rows are listed"
+    );
+
+    let only_a = list_dropped_tables(&pool, &[tenant_a], 100).await.unwrap();
+    assert_eq!(
+        only_a
+            .iter()
+            .map(|r| r.bronze_table.as_str())
+            .collect::<Vec<_>>(),
+        vec!["stock", "orders"]
+    );
+
+    assert!(
+        list_dropped_tables(&pool, &[], 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an empty tenant list lists nothing, never everything"
+    );
+
+    sqlx::query(
+        "UPDATE upload_table_drop SET expires_at = now() - interval '1 second' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let unexpired = list_dropped_tables(&pool, &[tenant_a], 100).await.unwrap();
+    assert_eq!(
+        unexpired
+            .iter()
+            .map(|r| r.bronze_table.as_str())
+            .collect::<Vec<_>>(),
+        vec!["stock"],
+        "a row past its window is not in the list"
+    );
+
+    let limited = list_dropped_tables(&pool, &[tenant_a, tenant_b], 1)
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 1, "the limit is the list's bound");
+    Ok(())
+}
+
+/// `DATA-55` D10: the tenant's deletion hides the row from every list and does
+/// not free the name — the table stays restorable and no load may take it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_drop_whose_tenant_is_gone_is_listed_for_nobody_and_still_closes_the_name(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-gone").await;
+    claim(&pool, tenant_a, "orders", "up-1").await;
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Ada Lovelace", Some(4)),
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+
+    sqlx::query("UPDATE upload_table_drop SET tenant_id = NULL WHERE bronze_table = 'orders'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        list_dropped_tables(&pool, &[tenant_a], 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a row with no tenant shows to nobody"
+    );
+    let still = dropped_table(&pool, "orders").await.unwrap();
+    assert!(
+        still.is_some(),
+        "the name stays closed: the table can still be restored"
+    );
+    Ok(())
+}
+
+/// `DATA-55` D4 rule 5: a drop is refused while a load is in progress, and
+/// only the uploads actually loading into THAT table count.
+#[sqlx::test(migrations = "../../migrations")]
+async fn loading_into_lists_only_the_uploads_loading_into_that_table(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-loading").await;
+    add(&pool, "up-1", tenant_a, &"a".repeat(64)).await;
+    add(&pool, "up-2", tenant_a, &"b".repeat(64)).await;
+    add(&pool, "up-3", tenant_a, &"c".repeat(64)).await;
+
+    start(&pool, "up-1", "stock_raw", LoadMode::Replace, Some("run-1")).await;
+    start(&pool, "up-2", "stock_raw", LoadMode::Replace, Some("run-2")).await;
+    mark_finished(&pool, "up-2", Some("run-2"), None, Some(2))
+        .await
+        .unwrap()
+        .expect("the load is settled");
+    start(&pool, "up-3", "other_raw", LoadMode::Replace, Some("run-3")).await;
+
+    assert_eq!(
+        ids(&loading_into(&pool, "stock_raw").await.unwrap()),
+        vec!["up-1"]
+    );
+    assert_eq!(
+        ids(&loading_into(&pool, "other_raw").await.unwrap()),
+        vec!["up-3"]
+    );
+    assert!(
+        loading_into(&pool, "nobody_raw").await.unwrap().is_empty(),
+        "a table nothing loads into lists nothing"
+    );
     Ok(())
 }

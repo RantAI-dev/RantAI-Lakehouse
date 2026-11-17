@@ -8,8 +8,10 @@
 //! `host` shape `<endpoint>|<bucket>` is read only for a row with no
 //! adapter):
 //!
-//! - **`PostgreSQL`** (`sqlx`, already a `lakehouse-api` dependency for
-//!   `lakehouse-store`) — opens a real connection and runs `SELECT 1`.
+//! - **`PostgreSQL`** ([`crate::pg_probe`], `SEC-14` part B) — a minimal
+//!   TLS-first client that authenticates only with `SCRAM-SHA-256` and runs
+//!   `SELECT 1`; `sqlx` still backs discovery, listing and deprovisioning,
+//!   never the connection test.
 //! - **S3-compatible object storage** (`object_store`, already a workspace
 //!   dependency via `lakehouse-iceberg`) — does an authenticated
 //!   `list_with_delimiter` (a cheap, bounded listing call; no data read or
@@ -27,6 +29,9 @@
 //! only for a pre-WS3 row with no adapter — see [`probe`]'s doc comment for
 //! the `adapter`-first-then-legacy-`kind` dispatch rule.
 //!
+//! A `saas` adapter (`SRC-3`, the business-app vendors) is tested by the
+//! child module `saas`: one `GET` of the vendor's "who am I" request.
+//!
 //! A `sheets` adapter is registered (`connector_type`, `0035`) but ships
 //! **`supported: false` unconditionally** — see [`probe_sheets`]'s doc
 //! comment for why (no verified Google service-account token exchange
@@ -34,7 +39,12 @@
 //!
 //! Oracle, `MongoDB`, Kafka and SFTP connect only from the orchestrator
 //! (`dagster/dispar_orchestrate/adapters/`); this build has no client for
-//! them. They report [`Outcome::not_testable_here`] (`SRC-6` F3, F4):
+//! them. (Oracle's connection test runs there since `SRC-4` T1.1, and a
+//! `MongoDB` change-capture connector's since slice 5:
+//! `POST /api/connectors/{id}/test` launches it and the result is recorded
+//! with the sentences of [`outcome_of_orchestrator_test`]; the probes below
+//! stay what the credential flows use.) They report
+//! [`Outcome::not_testable_here`] (`SRC-6` F3, F4):
 //! `supported: false`, no latency, so a credential change saves with
 //! `verified: false` and the connector's stored health is not touched. Any
 //! other type with no dial implementation and no adapter (MQTT, SAP/ERP,
@@ -127,9 +137,10 @@
 //! 60s outer bound. No retries: one attempt, one measured result.
 
 use std::net::IpAddr;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use lakehouse_core::secret::DynSecretResolver;
+use lakehouse_core::secret::{DynSecretResolver, SecretValue};
 use lakehouse_store::connectors::ConnectorDialInfo;
 use lakehouse_store::ingest_spec::{
     CdcDial, Dial, FilesProtocol, RestAuth, RestDial, SqlDial, SqlDriver,
@@ -138,10 +149,13 @@ use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use sqlx::Connection;
 use sqlx::mysql::{MySqlConnectOptions, MySqlConnection, MySqlSslMode};
-use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
+use crate::connector_oauth::{self, OAuthSettings, TokenFailure};
 use crate::internal_hosts::InternalHosts;
+
+mod saas;
 
 /// Bound on a single dial attempt (connect + one cheap operation). Chosen
 /// to be a "few seconds" per the task brief — long enough that a healthy
@@ -168,6 +182,12 @@ pub struct Outcome {
     pub latency_ms: Option<i64>,
     /// Human-readable result message.
     pub message: String,
+    /// `SRC-12` part C: the new refresh token an `OAuth2` provider issued while
+    /// the probe used the stored one. A provider that rotates refresh tokens has
+    /// already invalidated the old one, so a probe that dropped this would sign
+    /// the connector out; the caller must store it (`routes::connector_oauth`).
+    /// `None` for every other probe. Never serialized, never logged.
+    pub rotated_refresh_token: Option<SecretValue>,
 }
 
 impl Outcome {
@@ -180,6 +200,7 @@ impl Outcome {
                 "This build cannot test a {kind:?} connector: no live-dial implementation \
                  exists for this connector type yet."
             ),
+            rotated_refresh_token: None,
         }
     }
 
@@ -191,6 +212,7 @@ impl Outcome {
             supported: false,
             latency_ms: None,
             message: message.into(),
+            rotated_refresh_token: None,
         }
     }
 
@@ -210,6 +232,7 @@ impl Outcome {
             supported: true,
             latency_ms: Some(elapsed_millis(elapsed)),
             message: message.into(),
+            rotated_refresh_token: None,
         }
     }
 
@@ -219,6 +242,7 @@ impl Outcome {
             supported: true,
             latency_ms: Some(elapsed_millis(elapsed)),
             message: message.into(),
+            rotated_refresh_token: None,
         }
     }
 
@@ -233,7 +257,122 @@ impl Outcome {
             supported: true,
             latency_ms: None,
             message: message.into(),
+            rotated_refresh_token: None,
         }
+    }
+}
+
+/// The connectors whose connection test runs in the orchestrator because the
+/// API has no client for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestratorTested {
+    /// An Oracle `sql` connector (`SRC-4` T1.1).
+    Oracle,
+    /// A `MongoDB` change-capture connector (`SRC-4` slice 5, decision S5-f).
+    MongoDb,
+}
+
+impl OrchestratorTested {
+    /// The product's name in the fixed sentences.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Oracle => "Oracle",
+            Self::MongoDb => "MongoDB",
+        }
+    }
+
+    /// What a passed test says it did: the one statement the orchestrator ran.
+    const fn success_sentence(self) -> &'static str {
+        match self {
+            Self::Oracle => "Connected via Oracle and ran SELECT 1 FROM DUAL.",
+            Self::MongoDb => "Connected via MongoDB and ran ping.",
+        }
+    }
+}
+
+/// Which orchestrator test `info` takes, if any (`SRC-4` T1.1, slice 5): an
+/// Oracle `sql` connector or a `MongoDB` change-capture connector. The API has
+/// no client for either; its own answer for such a connector stays
+/// [`Outcome::not_testable_here`] (the credential-change and rotate-secret
+/// flows probe with [`probe_with`] and keep `verified: false`), and only
+/// `POST /api/connectors/{id}/test` launches the real test.
+#[must_use]
+pub fn orchestrator_tested_source(info: &ConnectorDialInfo) -> Option<OrchestratorTested> {
+    match info.adapter.as_deref() {
+        Some("sql") => match Dial::parse("sql", &info.dial) {
+            Ok(Dial::Sql(dial)) if dial.driver == SqlDriver::Oracle => {
+                Some(OrchestratorTested::Oracle)
+            }
+            _ => None,
+        },
+        Some("cdc") => match Dial::parse("cdc", &info.dial) {
+            Ok(Dial::CdcMongo(_)) => Some(OrchestratorTested::MongoDb),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `info` is tested by the orchestrator instead of by this API; see
+/// [`orchestrator_tested_source`].
+#[must_use]
+pub fn is_tested_in_orchestrator(info: &ConnectorDialInfo) -> bool {
+    orchestrator_tested_source(info).is_some()
+}
+
+/// The fixed `Outcome` of a connection test the orchestrator ran for `source`
+/// and posted (`SRC-4` T1.1, slice 5), in the sentences the other drivers use
+/// ("Connected via X and ran SELECT 1.", "X connection failed: <class>"): the
+/// orchestrator sends a latency or a closed error class, never text, so the
+/// sentence is this module's own (AGENTS.md principle 4). A figure the
+/// orchestrator did not measure is not invented: a failure carries no latency.
+#[must_use]
+pub(crate) fn outcome_of_orchestrator_test(
+    outcome: &lakehouse_store::connector_discovery::Outcome,
+    source: OrchestratorTested,
+) -> Outcome {
+    use lakehouse_store::connector_discovery::{ErrorClass, Outcome as Reported};
+    match outcome {
+        Reported::Tested(tested) => Outcome::success(
+            Duration::from_millis(u64::try_from(tested.latency_ms).unwrap_or(0)),
+            source.success_sentence(),
+        ),
+        Reported::Failed(ErrorClass::Timeout) => Outcome {
+            ok: false,
+            supported: true,
+            latency_ms: None,
+            message: format!("{} connection timed out", source.name()),
+            rotated_refresh_token: None,
+        },
+        Reported::Failed(class) => {
+            let phrase = match class {
+                ErrorClass::Unreachable | ErrorClass::Failed | ErrorClass::Timeout => {
+                    "connection failed"
+                }
+                ErrorClass::SignInRefused => "authentication failed",
+                ErrorClass::AddressRefused => "address not allowed by this installation",
+                ErrorClass::NoPermission => "permission denied",
+                ErrorClass::TooManyObjects | ErrorClass::NotSupported => {
+                    "the connector has no saved connection settings to test"
+                }
+            };
+            Outcome {
+                ok: false,
+                supported: true,
+                latency_ms: None,
+                message: format!("{} connection failed: {phrase}", source.name()),
+                rotated_refresh_token: None,
+            }
+        }
+        // A listing or a preview is not a test result; `finish` refuses it for
+        // a test request, so this arm is not reached from the result route.
+        Reported::Listing(_) | Reported::Preview(_) => Outcome {
+            ok: false,
+            supported: true,
+            latency_ms: None,
+            message: format!("{} connection failed: connection failed", source.name()),
+            rotated_refresh_token: None,
+        },
     }
 }
 
@@ -262,17 +401,41 @@ fn elapsed_millis(elapsed: Duration) -> i64 {
 /// deprovision step already uses (WS3 plan review X4).
 ///
 /// [`Config::connector_probe_allow_internal_hosts`]: crate::config::Config::connector_probe_allow_internal_hosts
+///
+/// `ca` is the CA every TLS-able dial verifies the database server against
+/// (`SEC-14` part B, [`crate::config::Config::connector_tls_ca`]); `None` is
+/// D5's `require` posture. No `OAuth2` settings: the deployment-aware call is
+/// [`probe_with`], which the routes use.
 pub async fn probe(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
+) -> Outcome {
+    probe_with(info, resolver, internal_hosts, OAuthSettings::default(), ca).await
+}
+
+/// [`probe`] with the installation's `OAuth2` settings (`SRC-12` part C): the
+/// routes call this one, so a gate that admits an `http` provider is honoured
+/// by the connection test as well as by the sign-in. `ca` is the CA every
+/// TLS-able dial verifies the database server against (`SEC-14` part B,
+/// [`crate::config::Config::connector_tls_ca`]); `None` is D5's `require`.
+pub async fn probe_with(
+    info: &ConnectorDialInfo,
+    resolver: &dyn DynSecretResolver,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+    ca: Option<&Path>,
 ) -> Outcome {
     match info.adapter.as_deref() {
         Some(adapter @ ("sql" | "cdc")) => {
-            Box::pin(probe_dial(adapter, info, resolver, internal_hosts)).await
+            Box::pin(probe_dial(adapter, info, resolver, internal_hosts, ca)).await
         }
-        Some("rest") => probe_rest_info(info, resolver, internal_hosts).await,
+        Some("rest") => probe_rest_info(info, resolver, internal_hosts, oauth).await,
         Some("sheets") => probe_sheets(),
+        // `SRC-3` T1.4: the vendor's own "who am I" request, at an address the
+        // vendor table builds from the connector's account.
+        Some("saas") => saas::probe_saas_info(info, resolver, internal_hosts, oauth).await,
         // SRC-6 F4: these connect only from the orchestrator. Explicit arms,
         // so the answer does not depend on falling through to the `kind`
         // dispatch, whose label for an adapter row is free-form.
@@ -283,7 +446,7 @@ pub async fn probe(
         // in its `dial`, the settings the load itself uses. `info.host` is a
         // display value for it (the wizard stores the bucket name there).
         Some("files") => probe_files(info, resolver, internal_hosts).await,
-        _ => probe_by_kind(info, resolver, internal_hosts).await,
+        _ => probe_by_kind(info, resolver, internal_hosts, ca).await,
     }
 }
 
@@ -293,10 +456,11 @@ async fn probe_by_kind(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Outcome {
     let kind = info.kind.to_lowercase();
     if kind.contains("postgres") {
-        probe_postgres(info, resolver, internal_hosts).await
+        probe_postgres(info, resolver, internal_hosts, ca).await
     } else if kind.contains("object storage") || kind.contains("s3") {
         probe_s3(info, resolver, internal_hosts).await
     } else {
@@ -366,6 +530,7 @@ async fn probe_dial(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Outcome {
     let parsed = match Dial::parse(adapter, &info.dial) {
         Ok(dial) => dial,
@@ -374,12 +539,16 @@ async fn probe_dial(
     let target = match &parsed {
         Dial::Sql(dial) => DialTarget::from(dial),
         Dial::Cdc(dial) => DialTarget::from(dial),
+        // `SRC-4` slice 5: the API has no `MongoDB` client; like a batch `MongoDB`
+        // connector, only the orchestrator dials it.
+        Dial::CdcMongo(_) => return Outcome::not_testable_here("MongoDB"),
         Dial::Files(_)
         | Dial::Rest(_)
         | Dial::Sheets(_)
         | Dial::Mongo(_)
         | Dial::Kafka(_)
-        | Dial::Sftp(_) => {
+        | Dial::Sftp(_)
+        | Dial::Saas(_) => {
             return Outcome::misconfigured(format!(
                 "connector is misconfigured: its dial does not match its own adapter {adapter:?}"
             ));
@@ -393,15 +562,25 @@ async fn probe_dial(
                 port: target.port,
                 database: target.database,
             };
-            dial_postgres(&target, &info.secret_ref, resolver, internal_hosts).await
+            dial_postgres(&target, &info.secret_ref, resolver, internal_hosts, ca).await
         }
-        SqlDriver::Mysql => probe_mysql(&target, &info.secret_ref, resolver, internal_hosts).await,
+        SqlDriver::Mysql => {
+            probe_mysql(
+                &target,
+                &info.secret_ref,
+                resolver,
+                internal_hosts,
+                mysql_family_label(&info.kind),
+            )
+            .await
+        }
         SqlDriver::Mssql => {
             Box::pin(probe_mssql(
                 &target,
                 &info.secret_ref,
                 resolver,
                 internal_hosts,
+                ca,
             ))
             .await
         }
@@ -423,6 +602,7 @@ async fn probe_mysql(
     secret_ref: &str,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    label: &'static str,
 ) -> Outcome {
     let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
         Ok(approved) => approved,
@@ -453,18 +633,30 @@ async fn probe_mysql(
     let elapsed = started.elapsed();
 
     match attempt {
-        Ok(Ok(())) => Outcome::success(elapsed, "Connected via MySQL and ran SELECT 1."),
+        Ok(Ok(())) => Outcome::success(elapsed, format!("Connected via {label} and ran SELECT 1.")),
         Ok(Err(err)) => Outcome::failure(
             elapsed,
-            format!("MySQL connection failed: {}", classify_sqlx_error(&err)),
+            format!("{label} connection failed: {}", classify_sqlx_error(&err)),
         ),
         Err(_) => Outcome::failure(
             elapsed,
             format!(
-                "MySQL connection timed out after {}s",
+                "{label} connection timed out after {}s",
                 DIAL_TIMEOUT.as_secs()
             ),
         ),
+    }
+}
+
+/// What a `mysql`-driver connector's test calls its server (`SRC-41` D19, QA
+/// `LH-SRC-6-19`): `MariaDB` for the type named exactly that (`0035`), `MySQL`
+/// for `MySQL` and any other text (`MySQL CDC`, a stale label). `kind` itself
+/// is never put into the sentence.
+fn mysql_family_label(kind: &str) -> &'static str {
+    if kind == "MariaDB" {
+        "MariaDB"
+    } else {
+        "MySQL"
     }
 }
 
@@ -499,11 +691,15 @@ pub(crate) fn classify_tiberius_error(err: &tiberius::error::Error) -> &'static 
 /// before `secret_ref` is resolved or a `TcpStream` is even opened — see
 /// `probe_mssql_blocks_an_internal_host_before_dialing`, which mirrors
 /// `probe_mysql`'s own SSRF test with a panicking resolver.
+///
+/// `SEC-14` part B (D5/E3): the session always requests encryption
+/// ([`apply_mssql_tls`]) and, with a CA, verifies the chain against it.
 async fn probe_mssql(
     target: &DialTarget<'_>,
     secret_ref: &str,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Outcome {
     let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
         Ok(approved) => approved,
@@ -526,12 +722,7 @@ async fn probe_mssql(
         target.user,
         password.expose_secret(),
     ));
-    // Tier 1 has no cert-pinning story for an arbitrary operator-supplied
-    // SQL Server host -- same "state the TLS posture explicitly" reasoning
-    // as probe_postgres's PgSslMode::Prefer, applied to tiberius's own
-    // "accept the presented certificate without verifying its chain"
-    // knob.
-    config.trust_cert();
+    apply_mssql_tls(&mut config, ca);
     // SEC-15: the socket goes to the approved address; `config.host` keeps
     // the configured name for the TDS handshake, which is what `SEC-14`
     // needs for certificate verification.
@@ -598,15 +789,17 @@ async fn probe_rest_info(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
 ) -> Outcome {
     match Dial::parse("rest", &info.dial) {
         Ok(Dial::Rest(dial)) => {
-            probe_rest(
+            probe_rest_with(
                 &dial,
                 &info.secret_ref,
                 info.secret_ref_secondary.as_deref(),
                 resolver,
                 internal_hosts,
+                oauth,
             )
             .await
         }
@@ -619,12 +812,37 @@ async fn probe_rest_info(
 /// `resolve_checked` runs FIRST, against `dial.base_url`'s own
 /// host/port, before any credential is resolved or request sent — see
 /// `probe_rest_blocks_an_internal_host_before_dialing`.
+#[cfg(test)]
 async fn probe_rest(
     dial: &RestDial,
     secret_ref: &str,
     secret_ref_secondary: Option<&str>,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+) -> Outcome {
+    probe_rest_with(
+        dial,
+        secret_ref,
+        secret_ref_secondary,
+        resolver,
+        internal_hosts,
+        OAuthSettings::default(),
+    )
+    .await
+}
+
+/// [`probe_rest`] with the installation's `OAuth2` settings.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per authentication shape, each short; splitting would scatter the one request that follows"
+)]
+async fn probe_rest_with(
+    dial: &RestDial,
+    secret_ref: &str,
+    secret_ref_secondary: Option<&str>,
+    resolver: &dyn DynSecretResolver,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
 ) -> Outcome {
     let Some((host, port)) = parse_endpoint_host_port(&dial.base_url) else {
         return Outcome::misconfigured(
@@ -641,6 +859,7 @@ async fn probe_rest(
     };
 
     let request = client.get(&dial.base_url);
+    let mut rotated: Option<SecretValue> = None;
     let request = match &dial.auth {
         RestAuth::ApiKey { header } => {
             let key = match resolver.resolve_dyn(secret_ref).await {
@@ -689,23 +908,96 @@ async fn probe_rest(
             };
             request.basic_auth(username.expose_secret(), Some(password.expose_secret()))
         }
-        RestAuth::Oauth2ClientCredentials { .. } => {
-            // Never fabricated: an OAuth2 client-credentials exchange is a
-            // second network call this build's probe does not implement
-            // (mirrors probe_sheets's own "unsupported, honestly" posture
-            // for a credential exchange this workspace cannot verify).
-            // `supported: false`, not misconfigured: nothing about the
-            // connector is wrong, and a misconfigured outcome would make
-            // `set_credential` refuse every OAuth2 credential outright.
-            return Outcome {
-                ok: false,
-                supported: false,
-                latency_ms: None,
-                message: "This build cannot test REST OAuth2 client-credentials auth: the probe \
-                          does not perform the token exchange. Ingest runs still use the stored \
-                          client id and secret."
-                    .to_owned(),
+        RestAuth::Oauth2ClientCredentials { token_url } => {
+            // `SRC-12` part C: the test performs the token request the load
+            // performs (decision 7), so a wrong client id or secret is found
+            // here and not on the first run. The id is the primary slot, the
+            // secret the secondary one (`secret_field_names`).
+            let Some(secondary) = secret_ref_secondary else {
+                return Outcome::misconfigured(
+                    "connector is misconfigured: OAuth2 client credentials need a client id and \
+                     a client secret, and this connector stores only one credential",
+                );
             };
+            let (client_id, client_secret) = match (
+                resolver.resolve_dyn(secret_ref).await,
+                resolver.resolve_dyn(secondary).await,
+            ) {
+                (Ok(id), Ok(secret)) => (id, secret),
+                (Err(err), _) | (_, Err(err)) => {
+                    return Outcome::misconfigured(format!(
+                        "could not resolve the connector's credential: {err}"
+                    ));
+                }
+            };
+            let started = Instant::now();
+            let tokens = match connector_oauth::token_request(
+                token_url,
+                &[
+                    ("grant_type", "client_credentials"),
+                    ("client_id", client_id.expose_secret()),
+                    ("client_secret", client_secret.expose_secret()),
+                ],
+                internal_hosts,
+                oauth,
+            )
+            .await
+            {
+                Ok(tokens) => tokens,
+                Err(failure) => return token_failure_outcome(&failure, started.elapsed()),
+            };
+            request.bearer_auth(tokens.access_token.expose_secret())
+        }
+        RestAuth::Oauth2AuthorizationCode {
+            client_id,
+            token_url,
+            ..
+        } => {
+            // Client secret in the primary slot, refresh token in the
+            // secondary. No refresh token yet means nobody has signed in:
+            // nothing is wrong with the connector, and a failure here would
+            // make `set_credential` refuse the client secret that has to be
+            // saved BEFORE the first sign-in, so this is `supported: false`
+            // with the reason, never a fabricated success.
+            let client_secret = match resolver.resolve_dyn(secret_ref).await {
+                Ok(secret) => secret,
+                Err(err) => {
+                    return Outcome::misconfigured(format!(
+                        "could not resolve the connector's credential: {err}"
+                    ));
+                }
+            };
+            let refresh_token = match secret_ref_secondary {
+                Some(secondary) => resolver.resolve_dyn(secondary).await.ok(),
+                None => None,
+            };
+            let Some(refresh_token) = refresh_token else {
+                return Outcome::not_testable_with(
+                    "Nobody has signed in to this connector yet, so the connection cannot be \
+                     tested. Use Sign in on the connector page, then test again.",
+                );
+            };
+            let started = Instant::now();
+            let tokens = match connector_oauth::token_request(
+                token_url,
+                &[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh_token.expose_secret()),
+                    ("client_id", client_id),
+                    ("client_secret", client_secret.expose_secret()),
+                ],
+                internal_hosts,
+                oauth,
+            )
+            .await
+            {
+                Ok(tokens) => tokens,
+                Err(failure) => return token_failure_outcome(&failure, started.elapsed()),
+            };
+            // A rotating provider has retired the token just used; the caller
+            // stores the new one (`Outcome::rotated_refresh_token`).
+            rotated = tokens.refresh_token;
+            request.bearer_auth(tokens.access_token.expose_secret())
         }
     };
 
@@ -713,7 +1005,7 @@ async fn probe_rest(
     let attempt = tokio::time::timeout(DIAL_TIMEOUT, request.send()).await;
     let elapsed = started.elapsed();
 
-    match attempt {
+    let mut outcome = match attempt {
         // SEC-15: a redirect is reported, never followed; the `Location`
         // is not echoed (it is the server's text, and may name an address).
         Ok(Ok(response)) if response.status().is_redirection() => Outcome::failure(
@@ -740,6 +1032,24 @@ async fn probe_rest(
             elapsed,
             format!("REST request timed out after {}s", DIAL_TIMEOUT.as_secs()),
         ),
+    };
+    // Whatever the request to the API itself answered, a provider that rotated
+    // the refresh token has already retired the old one: hand the new one back.
+    outcome.rotated_refresh_token = rotated;
+    outcome
+}
+
+/// The outcome for a token request that did not succeed (`SRC-12` part C): a
+/// refused address is a misconfiguration (no request was made), a refused
+/// credential or an unreachable provider is a failed test. The text is
+/// [`TokenFailure::message`], fixed, never the provider's own words.
+fn token_failure_outcome(failure: &TokenFailure, elapsed: Duration) -> Outcome {
+    match failure {
+        TokenFailure::Address(message) => Outcome::misconfigured(message.clone()),
+        TokenFailure::Refused | TokenFailure::Unavailable => Outcome::failure(
+            elapsed,
+            format!("OAuth token request failed: {}", failure.message()),
+        ),
     }
 }
 
@@ -748,7 +1058,7 @@ async fn probe_rest(
 /// URL with [`parse_endpoint_host_port`]'s hand-rolled splitter, the client
 /// with the `url` crate; a URL the two read differently could make the client
 /// dial a host the check never saw, so a mismatch is refused.
-fn url_names_target(url: &str, host: &str, port: u16) -> bool {
+pub(crate) fn url_names_target(url: &str, host: &str, port: u16) -> bool {
     reqwest::Url::parse(url).is_ok_and(|parsed| {
         parsed
             .host_str()
@@ -769,7 +1079,7 @@ fn url_names_target(url: &str, host: &str, port: u16) -> bool {
 ///
 /// A fixed message when `url` does not name the checked host and port, or the
 /// client cannot be built.
-fn pinned_http_client(
+pub(crate) fn pinned_http_client(
     url: &str,
     host: &str,
     port: u16,
@@ -846,6 +1156,7 @@ fn probe_sheets() -> Outcome {
         message: "This build cannot test a Google Sheets connector: no verified \
                    service-account token exchange exists yet."
             .to_owned(),
+        rotated_refresh_token: None,
     }
 }
 
@@ -958,15 +1269,16 @@ impl Approved {
 /// `SEC-15`: `PostgreSQL` connect options that dial the [`Approved`] address
 /// (host and port), never the name. The TLS posture is pinned explicitly
 /// rather than left to `sqlx`'s default so it is a decision this module
-/// states: `Prefer` (attempt TLS, fall back to plaintext) matches this
-/// deployment's compose-network Postgres, which does not terminate TLS.
-/// `SEC-14` owns changing it, and must keep the name for certificate
-/// verification when it does.
+/// states; `SEC-14` part B changed it from `Prefer` (attempt TLS, fall back
+/// to plaintext, which is what this deployment's compose-network Postgres
+/// needed while it did not terminate TLS) to `Require`/`VerifyCa` -- see
+/// [`pg_options_for_address`], the one place that decision is written down.
 pub(crate) fn pg_connect_options(
     approved: &Approved,
     user: &str,
     password: &str,
     database: &str,
+    ca: Option<&Path>,
 ) -> PgConnectOptions {
     pg_options_for_address(
         &approved.primary_host(),
@@ -974,32 +1286,89 @@ pub(crate) fn pg_connect_options(
         user,
         password,
         database,
+        ca,
     )
 }
 
 /// The one place the `PostgreSQL` TLS mode is set for connector dials
-/// (`SEC-15 review fix (SHOULD-FIX 2)`; `SEC-14` part B changes it here).
+/// (`SEC-15 review fix (SHOULD-FIX 2)`; `SEC-14` part B changed it here).
 /// `host` must already be an approved IP text, not a name:
 /// [`pg_connect_options`] passes [`Approved::primary_host`], and
 /// `connector_deprovision::PgTarget` carries the same text and port.
-pub(crate) fn pg_options_for_address(
+///
+/// `SEC-14` part B (D5/E1), the posture stated rather than inherited: with no
+/// `ca` it is [`PgSslMode::Require`] -- encrypt, and take the server
+/// certificate as-is; with one it is [`PgSslMode::VerifyCa`] against that CA.
+/// Never [`PgSslMode::Prefer`] (attempt TLS, fall back to plaintext) and
+/// never [`PgSslMode::Disable`].
+///
+/// Because these options dial the approved ADDRESS rather than the
+/// configured NAME (`SEC-15`), `VerifyCa` can prove only the chain: a name
+/// check would compare the certificate against an IP literal and fail every
+/// dial. `verify-ca` is therefore the strongest mode this helper can use,
+/// and the connection test is what checks the name -- it dials the approved
+/// address with a client of its own (`pg_probe`, D5/E2).
+// PR #192 review BLOCKER 10: pub for integration tests.
+#[must_use]
+pub fn pg_options_for_address(
     host: &str,
     port: u16,
     user: &str,
     password: &str,
     database: &str,
+    ca: Option<&Path>,
 ) -> PgConnectOptions {
-    PgConnectOptions::new()
+    let options = PgConnectOptions::new()
         .host(host)
         .port(port)
         .username(user)
         .password(password)
-        .database(database)
-        .ssl_mode(PgSslMode::Prefer)
+        .database(database);
+    match ca {
+        Some(path) => options.ssl_mode(PgSslMode::VerifyCa).ssl_root_cert(path),
+        None => options.ssl_mode(PgSslMode::Require),
+    }
+}
+
+/// `SEC-14` part B (D5/E3): the ONE place a SQL Server dial's TLS posture
+/// is set, shared by the connection test ([`probe_mssql`]), schema discovery
+/// and listing so no dial can drift from another.
+///
+/// Stated rather than inherited: `tiberius`'s own default already requires
+/// encryption with its `rustls` feature, but a default that changes with a
+/// feature flag is not a decision this module makes, and the previous
+/// comment here said only "Tier 1 has no cert-pinning story".
+///
+/// * No CA (D5's `require`): the session is encrypted and the presented
+///   certificate is accepted without a chain check — the same posture
+///   [`pg_options_for_address`] takes with no CA.
+/// * With a CA: [`tiberius::Config::trust_cert_ca`] verifies the chain
+///   against it. Tiberius adds the configured CA to native system roots, so
+///   SQL Server accepts either the configured CA or any public root, unlike
+///   the PostgreSQL connection test (`pg_probe`), which trusts only the
+///   configured CA bundle (SEC-14B review round 1, SHOULD-FIX 7). The `sqlx`
+///   PostgreSQL dials are in between: `sqlx` adds the public webpki roots to
+///   the bundle it is given. tiberius checks the certificate's names against
+///   `config.host`, which is the CONFIGURED name (see the `SEC-15` socket note
+///   at each call site), so this is verify-full for SQL Server, not verify-ca.
+///
+/// The two arms are mutually exclusive on purpose: `trust_cert_ca` panics
+/// when it is called after `trust_cert`, so one `match` keeps them apart.
+pub(crate) fn apply_mssql_tls(config: &mut tiberius::Config, ca: Option<&Path>) {
+    config.encryption(tiberius::EncryptionLevel::Required);
+    match ca {
+        Some(path) => config.trust_cert_ca(path.to_string_lossy().into_owned()),
+        None => config.trust_cert(),
+    }
 }
 
 /// `SEC-15`: `MySQL`/`MariaDB` connect options that dial the [`Approved`]
-/// address. Same TLS note as [`pg_connect_options`] (`Preferred`).
+/// address. `SEC-14` part B leaves `MySQL` alone (D9): it keeps `Preferred`,
+/// the one posture here that still falls back to plaintext, and says so
+/// rather than reading as an oversight. The password is not sent over that
+/// plaintext fallback: `SEC-41` decision 4 keeps `sqlx`'s `mysql-rsa` feature
+/// off, so a server that asks for the password without TLS is refused with
+/// `MYSQL_PLAINTEXT_PASSWORD_REFUSED` rather than handed it.
 pub(crate) fn mysql_connect_options(
     approved: &Approved,
     user: &str,
@@ -1027,9 +1396,18 @@ pub(crate) async fn connect_pinned(approved: &Approved) -> std::io::Result<tokio
 /// The refusal text for a host that resolves to an address
 /// [`is_blocked_ip`] covers. Names the caller's own `host` string, never the
 /// address it resolved to (`SEC-15`, feature page decision 6).
+///
+/// `SEC-25` (c): the literal used to be one long line with the line breaks
+/// (and their indentation) spelled as runs of spaces, so every user and log
+/// reader saw "which this          installation". The `\` continuations
+/// below keep the same sentence with single spaces.
 fn refused_internal_message(host: &str) -> String {
     format!(
-        "refusing to dial {host:?}: it resolves to a private/internal address, which this          installation does not allow connection tests to reach (an operator can list its          network in CONNECTOR_PROBE_ALLOWED_CIDRS, or set          CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to allow every internal address for a          trusted internal deployment)"
+        "refusing to dial {host:?}: it resolves to a private/internal address, which this \
+         installation does not allow connection tests to reach (an operator can list its \
+         network in CONNECTOR_PROBE_ALLOWED_CIDRS, or set \
+         CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to allow every internal address for a \
+         trusted internal deployment)"
     )
 }
 
@@ -1068,6 +1446,24 @@ pub(crate) async fn resolve_checked(
     check_addrs(host, addrs, internal_hosts)
 }
 
+/// The first of `addrs` that [`is_blocked_ip`] refuses and `internal_hosts`
+/// does not permit, if any: the one address policy, shared by the connector
+/// dials and the alert webhook sender (`SEC-10`, `webhook_guard`) so there
+/// is a single implementation of what "internal" means. `allow_all` skips
+/// the check entirely, as it always has.
+pub(crate) fn first_refused(
+    addrs: &[std::net::SocketAddr],
+    internal_hosts: &InternalHosts,
+) -> Option<IpAddr> {
+    if internal_hosts.allow_all {
+        return None;
+    }
+    addrs
+        .iter()
+        .map(std::net::SocketAddr::ip)
+        .find(|ip| is_blocked_ip(ip) && !internal_hosts.permits(ip))
+}
+
 /// The decision half of [`resolve_checked`], on addresses already resolved:
 /// separate so the mixed-answer case (one public and one internal address)
 /// can be tested without a resolver.
@@ -1080,17 +1476,13 @@ fn check_addrs(
         tracing::warn!(%host, "SEC-15: connector host resolved to no address");
         return Err(format!("host {host:?} did not resolve to any address"));
     };
-    if !internal_hosts.allow_all {
-        for addr in &addrs {
-            if is_blocked_ip(&addr.ip()) && !internal_hosts.permits(&addr.ip()) {
-                tracing::warn!(
-                    %host,
-                    resolved = %addr.ip(),
-                    "SEC-15: refused a connector host that resolves to an internal address"
-                );
-                return Err(refused_internal_message(host));
-            }
-        }
+    if let Some(refused) = first_refused(&addrs, internal_hosts) {
+        tracing::warn!(
+            %host,
+            resolved = %refused,
+            "SEC-15: refused a connector host that resolves to an internal address"
+        );
+        return Err(refused_internal_message(host));
     }
     Ok(Approved {
         primary,
@@ -1143,6 +1535,34 @@ pub(crate) fn parse_postgres_host(host: &str) -> Option<PgDialTarget<'_>> {
     })
 }
 
+/// What a `MySQL` dial says when the server asked for its password over a
+/// connection that is not encrypted and this build has no RSA backend to
+/// send it (`SEC-41` decision 4, spec D3: the `mysql-rsa` feature stays off,
+/// so the password is never RSA-encrypted to a server that did not offer
+/// TLS). One sentence, safe to show: it repeats no upstream text.
+pub(crate) const MYSQL_PLAINTEXT_PASSWORD_REFUSED: &str = "This MySQL server asks for its \
+     password over an unencrypted connection. Turn on TLS on the server, or use \
+     mysql_native_password for this user.";
+
+/// Whether `err` is `sqlx-mysql` 0.9's refusal to send a password without
+/// TLS, i.e. the `caching_sha2_password` full-auth or `sha256_password` path
+/// with the `rsa` feature off.
+///
+/// The type is the discriminator `sqlx` offers: `rsa_backend::encrypt`
+/// returns [`sqlx::Error::Configuration`] (`sqlx-mysql-0.9.0/src/
+/// connection/auth.rs`, the `#[cfg(not(feature = "rsa"))]` module), and
+/// `sqlx` has no dedicated error kind for it — so the guard also matches the
+/// one fixed sentence that module returns. Both halves are ours to check:
+/// the text is `sqlx`'s own constant, never a server's reply.
+pub(crate) fn is_mysql_plaintext_password_refusal(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Configuration(source) => {
+            source.to_string().contains("RSA auth backend disabled")
+        }
+        _ => false,
+    }
+}
+
 /// Classify a `sqlx` connection error into one of a small set of generic
 /// failure classes — see the module doc comment's "Error messages never
 /// echo upstream data" section for why this never formats `err` itself.
@@ -1159,6 +1579,11 @@ pub(crate) fn classify_sqlx_error(err: &sqlx::Error) -> &'static str {
             std::io::ErrorKind::PermissionDenied => "permission denied",
             _ => "connection failed",
         },
+        // `SEC-41` decision 4: the operator can act on this one (it names
+        // TLS), so it gets its own sentence instead of "connection failed".
+        sqlx::Error::Configuration(_) if is_mysql_plaintext_password_refusal(err) => {
+            MYSQL_PLAINTEXT_PASSWORD_REFUSED
+        }
         sqlx::Error::Tls(_) => "TLS error",
         sqlx::Error::Database(db_err) => match db_err.code().as_deref() {
             // PostgreSQL error codes: 28P01 invalid_password,
@@ -1175,6 +1600,7 @@ async fn probe_postgres(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Outcome {
     let Some(target) = parse_postgres_host(&info.host) else {
         return Outcome::misconfigured(
@@ -1182,18 +1608,26 @@ async fn probe_postgres(
              \"<user>@<host>:<port>/<database>\"",
         );
     };
-    dial_postgres(&target, &info.secret_ref, resolver, internal_hosts).await
+    dial_postgres(&target, &info.secret_ref, resolver, internal_hosts, ca).await
 }
 
 /// The one real Postgres dial, shared by [`probe_postgres`] (a pre-WS3 row's
 /// legacy `host` string) and [`probe_dial`] (a `sql`/`cdc` adapter's
 /// `dial`). `resolve_checked` runs FIRST, before `secret_ref` is resolved —
 /// the same SSRF ordering every other probe here keeps.
+///
+/// Since `SEC-14` part B (E2/D8) this dial is [`crate::pg_probe`], not
+/// `sqlx`: the test must refuse a server that asks for a cleartext or MD5
+/// password rather than answer it, which `sqlx` offers no way to do, and it
+/// upgrades to TLS before the startup packet, so no credential can leave
+/// over a plaintext channel. `sqlx` still backs the other Postgres dials
+/// (discovery, listing, deprovisioning), which now require TLS too.
 async fn dial_postgres(
     target: &PgDialTarget<'_>,
     secret_ref: &str,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Outcome {
     let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
         Ok(approved) => approved,
@@ -1207,31 +1641,23 @@ async fn dial_postgres(
             ));
         }
     };
-    let options = pg_connect_options(
-        &approved,
-        target.user,
-        password.expose_secret(),
-        target.database,
-    );
-
     let started = Instant::now();
-    let attempt = tokio::time::timeout(DIAL_TIMEOUT, async {
-        let mut conn = PgConnection::connect_with(&options).await?;
-        sqlx::query("SELECT 1").execute(&mut conn).await?;
-        conn.close().await
-    })
+    // `pg_probe` speaks the protocol itself so it can refuse every
+    // authentication method but SCRAM-SHA-256, and it requires TLS before
+    // the startup packet (D5/D8). The credential stays a `SecretValue` and
+    // is exposed only inside the SCRAM computation.
+    let attempt = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        crate::pg_probe::connect_and_select(target, &approved, &password, ca),
+    )
     .await;
     let elapsed = started.elapsed();
 
     match attempt {
         Ok(Ok(())) => Outcome::success(elapsed, "Connected via PostgreSQL and ran SELECT 1."),
-        Ok(Err(err)) => Outcome::failure(
-            elapsed,
-            format!(
-                "PostgreSQL connection failed: {}",
-                classify_sqlx_error(&err)
-            ),
-        ),
+        // `PgProbeError`'s Display is one fixed class per failure kind, never
+        // upstream text (`SEC-11`).
+        Ok(Err(err)) => Outcome::failure(elapsed, format!("PostgreSQL connection failed: {err}")),
         Err(_) => Outcome::failure(
             elapsed,
             format!(
@@ -1265,10 +1691,12 @@ fn parse_s3_host(host: &str) -> Option<(&str, &str)> {
 pub(crate) fn parse_endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
     let (authority, default_port) = if let Some(rest) = endpoint.strip_prefix("https://") {
         (rest, 443)
-    } else if let Some(rest) = endpoint.strip_prefix("http://") {
-        (rest, 80)
     } else {
-        return None;
+        // REL-9: `?` on the remaining prefix says the same thing as the
+        // explicit `else { return None; }` it replaced (clippy's
+        // `question_mark` under 1.99); an endpoint with neither scheme is
+        // not a URL this function understands.
+        (endpoint.strip_prefix("http://")?, 80)
     };
     let authority = authority.split(['/', '?', '#']).next()?;
     if authority.is_empty() {
@@ -1327,7 +1755,7 @@ fn classify_via_reqwest_source(err: &(dyn std::error::Error + 'static)) -> &'sta
 /// The S3 client for [`probe_s3`], pinned to the [`Approved`] addresses of
 /// `endpoint_host` (see [`PinnedHttpConnector`]). Separate from `probe_s3` so
 /// a test can build the same client against a stand-in server.
-fn s3_client(
+pub(crate) fn s3_client(
     endpoint: &str,
     bucket: &str,
     endpoint_host: &str,
@@ -1527,6 +1955,7 @@ mod tests {
                 &info(kind, "h", "env:X", None),
                 &resolver,
                 &InternalHosts::NONE,
+                None,
             )
             .await;
             assert!(!outcome.supported, "{kind} must be unsupported");
@@ -1550,6 +1979,7 @@ mod tests {
             &info("PostgreSQL", "not-a-valid-host-shape", "env:X", None),
             &resolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1577,6 +2007,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1601,6 +2032,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1631,6 +2063,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(!outcome.ok);
@@ -1655,6 +2088,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1689,7 +2123,7 @@ mod tests {
             let mut row = info(kind, "h", "env:X", None);
             row.adapter = Some(adapter.to_owned());
             row.dial = dial;
-            let outcome = probe(&row, &resolver, &InternalHosts::NONE).await;
+            let outcome = probe(&row, &resolver, &InternalHosts::NONE, None).await;
             assert!(!outcome.supported, "{kind} must be unsupported");
             assert!(!outcome.ok, "{kind} must never report ok=true");
             assert!(outcome.latency_ms.is_none(), "{kind} has no latency");
@@ -1719,6 +2153,7 @@ mod tests {
             &info("MQTT", "h", "env:X", None),
             &resolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(!outcome.supported);
@@ -1733,6 +2168,7 @@ mod tests {
             &info("Object storage", "http://127.0.0.1:1|bucket", "env:X", None),
             &resolver,
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1755,6 +2191,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1779,6 +2216,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1804,6 +2242,7 @@ mod tests {
             ),
             &resolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(!outcome.ok);
@@ -1844,6 +2283,7 @@ mod tests {
             ),
             &s3_keys(),
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -1867,6 +2307,7 @@ mod tests {
             ),
             &s3_keys(),
             &InternalHosts::ALL,
+            None,
         )
         .await;
         // The old host would have been refused with no latency; the dial's
@@ -1888,6 +2329,7 @@ mod tests {
             ),
             &s3_keys(),
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(!outcome.ok);
@@ -1904,6 +2346,7 @@ mod tests {
             ),
             &s3_keys(),
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(!outcome.supported);
@@ -1924,6 +2367,7 @@ mod tests {
             ),
             &s3_keys(),
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(!outcome.supported);
@@ -1938,12 +2382,29 @@ mod tests {
             &files_info("my-bucket", serde_json::json!({})),
             &s3_keys(),
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
         assert!(!outcome.ok);
         assert!(outcome.latency_ms.is_none());
         assert!(outcome.message.contains("dial is invalid"));
+    }
+
+    /// `SEC-25` (c): the refusal a person and a log reader see must have
+    /// single spaces. The literal used to spell its line breaks as runs of
+    /// spaces ("which this          installation"), so this asserts the
+    /// WHOLE sentence, not a `contains`.
+    #[test]
+    fn the_private_address_refusal_reads_with_single_spaces() {
+        assert_eq!(
+            refused_internal_message("db.internal"),
+            "refusing to dial \"db.internal\": it resolves to a private/internal address, \
+             which this installation does not allow connection tests to reach (an operator \
+             can list its network in CONNECTOR_PROBE_ALLOWED_CIDRS, or set \
+             CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to allow every internal address for \
+             a trusted internal deployment)"
+        );
     }
 
     #[test]
@@ -2163,12 +2624,95 @@ mod tests {
     #[test]
     fn sql_connect_options_dial_the_approved_address_not_the_name() {
         let approved = approved_for(sock_with_port("192.0.2.9", 6543), "db.example.com");
-        let pg = pg_connect_options(&approved, "u", "p", "d");
+        let pg = pg_connect_options(&approved, "u", "p", "d", None);
         assert_eq!(pg.get_host(), "192.0.2.9");
         assert_eq!(pg.get_port(), 6543);
         let mysql = mysql_connect_options(&approved, "u", "p", "d");
         assert_eq!(mysql.get_host(), "192.0.2.9");
         assert_eq!(mysql.get_port(), 6543);
+    }
+
+    /// `SEC-14` part B (E3, D5): a SQL Server dial always requires
+    /// encryption, and verifies the CA when one is configured. tiberius
+    /// exposes no getter for either (`Config`'s fields are crate-private),
+    /// so both are read through its `Debug` -- `encryption: Required`,
+    /// `bypass: true` for the accept-anything posture, and the
+    /// `File("<path>")` an extra CA is recorded as.
+    #[test]
+    fn mssql_tls_requires_encryption_and_uses_the_ca_when_set() {
+        let mut without_ca = tiberius::Config::new();
+        apply_mssql_tls(&mut without_ca, None);
+        let without_ca = format!("{without_ca:?}");
+        assert!(
+            without_ca.contains("encryption: Required"),
+            "encryption must be required, never optional: {without_ca}"
+        );
+        assert!(
+            without_ca.contains("bypass: true"),
+            "with no CA the certificate is taken as-is (D5's require): {without_ca}"
+        );
+        assert!(
+            !without_ca.contains("VerifyCa") && !without_ca.contains("VerifyFull"),
+            "the bypass posture must not claim to verify: {without_ca}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, b"-----BEGIN CERTIFICATE-----\n").unwrap();
+        let mut with_ca = tiberius::Config::new();
+        apply_mssql_tls(&mut with_ca, Some(ca.as_path()));
+        let with_ca = format!("{with_ca:?}");
+        assert!(
+            with_ca.contains("encryption: Required"),
+            "a CA must not change the encryption level: {with_ca}"
+        );
+        assert!(
+            with_ca.contains(&format!("File({:?})", ca.to_str().unwrap())),
+            "the CA file must be attached to the config: {with_ca}"
+        );
+        assert!(
+            !with_ca.contains("bypass: true"),
+            "with a CA the chain is verified, not bypassed: {with_ca}"
+        );
+    }
+
+    /// `SEC-14` part B (E1, D5): the sqlx `PostgreSQL` TLS mode is `Require`
+    /// with no CA -- never `Prefer`, which falls back to plaintext, and never
+    /// `Disable` -- and `VerifyCa` with that CA attached when
+    /// `CONNECTOR_TLS_CA_FILE` is set.
+    ///
+    /// sqlx 0.8's `PgSslMode` is `Copy + Debug` but not `PartialEq`, and
+    /// `ssl_root_cert` has no getter, so both are read through the options'
+    /// `Debug`: the variant names and the `File("<path>")` it prints.
+    #[test]
+    fn pg_tls_mode_is_require_without_a_ca_and_verify_ca_with_one() {
+        let approved = approved_for(sock_with_port("192.0.2.9", 5432), "db.example.com");
+
+        let without = format!("{:?}", pg_connect_options(&approved, "u", "p", "d", None));
+        assert!(
+            without.contains("Require"),
+            "with no CA a dial must still require TLS: {without}"
+        );
+        assert!(
+            !without.contains("Prefer") && !without.contains("Disable"),
+            "the mode must never be one that falls back to plaintext: {without}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, b"-----BEGIN CERTIFICATE-----\n").unwrap();
+        let with = format!(
+            "{:?}",
+            pg_connect_options(&approved, "u", "p", "d", Some(ca.as_path()))
+        );
+        assert!(
+            with.contains("VerifyCa"),
+            "with a CA a dial must verify the chain: {with}"
+        );
+        assert!(
+            with.contains(ca.to_str().unwrap()),
+            "the CA file must be attached to the options: {with}"
+        );
     }
 
     /// SEC-15 (K2): the `tiberius` socket goes to the approved address. The
@@ -2393,6 +2937,7 @@ mod tests {
             "env:UNUSED",
             &PanicIfCalledResolver,
             &InternalHosts::NONE,
+            "MySQL",
         )
         .await;
         assert!(!outcome.ok);
@@ -2406,6 +2951,52 @@ mod tests {
             "{}",
             outcome.message
         );
+    }
+
+    /// `SRC-41` D19 (QA `LH-SRC-6-19`): a failed test of a `MariaDB` connector
+    /// names `MariaDB`, and a `MySQL` one names `MySQL`. Fails if the call
+    /// passes the constant `"MySQL"`.
+    #[tokio::test]
+    async fn a_mariadb_connectors_failed_test_names_mariadb_and_a_mysql_connectors_names_mysql() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("PG_TEST_PASSWORD".to_owned(), "irrelevant".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let info = |kind: &str| ConnectorDialInfo {
+            kind: kind.to_owned(),
+            host: "127.0.0.1".to_owned(),
+            secret_ref: "env:PG_TEST_PASSWORD".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("sql".to_owned()),
+            dial: serde_json::json!({
+                "driver": "mysql", "host": "127.0.0.1", "port": 1,
+                "database": "x", "user": "u",
+            }),
+        };
+
+        let maria = probe(&info("MariaDB"), &resolver, &InternalHosts::ALL, None).await;
+        assert!(
+            maria.message.contains("MariaDB connection failed"),
+            "{}",
+            maria.message
+        );
+        assert!(!maria.message.contains("MySQL"), "{}", maria.message);
+
+        let mysql = probe(&info("MySQL"), &resolver, &InternalHosts::ALL, None).await;
+        assert!(
+            mysql.message.contains("MySQL connection failed"),
+            "{}",
+            mysql.message
+        );
+    }
+
+    /// The label is one of two constants, chosen by the type's exact name; the
+    /// type's own text never reaches the sentence (`SRC-41` D19).
+    #[test]
+    fn the_label_is_one_of_two_constants() {
+        assert_eq!(mysql_family_label("MariaDB"), "MariaDB");
+        assert_eq!(mysql_family_label("MySQL"), "MySQL");
+        assert_eq!(mysql_family_label("MySQL CDC"), "MySQL");
+        assert_eq!(mysql_family_label("mariadb; x"), "MySQL");
     }
 
     /// A `sql`-adapter Postgres connector as the console wizard creates it:
@@ -2441,6 +3032,7 @@ mod tests {
             &wizard_postgres_info("127.0.0.1", 1, "env:PG_TEST_PASSWORD"),
             &resolver,
             &InternalHosts::ALL,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -2470,6 +3062,7 @@ mod tests {
             &wizard_postgres_info("127.0.0.1", 5432, "env:UNUSED"),
             &PanicIfCalledResolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(outcome.supported);
@@ -2494,6 +3087,7 @@ mod tests {
             "env:UNUSED",
             &PanicIfCalledResolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(!outcome.ok);
@@ -2641,6 +3235,248 @@ mod tests {
         assert!(outcome.ok, "{}", outcome.message);
     }
 
+    // ── SRC-12 part C: the connection test performs the OAuth token request ──
+
+    const OAUTH_GATE: OAuthSettings = OAuthSettings { allow_http: true };
+
+    fn oauth_code_dial(server: &wiremock::MockServer) -> RestDial {
+        RestDial {
+            base_url: format!("{}/api", server.uri()),
+            auth: RestAuth::Oauth2AuthorizationCode {
+                client_id: "app-1".to_owned(),
+                authorize_url: format!("{}/authorize", server.uri()),
+                token_url: format!("{}/token", server.uri()),
+                revocation_url: None,
+                scopes: vec![],
+            },
+            pagination: lakehouse_store::ingest_spec::RestPagination::None,
+            endpoints: vec![],
+        }
+    }
+
+    fn oauth_secrets(refresh_token: bool) -> EnvSecretResolver {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "OAUTH_CLIENT_SECRET".to_owned(),
+            "client-secret-1".to_owned(),
+        );
+        if refresh_token {
+            map.insert("OAUTH_REFRESH_TOKEN".to_owned(), "refresh-1".to_owned());
+        }
+        EnvSecretResolver::with_map(map)
+    }
+
+    async fn token_endpoint(
+        server: &wiremock::MockServer,
+        response: wiremock::ResponseTemplate,
+        expected_calls: u64,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(response)
+            .expect(expected_calls)
+            .mount(server)
+            .await;
+    }
+
+    async fn api_endpoint(server: &wiremock::MockServer, bearer: &str, status: u16) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                format!("Bearer {bearer}").as_str(),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(status))
+            .mount(server)
+            .await;
+    }
+
+    async fn probe_code(
+        server: &wiremock::MockServer,
+        resolver: &EnvSecretResolver,
+        secondary: Option<&str>,
+        settings: OAuthSettings,
+    ) -> Outcome {
+        probe_rest_with(
+            &oauth_code_dial(server),
+            "env:OAUTH_CLIENT_SECRET",
+            secondary,
+            resolver,
+            &InternalHosts::ALL,
+            settings,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn probe_rest_authorization_code_refreshes_then_calls_the_api_and_hands_back_a_rotated_token()
+     {
+        let server = wiremock::MockServer::start().await;
+        token_endpoint(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "refresh_token": "refresh-2"
+            })),
+            1,
+        )
+        .await;
+        api_endpoint(&server, "access-1", 200).await;
+        let outcome = probe_code(
+            &server,
+            &oauth_secrets(true),
+            Some("env:OAUTH_REFRESH_TOKEN"),
+            OAUTH_GATE,
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.message);
+        // The provider retired refresh-1; the caller must store this one.
+        assert_eq!(
+            outcome
+                .rotated_refresh_token
+                .as_ref()
+                .map(SecretValue::expose_secret),
+            Some("refresh-2")
+        );
+        let token_request = &server.received_requests().await.unwrap()[0];
+        let body = String::from_utf8_lossy(&token_request.body).into_owned();
+        assert!(body.contains("grant_type=refresh_token"), "{body}");
+        assert!(body.contains("refresh_token=refresh-1"), "{body}");
+        assert!(body.contains("client_id=app-1"), "{body}");
+        assert!(!outcome.message.contains("access-1") && !outcome.message.contains("refresh-"));
+    }
+
+    #[tokio::test]
+    async fn probe_rest_authorization_code_keeps_a_rotated_token_when_the_api_rejects_the_call() {
+        let server = wiremock::MockServer::start().await;
+        token_endpoint(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "refresh_token": "refresh-2"
+            })),
+            1,
+        )
+        .await;
+        api_endpoint(&server, "access-1", 401).await;
+        let outcome = probe_code(
+            &server,
+            &oauth_secrets(true),
+            Some("env:OAUTH_REFRESH_TOKEN"),
+            OAUTH_GATE,
+        )
+        .await;
+        assert!(outcome.supported && !outcome.ok);
+        assert!(
+            outcome.rotated_refresh_token.is_some(),
+            "a failed call must not lose the provider's new refresh token"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_rest_authorization_code_without_a_refresh_token_is_not_testable_and_dials_nothing()
+     {
+        let server = wiremock::MockServer::start().await;
+        token_endpoint(&server, wiremock::ResponseTemplate::new(500), 0).await;
+        // No secondary slot value, and a secondary that names nothing.
+        for secondary in [None, Some("env:OAUTH_REFRESH_TOKEN")] {
+            let outcome = probe_code(&server, &oauth_secrets(false), secondary, OAUTH_GATE).await;
+            assert!(!outcome.supported && !outcome.ok, "{}", outcome.message);
+            assert!(outcome.message.contains("signed in"), "{}", outcome.message);
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_rest_authorization_code_refused_refresh_is_a_failure_without_the_providers_words()
+     {
+        let server = wiremock::MockServer::start().await;
+        token_endpoint(
+            &server,
+            wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant", "error_description": "PROVIDER-WORDS"
+            })),
+            1,
+        )
+        .await;
+        let outcome = probe_code(
+            &server,
+            &oauth_secrets(true),
+            Some("env:OAUTH_REFRESH_TOKEN"),
+            OAUTH_GATE,
+        )
+        .await;
+        assert!(outcome.supported && !outcome.ok);
+        assert!(
+            outcome.message.contains("sign in again"),
+            "{}",
+            outcome.message
+        );
+        assert!(!outcome.message.contains("PROVIDER-WORDS"));
+        assert!(!outcome.message.contains("invalid_grant"));
+        assert!(outcome.rotated_refresh_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_rest_authorization_code_refuses_an_http_token_address_unless_the_gate_switch_is_on()
+     {
+        let server = wiremock::MockServer::start().await;
+        token_endpoint(&server, wiremock::ResponseTemplate::new(500), 0).await;
+        let outcome = probe_code(
+            &server,
+            &oauth_secrets(true),
+            Some("env:OAUTH_REFRESH_TOKEN"),
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert!(outcome.message.contains("https"), "{}", outcome.message);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_rest_client_credentials_performs_the_token_request_the_load_performs() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .and(wiremock::matchers::body_string_contains(
+                "grant_type=client_credentials",
+            ))
+            .and(wiremock::matchers::body_string_contains("client_id=id-1"))
+            .and(wiremock::matchers::body_string_contains(
+                "client_secret=secret-1",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "access_token": "access-9" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        api_endpoint(&server, "access-9", 200).await;
+        let dial = RestDial {
+            base_url: format!("{}/api", server.uri()),
+            auth: RestAuth::Oauth2ClientCredentials {
+                token_url: format!("{}/token", server.uri()),
+            },
+            pagination: lakehouse_store::ingest_spec::RestPagination::None,
+            endpoints: vec![],
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert("OAUTH_CC_ID".to_owned(), "id-1".to_owned());
+        map.insert("OAUTH_CC_SECRET".to_owned(), "secret-1".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let outcome = probe_rest_with(
+            &dial,
+            "env:OAUTH_CC_ID",
+            Some("env:OAUTH_CC_SECRET"),
+            &resolver,
+            &InternalHosts::ALL,
+            OAUTH_GATE,
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(outcome.rotated_refresh_token.is_none());
+    }
+
     #[tokio::test]
     async fn probe_rest_basic_auth_without_a_password_slot_is_misconfigured() {
         let server = wiremock::MockServer::start().await;
@@ -2676,5 +3512,156 @@ mod tests {
         assert!(!outcome.ok);
         assert!(!outcome.supported);
         assert!(outcome.latency_ms.is_none());
+    }
+
+    /// `SEC-41` decision 4: `sqlx-mysql` 0.9 without `mysql-rsa` refuses to
+    /// send a password to a server that asked for it over a plaintext
+    /// connection. That refusal must reach the operator as the one fixed
+    /// sentence (it names TLS), and no other `Configuration` error may be
+    /// mistaken for it.
+    #[test]
+    fn a_mysql_password_refusal_over_plaintext_has_its_own_sentence() {
+        // The exact `Error::Configuration` text `sqlx-mysql` 0.9's
+        // `#[cfg(not(feature = "rsa"))]` backend returns.
+        let refusal = sqlx::Error::Configuration(
+            "RSA auth backend disabled; enable feature `mysql-rsa` (or `rsa` if using \
+             sqlx-mysql directly) or use TLS."
+                .into(),
+        );
+        assert!(is_mysql_plaintext_password_refusal(&refusal));
+        assert_eq!(
+            classify_sqlx_error(&refusal),
+            MYSQL_PLAINTEXT_PASSWORD_REFUSED,
+            "the refusal must keep its own actionable sentence"
+        );
+        assert!(
+            MYSQL_PLAINTEXT_PASSWORD_REFUSED.contains("Turn on TLS"),
+            "the sentence must tell the operator what to do: {MYSQL_PLAINTEXT_PASSWORD_REFUSED}"
+        );
+
+        // A `Configuration` error from anywhere else stays generic: the
+        // match is on `sqlx`'s own fixed text, never on "any configuration
+        // problem".
+        let other = sqlx::Error::Configuration("some other option".into());
+        assert!(!is_mysql_plaintext_password_refusal(&other));
+        assert_eq!(classify_sqlx_error(&other), "connection failed");
+    }
+
+    /// `SRC-4` T1.1: only an Oracle `sql` connector is tested by the
+    /// orchestrator; the others keep their own answer.
+    #[test]
+    fn only_an_oracle_sql_connector_is_tested_in_the_orchestrator() {
+        let mut row = info("Oracle", "h", "env:X", None);
+        row.adapter = Some("sql".to_owned());
+        row.dial = serde_json::json!({
+            "driver": "oracle", "host": "db.invalid", "port": 1521,
+            "database": "ORCL", "user": "u", "sslMode": "disable"
+        });
+        assert!(is_tested_in_orchestrator(&row));
+
+        row.dial = serde_json::json!({
+            "driver": "postgres", "host": "db.invalid", "port": 5432,
+            "database": "d", "user": "u"
+        });
+        assert!(!is_tested_in_orchestrator(&row));
+
+        let mut mongo = info("MongoDB", "h", "env:X", None);
+        mongo.adapter = Some("mongodb".to_owned());
+        assert!(!is_tested_in_orchestrator(&mongo));
+        assert!(!is_tested_in_orchestrator(&info(
+            "Oracle", "h", "env:X", None
+        )));
+    }
+
+    /// `SRC-4` T1.1: what the orchestrator reports becomes the fixed sentences,
+    /// with a latency only for a success.
+    #[test]
+    fn the_orchestrators_test_result_becomes_a_fixed_outcome() {
+        use lakehouse_store::connector_discovery::{ErrorClass, Outcome as Reported, Tested};
+
+        let passed = outcome_of_orchestrator_test(
+            &Reported::Tested(Tested {
+                latency_ms: 212,
+                mongo_setup: None,
+                oracle_setup: None,
+            }),
+            OrchestratorTested::Oracle,
+        );
+        assert!(passed.ok && passed.supported);
+        assert_eq!(passed.latency_ms, Some(212));
+        assert_eq!(
+            passed.message,
+            "Connected via Oracle and ran SELECT 1 FROM DUAL."
+        );
+
+        for (class, sentence) in [
+            (
+                ErrorClass::SignInRefused,
+                "Oracle connection failed: authentication failed",
+            ),
+            (
+                ErrorClass::Unreachable,
+                "Oracle connection failed: connection failed",
+            ),
+            (ErrorClass::Timeout, "Oracle connection timed out"),
+            (
+                ErrorClass::NoPermission,
+                "Oracle connection failed: permission denied",
+            ),
+        ] {
+            let failed =
+                outcome_of_orchestrator_test(&Reported::Failed(class), OrchestratorTested::Oracle);
+            assert!(!failed.ok && failed.supported, "{class:?}");
+            assert!(failed.latency_ms.is_none(), "no latency was measured");
+            assert_eq!(failed.message, sentence);
+        }
+    }
+
+    /// `SRC-4` slice 5 (S5-f): a `MongoDB` change-capture connector is tested by the
+    /// orchestrator too, and its result is said in `MongoDB`'s own name.
+    #[test]
+    fn a_mongodb_cdc_connector_is_tested_in_the_orchestrator_and_reported_in_its_name() {
+        use lakehouse_store::connector_discovery::{ErrorClass, Outcome as Reported, Tested};
+
+        let mut row = info("MongoDB CDC", "h", "env:X", None);
+        row.adapter = Some("cdc".to_owned());
+        row.dial = serde_json::json!({
+            "driver": "mongodb", "hosts": ["m.invalid:27017"], "database": "shop",
+            "user": "u", "replicaSet": "rs0"
+        });
+        assert_eq!(
+            orchestrator_tested_source(&row),
+            Some(OrchestratorTested::MongoDb)
+        );
+        // A SQL change-capture connector is tested by the API itself.
+        row.dial = serde_json::json!({
+            "driver": "postgres", "host": "db.invalid", "port": 5432, "database": "d",
+            "user": "u", "slotName": "s", "publicationName": "p"
+        });
+        assert_eq!(orchestrator_tested_source(&row), None);
+
+        let passed = outcome_of_orchestrator_test(
+            &Reported::Tested(Tested {
+                latency_ms: 9,
+                mongo_setup: None,
+                oracle_setup: None,
+            }),
+            OrchestratorTested::MongoDb,
+        );
+        assert!(passed.ok && passed.supported);
+        assert_eq!(passed.latency_ms, Some(9));
+        assert_eq!(passed.message, "Connected via MongoDB and ran ping.");
+        for (class, sentence) in [
+            (
+                ErrorClass::SignInRefused,
+                "MongoDB connection failed: authentication failed",
+            ),
+            (ErrorClass::Timeout, "MongoDB connection timed out"),
+        ] {
+            let failed =
+                outcome_of_orchestrator_test(&Reported::Failed(class), OrchestratorTested::MongoDb);
+            assert!(!failed.ok && failed.supported && failed.latency_ms.is_none());
+            assert_eq!(failed.message, sentence);
+        }
     }
 }

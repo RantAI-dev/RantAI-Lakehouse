@@ -1,0 +1,607 @@
+# `SEC-17` Upload hardening: plan
+
+Planner: Claude Opus. Developer: a different agent. Base: `origin/main` at
+`cd8e3df`. Branch: `fix/sec-17-upload-hardening`. Spec:
+`docs/core/specs/sec-17.md`. Feature page:
+`docs/core/features/upload-limits-and-safe-csv.md` (decisions D1–D8; not yet
+signed, the defaults are built).
+
+## 1. What is wrong, with anchors (verified at `cd8e3df`)
+
+- **No column cap.** The API's preview takes the header record as it is:
+  `rust/crates/lakehouse-api/src/upload_parse.rs:499` (`preview`, `columns =
+  records.get(header_row)`). It reads at most `PREVIEW_BYTES` (256 KB,
+  `routes/uploads.rs:112`), so the API itself sees at most about 262,000
+  cells; the unbounded part is the job. `dagster/dispar_orchestrate/
+  file_ingest.py:360` (`parse_file`) refuses a header with no columns and a
+  file with more than `MAX_ROWS` rows (`:100`), and has no width check.
+  `routes/uploads.rs:1259` (`ingest`) launches the job without reading the
+  file.
+- **No concurrency limit.** `routes/uploads.rs:512` (`create`) reads a part
+  of up to 50 MB into memory for every request it is given. `ingest` marks
+  a row `ingesting` and launches a run with no count of the runs already
+  going.
+- **Formula cells.** `src/lib/csv.ts:15` (`escapeCell`) quotes for RFC 4180
+  only. Every console-written CSV goes through `toCsv` in that file
+  (`src/lib/table-csv.ts`, `src/features/dashboards/tile-dialogs.tsx:24`).
+  `rust/crates/lakehouse-api/src/routes/query.rs:1001` (`download`) returns
+  `ClickHouse`'s `FORMAT CSV` bytes untouched.
+
+Already there and to be reused: `ApiError::TooManyRequests { message,
+retry_after_secs }` (`rust/crates/lakehouse-core/src/error.rs:97`, rendered
+with `Retry-After` in `lakehouse-api/src/error.rs:52`); the fixed failure
+reasons shared by the job and the API (`JOB_FAILURE_REASONS`,
+`routes/uploads.rs:232`; `FAILURE_REASONS`, `file_ingest.py:139`;
+`ops/fixtures/upload_load_failure_reasons.json`, which a test on each side
+reads).
+
+## 2. Decisions already made
+
+Feature page D1–D8. In engineering terms:
+
+- E1. One sentence for the cap everywhere: `The file has more than 1,000
+  columns.` It is the eighth job failure reason.
+- E2. The cap counts the cells of the header record under the reading in use
+  (encoding, delimiter, header row). The API counts on the first
+  `PREVIEW_BYTES`; a header record cut off by that boundary is counted as
+  far as it goes (a cut can only undercount, and 1,001 cells need about
+  1 KB, so a header that breaks the cap is always seen). The job counts on
+  the whole file and is the authority.
+- E3. `GET …/preview` over the cap answers 400 with the sentence. The
+  console's Check step shows it and keeps its delimiter, encoding and header
+  row controls usable.
+- E4. `create` is not given the cap: it has no reading to count under, and a
+  wrong guess must not refuse a good file.
+- E5. Files being received: counted in the API process (per user and in
+  total), taken before the body is read, given back when the handler
+  returns, on every path. Loads: counted in Postgres as rows in `ingesting`,
+  per `uploaded_by` and in total, in the same transaction that marks the
+  row, serialised by a transaction-level advisory lock so two simultaneous
+  starts cannot both take the last place.
+- E6. Over either limit: `ApiError::TooManyRequests` with `Too many uploads
+  are in progress. Try again in a moment.` and `retry_after_secs: 5`.
+- E7. `UPLOAD_MAX_CONCURRENT_PER_USER` (default 4) and
+  `UPLOAD_MAX_CONCURRENT` (default 16), read once into the config. A value
+  that is not a whole number of 1 or more is a start-up error (fail closed),
+  not a silent default.
+- E8. Formula rule, identical in TypeScript and Rust: a cell whose first
+  character is `=`, `+`, `-`, `@`, U+0009 or U+000D gets `'` in front,
+  unless the whole cell matches `^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$`.
+  The apostrophe goes on before RFC 4180 quoting, so it ends up inside the
+  quotes.
+- E9. The query download is rewritten in the API, field by field, by a small
+  state machine over the bytes `ClickHouse` returned. No new dependency.
+  Parquet is returned as it is.
+- E10. No migration.
+
+## 3. Tasks
+
+One task per commit, in this order. Rust tasks sit together.
+
+**T1. Column cap in the API.** In `upload_parse.rs`: `pub const
+MAX_COLUMNS: usize = 1_000` and a function that returns the header record's
+width for a head and a reading without dropping a cut-off last record.
+`routes::uploads::preview` answers 400 `TOO_MANY_COLUMNS` over the cap.
+`routes::uploads::ingest` reads the head (`store.head_bytes`) under the
+requested reading and answers 400 before any claim, mark or launch.
+`JOB_FAILURE_REASONS` becomes eight; `ops/fixtures/
+upload_load_failure_reasons.json` gets the sentence (the same commit, since
+the Rust test reads the file).
+*Check:* unit tests in `upload_parse.rs` (1,000 passes, 1,001 fails, a head
+of 256 KB of commas fails, a cut-off header is counted); route tests in
+`tests/upload_routes.rs` (preview 400; ingest 400 and the orchestrator mock
+received no launch; a 1,000-column file previews).
+
+**T2. Concurrency limits in the API.** Config fields per E7. A limiter in
+`AppState` for files being received (a guard type that gives the place back
+on drop). `create` takes a place first. A store function that counts and
+marks in one transaction under an advisory lock, used by `ingest` in place
+of `mark_ingesting`; the claim made just before it must be released, as the
+existing refusal paths release it, when the limit refuses.
+*Check:* unit tests for the limiter (fifth per user refused, another user
+admitted, seventeenth in total refused, a dropped guard frees the place);
+`sqlx::test` for the store function (four rows `ingesting` for one
+`uploaded_by` refuse a fifth, a different `uploaded_by` passes, sixteen in
+total refuse the next); a route test that a refused `ingest` answers 429
+with `Retry-After` and leaves the row `uploaded` with no table claim;
+config tests for the defaults and for a bad value.
+
+**T3. Query download.** A module (for example `csv_safe.rs`) with the E8
+rule and the rewriter; `routes::query::download` passes CSV through it.
+*Check:* unit tests: quoted and unquoted fields; a quoted field holding
+commas, doubled quotes and line breaks; `=`, `+`, `-`, `@`, tab, CR first;
+numbers left alone (`-5`, `+3.2e4`, `.5`, `-1+1` is not one); empty fields;
+CRLF and LF row ends; the last row with and without a row end; a route test
+that a download whose mocked engine answer holds `"=1+1"` returns
+`"'=1+1"` and that `format=parquet` bytes are unchanged.
+
+**T4. Other CSV writers in the API.** `gold_export.rs`, `routes/alerts.rs`
+and `routes/support.rs` mention CSV. Read each. If one writes a CSV file a
+person downloads, pass it through T3's function in this commit; if not,
+say what it does in the handoff. No change is also a result; write it down.
+
+**T5. The job.** `file_ingest.py`: `MAX_COLUMNS = 1_000`,
+`TOO_MANY_COLUMNS`, added to `FAILURE_REASONS` in the fixture's order,
+raised by `parse_file` right after the header is read and before any row
+is.
+*Check:* tests in `test_file_ingest.py` named as sentences: a header of
+1,000 columns is parsed; a header of 1,001 is refused with the sentence
+before any row is read; the reasons still equal the fixture.
+
+**T6. Console CSV.** `src/lib/csv.ts`: the E8 rule in `escapeCell`'s place
+in the pipeline (apostrophe first, then quoting), for headers and cells.
+New comments in English.
+*Check:* `src/lib/csv.test.ts` cases mirroring T3's; `table-csv` tests
+still pass.
+
+**T7. Console messages.** The Check step shows the 400 sentence from
+`preview` and keeps its controls usable; a 429 from `create` or `ingest`
+shows the sentence and leaves the form as it was so the person can press
+again. Look first: `apiFetch` and the upload client may already carry an
+API message through unchanged, in which case this task is tests only.
+*Check:* component tests for both.
+
+**T8. Gate and docs.** `ops/g9/upload_test.py`: a step that uploads a
+1,001-column file and expects 400 from preview and from ingest. `CHANGELOG.md`
+entry. `docs/core/features/upload-file.md`: the limits, in its Limits
+section. `.env.example`: the two variables, commented, with their defaults.
+`docker-compose.yml`: pass them through with `${X:-}` only if the API
+service lists its variables one by one (look first).
+
+## 4. Pull request
+
+One slice, all tasks.
+
+## 5. Out of scope
+
+Everything under "Not included" on the feature page. No change to
+`routes/pipelines.rs` or `routes/lineage.rs`. No migration. No new
+dependency.
+
+## 6. Verification
+
+Per commit: the scoped checks of `AGENTS.md` ("Keep build time down").
+Before handoff, on the final commit: the block in `AGENTS.md` for Rust,
+TypeScript and Python.
+
+**On this machine, do not build Rust test binaries**: `cargo test`, `cargo
+build` and `cargo check --tests` have crashed the machine. Run `cargo fmt
+--check` and `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` with `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target
+CARGO_BUILD_JOBS=2`, and write every Rust test as *not verified* in the
+handoff. CI on the pull request runs them.
+
+## 7. Handoff
+
+Developer: Claude Sonnet 5.5. Branch `fix/sec-17-upload-hardening`, one slice
+(all tasks), eight task commits on top of `1e47938`.
+
+### Commits
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T1 | `e8ac7f8` | fix(api): refuse a file with more than 1,000 columns at preview and ingest |
+| T2 | `92c2018` | fix(api): limit uploads in progress per user and in total |
+| T3 | `2a8e936` | fix(api): query CSV download writes cells that cannot run a formula |
+| T4 | `2121421` | docs(api): no other CSV writer in the API needs the formula rule (empty commit, the finding) |
+| T5 | `3636e12` | fix(dagster): the file load refuses a header of more than 1,000 columns |
+| T6 | `9ea65bc` | fix(frontend): CSV files the console writes cannot run a formula |
+| T7 | `8590342` | fix(frontend): keep the Check step's controls when the file has too many columns |
+| T8 | `deaa69b` | docs(ops): gate step, changelog and settings for the SEC-17 upload limits |
+
+### Commands run, with results
+
+All Rust commands with `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2`, in the foreground.
+
+- `cd rust && cargo fmt --check`: clean on the final commit.
+- `cd rust && cargo clippy --workspace --all-targets --all-features -- -D warnings`: finished, 0 warnings, on the final commit. (`--all-targets` type-checks the unit and integration tests without linking them.) Also run per Rust commit as `cargo clippy -p lakehouse-api` / `-p lakehouse-store --all-targets -- -D warnings`.
+- `bun run typecheck`: clean. `bun run lint`: 0 errors, 6 warnings (all in files this change does not touch, present before).
+- `bun run test`: 877 pass, 1 skip, 0 fail, 878 tests in 99 files.
+- `python3 ops/lint/check_intra_package_imports.py`: OK. `python3 ops/lint/check_bare_iceberg_count.py`: OK.
+- `docker compose --profile '*' config --quiet`: exit 0, no output.
+- `git status`: clean apart from the untracked `node_modules` symlink (not staged).
+
+### Not verified, and why
+
+- **Every Rust test** (`cargo test` is forbidden on this machine): the new unit tests in `upload_parse.rs`, `upload_limits.rs`, `csv_safe.rs`, `config.rs`; the `sqlx::test` store tests in `lakehouse-store/tests/uploads.rs`; the route tests in `lakehouse-api/tests/upload_routes.rs` and `query_download.rs`; and every existing Rust test (the changed `ingest` now reads the stored object before the claim). Only compilation (clippy `--all-targets`) is shown.
+- `(cd dagster && python -m pytest ...)`: `pytest` and `dagster` are not installed here. The new tests in `test_file_ingest.py` and the changed one (seven to eight reasons) were not run. Only `ast.parse` of both files was checked.
+- `ops/g9/upload_test.py` step 8: needs a running stack; only `ast.parse`.
+- `docker compose up` for the two new variables (AGENTS.md rule 8): not done; only `config --quiet`. The change is two `${X:-}` lines on the API service.
+- Console behaviour in a browser (the Check step with the controls on a first-read 400): component tests only.
+
+### Tests most likely to fail in CI, and why
+
+1. `the_fifth_simultaneous_upload_of_one_user_is_429_with_retry_after` (`upload_routes.rs`): five uploads in `tokio::join!` over a 1.5 s delayed `PUT`; it counts exactly four 201 and one 429, so it depends on all five reaching the handler within 1.5 s. A slow CI database could break the overlap (then it would see five 201). It is the only timing-based test. It also assumes `wiremock` priority 1 beats the default `PUT` mock, as `break_bucket` relies on.
+2. `a_fifth_load_of_one_uploader_is_429_and_claims_and_launches_nothing` and `loads_of_another_uploader_do_not_count_against_this_one`: they build the four loads with `seed_loading` (uploaded by `Seeded Uploader`) and ingest a fifth seeded upload as Bayu. They rely on `ingest` counting the upload's recorded `uploaded_by` and not Bayu's name (decision D6). If the store's `COLS` or `seed` change, they fail.
+3. `a_header_of_commas_longer_than_the_preview_is_refused`: 300 KiB of commas goes through `sniff` and `check_file` at upload; I read both and expect it accepted as text, but did not run it.
+4. `lakehouse-store` tests (`mark_ingesting_within_limits`): first use of `pool.begin()` with the advisory lock for this table; `under_limits` takes `&mut PgConnection` and is called with `&mut tx` (it compiles under clippy).
+5. `the_reasons_the_api_knows_are_the_reasons_in_the_shared_fixture`: the fixture has the eighth sentence appended last; the Rust and Python constants are in that order.
+6. Python: `test_a_header_of_1001_columns_is_refused_before_any_row_is_read` relies on a header-only file otherwise failing as `NO_ROWS`, which `parse_file` does.
+
+### Mismatches between the plan and the code, and what I chose
+
+1. **"The claim made just before it must be released, as the existing refusal paths release it" (T2).** No existing path releases a table claim: `uploads.rs` (store) states "A claim is NEVER RELEASED", and `ingest` leaves the claim after a conflict or a failed launch. I did not add a release (that would break the module's invariant). Instead `ingest` asks a read-only count (`uploads::loads_under_limits`) before `claim_table`, so the normal refusal leaves no claim and the row `uploaded`; the locked count in `mark_ingesting_within_limits` stays the decision. In the race where a request passes the read and loses the locked count, the claim stands, like a claim after a failed launch. The route test for the 429 asserts no claim for the normal case. **Planner: confirm this is acceptable, or ask for a claim-and-mark in one transaction.**
+2. **E9 "rewritten ... by a small state machine" and T3 `format=parquet`:** done as planned; the CSV test also covers the existing happy path (`n\n1\n2\n` is unchanged).
+3. **E3/T7 "the Check step shows it and keeps its controls".** Not tests-only: on a first-read 400 the step had only a Retry button (no preview, so no controls). `UploadCheckStep` now renders the controls with an undecided "Detected by the service" option when the failure is `invalid_request` and nothing is shown yet. The client already carried the 429 and 400 sentences and statuses unchanged, so no client change (tests added).
+4. **Per-user key for received files.** `create` has no `uploaded_by`; it uses `principal.display_name`, the same text `uploaded_by` records (two users with one display name share a place count; the same holds for loads).
+5. **Where the 400 is checked in `ingest`:** after the `ingesting` and tenant checks and before `ensure_table_free` (the first external call), reading the head with `head_bytes`. A missing object now answers 503 from `ingest` where it used to answer from the launch; no existing test seeds an upload without its object.
+6. **Python `parse_file`:** the column count is taken on a header list the reader already built, so a 50 MB header of commas still builds that list in the job before it is refused. The API refuses such a file first; the job is the authority for a load started another way.
+
+### Review fixes
+
+- `SEC-17 review fix (SHOULD-FIX 1)`: `under_limits` (and so `loads_under_limits`) ignores `ingesting` rows whose `updated_at` is over 6 hours old (`LOAD_COUNTS_FOR_HOURS`, bound as `$2` of `make_interval`). New store test `loads_older_than_six_hours_do_not_count_against_the_limits` (sqlx::test, not run locally; `file_upload.updated_at` has no trigger in the migrations, so the test sets it directly). 6 hours added to the Limits list of `upload-file.md`.
+
+### T4: what each file does
+
+- `rust/crates/lakehouse-api/src/gold_export.rs`: exports a Gold mart to Iceberg (Parquet files) through `iceberg-rust`. The only "CSV" in it is a test string, `url('h', 'CSV')`, for the read-only SQL gate. Writes no CSV a person downloads. No change.
+- `rust/crates/lakehouse-api/src/routes/alerts.rs`: the only "CSV" is a gate test (`url('http://example.com/x.csv', 'CSV')`). No CSV is written. No change.
+- `rust/crates/lakehouse-api/src/routes/support.rs`: the only "CSV" is the same kind of gate test string. No change.
+- A search for `text/csv`, `FORMAT CSV`, `to_csv` and `.csv` over `rust/crates` finds one writer, `routes/query.rs` `download` (done in T3). The console's writers all go through `toCsv` in `src/lib/csv.ts` (T6).
+
+### Open decisions (the product owner's)
+
+D1 to D8 of the feature page are unsigned; the defaults are built. The page's acceptance checklist is for the product owner on a running console and was not run.
+
+## 8. Review
+
+Reviewed 2026-10-08 at `1a6b7af`: the non-test code of `csv_safe.rs`, the
+store function `mark_ingesting_within_limits` and its count, and the
+handoff. The rest of the diff (`upload_limits.rs`, the handlers, the
+console) is not yet read line by line.
+
+CI on pull request 86: every check passes, the Rust test jobs, the Dagster
+unit tests and the G-gates among them, except the two `gitleaks` jobs,
+which fail on `main` as well. No Rust test was run on the build machine
+(*not verified* locally).
+
+Plan errors, mine: section 3 T2 said a refused claim "must be released, as
+the existing refusal paths release it". Nothing releases a claim. The
+developer's read-only count before the claim is accepted as built.
+
+- `SHOULD-FIX` 1. `lakehouse-store/src/uploads.rs`, `under_limits`: every
+  row in `ingesting` counts, for ever. A row leaves `ingesting` when its
+  job reports or when someone reads it (`Settler`, on `get`, `list`,
+  `ingest`, `delete`), and `list` reads one tenant's rows. So sixteen loads
+  whose jobs died, in tenants where nobody opens the page, refuse every
+  load in the installation: one tenant's neglect becomes every tenant's
+  outage. Feature page D9: a row whose `updated_at` is more than 6 hours
+  old does not count. Apply it in `under_limits` and in the read-only
+  `loads_under_limits`, as one constant with the reason beside it, bound
+  as a parameter; add a store test (sixteen old rows do not refuse, a
+  fresh sixteenth does).
+- Accepted, written on the feature page: files being received are counted
+  by display name, and a load counts against the uploader.
+- For the product owner: the job still builds a 50 MB header in memory
+  before refusing it; the API refuses first, so this is reachable only by a
+  load started without the API.
+
+## 9. Round 2 (2026-10-16): bring the branch up to `main`
+
+Planner: the Security & Delivery lane. The branch was 566 commits behind
+`origin/main`. `DATA-19` (#165, uploads feed pipelines) merged on
+2026-10-15 and changed the same upload code; this round waited for it.
+The feature page's decisions D1–D9 were signed by the product owner on
+2026-10-15 as built. The review of the merged result goes under §10.
+
+### Decisions already made
+
+- Merge, do not rebase: one merge commit. Nobody force-pushes this branch.
+- Conflicts expected in `docs/core/features/upload-file.md`,
+  `ops/g9/upload_test.py`, `lakehouse-api` `config.rs`, `lib.rs`,
+  `main.rs`, `routes/uploads.rs`, `state.rs`, `tests/query_download.rs`,
+  `lakehouse-store/tests/uploads.rs`, `src/features/connectors/upload-check-step.tsx`
+  and `upload-file-page.test.tsx`. Resolve hunk by hunk (rule 9); keep
+  both sides' intent; adapt this branch's code to `main`'s shapes.
+- `lakehouse-store/src/uploads.rs` merges without a textual conflict but
+  both sides changed it: read the merged `under_limits`,
+  `loads_under_limits`, `mark_ingesting_within_limits` and every function
+  `DATA-19` added, and make sure a load started by `DATA-19`'s new path
+  (an upload feeding a pipeline, a re-run on re-upload) is counted by the
+  same limits (D2–D4, D9) and settles the same way. If `DATA-19` added a
+  second way into `ingesting` that bypasses the limit check, that is a
+  gap: stop and report it with the anchors.
+- Upstream errors through `upstream_error` (SEC-11; `tests/sec11_guard.rs`
+  must pass). Config booleans `== "true"`; new settings in README and
+  `.env.example` (rule 5: no default credentials; `.env.example` is
+  must-set-free since `SEC-18`).
+
+### Tasks (one commit each, in order)
+
+**M1. Merge `origin/main`.** Acceptance: `cargo check -j 4 -p lakehouse-store -p lakehouse-api --all-targets`
+compiles; `bun run typecheck` passes.
+
+**M2. Make the merged branch pass** (separate commit, body lists each fix).
+Never weaken a test (rule 2); a `main` test that fails because of a
+SEC-17 decision is changed and named in the body.
+
+**M3. Verification on the final commit, foreground or detached-and-polled,
+under the heavy lock:**
+```
+cd rust && cargo fmt --check
+cargo clippy -j 4 --workspace --all-targets --all-features -- -D warnings
+RUST_TEST_THREADS=4 cargo test -j 4 -p lakehouse-store -p lakehouse-api --no-fail-fast
+```
+Quote the `test result:` line of EVERY test binary (about 70) and the
+totals; a failure in a suite this branch does not touch is rerun alone with
+`RUST_TEST_THREADS=2` before it is called flaky. Then `bun run typecheck`,
+`bun run lint`, `bun test src/lib`, `bun test src/services`,
+`bun test src/features/connectors` (counts); Dagster on Python 3.11 as CI:
+`cd dagster && ~/.cache/rantai-dagster-venv-311/bin/python -m pytest dispar_orchestrate -q -m "not loader"`;
+`python3 ops/lint/check_intra_package_imports.py`,
+`python3 -m py_compile ops/g9/upload_test.py`; gitleaks `dir` (ignore only
+an untracked, gitignored `.env`).
+
+### Out of scope
+
+Unchanged from §5. New gaps you notice outside SEC-17: list them in the
+handoff; the planner files them.
+
+## 10. Review of round 2 (planner, 2026-10-16)
+
+Reviewed the merged result at `c1ce5fe8` (developer: MiniMax-M3; its
+quota ran out after M2, so there is no handoff for this round). The merge
+(`588b8b34`), `cargo fmt` (`a752d582`) and the `too_many_lines` split of
+`ingest` (`c1ce5fe8`, behaviour unchanged: the launch tail moved into
+`finish_launch_and_audit`) were read.
+
+The §9 semantic check holds: the only production path into `ingesting`
+is `mark_ingesting_within_limits` (`routes/uploads.rs`); the unlimited
+`mark_ingesting` is called only from a test (`routes/load_alerts.rs`,
+inside `#[cfg(test)]`), and `DATA-19`'s re-upload goes through the same
+route, so it is counted.
+
+Planner's runs on `c1ce5fe8`: `cargo fmt --check` ok; workspace clippy
+`-D warnings` exit 0; `cargo test -p lakehouse-store -p lakehouse-api
+--no-fail-fast`: 71 binaries, 4645 passed, 0 failed, 4 ignored;
+`bun run typecheck` exit 0; `bun run lint` 0 errors, 8 warnings;
+`bun test src/lib` 602 pass, 1 skip; `src/services` 79 pass; Dagster on
+Python 3.11 (`-m "not loader"`) 821 passed; imports lint OK;
+`py_compile ops/g9/upload_test.py` ok; gitleaks `dir` no leaks.
+
+**BLOCKER 1. One console test fails against `main`'s upload wizard.**
+`bun test src/features/connectors`: 241 pass, 1 fail —
+`UploadFilePage, limits > shows the too-many-uploads sentence for a file
+that was not accepted and sends again on the next press`
+(`src/features/connectors/upload-file-page.test.tsx`): "Unable to find a
+label with the text of: Choose a file". `main` reworked the wizard
+(`5bbca542`, `1dd235d1`, `9d6df397`); the label lives in
+`upload-file-step.tsx` and is rendered only in some states, so this test's
+second step looks for a control the new wizard does not show there. Fix
+the test to drive the current wizard to the same point (the refusal is
+shown, and pressing again sends again); do not change the component to fit
+the test, and do not weaken what the test asserts (rule 2). Check:
+`bun test src/features/connectors` 0 fail, the count quoted.
+
+### Handoff (2026-10-16, round 3)
+
+#### 1. Commits
+
+- `5792792e5d8c` `fix(frontend): drive the SEC-17 429 test through main's upload wizard` — PR #86 review round 2, BLOCKER 1, the only code change of this round.
+- This commit: `docs(plan): record round 3 handoff (SEC-17)`.
+
+Full log `git log --oneline --abbrev=12 origin/main..HEAD`, captured before this commit:
+
+```
+5792792e5d8c fix(frontend): drive the SEC-17 429 test through main's upload wizard
+7c1bedb026aa docs(plan): SEC-17 round 2 review: 1 BLOCKER
+c1ce5fe8d97c refactor(api): extract `ingest` helpers to clear the clippy `too_many_lines` cap (SEC-17 round 2 M2)
+a752d58237a8 style(rust): cargo fmt after the SEC-17 / main merge (SEC-17 round 2 M2)
+588b8b34eac4 merge: bring fix/sec-17-upload-hardening up to origin/main (SEC-17 round 2 M1)
+b510f7948251 docs(plan): SEC-17 round 2, bring the branch up to main
+f43a1b777470 fix(store): a load shown as running for over 6 hours no longer counts
+98bff7e8a413 docs(security): first review of SEC-17
+1a6b7afc7c57 docs(security): handoff of SEC-17
+deaa69bd33b4 docs(ops): gate step, changelog and settings for the SEC-17 upload limits
+```
+
+#### 2. What BLOCKER 1 was, and the fix
+
+The test `UploadFilePage, limits > shows the too-many-uploads sentence for a
+file that was not accepted and sends again on the next press`
+(`src/features/connectors/upload-file-page.test.tsx`) failed at line 996 with
+`Unable to find a label with the text of: Choose a file`. `main`'s reworked
+wizard (`upload-file-step.tsx`) labels the real file input "Choose a file" only
+before a file is picked and "Choose another" once one is, so the test's second
+assertion looked for a label that state does not render.
+
+The component is correct; the assertion was stale. It now checks the
+picked-state control (`getByLabelText("Choose another")`) and that the chosen
+file (`stock.csv`) is still shown — the same "the form is as it was" claim, not
+a weaker one. `next()` staying enabled and the second press sending a second
+POST are unchanged. No component code was changed (AGENTS.md rule 2).
+
+#### 3. Verification commands, verbatim, with counts
+
+- `flock /home/shiro/rantai/.locks/heavy.lock bun test src/features/connectors`:
+
+```
+242 pass
+0 fail
+1036 expect() calls
+Ran 242 tests across 14 files. [10.68s]
+```
+
+- `bun run typecheck` (`bun --bun tsc --noEmit`): no output, exit 0.
+- `bun run lint`: `✖ 8 problems (0 errors, 8 warnings)`. The 8 warnings are the
+  pre-existing ones (react-hooks/exhaustive-deps, no-unused-vars,
+  no-location-assign-relative-destination); none is in
+  `upload-file-page.test.tsx`.
+- gitleaks
+  (`docker run --rm -v "$PWD":/repo -w /repo zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact`):
+  `scanned ~24731097 bytes (24.73 MB) in 4.57s` / `no leaks found`.
+
+#### 4. Skipped, and premises
+
+- Rust, Python and docker: out of scope this round; no file of those languages
+  was touched, so *not verified* here.
+- Whole `bun run test` / `bun test src`: *not run* (dev-rules forbid them);
+  only the touched folder `src/features/connectors` was run.
+- No premise of the plan turned out wrong. The plan's §10 BLOCKER 1 described
+  the code exactly: the label is in `upload-file-step.tsx` and is rendered only
+  in the no-file state.
+
+#### 5. Repository state
+
+`git status --short` (empty):
+
+```
+```
+
+`git log --oneline --abbrev=12 origin/main..HEAD | head`:
+
+```
+5792792e5d8c fix(frontend): drive the SEC-17 429 test through main's upload wizard
+7c1bedb026aa docs(plan): SEC-17 round 2 review: 1 BLOCKER
+c1ce5fe8d97c refactor(api): extract `ingest` helpers to clear the clippy `too_many_lines` cap (SEC-17 round 2 M2)
+a752d58237a8 style(rust): cargo fmt after the SEC-17 / main merge (SEC-17 round 2 M2)
+588b8b34eac4 merge: bring fix/sec-17-upload-hardening up to origin/main (SEC-17 round 2 M1)
+b510f7948251 docs(plan): SEC-17 round 2, bring the branch up to main
+f43a1b777470 fix(store): a load shown as running for over 6 hours no longer counts
+98bff7e8a413 docs(security): first review of SEC-17
+1a6b7afc7c57 docs(security): handoff of SEC-17
+deaa69bd33b4 docs(ops): gate step, changelog and settings for the SEC-17 upload limits
+```
+
+`git ls-remote --heads origin fix/sec-17-upload-hardening` (12-char prefix of the
+full output):
+
+```
+5792792e5d8c	refs/heads/fix/sec-17-upload-hardening
+```
+
+Round 3, reviewed 2026-10-16 at `5792792e` (developer: DeepSeek v4.1 flash,
+opencode free). BLOCKER 1 fixed: the test now asserts what the reworked
+wizard shows after a refusal (the chosen file's name and its "Choose
+another" control) and still that pressing Next sends again; nothing it
+asserted was dropped. Planner: `bun test src/features/connectors` 242 pass,
+0 fail; `bun run typecheck` exit 0; `bun run lint` 0 errors, 8 warnings.
+`origin/main` merged again (`CHANGELOG.md`: both sides kept). No open
+`BLOCKER`.
+
+### Handoff (2026-10-16, round 4)
+
+#### 1. Commits
+
+- `2a58122c3d29` `merge: bring fix/sec-17-upload-hardening up to origin/main
+  (SEC-17 round 4 M1)` — `origin/main` (5c93fd20, PR #144, SRC-11/12/13) merged
+  into the branch. Two files conflicted; both resolved hunk by hunk, both
+  sides kept (AGENTS.md rule 9): `config.rs` (SEC-17 `upload_max_concurrent*`
+  alongside SRC-11 `connector_auto_disable_after` in the struct, `Debug` impl
+  and `from_map`) and `state.rs` (SEC-17 `upload_limits::ReceiveLimiter` import
+  alongside SRC-12 `secret_crypto`/`secret_manager`; both wirings survive in
+  `AppState::new`). No `--ours`/`--theirs`.
+- `2b408d9bbff9` `refactor(api): extract connector_secrets_keyring to clear
+  the clippy too_many_lines cap (SEC-17 round 4 M2)` — the merge pushed
+  `AppState::new` to 104/100 lines, so `clippy -D warnings` failed. The
+  keyring construction moved into `connector_secrets_keyring(config: &Config)`,
+  behaviour unchanged, same remedy as round 2's ingest split (`c1ce5fe8`), not
+  an `#[allow]`.
+- This commit: `docs(plan): record round 4 handoff (SEC-17)`.
+
+Full log `git log --oneline --abbrev=12 origin/main..HEAD`, captured before
+this commit:
+
+```
+2b408d9bbff9 refactor(api): extract connector_secrets_keyring to clear the clippy too_many_lines cap (SEC-17 round 4 M2)
+2a58122c3d29 merge: bring fix/sec-17-upload-hardening up to origin/main (SEC-17 round 4 M1)
+0027492f75fd docs: SEC-17 round 3 review (no open finding), decisions signed, backlog Done
+96c992d7167f Merge remote-tracking branch 'origin/main' into fix/sec-17-upload-hardening
+94af79039aa6 docs(plan): record round 3 handoff (SEC-17)
+5792792e5d8c fix(frontend): drive the SEC-17 429 test through main's upload wizard
+7c1bedb026aa docs(plan): SEC-17 round 2 review: 1 BLOCKER
+c1ce5fe8d97c refactor(api): extract `ingest` helpers to clear the clippy `too_many_lines` cap (SEC-17 round 2 M2)
+a752d58237a8 style(rust): cargo fmt after the SEC-17 / main merge (SEC-17 round 2 M2)
+588b8b34eac4 merge: bring fix/sec-17-upload-hardening up to origin/main (SEC-17 round 2 M1)
+```
+
+#### 2. Conflicts resolved (M1)
+
+Only `rust/crates/lakehouse-api/src/config.rs` and
+`rust/crates/lakehouse-api/src/state.rs` conflicted textually; every other
+touched file (`CHANGELOG.md`, `docker-compose.yml`, `.env.example`, `main.rs`,
+`lib.rs`, `BACKLOG.md`, the realm of #144's new modules) auto-merged with both
+sides. `config.rs` had three hunks (struct field, `Debug` impl field,
+`from_map` initialiser) — each kept SEC-17's `upload_max_concurrent_per_user`/
+`upload_max_concurrent` and SRC-11's `connector_auto_disable_after`.
+`state.rs` had one hunk (the `use crate::…` block) — kept SEC-17's
+`upload_limits::ReceiveLimiter` and SRC-12's `secret_crypto`/`secret_manager`
+imports. The receive counter itself (`AppState.upload_receive`,
+`ReceiveLimiter::new(...)`) and #144's keyring/resolver wiring auto-merged and
+both survive.
+
+#### 3. Verification commands, verbatim, with counts
+
+All Rust commands under `flock /home/shiro/rantai/.locks/heavy.lock`, with
+`CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target`, `-j 4`, and a fresh
+`find rust -name '*.rs' -o -name '*.sql' -o -name Cargo.toml | xargs touch`
+before the first one.
+
+- `cargo fmt --check`: no output, exit 0.
+- `cargo clippy -j 4 --workspace --all-targets --all-features -- -D warnings`:
+  `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 2m 29s`,
+  exit 0. (First run on the merge commit failed 104/100 at
+  `state.rs:597 AppState::new`; the M2 commit is what makes this green.)
+- The task wrote the lib filter as `--lib config:: state::`; `cargo test`
+  takes one `TESTNAME`, so it was run as two invocations. Both:
+  - `cargo test -j 4 -p lakehouse-api --lib config::`:
+    `test result: ok. 92 passed; 0 failed; 0 ignored; 0 measured; 1849 filtered out; finished in 30.04s`
+  - `cargo test -j 4 -p lakehouse-api --lib state::`:
+    `test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 1927 filtered out; finished in 0.00s`
+    (the known environment failure
+    `state::tests::connector_secret_resolver_…_probe_flag` passed here).
+- `cargo test -j 4 -p lakehouse-api --test upload_routes`, default
+  `RUST_TEST_THREADS=4`:
+  `test result: FAILED. 56 passed; 38 failed; 0 ignored; 0 measured; 0 filtered out; finished in 69.71s`.
+  Every one of the 38 failures is the same environment error, not a code
+  failure: `connect to the fresh per-test database: Database(PgDatabaseError {
+  severity: Fatal, code: "53100", message: "could not resize shared memory
+  segment \"/PostgreSQL.…\" to 33554432 bytes: No space left on device" })` at
+  `tests/common/mod.rs:150`. Four concurrent Postgres testcontainers exhausted
+  `/dev/shm` (6.8 G tmpfs; 6.5 G free again after the run).
+- Rerun alone with `RUST_TEST_THREADS=2`, same command otherwise:
+  `test result: ok. 94 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 71.15s`,
+  exit 0.
+- gitleaks
+  (`docker run --rm -v "$PWD":/repo -w /repo zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact`):
+  `scanned ~26458328 bytes (26.46 MB) in 4.81s` / `no leaks found`.
+
+#### 4. Skipped, and premises
+
+- TypeScript, Python and docker-compose: out of scope this round; no file of
+  those languages was changed by either commit, so *not verified* here.
+- Whole `bun run test` / `bun test src`: *not run* (dev-rules forbid them).
+- No premise of the plan turned out wrong. §9's conflict list matched: only
+  `config.rs` and `state.rs` conflicted this time (the upload/store/TS files
+  it names had already been merged in round 2 and did not conflict again).
+- The `too_many_lines` cap crossing is a merge artefact (each side alone was
+  under 100); it is fixed at the cause, not suppressed.
+
+#### 5. Repository state
+
+`git status --short` (empty before the handoff commit; the handoff file was
+written after):
+
+```
+```
+
+`git log --oneline --abbrev=12 origin/main..HEAD | head`:
+
+```
+2b408d9bbff9 refactor(api): extract connector_secrets_keyring to clear the clippy too_many_lines cap (SEC-17 round 4 M2)
+2a58122c3d29 merge: bring fix/sec-17-upload-hardening up to origin/main (SEC-17 round 4 M1)
+0027492f75fd docs: SEC-17 round 3 review (no open finding), decisions signed, backlog Done
+96c992d7167f Merge remote-tracking branch 'origin/main' into fix/sec-17-upload-hardening
+94af79039aa6 docs(plan): record round 3 handoff (SEC-17)
+5792792e5d8c fix(frontend): drive the SEC-17 429 test through main's upload wizard
+7c1bedb026aa docs(plan): SEC-17 round 2 review: 1 BLOCKER
+c1ce5fe8d97c refactor(api): extract `ingest` helpers to clear the clippy `too_many_lines` cap (SEC-17 round 2 M2)
+a752d58237a8 style(rust): cargo fmt after the SEC-17 / main merge (SEC-17 round 2 M2)
+588b8b34eac4 merge: bring fix/sec-17-upload-hardening up to origin/main (SEC-17 round 2 M1)
+```
+
+`git ls-remote --heads origin fix/sec-17-upload-hardening` (12-char prefix of
+the full output):
+
+```
+2b408d9bbff9	refs/heads/fix/sec-17-upload-hardening
+```

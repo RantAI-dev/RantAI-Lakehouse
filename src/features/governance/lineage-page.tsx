@@ -16,7 +16,9 @@ import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
 import { assetService, governanceService } from "@/services"
 import type { LineageGraph } from "@/services/contracts/governance"
+import { MappingList } from "@/features/catalog/column-lineage"
 import { getLineageColumns } from "./lineage-columns"
+import { UsedBy } from "./used-by"
 
 function ConnectionsTable({ graph }: { readonly graph: LineageGraph }) {
   const tableUrlState = useTableUrlState()
@@ -71,6 +73,12 @@ function ConnectionsTable({ graph }: { readonly graph: LineageGraph }) {
       <DataTable table={table} />
     </div>
   )
+}
+
+/** The table key a "Used by" list can be asked for (`serving.orders`, `table:serving.orders`); empty for a chart, metric, connector or dataset focus. */
+export function usedByTable(focus: string): string {
+  const key = focus.startsWith("table:") ? focus.slice("table:".length) : focus
+  return /^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$/.test(key) ? key : ""
 }
 
 export function LineagePage() {
@@ -129,16 +137,11 @@ export function LineagePage() {
           >
             <ConnectionsTable graph={state.data} />
           </SectionCard>
+          {/* BI-14 (plan D5): the charts under a table; a chart, SQL source or metric focus is drawn by the graph above. */}
+          {usedByTable(focus) ? <UsedBy table={usedByTable(focus)} size="default" /> : null}
           {state.data.columnMappings.length > 0 ? (
             <SectionCard title="Column mappings">
-              <ul className="space-y-2 text-sm">
-                {state.data.columnMappings.map((m) => (
-                  <li key={`${m.source}-${m.target}`} className="font-mono text-xs">
-                    {m.source} → {m.target}{" "}
-                    <span className="text-muted-foreground">({m.transform})</span>
-                  </li>
-                ))}
-              </ul>
+              <MappingList mappings={state.data.columnMappings} />
             </SectionCard>
           ) : null}
           {state.data.coverage?.length ? (

@@ -1,10 +1,12 @@
 import type { EChartsOption } from "echarts";
 import type { ChartSpec } from "@/lib/dashboard-specs";
 import { escapeHtml, pointLimit, pointSize, toPoints } from "@/lib/geo-points";
-import { matchRegionRows } from "@/lib/geo-regions";
+import { matchRegionRows, rawNamesByFeature } from "@/lib/geo-regions";
 import { ZOOM_MAX, ZOOM_MIN } from "@/lib/geo-view";
-import { fmtInt } from "./chart-option";
-import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, mapEntry, mapFeatureNames } from "./echarts-maps";
+import type { ValueFormat } from "@/lib/chart-style";
+import { formatValue } from "@/lib/value-format";
+import { fmtInt as plainInt } from "./chart-option";
+import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, mapEntry, mapFeatureAliases, mapFeatureNames } from "./echarts-maps";
 
 /** What the three map kinds need of a chart spec. */
 export type GeoSpec = Pick<ChartSpec, "kind" | "x" | "y" | "map" | "lat" | "lon" | "sqlSource">;
@@ -19,6 +21,19 @@ type Row = Record<string, unknown>;
 /** The map a spec is drawn on: its own, else the default for its kind. */
 export function resolveMapId(spec: Pick<ChartSpec, "kind" | "map">): string {
   return spec.map || (spec.kind === "geomap" ? DEFAULT_CHOROPLETH_MAP : DEFAULT_POINT_MAP);
+}
+
+/**
+ * For a choropleth, each map feature with the distinct spellings the rows
+ * store for it (what a click drills into); undefined for the point kinds.
+ * Uses the same level and feature names as the drawing, so a click and the
+ * colour agree on which rows belong to a region.
+ */
+export function regionNamesFor(spec: GeoSpec, rows: Row[]): Map<string, string[]> | undefined {
+  if (spec.kind !== "geomap") return undefined;
+  const mapId = resolveMapId(spec);
+  const level = mapEntry(mapId)?.level ?? "province";
+  return rawNamesByFeature(rows.map((r) => String(r[spec.x] ?? "")), level, mapFeatureNames(mapId), mapFeatureAliases(mapId));
 }
 
 /** A cell as a number; a missing or non-numeric cell is NaN, never 0. */
@@ -52,7 +67,12 @@ const POINT_RAMP = (dark: boolean) =>
  */
 const HEAT_RAMP = ["#6366f1", "#0ea5e9", "#10b981", "#facc15", "#ef4444"];
 
-export function buildGeoOption(spec: GeoSpec, rows: Row[], dark: boolean): GeoBuild {
+/** BI-17: how a map writes its numbers and, for the kinds that colour by value, which colours. */
+export type GeoLook = { format?: ValueFormat; locale?: string; byValue?: string[] };
+
+export function buildGeoOption(spec: GeoSpec, rows: Row[], dark: boolean, look: GeoLook = {}): GeoBuild {
+  // With no format this is the console's own number writing, as before.
+  const fmtInt = (v: number) => (look.format ? formatValue(v, look.format, look.locale ?? "en-US", 0) : plainInt(v));
   const mapId = resolveMapId(spec);
   const axis = dark ? "#a1a1aa" : "#71717a";
   const tooltip = {
@@ -80,7 +100,7 @@ export function buildGeoOption(spec: GeoSpec, rows: Row[], dark: boolean): GeoBu
 
   if (spec.kind === "geomap") {
     const named = rows.map((r) => ({ name: String(r[spec.x] ?? ""), value: cellNumber(r[yCol]) }));
-    const match = matchRegionRows(named, level, mapFeatureNames(mapId));
+    const match = matchRegionRows(named, level, mapFeatureNames(mapId), mapFeatureAliases(mapId));
     const maxV = Math.max(1, ...match.data.map((d) => d.value));
     const notices = match.unmatchedRows > 0 ? [unmatchedNotice(match.unmatchedRows, match.unmatchedNames)] : [];
     const option: EChartsOption = {
@@ -95,7 +115,7 @@ export function buildGeoOption(spec: GeoSpec, rows: Row[], dark: boolean): GeoBu
       visualMap: {
         min: 0, max: maxV, left: "left", bottom: 6, calculable: true, itemHeight: 70,
         formatter: (v: unknown) => fmtInt(Number(v)),
-        textStyle: { color: axis, fontSize: 10 }, inRange: { color: RAMP(dark) },
+        textStyle: { color: axis, fontSize: 10 }, inRange: { color: look.byValue ?? RAMP(dark) },
       },
       series: [{
         type: "map", map: mapId, ...roam,
@@ -164,7 +184,7 @@ export function buildGeoOption(spec: GeoSpec, rows: Row[], dark: boolean): GeoBu
       },
     },
     geo,
-    visualMap: visualMap(POINT_RAMP(dark), true),
+    visualMap: visualMap(look.byValue ?? POINT_RAMP(dark), true),
     series: [{
       type: "scatter", coordinateSystem: "geo",
       symbolSize: (v: unknown) => pointSize((v as number[])[2], maxV),

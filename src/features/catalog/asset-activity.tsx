@@ -9,18 +9,6 @@ import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
-import {
   Table,
   TableBody,
   TableCell,
@@ -29,11 +17,13 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { useAuth } from "@/features/auth/auth-provider"
-import { useServiceAction } from "@/hooks/use-service"
+import { useService, useServiceAction } from "@/hooks/use-service"
 import { assetSnapshotQueryHref } from "@/lib/asset-query"
+import { cn } from "@/lib/utils"
 import { snapshotRetentionText } from "@/lib/snapshot-picker"
 import {
   formatCompactNumber,
+  formatDate,
   formatDateTime,
   formatLagSeconds,
   formatNumber,
@@ -46,15 +36,17 @@ import {
   snapshotsNewestFirst,
 } from "@/lib/lakehouse-view"
 import { fmtMeasured, type Measured } from "@/lib/measured"
-import { notifyError, notifySuccess } from "@/lib/notify"
+import { withNotify } from "@/lib/notify"
 import { schemaHistory } from "@/lib/schema-history"
-import { governanceService } from "@/services"
+import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
-import type { DatasetSla } from "@/services/contracts/governance"
 import type { LakehouseSchemaVersion } from "@/services/contracts/lakehouse"
+import { FreshnessTargetDialog } from "@/features/governance/freshness-target-dialog"
+import { DropTableAction } from "./asset-drop"
 import { lineageKey } from "./asset-lineage"
-import type { IcebergTableState } from "./asset-storage"
+import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { ALL, CountToggle } from "./count-toggle"
+import { TableGrantNote } from "./table-grant-note"
 
 /** How many snapshots, or changes, are listed before the reader asks for more. */
 const PAGE_SIZES = [10, 25, 50] as const
@@ -68,9 +60,100 @@ function QuietEmpty({ title, description }: { title: string; description?: strin
   return <EmptyState title={title} description={description} className="py-4" />
 }
 
+/** One list of the usage card: a quiet heading, an optional note under it, rows or the empty sentence. */
+function UsageList({
+  title,
+  note,
+  empty,
+  children,
+}: {
+  title: string
+  note?: string
+  empty: string
+  children: React.ReactNode[]
+}) {
+  return (
+    <div>
+      <div className="text-xs font-medium text-muted-foreground">{title}</div>
+      {note ? <p className="mb-1 text-xs text-muted-foreground">{note}</p> : null}
+      {children.length === 0 ? (
+        <p className="text-sm text-muted-foreground">{empty}</p>
+      ) : (
+        <ul className="divide-y divide-border text-sm">{children}</ul>
+      )}
+    </div>
+  )
+}
+
+function UsageRow({ children, count, when }: { children: React.ReactNode; count: string; when?: string }) {
+  return (
+    <li className="flex items-center gap-2 py-1.5">
+      <span className="min-w-0 flex-1 truncate">{children}</span>
+      <span className="shrink-0 text-xs text-muted-foreground tabular-nums">{count}</span>
+      {when ? <span className="shrink-0 text-xs text-muted-foreground">{formatRelativeTime(when)}</span> : null}
+    </li>
+  )
+}
+
 /** `+1,200` for rows a snapshot added; a dash when it added none or did not say. */
 function signed(value: Measured, sign: "+" | "−") {
   return value === null || value === 0 ? "—" : `${sign}${formatNumber(value)}`
+}
+
+/**
+ * Where the asset's Iceberg table is missing: says so and, when the catalog
+ * still keeps a dropped copy, when it was dropped and until when it can come
+ * back (`DATA-15` F4). A holder of `governance:write` gets Restore; after it
+ * the page reloads the table. Where restore does not apply, or nothing is
+ * kept, only the plain sentence shows, with the reason when there is one.
+ */
+function DroppedTable({ asset: a, onRestored }: { asset: AssetDetail; onRestored: () => void }) {
+  const { hasPermission } = useAuth()
+  const status = useService(
+    (s) => assetService.getRestoreStatus(a.id, s),
+    [a.id]
+  )
+  // PR #106 review R1 SHOULD-FIX DATA-15 1: withNotify delivers error toast with real error
+  const restore = useServiceAction(
+    withNotify(
+      { success: "Table restored", error: "Failed to restore the table" },
+      (signal) => assetService.restoreTable(a.id, signal)
+    )
+  )
+  const restorable = status.status === "success" && status.data && status.data.supported === undefined && status.data.restorable
+    ? status.data
+    : null
+  const reason =
+    status.status === "success" && status.data && !restorable
+      ? status.data.reason
+      : undefined
+
+  async function run() {
+    // PR #106 review R1 SHOULD-FIX DATA-15 1
+    if ((await restore.run()) === null) return
+    onRestored()
+  }
+
+  return (
+    <EmptyState
+      title="No Iceberg table for this asset"
+      description={
+        restorable?.droppedAt
+          ? `It was dropped on ${formatDate(restorable.droppedAt)}.${
+              restorable.expiresAt ? ` It can be restored until ${formatDate(restorable.expiresAt)}.` : ""
+            }`
+          : reason
+      }
+      action={
+        restorable && hasPermission("governance:write") ? (
+          <Button size="sm" onClick={() => void run()} disabled={restore.status === "pending"}>
+            {`Restore${restorable.expiresAt ? ` (until ${formatDate(restorable.expiresAt)})` : ""}`}
+          </Button>
+        ) : undefined
+      }
+      className="py-4"
+    />
+  )
 }
 
 /**
@@ -93,7 +176,7 @@ function IcebergSnapshots({
   if (state.status === "loading") return <QuietEmpty title="Loading snapshots…" />
   if (state.status === "error") {
     if (state.error.code === "not_found") {
-      return <QuietEmpty title="No Iceberg table for this asset" />
+      return <DroppedTable asset={a} onRestored={state.reload} />
     }
     return <ErrorState error={state.error} onRetry={state.reload} />
   }
@@ -108,6 +191,7 @@ function IcebergSnapshots({
           <TableRow className="hover:bg-transparent">
             <TableHead className="text-xs">Committed</TableHead>
             <TableHead className="text-xs">Operation</TableHead>
+            <TableHead className="text-xs">Author</TableHead>
             <TableHead className="text-right text-xs">Added</TableHead>
             <TableHead className="text-right text-xs">Deleted</TableHead>
             <TableHead className="text-right text-xs">Rows after</TableHead>
@@ -118,7 +202,7 @@ function IcebergSnapshots({
         </TableHeader>
         <TableBody>
           {snapshots.map((s, i) => {
-            const href = assetSnapshotQueryHref(a, s.id)
+            const href = assetSnapshotQueryHref(a, s.id, icebergTableOf(state))
             return (
               <TableRow key={s.id}>
                 <TableCell className="py-1.5 text-xs" title={formatDateTime(msToIso(s.timestampMs))}>
@@ -130,6 +214,13 @@ function IcebergSnapshots({
                   ) : null}
                 </TableCell>
                 <TableCell className="py-1.5 text-xs">{s.operation}</TableCell>
+                {/* DATA-15 F5, DATA-52: only the author a commit recorded. An upload records
+                    `<name> (file upload)`, a connector's replace or append its run; a merge
+                    load, which dlt writes itself, and a version written before 2026-11-12
+                    record none. */}
+                <TableCell className={cn("py-1.5 text-xs", s.author ? undefined : "text-muted-foreground")}>
+                  {s.author ?? "unknown"}
+                </TableCell>
                 <TableCell className="py-1.5 text-right text-xs tabular-nums">
                   {signed(s.summary.addedRecords, "+")}
                 </TableCell>
@@ -156,140 +247,6 @@ function IcebergSnapshots({
         </TableBody>
       </Table>
     </div>
-  )
-}
-
-const selectClassName = "h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm"
-
-const UNIT_MINUTES = { minutes: 1, hours: 60, days: 1440 } as const
-type Unit = keyof typeof UNIT_MINUTES
-
-/**
- * How often the table is expected to refresh, as the whole number of
- * minutes the SLA stores — or `null` while the form does not say one.
- */
-export function slaMinutes(amount: string, unit: Unit): number | null {
-  const n = Number(amount)
-  if (amount.trim() === "" || !Number.isInteger(n) || n <= 0) return null
-  return n * UNIT_MINUTES[unit]
-}
-
-/** The largest unit a number of minutes is a whole count of. */
-function inLargestUnit(minutes: number): { amount: string; unit: Unit } {
-  for (const unit of ["days", "hours"] as const) {
-    if (minutes % UNIT_MINUTES[unit] === 0) return { amount: String(minutes / UNIT_MINUTES[unit]), unit }
-  }
-  return { amount: String(minutes), unit: "minutes" }
-}
-
-function SetTargetDialog({
-  asset: a,
-  onClose,
-  onSaved,
-}: {
-  asset: AssetDetail
-  onClose: () => void
-  onSaved: () => void
-}) {
-  // Start from the SLA in force; a target taken from the registry's
-  // frequency is not an SLA, so the form then starts from a day.
-  const current =
-    a.freshnessTargetSource === "sla" && a.freshnessTargetSeconds
-      ? inLargestUnit(Math.round(a.freshnessTargetSeconds / 60))
-      : { amount: "1", unit: "days" as Unit }
-  const [amount, setAmount] = React.useState(current.amount)
-  const [unit, setUnit] = React.useState<Unit>(current.unit)
-  const save = useServiceAction((signal, input: DatasetSla) =>
-    governanceService.putDatasetSla(input, signal)
-  )
-  const remove = useServiceAction((signal, table: string) =>
-    governanceService.deleteDatasetSla(table, signal)
-  )
-  const minutes = slaMinutes(amount, unit)
-  // Only an SLA can be removed: a target the registry's refresh frequency
-  // gives is not something this dialog set.
-  const hasSla = a.freshnessTargetSource === "sla"
-
-  async function removeTarget() {
-    // `run` resolves to `null` only on failure.
-    if ((await remove.run(lineageKey(a))) === null) {
-      notifyError("Failed to remove the freshness target", remove.error)
-      return
-    }
-    notifySuccess("Freshness target removed")
-    onSaved()
-  }
-
-  async function submit() {
-    if (minutes === null) return
-    const saved = await save.run({ tableName: lineageKey(a), expectedIntervalMinutes: minutes })
-    if (saved === null) return
-    notifySuccess("Freshness target saved")
-    onSaved()
-  }
-
-  return (
-    <Dialog open onOpenChange={(next) => (next ? undefined : onClose())}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Set freshness target</DialogTitle>
-          <DialogDescription>
-            How often {a.name} must receive new data. Past that, it reads as late and its
-            health as degraded.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="grid gap-1.5">
-          <RequiredLegend />
-          <Label htmlFor="sla-amount" required>New data at least every</Label>
-          <div className="flex gap-2">
-            <Input
-              id="sla-amount"
-              aria-required
-              inputMode="numeric"
-              className="w-24"
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
-              aria-invalid={minutes === null}
-            />
-            <select
-              aria-label="Unit"
-              className={selectClassName}
-              value={unit}
-              onChange={(e) => setUnit(e.target.value as Unit)}
-            >
-              {(Object.keys(UNIT_MINUTES) as Unit[]).map((u) => (
-                <option key={u} value={u}>
-                  {u}
-                </option>
-              ))}
-            </select>
-          </div>
-          {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}
-        </div>
-        <DialogFooter>
-          {hasSla ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              className="mr-auto text-destructive"
-              onClick={() => void removeTarget()}
-              disabled={remove.status === "pending" || save.status === "pending"}
-              title="The asset goes back to having no target of its own"
-            >
-              {remove.status === "pending" ? "Removing…" : "Remove target"}
-            </Button>
-          ) : null}
-          <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
-          <Button
-            size="sm"
-            onClick={() => void submit()}
-            disabled={minutes === null || save.status === "pending" || remove.status === "pending"}
-          >
-            {save.status === "pending" ? "Saving…" : "Save target"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   )
 }
 
@@ -334,8 +291,16 @@ function FreshnessCard({ asset: a, onChanged }: { asset: AssetDetail; onChanged:
         className="text-sm"
       />
       {setting ? (
-        <SetTargetDialog
-          asset={a}
+        <FreshnessTargetDialog
+          table={lineageKey(a)}
+          label={a.name}
+          // A target taken from the registry's frequency is not an SLA, so
+          // the form then starts from a day and offers no Remove.
+          currentMinutes={
+            a.freshnessTargetSource === "sla" && a.freshnessTargetSeconds
+              ? Math.round(a.freshnessTargetSeconds / 60)
+              : null
+          }
           onClose={() => setSetting(false)}
           onSaved={() => {
             setSetting(false)
@@ -405,9 +370,21 @@ export function AssetActivity({
     iceberg.status === "success" ? (iceberg.data?.schemaVersions ?? []) : [],
     a.schemaVersions
   )
+  const { hasPermission } = useAuth()
   const [snapshotLimit, setSnapshotLimit] = React.useState<number>(PAGE_SIZES[0])
   const [changeLimit, setChangeLimit] = React.useState<number>(PAGE_SIZES[0])
   const snapshotCount = iceberg.status === "success" ? (iceberg.data?.snapshots.length ?? 0) : 0
+  // `DATA-55` (QA `LH-DATA-15-06`, `TC-1731`): Drop table is offered only to
+  // `governance:write` — the permission that restores (D6, proposed) — and only
+  // for a Bronze table that exists and an upload made. The check hides the
+  // control AND the request: without the permission nothing is asked of
+  // `/drop`, which would answer 403 anyway.
+  const canDrop =
+    hasPermission("governance:write") &&
+    iceberg.status === "success" &&
+    iceberg.data !== null &&
+    isIcebergCandidate(a) &&
+    Boolean(a.tableName)
   // DATA-16 D2: how far back versions go is what the list shows, never a promise.
   const retention =
     iceberg.status === "success" && iceberg.data && iceberg.data.snapshots.length > 0
@@ -424,6 +401,9 @@ export function AssetActivity({
 
   return (
     <div className="flex flex-col gap-2">
+      {/* GOV-11 (review round 1 R2): usage is withheld from a caller
+          admitted by a table grant, so its lists are empty on purpose. */}
+      <TableGrantNote asset={a} />
       <FreshnessCard asset={a} onChanged={onChanged} />
       <SectionCard
         size="sm"
@@ -432,14 +412,19 @@ export function AssetActivity({
           retention ? ` ${retention}.` : ""
         }${snapshotCount > snapshotLimit ? ` Showing the newest ${snapshotLimit} of ${snapshotCount}.` : ""}`}
         action={
-          snapshotCount > PAGE_SIZES[0] ? (
-            <CountToggle
-              label="Show"
-              ariaLabel="Snapshots to show"
-              options={sizesFor(snapshotCount)}
-              value={snapshotLimit}
-              onChange={setSnapshotLimit}
-            />
+          canDrop || snapshotCount > PAGE_SIZES[0] ? (
+            <div className="flex items-center gap-2">
+              {snapshotCount > PAGE_SIZES[0] ? (
+                <CountToggle
+                  label="Show"
+                  ariaLabel="Snapshots to show"
+                  options={sizesFor(snapshotCount)}
+                  value={snapshotLimit}
+                  onChange={setSnapshotLimit}
+                />
+              ) : null}
+              {canDrop ? <DropTableAction asset={a} onDropped={iceberg.reload} /> : null}
+            </div>
           ) : undefined
         }
       >
@@ -490,7 +475,12 @@ export function AssetActivity({
                 <li key={c.id} className="flex flex-wrap items-baseline gap-2 py-1.5">
                   <span className="font-medium">{c.actor}</span>
                   <span className="text-muted-foreground">{c.summary}</span>
-                  <span className="ml-auto text-xs text-muted-foreground">
+                  {/* QA `LH-DATA-12-01` F2 (`DATA-54`): the date and time on
+                      hover, as the Snapshots table of this file does. */}
+                  <span
+                    className="ml-auto text-xs text-muted-foreground"
+                    title={formatDateTime(c.at)}
+                  >
                     {formatRelativeTime(c.at)}
                   </span>
                 </li>
@@ -500,14 +490,14 @@ export function AssetActivity({
         </SectionCard>
         <SectionCard
           size="sm"
-          title="Usage (7d)"
-          description="Queries run in Query Studio or by the copilot that read this asset, by anyone. Only your own query text is shown."
+          title={`Usage (${a.usage?.days ?? 30}d)`}
+          description="Queries run in Query Studio or by AI Copilot that read this asset, by anyone. Only your own query text is shown in full; everyone's frequent queries are shown without their values."
         >
           {a.usage === null ? (
             <QuietEmpty title="Usage not measured" description="The query history could not be read." />
-          ) : a.usage.queries7d === 0 ? (
+          ) : a.usage.queries === 0 ? (
             <QuietEmpty
-              title="No Query Studio or copilot query in the last 7 days"
+              title={`No Query Studio or AI Copilot query in the last ${a.usage.days} days`}
               description={uncounted ?? undefined}
             />
           ) : (
@@ -515,8 +505,8 @@ export function AssetActivity({
               <dl className="grid grid-cols-3 gap-2 text-sm">
                 {(
                   [
-                    ["Queries", formatNumber(a.usage.queries7d)],
-                    ["People", formatNumber(a.usage.users7d)],
+                    ["Queries", formatNumber(a.usage.queries)],
+                    ["People", formatNumber(a.usage.users)],
                     ["Avg latency", `${formatNumber(a.usage.avgLatencyMs)} ms`],
                   ] as const
                 ).map(([label, value]) => (
@@ -526,6 +516,64 @@ export function AssetActivity({
                   </div>
                 ))}
               </dl>
+              {a.usage.truncated ? (
+                <p className="text-xs text-muted-foreground">
+                  {`Based on the newest ${formatNumber(a.usage.basedOn)} queries that mention this table; older ones in the ${a.usage.days} days are not counted.`}
+                </p>
+              ) : null}
+              <UsageList title="Frequent users" empty="No one yet.">
+                {/* `DATA-52` (QA `LH-DATA-12-01` F3): names are not unique -- two people
+                    may share one, and the API sends display names now -- so the rows are
+                    keyed by position and name. */}
+                {a.usage.frequentUsers.map((u, index) => (
+                  <UsageRow
+                    key={`${index}:${u.name}`}
+                    count={`${formatNumber(u.queries)} quer${u.queries === 1 ? "y" : "ies"}`}
+                  >
+                    {u.name}
+                  </UsageRow>
+                ))}
+              </UsageList>
+              <UsageList
+                title="Frequent queries"
+                note={
+                  a.usage.unparsed > 0
+                    ? `${formatNumber(a.usage.unparsed)} quer${a.usage.unparsed === 1 ? "y" : "ies"} could not be read as SQL and ${a.usage.unparsed === 1 ? "is" : "are"} left out. Values are shown as ?.`
+                    : "Values are shown as ?."
+                }
+                empty="None."
+              >
+                {a.usage.frequentQueries.map((q) => (
+                  <UsageRow key={q.sql} count={`${formatNumber(q.runs)} run${q.runs === 1 ? "" : "s"}`} when={q.lastAt}>
+                    <span className="font-mono text-xs" title={q.sql}>
+                      {q.sql}
+                    </span>
+                  </UsageRow>
+                ))}
+              </UsageList>
+              <UsageList title="Tables joined with it" empty="No query read it together with another table.">
+                {a.usage.joinedTables.map((t) => (
+                  <UsageRow key={t.table} count={`${formatNumber(t.queries)} quer${t.queries === 1 ? "y" : "ies"}`}>
+                    {t.assetId ? (
+                      <Link
+                        href={`/data/assets/${encodeURIComponent(t.assetId)}`}
+                        className="font-mono text-xs text-primary hover:underline"
+                      >
+                        {t.table}
+                      </Link>
+                    ) : (
+                      <span className="font-mono text-xs">{t.table}</span>
+                    )}
+                  </UsageRow>
+                ))}
+              </UsageList>
+              <UsageList title="Column popularity" note={a.usage.columnsNote} empty="No column was named by a query on this table alone.">
+                {a.usage.columns.map((c) => (
+                  <UsageRow key={c.name} count={`${formatNumber(c.queries)} quer${c.queries === 1 ? "y" : "ies"}`}>
+                    <span className="font-mono text-xs">{c.name}</span>
+                  </UsageRow>
+                ))}
+              </UsageList>
               <div>
                 {uncounted ? <p className="mb-2 text-xs text-muted-foreground">{uncounted}</p> : null}
                 <div className="mb-1 text-xs font-medium text-muted-foreground">Your recent queries</div>

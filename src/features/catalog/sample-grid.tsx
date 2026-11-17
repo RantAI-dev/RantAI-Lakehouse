@@ -228,7 +228,7 @@ function HeaderCell({
           data-col={col}
           tabIndex={tabStop ? 0 : -1}
           aria-label={label}
-          title={`${label}. Only the rows shown are sorted, not the table.`}
+          title={`${label}. Only the rows loaded are sorted, not the table.`}
           onClick={onSort}
           className={cn(
             "grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground outline-none hover:bg-background hover:text-foreground focus-visible:ring-2 focus-visible:ring-chart-3",
@@ -244,7 +244,7 @@ function HeaderCell({
 
 /**
  * The grid. `order` is the rows' places in `rows`, in the order to show
- * them, so a sort changes `order` and not the rows; a row keeps its `at`
+ * them (one page of it; `rowOffset` rows come before), so a sort changes `order` and not the rows; a row keeps its `at`
  * (its place in `rows`) and its picked state when the sort moves it.
  *
  * Picking: a press on a cell picks it; a press on a column's name picks the
@@ -258,6 +258,7 @@ export function SampleGrid({
   columns,
   rows,
   order,
+  rowOffset,
   schema,
   sort,
   onSort,
@@ -266,7 +267,10 @@ export function SampleGrid({
 }: {
   columns: string[]
   rows: SampleRow[]
+  /** The places to show: one page of the sorted order. */
   order: number[]
+  /** How many rows come before this page, so the gutter counts from the first row loaded. */
+  rowOffset: number
   schema: ReadonlyMap<string, AssetColumn>
   sort: SortState
   onSort: (column: string) => void
@@ -392,7 +396,7 @@ export function SampleGrid({
                     scope="row"
                     className="sticky left-0 z-10 w-12 min-w-12 max-w-12 border-r border-b border-border bg-card px-2 py-1.5 text-right align-middle text-[11px] font-normal text-muted-foreground tabular-nums group-hover/row:bg-muted"
                   >
-                    {pos + 1}
+                    {rowOffset + pos + 1}
                   </th>
                   {columns.map((name, c) => {
                     const column = schema.get(name)

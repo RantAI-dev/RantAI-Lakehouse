@@ -103,6 +103,23 @@ def test_build_source_never_interpolates_the_username_or_password_into_a_uri_str
     # no string-building step for it to be mangled or escape out of.
     assert captured["password"] == "p@ss/word:with?special&chars"
 
+def test_connect_passes_a_change_capture_dials_tls_options_and_adds_none_for_a_batch_dial(monkeypatch):
+    """`SRC-4` slice 5: `clientOptions` (set by `discover._cdc_mongo` from the dial's `sslMode`)
+    reach `MongoClient` as keyword arguments; a batch `MongoDial` has none, so nothing is added."""
+    from dispar_orchestrate.adapters.mongodb import connect
+
+    captured = {}
+    monkeypatch.setattr("dispar_orchestrate.adapters.mongodb.MongoClient", lambda **kwargs: captured.update(kwargs))
+    ok = lambda h, p: ResolvedAddress(ip="10.0.0.5", port=p, family=2)  # noqa: E731
+    base = {"hosts": ["mongo-a.invalid:27017"], "database": "shop", "username": "reader", "directConnection": True}
+    connect(base, {"password": "x"}, resolve_checked=ok)
+    assert "tls" not in captured and "tlsAllowInvalidHostnames" not in captured
+    captured.clear()
+    connect({**base, "clientOptions": {"tls": True, "tlsAllowInvalidHostnames": False}}, {"password": "x"}, resolve_checked=ok)
+    assert captured["tls"] is True and captured["tlsAllowInvalidHostnames"] is False
+    assert captured["directConnection"] is True
+
+
 def test_reading_documents_runs_inside_checking_resolver_so_a_rebound_host_is_refused():
     """The seed-host check happens before `MongoClient` exists; pymongo then
     resolves those names ITSELF, lazily, when the first document is pulled.

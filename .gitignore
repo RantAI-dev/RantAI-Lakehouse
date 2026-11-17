@@ -74,3 +74,11 @@ dist/
 # overrides (per-connector credential env vars).
 /data/rawdata.xls
 docker-compose.override.yml
+
+# SEC-56 (D8): the operator's directory for the SMTP relay's CA bundle.
+# The DIRECTORY is in the repository (with its `.gitkeep`, so the compose
+# mount always has something to mount); the certificates an operator drops
+# into it are not. `*.pem` above covers the usual name; this covers the
+# rest, because a committed key is a leak and gitleaks reads it as one.
+ops/smtp-ca/*
+!ops/smtp-ca/.gitkeep

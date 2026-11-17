@@ -11,24 +11,6 @@
  */
 import type { Measured } from "@/lib/measured"
 
-export type LakehouseWarehouse = {
-  id: string
-  name: string
-  /**
-   * Reported by the Management API only, which this service's reader
-   * identity cannot call — always `null` today, kept typed loosely (not
-   * `string | null`) so a future real value isn't forced into the wrong
-   * shape.
-   */
-  storageProfile: unknown
-  /**
-   * Nothing on this service proves Lakekeeper actually vends credentials
-   * for this warehouse's storage profile — always `null` today.
-   */
-  credentialVending: unknown
-  reachable: boolean
-}
-
 export type LakehouseNamespace = {
   name: string
   /** `null` when the per-namespace table listing did not finish in budget. */
@@ -81,6 +63,14 @@ export type LakehouseSnapshot = {
   // Iceberg snapshot operation — known values widened with `| string` since
   // the catalog is free to report an operation this contract doesn't list.
   operation: "append" | "replace" | "overwrite" | "delete" | string
+  /**
+   * Who made the commit, where the product recorded it (the snapshot summary
+   * key `rantai.author`, `DATA-15`); `null` where it did not, and the page then
+   * says "unknown". A file upload records `<name> (file upload)` (`DATA-52`) and
+   * a connector's replace or append its run; a merge load, which `dlt` writes
+   * itself, and a version written before 2026-11-12 record none.
+   */
+  author: string | null
   summary: LakehouseSnapshotSummary
 }
 
@@ -219,7 +209,6 @@ export type LakehouseCapacity = {
 }
 
 export interface LakehouseService {
-  listWarehouses(signal?: AbortSignal): Promise<LakehouseWarehouse[]>
   getCapacity(signal?: AbortSignal): Promise<LakehouseCapacity>
   listNamespaces(warehouse?: string, signal?: AbortSignal): Promise<LakehouseNamespace[]>
   listTables(

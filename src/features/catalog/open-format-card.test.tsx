@@ -15,18 +15,53 @@ function jsonResponse(body: unknown, status = 200): Response {
   })
 }
 
+/**
+ * What the mart's consumers route answers when outside reading is not
+ * set up — the honest refusal of DATA-5 D4/D7. It is the default for
+ * every test in this file that does not care about readers.
+ */
+const consumersRefusalBody = {
+  mart: "mart_a",
+  supported: false,
+  consumers: null,
+  reason: "Outside reading is not set up: OUTSIDE_S3_ENDPOINT is not set.",
+}
+
+/**
+ * Installs the fetch mock for one test.
+ *
+ * The card asks the mart's outside-reader count as well as its
+ * publication (DATA-5 D10), and the count's URL also matches the "last
+ * export" pattern the per-test handler uses. `mockApi` therefore
+ * answers `/consumers` first — with `consumers` when the test passes
+ * one, with the honest refusal otherwise — and hands every other URL to
+ * the test's own handler.
+ */
+function mockApi(impl: (url: string) => Response, consumers?: unknown): void {
+  global.fetch = mock(async (input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input.toString()
+    if (url.includes("/consumers")) {
+      return jsonResponse(consumers ?? consumersRefusalBody)
+    }
+    return impl(url)
+  }) as unknown as typeof fetch
+}
+
 const publicationBody: Record<string, unknown> = {
   mart: "mart_a",
   enabled: true,
   updatedAt: "2026-10-02T04:00:00Z",
   lastChangedAt: "2026-10-02T03:30:00Z",
   lastExportedAt: "2026-10-02T04:00:00Z",
+  changedSinceExport: false,
+  lastFailure: null,
   canEdit: true,
 }
 
 const readBackBody = {
   namespace: "gold",
   table: "mart_a",
+  published: true,
   formatVersion: 2,
   rowsInIceberg: 42,
   snapshotId: { value: 12345, measured: true },
@@ -37,19 +72,26 @@ function mockReadBack() {
   return jsonResponse(readBackBody)
 }
 
+/**
+ * A timestamp `h` hours before now, as the API sends it. The card
+ * renders the age of a read relative to the moment it renders, so the
+ * tests assert the age they set ("2h ago") rather than the instant.
+ */
+function hoursAgo(h: number): string {
+  return new Date(Date.now() - h * 3_600_000).toISOString()
+}
+
 const emptyRunsBody = { mart: "mart_a", runs: [] satisfies GoldExportRun[] }
 
 import type { GoldExportRun } from "@/services/contracts/gold"
 
 describe("OpenFormatCard", () => {
-  it("shows Up to date when lastChangedAt is strictly before lastExportedAt", async () => {
-    global.fetch = mock(async (input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input.toString()
+  it("shows Up to date when changedSinceExport is false", async () => {
+    mockApi((url) => {
       if (url.includes("/publication")) {
         return jsonResponse({
           ...publicationBody,
-          lastChangedAt: "2026-10-02T03:30:00Z",
-          lastExportedAt: "2026-10-02T04:00:00Z",
+          changedSinceExport: false,
         })
       }
       if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
@@ -59,43 +101,68 @@ describe("OpenFormatCard", () => {
         return jsonResponse(emptyRunsBody)
       }
       throw new Error(`unexpected fetch: ${url}`)
-    }) as unknown as typeof fetch
+    })
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
-    await waitFor(() => expect(screen.getByText("Up to date")).toBeDefined())
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Up to date"),
+    )
   })
 
-  it("shows Out of date when lastChangedAt is equal to lastExportedAt", async () => {
-    global.fetch = mock(async (input: RequestInfo | URL) => {
+  // QA LH-DATA-1-01 (DATA-49), review round 1 R1: the answer to a failed publish
+  // is `lastFailure` on the publication route and a new run in the history, so the
+  // card reads both again the moment the action settles. Before, it kept the status
+  // it had — "Up to date" — until the person loaded the page again.
+  it("reads the publication again after a failed Publish now and says Last publish failed", async () => {
+    const reason = "This mart has 12000000 rows, exceeding GOLD_EXPORT_MAX_ROWS."
+    let publications = 0
+    let posts = 0
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
       if (url.includes("/publication")) {
-        return jsonResponse({
-          ...publicationBody,
-          lastChangedAt: "2026-10-02T04:00:00Z",
-          lastExportedAt: "2026-10-02T04:00:00Z",
-        })
+        publications += 1
+        return jsonResponse(
+          publications === 1
+            ? publicationBody
+            : { ...publicationBody, lastFailure: { failedAt: "2026-10-02T05:00:00Z", reason } },
+        )
       }
-      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+      if (init?.method === "POST" && url.includes("/api/gold/export/mart_a")) {
+        posts += 1
+        return jsonResponse({ error: reason }, 422)
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/exports")) {
         return mockReadBack()
       }
       if (url.includes("/api/gold/exports")) {
         return jsonResponse(emptyRunsBody)
       }
-      throw new Error(`unexpected fetch: ${url}`)
+      throw new Error(`unexpected fetch: ${init?.method} ${url}`)
     }) as unknown as typeof fetch
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
-    await waitFor(() => expect(screen.getByText("Out of date")).toBeDefined())
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Up to date"),
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Publish now" }))
+    await waitFor(() => expect(posts).toBe(1))
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Last publish failed"),
+    )
+    expect(screen.getByTestId("publication-failure").textContent).toContain(reason)
   })
 
-  it("shows Not measured when lastChangedAt is null", async () => {
-    global.fetch = mock(async (input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input.toString()
+  // QA LH-DATA-1-01 (DATA-49): a failed newest run outranks the fingerprint
+  // comparison, and the card says what failed, when, and where the last good copy is.
+  it("shows Last publish failed with the time, the reason and the last successful publish", async () => {
+    mockApi((url) => {
       if (url.includes("/publication")) {
         return jsonResponse({
           ...publicationBody,
-          lastChangedAt: null,
-          lastExportedAt: "2026-10-02T04:00:00Z",
+          changedSinceExport: false,
+          lastFailure: { failedAt: "2026-10-02T05:00:00Z", reason: "The catalog request failed. Reference: abc123" },
         })
       }
       if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
@@ -105,15 +172,96 @@ describe("OpenFormatCard", () => {
         return jsonResponse(emptyRunsBody)
       }
       throw new Error(`unexpected fetch: ${url}`)
-    }) as unknown as typeof fetch
+    })
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
-    await waitFor(() => expect(screen.getByText("Not measured")).toBeDefined())
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Last publish failed"),
+    )
+    expect(screen.getByTestId("publication-status").className).toContain("text-destructive")
+    const failure = screen.getByTestId("publication-failure").textContent ?? ""
+    expect(failure).toContain("Failed ")
+    expect(failure).toContain("The catalog request failed. Reference: abc123")
+    expect(screen.getByText(/Last successful publish: /)).toBeDefined()
+  })
+
+  it("says nothing has been published yet when the only run failed", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          lastExportedAt: null,
+          changedSinceExport: null,
+          lastFailure: { failedAt: null, reason: "A value in this table could not be written in open format." },
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Last publish failed"),
+    )
+    expect(screen.getByTestId("publication-failure").textContent).toBe(
+      "Failed: A value in this table could not be written in open format.",
+    )
+    expect(screen.getByText("Nothing has been published yet.")).toBeDefined()
+  })
+
+  it("shows Out of date when changedSinceExport is true", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          changedSinceExport: true,
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Out of date"),
+    )
+  })
+
+  it("shows Not measured when changedSinceExport is null", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          changedSinceExport: null,
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Not measured"),
+    )
   })
 
   it("shows Never published when lastExportedAt is null", async () => {
-    global.fetch = mock(async (input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input.toString()
+    mockApi((url) => {
       if (url.includes("/publication")) {
         return jsonResponse({
           ...publicationBody,
@@ -125,15 +273,85 @@ describe("OpenFormatCard", () => {
         return jsonResponse(emptyRunsBody)
       }
       throw new Error(`unexpected fetch: ${url}`)
-    }) as unknown as typeof fetch
+    })
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
     await waitFor(() => expect(screen.getByText("Never published")).toBeDefined())
   })
 
+  // QA LH-DATA-1-01 (DATA-49): a mart never published answers `published: false`,
+  // and the card shows no last-published rows for it — there is nothing to name.
+  //
+  // Review round 1 R5: the publication here HAS a last export on record, so
+  // `hasHistory` is true and the `published` read-back is the only thing that
+  // closes the two rows. With `lastExportedAt: null` the test passed even with the
+  // `published` check removed, which proved nothing.
+  it("shows no last-published rows when the read-back says the table is not there", async () => {
+    let readBacks = 0
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          lastExportedAt: "2026-10-02T04:00:00Z",
+          changedSinceExport: false,
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        readBacks += 1
+        // The catalog no longer has the table, so the read-back names no copy —
+        // a stray snapshot in the body is still not a published one.
+        return jsonResponse({
+          namespace: "gold",
+          table: "mart_a",
+          published: false,
+          formatVersion: null,
+          rowsInIceberg: null,
+          snapshotId: { value: 999, measured: true },
+          exportedAt: "2026-10-02T04:00:00Z",
+        })
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Up to date"),
+    )
+    await waitFor(() => expect(readBacks).toBe(1))
+    expect(screen.queryByText("Last published")).toBeNull()
+    expect(screen.queryByText("999")).toBeNull()
+    expect(screen.queryByText("Snapshot")).toBeNull()
+    expect(screen.queryByText("Could not be read")).toBeNull()
+  })
+
+  // A failed read-back is a failure, not "never published": the row says the copy
+  // could not be read, with the API's sentence as its tooltip.
+  it("says the published copy could not be read when the read-back fails", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({ ...publicationBody })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return jsonResponse({ error: "The catalog request failed. Reference: abc123" }, 500)
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    const cell = await screen.findByText("Could not be read")
+    expect(cell.className).toContain("text-destructive")
+    expect(cell.getAttribute("title")).toBe("The catalog request failed. Reference: abc123")
+    expect(screen.queryByText("Never published")).toBeNull()
+  })
+
   it("disables the switch when canEdit is false and shows an explanation", async () => {
-    global.fetch = mock(async (input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input.toString()
+    mockApi((url) => {
       if (url.includes("/publication")) {
         return jsonResponse({
           ...publicationBody,
@@ -147,7 +365,7 @@ describe("OpenFormatCard", () => {
         return jsonResponse(emptyRunsBody)
       }
       throw new Error(`unexpected fetch: ${url}`)
-    }) as unknown as typeof fetch
+    })
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
     await waitFor(() => expect(screen.getByText(/gold:export/)).toBeDefined())
@@ -156,14 +374,42 @@ describe("OpenFormatCard", () => {
     expect(switchEl.hasAttribute("data-disabled")).toBe(true)
   })
 
+  it("makes no request for the publish history when the person may not edit", async () => {
+    // QA LH-DATA-1-02 (plan D7): those routes need gold:export, and a 401
+    // from them signed the person out. A read-only publication asks for the
+    // publication and the readers only.
+    const urls: string[] = []
+    mockApi((url) => {
+      urls.push(url)
+      if (url.includes("/publication")) {
+        return jsonResponse({ ...publicationBody, canEdit: false })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText(/gold:export/)).toBeDefined())
+    // Let any request the card would still send go out before looking.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(urls.some((u) => u.includes("/api/gold/exports"))).toBe(false)
+    expect(
+      urls.some(
+        (u) =>
+          u.includes("/api/gold/export/mart_a") &&
+          !u.includes("/publication") &&
+          !u.includes("/exports"),
+      ),
+    ).toBe(false)
+    expect(screen.queryByText("Last 5 publish runs")).toBeNull()
+  })
+
   it("leaves the switch off after a failed PUT and shows the server's error", async () => {
     // PR slice D review D-S2: render from toggle.status === "error",
     // not from a stale closure capture of toggle.error. The returned
     // error message routes through the service action state so the test
     // can assert the server's actual message appears in the DOM.
     let putCalled = false
-    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString()
+    mockApi((url) => {
       if (url.includes("/publication")) {
         if (putCalled) {
           return jsonResponse({ error: "Gold export is internal to this server — the previous response is still valid" }, 500)
@@ -178,7 +424,7 @@ describe("OpenFormatCard", () => {
         return jsonResponse(emptyRunsBody)
       }
       throw new Error(`unexpected fetch: ${url}`)
-    }) as unknown as typeof fetch
+    })
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
     await waitFor(() => {
@@ -195,8 +441,7 @@ describe("OpenFormatCard", () => {
   it("shows Never published and no last-export info when switch is off and mart was never published", async () => {
     // PR slice D review D-B3: with the switch off and never published,
     // the card still shows "Never published" and no last-export line.
-    global.fetch = mock(async (input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input.toString()
+    mockApi((url) => {
       if (url.includes("/publication")) {
         return jsonResponse({
           ...publicationBody,
@@ -209,7 +454,7 @@ describe("OpenFormatCard", () => {
         return jsonResponse(emptyRunsBody)
       }
       throw new Error(`unexpected fetch: ${url}`)
-    }) as unknown as typeof fetch
+    })
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
     await waitFor(() => expect(screen.getByText("Never published")).toBeDefined())
@@ -220,8 +465,7 @@ describe("OpenFormatCard", () => {
     // PR slice D review D-B3: with the switch off and a prior publish
     // on record, the card still shows last published time, snapshot,
     // and the "Publishing is off" note.
-    global.fetch = mock(async (input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input.toString()
+    mockApi((url) => {
       if (url.includes("/publication")) {
         return jsonResponse({
           ...publicationBody,
@@ -237,11 +481,14 @@ describe("OpenFormatCard", () => {
         return jsonResponse(emptyRunsBody)
       }
       throw new Error(`unexpected fetch: ${url}`)
-    }) as unknown as typeof fetch
+    })
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
-    await waitFor(() => expect(screen.getByText("Up to date")).toBeDefined())
-    expect(screen.getByText("Last published")).toBeDefined()
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Up to date"),
+    )
+    // PR #456 CI: the history is read only after the publication loads (plan D7), so wait for it.
+    expect(await screen.findByText("Last published")).toBeDefined()
     expect(screen.getByText("Publishing is off; this copy is no longer updated.")).toBeDefined()
   })
 
@@ -259,8 +506,7 @@ describe("OpenFormatCard", () => {
       startedAt: "2026-10-02T04:00:00Z",
       finishedAt: "2026-10-02T04:00:02Z",
     }
-    global.fetch = mock(async (input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input.toString()
+    mockApi((url) => {
       if (url.includes("/publication")) {
         return jsonResponse(publicationBody)
       }
@@ -271,9 +517,239 @@ describe("OpenFormatCard", () => {
         return jsonResponse({ mart: "mart_a", runs: [failedRun] })
       }
       throw new Error(`unexpected fetch: ${url}`)
-    }) as unknown as typeof fetch
+    })
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
     await waitFor(() => expect(screen.getByText("ClickHouse connection refused (111)")).toBeDefined())
   })
+
+  it("shows Copies kept at last trim with when it was counted and the oldest copy", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          trim: {
+            status: "success",
+            copiesKept: 7,
+            oldestKeptExportedAt: "2026-10-14T10:00:00Z",
+            finishedAt: "2026-10-14T10:05:00Z",
+            reason: null,
+          },
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    // The label changes by D17 (DATA-49): the number is the last trim's, and a
+    // publish after it is not counted, so the row says when it was counted.
+    await waitFor(() => expect(screen.getByText("Copies kept at last trim")).toBeDefined())
+    expect(screen.getByText(/^7 \(counted .+; oldest .+\)$/)).toBeDefined()
+  })
+
+  it("does not show a counted time when the trim recorded none", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          trim: {
+            status: "success",
+            copiesKept: 3,
+            oldestKeptExportedAt: null,
+            finishedAt: "",
+            reason: null,
+          },
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("Copies kept at last trim")).toBeDefined())
+    const value = screen.getByText("Copies kept at last trim").nextElementSibling?.textContent
+    expect(value).toBe("3")
+  })
+
+  it("shows failed trim reason and never trimmed when trim failed", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          trim: {
+            status: "failed",
+            copiesKept: null,
+            oldestKeptExportedAt: null,
+            finishedAt: "2026-10-14T10:05:00Z",
+            reason: "delete_failed",
+          },
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("Trim failed: delete_failed")).toBeDefined())
+    expect(screen.queryByText("Copies kept at last trim")).toBeNull()
+    expect(screen.queryByText(/\btrimmed\b/i)).toBeNull()
+  })
+
+  it("never shows trimmed when trim is null", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          trim: null,
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() =>
+      expect(screen.getByTestId("publication-status").textContent).toBe("Up to date"),
+    )
+    expect(screen.queryByText("Copies kept at last trim")).toBeNull()
+    expect(screen.queryByText(/\btrimmed\b/i)).toBeNull()
+  })
+
+  // ── DATA-5 D10: the "Readers (7 days)" row ──────────────────────
+  //
+  // Three states, and the third one is the point of the feature: a
+  // mart nobody read says "No reads in 7 days", while a deployment
+  // without outside reading says "Not measured" with the reason — never
+  // a zero.
+
+  it("names each tool that read the table, its reads and its last read", async () => {
+    mockApi(
+      (url) => {
+        if (url.includes("/publication")) {
+          return jsonResponse(publicationBody)
+        }
+        if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+          return mockReadBack()
+        }
+        if (url.includes("/api/gold/exports")) {
+          return jsonResponse(emptyRunsBody)
+        }
+        throw new Error(`unexpected fetch: ${url}`)
+      },
+      {
+        mart: "mart_a",
+        supported: true,
+        windowDays: 7,
+        consumers: [
+          {
+            identityId: "11111111-1111-1111-1111-111111111111",
+            name: "Finance DuckDB",
+            reads: 4,
+            lastReadAt: hoursAgo(2),
+          },
+        ],
+      },
+    )
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("Readers (7 days)")).toBeDefined())
+    expect(screen.getByText(/Finance DuckDB: 4 reads, last 2h ago/)).toBeDefined()
+  })
+
+  it("names at most five tools and counts the rest", async () => {
+    const readers = Array.from({ length: 7 }, (_, i) => ({
+      identityId: `00000000-0000-0000-0000-00000000000${i}`,
+      name: `Tool ${i + 1}`,
+      reads: i + 1,
+      lastReadAt: hoursAgo(1),
+    }))
+    mockApi(
+      (url) => {
+        if (url.includes("/publication")) {
+          return jsonResponse(publicationBody)
+        }
+        if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+          return mockReadBack()
+        }
+        if (url.includes("/api/gold/exports")) {
+          return jsonResponse(emptyRunsBody)
+        }
+        throw new Error(`unexpected fetch: ${url}`)
+      },
+      { mart: "mart_a", supported: true, windowDays: 7, consumers: readers },
+    )
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("Readers (7 days)")).toBeDefined())
+    expect(screen.getByText(/Tool 5: 5 reads/)).toBeDefined()
+    expect(screen.queryByText(/Tool 6:/)).toBeNull()
+    expect(screen.getByText("and 2 more")).toBeDefined()
+  })
+
+  it("says No reads in 7 days when the door is set up and nobody read the table", async () => {
+    mockApi(
+      (url) => {
+        if (url.includes("/publication")) {
+          return jsonResponse(publicationBody)
+        }
+        if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+          return mockReadBack()
+        }
+        if (url.includes("/api/gold/exports")) {
+          return jsonResponse(emptyRunsBody)
+        }
+        throw new Error(`unexpected fetch: ${url}`)
+      },
+      { mart: "mart_a", supported: true, windowDays: 7, consumers: [] },
+    )
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("No reads in 7 days")).toBeDefined())
+  })
+
+  it("says Not measured with the reason when outside reading is not set up", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse(publicationBody)
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("Not measured")).toBeDefined())
+    // The reason is the title of the same element: the admin must learn
+    // what to set up, not only that nothing was counted.
+    const refusal = screen.getByTitle(
+      "Outside reading is not set up: OUTSIDE_S3_ENDPOINT is not set.",
+    )
+    expect(refusal.textContent).toBe("Not measured")
+  })
+
 })

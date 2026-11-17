@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "version": "0.2.0",
+  "gitSha": "0123456789abcdef0123456789abcdef01234567",
+  "createdAt": "2026-11-01T00:00:00Z",
+  "minFrom": "0.0.0",
+  "stops": [],
+  "images": {
+    "lakehouse-api": "ghcr.io/rantai-dev/rantai-lakehouse-api:0.2.0@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "files": {
+    "docker-compose.yml": "6a0dd8e94c80c6d74f7477896f971336edd0b619c41297e81116fbca66f9b6d9"
+  }
+}

@@ -1,5 +1,4 @@
 import type {
-  ActorKind,
   AlertStatus,
   Severity,
   StorageTier,
@@ -7,7 +6,8 @@ import type {
 import type { Measured } from "@/lib/measured"
 
 /**
- * Executive-operational summary shown on the Overview page.
+ * Executive-operational summary: Home reads it, and System status shows its
+ * query figures (`WEB-3` S2-D2).
  *
  * WS1 task 1.8: most fields below became `Measured` because nothing in the
  * API measures them yet (schedule lateness, cache-hit rate, the policy
@@ -34,29 +34,6 @@ export type OverviewSummary = {
   // `healthy`/`unhealthy` are real probe counts; the API has
   // no "degraded" probe state (only ok/not-ok), so it always reports 0.
   services: { healthy: number; degraded: number; unhealthy: number }
-}
-
-export type ActivityCategory =
-  | "pipeline"
-  | "query"
-  | "schema"
-  | "policy"
-  | "connector"
-  | "agent"
-  | "approval"
-  | "incident"
-
-export type ActivityItem = {
-  id: string
-  at: string
-  actor: string
-  actorKind: ActorKind
-  action: string
-  target: string
-  targetHref?: string
-  category: ActivityCategory
-  /** Correlates the activity item with its immutable audit event. */
-  auditEventId?: string
 }
 
 export type AlertItem = {
@@ -100,7 +77,6 @@ export type AlertItem = {
 
 export interface OverviewService {
   getSummary(signal?: AbortSignal): Promise<OverviewSummary>
-  listActivity(signal?: AbortSignal): Promise<ActivityItem[]>
   listAlerts(signal?: AbortSignal): Promise<AlertItem[]>
   acknowledgeAlert(id: string, signal?: AbortSignal): Promise<AlertItem>
   resolveAlert(id: string, note: string, signal?: AbortSignal): Promise<AlertItem>

@@ -1,0 +1,73 @@
+# Daily all-branch history scan with gitleaks (SEC-36, D2).
+#
+# Why this exists:
+# The repository is public, so any secret committed to any branch is
+# publicly visible. We must scan all branches across the repository
+# history to detect leaks early.
+#
+# Deliberately NOT a pull-request check:
+# This workflow runs on a daily schedule and via manual dispatch only.
+# It is intentionally not triggered on `push` or `pull_request` so that
+# a leak on an unrelated branch (or an open PR) does not turn unrelated
+# PRs red or block unrelated merges.
+
+name: Security (all branches)
+
+on:
+  schedule:
+    # Run once daily at 03:17 UTC (SEC-36, D2)
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-all-branches-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  history-scan-all-branches:
+    name: gitleaks (all branches) — see job summary and docs/CI.md
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout (all history)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all branches
+        run: |
+          git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+          git fetch --all --tags
+
+      - name: Explain this job's purpose and known status
+        run: |
+          cat <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          ## history-scan-all-branches
+
+          Scans all git branches and history with `.gitleaks.toml`
+          (SEC-36, D2). Runs daily on schedule and manually via
+          workflow_dispatch. This is deliberately not a pull request check
+          so that leaks on one branch do not block unrelated PRs.
+
+          A red run means a branch in the repository carries an un-baselined
+          finding: the branch owner must rotate the secret, remove or fix the
+          offending value, or baseline it in `.gitleaksignore` with exact
+          fingerprint and proof. See docs/CI.md.
+          EOF
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      # Same .gitleaks.toml as the working-tree job.
+      # Scans all branches across full history with --log-opts="--all".
+      # Deliberately fails loudly on findings (no continue-on-error).
+      - name: gitleaks detect (all branches)
+        run: gitleaks detect --source . --config .gitleaks.toml --redact -v --log-opts="--all"

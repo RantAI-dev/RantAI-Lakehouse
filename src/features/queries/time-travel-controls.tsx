@@ -14,11 +14,11 @@ import { lakehouseService } from "@/services"
  * Iceberg time-travel controls: the user picks a namespace, then a table
  * (from `lakehouseService.listTables`), and that table's own snapshots
  * (from `getTableDetail`) feed the picker. The table only selects whose
- * versions are listed: the pin is a query-wide ClickHouse setting
- * (`pinSnapshot`), so it is not written next to a table name and applies to
- * every raw table the query reads (`DATA-16` F7). Past versions are
- * queried on ClickHouse only; on Trino the controls are disabled and say
- * why (`DATA-16` F5, `DATA-21`).
+ * versions are listed. On ClickHouse the pin is a query-wide setting
+ * (`pinSnapshot`), so it is not written next to a table name and applies
+ * to every raw table the query reads (`DATA-16` F7). On Trino a version
+ * belongs to one table, so the pin is written on that table's own
+ * reference — `FROM bronze.orders FOR VERSION AS OF <id>` (`DATA-21` D5).
  */
 export function IcebergTimeTravelControls({
   sql,
@@ -32,7 +32,11 @@ export function IcebergTimeTravelControls({
   const [namespace, setNamespace] = React.useState<string | null>(null)
   const [table, setTable] = React.useState<string | null>(null)
   const [snapshotId, setSnapshotId] = React.useState<string | null>(null)
-  const supported = engine === "clickhouse"
+  const supported = engine === "clickhouse" || engine === "trino"
+  // The table the version belongs to, as the statement names it: the
+  // namespace and the table the picker holds. On Trino the pin is
+  // written on that reference (`DATA-21` D5).
+  const tableRef = namespace && table ? `${namespace}.${table}` : undefined
 
   const namespacesState = useService((s) => lakehouseService.listNamespaces(undefined, s), [])
   const tablesState = useService(
@@ -53,7 +57,7 @@ export function IcebergTimeTravelControls({
 
   function handleApply() {
     if (!snapshotId) return
-    const next = pinSnapshot(sql, engine, snapshotId)
+    const next = pinSnapshot(sql, engine, snapshotId, tableRef)
     if (next !== null) onApply(next)
   }
 
@@ -126,8 +130,10 @@ export function IcebergTimeTravelControls({
       </div>
       <p className="text-muted-foreground">
         {supported
-          ? "One version applies to every raw table in the query."
-          : "Past versions can be queried on ClickHouse only."}
+          ? engine === "clickhouse"
+            ? "One version applies to every raw table in the query."
+            : "The version applies to the table you picked."
+          : "Past versions can be queried on ClickHouse and Trino."}
         {supported && snapshots.length > 0 ? ` ${snapshotRetentionText(snapshots)}` : ""}
       </p>
     </div>

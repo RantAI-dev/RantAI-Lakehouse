@@ -24,14 +24,18 @@ use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
     ConnectorFilter, CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec,
-    IngestSpecInput, REPEATED_FAILURE_STREAK, SecretRefSwap, SecretSlot, UpdateConnectorInput,
-    any_connector_targets, connector_ids_in_tenants, connector_in_tenants, create_connector,
-    delete_connector, get_connector, get_connector_dial_info, get_ingest_spec, list_connectors,
-    list_ingestible_connectors, record_run_once, record_run_result, record_test_result,
-    set_ingest_spec, swap_secret_ref, swap_secret_refs, update_connector,
+    DEFAULT_AUTO_DISABLE_AFTER, IngestSpecInput, REPEATED_FAILURE_STREAK, ResumeOutcome,
+    SecretRefSwap, SecretSlot, UpdateConnectorInput, any_connector_of_tenant_targets,
+    any_connector_targets, auto_disable_pause_reason, connector_ids_in_tenants,
+    connector_in_tenants, create_connector, delete_connector, get_connector,
+    get_connector_dial_info, get_ingest_spec, is_auto_disable_pause_reason, list_connectors,
+    list_ingestible_connectors, list_ingestible_connectors_for_tenant, record_run_once,
+    record_run_result, record_test_result, resume_connector, set_ingest_spec, swap_secret_ref,
+    swap_secret_refs, update_connector,
 };
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
+use lakehouse_store::schema_change::SCHEMA_CHANGE_PAUSE_REASON;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -162,11 +166,16 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
     .unwrap();
 
     let before = get_connector(&pool, &connector.id).await.unwrap().unwrap();
-    assert!(before.dependent_pipelines.is_empty());
+    assert_eq!(
+        before.dependent_pipelines,
+        [] as [lakehouse_store::connectors::ConnectorDependent; 0]
+    );
 
     let pipeline = create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: "dependents test pipeline".to_owned(),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),
@@ -188,6 +197,12 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
             // pipeline" the connector's reverse-lookup assertion uses,
             // not a write where the route mints an id in advance.
             id: None,
+            // BLD-2: this fixture is about the connector's dependent
+            // pipelines, not about a refresh policy.
+            target_lag: None,
+            // BLD-1 / D1: no author; this fixture only exists to be found
+            // by the connector's reverse lookup.
+            run_as: None,
         },
         None,
     )
@@ -816,6 +831,65 @@ async fn list_ingestible_connectors_carries_the_secret_ref_name_never_resolved(
     Ok(())
 }
 
+/// `SEC-16`: `list_ingestible_connectors_for_tenant` returns the asked
+/// tenant's rows and nothing else; a connector with no tenant is in no
+/// tenant's list, only in the unscoped one. Written to fail against a query
+/// that ignores the tenant.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_ingestible_connectors_for_tenant_returns_only_that_tenants_rows(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = create_tenant(&pool, &tenant_input("tenant-a-ingestible"))
+        .await
+        .unwrap();
+    let tenant_b = create_tenant(&pool, &tenant_input("tenant-b-ingestible"))
+        .await
+        .unwrap();
+    let tenant_a_id: Uuid = tenant_a.id.parse().unwrap();
+    let tenant_b_id: Uuid = tenant_b.id.parse().unwrap();
+    let spec = IngestSpecInput {
+        adapter: "sql".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({
+            "driver": "mysql",
+            "host": "source.example.internal",
+            "port": 3306,
+            "database": "orders",
+            "user": "app_reader",
+        }),
+        source_objects: serde_json::json!([{"name": "orders", "target": "orders"}]),
+        schedule_cron: Some("0 * * * *".to_owned()),
+    };
+    let mut ids = Vec::new();
+    for name in ["ingestible of a", "ingestible of b", "ingestible of nobody"] {
+        let (created, _credential_names) =
+            create_connector(&pool, &minimal_input(name)).await.unwrap();
+        set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
+        ids.push(created.id);
+    }
+    set_connector_tenant(&pool, &ids[0], tenant_a_id).await;
+    set_connector_tenant(&pool, &ids[1], tenant_b_id).await;
+
+    let of_a = list_ingestible_connectors_for_tenant(&pool, tenant_a_id)
+        .await
+        .unwrap();
+    assert!(of_a.iter().any(|r| r.id == ids[0]), "A's own row is listed");
+    assert!(!of_a.iter().any(|r| r.id == ids[1]), "B's row is absent");
+    assert!(
+        !of_a.iter().any(|r| r.id == ids[2]),
+        "a connector with no tenant is in no tenant's list"
+    );
+
+    let all = list_ingestible_connectors(&pool).await.unwrap();
+    for id in &ids {
+        assert!(
+            all.iter().any(|r| &r.id == id),
+            "the unscoped list has {id}"
+        );
+    }
+    Ok(())
+}
+
 /// A `dial` that fails its adapter's own validation (`sql` requires
 /// `driver`/`host`/`port`/`database`/`user`, and rejects an unknown field
 /// like `password`) is rejected as [`StoreError::Validation`] and never
@@ -1224,7 +1298,10 @@ async fn unknown_connector_probe_writes_nothing(pool: PgPool) -> sqlx::Result<()
     let history = list_probe_results(&pool, "conn-does-not-exist", 50)
         .await
         .unwrap();
-    assert!(history.is_empty());
+    assert_eq!(
+        history,
+        [] as [lakehouse_store::connector_probe_result::ConnectorProbeResult; 0]
+    );
     Ok(())
 }
 
@@ -1601,6 +1678,58 @@ fn sql_spec_with_objects(source_objects: serde_json::Value) -> IngestSpecInput {
     }
 }
 
+/// `SEC-16`: `any_connector_of_tenant_targets` answers for the asked
+/// tenant's connectors only. Another tenant's connector, and one with no
+/// tenant, never count, however exactly the target matches.
+#[sqlx::test(migrations = "../../migrations")]
+async fn any_connector_of_tenant_targets_counts_only_that_tenants_connectors(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = create_tenant(&pool, &tenant_input("tenant-a-targets"))
+        .await
+        .unwrap();
+    let tenant_b = create_tenant(&pool, &tenant_input("tenant-b-targets"))
+        .await
+        .unwrap();
+    let tenant_a_id: Uuid = tenant_a.id.parse().unwrap();
+    let tenant_b_id: Uuid = tenant_b.id.parse().unwrap();
+    let spec = |target: &str| {
+        sql_spec_with_objects(serde_json::json!([{ "name": "public.t", "target": target }]))
+    };
+    let mut ids = Vec::new();
+    for (name, target) in [
+        ("targets of a", "a_target"),
+        ("targets of b", "b_target"),
+        ("targets of nobody", "nobody_target"),
+    ] {
+        let (created, _) = create_connector(&pool, &minimal_input(name)).await.unwrap();
+        set_ingest_spec(&pool, &created.id, &spec(target))
+            .await
+            .unwrap();
+        ids.push(created.id);
+    }
+    set_connector_tenant(&pool, &ids[0], tenant_a_id).await;
+    set_connector_tenant(&pool, &ids[1], tenant_b_id).await;
+
+    assert!(
+        any_connector_of_tenant_targets(&pool, tenant_a_id, "a_target")
+            .await
+            .unwrap()
+    );
+    for other in ["b_target", "nobody_target", "a_targe"] {
+        assert!(
+            !any_connector_of_tenant_targets(&pool, tenant_a_id, other)
+                .await
+                .unwrap(),
+            "{other} is not a target of tenant A's connectors"
+        );
+    }
+    // The unscoped question still sees all of them.
+    assert!(any_connector_targets(&pool, "b_target").await.unwrap());
+    assert!(any_connector_targets(&pool, "nobody_target").await.unwrap());
+    Ok(())
+}
+
 /// An upload may never load into a table a connector loads (ADR 0014,
 /// decision 5). `any_connector_targets` answers for every connector, by the
 /// `target` of each source object and by nothing else: not a prefix, not a
@@ -1773,19 +1902,43 @@ async fn record_run_once_counts_a_run_once_and_hands_a_retry_the_runs_own_streak
     let id = "conn-pg-lakehouse";
     let at = time::OffsetDateTime::now_utc();
     for (run, expected) in [("run-1", 1), ("run-2", 2), ("run-3", 3)] {
-        let r = record_run_once(&pool, run, id, "failure", false, at)
-            .await
-            .unwrap();
+        let r = record_run_once(
+            &pool,
+            run,
+            id,
+            "failure",
+            false,
+            at,
+            DEFAULT_AUTO_DISABLE_AFTER,
+        )
+        .await
+        .unwrap();
         assert!(r.first_seen, "{run}");
         assert_eq!(r.failure_streak, Some(expected), "{run}");
     }
     // A fourth run moves the connector on; run 3's retry still reads 3.
-    record_run_once(&pool, "run-4", id, "failure", false, at)
-        .await
-        .unwrap();
-    let retry = record_run_once(&pool, "run-3", id, "failure", false, at)
-        .await
-        .unwrap();
+    record_run_once(
+        &pool,
+        "run-4",
+        id,
+        "failure",
+        false,
+        at,
+        DEFAULT_AUTO_DISABLE_AFTER,
+    )
+    .await
+    .unwrap();
+    let retry = record_run_once(
+        &pool,
+        "run-3",
+        id,
+        "failure",
+        false,
+        at,
+        DEFAULT_AUTO_DISABLE_AFTER,
+    )
+    .await
+    .unwrap();
     assert!(!retry.first_seen);
     assert_eq!(retry.failure_streak, Some(3));
     let c = get_connector(&pool, id).await.unwrap().unwrap().connector;
@@ -1798,10 +1951,165 @@ async fn record_run_once_counts_a_run_once_and_hands_a_retry_the_runs_own_streak
     .await?;
     assert_eq!(rows, 4);
 
-    let ok = record_run_once(&pool, "run-5", id, "success", true, at)
+    let ok = record_run_once(
+        &pool,
+        "run-5",
+        id,
+        "success",
+        true,
+        at,
+        DEFAULT_AUTO_DISABLE_AFTER,
+    )
+    .await
+    .unwrap();
+    assert_eq!((ok.first_seen, ok.failure_streak), (true, Some(0)));
+    Ok(())
+}
+
+/// `SRC-11` D3: the run that brings the streak to the threshold pauses the
+/// connector, with the number in the reason, once; its retry reports the same
+/// answer and writes nothing; a later failure of the paused connector pauses
+/// nothing again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_nth_failed_run_pauses_the_connector_once(pool: PgPool) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let at = time::OffsetDateTime::now_utc();
+    for run in ["run-1", "run-2"] {
+        let r = record_run_once(&pool, run, id, "failure", false, at, 3)
+            .await
+            .unwrap();
+        assert!(!r.auto_disabled, "{run}");
+    }
+    let before = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert!(before.paused_at.is_none());
+
+    let third = record_run_once(&pool, "run-3", id, "failure", false, at, 3)
         .await
         .unwrap();
-    assert_eq!((ok.first_seen, ok.failure_streak), (true, Some(0)));
+    assert!(third.first_seen && third.auto_disabled);
+    let paused = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!(
+        paused.paused_reason.as_deref(),
+        Some("Paused after 3 failed runs in a row")
+    );
+    assert!(paused.paused_at.is_some());
+
+    // The sensor's retry of run 3 gets the same answer and changes nothing.
+    let retry = record_run_once(&pool, "run-3", id, "failure", false, at, 3)
+        .await
+        .unwrap();
+    assert!(!retry.first_seen && retry.auto_disabled);
+    // The next failure finds the connector paused already.
+    let fourth = record_run_once(&pool, "run-4", id, "failure", false, at, 3)
+        .await
+        .unwrap();
+    assert!(!fourth.auto_disabled);
+    let (marks,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pipeline_run_event WHERE pipeline_id = $1 AND kind = 'auto_disabled'",
+    )
+    .bind(format!("connector:{id}"))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(marks, 1);
+    Ok(())
+}
+
+/// `SRC-11` D3: a success resets the count, so failures before it do not add
+/// to those after it, and a success never lifts a pause.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_success_before_the_threshold_resets_the_count(pool: PgPool) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let at = time::OffsetDateTime::now_utc();
+    for (run, kind, ok) in [
+        ("run-1", "failure", false),
+        ("run-2", "failure", false),
+        ("run-3", "success", true),
+        ("run-4", "failure", false),
+        ("run-5", "failure", false),
+    ] {
+        let r = record_run_once(&pool, run, id, kind, ok, at, 3)
+            .await
+            .unwrap();
+        assert!(!r.auto_disabled, "{run}");
+    }
+    let c = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!((c.failure_streak, c.paused_at), (2, None));
+    Ok(())
+}
+
+/// `SRC-11` D4: resume lifts the auto-disable pause and sets the count to 0;
+/// a second resume finds nothing paused; an unknown id is `NotFound`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn resume_lifts_the_auto_disable_pause_and_resets_the_count(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let at = time::OffsetDateTime::now_utc();
+    for run in ["run-1", "run-2", "run-3"] {
+        record_run_once(&pool, run, id, "failure", false, at, 3)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        resume_connector(&pool, id).await.unwrap(),
+        ResumeOutcome::Resumed
+    );
+    let c = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!(
+        (
+            c.paused_reason,
+            c.paused_at,
+            c.failure_streak,
+            c.health.as_str()
+        ),
+        (None, None, 0, "unknown")
+    );
+    assert_eq!(
+        resume_connector(&pool, id).await.unwrap(),
+        ResumeOutcome::NotPaused
+    );
+    let err = resume_connector(&pool, "conn-nope").await.unwrap_err();
+    assert!(matches!(err, StoreError::NotFound), "{err:?}");
+    Ok(())
+}
+
+/// `SRC-11` D4: resume lifts only its own pause. A schema-change pause stays
+/// (approving the change lifts it), failures under it do not replace its
+/// reason, and the pause is recognised by shape, not by one number.
+#[sqlx::test(migrations = "../../migrations")]
+async fn resume_leaves_a_schema_change_pause_alone(pool: PgPool) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    sqlx::query("UPDATE connector SET paused_reason = $2, paused_at = now() WHERE id = $1")
+        .bind(id)
+        .bind(SCHEMA_CHANGE_PAUSE_REASON)
+        .execute(&pool)
+        .await?;
+    let at = time::OffsetDateTime::now_utc();
+    for run in ["run-1", "run-2", "run-3"] {
+        let r = record_run_once(&pool, run, id, "failure", false, at, 3)
+            .await
+            .unwrap();
+        assert!(!r.auto_disabled, "{run}: already paused by something else");
+    }
+    assert_eq!(
+        resume_connector(&pool, id).await.unwrap(),
+        ResumeOutcome::PausedForAnotherReason
+    );
+    let c = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!(c.paused_reason.as_deref(), Some(SCHEMA_CHANGE_PAUSE_REASON));
+    assert_eq!(c.failure_streak, 3, "nothing was reset");
+
+    assert!(is_auto_disable_pause_reason(&auto_disable_pause_reason(30)));
+    assert!(is_auto_disable_pause_reason(
+        "Paused after 7 failed runs in a row"
+    ));
+    assert!(!is_auto_disable_pause_reason(SCHEMA_CHANGE_PAUSE_REASON));
+    assert!(!is_auto_disable_pause_reason(
+        "Paused after  failed runs in a row"
+    ));
+    assert!(!is_auto_disable_pause_reason(
+        "Paused after x failed runs in a row"
+    ));
     Ok(())
 }
 
@@ -1818,6 +2126,7 @@ async fn record_run_once_leaves_no_dedupe_row_for_an_unknown_connector(
         "failure",
         false,
         time::OffsetDateTime::now_utc(),
+        DEFAULT_AUTO_DISABLE_AFTER,
     )
     .await
     .unwrap_err();
@@ -1827,6 +2136,270 @@ async fn record_run_once_leaves_no_dedupe_row_for_an_unknown_connector(
             .fetch_one(&pool)
             .await?;
     assert_eq!(rows, 0);
+    Ok(())
+}
+
+/// A run-end time `secs` after a fixed instant: the `SRC-32` tests need runs
+/// whose reports arrive in a different order from the one they ended in.
+fn ended_at(secs: i64) -> time::OffsetDateTime {
+    time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1_700_000_000 + secs)
+}
+
+/// The time a connector column holds, read back from the store's ISO form.
+fn stored_at(at: Option<&str>) -> time::OffsetDateTime {
+    time::OffsetDateTime::parse(
+        at.expect("the column holds a time"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("the store writes RFC 3339")
+}
+
+/// `SRC-32`: a success reported after a later run's failure is late: it keeps
+/// the streak and the health that failure set, and only records its own time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_success_reported_after_a_later_failure_keeps_the_streak_and_the_health(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let (t1, t2) = (ended_at(0), ended_at(60));
+    record_run_once(&pool, "run-2", id, "failure", false, t2, 3)
+        .await
+        .unwrap();
+
+    let late = record_run_once(&pool, "run-1", id, "success", true, t1, 3)
+        .await
+        .unwrap();
+    assert!(late.first_seen);
+    assert_eq!(
+        late.failure_streak, None,
+        "a late success produced no count of its own (`SRC-32` review round 1, BLOCKER 1)"
+    );
+    assert!(!late.auto_disabled);
+
+    let c = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!(c.failure_streak, 1, "the late success counted nothing");
+    assert_eq!(
+        c.health, "degraded",
+        "the later failure still decides the health"
+    );
+    assert_eq!(stored_at(c.last_run_success_at.as_deref()), t1);
+    assert_eq!(stored_at(c.last_run_failure_at.as_deref()), t2);
+    Ok(())
+}
+
+/// `SRC-32`: the sequence seen in `g6-ops`, where a late success undid a count
+/// and the connector never paused. Failures of runs 2, 3 and 4 ended at `t2`,
+/// `t3` and `t4`; run 1's success ended at `t1` and is reported between them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_late_success_between_failures_does_not_stop_the_third_from_pausing(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let (t1, t2, t3, t4) = (ended_at(0), ended_at(60), ended_at(120), ended_at(180));
+    let second = record_run_once(&pool, "run-2", id, "failure", false, t2, 3)
+        .await
+        .unwrap();
+    assert_eq!(second.failure_streak, Some(1));
+    record_run_once(&pool, "run-1", id, "success", true, t1, 3)
+        .await
+        .unwrap();
+    let third = record_run_once(&pool, "run-3", id, "failure", false, t3, 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        third.failure_streak,
+        Some(2),
+        "the late success did not reset the count"
+    );
+    assert!(!third.auto_disabled);
+    let fourth = record_run_once(&pool, "run-4", id, "failure", false, t4, 3)
+        .await
+        .unwrap();
+    assert!(fourth.auto_disabled, "the third failure in a row pauses it");
+
+    let reason = auto_disable_pause_reason(3);
+    let c = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!(c.paused_reason.as_deref(), Some(reason.as_str()));
+    assert_eq!(stored_at(c.paused_at.as_deref()), t4);
+    assert_eq!((c.failure_streak, c.health.as_str()), (3, "unhealthy"));
+    Ok(())
+}
+
+/// `SRC-32`: a failure reported after a later success is late: it keeps the
+/// count at 0 and the health healthy, records its own time, and does not pause
+/// even at a threshold of one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failure_reported_after_a_later_success_counts_nothing_and_pauses_nothing(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let (t1, t2) = (ended_at(0), ended_at(60));
+    record_run_once(&pool, "run-2", id, "success", true, t2, 1)
+        .await
+        .unwrap();
+    let late = record_run_once(&pool, "run-1", id, "failure", false, t1, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        late.failure_streak, None,
+        "the later success still decides the count, and a late failure counted none of it"
+    );
+    assert!(!late.auto_disabled, "a late failure never pauses");
+
+    let c = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!((c.failure_streak, c.health.as_str()), (0, "healthy"));
+    assert!(c.paused_at.is_none());
+    assert_eq!(stored_at(c.last_run_failure_at.as_deref()), t1);
+    assert_eq!(stored_at(c.last_run_success_at.as_deref()), t2);
+    Ok(())
+}
+
+/// `SRC-32` review round 1, BLOCKER 1: a late report produced none of the
+/// count it would have read, so its dedupe row stores no streak and the first
+/// report and its retry both answer `None`. The API raises "3 in a row" off
+/// that per-run value, and a run that ended before those failures must not
+/// raise it for them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_late_failure_stores_no_streak_on_its_row_and_its_retry_reads_none(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let (t1, t2) = (ended_at(0), ended_at(60));
+    record_run_once(&pool, "run-2", id, "success", true, t2, 3)
+        .await
+        .unwrap();
+    for (run, at) in [
+        ("run-3", ended_at(120)),
+        ("run-4", ended_at(180)),
+        ("run-5", ended_at(240)),
+    ] {
+        let r = record_run_once(&pool, run, id, "failure", false, at, 3)
+            .await
+            .unwrap();
+        assert!(r.first_seen, "{run}");
+    }
+    assert_eq!(
+        streak_and_health(&pool, id).await,
+        (3, "unhealthy".to_owned())
+    );
+
+    // Run 1's failure ended before the success at `t2`, so it is late even
+    // though the connector's streak stands at 3.
+    let late = record_run_once(&pool, "run-1", id, "failure", false, t1, 3)
+        .await
+        .unwrap();
+    assert!(late.first_seen);
+    assert_eq!(
+        late.failure_streak, None,
+        "a late failure produced no count of its own"
+    );
+    assert!(!late.auto_disabled);
+    assert_eq!(
+        streak_and_health(&pool, id).await,
+        (3, "unhealthy".to_owned()),
+        "the later failures still decide the connector's state"
+    );
+
+    let stored: Option<i32> = sqlx::query_scalar(
+        "SELECT failure_streak FROM pipeline_run_event WHERE run_id = $1 AND kind = 'failure'",
+    )
+    .bind("run-1")
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stored, None, "the dedupe row keeps no streak");
+
+    let retry = record_run_once(&pool, "run-1", id, "failure", false, t1, 3)
+        .await
+        .unwrap();
+    assert!(!retry.first_seen);
+    assert_eq!(
+        retry.failure_streak, None,
+        "its retry reads the same empty streak back"
+    );
+    Ok(())
+}
+
+/// The connector's `failure_streak` and `health`, as the store left them.
+async fn streak_and_health(pool: &PgPool, id: &str) -> (i32, String) {
+    sqlx::query_as("SELECT failure_streak, health FROM connector WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("the connector row")
+}
+/// success leaves the recorded time at the newer one, and two failures
+/// reported out of order both count (their order between themselves does not
+/// matter).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_older_report_never_moves_its_own_run_time_back(pool: PgPool) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let (t1, t2) = (ended_at(0), ended_at(60));
+    for (run, at) in [("run-2", t2), ("run-1", t1)] {
+        record_run_once(&pool, run, id, "success", true, at, 3)
+            .await
+            .unwrap();
+    }
+    let c = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!(
+        stored_at(c.last_run_success_at.as_deref()),
+        t2,
+        "an older success does not move the time back"
+    );
+    assert_eq!((c.failure_streak, c.health.as_str()), (0, "healthy"));
+
+    let (t4, t5) = (ended_at(240), ended_at(300));
+    for (run, at) in [("run-5", t5), ("run-4", t4)] {
+        let r = record_run_once(&pool, run, id, "failure", false, at, 3)
+            .await
+            .unwrap();
+        assert!(r.first_seen, "{run}");
+    }
+    let c = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!(c.failure_streak, 2, "two failures out of order both count");
+    assert_eq!(
+        stored_at(c.last_run_failure_at.as_deref()),
+        t5,
+        "an older failure does not move the time back"
+    );
+    Ok(())
+}
+
+/// `SRC-32`: a success that ended at the same time as the failure is not late
+/// (only a strictly later run is), so it still resets the count.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failure_and_a_success_that_ended_at_the_same_time_reset_the_count(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let t = ended_at(0);
+    record_run_once(&pool, "run-1", id, "failure", false, t, 3)
+        .await
+        .unwrap();
+    let ok = record_run_once(&pool, "run-2", id, "success", true, t, 3)
+        .await
+        .unwrap();
+    assert_eq!(ok.failure_streak, Some(0));
+
+    let c = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!((c.failure_streak, c.health.as_str()), (0, "healthy"));
+    assert_eq!(stored_at(c.last_run_success_at.as_deref()), t);
+    Ok(())
+}
+
+/// `SRC-32`: the direct writer answers with the connector's state as well, so
+/// a late success does not read as `"healthy"` while a later failure stands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_run_result_reports_a_late_success_as_the_connectors_state(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    record_run_result(&pool, id, false, ended_at(60))
+        .await
+        .unwrap();
+    let late = record_run_result(&pool, id, true, ended_at(0))
+        .await
+        .unwrap();
+    assert_eq!((late.health.as_str(), late.failure_streak), ("degraded", 1));
     Ok(())
 }
 
@@ -1847,11 +2420,11 @@ async fn connector_ids_in_tenants_keeps_only_the_ids_of_the_callers_tenants(
         .expect("query");
     assert!(own.contains(&"conn-pg-lakehouse".to_owned()));
     assert!(!own.contains(&"conn-does-not-exist".to_owned()));
-    assert!(
+    assert_eq!(
         connector_ids_in_tenants(&pool, &ids, &[])
             .await
-            .expect("query")
-            .is_empty()
+            .expect("query"),
+        [] as [std::string::String; 0]
     );
     Ok(())
 }

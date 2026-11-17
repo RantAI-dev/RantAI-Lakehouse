@@ -5,10 +5,12 @@
 //! `ClickHouse` aggregates with `Dagster` run history (`POST` is
 //! read-only despite the verb — it only lists recent runs).
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
@@ -19,7 +21,8 @@ use serde_json::{Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::next_run::next_run_at;
-use crate::routes::support::{js_error, num_or_zero, str_col};
+use crate::routes::catalog::NOT_IN_PRIMARY;
+use crate::routes::support::{num_or_zero, str_col, upstream_message};
 use crate::state::AppState;
 use lakehouse_dagster::{
     DgClient, DgError, DgJob, DgRun, DgSchedule, iso_from_unix_seconds, map_run_status,
@@ -48,10 +51,55 @@ pub async fn get(State(state): State<AppState>) -> Response {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
+}
+
+/// DATA-42 D7: the assets statement of this route, as a named constant, so
+/// the test runs the statement this route SHIPS rather than a copy of it.
+///
+/// `{not_in_primary}` is where the one clause goes: the primary-wins
+/// predicate every secondary branch carries (DATA-40 D3, in the ONE place
+/// it is defined — [`crate::routes::catalog::NOT_IN_PRIMARY`]). It is a
+/// placeholder and not the clause itself because a `const` cannot hold
+/// another `const`'s value, and the clause must not be re-typed here
+/// (DATA-42 D2).
+///
+/// DATA-42 D1/D3: the primary registry wins (the secondary branch drops
+/// the slugs the primary holds), and every registry table is read with
+/// `FINAL` — the registry is a `ReplacingMergeTree ORDER BY slug` that
+/// every run of a connector writes again, and `ClickHouse` merges the
+/// copies only in the background.
+///
+/// Each union is deduplicated on its own, so the join below meets one
+/// catalog row and one sync row per slug.
+const ASSETS_SQL: &str =
+    "SELECT toString(count()) n, toString(countIf(coalesce(s.total,0)=0)) stale FROM (
+     SELECT slug FROM lake.`bronze_meta.dataset_catalog` FINAL
+     UNION ALL SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog` FINAL
+     WHERE slug {not_in_primary}) c
+   LEFT JOIN (SELECT slug,total FROM lake.`bronze_meta.dataset_sync` FINAL
+              UNION ALL SELECT slug,total FROM lake.`bronze_meta_sec.dataset_sync` FINAL
+              WHERE slug {not_in_primary}) s ON c.slug=s.slug";
+
+/// DATA-42 D7: the warm-tier asset count, as a named constant. See
+/// [`ASSETS_SQL`] for the `{not_in_primary}` placeholder and for the
+/// primary-wins rule it carries (DATA-42 D1/D3).
+const WARM_ASSETS_SQL: &str = "SELECT toString(count()) assets FROM (
+     SELECT total FROM lake.`bronze_meta.dataset_sync` FINAL
+     UNION ALL SELECT total FROM lake.`bronze_meta_sec.dataset_sync` FINAL
+     WHERE slug {not_in_primary})";
+
+/// [`ASSETS_SQL`] with the primary-wins clause spliced in.
+fn assets_sql() -> String {
+    ASSETS_SQL.replace("{not_in_primary}", NOT_IN_PRIMARY)
+}
+
+/// [`WARM_ASSETS_SQL`] with the primary-wins clause spliced in.
+fn warm_assets_sql() -> String {
+    WARM_ASSETS_SQL.replace("{not_in_primary}", NOT_IN_PRIMARY)
 }
 
 async fn get_body(
@@ -60,16 +108,7 @@ async fn get_body(
     pg: Option<&PgPool>,
     probes: &[crate::health::ServiceHealth],
 ) -> Result<Value, OverviewError> {
-    let assets_row = ch
-        .rows(
-            "SELECT toString(count()) n, toString(countIf(coalesce(s.total,0)=0)) stale FROM (
-         SELECT slug FROM lake.`bronze_meta.dataset_catalog`
-         UNION ALL SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog`) c
-       LEFT JOIN (SELECT slug,total FROM lake.`bronze_meta.dataset_sync`
-                  UNION ALL SELECT slug,total FROM lake.`bronze_meta_sec.dataset_sync`) s ON c.slug=s.slug",
-            None,
-        )
-        .await?;
+    let assets_row = ch.rows(&assets_sql(), None).await?;
     let hot_row = ch
         .rows(
             "SELECT toString(sum(bytes_on_disk)) bytes, toString(uniqExact(table)) assets FROM system.parts WHERE database='serving' AND active",
@@ -80,12 +119,7 @@ async fn get_body(
     // A `rows` column used to feed `warm.bytes` via an invented
     // rows-times-220-bytes constant; that estimate is gone (see below), so
     // the column that only fed it is gone too.
-    let warm_row = ch
-        .rows(
-            "SELECT toString(count()) assets FROM (SELECT total FROM lake.`bronze_meta.dataset_sync` UNION ALL SELECT total FROM lake.`bronze_meta_sec.dataset_sync`)",
-            None,
-        )
-        .await?;
+    let warm_row = ch.rows(&warm_assets_sql(), None).await?;
     let q_row = ch
         .rows(
             "SELECT toString(count()) vol, toString(round(quantile(0.95)(query_duration_ms))) p95,
@@ -338,17 +372,56 @@ async fn count_delayed_schedules(
 /// (every console and Copilot action lands there). Despite the verb this
 /// reads only; there is no request body and nothing is mutated.
 ///
+/// The route is open to every signed-in person (`Policy::RequiresAuth`), but
+/// the feed is a read of the audit trail, and only `audit:read` reads that
+/// (`GOV-1` Decision 9). A holder gets the newest rows of everyone; anybody
+/// else gets the newest rows of their own. The route is reachable only
+/// signed in and nothing calls this function in-process, so a principal is
+/// always present: there is no unnarrowed no-principal branch, unlike
+/// `governance::read_kind`.
+///
 /// `Dagster` run history is the fallback for deployments whose console
-/// Postgres is not configured.
-pub async fn refresh(State(state): State<AppState>) -> Response {
+/// Postgres is not configured. It lists the runs of every pipeline, not the
+/// person's own actions, so it is served to a holder of `audit:read` only.
+pub async fn refresh(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    let reads_everyones = principal.has("audit:read");
+    // The audit writers store `principal.id.uuid().to_string()` in
+    // `audit_event.principal_id`, so that is the value that names "their own".
+    let own_id = principal.id.uuid().to_string();
+    let only_principal = (!reads_everyones).then_some(own_id.as_str());
     if let Some(pool) = state.pg.as_deref() {
-        match overview::recent_activity(pool, 20).await {
+        match overview::recent_activity(pool, 20, only_principal).await {
             Ok(activity) => {
                 return (StatusCode::OK, ApiJson(json!({ "activity": activity }))).into_response();
             }
             // Say so rather than silently falling back to the orchestrator.
-            Err(err) => tracing::warn!(error = %err, "audit activity read failed; trying Dagster"),
+            // A holder of `audit:read` goes on to the Dagster run list below;
+            // anybody else is answered right here.
+            Err(err) => {
+                tracing::warn!(error = %err, "audit activity read failed");
+                if !reads_everyones {
+                    // The run list is not theirs to read, and an empty 200
+                    // would read as "you have done nothing yet" when the
+                    // read failed. A fixed message: the database's own text
+                    // never reaches a response.
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        ApiJson(json!({ "activity": [], "error": "database error" })),
+                    )
+                        .into_response();
+                }
+            }
         }
+    }
+    // Only reached with no console Postgres (the audit read did not run, so
+    // there is no failure to report) or by a holder after a failed read. The
+    // run list below covers every pipeline, not the person's own actions, so
+    // a person without `audit:read` gets an empty feed instead of it.
+    if !reads_everyones {
+        return (StatusCode::OK, ApiJson(json!({ "activity": [] }))).into_response();
     }
     match state.dagster.list_runs(20).await {
         Ok(runs) => {
@@ -370,7 +443,7 @@ pub async fn refresh(State(state): State<AppState>) -> Response {
         }
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "activity": [], "error": js_error(err) })),
+            ApiJson(json!({ "activity": [], "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -893,5 +966,330 @@ mod tests {
         let result = count_delayed_schedules(&dagster, &jobs, now).await;
 
         assert_eq!(result, Some(1));
+    }
+
+    // ── DATA-42 D1/D3/D7: the primary registry wins. ─────────────────────
+    //
+    // The overview counts the Bronze datasets from BOTH registries: a slug
+    // that is in both was counted TWICE in `assets`, and its sync row
+    // twice in `stale`; the warm tier's dataset count counted it twice as
+    // well.
+    //
+    // These tests run against a REAL `ClickHouse` (the compose file's own
+    // `26.8` tag, through `testcontainers`), and they run the route's OWN
+    // statements -- the named constants of D7 -- so the statement tested
+    // is the statement shipped.
+    mod registry_clash {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_clickhouse::ChClient;
+
+        use super::*;
+        use crate::routes::bronze_registry_fixture::{clickhouse, pinned, seed_catalog, seed_sync};
+
+        /// The row the assets statement answers.
+        async fn assets_row(ch: &ChClient) -> serde_json::Map<String, Value> {
+            let rows = ch.rows(&assets_sql(), None).await.unwrap();
+            rows.into_iter()
+                .next()
+                .expect("the assets statement answers")
+        }
+
+        /// The row the warm-assets statement answers.
+        async fn warm_assets_row(ch: &ChClient) -> serde_json::Map<String, Value> {
+            let rows = ch.rows(&warm_assets_sql(), None).await.unwrap();
+            rows.into_iter()
+                .next()
+                .expect("the warm-assets statement answers")
+        }
+
+        /// A slug the two registries both hold: one dataset, counted once,
+        /// and the PRIMARY's row count is the one that counts.
+        #[tokio::test]
+        async fn a_clashing_dataset_is_counted_once_and_follows_the_primary() {
+            let (url, _container) = clickhouse().await;
+            let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "clash_overview",
+                "Primary overview",
+                "clash_overview_raw",
+            )
+            .await;
+            // The primary's dataset has no rows yet: it is the stale one.
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "clash_overview",
+                "Primary overview",
+                "clash_overview_raw",
+                0,
+            )
+            .await;
+            seed_catalog(
+                &ch,
+                "bronze_meta_sec",
+                "clash_overview",
+                "Secondary overview",
+                "clash_overview_sec_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta_sec",
+                "clash_overview",
+                "Secondary overview",
+                "clash_overview_sec_raw",
+                99,
+            )
+            .await;
+
+            let row = assets_row(&ch).await;
+            assert_eq!(
+                str_col(&row, "n"),
+                "1",
+                "one dataset, counted once: {row:?}"
+            );
+            assert_eq!(
+                str_col(&row, "stale"),
+                "1",
+                "the primary's row count (none) is the stale one, not the \
+                 secondary's: {row:?}"
+            );
+
+            let row = warm_assets_row(&ch).await;
+            assert_eq!(
+                str_col(&row, "assets"),
+                "1",
+                "one dataset in the warm tier: {row:?}"
+            );
+        }
+
+        /// A slug a second run wrote again is counted once, not twice.
+        ///
+        /// DATA-42 D3: without `FINAL` the two copies of the row are two
+        /// rows, so the dataset is counted twice.
+        #[tokio::test]
+        async fn a_slug_written_twice_to_the_primary_is_counted_once() {
+            let (url, _container) = clickhouse().await;
+            // `max_threads=1` pins the engine's read order, so WHICH of
+            // the two copies `FINAL` keeps is one thing and not a coin
+            // toss (a URL setting, so the statement the module sends is
+            // the statement that runs).
+            let ch = ChClient::new(pinned(&url), "default".to_owned(), String::new());
+
+            // The two copies of the rows stay apart: no merge may collapse
+            // them before the statements read them.
+            ch.exec(
+                "SYSTEM STOP MERGES lake.`bronze_meta.dataset_catalog`",
+                None,
+            )
+            .await
+            .expect("stop the merges of the catalog table");
+            ch.exec("SYSTEM STOP MERGES lake.`bronze_meta.dataset_sync`", None)
+                .await
+                .expect("stop the merges of the sync table");
+
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "twice_overview",
+                "Twice overview",
+                "twice_overview_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "twice_overview",
+                "Twice overview",
+                "twice_overview_raw",
+                10,
+            )
+            .await;
+            // The same run again, before `ClickHouse` merged the parts.
+            seed_catalog(
+                &ch,
+                "bronze_meta",
+                "twice_overview",
+                "Twice overview again",
+                "twice_overview_raw",
+            )
+            .await;
+            seed_sync(
+                &ch,
+                "bronze_meta",
+                "twice_overview",
+                "Twice overview again",
+                "twice_overview_raw",
+                20,
+            )
+            .await;
+
+            let row = assets_row(&ch).await;
+            assert_eq!(
+                str_col(&row, "n"),
+                "1",
+                "one dataset, counted once: {row:?}"
+            );
+            assert_eq!(
+                str_col(&row, "stale"),
+                "0",
+                "the newer row count (20) is not a stale one: {row:?}"
+            );
+
+            let row = warm_assets_row(&ch).await;
+            assert_eq!(
+                str_col(&row, "assets"),
+                "1",
+                "one dataset in the warm tier: {row:?}"
+            );
+        }
+    }
+}
+
+/// `GOV-1` Decision 9: the Dagster run list that `POST /api/overview` falls
+/// back on (no console Postgres, or a failed audit read) shows orchestrator
+/// activity of every pipeline, so it is served only to a holder of
+/// `audit:read`, like the audit rows it stands in for.
+///
+/// The handler runs behind a one-route router with the principal as a layer,
+/// the way the real auth middleware hands it over, and a `wiremock` Dagster
+/// records what it was asked. No Postgres is needed; the audit-row half of
+/// the rule is in `tests/overview_feed.rs`.
+#[cfg(test)]
+mod feed_scope {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use axum::routing::post;
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::config::Config;
+
+    fn principal(permissions: &str) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::new_v4()),
+            tenant_ids: Vec::new(),
+            display_name: "Test".to_owned(),
+            permissions: PermissionSet::parse(permissions),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// A Dagster that answers one run, and the state that points at it.
+    /// `pg` is `None` unless `unreachable_pg` is set, which gives the state a
+    /// pool whose every read fails.
+    async fn state_with_dagster(unreachable_pg: bool) -> (AppState, wiremock::MockServer) {
+        let server = wiremock::MockServer::start().await;
+        let body = json!({
+            "data": { "runsOrError": { "__typename": "Runs", "results": [{
+                "runId": "run-1",
+                "jobName": "orders_job",
+                "status": "SUCCESS",
+                "startTime": 1_700_000_000,
+                "endTime": Value::Null,
+            }] } }
+        });
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let mut state = AppState::new(Config::from_map(&HashMap::new()).expect("a test Config"));
+        state.dagster = Arc::new(DgClient::new(server.uri()));
+        if unreachable_pg {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(Duration::from_secs(2))
+                .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
+                .expect("a parseable URL");
+            state.pg = Some(Arc::new(pool));
+        }
+        (state, server)
+    }
+
+    /// `POST /` through the handler as `who`: the status and the JSON body.
+    async fn post_as(state: AppState, who: Principal) -> (StatusCode, Value) {
+        let router = axum::Router::new()
+            .route("/", post(refresh))
+            .layer(Extension(who))
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn without_a_console_database_a_person_without_audit_read_gets_an_empty_feed_and_dagster_is_not_asked()
+     {
+        let (state, dagster) = state_with_dagster(false).await;
+
+        let (status, body) = post_as(state, principal("governance:read")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "activity": [] }));
+        assert!(
+            dagster.received_requests().await.unwrap().is_empty(),
+            "the run list of every pipeline was fetched for a person who may not read it"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_console_database_a_holder_of_audit_read_gets_the_dagster_run_list() {
+        let (state, _dagster) = state_with_dagster(false).await;
+
+        let (status, body) = post_as(state, principal("audit:read")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["activity"][0]["target"], "orders_job");
+        assert_eq!(body["activity"][0]["actor"], "Dagster");
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_read_gives_a_person_without_audit_read_a_503_not_the_dagster_run_list()
+    {
+        let (state, dagster) = state_with_dagster(true).await;
+
+        let (status, body) = post_as(state, principal("governance:read")).await;
+
+        // An empty 200 would read as "you have done nothing yet"; the failure
+        // is said, with a fixed message (never the database's own text).
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, json!({ "activity": [], "error": "database error" }));
+        assert!(
+            dagster.received_requests().await.unwrap().is_empty(),
+            "a failed audit read fell through to the run list for a person who may not read it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_read_still_falls_back_to_dagster_for_a_holder_of_audit_read() {
+        let (state, _dagster) = state_with_dagster(true).await;
+
+        let (status, body) = post_as(state, principal("audit:read")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["activity"][0]["target"], "orders_job");
     }
 }

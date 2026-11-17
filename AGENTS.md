@@ -31,6 +31,12 @@ rule, not a preference:
   all product code and tests, and it does **not** change the plan's scope
   or decisions. If the plan is wrong against the code, it stops and reports
   the mismatch instead of improvising.
+  - **Exception for console design work** (product owner, 2026-11-04): a
+    task that revamps screens, merges pages or creates new UI is built by
+    an **Opus developer agent** — a separate session from the planner, with
+    the same developer rules. Removing UI and small fixes stay with the
+    other agents. The planner still plans and reviews; it never builds
+    the slice it reviews.
 
 The reason is independence: an author reviewing its own diff confirms its
 own assumptions. Keeping the roles in separate agents is what makes the
@@ -89,9 +95,11 @@ part of the plan and of the diff. This covers the assistant's work for
 dashboards only (backlog `AI-1` to `AI-15`); the AI team plans the
 assistant's other work itself.
 
-**Waits for.** A backlog item that cannot start until another merges says
-so in its text: **Waits for `BI-9`**. Nobody starts it before that item is
-merged; the planner checks this before writing its plan.
+**Blocked by** (was "Waits for"). A backlog item that cannot start until
+another merges says so in its text: **Blocked by `BI-9`**, or for one part,
+**Blocked by `QS-5` (variables part)**. Nobody starts it (or that part)
+before the blocker is merged; the planner checks this before writing its
+plan. `docs/core/BACKLOG.md` lists both directions under Dependencies.
 
 ## Five principles
 
@@ -113,8 +121,13 @@ merged; the planner checks this before writing its plan.
 Comments and commit messages are in English. Going around a choke point
 (`apiFetch`, `POLICY_TABLE`, `ApiJson`, `_assert_or_create_schema`, the
 allowlisted resolver) is allowed only with a comment at the site saying why.
-Known gap: `ApiError::Internal(err.to_string())` leaks upstream text in
-fourteen Phase-1 handlers — do not add another.
+Upstream error text never reaches a response (SEC-11, closed): the
+"fourteen Phase-1 handlers" gap is gone, and `lakehouse-clickhouse` has no
+`From<ChError> for ApiError` any more, so a `?` on a `ChError` in a route does
+not compile. Report an upstream error with `upstream_error` (the raw text to
+the log under a reference id, a fixed message and the id to the caller);
+`tests/sec11_guard.rs` fails when a route line puts an error's own text in a
+response, and an allowlist entry there needs a reason.
 
 ## Vocabulary you will see and must use correctly
 
@@ -199,6 +212,19 @@ for it on every step.
   just before the handoff, and once more by the reviewer before merge. CI
   runs it again on the PR. That is three full runs per PR, not one per
   commit.
+- **CI's `test` job is `cargo nextest run --workspace`, in three partitions**
+  (`REL-20`): the single `cargo test --workspace` became three parallel
+  nextest partitions plus `cargo test --doc`. Local developers may keep
+  `cargo test`; only the CI command changed.
+- **Integration tests are one binary per crate** (`OPS-32`): `lakehouse-api`,
+  `lakehouse-store` and `lakehouse-auth` build `tests/it.rs`, which declares
+  every test file as a module. Run one file with
+  `cargo test -p lakehouse-api --test it route_auth::` (or
+  `cargo nextest run -p lakehouse-api --test it -E 'test(/^route_auth::/)'`);
+  `--test <file>` works only for `hostile_uploads`, `identity_password` and
+  `parity`, which stay separate. A new test file gets a `mod <name>;` line in
+  `tests/it.rs` (and `use crate::common;` instead of `mod common;`), or the
+  `Repo lints` job fails.
 - **Batch Rust work.** Plans order tasks so the Rust changes sit together,
   and a migration lands in the same sitting as the code that uses it
   (`sqlx::test` embeds migrations at compile time, so each migration edit
@@ -221,6 +247,10 @@ bun run typecheck && bun run lint && bun run test
 python3 ops/lint/check_intra_package_imports.py && python3 ops/lint/check_bare_iceberg_count.py
 (cd dagster && python -m pytest dispar_orchestrate -q)
 docker compose --profile '*' config --quiet   # plus a real `up` for compose edits
+# SEC-18: compose has no default credentials, so `config` needs
+# POSTGRES_PASSWORD, RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY and
+# LAKEKEEPER_ENCRYPTION_KEY set: run `sh ops/init-env.sh` once (it writes a
+# local .env and refuses to overwrite one), or export throwaway values.
 git status                                    # nothing generated staged
 ```
 

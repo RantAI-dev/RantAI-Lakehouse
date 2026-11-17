@@ -1,14 +1,22 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import {
   ConnectorIngestPanel,
   cronProblem,
   defaultDiscoverSchema,
   defaultTarget,
-  groupResultsByRun,
+  labelTarget,
+  isAutoDisablePause,
   loadModeProblem,
+  lockedColumns,
+  REST_OLD_OBJECT_NOTE,
   targetProblem,
 } from "./connector-ingest-panel"
+import type { SourceObject } from "@/services/contracts/connectors"
+
+/** A saved object as the server sends it: the same fields as the contract, with the mode a plain string so fixtures stay literals. */
+type WireSourceObject = Omit<SourceObject, "loadMode"> & { loadMode?: string }
 
 const originalFetch = global.fetch
 
@@ -25,7 +33,7 @@ const SPEC = {
   adapter: "sql",
   ingestMode: "batch",
   dial: { driver: "postgres", host: "192.168.18.205", port: 55432, database: "northwind", user: "postgres", sslMode: null },
-  sourceObjects: [] as { name: string; target: string }[],
+  sourceObjects: [] as WireSourceObject[],
   scheduleCron: null as string | null,
   secretRefs: { primary: "file:/run/secrets/connector_managed_x_password", secondary: null },
   nextRunAt: null as string | null,
@@ -33,11 +41,32 @@ const SPEC = {
 
 type Call = { url: string; method: string; body: unknown }
 
+type Found = { name: string; columns: { name: string; typeName: string }[]; primaryKey?: string[] }
+
+/** What the source holds: the tables a test passes as `discovered`, else two small ones. */
+function found(options: { discovered?: unknown[] }): Found[] {
+  return (
+    (options.discovered as Found[] | undefined) ?? [
+      { name: "public.orders", columns: [{ name: "order_id", typeName: "smallint" }] },
+      { name: "public.customers", columns: [{ name: "customer_id", typeName: "text" }] },
+    ]
+  )
+}
+
 function stubFetch(
   spec: typeof SPEC = SPEC,
-  history: { runs: unknown[]; results: unknown[] } = { runs: [], results: [] },
+  // SRC-11: the run record (`GET .../runs`) and the log of each run by id (`GET .../runs/{id}/log`).
+  // SRC-39: `maxRuntimeSeconds` is the run limit the API judges runs by (absent in an older answer).
+  history: { runs: unknown[]; logs?: Record<string, unknown>; maxRuntimeSeconds?: number } = { runs: [] },
   // SRC-10: what discovery finds, and how a run of the connector is answered (the default launches run 0123456789abcdef).
-  options: { discovered?: unknown[]; onRun?: (body: unknown) => Response } = {}
+  // SRC-11: how Resume is answered (the default lifts the pause).
+  options: {
+    discovered?: unknown[]
+    /** SRC-13: a listing of objects that are not tables (topics, endpoints, collections); wins over `discovered` for the list. */
+    listing?: unknown[]
+    onRun?: (body: unknown) => Response
+    onResume?: () => Response
+  } = {}
 ): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -50,18 +79,35 @@ function stubFetch(
       const scheduleCron = body.scheduleCron ?? null
       return json({ ...spec, ...body, scheduleCron, nextRunAt: scheduleCron ? "2026-10-01T02:00:00Z" : null })
     }
-    if (url.includes("/api/governance/ingest-runs")) return json(history.results)
-    if (url.includes("/ingest/runs")) return json(history.runs)
-    if (url.includes("/debezium-properties")) {
-      return json({ table: "public.orders", properties: "database.password=${DB_PASSWORD}", note: "References only." })
+    if (url.endsWith("/runs")) return json({ runs: history.runs, maxRuntimeSeconds: history.maxRuntimeSeconds })
+    const log = /\/runs\/([^/]+)\/log(\?format=text)?$/.exec(url)
+    if (log) {
+      if (log[2]) return new Response("run 0123 (schedule), succeeded\n", { status: 200, headers: { "Content-Type": "text/plain" } })
+      const body = history.logs?.[log[1]!]
+      return body ? json(body) : json({ error: "not found" }, 404)
     }
-    if (url.includes("/discover")) {
+    if (url.endsWith("/resume") && method === "POST") return options.onResume ? options.onResume() : json({ resumed: true })
+    // SRC-13: names first (`/discovery/list`), the columns of one object when it is opened (`/discovery/preview`).
+    if (url.endsWith("/discovery/list") && method === "POST") {
       return json({
-        supported: true,
-        objects: options.discovered ?? [
-          { name: "public.orders", columns: [{ name: "order_id", typeName: "smallint" }] },
-          { name: "public.customers", columns: [{ name: "customer_id", typeName: "text" }] },
-        ],
+        kind: "list",
+        state: "done",
+        objects: options.listing ?? found(options).map((o) => ({ name: o.name, kind: "table" })),
+      })
+    }
+    if (url.endsWith("/discovery/preview") && method === "POST") {
+      // Only a table a test names in `discovered` has columns to read; the default listing's tables answer
+      // that the source cannot say, so a table saved or typed in a test keeps the typed key and cursor fields.
+      const object = ((options.discovered as Found[] | undefined) ?? []).find((o) => o.name === body.object)
+      if (!object) {
+        return json({ kind: "preview", state: "failed", object: body.object, errorClass: "failed", reason: "The source could not be read." })
+      }
+      return json({
+        kind: "preview",
+        state: "done",
+        object: object.name,
+        columns: object.columns.map((c) => ({ ...c, inferred: false })),
+        primaryKey: object.primaryKey ?? [],
       })
     }
     if (url.includes("/ingest/run")) return options.onRun ? options.onRun(body) : json({ runId: "0123456789abcdef" })
@@ -82,12 +128,25 @@ describe("ingest panel helpers", () => {
     // ... and a key (the two lines below named no key before the key field existed).
     expect(loadModeProblem({ loadMode: "incremental_dedup", incrementalKey: "updated_at", primaryKey: ["id"] })).toBeNull()
     expect(loadModeProblem({ loadMode: "replace_dedup", primaryKey: ["id"] })).toBeNull()
+    // SRC-4 S2-g: change capture needs a key and no cursor.
+    expect(loadModeProblem({ loadMode: "incremental_dedup", primaryKey: ["id"], adapter: "cdc" })).toBeNull()
+    expect(loadModeProblem({ loadMode: "history", primaryKey: ["id"], adapter: "cdc" })).toBeNull()
+    expect(loadModeProblem({ loadMode: "incremental_dedup", adapter: "cdc" })).toMatch(/cannot follow a table without a key/)
+    // PR #216 final review BLOCKER 18: `incremental` appends a changed business-app record as a second row.
+    expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at", adapter: "saas" })).toMatch(/one per key/)
+    expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at", adapter: "sql" })).toBeNull()
   })
 
   it("names a Bronze table after the connector and the source table", () => {
     expect(defaultTarget("northwind", "public.orders")).toBe("northwind_orders")
     expect(defaultTarget("Northwind DB!", "public.Order Details")).toBe("northwind_db_order_details")
     expect(defaultTarget("2024 sales", "t")).toBe("t_2024_sales_t")
+  })
+  it("names the table of a labelled object from the whole label (slice 5 review BLOCKER 14)", () => {
+    expect(labelTarget("intranet", "Team Site / Tasks")).toBe("intranet_team_site_tasks")
+    expect(labelTarget("Intranet", "v1.2 Plan / Q3 2026")).toBe("intranet_v1_2_plan_q3_2026")
+    expect(labelTarget("2024", "HR / Staff")).toBe("t_2024_hr_staff")
+    expect(labelTarget("", "!!!")).toBe("table")
   })
   // The edge cases below are pinned by `default_bronze_target`'s Rust test as
   // well (`lakehouse-store/src/ingest_spec.rs`): both rules must agree.
@@ -127,14 +186,17 @@ describe("ConnectorIngestPanel", () => {
     expect((screen.getByLabelText("Schema") as HTMLInputElement).value).toBe("public")
     fireEvent.click(screen.getByRole("button", { name: "Find tables" }))
     await screen.findByText("public.orders")
-    const discover = calls.find((c) => c.url.includes("/discover"))
-    expect(discover?.url).toContain("/api/connectors/conn-northwind/discover?schema=public")
+    // SRC-13: the listing is the new route, asked for the schema in the field.
+    const discover = calls.find((c) => c.url.endsWith("/discovery/list"))
+    expect(discover?.url).toBe("/api/connectors/conn-northwind/discovery/list")
+    expect(discover?.method).toBe("POST")
+    expect(discover?.body).toEqual({ schema: "public" })
 
     fireEvent.click(screen.getByLabelText(/public\.orders/))
     const target = screen.getByLabelText("Bronze table for public.orders") as HTMLInputElement
     expect(target.value).toBe("northwind_orders")
 
-    fireEvent.change(screen.getByLabelText("Schedule"), { target: { value: "0 2 * * *" } })
+    chooseOption(screen.getByLabelText("Schedule"), "Every day at 02:00 UTC")
     // A saved schedule applies on its own, with no orchestrator reload.
     expect(screen.getByText("Runs on this schedule within a minute of saving.")).toBeDefined()
     // Unsaved changes block a run.
@@ -180,14 +242,16 @@ describe("ConnectorIngestPanel", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
 
-    const mode = screen.getByLabelText("Load mode for public.orders") as HTMLSelectElement
-    expect(mode.value).toBe("replace")
-    fireEvent.change(mode, { target: { value: "incremental" } })
+    const mode = screen.getByLabelText("Load mode for public.orders")
+    // WEB-9 D5: the trigger shows the mode's label, where the select held its value.
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Replace all rows")
+    chooseOption(mode, "Add only new rows")
     // No column yet: the reason is shown and the save is off.
     expect(screen.getByText(/Pick the column that marks new rows/)).toBeDefined()
     const save = screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
     expect(save.disabled).toBe(true)
 
+    // The source cannot list this table's columns here, so the cursor is typed.
     fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "order_id" } })
     expect(screen.getByText(/later runs add rows whose order_id is higher/)).toBeDefined()
     expect(save.disabled).toBe(false)
@@ -206,15 +270,17 @@ describe("ConnectorIngestPanel", () => {
   it("shows a table saved without a mode as replace, and offers incremental to SQL only", async () => {
     stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
     const sql = render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-    const mode = (await screen.findByLabelText("Load mode for public.orders")) as HTMLSelectElement
-    expect(mode.value).toBe("replace")
-    expect([...mode.options].map((o) => o.value)).toEqual([
-      "replace",
-      "incremental",
-      "append",
-      "replace_dedup",
-      "incremental_dedup",
-      "history",
+    const mode = await screen.findByLabelText("Load mode for public.orders")
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Replace all rows")
+    // WEB-9 D5: the modes are read from the opened list, by the words a person reads.
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add only new rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Add only new rows, one per key",
+      "Keep history",
     ])
     expect((screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement).disabled).toBe(true)
     sql.unmount()
@@ -226,8 +292,14 @@ describe("ConnectorIngestPanel", () => {
       sourceObjects: [{ name: "orders", target: "api_orders" }],
     })
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
-    const restMode = (await screen.findByLabelText("Load mode for orders")) as HTMLSelectElement
-    expect([...restMode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "history"])
+    const restMode = await screen.findByLabelText("Load mode for orders")
+    fireEvent.click(restMode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Keep history",
+    ])
   })
 
   it("does not save a Bronze name that is not an identifier", async () => {
@@ -300,7 +372,7 @@ describe("ConnectorIngestPanel layout", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Find tables" }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
     expect((screen.getByLabelText("Bronze table for public.orders") as HTMLInputElement).value).toBe("northwind_orders")
-    fireEvent.change(screen.getByLabelText("Schedule"), { target: { value: "0 2 * * *" } })
+    chooseOption(screen.getByLabelText("Schedule"), "Every day at 02:00 UTC")
     fireEvent.click(screen.getByRole("button", { name: "Save tables and schedule" }))
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
     expect((calls.find((c) => c.method === "PUT")?.body as { scheduleCron: string }).scheduleCron).toBe("0 2 * * *")
@@ -317,7 +389,9 @@ describe("ConnectorIngestPanel layout", () => {
 
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     expect((await screen.findByLabelText("Bronze table for public.orders")).className).not.toContain("max-w-")
-    expect(screen.getByLabelText("Schedule").className).not.toContain("max-w-")
+    // WEB-9 D3: the trigger always carries the design system's `max-w-full`, so
+    // the page's own cap is the one to look for (absent here).
+    expect(screen.getByLabelText("Schedule").className).not.toContain("max-w-xs")
   })
 
   /**
@@ -328,18 +402,16 @@ describe("ConnectorIngestPanel layout", () => {
   describe("a run's row", () => {
     const history = {
       runs: [
-        { runId: "run-1234567890", status: "completed", startedAt: "2026-09-29T08:21:51.171Z", endedAt: "2026-09-29T08:22:33.646Z" },
-      ],
-      results: [
         {
-          connectorId: "conn-northwind",
-          job: "ingest_job",
-          object: "public.orders",
-          rows: 7,
-          startedAt: "2026-09-29T08:22:00.000Z",
-          endedAt: "2026-09-29T08:22:10.000Z",
+          runId: "run-1234567890",
+          trigger: "schedule",
           status: "succeeded",
-          error: "",
+          startedAt: "2026-09-29T08:21:51.171Z",
+          endedAt: "2026-09-29T08:22:33.646Z",
+          durationSeconds: 42,
+          rowsLoaded: 7,
+          attempts: 1,
+          endReason: "completed",
         },
       ],
     }
@@ -347,10 +419,10 @@ describe("ConnectorIngestPanel layout", () => {
     it("has two lines in the card layout: the verdict, id and untruncated summary, then when and how long", async () => {
       stubFetch(SPEC, history)
       render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
-      const summaryText = await screen.findByText("1 of 1 tables · 7 rows")
+      const summaryText = await screen.findByText("7 rows · 1 attempt")
       expect(summaryText.className).not.toContain("truncate")
       const firstLine = summaryText.parentElement as HTMLElement
-      expect(within(firstLine).getByText("Completed")).toBeDefined()
+      expect(within(firstLine).getByText("Succeeded")).toBeDefined()
       expect(within(firstLine).getByText("run-1234")).toBeDefined()
       // When and how long is on its own, muted line below, whole.
       const second = screen.getByText(/took 42 s|took 42\.\d s/)
@@ -363,10 +435,10 @@ describe("ConnectorIngestPanel layout", () => {
     it("keeps one line, with the summary truncated, in the embedded layout", async () => {
       stubFetch(SPEC, history)
       render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-      const summaryText = await screen.findByText("1 of 1 tables · 7 rows")
+      const summaryText = await screen.findByText("7 rows · 1 attempt")
       expect(summaryText.className).toContain("truncate")
       const line = summaryText.parentElement as HTMLElement
-      expect(within(line).getByText("Completed")).toBeDefined()
+      expect(within(line).getByText("Succeeded")).toBeDefined()
       expect(within(line).getByText(/took /)).toBeDefined()
     })
   })
@@ -382,7 +454,7 @@ describe("ConnectorIngestPanel layout", () => {
     const { container } = render(
       <ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />
     )
-    await screen.findByText(/Debezium properties/)
+    await screen.findByText("public.orders")
     expect(cardTitles(container)).toEqual(["Tables to ingest", "Runs"])
     const tables = (screen.getByText("Tables to ingest", { selector: "[data-slot=card-title]" }).closest(
       "[data-slot=card]"
@@ -440,45 +512,6 @@ describe("ConnectorIngestPanel onTableCount", () => {
   })
 })
 
-describe("groupResultsByRun", () => {
-  const result = (object: string, startedAt: string, status = "succeeded") => ({
-    connectorId: "conn-northwind",
-    job: "ingest_job",
-    object,
-    rows: 1,
-    startedAt,
-    endedAt: startedAt,
-    status,
-    error: "",
-  })
-
-  it("puts each table result under the run it happened in, oldest table first, and older results last", () => {
-    const runs = [
-      { runId: "run-2", status: "running" as const, startedAt: "2026-09-29T08:22:39.206Z", endedAt: null, object: null, action: null },
-      { runId: "run-1", status: "completed" as const, startedAt: "2026-09-29T08:21:51.171Z", endedAt: "2026-09-29T08:22:33.646Z", object: null, action: null },
-    ]
-    const groups = groupResultsByRun(runs, [
-      result("public.orders", "2026-09-29T08:22:59.700710+00:00"),
-      result("public.categories", "2026-09-29T08:22:42.972055+00:00"),
-      result("public.us_states", "2026-09-29T08:22:30.023414+00:00"),
-      result("public.categories", "2026-09-29T07:48:10.000000+00:00", "rejected"),
-    ])
-    expect(groups.map((g) => g.run?.runId ?? "earlier")).toEqual(["run-2", "run-1", "earlier"])
-    expect(groups[0]!.results.map((r) => r.object)).toEqual(["public.categories", "public.orders"])
-    expect(groups[1]!.results.map((r) => r.object)).toEqual(["public.us_states"])
-    expect(groups[2]!.results[0]!.status).toBe("rejected")
-  })
-
-  it("keeps a run that reached no table, so a failure before the first table still shows", () => {
-    const groups = groupResultsByRun(
-      [{ runId: "run-401", status: "failed", startedAt: "2026-09-29T06:48:06.638Z", endedAt: "2026-09-29T06:48:09.000Z", object: null, action: null }],
-      []
-    )
-    expect(groups).toHaveLength(1)
-    expect(groups[0]!.results).toEqual([])
-  })
-})
-
 /**
  * SRC-10 decisions 2, 3 and 4: the modes a source offers, the key of a
  * deduplicating table (filled from discovery, typed otherwise), and the problems
@@ -490,13 +523,14 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     sourceObjects: [{ name: "public.orders", target: "northwind_orders", ...extra }],
   })
   const saveButton = () => screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
-  const modeOf = async (name: string) => (await screen.findByLabelText(`Load mode for ${name}`)) as HTMLSelectElement
+  const modeOf = async (name: string) => await screen.findByLabelText(`Load mode for ${name}`)
 
   it("offers six modes to a SQL source, labelled in plain words", async () => {
     stubFetch(saved())
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
-    expect([...mode.options].map((o) => o.textContent)).toEqual([
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
       "Replace all rows",
       "Add only new rows",
       "Add all rows again",
@@ -505,7 +539,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
       "Keep history",
     ])
     // Nothing is missing, so there is no line about a missing mode.
-    expect(screen.queryByText(/offered for SQL sources only/)).toBeNull()
+    expect(screen.queryByText(/offered for SQL sources and business apps only/)).toBeNull()
   })
 
   it("offers four modes to any other batch source and says why the incremental ones are missing", async () => {
@@ -517,8 +551,34 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     })
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
     const mode = await modeOf("orders")
-    expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "history"])
-    expect(screen.getByText(/Adding only new rows, with or without one row per key, is offered for SQL sources only/)).toBeDefined()
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Keep history",
+    ])
+    expect(screen.getByText(/Adding only new rows, with or without one row per key, is offered for SQL sources and business apps only/)).toBeDefined()
+  })
+
+  it("offers five modes to a business app, without the append-only incremental one (final review BLOCKER 18)", async () => {
+    stubFetch({
+      ...SPEC,
+      adapter: "saas",
+      dial: { vendor: "zendesk", account: "acme", auth: { type: "integration" } } as unknown as typeof SPEC.dial,
+      sourceObjects: [{ name: "tickets", target: "saas_tickets" }],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-saas" connectorName="acme" />)
+    const mode = await modeOf("tickets")
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Add only new rows, one per key",
+      "Keep history",
+    ])
+    expect(screen.queryByText(/offered for SQL sources and business apps only/)).toBeNull()
   })
 
   it("says in each hint what happens to the rows already in the table", async () => {
@@ -532,8 +592,16 @@ describe("ConnectorIngestPanel load modes and keys", () => {
       incremental: /keep the rows already there/,
       incremental_dedup: /merge .* into the rows already there/,
     }
+    // WEB-9 D5: each mode is chosen by the label the trigger shows for it.
+    const labels: Record<string, string> = {
+      replace: "Replace all rows",
+      append: "Add all rows again",
+      replace_dedup: "Replace all rows, one per key",
+      incremental: "Add only new rows",
+      incremental_dedup: "Add only new rows, one per key",
+    }
     for (const [value, hint] of Object.entries(hints)) {
-      fireEvent.change(mode, { target: { value } })
+      chooseOption(mode, labels[value])
       if (value.startsWith("incremental")) {
         fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "order_id" } })
       }
@@ -549,16 +617,17 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
 
-    fireEvent.change(mode, { target: { value: "replace_dedup" } })
+    chooseOption(mode, "Replace all rows, one per key")
     expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
     expect(saveButton().disabled).toBe(true)
     fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id" } })
     expect(screen.queryByText(/cannot be saved without a key/)).toBeNull()
     expect(saveButton().disabled).toBe(false)
 
-    fireEvent.change(mode, { target: { value: "incremental_dedup" } })
+    chooseOption(mode, "Add only new rows, one per key")
     expect(screen.getByText(/Pick the column that marks new rows/)).toBeDefined()
     expect(saveButton().disabled).toBe(true)
+    // No column list from this source, so the cursor is typed.
     fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "updated_at" } })
     expect(saveButton().disabled).toBe(false)
 
@@ -573,7 +642,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
     fireEvent.change(await screen.findByLabelText("Add by name"), { target: { value: "orders" } })
     fireEvent.click(screen.getByRole("button", { name: "Add" }))
-    fireEvent.change(await modeOf("orders"), { target: { value: "replace_dedup" } })
+    chooseOption(await modeOf("orders"), "Replace all rows, one per key")
     fireEvent.change(screen.getByLabelText("Key columns for orders"), { target: { value: "id, region" } })
     fireEvent.click(saveButton())
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
@@ -600,8 +669,8 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "incremental_dedup" } })
-    fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "updated_at" } })
+    chooseOption(await modeOf("public.orders"), "Add only new rows, one per key")
+    chooseOption(screen.getByLabelText("New-row column for public.orders"), "updated_at")
 
     const ticked = (name: string) =>
       (screen.getByLabelText(`${name} is part of the key of public.orders`) as HTMLInputElement).checked
@@ -629,7 +698,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.customers/))
-    fireEvent.change(await modeOf("public.customers"), { target: { value: "replace_dedup" } })
+    chooseOption(await modeOf("public.customers"), "Replace all rows, one per key")
     // Declares no key: nothing is ticked, and Save says why it is off.
     expect((screen.getByLabelText("customer_id is part of the key of public.customers") as HTMLInputElement).checked).toBe(false)
     expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
@@ -640,7 +709,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     stubFetch(saved({ loadMode: "replace_dedup", primaryKey: ["id"] }))
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
-    expect(mode.value).toBe("replace_dedup")
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Replace all rows, one per key")
     expect((screen.getByLabelText("Key columns for public.orders") as HTMLInputElement).value).toBe("id")
     expect(saveButton().disabled).toBe(true)
   })
@@ -648,23 +717,29 @@ describe("ConnectorIngestPanel load modes and keys", () => {
   // UX-1-R6: aria-required is unsupported on a native fieldset's implicit
   // group role. The star belongs on a visible legend with linked instructions,
   // and no individual checkbox should claim to be required.
+  // UX-1-R6: the star belongs on a visible group label, not on the fieldset
+  // role or any individual checkbox. The current form renders a wrapping row
+  // with a labelled span and a fieldset with aria-label.
   it("uses a visible legend for the key group instead of aria-required on the fieldset", async () => {
     stubFetch(SPEC, undefined, { discovered: FOUND })
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "incremental_dedup" } })
+    chooseOption(await modeOf("public.orders"), "Replace all rows, one per key")
 
     const checkbox = screen.getByLabelText("order_id is part of the key of public.orders")
     const fieldset = checkbox.closest("fieldset") as HTMLFieldSetElement
     expect(fieldset).not.toBeNull()
     expect(fieldset.hasAttribute("aria-required")).toBe(false)
-    const legend = fieldset.querySelector("legend")
-    expect(legend?.textContent).toContain("Key")
-    expect(legend?.querySelector('span[aria-hidden="true"][class*="before:content-"]')).not.toBeNull()
-    const help = document.getElementById(fieldset.getAttribute("aria-describedby") ?? "")
-    expect(help?.textContent).toContain("at least one")
+    expect(fieldset.getAttribute("aria-label")).toContain("Key columns")
     expect(checkbox.hasAttribute("aria-required")).toBe(false)
+
+    const keyLabel = Array.from(document.querySelectorAll("span")).find((s) =>
+      s.textContent?.trim().startsWith("Key")
+    )
+    expect(keyLabel).not.toBeNull()
+    expect(keyLabel?.querySelector('span[aria-hidden="true"][class*="before:content-"]')).not.toBeNull()
+    expect(document.querySelector('p[id$="-help"]')?.textContent).toContain("at least one")
   })
 })
 
@@ -678,13 +753,13 @@ describe("ConnectorIngestPanel history mode", () => {
     sourceObjects: [{ name: "public.orders", target: "northwind_orders", ...extra }],
   })
   const saveButton = () => screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
-  const modeOf = async (name: string) => (await screen.findByLabelText(`Load mode for ${name}`)) as HTMLSelectElement
+  const modeOf = async (name: string) => await screen.findByLabelText(`Load mode for ${name}`)
   const BOUNDARY = "After saving, use Refresh, removing rows on this table: its rows must be rebuilt for the new mode."
 
   it("says in one line what is kept and that each run reads the whole table", async () => {
     stubFetch(saved())
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id" } })
     expect(
       screen.getByText(
@@ -696,7 +771,7 @@ describe("ConnectorIngestPanel history mode", () => {
   it("asks for a key like the deduplicating modes, and shows no cursor field", async () => {
     stubFetch(saved())
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
     expect(saveButton().disabled).toBe(true)
     expect(screen.queryByLabelText("New-row column for public.orders")).toBeNull()
@@ -708,7 +783,7 @@ describe("ConnectorIngestPanel history mode", () => {
   it("saves the key and no cursor, even if the table had a cursor before", async () => {
     const calls = stubFetch(saved({ loadMode: "incremental", incrementalKey: "updated_at" }))
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id, region" } })
     fireEvent.click(saveButton())
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
@@ -730,7 +805,7 @@ describe("ConnectorIngestPanel history mode", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     expect((screen.getByLabelText("order_id is part of the key of public.orders") as HTMLInputElement).checked).toBe(true)
     expect(saveButton().disabled).toBe(false)
   })
@@ -740,11 +815,11 @@ describe("ConnectorIngestPanel history mode", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
-    fireEvent.change(mode, { target: { value: "append" } })
+    chooseOption(mode, "Add all rows again")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
-    fireEvent.change(mode, { target: { value: "history" } })
+    chooseOption(mode, "Keep history")
     expect(screen.getByText(BOUNDARY)).toBeDefined()
-    fireEvent.change(mode, { target: { value: "replace" } })
+    chooseOption(mode, "Replace all rows")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
   })
 
@@ -752,9 +827,9 @@ describe("ConnectorIngestPanel history mode", () => {
     stubFetch(saved({ loadMode: "history", primaryKey: ["id"] }))
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
-    expect(mode.value).toBe("history")
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Keep history")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
-    fireEvent.change(mode, { target: { value: "replace_dedup" } })
+    chooseOption(mode, "Replace all rows, one per key")
     expect(screen.getByText(BOUNDARY)).toBeDefined()
   })
 
@@ -765,7 +840,7 @@ describe("ConnectorIngestPanel history mode", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
   })
 
@@ -796,6 +871,23 @@ describe("ConnectorIngestPanel history mode", () => {
  * SRC-10 decision 5: refresh or clear one table, each behind a confirmation, and
  * the run view naming the table and the action.
  */
+/** A run record as `GET .../runs` answers it; a test overrides what it is about. */
+function record(extra: Record<string, unknown> = {}) {
+  return {
+    runId: "run-0000000001",
+    trigger: "schedule",
+    table: null,
+    status: "succeeded",
+    startedAt: "2026-10-12T08:00:00.000Z",
+    endedAt: "2026-10-12T08:00:30.000Z",
+    durationSeconds: 30,
+    rowsLoaded: 100,
+    attempts: 1,
+    endReason: "completed",
+    ...extra,
+  }
+}
+
 describe("ConnectorIngestPanel refresh and clear", () => {
   const SAVED = {
     ...SPEC,
@@ -853,8 +945,7 @@ describe("ConnectorIngestPanel refresh and clear", () => {
 
   it("is disabled, with the reason as its title, while a run of this connector is going", async () => {
     stubFetch(SAVED, {
-      runs: [{ runId: "run-live-0001", status: "running", startedAt: "2026-10-12T08:00:00Z", endedAt: null, object: null, action: null }],
-      results: [],
+      runs: [record({ runId: "run-live-0001", status: "running", startedAt: new Date().toISOString(), endedAt: null })],
     })
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
     await waitFor(() => expect(menu().disabled).toBe(true))
@@ -922,22 +1013,21 @@ describe("ConnectorIngestPanel refresh and clear", () => {
     await waitFor(() => expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull())
   })
 
-  it("names the table and the action in the run list", async () => {
-    stubFetch(SAVED, {
-      runs: [
-        { runId: "run-clear-0001", status: "completed", startedAt: "2026-10-12T08:00:00Z", endedAt: "2026-10-12T08:00:05Z", object: "public.orders", action: "clear" },
-        { runId: "run-all-000001", status: "completed", startedAt: "2026-10-12T07:00:00Z", endedAt: "2026-10-12T07:00:30Z", object: null, action: null },
-      ],
-      results: [
-        { connectorId: "conn-northwind", job: "ingest_job", object: "public.orders", rows: 0, startedAt: "2026-10-12T08:00:01Z", endedAt: "2026-10-12T08:00:02Z", status: "cleared", error: "" },
-      ],
+  it("offers a change-capture table the current row per key and history only, and asks for no cursor", async () => {
+    stubFetch({
+      ...SPEC,
+      adapter: "cdc",
+      ingestMode: "cdc",
+      dial: { ...SPEC.dial, driver: "postgres" },
+      sourceObjects: [{ name: "public.orders", target: "northwind_orders", loadMode: "incremental_dedup", primaryKey: ["id"] }],
     })
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
-    expect(await screen.findByText("Clear · public.orders")).toBeDefined()
-    expect(screen.getByText("Table emptied · nothing loaded")).toBeDefined()
-    expect(screen.getByText("cleared")).toBeDefined()
-    // A run of every table names no table.
-    expect(screen.queryByText(/Refresh, keeping rows · /)).toBeNull()
+    const mode = await screen.findByLabelText("Load mode for public.orders")
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["Current row per key", "Keep history"])
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Current row per key")
+    expect(screen.queryByLabelText("New-row column for public.orders")).toBeNull()
+    expect(screen.getByText(/The table holds the current row of each key/)).toBeDefined()
   })
 
   it("has no table menu for a CDC connector, whose tables stream", async () => {
@@ -945,5 +1035,700 @@ describe("ConnectorIngestPanel refresh and clear", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
     await screen.findByText("public.orders")
     expect(screen.queryByRole("button", { name: "Refresh or clear public.orders" })).toBeNull()
+  })
+})
+
+/**
+ * SRC-11 decision 7: the Runs card reads the product's own run record (newest 50), with how each run was started,
+ * its rows, duration and attempts, and no longer matches table results to orchestrator runs by time. A run whose
+ * record says running for longer than the bound is "no end reported", not active forever.
+ */
+describe("ConnectorIngestPanel runs from the run record", () => {
+  const panel = () =>
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+
+  it("lists each run with its trigger, rows, attempts and duration, from the run record only", async () => {
+    const calls = stubFetch(SPEC, {
+      runs: [
+        record({ runId: "run-sched-0001", trigger: "schedule", rowsLoaded: 1200, attempts: 3, durationSeconds: 95 }),
+        record({ runId: "run-user-00002", trigger: "user", status: "failed", endReason: "table_failed", rowsLoaded: 0, attempts: 4 }),
+        record({ runId: "run-clear-0003", trigger: "clear", rowsLoaded: 0 }),
+        record({ runId: "run-paused-004", trigger: "other", status: "paused", endReason: "connector_paused", rowsLoaded: 0, attempts: 0 }),
+      ],
+    })
+    panel()
+    expect(await screen.findByText("1,200 rows · 3 attempts")).toBeDefined()
+    // "Schedule" is also the title of the card beside this one.
+    const runsCard = screen.getByText("Runs", { selector: "[data-slot=card-title]" }).closest("[data-slot=card]") as HTMLElement
+    expect(within(runsCard).getByText("Schedule")).toBeDefined()
+    expect(screen.getByText("Started by a user")).toBeDefined()
+    expect(screen.getByText("Clear")).toBeDefined()
+    expect(screen.getByText("Started from the orchestrator")).toBeDefined()
+    expect(screen.getByText(/took 1m 35s/)).toBeDefined()
+    expect(screen.getByText("0 rows · 4 attempts")).toBeDefined()
+    expect(screen.getByText("Failed")).toBeDefined()
+    expect(screen.getByText("Paused")).toBeDefined()
+    // The old reads are gone: no per-table results, no orchestrator run list.
+    expect(calls.some((c) => c.url.includes("/api/governance/ingest-runs") || c.url.includes("/ingest/runs"))).toBe(false)
+    expect(calls.some((c) => c.url.endsWith("/api/connectors/conn-northwind/runs"))).toBe(true)
+  })
+
+  // SRC-10 decision 5, restored by SRC-11 review 1 BLOCKER 2: the run record now carries the table.
+  it("names the table and the action in the run list", async () => {
+    stubFetch(SPEC, {
+      runs: [
+        record({ runId: "run-clear-0001", trigger: "clear", table: "public.orders", rowsLoaded: 0 }),
+        record({ runId: "run-refresh-002", trigger: "refresh", table: "public.customers" }),
+        record({ runId: "run-all-0000003", trigger: "schedule" }),
+      ],
+    })
+    panel()
+    expect(await screen.findByText("Clear · public.orders")).toBeDefined()
+    expect(screen.getByText("Refresh · public.customers")).toBeDefined()
+    // A run of every table names no table.
+    expect(screen.queryByText(/^Schedule · /)).toBeNull()
+  })
+
+  it("says why each run ended, in plain words", async () => {
+    stubFetch(SPEC, {
+      runs: [
+        record({ runId: "run-0000000001", endReason: "completed" }),
+        record({ runId: "run-0000000002", status: "failed", endReason: "table_failed" }),
+        record({ runId: "run-0000000003", status: "paused", endReason: "connector_paused" }),
+      ],
+    })
+    panel()
+    expect(await screen.findAllByText("Every table was loaded.")).toHaveLength(1)
+    expect(screen.getByText("At least one table could not be loaded.")).toBeDefined()
+    expect(screen.getByText("The connector was paused, so nothing was loaded.")).toBeDefined()
+  })
+
+  // SRC-39 (QA TC-1702): a run the time limit stopped says so, in plain words.
+  it("says a run that outlived its limit was stopped", async () => {
+    stubFetch(SPEC, {
+      runs: [record({ runId: "run-timed-0001", status: "failed", endReason: "timed_out" })],
+    })
+    panel()
+    expect(
+      await screen.findByText("The run did not finish within the time limit and was stopped."),
+    ).toBeDefined()
+  })
+
+  it("says there are no runs yet when the record is empty", async () => {
+    stubFetch(SPEC)
+    panel()
+    expect(await screen.findByText("No runs yet.")).toBeDefined()
+  })
+
+  it("shows a run recorded as running but started long ago as no end reported, and leaves Run now enabled", async () => {
+    stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] }, {
+      runs: [record({ runId: "run-stuck-0001", status: "running", startedAt: "2026-10-01T08:00:00.000Z", endedAt: null, durationSeconds: null, endReason: null })],
+    })
+    panel()
+    expect(await screen.findAllByText("No end reported")).toHaveLength(2) // the pill and the summary
+    expect(screen.getByText("This run never reported its end. It may have been stopped before it finished.")).toBeDefined()
+    expect(screen.queryByText(/is running/)).toBeNull()
+    await waitFor(() => expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(false))
+  })
+
+  // SRC-39 (review round 1, R8): the limit is the API's setting, not a copy of six hours here. A
+  // raised limit must keep the page and the API in step, or "Run now" is offered for a run the API
+  // still refuses (that is QA TC-1702 itself).
+  it("keeps a run going for the limit the API sends, not for six hours", async () => {
+    stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] }, {
+      maxRuntimeSeconds: 12 * 60 * 60,
+      runs: [record({ runId: "run-long-0001", status: "running", startedAt: new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString(), endedAt: null, durationSeconds: null, endReason: null })],
+    })
+    panel()
+    expect(await screen.findByText(/Run run-long is running/)).toBeDefined()
+    expect(screen.queryByText("No end reported")).toBeNull()
+    await waitFor(() => expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(true))
+  })
+
+  it("shows a run recorded as running a moment ago as active, with Run now disabled", async () => {
+    stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] }, {
+      runs: [record({ runId: "run-live-00001", status: "running", startedAt: new Date().toISOString(), endedAt: null, durationSeconds: null, endReason: null })],
+    })
+    panel()
+    expect(await screen.findByText(/Run run-live is running/)).toBeDefined()
+    expect(screen.getByText("Running")).toBeDefined()
+    expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it("says the run record could not be loaded, with the API's words", async () => {
+    stubFetch(SPEC)
+    const original = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/runs")) return json({ error: "the store is unavailable" }, 500)
+      return original(input, init)
+    }) as unknown as typeof fetch
+    panel()
+    expect(await screen.findByText(/the store is unavailable/)).toBeDefined()
+  })
+})
+
+describe("ConnectorIngestPanel run log", () => {
+  const LOG = {
+    run: record({ runId: "run-log-000001", status: "succeeded", attempts: 3 }),
+    attempts: [
+      { table: "public.orders", attempt: 1, startedAt: "2026-10-12T08:00:01.000Z", endedAt: "2026-10-12T08:00:02.000Z", rowsLoaded: 0, result: "failed", errorClass: "unreachable", waitSeconds: 60 },
+      { table: "public.orders", attempt: 2, startedAt: "2026-10-12T08:01:05.000Z", endedAt: "2026-10-12T08:01:06.000Z", rowsLoaded: 0, result: "failed", errorClass: "sign_in_refused", waitSeconds: null },
+      { table: "public.customers", attempt: 1, startedAt: "2026-10-12T08:01:10.000Z", endedAt: "2026-10-12T08:01:20.000Z", rowsLoaded: 1200, result: "succeeded", errorClass: null, waitSeconds: null },
+    ],
+    lines: [
+      { at: "2026-10-12T08:00:00.000Z", event: "run_started", table: null, attempt: null, text: "Run started by the schedule" },
+      { at: "2026-10-12T08:00:02.000Z", event: "retry_wait", table: "public.orders", attempt: 1, text: "Next attempt in 1 min" },
+      { at: "2026-10-12T08:01:20.000Z", event: "run_ended", table: null, attempt: null, text: "Run ended: every table loaded" },
+    ],
+  }
+  const panel = () =>
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+
+  it("opens a run's log on request: each attempt with its result in product words, then the lines", async () => {
+    const calls = stubFetch(SPEC, { runs: [LOG.run], logs: { "run-log-000001": LOG } })
+    panel()
+    // Nothing is read until the log is asked for.
+    await screen.findByText("Show log")
+    expect(calls.some((c) => c.url.includes("/log"))).toBe(false)
+    fireEvent.click(screen.getByRole("button", { name: "Show log" }))
+
+    expect(await screen.findByText("The source could not be reached. Next attempt in 1 min.")).toBeDefined()
+    expect(screen.getByText("The source refused the sign-in")).toBeDefined()
+    expect(screen.getByText("1,200 rows")).toBeDefined()
+    expect(screen.getAllByText("attempt 1")).toHaveLength(2)
+    expect(screen.getByText("Run started")).toBeDefined()
+    expect(screen.getByText("Waiting to retry")).toBeDefined()
+    expect(screen.getByText("Run ended")).toBeDefined()
+    expect(screen.getByText("Next attempt in 1 min")).toBeDefined()
+    expect(calls.some((c) => c.url.endsWith("/runs/run-log-000001/log"))).toBe(true)
+  })
+
+  it("words the two business-app classes (SRC-3, migration 0097) and says a rate limit used its retries", async () => {
+    const log = {
+      ...LOG,
+      attempts: [
+        { table: "tickets", attempt: 1, startedAt: "2026-10-12T08:00:01.000Z", endedAt: "2026-10-12T08:00:02.000Z", rowsLoaded: 0, result: "failed", errorClass: "rate_limited", waitSeconds: null },
+        { table: "owners", attempt: 1, startedAt: "2026-10-12T08:01:05.000Z", endedAt: "2026-10-12T08:01:06.000Z", rowsLoaded: 0, result: "failed", errorClass: "permission_missing", waitSeconds: null },
+      ],
+    }
+    stubFetch(SPEC, { runs: [LOG.run], logs: { "run-log-000001": log } })
+    panel()
+    fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+    // A rate limit is retried, so with no wait left it says the retries are used up; a missing permission is not.
+    expect(await screen.findByText("The source limited the rate of requests. Retries are used up.")).toBeDefined()
+    expect(screen.getByText("The account lacks a permission at the source")).toBeDefined()
+  })
+
+  it("downloads the same log as text from the same route with ?format=text", async () => {
+    const calls = stubFetch(SPEC, { runs: [LOG.run], logs: { "run-log-000001": LOG } })
+    const created: Blob[] = []
+    const originalCreate = URL.createObjectURL
+    const originalRevoke = URL.revokeObjectURL
+    URL.createObjectURL = ((blob: Blob) => {
+      created.push(blob)
+      return "blob:log"
+    }) as typeof URL.createObjectURL
+    URL.revokeObjectURL = (() => {}) as typeof URL.revokeObjectURL
+    try {
+      panel()
+      fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+      fireEvent.click(await screen.findByRole("button", { name: "Download log" }))
+      await waitFor(() => expect(created).toHaveLength(1))
+      expect(await created[0]!.text()).toBe("run 0123 (schedule), succeeded\n")
+      expect(calls.some((c) => c.url.endsWith("/runs/run-log-000001/log?format=text"))).toBe(true)
+    } finally {
+      URL.createObjectURL = originalCreate
+      URL.revokeObjectURL = originalRevoke
+    }
+  })
+
+  it("says so, and still offers the download, when a run has no log lines left", async () => {
+    stubFetch(SPEC, { runs: [LOG.run], logs: { "run-log-000001": { run: LOG.run, attempts: [], lines: [] } } })
+    panel()
+    fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+    expect(await screen.findByText(/This run has no log lines\. Logs are kept for 30 days/)).toBeDefined()
+    expect(screen.getByRole("button", { name: "Download log" })).toBeDefined()
+  })
+
+  it("shows the API's words when the log cannot be read", async () => {
+    stubFetch(SPEC, { runs: [LOG.run], logs: {} })
+    panel()
+    fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+    expect(await screen.findByText(/not found/)).toBeDefined()
+  })
+})
+
+describe("ConnectorIngestPanel resume", () => {
+  const AUTO = "Paused after 30 failed runs in a row"
+  const panel = (props: Partial<React.ComponentProps<typeof ConnectorIngestPanel>> = {}) =>
+    render(
+      <ConnectorIngestPanel
+        connectorId="conn-northwind"
+        connectorName="northwind"
+        layout="page"
+        pausedReason={AUTO}
+        {...props}
+      />
+    )
+
+  it("recognises the pause repeated failures set, whatever the number, and no other", () => {
+    expect(isAutoDisablePause("Paused after 30 failed runs in a row")).toBe(true)
+    expect(isAutoDisablePause("Paused after 3 failed runs in a row")).toBe(true)
+    expect(isAutoDisablePause("Paused after  failed runs in a row")).toBe(false)
+    expect(isAutoDisablePause("Paused by the schema-change policy until a change is approved")).toBe(false)
+    expect(isAutoDisablePause(null)).toBe(false)
+  })
+
+  it("offers Resume on the auto-disable pause, posts it, and tells the page", async () => {
+    const calls = stubFetch(SPEC)
+    const onResumed = mock(() => {})
+    panel({ onResumed })
+    expect(await screen.findByText(`Paused: ${AUTO}`)).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }))
+    await waitFor(() => expect(onResumed).toHaveBeenCalled())
+    const post = calls.find((c) => c.url.endsWith("/api/connectors/conn-northwind/resume"))
+    expect(post?.method).toBe("POST")
+    expect(post?.body).toBeUndefined()
+  })
+
+  it("shows the 409's fixed text as it came, and does not tell the page", async () => {
+    const refusal =
+      "This connector is not paused because of repeated failures. If a schema change is waiting, approve it under Schema changes to resume it."
+    stubFetch(SPEC, undefined, { onResume: () => json({ error: refusal }, 409) })
+    const onResumed = mock(() => {})
+    panel({ onResumed })
+    fireEvent.click(await screen.findByRole("button", { name: "Resume" }))
+    expect((await screen.findByRole("alert")).textContent).toBe(refusal)
+    expect(onResumed).not.toHaveBeenCalled()
+  })
+
+  it("offers no Resume for a pause the schema-change policy set", async () => {
+    stubFetch(SPEC)
+    panel({ pausedReason: "Paused by the schema-change policy until a change is approved" })
+    expect(await screen.findByText(/Paused: Paused by the schema-change policy/)).toBeDefined()
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull()
+  })
+
+  it("disables Run now while paused", async () => {
+    stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
+    panel()
+    await screen.findByText(`Paused: ${AUTO}`)
+    expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+})
+
+/**
+ * SRC-11 decisions 9 to 11: column choice per table for PostgreSQL, MySQL (MariaDB) and SQL Server; key and
+ * cursor columns ticked and locked with the reason; other types say it is not available.
+ */
+describe("ConnectorIngestPanel column choice", () => {
+  const FOUND = [
+    {
+      name: "public.orders",
+      columns: [
+        { name: "order_id", typeName: "integer" },
+        { name: "region", typeName: "text" },
+        { name: "updated_at", typeName: "timestamp" },
+        { name: "discount", typeName: "numeric" },
+      ],
+      primaryKey: ["order_id"],
+    },
+  ]
+  const saved = (extra: Record<string, unknown> = {}, spec: typeof SPEC = SPEC) => ({
+    ...spec,
+    sourceObjects: [{ name: "public.orders", target: "northwind_orders", loadMode: "replace", ...extra }],
+  })
+  const saveButton = () => screen.getByRole("button", { name: "Save tables and schedule" })
+  const box = (column: string) => screen.getByLabelText(`Load column ${column} of public.orders`) as HTMLInputElement
+
+  async function openColumns() {
+    fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
+    // QA LH-SRC-6-50 (SRC-41 D18): a count of one is singular; the line used
+    // to read "1 tables found".
+    await screen.findByText("1 table found")
+    fireEvent.click(await screen.findByText(/^Columns/, { selector: "summary" }))
+    // The columns are read through the preview route when the section opens (SRC-13), so they arrive after the click.
+    await screen.findAllByLabelText(/^Load column /)
+  }
+
+  it("lists the columns discovery found, ticked, and saves an unticked one as excluded", async () => {
+    const calls = stubFetch(saved(), undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+    expect(["order_id", "region", "updated_at", "discount"].map((c) => box(c).checked)).toEqual([true, true, true, true])
+
+    fireEvent.click(box("discount"))
+    expect(box("discount").checked).toBe(false)
+    expect(screen.getByText(/^Columns · 1 left out/)).toBeDefined()
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      { name: "public.orders", target: "northwind_orders", loadMode: "replace", excludedColumns: ["discount"] },
+    ])
+  })
+
+  it("shows a saved exclusion unticked, lets it be ticked again, and then saves none", async () => {
+    const calls = stubFetch(saved({ excludedColumns: ["discount"] }), undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+    expect(box("discount").checked).toBe(false)
+    fireEvent.click(box("discount"))
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown[] }).sourceObjects[0]).toEqual({
+      name: "public.orders",
+      target: "northwind_orders",
+      loadMode: "replace",
+    })
+  })
+
+  it("locks the key columns of a deduplicating table and the cursor column, ticked, with the reason", async () => {
+    stubFetch(
+      saved({ loadMode: "incremental_dedup", incrementalKey: "updated_at", primaryKey: ["order_id"] }),
+      undefined,
+      { discovered: FOUND }
+    )
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+    for (const locked of ["order_id", "updated_at"]) {
+      expect(box(locked).checked).toBe(true)
+      expect(box(locked).disabled).toBe(true)
+    }
+    expect(screen.getByText("Key column: it identifies a row of this table.")).toBeDefined()
+    expect(screen.getByText("Cursor column: it marks which rows are new.")).toBeDefined()
+    expect(box("region").disabled).toBe(false)
+  })
+
+  // WEB-13: a source column name is arbitrary data. happy-dom computes no
+  // geometry, so the wrapping is asserted as structure; the measured fit is a
+  // manual-QA item (see the plan).
+  it("keeps a long loaded-column name whole, wraps it, and saves the exact exclusion", async () => {
+    const LONG_COLUMN = "source_generated_extremely_long_column_name_" + "segment_".repeat(6) + "final"
+    const found = [
+      {
+        name: "public.orders",
+        columns: [
+          { name: LONG_COLUMN, typeName: "text" },
+          { name: "id", typeName: "integer" },
+        ],
+        primaryKey: [],
+      },
+    ]
+    const calls = stubFetch(saved(), undefined, { discovered: found })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+
+    const input = screen.getByLabelText(`Load column ${LONG_COLUMN} of public.orders`) as HTMLInputElement
+    const label = input.closest("label") as HTMLElement
+    const text = within(label).getByText(LONG_COLUMN)
+    expect(text.textContent).toBe(LONG_COLUMN)
+    expect(text.className).toContain("break-all")
+    expect(label.className).toContain("min-w-0")
+    expect(input.className).toContain("shrink-0")
+
+    fireEvent.click(input)
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      { name: "public.orders", target: "northwind_orders", loadMode: "replace", excludedColumns: [LONG_COLUMN] },
+    ])
+  })
+
+  it("keeps a long key column name whole and selectable, with its locked reason", async () => {
+    const LONG_KEY = "dedup_key_extremely_long_column_name_" + "segment_".repeat(6) + "final"
+    const found = [
+      {
+        name: "public.orders",
+        columns: [
+          { name: LONG_KEY, typeName: "text" },
+          { name: "id", typeName: "integer" },
+        ],
+        primaryKey: [LONG_KEY, "id"],
+      },
+    ]
+    const calls = stubFetch(
+      saved({ loadMode: "replace_dedup", primaryKey: [LONG_KEY, "id"] }),
+      undefined,
+      { discovered: found }
+    )
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+
+    // The locked-column reason is still there for the long key column.
+    const loadedBox = box(LONG_KEY)
+    expect(loadedBox.disabled).toBe(true)
+    expect(
+      within(loadedBox.closest("label") as HTMLElement).getByText(
+        "Key column: it identifies a row of this table."
+      )
+    ).toBeTruthy()
+
+    // The key choice shows the full name and toggles to the exact value.
+    const keyInput = screen.getByLabelText(`${LONG_KEY} is part of the key of public.orders`) as HTMLInputElement
+    const keyLabel = keyInput.closest("label") as HTMLElement
+    const keyText = within(keyLabel).getByText(LONG_KEY)
+    expect(keyText.className).toContain("break-all")
+    expect(keyLabel.className).toContain("min-w-0")
+    expect(keyInput.className).toContain("shrink-0")
+    expect(keyInput.checked).toBe(true)
+    fireEvent.click(keyInput)
+    expect(keyInput.checked).toBe(false)
+
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const savedBody = (calls.find((c) => c.method === "PUT")?.body as {
+      sourceObjects: { primaryKey: string[] }[]
+    }).sourceObjects[0]
+    expect(savedBody.primaryKey).toEqual(["id"])
+  })
+
+  it("never sends a key or cursor column as excluded, even if it was unticked before the mode needed it", async () => {
+    stubFetch(
+      saved({ loadMode: "replace_dedup", primaryKey: ["order_id"], excludedColumns: ["order_id", "discount"] }),
+      undefined,
+      { discovered: FOUND }
+    )
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+    expect(box("order_id").checked).toBe(true)
+    // The saved list held a key column; what would be saved now drops it, so the page is changed, not silently different.
+    expect(screen.getByText(/^Columns · 1 left out/)).toBeDefined()
+  })
+
+  // SRC-13 lifts SRC-11's limit that only a table found in this visit lists its columns: opening the section of a
+  // saved table reads them through the preview route.
+  it("reads the columns of a saved table when its section is opened, without finding it first", async () => {
+    const calls = stubFetch(saved({ excludedColumns: ["discount"] }), undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    expect(calls.some((c) => c.url.endsWith("/discovery/preview"))).toBe(false)
+    fireEvent.click(await screen.findByText(/^Columns/, { selector: "summary" }))
+    expect((await screen.findByLabelText("Load column region of public.orders")) as HTMLInputElement).toBeDefined()
+    expect(box("discount").checked).toBe(false)
+    const preview = calls.filter((c) => c.url.endsWith("/discovery/preview"))
+    expect(preview.map((c) => c.body)).toEqual([{ object: "public.orders" }])
+  })
+
+  it("says what failed when the columns of a saved table cannot be read, and keeps the left-out list", async () => {
+    stubFetch(saved({ excludedColumns: ["discount"] }))
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    fireEvent.click(await screen.findByText(/^Columns/, { selector: "summary" }))
+    expect(await screen.findByText(/Left out: discount\. Cannot read the columns · The source could not be read\./)).toBeDefined()
+  })
+
+  it.each(["mysql", "mssql", "oracle"])("is offered for the %s driver too", async (driver) => {
+    stubFetch(saved({}, { ...SPEC, dial: { ...SPEC.dial, driver } }), undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+    expect(box("region").checked).toBe(true)
+  })
+
+  it.each([
+    ["files", { ...SPEC, adapter: "files", dial: {} }],
+    ["REST", { ...SPEC, adapter: "rest", dial: {} }],
+  ])("says column choice is not available for a %s source and offers no column list", async (_label, spec) => {
+    stubFetch(saved({}, spec as typeof SPEC))
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    expect(await screen.findByText("Column choice is not available for this source type.")).toBeDefined()
+    expect(screen.queryByText(/^Columns/)).toBeNull()
+  })
+
+  it("does not say it for a source that has no tables selected, nor offer it for a change-capture one", async () => {
+    stubFetch({ ...SPEC, adapter: "cdc", ingestMode: "cdc", sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText("public.orders")
+    expect(screen.queryByText("Column choice is not available for this source type.")).toBeNull()
+  })
+
+  it("works out what a mode locks", () => {
+    expect(lockedColumns({ loadMode: "replace", primaryKey: ["id"], incrementalKey: "ts" }).size).toBe(0)
+    expect([...lockedColumns({ loadMode: "history", primaryKey: ["id", "region"] }).keys()]).toEqual(["id", "region"])
+    expect([...lockedColumns({ loadMode: "incremental", incrementalKey: " ts " }).keys()]).toEqual(["ts"])
+  })
+})
+
+/**
+ * SRC-13 in the panel: the Find flow for each type, Kafka's topic choice (D4), Oracle's add by name (D5), and the
+ * REST row note (D3).
+ */
+describe("ConnectorIngestPanel table discovery", () => {
+  const KAFKA = {
+    ...SPEC,
+    adapter: "kafka",
+    dial: {
+      bootstrapServers: ["k1.internal:9092"],
+      topic: "orders",
+      auth: { type: "none" },
+      groupId: "g",
+      microBatchSeconds: 30,
+    } as unknown as typeof SPEC.dial,
+    sourceObjects: [{ name: "orders", target: "kafka_orders" }],
+  }
+
+  it("lists a Kafka connector's topics, and picking one saves the dial's topic with no credential", async () => {
+    const calls = stubFetch(KAFKA, undefined, {
+      listing: [
+        { name: "orders", kind: "topic" },
+        { name: "payments", kind: "topic" },
+      ],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-kafka" connectorName="events" />)
+    expect((await screen.findByTestId("kafka-topic")).textContent).toBe("orders")
+    fireEvent.click(screen.getByRole("button", { name: "Find topics" }))
+    fireEvent.click(await screen.findByLabelText("payments"))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const put = calls.find((c) => c.method === "PUT")?.body as Record<string, unknown>
+    expect(put.dial).toEqual({ ...KAFKA.dial, topic: "payments" })
+    expect(put.sourceObjects).toEqual(KAFKA.sourceObjects)
+    // SEC-14: a topic is not a target, so nothing but the topic changes and no credential travels.
+    expect("credential" in put).toBe(false)
+    await waitFor(() => expect(screen.getByTestId("kafka-topic").textContent).toBe("payments"))
+  })
+
+  it("lists an Oracle connector's tables and also takes one added by name", async () => {
+    const calls = stubFetch(
+      { ...SPEC, dial: { ...SPEC.dial, driver: "oracle", user: "hr" } },
+      undefined,
+      { listing: [{ name: "HR.EMPLOYEES", kind: "table" }] }
+    )
+    render(<ConnectorIngestPanel connectorId="conn-ora" connectorName="erp" />)
+    expect((await screen.findByLabelText<HTMLInputElement>("Schema")).value).toBe("HR")
+    fireEvent.click(screen.getByRole("button", { name: "Find tables" }))
+    await screen.findByText("HR.EMPLOYEES")
+    expect(calls.find((c) => c.url.endsWith("/discovery/list"))?.body).toEqual({ schema: "HR" })
+
+    fireEvent.change(screen.getByLabelText("Add by name"), { target: { value: "SALES.ORDERS" } })
+    fireEvent.click(screen.getByRole("button", { name: "Add" }))
+    expect(screen.getByLabelText("Bronze table for SALES.ORDERS")).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Save tables and schedule" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      { name: "SALES.ORDERS", target: "erp_orders", loadMode: "replace" },
+    ])
+  })
+
+  it("an Oracle change-capture connector lists nothing: its tables are typed by hand, in upper case (SRC-4 Amendment 10)", async () => {
+    const calls = stubFetch({
+      ...SPEC,
+      adapter: "cdc",
+      ingestMode: "cdc",
+      dial: { driver: "oracle", host: "h", port: 1521, database: "FREE", pdbName: "FREEPDB1", user: "c##dbzuser", sslMode: "require" } as unknown as typeof SPEC.dial,
+      sourceObjects: [],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-ora-cdc" connectorName="erp" />)
+    fireEvent.change(await screen.findByLabelText("Add by name"), { target: { value: "shop.orders" } })
+    expect(screen.queryByRole("button", { name: "Find tables" })).toBeNull()
+    expect(screen.getByText(/not checked against the source until you test the connection/)).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Add" }))
+    expect(screen.getByLabelText("Bronze table for SHOP.ORDERS")).toBeDefined()
+    fireEvent.change(screen.getByLabelText("Key columns for SHOP.ORDERS"), { target: { value: "ID" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save tables and schedule" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: { name: string }[] }).sourceObjects[0].name).toBe(
+      "SHOP.ORDERS"
+    )
+  })
+
+  it("gives a SQL source no add-by-name field, since its list is the whole source", async () => {
+    stubFetch()
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    await screen.findByRole("button", { name: "Find tables" })
+    expect(screen.queryByLabelText("Add by name")).toBeNull()
+  })
+
+  it("loads the columns of a ticked SQL table once, to pick its key and cursor from", async () => {
+    const calls = stubFetch(SPEC, undefined, {
+      discovered: [{ name: "public.orders", columns: [{ name: "order_id", typeName: "integer" }], primaryKey: ["order_id"] }],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Find tables" }))
+    fireEvent.click(await screen.findByLabelText(/public\.orders/))
+    await waitFor(() => expect(calls.filter((c) => c.url.endsWith("/discovery/preview")).length).toBe(1))
+    chooseOption(await screen.findByLabelText("Load mode for public.orders"), "Keep history")
+    await screen.findByLabelText("order_id is part of the key of public.orders")
+    expect(calls.filter((c) => c.url.endsWith("/discovery/preview")).length).toBe(1)
+  })
+
+  const REST = {
+    ...SPEC,
+    adapter: "rest",
+    dial: {
+      baseUrl: "https://api.example.com",
+      auth: { type: "bearer" },
+      pagination: { type: "none" },
+      endpoints: [{ path: "/orders" }, { path: "/users" }],
+    } as unknown as typeof SPEC.dial,
+  }
+
+  it("says a REST table saved before endpoints could be picked loads every endpoint, and not one that names an endpoint", async () => {
+    stubFetch({
+      ...REST,
+      sourceObjects: [
+        { name: "orders_table", target: "api_orders_table" },
+        { name: "/users", target: "api_users" },
+      ],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
+    await screen.findByLabelText("Bronze table for orders_table")
+    expect(screen.getAllByText(REST_OLD_OBJECT_NOTE).length).toBe(1)
+    expect(within(screen.getByLabelText("Bronze table for orders_table").closest("li") as HTMLElement).getByText(REST_OLD_OBJECT_NOTE)).toBeDefined()
+  })
+
+  it("picks a REST endpoint by its path from the list", async () => {
+    const calls = stubFetch(REST, undefined, {
+      listing: [
+        { name: "/orders", kind: "endpoint" },
+        { name: "/users", kind: "endpoint" },
+      ],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
+    fireEvent.click(await screen.findByRole("button", { name: "Find endpoints" }))
+    fireEvent.click(await screen.findByLabelText("/users"))
+    fireEvent.click(screen.getByRole("button", { name: "Save tables and schedule" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      { name: "/users", target: "api_users", loadMode: "replace" },
+    ])
+  })
+
+  it("keeps the typed-name field and its explanation for a type that cannot list", async () => {
+    stubFetch({ ...SPEC, adapter: "sheets", dial: {} as unknown as typeof SPEC.dial })
+    render(<ConnectorIngestPanel connectorId="conn-sheets" connectorName="sheet" />)
+    expect(await screen.findByLabelText("Add by name")).toBeDefined()
+    expect(screen.getByText("This connector type cannot list its objects, so type each one as the source names it.")).toBeDefined()
+    expect(screen.queryByRole("button", { name: /^Find / })).toBeNull()
+  })
+})
+
+// QA LH-SRC-6-16 (SRC-41 D17): a run's status is closed by the orchestrator's
+// run-status sensor, which can report minutes after the last table's rows are
+// counted. The card says so once an attempt has ended; nothing is retimed.
+describe("the Runs card says the status follows the orchestrator's report (LH-SRC-6-16)", () => {
+  const SENTENCE = /The status changes when the orchestrator reports the end of the run/
+  const live = (attempts: number, status = "running") =>
+    record({
+      runId: "run-live-0001",
+      status,
+      startedAt: new Date().toISOString(),
+      endedAt: status === "running" ? null : new Date().toISOString(),
+      attempts,
+    })
+
+  it("says the status follows the orchestrator's report once an attempt has ended", async () => {
+    stubFetch(SPEC, { runs: [live(1)] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText(/Run run-live is running/)
+    expect(screen.getByText(SENTENCE)).toBeDefined()
+
+    cleanup()
+    stubFetch(SPEC, { runs: [live(0)] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText(/Run run-live is running/)
+    expect(screen.queryByText(SENTENCE)).toBeNull()
+
+    cleanup()
+    stubFetch(SPEC, { runs: [live(1, "succeeded")] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText("Succeeded")
+    expect(screen.queryByText(SENTENCE)).toBeNull()
   })
 })

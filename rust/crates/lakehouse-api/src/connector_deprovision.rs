@@ -4,27 +4,21 @@
 //! replication slot pins WAL and fills the customer's production database
 //! disk").
 //!
-//! # This makes `ops/debezium/deprovision_connector.sh`'s comment false
+//! # History
 //!
-//! That script's header says `DELETE /api/connectors/{id}` doesn't call it
-//! "because the Rust API has no mechanism to safely resolve an arbitrary
-//! connector's secretRef and dial an arbitrary host from inside the
-//! product process". That was true when it was written. It no longer is:
-//! [`crate::connector_probe`] does exactly that today (real dial, resolved
-//! secretRef, SSRF-checked host) for `POST /api/connectors/{id}/test`. This
-//! module is the same capability aimed at deprovisioning instead of
-//! testing, and `routes::connectors::delete` calls it directly —
-//! `ops/debezium/deprovision_connector.sh` stays as the mechanism
-//! `ops/g4/g4_test.py` drives from outside the process (it has no Rust
-//! process to call into), but the product's own delete path no longer
-//! orphans a slot the way it used to.
+//! Until `SRC-4` slice 2 a shell script (`ops/debezium/deprovision_connector.sh`)
+//! did this from outside the product, because the API had no way to dial an
+//! arbitrary host safely. [`crate::connector_probe`] gave it one, this module
+//! is that capability aimed at deprovisioning, `routes::connectors::delete`
+//! calls it directly, and the script is gone (decision S2-h): the `g4-cdc` gate
+//! now proves the slot is dropped through `DELETE /api/connectors/{id}`.
 //!
-//! # Ordering — mirrors the shell script exactly
+//! # Ordering
 //!
 //! 1. `DROP PUBLICATION IF EXISTS` — safe to do regardless of slot state.
 //! 2. `pg_terminate_backend` any backend actively consuming the slot — a
 //!    slot cannot be dropped while something is consuming it, so whatever
-//!    that consumer is (a live `debezium-server` process, most likely)
+//!    that consumer is (a live `Kafka Connect` task, most likely)
 //!    must be kicked off it first.
 //! 3. Poll briefly for the slot to go inactive, then `pg_drop_replication_slot`.
 //!
@@ -35,6 +29,7 @@
 //! now dropped" from "was never there" so a caller that wants to know can.
 
 use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
 
 use lakehouse_core::secret::SecretValue;
@@ -274,6 +269,7 @@ pub async fn drop_slot_and_publication(
     target: &PgTarget,
     slot_name: &str,
     publication_name: &str,
+    ca: Option<&Path>,
 ) -> Result<Deprovisioned, DeprovisionError> {
     // SEC-15 review fix (SHOULD-FIX 2): the TLS mode is set in one place,
     // `connector_probe`, shared with the connection test and discovery.
@@ -283,6 +279,7 @@ pub async fn drop_slot_and_publication(
         &target.user,
         target.password.expose_secret(),
         &target.database,
+        ca,
     );
 
     let connect_label = format!("slot {slot_name:?} / publication {publication_name:?}");
@@ -345,7 +342,10 @@ async fn drop_publication(
     let drop_sql = format!("DROP PUBLICATION IF EXISTS \"{publication_name}\"");
     with_timeout(
         publication_name,
-        sqlx::query(&drop_sql).execute(&mut *conn),
+        // safe: `publication_name` passed `ConnectorSlug::new` above, whose
+        // alphabet (`^[a-z0-9][a-z0-9_]{0,62}$`) cannot close the quoted
+        // identifier.
+        sqlx::query(sqlx::AssertSqlSafe(drop_sql.as_str())).execute(&mut *conn),
         |source| DeprovisionError::DropPublication {
             publication: publication_name.to_owned(),
             source,
@@ -388,7 +388,7 @@ async fn drop_slot(
         source,
     })?;
     // A slot must be inactive before it can be dropped — if some process
-    // (most likely a live `debezium-server`) is still consuming it,
+    // (most likely a live `Kafka Connect` task) is still consuming it,
     // terminate that backend's replication connection first. Absent slot
     // means this simply affects zero rows, which is fine.
     with_timeout(
@@ -407,8 +407,7 @@ async fn drop_slot(
     .await?;
 
     // Give Postgres a moment to mark the slot inactive after the terminate
-    // above, same 5-attempt/1s-apart shape as
-    // `ops/debezium/deprovision_connector.sh`.
+    // above, 5 attempts, 1s apart.
     for _ in 0..SLOT_INACTIVE_POLL_ATTEMPTS {
         let active: Option<(bool,)> = with_timeout(
             slot_name,
@@ -466,18 +465,21 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
+    use crate::tls_proxy::TlsProxy;
 
-    /// Build a [`PgTarget`] dialing the SAME per-test Postgres database
+    /// Build a [`PgTarget`] for the SAME per-test Postgres database
     /// `#[sqlx::test]` already handed us via `pool` — extracting
-    /// host/port/user/database from the pool's own connect options rather
-    /// than hardcoding them, so this keeps working if
+    /// user/database from the pool's own connect options rather than
+    /// hardcoding them, so this keeps working if
     /// `lakehouse-test-support` ever changes its fixed superuser
-    /// credentials.
-    fn target_for(pool: &PgPool) -> PgTarget {
+    /// credentials — but pointed at `proxy`, because since `SEC-14` part B a
+    /// production dial requires TLS and the shared test Postgres does not
+    /// serve it (see [`TlsProxy`]).
+    fn target_for(pool: &PgPool, proxy: &TlsProxy) -> PgTarget {
         let options = pool.connect_options();
         PgTarget {
-            host: options.get_host().to_owned(),
-            port: options.get_port(),
+            host: "127.0.0.1".to_owned(),
+            port: proxy.port(),
             user: options.get_username().to_owned(),
             // `lakehouse-test-support` always starts the container with
             // the official Postgres image's default superuser password.
@@ -489,13 +491,22 @@ mod tests {
         }
     }
 
+    /// A TLS-terminating proxy in front of the server `pool` is connected
+    /// to.
+    async fn proxy_for(pool: &PgPool) -> TlsProxy {
+        let options = pool.connect_options();
+        TlsProxy::start(options.get_host(), options.get_port()).await
+    }
+
     #[sqlx::test(migrations = false)]
     async fn absent_slot_and_publication_is_success_not_an_error(pool: PgPool) -> sqlx::Result<()> {
-        let target = target_for(&pool);
+        let proxy = proxy_for(&pool).await;
+        let target = target_for(&pool, &proxy);
         let result = drop_slot_and_publication(
             &target,
             "nope_never_provisioned_slot",
             "nope_never_provisioned_pub",
+            None,
         )
         .await
         .unwrap();
@@ -512,10 +523,12 @@ mod tests {
             .execute(&pool)
             .await?;
 
-        let target = target_for(&pool);
-        let result = drop_slot_and_publication(&target, "realpub_test_slot", "realpub_test_pub")
-            .await
-            .unwrap();
+        let proxy = proxy_for(&pool).await;
+        let target = target_for(&pool, &proxy);
+        let result =
+            drop_slot_and_publication(&target, "realpub_test_slot", "realpub_test_pub", None)
+                .await
+                .unwrap();
         assert_eq!(result.publication, DropOutcome::Dropped);
         assert_eq!(result.slot, DropOutcome::NotPresent);
 
@@ -527,10 +540,11 @@ mod tests {
 
         // Idempotent: calling again on an already-clean connector must
         // still succeed and report NotPresent, not fail.
-        let target = target_for(&pool);
-        let second = drop_slot_and_publication(&target, "realpub_test_slot", "realpub_test_pub")
-            .await
-            .unwrap();
+        let target = target_for(&pool, &proxy);
+        let second =
+            drop_slot_and_publication(&target, "realpub_test_slot", "realpub_test_pub", None)
+                .await
+                .unwrap();
         assert_eq!(second.publication, DropOutcome::NotPresent);
         Ok(())
     }
@@ -545,8 +559,9 @@ mod tests {
     async fn invalid_publication_name_is_rejected_before_any_query(
         pool: PgPool,
     ) -> sqlx::Result<()> {
-        let target = target_for(&pool);
-        let err = drop_slot_and_publication(&target, "safe_slot", "not a valid slug\"; --")
+        let proxy = proxy_for(&pool).await;
+        let target = target_for(&pool, &proxy);
+        let err = drop_slot_and_publication(&target, "safe_slot", "not a valid slug\"; --", None)
             .await
             .expect_err("a non-slug-shaped publication name must be rejected");
         assert!(
@@ -565,10 +580,14 @@ mod tests {
             database: "postgres".to_owned(),
         };
         let started = std::time::Instant::now();
-        let err =
-            drop_slot_and_publication(&target, "unreachable_test_slot", "unreachable_test_pub")
-                .await
-                .expect_err("nothing listens on port 1");
+        let err = drop_slot_and_publication(
+            &target,
+            "unreachable_test_slot",
+            "unreachable_test_pub",
+            None,
+        )
+        .await
+        .expect_err("nothing listens on port 1");
         assert!(started.elapsed() < QUERY_TIMEOUT + Duration::from_secs(2));
         assert!(matches!(
             err,

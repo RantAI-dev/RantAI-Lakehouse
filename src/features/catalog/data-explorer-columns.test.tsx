@@ -42,6 +42,19 @@ describe("Data Explorer columns", () => {
     expect(screen.queryByText(/column|tag|description|approximate/)).toBeNull()
   })
 
+  it("shows an approximate name match as approximate, without naming the name (DATA-32)", () => {
+    render(
+      <>
+        {cellOf("name", {
+          name: "Revenue",
+          matchedOn: { field: "name", value: "", approximate: true },
+        })}
+      </>,
+    )
+    expect(screen.getByText("Revenue")).toBeTruthy()
+    expect(screen.getByText("approximate match")).toBeTruthy()
+  })
+
   it("truncates a long owner and keeps the full value as its title", () => {
     // DATA-11 review SHOULD-FIX 7: the Owner cell may not widen the table.
     const owner = "a-very-long-owner-address@example.invalid"
@@ -58,6 +71,15 @@ describe("Data Explorer columns", () => {
     expect(screen.getByText("pii")).toBeTruthy()
     render(<>{cellOf("tags", {})}</>)
     expect(screen.getByText("—")).toBeTruthy()
+  })
+
+  it("shows governed tags as key: value pills beside the free tags", () => {
+    // DATA-12 part 2: the Tags column shows both kinds.
+    render(<>{cellOf("tags", { tags: ["pii"], governedTags: { data_domain: "finance" } })}</>)
+    expect(screen.getByText("data_domain: finance")).toBeTruthy()
+    expect(screen.getByText("pii")).toBeTruthy()
+    render(<>{cellOf("tags", { governedTags: { tier: "gold" } })}</>)
+    expect(screen.getByText("tier: gold")).toBeTruthy()
   })
 
   it("filters Owner and Tags as text and offers no sort on Tags", () => {
@@ -80,3 +102,31 @@ describe("Data Explorer columns", () => {
     ])
   })
 })
+
+describe("Data Explorer certification mark (DATA-12)", () => {
+  it.each([
+    ["certified", "Certified"],
+    ["deprecated", "Deprecated"],
+  ])("shows the %s mark beside the name", (certification, label) => {
+    render(<>{cellOf("name", { name: "Sales", certification })}</>)
+    expect(screen.getByText("Sales")).toBeTruthy()
+    expect(screen.getByText(label)).toBeTruthy()
+  })
+
+  it("shows no mark beside the name of a table without one", () => {
+    render(<>{cellOf("name", { name: "Sales" })}</>)
+    expect(screen.queryByText("Certified")).toBeNull()
+    expect(screen.queryByText("Deprecated")).toBeNull()
+  })
+
+  it("filters on certification with a multi-select of the two marks", () => {
+    expect(column("certification").meta).toMatchObject({
+      variant: "multiSelect",
+      options: [
+        { value: "certified", label: "Certified" },
+        { value: "deprecated", label: "Deprecated" },
+      ],
+    })
+  })
+})
+

@@ -22,7 +22,7 @@ any of them can still be changed before the part that implements it merges.
 | D2 | Without credentials | Refused with 409 and a fixed message; nothing is written and nothing is dialled. |
 | D3 | Which credentials | Every slot the connector has after the change. |
 | D4 | Changing `host` through the general edit route | Follows the same rule. Not in the spec's table; added because it is the same path. |
-| D5 | PostgreSQL TLS | `require` at least; `verify-full` when a CA file is configured. |
+| D5 | PostgreSQL TLS | `require` at least. When a CA file is configured: `verify-full` for the connection test (its own client checks the name while dialling the approved address); `verify-ca` for discovery and deprovisioning, whose library can check a name only against the address it dials, which `SEC-15` pins to the approved IP. Amended by the product owner, 2026-10-16. |
 | D6 | Where the CA comes from | One setting, `CONNECTOR_TLS_CA_FILE`, for PostgreSQL and SQL Server. |
 | D7 | The compose PostgreSQL | Gets TLS, and the API is given its CA. |
 | D8 | No clear-text authentication | The connection test uses a small client of its own that accepts SCRAM-SHA-256 only. |
@@ -38,9 +38,11 @@ any of them can still be changed before the part that implements it merges.
 
 ## Acceptance checklist (product owner, on a running console)
 
-- [ ] Every Target row of the spec works as written
-- [ ] Re-pointing the seeded connector without new credentials returns 409
-- [ ] With new credentials in the same step, the change is saved and the test runs against the new place
-- [ ] Editing a connector's host in the console asks for the credentials again
-- [ ] A test against a server that asks for clear-text password authentication never sends the password
-- [ ] A user without the permission is refused
+- [x] Every Target row of the spec works as written
+- [x] Re-pointing the seeded connector without new credentials returns 409
+- [x] With new credentials in the same step, the change is saved and the test runs against the new place
+- [x] Editing a connector's host in the console asks for the credentials again
+- [x] A test against a server that asks for clear-text password authentication never sends the password
+- [x] A user without the permission is refused
+
+Accepted by the product owner on 2026-11-02 (build not recorded by the acceptor).

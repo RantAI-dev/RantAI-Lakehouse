@@ -1,6 +1,17 @@
 import type { NextConfig } from "next";
+import { devOrigins } from "./src/lib/dev-origins";
+
+// `OPS-11`: Next.js 16.4 serves the dev server's own resources (HMR, chunks)
+// only to `localhost` unless the host is listed here, so a dev console opened
+// by a LAN address never finishes loading. `CONSOLE_ALLOWED_DEV_ORIGINS`
+// (comma-separated hostnames, `*.` wildcards allowed, see docs/CONFIGURATION.md) adds
+// hosts; `127.0.0.1` is always allowed (`BI-1 QA fix`, see `src/lib/dev-origins.ts`).
+// It affects `next dev` only: a production build ignores it.
+const allowedDevOrigins = devOrigins(process.env.CONSOLE_ALLOWED_DEV_ORIGINS);
 
 const nextConfig: NextConfig = {
+  allowedDevOrigins,
+
   // Jejak build mandiri (server + node_modules minimal) supaya image Docker
   // konsol tetap ramping — dipakai stack demo `rantai-lake-demo`.
   output: "standalone",
@@ -17,13 +28,35 @@ const nextConfig: NextConfig = {
     // value here cuts uploads the API would take, and a larger one buys
     // nothing because the API refuses the excess itself.
     proxyClientMaxBodySize: 51 * 1024 * 1024,
+    // Next.js's /api proxy gives up on an upstream that has not answered in 30
+    // seconds (`proxyTimeout`, 30000 ms by default, in next's `proxy-request.js`).
+    // `SRC-13` decision D9 lets a table listing take up to 120 seconds (a schema of
+    // 10,000 tables) and the API's route timeout for the two discovery paths is 130
+    // (`DISCOVERY_REQUEST_TIMEOUT` in `rust/crates/lakehouse-api/src/routes/mod.rs`), so with the
+    // default the console would report a failure for a listing the API was still
+    // answering. Keep this equal to the LARGEST route timeout in that function: the
+    // chart and table downloads (`EXPORT_REQUEST_TIMEOUT`, 310 s; BI-1 review fix
+    // (BLOCKER) R2) are longer than the discovery paths, and the proxy would cut a
+    // long Excel download at the old 130 s while the API was still sending it.
+    proxyTimeout: 310_000,
   },
 
   // Proxy /api/* to the Rust backend service. Browser URLs stay the same;
   // Next.js only serves the UI while the Rust axum service owns the API.
   async rewrites() {
     const target = process.env.RUST_API_URL ?? "http://localhost:8080";
-    return [{ source: "/api/:path*", destination: `${target}/api/:path*` }];
+    return [
+      // The API's health route lives at `/health`, NOT under `/api/`, so
+      // the console could not reach it through the rewrite below (it
+      // would ask the API for `/api/health`, which is not a route). This
+      // one exposes it as `/api/health`, and it comes FIRST: the rewrites
+      // are matched top to bottom, so the general `/api/:path*` below
+      // never sees this path. The console's own `/health` PAGE (the
+      // platform dashboard) is a filesystem route, and filesystem routes
+      // are served before any rewrite, so the two cannot collide.
+      { source: "/api/health", destination: `${target}/health` },
+      { source: "/api/:path*", destination: `${target}/api/:path*` },
+    ];
   },
 };
 

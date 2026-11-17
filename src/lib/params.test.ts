@@ -1,0 +1,124 @@
+import assert from "node:assert/strict"
+import test from "node:test"
+
+import {
+  acceptedParams, columnSwitchParams, limitParam, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, refLinesFromDef, refLinesPayload, isComputedLine,
+  savedParamsBody, slotParam, slotText, withParamsParam, withValue, type ParamControl, type ParamDef,
+} from "./params"
+
+const def = (name: string, type: string, extra: Partial<ParamDef> = {}): ParamDef => ({ id: `p_${name}`, name, label: name, type, default: 1, ...extra })
+const control = (name: string, value: string | number): ParamControl => ({ param: def(name, "number"), value })
+
+test("a parameter slot is the text {name} and nothing else is", () => {
+  assert.equal(slotText("pick"), "{pick}")
+  assert.equal(slotParam("{pick}"), "pick")
+  for (const t of ["pick", "{}", "{a b}", "{1a}", "", null, undefined]) assert.equal(slotParam(t as string), null)
+})
+
+test("the server's {param} objects become slot text where a definition enters the console", () => {
+  const got = normalizeDef({
+    dimension: { param: "dim" }, breakdown: "b", limit: { param: "n" },
+    measures: ["visitors", { column: { param: "m" } }, { column: { param: "m2" }, aggregate: "avg" }, { column: "x", aggregate: "sum" }],
+  })
+  assert.equal(got?.dimension, "{dim}")
+  assert.equal(got?.breakdown, "b")
+  assert.deepEqual(got?.measures, ["visitors", "{m}", { column: "{m2}", aggregate: "avg" }, { column: "x", aggregate: "sum" }])
+  assert.equal(limitParam(got?.limit), "n")
+  assert.equal(limitParam(20), null)
+})
+
+test("a definition without parameters comes back equal", () => {
+  const plain = { dimension: "a", measures: ["b"], limit: 5 }
+  assert.deepEqual(normalizeDef(plain), plain)
+  assert.equal(normalizeDef(undefined), undefined)
+})
+
+test("only an object of text and numbers in the address is a choice", () => {
+  assert.deepEqual(readParamsParam('{"target":500,"pick":"rooms"}'), { target: 500, pick: "rooms" })
+  for (const bad of [null, "", "[1]", "nope", '"x"', '{"a":{"b":1}}', "{}"]) assert.equal(readParamsParam(bad), null)
+})
+
+test("values are written to and removed from the address", () => {
+  assert.equal(withParamsParam("f=1", { target: 5 }), "f=1&p=%7B%22target%22%3A5%7D")
+  assert.equal(withParamsParam("f=1&p=%7B%7D", null), "f=1")
+  assert.equal(paramsQuery(null), null)
+  assert.equal(paramsQuery({ a: 1 }), '{"a":1}')
+})
+
+test("a value equal to the saved one is dropped, so the address holds only differences", () => {
+  assert.deepEqual(withValue(null, { target: 1000 }, "target", 500), { target: 500 })
+  assert.equal(withValue({ target: 500 }, { target: 1000 }, "target", "1000"), null)
+  assert.deepEqual(withValue({ a: 1, b: 2 }, { a: 1 }, "b", 3), { a: 1, b: 3 })
+})
+
+test("Save as default is offered only when a shown value differs from the saved one", () => {
+  const controls = [control("target", 500)]
+  assert.equal(paramsDiffer(controls, { target: 1000 }), true)
+  assert.equal(paramsDiffer(controls, { target: 500 }), false)
+  assert.equal(paramsDiffer([control("target", 1)], undefined), false)
+  assert.deepEqual(savedParamsBody(controls), [{ name: "target", value: 500 }])
+})
+
+test("only an all-text list can switch a column", () => {
+  const text = def("a", "list", { values: [{ value: "x", label: "x" }] })
+  const nums = def("b", "list", { values: [{ value: 1, label: "1" }] })
+  assert.deepEqual(columnSwitchParams([text, nums, def("c", "number")]).map((d) => d.name), ["a"])
+})
+
+test("reference lines round trip, and a row with neither a number nor a parameter is dropped", () => {
+  const lines = [{ value: 5, label: "Goal" }, { value: { param: "target" } }]
+  assert.deepEqual(refLinesPayload(refLinesFromDef(lines)), lines)
+  assert.deepEqual(refLinesPayload([{ value: "", param: "", label: "x" }, { value: "abc", param: "", label: "" }]), [])
+  const six = Array.from({ length: 6 }, (_, i) => ({ value: String(i), param: "", label: "" }))
+  assert.equal(refLinesPayload(six).length, 5)
+})
+
+test("computed lines and bands round trip, and a computed line carries no value", () => {
+  const lines = [
+    { kind: "average", color: "#112233" },
+    { kind: "trend", measure: "visitors", label: "Trend" },
+    { kind: "band", value: 1, to: { param: "hi" }, label: "Normal" },
+    { value: 5 },
+  ]
+  assert.deepEqual(refLinesPayload(refLinesFromDef(lines)), lines)
+  // A band with one edge missing, and an old line without a kind, behave.
+  assert.deepEqual(refLinesPayload([{ value: "1", param: "", label: "", kind: "band", to: "" }]), [])
+  assert.deepEqual(refLinesPayload([{ value: "2", param: "", label: "" }]), [{ value: 2 }])
+  assert.equal(isComputedLine("median"), true)
+  assert.equal(isComputedLine("band"), false)
+})
+
+// BI-17 part B (plan D1): the forecast line and its horizon.
+test("a forecast line round-trips with its horizon and measure", () => {
+  const lines = [{ kind: "forecast", horizon: 6, label: "Outlook", measure: "visitors" }]
+  assert.deepEqual(refLinesPayload(refLinesFromDef(lines)), lines)
+  assert.equal(isComputedLine("forecast"), true)
+})
+
+test("a forecast with no whole horizon from 1 to 60 is not sent, and only the first forecast is kept", () => {
+  const draft = (horizon: string) => ({ value: "", param: "", label: "", kind: "forecast" as const, horizon })
+  assert.deepEqual(refLinesPayload([draft("")]), [])
+  assert.deepEqual(refLinesPayload([draft("0")]), [])
+  assert.deepEqual(refLinesPayload([draft("61")]), [])
+  assert.deepEqual(refLinesPayload([draft("2.5")]), [])
+  assert.deepEqual(refLinesPayload([draft("60")]), [{ kind: "forecast", horizon: 60 }])
+  assert.deepEqual(refLinesPayload([draft("3"), draft("9")]), [{ kind: "forecast", horizon: 3 }])
+})
+
+test("a chart saved before forecasts is sent back byte for byte", () => {
+  const lines = [{ value: 5, label: "Goal" }, { kind: "average" }, { kind: "band", value: 1, to: 2 }]
+  assert.deepEqual(refLinesPayload(refLinesFromDef(lines)), lines)
+})
+
+// QA LH-BI-11-06 (BI-52): the address keeps what the server accepted, and
+// nothing it refused or does not know.
+test("a refused value and a name the answer does not know leave what the address carries, and nothing left is no parameter at all", () => {
+  const sent = { target: 51, pick: "b", gone: 1 }
+  assert.deepEqual(
+    acceptedParams(sent, [{ name: "target", reason: "parameter 'target' must be at most 50." }], { pick: "b", target: 30 }),
+    { pick: "b" },
+  )
+  assert.equal(acceptedParams({ target: 51 }, [{ name: "target", reason: "x" }], { target: 30 }), null)
+  assert.equal(acceptedParams(null, [], {}), null)
+  assert.deepEqual(acceptedParams({ pick: "b" }, [], { pick: "b" }), { pick: "b" })
+})

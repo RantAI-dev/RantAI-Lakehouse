@@ -1,0 +1,8 @@
+{
+  "columns": ["id", "name", "price", "active", "tags", "meta", "note", "extra"],
+  "rows": [
+    ["1", "Anna", "1.5", "true", "[\"a\",\"b\"]", "{\"x\":1,\"y\":\"z\"}", null, null],
+    ["2", "Budi", "12", "false", "[]", "{}", null, "only here"],
+    ["3", "Citra é", "0.25", "true", "[\"c\"]", "{\"x\":2}", null, null]
+  ]
+}

@@ -5,19 +5,17 @@ import type {
   LakehouseService,
   LakehouseTableDetail,
   LakehouseTableSummary,
-  LakehouseWarehouse,
   MaintenancePolicyInput,
   MaintenancePolicyResult,
 } from "../contracts/lakehouse"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 import {
   lakehouseCapacityUrl,
   lakehouseMaintenanceUrl,
   lakehouseNamespacesUrl,
   lakehouseTableDetailUrl,
   lakehouseTablesUrl,
-  lakehouseWarehousesUrl,
 } from "@/lib/lakehouse-view"
 
 /**
@@ -34,28 +32,21 @@ async function request<T>(
   const res = await apiFetch(url, init)
   const json = await res.json()
   if (!res.ok) {
+    // QA TC-1724 (WEB-12): a refusal goes through deniedFor.
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500 || res.status === 503
-            ? "unavailable"
-            : "invalid_request"
+      res.status === 404
+        ? "not_found"
+        : res.status >= 500 || res.status === 503
+          ? "unavailable"
+          : "invalid_request"
     throw new ServiceError(kind, json?.error ?? fallbackMessage)
   }
   return json as T
 }
 
 export const icebergLakehouseService: LakehouseService = {
-  async listWarehouses(signal) {
-    const json = await request<{ warehouses: LakehouseWarehouse[] }>(
-      lakehouseWarehousesUrl(),
-      { cache: "no-store", signal },
-      "Lakehouse warehouses could not be loaded"
-    )
-    return json.warehouses
-  },
   async getCapacity(signal) {
     return request<LakehouseCapacity>(
       lakehouseCapacityUrl(),

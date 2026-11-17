@@ -4,12 +4,15 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-# Real floor, not the edition-2024 minimum (1.85). Verified by building
-# --locked against progressively newer toolchains: 1.85 fails because
-# testcontainers/testcontainers-modules require 1.88, time/time-core/
-# time-macros require 1.88.0, etcetera requires 1.87.0, and ferroid
-# requires 1.85.1. 1.88.0 builds clean. See docs/CI.md.
-rust-version = "1.88"
+# Floor, not the edition-2024 minimum (1.85). Since REL-9 (product-owner
+# decision D1, 2026-10-17) the floor is the latest stable, same release as
+# the `rust-toolchain.toml` pin: `sqlx` 0.9 — which `SEC-41` lands —
+# requires rustc 1.94, so a held-over lower promise could not be kept, and
+# the owner chose to move pin and floor together rather than chase
+# dependency floors. The CI `msrv` job checks it one patch below the pin
+# with `cargo +1.99.0 check --workspace --all-targets --locked`. See
+# docs/CI.md.
+rust-version = "1.99"
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
@@ -31,8 +34,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 indexmap = { version = "2", features = ["serde"] }
 hmac = "0.13"
 sha2 = "0.11"
+# In-process store of remembered dashboard results (`BI-4` part B). Already in
+# `Cargo.lock` (0.12.16, via `iceberg`) with the `future` feature, so it adds no crate.
+moka = { version = "0.12.16", default-features = false, features = ["future"] }
 base64 = "0.23"
 rand = "0.10"
+# `SRC-12` decision 4: AES-256-GCM for managed connector credentials at rest
+# (`lakehouse-api::secret_crypto`). RustCrypto, already in the lockfile
+# (0.10.3) through `iceberg`, so no new crate enters the dependency check;
+# `alloc` for the `Vec`-returning AEAD calls, `aes` for the cipher; the
+# `getrandom` feature is left off, nonces come from `rand`.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 # `routes::auth::oidc_start` builds the IdP authorize
 # redirect via `url::Url`'s query-pair encoder rather than hand-formatting
 # a query string, so a param value can never break the URL's structure.
@@ -44,12 +56,40 @@ url = "2"
 # transitively (via `reqwest`, `2.12.1` in `Cargo.lock`) — this is the
 # first DIRECT use, so it needs its own workspace entry.
 ipnet = "2"
+# `SEC-22`: the child process that reads an uploaded workbook or a Parquet
+# file (`lakehouse-api::upload_convert`) sets its OWN resource limits
+# (`RLIMIT_DATA`, `RLIMIT_CPU`) before it reads anything, so a crafted file
+# that asks for more memory than the machine has ends the child and never
+# the API. `nix` does that without `unsafe` (`Command::pre_exec` is the
+# other way). Already in `Cargo.lock` (0.31.3) through other crates, so the
+# lockfile gains no package; only the `resource` feature and the
+# `lakehouse-api` dependency list change. MIT.
+# The `fs` feature is here for `lakehousectl` (REL-2 S3-T2): the
+# pre-flight check reads the free disk with `statvfs`, and `nix` does
+# that without `unsafe` in the crate.
+nix = { version = "0.31", default-features = false, features = ["resource", "fs"] }
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+# `RPT-1` (`lakehouse-store::report_schedule`): zone-aware schedule maths needs a
+# time zone database in Rust, and the workspace had none (the zone list lives
+# in the engine). `jiff` was already in `Cargo.lock` through `serde_with`, with
+# its bundled database `jiff-tzdb`, so this adds no package; `tzdb-bundle-always`
+# makes the schedule independent of the container image having `tzdata`.
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder", "tokio1-rustls-tls"] }
 wiremock = "0.6"
 tempfile = "3"
 tokio-util = "0.7"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "uuid", "time", "json", "macros", "migrate"] }
+# `SEC-41` decision 1: `sqlx` 0.9 dropped the combined `runtime-tokio-rustls`
+# feature; `runtime-tokio` + `tls-rustls` is the same pair of things it meant
+# (`tls-rustls` = `tls-rustls-ring` = `tls-rustls-ring-webpki`: rustls' ring
+# provider with webpki roots), so a connector dial uses the same crypto
+# provider and the same root store as under 0.8. `default-features = false`
+# because 0.9's default set adds `any`, which this workspace never uses
+# (`sqlx::Any`/`AnyPool` appear nowhere); `mysql-rsa` stays off (`SEC-41`
+# decision 3 / spec D3), so a MySQL server with no TLS that asks for a
+# SHA-2 password plugin is refused rather than sent an RSA-encrypted
+# password, and `rsa` leaves the API binary.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "uuid", "time", "json", "macros", "migrate"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 argon2 = "0.6"
@@ -58,30 +98,69 @@ subtle = "2"
 # with NEITHER backend enabled by default; `CryptoProvider::get_default()`
 # panics at runtime ("Could not automatically determine the process-level
 # CryptoProvider...") unless exactly one of `rust_crypto`/`aws_lc_rs` is
-# selected. Chose `rust_crypto` (pure-Rust, no new C dependency) to match
-# every other crypto crate already in this workspace (sha2, hmac, argon2,
-# rand are all RustCrypto-ecosystem).
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
+# selected. Chose `rust_crypto` then (pure-Rust); switched to `aws_lc_rs`
+# for SEC-51, because `rust_crypto` pulls `p256`/`p384` -> `ecdsa` ->
+# `elliptic-curve`, which pins `crypto-bigint` ^0.5, and that version is
+# `RUSTSEC-2026-0387` (timing variability in modular reduction) with no
+# patched 0.5 release. `aws_lc_rs` adds no C dependency here: `aws-lc-rs`
+# is already compiled into this workspace through `object_store`/`rustls`.
+# Exactly one backend must stay selected -- selecting both would link two
+# providers and fail to build.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 # `lakehouse-api::next_run` (WS4 item G2) is the first workstream to land
 # this dependency -- WS5 also needs cron-next-occurrence computation and
 # reuses this same entry rather than adding a second one (programme rule:
-# whichever workstream lands first adds it). No feature flag: `croner`
-# 2.x's plan-doc-assumed `chrono` FEATURE does not exist -- confirmed by
-# reading the crate's own Cargo.toml after `cargo fetch` (a required
-# hedge from this task's own plan doc, which flagged the API as
-# independently unverified) -- `chrono` is croner 2.x's one, non-optional,
-# always-on datetime backend; `next_run.rs`'s own doc comment has the
-# full API-shape correction (`Cron::new(..).parse()`, not `FromStr`).
-croner = { version = "2" }
+# whichever workstream lands first adds it). `croner` 4 keeps `chrono` as
+# its datetime backend behind the `chrono` feature, which is in the default
+# features; the entry therefore keeps the defaults on (4.0.1 `Cargo.toml`,
+# `default = ["chrono"]`). `next_run.rs` documents the parser settings that
+# keep the 2.x behaviour (five fields, lenient steps).
+croner = { version = "4" }
 # WS7 Phase B (`lakehouse-api::sql_rewrite`) — the enforcement-side SQL
 # rewriter needs a real parser, not a regex/string scan, to apply masking
 # and row-filter obligations without ever misreading a construct as safe.
-# 0.62 verified latest via docs.rs/sqlparser/latest as of 2026-09-11;
+# 0.63 verified latest via docs.rs/sqlparser/latest as of 2026-10-14;
 # `resolver = "3"` locks the exact patch in `Cargo.lock` on first build.
-sqlparser = "0.62"
+sqlparser = "0.63"
+# SEC-14 part B (E2, D5/D8, SHOULD-FIX 9): the Postgres connection test speaks
+# the wire protocol itself (`lakehouse-api::pg_probe`) so it can refuse every
+# authentication method but SCRAM-SHA-256, which `sqlx` offers no way to
+# do. Pinned to 0.6.12 because this code relies on the SCRAM iteration cap
+# there to prevent iteration exhaustion attacks. MIT OR Apache-2.0.
+postgres-protocol = "0.6.12"
+# `postgres-protocol`'s `SaslMechanisms` is a
+# `fallible_iterator::FallibleIterator`, and reading its mechanisms needs the
+# trait in scope. Declared directly because `postgres-protocol` already pulls
+# the crate in, so it adds no package of its own. MIT OR Apache-2.0.
+fallible-iterator = "0.2"
+# `postgres-protocol` frames messages in `bytes::BytesMut`; already in
+# `Cargo.lock` (a `tokio`/`sqlx` dependency) -- this is the first direct use.
+bytes = "1"
+# SEC-14 part B (D5): the TLS a connector dial makes. Used by the
+# connection test's own client and by the test-only TLS-terminating proxy in
+# front of the shared test Postgres (`lakehouse-api::tls_proxy`).
+# PR #192 review BLOCKER 10: both `ring` and `aws-lc-rs` are enabled across
+# the workspace's dependencies -- `aws-lc-rs` arrives through `object_store`'s
+# `aws` feature (hence `reqwest`'s `__rustls-aws-lc-rs` and `hyper-rustls`'s
+# `aws-lc-rs`) and through `tokio-rustls`'s default features, which
+# `tiberius` turns on -- so rustls cannot pick a process default on its own
+# and panics with "Could not automatically determine the process-level
+# CryptoProvider" the first time something asks for one. `sqlx`'s `VerifyCa`
+# path and `hyper-rustls` (through `reqwest` and `object_store`) both ask.
+# `main` installs `ring` explicitly at start-up, before any task can dial;
+# `ring` is the provider this entry, `sqlx` and `pg_probe` name explicitly.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+# `ClientConfig`/`ServerConfig`, the `require`-posture certificate verifier,
+# and `rustls::pki_types` (the `CertificateDer` PEM reader `pg_probe` uses for
+# `CONNECTOR_TLS_CA_FILE`) all come from the rustls `tokio-rustls` above
+# re-exports, so no direct `rustls-pki-types` dependency is needed.
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 
 [workspace.lints.rust]
-future-incompatible = "warn"
+# `future_incompatible` with an underscore: Cargo 1.99 warns that the
+# hyphenated `future-incompatible` spelling is deprecated and will not work
+# in a future edition (REL-9). Same lint, same level.
+future_incompatible = "warn"
 nonstandard_style = { level = "deny", priority = -1 }
 missing_docs = "warn"
 

@@ -11,6 +11,6 @@
   "status": 401,
   "contentType": "application/json;charset=utf-8",
   "body": {
-    "error": "invalid_or_expired"
+    "error": "embed token is invalid or expired"
   }
 }

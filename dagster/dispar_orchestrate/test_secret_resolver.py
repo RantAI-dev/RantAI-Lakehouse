@@ -7,9 +7,22 @@ full trust model and the bug this replaces.
 
 from __future__ import annotations
 
-import pytest
+import base64
+import json
+import os
+from pathlib import Path
+from typing import Any
 
-from dispar_orchestrate.secret_resolver import SecretRefRejected, resolve_secret_ref, resolve_secrets
+import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from dispar_orchestrate import secret_resolver
+from dispar_orchestrate.secret_resolver import (
+    SecretRefRejected,
+    open_managed_credential,
+    resolve_secret_ref,
+    resolve_secrets,
+)
 
 
 def test_resolve_secret_ref_reads_an_allowlisted_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -114,3 +127,148 @@ def test_resolve_secrets_returns_empty_for_kafka_none_auth_with_no_secret_ref_at
     # required for a PLAINTEXT broker, so this must not raise
     # SecretRefRejected for a missing primary ref.
     assert resolve_secrets("kafka", "none", None, None) == {}
+
+
+# ── SRC-12 decision 4: managed credentials are sealed at rest ────────────────
+#
+# The vector is the one `lakehouse-api`'s `secret_crypto.rs` tests also open:
+# written once with this package's AESGCM, so passing here AND there is what
+# proves the two implementations read the same format.
+
+_VECTOR_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "rust/crates/lakehouse-api/tests/fixtures/connector_secret_vector.json"
+)
+
+
+def _vector() -> dict[str, Any]:
+    return json.loads(_VECTOR_PATH.read_text())
+
+
+def _vector_key(vector: dict[str, Any]) -> str:
+    """The vector's key, base64, built from its description (SEC-36).
+
+    The fixture stores `key_length`, `key_start` and `key_step`, not the key
+    text, so no key-shaped literal sits in the repository for a secret scanner.
+    """
+    key = bytes((vector["key_start"] + i * vector["key_step"]) % 256 for i in range(vector["key_length"]))
+    return base64.b64encode(key).decode()
+
+
+def _other_key() -> str:
+    return base64.b64encode(bytes([7]) * 32).decode()
+
+
+def test_the_shared_vector_written_by_the_api_format_opens_here(monkeypatch: pytest.MonkeyPatch) -> None:
+    vector = _vector()
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _vector_key(vector))
+    monkeypatch.delenv("CONNECTOR_SECRETS_KEY_PREVIOUS", raising=False)
+    sealed = base64.b64decode(vector["sealed_base64"])
+    assert open_managed_credential(vector["file_name"], sealed) == vector["plaintext"]
+
+
+def test_a_sealed_file_copied_under_another_connectors_name_does_not_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    vector = _vector()
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _vector_key(vector))
+    sealed = base64.b64decode(vector["sealed_base64"])
+    with pytest.raises(SecretRefRejected, match="cannot be decrypted with this installation's key"):
+        open_managed_credential(vector["other_file_name"], sealed)
+
+
+def test_the_previous_key_opens_a_file_sealed_before_a_key_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    vector = _vector()
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _other_key())
+    sealed = base64.b64decode(vector["sealed_base64"])
+    with pytest.raises(SecretRefRejected, match="cannot be decrypted"):
+        open_managed_credential(vector["file_name"], sealed)
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY_PREVIOUS", _vector_key(vector))
+    assert open_managed_credential(vector["file_name"], sealed) == vector["plaintext"]
+
+
+@pytest.mark.parametrize("bad_key", ["not base64 !", "c2hvcnQ=", base64.b64encode(bytes(33)).decode()])
+def test_a_malformed_key_is_refused_with_a_fixed_text_that_never_echoes_it(
+    monkeypatch: pytest.MonkeyPatch, bad_key: str
+) -> None:
+    vector = _vector()
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", bad_key)
+    with pytest.raises(SecretRefRejected) as excinfo:
+        open_managed_credential(vector["file_name"], base64.b64decode(vector["sealed_base64"]))
+    assert "key is missing or invalid" in str(excinfo.value)
+    assert bad_key not in str(excinfo.value)
+
+
+def test_a_missing_key_is_refused_with_the_fixed_text_and_the_setting_goes_to_the_log(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    vector = _vector()
+    monkeypatch.delenv("CONNECTOR_SECRETS_KEY", raising=False)
+    with pytest.raises(SecretRefRejected, match="key is missing or invalid"):
+        open_managed_credential(vector["file_name"], base64.b64decode(vector["sealed_base64"]))
+    assert "CONNECTOR_SECRETS_KEY is not set" in caplog.text
+
+
+def test_bytes_that_are_not_a_seal_are_refused_not_read_as_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _vector_key(_vector()))
+    for not_sealed in (b"", b"plain-password", bytes([1]) * 5, bytes([9]) * 40):
+        with pytest.raises(SecretRefRejected, match="not in a format this build reads"):
+            open_managed_credential("connector_managed_conn_x_password", not_sealed)
+
+
+def _point_secrets_dir_at(monkeypatch: pytest.MonkeyPatch, directory: Path) -> None:
+    # `/run/secrets` does not exist outside the container, so the test moves
+    # both the base directory and the one allowlist pattern that names it.
+    # The production constant is untouched; this only gives the same rule a
+    # directory the test can write.
+    monkeypatch.setattr(secret_resolver, "_SECRETS_BASE_DIR", str(directory))
+    monkeypatch.setattr(
+        secret_resolver, "CONNECTOR_ALLOWED_SECRET_REF_PATTERNS", (f"file:{directory}/connector_*",)
+    )
+
+
+def test_resolve_secret_ref_opens_a_managed_file_and_reads_an_operator_file_as_before(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    vector = _vector()
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _vector_key(vector))
+    _point_secrets_dir_at(monkeypatch, tmp_path)
+    (tmp_path / vector["file_name"]).write_bytes(base64.b64decode(vector["sealed_base64"]))
+    (tmp_path / "connector_conn_ops_password").write_text("operator-pass\n")
+
+    assert resolve_secret_ref(f"file:{tmp_path}/{vector['file_name']}") == vector["plaintext"]
+    assert resolve_secret_ref(f"file:{tmp_path}/connector_conn_ops_password") == "operator-pass"
+
+
+def test_resolve_secret_ref_refuses_a_plain_file_under_a_managed_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _vector_key(_vector()))
+    _point_secrets_dir_at(monkeypatch, tmp_path)
+    (tmp_path / "connector_managed_conn_old_password").write_text("plain-password")
+    with pytest.raises(SecretRefRejected) as excinfo:
+        resolve_secret_ref(f"file:{tmp_path}/connector_managed_conn_old_password")
+    assert "plain-password" not in str(excinfo.value)
+
+
+def test_resolve_secret_ref_refuses_a_managed_file_under_the_wrong_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    vector = _vector()
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _other_key())
+    monkeypatch.delenv("CONNECTOR_SECRETS_KEY_PREVIOUS", raising=False)
+    _point_secrets_dir_at(monkeypatch, tmp_path)
+    (tmp_path / vector["file_name"]).write_bytes(base64.b64decode(vector["sealed_base64"]))
+    with pytest.raises(SecretRefRejected, match="cannot be decrypted with this installation's key") as excinfo:
+        resolve_secret_ref(f"file:{tmp_path}/{vector['file_name']}")
+    assert vector["plaintext"] not in str(excinfo.value)
+    assert os.environ["CONNECTOR_SECRETS_KEY"] not in str(excinfo.value)
+
+
+def test_a_value_sealed_here_round_trips_through_the_same_open_function(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Python never seals in production; this only checks that open does not
+    # depend on anything but the documented layout.
+    key = bytes([11]) * 32
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", base64.b64encode(key).decode())
+    nonce = bytes(range(12))
+    name = "connector_managed_conn_r_password"
+    sealed = bytes([1]) + nonce + AESGCM(key).encrypt(nonce, b"round-trip", name.encode())
+    assert open_managed_credential(name, sealed) == "round-trip"

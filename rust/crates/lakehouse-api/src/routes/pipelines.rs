@@ -5,6 +5,18 @@
 //! Ports `src/app/api/pipelines/route.ts`,
 //! `src/app/api/pipelines/[id]/runs/route.ts`, and
 //! `src/app/api/pipelines/[id]/trigger/route.ts`.
+//!
+//! # Target lag: read here, decided elsewhere
+//!
+//! This module serialises a pipeline's target lag (`targetLag`, plan D2)
+//! and attaches the `lag` measurement the console shows (plan D8), but it
+//! decides nothing about it: every "is it fresh enough, run or wait"
+//! question is answered once, in [`crate::pipeline_lag`], from the
+//! orchestrator's lag-check route. The list therefore reads the state
+//! table once for every lag pipeline it is returning instead of asking
+//! per pipeline, and the list payload and the detail payload cannot drift
+//! apart over what "behind" means, because neither of them is what
+//! decides it.
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -19,7 +31,7 @@ use lakehouse_dagster::{
     SensorOutcome, iso_from_unix_seconds, map_run_status,
 };
 use lakehouse_notify::EmailSender;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::pipelines::{self, CreatePipelineInput};
 use lakehouse_store::{PgPool, StoreError};
 use serde::Deserialize;
@@ -27,12 +39,13 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
-use crate::routes::alerts::{ApiSilenceSource, smtp_config};
+use crate::routes::alerts::ApiSilenceSource;
 use crate::routes::authored_pipelines;
 use crate::routes::load_alerts;
-use crate::routes::support::{extract_json_object, js_error};
+use crate::routes::support::{extract_json_object, upstream_message};
 use crate::state::AppState;
 
 use crate::tenant::TENANT_OWNER;
@@ -106,7 +119,7 @@ pub async fn list(
         // String(e) }, { status: 503 }); }` in `pipelines/route.ts`.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "pipelines": [], "error": js_error(err) })),
+            ApiJson(json!({ "pipelines": [], "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -187,7 +200,55 @@ async fn list_body(
             all_tenants,
         };
         let authored = pipelines::list_pipelines(pg, &filter).await?;
-        pipelines.extend(authored.iter().filter_map(|p| serde_json::to_value(p).ok()));
+        // BLD-2 plan D8: `targetLag` rides on the serialized row; `lag` is
+        // added here because it is a MEASUREMENT the check writes, and one
+        // read of many pipelines' state is one query (`AC5` makes it
+        // visible on the list too, not only on the page). Both store reads
+        // propagate: a swallowed failure would report every lag pipeline as
+        // "no check has run", which is a different and wrong claim.
+        let lag_ids: Vec<&str> = authored
+            .iter()
+            .filter(|p| p.target_lag.is_some())
+            .map(|p| p.id.as_str())
+            .collect();
+        let lag_states = pipelines::list_lag_states(pg, &lag_ids).await?;
+        let no_readers = crate::pipeline_lag::downstream_without_readers(pg, &authored).await?;
+        // BLD-2 review R5 SHOULD-FIX 1: the whole list's chain walks share
+        // ONE connection and the stop answers come from the `lag_states`
+        // map above — a per-row walk plus a per-upstream state read used
+        // to multiply the round trips by rows.
+        let upstream_stops =
+            crate::pipeline_lag::upstream_stops_for_list(pg, &authored, &lag_states).await?;
+        let now = time::OffsetDateTime::now_utc();
+        for p in &authored {
+            if let Ok(mut val) = serde_json::to_value(p) {
+                if let Value::Object(obj) = &mut val {
+                    // BLD-2 review R4 BLOCKER 1 (a) / decision R16 + R5
+                    // decision R18: the answer comes from the SAME chain the
+                    // check walks, and the walk stops where the check's own
+                    // upstream evaluation stops — first open request, deepest
+                    // first — not from `dependsOn` alone. A pipeline with no
+                    // target lag is never shown a `lag` object, and its chain
+                    // was not walked either, so it has no entry in
+                    // `upstream_stops` at all.
+                    let upstream_stop = upstream_stops
+                        .get(&p.id)
+                        .and_then(std::option::Option::as_ref);
+                    obj.insert(
+                        "lag".to_owned(),
+                        crate::pipeline_lag::lag_json(
+                            p.target_lag,
+                            lag_states.get(&p.id),
+                            now,
+                            no_readers.contains(&p.id),
+                            i32::from(p.max_retries),
+                            upstream_stop,
+                        ),
+                    );
+                }
+                pipelines.push(val);
+            }
+        }
     }
     match dagster_jobs_refused {
         None => Ok(json!({ "pipelines": pipelines })),
@@ -250,6 +311,8 @@ fn dagster_pipeline_row(
         "slaOk": sla_ok.map_or(Value::Null, Value::Bool),
         "late": late_value.map_or(Value::Null, Value::Bool),
         "freshnessLagSeconds": Value::Null,
+        "targetLag": Value::Null,
+        "lag": Value::Null,
     })
 }
 
@@ -395,7 +458,7 @@ async fn runs_body(state: &AppState, id: &str) -> Value {
         }),
         Err(err) => {
             tracing::warn!(%err, "pipeline runs: orchestrator unreachable");
-            json!({ "runs": [], "unavailable": js_error(err) })
+            json!({ "runs": [], "unavailable": upstream_message(err) })
         }
     }
 }
@@ -566,14 +629,14 @@ pub async fn volume(
         Ok(runs) => volume_body(&runs),
         Err(err) => {
             // AGENTS.md rule 4: never leak upstream detail into a
-            // response body. `js_error` is `Display`, not the original
+            // response body. `upstream_message` is `Display`, not the original
             // error's own message — it is the routing layer's fixed
-            // string (`routes::support::js_error`).
+            // string (`routes::support::upstream_message`).
             tracing::warn!(%err, "pipeline volume: orchestrator unreachable");
             json!({
                 "runs": [],
                 "medianRows": Value::Null,
-                "unavailable": js_error(err),
+                "unavailable": upstream_message(err),
             })
         }
     };
@@ -750,7 +813,7 @@ async fn dagster_detail(state: &AppState, job_name: &str) -> Response {
         Err(err) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response();
         }
@@ -767,7 +830,7 @@ async fn dagster_detail(state: &AppState, job_name: &str) -> Response {
         Err(err) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response();
         }
@@ -958,8 +1021,80 @@ async fn authored_detail(
         );
         obj.insert("upstream".to_owned(), json!(upstream));
         obj.insert("downstream".to_owned(), json!(downstream));
+        // BLD-2 plan D8: the Freshness panel's `lag` object.
+        let lag = match detail_lag(pool, &pipeline).await {
+            Ok(lag) => lag,
+            Err(err) => {
+                tracing::warn!(%err, pipeline_id = %id, "authored_detail: target lag lookup failed");
+                return ApiRejection(err.into()).into_response();
+            }
+        };
+        obj.insert("lag".to_owned(), lag);
+        // BLD-1 / D2: the author this pipeline reads as, by NAME. The
+        // console shows "Reads as: <name>", and it cannot get that from
+        // `GET /api/identity/users` -- that route is `identity:read`, which
+        // no ordinary role holds, and the people who operate pipelines are
+        // Data Engineers, not Platform Admins. Null when no author is
+        // recorded, which is the state in which the pipeline does not run.
+        obj.insert(
+            "runAsName".to_owned(),
+            match pipeline.run_as {
+                Some(run_as) => match lakehouse_store::identity::display_name(pool, run_as).await {
+                    Ok(name) => name.map_or(Value::Null, Value::String),
+                    Err(err) => {
+                        // The name is decoration on a response that is
+                        // otherwise complete: a failure here must not turn
+                        // a readable pipeline into a 500. The id is still
+                        // there, and the page degrades to it.
+                        tracing::warn!(%err, %run_as, "authored_detail: author name lookup failed");
+                        Value::Null
+                    }
+                },
+                None => Value::Null,
+            },
+        );
     }
     (StatusCode::OK, ApiJson(body)).into_response()
+}
+
+/// BLD-2 plan D8: the `lag` object for one pipeline's detail payload —
+/// what its target is, how far behind it is, and why. Two store reads
+/// when the pipeline has a target lag (and none when it has none, which is
+/// the common case).
+///
+/// Both reads fail loudly: a swallowed error would answer "no check has
+/// run" for a pipeline that is in fact being checked every 30 seconds,
+/// which is a different and wrong claim (`BLD-2-AC5`).
+async fn detail_lag(pool: &PgPool, pipeline: &pipelines::Pipeline) -> Result<Value, StoreError> {
+    if pipeline.target_lag.is_none() {
+        return Ok(crate::pipeline_lag::lag_json(
+            None,
+            None,
+            time::OffsetDateTime::now_utc(),
+            false,
+            0,
+            None,
+        ));
+    }
+    let state = pipelines::get_lag_state(pool, &pipeline.id).await?;
+    let no_readers =
+        crate::pipeline_lag::downstream_without_readers(pool, std::slice::from_ref(pipeline))
+            .await?;
+    // BLD-2 review R4 BLOCKER 1 (a) / decision R16 + SHOULD-FIX 3:
+    // the answer comes from the SAME chain the check walks (not
+    // `dependsOn` alone) and the read propagates with `?` — the old code
+    // refused decision R16's answer: it walked `dependsOn` and swallowed
+    // every store error with `if let Ok(...)`, so a failing read silently
+    // answered "nothing is blocking this pipeline".
+    let upstream_stop = crate::pipeline_lag::upstream_stop_of(pool, pipeline).await?;
+    Ok(crate::pipeline_lag::lag_json(
+        pipeline.target_lag,
+        state.as_ref(),
+        time::OffsetDateTime::now_utc(),
+        no_readers.contains(&pipeline.id),
+        i32::from(pipeline.max_retries),
+        upstream_stop.as_ref(),
+    ))
 }
 
 /// Build the `upstream` array for `authored_detail`: one entry per id
@@ -1188,7 +1323,7 @@ pub async fn source(
         Err(err) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response();
         }
@@ -1267,7 +1402,7 @@ pub async fn run_steps(
             .into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -1424,8 +1559,8 @@ const MAX_LOG_LINES_PER_PAGE: u32 = 500;
 ///
 /// 404 if `run_id` names a run `Dagster` reports as not found
 /// (`RunNotFoundError`); 503 if the `Dagster` `run_logs` call fails for
-/// any other reason, via [`js_error`], same as every other `Dagster`-
-/// backed route in this module — `js_error` wraps `DgError`'s own
+/// any other reason, via [`upstream_message`], same as every other `Dagster`-
+/// backed route in this module — `upstream_message` wraps `DgError`'s own
 /// `Display` (a client-generated summary already truncated/shaped by
 /// `lakehouse_dagster`, never a raw HTTP response body or stack trace),
 /// not a fresh classification step of its own; a transport-level failure
@@ -1479,12 +1614,12 @@ pub async fn run_logs(
             ApiJson(json!({ "error": format!("run {run_id} not found") })),
         )
             .into_response(),
-        // Never forward the raw Dagster error body -- `js_error` classifies
+        // Never forward the raw Dagster error body -- `upstream_message` classifies
         // it the same way every other Dagster-backed route in this file
         // does.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -1695,10 +1830,9 @@ fn pipeline_audit_event(
     }
 }
 
-/// Best-effort `pipeline_audit_event` insert — log and continue on `Err`,
-/// same non-fatal posture as `routes::connectors`'s call sites: a failed
-/// audit write must never turn an already-succeeded pipeline action into
-/// an error response.
+/// Best-effort `pipeline_audit_event` insert: a failed audit write never
+/// turns an already-succeeded pipeline action into an error response, and is
+/// logged and counted by [`audit_coverage::record_best_effort`].
 pub(super) async fn record_pipeline_audit(
     state: &AppState,
     principal: &Principal,
@@ -1706,13 +1840,8 @@ pub(super) async fn record_pipeline_audit(
     id: &str,
     args: Value,
 ) {
-    let Some(pool) = state.pg.as_deref() else {
-        return;
-    };
     let event = pipeline_audit_event(principal, action, id, args);
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, action, pipeline_id = id, "failed to record pipeline audit event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 /// F2.5 (PR #59 review): cap on the serialized size of `runConfig`.
@@ -1864,6 +1993,11 @@ const REFUSED_RUN_CONFIG_HINT: &[(&str, &str)] = &[
 /// Returns a 401 [`Response`] (not a propagated [`ApiError`] — this
 /// handler predates `ApiResult` and stays bare-`Response`-returning, like
 /// [`pause`]/[`resume`]) if no principal is present.
+///
+/// A launch that meets a job `Dagster` has not loaded yet answers `503`
+/// with `code: orchestrator_job_not_loaded` (`PR #105 CI fix`; see
+/// `routes::connectors::ingest_run` for the contract); any other launch
+/// failure is the generic `422`.
 pub async fn trigger(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -1971,6 +2105,15 @@ pub async fn trigger(
             // the body is the FIXED message below. The upstream detail
             // is logged at the dagster crate boundary.
             if let Some(failure) = outcome.failure {
+                // `PR #105 CI fix` (SEC-11): a job the orchestrator has not
+                // loaded yet is a 503 with the stable `orchestrator_job_not_loaded`
+                // code, decided from Dagster's typed result, so the gates
+                // retry on the code and not on Dagster's text. Everything
+                // else keeps main's 404 / 422 split below.
+                if outcome.job_not_loaded {
+                    return ApiRejection(crate::upstream_error::job_not_loaded(&failure.as_str()))
+                        .into_response();
+                }
                 let status = match failure {
                     lakehouse_dagster::LaunchFailure::NotFound => StatusCode::NOT_FOUND,
                     lakehouse_dagster::LaunchFailure::Refused => StatusCode::UNPROCESSABLE_ENTITY,
@@ -2006,7 +2149,7 @@ pub async fn trigger(
         // status: 503 }); }` in `[id]/trigger/route.ts`.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -2088,7 +2231,7 @@ async fn validate_run_config_response(
         Err(err) => Some(
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response(),
         ),
@@ -2360,7 +2503,7 @@ fn build_config_error_body(errors: Vec<lakehouse_dagster::ConfigValidationError>
 ///
 /// Returns a 401 [`Response`] (same posture as [`trigger`]/[`pause`]/
 /// [`resume`]) if no principal is present. Returns a 503 with
-/// `js_error(err)` (matching [`source`]'s posture) if the GraphQL call
+/// `upstream_message(err)` (matching [`source`]'s posture) if the GraphQL call
 /// fails for any other reason.
 pub async fn config_schema(
     State(state): State<AppState>,
@@ -2494,7 +2637,7 @@ pub async fn run_failed_event(
         .dagster
         .pipeline_run_status(&req.run_id)
         .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
     let Some(info) = status else {
         return Err(ApiError::NotFound(format!("run {} not found in Dagster", req.run_id)).into());
     };
@@ -2524,8 +2667,9 @@ pub async fn run_failed_event(
             "reason": "run already alerted; sensor retry ignored",
         })));
     }
-    let http = reqwest::Client::new();
-    let email = EmailSender::new(smtp_config(&state.config));
+    // SEC-10: the sender checks every webhook target and never follows a redirect.
+    let http = state.webhook_sender();
+    let email = EmailSender::new(crate::runtime_settings::email(&state).await.smtp());
     let silence_source: Option<Box<dyn SilenceSource>> = state
         .pg
         .as_deref()
@@ -2540,7 +2684,7 @@ pub async fn run_failed_event(
         silence_source.as_deref().map(|s| s as &dyn SilenceSource),
     )
     .await
-    .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
     Ok(ApiJson(json!({ "matched": matched })))
 }
 
@@ -2603,7 +2747,7 @@ async fn volume_drop_for_run(
         .dagster
         .list_runs_for_job_with_materializations(&job, 30)
         .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
     let mut history: Vec<i64> = Vec::with_capacity(runs_with_rows.len());
     let mut current_rows: Option<i64> = None;
     let mut found_current = false;
@@ -2662,10 +2806,12 @@ pub async fn run_finished_event(
     // may deliver `connector_success`. An upload's success needs no alert.
     if load_alerts::is_connector_job(&req.job_name) {
         return Ok(ApiJson(
-            load_alerts::connector_run_event(&state, pool, &req, load_alerts::Outcome::Success)
-                .await?,
+            super::quality_load::connector_success(&state, pool, &req).await?,
         ));
     }
+    // DATA-14 (F4): an upload's success needs no alert, but its table was just
+    // loaded (followed up in the background); the answer stays "unknown jobName".
+    super::quality_load::spawn_upload(&state, &req);
     let Some(pipeline_id) = job_name_to_pipeline_id(pool, &req.job_name).await? else {
         return Ok(ApiJson(json!({
             "matched": 0,
@@ -2681,7 +2827,7 @@ pub async fn run_finished_event(
         .dagster
         .pipeline_run_status(&req.run_id)
         .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
     let Some(info) = status else {
         return Err(ApiError::NotFound(format!("run {} not found in Dagster", req.run_id)).into());
     };
@@ -2692,6 +2838,14 @@ pub async fn run_finished_event(
         ))
         .into());
     }
+    // DATA-13 (F2): the run is confirmed SUCCESS, so the SQL it ran becomes
+    // the pipeline's column lineage. A failed run was refused above and
+    // writes nothing.
+    super::lineage::columns::record_pipeline_run(&state, pool, &pipeline_id).await;
+    // DATA-14 (F4): the same confirmed success starts the on-load checks of
+    // the pipeline's target table, in the background; nothing here can fail
+    // this event.
+    super::quality_load::spawn_pipeline(&state, &req.run_id, &pipeline_id);
     // Plan 1f: compute the two per-run outcomes from the run's own data
     // and the pipeline's `pipeline_sla` row, then hand them to the
     // evaluator. `slow` is `None` when no duration SLA is configured
@@ -2711,8 +2865,9 @@ pub async fn run_finished_event(
         // No SLA at all — the alert rule cannot decide.
         None
     };
-    let http = reqwest::Client::new();
-    let email = EmailSender::new(smtp_config(&state.config));
+    // SEC-10: the sender checks every webhook target and never follows a redirect.
+    let http = state.webhook_sender();
+    let email = EmailSender::new(crate::runtime_settings::email(&state).await.smtp());
     let silence_source: Option<Box<dyn SilenceSource>> = state
         .pg
         .as_deref()
@@ -2742,7 +2897,7 @@ pub async fn run_finished_event(
                 silence_source.as_deref().map(|s| s as &dyn SilenceSource),
             )
             .await
-            .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+            .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
         }
     }
     if volume_drop == Some(true) {
@@ -2760,7 +2915,7 @@ pub async fn run_finished_event(
                 silence_source.as_deref().map(|s| s as &dyn SilenceSource),
             )
             .await
-            .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+            .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
         }
     }
     Ok(ApiJson(json!({ "matched": matched })))
@@ -2772,6 +2927,14 @@ pub async fn run_finished_event(
 /// not loaded (marked ready while it was down, say) gets one reload; if
 /// the job is still missing, 409 says so rather than a launch error that
 /// reads like a bad job name.
+// `result_large_err` now reports `async fn`s too (clippy 1.98,
+// rust-clippy#17130). The `Err` here is a ready `Response` the route returns
+// verbatim, so boxing it would change this helper's contract and every call
+// site for an allocation only on the error path (REL-9, decision D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the route returns verbatim; boxing it would change every call site for no gain on the success path"
+)]
 async fn authored_launch_target(state: &AppState, id: &str) -> Result<String, Response> {
     let pool = pool(state).map_err(|err| ApiRejection(err).into_response())?;
     let pipeline = pipelines::get_pipeline(pool, id)
@@ -2857,12 +3020,25 @@ pub(super) fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result
 pub struct CreatePipelineBody {
     name: String,
     kind: String,
-    source_zone: String,
-    source_table: String,
+    /// BLD-1 part 1 / D3: the legacy form's first field. Absent when the body
+    /// sent `inputs` and `steps`, which is the other form of the same thing.
+    #[serde(default)]
+    source_zone: Option<String>,
+    /// See [`Self::source_zone`].
+    #[serde(default)]
+    source_table: Option<String>,
     #[serde(default)]
     incremental_column: Option<String>,
+    /// The legacy form's transforms. Absent is the same as empty for the
+    /// legacy form, and is not allowed together with `inputs`/`steps`.
     #[serde(default)]
-    transforms: Vec<String>,
+    transforms: Option<Vec<String>>,
+    /// BLD-1 part 1 / D1: the definition's inputs, the new form.
+    #[serde(default)]
+    inputs: Option<Vec<lakehouse_store::pipelines::PipelineInput>>,
+    /// BLD-1 part 1 / D1: the definition's steps, the new form.
+    #[serde(default)]
+    steps: Option<Vec<lakehouse_store::pipelines::PipelineStep>>,
     #[serde(default)]
     fbic_enabled: bool,
     #[serde(default)]
@@ -2892,6 +3068,25 @@ pub struct CreatePipelineBody {
     /// connector picker). Must be a connector in the creator's tenant.
     #[serde(default)]
     connector_id: Option<String>,
+    /// BLD-2: target lag (plan D2, D8).
+    #[serde(default)]
+    pub target_lag: Option<lakehouse_store::pipelines::TargetLag>,
+}
+
+/// BLD-1 / D1: the `app_user` id a principal may author a pipeline as, or
+/// `None` when the principal is not a person.
+///
+/// `pipeline_definition.run_as` (migration `0076`) references `app_user`,
+/// and a service identity has no row there — `PrincipalId::uuid()` hands
+/// back its `service_identity.id` just the same, so binding the uuid
+/// blindly would fail the foreign key for every service-created pipeline.
+/// Returning `None` instead stores "no author", which D2 refuses to run,
+/// and an admin can assign through `PUT /api/pipelines/{id}/run-as`.
+fn author_id(principal: &Principal) -> Option<uuid::Uuid> {
+    match principal.id {
+        PrincipalId::User(id) => Some(id),
+        PrincipalId::Service(_) => None,
+    }
 }
 
 /// `POST /api/pipelines` — author a new pipeline definition. Returns 201.
@@ -2919,11 +3114,34 @@ pub async fn create(
     // used to be inserted unassigned, which no tenant-scoped read shows.
     let tenant_id = crate::tenant_scope::resolve(&principal, &headers)?;
     let body: CreatePipelineBody = parse_body(&body)?;
-    for (index, transform) in body.transforms.iter().enumerate() {
-        crate::transform_grammar::parse_transform(transform).map_err(|err| {
-            ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
-        })?;
-    }
+    // BLD-3 / D4: refuse a `bronze` target before anything is written.
+    // Same validator (and same message) as `authored_pipelines::update`
+    // and `authored_pipelines::restore_version` run; the assistant's
+    // `create_pipeline` tool lands here too, so it is refused with the
+    // same wording its schema enum no longer offers.
+    crate::routes::authored_pipelines::validate_target_zone(&body.target_zone)?;
+    // BLD-1 part 1 / D3: whichever of the two body forms this is, one
+    // function turns it into D1's shape. A body that sends both is refused
+    // here, before anything else reads them.
+    let form = crate::routes::authored_pipelines::definition_form(
+        body.inputs,
+        body.steps,
+        body.source_zone.as_deref(),
+        body.source_table.as_deref(),
+        body.transforms.as_deref(),
+    )?;
+    // The first input is the one the per-table upstreams and the connector
+    // watch (D12); the compiler has already refused a definition with none.
+    let first = crate::routes::authored_pipelines::first_input(&form)?;
+    // DATA-19 / D2 + BLD-4 / D2: `file_ingest_job` and `ingest_job` are
+    // only upstreams of a pipeline that reads a Bronze table, so the create
+    // route applies the same guard `authored_pipelines::update` and
+    // `restore_version` run — one rule, one message per job, three call
+    // sites. D12: the FIRST input is the one such a job loads.
+    crate::routes::authored_pipelines::validate_per_table_upstream(
+        &first.zone,
+        Some(&body.depends_on),
+    )?;
     // Plan 1c: validate `max_retries` against the same `0..=5` the
     // column CHECK enforces (migration 0051). Catching it here means a
     // bad value returns a 400 with the field name, not a 500 from the
@@ -2934,53 +3152,59 @@ pub async fn create(
     {
         return Err(ApiError::BadRequest("maxRetries must be between 0 and 5".to_owned()).into());
     }
-    // Validate `depends_on` against the live authored graph + Dagster
-    // job list. PR #57 review F1.7: the id the row will carry is
-    // minted FIRST (`slug_id` derives it from `body.name` and a
-    // timestamp suffix), so the validator's self-reference rule and
-    // any cycle rule see the real id, not `body.name`. Pre-fix this
-    // used `body.name` and so a self-reference was missed whenever the
-    // slug stripped a character the name contained (a name with a
-    // dash, a colon, an apostrophe — every name the LLM
-    // `derive_pipeline_name` produces is snake_case and equal to the
-    // slug, but every other user-typed name is at risk).
-    //
-    // Dagster unreachable degrades to "no Dagster upstreams accepted"
-    // (empty list) rather than 500ing the create. The schedule-ticks
-    // route uses the same pattern — a missing orchestrator on a write
-    // path is a configuration problem the operator reads about in the
-    // logs, not a reason to refuse a create that the rest of the store
-    // would happily accept.
+    // PR #57 review F1.7: the id the row will carry is minted FIRST
+    // (`slug_id` derives it from `body.name` and a timestamp suffix), so the
+    // validator's self-reference rule and any cycle rule see the real id, not
+    // `body.name`.
     let id = pipelines::slug_id(&body.name);
-    let dagster_jobs = match state.dagster.list_jobs().await {
-        Ok(j) => j,
-        Err(err) => {
-            tracing::warn!(%err, "create: dagster unreachable, depends_on accepts authored upstreams only");
-            Vec::new()
-        }
-    };
-    let others =
-        crate::routes::authored_pipelines::collect_authored_depends_on(pool(&state)?, None).await?;
-    crate::routes::authored_pipelines::validate_depends_on(
-        &id,
-        &body.depends_on,
-        &others,
-        &dagster_jobs,
-    )?;
+    // The upstream half: the live authored graph plus Dagster's jobs.
+    crate::routes::authored_pipelines::validate_upstreams(&state, &id, &body.depends_on, "create")
+        .await?;
+    crate::routes::authored_pipelines::validate_target_lag(body.target_lag)?;
     let connector_id = body
         .connector_id
         .map(|id| id.trim().to_owned())
         .filter(|id| !id.is_empty());
     if let Some(connector_id) = connector_id.as_deref() {
-        require_connector_in_tenant(pool(&state)?, connector_id, tenant_id).await?;
+        // BLD-7 / decision 2 + DEC-15 + BLD-1 part 1 / D12: a pipeline that
+        // names a connector reads one of that connector's Bronze tables --
+        // exactly one input, the table its ingest writes. The tenant check
+        // runs first, so an out-of-tenant connector keeps answering "not a
+        // connector in your tenant" whatever the input says.
+        crate::routes::authored_pipelines::check_connector_for_definition(
+            pool(&state)?,
+            &lakehouse_store::pipelines::ConnectorChange::Set(connector_id.to_owned()),
+            None,
+            tenant_id,
+            &form.inputs,
+        )
+        .await?;
     }
+    // BLD-1 part 1 / D2–D6 and D9 (F1): compiled, gated and rewritten as the
+    // person the pipeline will read as, before anything is stored.
+    crate::routes::authored_pipelines::compile_and_save_check(
+        &state,
+        tenant_id,
+        author_id(&principal),
+        &form.inputs,
+        &form.steps,
+        (&body.target_zone, &body.target_table),
+    )
+    .await?;
+    // BLD-1 / D1: the creator is the author, so a pipeline reads as the
+    // person who made it. Only a HUMAN principal gets an author: a service
+    // identity has no `app_user` row, so it stores `None` and does not run
+    // until an admin assigns one (D2).
+    let run_as = author_id(&principal);
     let input = CreatePipelineInput {
         name: body.name,
         kind: body.kind,
-        source_zone: body.source_zone,
-        source_table: body.source_table,
+        source_zone: first.zone.clone(),
+        source_table: first.table.clone(),
         incremental_column: body.incremental_column,
-        transforms: body.transforms,
+        transforms: form.legacy_transforms.unwrap_or_default(),
+        inputs: form.inputs,
+        steps: form.steps,
         fbic_enabled: body.fbic_enabled,
         target_zone: body.target_zone,
         target_table: body.target_table,
@@ -2992,6 +3216,15 @@ pub async fn create(
         depends_on: body.depends_on,
         connector_id,
         id: Some(id),
+        target_lag: body.target_lag,
+        // BLD-1 / D1: the creator is the author, so a pipeline reads as
+        // the person who made it. Only a HUMAN principal gets an author:
+        // `PrincipalId::Service` has no `app_user` row for the foreign
+        // key to point at, and "the service account reads everything" is
+        // exactly what this column exists to stop. Such a row stays
+        // `run_as = NULL` and does not run until an admin assigns an
+        // author (D2).
+        run_as,
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     // WS5 item D4: best-effort, never turns a successful create into an
@@ -3014,7 +3247,11 @@ pub async fn create(
 /// unknown id, another tenant's connector and an unassigned one get the
 /// same answer, so this is no oracle for which connector ids exist. A
 /// creator in no tenant owns no connector, so it cannot name one.
-async fn require_connector_in_tenant(
+///
+/// `BLD-9` / decision 7 calls this from `PUT` too, with the PIPELINE's
+/// tenant (the row `in_scope` already vouched for), so an edit cannot
+/// attach a connector from another tenant.
+pub(crate) async fn require_connector_in_tenant(
     pool: &PgPool,
     connector_id: &str,
     tenant_id: Option<Uuid>,
@@ -3037,10 +3274,10 @@ async fn require_connector_in_tenant(
 /// `changed_by` is the principal the route had on the
 /// `Extension<Principal>`; it lands in the `created` version row's
 /// `changed_by` column (Plan R4 2b). `routes::pipelines::generate`'s
-/// own caller passes its own principal — `generate` does not audit today
-/// (WS5 item D4), but the version row still goes through `create_pipeline`
-/// so the create is captured in history without a separate route-side
-/// write.
+/// own caller passes its own principal; the version row goes through
+/// `create_pipeline`, so the create is captured in history without a separate
+/// route-side write, and `generate` writes its own audit row
+/// (`pipeline.generate`, `GOV-1 review`).
 async fn create_named_pipeline(
     pool: &PgPool,
     input: &CreatePipelineInput,
@@ -3147,6 +3384,8 @@ pub async fn generate(
         .and_then(|d| d.schedule.clone())
         .unwrap_or_else(|| "On demand".to_owned());
     let input = CreatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
         name,
         kind,
         source_zone: body.database.clone(),
@@ -3184,8 +3423,26 @@ pub async fn generate(
         // so no id was minted in advance — the store's default `slug_id`
         // path applies. PR #57 review F1.7.
         id: None,
+        // BLD-2 T4: same as `create` — a pipeline an LLM drafts starts
+        // with no target lag until a user or the assistant sets one.
+        target_lag: None,
+        // BLD-1 / D1: the LLM proposes the SHAPE, never the identity. The
+        // author is the human who asked, exactly as in `create`.
+        run_as: author_id(&principal),
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
+    // `GOV-1 review`: the route authors a pipeline, so it is on the audit
+    // trail like `create`, under its own action so that a pipeline a model
+    // drafted can be told from one a person wrote. The row names the
+    // pipeline and carries no argument: the instruction stays out of it.
+    record_pipeline_audit(
+        &state,
+        &principal,
+        "pipeline.generate",
+        &created.id,
+        Value::Null,
+    )
+    .await;
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
@@ -3241,8 +3498,11 @@ async fn llm_pipeline_draft(
     // Generous enough for a model that thinks before it answers: a reply
     // cut off mid-JSON parses as nothing, and the caller then silently
     // gets the fallback draft.
-    let reply = match state
-        .llm
+    // `ADM-9`: the client comes from the resolver, which rebuilds it when
+    // the effective provider settings change.
+    let assistant = crate::runtime_settings::assistant(state).await;
+    let reply = match assistant
+        .client
         .chat(
             &messages,
             ChatOptions {
@@ -3540,7 +3800,7 @@ async fn dagster_schedule_toggle(state: &AppState, job_name: &str, paused: bool)
         Err(err) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response();
         }
@@ -3572,12 +3832,16 @@ async fn dagster_schedule_toggle(state: &AppState, job_name: &str, paused: bool)
         }
         Ok(o) => (
             StatusCode::CONFLICT,
-            ApiJson(json!({ "error": o.error.unwrap_or_else(|| "schedule mutation failed".to_owned()) })),
+            ApiJson(json!({
+                "error": o
+                    .error
+                    .map_or_else(|| "schedule mutation failed".to_owned(), upstream_message)
+            })),
         )
             .into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -3618,15 +3882,25 @@ fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
 /// The helper returns a `Response` so the caller can `return rejection;`
 /// directly. A `RunNotFoundError` (or `__typename != "Run"`) becomes the
 /// same "run not found" body the routes' other branches produce, so a
-/// caller cannot tell "out of scope" from "no such run". A transport
-/// failure surfaces as 503 with the classified error string (AGENTS.md
-/// rule 4).
+/// caller cannot tell "out of scope" from "no such run". A failed
+/// `pipeline_run_pipeline_name` surfaces as 503 with the FIXED body
+/// `{"error": "orchestrator error"}` and the detail only to `tracing`
+/// (PR #80 review BLOCKER 1, AGENTS.md principle 4).
+///
+/// It answers the run's job name, which a route that must treat one job
+/// differently reads (`DATA-61`: a file load is not re-run from here).
+// Same reason as `authored_launch_target` above: the `Err` is the ready
+// rejection the caller returns, not a value it inspects (REL-9, D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the route returns verbatim; boxing it would change every call site for no gain on the success path"
+)]
 async fn enforce_run_id_pipeline_scope(
     state: &AppState,
     principal: &Principal,
     headers: &HeaderMap,
     run_id: &str,
-) -> Result<(), Response> {
+) -> Result<String, Response> {
     let pipeline_name = match state.dagster.pipeline_run_pipeline_name(run_id).await {
         Ok(Some(name)) => name,
         Ok(None) => {
@@ -3637,9 +3911,26 @@ async fn enforce_run_id_pipeline_scope(
                 .into_response());
         }
         Err(err) => {
+            // PR #80 review BLOCKER 1: this branch answered
+            // `js_error(err)`, i.e. it rendered the orchestrator-side
+            // failure into the caller's 503 body — upstream text in a
+            // response (AGENTS.md principle 4), added by this PR on all
+            // four runId routes. `pipeline_run_pipeline_name` can only
+            // fail two ways (see `lakehouse_dagster::DgClient::
+            // pipeline_run_pipeline_name`): a transport failure
+            // (`DgError::Transport`, whose `Display` is the fixed
+            // "fetch failed"; the real `reqwest` error, URL included,
+            // stays its `#[source]`) or a response body that is not
+            // valid JSON (`DgError::Server`, carrying the parse error).
+            // Neither is a caller-facing message, and the body must not
+            // depend on which variant arrived, so it is FIXED here and
+            // the detail goes to `tracing` — the same treatment this
+            // PR's other F2.7 sites use (e.g. the `run_config_schema`
+            // arm, `pipeline config-schema: orchestrator unreachable`).
+            tracing::warn!(%err, "pipeline run scope: orchestrator lookup failed");
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": "orchestrator error" })),
             )
                 .into_response());
         }
@@ -3647,7 +3938,7 @@ async fn enforce_run_id_pipeline_scope(
     let Some(suffix) = crate::routes::authored_pipelines::pipeline_id_from_job_name(&pipeline_name)
     else {
         // Dagster-native job name — un-tenanted, proceed.
-        return Ok(());
+        return Ok(pipeline_name);
     };
     // F2.1 (PR #59 review): the factory's `_dagster_safe_name` collapses
     // every `pl-foo-bar` and `pl_foo_bar` to the same `pl_foo_bar`, so
@@ -3669,7 +3960,7 @@ async fn enforce_run_id_pipeline_scope(
     {
         return Err(ApiRejection(rejection.0).into_response());
     }
-    Ok(())
+    Ok(pipeline_name)
 }
 
 /// `POST /api/pipelines/runs/{runId}/cancel` — terminate a running
@@ -3738,10 +4029,28 @@ pub async fn cancel_run(
         },
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
+}
+
+/// `DATA-61` (#501 review, round 1 (R4)): why a file load is not re-run from
+/// Pipelines. A re-run would execute the run's old config again, skipping
+/// everything `POST /api/uploads/{id}/ingest` checks — whether the table name
+/// is free, the `DATA-55` refusal of a dropped table, and the claim that marks
+/// the upload as loading. The upload's own load makes those checks, so it is
+/// the way to load a file again.
+const FILE_LOAD_NOT_RERUN: &str = "A file load is not re-run from Pipelines. Load the file again from the \"Uploaded files\" tab of Sources, which checks the table first.";
+
+/// The `409` body of a re-run of a file load: [`FILE_LOAD_NOT_RERUN`], the one
+/// sentence, so the route and its tests read the same text (`DATA-61`).
+fn file_load_not_rerun() -> Response {
+    (
+        StatusCode::CONFLICT,
+        ApiJson(json!({ "error": FILE_LOAD_NOT_RERUN })),
+    )
+        .into_response()
 }
 
 /// `POST /api/pipelines/runs/{runId}/retry` — re-execute a finished run.
@@ -3752,7 +4061,9 @@ pub async fn cancel_run(
 /// # Errors
 ///
 /// Same as [`cancel_run`], plus 400 for a body that names no known
-/// strategy.
+/// strategy, and `409` with [`FILE_LOAD_NOT_RERUN`] for a run of
+/// `file_ingest_job` whatever the strategy — a file load is not re-run from
+/// here (`DATA-61`).
 pub async fn retry_run(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -3777,10 +4088,18 @@ pub async fn retry_run(
     // cannot be retried by a caller in this one — a run's existence
     // would otherwise be observable through the run-failed/run-
     // finished sensor payloads.
-    if let Err(rejection) =
-        enforce_run_id_pipeline_scope(&state, &principal, &headers, &run_id).await
-    {
-        return rejection;
+    let job = match enforce_run_id_pipeline_scope(&state, &principal, &headers, &run_id).await {
+        Ok(job) => job,
+        Err(rejection) => return rejection,
+    };
+    // DATA-61 (#501 review, round 1 (R4)): a file load is not re-run from
+    // Pipelines. Its old config may name a table that is no longer free, and
+    // the `DATA-55` refusal and the load claim would all be skipped; the
+    // upload's own "Load" makes them. The refusal comes after the scope check
+    // (an unknown or out-of-scope run is still 404) and before the body is
+    // read or anything is launched.
+    if job == crate::routes::uploads::FILE_INGEST_JOB {
+        return file_load_not_rerun();
     }
     let request = match parse_retry_request(&body) {
         Ok(r) => r,
@@ -3817,7 +4136,7 @@ pub async fn retry_run(
             Err(err) => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    ApiJson(json!({ "error": js_error(err) })),
+                    ApiJson(json!({ "error": upstream_message(err) })),
                 )
                     .into_response();
             }
@@ -3828,7 +4147,7 @@ pub async fn retry_run(
             Err(err) => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    ApiJson(json!({ "error": js_error(err) })),
+                    ApiJson(json!({ "error": upstream_message(err) })),
                 )
                     .into_response();
             }
@@ -3876,7 +4195,7 @@ pub async fn retry_run(
         Err(err) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response();
         }
@@ -4091,6 +4410,91 @@ pub async fn assign_pipeline_tenant(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Body for `PUT /api/pipelines/{id}/run-as`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignRunAsBody {
+    /// The `app_user` the pipeline will read as.
+    user_id: Uuid,
+}
+
+/// BLD-1 / D2: assign the user an authored pipeline reads as.
+///
+/// Without this route, migration `0076`'s backfill is the only thing that
+/// ever sets `run_as`, so every pipeline created before the migration —
+/// and every pipeline a service identity created — would sit at `NULL`
+/// and, under D2, never run. This is the administrative way out.
+///
+/// # Why the author must be inside the pipeline's own tenant
+///
+/// A pipeline's reads are governed as its author, so an author outside
+/// the pipeline's tenant would let the row read across a scope boundary
+/// the pipeline itself may not cross. The membership is read from
+/// `app_user_tenant` — the same row the author's own session resolves its
+/// tenants from — so the two can never disagree.
+///
+/// A pipeline with no tenant yet has no tenant to check membership
+/// against, so it is refused rather than waved through: assign it a
+/// tenant through `PUT /api/pipelines/{id}/tenant` first.
+///
+/// # Errors
+///
+/// 404 if the pipeline id or the user id does not exist — the same status
+/// for both, matching `assign_pipeline_tenant`'s no-existence-leak rule.
+/// 409 if the pipeline has no tenant yet. 400 for a malformed body. 503 if
+/// no pool is configured; 500 on any other database failure.
+pub async fn assign_pipeline_run_as(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
+    let AssignRunAsBody { user_id } = parse_body(&body)?;
+    let db_pool = pool(&state)?;
+    if !lakehouse_store::identity::user_exists(db_pool, user_id).await? {
+        return Err(ApiError::NotFound("user not found".to_owned()).into());
+    }
+    // The pipeline must be readable as its own tenant's member, so load it
+    // first: a missing pipeline answers 404 before the tenant question is
+    // even asked, and a `Dagster` job id (no such row) takes the same path.
+    let pipeline = pipelines::get_pipeline(db_pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+    let Some(tenant_id) = pipeline.tenant_id else {
+        return Err(ApiError::Conflict(
+            "this pipeline has no tenant yet, so there is no way to check who may \
+             read as it; assign it a tenant first"
+                .to_owned(),
+        )
+        .into());
+    };
+    if !lakehouse_store::identity::user_in_tenant(db_pool, user_id, tenant_id).await? {
+        return Err(ApiError::Unprocessable(
+            "that user is not a member of this pipeline's tenant".to_owned(),
+        )
+        .into());
+    }
+    pipelines::assign_run_as(db_pool, &id, user_id)
+        .await
+        .map_err(|err| match err {
+            lakehouse_store::StoreError::NotFound => {
+                ApiError::NotFound(format!("Pipeline {id} not found"))
+            }
+            other => other.into(),
+        })?;
+    // Assigning the author changes who every future run reads as, so it is
+    // audited like any other pipeline write rather than silently applied.
+    record_pipeline_audit(
+        &state,
+        &principal,
+        "pipeline.run_as.assign",
+        &id,
+        json!({ "userId": user_id }),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod dagster_half_tenant_gate {
     //! The `Dagster`-job half of
@@ -4131,6 +4535,10 @@ mod dagster_half_tenant_gate {
     fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
         let mut env = HashMap::new();
         env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+        // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+        // database, so a state that builds bronze pipelines names it the way
+        // compose does (`ICEBERG_QUERY_DB`).
+        env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
         env.insert(
             "DAGSTER_URL".to_owned(),
             "http://127.0.0.1:1/graphql".to_owned(),
@@ -4206,9 +4614,11 @@ mod tests {
     /// A logged-in human principal — mirrors `routes::query`/
     /// `routes::agents`/`routes::connectors`'s own test fixture of the
     /// same name.
+    pub(super) const SEED_USER: &str = "33333333-3333-4333-8333-000000000001";
+
     pub(super) fn fixture_user_principal() -> Principal {
         Principal {
-            id: PrincipalId::User(Uuid::from_u128(1)),
+            id: PrincipalId::User(Uuid::parse_str(SEED_USER).unwrap()),
             tenant_ids: Vec::new(),
             display_name: "Rina Wijaya".to_owned(),
             permissions: PermissionSet::parse("pipeline:write"),
@@ -4242,6 +4652,21 @@ mod tests {
             provider: "service".to_owned(),
             must_change_password: false,
             role_names: Vec::new(),
+        }
+    }
+
+    /// The seeded `fajar@meridian.example` with NO tenant: a real `app_user`
+    /// (the `run_as` key) whose role is `*:*` in the DATABASE — which is what
+    /// the save-time gate reads (it runs as the author, not as the caller).
+    ///
+    /// BLD-1 part 1 review R1-B8: a fixture that creates a pipeline with NO
+    /// tenant needs this author — a restricted one is refused by D9's gate,
+    /// which reads a tenantless pipeline as reaching nothing.
+    pub(super) fn fixture_admin_no_tenant_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::parse_str("33333333-3333-4333-8333-000000000006").unwrap()),
+            permissions: PermissionSet::parse("*:*"),
+            ..fixture_user_principal()
         }
     }
 
@@ -4374,6 +4799,33 @@ mod tests {
         let headers = headers_with_x_tenant(Uuid::from_u128(2)); // not a member
         let resp = list(State(state), Some(Extension(principal)), headers).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// BLD-3 / D4: `POST /api/pipelines` refuses a `bronze` target with the
+    /// message `PUT`, the restore route and the orchestrator's own op all
+    /// use. Checked against `state_without_pool()` on purpose: the guard
+    /// is on the parsed body, so it must refuse before any store,
+    /// orchestrator or tenant lookup decides anything. The assistant's
+    /// `create_pipeline` tool calls this same handler, so the assistant
+    /// gets the refusal too even if its own schema enum is bypassed.
+    #[tokio::test]
+    async fn create_with_a_bronze_target_is_refused() {
+        let body = Bytes::from_static(
+            br#"{"name":"pl-bronze-target","kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"bronze","targetTable":"t","schedule":"manual","transforms":[]}"#,
+        );
+        let err = create(
+            State(state_without_pool()),
+            Extension(fixture_user_principal()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect_err("a bronze target must be refused");
+        assert_eq!(err.0.status(), 400);
+        assert_eq!(
+            err.0.to_string(),
+            crate::routes::authored_pipelines::BRONZE_TARGET_REFUSED
+        );
     }
 
     /// WS5 item D4, failing-test-first: `pipeline_audit_event` did not
@@ -5074,7 +5526,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = detail(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_member_principal())),
                 HeaderMap::new(),
                 Path("bronze_maintenance_job".to_owned()),
             )
@@ -5098,7 +5550,10 @@ mod tests {
                 "dispar_orchestrate/maintenance.py::run_bronze_maintenance"
             );
             assert_eq!(ops[0]["commit"], "unknown");
-            assert!(v["config"].as_array().expect("config array").is_empty());
+            assert_eq!(
+                v["config"].as_array().expect("config array").as_slice(),
+                &[] as &[serde_json::Value]
+            );
             assert!(v["definition"].is_null());
         }
 
@@ -5131,7 +5586,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = detail(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_member_principal())),
                 HeaderMap::new(),
                 Path("no_such_job".to_owned()),
             )
@@ -5157,6 +5612,10 @@ mod tests {
         fn pg_state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }
@@ -5183,16 +5642,34 @@ mod tests {
         /// dropped: the pipeline was saved (the toast said so) but `list`,
         /// which shows only the caller's tenant, never returned it, and the
         /// connector could be deleted from under it.
+        ///
+        /// BLD-7 / decision 2: the source is now one of the connector's own
+        /// ingest targets (`conn-pg-lakehouse` loads `ingest_demo.orders`
+        /// into `orders`, migration 0034), so the create is also the proof
+        /// that naming that target is accepted.
         #[sqlx::test(migrations = "../../migrations")]
         async fn create_stores_the_authors_tenant_and_the_connector(pool: sqlx::PgPool) {
             use lakehouse_test_support as _;
 
             let state = pg_state_for(&pool);
+            // R1-B8: a restricted caller who MAY read the table it names — the
+            // connector's Bronze table, claimed by its own tenant.
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                SEED_TENANT.parse().unwrap(),
+                "orders",
+                "upload-connector-route",
+            )
+            .await
+            .expect("claim the connector's table");
             let (_, ApiJson(created)) = create(
                 State(state.clone()),
                 Extension(fixture_member_principal()),
                 HeaderMap::new(),
-                create_body(&json!({ "connectorId": "conn-pg-lakehouse" })),
+                create_body(&json!({
+                    "connectorId": "conn-pg-lakehouse",
+                    "sourceTable": "orders",
+                })),
             )
             .await
             .expect("create should succeed");
@@ -5217,6 +5694,143 @@ mod tests {
             assert!(
                 dependents.iter().any(|d| d.id == created.id),
                 "must depend on its connector"
+            );
+        }
+
+        /// BLD-7 / decision 2: `bronze.<one of the connector's ingest
+        /// targets>` is accepted, and the stored row keeps both the source
+        /// and the connector.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_accepts_a_connector_with_one_of_its_bronze_tables(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            // R1-B8: a restricted caller who MAY read the table it names.
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                SEED_TENANT.parse().unwrap(),
+                "orders",
+                "upload-connector-route-2",
+            )
+            .await
+            .expect("claim the connector's table");
+            let (status, ApiJson(created)) = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({
+                    "connectorId": "conn-pg-lakehouse",
+                    "sourceTable": "orders",
+                })),
+            )
+            .await
+            .expect("a Bronze table the connector loads should be accepted");
+
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(created.source, "bronze.orders");
+            assert_eq!(created.connector_id.as_deref(), Some("conn-pg-lakehouse"));
+        }
+
+        /// BLD-7 / decision 2: a non-Bronze source is refused with the one
+        /// fixed sentence that names the tables the connector does load,
+        /// and nothing is stored.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_a_non_bronze_source_for_a_connector(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let err = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({
+                    "connectorId": "conn-pg-lakehouse",
+                    "sourceZone": "silver",
+                    "sourceTable": "orders",
+                })),
+            )
+            .await
+            .expect_err("a silver source with a connector must be refused");
+
+            assert_eq!(err.0.status(), 400);
+            let message = err.0.to_string();
+            assert!(
+                message.contains("reads one of that connector's Bronze tables"),
+                "the refusal says what to pick, got: {message}"
+            );
+            assert!(
+                message.contains("orders"),
+                "the refusal lists the connector's own table, got: {message}"
+            );
+            let listed = pipelines::list_pipelines(
+                &pool,
+                &pipelines::PipelineFilter {
+                    tenant_id: Some(SEED_TENANT.parse().unwrap()),
+                    all_tenants: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                listed
+                    .iter()
+                    .all(|p| !p.name.starts_with("tenant-route-test-")),
+                "a refused create stores nothing"
+            );
+        }
+
+        /// BLD-7 / decision 2: a Bronze table the connector does not load
+        /// is refused the same way.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_a_bronze_table_the_connector_does_not_load(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let err = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({
+                    "connectorId": "conn-pg-lakehouse",
+                    "sourceTable": "some_other_table",
+                })),
+            )
+            .await
+            .expect_err("a table outside the connector's targets must be refused");
+
+            assert_eq!(err.0.status(), 400);
+            assert!(
+                err.0
+                    .to_string()
+                    .contains("reads one of that connector's Bronze tables"),
+                "the refusal is the same fixed sentence"
+            );
+        }
+
+        /// BLD-7 / decision 2: a connector that has not loaded anything yet
+        /// (`conn-s3-warehouse` ships with an empty `source_objects`,
+        /// migration 0034) says so, instead of pretending it has a table.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_a_connector_with_no_ingest_targets(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let err = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({
+                    "connectorId": "conn-s3-warehouse",
+                    "sourceTable": "anything",
+                })),
+            )
+            .await
+            .expect_err("a connector with no tables cannot be a source yet");
+
+            assert_eq!(err.0.status(), 400);
+            assert_eq!(
+                err.0.to_string(),
+                crate::routes::authored_pipelines::CONNECTOR_HAS_NO_TABLES
             );
         }
 
@@ -5259,6 +5873,15 @@ mod tests {
             use lakehouse_test_support as _;
 
             let state = pg_state_for(&pool);
+            // R1-B8: a restricted caller who MAY read the table it names.
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                SEED_TENANT.parse().unwrap(),
+                "t",
+                "upload-detail-route",
+            )
+            .await
+            .expect("claim the fixture table");
             let body = Bytes::from(
                 serde_json::to_vec(&json!({
                     "name": format!("detail-route-test-{}", uuid::Uuid::new_v4()),
@@ -5274,7 +5897,7 @@ mod tests {
             );
             let (_, ApiJson(created)) = create(
                 State(state.clone()),
-                Extension(fixture_user_principal()),
+                Extension(fixture_member_principal()),
                 HeaderMap::new(),
                 body,
             )
@@ -5314,7 +5937,7 @@ mod tests {
             let state = AppState::new(config);
             let response = detail(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_member_principal())),
                 HeaderMap::new(),
                 Path("pl-does-not-exist".to_owned()),
             )
@@ -5651,7 +6274,7 @@ mod tests {
             let tenant_principal = |tenant_id: uuid::Uuid| -> Principal {
                 Principal {
                     tenant_ids: vec![tenant_id],
-                    ..fixture_user_principal()
+                    ..fixture_member_principal()
                 }
             };
 
@@ -5682,6 +6305,8 @@ mod tests {
             let seeded = pipelines::create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    inputs: Vec::new(),
+                    steps: Vec::new(),
                     name: "source-route-scope".to_owned(),
                     kind: "batch".to_owned(),
                     source_zone: "bronze".to_owned(),
@@ -5699,6 +6324,10 @@ mod tests {
                     depends_on: Vec::new(),
                     connector_id: None,
                     id: None,
+                    // BLD-2: this fixture is not about a target lag.
+                    target_lag: None,
+                    // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                    run_as: None,
                 },
                 None,
             )
@@ -5836,7 +6465,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = config_schema(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_member_principal())),
                 Path("pl-authored".to_owned()),
             )
             .await;
@@ -5872,7 +6501,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = config_schema(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_member_principal())),
                 Path("ingest_job".to_owned()),
             )
             .await;
@@ -5911,7 +6540,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = config_schema(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_member_principal())),
                 Path("not_a_job".to_owned()),
             )
             .await;
@@ -5951,7 +6580,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = config_schema(
                 State(state),
-                Some(Extension(fixture_user_principal())),
+                Some(Extension(fixture_member_principal())),
                 Path("ingest_job".to_owned()),
             )
             .await;
@@ -6047,7 +6676,10 @@ mod tests {
             // "failed", never the raw Dagster string.
             assert_eq!(steps[0]["status"], "failed");
             assert!(steps[0]["startMs"].is_number());
-            assert!(steps[0]["materializations"].as_array().unwrap().is_empty());
+            assert_eq!(
+                steps[0]["materializations"].as_array().unwrap().as_slice(),
+                &[] as &[serde_json::Value]
+            );
         }
 
         #[tokio::test]
@@ -6519,6 +7151,124 @@ mod tests {
                 "retry not-found body MUST be the fixed classified string",
             );
         }
+
+        /// `DATA-61` (#501 review, round 1 (R4)): a re-run of a file load is
+        /// refused with one sentence — whatever the strategy — and nothing is
+        /// launched. The upload's own "Load" is the way to load a file again,
+        /// because it runs the checks a re-run would skip.
+        #[tokio::test]
+        async fn a_rerun_of_a_file_load_is_refused_with_a_sentence_and_launches_nothing() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "pipelineRunOrError",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run",
+                        "runId": "r1",
+                        "status": "FAILURE",
+                        "pipelineName": "file_ingest_job"
+                    } }
+                })))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "launchRunReexecution",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "launchRunReexecution": {
+                        "__typename": "LaunchRunSuccess", "run": { "runId": "r-new" }
+                    } }
+                })))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            for body in [
+                &br"{}"[..],
+                &br#"{"strategy":"fromFailure"}"#[..],
+                &br#"{"strategy":"selected","stepKeys":["load"]}"#[..],
+            ] {
+                let state = state_with_dagster(&server.uri());
+                let response = retry_run(
+                    State(state),
+                    Some(Extension(fixture_unrestricted_principal())),
+                    HeaderMap::new(),
+                    Path("r1".to_owned()),
+                    Bytes::from_static(body),
+                )
+                .await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::CONFLICT,
+                    "a file load is not re-run from Pipelines, whatever the body"
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("collect body");
+                let parsed: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+                assert_eq!(parsed["error"], FILE_LOAD_NOT_RERUN);
+            }
+            let requests = server.received_requests().await.expect("request log");
+            for request in &requests {
+                let body = String::from_utf8_lossy(&request.body);
+                assert!(
+                    !body.contains("launchRunReexecution") && !body.contains("runOrError(runId"),
+                    "nothing was asked beyond the job name, got {body}"
+                );
+            }
+        }
+
+        /// `DATA-61` (#501 review, round 1 (R4)): the guard shuts out no other
+        /// job — a connector's load is re-run as it was.
+        #[tokio::test]
+        async fn a_rerun_of_another_job_still_launches() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "pipelineRunOrError",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run",
+                        "runId": "r1",
+                        "status": "FAILURE",
+                        "pipelineName": "ingest_job"
+                    } }
+                })))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "launchRunReexecution",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "launchRunReexecution": {
+                        "__typename": "LaunchRunSuccess", "run": { "runId": "r-new" }
+                    } }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = retry_run(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path("r1".to_owned()),
+                Bytes::from_static(br"{}"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let parsed: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+            assert_eq!(parsed["id"], "r-new");
+        }
     }
 
     /// Plan 1c (R2, day-1): `GET /api/pipelines/{id}/runs/steps` — the
@@ -6655,6 +7405,61 @@ mod tests {
             assert_eq!(
                 parsed["error"], "orchestrator refused the mutation",
                 "cancel not-found body MUST be the fixed classified string",
+            );
+        }
+
+        /// PR #80 review BLOCKER 1: the runId scope check's own error
+        /// branch answered `js_error(err)`. This pins the fixed body.
+        ///
+        /// The upstream failure is produced by a body that is not valid
+        /// JSON (carrying a distinctive upstream-only text), NOT by a
+        /// top-level GraphQL `errors` array: `pipeline_run_pipeline_name`
+        /// reads `/data/pipelineRunOrError` and returns `Ok(None)` when
+        /// it is absent, so a GraphQL `errors` array takes the helper's
+        /// "run not found" 404 branch
+        /// (`lakehouse_dagster/src/lib.rs`, `pipeline_run_pipeline_name`).
+        /// An unparsable body is the only way to reach the 503 branch,
+        /// and it is also the branch whose detail is a class of upstream
+        /// text the caller must never see.
+        #[tokio::test]
+        async fn cancel_returns_503_with_fixed_body_when_the_scope_lookup_body_is_unparsable() {
+            const SENTINEL: &str = "SECRET-UPSTREAM-TEXT";
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/plain")
+                        .set_body_string(format!("<html>gateway said {SENTINEL}</html>")),
+                )
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = cancel_run(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path("r1".to_owned()),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a failed run-scope lookup MUST be a 503",
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let body_text = std::str::from_utf8(&body).expect("utf-8");
+            assert!(
+                !body_text.contains(SENTINEL),
+                "the orchestrator's own text MUST NOT be forwarded anywhere in the body, got {body_text}"
+            );
+            let parsed: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert_eq!(
+                parsed,
+                json!({ "error": "orchestrator error" }),
+                "the scope-lookup 503 body MUST be exactly the fixed classified object, got {parsed}",
             );
         }
     }
@@ -7140,6 +7945,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = std::collections::HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }
@@ -7239,8 +8048,49 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
+        }
+
+        /// R1-B9: a service identity can create a pipeline, and it has no
+        /// author — a service has no `app_user` row to read as, and "the
+        /// service account reads everything" is what `run_as` exists to stop
+        /// (D2). The pipeline does not run until an admin assigns one.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_with_a_service_identity_stores_no_author(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let (status, ApiJson(created)) = create(
+                State(state),
+                Extension(fixture_service_principal()),
+                HeaderMap::new(),
+                Bytes::from(
+                    serde_json::to_vec(&json!({
+                        "name": format!("service-created-{}", uuid::Uuid::new_v4()),
+                        "kind": "batch",
+                        "sourceZone": "silver",
+                        "sourceTable": "orders",
+                        "transforms": [],
+                        "targetZone": "silver",
+                        "targetTable": "service_created_out",
+                        "schedule": "manual",
+                    }))
+                    .expect("serialize"),
+                ),
+            )
+            .await
+            .expect("a service identity may create a pipeline");
+
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(created.run_as, None);
+            let stored = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(stored.run_as, None);
         }
 
         fn status_body(status: &str) -> Bytes {
@@ -7248,6 +8098,17 @@ mod tests {
         }
 
         async fn create_draft(state: &AppState) -> pipelines::Pipeline {
+            // R1-B8: a restricted caller who MAY read the table it names — the
+            // save-time gate (D9) allows a Bronze table its own tenant claimed.
+            let pool = state.pg.as_deref().expect("DATABASE_URL was set");
+            lakehouse_store::uploads::claim_table(
+                pool,
+                SEED_TENANT.parse().unwrap(),
+                "t",
+                "upload-status-route",
+            )
+            .await
+            .expect("claim the fixture table");
             let body = Bytes::from(
                 serde_json::to_vec(&json!({
                     "name": format!("status-route-test-{}", uuid::Uuid::new_v4()),
@@ -7262,7 +8123,7 @@ mod tests {
             );
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
-                Extension(fixture_user_principal()),
+                Extension(fixture_member_principal()),
                 HeaderMap::new(),
                 body,
             )
@@ -7395,6 +8256,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }
@@ -7422,6 +8287,10 @@ mod tests {
         /// `0042_tenant_provisioning.sql` (whose own comment records that
         /// it backfills nothing for this table at all).
         async fn seed_pipeline_with_null_tenant(state: &AppState, name: &str) -> String {
+            // R1-B8: this fixture creates a pipeline with NO tenant, which a
+            // restricted caller cannot do — D9's gate reads a tenantless
+            // pipeline as reaching nothing (handoff mismatch 3). The seam under
+            // test (tenant assignment) is the route's, not the caller's.
             let body = Bytes::from(
                 serde_json::to_vec(&json!({
                     "name": name,
@@ -7436,7 +8305,7 @@ mod tests {
             );
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
-                Extension(fixture_user_principal()),
+                Extension(fixture_admin_no_tenant_principal()),
                 HeaderMap::new(),
                 body,
             )
@@ -7660,15 +8529,15 @@ mod tests {
         use crate::config::Config;
         use crate::routes::pipelines::TriggerBody;
 
-        /// Wiremock-backed `Dagster` only — no Postgres pool, so audit
-        /// writes are silently skipped (the `record_pipeline_audit`
-        /// helper's `state.pg.as_deref()` check) and the trigger can be
-        /// tested in isolation.
+        /// Wiremock-backed `Dagster` only — no Postgres pool, so the audit
+        /// write fails (counted, never fatal: `record_pipeline_audit`) and
+        /// the trigger can be tested in isolation.
         fn state_with_dagster(server_uri: &str) -> AppState {
             let mut env = HashMap::new();
             env.insert("DAGSTER_URL".to_owned(), format!("{server_uri}/graphql"));
-            // No DATABASE_URL — the audit best-effort path skips when
-            // there's no pool, so we don't need a real one here.
+            // No DATABASE_URL — the best-effort audit write fails without
+            // a pool and the action still succeeds, so we don't need a
+            // real one here.
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }
@@ -8199,6 +9068,8 @@ mod tests {
             let seeded = create_pipeline(
                 &pool,
                 &CreatePipelineInput {
+                    inputs: Vec::new(),
+                    steps: Vec::new(),
                     name: id.clone(),
                     kind: "batch".to_owned(),
                     source_zone: "bronze".to_owned(),
@@ -8216,6 +9087,10 @@ mod tests {
                     depends_on: Vec::new(),
                     connector_id: None,
                     id: Some(id.clone()),
+                    // BLD-2: this fixture is not about a target lag.
+                    target_lag: None,
+                    // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                    run_as: None,
                 },
                 None,
             )
@@ -8639,10 +9514,13 @@ mod tests {
         }
 
         /// F2.7 SENTINEL: `launchRun` returning `PipelineNotFoundError`
-        /// MUST surface as a 404 with the FIXED body. Dagster's
-        /// typename/message MUST NOT appear anywhere in the body.
+        /// MUST surface as a 503 `orchestrator_job_not_loaded` with a
+        /// FIXED body. Dagster's typename/message MUST NOT appear anywhere
+        /// in the body. (`PR #105 CI fix`: a code location that is still
+        /// loading answers exactly this, so the gates retry on the code;
+        /// #80 first pinned it as a 404, the merge of the two chose 503.)
         #[tokio::test]
-        async fn trigger_with_run_config_pipeline_not_found_returns_404_with_fixed_body() {
+        async fn trigger_with_run_config_pipeline_not_found_returns_503_job_not_loaded() {
             const SENTINEL: &str = "TRIGGER_PIPELINE_NOT_FOUND_SENTINEL_444";
             let server = MockServer::start().await;
             Mock::given(method("POST"))
@@ -8667,8 +9545,8 @@ mod tests {
             .await;
             assert_eq!(
                 response.status(),
-                StatusCode::NOT_FOUND,
-                "PipelineNotFoundError on launchRun MUST be a 404",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PipelineNotFoundError on launchRun MUST be a 503 (job not loaded)",
             );
             let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -8680,8 +9558,12 @@ mod tests {
             );
             let parsed: Value = serde_json::from_slice(&body_bytes).expect("valid JSON");
             assert_eq!(
-                parsed["error"], "orchestrator refused the launch",
-                "trigger not-found body MUST be the fixed classified string",
+                parsed["code"], "orchestrator_job_not_loaded",
+                "trigger not-found body MUST carry the stable retry code",
+            );
+            assert!(
+                !body_str.contains("PipelineNotFoundError"),
+                "the typename MUST NOT appear in the body, got {body_str}"
             );
         }
 
@@ -8706,9 +9588,12 @@ mod tests {
         /// the caller sent a non-object (or no body at all).
         #[test]
         fn top_level_keys_for_non_objects_is_empty() {
-            assert!(top_level_keys(&Value::Null).is_empty());
-            assert!(top_level_keys(&json!([])).is_empty());
-            assert!(top_level_keys(&json!("string")).is_empty());
+            assert_eq!(top_level_keys(&Value::Null), [] as [std::string::String; 0]);
+            assert_eq!(top_level_keys(&json!([])), [] as [std::string::String; 0]);
+            assert_eq!(
+                top_level_keys(&json!("string")),
+                [] as [std::string::String; 0]
+            );
         }
     }
 
@@ -8753,6 +9638,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool, dagster_uri: &str) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             env.insert("DAGSTER_URL".to_owned(), format!("{dagster_uri}/graphql"));
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
@@ -8809,6 +9698,7 @@ mod tests {
                     resource_id: Some("silver_rebuild".to_owned()),
                     principal_id: None,
                     since: None,
+                    ..AuditFilter::default()
                 },
             )
             .await
@@ -8869,6 +9759,15 @@ mod tests {
             env.insert("DATABASE_URL".to_owned(), database_url);
             env.insert("DAGSTER_URL".to_owned(), format!("{dagster_url}/graphql"));
             env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            // BLD-1 part 1 / D4: the fixture pipelines below read Bronze, which
+            // the compiler names through this database.
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
+            // SEC-10: these tests deliver to a `wiremock` webhook on loopback,
+            // which the production webhook policy refuses and no setting can
+            // open; this test-only switch (absent from production builds) lets
+            // the delivery reach it. The refusal itself is tested in
+            // `webhook_guard`.
+            env.insert("WEBHOOK_TEST_ALLOW_ALL".to_owned(), "true".to_owned());
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }
@@ -8902,15 +9801,25 @@ mod tests {
                 }))
                 .expect("serialize"),
             );
+            // R1-B8: a restricted caller who MAY read the table it names — the
+            // save-time gate (D9) allows a Bronze table its own tenant claimed.
+            let pool = state.pg.as_deref().expect("DATABASE_URL was set");
+            lakehouse_store::uploads::claim_table(
+                pool,
+                SEED_TENANT.parse().unwrap(),
+                "t",
+                "upload-run-finished-route",
+            )
+            .await
+            .expect("claim the fixture table");
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
-                Extension(fixture_user_principal()),
+                Extension(fixture_member_principal()),
                 HeaderMap::new(),
                 body,
             )
             .await
             .expect("create should succeed");
-            let pool = state.pg.as_deref().expect("DATABASE_URL was set");
             sqlx::query("UPDATE pipeline_definition SET status = 'ready' WHERE id = $1")
                 .bind(&pipeline.id)
                 .execute(pool)
@@ -9034,11 +9943,15 @@ mod tests {
                 "the retry for the same (run, kind) is deduped away"
             );
 
-            let rows: Vec<(String, String, String)> =
-                sqlx::query_as("SELECT run_id, pipeline_id, kind FROM pipeline_run_event")
-                    .fetch_all(&pool)
-                    .await
-                    .expect("read the dedupe table");
+            // DATA-14 (F4): the load's quality follow-up is deduped in this table
+            // too, in the background; this test is about the alert kinds.
+            let rows: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT run_id, pipeline_id, kind FROM pipeline_run_event \
+                 WHERE kind <> 'quality_load'",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("read the dedupe table");
             assert_eq!(
                 rows,
                 vec![(
@@ -9104,6 +10017,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             // DAGSTER_URL is irrelevant for the routes under walk (none of
             // them dial Dagster when the scope check fails first); the
             // default localhost address is fine.
@@ -9114,12 +10031,14 @@ mod tests {
         fn tenant_principal(tenant_id: uuid::Uuid) -> Principal {
             Principal {
                 tenant_ids: vec![tenant_id],
-                ..fixture_user_principal()
+                ..fixture_member_principal()
             }
         }
 
         fn seed_input(name: &str) -> CreatePipelineInput {
             CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: name.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -9137,6 +10056,10 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
+                // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 
@@ -10178,6 +11101,10 @@ mod tests {
         fn state_for(pool: &sqlx::PgPool) -> AppState {
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            // BLD-1 part 1 / D4: a bronze input is compiled through the catalog
+            // database, so a state that builds bronze pipelines names it the way
+            // compose does (`ICEBERG_QUERY_DB`).
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
         }
 
@@ -10187,6 +11114,8 @@ mod tests {
             tenant_id: Option<uuid::Uuid>,
         ) -> CreatePipelineInput {
             CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: name.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -10204,6 +11133,10 @@ mod tests {
                 depends_on,
                 connector_id: None,
                 id: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
+                // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 
@@ -10225,7 +11158,7 @@ mod tests {
         fn tenant_principal(tenant_id: uuid::Uuid) -> Principal {
             Principal {
                 tenant_ids: vec![tenant_id],
-                ..fixture_user_principal()
+                ..fixture_member_principal()
             }
         }
 

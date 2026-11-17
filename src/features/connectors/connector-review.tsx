@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { saasVendorById } from "@/lib/connectors/saas-vendors"
 
 type Item = { label: string; value: React.ReactNode }
 
@@ -49,11 +50,40 @@ export function connectionReviewItems(adapter: string | null, dial: Record<strin
         { label: "SSL mode", value: text(d.sslMode) || "Driver default" },
       ]
     case "cdc":
+      if (Array.isArray(d.hosts)) {
+        // MongoDB change capture (`SRC-4` slice 5): the replica set's seeds, not one host and port.
+        return [
+          { label: "Hosts", value: list(d.hosts) },
+          { label: "Replica set", value: text(d.replicaSet) },
+          { label: "Database", value: text(d.database) },
+          { label: "User", value: text(d.user) },
+        ]
+      }
+      if (d.driver === "oracle") {
+        // `SRC-4` slice 6 (S6-c): Oracle's two modes, said in words; the server's certificate is never checked.
+        return [
+          { label: "Server", value: hostPort(d) },
+          { label: "Container database", value: text(d.database) },
+          ...(text(d.pdbName) ? [{ label: "PDB", value: text(d.pdbName) }] : []),
+          { label: "User", value: text(d.user) },
+          {
+            label: "Encryption",
+            value:
+              text(d.sslMode) === "disable"
+                ? "Not encrypted"
+                : "Encrypted (Oracle native network encryption); the server is not authenticated",
+          },
+        ]
+      }
       return [
         { label: "Server", value: hostPort(d) },
         { label: "Database", value: text(d.database) },
         { label: "User", value: text(d.user) },
-        { label: "Slot / publication", value: [text(d.slotName), text(d.publicationName)].filter(Boolean).join(" / ") },
+        { label: "TLS mode", value: text(d.sslMode) || "require" },
+        ...(text(d.slotName) || text(d.publicationName)
+          ? [{ label: "Slot / publication", value: [text(d.slotName), text(d.publicationName)].filter(Boolean).join(" / ") }]
+          : []),
+        ...(text(d.serverId) ? [{ label: "Server id", value: text(d.serverId) }] : []),
       ]
     case "files":
       return [
@@ -80,6 +110,12 @@ export function connectionReviewItems(adapter: string | null, dial: Record<strin
         { label: "Pagination", value: text((d.pagination as { type?: unknown } | undefined)?.type) || "none" },
       ]
     }
+    case "saas":
+      return [
+        { label: "Business app", value: saasVendorById(d.vendor)?.label ?? text(d.vendor) },
+        { label: "Account", value: text(d.account) },
+        { label: "Sign-in", value: authType(d) === "integration" ? "Integration credential" : "Browser sign-in" },
+      ]
     case "sheets":
       return [
         { label: "Spreadsheet", value: text(d.spreadsheetId) },

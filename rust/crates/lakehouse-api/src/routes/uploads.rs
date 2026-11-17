@@ -19,12 +19,37 @@
 //! 3. `POST /api/uploads/{id}/ingest` hands the file to `file_ingest_job` with
 //!    what the user confirmed. The job writes Bronze through the shared sink.
 //!    This module never writes Iceberg.
+//!    A large file, or several, takes the chunked route instead (`DATA-17`,
+//!    [`sessions`]): `POST /api/uploads/sessions`, `PUT .../parts/{n}`,
+//!    `GET .../parts`, `POST .../complete`. It ends in the same state, an
+//!    `uploaded` file, after the same checks and the same sentences, so every
+//!    step below works on either.
 //! 4. `GET /api/uploads` and `GET /api/uploads/{id}` report the outcome. The
 //!    job writes nothing to Postgres (ADR 0014, decision 5): the API reads its
 //!    result back from `lake.bronze_meta.ingest_run` and settles the row when
 //!    it is read ([`Settler`]).
 //! 5. `DELETE /api/uploads/{id}` removes the object and the row. The table the
 //!    upload became stays, and so does the claim on its name.
+//!
+//! # Folders (`DATA-35`)
+//!
+//! The Uploaded files tab groups files in folders ([`folders`]): the folder routes,
+//! `POST /api/uploads/move`, and `folderId` on `GET /api/uploads` and on an ingest.
+//! A folder is a grouping only; a file's table does not change with it.
+//!
+//! # Chunked uploads (`DATA-17`, plan AD1)
+//!
+//! `POST /api/uploads` reads the whole file in one request, and the proxy in
+//! front of the API cuts a body past 51 MiB, so it stays at 50 MiB for API
+//! callers and scripts (feature page decision 14). The console uses the
+//! chunked route: the file arrives as 8 MiB pieces, each stored as one part of
+//! an S3 multipart upload, with the multipart id and every piece's `ETag` and
+//! SHA-256 in Postgres (`file_upload_part`, migration `0090`), so a restart
+//! loses nothing and any API process can take the next piece. The file is
+//! `receiving` until it completes; preview and ingest refuse it (409) and
+//! delete aborts it. The protocol, its memory bound and the limit it shares
+//! with `POST /api/uploads` are written at the top of [`sessions`]; the
+//! hourly sweep that removes unfinished sessions is `crate::upload_sweep`.
 //!
 //! # Posture
 //!
@@ -39,7 +64,7 @@
 //!   error reaches a response only as the store's own fixed `database error`.
 //!   The one piece of recorded text a response can carry is a reason
 //!   `file_ingest_job` wrote into `ingest_run`, and only when it is one of the
-//!   seven the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
+//!   twelve the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
 //!   anything else the job recorded is shown as [`LOAD_FAILED`].
 //! * **Fail closed on a table name.** A load may target a table that does not
 //!   exist or one this tenant's uploads claimed; never a connector's table,
@@ -47,33 +72,51 @@
 //!   (`lakehouse_store::uploads::claim_table`, review finding B4), not the
 //!   upload rows'. When the API cannot tell, it answers 503 and does not guess
 //!   that the name is free ([`ensure_table_free`]).
+//!   A name whose table was dropped from the console and can still be
+//!   restored is closed too (`DATA-55` D11, QA `LH-DATA-15-06`, `TC-1731`):
+//!   a new load would create a table of that name, and the dropped one could
+//!   no longer come back, so the answer is [`TABLE_DROPPED`] until the window
+//!   ends.
 //! * **One load per upload, and the row is claimed before the job is
 //!   launched** (review finding B2): see [`ingest`].
 //!
 //! # Excel workbooks
 //!
 //! An `.xls` or `.xlsx` is accepted (ADR 0014, amendment of 2026-10-07): the
-//! workbook is stored as it arrived, the preview converts the chosen sheet to
-//! delimited text in memory ([`crate::upload_workbook`]) and shows it through
-//! the same preview as a CSV, and an ingest stores that text as a CSV object
-//! beside the original ([`converted_key`]) and launches the unchanged
-//! `file_ingest_job` on it with a fixed dialect (UTF-8, comma). Whether an
-//! upload IS a workbook is decided by its stored name AND its first bytes
-//! ([`conversion_of_head`]): a text export named `.xls` (the file that motivated
-//! the feature) is still text. The chosen sheet cannot go in the job's run
-//! configuration (its schema is closed and the job does not change), so it is
-//! recorded in the upload's `parse_options` and in the audit event.
+//! workbook is stored as it arrived, the preview shows the chosen sheet as
+//! delimited text through the same preview as a CSV, and an ingest launches
+//! the unchanged `file_ingest_job` on that text with a fixed dialect (UTF-8,
+//! comma).
+//!
+//! `SEC-22` D1a: the workbook is NEVER read in this process. A file
+//! declares how much memory its reader will want, and an allocation failure
+//! ends the process that made it — so the read happens in a child process
+//! ([`crate::upload_convert`]), which is this binary started again as
+//! `inspect-upload` and runs under a memory limit of its own. The sheet is
+//! converted ONCE (`SEC-22` D5) and stored beside the original as
+//! `<key>.converted.<n>.csv` (n is the sheet's position in the workbook's
+//! list), with the list of the sheets as `<key>.sheets.json` and the answer
+//! of the conversion as `<key>.converted.<n>.json`; a preview reads the
+//! stored text, the first 256 KiB of it, and a load uses the same text.
+//! Whether an upload IS a workbook is decided by its stored name AND its
+//! first bytes ([`conversion_of_head`]): a text export named `.xls` (the
+//! file that motivated the feature) is still text. The chosen sheet cannot
+//! go in the job's run configuration (its schema is closed and the job does
+//! not change), so it is recorded in the upload's `parse_options` and in the
+//! audit event.
 //!
 //! # Parquet files
 //!
 //! A `.parquet` file takes the same path as a workbook (section 11 of
-//! `docs/superpowers/plans/2026-10-07-upload-excel.md`): stored as it arrived,
-//! converted in memory for the preview ([`crate::upload_parquet`]) and, at
-//! ingest, stored as a CSV object beside the original ([`converted_key`]) that
-//! the unchanged job loads with the fixed dialect. A file has one table and its
-//! own column names, so there is no sheet and the header row is fixed at 0
-//! (`headerRow` in a request is not read). Whether an upload IS a Parquet file
-//! is decided by its stored name AND its first bytes, as for a workbook
+//! `docs/superpowers/plans/2026-10-07-upload-excel.md`): stored as it
+//! arrived, read by the same child process (`SEC-22` D1a), and, at ingest,
+//! read by the unchanged job, which streams it by row group. The child is
+//! given the file by RANGES (`SEC-22` P1) — the tail of the file, which holds
+//! the footer, and its first row group — and never the file itself, which
+//! may be two gibibytes long. A file has one table and its own column names,
+//! so there is no sheet and the header row is fixed at 0 (`headerRow` in a
+//! request is not read). Whether an upload IS a Parquet file is decided by
+//! its stored name AND its first bytes, as for a workbook
 //! ([`conversion_of_head`]). Where the code branches on "is this converted
 //! before it is loaded", it branches on [`Conversion`], not on a workbook.
 //!
@@ -101,9 +144,13 @@ use lakehouse_clickhouse::ChError;
 use lakehouse_core::ApiError;
 use lakehouse_dagster::map_run_status;
 use lakehouse_store::PgPool;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::connectors;
-use lakehouse_store::uploads::{self, LoadMode, NewUpload, TableClaim, Upload};
+use lakehouse_store::upload_folders;
+use lakehouse_store::uploads::{
+    self, ClaimFolder, FolderFilter, LimitOutcome, ListFilter, LoadClaim, LoadLimits, LoadMode,
+    MarkOutcome, NewUpload, TableClaim, Upload,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -115,13 +162,27 @@ use super::catalog::registered_slug;
 use super::catalog_source::{PresenceUnknown, iceberg_table_presence};
 use super::governance::{IngestRunRow, ingest_runs_or_empty};
 use super::lakehouse::is_unknown_table_or_database_error;
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::QUERY_STRING_UNREADABLE;
 use crate::state::AppState;
-use crate::upload_parquet::{self, ParquetInfo};
+use crate::upload_convert::{self, Answer, ConversionError, FileKind, Operation, Source};
+use crate::upload_formats::{self, ByName, Compression, Format, Layout, Refusal};
+use crate::upload_limits::{RETRY_AFTER_SECS, too_many_large_loads, too_many_uploads};
+use crate::upload_parquet::{self, ParquetFooter, ParquetInfo};
+use crate::upload_parquet_parts::Part;
+use crate::upload_parquet_range::RangeReader;
 use crate::upload_parse::{self, Encoding, Kind, Overrides, Preview};
-use crate::upload_store::{PREFIX, UploadStore};
-use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
+use crate::upload_store::{PREFIX, UploadStore, UploadStoreError};
+use crate::upload_workbook::{self, WorkbookInfo};
+
+pub(super) mod columns;
+pub(super) mod folders;
+pub(super) mod group;
+pub(super) mod sessions;
+
+use columns::{ColumnPlan, Sample, SpecView};
 
 /// Largest file this endpoint accepts, in bytes.
 ///
@@ -130,6 +191,18 @@ use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
 /// 500 MB of API process (ADR 0014, decision 2). The message says "50 MB"
 /// and means 50 MiB, as the plan words it.
 pub(super) const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
+
+/// The most bytes a gzip or zip file, or the files of one load together, may
+/// unpack to or add up to: 2 GiB, exactly 2,147,483,648. Its own constant and
+/// not [`MAX_UPLOAD_BYTES`], which means the `POST /api/uploads` file size
+/// only: the API's gzip and zip check, the grouped-load total
+/// (`group::members`) and the `max_bytes` that [`run_config`] sends to the
+/// job all read this one, so the three cannot disagree. Before it, the job was
+/// told 50 MiB and refused any gzip above that once unpacked, a size the
+/// session path already took (found in the measurement of
+/// `docs/plans/DATA-17-RESULT.md`). A bomb is decoded by range and counted,
+/// never held, so the size costs time and not memory. Plan T6.2, item 2.
+pub(crate) const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// What `DefaultBodyLimit` allows the `POST /api/uploads` request as a whole:
 /// the cap plus 1 MiB for the multipart framing around the file. Applied to
@@ -144,12 +217,6 @@ const PREVIEW_BYTES: usize = 256 * 1024;
 
 /// Rows the preview returns.
 const PREVIEW_ROWS: usize = 20;
-
-/// How many records of a converted sheet the preview reads. A workbook is read
-/// whole to be converted, but the preview runs on text, and a header-row
-/// change re-runs it: a prefix keeps that cheap. A header row chosen past this
-/// shows no columns, as for a text file whose head is shorter than the row.
-const WORKBOOK_PREVIEW_RECORDS: usize = 2000;
 
 /// How many rows of a Parquet file the preview decodes (the converted text has
 /// one record more, the column names). Only these are decoded: the footer
@@ -176,16 +243,18 @@ const STALE_CLAIM: time::Duration = time::Duration::minutes(2);
 /// and a loading upload can be neither deleted nor loaded again.
 ///
 /// One hour is a bound chosen to be well past any load of a file at the
-/// [`MAX_UPLOAD_BYTES`] cap, not a measurement: no load of a file that size has
-/// been timed. It only has to be long enough that a run which is merely slow,
-/// or about to start, is not failed under its own feet.
+/// [`MAX_UNPACKED_BYTES`] cap, not a measurement of the bound itself: the loads
+/// of `docs/plans/DATA-17-RESULT.md` took under two minutes at 2 GiB on one
+/// runner, so an hour leaves a wide margin. It only has to be long enough that a
+/// run which is merely slow, or about to start, is not failed under its own feet.
 const UNKNOWN_RUN_BOUND: time::Duration = time::Duration::hours(1);
 
 /// How long a read waits for the orchestrator or for `ClickHouse` while it
 /// settles a loading upload. A bound so that a page that polls is not held
 /// for the whole request deadline by a hung connection; not a measurement.
-/// The upload is returned unchanged when it elapses.
-const SETTLE_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// The upload is returned unchanged when it elapses. The connector's run list
+/// uses it too, for the same reason.
+pub(super) const SETTLE_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The Dagster job that loads an uploaded file
 /// (`dagster/dispar_orchestrate/file_ingest.py`).
@@ -207,10 +276,16 @@ const NOT_MULTIPART: &str = "The request must be a multipart form with one part 
 const NO_FILE_PART: &str = "The form has no part named file.";
 const UNREADABLE: &str = "The upload could not be read.";
 const EMPTY_FILE: &str = "The file is empty.";
-const TOO_LARGE: &str = "The file is larger than the 50 MB limit.";
-const WORKBOOK: &str = "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.";
+pub(crate) const TOO_LARGE: &str = "The file is larger than the 50 MB limit.";
+const WORKBOOK: &str = "This looks like a workbook or a zip archive that is not named like one. Excel workbooks must end in .xls or .xlsx and zip archives in .zip; or save the sheet as .xlsx or CSV first.";
 const PARQUET: &str = "This looks like a Parquet file, but its name does not end in .parquet. Rename it to end in .parquet and upload it again.";
-const OTHER_BINARY: &str = "This is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.";
+const OTHER_BINARY: &str = "This is not a file this upload reads. Upload CSV, TSV, JSON, JSON Lines, Avro, Parquet or Excel (.xls, .xlsx) files, a .gz of a text or JSON file, or a .zip of such files.";
+const GZIP: &str = "This looks like a gzip file, but its name does not end in .gz. Rename it to end in .gz (for example data.csv.gz) and upload it again.";
+const AVRO: &str = "This looks like an Avro file, but its name does not end in .avro. Rename it to end in .avro and upload it again.";
+const NOT_AVRO: &str = "This file is named .avro but is not an Avro file.";
+const NOT_AN_ARCHIVE: &str =
+    "This file is named like a .gz or .zip archive but is not one. Rename it to match what it is.";
+const ZIP_COLUMNS_DIFFER: &str = "The files of the zip archive do not all have the same columns. Remove the ones that differ before loading.";
 const EMPTY_SHEET: &str = "That sheet is empty, so there is nothing to load.";
 const EMPTY_PARQUET: &str = "That Parquet file has no rows, so there is nothing to load.";
 const SHEET_RULE: &str = "sheet must be text.";
@@ -221,19 +296,33 @@ const BODY_NOT_AN_OBJECT: &str = "The request body must be a JSON object.";
 /// console must say the same one; it does not exist yet.
 const TABLE_NAME_RULE: &str = "Table names start with a lower-case letter and use lower-case letters and digits joined by single underscores, with at most 128 characters.";
 const MODE_RULE: &str = "mode must be replace or append.";
+const ALSO_UPLOADS_RULE: &str =
+    "alsoUploads must be a list of at most 9 upload ids, each used once, none of them this upload.";
+/// The sentence a `folderId` that is neither text nor null gets. One sentence for
+/// the ingest and for the move (`PR #259 review SHOULD-FIX 5`, rule 4): the
+/// folders' own routes read this one.
+pub(super) const FOLDER_ID_RULE: &str = "folderId must be text or null.";
+const OTHER_BUSY: &str = "One of the other files is already being loaded.";
 const ENCODING_RULE: &str = "encoding must be utf-8 or utf-16.";
 const DELIMITER_RULE: &str = "delimiter must be a comma, a semicolon, a tab or a pipe.";
 const HEADER_ROW_RULE: &str = "headerRow must be a whole number, 0 or more.";
-const QUERY_UNREADABLE: &str = "The query string could not be read.";
 const ALREADY_LOADING: &str = "This upload is already being loaded.";
 const TABLE_BUSY: &str = "Another upload is loading into that table.";
 const CONNECTOR_TABLE: &str = "A connector loads that table, so a file cannot be loaded into it.";
 /// The one sentence for a table name that is not this tenant's to load into:
-/// another tenant holds the claim on it, or it exists and nobody claimed it.
-/// Deliberately the same for both, so that the answer does not tell a caller
-/// which of the two it is (review finding B4): a tenant must not be able to
-/// learn what other tenants have claimed, or which names are theirs.
-const TABLE_NOT_FREE: &str = "That table name is in use and no upload of this tenant created it, so a file cannot be loaded into it.";
+/// another tenant holds the claim on it, another tenant's connector loads it,
+/// a lost claim, or it exists and nobody claimed it. Deliberately the same
+/// for all of them, so that the answer does not tell a caller which it is
+/// (review finding B4, `SEC-16`): a tenant must not be able to learn what
+/// other tenants have claimed or connected, or which names are theirs. It
+/// names no reason and no connector. The constant keeps its name; the text is
+/// `SEC-16`'s, replacing a sentence that said "no upload of this tenant
+/// created it".
+const TABLE_NOT_FREE: &str = "That table name cannot be used. Choose another name.";
+/// A load into a table that was dropped from the console and can still be
+/// restored (`DATA-55` D11). A new table of that name would make the dropped
+/// one impossible to undrop, so the name stays closed until the window ends.
+const TABLE_DROPPED: &str = "That table was dropped and can still be restored. Restore it from its page in the Catalog, or choose another name.";
 const TABLE_UNCHECKED: &str =
     "Could not check whether that table already exists, so nothing was loaded.";
 const NO_QUERY_DATABASE: &str = "Uploads need ICEBERG_QUERY_DB to be set, so the API can check that a table name is free. Nothing was loaded.";
@@ -242,6 +331,9 @@ const LAUNCH_UNREACHABLE: &str =
 const LAUNCH_REFUSED: &str = "The orchestrator refused to start the load.";
 const NOT_RECORDED: &str = "The load was started but could not be recorded.";
 const DELETE_WHILE_LOADING: &str = "This upload is being loaded, so it cannot be deleted yet.";
+/// A chunked upload (`DATA-17`) whose pieces are still arriving can be
+/// neither previewed nor loaded: its object does not exist yet.
+const STILL_RECEIVING: &str = "This upload is still being received, so it cannot be used yet.";
 
 // What the row records when a load ends without the job's own reason.
 
@@ -259,10 +351,10 @@ const LOAD_FAILED: &str = "The load failed.";
 const RUN_UNKNOWN: &str = "The orchestrator no longer knows this load.";
 
 // The reasons `file_ingest_job` records when a load fails (plan T7). The API
-// shows a recorded reason only when it is one of these seven (review finding
+// shows a recorded reason only when it is one of these twelve (review finding
 // B6): `ingest_run.error` is free text, so one `str(exc)` in the job would
 // otherwise put exception text, a host or a path into a response. These are
-// the same seven as `ops/fixtures/upload_load_failure_reasons.json`, which a
+// the same twelve as `ops/fixtures/upload_load_failure_reasons.json`, which a
 // test below reads and which the job's own tests assert its constants against.
 
 const JOB_FILE_UNREADABLE: &str = "The stored file could not be read.";
@@ -274,10 +366,27 @@ const JOB_NO_ROWS: &str = "The file has no rows below the header row.";
 const JOB_TOO_MANY_ROWS: &str = "The file has more than 2,000,000 rows.";
 const JOB_LOAD_FAILED: &str = "The load into the table failed.";
 const JOB_NOT_REGISTERED: &str = "The table was loaded but could not be registered in the catalog.";
+// `SEC-17`: the one sentence for the column cap, as the preview's and the
+// ingest's 400 and as the job's failure reason (`TOO_MANY_COLUMNS` in
+// `file_ingest.py`). One constant, so the three cannot word it differently.
+const JOB_TOO_MANY_COLUMNS: &str = "The file has more than 1,000 columns.";
+// `DATA-18`: a load told to stop at a value that does not fit its column's type.
+const JOB_BAD_VALUES: &str = "Some values do not fit their column's type.";
+// `DATA-17` slice 4 (decision 2): the decoded bytes of a gzip or zip file passed the cap.
+// No longer raised (`DATA-51` named the number): kept so a load an older job recorded
+// keeps its message, as `JOB_TOO_MANY_ROWS` did.
+const JOB_TOO_LARGE_UNPACKED_UNNAMED: &str =
+    "The file is larger than the upload limit once unpacked.";
+// PR #186 review SHOULD-FIX 1: the column list sent with the load is not the file's (a JSON key that
+// first appears after the rows the preview sampled), so the person is told to look at the preview again.
+const JOB_COLUMNS_NOT_PREVIEWED: &str = "The file's columns are not the ones the preview showed.";
+// `DATA-51` (`LH-DATA-17-13`): the same sentence as the API's own refusal once unpacked,
+// whose number comes from [`MAX_UNPACKED_BYTES`] (`Refusal::TooLargeUnpacked`).
+const JOB_TOO_LARGE_UNPACKED: &str = "The file is larger than the 2 GB limit once unpacked.";
 
 /// Every reason the job may record, in the order of
 /// `ops/fixtures/upload_load_failure_reasons.json`.
-const JOB_FAILURE_REASONS: [&str; 7] = [
+const JOB_FAILURE_REASONS: [&str; 12] = [
     JOB_FILE_UNREADABLE,
     JOB_HEADER_PAST_END,
     JOB_HEADER_NO_COLUMNS,
@@ -285,6 +394,11 @@ const JOB_FAILURE_REASONS: [&str; 7] = [
     JOB_TOO_MANY_ROWS,
     JOB_LOAD_FAILED,
     JOB_NOT_REGISTERED,
+    JOB_TOO_MANY_COLUMNS,
+    JOB_BAD_VALUES,
+    JOB_TOO_LARGE_UNPACKED_UNNAMED,
+    JOB_COLUMNS_NOT_PREVIEWED,
+    JOB_TOO_LARGE_UNPACKED,
 ];
 
 fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
@@ -496,6 +610,268 @@ fn converted_key(storage_key: &str) -> String {
     format!("{storage_key}.converted.csv")
 }
 
+/// The key the sheets of a workbook are stored under, beside the original
+/// (`SEC-22` D5). The list is small and is read from storage, so a preview
+/// needs no child to know which sheets the workbook has.
+fn sheets_key(storage_key: &str) -> String {
+    format!("{storage_key}.sheets.json")
+}
+
+/// The key a converted sheet's text is stored under: the sheet's position in
+/// the workbook's list (`SEC-22` D5).
+fn converted_text_key(storage_key: &str, position: usize) -> String {
+    format!("{storage_key}.converted.{position}.csv")
+}
+
+/// The key the answer of a converted sheet is stored under: what the sheet
+/// is and whether it was empty (`SEC-22` D5).
+fn converted_answer_key(storage_key: &str, position: usize) -> String {
+    format!("{storage_key}.converted.{position}.json")
+}
+
+/// The suffix of the object the job writes its report of values that did not fit
+/// to (`file_ingest.REPORT_SUFFIX`, plan AD6).
+const REPORT_SUFFIX: &str = ".bad-values.json";
+
+/// The key the job's report of values that did not fit is stored under, beside
+/// the ORIGINAL of the upload: the API reads it there (`DATA-31`), and the job
+/// writes it there too, whatever object it read.
+fn report_key(storage_key: &str) -> String {
+    format!("{storage_key}{REPORT_SUFFIX}")
+}
+
+/// The answer a conversion failure gets.
+///
+/// Each failure is one answer (`SEC-22` D4): the installation is busy (429),
+/// the child could not be started (500), the child was killed or ran out of
+/// time (400, one sentence for all of them), the file was refused (400, the
+/// refusal's own sentence), or the store failed (503).
+fn conversion_error(kind: FileKind, err: ConversionError) -> ApiError {
+    match err {
+        ConversionError::Busy => ApiError::TooManyRequests {
+            message: upload_convert::TOO_MANY_CONVERSIONS.to_owned(),
+            retry_after_secs: RETRY_AFTER_SECS,
+        },
+        // A child that could not be started, and a child that could not set
+        // its own limits, are both the installation's fault and not the
+        // file's (`PR #187` review SHOULD-FIX 4).
+        ConversionError::NotStarted | ConversionError::LimitFailed => {
+            ApiError::Internal(CONVERSION_FAILED.to_owned())
+        }
+        ConversionError::ResourceLimit => {
+            ApiError::BadRequest(upload_convert::NEEDS_MORE_MEMORY.to_owned())
+        }
+        ConversionError::Refused(refusal) => ApiError::BadRequest(kind.sentence(&refusal)),
+        ConversionError::Store(err) => ApiError::from(err),
+    }
+}
+
+/// The workbook's sheets, from the stored list, or from a fresh run of the
+/// child.
+///
+/// An upload made before `SEC-22` has no stored list: it runs the child once
+/// and stores the list, and every later read finds it.
+///
+/// # Errors
+///
+/// 400 with the child's own sentence for a file that cannot be read; 429
+/// when every conversion slot is taken; 500 when the child could not be
+/// started; 503 when the object store is unavailable.
+async fn sheets_of(
+    state: &AppState,
+    store: &UploadStore,
+    row: &Upload,
+) -> Result<WorkbookInfo, ApiError> {
+    let key = sheets_key(&row.storage_key);
+    match store.get_all(&key).await {
+        Ok(bytes) => {
+            if let Some(info) = stored_sheets(&bytes) {
+                return Ok(info);
+            }
+            tracing::warn!(
+                key = %key,
+                "the stored list of sheets could not be read; the file is read again"
+            );
+        }
+        // The object is not there: an upload made before `SEC-22`.
+        Err(crate::upload_store::UploadStoreError::Unavailable("not found")) => {}
+        Err(err) => return Err(err.into()),
+    }
+    let source = Source::Stored {
+        store: store.clone(),
+        key: row.storage_key.clone(),
+    };
+    let answer = state
+        .conversion_runner
+        .answer(Operation::ListSheets, source)
+        .await
+        .map_err(|err| conversion_error(FileKind::Workbook, err))?;
+    let info = sheets_of_answer(&answer)?;
+    let line = serde_json::to_vec(&answer)
+        .map_err(|_err| ApiError::Internal(CONVERSION_FAILED.to_owned()))?;
+    store.put(&key, Bytes::from(line)).await?;
+    Ok(info)
+}
+
+/// The sheets an answer holds, or `None` when the answer is not one.
+fn stored_sheets(bytes: &[u8]) -> Option<WorkbookInfo> {
+    let answer: Answer = serde_json::from_slice(bytes).ok()?;
+    sheets_of_answer(&answer).ok()
+}
+
+/// The sheets an answer holds.
+///
+/// # Errors
+///
+/// 500 when the answer is not one of the answers this module knows.
+fn sheets_of_answer(answer: &Answer) -> Result<WorkbookInfo, ApiError> {
+    match answer {
+        Answer::Sheets { info } | Answer::Sheet { info, .. } => Ok(info.clone()),
+        Answer::Parquet { .. } | Answer::Refusal { .. } => {
+            Err(ApiError::Internal(CONVERSION_FAILED.to_owned()))
+        }
+    }
+}
+
+/// What a Parquet answer holds: the footer's account of the file, and where
+/// its first row group is.
+///
+/// The answer itself is read by [`upload_convert::parquet_footer_of_answer`],
+/// the one reader an S3 connector's preview also calls (`SEC-55` D3).
+///
+/// # Errors
+///
+/// 500 when the answer is not one of the answers this module knows.
+fn parquet_of_answer(answer: &Answer) -> Result<ParquetFooter, ApiError> {
+    upload_convert::parquet_footer_of_answer(answer)
+        .ok_or_else(|| ApiError::Internal(CONVERSION_FAILED.to_owned()))
+}
+
+/// The sheet the request names, and its position in the workbook's list.
+///
+/// No name means the workbook's default sheet, the same rule
+/// [`crate::upload_workbook::read_sheet`] uses; a name the workbook does not
+/// have is refused with the workbook's own sentence.
+///
+/// # Errors
+///
+/// 400 with [`UNKNOWN_SHEET`] for a name the workbook does not have.
+fn sheet_position(info: &WorkbookInfo, sheet: Option<&str>) -> Result<(String, usize), ApiError> {
+    let wanted = match sheet {
+        None => info.default_sheet.clone(),
+        Some(name) => name.to_owned(),
+    };
+    match info.sheets.iter().position(|listed| listed.name == wanted) {
+        Some(position) => Ok((wanted, position)),
+        None => Err(ApiError::BadRequest(
+            crate::upload_workbook::WorkbookError::UnknownSheet.to_string(),
+        )),
+    }
+}
+
+/// The file the child reads: the stored original, read in pieces.
+fn stored_source(store: &UploadStore, row: &Upload) -> Source {
+    Source::Stored {
+        store: store.clone(),
+        key: row.storage_key.clone(),
+    }
+}
+
+/// A Parquet file the API reads, and where its bytes are.
+///
+/// A Parquet file is read by RANGES and never whole (`SEC-22` P1): the child
+/// is given the file's tail, which holds the footer, and its first row
+/// group. A file of the chunked upload's cap is two gibibytes long, and the
+/// API moves neither more nor less than those two ranges.
+enum ParquetFile<'a> {
+    /// The bytes of an upload that has just arrived.
+    Bytes(&'a Bytes),
+    /// A stored object, with the size the store reports.
+    Stored {
+        /// The store the object is in.
+        store: &'a UploadStore,
+        /// The key the object is under.
+        key: &'a str,
+        /// The size of the object, in bytes.
+        size: u64,
+    },
+}
+
+impl<'a> ParquetFile<'a> {
+    /// The stored object at `key`, with its size.
+    ///
+    /// # Errors
+    ///
+    /// 503 when the object is missing or the store fails.
+    async fn stored(store: &'a UploadStore, key: &'a str) -> Result<Self, ApiError> {
+        let size = store.object_size(key).await?;
+        let Some(size) = size else {
+            return Err(UploadStoreError::Unavailable("not found").into());
+        };
+        Ok(Self::Stored { store, key, size })
+    }
+
+    /// The size of the file, in bytes.
+    fn size(&self) -> u64 {
+        match self {
+            Self::Bytes(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            Self::Stored { size, .. } => *size,
+        }
+    }
+
+    /// The source that feeds the child the given parts of this file.
+    fn source(&self, parts: Vec<Part>) -> Source {
+        match self {
+            Self::Bytes(bytes) => Source::Parts {
+                bytes: (*bytes).clone(),
+                parts,
+            },
+            Self::Stored { store, key, .. } => Source::StoredParts {
+                store: (*store).clone(),
+                key: (*key).to_owned(),
+                parts,
+            },
+        }
+    }
+}
+
+/// What a Parquet file's footer says, read by the child (`SEC-22` P1).
+///
+/// The child is given the file's TAIL — the footer and the eight bytes that
+/// follow it — and answers the footer's account of the file and the byte
+/// range of its first row group. The API never decodes a footer itself: a
+/// footer declares how much memory its reader will want, and that allocation
+/// ends the process that makes it.
+///
+/// # Errors
+///
+/// 400 with the child's own sentence for a file that cannot be read; 429 when
+/// every conversion slot is taken; 500 when the child could not be started;
+/// 503 when the object store is unavailable.
+async fn parquet_footer(
+    state: &AppState,
+    file: &ParquetFile<'_>,
+) -> Result<ParquetFooter, ApiError> {
+    let tail = Part::tail(file.size(), state.conversion_runner.parquet_tail_bytes());
+    let source = file.source(vec![tail]);
+    let answer = state
+        .conversion_runner
+        .answer(Operation::InspectParquet { size: file.size() }, source)
+        .await
+        .map_err(|err| conversion_error(FileKind::Parquet, err))?;
+    parquet_of_answer(&answer)
+}
+
+/// The text of a Parquet file's columns and no rows: what a preview shows
+/// when the file's first row group is over the bound and its bytes are not
+/// worth moving (`SEC-22` P1).
+fn parquet_header(info: &ParquetInfo) -> Bytes {
+    let mut out = Vec::new();
+    let names: Vec<&str> = info.columns.iter().map(|c| c.name.as_str()).collect();
+    let _written = upload_workbook::write_record(&mut out, &names);
+    Bytes::from(upload_workbook::finish_text(out))
+}
+
 /// The conversion an upload needs, judged from its stored name AND its first
 /// bytes: a text export called `.xls` (ADR 0014's motivating file) is text, and
 /// so is a text file called `.parquet`. A file whose footer is encrypted starts
@@ -530,9 +906,13 @@ async fn conversion_of(state: &AppState, row: &Upload) -> Result<Option<Conversi
     Ok(conversion_of_head(&row.storage_key, &head))
 }
 
-/// Run a conversion on a blocking thread (parsing is CPU work on up to 50 MB)
-/// and turn its refusal into a 400 with the refusal's own sentence. A task that
-/// did not finish is logged and answered with a fixed sentence.
+/// Run an ARCHIVE check on a blocking thread (unpacking is CPU work on up to
+/// 50 MB) and turn its refusal into a 400 with the refusal's own sentence.
+/// A task that did not finish is logged and answered with a fixed sentence.
+///
+/// The workbook and Parquet reads do NOT come here: they are done by the
+/// child process (`SEC-22` D1a), which is the only place a file somebody
+/// chose is parsed.
 async fn blocking<T: Send + 'static, E: std::fmt::Display + Send + 'static>(
     work: impl FnOnce() -> Result<T, E> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -631,6 +1011,17 @@ enum Accepted {
     /// Starts like a Parquet file (or like an encrypted one) and is named
     /// `.parquet`; whether it really opens is for `upload_parquet` to say.
     Parquet,
+    /// A top-level JSON array, named `.json` (`DATA-17` slice 4).
+    Json,
+    /// JSON Lines, named `.jsonl` or `.ndjson`.
+    JsonLines,
+    /// An Avro container, named `.avro`.
+    Avro,
+    /// A gzip stream named `.gz` that holds text or JSON.
+    Gzip,
+    /// A zip archive named `.zip`; its files are listed when it is opened
+    /// ([`open_whole`](sessions)) and each time it is read.
+    Zip,
 }
 
 /// Whether the bytes of an upload are acceptable: not empty, within the cap,
@@ -645,19 +1036,180 @@ fn check_file(bytes: &[u8], filename: &str) -> Result<Accepted, ApiError> {
     if bytes.len() > MAX_UPLOAD_BYTES {
         return Err(ApiError::BadRequest(TOO_LARGE.to_owned()));
     }
-    if has_parquet_name(filename) && upload_parquet::has_encrypted_magic(bytes) {
+    classify_head(bytes, filename)
+}
+
+/// What a file is, from its first bytes and its name: the kind rules of
+/// [`check_file`] without its size rules. A chunked upload (`sessions`) has
+/// had its size checked when the session opened and is classified from its
+/// first 64 KiB, so both paths refuse with the same sentences.
+fn classify_head(head: &[u8], filename: &str) -> Result<Accepted, ApiError> {
+    if has_parquet_name(filename) && upload_parquet::has_encrypted_magic(head) {
         // Not a magic `sniff` knows; the reader names the real reason.
         return Ok(Accepted::Parquet);
     }
-    let message = match upload_parse::sniff(bytes) {
-        Kind::DelimitedText => return Ok(Accepted::Text),
+    let named = upload_formats::by_name(filename);
+    let message = match upload_parse::sniff(head) {
+        Kind::DelimitedText => return classify_text(head, named),
         Kind::Workbook if has_workbook_name(filename) => return Ok(Accepted::Workbook),
+        Kind::Workbook if named == ByName::Zip => return Ok(Accepted::Zip),
         Kind::Workbook => WORKBOOK,
         Kind::Parquet if has_parquet_name(filename) => return Ok(Accepted::Parquet),
         Kind::Parquet => PARQUET,
-        Kind::OtherBinary => OTHER_BINARY,
+        Kind::Gzip if matches!(named, ByName::Gzip(_)) => return classify_gzip(head),
+        Kind::Gzip => GZIP,
+        Kind::Avro if named == ByName::Plain(Format::Avro) => return Ok(Accepted::Avro),
+        Kind::Avro => AVRO,
+        Kind::OtherBinary => return Err(ApiError::BadRequest(unreadable_as_named(filename))),
     };
     Err(ApiError::BadRequest(message.to_owned()))
+}
+
+/// The sentence for bytes that are neither text nor a kind this API knows, said by what the
+/// file's NAME claims it is (QA `LH-DATA-17-05`, `DATA-51`): a damaged file of a format this
+/// upload reads "could not be opened" as that format, which is a different answer from "this
+/// is not a format this upload reads". Every name has an answer, the last being [`OTHER_BINARY`]
+/// for a name that claims nothing, so the function returns no `Result` and needs no `# Errors`.
+fn unreadable_as_named(filename: &str) -> String {
+    if has_parquet_name(filename) {
+        return upload_parquet::ParquetFileError::Unreadable.to_string();
+    }
+    if has_workbook_name(filename) {
+        return upload_workbook::WorkbookError::Unreadable.to_string();
+    }
+    match upload_formats::by_name(filename) {
+        ByName::Plain(Format::Avro) => NOT_AVRO,
+        ByName::Plain(Format::Json | Format::JsonLines) => return Refusal::JsonInvalid.to_string(),
+        ByName::Gzip(_) | ByName::Zip => NOT_AN_ARCHIVE,
+        ByName::Plain(_) | ByName::Other => OTHER_BINARY,
+    }
+    .to_owned()
+}
+
+/// Text by its first bytes: delimited text, unless its name says JSON, JSON Lines or an
+/// archive, in which case the first byte of the document must agree (`[` for an array, `{`
+/// for lines): the name is never enough, as for a workbook.
+fn classify_text(head: &[u8], named: ByName) -> Result<Accepted, ApiError> {
+    let first = head
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(head)
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace());
+    let refuse = |message: &str| Err(ApiError::BadRequest(message.to_owned()));
+    match named {
+        ByName::Other => Ok(Accepted::Text),
+        ByName::Plain(Format::Json) if first == Some(&b'[') => Ok(Accepted::Json),
+        ByName::Plain(Format::Json) => refuse(&Refusal::JsonNotArray.to_string()),
+        ByName::Plain(Format::JsonLines) if first == Some(&b'{') => Ok(Accepted::JsonLines),
+        ByName::Plain(Format::JsonLines) => refuse(&Refusal::JsonNotObjects.to_string()),
+        ByName::Plain(_) => refuse(NOT_AVRO),
+        ByName::Gzip(_) | ByName::Zip => refuse(NOT_AN_ARCHIVE),
+    }
+}
+
+/// A gzip stream: its first decoded bytes must be text (not another archive, not binary).
+fn classify_gzip(head: &[u8]) -> Result<Accepted, ApiError> {
+    let (inner, _more) = upload_formats::gunzip_prefix(head, 64 * 1024)
+        .map_err(|refusal| ApiError::BadRequest(refusal.to_string()))?;
+    match upload_parse::sniff(&inner) {
+        Kind::DelimitedText => Ok(Accepted::Gzip),
+        _ => Err(ApiError::BadRequest(Refusal::GzipHoldsOther.to_string())),
+    }
+}
+
+/// Store the uploaded file and, for a workbook, the list of its sheets.
+///
+/// Bytes first: a row that exists means its object exists. The list of the
+/// sheets goes beside the original (`SEC-22` D5): a preview reads it from
+/// storage and needs no child to know which sheets the workbook has.
+///
+/// # Errors
+///
+/// 503 when the object store refuses the write. The original is taken back
+/// out when the list of the sheets cannot be stored: a workbook without its
+/// list would be read again by every preview.
+async fn store_upload(
+    store: &UploadStore,
+    key: &str,
+    bytes: Bytes,
+    sheets_answer: Option<&Answer>,
+) -> Result<(), ApiError> {
+    store.put(key, bytes).await?;
+    let Some(answer) = sheets_answer else {
+        return Ok(());
+    };
+    let list_key = sheets_key(key);
+    let line = serde_json::to_vec(answer)
+        .map_err(|_err| ApiError::Internal(CONVERSION_FAILED.to_owned()))?;
+    if let Err(err) = store.put(&list_key, Bytes::from(line)).await {
+        tracing::warn!(%err, key = %list_key, "the list of sheets could not be stored; the original is taken back out");
+        if let Err(cleanup) = store.delete(key).await {
+            tracing::warn!(%cleanup, key = %key, "an upload object could not be removed after its list of sheets failed");
+        }
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+/// What the child said about an uploaded file.
+struct ChildReading {
+    /// The sheets of a workbook.
+    workbook: Option<WorkbookInfo>,
+    /// The columns and the row count of a Parquet file.
+    parquet: Option<ParquetInfo>,
+    /// The answer the list of sheets is stored as (`SEC-22` D5).
+    sheets: Option<Answer>,
+}
+
+/// Read an uploaded workbook or Parquet file with the child.
+///
+/// `SEC-22` D1a: the read happens in a child process, never in this one — a
+/// file that asks for more memory than the machine has must not end the API
+/// for every tenant.
+///
+/// # Errors
+///
+/// 400 with the child's own sentence for a file that cannot be read; 429 when
+/// every conversion slot is taken; 500 when the child could not be started.
+async fn read_with_child(
+    state: &AppState,
+    accepted: Accepted,
+    bytes: &Bytes,
+) -> Result<ChildReading, ApiError> {
+    match accepted {
+        Accepted::Workbook => {
+            let source = Source::Bytes(bytes.clone());
+            let answer = state
+                .conversion_runner
+                .answer(Operation::ListSheets, source)
+                .await
+                .map_err(|err| conversion_error(FileKind::Workbook, err))?;
+            let workbook = sheets_of_answer(&answer)?;
+            Ok(ChildReading {
+                workbook: Some(workbook),
+                parquet: None,
+                sheets: Some(answer),
+            })
+        }
+        Accepted::Parquet => {
+            // `SEC-22` P1: the child is given the file's TAIL, which holds
+            // the footer, and never the whole file.
+            let file = ParquetFile::Bytes(bytes);
+            let footer = parquet_footer(state, &file).await?;
+            Ok(ChildReading {
+                workbook: None,
+                parquet: Some(footer.info),
+                sheets: None,
+            })
+        }
+        // Every other kind of file is not read by the child: a text file is
+        // read as text, and a gzip or a zip is checked here.
+        _ => Ok(ChildReading {
+            workbook: None,
+            parquet: None,
+            sheets: None,
+        }),
+    }
 }
 
 /// `POST /api/uploads` — one multipart part named `file`. 201 with the
@@ -671,12 +1223,15 @@ fn check_file(bytes: &[u8], filename: &str) -> Result<Accepted, ApiError> {
 ///
 /// # Errors
 ///
-/// 400 for a caller in no tenant, a request that is not a multipart form, no
+/// 429 (`Retry-After: 5`) when the caller already has the configured number of
+/// files being received, or the installation has (`SEC-17`); 400 for a caller
+/// in no tenant, a request that is not a multipart form, no
 /// `file` part, an empty file, a file over [`MAX_UPLOAD_BYTES`], a workbook
 /// that is not an `.xls` or `.xlsx` or does not open (damaged, password
 /// protected, no sheet), a Parquet file that is not named `.parquet` or does
 /// not open (damaged, encrypted, a binary or nested column, over the cell cap)
-/// or another binary (each with its own fixed sentence); 404 if `X-Tenant` names a tenant the caller does not belong to;
+/// or another binary (each with its own fixed sentence), and a header with
+/// more than 1,000 columns (`SEC-17`); 404 if `X-Tenant` names a tenant the caller does not belong to;
 /// 503 when Postgres or the object store is unavailable.
 pub async fn create(
     State(state): State<AppState>,
@@ -690,6 +1245,14 @@ pub async fn create(
     let Some(tenant_id) = crate::tenant_scope::resolve(&principal, &headers)? else {
         return Err(ApiError::BadRequest(NO_TENANT.to_owned()).into());
     };
+    // `SEC-17`: a place is taken before the body is read, because each file
+    // being received is held in memory (up to 50 MB), and is given back when
+    // `_place` drops at the end of the handler, on every path. Keyed by the
+    // display name, the same text `uploaded_by` records, so the per-user
+    // number means the same for receiving and for loading.
+    let Some(_place) = state.upload_receive.try_acquire(&principal.display_name) else {
+        return Err(too_many_uploads().into());
+    };
     let pool = pool(&state)?;
     let store = UploadStore::connect(&state.config).await?;
     let form = form.map_err(|err| {
@@ -698,24 +1261,30 @@ pub async fn create(
     })?;
     let part = read_file_part(form).await?;
     let accepted = check_file(&part.bytes, &part.filename)?;
-    // A workbook or a Parquet file is opened before anything is stored: only
-    // what opens is kept. (A Parquet file is opened by its footer; a page that
-    // cannot be decoded is found when the file is converted.)
-    let (workbook, parquet) = match accepted {
-        Accepted::Text => (None, None),
-        Accepted::Workbook => {
-            let bytes = part.bytes.clone();
-            (
-                Some(blocking(move || upload_workbook::list_sheets(&bytes)).await?),
-                None,
-            )
+    // A workbook or a Parquet file is read before anything is stored: only
+    // what opens is kept. (`SEC-22` D1a: the read happens in a child
+    // process, never in this one — a file that asks for more memory than the
+    // machine has must not end the API for every tenant.)
+    let cap = MAX_UNPACKED_BYTES;
+    let (workbook, parquet, sheets_answer) = match accepted {
+        Accepted::Text | Accepted::Json | Accepted::JsonLines | Accepted::Avro => {
+            (None, None, None)
         }
-        Accepted::Parquet => {
+        // `DATA-17` slice 4 (decision 2): what a gzip or zip file unpacks to counts toward
+        // the cap, and a bomb is refused here, before anything is stored.
+        Accepted::Gzip => {
             let bytes = part.bytes.clone();
-            (
-                None,
-                Some(blocking(move || upload_parquet::inspect(&bytes)).await?),
-            )
+            blocking(move || upload_formats::check_gzip(std::io::Cursor::new(bytes), cap)).await?;
+            (None, None, None)
+        }
+        Accepted::Zip => {
+            let bytes = part.bytes.clone();
+            blocking(move || upload_formats::check_zip(std::io::Cursor::new(bytes), cap)).await?;
+            (None, None, None)
+        }
+        other => {
+            let reading = read_with_child(&state, other, &part.bytes).await?;
+            (reading.workbook, reading.parquet, reading.sheets)
         }
     };
 
@@ -727,7 +1296,7 @@ pub async fn create(
     // Bytes first, row second: a row that exists means its object exists. The
     // reverse order leaves rows pointing at nothing whenever the store write
     // fails.
-    store.put(&key, part.bytes).await?;
+    store_upload(&store, &key, part.bytes, sheets_answer.as_ref()).await?;
     let row = match uploads::insert(
         pool,
         &NewUpload {
@@ -769,7 +1338,7 @@ pub async fn create(
         json!({ "fileName": row.original_filename, "sizeBytes": row.size_bytes }),
         "executed",
     );
-    record_audit(pool, event).await;
+    audit_coverage::record_best_effort(&state, event).await;
     Ok((
         StatusCode::CREATED,
         ApiJson(CreateResponse {
@@ -903,6 +1472,46 @@ impl<'a> Settler<'a> {
         if row.status != "ingesting" {
             return row;
         }
+        if let Some(primary_id) = row.loaded_with.clone() {
+            return self.settle_with_primary(row, &primary_id).await;
+        }
+        self.settle_own(row).await
+    }
+
+    /// A file of a load of several files has no run of its own (`DATA-17` slice 5): it ends
+    /// when the primary ends, in the transaction that settles the primary
+    /// ([`uploads::mark_finished`]). So settling it is settling the primary and reading it
+    /// again. A file whose primary is gone or no longer loading was left by a claim that
+    /// never finished; it is failed after the same two minutes a claim with no run is
+    /// ([`STALE_CLAIM`]), and not before, because the primary's claim is written in the same
+    /// transaction as its own and a younger orphan is not an orphan yet.
+    async fn settle_with_primary(&mut self, row: Upload, primary_id: &str) -> Upload {
+        let primary = match uploads::get(self.pool, primary_id).await {
+            Ok(primary) => primary,
+            Err(err) => {
+                tracing::warn!(%err, upload_id = %row.id, "the primary of a loading file could not be read");
+                return row;
+            }
+        };
+        if let Some(primary) =
+            primary.filter(|p| p.status == "ingesting" && p.loaded_with.is_none())
+        {
+            self.settle_own(primary).await;
+            return uploads::get(self.pool, &row.id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(row);
+        }
+        if claim_is_stale(row.updated_at, OffsetDateTime::now_utc()) {
+            return self
+                .record(row, None, &Outcome::Failed(NOT_STARTED.to_owned()))
+                .await;
+        }
+        row
+    }
+
+    async fn settle_own(&mut self, row: Upload) -> Upload {
         let Some(run_id) = row.run_id.clone() else {
             return if claim_is_stale(row.updated_at, OffsetDateTime::now_utc()) {
                 self.record(row, None, &Outcome::Failed(NOT_STARTED.to_owned()))
@@ -1009,7 +1618,11 @@ impl<'a> Settler<'a> {
             }
         };
         match settled {
-            Ok(Some(updated)) => updated,
+            Ok(Some(updated)) => match run_id {
+                // `DATA-18`: a typed load may have left a report of values that did not fit.
+                Some(run_id) => columns::keep_report(self.state, self.pool, updated, run_id).await,
+                None => updated,
+            },
             Ok(None) => uploads::get(self.pool, &row.id)
                 .await
                 .ok()
@@ -1033,31 +1646,71 @@ pub(super) async fn settle_loading_upload(state: &AppState, pool: &PgPool, row: 
 
 /// `GET /api/uploads` — the active tenant's uploads, newest first, at most
 /// [`LIST_LIMIT`]. A caller in no tenant gets an empty list, never another
-/// tenant's. A loading upload is settled first.
+/// tenant's. A loading upload is settled first. `folderId=<id>|none`,
+/// `q=<text>` and `table=<name>` narrow the list before the window is cut
+/// (`DATA-35`, `DATA-47`, [`ListQuery`]).
 ///
 /// # Errors
 ///
-/// 404 if `X-Tenant` names a tenant the caller does not belong to; 503 if no
-/// pool is configured; 500 on a database failure.
+/// 400 for a query string that cannot be read; 404 if `X-Tenant` names a tenant the
+/// caller does not belong to; 503 if no pool is configured; 500 on a database
+/// failure.
 pub async fn list(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     headers: HeaderMap,
+    query: Result<Query<ListQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<ApiJson<Vec<UploadView>>> {
     let Some(Extension(principal)) = principal else {
         return Err(ApiError::unauthorized().into());
     };
+    let Query(query) = query.map_err(|err| {
+        tracing::warn!(%err, "an upload list query string could not be read");
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
+    })?;
     let Some(tenant_id) = crate::tenant_scope::resolve(&principal, &headers)? else {
         return Ok(ApiJson(Vec::new()));
     };
     let pool = pool(&state)?;
-    let rows = uploads::list(pool, tenant_id, LIST_LIMIT).await?;
+    // `DATA-35` AD-5: the filters narrow the rows BEFORE the newest-100 window is cut,
+    // so a folder's files and a search are not hidden by newer files elsewhere. With
+    // neither, this is the list it always was.
+    let text = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    // `DATA-47` (QA `LH-DATA-35-03`): the Table step asks which uploads loaded into
+    // one table, by its exact raw name. An empty value is no filter, like `q`.
+    let table = query
+        .table
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let filter = ListFilter {
+        folder: match query.folder_id.as_deref() {
+            None | Some("") => FolderFilter::Any,
+            Some("none") => FolderFilter::NoFolder,
+            Some(id) => FolderFilter::In(id),
+        },
+        text,
+        table,
+    };
+    let rows = uploads::list_filtered(pool, tenant_id, LIST_LIMIT, &filter).await?;
     let mut settler = Settler::new(&state, pool);
     let mut views = Vec::with_capacity(rows.len());
     for row in rows {
         views.push(settler.settle(row).await.into());
     }
     Ok(ApiJson(views))
+}
+
+/// Query parameters of [`list`] (`DATA-35`, plan AD-5; `DATA-47`).
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    /// A folder id, or `none` for the files in no folder; absent: every file.
+    #[serde(rename = "folderId")]
+    folder_id: Option<String>,
+    /// Text a file name or a table name must contain, case-insensitively.
+    q: Option<String>,
+    /// Exactly this raw table name; absent or empty: every table.
+    table: Option<String>,
 }
 
 /// `GET /api/uploads/{id}` — one upload, settled first if it is loading.
@@ -1090,11 +1743,17 @@ pub struct PreviewQuery {
     /// For a workbook: the sheet to read (its default when absent). Ignored
     /// for a text file.
     sheet: Option<String>,
+    /// A table the file will be added to: when it is a table of the caller's
+    /// tenant, the columns' names and types are the table's (`DATA-18`
+    /// decision 9). Anything else is ignored, so the answer says nothing about
+    /// tables of other tenants.
+    table: Option<String>,
 }
 
 /// `GET /api/uploads/{id}/preview`'s response: the [`Preview`] and, for a
 /// workbook, which sheet it shows and which sheets there are.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreviewResponse {
     #[serde(flatten)]
     preview: Preview,
@@ -1104,6 +1763,50 @@ pub struct PreviewResponse {
     /// the row count its footer states (`preview.rows` are the first ones).
     #[serde(skip_serializing_if = "Option::is_none")]
     parquet: Option<ParquetInfo>,
+    /// For JSON, JSON Lines, Avro, gzip and zip (`DATA-17` slice 4): what the file is
+    /// read as. Absent for text, workbooks and Parquet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layout: Option<LayoutView>,
+    /// For a zip: its files and whether each has the first file's columns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive: Option<ArchiveView>,
+    /// Every column with its name, its starting type and its date reading
+    /// (`DATA-18`).
+    column_specs: Vec<SpecView>,
+    /// How many data rows the guess read (at most 10,000, or 16 MiB).
+    sampled_rows: usize,
+    /// The names and types are a table's, not a guess.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    from_table: bool,
+}
+
+/// What a file is read as (`DATA-17` slice 4).
+#[derive(Debug, Serialize)]
+pub struct LayoutView {
+    /// `delimited`, `json`, `jsonl` or `avro`.
+    format: &'static str,
+    /// `none`, `gzip` or `zip`.
+    compression: &'static str,
+}
+
+/// The files of a zip archive.
+#[derive(Debug, Serialize)]
+pub struct ArchiveView {
+    files: Vec<ArchiveFileView>,
+}
+
+/// One file of a zip archive.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveFileView {
+    /// Its name inside the archive.
+    name: String,
+    /// Its uncompressed size as the archive declares it.
+    size_bytes: u64,
+    /// How many columns its header (or keys, or fields) has.
+    columns: usize,
+    /// Whether it has the first file's columns, whatever their order.
+    matches_first: bool,
 }
 
 /// What a workbook preview adds to a [`Preview`].
@@ -1146,14 +1849,14 @@ fn overrides_of(query: &PreviewQuery) -> Result<Overrides, ApiError> {
 /// the cost does not grow with the file. Every detected value can be
 /// overridden; whatever the user settles on is what [`ingest`] is handed.
 ///
-/// A workbook is read whole, converted on a blocking thread, and its first
-/// [`WORKBOOK_PREVIEW_RECORDS`] records go through the same preview as a CSV,
-/// under the fixed dialect the load will use. `encoding` and `delimiter` are
-/// validated and then ignored for a workbook (they have no meaning there; the
-/// answer says `utf-8` and `,`), `headerRow` applies, and `sheet` picks the
-/// sheet. The answer adds `workbook`: the sheet read and the sheets there are.
+/// A workbook's sheet is converted ONCE and stored (`SEC-22` D5); the
+/// preview reads the stored text, the first [`PREVIEW_BYTES`] of it, exactly
+/// as it reads a text upload. `encoding` and `delimiter` are validated and
+/// then ignored for a workbook (they have no meaning there; the answer says
+/// `utf-8` and `,`), `headerRow` applies, and `sheet` picks the sheet. The
+/// answer adds `workbook`: the sheet read and the sheets there are.
 ///
-/// A Parquet file is converted the same way (only the first
+/// A Parquet file is read the same way (only the first
 /// [`PARQUET_PREVIEW_ROWS`] rows are decoded). `encoding`, `delimiter`,
 /// `headerRow` and `sheet` are validated and then ignored: the header is the
 /// file's own column names, always the first record. The answer adds
@@ -1164,90 +1867,579 @@ fn overrides_of(query: &PreviewQuery) -> Result<Overrides, ApiError> {
 /// 400 for an `encoding`, `delimiter` or `headerRow` that is not valid, and
 /// for a workbook or Parquet file that cannot be read, a `sheet` a workbook
 /// does not have or a sheet or file over the cell limit (each with its own
-/// fixed sentence); 404
-/// for an unknown upload or another tenant's; 503 when Postgres or the object
-/// store is unavailable.
+/// fixed sentence), and for a text file with a header of more than 1,000
+/// columns (`SEC-17`); 404
+/// for an unknown upload or another tenant's; 409 for an upload still being
+/// received (`DATA-17`); 503 when Postgres or the object store is unavailable.
 pub async fn preview(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     query: Result<Query<PreviewQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<ApiJson<PreviewResponse>> {
     let Query(query) = query.map_err(|err| {
         tracing::warn!(%err, "a preview query string could not be read");
-        ApiError::BadRequest(QUERY_UNREADABLE.to_owned())
+        ApiError::BadRequest(QUERY_STRING_UNREADABLE.to_owned())
     })?;
-    let overrides = overrides_of(&query)?;
     let row = uploads::get(pool(&state)?, &id)
         .await?
         .ok_or_else(not_found)?;
+    let (mut response, sample) = preview_with_sample(&state, &row, &query).await?;
+    // `DATA-18` decision 9: when the file will be added to a table of the
+    // caller's tenant, that table's names and types are the columns'.
+    let held = match (&query.table, principal) {
+        (Some(table), Some(Extension(principal))) => {
+            match crate::tenant_scope::resolve(&principal, &headers)? {
+                Some(tenant_id) => columns::own_table_columns(&state, tenant_id, table)
+                    .await
+                    .filter(|held| held.len() == sample.header.len()),
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    response.column_specs = columns::spec_views(&sample, held.as_ref());
+    response.sampled_rows = sample.rows.len();
+    response.from_table = held.is_some();
+    Ok(ApiJson(response))
+}
+
+/// The preview of an upload and the sample its columns are guessed from: the
+/// header and up to 10,000 data rows (`DATA-18`, decision 1). Shared by the
+/// preview and the check; the columns of the response are filled in by the
+/// caller.
+///
+/// # Errors
+///
+/// As [`preview`].
+async fn preview_with_sample(
+    state: &AppState,
+    row: &Upload,
+    query: &PreviewQuery,
+) -> Result<(PreviewResponse, Sample), ApiError> {
+    let overrides = overrides_of(query)?;
+    if row.status == "receiving" {
+        return Err(ApiError::Conflict(STILL_RECEIVING.to_owned()));
+    }
     let store = UploadStore::connect(&state.config).await?;
     let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
     match conversion_of_head(&row.storage_key, &head) {
         Some(Conversion::Workbook) => {
-            let response =
-                workbook_preview(&store, &row, query.sheet, overrides.header_row).await?;
-            return Ok(ApiJson(response));
+            return workbook_preview(
+                state,
+                &store,
+                row,
+                query.sheet.clone(),
+                overrides.header_row,
+            )
+            .await;
         }
         Some(Conversion::Parquet) => {
-            return Ok(ApiJson(parquet_preview(&store, &row).await?));
+            return parquet_preview(state, &store, row).await;
         }
         None => {}
+    }
+    // `DATA-17` slice 4: JSON, JSON Lines, Avro, gzip and zip.
+    if let Some(layout) = layout_of(&store, row).await? {
+        let sampled = layout_sample(&store, row, layout, overrides).await?;
+        return Ok((
+            PreviewResponse {
+                preview: sampled.preview,
+                workbook: None,
+                parquet: None,
+                layout: Some(LayoutView {
+                    format: layout.format.as_str(),
+                    compression: layout.compression.as_str(),
+                }),
+                archive: sampled.archive,
+                column_specs: Vec::new(),
+                sampled_rows: 0,
+                from_table: false,
+            },
+            sampled.sample,
+        ));
     }
     // A preview reads one chunk, so "20 rows" never implies the file has only
     // 20: `truncated` says the file goes on.
     let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
-    Ok(ApiJson(PreviewResponse {
-        preview: upload_parse::preview(&head, head_is_truncated, overrides, PREVIEW_ROWS),
-        workbook: None,
-        parquet: None,
-    }))
+    // `SEC-17`: a header with more than `MAX_COLUMNS` cells is refused here,
+    // not shown. The 400 is per reading, so the Check step can still change
+    // the delimiter or header row (a wrong guess must not lock a good file
+    // out). Workbook and Parquet paths run their own refusal (`upload_workbook`
+    // and `upload_parquet`), so the column cap is checked only for text.
+    if upload_parse::header_width(&head, head_is_truncated, overrides) > upload_parse::MAX_COLUMNS {
+        return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()));
+    }
+    let preview = upload_parse::preview(&head, head_is_truncated, overrides, PREVIEW_ROWS);
+    // The guess reads more than the preview shows (decision 1): up to 16 MiB,
+    // and of that the first 10,000 data rows.
+    let sample_bytes = columns::SAMPLE_BYTES;
+    let wide = if head_is_truncated {
+        store.head_bytes(&row.storage_key, sample_bytes).await?
+    } else {
+        head
+    };
+    let wide_truncated = row.size_bytes > i64::try_from(sample_bytes).unwrap_or(i64::MAX);
+    let rows =
+        upload_parse::sample_records(&wide, wide_truncated, preview.using, columns::SAMPLE_ROWS);
+    let sample = Sample {
+        header: preview.columns.clone(),
+        rows,
+        declared: None,
+    };
+    Ok((
+        PreviewResponse {
+            preview,
+            workbook: None,
+            parquet: None,
+            layout: None,
+            archive: None,
+            column_specs: Vec::new(),
+            sampled_rows: 0,
+            from_table: false,
+        },
+        sample,
+    ))
+}
+
+/// What an upload is read as when it is JSON, JSON Lines, Avro, gzip or zip, or `None` for
+/// everything else (text, a workbook, Parquet). The name says it, and the first bytes agreed
+/// when the file arrived ([`classify_head`]); a gzip file with no inner name is classed by its
+/// first decoded byte, and a zip by the extensions of its files.
+///
+/// # Errors
+///
+/// 400 with the reader's own sentence for a gzip or zip file that no longer opens; 503 when
+/// the object store is unavailable.
+async fn layout_of(store: &UploadStore, row: &Upload) -> Result<Option<Layout>, ApiError> {
+    Ok(match upload_formats::by_name(&row.original_filename) {
+        ByName::Other => None,
+        ByName::Plain(format) => Some(Layout {
+            compression: Compression::None,
+            format,
+        }),
+        ByName::Gzip(Some(format)) => Some(Layout {
+            compression: Compression::Gzip,
+            format,
+        }),
+        ByName::Gzip(None) => {
+            let reader = RangeReader::open(store, &row.storage_key).await?;
+            let (prefix, _more) =
+                blocking(move || upload_formats::gunzip_prefix(reader.sequential(), 4096)).await?;
+            Some(Layout {
+                compression: Compression::Gzip,
+                format: upload_formats::format_of_text(&prefix),
+            })
+        }
+        ByName::Zip => {
+            let reader = RangeReader::open(store, &row.storage_key).await?;
+            let listing = blocking(move || upload_formats::zip_listing(reader.seekable())).await?;
+            Some(Layout {
+                compression: Compression::Zip,
+                format: listing.format,
+            })
+        }
+    })
+}
+
+/// [`layout_of`] for an upload that is not a workbook or a Parquet file.
+///
+/// # Errors
+///
+/// As [`layout_of`].
+async fn layout_unless_converted(
+    state: &AppState,
+    row: &Upload,
+    conversion: Option<Conversion>,
+) -> Result<Option<Layout>, ApiError> {
+    if conversion.is_some() {
+        return Ok(None);
+    }
+    layout_of(&UploadStore::connect(&state.config).await?, row).await
+}
+
+/// What the job is told the object is: its format and its wrapper (`DATA-17` slice 4 adds
+/// the wrapper).
+fn job_kind(
+    conversion: Option<Conversion>,
+    layout: Option<Layout>,
+) -> (&'static str, &'static str) {
+    (
+        if conversion == Some(Conversion::Parquet) {
+            "parquet"
+        } else {
+            layout.map_or("delimited", |l| l.format.as_str())
+        },
+        layout.map_or("none", |l| l.compression.as_str()),
+    )
+}
+
+/// How many decoded bytes of each file after a zip's first are read to learn its columns.
+const ARCHIVE_HEADER_BYTES: usize = 256 * 1024;
+
+/// A preview and its sample, read from the decoded bytes of a layout.
+struct Sampled {
+    preview: Preview,
+    sample: Sample,
+    archive: Option<ArchiveView>,
+}
+
+/// The preview and sample of decoded bytes of one `format`: delimited text as for a CSV, JSON
+/// and Avro from their own readers (the dialect is fixed: UTF-8, comma, the keys or fields
+/// are the header).
+///
+/// # Errors
+///
+/// 400 with the refusal's sentence.
+fn sample_of(
+    format: Format,
+    bytes: &[u8],
+    truncated: bool,
+    overrides: Overrides,
+) -> Result<(Preview, Sample), ApiError> {
+    let refused = |refusal: Refusal| ApiError::BadRequest(refusal.to_string());
+    let parsed = match format {
+        Format::Delimited => {
+            let head_len = bytes.len().min(PREVIEW_BYTES);
+            let head = &bytes[..head_len];
+            let head_truncated = truncated || head_len < bytes.len();
+            if upload_parse::header_width(head, head_truncated, overrides)
+                > upload_parse::MAX_COLUMNS
+            {
+                return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()));
+            }
+            let preview = upload_parse::preview(head, head_truncated, overrides, PREVIEW_ROWS);
+            let rows =
+                upload_parse::sample_records(bytes, truncated, preview.using, columns::SAMPLE_ROWS);
+            let sample = Sample {
+                header: preview.columns.clone(),
+                rows,
+                declared: None,
+            };
+            return Ok((preview, sample));
+        }
+        Format::Json => upload_formats::read_json(bytes, truncated, false, columns::SAMPLE_ROWS),
+        Format::JsonLines => {
+            upload_formats::read_json(bytes, truncated, true, columns::SAMPLE_ROWS)
+        }
+        Format::Avro => upload_formats::read_avro(bytes, truncated, columns::SAMPLE_ROWS),
+    }
+    .map_err(refused)?;
+    let reading = upload_parse::Reading {
+        encoding: Encoding::Utf8,
+        delimiter: ',',
+        header_row: 0,
+    };
+    let preview = Preview {
+        detected: reading,
+        using: reading,
+        columns: parsed.columns.clone(),
+        rows: parsed.rows.iter().take(PREVIEW_ROWS).cloned().collect(),
+        truncated: parsed.more,
+    };
+    let sample = Sample {
+        header: parsed.columns,
+        rows: parsed.rows,
+        declared: parsed.declared,
+    };
+    Ok((preview, sample))
+}
+
+/// The columns of one file of an archive: its header, keys or fields.
+fn header_of(
+    format: Format,
+    bytes: &[u8],
+    truncated: bool,
+    overrides: Overrides,
+) -> Result<Vec<String>, ApiError> {
+    Ok(sample_of(format, bytes, truncated, overrides)?.1.header)
+}
+
+/// Read the first rows of a layout: the file itself, the decoded stream of a gzip file, or the
+/// first file of a zip with a check that every other file has the same columns.
+///
+/// # Errors
+///
+/// 400 with the refusal's sentence; 503 when the object store is unavailable.
+async fn layout_sample(
+    store: &UploadStore,
+    row: &Upload,
+    layout: Layout,
+    overrides: Overrides,
+) -> Result<Sampled, ApiError> {
+    let want = columns::SAMPLE_BYTES;
+    let plain = |bytes: &[u8], truncated: bool| -> Result<Sampled, ApiError> {
+        let (preview, sample) = sample_of(layout.format, bytes, truncated, overrides)?;
+        Ok(Sampled {
+            preview,
+            sample,
+            archive: None,
+        })
+    };
+    match layout.compression {
+        Compression::None => {
+            let bytes = store.head_bytes(&row.storage_key, want).await?;
+            let truncated = row.size_bytes > i64::try_from(want).unwrap_or(i64::MAX);
+            plain(&bytes, truncated)
+        }
+        Compression::Gzip => {
+            let reader = RangeReader::open(store, &row.storage_key).await?;
+            let (bytes, more) =
+                blocking(move || upload_formats::gunzip_prefix(reader.sequential(), want)).await?;
+            plain(&bytes, more)
+        }
+        Compression::Zip => {
+            let reader = RangeReader::open(store, &row.storage_key).await?;
+            let (listing, heads) = blocking(move || {
+                let listing = upload_formats::zip_listing(reader.seekable())?;
+                let mut heads = Vec::with_capacity(listing.files.len());
+                for position in 0..listing.files.len() {
+                    let limit = if position == 0 {
+                        want
+                    } else {
+                        ARCHIVE_HEADER_BYTES
+                    };
+                    heads.push(upload_formats::zip_file_prefix(
+                        reader.seekable(),
+                        position,
+                        limit,
+                    )?);
+                }
+                Ok::<_, Refusal>((listing, heads))
+            })
+            .await?;
+            let (first_bytes, first_more) = heads.first().cloned().unwrap_or_default();
+            let mut sampled = plain(&first_bytes, first_more)?;
+            let wanted = crate::upload_types::clean_names(&sampled.sample.header);
+            let mut files = Vec::with_capacity(heads.len());
+            for (info, (bytes, more)) in listing.files.iter().zip(&heads) {
+                let header = header_of(layout.format, bytes, *more, overrides)?;
+                let mut names = crate::upload_types::clean_names(&header);
+                names.sort();
+                let mut expected = wanted.clone();
+                expected.sort();
+                files.push(ArchiveFileView {
+                    name: info.name.clone(),
+                    size_bytes: info.size,
+                    columns: header.len(),
+                    matches_first: names == expected,
+                });
+            }
+            sampled.archive = Some(ArchiveView { files });
+            Ok(sampled)
+        }
+    }
 }
 
 /// The preview of a workbook: its sheet as text, read the way the load reads
 /// it (UTF-8, comma).
+///
+/// The sheet is converted ONCE and stored (`SEC-22` D5); the preview reads
+/// the stored text, exactly as it reads a text upload — the first
+/// [`PREVIEW_BYTES`] of it for the preview, and the first
+/// [`columns::SAMPLE_BYTES`] for the guess — so a second preview, a header
+/// row the user changed, say, runs no child at all.
 async fn workbook_preview(
+    state: &AppState,
     store: &UploadStore,
     row: &Upload,
     sheet: Option<String>,
     header_row: Option<usize>,
-) -> Result<PreviewResponse, ApiError> {
-    let bytes = store.get_all(&row.storage_key).await?;
-    let (info, name, csv, cut) = blocking(move || {
-        let read = upload_workbook::read_sheet(&bytes, sheet.as_deref())?;
-        let cut = read.data.rows() > WORKBOOK_PREVIEW_RECORDS;
-        let csv = read.data.to_csv(Some(WORKBOOK_PREVIEW_RECORDS));
-        Ok::<_, WorkbookError>((read.info, read.data.name().to_owned(), csv, cut))
-    })
-    .await?;
+) -> Result<(PreviewResponse, Sample), ApiError> {
+    let info = sheets_of(state, store, row).await?;
+    let (name, position) = sheet_position(&info, sheet.as_deref())?;
+    let text_key = converted_text_key(&row.storage_key, position);
+    let answer_key = converted_answer_key(&row.storage_key, position);
+    // The answer beside the text is the MARKER of a finished conversion: a
+    // text without it is a conversion that did not finish, and is converted
+    // again (`SEC-22` P2).
+    let committed = store.object_size(&answer_key).await?.is_some()
+        && store.object_size(&text_key).await?.is_some();
+    let mut size = store.object_size(&text_key).await?;
+    if !committed {
+        let source = stored_source(store, row);
+        state
+            .conversion_runner
+            .convert_and_store(
+                Operation::ConvertSheet(Some(name.clone())),
+                source,
+                store,
+                &text_key,
+                &answer_key,
+            )
+            .await
+            .map_err(|err| conversion_error(FileKind::Workbook, err))?;
+        size = store.object_size(&text_key).await?;
+    }
     let overrides = Overrides {
         encoding: Some(Encoding::Utf8),
         delimiter: Some(','),
         header_row,
     };
-    Ok(PreviewResponse {
-        preview: upload_parse::preview(&csv, cut, overrides, PREVIEW_ROWS),
-        workbook: Some(WorkbookView { sheet: name, info }),
-        parquet: None,
-    })
+    // The text is read as a text upload's text is: the first
+    // [`PREVIEW_BYTES`] of it.
+    let head = store.head_bytes(&text_key, PREVIEW_BYTES).await?;
+    let cut = size.unwrap_or(0) > u64::try_from(PREVIEW_BYTES).unwrap_or(u64::MAX);
+    let preview = upload_parse::preview(&head, cut, overrides, PREVIEW_ROWS);
+    // The guess reads more than the preview shows (decision 1): up to
+    // [`columns::SAMPLE_BYTES`], and of that the first 10,000 data rows —
+    // the text path's sample, of the stored text. It fell to the preview's
+    // 256 KiB when the workbook's text became stored text
+    // (`PR #187` review SHOULD-FIX 2), so a wide sheet was guessed from far
+    // fewer rows than the same sheet as a CSV.
+    let sample_bytes = columns::SAMPLE_BYTES;
+    let wide = store.head_bytes(&text_key, sample_bytes).await?;
+    let wide_cut = size.unwrap_or(0) > u64::try_from(sample_bytes).unwrap_or(u64::MAX);
+    let rows = upload_parse::sample_records(&wide, wide_cut, preview.using, columns::SAMPLE_ROWS);
+    let sample = Sample {
+        header: preview.columns.clone(),
+        rows,
+        declared: None,
+    };
+    Ok((
+        PreviewResponse {
+            preview,
+            workbook: Some(WorkbookView { sheet: name, info }),
+            parquet: None,
+            layout: None,
+            archive: None,
+            column_specs: Vec::new(),
+            sampled_rows: 0,
+            from_table: false,
+        },
+        sample,
+    ))
+}
+
+/// The first row group of a Parquet file, as the child answered it, when it
+/// is one the API may fetch.
+///
+/// The child's answer is checked against the file before anything is
+/// fetched: a group that lies about where it is, or how long it is, must
+/// not reach the store as a read outside the file. `read_range` does not
+/// clamp, and a read outside the file ends with the resource-limit sentence
+/// — a false reason for a file that is fine (`PR #187` review round 2 S2).
+///
+/// A group over the bound is `None`: the file is shown as its columns and no
+/// rows, and its bytes are not moved at all.
+///
+/// # Errors
+///
+/// 400 with the Parquet reader's own sentence for a group that lies about
+/// the file.
+fn parquet_group(
+    group: Option<upload_parquet::GroupRange>,
+    size: u64,
+    bound: u64,
+) -> Result<Option<upload_parquet::GroupRange>, ApiError> {
+    let Some(group) = group else {
+        return Ok(None);
+    };
+    let end = group.offset.checked_add(group.len).ok_or_else(|| {
+        ApiError::BadRequest(upload_parquet::ParquetFileError::Unreadable.to_string())
+    })?;
+    if end > size {
+        return Err(ApiError::BadRequest(
+            upload_parquet::ParquetFileError::Unreadable.to_string(),
+        ));
+    }
+    if group.len > bound {
+        return Ok(None);
+    }
+    Ok(Some(group))
 }
 
 /// The preview of a Parquet file: its first rows as text, read the way the load
 /// reads them (UTF-8, comma, the first record is the header).
-async fn parquet_preview(store: &UploadStore, row: &Upload) -> Result<PreviewResponse, ApiError> {
-    let bytes = store.get_all(&row.storage_key).await?;
-    let converted =
-        blocking(move || upload_parquet::convert(&bytes, Some(PARQUET_PREVIEW_ROWS))).await?;
-    let cut = converted.info.rows > u64::try_from(PARQUET_PREVIEW_ROWS).unwrap_or(u64::MAX);
+///
+/// `SEC-22` P1: the file is read by RANGES and never whole. The child is
+/// given the file's tail — which holds the footer — and answers where the
+/// file's first row group is; the group's bytes are fetched then, and the
+/// child is asked for the rows. A file whose first row group is over the
+/// bound is shown as its columns and no rows, and its group's bytes are not
+/// moved at all.
+async fn parquet_preview(
+    state: &AppState,
+    store: &UploadStore,
+    row: &Upload,
+) -> Result<(PreviewResponse, Sample), ApiError> {
+    let file = ParquetFile::stored(store, &row.storage_key).await?;
+    let footer = parquet_footer(state, &file).await?;
+    let info = footer.info;
+    let size = file.size();
+    let group = parquet_group(
+        footer.group,
+        size,
+        state.conversion_runner.parquet_group_bytes(),
+    )?;
+    let mut cut_text = false;
+    let csv = match group {
+        Some(group) => {
+            let parts = vec![
+                Part::tail(size, state.conversion_runner.parquet_tail_bytes()),
+                Part {
+                    offset: group.offset,
+                    length: group.len,
+                },
+            ];
+            let source = file.source(parts);
+            // The API reads at most the sample's worth of text: a Parquet
+            // file may hold 512 MiB of it, and the API must not hold that
+            // (`PR #187` review SHOULD-FIX 6). A child that writes more is
+            // killed, and the preview says the text is cut.
+            let read = state
+                .conversion_runner
+                .answer_with_text(
+                    Operation::PreviewParquet {
+                        rows: PARQUET_PREVIEW_ROWS,
+                        size,
+                        group_offset: group.offset,
+                        group_len: group.len,
+                    },
+                    source,
+                    state.conversion_runner.text_limit(),
+                )
+                .await
+                .map_err(|err| conversion_error(FileKind::Parquet, err))?;
+            cut_text = read.cut;
+            read.text
+        }
+        // The first row group is over the bound: the columns and no rows.
+        None => parquet_header(&info),
+    };
+    let cut = cut_text || info.rows > u64::try_from(PARQUET_PREVIEW_ROWS).unwrap_or(u64::MAX);
     let overrides = Overrides {
         encoding: Some(Encoding::Utf8),
         delimiter: Some(','),
         header_row: Some(0),
     };
-    Ok(PreviewResponse {
-        preview: upload_parse::preview(&converted.csv, cut, overrides, PREVIEW_ROWS),
-        workbook: None,
-        parquet: Some(converted.info),
-    })
+    let preview = upload_parse::preview(&csv, cut, overrides, PREVIEW_ROWS);
+    let rows = upload_parse::sample_records(&csv, cut, preview.using, columns::SAMPLE_ROWS);
+    // A Parquet file's own types are the starting types (decision 10).
+    let declared = info
+        .columns
+        .iter()
+        .map(|column| crate::upload_types::declared_from_parquet(&column.type_name))
+        .collect();
+    let sample = Sample {
+        header: preview.columns.clone(),
+        rows,
+        declared: Some(declared),
+    };
+    Ok((
+        PreviewResponse {
+            preview,
+            workbook: None,
+            parquet: Some(info),
+            layout: None,
+            archive: None,
+            column_specs: Vec::new(),
+            sampled_rows: 0,
+            from_table: false,
+        },
+        sample,
+    ))
 }
 
 // ── Ingest ───────────────────────────────────────────────────────────────
@@ -1262,6 +2454,18 @@ struct IngestRequest {
     header_row: u64,
     /// The sheet to load, for a workbook (`None`: its default sheet).
     sheet: Option<String>,
+    /// The columns as confirmed and what to do with a value that does not fit
+    /// (`DATA-18`); `None`: every column text.
+    columns: Option<ColumnPlan>,
+    /// The other files of a load of several files (`DATA-17` slice 5), at most 9, as
+    /// named; empty for a load of one file.
+    also_uploads: Vec<String>,
+    /// The folder every file of the load is put in and the table remembers
+    /// (`DATA-35` decision 2, AD-4). [`folders::FolderRef::Absent`]: the request
+    /// said nothing, so the table's remembered folder applies
+    /// ([`effective_folder`]); [`folders::FolderRef::Null`]: `folderId: null`,
+    /// "no folder" chosen on purpose.
+    folder_id: folders::FolderRef,
 }
 
 /// Why a raw table name is refused, or `None` (review finding C1).
@@ -1317,8 +2521,9 @@ fn text_field<'a>(fields: &'a Map<String, Value>, name: &str) -> Result<&'a str,
 
 /// Validate the body of `POST /api/uploads/{id}/ingest`: `bronzeTable`,
 /// `mode` (optional, `replace` by default), `encoding`, `delimiter`,
-/// `headerRow` and, optional, `sheet`. All are checked; the load uses exactly
-/// what was confirmed and nothing is guessed (ADR 0014, decision 3).
+/// `headerRow` and, optional, `sheet`, `columns` with `onBadValue`, `alsoUploads`
+/// (`DATA-17` slice 5) and `folderId` (`DATA-35`). All are checked; the load uses exactly what was confirmed
+/// and nothing is guessed (ADR 0014, decision 3).
 ///
 /// For a `conversion` (a workbook or a Parquet file) the dialect is not the
 /// user's to choose: the converted text is always UTF-8 with commas, `encoding`
@@ -1330,7 +2535,12 @@ fn text_field<'a>(fields: &'a Map<String, Value>, name: &str) -> Result<&'a str,
 fn parse_ingest_request(
     body: &[u8],
     conversion: Option<Conversion>,
+    layout: Option<Layout>,
 ) -> Result<IngestRequest, ApiError> {
+    // JSON, JSON Lines and Avro have no dialect to choose (`DATA-17` slice 4): UTF-8, a
+    // comma, and the keys or fields as the header, as for Parquet. A gzip or zip file of
+    // delimited text keeps the person's choice.
+    let fixed = conversion.is_some() || layout.is_some_and(|l| l.format != Format::Delimited);
     let bad = |message: &str| ApiError::BadRequest(message.to_owned());
     let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(body) else {
         return Err(bad(BODY_NOT_AN_OBJECT));
@@ -1344,7 +2554,7 @@ fn parse_ingest_request(
         Some(Value::String(text)) => LoadMode::parse(text).ok_or_else(|| bad(MODE_RULE))?,
         Some(_) => return Err(bad(MODE_RULE)),
     };
-    let (encoding, delimiter) = if conversion.is_some() {
+    let (encoding, delimiter) = if fixed {
         (Encoding::Utf8, ',')
     } else {
         (
@@ -1355,6 +2565,7 @@ fn parse_ingest_request(
     };
     let header_row = match (conversion, fields.get("headerRow")) {
         (Some(Conversion::Parquet), _) => 0,
+        _ if layout.is_some_and(|l| l.format != Format::Delimited) => 0,
         (_, None | Some(Value::Null)) => return Err(bad("headerRow is required.")),
         (_, Some(value)) => value.as_u64().ok_or_else(|| bad(HEADER_ROW_RULE))?,
     };
@@ -1363,6 +2574,23 @@ fn parse_ingest_request(
         Some(Value::String(name)) => Some(name.clone()),
         Some(_) => return Err(bad(SHEET_RULE)),
     };
+    let columns = columns::parse_column_plan(&fields)?;
+    let also_uploads = match fields.get("alsoUploads") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(ids)) => ids
+            .iter()
+            .map(|id| id.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| bad(ALSO_UPLOADS_RULE))?,
+        Some(_) => return Err(bad(ALSO_UPLOADS_RULE)),
+    };
+    group::check_also_list(&also_uploads)?;
+    let folder_id = match fields.get("folderId") {
+        None => folders::FolderRef::Absent,
+        Some(Value::Null) => folders::FolderRef::Null,
+        Some(Value::String(id)) if !id.is_empty() => folders::FolderRef::Id(id.clone()),
+        Some(_) => return Err(bad(FOLDER_ID_RULE)),
+    };
     Ok(IngestRequest {
         table: table.to_owned(),
         mode,
@@ -1370,16 +2598,28 @@ fn parse_ingest_request(
         delimiter,
         header_row,
         sheet,
+        columns,
+        also_uploads,
+        folder_id,
     })
 }
 
 /// Whether `table` may be loaded into by an upload of `tenant_id`, or why
 /// not. The rule (ADR 0014, decision 5, review finding B4), in this order:
 ///
-/// 1. A table a connector loads: never.
+/// 1. A table a connector loads: never. The sentence says so
+///    ([`CONNECTOR_TABLE`]) only when the connector is the caller's own
+///    tenant's; for another tenant's (or an unassigned) connector it is the
+///    one sentence of [`TABLE_NOT_FREE`], so the answer does not tell a
+///    person that someone else has a connector writing a table of that name
+///    (`SEC-16`).
 /// 2. The claim table's answer ([`uploads::table_claim`]): the name is this
-///    tenant's, and it is free to load into, whether or not the table exists
-///    yet; or it is another tenant's, and it is not.
+///    tenant's and no drop of it is on record inside its window, and it is
+///    free to load into, whether or not the table exists yet; or it is another
+///    tenant's, and it is not. A name this tenant's table was dropped from,
+///    while that table can still be restored, is [`TABLE_DROPPED`]
+///    (`DATA-55` D11): a new table of that name would make the dropped one
+///    impossible to bring back.
 /// 3. Nobody's claim: the table must not exist (a registry row or an Iceberg
 ///    table). Never "free" on a doubt.
 ///
@@ -1390,11 +2630,13 @@ fn parse_ingest_request(
 ///
 /// # Errors
 ///
-/// 409 for a connector's table, for a name another tenant holds, and for an
-/// existing table nobody claimed (the last two with one sentence,
-/// [`TABLE_NOT_FREE`]); 503 when the question cannot be answered (Postgres,
-/// `ClickHouse` or the Iceberg query database did not give a definite
-/// answer, or there is no Iceberg query database to ask).
+/// 409 for a connector's table ([`CONNECTOR_TABLE`] for the caller's own
+/// tenant's connector, otherwise [`TABLE_NOT_FREE`]), for a name another
+/// tenant holds, for an existing table nobody claimed (those with the one
+/// sentence, [`TABLE_NOT_FREE`]), and for this tenant's table that was dropped
+/// and can still be restored ([`TABLE_DROPPED`]); 503 when the question
+/// cannot be answered (Postgres, `ClickHouse` or the Iceberg query database did
+/// not give a definite answer, or there is no Iceberg query database to ask).
 async fn ensure_table_free(
     state: &AppState,
     pool: &PgPool,
@@ -1405,19 +2647,46 @@ async fn ensure_table_free(
         tracing::warn!(%err, table, "could not check whether a raw table name is free");
         ApiError::Unavailable(TABLE_UNCHECKED.to_owned())
     };
-    if connectors::any_connector_targets(pool, table)
+    // SEC-16: the connector's own sentence only for the caller's tenant. A
+    // connector of anyone else still closes the name (ADR 0014, decision 5:
+    // raw table names are shared), but with the sentence every other reason
+    // gets.
+    if connectors::any_connector_of_tenant_targets(pool, tenant_id, table)
         .await
         .map_err(|err| unchecked(&err))?
     {
         return Err(ApiError::Conflict(CONNECTOR_TABLE.to_owned()));
+    }
+    if connectors::any_connector_targets(pool, table)
+        .await
+        .map_err(|err| unchecked(&err))?
+    {
+        return Err(ApiError::Conflict(TABLE_NOT_FREE.to_owned()));
     }
     match uploads::table_claim(pool, tenant_id, table)
         .await
         .map_err(|err| unchecked(&err))?
     {
         // This tenant's own claim settles it, whether or not the table exists
-        // yet: replacing or adding to one's own table is the point.
-        TableClaim::Ours => return Ok(()),
+        // yet: replacing or adding to one's own table is the point — unless its
+        // table was dropped from the console and can still be restored
+        // (DATA-55 D11, QA LH-DATA-15-06, TC-1731). The load job would create a
+        // new table of that name, and the dropped one could no longer be
+        // undropped. The record is believed whether or not the table is there,
+        // and a table that IS there only heals it once the record is past its
+        // grace (`DATA-55` review R2, U5, `dropped_now`): a young record whose
+        // `DELETE` may still be on its way keeps the name closed, and a stale
+        // one cannot. An unreadable record is `unchecked` like its neighbours:
+        // 503, never an assumption that the name is free (fail closed).
+        TableClaim::Ours => {
+            if super::catalog_drop::dropped_now(state, pool, table)
+                .await
+                .map_err(|err| unchecked(&err))?
+            {
+                return Err(ApiError::Conflict(TABLE_DROPPED.to_owned()));
+            }
+            return Ok(());
+        }
         // Another tenant's claim, or a claim whose tenant is gone. The same
         // sentence as for an existing table nobody claimed, so the answer does
         // not say which it is.
@@ -1486,35 +2755,138 @@ fn upload_audit_event(
     }
 }
 
-/// Best effort: a failed audit write never fails, or undoes, the action it
-/// records.
-async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
-    let action = event.action.clone();
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, action, "failed to record an upload audit event");
+/// Who a load is recorded as in the table's own history (`DATA-52`, QA
+/// `LH-DATA-15-08`): the display name of the person who pressed Load, and
+/// ` (file upload)` after it, so a version written by an upload says how it was
+/// written. A name with nothing usable in it is `file upload` alone rather than a
+/// bare suffix. Control characters go (a name is shown in a table's history) and
+/// the name is cut at [`MAX_STORED_TEXT_CHARS`], like every other stored text of
+/// an upload.
+fn load_author(display_name: &str) -> String {
+    let name: String = display_name
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_STORED_TEXT_CHARS)
+        .collect();
+    let name = name.trim();
+    if name.is_empty() {
+        "file upload".to_owned()
+    } else {
+        format!("{name} (file upload)")
     }
 }
 
 /// The run config `file_ingest_job` takes: `ops.ingest_uploaded_file.config`
 /// (plan T7). `load_key` is the object the job reads: the upload's own, or the
 /// converted sheet of a workbook ([`converted_key`]). The config schema is
-/// closed, so nothing about the sheet can be added here.
-fn run_config(upload_id: &str, request: &IngestRequest, load_key: &str) -> Value {
+/// closed, so nothing about the sheet can be added here. `load_keys` lists every
+/// file of the load, the primary first (`DATA-17` slice 5, plan AD5); the
+/// `bronze_table_name` path the `DATA-19` sensor reads does not move. `author` is
+/// [`load_author`]'s answer for the person who started the load (`DATA-52`); the
+/// job takes it from this change on, so the schema stays closed.
+fn run_config(
+    upload_id: &str,
+    request: &IngestRequest,
+    load_keys: &[String],
+    (format, compression): (&str, &str),
+    author: &str,
+) -> Value {
+    let (columns, on_bad_value) = columns::run_config_columns(request.columns.as_ref());
     json!({
         "ops": {
             "ingest_uploaded_file": {
                 "config": {
                     "upload_id": upload_id,
-                    "storage_key": load_key,
+                    "storage_keys": load_keys,
+                    "format": format,
+                    "compression": compression,
+                    "max_bytes": MAX_UNPACKED_BYTES,
                     "bronze_table_name": request.table,
                     "load_mode": request.mode.as_str(),
                     "encoding": request.encoding.as_str(),
                     "delimiter": request.delimiter.to_string(),
                     "header_row": request.header_row,
+                    "columns": columns,
+                    "on_bad_value": on_bad_value,
+                    "author": author,
                 }
             }
         }
     })
+}
+
+/// The load limits of `SEC-17`, from the configuration.
+fn load_limits(state: &AppState) -> LoadLimits {
+    LoadLimits {
+        per_user: i64::from(state.config.upload_max_concurrent_per_user),
+        total: i64::from(state.config.upload_max_concurrent),
+        // `DATA-37` decision D2: how many large loads may run at once in the
+        // installation. A load that is not large never counts against it and
+        // is never refused by it (decision D3).
+        large: i64::from(state.config.upload_max_concurrent_large),
+    }
+}
+
+/// `SEC-17`: count the header's cells under the reading the user confirmed,
+/// AND ask the load limit, before any claim, mark or launch. A file the job
+/// would refuse leaves no table claim behind, and a request that passes
+/// the read but loses the locked count in `mark_ingesting_within_limits`
+/// below keeps its claim, as a claim does when a launch fails (a claim
+/// is never released).
+///
+/// # Errors
+///
+/// 429 (`Retry-After: 5`) when the `uploaded_by` already has the configured
+/// number of loads running, or the installation has; 429 with the
+/// large-load sentence when the installation already runs the configured
+/// number of large loads and this one is large too (`DATA-37`); 400 when the
+/// header has more than 1,000 columns under the confirmed reading; 503 when
+/// the object store cannot serve the head.
+async fn check_within_limits_and_column_cap(
+    state: &AppState,
+    pool: &PgPool,
+    row: &Upload,
+    request: &IngestRequest,
+    layout: Option<Layout>,
+) -> ApiResult<LoadLimits> {
+    let limits = load_limits(state);
+    match uploads::loads_under_limits(pool, &row.id, &request.also_uploads, limits).await? {
+        LimitOutcome::Under => {}
+        LimitOutcome::LimitReached => return Err(too_many_uploads().into()),
+        // `DATA-37` decision D4: the refusal of the large-load limit has a
+        // sentence of its own, so the person can tell it from the per-user
+        // one.
+        LimitOutcome::LargeLimitReached => return Err(too_many_large_loads().into()),
+    }
+    let store = UploadStore::connect(&state.config).await?;
+    if let Some(layout) = layout {
+        // `DATA-17` slice 4: the same read as the preview (it refuses more than 1,000
+        // columns), and a zip whose files differ in their columns is not loaded.
+        let confirmed = Overrides {
+            encoding: Some(request.encoding),
+            delimiter: Some(request.delimiter),
+            header_row: Some(usize::try_from(request.header_row).unwrap_or(usize::MAX)),
+        };
+        let sampled = layout_sample(&store, row, layout, confirmed).await?;
+        if sampled
+            .archive
+            .is_some_and(|archive| archive.files.iter().any(|file| !file.matches_first))
+        {
+            return Err(ApiError::BadRequest(ZIP_COLUMNS_DIFFER.to_owned()).into());
+        }
+        return Ok(limits);
+    }
+    let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
+    let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
+    let confirmed = Overrides {
+        encoding: Some(request.encoding),
+        delimiter: Some(request.delimiter),
+        header_row: Some(usize::try_from(request.header_row).unwrap_or(usize::MAX)),
+    };
+    if upload_parse::header_width(&head, head_is_truncated, confirmed) > upload_parse::MAX_COLUMNS {
+        return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()).into());
+    }
+    Ok(limits)
 }
 
 /// Launch `file_ingest_job` for the claimed upload and return the run id. A
@@ -1526,11 +2898,16 @@ async fn launch(
     pool: &PgPool,
     claimed: &Upload,
     request: &IngestRequest,
-    load_key: &str,
+    load_keys: &[String],
+    kind: (&str, &str),
+    author: &str,
 ) -> Result<String, ApiError> {
     let failure = match state
         .dagster
-        .launch_run_with_config(FILE_INGEST_JOB, &run_config(&claimed.id, request, load_key))
+        .launch_run_with_config(
+            FILE_INGEST_JOB,
+            &run_config(&claimed.id, request, load_keys, kind, author),
+        )
         .await
     {
         Ok(launched) => {
@@ -1545,11 +2922,12 @@ async fn launch(
             ApiError::Unavailable(LAUNCH_UNREACHABLE.to_owned())
         }
     };
-    if let Err(err) =
-        uploads::mark_finished(pool, &claimed.id, None, Some(COULD_NOT_START), None).await
-    {
-        tracing::warn!(%err, upload_id = %claimed.id, "a claim that could not be launched could not be settled");
-    }
+    settle_claim_failed(
+        pool,
+        claimed,
+        "a claim that could not be launched could not be settled",
+    )
+    .await;
     Err(failure)
 }
 
@@ -1561,9 +2939,47 @@ struct Converted {
     sheet: Option<String>,
 }
 
-/// Convert a workbook upload's chosen sheet, or a Parquet upload's table, and
-/// store the text as a CSV beside the original. The object is written again by
-/// the next load of the same upload, and removed with the upload ([`delete`]).
+/// Check what a Parquet file's footer says, by reading it in a child process
+/// (`SEC-22` D1a, P1).
+///
+/// The checks the conversion used to make at ingest, now made on the footer
+/// alone (`DATA-17` T2.2): the file opens, has rows, and has no more columns
+/// than a table may. The child is given the file's tail, so a file of any
+/// size is checked the same way.
+///
+/// # Errors
+///
+/// 400 with the reader's own sentence for a file that no longer opens, is
+/// encrypted, has a binary or nested column, or is over the cell cap; with
+/// [`EMPTY_PARQUET`] for a file with no rows and [`JOB_TOO_MANY_COLUMNS`] for
+/// one with more than 1,000 columns; 503 when the object store is unavailable.
+async fn check_parquet_footer(state: &AppState, row: &Upload) -> Result<(), ApiError> {
+    let store = UploadStore::connect(&state.config).await?;
+    let file = ParquetFile::stored(&store, &row.storage_key).await?;
+    let footer = parquet_footer(state, &file).await?;
+    let info = footer.info;
+    if info.rows == 0 {
+        return Err(ApiError::BadRequest(EMPTY_PARQUET.to_owned()));
+    }
+    if info.columns.len() > upload_parse::MAX_COLUMNS {
+        return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()));
+    }
+    Ok(())
+}
+
+/// Convert a workbook upload's chosen sheet and store the text beside the
+/// original, or use the text that is already there.
+///
+/// The sheet is converted ONCE (`SEC-22` D5): the text is stored under the
+/// sheet's position in the workbook's list, and the answer beside it. A load
+/// that finds the text reads it; only a load that does not find it converts.
+///
+/// # Errors
+///
+/// 400 with the child's own sentence for a file that cannot be read, a sheet
+/// the workbook does not have, or a sheet with no cells; 429 when every
+/// conversion slot is taken; 500 when the child could not be started; 503
+/// when the object store is unavailable.
 async fn convert_upload(
     state: &AppState,
     row: &Upload,
@@ -1571,41 +2987,277 @@ async fn convert_upload(
     sheet: Option<&str>,
 ) -> Result<Converted, ApiError> {
     let store = UploadStore::connect(&state.config).await?;
-    let bytes = store.get_all(&row.storage_key).await?;
-    let (sheet, csv) = match conversion {
+    let (sheet, key) = match conversion {
         Conversion::Workbook => {
-            let asked = sheet.map(str::to_owned);
-            let (name, empty, csv) = blocking(move || {
-                let read = upload_workbook::read_sheet(&bytes, asked.as_deref())?;
-                Ok::<_, WorkbookError>((
-                    read.data.name().to_owned(),
-                    read.data.is_empty(),
-                    read.data.to_csv(None),
-                ))
-            })
-            .await?;
-            if empty {
+            let info = sheets_of(state, &store, row).await?;
+            let (name, position) = sheet_position(&info, sheet)?;
+            let key = converted_text_key(&row.storage_key, position);
+            let answer_key = converted_answer_key(&row.storage_key, position);
+            // The answer of the conversion says whether the sheet has cells
+            // at all; it is stored beside the text (`SEC-22` D5), so a load
+            // that finds the text finds the answer too. It is also the
+            // MARKER of a finished conversion (`SEC-22` P2): a text without
+            // it is a conversion that did not finish.
+            let stored_answer = match store.get_all(&answer_key).await {
+                Ok(bytes) => match serde_json::from_slice::<Answer>(&bytes) {
+                    Ok(answer) => Some(answer),
+                    Err(err) => {
+                        tracing::warn!(%err, key = %answer_key, "the stored answer of a conversion could not be read");
+                        None
+                    }
+                },
+                // There is no answer: the file was uploaded before `SEC-22`,
+                // or a conversion that failed left none.
+                Err(crate::upload_store::UploadStoreError::Unavailable("not found")) => None,
+                Err(err) => return Err(err.into()),
+            };
+            if let Some(Answer::Sheet { empty: true, .. }) = stored_answer {
                 return Err(ApiError::BadRequest(EMPTY_SHEET.to_owned()));
             }
-            (Some(name), csv)
-        }
-        Conversion::Parquet => {
-            let converted = blocking(move || upload_parquet::convert(&bytes, None)).await?;
-            if converted.info.rows == 0 {
-                return Err(ApiError::BadRequest(EMPTY_PARQUET.to_owned()));
+            let committed = stored_answer.is_some() && store.object_size(&key).await?.is_some();
+            if !committed {
+                let source = stored_source(&store, row);
+                let answer = state
+                    .conversion_runner
+                    .convert_and_store(
+                        Operation::ConvertSheet(Some(name.clone())),
+                        source,
+                        &store,
+                        &key,
+                        &answer_key,
+                    )
+                    .await
+                    .map_err(|err| conversion_error(FileKind::Workbook, err))?;
+                if let Answer::Sheet { empty: true, .. } = answer {
+                    return Err(ApiError::BadRequest(EMPTY_SHEET.to_owned()));
+                }
             }
-            (None, converted.csv)
+            (Some(name), key)
         }
+        // A Parquet file is not converted: the job reads it natively (`DATA-17`
+        // T2.2), and `ingest` checks its footer.
+        Conversion::Parquet => return Err(ApiError::Internal(CONVERSION_FAILED.to_owned())),
     };
-    let key = converted_key(&row.storage_key);
-    store.put(&key, Bytes::from(csv)).await?;
     Ok(Converted { key, sheet })
+}
+
+/// Claim the upload, and the other files of its load, as `ingesting`: the reading, the table,
+/// the mode and the column list are written by the claim itself, so a row is never
+/// `ingesting` with half of what its load was told (`DATA-18`).
+///
+/// `SEC-17`: the count and the marks are one locked transaction, so two starts at the same
+/// moment cannot both take the last place. `DATA-17` slice 5: the other files are claimed in
+/// the same transaction, so a load of several files is never half taken.
+///
+/// # Errors
+///
+/// 429 when a limit is reached (each with its own sentence: the per-user and
+/// the installation-wide one, and the large-load one of `DATA-37`); 409 when
+/// this upload was claimed by another request, or one of the other files was
+/// taken or went away since the checks; 404 when this upload went away.
+async fn claim_load(
+    pool: &PgPool,
+    row: &Upload,
+    request: &IngestRequest,
+    folder: ClaimFolder,
+    converted: Option<&Converted>,
+    limits: LoadLimits,
+) -> ApiResult<Upload> {
+    let mut parse_options = json!({
+        "encoding": request.encoding.as_str(),
+        "delimiter": request.delimiter.to_string(),
+        "headerRow": request.header_row,
+    });
+    if let (
+        Value::Object(map),
+        Some(Converted {
+            sheet: Some(sheet), ..
+        }),
+    ) = (&mut parse_options, converted)
+    {
+        map.insert("sheet".to_owned(), json!(sheet));
+    }
+    let (column_spec, on_bad_value) = columns::claim_fields(request.columns.as_ref());
+    let outcome = uploads::mark_group_within_limits(
+        pool,
+        &row.id,
+        &request.also_uploads,
+        &LoadClaim {
+            parse_options: &parse_options,
+            bronze_table: &request.table,
+            load_mode: request.mode,
+            column_spec: column_spec.as_ref(),
+            on_bad_value,
+            folder,
+        },
+        limits,
+    )
+    .await?;
+    Ok(match outcome {
+        MarkOutcome::Marked(claimed) => *claimed,
+        MarkOutcome::LimitReached => return Err(too_many_uploads().into()),
+        // `DATA-37` decision D4: the refusal of the large-load limit has a
+        // sentence of its own. The early read above answers it too, so the
+        // person sees the same sentence whichever check refused the load.
+        MarkOutcome::LargeLimitReached => return Err(too_many_large_loads().into()),
+        MarkOutcome::GroupNotMarked => {
+            // One of the other files was taken, or went away, since the checks.
+            return Err(ApiError::Conflict(OTHER_BUSY.to_owned()).into());
+        }
+        MarkOutcome::NotMarked => {
+            // Lost the race to another request, or the upload went away.
+            return Err(match uploads::get(pool, &row.id).await? {
+                Some(_) => ApiError::Conflict(ALREADY_LOADING.to_owned()),
+                None => not_found(),
+            }
+            .into());
+        }
+    })
+}
+
+/// Settle a claim that will not be launched as failed, the one way every
+/// refusal after [`claim_load`] does (`DATA-55` review S9): the row must not sit
+/// at `ingesting` with no run. Best effort — a failure is logged with the
+/// caller's own words, and the caller's refusal is the answer either way.
+async fn settle_claim_failed(pool: &PgPool, claimed: &Upload, why: &'static str) {
+    if let Err(err) =
+        uploads::mark_finished(pool, &claimed.id, None, Some(COULD_NOT_START), None).await
+    {
+        tracing::warn!(%err, upload_id = %claimed.id, "{why}");
+    }
+}
+
+/// The folder a load puts its files in (`DATA-35` decision 2, plan AD-4): the one
+/// the request named, which must be the upload's tenant's (decision 5, `SEC-16`:
+/// another tenant's reads as a folder that does not exist, and nothing has been
+/// claimed yet); "no folder" when it said `null`; and, when it said nothing, the
+/// folder the table's claim remembers from its latest load, so a re-upload joins
+/// the table's folder (a table that remembers none leaves the file where it is).
+///
+/// # Errors
+///
+/// 404 for a folder that is not the tenant's; 500 on a database failure.
+async fn effective_folder(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    request: &IngestRequest,
+) -> ApiResult<ClaimFolder> {
+    match &request.folder_id {
+        folders::FolderRef::Id(folder) => {
+            if upload_folders::folder_in_tenant(pool, tenant_id, folder).await? {
+                Ok(ClaimFolder::Some(folder.clone()))
+            } else {
+                Err(ApiError::NotFound(folders::FOLDER_NOT_FOUND.to_owned()).into())
+            }
+        }
+        // `PR #259 review BLOCKER 1`: "no folder" is a choice, and it is a choice
+        // the table remembers: the file leaves the folder it is in and the claim
+        // forgets its folder (the claim records the latest load's choice, AD-4).
+        folders::FolderRef::Null => Ok(ClaimFolder::None),
+        // No folder named: the table's remembered folder applies, and a table that
+        // remembers none leaves the file where it is.
+        folders::FolderRef::Absent => Ok(
+            match upload_folders::claim_folder(pool, tenant_id, &request.table).await? {
+                Some(folder) => ClaimFolder::Some(folder),
+                None => ClaimFolder::Keep,
+            },
+        ),
+    }
+}
+
+/// The reading the request confirmed, as the preview takes it.
+fn reading_of(request: &IngestRequest) -> PreviewQuery {
+    PreviewQuery {
+        encoding: Some(request.encoding.as_str().to_owned()),
+        delimiter: Some(request.delimiter.to_string()),
+        header_row: Some(request.header_row.to_string()),
+        sheet: request.sheet.clone(),
+        table: None,
+    }
+}
+
+/// `DATA-17` slice 5, decision 4: refuse a load whose other files cannot go into the
+/// first file's table, with the list `compare` gives ([`group::refusal`]). Nothing to
+/// check for one file.
+///
+/// # Errors
+///
+/// 400 with the list, or what [`group::mismatches`] answers.
+async fn check_group(
+    state: &AppState,
+    first: &Upload,
+    others: &[group::Member],
+    request: &IngestRequest,
+) -> Result<(), ApiError> {
+    if others.is_empty() {
+        return Ok(());
+    }
+    // No column list is every column text, which every value fits.
+    let typing = request
+        .columns
+        .as_ref()
+        .map_or(group::Typing::Text, |plan| {
+            group::Typing::Plan(&plan.columns)
+        });
+    let found = group::mismatches(state, first, others, &reading_of(request), &typing).await?;
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(group::refusal(&found))
+    }
+}
+
+/// The objects the job reads, the primary's first: each file's own object, or its converted
+/// sheet when it is a workbook (a Parquet file's footer is checked, and it is read as it is).
+/// A refusal here claims nothing.
+///
+/// # Errors
+///
+/// As [`convert_upload`] and [`check_parquet_footer`].
+async fn load_keys_of(
+    state: &AppState,
+    row: &Upload,
+    converted: Option<&Converted>,
+    others: &[group::Member],
+    request: &IngestRequest,
+) -> Result<Vec<String>, ApiError> {
+    let mut keys = Vec::with_capacity(1 + others.len());
+    keys.push(converted.map_or_else(|| row.storage_key.clone(), |done| done.key.clone()));
+    for other in others {
+        keys.push(match other.conversion {
+            Some(Conversion::Workbook) => {
+                convert_upload(
+                    state,
+                    &other.row,
+                    Conversion::Workbook,
+                    request.sheet.as_deref(),
+                )
+                .await?
+                .key
+            }
+            Some(Conversion::Parquet) => {
+                check_parquet_footer(state, &other.row).await?;
+                other.row.storage_key.clone()
+            }
+            None => other.row.storage_key.clone(),
+        });
+    }
+    Ok(keys)
 }
 
 /// `POST /api/uploads/{id}/ingest` — load this file into a raw table, with
 /// the encoding, delimiter and header row the user confirmed. Body
 /// `{ bronzeTable, mode?, encoding, delimiter, headerRow, sheet? }`; `mode` is
 /// `replace` (default) or `append`. Returns `{ upload, runId }`.
+///
+/// # Several files (`DATA-17` slice 5)
+///
+/// `alsoUploads` (at most 9 upload ids of the same tenant and the same kind of file, none
+/// being received) makes one load of all of them into the one table: one run, whose config
+/// lists every file's object in `storage_keys`, this upload first. The other files are
+/// settled with this one ([`Settler`]); the response is for this upload. The columns of the
+/// others are compared with this one's first ([`group`]) and a load whose files differ is
+/// refused with the list before anything is claimed. The cap counts the files together.
 ///
 /// For a workbook, `encoding` and `delimiter` are not read and `sheet` picks
 /// the sheet (the default one when absent): the sheet is converted, stored as
@@ -1623,7 +3275,7 @@ async fn convert_upload(
 /// finished must not block the next one); check the table is free
 /// ([`ensure_table_free`]) and not being loaded by another upload; CLAIM THE
 /// TABLE NAME ([`uploads::claim_table`]); CLAIM the row
-/// ([`uploads::mark_ingesting`], no run id); launch; attach the run
+/// ([`uploads::mark_ingesting_within_limits`], no run id); launch; attach the run
 /// ([`uploads::attach_run`]).
 ///
 /// The table claim comes just before the row claim (review finding B4): the
@@ -1639,15 +3291,25 @@ async fn convert_upload(
 ///
 /// # Errors
 ///
-/// 400 for a body that is not valid (each field has its own sentence), and
-/// for a workbook or Parquet file that cannot be read, a sheet a workbook does
-/// not have, a sheet or file over the cell limit, an empty sheet or a Parquet
-/// file with no rows; 404
-/// for an unknown upload or another tenant's; 409 when this upload is already
-/// loading, another is loading into that table, a connector loads it, or the
-/// name is in use and no upload of this tenant created it ([`TABLE_NOT_FREE`]:
-/// another tenant holds the claim, the table exists and nobody claimed it, or
-/// another tenant won the claim a moment ago); 422 when the orchestrator
+/// 429 (`Retry-After: 5`) when the person who uploaded the file already has
+/// the configured number of loads running, or the installation has
+/// (`SEC-17`); 429 with the large-load sentence when the installation
+/// already runs the configured number of large loads and this one is large
+/// too (`DATA-37`); 400 for a body that is not valid (each field has its own
+/// sentence), for a
+/// workbook or Parquet file that cannot be read, a sheet a workbook does not
+/// have, a sheet or file over the cell limit, an empty sheet or a Parquet
+/// file with no rows, and for a header with more than 1,000 columns under the
+/// confirmed reading (`SEC-17`, checked before any claim); 404
+/// for an unknown upload or another tenant's, or an unknown or other tenant's file of
+/// `alsoUploads`, or a `folderId` that is not a folder of the upload's tenant
+/// (`DATA-35`; a `folderId` that is not text is 400); 400 also for more than nine of them, a file of another kind, the files
+/// together over the cap and files whose columns differ; 409 when this upload (or one of
+/// `alsoUploads`) is still being received (`DATA-17`), is already loading, another is
+/// loading into that table, a connector loads it, or the
+/// name cannot be used ([`TABLE_NOT_FREE`]: another tenant's connector loads
+/// it, another tenant holds the claim, the table exists and nobody claimed it,
+/// or another tenant won the claim a moment ago); 422 when the orchestrator
 /// refuses the launch; 503 when the table check cannot be made or the
 /// orchestrator cannot be reached; 500 when a launched run could not be
 /// recorded.
@@ -1662,9 +3324,13 @@ pub async fn ingest(
     };
     let pool = pool(&state)?;
     let row = uploads::get(pool, &id).await?.ok_or_else(not_found)?;
+    if row.status == "receiving" {
+        return Err(ApiError::Conflict(STILL_RECEIVING.to_owned()).into());
+    }
     // The row first: what the body must carry depends on what the upload is.
     let conversion = conversion_of(&state, &row).await?;
-    let request = parse_ingest_request(&body, conversion)?;
+    let layout = layout_unless_converted(&state, &row, conversion).await?;
+    let request = parse_ingest_request(&body, conversion, layout)?;
     let row = Settler::new(&state, pool).settle(row).await;
     if row.status == "ingesting" {
         return Err(ApiError::Conflict(ALREADY_LOADING.to_owned()).into());
@@ -1672,17 +3338,41 @@ pub async fn ingest(
     let Some(tenant_id) = row.tenant_id else {
         return Err(not_found().into());
     };
+    let folder = effective_folder(pool, tenant_id, &request).await?;
+    let others = group::members(
+        &state,
+        pool,
+        &principal,
+        &row,
+        &request.also_uploads,
+        group::kind_of(conversion, layout),
+    )
+    .await?;
+    let limits = check_within_limits_and_column_cap(&state, pool, &row, &request, layout).await?;
     ensure_table_free(&state, pool, tenant_id, &request.table).await?;
     if uploads::table_being_loaded(pool, &request.table, &row.id).await? {
         return Err(ApiError::Conflict(TABLE_BUSY.to_owned()).into());
     }
+    // `DATA-18`: the column list is checked before anything is claimed.
+    columns::plan_columns(&state, &row, &request, conversion).await?;
+    // `DATA-17` slice 5: the other files have the first one's columns, or the load is
+    // refused with the list, before anything is claimed (decision 4).
+    check_group(&state, &row, &others, &request).await?;
     let converted = match conversion {
-        Some(kind) => Some(convert_upload(&state, &row, kind, request.sheet.as_deref()).await?),
+        Some(Conversion::Workbook) => Some(
+            convert_upload(&state, &row, Conversion::Workbook, request.sheet.as_deref()).await?,
+        ),
+        // `DATA-17` T2.2: a Parquet file is read by the job as it is. Its footer
+        // is checked here, as the conversion used to check it, so a refusal
+        // claims no table name.
+        Some(Conversion::Parquet) => {
+            check_parquet_footer(&state, &row).await?;
+            None
+        }
         None => None,
     };
-    let load_key = converted
-        .as_ref()
-        .map_or(row.storage_key.as_str(), |done| done.key.as_str());
+    let load_keys = load_keys_of(&state, &row, converted.as_ref(), &others, &request).await?;
+    let kind = job_kind(conversion, layout);
     // Review finding B4: the name is claimed here, in one statement the
     // database arbitrates, and not before. `false` is a tenant that took the
     // name between the checks above and now, or one whose claim was always
@@ -1692,39 +3382,77 @@ pub async fn ingest(
         return Err(ApiError::Conflict(TABLE_NOT_FREE.to_owned()).into());
     }
 
-    let mut parse_options = json!({
-        "encoding": request.encoding.as_str(),
-        "delimiter": request.delimiter.to_string(),
-        "headerRow": request.header_row,
-    });
-    if let (
-        Value::Object(map),
-        Some(Converted {
-            sheet: Some(sheet), ..
-        }),
-    ) = (&mut parse_options, &converted)
-    {
-        map.insert("sheet".to_owned(), json!(sheet));
-    }
-    let Some(claimed) = uploads::mark_ingesting(
-        pool,
-        &row.id,
-        &parse_options,
-        &request.table,
-        request.mode,
-        None,
-    )
-    .await?
-    else {
-        // Lost the race to another request, or the upload went away.
-        return Err(match uploads::get(pool, &row.id).await? {
-            Some(_) => ApiError::Conflict(ALREADY_LOADING.to_owned()),
-            None => not_found(),
-        }
-        .into());
-    };
+    let claimed = claim_load(pool, &row, &request, folder, converted.as_ref(), limits).await?;
 
-    let run_id = launch(&state, pool, &claimed, &request, load_key).await?;
+    // `DATA-55` review R3: the write comes first and the check second, so a drop
+    // recorded between `ensure_table_free` and this claim cannot pass its own
+    // check while this load passes its earlier one. The claim is already
+    // `ingesting`, so a refusal settles it as failed, the way a refused launch
+    // does — never leaving a row that just sits at `ingesting`.
+    match super::catalog_drop::dropped_now(&state, pool, &request.table).await {
+        Ok(false) => {}
+        Ok(true) => {
+            settle_claim_failed(
+                pool,
+                &claimed,
+                "a claim refused for a dropped table could not be settled",
+            )
+            .await;
+            return Err(ApiError::Conflict(TABLE_DROPPED.to_owned()).into());
+        }
+        Err(err) => {
+            // The record could not be read: whether the name is dropped is not
+            // known, so the load must not start — and must not stay loading.
+            settle_claim_failed(
+                pool,
+                &claimed,
+                "a claim that could not be checked could not be settled",
+            )
+            .await;
+            return Err(err.into());
+        }
+    }
+
+    // `DATA-52`: the author is the person who pressed Load, taken from the
+    // authenticated principal rather than from anything the request sent.
+    let author = load_author(&principal.display_name);
+    let run_id = launch(&state, pool, &claimed, &request, &load_keys, kind, &author).await?;
+    let attached = finish_launch_and_audit(
+        &state,
+        &principal,
+        &claimed,
+        run_id.clone(),
+        &request,
+        converted.as_ref(),
+        conversion,
+    )
+    .await?;
+    Ok(ApiJson(IngestResponse {
+        upload: attached.into(),
+        run_id,
+    }))
+}
+
+/// Attach the run the launch gave us to the `ingesting` row, and record the
+/// `upload.ingest` audit event the rest of the system reads. Extracted from
+/// `ingest` so the handler stays under the clippy `too_many_lines` cap.
+///
+/// # Errors
+///
+/// 500 when the launched run could not be attached to its upload (an
+/// `ingesting` row with no run is the only one that takes a run, so the only
+/// way this happens is a row settled or was deleted between the launch and
+/// the attach — a logged error, not a panic).
+async fn finish_launch_and_audit(
+    state: &AppState,
+    principal: &Principal,
+    claimed: &Upload,
+    run_id: String,
+    request: &IngestRequest,
+    converted: Option<&Converted>,
+    conversion: Option<Conversion>,
+) -> ApiResult<Upload> {
+    let pool = pool(state)?;
     let Some(attached) = uploads::attach_run(pool, &claimed.id, &run_id).await? else {
         // Not reachable through this API: only an `ingesting` row with no run
         // takes a run, and nothing settles or deletes the claim in the
@@ -1739,8 +3467,16 @@ pub async fn ingest(
         "table": request.table,
         "mode": request.mode.as_str(),
     });
+    if let (Value::Object(map), false) = (&mut args, request.also_uploads.is_empty()) {
+        // `DATA-17` slice 5: the other files of the load, so the audit trail of the
+        // primary says which uploads went into the table with it.
+        map.insert("alsoUploads".to_owned(), json!(request.also_uploads));
+    }
+    if let (Value::Object(map), Some(folder)) = (&mut args, &attached.folder_id) {
+        map.insert("folderId".to_owned(), json!(folder));
+    }
     if let Value::Object(map) = &mut args {
-        match (&converted, conversion) {
+        match (converted, conversion) {
             (
                 Some(Converted {
                     sheet: Some(sheet), ..
@@ -1749,24 +3485,23 @@ pub async fn ingest(
             ) => {
                 map.insert("sheet".to_owned(), json!(sheet));
             }
-            (Some(_), Some(Conversion::Parquet)) => {
+            (_, Some(Conversion::Parquet)) => {
                 map.insert("format".to_owned(), json!("parquet"));
             }
             _ => {}
         }
     }
-    let event = upload_audit_event(&principal, "upload.ingest", &attached.id, args, "executed");
-    record_audit(pool, event).await;
-    Ok(ApiJson(IngestResponse {
-        upload: attached.into(),
-        run_id,
-    }))
+    let event = upload_audit_event(principal, "upload.ingest", &attached.id, args, "executed");
+    audit_coverage::record_best_effort(state, event).await;
+    Ok(attached)
 }
 
 // ── Delete ───────────────────────────────────────────────────────────────
 
 /// `DELETE /api/uploads/{id}` — remove the object (and the converted text of a
-/// workbook or Parquet file), then the row. 204. The
+/// workbook or Parquet file, and the report of values that did not fit), then
+/// the row. 204. For an upload still being received (`DATA-17`) it aborts the
+/// multipart upload first. The
 /// table the upload became is not touched, and neither is the claim on its
 /// name: that is a record of its own ([`uploads::claim_table`]) and is never
 /// released, so a later upload of the tenant can still load into the table and
@@ -1796,14 +3531,51 @@ pub async fn delete(
         return Err(ApiError::Conflict(DELETE_WHILE_LOADING.to_owned()).into());
     }
     let store = UploadStore::connect(&state.config).await?;
-    if conversion_for_name(&row.storage_key).is_some() {
-        // The converted text of a workbook or a Parquet file, if a load wrote
-        // one: derived data goes first, and a key that is not there is
-        // success. A text file named `.xls` or `.parquet` has none, and
-        // deleting a missing key is a no-op.
+    if row.status == "receiving" {
+        // A session has no converted text and maybe no object: abort the
+        // multipart upload (its pieces are bytes S3 keeps and bills for), then
+        // remove whatever sits at the key. (A session that completed between
+        // the read above and this call is simply deleted whole, which is what
+        // the caller asked for.)
+        sessions::abort_session(&store, &row).await?;
+    } else if conversion_for_name(&row.storage_key).is_some() {
+        // The derived data of a workbook (`SEC-22` D8): the list of its
+        // sheets, the converted text of each sheet and the answer beside it,
+        // and the legacy converted text of an upload made before `SEC-22`.
+        // Derived data goes first, and a key that is not there is success.
+        // A text file named `.xls` or `.parquet` has none, and deleting a
+        // missing key is a no-op.
+        let sheets = sheets_key(&row.storage_key);
+        // The number of sheets is normally known: the API wrote the list
+        // itself. When the list is there but cannot be read, the delete
+        // looks for [`upload_workbook::MAX_SHEETS`] of them, so a workbook
+        // whose list was damaged does not leave its converted text behind
+        // (`PR #187` review SHOULD-FIX 7). When there is no list at all,
+        // there is no converted text under the new names either: an upload
+        // from before `SEC-22` has the legacy one, which is removed below.
+        let sheets_count = match store.get_all(&sheets).await {
+            Ok(bytes) => {
+                stored_sheets(&bytes).map_or(upload_workbook::MAX_SHEETS, |info| info.sheets.len())
+            }
+            Err(crate::upload_store::UploadStoreError::Unavailable("not found")) => 0,
+            Err(err) => return Err(err.into()),
+        };
+        for position in 0..sheets_count {
+            store
+                .delete(&converted_text_key(&row.storage_key, position))
+                .await?;
+            store
+                .delete(&converted_answer_key(&row.storage_key, position))
+                .await?;
+        }
+        store.delete(&sheets).await?;
         store.delete(&converted_key(&row.storage_key)).await?;
     }
     store.delete(&row.storage_key).await?;
+    // The report of values that did not fit belongs to the upload: it is
+    // beside the original (`DATA-31`), and a delete takes it with it. A
+    // missing object is a no-op, as for the others.
+    store.delete(&report_key(&row.storage_key)).await?;
     if !uploads::delete(pool, &row.id).await? {
         // Refused because a load was claimed after the check above, or the
         // row was deleted by another request meanwhile.
@@ -1819,7 +3591,7 @@ pub async fn delete(
         map.insert("table".to_owned(), json!(table));
     }
     let event = upload_audit_event(&principal, "upload.delete", &row.id, args, "executed");
-    record_audit(pool, event).await;
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1828,6 +3600,20 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    // ── the conversion's answer ──────────────────────────────────────────
+
+    /// A child that could not set its own limits is the installation's
+    /// fault, not the file's: it is a 500, and it says the same sentence as
+    /// a child that could not be started (`PR #187` review SHOULD-FIX 4).
+    #[test]
+    fn a_child_that_could_not_set_its_limits_is_a_500() {
+        let err = conversion_error(FileKind::Workbook, ConversionError::LimitFailed);
+        assert!(
+            matches!(err, ApiError::Internal(_)),
+            "the answer is a 500: {err:?}"
+        );
+    }
 
     // ── the storage key ─────────────────────────────────────────────────
 
@@ -1907,15 +3693,15 @@ mod tests {
         // changed with what is accepted.
         assert_eq!(
             refusal(b"PK\x03\x04rest of a zip"),
-            "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."
+            "This looks like a workbook or a zip archive that is not named like one. Excel workbooks must end in .xls or .xlsx and zip archives in .zip; or save the sheet as .xlsx or CSV first."
         );
         assert!(refusal(&[0xD0, 0xCF, 0x11, 0xE0, 1, 2, 3, 4]).contains("workbook"));
         assert_eq!(
             refusal(b"PAR1\x15\x04rest"),
             "This looks like a Parquet file, but its name does not end in .parquet. Rename it to end in .parquet and upload it again."
         );
-        assert!(refusal(b"%PDF-1.7 ...").contains("not a delimited text file"));
-        assert!(refusal(b"a,b\0c,d").contains("not a delimited text file"));
+        assert!(refusal(b"%PDF-1.7 ...").contains("not a file this upload reads"));
+        assert!(refusal(b"a,b\0c,d").contains("not a file this upload reads"));
     }
 
     /// A Parquet file is accepted by its first bytes AND a `.parquet` name;
@@ -1953,6 +3739,41 @@ mod tests {
         assert!(check_file(encrypted, "a.csv").is_err());
     }
 
+    /// Bytes that are neither text nor a kind the API knows are answered by what the
+    /// file's name claims: "could not be opened" as that format, never "a format this
+    /// upload does not read" (QA `LH-DATA-17-05`, `DATA-51`).
+    #[test]
+    fn a_binary_file_named_like_an_accepted_format_is_told_it_could_not_be_opened() {
+        // The bytes of the "not text" case above: a NUL byte, so no reader takes it.
+        let binary = b"a,b\0c,d";
+        let refusal = |name: &str| check_file(binary, name).unwrap_err().to_string();
+        let sentences = [
+            (
+                "a.parquet",
+                upload_parquet::ParquetFileError::Unreadable.to_string(),
+            ),
+            (
+                "a.xlsx",
+                upload_workbook::WorkbookError::Unreadable.to_string(),
+            ),
+            ("a.avro", NOT_AVRO.to_owned()),
+            ("a.json", Refusal::JsonInvalid.to_string()),
+            ("a.csv.gz", NOT_AN_ARCHIVE.to_owned()),
+            ("a.zip", NOT_AN_ARCHIVE.to_owned()),
+        ];
+        for (name, sentence) in sentences {
+            assert_eq!(refusal(name), sentence, "{name}");
+            assert!(
+                !sentence.contains("not a file this upload reads"),
+                "{name} must not be answered as a format this upload does not read"
+            );
+        }
+        // A name that claims no format keeps the format-list sentence.
+        for name in ["a.bin", "a.pdf"] {
+            assert_eq!(refusal(name), OTHER_BINARY, "{name}");
+        }
+    }
+
     #[test]
     fn what_a_stored_upload_is_converted_from_follows_its_name_and_its_first_bytes() {
         let zip = b"PK\x03\x04rest";
@@ -1985,7 +3806,7 @@ mod tests {
     #[test]
     fn a_parquet_load_reads_neither_a_dialect_nor_a_header_row() {
         let bare = json!({ "bronzeTable": "orders_raw" });
-        let request = parse_ingest_request(&body(&bare), Some(Conversion::Parquet)).unwrap();
+        let request = parse_ingest_request(&body(&bare), Some(Conversion::Parquet), None).unwrap();
         assert_eq!(request.encoding, Encoding::Utf8);
         assert_eq!(request.delimiter, ',');
         assert_eq!(request.header_row, 0);
@@ -1994,13 +3815,13 @@ mod tests {
         sent["headerRow"] = json!(5);
         sent["encoding"] = json!("utf-16");
         sent["delimiter"] = json!(";");
-        let request = parse_ingest_request(&body(&sent), Some(Conversion::Parquet)).unwrap();
+        let request = parse_ingest_request(&body(&sent), Some(Conversion::Parquet), None).unwrap();
         assert_eq!((request.header_row, request.encoding), (0, Encoding::Utf8));
         // The rest of the body is checked as for any upload.
         let mut bad_table = bare;
         bad_table["bronzeTable"] = json!("Orders");
         assert_eq!(
-            parse_ingest_request(&body(&bad_table), Some(Conversion::Parquet))
+            parse_ingest_request(&body(&bad_table), Some(Conversion::Parquet), None)
                 .unwrap_err()
                 .to_string(),
             TABLE_NAME_RULE
@@ -2022,15 +3843,72 @@ mod tests {
                 "{name}"
             );
         }
-        for name in [
-            "a.xlsm", "a.xlsb", "a.ods", "a.zip", "a.csv", "a", "a.docx", "",
-        ] {
+        for name in ["a.xlsm", "a.xlsb", "a.ods", "a.csv", "a", "a.docx", ""] {
             assert!(check_file(zip, name).is_err(), "{name}");
             assert!(check_file(&ole, name).is_err(), "{name}");
         }
         for name in ["a.xls", "a.xlsx", "a.csv", "a"] {
             assert_eq!(check_file(b"id,name\n1,a\n", name).unwrap(), Accepted::Text);
         }
+        // `DATA-17` slice 4: a `.zip` is an archive; its files are checked when it is opened.
+        assert_eq!(check_file(zip, "a.zip").unwrap(), Accepted::Zip);
+    }
+
+    /// `DATA-17` slice 4: each new kind needs its first bytes AND its name; a name alone
+    /// never makes a file one, as for a workbook.
+    #[test]
+    fn json_jsonl_avro_gzip_and_zip_need_both_their_first_bytes_and_their_name() {
+        let gzip = |data: &[u8]| {
+            use std::io::Write as _;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(data).unwrap();
+            encoder.finish().unwrap()
+        };
+        let gz = gzip(b"id,name\n1,a\n");
+        let avro = b"Obj\x01\x04\x16avro.schema";
+        assert_eq!(
+            check_file(b" [{\"a\": 1}]", "a.json").unwrap(),
+            Accepted::Json
+        );
+        assert_eq!(
+            check_file(b"\xef\xbb\xbf[]", "A.JSON").unwrap(),
+            Accepted::Json
+        );
+        assert_eq!(
+            check_file(b"{\"a\": 1}\n", "a.jsonl").unwrap(),
+            Accepted::JsonLines
+        );
+        assert_eq!(
+            check_file(b"{\"a\": 1}\n", "a.ndjson").unwrap(),
+            Accepted::JsonLines
+        );
+        assert_eq!(check_file(avro, "a.avro").unwrap(), Accepted::Avro);
+        assert_eq!(check_file(&gz, "a.csv.gz").unwrap(), Accepted::Gzip);
+        assert_eq!(check_file(&gz, "a.gz").unwrap(), Accepted::Gzip);
+        // A name that says JSON over text that is not an array, an object per line, or Avro.
+        let refused = |bytes: &[u8], name: &str| check_file(bytes, name).unwrap_err().to_string();
+        assert_eq!(
+            refused(b"id,name\n1,a\n", "a.json"),
+            "A JSON file must hold an array of objects."
+        );
+        assert_eq!(
+            refused(b"{\"a\": 1}", "a.json"),
+            "A JSON file must hold an array of objects."
+        );
+        assert!(refused(b"[1]", "a.jsonl").contains("must be a JSON object"));
+        assert!(refused(b"id,name\n", "a.avro").contains("is not an Avro file"));
+        assert!(refused(b"id,name\n", "a.gz").contains("is not one"));
+        assert!(refused(b"id,name\n", "a.zip").contains("is not one"));
+        // The right bytes under the wrong name.
+        assert!(refused(&gz, "a.csv").contains("does not end in .gz"));
+        assert!(refused(&gz, "a.json").contains("does not end in .gz"));
+        assert!(refused(avro, "a.csv").contains("does not end in .avro"));
+        assert!(refused(b"PK\x03\x04x", "a.docx").contains("not named like one"));
+        // A gzip file must hold text: another gzip, a zip, or binary data is refused.
+        assert!(refused(&gzip(&gz), "a.gz").contains("not another archive"));
+        assert!(refused(&gzip(b"PK\x03\x04x"), "a.gz").contains("not another archive"));
+        assert!(refused(&gzip(b"%PDF-1.7 ..."), "a.gz").contains("must hold a CSV"));
     }
 
     #[test]
@@ -2061,6 +3939,39 @@ mod tests {
             "The file is larger than the 50 MB limit."
         );
         assert!(check_file(&over[..MAX_UPLOAD_BYTES], "x.csv").is_ok());
+    }
+
+    /// Plan T6.2 item 2: the unpacked cap (what the job is told, and what a gzip,
+    /// a zip or a grouped load may add up to) is 2 GiB and is not the 50 MiB of
+    /// one `POST /api/uploads` file.
+    #[test]
+    fn the_unpacked_cap_is_2_gib_and_is_not_the_cap_of_a_whole_file() {
+        assert_eq!(MAX_UNPACKED_BYTES, 2_147_483_648);
+        assert_ne!(MAX_UNPACKED_BYTES, u64::try_from(MAX_UPLOAD_BYTES).unwrap());
+    }
+
+    /// `DATA-51` (QA `LH-DATA-17-13`): the refusal once unpacked names the cap, and the
+    /// job's recorded reason for it is that same sentence -- the API shows a recorded
+    /// reason only when it is one of [`JOB_FAILURE_REASONS`], so the two must not drift.
+    #[test]
+    fn the_unpacked_sentences_name_the_unpacked_cap() {
+        assert_eq!(
+            MAX_UNPACKED_BYTES % (1024 * 1024 * 1024),
+            0,
+            "the sentence says a whole number of GB"
+        );
+        let gigabytes = MAX_UNPACKED_BYTES / (1024 * 1024 * 1024);
+        assert_eq!(
+            JOB_TOO_LARGE_UNPACKED,
+            Refusal::TooLargeUnpacked.to_string()
+        );
+        let cap = format!("the {gigabytes} GB limit");
+        for sentence in [
+            JOB_TOO_LARGE_UNPACKED,
+            Refusal::TooLargeUnpacked.to_string().as_str(),
+        ] {
+            assert!(sentence.contains(&cap), "{sentence} must name {cap}");
+        }
     }
 
     #[test]
@@ -2159,14 +4070,40 @@ mod tests {
     }
 
     fn refusal_of(value: &Value) -> String {
-        parse_ingest_request(&body(value), None)
+        parse_ingest_request(&body(value), None, None)
             .unwrap_err()
             .to_string()
     }
 
     #[test]
+    fn the_folder_is_optional_text_or_null_and_nothing_else() {
+        let read = |value: Value| parse_ingest_request(&body(&value), None, None);
+        let mut with = valid();
+        assert_eq!(
+            read(with.clone()).unwrap().folder_id,
+            folders::FolderRef::Absent,
+            "said nothing"
+        );
+        with["folderId"] = json!(null);
+        assert_eq!(
+            read(with.clone()).unwrap().folder_id,
+            folders::FolderRef::Null,
+            "said none"
+        );
+        with["folderId"] = json!("uf-1");
+        assert_eq!(
+            read(with.clone()).unwrap().folder_id,
+            folders::FolderRef::Id("uf-1".to_owned())
+        );
+        for bad in [json!(3), json!(""), json!(["uf-1"]), json!(true)] {
+            with["folderId"] = bad;
+            assert_eq!(read(with.clone()).unwrap_err().to_string(), FOLDER_ID_RULE);
+        }
+    }
+
+    #[test]
     fn a_complete_body_is_accepted_and_mode_defaults_to_replace() {
-        let request = parse_ingest_request(&body(&valid()), None).unwrap();
+        let request = parse_ingest_request(&body(&valid()), None, None).unwrap();
         assert_eq!(
             request,
             IngestRequest {
@@ -2176,6 +4113,9 @@ mod tests {
                 delimiter: ',',
                 header_row: 0,
                 sheet: None,
+                columns: None,
+                also_uploads: Vec::new(),
+                folder_id: folders::FolderRef::Absent,
             }
         );
         let mut full = valid();
@@ -2183,7 +4123,7 @@ mod tests {
         full["encoding"] = json!("utf-16");
         full["delimiter"] = json!("\t");
         full["headerRow"] = json!(4);
-        let request = parse_ingest_request(&body(&full), None).unwrap();
+        let request = parse_ingest_request(&body(&full), None, None).unwrap();
         assert_eq!(request.mode, LoadMode::Append);
         assert_eq!(request.encoding, Encoding::Utf16);
         assert_eq!(request.delimiter, '\t');
@@ -2191,7 +4131,9 @@ mod tests {
         let mut null_mode = valid();
         null_mode["mode"] = Value::Null;
         assert_eq!(
-            parse_ingest_request(&body(&null_mode), None).unwrap().mode,
+            parse_ingest_request(&body(&null_mode), None, None)
+                .unwrap()
+                .mode,
             LoadMode::Replace
         );
     }
@@ -2251,7 +4193,7 @@ mod tests {
         };
         let longest = "a".repeat(128);
         for ok in ["a", "a1", "a_1", "sap_material_master", longest.as_str()] {
-            let request = parse_ingest_request(&body(&with_table(ok)), None).unwrap();
+            let request = parse_ingest_request(&body(&with_table(ok)), None, None).unwrap();
             assert_eq!(request.table, ok);
         }
         let too_long = "a".repeat(129);
@@ -2283,7 +4225,7 @@ mod tests {
     #[test]
     fn a_body_that_is_not_a_json_object_is_refused_without_serde_text() {
         for raw in [&b""[..], b"not json", b"[1]", b"\"x\"", b"null", b"{"] {
-            let err = parse_ingest_request(raw, None).unwrap_err();
+            let err = parse_ingest_request(raw, None, None).unwrap_err();
             assert_eq!(err.status(), 400);
             assert_eq!(err.to_string(), "The request body must be a JSON object.");
         }
@@ -2301,6 +4243,7 @@ mod tests {
             delimiter: delimiter.map(str::to_owned),
             header_row: header_row.map(str::to_owned),
             sheet: None,
+            table: None,
         }
     }
 
@@ -2312,18 +4255,18 @@ mod tests {
         v["encoding"] = json!("utf-16");
         v["delimiter"] = json!(";");
         v["sheet"] = json!("Quirks");
-        let request = parse_ingest_request(&body(&v), Some(Conversion::Workbook)).unwrap();
+        let request = parse_ingest_request(&body(&v), Some(Conversion::Workbook), None).unwrap();
         assert_eq!(request.encoding, Encoding::Utf8);
         assert_eq!(request.delimiter, ',');
         assert_eq!(request.sheet.as_deref(), Some("Quirks"));
         // Not read at all, so not required either.
         let bare = json!({ "bronzeTable": "stock_raw", "headerRow": 2 });
-        let request = parse_ingest_request(&body(&bare), Some(Conversion::Workbook)).unwrap();
+        let request = parse_ingest_request(&body(&bare), Some(Conversion::Workbook), None).unwrap();
         assert_eq!(request.header_row, 2);
         assert_eq!(request.sheet, None);
         // Still required and checked for a text file.
         assert_eq!(
-            parse_ingest_request(&body(&bare), None)
+            parse_ingest_request(&body(&bare), None, None)
                 .unwrap_err()
                 .to_string(),
             "encoding is required."
@@ -2332,7 +4275,7 @@ mod tests {
         let mut bad_table = bare.clone();
         bad_table["bronzeTable"] = json!("Orders");
         assert_eq!(
-            parse_ingest_request(&body(&bad_table), Some(Conversion::Workbook))
+            parse_ingest_request(&body(&bad_table), Some(Conversion::Workbook), None)
                 .unwrap_err()
                 .to_string(),
             TABLE_NAME_RULE
@@ -2350,7 +4293,7 @@ mod tests {
             (None, &bad_text_sheet),
         ] {
             assert_eq!(
-                parse_ingest_request(&body(body_with_bad_sheet), conversion)
+                parse_ingest_request(&body(body_with_bad_sheet), conversion, None)
                     .unwrap_err()
                     .to_string(),
                 "sheet must be text."
@@ -2359,22 +4302,103 @@ mod tests {
     }
 
     #[test]
+    fn the_other_files_are_read_from_the_body_and_the_config_lists_every_object_primary_first() {
+        let mut with_others = valid();
+        with_others["alsoUploads"] = json!(["up-2", "up-3"]);
+        let request = parse_ingest_request(&body(&with_others), None, None).unwrap();
+        assert_eq!(request.also_uploads, ["up-2", "up-3"]);
+        let keys = [
+            "uploads/t/up-1.csv",
+            "uploads/t/up-2.csv",
+            "uploads/t/up-3.csv",
+        ]
+        .map(str::to_owned);
+        let config = run_config(
+            "up-1",
+            &request,
+            &keys,
+            ("delimited", "none"),
+            "a person (file upload)",
+        );
+        let job = &config["ops"]["ingest_uploaded_file"]["config"];
+        assert_eq!(job["storage_keys"], json!(keys));
+        assert_eq!(job["upload_id"], "up-1");
+        assert_eq!(
+            job["bronze_table_name"], "stock_raw",
+            "the DATA-19 sensor path does not move"
+        );
+        let mut null_list = valid();
+        null_list["alsoUploads"] = Value::Null;
+        assert_eq!(
+            parse_ingest_request(&body(&null_list), None, None)
+                .unwrap()
+                .also_uploads,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
     fn the_job_is_told_the_converted_object_and_the_fixed_dialect() {
         let request = parse_ingest_request(
             &body(&json!({ "bronzeTable": "stock_raw", "headerRow": 1, "sheet": "Stock" })),
             Some(Conversion::Workbook),
+            None,
         )
         .unwrap();
-        let config = run_config("up-1", &request, "uploads/t/up-1.xlsx.converted.csv");
+        let config = run_config(
+            "up-1",
+            &request,
+            &["uploads/t/up-1.xlsx.converted.csv".to_owned()],
+            ("delimited", "none"),
+            "a person (file upload)",
+        );
         let job = &config["ops"]["ingest_uploaded_file"]["config"];
         assert_eq!(job["upload_id"], "up-1");
-        assert_eq!(job["storage_key"], "uploads/t/up-1.xlsx.converted.csv");
+        assert_eq!(
+            job["storage_keys"],
+            json!(["uploads/t/up-1.xlsx.converted.csv"])
+        );
+        assert_eq!(job["format"], "delimited");
         assert_eq!(job["encoding"], "utf-8");
         assert_eq!(job["delimiter"], ",");
         assert_eq!(job["header_row"], 1);
         assert!(
             job.get("sheet").is_none(),
             "the job's config schema is closed"
+        );
+    }
+
+    /// `DATA-52`: the job is told who started the load, as the API stores it.
+    #[test]
+    fn the_run_config_names_who_started_the_load() {
+        let request = parse_ingest_request(&body(&valid()), None, None).unwrap();
+        let config = run_config(
+            "up-1",
+            &request,
+            &["uploads/t/up-1.csv".to_owned()],
+            ("delimited", "none"),
+            "Rina Wijaya (file upload)",
+        );
+        let job = &config["ops"]["ingest_uploaded_file"]["config"];
+        assert_eq!(job["author"], "Rina Wijaya (file upload)");
+    }
+
+    /// `DATA-52` (QA `LH-DATA-15-08`): a name is shown in a table's history, so it
+    /// carries no control character and no more than a stored text does; and an
+    /// upload with no usable name says how it was written, not " (file upload)".
+    #[test]
+    fn the_author_of_a_load_is_the_name_without_control_characters_or_file_upload_alone() {
+        assert_eq!(load_author("Rina Wijaya"), "Rina Wijaya (file upload)");
+        assert_eq!(load_author("Rina\nWijaya\u{7}"), "RinaWijaya (file upload)");
+        assert_eq!(load_author("  Rina Wijaya  "), "Rina Wijaya (file upload)");
+        for nothing in ["", "   ", "\n\u{7}"] {
+            assert_eq!(load_author(nothing), "file upload", "{nothing:?}");
+        }
+        let long = "x".repeat(300);
+        let author = load_author(&long);
+        assert_eq!(
+            author,
+            format!("{} (file upload)", "x".repeat(MAX_STORED_TEXT_CHARS))
         );
     }
 
@@ -2540,8 +4564,8 @@ mod tests {
     }
 
     /// Review finding B6: a recorded reason reaches a response only when it is
-    /// one of the seven the API knows (six before finding C2). Each of the
-    /// seven is kept; text that is near one of them, text with detail added,
+    /// one of the twelve the API knows (six before finding C2). Each of the
+    /// twelve is kept; text that is near one of them, text with detail added,
     /// and exception text are all the fixed `The load failed.`.
     #[test]
     fn a_recorded_reason_is_shown_only_when_it_is_one_the_api_knows() {
@@ -2576,8 +4600,10 @@ mod tests {
         }
     }
 
-    /// Review findings B6 and C2: the seven reasons the API knows are the
-    /// seven in the file the job's own tests assert its constants against
+    /// Review findings B6 and C2: the twelve reasons the API knows are the
+    /// twelve in the file (Phase 3 slice 3 review BLOCKER 3: `DATA-18` added the ninth;
+    /// `DATA-17` slice 4 the tenth; PR #186 review SHOULD-FIX 1 the eleventh;
+    /// `DATA-51` the twelfth) the job's own tests assert its constants against
     /// too, in the same order, so the two sides cannot drift apart
     /// unnoticed. Read here from test code only, with `include_str!`, so the
     /// release build of the API depends on nothing outside `rust/`.
@@ -2593,7 +4619,7 @@ mod tests {
         let mut distinct = JOB_FAILURE_REASONS.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(distinct.len(), 7, "seven different reasons");
+        assert_eq!(distinct.len(), 12, "twelve different reasons");
         assert!(
             !JOB_FAILURE_REASONS.contains(&LOAD_FAILED),
             "the fixed fallback is not one of the job's reasons"
@@ -2638,7 +4664,7 @@ mod tests {
         assert_eq!(RUN_UNKNOWN, "The orchestrator no longer knows this load.");
         assert_eq!(
             TABLE_NOT_FREE,
-            "That table name is in use and no upload of this tenant created it, so a file cannot be loaded into it."
+            "That table name cannot be used. Choose another name."
         );
         // T7a, review findings C1 and C2.
         assert_eq!(

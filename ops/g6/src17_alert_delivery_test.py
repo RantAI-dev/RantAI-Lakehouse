@@ -46,9 +46,12 @@ overrides it). `docker compose run` does not give the container its service
 name as a network alias unless `--use-aliases` is passed, so the gate does not
 rely on the name.
 
-`SEC-10` (alert webhooks cannot reach internal addresses) is NOT built yet.
-When it lands it will refuse this receiver's address by default and must give
-this gate its documented opt-in (the gate may not weaken the default).
+`SEC-10` (alert webhooks cannot reach internal addresses) is built: the API
+refuses this receiver's address by default. The gate's documented opt-in is
+`WEBHOOK_ALLOWED_CIDRS` on `lakehouse-api`, set in
+`ops/g6/docker-compose.g6.override.yml` to the pinned gate subnet only (the
+runner's receiver lives inside it); the default stays closed and the gate does
+not weaken it.
 
 # Settings (environment)
 
@@ -93,7 +96,14 @@ RUN_FAILURE_TIMEOUT_S = 120
 
 
 class AlertGateFailure(Exception):
-    """A step of this gate failed; the message starts with the step's name."""
+    """A step of this gate failed; the message starts with the step's name.
+    When it quotes an API reference id (SEC-11 hides upstream error text
+    behind one), the note from `matrix.reference_hint` names the log lines to
+    read (PR #105 CI fix)."""
+
+    def __init__(self, message: object = "") -> None:
+        text = str(message)
+        super().__init__(text + matrix.reference_hint(text))
 
 
 def say(line: str) -> None:

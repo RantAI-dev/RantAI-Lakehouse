@@ -1,88 +1,836 @@
-// UX-1-R3: every kind-dependent required control in the chart builder must
-// have an id linked to a visible Label that carries the shared required prop,
-// not just aria-required on an unlabelled trigger.
-mock.module("next/navigation", () => ({
-  usePathname: () => "/dashboards",
-  useSearchParams: () => new URLSearchParams(),
-  useRouter: () => ({
-    push: () => {},
-    replace: () => {},
-    refresh: () => {},
-    back: () => {},
-    forward: () => {},
-    prefetch: () => {},
-  }),
-}))
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 
-import { render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock } from "bun:test"
-import { AuthProvider } from "@/features/auth/auth-provider"
-import { ChartBuilder } from "./chart-builder"
+import * as realAuth from "@/features/auth/auth-provider"
 
-const originalFetch = global.fetch
-afterEach(() => {
-  global.fetch = originalFetch
+// The builder reads the signed-in user's permissions; a plain editor without `dashboard:sql` is enough here.
+// PR #160 CI fix: `mock.module` outlives this file in `bun test src`, so the real exports are kept and only
+// `useAuth` is replaced, and the real module is put back in `afterAll`; a bare `{ useAuth }` left
+// `tenant-switcher.test.tsx`, which runs later, without `AuthProvider`.
+const real = { ...realAuth }
+mock.module("@/features/auth/auth-provider", () => ({ ...real, useAuth: () => ({ hasPermission: () => false }) }))
+afterAll(() => {
+  mock.module("@/features/auth/auth-provider", () => real)
 })
 
-function stubFetch() {
-  global.fetch = mock(async (input: RequestInfo | URL) => {
+import { ChartBuilder, type ChartDef } from "./chart-builder"
+
+const originalFetch = global.fetch
+let bodies: Record<string, unknown>[] = []
+
+/** The routes the builder calls on open: the marts, the fields of `mart_visits`, and the preview (answered with an error, which is enough). */
+beforeEach(() => {
+  bodies = []
+  window.localStorage.clear()
+  global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
-    const json = (body: unknown) =>
-      new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })
-    if (url.includes("/api/auth/me")) {
+    const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
+    if (url.includes("/specs/preview")) {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)))
+      return json({ error: "not in this test" }, 400)
+    }
+    if (url.includes("/api/dashboard/fields") && url.includes("mart=")) {
       return json({
-        id: "u1",
-        name: "Builder",
-        email: null,
-        roles: [],
-        permissions: ["*:*"],
-        tenants: [{ id: "t1", name: "Acme", slug: "acme" }],
+        dimensions: ["provinsi", "category"], measures: ["visitors", "stay", "mart_demo_province_capacity__rooms"], calculated: [], hierarchies: [],
+        columns: [{ name: "provinsi", type: "String" }, { name: "category", type: "String" }, { name: "visitors", type: "UInt64" }, { name: "stay", type: "Float64" }, { name: "mart_demo_province_capacity__rooms", type: "Float64" }],
       })
     }
-    if (url.includes("/api/dashboard/fields")) return json({ marts: [] })
-    if (url.includes("/api/dashboard/sql-sources")) return json([])
-    return json({})
+    if (url.includes("/api/dashboard/fields")) return json({ marts: [{ name: "mart_visits", rows: 10 }] })
+    if (url.includes("/api/dashboard/sources")) return json({ sources: [] })
+    if (url.includes("/api/dashboard/metrics") && !url.includes("usage")) {
+      return json({ metrics: [{ id: "m1", name: "coba_metrik", label: "Coba metrik", description: "", sourceKind: "mart", sourceId: "mart_visits", formula: "sum(visitors)" }] })
+    }
+    // Segments and parameters: the builder carries on without them.
+    return json({ error: "not in this test" }, 500)
   }) as unknown as typeof fetch
+})
+afterEach(() => {
+  global.fetch = originalFetch
+  cleanup()
+})
+
+const barDef: ChartDef = { title: "Visitors", kind: "bar", mart: "mart_visits", dimension: "provinsi", measures: ["visitors"], aggregate: "sum" }
+
+function renderBuilder(initial?: ChartDef) {
+  return render(<ChartBuilder onSaved={() => {}} onCancel={() => {}} initial={initial} editId={initial ? "c_1" : undefined} />)
 }
 
-/** The label must be visible, associated by htmlFor, and carry data-required. */
-function expectAssociatedRequiredLabel(id: string) {
-  const control = document.getElementById(id)
-  expect(control).not.toBeNull()
-  const label = document.querySelector(`label[for="${id}"]`)
-  expect(label).not.toBeNull()
-  expect(label?.getAttribute("data-required")).toBe("")
-  expect(control?.getAttribute("aria-required")).toBe("true")
+describe("ChartBuilder sections (phase 2 QA R3)", () => {
+  it("shows five ordered sections and folds the last two", async () => {
+    renderBuilder(barDef)
+    const headings = await screen.findAllByRole("heading", { level: 3 })
+    // A folded section also shows its summary after the title (phase 2 QA R10). BI-17 added "Format" as the fifth.
+    const titles = ["Data", "What to show", "Sort and filter", "More options", "Format"]
+    expect(headings.map((h) => h.textContent ?? "")).toHaveLength(5)
+    headings.forEach((h, i) => expect(h.textContent).toContain(titles[i]))
+    expect(screen.getByRole("button", { name: /More options/ }).getAttribute("aria-expanded")).toBe("false")
+    expect(screen.getByRole("button", { name: /Format/ }).getAttribute("aria-expanded")).toBe("false")
+    // Nothing of the folded options is drawn, and no row of chips or default-aggregate select stands in the form.
+    expect(screen.queryByText("Reference lines")).toBeNull()
+    expect(screen.queryByText("Parameters")).toBeNull()
+    expect(screen.queryByText(/Aggregation .*default/)).toBeNull()
+    expect(screen.queryByText("New calculated field")).toBeNull()
+  })
+
+  it("opens the fold on its own when the edited chart uses something inside it", async () => {
+    renderBuilder({ ...barDef, click: { kind: "url", url: "https://example.com/x" } })
+    const toggle = await screen.findByRole("button", { name: /More options/ })
+    await waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("true"))
+    expect(screen.getByText("Parameters")).toBeTruthy()
+  })
+
+  // BI-17: the reference lines editor moved from More options to the Format section.
+  it("opens Format, not More options, for a chart with a reference line, and lists the line there", async () => {
+    renderBuilder({ ...barDef, referenceLines: [{ value: 100 }] as never })
+    const format = await screen.findByRole("button", { name: /Format/ })
+    await waitFor(() => expect(format.getAttribute("aria-expanded")).toBe("true"))
+    expect(screen.getByRole("button", { name: /More options/ }).getAttribute("aria-expanded")).toBe("false")
+    expect(screen.getByLabelText("Line 1 value")).toBeTruthy()
+  })
+
+  it("opens the fold for steps, and a user can open it by hand", async () => {
+    const { unmount } = renderBuilder({ ...barDef, steps: [{ filter: [{ column: "visitors", op: "gt", value: "5" }] }] })
+    await waitFor(() => expect(screen.getByRole("button", { name: /More options/ }).getAttribute("aria-expanded")).toBe("true"))
+    unmount()
+    cleanup()
+    renderBuilder(barDef)
+    const toggle = await screen.findByRole("button", { name: /More options/ })
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute("aria-expanded")).toBe("true")
+    expect(screen.getByText("Parameters")).toBeTruthy()
+  })
+
+  it("keeps a text note to its title and content", async () => {
+    renderBuilder({ title: "Note", kind: "text", text: "hello" })
+    await screen.findByText(/Content \(markdown\)/)
+    expect(screen.queryAllByRole("heading", { level: 3 })).toHaveLength(0)
+  })
+})
+
+describe("ChartBuilder aggregation (phase 2 QA R4)", () => {
+  it("shows a saved chart-level aggregate on each measure and sends the same definition back", async () => {
+    renderBuilder({ ...barDef, measures: ["visitors", "stay"], aggregate: "avg" })
+    await waitFor(() => expect(screen.getByLabelText("Aggregation of stay").textContent).toContain("avg"))
+    expect(screen.getByLabelText("Aggregation of visitors").textContent).toContain("avg")
+    // The preview is requested with the very measures and aggregate that were saved.
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    const sent = bodies[bodies.length - 1]
+    expect(sent.measures).toEqual(["visitors", "stay"])
+    expect(sent.aggregate).toBe("avg")
+  })
+})
+
+describe("ChartBuilder kind rules (phase 2 QA R5)", () => {
+  it("hides steps and questions while 'Other' is on and says why beside the switch", async () => {
+    renderBuilder({ ...barDef, other: true, limit: 5, steps: undefined })
+    const toggle = await screen.findByRole("button", { name: /More options/ })
+    fireEvent.click(toggle)
+    await waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("true"))
+    expect(screen.getByText("While this is on, steps and more questions are not available.")).toBeTruthy()
+    expect(screen.queryByText("Steps")).toBeNull()
+    expect(screen.queryByText("More questions")).toBeNull()
+    expect(screen.queryByText(/Remove .* to combine questions/)).toBeNull()
+  })
+
+  it("offers 'Other', steps and questions to a bar, and none of them to a KPI", async () => {
+    const { unmount } = renderBuilder({ ...barDef, click: { kind: "url", url: "https://example.com/x" } })
+    await screen.findByLabelText("Group the rest as Other")
+    expect(screen.getByText("Steps")).toBeTruthy()
+    expect(screen.getByText("More questions")).toBeTruthy()
+    unmount()
+    cleanup()
+    renderBuilder({ title: "K", kind: "kpi", mart: "mart_visits", measures: ["visitors"], aggregate: "sum" })
+    await screen.findByText("Filters")
+    expect(screen.queryByLabelText("Group the rest as Other")).toBeNull()
+    expect(screen.queryByText("Sort")).toBeNull()
+    expect(screen.queryByText("Steps")).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: /More options/ }))
+    expect(screen.queryByText("Steps")).toBeNull()
+    expect(screen.queryByText("More questions")).toBeNull()
+    expect(screen.queryByText("Reference lines")).toBeNull()
+  })
+})
+
+describe("ChartBuilder single-number payload (QA LH-BI-2-01)", () => {
+  it("sends a reusable metric of a KPI as { metric }, not as the raw row column", async () => {
+    renderBuilder({ title: "K", kind: "kpi", mart: "mart_visits", measures: [{ metric: "coba_metrik" }] as never, aggregate: "sum" })
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    expect(bodies[bodies.length - 1]!.measures).toEqual([{ metric: "coba_metrik" }])
+  })
+
+  it("keeps a plain column of a KPI as the column name, as before", async () => {
+    renderBuilder({ title: "K", kind: "kpi", mart: "mart_visits", measures: ["visitors"], aggregate: "sum" })
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    expect(bodies[bodies.length - 1]!.measures).toEqual(["visitors"])
+  })
+})
+
+describe("ChartBuilder dimension beside more questions (QA LH-BI-13-01)", () => {
+  /** The fields answer names `visitors` a number column, as a year column would be. */
+  function withNumberKinds() {
+    const inner = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const res = await inner(input, init)
+      const url = String(input)
+      if (url.includes("/api/dashboard/fields") && url.includes("mart=")) {
+        const body = (await res.json()) as Record<string, unknown>
+        return new Response(JSON.stringify({ ...body, kinds: { visitors: "number", stay: "number" } }), { status: 200, headers: { "Content-Type": "application/json" } })
+      }
+      return res
+    }) as unknown as typeof fetch
+  }
+  const layered = {
+    ...barDef,
+    dimension: "provinsi",
+    // The question's own dimension must line up with the chart's (both numbers), as it does
+    // for a year column, or the builder drops it and the chart cannot be sent at all.
+    layers: [{ mart: "mart_visits", dimension: "stay", measures: ["stay"], aggregate: "sum", draw: "line", axis: "right" }],
+  } as unknown as ChartDef
+
+  it("still offers a number column as the dimension when the chart has more questions", async () => {
+    withNumberKinds()
+    renderBuilder({ ...layered, dimension: "visitors" })
+    await screen.findByLabelText("Aggregation of visitors")
+    // The trigger of the Dimension (X) select is the one in the same field as its label.
+    const field = screen.getByText(/^Dimension \(X\)/).closest("div") as HTMLElement
+    fireEvent.click(field.querySelector('[role="combobox"]') as HTMLElement)
+    // `stay` is a number column, in no way a dimension of the source: only the rule that keeps numbers offers it.
+    expect(await screen.findByRole("option", { name: "stay" })).toBeTruthy()
+    expect(screen.getByRole("option", { name: "provinsi" })).toBeTruthy()
+  })
+
+  it("saves that number dimension without a bin, because bins are off beside more questions", async () => {
+    withNumberKinds()
+    renderBuilder({ ...layered, dimension: "visitors" })
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    expect(bodies[bodies.length - 1]!.dimension).toBe("visitors")
+    expect(bodies[bodies.length - 1]!.dimensionBin).toBeUndefined()
+  })
+})
+
+describe("ChartBuilder kind switch (phase 2 QA R6)", () => {
+  it("keeps the dimension as the first grouping of a data table and back as the dimension of a chart", async () => {
+    renderBuilder({ ...barDef, breakdown: "category" })
+    await screen.findByLabelText("Aggregation of visitors")
+    // The type list is folded for a chart being edited; the menu in the header changes the type.
+    fireEvent.click(screen.getByRole("button", { name: /Change chart type/ }))
+    fireEvent.click(screen.getByRole("button", { name: "Data table" }))
+    // The dimension and the breakdown are the first groupings, so the steps editor has something to keep.
+    expect(await screen.findByLabelText("Move provinsi down")).toBeTruthy()
+    expect(screen.getByLabelText("Remove category")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: /Change chart type/ }))
+    fireEvent.click(screen.getByRole("button", { name: "Bar" }))
+    await waitFor(() => expect(screen.queryByLabelText("Remove category")).toBeNull())
+    expect(screen.getAllByText("provinsi").length).toBeGreaterThan(0)
+  })
+})
+
+const expanded = (name: RegExp | string) => screen.getByRole("button", { name }).getAttribute("aria-expanded")
+
+describe("ChartBuilder type list (phase 2 QA R9)", () => {
+  it("shows the list for a new chart, folds it once a type is chosen, and the choice of folding is remembered", async () => {
+    const { unmount } = renderBuilder()
+    expect(screen.getByRole("navigation", { name: "Chart type" })).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Line" }))
+    // No remembered choice yet: choosing a type folds the list away, and nothing is stored by that.
+    expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
+    expect(window.localStorage.getItem("lh.chartBuilder.typeList")).toBeNull()
+    // Opening it by hand is remembered, and a builder opened later starts open.
+    fireEvent.click(screen.getByRole("button", { name: "Show the chart type list" }))
+    expect(screen.getByRole("navigation", { name: "Chart type" })).toBeTruthy()
+    expect(window.localStorage.getItem("lh.chartBuilder.typeList")).toBe("expanded")
+    unmount()
+    cleanup()
+    renderBuilder({ ...barDef })
+    expect(screen.getByRole("navigation", { name: "Chart type" })).toBeTruthy()
+    // Folding by hand is remembered too, and a new chart then opens folded.
+    fireEvent.click(screen.getByRole("button", { name: "Fold the chart type list" }))
+    expect(window.localStorage.getItem("lh.chartBuilder.typeList")).toBe("collapsed")
+    cleanup()
+    renderBuilder()
+    expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
+  })
+
+  it("starts folded for an edited chart, and the folded control still searches the types", async () => {
+    renderBuilder(barDef)
+    expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: /Change chart type, now Bar/ }))
+    const search = screen.getByLabelText("Search chart types")
+    fireEvent.change(search, { target: { value: "sankey" } })
+    expect(screen.queryByRole("button", { name: "Line" })).toBeNull()
+    fireEvent.keyDown(search, { key: "Enter" })
+    // The first match was picked and the menu closed.
+    await waitFor(() => expect(screen.queryByLabelText("Search chart types") === null).toBe(true))
+    expect(screen.getByRole("button", { name: /Change chart type, now Sankey/ })).toBeTruthy()
+  })
+
+  it("closes the folded type menu on Escape and on an outside press, and focus returns to its trigger (phase 2 QA R17)", async () => {
+    renderBuilder(barDef)
+    const trigger = () => screen.getByRole("button", { name: /Change chart type, now Bar/ })
+    fireEvent.click(trigger())
+    const search = await screen.findByLabelText("Search chart types")
+    fireEvent.keyDown(search, { key: "Escape" })
+    await waitFor(() => expect(screen.queryByLabelText("Search chart types") === null).toBe(true))
+    // A boolean, not the element: a failing match would print the whole dialog on every retry.
+    await waitFor(() => expect(document.activeElement === trigger()).toBe(true))
+    // The dialog itself stays open after the Escape.
+    expect(screen.getByText("Edit chart")).toBeTruthy()
+    fireEvent.click(trigger())
+    await screen.findByLabelText("Search chart types")
+    const heading = screen.getByText("Edit chart")
+    fireEvent.pointerDown(heading)
+    fireEvent.mouseDown(heading)
+    fireEvent.click(heading)
+    await waitFor(() => expect(screen.queryByLabelText("Search chart types") === null).toBe(true))
+    expect(screen.getByText("Edit chart")).toBeTruthy()
+  })
+
+  it("works when the browser refuses storage", async () => {
+    const read = spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new Error("blocked") })
+    const write = spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("blocked") })
+    try {
+      renderBuilder()
+      expect(screen.getByRole("navigation", { name: "Chart type" })).toBeTruthy()
+      fireEvent.click(screen.getByRole("button", { name: "Fold the chart type list" }))
+      expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
+    } finally {
+      read.mockRestore()
+      write.mockRestore()
+    }
+  })
+})
+
+describe("ChartBuilder accordion (phase 2 QA R10)", () => {
+  it("opens only section 1 for a new chart, with no way on until its required field is filled", async () => {
+    renderBuilder()
+    await screen.findByText("Data source")
+    expect(expanded(/^Data(?! table)/)).toBe("true")
+    expect(expanded(/What to show/)).toBe("false")
+    expect(expanded(/Sort and filter/)).toBe("false")
+    // Opening another section folds the open one.
+    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
+    expect(expanded(/What to show/)).toBe("true")
+    expect(expanded(/^Data(?! table)/)).toBe("false")
+  })
+
+  it("has no Next button, even once the source is picked (phase 2 QA R19)", async () => {
+    renderBuilder()
+    fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
+    fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
+    await screen.findByText("Data source")
+    expect(screen.queryByRole("button", { name: /^Next/ })).toBeNull()
+    // Opening a section by its heading still folds the open one.
+    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
+    expect(expanded(/What to show/)).toBe("true")
+    expect(expanded(/^Data(?! table)/)).toBe("false")
+  })
+
+  it("opens an edited chart with sections 1 to 3 folded to one-line summaries", async () => {
+    renderBuilder({ ...barDef, measures: ["visitors", { column: "stay", aggregate: "avg" }] as never, filters: [{ column: "category", op: "eq", value: "a" }] as never, limit: 5 })
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Data(?! table)/ }).textContent).toContain("mart_visits"))
+    expect(expanded(/^Data(?! table)/)).toBe("false")
+    expect(expanded(/What to show/)).toBe("false")
+    expect(expanded(/Sort and filter/)).toBe("false")
+    expect(screen.getByRole("button", { name: /What to show/ }).textContent).toContain("provinsi · visitors, avg of stay")
+    expect(screen.getByRole("button", { name: /Sort and filter/ }).textContent).toContain("highest first · top 5 · 1 filter")
+    // A folded section is opened by its heading, which is a button reached by Tab.
+    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
+    expect(expanded(/What to show/)).toBe("true")
+  })
+
+  it("opens the section that holds a missing field and focuses the field when saving", async () => {
+    renderBuilder({ title: "T", kind: "bar", mart: "mart_visits", measures: ["visitors"], aggregate: "sum" })
+    await screen.findByLabelText("Aggregation of visitors")
+    expect(expanded(/What to show/)).toBe("false")
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }))
+    await waitFor(() => expect(expanded(/What to show/)).toBe("true"))
+    expect(screen.getByRole("alert").textContent).toContain("Dimension (X)")
+    const focused = document.activeElement as HTMLElement
+    expect(focused.closest("section")?.querySelector("h3")?.textContent).toContain("What to show")
+  })
+
+  it("opens section 1 and focuses the source select when a new chart has no source", async () => {
+    renderBuilder()
+    await screen.findByText("Data source")
+    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
+    fireEvent.click(screen.getByRole("button", { name: "Create chart" }))
+    await waitFor(() => expect(expanded(/^Data(?! table)/)).toBe("true"))
+    const focused = document.activeElement as HTMLElement
+    expect(focused.closest("section")?.querySelector("h3")?.textContent).toContain("Data")
+    expect(focused.hasAttribute("data-placeholder")).toBe(true)
+  })
+})
+
+describe("ChartBuilder header (phase 2 QA R11)", () => {
+  it("keeps title, dashboard and width in one row and has no helper line under the title", async () => {
+    renderBuilder()
+    const title = await screen.findByLabelText(/^Title/)
+    const row = title.closest("div.grid")?.parentElement as HTMLElement
+    expect(row.textContent).toContain("Dashboard")
+    expect(row.textContent).toContain("Width")
+    expect(screen.queryByText(/Left empty, the chart is saved as/)).toBeNull()
+  })
+})
+
+describe("ChartBuilder long column names (phase 2 QA R14)", () => {
+  it("shows a picked joined measure by its own name with the table as a tag, and the full reference on hover", async () => {
+    renderBuilder({ ...barDef, measures: ["mart_demo_province_capacity__rooms"] })
+    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
+    const trigger = await screen.findByRole("combobox", { name: /^Measure/ })
+    await waitFor(() => expect(trigger.textContent).toContain("rooms"))
+    expect(trigger.textContent).toContain("capacity")
+    expect(trigger.textContent).not.toContain("__")
+    expect(trigger.getAttribute("title")).toBe("mart_demo_province_capacity.rooms")
+    // The label folds inside the trigger instead of widening it.
+    expect(trigger.querySelector(".truncate")?.textContent).toBe("rooms")
+  })
+
+  it("gives every grid of the form a column the container sizes, so no long name can scroll the form sideways", async () => {
+    renderBuilder({ ...barDef, measures: ["mart_demo_province_capacity__rooms"] })
+    const section = (await screen.findByRole("button", { name: /What to show/ })).closest("section") as HTMLElement
+    expect(section.className).toContain("grid-cols-[minmax(0,1fr)]")
+    expect(section.querySelector("[id$=-panel]")?.className).toContain("grid-cols-[minmax(0,1fr)]")
+    const form = section.parentElement as HTMLElement
+    expect(form.className).toContain("grid-cols-[minmax(0,1fr)]")
+    expect(form.className).toContain("min-w-0")
+    expect(form.className).toContain("[&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]")
+  })
+})
+
+describe("ChartBuilder conditional controls (phase 2 QA R15)", () => {
+  it("puts the bin of a number dimension in a row of its own, so Dimension and Breakdown stay in one row", async () => {
+    renderBuilder({ ...barDef, dimension: "visitors", measures: ["stay"] })
+    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
+    const bin = await screen.findByLabelText("Group in bins")
+    const dimension = document.querySelector("[data-slot=dimension-field]") as HTMLElement
+    const breakdown = document.querySelector("[data-slot=breakdown-field]") as HTMLElement
+    const row = document.querySelector("[data-slot=conditional-row]") as HTMLElement
+    // Both fields hold only their label and select, are siblings in one grid, and do not stretch.
+    expect(dimension.contains(bin)).toBe(false)
+    expect(breakdown.contains(bin)).toBe(false)
+    expect(row.contains(bin)).toBe(true)
+    expect(dimension.parentElement).toBe(breakdown.parentElement)
+    expect(row.parentElement).toBe(dimension.parentElement)
+    expect(dimension.className).toContain("content-start")
+    expect(breakdown.className).toContain("content-start")
+    expect(dimension.parentElement?.className).toContain("items-start")
+    expect(row.className).toContain("sm:col-span-2")
+  })
+
+  it("draws no extra row when the dimension needs no bin or grain", async () => {
+    renderBuilder(barDef)
+    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
+    await screen.findByText(/Dimension \(X\)/)
+    expect(document.querySelector("[data-slot=conditional-row]")).toBeNull()
+  })
+})
+
+describe("ChartBuilder labels (phase 2 QA R20)", () => {
+  it("suggests a title from the metric's label, not its stored reference", async () => {
+    renderBuilder({ title: "", kind: "bar", mart: "mart_visits", dimension: "category", measures: [{ metric: "coba_metrik" }] as never })
+    const field = await screen.findByLabelText("Title")
+    await waitFor(() => expect(field.getAttribute("placeholder")).toBe("Coba metrik by category"))
+  })
+
+  // `WEB-7` D6: the breadcrumb was the dialog's; the page title is FormPage's,
+  // and the kind is named beside the type list, or on the control that changes
+  // it when that list is folded.
+  it("names the page in the header and the kind beside the list, and no chevron in the title", async () => {
+    const { unmount } = renderBuilder()
+    const heading = screen.getByRole("heading", { level: 1 })
+    expect(heading.textContent).toBe("New chart")
+    expect(heading.querySelector("svg")).toBeNull()
+    // The kind follows a chevron in the builder's own header row.
+    const kind = document.querySelector("[data-slot=chart-kind]") as HTMLElement
+    expect(kind.textContent).toContain("Horizontal bar")
+    expect(kind.querySelector("svg")).not.toBeNull()
+    unmount()
+    cleanup()
+    renderBuilder(barDef)
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Edit chart")
+    // Folded, the same name is on the control that changes it.
+    expect(screen.getByRole("button", { name: /Change chart type, now Bar/ })).toBeTruthy()
+    expect(document.querySelector("[data-slot=chart-kind]")).toBeNull()
+  })
+})
+
+describe("ChartBuilder resizable split (phase 2 QA R18)", () => {
+  it("draws a focusable separator between the form panel and the preview panel at a wide screen", async () => {
+    const original = window.matchMedia
+    window.matchMedia = ((query: string) => ({
+      matches: true, media: query, onchange: null,
+      addEventListener: () => {}, removeEventListener: () => {}, addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia
+    try {
+      renderBuilder(barDef)
+      await screen.findByLabelText("Aggregation of visitors")
+      const handle = document.querySelector('[data-slot="resizable-handle"]') as HTMLElement
+      expect(handle).not.toBeNull()
+      expect(handle.getAttribute("role")).toBe("separator")
+      expect(handle.getAttribute("aria-orientation")).toBe("vertical")
+      expect(handle.getAttribute("tabindex")).toBe("0")
+      const panels = Array.from(document.querySelectorAll('[data-slot="resizable-panel"]'))
+      expect(panels.length).toBe(2)
+      // The form panel holds the form (its own scroller) and the preview panel the preview.
+      expect(panels[0].querySelector('[aria-label="Aggregation of visitors"]')).not.toBeNull()
+      expect(panels[1].querySelector('section[aria-label="Preview"]')).not.toBeNull()
+    } finally {
+      window.matchMedia = original
+    }
+  })
+})
+
+// BI-17 part A, T7: the Format section.
+const FULL_STYLE = {
+  format: { style: "compact", currency: "IDR", decimals: 2 },
+  valueFormats: { visitors: { style: "percent", decimals: 1 } },
+  dateFormat: { style: "monthYear", abbreviate: true },
+  colors: { palette: "muted", series: { visitors: "#112233" }, byValue: ["#dbeafe", "#1d4ed8"] },
+  axes: { x: { title: "Province", rotate: 45 }, y: { title: "Visitors", min: 0, max: 5000, log: true, show: false } },
+  labels: { show: true },
+  annotations: [{ x: "Bali", text: "Peak season" }],
+  tooltip: { fields: ["visitors"] },
 }
 
+describe("ChartBuilder Format section (BI-17 part A)", () => {
+  it("reopens a chart saved with every field and sends the same style back", async () => {
+    renderBuilder({ ...barDef, ...FULL_STYLE } as ChartDef)
+    const toggle = await screen.findByRole("button", { name: /Format/ })
+    await waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("true"))
+    // The controls hold what was saved.
+    expect((screen.getByLabelText("Number format decimals") as HTMLInputElement).value).toBe("2")
+    expect((screen.getByLabelText("Number format currency code") as HTMLInputElement).value).toBe("IDR")
+    expect((screen.getByLabelText("X axis title") as HTMLInputElement).value).toBe("Province")
+    expect((screen.getByLabelText("Y axis maximum") as HTMLInputElement).value).toBe("5000")
+    expect((screen.getByLabelText("Note 1 text") as HTMLInputElement).value).toBe("Peak season")
+    expect(screen.getByLabelText("Palette").textContent).toContain("Muted")
+    // The preview request carries the style exactly as saved.
+    await waitFor(() => expect(bodies.some((b) => b.axes)).toBe(true))
+    const sent = bodies[bodies.length - 1]!
+    for (const [field, value] of Object.entries(FULL_STYLE)) expect(sent[field], field).toEqual(value)
+  })
+
+  it("a bar chart offers colours, axes, labels, notes and reference lines, and no conditional colours", async () => {
+    renderBuilder(barDef)
+    fireEvent.click(await screen.findByRole("button", { name: /Format/ }))
+    for (const title of ["Values", "Dates", "Colours", "Axes", "Labels", "Notes", "Tooltip"]) expect(screen.getByText(title), title).toBeTruthy()
+    expect(screen.getByText("Reference lines")).toBeTruthy()
+    expect(screen.queryByText("Conditional colours")).toBeNull()
+  })
+
+  it("a table offers conditional colours and number formats, and no axes or palette", async () => {
+    renderBuilder({ title: "T", kind: "table", mart: "mart_visits", dimension: "provinsi", measures: ["visitors"], aggregate: "sum" })
+    fireEvent.click(await screen.findByRole("button", { name: /Format/ }))
+    expect(screen.getByText("Conditional colours", { selector: "legend" })).toBeTruthy()
+    expect(screen.getByText("Values")).toBeTruthy()
+    for (const title of ["Axes", "Colours", "Labels", "Notes", "Tooltip"]) expect(screen.queryByText(title), title).toBeNull()
+  })
+
+  it("does not send a conditional rule that has no column yet", async () => {
+    renderBuilder({ title: "T", kind: "table", mart: "mart_visits", dimension: "provinsi", measures: ["visitors"], aggregate: "sum" })
+    fireEvent.click(await screen.findByRole("button", { name: /Format/ }))
+    fireEvent.click(screen.getByRole("button", { name: /Add a rule/ }))
+    fireEvent.change(screen.getByLabelText("Rule 1 value"), { target: { value: "1000" } })
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    expect(bodies[bodies.length - 1]!.conditional).toBeUndefined()
+  })
+
+  it("a line added to a bar chart is a goal line at the number given", async () => {
+    renderBuilder(barDef)
+    fireEvent.click(await screen.findByRole("button", { name: /Format/ }))
+    fireEvent.click(screen.getByRole("button", { name: /Add a line/ }))
+    fireEvent.change(screen.getByLabelText("Line 1 value"), { target: { value: "1000" } })
+    fireEvent.change(screen.getByLabelText("Line 1 label"), { target: { value: "Goal" } })
+    await waitFor(() => expect(bodies.some((b) => b.referenceLines)).toBe(true))
+    expect(bodies[bodies.length - 1]!.referenceLines).toEqual([{ value: 1000, label: "Goal" }])
+  })
+})
+
+describe("ChartBuilder freshness (BI-4 part B)", () => {
+  it("shows the chart's own rule, opening the fold it sits in, and refuses minutes out of range in a sentence", async () => {
+    renderBuilder({ ...barDef, cache: { mode: "minutes", minutes: 30 } })
+    const minutes = (await screen.findByLabelText("Freshness: minutes")) as HTMLInputElement
+    expect(minutes.value).toBe("30")
+    fireEvent.change(minutes, { target: { value: "5000" } })
+    expect((await screen.findByRole("alert")).textContent).toBe("Remember for between 1 minute and 24 hours (1 to 1440 minutes).")
+  })
+
+  it("offers 'Follow the default' to a chart with no rule of its own and no minutes box", async () => {
+    renderBuilder(barDef)
+    fireEvent.click(await screen.findByRole("button", { name: /More options/ }))
+    expect(await screen.findByLabelText("Freshness")).toBeTruthy()
+    expect(screen.queryByLabelText("Freshness: minutes")).toBeNull()
+  })
+})
+
+describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
+  it("asks for an X metric and a Y metric, and a size for a bubble chart", async () => {
+    renderBuilder(barDef)
+    const trigger = await screen.findByRole("button", { name: /Change chart type, now Bar/ })
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByRole("button", { name: "Scatter (X vs Y)" }))
+    await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
+    expect(screen.getByText("Y metric")).toBeTruthy()
+    expect(screen.queryByText("Size metric")).toBeNull()
+  })
+
+  it("does the same when the chart is new and the data source is picked after the kind", async () => {
+    renderBuilder()
+    const scatter = await screen.findByRole("button", { name: "Scatter (X vs Y)" })
+    fireEvent.click(scatter)
+    await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
+    expect(screen.getByText("Y metric")).toBeTruthy()
+  })
+
+  it("keeps the Y metric when the data source is picked after the kind (it used to reset to one row)", async () => {
+    renderBuilder()
+    fireEvent.click(await screen.findByRole("button", { name: "Bubble (X, Y, size)" }))
+    fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
+    fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
+    await screen.findByText("Data source")
+    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
+    await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
+    expect(screen.getByText("Y metric")).toBeTruthy()
+    expect(screen.getByText("Size metric")).toBeTruthy()
+  })
+})
+
+describe("ChartBuilder chosen mart mark (QA LH-DATA-12-17)", () => {
+  /** The `beforeEach` stub, with the marts answer replaced. */
+  function stubMarts(marts: unknown[]) {
+    const base = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes("/api/dashboard/fields") && !url.includes("mart=")) {
+        return new Response(JSON.stringify({ marts }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      return (base as typeof fetch)(input, init)
+    }) as unknown as typeof fetch
+  }
+
+  // QA `LH-DATA-12-17` F1 (`DATA-54`): the picker's trigger shows the mart's
+  // name only, so the mark of the list row was lost once a mart was chosen.
+  it("shows Certified under the picker once a certified mart is chosen", async () => {
+    stubMarts([{ name: "mart_visits", rows: 10, certification: "certified" }])
+    renderBuilder(barDef)
+    const mark = await screen.findByTestId("chosen-mart-mark")
+    expect(mark.textContent).toContain("Certified")
+  })
+
+  it("shows no mark line for a mart without one", async () => {
+    renderBuilder(barDef)
+    // The form has loaded its marts once the chosen mart is on screen.
+    expect((await screen.findAllByText(/mart_visits/)).length).toBeGreaterThan(0)
+    expect(screen.queryByTestId("chosen-mart-mark")).toBeNull()
+  })
+})
+
+// `BI-47` (QA `LH-BI-6-01`): a dashboard parameter slot (`{ukuran}`) is a
+// dimension, a breakdown and a measure, never a filter column — the server has
+// no column to list its values from.
+describe("ChartBuilder and a parameter slot (QA LH-BI-6-01)", () => {
+  /** The board's parameters: one list whose values are columns, so the builder offers it as a dimension. */
+  function withListParam() {
+    const inner = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/api/dashboard/params")) {
+        const params = [{
+          id: "p1", name: "ukuran", label: "Ukuran", type: "list", default: "provinsi",
+          values: [{ value: "provinsi", label: "provinsi" }, { value: "category", label: "category" }],
+        }]
+        return new Response(JSON.stringify({ params }), { status: 200, headers: { "Content-Type": "application/json" } })
+      }
+      return inner(input, init)
+    }) as unknown as typeof fetch
+  }
+
+  it("a parameter slot is offered as a dimension and not as a filter column", async () => {
+    withListParam()
+    renderBuilder(barDef)
+    await screen.findByLabelText("Aggregation of visitors")
+    // The slot is a dimension of the picker.
+    const dimensionField = screen.getByText(/^Dimension \(X\)/).closest("div") as HTMLElement
+    fireEvent.click(dimensionField.querySelector('[role="combobox"]') as HTMLElement)
+    expect(await screen.findByRole("option", { name: /\{ukuran\}/ })).toBeTruthy()
+    // Close that list, open the filter section, and ask for a filter column.
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" })
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    fireEvent.click(await screen.findByLabelText("Add a filter"))
+    expect(await screen.findByRole("option", { name: "provinsi" })).toBeTruthy()
+    expect(screen.queryByRole("option", { name: /\{ukuran\}/ })).toBeNull()
+  })
+})
+
+// `BI-46` (QA `LH-BI-6-01`): a date breakdown can be grouped by a period, and
+// the limit says what it counts when the chart has a breakdown.
+describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
+  /** Adds a date column the base stub does not have. */
+  function withDateColumn() {
+    const inner = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const res = await inner(input, init)
+      if (url.includes("/api/dashboard/fields") && url.includes("mart=")) {
+        const body = (await res.json()) as Record<string, unknown>
+        return new Response(JSON.stringify({
+          ...body,
+          dimensions: [...(body.dimensions as string[]), "d"],
+          kinds: { d: "date" },
+          columns: [...(body.columns as { name: string; type: string }[]), { name: "d", type: "Date" }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } })
+      }
+      return res
+    }) as unknown as typeof fetch
+  }
+
+  /** A base-ui Select choice: open, focus the option, click it (as format-section does). */
+  function choose(trigger: HTMLElement, option: string) {
+    fireEvent.click(trigger)
+    const target = screen.getByRole("option", { name: option })
+    fireEvent.focus(target)
+    fireEvent.click(target)
+  }
+
+  it("choosing a date breakdown offers its grain and the preview request carries it", async () => {
+    withDateColumn()
+    renderBuilder({ ...barDef })
+    await screen.findByLabelText("Aggregation of visitors")
+    const breakdownField = document.querySelector('[data-slot="breakdown-field"]') as HTMLElement
+    choose(breakdownField.querySelector('[role="combobox"]') as HTMLElement, "d")
+    const groupBy = await screen.findByLabelText("Group the breakdown by")
+    choose(groupBy, "Month")
+    await waitFor(() => expect(bodies.some((b) => b.breakdownGrain === "month")).toBe(true))
+  })
+
+  it("the limit label names the breakdown when the chart has one", async () => {
+    renderBuilder({ ...barDef, breakdown: "category" })
+    await screen.findByLabelText("Aggregation of visitors")
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    expect(await screen.findByText("Limit (Top N, dimension and breakdown)")).toBeTruthy()
+    cleanup()
+    // A grain on a date dimension makes the limit the breakdown's alone.
+    withDateColumn()
+    renderBuilder({ ...barDef, dimension: "d", breakdown: "category", grain: "month" })
+    await screen.findByLabelText("Aggregation of visitors")
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    expect(await screen.findByText("Breakdown values (Top N)")).toBeTruthy()
+  })
+
+  /** Adds a table-calculation measure the base stub does not have. */
+  function withTableCalc() {
+    const inner = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const res = await inner(input, init)
+      if (url.includes("/api/dashboard/fields") && url.includes("mart=")) {
+        const body = (await res.json()) as Record<string, unknown>
+        return new Response(JSON.stringify({
+          ...body,
+          measures: [...(body.measures as string[]), "running"],
+          calculated: [{
+            id: "f_1", sourceKind: "mart", sourceId: "mart_visits", name: "running",
+            formula: "RunningTotal(Sum(visitors))", level: "table", type: "number", createdBy: "u",
+          }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } })
+      }
+      return res
+    }) as unknown as typeof fetch
+  }
+
+  // `BI-46` review round 1, R7: beside a breakdown the limit counts breakdown
+  // values, so a grain pick keeps the untouched 20 instead of lifting it to the
+  // grained maximum, which the preview request would carry as no cap at all.
+  // A NEW chart: an edited one opens with its saved limit already "touched".
+  it("a grain pick beside a breakdown keeps the untouched limit at twenty", async () => {
+    withDateColumn()
+    renderBuilder()
+    fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
+    fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
+    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
+    const dimensionField = document.querySelector("[data-slot=dimension-field]") as HTMLElement
+    choose(dimensionField.querySelector('[role="combobox"]') as HTMLElement, "d")
+    // The pickers' lists close after a choice; wait for it so the next list is
+    // the only one with its options.
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
+    const breakdownField = document.querySelector('[data-slot="breakdown-field"]') as HTMLElement
+    choose(breakdownField.querySelector('[role="combobox"]') as HTMLElement, "category")
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
+    choose(await screen.findByLabelText("Measure (Y)"), "visitors")
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
+    choose(await screen.findByLabelText("Group by"), "Month")
+    await waitFor(() => expect(bodies.some((b) => b.grain === "month" && b.limit === 20)).toBe(true))
+    expect(bodies.some((b) => b.grain === "month" && b.limit === 1000)).toBe(false)
+  })
+
+  // `BI-46` review round 1, R4: the server builds no breakdown cap for a table
+  // calculation, so the field must not be labelled as one.
+  it("a table-calculation measure keeps the limit label the chart always had", async () => {
+    withTableCalc()
+    renderBuilder({ ...barDef, measures: ["running"], breakdown: "category" })
+    await screen.findByLabelText("Aggregation of running")
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    expect(await screen.findByText("Limit (Top N)")).toBeTruthy()
+    expect(screen.queryByText("Limit (Top N, dimension and breakdown)")).toBeNull()
+    expect(screen.queryByText("Breakdown values (Top N)")).toBeNull()
+  })
+})
+
+// QA `LH-BI-6-25` (`BI-49`): a radar compares measures like a bar does, so the
+// builder offers "Add measure" and the preview carries both.
+describe("ChartBuilder radar measures (QA LH-BI-6-25)", () => {
+  /** A base-ui Select choice: open, focus the option, click it (as format-section does). */
+  function choose(trigger: HTMLElement, option: string) {
+    fireEvent.click(trigger)
+    const target = screen.getByRole("option", { name: option })
+    fireEvent.focus(target)
+    fireEvent.click(target)
+  }
+
+  it("a radar offers Add measure and sends both measures", async () => {
+    renderBuilder({ ...barDef, kind: "radar" })
+    await screen.findByLabelText("Measure (Y)")
+    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
+    fireEvent.click(await screen.findByRole("button", { name: /Add measure/ }))
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
+    choose(await screen.findByLabelText("Measure 2"), "stay")
+    await waitFor(() => expect(bodies.some((b) => Array.isArray(b.measures) && b.measures.length === 2)).toBe(true))
+    const body = bodies[bodies.length - 1]!
+    expect(body.kind).toBe("radar")
+    expect(body.measures).toEqual(["visitors", "stay"])
+  })
+})
+
+/**
+ * UX-1-R3 (reconciled to the current builder): a required control's visible
+ * label must be associated by `htmlFor` with the control's `id`, and the
+ * control must carry `aria-required`. Main's builder draws its own star on
+ * the label; these checks assert association and semantics, not the glyph.
+ */
 describe("ChartBuilder required control associations (UX-1-R3)", () => {
-  it("associates every required kind-dependent select with a visible Label", () => {
-    stubFetch()
-    render(
-      <AuthProvider>
-        <ChartBuilder open hideTrigger onOpenChange={mock()} onSaved={mock()} />
-      </AuthProvider>
-    )
+  function expectAssociatedRequiredLabel(id: string) {
+    const control = document.getElementById(id)
+    expect(control).not.toBeNull()
+    const label = document.querySelector(`label[for="${id}"]`)
+    expect(label).not.toBeNull()
+    expect(label?.textContent).toContain("*")
+    expect(control?.getAttribute("aria-required")).toBe("true")
+  }
 
-    // hbar (the default kind) renders dimension + measure + data source.
+  it("associates the data-source and dimension selects with visible required labels", async () => {
+    renderBuilder(barDef)
+    await screen.findByLabelText("Aggregation of visitors")
     expectAssociatedRequiredLabel("ch-source")
     expectAssociatedRequiredLabel("ch-dimension")
-    expectAssociatedRequiredLabel("ch-measure")
     expect(screen.getByText(/Required/)).toBeDefined()
   })
 
-  it("uses the shared required prop for the text-chart title and content", () => {
-    stubFetch()
-    render(
-      <AuthProvider>
-        <ChartBuilder open hideTrigger onOpenChange={mock()} onSaved={mock()} initial={{ kind: "text" }} />
-      </AuthProvider>
-    )
-
-    const titleLabel = document.querySelector('label[for="ch-title"]')
-    const contentLabel = document.querySelector('label[for="ch-content"]')
-    expect(titleLabel?.getAttribute("data-required")).toBe("")
-    expect(contentLabel?.getAttribute("data-required")).toBe("")
+  it("uses an associated label and required semantics for a text chart's content", () => {
+    renderBuilder({ title: "Note", kind: "text", text: "hello" })
+    const label = document.querySelector('label[for="ch-content"]')
+    expect(label?.textContent).toContain("*")
     expect(document.getElementById("ch-content")?.getAttribute("aria-required")).toBe("true")
   })
 })

@@ -1,0 +1,219 @@
+# BI-14: lineage from a chart to its sources (with AI-13)
+
+Planner and reviewer: Claude Opus. Developer: a non-Opus coding agent.
+Branch: `feat/bi-phase-6` (to be cut; shared with `BI-16` C and `BI-17` B),
+base `feat/bi-phase-4` until phase 4 merges, then `main`. Feature page:
+`docs/core/features/chart-lineage.md` (decision 1 waits for the owner, Q6;
+the rest planner defaults confirmed at the phase 6 QA). Spec:
+`docs/core/specs/bi-14.md`; assistant `docs/core/specs/ai-13.md`.
+**Blocked by `DATA-13` (column part): cleared**, `DATA-13` merged in #106
+(In Acceptance); its code is on this base (`routes/lineage/columns.rs`).
+
+Anchors were read on 2026-10-23 on `feat/bi-phase-4` at `150a081a`. Find
+each by the symbol named. New lineage code goes in `routes/lineage/`, not
+in `lineage.rs` (that file is upstream-shaped and already long).
+
+## 1. Decisions already made (do not re-ask, do not change)
+
+The feature page's table, plus these build decisions.
+
+- **D1 Chart route.** `GET /api/dashboard/charts/{id}/lineage`
+  (`lineage:read` per Q6 as signed; both ways in `route_auth`). The chart
+  is loaded through the person's `Viewer` (`viewer_of`) so a chart in
+  someone else's personal space reads as not found. Answer: `{ chart,
+  steps: [{ id, kind, label, refreshedAt?, refreshSource?, notRecorded? }],
+  edges: [...], fields: [{ field, columns: [{ table, column, via }] }],
+  coverage: [...], supported: true }`. Module
+  `routes/lineage/charts.rs`.
+- **D2 Start nodes.** From the stored chart (`StoredChartSpec`):
+  `def.mart` → `serving.<mart>`; `def.sql_source` → the column-lineage
+  key `sql_source_key(id)` and, through `column_lineage` rows, the tables
+  it reads; `shape.joins_list()` tables; `shape.layers_list()` (each
+  layer's mart or SQL source); measures that reference a metric →
+  `metric:<id>` → the metric's mart. From these, the existing table graph
+  (`lineage::build`'s `Graph`; its `reachable` walks both ways, so the chart route uses an upstream-only walk: a `forward: false` pass of the same function, parameterised, not a copy) adds
+  Silver, Bronze, connector, upload and pipeline nodes. No second graph
+  builder: `build` is refactored to expose the assembled `Graph` to the
+  new module (`pub(crate)` constructor), not copied (rule 4).
+- **D3 Refresh times.** Gold/Silver: `builds.rs` `BUILDS_SQL`'s `at`
+  (already read for the graph); Bronze: the Iceberg `last_updated_ms` the
+  catalog reads (`routes/catalog.rs` freshness, the same helper, not a new
+  Iceberg call); connector: last successful run from
+  `lakehouse_store::connector_run`; upload: its claim's time. Each step
+  carries `refreshSource` naming the record. No record → `notRecorded:
+  true` and a `coverage` line.
+- **D4 Columns.** For each of the chart's fields (dimension, measures,
+  series, calculated fields), the columns from `columns::mappings_touching`
+  on the start tables, walked upstream as far as mappings exist; a
+  calculated field's referenced columns from its compiled formula
+  (`lakehouse_bi::formula`). Fields with no mapping say so.
+- **D5 Used by.** `GET /api/governance/lineage/used-by?table=` (`lineage:read`):
+  every stored chart whose start nodes (D2) include the table, directly or
+  through a SQL source or metric, filtered by `Viewer`, up to 200, with
+  `hiddenCount` for those filtered out by visibility, and their boards.
+  Implemented in `routes/lineage/used_by.rs` from
+  `store::list_stored_charts` and `store::list_boards` for the viewer, plus
+  one unfiltered count (no names) for `hiddenCount`. The table graph gains
+  chart, SQL source and metric node kinds so `?focus=` on the lineage page
+  shows them (downstream edges table → chart).
+- **D6 Assistant (AI-13).** Tool `get_chart_lineage { chart }` (ReadOnly)
+  calling the D1 code with the person's principal and the same permission
+  check (the tool refuses with the route's sentence without
+  `lineage:read`); `get_lineage` adds `usedBy` (D5) for a table focus.
+  Prompt line; `capabilities.ts`; fixture regenerated with the ignored
+  writer test; count pin +1; the `AI-13-AC1` case in
+  `ops/ai_eval/dashboard_cases.json`.
+- **D7 Console.** Tile menu item "Where does this come from"
+  (`dashboard-page.tsx` tile menu), opening a side panel
+  (`src/features/dashboards/chart-lineage-panel.tsx`) through a new
+  `dashboardService.chartLineage(id, signal)` (contracts → client →
+  `services/index.ts`); "Open in lineage" links to
+  `/lineage?focus=chart:<id>`; Data Explorer's asset page and the lineage
+  page gain a "Used by" list. Hidden in embeds and public links.
+
+## 2. Anchors (verified at `150a081a`, find by symbol)
+
+- Lineage: `routes/lineage.rs` module doc (edge/record table), `Graph`
+  (`node`, `edge`, `coverage`), `table_id`, `zone_node`, `reachable`,
+  `matches_focus`, `build` (`MAX_NODES` 150), `add_shared`,
+  `add_tenant_owned`; `routes/lineage/builds.rs` `BUILDS_SQL` (the `at`
+  column), `drop_repeats`; `routes/lineage/columns.rs` `sql_source_key`,
+  `record_sql_source`, `mappings_touching`, `read`, `graph_key`,
+  `zone_key`; `lakehouse_store::column_lineage` (`MappingRow`,
+  `Direction`, `Scope`).
+- Routes and policy: `routes/governance.rs` `lineage`, `column_lineage`;
+  `routes/mod.rs` (`/api/governance/lineage` and `/columns` registered
+  before `{kind}`: the new `used-by` path goes with them); `policy.rs`
+  rows for both (`lineage:read`); seeds `0002_seed_identity.sql`
+  (`Analyst` has `lineage:read`, `Dashboard Viewer` has only
+  `dashboard:read`).
+- Charts: `lakehouse-bi/src/store.rs` `list_stored_charts`,
+  `list_boards`; `routes/dashboard_organise.rs` `viewer_of`;
+  `routes/dashboard.rs` `effective_chart`; chart shape `joins_list`,
+  `layers_list`; `routes/layers.rs` `layer_sources`.
+- Freshness sources: `routes/catalog.rs` (Bronze `freshnessLagSeconds`
+  from Iceberg `last_updated_ms`); `lakehouse-store/src/connector_run.rs`
+  `list_runs`.
+- Assistant: `routes/ai/tools/data.rs` `get_lineage`;
+  `routes/ai/registry.rs` `get_lineage_schema`, `TOOLS`;
+  `capabilities.ts`; `page-context.ts`.
+- Console: `src/features/governance/lineage-page.tsx` (`?focus=`),
+  `lineage-graph.tsx`, `lineage-columns.tsx`; Data Explorer asset page
+  (`src/features/catalog/asset-detail-tabs.tsx`, lineage tab);
+  `dashboard-page.tsx` tile menu.
+
+## 3. Tasks (one commit each, in order; Rust first)
+
+**T1 Graph reuse and new node kinds (D2, D5 graph part).** Expose the
+assembled graph; add chart, SQL source and metric nodes with downstream
+edges from their tables, each edge's `evidence` naming the stored chart
+or source. *Accept:* existing lineage tests unchanged and green; a test
+graph with a chart over a mart, one over a SQL source and one with a
+metric gives the expected nodes and evidence; `MAX_NODES` still bounds.
+
+**T2 Chart route (D1, D3, D4).** *Accept:* route tests: path from a chart
+to a connector (fixture records), refresh times with their sources, a
+step with no record says so; a chart in another person's personal space
+→ 404; without `lineage:read` → 403 with the sentence; columns per field
+from fixture mappings, a calculated field's columns; SEC-11 guard green;
+`route_auth` both ways.
+
+**T3 Used by (D5).** *Accept:* lists charts directly on the table, via a
+SQL source, via a metric; another person's personal chart not listed and
+counted in `hiddenCount`; 200 cap; `route_auth` both ways.
+
+**T4 Assistant (D6).** *Accept:* tool tests (path for a chart, refusal
+without `lineage:read`, `usedBy` on `get_lineage`); fixture; count pin;
+`capabilities.ts` test; AI-13-AC1 case.
+
+**T5 Console (D7).** *Accept:* panel component tests (steps, "not
+recorded", refusal sentence for a viewer without the permission, open in
+lineage link); lineage page renders chart nodes; "Used by" on the asset
+page; no menu item in the embed view; typecheck, lint, tests of the
+touched files; webpack build.
+
+## 4. Out of scope
+
+Filter and parameter lineage, column-level impact lists, inferring edges
+the platform did not record, lineage in embeds or public links.
+
+## 5. Must verify, not assume
+
+- Whether the assistant's existing `get_lineage` checks `lineage:read`
+  (it calls `lineage::build` with the principal, but the permission is a
+  route policy); if it does not, that is a pre-existing gap: report it
+  and add the check in T4 with a test (rule 13 citation: this plan).
+- How a measure names a metric in the stored chart (the field catalog
+  path `annotate_metric_labels` reads) so D2 finds metrics.
+- That the Bronze freshness helper in `catalog.rs` can be called for one
+  table without listing the catalog.
+- That `system.query_log` retention on the deployment matches the 180-day
+  bound of `BUILDS_SQL` (the feature page's limit says half a year).
+
+## 6. Checks
+
+As in the phase 4 plans (same cargo environment:
+`CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-uiux-target CARGO_BUILD_JOBS=2
+CARGO_INCREMENTAL=0`, one cargo command at a time, `--test-threads=4`,
+`route_auth` at 2; check `free -g` / `df -h /` first; never `cargo build -p
+lakehouse-api`; no `rust/target`; no prettier; touch the crate sources
+before clippy when several worktrees share the target dir). Per task the
+crates touched (`lakehouse-bi` if the store gains a read, `lakehouse-api`),
+the `lakehouse-api` lib filters `lineage`, `governance`, `ai`, the
+integration files `route_auth`, `route_policy`, `sec11_guard`, `ai_tool`
+and the lineage integration tests. Once, before the handoff: `cargo fmt
+--check` and whole-workspace `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` with the environment above (no full
+workspace test run on this machine; CI runs it on the PR). TS:
+typecheck, lint, tests of the files touched; the webpack build after T5.
+No migration is expected; if one turns out to be needed: next free number
+at build time, check every branch (`0098`+ are being taken by `BI-19`).
+
+## 7. Handoff (developer appends)
+
+### T5 Console (developer, branch `feat/bi-phase-6`; Rust T1 to T4 not built)
+
+Commit: `130a46eb` feat(dashboards): BI-14 chart lineage in the console (T5). TypeScript only; no cargo command, no Rust change.
+
+Built (feature decisions 1, 5, 6, 7; plan D7): the item "Where does this come from" on the tile menu of each stored (non-built-in) chart; `chart-lineage-panel.tsx` (path as a vertical list, kind and refresh time per step, "Not recorded" where there is no record, the columns behind each field or "No column mapping recorded", coverage lines, "Open in lineage" to `/lineage?focus=chart:<id>`); `features/governance/used-by.tsx` ("Used by": chart, dashboard, how it reads the table, "and N more you do not have access to") on the asset page's lineage tab and on the lineage page for a table focus; the lineage page labels chart, SQL source, metric and upload nodes. Contracts: `dashboardService.chartLineage(id)` and `governanceService.getUsedBy(table)`. Owner decision Q6: without `lineage:read` the panel and the list show "Lineage needs the lineage permission; ask your administrator." and call nothing; a 403 from the server shows the same sentence. The menu item is shown to everyone who sees the chart. Embeds and public links do not use the dashboard page, so they have no item (not tested: no embed test renders the tile menu).
+
+**Contract for T2 and T3 (the plan names the fields, not their shapes where noted):**
+- `GET /api/dashboard/charts/{id}/lineage` answers `{ chart: { id, title }, steps: [{ id, kind, label, refreshedAt?, refreshSource?, notRecorded? }], edges: [{ id, from, to, kind, evidence? }], fields: [{ field, columns: [{ table, column, via }] }], coverage: string[], supported: boolean }`. `chart` as an object with id and title is my choice (D1 names `chart` only). `kind` is one of `chart`, `sql_source`, `metric`, `gold`, `silver`, `bronze`, `connector`, `upload`, `pipeline`. `steps` come in path order, the chart first, the connector or upload last. `refreshedAt` is an ISO 8601 instant, shown in the report zone; `refreshSource` is a short phrase ("last Gold build", "Iceberg last update", "last connector run", "upload time"); with `notRecorded: true` there is no `refreshedAt`. `via` names the step that produced the column ("Gold build", "formula", "SQL source"). 403 with `{ error }` without `lineage:read`; 404 for a chart the person cannot see.
+- `GET /api/governance/lineage/used-by?table=serving.x` answers `{ supported, table, charts: [{ chartId, chartTitle, dashboardId, dashboardTitle, via }], hiddenCount, truncated? }` with `via` one of `direct`, `sql_source`, `metric`; at most 200 charts; `truncated` true when more matched. The chart row reuses the column-lineage `charts` field names. The dashboard link is `/dashboards?board=<dashboardId>`.
+- Graph nodes (T1): ids `chart:<id>` and `metric:<id>`; node `kind` `chart`, `sql_source` or `metric`. The console only labels them; a focus on a chart id draws what the server returns.
+
+Not built: the lineage page's chart nodes are labelled but the page has no chart-specific view; focus input still takes a typed id.
+
+Checks (from `/home/hv/lakehouse-phase6-build`, run once on the three commits of this session: Gantt switch, BI-14 console, C2b console):
+- `bun run typecheck`: exit 0. `bun run lint`: 0 errors, 9 warnings, none in these files.
+- `bun test src` (summary lines only): 2570 pass, 1 skip, 0 fail (265 files).
+- An earlier full run after `130a46eb` showed 558 failures, all from my change: `asset-detail-tabs.test.tsx` stubs every `/api/governance/lineage*` path with the lineage graph, so "Used by" got a graph with no `charts`, threw in render and tore down the DOM for the file. Fixed in the next commit (a malformed answer is "could not be read just now", and the stub answers the used-by route); no failure was pre-existing.
+- New tests: `chart-lineage-panel.test.tsx` 6, `used-by.test.tsx` 7 (panel steps and refresh times, "Not recorded", columns, link, refusal sentence both ways, failure message; list, hidden count, none, malformed answer).
+- Not verified: the webpack build; the panel in a browser; the tile menu item itself (no test renders the dashboard tile menu).
+
+
+### T1 to T3 server half (developer, branch `feat/bi-phase-6`)
+
+One commit for the three tasks (they share `routes/lineage/charts.rs` and the module declarations in `lineage.rs`, so splitting them would leave commits that do not compile). Rust only. Verified with `cargo clippy -p lakehouse-api --all-targets -- -D warnings` (clean) and `cargo check`; the **new route tests (`tests/chart_lineage_routes.rs`) and the existing lineage and `route_auth` tests were not run locally** (disk): CI is the check.
+
+**T1.** `lineage::assemble` returns the assembled table graph (what `build` used to assemble inline; `build` is `assemble` plus the dashboard objects plus the focus, and its answer for a deployment with no stored charts is unchanged); `walk(g, start, directions)` is the one walk, `reachable` is `walk` both ways and `upstream` is `walk` backwards (a parameterised pass of the same function, not a copy). New node kinds `chart` (`chart:<id>`), `sql_source` (`sql_source:<id>`) and `metric` (`metric:<id>`), added by `charts::add_dashboard_nodes` for the charts the caller's `Viewer` may see: edges table -> chart, table -> SQL source (from the source's `column_lineage` rows), SQL source -> chart, mart or SQL source -> metric, metric -> chart; each edge's `evidence` names the stored chart, the source's column mappings or the metric. `MAX_NODES` still bounds the walk. A dashboard store that cannot be read leaves the dashboard objects out and is logged (no `coverage` line on the lineage page, so its existing answers do not change). Unit tests: start nodes of a chart (mart, joins, SQL source, metric), the graph for a chart over a SQL source and a metric with evidence, formula column reading.
+
+**T2.** `GET /api/dashboard/charts/{id}/lineage` (`lineage:read`, Q6) in `routes/lineage/charts.rs`, the contract of the console half: `{ chart: { id, title }, steps, edges, fields, coverage, supported: true }`. The chart is found through `viewer_of`, so another person's personal chart is the same 404 ("No such chart.") as an unknown id. Steps are the upstream walk from the chart, nearest first. Refresh times: Gold and Silver from the build record (`builds.rs` now also keeps the `at` of the last logged build in `Graph.refreshed`; `refreshSource` "last build in the query log", shown as an ISO instant in UTC), connector from its last succeeded run (`connector_run::list_runs`, "last successful connector run"). **Not recorded** (flagged `notRecorded` with a `coverage` line): Bronze tables and uploads, and any Gold or Silver table with no logged build. Deviations from D3: the Bronze Iceberg `last_updated_ms` is not read (the catalog helper lists the catalog; calling it for one table needs a refactor of `routes/catalog.rs`, left for the planner's call) and an upload's claim time is not stored (`upload_table_claim` rows are returned without a time by `ClaimedTable`). Columns (D4): for each field (dimension, breakdown, measures), the `column_lineage` walk upwards from the chart's marts and SQL sources (`via` "table build", "pipeline", "SQL source"); a calculated field or metric is read from its formula text (`[Name]` and bare names, no compilation) and each referenced column is also walked (`via` "formula"). Not done: recursion through calculated fields that name other calculated fields.
+
+**T3.** `GET /api/governance/lineage/used-by?table=` (`lineage:read`) in `routes/lineage/used_by.rs`: the charts whose start nodes include the table, `via` `direct`, `sql_source` or `metric`, with dashboard ids and titles, at most 200 (`truncated`), `hiddenCount` for charts matching for the system viewer and not for the caller (counted, never named). A SQL source "reads" a table when a `sql_source` column mapping names it. A table not shaped like `serving.x`, `silver.x` or `bronze.x` (`gold.x` is `serving.x`) is a 400.
+
+Both routes are in `POLICY_TABLE`, so the table-driven `route_auth` and `route_policy` tests cover them both ways. Q6 is applied as signed: a dashboard viewer without `lineage:read` gets a 403. Open points for the planner: (1) the lineage page now lists dashboard objects that a `lineage:read` holder without `dashboard:read` can also see by name (the charts the `Viewer` allows, as the plan says); say if that should require `dashboard:read` as the SQL-source mappings do; (2) the Bronze refresh time as above. `AI-13` (T4) is not built.
+
+### Review fix B1 (developer)
+
+BLOCKER B1 fixed: `used-by` names a chart only to a caller with `dashboard:read`; a `lineage:read`-only caller gets `charts: []` and every match in `hiddenCount`. The same rule applies to the other two places that name charts: the chart nodes on the lineage page (`add_dashboard_nodes` adds none without `dashboard:read`) and the chart route (404 "No such chart.", as for an unknown id). Route test `a_caller_with_lineage_read_only_is_told_no_chart_names` (used-by, chart route, lineage page, and the named case with both permissions). Clippy clean; the test was not run locally (CI). The Bronze and upload refresh gap stays `notRecorded`, as decided.
+
+## 8. Review (planner appends)
+
+### Review of T1–T3 (server, `6498398e`), planner, 2026-10-24
+
+Read against the plan and the handoff; CI on #246 is the build check (local integration tests not run, disk).
+
+- **BLOCKER B1, used-by names charts without `dashboard:read`.** `GET /api/governance/lineage/used-by` (and the chart nodes on the lineage page) list chart names to a `lineage:read` holder who lacks `dashboard:read`. Fail closed, as the SQL-source mappings already do: without `dashboard:read` no chart is named; they are counted in `hiddenCount` only. Add a route test for a `lineage:read`-only caller.
+- **Accepted, D3 gap:** the Bronze Iceberg refresh time and an upload's claim time are `notRecorded` with the `coverage` line, not read. That is the honest answer (AGENTS rule 14); no catalog-helper refactor in this PR. The planner records the follow-up in the backlog.
+- **Accepted:** T1–T3 in one commit (shared module declarations would not compile split). AI-13 (T4) stays out of this slice.

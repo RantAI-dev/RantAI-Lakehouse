@@ -34,7 +34,7 @@ Panduan lengkap: **[setup/install.md](./setup/install.md)**
 |-------|-----|
 | **Tokens** | OKLCH colors (light + dark), radius, brand hex, animations |
 | **CSS** | `globals.css` modular — imports `tokens/*.css` |
-| **Fonts** | Geist + Geist Mono via `next/font` |
+| **Fonts** | Geist + Geist Mono, committed `woff2` files via `next/font/local` |
 | **UI** | 43 shadcn components (Button, Card, Dialog, Sidebar, …) |
 | **Motion** | FadeUp, StaggerContainer, ScaleIn, SlideIn |
 | **Theme** | ThemeProvider (dark default) |

@@ -1,20 +1,23 @@
 /**
- * Shared freshness helpers for Gold per-mart publication (PR slice D
- * review D-S5). Parse and compare RFC 3339 timestamps as times, not as
- * strings, so a local timezone offset in one string and a `Z` suffix in
- * another do not cause a spurious ordering flip. Used by both the
- * per-mart detail card and the Gold Exports overview page.
+ * Shared freshness helpers for Gold per-mart publication (DATA-10 D4 /
+ * PR slice D review D-S5). Reads `changedSinceExport`, the ClickHouse content
+ * fingerprint comparison between the current mart and its newest successful
+ * export run, avoiding false-positive "Out of date" signals caused by
+ * background merges or full table rewrites.
+ *
+ * `DATA-49` (QA `LH-DATA-1-01`) adds a first state: a failed newest run is
+ * "Last publish failed", whatever the last success says. The order is that
+ * failure, then "Never published", "Not measured", "Out of date" and "Up to
+ * date" — the card must not read "Up to date" through failed runs.
  */
 import type { GoldPublication } from "@/services/contracts/gold"
 
 export function freshnessLine(pub: GoldPublication): string {
+  if (pub.lastFailure) return "Last publish failed"
   if (pub.lastExportedAt === null) return "Never published"
-  if (pub.lastChangedAt === null) return "Not measured"
-  const changed = Date.parse(pub.lastChangedAt)
-  const exported = Date.parse(pub.lastExportedAt)
-  if (Number.isNaN(changed) || Number.isNaN(exported)) return "Not measured"
-  if (changed < exported) return "Up to date"
-  return "Out of date"
+  if (pub.changedSinceExport === null || pub.changedSinceExport === undefined) return "Not measured"
+  if (pub.changedSinceExport) return "Out of date"
+  return "Up to date"
 }
 
 export function publicationLabel(pub: GoldPublication): string {

@@ -1,0 +1,670 @@
+//! Grant and revoke from an asset's page over the real router (`DATA-15`
+//! F3): who may, what is refused with a fixed sentence, that a grant gives
+//! the permission and a revoke takes it away at the next principal load,
+//! and that the asset's history names both people.
+//!
+//! The caller is a principal holding `*:*`: it passes the catalog tenant
+//! gate (an unrestricted principal is never refused) and holds
+//! `access:approve`. The grantee is a zero-permission user.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use crate::common;
+
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode};
+use common::{
+    TestApp, create_principal_with_permissions, create_zero_permission_principal,
+    session_cookie_for_user, spin_up,
+};
+use serde_json::{Value, json};
+use sqlx::PgPool;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+const ASSET: &str = "silver.orders";
+
+async fn call(
+    app: &axum::Router,
+    verb: &str,
+    path: &str,
+    cookie: &str,
+    body: &str,
+) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(verb)
+                .uri(path)
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn grants_path() -> String {
+    format!("/api/catalog/{ASSET}/grants")
+}
+
+async fn email_of(pool: &PgPool, user: Uuid) -> String {
+    sqlx::query_scalar("SELECT email FROM app_user WHERE id = $1")
+        .bind(user)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// An admin cookie and a zero-permission grantee with their e-mail.
+async fn admin_and_grantee(pool: &PgPool) -> (String, Uuid, Uuid, String) {
+    let admin = create_principal_with_permissions(pool, "*:*").await;
+    let grantee = create_zero_permission_principal(pool).await;
+    let email = email_of(pool, grantee).await;
+    (
+        session_cookie_for_user(pool, admin).await,
+        admin,
+        grantee,
+        email,
+    )
+}
+
+async fn holds(pool: &PgPool, user: Uuid, permission: &str) -> bool {
+    lakehouse_auth::repository::load_principal_for_user(pool, user, "local".to_owned(), false)
+        .await
+        .unwrap()
+        .has(permission)
+}
+
+#[tokio::test]
+async fn a_direct_grant_is_listed_gives_the_permission_and_a_revoke_takes_it_away() {
+    let TestApp { router, pool } = spin_up().await;
+    let (cookie, _admin, grantee, email) = admin_and_grantee(&pool).await;
+    assert!(!holds(&pool, grantee, "query:read").await);
+
+    let (status, made) = call(
+        &router,
+        "POST",
+        &grants_path(),
+        &cookie,
+        &json!({"email": email, "permission": "query:read"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    let grant_id = made["id"].as_str().expect("the grant id").to_owned();
+    assert!(holds(&pool, grantee, "query:read").await);
+
+    let (status, listed) = call(&router, "GET", &grants_path(), &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let grants = listed["grants"].as_array().expect("a list");
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0]["id"], json!(grant_id));
+    assert_eq!(grants[0]["permission"], json!("query:read"));
+    assert_eq!(grants[0]["via"], json!("direct"));
+    assert_eq!(grants[0]["userEmail"], json!(email));
+    assert_eq!(grants[0]["grantedBy"], json!("Single Perm Test User"));
+
+    let (status, _) = call(
+        &router,
+        "DELETE",
+        &format!("{}/{grant_id}", grants_path()),
+        &cookie,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // A revoked grant no longer reaches the principal the next request loads.
+    assert!(!holds(&pool, grantee, "query:read").await);
+    let (_, listed) = call(&router, "GET", &grants_path(), &cookie, "").await;
+    assert_eq!(listed["grants"], json!([]));
+
+    // Already revoked: 404, with the fixed sentence.
+    let (status, again) = call(
+        &router,
+        "DELETE",
+        &format!("{}/{grant_id}", grants_path()),
+        &cookie,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(again["error"], json!("no such grant in force"));
+}
+
+#[tokio::test]
+async fn a_grant_and_a_revoke_are_audited_and_named_in_the_assets_history() {
+    let TestApp { router, pool } = spin_up().await;
+    let (cookie, _admin, _grantee, email) = admin_and_grantee(&pool).await;
+    let (_, made) = call(
+        &router,
+        "POST",
+        &grants_path(),
+        &cookie,
+        &json!({"email": email, "permission": "lineage:read"}).to_string(),
+    )
+    .await;
+    let grant_id = made["id"].as_str().unwrap().to_owned();
+    call(
+        &router,
+        "DELETE",
+        &format!("{}/{grant_id}", grants_path()),
+        &cookie,
+        "",
+    )
+    .await;
+
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_event WHERE resource_kind = 'catalog' AND resource_id = $1 \
+         ORDER BY at, id",
+    )
+    .bind(ASSET)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(actions, vec!["catalog.grant", "catalog.revoke"]);
+    let args: Value = sqlx::query_scalar(
+        "SELECT args FROM audit_event WHERE action = 'catalog.grant' AND resource_id = $1",
+    )
+    .bind(ASSET)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(args["permission"], json!("lineage:read"));
+    // PR #106 review R1 SHOULD-FIX DATA-15 3
+    assert_eq!(
+        args["grantee"],
+        json!(format!("Zero Perm Test User <{email}>"))
+    );
+    assert!(args["expiresAt"].is_string());
+}
+
+#[tokio::test]
+async fn every_refusal_has_its_status_and_a_fixed_sentence_and_stores_nothing() {
+    let TestApp { router, pool } = spin_up().await;
+    let (cookie, admin, grantee, email) = admin_and_grantee(&pool).await;
+    let admin_email = email_of(&pool, admin).await;
+
+    let post = |body: Value| {
+        let router = router.clone();
+        let cookie = cookie.clone();
+        async move { call(&router, "POST", &grants_path(), &cookie, &body.to_string()).await }
+    };
+
+    let (status, body) = call(&router, "POST", &grants_path(), &cookie, "not json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"],
+        json!("body must be JSON with an \"email\" and a \"permission\"")
+    );
+
+    let (status, body) = post(json!({"email": email, "permission": "*:*"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"],
+        json!("permission must be catalog:write, lineage:read or query:read")
+    );
+
+    let (status, body) = post(json!({"email": "  ", "permission": "query:read"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], json!("enter the e-mail of a user"));
+
+    let (status, body) =
+        post(json!({"email": "nobody@nowhere.invalid", "permission": "query:read"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], json!("no user with that email"));
+
+    let (status, body) = post(json!({"email": admin_email, "permission": "query:read"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        body["error"],
+        json!("permission_denied: you cannot grant access to yourself")
+    );
+
+    // Granting twice: the second finds the user already holds it.
+    let (status, _) = post(json!({"email": email, "permission": "query:read"})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = post(json!({"email": email, "permission": "query:read"})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["error"],
+        json!("that user already holds this permission")
+    );
+
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM access_grant WHERE user_id = $1")
+        .bind(grantee)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 1, "only the one successful grant is stored");
+}
+
+#[tokio::test]
+async fn a_revoke_from_another_assets_page_finds_no_such_grant() {
+    let TestApp { router, pool } = spin_up().await;
+    let (cookie, _admin, grantee, email) = admin_and_grantee(&pool).await;
+    let (_, made) = call(
+        &router,
+        "POST",
+        &grants_path(),
+        &cookie,
+        &json!({"email": email, "permission": "query:read"}).to_string(),
+    )
+    .await;
+    let grant_id = made["id"].as_str().unwrap();
+    let (status, _) = call(
+        &router,
+        "DELETE",
+        &format!("/api/catalog/silver.other/grants/{grant_id}"),
+        &cookie,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(holds(&pool, grantee, "query:read").await);
+}
+
+#[tokio::test]
+async fn a_user_who_already_has_the_permission_through_a_role_is_refused() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = create_principal_with_permissions(&pool, "*:*").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let reader = create_principal_with_permissions(&pool, "query:read").await;
+    let email = email_of(&pool, reader).await;
+    let (status, body) = call(
+        &router,
+        "POST",
+        &grants_path(),
+        &cookie,
+        &json!({"email": email, "permission": "query:read"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+#[tokio::test]
+async fn a_caller_who_passes_the_permission_but_not_the_tenant_gate_is_refused_before_the_body_is_read()
+ {
+    // `access:approve` without `*:*` and without the catalog tenant: the
+    // seeded app has several tenants and no `CATALOG_TENANT_ID`.
+    let TestApp { router, pool } = spin_up().await;
+    let approver = create_principal_with_permissions(&pool, "access:approve").await;
+    let cookie = session_cookie_for_user(&pool, approver).await;
+    for (verb, path) in [
+        ("GET", grants_path()),
+        ("POST", grants_path()),
+        ("DELETE", format!("{}/grant-x", grants_path())),
+    ] {
+        let (status, body) = call(&router, verb, &path, &cookie, "not json").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{verb} {path}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("permission_denied: per-dataset tenant ownership")),
+            "{verb} {path}: {body}"
+        );
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM access_grant")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+}
+
+#[tokio::test]
+async fn without_access_approve_every_grant_route_is_refused_by_the_permission_gate() {
+    let TestApp { router, pool } = spin_up().await;
+    let user = create_principal_with_permissions(&pool, "catalog:read, catalog:write").await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+    for (verb, path) in [
+        ("GET", grants_path()),
+        ("POST", grants_path()),
+        ("DELETE", format!("{}/grant-x", grants_path())),
+    ] {
+        let (status, body) = call(&router, verb, &path, &cookie, "{}").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{verb} {path}");
+        assert_eq!(body["error"], json!("permission_denied: access:approve"));
+    }
+}
+
+// PR #106 review R1 BLOCKER 4
+#[tokio::test]
+async fn a_granter_cannot_give_a_permission_they_do_not_hold() {
+    let mut overrides = std::collections::HashMap::new();
+    let tenant_id = "11111111-1111-4111-8111-000000000002";
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), tenant_id.to_owned());
+    let TestApp { router, pool } = common::spin_up_with_env(&overrides).await;
+
+    // Approver holds access:approve but NOT catalog:write
+    let approver = create_principal_with_permissions(&pool, "access:approve").await;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(approver)
+        .bind(tenant_id.parse::<Uuid>().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, approver).await;
+
+    let grantee = create_zero_permission_principal(&pool).await;
+    let email = email_of(&pool, grantee).await;
+
+    let (status, body) = call(
+        &router,
+        "POST",
+        &grants_path(),
+        &cookie,
+        &json!({"email": email, "permission": "catalog:write"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        body["error"],
+        json!("permission_denied: you cannot grant a permission you do not hold")
+    );
+}
+
+// PR #106 review R1 BLOCKER 5
+#[tokio::test]
+async fn a_grant_cannot_go_to_a_user_outside_the_catalog_tenant() {
+    let mut overrides = std::collections::HashMap::new();
+    let catalog_tenant = "11111111-1111-4111-8111-000000000002";
+    let other_tenant = "11111111-1111-4111-8111-000000000001";
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    let TestApp { router, pool } = common::spin_up_with_env(&overrides).await;
+
+    let admin = create_principal_with_permissions(&pool, "*:*").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+
+    let outsider = create_zero_permission_principal(&pool).await;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(outsider)
+        .bind(other_tenant.parse::<Uuid>().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let outsider_email = email_of(&pool, outsider).await;
+
+    let (status, body) = call(
+        &router,
+        "POST",
+        &grants_path(),
+        &cookie,
+        &json!({"email": outsider_email, "permission": "query:read"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        body["error"],
+        json!("permission_denied: grantee must be a member of the catalog tenant")
+    );
+}
+
+/// A catalog-tenant deployment and an unrestricted caller that may grant:
+/// the router, the database, and that caller's cookie and id.
+async fn catalog_tenant_app() -> (axum::Router, PgPool, String, Uuid) {
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
+    let TestApp { router, pool } = common::spin_up_with_env(&overrides).await;
+    let admin = create_principal_with_permissions(&pool, "*:*").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    (router, pool, cookie, admin)
+}
+
+/// The harness for `GOV-11` (`DEC-20`) below: a catalog-tenant deployment,
+/// an unrestricted caller that may grant, and a grantee with no permissions
+/// of their own who is a member of the catalog tenant.
+async fn catalog_tenant_harness() -> (axum::Router, PgPool, String, Uuid) {
+    let (router, pool, cookie, _admin) = catalog_tenant_app().await;
+    let grantee = create_zero_permission_principal(&pool).await;
+    common::in_the_catalog_tenant(&pool, grantee).await;
+    (router, pool, cookie, grantee)
+}
+
+/// [`catalog_tenant_app`] with a grantee who already holds `query:read`
+/// through a role (review round 1 R1): a grant therefore adds no
+/// permission, and only the grant check itself can refuse the page.
+async fn query_reader_harness() -> (axum::Router, PgPool, String, Uuid, Uuid) {
+    let (router, pool, cookie, admin) = catalog_tenant_app().await;
+    let grantee = create_principal_with_permissions(&pool, "query:read").await;
+    common::in_the_catalog_tenant(&pool, grantee).await;
+    (router, pool, cookie, admin, grantee)
+}
+
+/// A grant row of `permission` from `asset` to `grantee`, written straight
+/// into the table: the page's own route refuses a person who already holds
+/// the permission (409), and the grantees of review round 1 R1 hold
+/// `query:read` by role. The route's DELETE still revokes it.
+async fn grant_direct(
+    pool: &PgPool,
+    admin: Uuid,
+    asset: &str,
+    grantee: Uuid,
+    permission: &str,
+) -> String {
+    lakehouse_store::agents::create_direct_grant(pool, grantee, permission, asset, admin, 30)
+        .await
+        .expect("inserting the grant row")
+        .id
+}
+
+/// `GET /api/catalog/{id}` for `id` as `cookie`, parsed.
+async fn read_asset(router: &axum::Router, id: &str, cookie: &str) -> (StatusCode, Value) {
+    call(router, "GET", &format!("/api/catalog/{id}"), cookie, "").await
+}
+
+/// Grant `permission` from `asset` to `grantee` through the page's own grant
+/// route, so the row is the one a person makes there.
+async fn grant_from_asset(
+    router: &axum::Router,
+    pool: &PgPool,
+    admin_cookie: &str,
+    asset: &str,
+    grantee: Uuid,
+    permission: &str,
+) -> Value {
+    let email = email_of(pool, grantee).await;
+    let (status, body) = call(
+        router,
+        "POST",
+        &format!("/api/catalog/{asset}/grants"),
+        admin_cookie,
+        &json!({"email": email, "permission": permission}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// `GOV-11` (`DEC-20`; QA `LH-DATA-15-03` F2): a `query:read` grant made from
+/// a table's page opens that table's page for the grantee, who holds no
+/// `catalog:read` — and only that table: another table and the catalog list
+/// stay closed.
+///
+/// No engine is reachable in this harness, so an admitted read ends at 503;
+/// the assertion is "neither 401 nor 403", with the status in the message.
+#[tokio::test]
+async fn a_query_read_grant_on_a_table_opens_that_tables_page_and_no_other() {
+    let (router, pool, admin_cookie, grantee) = catalog_tenant_harness().await;
+    grant_from_asset(&router, &pool, &admin_cookie, ASSET, grantee, "query:read").await;
+    let cookie = session_cookie_for_user(&pool, grantee).await;
+
+    let (status, body) = read_asset(&router, ASSET, &cookie).await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a query:read grant from {ASSET} must open it, got {status}: {body}"
+    );
+
+    let (status, body) = read_asset(&router, "silver.customers", &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the grant opens one table, not another: {body}"
+    );
+
+    let (status, body) = call(&router, "GET", "/api/catalog", &cookie, "").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the catalog list is unchanged: {body}"
+    );
+}
+
+/// `GOV-11` (`DEC-20`): the grant must be in force. A revoked grant and an
+/// expired one both leave the page closed, with the same 403.
+///
+/// Review round 1 R1: the grantee holds `query:read` by role, so the grant
+/// adds no permission and revoking or expiring it takes none away. The page
+/// can only close because `holds_asset_grant` reads the grant row — which is
+/// what these assertions are named for.
+#[tokio::test]
+async fn a_revoked_or_expired_grant_no_longer_opens_the_page() {
+    let (router, pool, admin_cookie, admin, grantee) = query_reader_harness().await;
+    let cookie = session_cookie_for_user(&pool, grantee).await;
+
+    let grant_id = grant_direct(&pool, admin, ASSET, grantee, "query:read").await;
+    let (status, body) = read_asset(&router, ASSET, &cookie).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an in-force grant from {ASSET} must open it, got {status}: {body}"
+    );
+
+    // The revoke goes through the route, so it is the one a person makes.
+    let (status, body) = call(
+        &router,
+        "DELETE",
+        &format!("/api/catalog/{ASSET}/grants/{grant_id}"),
+        &admin_cookie,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = read_asset(&router, ASSET, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a revoked grant opens nothing: {body}"
+    );
+    assert_eq!(body["error"], json!("permission_denied: catalog:read"));
+
+    grant_direct(&pool, admin, ASSET, grantee, "query:read").await;
+    sqlx::query(
+        "UPDATE access_grant SET expires_at = now() - interval '1 second' \
+         WHERE user_id = $1 AND catalog_id = $2",
+    )
+    .bind(grantee)
+    .bind(ASSET)
+    .execute(&pool)
+    .await
+    .expect("expire the grant");
+    let (status, body) = read_asset(&router, ASSET, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an expired grant opens nothing: {body}"
+    );
+    assert_eq!(body["error"], json!("permission_denied: catalog:read"));
+}
+
+/// `GOV-11` (`DEC-20`): a grant of another permission from the same table
+/// does not open its page. The asset page takes `query:read`, not "any
+/// grant from this asset".
+///
+/// Review round 1 R1: the grantee holds `query:read` by role, so only the
+/// permission on the grant row can keep the page closed; the `lineage:read`
+/// grant goes through the page's own route, as a person makes it.
+#[tokio::test]
+async fn a_grant_of_another_permission_does_not_open_the_page() {
+    let (router, pool, admin_cookie, _admin, grantee) = query_reader_harness().await;
+    grant_from_asset(
+        &router,
+        &pool,
+        &admin_cookie,
+        ASSET,
+        grantee,
+        "lineage:read",
+    )
+    .await;
+    let cookie = session_cookie_for_user(&pool, grantee).await;
+
+    let (status, body) = read_asset(&router, ASSET, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a lineage:read grant does not open the page: {body}"
+    );
+    assert_eq!(body["error"], json!("permission_denied: catalog:read"));
+}
+
+/// Narrow every role `user` holds to exactly `grants` (`GOV-7` D4's shape,
+/// as `tests/table_access.rs` sets a role's table access up): the role stops
+/// being unrestricted and reads only the named tables.
+async fn narrow_to(pool: &PgPool, user: Uuid, grants: &[(&str, &str)]) {
+    let roles: Vec<Uuid> =
+        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_all(pool)
+            .await
+            .expect("the person's roles");
+    assert!(!roles.is_empty(), "the person must hold a role to narrow");
+    for role in roles {
+        sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .expect("narrow the role");
+        sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .expect("clear the grants");
+        for (schema, table) in grants {
+            sqlx::query(
+                "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, $2, $3)",
+            )
+            .bind(role)
+            .bind(schema)
+            .bind(table)
+            .execute(pool)
+            .await
+            .expect("grant the table");
+        }
+    }
+}
+
+/// `GOV-11` (`DEC-20`) and `GOV-7`: a grant gives a permission, not a table.
+/// A person admitted by a grant from `silver.orders` whose roles are narrowed
+/// to another table gets the same 404 an unknown id answers — not 403, which
+/// would say the grant was refused, and not 200/503, which would mean the
+/// table's columns and rows were read.
+///
+/// Review round 1 R3: `detail` runs `table_access_for` after the admission
+/// for every reader. Nothing but that order keeps this true, and nothing
+/// else asserted it before.
+#[tokio::test]
+async fn a_grant_does_not_open_a_table_the_persons_roles_hide() {
+    let (router, pool, _admin_cookie, admin, grantee) = query_reader_harness().await;
+    grant_direct(&pool, admin, ASSET, grantee, "query:read").await;
+    narrow_to(&pool, grantee, &[("silver", "customers")]).await;
+    let cookie = session_cookie_for_user(&pool, grantee).await;
+
+    let (status, body) = read_asset(&router, ASSET, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a hidden table stays hidden from a grant-holder: {body}"
+    );
+    assert_eq!(body["error"], json!("Asset not found"));
+}

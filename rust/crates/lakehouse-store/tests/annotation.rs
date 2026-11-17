@@ -26,7 +26,10 @@
 // by the linker before its ctor section is ever considered).
 use lakehouse_test_support as _;
 
-use lakehouse_store::annotation::{AnnotationInput, get_annotation, upsert_annotation};
+use lakehouse_store::annotation::{
+    AnnotationInput, CertificationInput, clear_certification, get_annotation, set_certification,
+    upsert_annotation,
+};
 use sqlx::PgPool;
 
 fn bronze_slug_input() -> AnnotationInput {
@@ -110,7 +113,7 @@ async fn upsert_replaces_an_existing_annotation(pool: PgPool) -> sqlx::Result<()
         .expect("row present");
     assert_eq!(got.owner.as_deref(), Some("new-owner"));
     assert_eq!(got.steward.as_deref(), Some("new-steward"));
-    assert!(got.tags.is_empty());
+    assert_eq!(got.tags, [] as [std::string::String; 0]);
     assert_eq!(got.description, None);
     Ok(())
 }
@@ -241,5 +244,209 @@ async fn exactly_20_valid_tags_is_accepted(pool: PgPool) -> sqlx::Result<()> {
         description: None,
     };
     upsert_annotation(&pool, &input).await.expect("upsert");
+    Ok(())
+}
+
+fn mark(status: &str, note: Option<&str>, replacement: Option<&str>) -> CertificationInput {
+    CertificationInput {
+        asset_id: "silver.mart_orders".to_owned(),
+        status: status.to_owned(),
+        note: note.map(str::to_owned),
+        replacement_asset_id: replacement.map(str::to_owned),
+        certified_by: "Ada Lovelace".to_owned(),
+    }
+}
+
+// DATA-12 F1: each status is stored and read back with who and when.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_certified_mark_round_trips(pool: PgPool) -> sqlx::Result<()> {
+    set_certification(&pool, &mark("certified", None, None))
+        .await
+        .expect("set");
+    let got = get_annotation(&pool, "silver.mart_orders")
+        .await
+        .expect("query")
+        .expect("row present");
+    assert_eq!(got.certification.as_deref(), Some("certified"));
+    assert_eq!(got.certified_by.as_deref(), Some("Ada Lovelace"));
+    assert!(got.certified_at.is_some());
+    assert_eq!(got.certification_note, None);
+    assert_eq!(got.replacement_asset_id, None);
+    // An asset with no annotation row gets one with empty details.
+    assert_eq!(got.tags, [] as [std::string::String; 0]);
+    assert_eq!(got.owner, None);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_deprecated_mark_keeps_its_note_and_replacement(pool: PgPool) -> sqlx::Result<()> {
+    set_certification(
+        &pool,
+        &mark(
+            "deprecated",
+            Some("Superseded"),
+            Some("silver.mart_orders_v2"),
+        ),
+    )
+    .await
+    .expect("set");
+    let got = get_annotation(&pool, "silver.mart_orders")
+        .await
+        .expect("query")
+        .expect("row present");
+    assert_eq!(got.certification.as_deref(), Some("deprecated"));
+    assert_eq!(got.certification_note.as_deref(), Some("Superseded"));
+    assert_eq!(
+        got.replacement_asset_id.as_deref(),
+        Some("silver.mart_orders_v2")
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn clearing_removes_all_five_columns_and_keeps_the_details(pool: PgPool) -> sqlx::Result<()> {
+    let mut details = bronze_slug_input();
+    details.asset_id = "silver.mart_orders".to_owned();
+    upsert_annotation(&pool, &details).await.expect("upsert");
+    set_certification(&pool, &mark("deprecated", Some("Old"), Some("x")))
+        .await
+        .expect("set");
+    clear_certification(&pool, "silver.mart_orders")
+        .await
+        .expect("clear");
+    let got = get_annotation(&pool, "silver.mart_orders")
+        .await
+        .expect("query")
+        .expect("row present");
+    assert_eq!(got.certification, None);
+    assert_eq!(got.certification_note, None);
+    assert_eq!(got.replacement_asset_id, None);
+    assert_eq!(got.certified_by, None);
+    assert_eq!(got.certified_at, None);
+    assert_eq!(got.owner.as_deref(), Some("data-eng"));
+    Ok(())
+}
+
+// DATA-12 F2: editing the details never changes a mark.
+#[sqlx::test(migrations = "../../migrations")]
+async fn upsert_annotation_after_a_mark_leaves_the_mark(pool: PgPool) -> sqlx::Result<()> {
+    set_certification(&pool, &mark("certified", None, None))
+        .await
+        .expect("set");
+    let mut details = bronze_slug_input();
+    details.asset_id = "silver.mart_orders".to_owned();
+    upsert_annotation(&pool, &details).await.expect("upsert");
+    let got = get_annotation(&pool, "silver.mart_orders")
+        .await
+        .expect("query")
+        .expect("row present");
+    assert_eq!(got.certification.as_deref(), Some("certified"));
+    assert_eq!(got.certified_by.as_deref(), Some("Ada Lovelace"));
+    assert_eq!(got.owner.as_deref(), Some("data-eng"));
+    Ok(())
+}
+
+// DATA-12 F2: setting a mark never changes the details.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_certification_after_details_leaves_the_details(pool: PgPool) -> sqlx::Result<()> {
+    let mut details = bronze_slug_input();
+    details.asset_id = "silver.mart_orders".to_owned();
+    upsert_annotation(&pool, &details).await.expect("upsert");
+    set_certification(&pool, &mark("certified", None, None))
+        .await
+        .expect("set");
+    let got = get_annotation(&pool, "silver.mart_orders")
+        .await
+        .expect("query")
+        .expect("row present");
+    assert_eq!(got.owner.as_deref(), Some("data-eng"));
+    assert_eq!(got.tags, vec!["pii".to_owned()]);
+    assert_eq!(got.description.as_deref(), Some("Order events"));
+    assert_eq!(got.certification.as_deref(), Some("certified"));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_note_with_certified_is_refused_by_the_check(pool: PgPool) -> sqlx::Result<()> {
+    assert!(
+        set_certification(&pool, &mark("certified", Some("why"), None))
+            .await
+            .is_err()
+    );
+    assert!(
+        set_certification(&pool, &mark("certified", None, Some("silver.x")))
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unknown_status_is_refused_by_the_check(pool: PgPool) -> sqlx::Result<()> {
+    assert!(
+        set_certification(&pool, &mark("trusted", None, None))
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+// Review round 1 R9 (`DATA-54`): the statement decides whether anything
+// changed, so two saves of the same mark at the same time write one row, one
+// history entry, and keep the first person and time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn setting_the_mark_that_is_already_set_writes_no_row(pool: PgPool) -> sqlx::Result<()> {
+    assert!(
+        set_certification(&pool, &mark("deprecated", Some("Superseded"), None))
+            .await
+            .expect("set"),
+        "the first save writes a row"
+    );
+    let before = get_annotation(&pool, "silver.mart_orders")
+        .await
+        .expect("query")
+        .expect("row present");
+    let before_updated: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT updated_at FROM asset_annotation WHERE asset_id = $1")
+            .bind("silver.mart_orders")
+            .fetch_one(&pool)
+            .await
+            .expect("updated_at");
+
+    let same = CertificationInput {
+        certified_by: "Someone Else".to_owned(),
+        ..mark("deprecated", Some("Superseded"), None)
+    };
+    assert!(
+        !set_certification(&pool, &same).await.expect("set"),
+        "a save carrying what is stored writes no row"
+    );
+    let after = get_annotation(&pool, "silver.mart_orders")
+        .await
+        .expect("query")
+        .expect("row present");
+    assert_eq!(
+        after.certified_by.as_deref(),
+        Some("Ada Lovelace"),
+        "who set the mark stays the first one"
+    );
+    assert_eq!(after.certified_at, before.certified_at);
+    let after_updated: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT updated_at FROM asset_annotation WHERE asset_id = $1")
+            .bind("silver.mart_orders")
+            .fetch_one(&pool)
+            .await
+            .expect("updated_at");
+    assert_eq!(
+        after_updated, before_updated,
+        "an unchanged save is no write"
+    );
+
+    assert!(
+        set_certification(&pool, &mark("deprecated", Some("Replaced"), None))
+            .await
+            .expect("set"),
+        "a different note is a write"
+    );
     Ok(())
 }

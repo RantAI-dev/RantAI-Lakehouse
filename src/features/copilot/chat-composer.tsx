@@ -29,7 +29,7 @@ export function ToolsMenu({
       <PopoverTrigger asChild>
         <button
           type="button"
-          title="Choose what Copilot can use"
+          title="Choose what AI Copilot can use"
           className={cn(
             "flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs transition-colors hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground",
             limited ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground",
@@ -42,11 +42,11 @@ export function ToolsMenu({
       </PopoverTrigger>
       <PopoverContent side="top" align="start" className="w-80 gap-2 p-2">
         <PopoverHeader className="px-1.5 pt-1">
-          <PopoverTitle>What Copilot can use</PopoverTitle>
+          <PopoverTitle>What AI Copilot can use</PopoverTitle>
           <PopoverDescription className="text-xs">
             {mode === "build"
-              ? "Turn one off to keep Copilot away from it in this chat. Anything that changes data still asks you first."
-              : "Ask mode only reads. Turn one off to keep Copilot from looking there."}
+              ? "Turn one off to keep AI Copilot away from it in this chat. Anything that changes data still asks you first."
+              : "Ask mode only reads. Turn one off to keep AI Copilot from looking there."}
           </PopoverDescription>
         </PopoverHeader>
         <div className="flex flex-col">
@@ -80,7 +80,7 @@ export function ToolsMenu({
  */
 export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) => void }) {
   return (
-    <div className="inline-flex rounded-lg bg-muted/60 p-0.5" role="group" aria-label="Copilot mode">
+    <div className="inline-flex rounded-lg bg-muted/60 p-0.5" role="group" aria-label="AI Copilot mode">
       {(["ask", "build"] as Mode[]).map((m) => (
         <button
           key={m}
@@ -181,6 +181,7 @@ export function ChatComposer({
         <input
           id="copilot-compact-message"
           aria-required
+          aria-label="Message AI Copilot"
           aria-describedby="copilot-compact-required-help"
           value={input}
           onChange={(e) => setInput(e.target.value)}

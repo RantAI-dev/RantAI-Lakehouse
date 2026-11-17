@@ -22,6 +22,15 @@
 # process it wraps.
 set -eu
 
+# SRC-12 decision 5: `docker compose run --rm lakehouse-api rotate-secrets-key`
+# passes a command through to the binary. A command is a one-off operator
+# task on the credentials volume, not a server start: no migrations, no
+# waiting on the database, and the binary decides what it accepts (it
+# refuses anything it does not know).
+if [ "$#" -gt 0 ]; then
+    exec /usr/local/bin/lakehouse-api "$@"
+fi
+
 if [ -n "${DATABASE_URL:-}" ]; then
     echo "entrypoint: applying migrations via sqlx-cli..." >&2
     if sqlx migrate run --source /app/migrations --database-url "$DATABASE_URL"; then

@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test"
-import { describeTransform, parseTransformDraft, renderTransformDraft } from "@/lib/transform-draft"
+import { describeTransform } from "@/lib/transform-draft"
 import type { PipelineRun } from "@/services/contracts/pipelines"
 import { describeCron, localizeScheduleTime, parseSchedule } from "./pipeline-schedule"
 import { runDurationMs, summarizeRuns } from "./pipeline-run-stats"
-import { failureLines, filterLogLines, formatLogOffset, type LogLine } from "./run-logs"
+import { classifiedFailureReason, failureLines, filterLogLines, formatLogOffset, type LogLine } from "./run-logs"
 
 function run(status: PipelineRun["status"], seconds: number | null, id: string = status): PipelineRun {
   return {
@@ -127,6 +127,59 @@ describe("run logs", () => {
   })
 })
 
+describe("the classified failure reason (BLD-8 decision 6)", () => {
+  const line = (level: string, message: string, stepKey: string | null = null): LogLine => ({
+    ts: 0,
+    level,
+    stepKey,
+    message,
+  })
+
+  test("shows this product's own config rejection, without the pipeline id in front", () => {
+    const lines = [
+      line(
+        "ERROR",
+        'Failure(description="authored pipeline \'pl-x\' config rejected: this pipeline names a connector but its source zone is not bronze: a pipeline made from a connector reads one of that connector\'s Bronze tables. Edit the pipeline: choose bronze and one of the connector\'s tables, or clear its connector.")',
+        "authored_pl_x"
+      ),
+    ]
+    expect(classifiedFailureReason(lines)).toBe(
+      "config rejected: this pipeline names a connector but its source zone is not bronze: a pipeline made from a connector reads one of that connector's Bronze tables. Edit the pipeline: choose bronze and one of the connector's tables, or clear its connector."
+    )
+  })
+
+  test("shows this product's own enforcement refusal", () => {
+    const lines = [
+      line(
+        "ERROR",
+        'Failure(description="authored pipeline \'pl-x\' refused: the author has no read access to silver.orders")'
+      ),
+    ]
+    expect(classifiedFailureReason(lines)).toBe(
+      "refused: the author has no read access to silver.orders"
+    )
+  })
+
+  test("withholds upstream text, so the caller can point at the log instead", () => {
+    // A driver's or a traceback's words are not ours: the API never sends
+    // them in a response (AGENTS.md principle 4), and the page must not
+    // present them as the reason either.
+    const upstream = [
+      line("ERROR", "export of 'x' failed: 401 Client Error", "export_gold_mart[x]"),
+      line("ERROR", "clickhouse: Code: 60. Table silver.orders does not exist", "authored_pl_x"),
+      line("ERROR", 'Execution of step "authored_pl_x" failed.'),
+      // PR review (BLD-7, SHOULD-FIX 2): a driver's "refused:" is not ours.
+      line("ERROR", "clickhouse: Connection refused: clickhouse:8123", "authored_pl_x"),
+    ]
+    expect(classifiedFailureReason(upstream)).toBeNull()
+  })
+
+  test("is null when the log has no error at all", () => {
+    expect(classifiedFailureReason([])).toBeNull()
+    expect(classifiedFailureReason([line("INFO", "started")])).toBeNull()
+  })
+})
+
 describe("describeTransform", () => {
   test("each verb reads back as a short phrase, and unknown text returns null", () => {
     expect(describeTransform("dedupe(nama_event)")).toEqual({ verb: "dedupe", detail: "one row per nama_event" })
@@ -154,23 +207,3 @@ describe("localizeScheduleTime", () => {
   })
 })
 
-describe("parseTransformDraft", () => {
-  test("every shape renderTransformDraft writes reads back to the same draft", () => {
-    const drafts = [
-      { verb: "dedupe", key: "id" },
-      { verb: "filter", column: "tahun", operator: ">=", value: "2020" },
-      { verb: "filter", column: "x", operator: "!=", value: "a b" },
-      { verb: "rename", from: "a", to: "b" },
-      { verb: "cast", column: "tahun", type: "Int32" },
-      { verb: "select", columns: "a,b" },
-    ] as const
-    for (const d of drafts) {
-      expect(parseTransformDraft(renderTransformDraft(d))).toEqual(d)
-    }
-  })
-  test("anything outside those shapes is null", () => {
-    expect(parseTransformDraft("drop(x)")).toBeNull()
-    expect(parseTransformDraft("cast(a,Decimal)")).toBeNull()
-    expect(parseTransformDraft("filter(a LIKE 'x')")).toBeNull()
-  })
-})

@@ -8,6 +8,16 @@
 //! `storage_key` is always a server-generated name rather than the user's
 //! own filename.
 //!
+//! # Chunked uploads (`DATA-17`, `0090_upload_parts.sql`)
+//!
+//! A large file arrives as a session: [`insert_receiving`] makes the row in
+//! the `receiving` state with the S3 multipart id, [`record_part`] notes each
+//! piece (a piece sent again replaces the earlier note), [`list_parts`] says
+//! what is there, and [`finish_receiving`] moves the row to `uploaded` once the
+//! store has assembled the object. The state is in Postgres so that any API
+//! process can take the next piece and a restart loses nothing.
+//! [`stale_receiving`] finds the sessions the hourly sweep abandons.
+//!
 //! # Tenant scope (ADR 0014, decision 6)
 //!
 //! An upload belongs to a tenant (`tenant_id`, `0058_upload_tenant_mode
@@ -39,6 +49,12 @@
 //!   [`TableClaim::Ours`] or [`TableClaim::Theirs`].
 //! - [`table_claimed`] asks whether anyone holds it, for the one caller with
 //!   no tenant to ask on behalf of (a connector's ingest spec, plan task T8).
+//! - [`list_claims`] lists a tenant's claims with the upload each one came
+//!   from and that upload's file name while it exists. It is the record the
+//!   lineage graph draws an `upload -> bronze.<table>` edge from (`DATA-19`),
+//!   which is why a claim outliving its upload matters outside the ownership
+//!   rules above: the origin of a table stays drawable after the file is
+//!   gone.
 //!
 //! A claim is NEVER RELEASED. Not when the upload that made it is deleted
 //! ([`delete`] removes the upload's row and nothing else), not when the load
@@ -86,6 +102,52 @@
 //!
 //! All four return `None` or `false` when they change nothing; the caller
 //! re-reads the row to tell "gone" from "not in that state".
+//!
+//! # Several files, one load (`DATA-17` slice 5, `0092_upload_loaded_with.sql`)
+//!
+//! A load of several files is one claim of a primary upload plus the others
+//! ([`mark_group_within_limits`]); the others carry `loaded_with = <primary>`. The
+//! primary alone has the run, and [`mark_finished`] settles the others with it. The
+//! load limits count a load once ([`loads_under_limits`] skips rows with
+//! `loaded_with`). A later claim of any of the files lets go of the files it led, and
+//! deleting a primary leaves the others with no pointer (`ON DELETE SET NULL`).
+//!
+//! # A separate limit on large loads (`DATA-37`)
+//!
+//! A load whose files total more than [`LARGE_LOAD_BYTES`] is a large load: the
+//! primary upload's `size_bytes` plus that of every upload it carries. How many
+//! large loads may run at once is a limit of its own ([`LoadLimits::large`]),
+//! checked with the other two in the same place and under the same lock, so two
+//! starts at the same moment cannot both take the last large place. A load that is
+//! not large never counts against it and is never refused by it.
+//!
+//! # Dropped tables (`DATA-55`, QA `LH-DATA-15-06`, `TC-1731`,
+//! `0141_upload_table_drop.sql`), and the functions below
+//!
+//! A table a file upload made can be dropped from its page in the console and
+//! restored there for 7 days (`DEC-21`). [`record_table_drop`] is the record of
+//! that drop: one row per raw table name holding the CURRENT state — who
+//! dropped it, for which tenant, which asset it belongs to, its row count (NULL
+//! when it could not be counted), when, and when the window ends. The history
+//! is the audit trail's, not this table's.
+//!
+//! - [`record_table_drop`] writes the row in ONE statement, so the primary key
+//!   decides between two drops of the same name sent at the same moment: the
+//!   second answers `None` and is refused rather than naming a second person on
+//!   a drop they did not make.
+//! - [`dropped_table`] answers "is this name dropped inside its window right
+//!   now" — asked at every load, which is what keeps a dropped table's name
+//!   closed while it can still be restored: a new table of that name would make
+//!   the dropped one impossible to bring back.
+//! - [`forget_table_drop_at`] removes the row a restore, a refused drop or a
+//!   drop the catalog answered read — and only that row: a record written after
+//!   that read belongs to another drop and stays.
+//! - [`heal_table_drop`] removes a row that says "dropped" for a table that is
+//!   there, once it is too old for its own drop to be in flight.
+//! - [`list_dropped_tables`] is the Catalog's list: the given tenants'
+//!   unexpired drops, newest first.
+//! - [`loading_into`] is the uploads loading into a name, for the check that
+//!   refuses a drop while a load is in progress.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -96,7 +158,7 @@ use uuid::Uuid;
 
 use crate::{PgPool, StoreError};
 
-fn ser_ts<S: serde::Serializer>(at: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error> {
+pub(crate) fn ser_ts<S: serde::Serializer>(at: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error> {
     let at = at.to_offset(time::UtcOffset::UTC);
     s.serialize_str(&format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
@@ -185,7 +247,9 @@ pub struct Upload {
     /// tenant-scoped read. Internal: never serialized.
     #[serde(skip)]
     pub tenant_id: Option<Uuid>,
-    /// `uploaded` | `ingesting` | `ingested` | `failed`.
+    /// `receiving` | `uploaded` | `ingesting` | `ingested` | `failed`.
+    /// `receiving` is a chunked upload whose pieces are still arriving
+    /// (`DATA-17`, `0090_upload_parts.sql`): it cannot be previewed or loaded.
     pub status: String,
     /// What the last load was told to use (encoding, delimiter, header
     /// row), as the API recorded it.
@@ -212,6 +276,43 @@ pub struct Upload {
     /// Failure reason when `status` is `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The size the client announced when it opened a chunked session
+    /// (`DATA-17`). `None` for a file that arrived in one request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_size: Option<i64>,
+    /// S3's id for the multipart upload in flight. Internal: with the storage
+    /// key it addresses the upload directly, so it is never serialized.
+    /// `None` once the upload is complete or aborted, and for a file that
+    /// arrived in one request.
+    #[serde(skip)]
+    pub multipart_id: Option<String>,
+    /// SHA-256 over the pieces' SHA-256s, in order, set when a chunked upload
+    /// completes. Internal: never serialized.
+    #[serde(skip)]
+    pub parts_digest: Option<Vec<u8>>,
+    /// The column list the last load was told, `[{source, name, type, ...}]`;
+    /// absent for a load with no list (every column text) and for an upload never
+    /// loaded (`DATA-18`, `0091_upload_column_spec.sql`).
+    #[serde(rename = "columns", skip_serializing_if = "Option::is_none")]
+    pub column_spec: Option<Json<Value>>,
+    /// `null` or `stop`: what the last load did with a value that does not fit
+    /// its column. Set exactly when `column_spec` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_bad_value: Option<String>,
+    /// The report of values that did not fit, `{count, byColumn, rows}`, set when
+    /// the last load found any (bounded: 100 values of 200 characters).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bad_values: Option<Json<Value>>,
+    /// The primary upload of the load this file belongs to, set on every OTHER file of
+    /// a load of several files (`DATA-17` slice 5, `0092_upload_loaded_with.sql`);
+    /// `None` for a file that loaded alone and for the primary itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loaded_with: Option<String>,
+    /// The folder the file sits in on the Uploaded files tab (`DATA-35`,
+    /// `0112_upload_folders.sql`); `None` is "No folder". A grouping only: it
+    /// changes nothing about the file's table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
     /// When the bytes were stored.
     #[serde(serialize_with = "ser_ts")]
     pub created_at: OffsetDateTime,
@@ -223,7 +324,8 @@ pub struct Upload {
 
 const COLS: &str = "id, original_filename, storage_key, content_type, size_bytes, sha256, \
                     uploaded_by, tenant_id, status, parse_options, bronze_table, load_mode, \
-                    row_count, run_id, error, created_at, updated_at";
+                    row_count, run_id, error, declared_size, multipart_id, parts_digest, column_spec, on_bad_value, \
+                    bad_values, loaded_with, folder_id, created_at, updated_at";
 
 /// Everything needed to record a file whose bytes are already stored.
 ///
@@ -252,6 +354,263 @@ pub struct NewUpload<'a> {
     pub tenant_id: Uuid,
 }
 
+/// Everything needed to open a chunked upload session (`DATA-17`).
+///
+/// Unlike [`NewUpload`] this is taken BEFORE any byte is stored: the row is
+/// the session, and the object appears at `storage_key` only when the
+/// multipart upload completes. A `receiving` row with no object is therefore
+/// normal, and the sweep removes the ones nobody finishes.
+#[derive(Debug, Clone)]
+pub struct NewReceiving<'a> {
+    /// Upload id, generated by the caller.
+    pub id: &'a str,
+    /// Browser-reported filename, for display only.
+    pub original_filename: &'a str,
+    /// Object key the finished file will be written to.
+    pub storage_key: &'a str,
+    /// Browser-reported MIME type; advisory (see [`Upload::content_type`]).
+    pub content_type: &'a str,
+    /// The size the client announced, in bytes. Positive.
+    pub declared_size: i64,
+    /// S3's id for the multipart upload just created at `storage_key`.
+    pub multipart_id: &'a str,
+    /// Display name of the uploading principal.
+    pub uploaded_by: &'a str,
+    /// The caller's active tenant, never a value from the request body.
+    pub tenant_id: Uuid,
+}
+
+/// Open a chunked upload session: record the row in the `receiving` state.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Conflict`] when `storage_key` (or `id`) is already
+/// registered, [`StoreError::ForeignKeyViolation`] when `tenant_id` names no
+/// tenant, and [`StoreError::Database`] on any other failure (a
+/// non-positive `declared_size` is refused by the table's `CHECK`).
+pub async fn insert_receiving(pool: &PgPool, new: &NewReceiving<'_>) -> Result<Upload, StoreError> {
+    let sql = format!(
+        "INSERT INTO file_upload \
+         (id, original_filename, storage_key, content_type, uploaded_by, tenant_id, status, \
+          declared_size, multipart_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'receiving', $7, $8) RETURNING {COLS}"
+    );
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(new.id)
+        .bind(new.original_filename)
+        .bind(new.storage_key)
+        .bind(new.content_type)
+        .bind(new.uploaded_by)
+        .bind(new.tenant_id)
+        .bind(new.declared_size)
+        .bind(new.multipart_id)
+        .fetch_one(pool)
+        .await?)
+}
+
+/// How many `receiving` sessions `uploaded_by` has open: what the session cap
+/// of the sessions route counts (Phase 3 slice 1 review SHOULD-FIX 1). Keyed by
+/// the display name the row records, the same text the `SEC-17` limits use.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn count_receiving(pool: &PgPool, uploaded_by: &str) -> Result<i64, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM file_upload WHERE status = 'receiving' AND uploaded_by = $1",
+    )
+    .bind(uploaded_by)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// One piece of a chunked upload, as recorded.
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct UploadPart {
+    /// S3's part number, `1..=10000`.
+    pub part_number: i32,
+    /// Size of the piece, in bytes.
+    pub size_bytes: i64,
+    /// S3's `ETag` for the piece, as the store returned it; the completion call
+    /// needs it back.
+    pub etag: String,
+    /// Hex SHA-256 of the piece, computed by the API as it received it.
+    pub sha256: String,
+}
+
+/// Record that piece `part_number` of upload `upload_id` is stored, replacing
+/// an earlier record of the same number (S3 keeps the last copy of a part
+/// number, so the record must too). Only a `receiving` upload takes a part:
+/// the check and the write are ONE statement, so a piece that races the
+/// completion of its upload is refused rather than recorded against a file
+/// that is already assembled.
+///
+/// Returns `false` when nothing was written: no such upload, or it is not
+/// `receiving`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure (a `part_number`
+/// outside `1..=10000` or a non-positive size is refused by the table's
+/// `CHECK`).
+pub async fn record_part(
+    pool: &PgPool,
+    upload_id: &str,
+    part: &UploadPart,
+) -> Result<bool, StoreError> {
+    let done = sqlx::query(
+        "INSERT INTO file_upload_part (upload_id, part_number, size_bytes, etag, sha256) \
+         SELECT $1, $2, $3, $4, $5 \
+          WHERE EXISTS (SELECT 1 FROM file_upload WHERE id = $1 AND status = 'receiving') \
+         ON CONFLICT (upload_id, part_number) DO UPDATE \
+            SET size_bytes = EXCLUDED.size_bytes, etag = EXCLUDED.etag, \
+                sha256 = EXCLUDED.sha256, received_at = now()",
+    )
+    .bind(upload_id)
+    .bind(part.part_number)
+    .bind(part.size_bytes)
+    .bind(&part.etag)
+    .bind(&part.sha256)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// The pieces recorded for `upload_id`, by part number.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn list_parts(pool: &PgPool, upload_id: &str) -> Result<Vec<UploadPart>, StoreError> {
+    Ok(sqlx::query_as(
+        "SELECT part_number, size_bytes, etag, sha256 FROM file_upload_part \
+         WHERE upload_id = $1 ORDER BY part_number",
+    )
+    .bind(upload_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Settle a chunked upload that the store has assembled: `receiving` becomes
+/// `uploaded`, with the stored object's size and the `parts_digest`, and
+/// `multipart_id` cleared. The piece records are removed: they describe an
+/// upload that no longer exists.
+///
+/// `sha256` stays empty on purpose. It is "the SHA-256 of the stored bytes",
+/// and a file that was never held whole has no such hash; filling it with the
+/// digest of the pieces would be a different quantity under the same name.
+/// The duplicate check for these files reads `parts_digest`
+/// ([`find_by_parts_digest`]).
+///
+/// Returns `None` when no row changed: no such upload, or it is not
+/// `receiving`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn finish_receiving(
+    pool: &PgPool,
+    id: &str,
+    size_bytes: i64,
+    parts_digest: &[u8],
+) -> Result<Option<Upload>, StoreError> {
+    let mut tx = pool.begin().await?;
+    let sql = format!(
+        "UPDATE file_upload SET status = 'uploaded', size_bytes = $2, \
+         parts_digest = $3, multipart_id = NULL, updated_at = now() \
+         WHERE id = $1 AND status = 'receiving' RETURNING {COLS}"
+    );
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    let row: Option<Upload> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .bind(size_bytes)
+        .bind(parts_digest)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if row.is_some() {
+        sqlx::query("DELETE FROM file_upload_part WHERE upload_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// `receiving` uploads created more than `older_than_hours` ago, oldest
+/// first, at most `limit` (clamped to `1..=500`). The hourly sweep aborts and
+/// removes them (`UPLOAD_SESSION_TTL_HOURS`). NOT tenant-scoped: the sweep is
+/// the server's own, not a request.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn stale_receiving(
+    pool: &PgPool,
+    older_than_hours: i32,
+    limit: i64,
+) -> Result<Vec<Upload>, StoreError> {
+    let sql = format!(
+        "SELECT {COLS} FROM file_upload \
+         WHERE status = 'receiving' AND created_at < now() - make_interval(hours => $1) \
+         ORDER BY created_at, id LIMIT $2"
+    );
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(older_than_hours)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(pool)
+        .await?)
+}
+
+/// Delete upload `id` only while it is still `receiving`: the sweep's and
+/// the abort path's delete. Unlike [`delete`] it cannot remove a file that
+/// was finished (or is loading) in the moment between the caller reading the
+/// row and deleting it. The piece records go with the row (`ON DELETE
+/// CASCADE`).
+///
+/// Returns whether a row was deleted.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn delete_receiving(pool: &PgPool, id: &str) -> Result<bool, StoreError> {
+    let done = sqlx::query("DELETE FROM file_upload WHERE id = $1 AND status = 'receiving'")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// The most recent chunked upload of `tenant_id` whose pieces hashed to
+/// `parts_digest`, excluding `exclude_id`: the duplicate check for files that
+/// were never held whole (see `0090_upload_parts.sql`). Scoped to the tenant
+/// for the reason [`find_by_sha256`] is.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn find_by_parts_digest(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    parts_digest: &[u8],
+    exclude_id: &str,
+) -> Result<Option<Upload>, StoreError> {
+    let sql = format!(
+        "SELECT {COLS} FROM file_upload \
+         WHERE tenant_id = $1 AND parts_digest = $2 AND id <> $3 \
+         ORDER BY created_at DESC, id DESC LIMIT 1"
+    );
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(tenant_id)
+        .bind(parts_digest)
+        .bind(exclude_id)
+        .fetch_optional(pool)
+        .await?)
+}
+
 /// Record an uploaded file, in the `uploaded` state.
 ///
 /// # Errors
@@ -266,7 +625,8 @@ pub async fn insert(pool: &PgPool, new: &NewUpload<'_>) -> Result<Upload, StoreE
           tenant_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(new.id)
         .bind(new.original_filename)
         .bind(new.storage_key)
@@ -285,13 +645,81 @@ pub async fn insert(pool: &PgPool, new: &NewUpload<'_>) -> Result<Upload, StoreE
 ///
 /// Returns [`StoreError::Database`] on a database failure.
 pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64) -> Result<Vec<Upload>, StoreError> {
+    list_filtered(pool, tenant_id, limit, &ListFilter::default()).await
+}
+
+/// Which folder's uploads a listing shows (`DATA-35`, plan AD5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FolderFilter<'a> {
+    /// Every upload of the tenant, whatever its folder.
+    #[default]
+    Any,
+    /// Only the uploads in no folder.
+    NoFolder,
+    /// Only the uploads directly in this folder.
+    In(&'a str),
+}
+
+/// What narrows a listing before the newest-first window is cut, so that a
+/// folder's files, a search and one table's uploads are not hidden by newer
+/// files elsewhere.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListFilter<'a> {
+    /// The folder to show.
+    pub folder: FolderFilter<'a>,
+    /// Text a file name or a table name must contain, case-insensitively.
+    /// The text is bound as a value; `%`, `_` and `\` in it match themselves.
+    pub text: Option<&'a str>,
+    /// Exactly this raw table name. Bound as a value and compared with `=`, so
+    /// `%` and `_` are ordinary characters and the case must match.
+    pub table: Option<&'a str>,
+}
+
+/// `tenant_id`'s uploads that match `filter`, newest first. `limit` is clamped to
+/// `1..=500`. A folder of another tenant matches nothing: the tenant is bound
+/// in the same statement. A table filter is an exact match on the raw
+/// `bronze_table`, not the contains-match [`ListFilter::text`] is: `stock` does
+/// not bring `stock_2026`, which is how the Table step asks which uploads of
+/// this tenant loaded into one table (`DATA-47`, QA `LH-DATA-35-03`).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn list_filtered(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    limit: i64,
+    filter: &ListFilter<'_>,
+) -> Result<Vec<Upload>, StoreError> {
+    let (by_folder, folder_id) = match filter.folder {
+        FolderFilter::Any => (false, None),
+        FolderFilter::NoFolder => (true, None),
+        FolderFilter::In(id) => (true, Some(id)),
+    };
+    // `ILIKE` with the user's text escaped: the pattern is `%text%` and only the
+    // wrapping `%` are wildcards.
+    let pattern = filter.text.map(|text| {
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        format!("%{escaped}%")
+    });
     let sql = format!(
         "SELECT {COLS} FROM file_upload WHERE tenant_id = $1 \
+           AND (NOT $3 OR folder_id IS NOT DISTINCT FROM $4) \
+           AND ($5::text IS NULL OR original_filename ILIKE $5 OR bronze_table ILIKE $5) \
+           AND ($6::text IS NULL OR bronze_table = $6) \
          ORDER BY created_at DESC, id DESC LIMIT $2"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(tenant_id)
         .bind(limit.clamp(1, 500))
+        .bind(by_folder)
+        .bind(folder_id)
+        .bind(pattern)
+        .bind(filter.table)
         .fetch_all(pool)
         .await?)
 }
@@ -304,7 +732,11 @@ pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64) -> Result<Vec<Uplo
 /// Returns [`StoreError::Database`] on a database failure.
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<Upload>, StoreError> {
     let sql = format!("SELECT {COLS} FROM file_upload WHERE id = $1");
-    Ok(sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// The upload whose load is run `run_id`, or `None` (`SRC-7` F6): the
@@ -320,7 +752,8 @@ pub async fn get_by_run_id(pool: &PgPool, run_id: &str) -> Result<Option<Upload>
     let sql = format!(
         "SELECT {COLS} FROM file_upload WHERE run_id = $1 ORDER BY updated_at DESC LIMIT 1"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(run_id)
         .fetch_optional(pool)
         .await?)
@@ -372,7 +805,8 @@ pub async fn find_by_sha256(
          WHERE tenant_id = $1 AND sha256 = $2 AND sha256 <> '' AND id <> $3 \
          ORDER BY created_at DESC, id DESC LIMIT 1"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(tenant_id)
         .bind(sha256)
         .bind(exclude_id)
@@ -409,10 +843,12 @@ pub async fn mark_ingesting(
     let sql = format!(
         "UPDATE file_upload SET status = 'ingesting', parse_options = $2, \
          bronze_table = $3, load_mode = $4, run_id = $5, error = NULL, row_count = NULL, \
+         column_spec = NULL, on_bad_value = NULL, bad_values = NULL, loaded_with = NULL, \
          updated_at = now() \
          WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(Json(parse_options.clone()))
         .bind(bronze_table)
@@ -420,6 +856,420 @@ pub async fn mark_ingesting(
         .bind(run_id)
         .fetch_optional(pool)
         .await?)
+}
+
+/// Hours after which an `ingesting` row no longer counts against the load
+/// limits (`SEC-17 review fix (SHOULD-FIX 1)`, feature page decision D9). A
+/// row leaves `ingesting` only when its job reports or someone reads it, so
+/// loads whose job died in a tenant nobody opens would otherwise count for
+/// ever and refuse every load in the installation. Six hours is far past the
+/// longest load (the request deadline and the job's own bounds are minutes);
+/// the row itself is not changed here, it is only not counted.
+const LOAD_COUNTS_FOR_HOURS: i32 = 6;
+
+/// A load whose files total more than this is a **large load** (`DATA-37`
+/// decision D1): the primary upload's `size_bytes` plus that of every
+/// upload it carries (`loaded_with`).
+///
+/// 512 MiB. `DATA-33` measured about 2.2 GiB of job memory for a 2 GiB
+/// load (`plans/DATA-17-RESULT.md`), so the sixteen loads the installation
+/// limit allows would ask for about 35 GiB on a host whose minimum is
+/// 16 GiB. The threshold is a constant and not a setting: it says what a
+/// large load IS. How many of them may run at once is the setting
+/// (`DATA-37` decision D2, `UPLOAD_MAX_CONCURRENT_LARGE`).
+pub const LARGE_LOAD_BYTES: i64 = 512 * 1024 * 1024;
+
+/// How many loads may run at once (`SEC-17`): per `uploaded_by` and in
+/// total. Both are at least 1; the API reads them from its configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadLimits {
+    /// Loads (`ingesting` rows that lead a load) one `uploaded_by` may have at once.
+    pub per_user: i64,
+    /// Loads any `uploaded_by` may have at once, together.
+    pub total: i64,
+    /// Large loads that may run at once in the whole installation
+    /// (`DATA-37` decision D2). A load that is not large never counts
+    /// against it and is never refused by it (decision D3).
+    pub large: i64,
+}
+
+/// What the load limits said about a load that wants to start (`DATA-37`
+/// decision D3: the large limit is checked with the other two, in the same
+/// place and under the same lock).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitOutcome {
+    /// Under every limit: the load may start.
+    Under,
+    /// The per-user or the installation-wide limit is reached.
+    LimitReached,
+    /// The large-load limit is reached (`DATA-37` decision D4: the refusal
+    /// has a sentence of its own, so the person can tell it from the
+    /// per-user one).
+    LargeLimitReached,
+}
+
+/// What [`mark_ingesting_within_limits`] did.
+#[derive(Debug)]
+pub enum MarkOutcome {
+    /// The upload is now `ingesting`.
+    Marked(Box<Upload>),
+    /// No row changed: no such upload, or it is already `ingesting`
+    /// (the same case [`mark_ingesting`] answers `None` for).
+    NotMarked,
+    /// A limit was reached; nothing was changed.
+    LimitReached,
+    /// The installation already runs the maximum number of large loads
+    /// (`DATA-37` decision D3); nothing was changed.
+    LargeLimitReached,
+    /// A load of several files: one of the other files could not be taken (it is
+    /// loading, being received, gone or another tenant's), so nothing was changed.
+    /// Only [`mark_group_within_limits`] answers it.
+    GroupNotMarked,
+}
+
+/// Whether the load of `id`, with the other files of `also`, may start: the
+/// person who uploaded it and the installation are both under `limits`, and
+/// the installation is under the large-load limit when this load is large. A
+/// read: the route asks it before it claims a table name so that a refusal
+/// leaves no claim behind; [`mark_ingesting_within_limits`] is what decides.
+///
+/// The person is the one the upload records, not whoever pressed Load
+/// (`SEC-17`, decision D6).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn loads_under_limits(
+    pool: &PgPool,
+    id: &str,
+    also: &[String],
+    limits: LoadLimits,
+) -> Result<LimitOutcome, StoreError> {
+    let mut conn = pool.acquire().await?;
+    Ok(under_limits(&mut conn, id, also, limits).await?)
+}
+
+/// The counts and the comparison, on a connection that may already hold
+/// the lock of [`mark_ingesting_within_limits`].
+///
+/// `DATA-37` decision D3: the large limit is checked here, with the other
+/// two, under the same lock, so two starts at the same moment cannot both
+/// take the last large place. The per-user and the installation-wide limits
+/// are read first, so a load that is over one of them keeps the refusal it
+/// has always had; the large limit speaks only for a load that is large.
+async fn under_limits(
+    conn: &mut sqlx::PgConnection,
+    id: &str,
+    also: &[String],
+    limits: LoadLimits,
+) -> Result<LimitOutcome, sqlx::Error> {
+    let (mine, all): (i64, i64) = sqlx::query_as(
+        "SELECT \
+           count(*) FILTER (WHERE uploaded_by = \
+             (SELECT uploaded_by FROM file_upload WHERE id = $1)), \
+           count(*) \
+         FROM file_upload WHERE status = 'ingesting' AND loaded_with IS NULL \
+           AND updated_at > now() - make_interval(hours => $2)",
+    )
+    .bind(id)
+    .bind(LOAD_COUNTS_FOR_HOURS)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !(mine < limits.per_user && all < limits.total) {
+        return Ok(LimitOutcome::LimitReached);
+    }
+    // `DATA-37` decision D1: the size of the load that wants to start is the
+    // primary's own plus that of the files it carries. A row that is not
+    // there counts as nothing: the caller has already settled the files.
+    let size: i64 = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT size_bytes FROM file_upload WHERE id = $1), 0) \
+           + COALESCE((SELECT sum(size_bytes) FROM file_upload WHERE id = ANY($2)), 0)::bigint",
+    )
+    .bind(id)
+    .bind(also)
+    .fetch_one(&mut *conn)
+    .await?;
+    if size <= LARGE_LOAD_BYTES {
+        // A load that is not large never counts against the large limit and
+        // is never refused by it (`DATA-37` decision D3).
+        return Ok(LimitOutcome::Under);
+    }
+    // The loads that are running and are large: a leading `ingesting` row
+    // whose own size plus that of the files it carries is over the
+    // threshold, counted in the same window as the counts above.
+    let large: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM file_upload AS leader \
+          WHERE leader.status = 'ingesting' AND leader.loaded_with IS NULL \
+            AND leader.updated_at > now() - make_interval(hours => $1) \
+            AND leader.size_bytes + COALESCE((SELECT sum(f.size_bytes) FROM file_upload f \
+                 WHERE f.loaded_with = leader.id), 0)::bigint > $2",
+    )
+    .bind(LOAD_COUNTS_FOR_HOURS)
+    .bind(LARGE_LOAD_BYTES)
+    .fetch_one(&mut *conn)
+    .await?;
+    if large < limits.large {
+        Ok(LimitOutcome::Under)
+    } else {
+        Ok(LimitOutcome::LargeLimitReached)
+    }
+}
+
+/// The folder a load puts its files in (`DATA-35` decision 2): three states, so
+/// that "leave it as it is", "no folder" and "this folder" are never mistaken
+/// for each other. An `Option<Option<String>>` would be, and clippy's
+/// `option_option` has the last word on that (PR #259 CI). The API's `folderId`
+/// has the same three states (`routes::uploads::folders::FolderRef`), and only
+/// the middle one is a change: an explicit "no folder" takes a file out of the
+/// folder it is in, while an absent field leaves it where it is
+/// (`PR #259 review BLOCKER 1`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ClaimFolder {
+    /// Leave the file's folder as it is: the load named no folder and the table's
+    /// claim remembers none either.
+    #[default]
+    Keep,
+    /// The load named "no folder": the file leaves the folder it is in, and the
+    /// table's claim forgets the folder it remembered.
+    None,
+    /// The load named this folder: the file goes into it, and the table's claim
+    /// remembers it.
+    Some(String),
+}
+
+impl ClaimFolder {
+    /// The folder id to bind, and whether the load names a folder at all. "No
+    /// folder" names one (as NULL), so the row is changed and the claim forgets;
+    /// a load that names none does not, so the file keeps the folder it has and
+    /// the claim keeps the one it remembers.
+    fn folder_parts(&self) -> (Option<&str>, bool) {
+        match self {
+            Self::Keep => (None, false),
+            Self::None => (None, true),
+            Self::Some(folder) => (Some(folder.as_str()), true),
+        }
+    }
+}
+
+/// What a claim writes on the rows it takes: the reading, the table and mode, and the
+/// column list (`DATA-18`) the load was told.
+#[derive(Debug, Clone)]
+pub struct LoadClaim<'a> {
+    /// What the load was told to use (encoding, delimiter, header row, sheet).
+    pub parse_options: &'a Value,
+    /// The raw table the load targets.
+    pub bronze_table: &'a str,
+    /// Replace or append.
+    pub load_mode: LoadMode,
+    /// The column list the load was told; `None` is every column text.
+    pub column_spec: Option<&'a Value>,
+    /// What to do with a value that does not fit; set exactly when `column_spec` is.
+    pub on_bad_value: Option<&'a str>,
+    /// The folder every file of the load is put in, and the table's claim
+    /// remembers (`DATA-35` decision 2). The caller has checked that a folder
+    /// named is the tenant's ([`crate::upload_folders::folder_in_tenant`]).
+    pub folder: ClaimFolder,
+}
+
+/// [`mark_ingesting`] with the load limits of `SEC-17`: counts the
+/// `ingesting` rows and marks this one in ONE transaction, serialised by a
+/// transaction-level advisory lock, so two starts at the same moment cannot
+/// both take the last place.
+///
+/// The lock is one key for the whole installation: starting a load is rare
+/// and the section it guards is two short statements. The count is of rows,
+/// not of runs: a row is `ingesting` from the claim until it is settled, so
+/// a claim that never got a run counts until it is settled as stale.
+///
+/// `column_spec`/`on_bad_value` are the column list the load was told and
+/// what it does with a value that does not fit (`DATA-18`); `None`/`None` is
+/// a load with no list, every column text. They are written by the same
+/// statement as the claim, so a row is never left `ingesting` with half of
+/// what its load was told.
+///
+/// This is [`mark_group_within_limits`] for a load of one file.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn mark_ingesting_within_limits(
+    pool: &PgPool,
+    id: &str,
+    parse_options: &Value,
+    bronze_table: &str,
+    load_mode: LoadMode,
+    limits: LoadLimits,
+    column_spec: Option<&Value>,
+    on_bad_value: Option<&str>,
+) -> Result<MarkOutcome, StoreError> {
+    let claim = LoadClaim {
+        parse_options,
+        bronze_table,
+        load_mode,
+        column_spec,
+        on_bad_value,
+        folder: ClaimFolder::Keep,
+    };
+    mark_group_within_limits(pool, id, &[], &claim, limits).await
+}
+
+/// Claim the primary upload `id` AND the `also` uploads for one load of several files
+/// (`DATA-17` slice 5, plan AD4), in the one transaction and under the one lock of
+/// [`mark_ingesting_within_limits`].
+///
+/// A load is ONE place against the limits, however many files it holds: the count
+/// skips rows that carry `loaded_with`, because the files after the first would
+/// otherwise make a ten-file load count ten times and `SEC-17`'s four per person
+/// would refuse it.
+///
+/// - Every row that takes part first lets go of the files it led before
+///   (`loaded_with` of those becomes NULL), so a group's label never counts files
+///   of an earlier load.
+/// - The primary is claimed exactly as [`mark_ingesting_within_limits`] claims it,
+///   with `loaded_with = NULL`.
+/// - Each of `also` takes the same reading, table, mode and column list, with
+///   `loaded_with = id`. It must be of the primary's tenant and neither
+///   `ingesting` nor `receiving`; if any one is not, nothing is changed
+///   ([`MarkOutcome::GroupNotMarked`]). The caller has already settled and
+///   checked them: this is the answer when one of them changed in between.
+///
+/// The size of the load is the primary's own plus that of the files it
+/// carries (`DATA-37` decision D1), so a load of several small files can be
+/// a large load. The large limit is checked with the other two, under the
+/// same lock (decision D3); a load that is over it is refused with
+/// [`MarkOutcome::LargeLimitReached`] and nothing is changed.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn mark_group_within_limits(
+    pool: &PgPool,
+    id: &str,
+    also: &[String],
+    claim: &LoadClaim<'_>,
+    limits: LoadLimits,
+) -> Result<MarkOutcome, StoreError> {
+    let mut tx = pool.begin().await?;
+    // `hashtext()` keys the lock on a constant string; the prefix keeps it
+    // apart from the other advisory locks keyed on bare strings.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('file_upload:ingest_limit'))")
+        .execute(&mut *tx)
+        .await?;
+    // `DATA-37` decision D3: the large limit is checked here, with the other
+    // two, under the same lock, so two starts at the same moment cannot both
+    // take the last large place.
+    match under_limits(&mut tx, id, also, limits).await? {
+        LimitOutcome::Under => {}
+        LimitOutcome::LimitReached => {
+            tx.rollback().await?;
+            return Ok(MarkOutcome::LimitReached);
+        }
+        LimitOutcome::LargeLimitReached => {
+            tx.rollback().await?;
+            return Ok(MarkOutcome::LargeLimitReached);
+        }
+    }
+    let mut taking: Vec<String> = Vec::with_capacity(also.len() + 1);
+    taking.push(id.to_owned());
+    taking.extend(also.iter().cloned());
+    sqlx::query("UPDATE file_upload SET loaded_with = NULL WHERE loaded_with = ANY($1)")
+        .bind(&taking)
+        .execute(&mut *tx)
+        .await?;
+    let sql = format!(
+        "UPDATE file_upload SET status = 'ingesting', parse_options = $2, \
+         bronze_table = $3, load_mode = $4, column_spec = $5, on_bad_value = $6, \
+         loaded_with = NULL, folder_id = CASE WHEN $8 THEN $7::text ELSE folder_id END, \
+         run_id = NULL, error = NULL, row_count = NULL, bad_values = NULL, updated_at = now() \
+         WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
+    );
+    // `DATA-35` decision 2: the folder the load names, and whether it names one at
+    // all. "No folder" is a choice (`$8` true, `$7` NULL) and takes the file out of
+    // the folder it is in; a load that names none leaves the file where it is.
+    let (folder, folder_named) = claim.folder.folder_parts();
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    let marked: Option<Upload> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .bind(Json(claim.parse_options.clone()))
+        .bind(claim.bronze_table)
+        .bind(claim.load_mode.as_str())
+        .bind(claim.column_spec.map(|spec| Json(spec.clone())))
+        .bind(claim.on_bad_value)
+        .bind(folder)
+        .bind(folder_named)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(marked) = marked else {
+        tx.commit().await?;
+        return Ok(MarkOutcome::NotMarked);
+    };
+    if !also.is_empty() {
+        // Same tenant as the primary, read from the primary's own row: a file of
+        // another tenant, or of none, is never taken, whatever the caller sent.
+        let taken = sqlx::query(
+            "UPDATE file_upload SET status = 'ingesting', parse_options = $2, \
+             bronze_table = $3, load_mode = $4, column_spec = $5, on_bad_value = $6, \
+             loaded_with = $7, folder_id = CASE WHEN $9 THEN $8::text ELSE folder_id END, \
+             run_id = NULL, error = NULL, row_count = NULL, bad_values = NULL, updated_at = now() \
+             WHERE id = ANY($1) AND status NOT IN ('ingesting', 'receiving') \
+               AND tenant_id = (SELECT tenant_id FROM file_upload WHERE id = $7)",
+        )
+        .bind(also)
+        .bind(Json(claim.parse_options.clone()))
+        .bind(claim.bronze_table)
+        .bind(claim.load_mode.as_str())
+        .bind(claim.column_spec.map(|spec| Json(spec.clone())))
+        .bind(claim.on_bad_value)
+        .bind(id)
+        .bind(folder)
+        .bind(folder_named)
+        .execute(&mut *tx)
+        .await?;
+        if usize::try_from(taken.rows_affected()).ok() != Some(also.len()) {
+            tx.rollback().await?;
+            return Ok(MarkOutcome::GroupNotMarked);
+        }
+    }
+    if folder_named {
+        // `DATA-35` decision 2: the table remembers the folder of its latest load, so
+        // a re-upload preselects it. An explicit "no folder" forgets it, and a load
+        // that names none leaves it as it was. The claim is the primary's tenant's
+        // own row.
+        sqlx::query(
+            "UPDATE upload_table_claim SET folder_id = $2 \
+             WHERE bronze_table = $1 AND tenant_id = $3",
+        )
+        .bind(claim.bronze_table)
+        .bind(folder)
+        .bind(marked.tenant_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(MarkOutcome::Marked(Box::new(marked)))
+}
+
+/// Keep the report of values that did not fit on the upload the load belongs to
+/// (`DATA-18`, plan AD6). Written when the API settles the row, whatever the
+/// outcome: a `stop` load fails with the report, a `null` load succeeds with it.
+/// Only a row that is `ingesting` or just settled under `run_id` takes it.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn record_bad_values(
+    pool: &PgPool,
+    id: &str,
+    run_id: &str,
+    report: &Value,
+) -> Result<bool, StoreError> {
+    let done = sqlx::query("UPDATE file_upload SET bad_values = $3 WHERE id = $1 AND run_id = $2")
+        .bind(id)
+        .bind(run_id)
+        .bind(Json(report.clone()))
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected() > 0)
 }
 
 /// Give a claimed upload the Dagster run that carries its load out: sets
@@ -448,7 +1298,8 @@ pub async fn attach_run(
          WHERE id = $1 AND status = 'ingesting' AND run_id IS NULL \
          RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(run_id)
         .fetch_optional(pool)
@@ -466,6 +1317,10 @@ pub async fn attach_run(
 ///
 /// `row_count` is kept only for a load that succeeded, and `None` stays
 /// `None` (not measured), never `0`. A failed load stores no count.
+///
+/// The files that loaded with this one (`loaded_with = id`, `DATA-17` slice 5) and are
+/// still `ingesting` end in the same transaction, with the same reason; settling the
+/// primary is how a load of several files is settled.
 ///
 /// Returns `None` when no row changed: no such upload, it is not
 /// `ingesting`, or it is `ingesting` under another run.
@@ -489,13 +1344,32 @@ pub async fn mark_finished(
          WHERE id = $1 AND status = 'ingesting' AND run_id IS NOT DISTINCT FROM $2 \
          RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    let mut tx = pool.begin().await?;
+    // safe: only the constant `COLS` is formatted in; values are bound (SEC-41).
+    let settled: Option<Upload> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .bind(run_id)
         .bind(error)
         .bind(row_count)
-        .fetch_optional(pool)
-        .await?)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if settled.is_some() {
+        // `DATA-17` slice 5: the files that loaded with this one end as it ends, in the
+        // same transaction, with its reason. Their own row count is not measured (the
+        // job reports one total, kept on the primary), so it stays NULL, never 0.
+        sqlx::query(
+            "UPDATE file_upload \
+             SET status = CASE WHEN $2::text IS NULL THEN 'ingested' ELSE 'failed' END, \
+                 error = $2, row_count = NULL, updated_at = now() \
+             WHERE loaded_with = $1 AND status = 'ingesting'",
+        )
+        .bind(id)
+        .bind(error)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(settled)
 }
 
 /// Delete an upload: its row goes. The caller deletes the upload's object
@@ -565,6 +1439,41 @@ pub async fn table_claim(
     })
 }
 
+/// Who holds each of `tables`, as `tenant_id` sees it, in ONE query.
+///
+/// The answer for a name is the one [`table_claim`] gives. A name nobody holds
+/// is not in the map: a caller reads a missing name as
+/// [`TableClaim::Unclaimed`]. It exists for a listing that asks about every
+/// table of a namespace (hundreds in one), where a query per table cost a
+/// round trip each.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn table_claims(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    tables: &[String],
+) -> Result<std::collections::HashMap<String, TableClaim>, StoreError> {
+    // `Option<Uuid>` as in `table_claim`: a row whose tenant is NULL.
+    let held: Vec<(String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT bronze_table, tenant_id FROM upload_table_claim WHERE bronze_table = ANY($1)",
+    )
+    .bind(tables)
+    .fetch_all(pool)
+    .await?;
+    Ok(held
+        .into_iter()
+        .map(|(table, holder)| {
+            let claim = match holder {
+                Some(holder) if holder == tenant_id => TableClaim::Ours,
+                _ => TableClaim::Theirs,
+            };
+            (table, claim)
+        })
+        .collect())
+}
+
 /// Claim `table` for `tenant_id`, on behalf of `upload_id`, in ONE statement:
 /// `true` when the claim is the tenant's afterwards, whether it was made now
 /// or held before; `false` when another tenant holds it, or when its tenant
@@ -610,6 +1519,80 @@ pub async fn claim_table(
     .fetch_one(pool)
     .await?;
     Ok(holder == Some(tenant_id))
+}
+
+/// One claimed raw table and the upload that asked for the name, as the
+/// lineage graph reads it (`routes::lineage`, `DATA-19` / D5).
+///
+/// `original_filename` is `None` when the `file_upload` row is gone: a
+/// claim outlives the upload that made it (the module doc), and deleting
+/// an upload deletes its row for real. A caller that shows this node says
+/// "deleted upload" for `None` rather than guessing a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedTable {
+    /// The claimed raw table name (`upload_table_claim.bronze_table`).
+    pub bronze_table: String,
+    /// The upload that first asked for the name (`upload_id`). Kept even
+    /// when that upload is gone — the claim must outlive it.
+    pub upload_id: String,
+    /// The upload's original file name, when the row still exists.
+    pub original_filename: Option<String>,
+    /// How many other files loaded with that upload (`loaded_with`, `DATA-17`
+    /// slice 5), so lineage can say "<file> and N more". Counted only among the
+    /// claim's own tenant's files.
+    pub also_loaded: i64,
+}
+
+/// Every claim `tenant_id` holds, with the file name of the upload that
+/// asked for the name when that row still exists.
+///
+/// The tenant rule is [`ConnectorFilter`]'s, the one every tenant-scoped
+/// read in this crate follows: `Some(t)` shows only the rows whose own
+/// `tenant_id` is `t`, so a claim whose tenant was deleted
+/// (`ON DELETE SET NULL`) belongs to nobody and is invisible to every
+/// tenant-scoped caller (fail closed); `None` is the unscoped read and
+/// shows every claim, `tenant_id IS NULL` included. It exists for the
+/// lineage route, which resolves its tenant first exactly as
+/// `routes::connectors::list` does.
+///
+/// One `LEFT JOIN`, not one query per claim: the lineage graph reads every
+/// claim of the caller's tenant on every focus, and a claim per table
+/// makes a second round trip per table.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn list_claims(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+) -> Result<Vec<ClaimedTable>, StoreError> {
+    // The count is of files of the claim's own tenant: `ingest` takes only files of
+    // the primary's tenant, and the equality here is what keeps a count from ever
+    // reaching across tenants if a row said otherwise (SEC-35, fail closed: a claim
+    // with no tenant counts nothing).
+    let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT c.bronze_table, c.upload_id, f.original_filename, \
+                (SELECT count(*) FROM file_upload g \
+                  WHERE g.loaded_with = c.upload_id AND g.tenant_id = c.tenant_id) \
+           FROM upload_table_claim c \
+           LEFT JOIN file_upload f ON f.id = c.upload_id \
+          WHERE ($1::uuid IS NULL OR c.tenant_id = $1) \
+          ORDER BY c.bronze_table",
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(bronze_table, upload_id, original_filename, also_loaded)| ClaimedTable {
+                bronze_table,
+                upload_id,
+                original_filename,
+                also_loaded,
+            },
+        )
+        .collect())
 }
 
 /// Whether ANY tenant holds `table`, a claim whose tenant is gone included.
@@ -658,4 +1641,244 @@ pub async fn table_being_loaded(
     .bind(exclude_id)
     .fetch_one(pool)
     .await?)
+}
+
+/// One dropped table's record while its window is open (`DATA-55`,
+/// `0141_upload_table_drop.sql`): the current state of the name, not one row
+/// per drop. A restore removes the row; the audit trail holds the history.
+///
+/// `row_count` is `None` when the rows could not be counted, never 0 for an
+/// unknown count (D7). `tenant_id` is `None` when the tenant that owned the
+/// name is gone: the row then shows in no tenant's list and still closes the
+/// name (the migration's header).
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct TableDrop {
+    /// The raw table name (`upload_table_drop.bronze_table`).
+    pub bronze_table: String,
+    /// The tenant whose upload claimed the name, when it still exists.
+    pub tenant_id: Option<Uuid>,
+    /// The asset id the table's page is served under.
+    pub asset_id: String,
+    /// The display name of the person who dropped it.
+    pub dropped_by: String,
+    /// The whole table's row count at the drop; `None` when not counted.
+    pub row_count: Option<i64>,
+    /// When the drop was recorded, by the database clock.
+    pub dropped_at: OffsetDateTime,
+    /// When the catalog's keep ends: `dropped_at` plus `kept_seconds`.
+    pub expires_at: OffsetDateTime,
+}
+
+/// What [`record_table_drop`] writes: the name, who dropped it for which
+/// tenant, the asset's id, its row count (if it was counted), and how long the
+/// catalog keeps the dropped table.
+#[derive(Debug, Clone)]
+pub struct NewTableDrop<'a> {
+    /// The raw table name being dropped.
+    pub bronze_table: &'a str,
+    /// The tenant whose upload claimed the name.
+    pub tenant_id: Uuid,
+    /// The asset id the table's page is served under.
+    pub asset_id: &'a str,
+    /// The display name of the person dropping it.
+    pub dropped_by: &'a str,
+    /// The whole table's row count, or `None` when it could not be counted.
+    pub row_count: Option<i64>,
+    /// The catalog's keep, in seconds (`DELETE_RETENTION_SECONDS`).
+    pub kept_seconds: i64,
+}
+
+/// Record that `new.bronze_table` was dropped, unless a drop inside its window
+/// is already on record. `DATA-55` D8/D9/D10.
+///
+/// ONE statement, so two drops of one name sent at the same moment cannot both
+/// succeed: the primary key is the arbiter, and the `DO UPDATE … WHERE
+/// d.expires_at <= now()` decides against the row the winner wrote. `None`
+/// means a drop inside its window is already there, and the caller refuses the
+/// second one; a row whose window has passed is replaced, because the name is
+/// free again.
+///
+/// `expires_at` is `now() + kept_seconds` in the same statement, so the window
+/// is the database clock's answer throughout, not the API's.
+///
+/// # Errors
+///
+/// Returns [`StoreError::ForeignKeyViolation`] when `new.tenant_id` names no
+/// tenant, and [`StoreError::Database`] on any other failure.
+pub async fn record_table_drop(
+    pool: &PgPool,
+    new: &NewTableDrop<'_>,
+) -> Result<Option<TableDrop>, StoreError> {
+    Ok(sqlx::query_as(
+        "INSERT INTO upload_table_drop AS d \
+             (bronze_table, tenant_id, asset_id, dropped_by, row_count, dropped_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, now(), now() + ($6::bigint * interval '1 second')) \
+         ON CONFLICT (bronze_table) DO UPDATE \
+            SET tenant_id = EXCLUDED.tenant_id, asset_id = EXCLUDED.asset_id, \
+                dropped_by = EXCLUDED.dropped_by, row_count = EXCLUDED.row_count, \
+                dropped_at = EXCLUDED.dropped_at, expires_at = EXCLUDED.expires_at \
+          WHERE d.expires_at <= now() \
+         RETURNING d.bronze_table, d.tenant_id, d.asset_id, d.dropped_by, d.row_count, \
+                   d.dropped_at, d.expires_at",
+    )
+    .bind(new.bronze_table)
+    .bind(new.tenant_id)
+    .bind(new.asset_id)
+    .bind(new.dropped_by)
+    .bind(new.row_count)
+    .bind(new.kept_seconds)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// The drop on record for `table`, while its window is open; `None` means the
+/// name is not dropped inside its window. Asked at every load (`DATA-55` D11)
+/// and before every drop (D4 rule 4).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn dropped_table(pool: &PgPool, table: &str) -> Result<Option<TableDrop>, StoreError> {
+    Ok(sqlx::query_as(
+        "SELECT bronze_table, tenant_id, asset_id, dropped_by, row_count, dropped_at, expires_at \
+           FROM upload_table_drop WHERE bronze_table = $1 AND expires_at > now()",
+    )
+    .bind(table)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Remove the drop on record for `table` ONLY when that row is still the one
+/// the caller read — the removal a restore, a drop the catalog refused and a
+/// drop whose second load check found a load all use (`DATA-55` review U1, U2).
+///
+/// The name's record can change under a caller that waited: a restore reads the
+/// record, then waits for the catalog's undrop; if the answer is slow and the
+/// old record is past its window, a second person can drop the table in those
+/// seconds and replace the row. Removing "the record of this name" would then
+/// delete THAT drop's record while its own `DELETE` goes out, which is the one
+/// state this feature must never reach: a dropped table with no record of it.
+/// `dropped_at` is the value the caller read, bound (never built into the SQL),
+/// and the row is removed only while it still carries exactly that value.
+///
+/// No grace here: these callers know their own outcome, so the record they wrote
+/// or read is theirs to clear at once. Healing a record for a table that exists
+/// is the other function, [`heal_table_drop`].
+///
+/// Returns whether a row went; `false` means there is no record, or a different
+/// one is on record now — both of which leave the caller's answer as it is.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn forget_table_drop_at(
+    pool: &PgPool,
+    table: &str,
+    dropped_at: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    remove_table_drop(pool, table, dropped_at, 0).await
+}
+
+/// Remove the drop on record for `table` ONLY when that record cannot belong to
+/// a drop still in flight — the guarded removal the healing rule uses
+/// (`DATA-55` review S1, [`dropped_now`] in `routes::catalog_drop`).
+///
+/// A drop writes its record first and sends the catalog's `DELETE` afterwards,
+/// so from the insert until the catalog has applied the `DELETE` the table
+/// exists and the record is TRUE. Healing therefore cannot be "the table
+/// exists, so the record is stale": that would let anything reading the record
+/// in that stretch remove it. Two guards make the removal safe: the record must
+/// be older than `grace_seconds`, longer than any drop can be in flight, and
+/// the row removed must still carry the `dropped_at` the caller read, so a
+/// record replaced since that read is never the one removed.
+///
+/// Returns whether a row went; `false` means the record is younger than the
+/// grace, was replaced, or is gone — all of which leave the caller's answer as
+/// "the record stands".
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn heal_table_drop(
+    pool: &PgPool,
+    table: &str,
+    dropped_at: OffsetDateTime,
+    grace_seconds: i64,
+) -> Result<bool, StoreError> {
+    remove_table_drop(pool, table, dropped_at, grace_seconds).await
+}
+
+/// The one guarded removal, written once for both callers above (`DATA-55`
+/// review U1): the row must carry the `dropped_at` that the caller read, and —
+/// when a grace is given — must be at least that old. `grace_seconds` of 0 asks
+/// for the `dropped_at` guard alone, which is what a caller that knows its own
+/// outcome wants.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+async fn remove_table_drop(
+    pool: &PgPool,
+    table: &str,
+    dropped_at: OffsetDateTime,
+    grace_seconds: i64,
+) -> Result<bool, StoreError> {
+    let done = sqlx::query(
+        "DELETE FROM upload_table_drop \
+          WHERE bronze_table = $1 AND dropped_at = $2 \
+            AND dropped_at <= now() - ($3::bigint * interval '1 second')",
+    )
+    .bind(table)
+    .bind(dropped_at)
+    .bind(grace_seconds)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// The unexpired drops of `tenant_ids`, newest first, at most `limit` — the
+/// Catalog's list (`DATA-55` D13). An empty `tenant_ids` lists nothing: the
+/// tenant rule has no "every tenant" reading here, unlike the unscoped
+/// [`list_claims`]. A caller of the list CAN have none — an unrestricted
+/// principal that belongs to no tenant — and such a caller is shown nothing,
+/// not everything: the list is read per tenant, and "every tenant" is exactly
+/// the answer that rule must not give.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn list_dropped_tables(
+    pool: &PgPool,
+    tenant_ids: &[Uuid],
+    limit: i64,
+) -> Result<Vec<TableDrop>, StoreError> {
+    Ok(sqlx::query_as(
+        "SELECT bronze_table, tenant_id, asset_id, dropped_by, row_count, dropped_at, expires_at \
+           FROM upload_table_drop \
+          WHERE tenant_id = ANY($1) AND expires_at > now() \
+          ORDER BY dropped_at DESC, bronze_table LIMIT $2",
+    )
+    .bind(tenant_ids)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// The uploads loading into `table` (`status = 'ingesting'`, any tenant: a
+/// table name is shared), for the check that refuses a drop while a load is in
+/// progress (`DATA-55` D4 rule 5). The route settles each row first
+/// (`routes::uploads::settle_loading_upload`), the way the upload routes do, so
+/// a load that has already ended is not counted as running.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn loading_into(pool: &PgPool, table: &str) -> Result<Vec<Upload>, StoreError> {
+    let sql =
+        format!("SELECT {COLS} FROM file_upload WHERE bronze_table = $1 AND status = 'ingesting'");
+    // safe: only the constant `COLS` is formatted in; values are bound.
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(table)
+        .fetch_all(pool)
+        .await?)
 }

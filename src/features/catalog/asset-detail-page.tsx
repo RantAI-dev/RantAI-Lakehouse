@@ -8,6 +8,7 @@ import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import {
+  CertificationBadge,
   ClassificationBadge,
   HealthBadge,
   TierBadge,
@@ -39,9 +40,16 @@ import { formatBytes, formatCompactNumber, formatRelativeTime } from "@/lib/form
 import { fmtMeasured } from "@/lib/measured"
 import { DATA_LAYER_LABEL, ENGINE_CATEGORY_LABEL } from "@/lib/status"
 import { assetService } from "@/services"
-import { ASSET_TYPE_LABEL, type RequestAccessInput } from "@/services/contracts/assets"
+import {
+  ASSET_TYPE_LABEL,
+  type AssetDetail,
+  type RequestAccessInput,
+} from "@/services/contracts/assets"
 import { classificationTitle, healthTitle, layerTitle, tierTitle } from "./asset-badges"
-import { AssetDetailTabs } from "./asset-detail-tabs"
+import { CertificationAction, DeprecationNotice } from "./asset-certification"
+import { AssetDetailTabsView } from "./asset-detail-tabs"
+import { useIcebergTable } from "./asset-storage"
+import type { MeaningState } from "./asset-meaning"
 import { useMeanings } from "./asset-column-data"
 import { MeaningBadge } from "./asset-meaning-view"
 
@@ -61,9 +69,13 @@ const REQUESTABLE_PERMISSIONS = ["catalog:write", "lineage:read", "query:read"] 
 /** Asset detail with schema, freshness, lineage hops, policies, and snapshots. */
 export function AssetDetailPage() {
   const params = useParams<{ assetId: string }>()
+  // WEB-3 S3-D1: a column's sensitivity and masks change from inside the
+  // opened column; a reload that swapped the page for a skeleton would close
+  // it. Keep the asset on screen while the same asset reloads.
   const state = useService(
     (s) => assetService.getAsset(params.assetId, s),
-    [params.assetId]
+    [params.assetId],
+    { keepDataOnReload: true }
   )
   const { hasPermission } = useAuth()
   // Read here, not in the Schema tab, so the header pill and the tab share one request.
@@ -73,15 +85,7 @@ export function AssetDetailPage() {
   const [reason, setReason] = React.useState("")
   const [submitted, setSubmitted] = React.useState(false)
   const request = useServiceAction((signal, catalogId: string, input: RequestAccessInput) => {
-    // `requestAccess` is optional on `AssetService` only so the dead
-    // `mock/assets.ts` fixture (never wired to `assetService`, see that
-    // contract's own doc comment) still satisfies the interface — the
-    // real (ClickHouse-backed) client this page always talks to
-    // implements it. Fail closed rather than silently no-op if that
-    // assumption is ever wrong.
-    if (!assetService.requestAccess) {
-      return Promise.reject(new Error("This deployment cannot request catalog access."))
-    }
+    // PR #106 review R2 SHOULD-FIX 6: requestAccess is required on AssetService
     return assetService.requestAccess(catalogId, input, signal)
   })
 
@@ -117,16 +121,20 @@ export function AssetDetailPage() {
     <div className="flex flex-col gap-3">
       <EntityHeader
         className="pb-3"
-        eyebrow={<Link href="/data" className="hover:underline">Data Explorer</Link>}
+        eyebrow={<Link href="/catalog" className="hover:underline">Catalog</Link>}
         title={a.name}
         titleAccessory={
           <>
+            <CertificationBadge certification={a.certification} />
             <TierBadge tier={a.tier} title={tierTitle(a)} />
             <ClassificationBadge
               classification={a.classification}
               title={classificationTitle(a)}
             />
             <HealthBadge health={a.health} title={healthTitle(a)} />
+            {hasPermission("governance:write") ? (
+              <CertificationAction asset={a} onChanged={state.reload} />
+            ) : null}
             <MeaningBadge state={meanings} columns={a.schema.map((c) => c.name)} />
             {missingPermissions.length > 0 ? (
               <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
@@ -137,39 +145,8 @@ export function AssetDetailPage() {
         }
         description={a.description}
       />
-      <MetadataList
-        density="compact"
-        columns={3}
-        items={[
-          { label: "Namespace", value: <span className="font-mono text-xs">{a.namespace}</span> },
-          { label: "Type", value: ASSET_TYPE_LABEL[a.type] },
-          {
-            label: "Layer",
-            value: <span title={layerTitle(a)}>{DATA_LAYER_LABEL[a.layer]}</span>,
-          },
-          { label: "Format", value: a.format },
-          { label: "Engine", value: ENGINE_CATEGORY_LABEL[a.engine] },
-          { label: "Rows", value: fmtMeasured(a.rows, formatCompactNumber) },
-          { label: "Size", value: fmtMeasured(a.sizeBytes, formatBytes) },
-          { label: "Owner", value: a.owner },
-          { label: "Residency", value: a.residency },
-          {
-            label: "Freshness",
-            value: (
-              <FreshnessIndicator
-                lagSeconds={a.freshnessLagSeconds}
-                targetSeconds={a.freshnessTargetSeconds ?? null}
-                targetSource={a.freshnessTargetSource}
-              />
-            ),
-          },
-          {
-            label: "Updated",
-            value: a.lastUpdated === null ? "—" : formatRelativeTime(a.lastUpdated),
-          },
-        ]}
-      />
-      <AssetDetailTabs asset={a} onAssetChanged={state.reload} meanings={meanings} />
+      <DeprecationNotice asset={a} replacementHidden={a.shownWithTableGrant === true} />
+      <AssetFacts asset={a} meanings={meanings} onAssetChanged={state.reload} />
 
       <Dialog open={open} onOpenChange={(next) => (next ? setOpen(true) : closeDialog())}>
         <DialogContent className="sm:max-w-md">
@@ -235,5 +212,77 @@ export function AssetDetailPage() {
         </DialogContent>
       </Dialog>
     </div>
+  )
+}
+
+/**
+ * The fact list and the tabs, which share one read of the asset's Iceberg
+ * table: the header needs it for the row count and the tabs for their own
+ * parts, and a second read would be a second answer (`DATA-54`).
+ */
+function AssetFacts({
+  asset: a,
+  meanings,
+  onAssetChanged,
+}: {
+  asset: AssetDetail
+  meanings: MeaningState
+  onAssetChanged: () => void
+}) {
+  const iceberg = useIcebergTable(a)
+  // QA `LH-DATA-15-07` F2 (`DATA-54`): the count is the registry's, and a
+  // table that is gone has no rows to count. Any other failure of the read
+  // keeps the count: it does not prove the table is gone.
+  const tableGone = iceberg.status === "error" && iceberg.error.code === "not_found"
+  return (
+    <>
+      <MetadataList
+        density="compact"
+        columns={3}
+        items={[
+          { label: "Namespace", value: <span className="font-mono text-xs">{a.namespace}</span> },
+          { label: "Type", value: ASSET_TYPE_LABEL[a.type] },
+          {
+            label: "Layer",
+            value: <span title={layerTitle(a)}>{DATA_LAYER_LABEL[a.layer]}</span>,
+          },
+          { label: "Format", value: a.format },
+          { label: "Engine", value: ENGINE_CATEGORY_LABEL[a.engine] },
+          {
+            label: "Rows",
+            value: tableGone ? (
+              <span title="No Iceberg table for this asset: the count the registry recorded is not shown.">
+                —
+              </span>
+            ) : (
+              fmtMeasured(a.rows, formatCompactNumber)
+            ),
+          },
+          { label: "Size", value: fmtMeasured(a.sizeBytes, formatBytes) },
+          { label: "Owner", value: a.owner },
+          { label: "Residency", value: a.residency },
+          {
+            label: "Freshness",
+            value: (
+              <FreshnessIndicator
+                lagSeconds={a.freshnessLagSeconds}
+                targetSeconds={a.freshnessTargetSeconds ?? null}
+                targetSource={a.freshnessTargetSource}
+              />
+            ),
+          },
+          {
+            label: "Updated",
+            value: a.lastUpdated === null ? "—" : formatRelativeTime(a.lastUpdated),
+          },
+        ]}
+      />
+      <AssetDetailTabsView
+        asset={a}
+        iceberg={iceberg}
+        onAssetChanged={onAssetChanged}
+        meanings={meanings}
+      />
+    </>
   )
 }

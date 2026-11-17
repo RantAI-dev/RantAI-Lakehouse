@@ -28,6 +28,7 @@
 //! byte-by-byte against a known value.
 
 use async_trait::async_trait;
+use sqlx::{Postgres, Transaction};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -180,12 +181,35 @@ pub async fn revoke_all_sessions_for_user(
     pool: &PgPool,
     app_user_id: Uuid,
 ) -> Result<(), AuthError> {
+    let mut tx = pool.begin().await?;
+    revoke_all_sessions_for_user_in_tx(&mut tx, app_user_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`revoke_all_sessions_for_user`], inside a transaction the CALLER owns.
+///
+/// ADM-3 D2: an admin password reset must both write the new credential
+/// and end the target's live sessions as ONE unit of work — a reset that
+/// changed the password but left the old sessions alive would not have
+/// locked the target out of anything.
+///
+/// Dropping `tx` without committing rolls the revocation back (sqlx's
+/// `Transaction` starts a rollback on drop).
+///
+/// # Errors
+///
+/// Returns [`AuthError::Database`] on a storage failure.
+pub async fn revoke_all_sessions_for_user_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    app_user_id: Uuid,
+) -> Result<(), AuthError> {
     sqlx::query(
         "UPDATE session SET revoked_at = now() \
          WHERE app_user_id = $1 AND revoked_at IS NULL",
     )
     .bind(app_user_id)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }

@@ -90,6 +90,7 @@ function stubFetch(connectors: unknown[] = []): string[] {
     urls.push(target)
     if (target === "/api/connectors") return json(connectors)
     if (target === "/api/uploads") return json([])
+    if (target === "/api/uploads/folders") return json([])
     throw new Error(`unexpected fetch: ${target}`)
   }) as unknown as typeof fetch
   return urls
@@ -109,7 +110,7 @@ describe("ConnectorsPage tabs", () => {
     renderPage()
     expect(
       await screen.findByText(
-        "Databases, change capture, object storage, files, REST APIs and message topics. Data enters the platform here before processing."
+        "Databases, change capture, object storage, files, REST APIs, message topics and business apps. Data enters the platform here before processing."
       )
     ).toBeDefined()
     expect(screen.queryByText(/SaaS/)).toBeNull()
@@ -257,5 +258,27 @@ describe("ConnectorsPage paused connectors", () => {
     expect(within(row).getByText(`Paused: ${reason}`)).toBeDefined()
     const other = screen.getByRole("link", { name: "events" }).closest("tr") as HTMLElement
     expect(within(other).queryByText(/Paused/)).toBeNull()
+  })
+})
+
+// QA LH-DATA-9-20 (WEB-11): a refused list said "Request could not be
+// processed" and did not name the permission.
+describe("ConnectorsPage refusal", () => {
+  it("says \"You don't have access\" and names the permission when the list is refused", async () => {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const target = String(input)
+      if (target === "/api/connectors") {
+        return json({ error: "permission_denied: connector:manage" }, 403)
+      }
+      return json([])
+    }) as unknown as typeof fetch
+    renderPage()
+
+    expect(await screen.findByText("You don't have access")).toBeDefined()
+    expect(
+      screen.getByText("This needs the connector:manage permission. Ask a workspace admin.")
+    ).toBeDefined()
+    expect(screen.queryByText("Request could not be processed")).toBeNull()
+    expect(document.body.textContent ?? "").not.toMatch(/permission_denied/)
   })
 })
