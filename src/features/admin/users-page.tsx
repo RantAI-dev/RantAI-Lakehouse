@@ -7,6 +7,7 @@ import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { CreateSheet } from "@/components/patterns/create-sheet"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
@@ -183,15 +184,17 @@ export function UsersPage() {
         onSubmit={handleCreate}
         submitLabel="Invite"
       >
+        <RequiredLegend />
         <div className="space-y-1.5">
-          <Label htmlFor="user-name">Name</Label>
-          <Input id="user-name" value={name} onChange={(e) => setName(e.target.value)} />
+          <Label htmlFor="user-name" required>Name</Label>
+          <Input id="user-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="user-email">Email</Label>
+          <Label htmlFor="user-email" required>Email</Label>
           <Input
             id="user-email"
             type="email"
+            aria-required
             value={email}
             onChange={(e) => setEmail(e.target.value)}
           />

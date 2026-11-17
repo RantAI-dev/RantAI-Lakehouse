@@ -6,6 +6,7 @@ import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { CreateSheet } from "@/components/patterns/create-sheet"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -186,23 +187,26 @@ export function ServiceIdentitiesPage() {
         submitting={create.status === "pending"}
         onSubmit={handleCreate}
       >
+        <RequiredLegend />
         <div className="space-y-1.5">
-          <Label htmlFor="si-name">Name</Label>
-          <Input id="si-name" value={name} onChange={(e) => setName(e.target.value)} />
+          <Label htmlFor="si-name" required>Name</Label>
+          <Input id="si-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="si-scopes">Scopes (comma-separated)</Label>
+          <Label htmlFor="si-scopes" required>Scopes (comma-separated)</Label>
           <Input
             id="si-scopes"
+            aria-required
             value={scopes}
             onChange={(e) => setScopes(e.target.value)}
             placeholder="query:read, storage:write"
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="si-env">Environment</Label>
+          <Label htmlFor="si-env" required>Environment</Label>
           <Input
             id="si-env"
+            aria-required
             value={environment}
             onChange={(e) => setEnvironment(e.target.value)}
             placeholder="production"

@@ -6,6 +6,7 @@ import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { CreateSheet } from "@/components/patterns/create-sheet"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -156,14 +157,16 @@ export function EmployeesPage() {
         submitting={create.status === "pending"}
         onSubmit={handleCreate}
       >
+        <RequiredLegend />
         <div className="space-y-1.5">
-          <Label htmlFor="emp-name">Name</Label>
-          <Input id="emp-name" value={name} onChange={(e) => setName(e.target.value)} />
+          <Label htmlFor="emp-name" required>Name</Label>
+          <Input id="emp-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="emp-purpose">Purpose</Label>
+          <Label htmlFor="emp-purpose" required>Purpose</Label>
           <Input
             id="emp-purpose"
+            aria-required
             value={purpose}
             onChange={(e) => setPurpose(e.target.value)}
           />
@@ -182,27 +185,30 @@ export function EmployeesPage() {
           </select>
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="emp-tools">Allowed tools (comma-separated)</Label>
+          <Label htmlFor="emp-tools" required>Allowed tools (comma-separated)</Label>
           <Input
             id="emp-tools"
+            aria-required
             value={allowedTools}
             onChange={(e) => setAllowedTools(e.target.value)}
             placeholder="sql.query, catalog.read"
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="emp-scope">Data scope</Label>
+          <Label htmlFor="emp-scope" required>Data scope</Label>
           <Input
             id="emp-scope"
+            aria-required
             value={dataScope}
             onChange={(e) => setDataScope(e.target.value)}
             placeholder="tenant:acme"
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="emp-budget">Budget limit</Label>
+          <Label htmlFor="emp-budget" required>Budget limit</Label>
           <Input
             id="emp-budget"
+            aria-required
             type="number"
             min={0}
             value={budgetLimit}

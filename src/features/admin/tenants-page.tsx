@@ -6,6 +6,7 @@ import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { CreateSheet } from "@/components/patterns/create-sheet"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
@@ -151,36 +152,41 @@ export function TenantsPage() {
         submitting={create.status === "pending"}
         onSubmit={handleCreate}
       >
+        <RequiredLegend />
         <div className="space-y-1.5">
-          <Label htmlFor="tenant-name">Name</Label>
+          <Label htmlFor="tenant-name" required>Name</Label>
           <Input
             id="tenant-name"
+            aria-required
             value={name}
             onChange={(e) => setName(e.target.value)}
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="tenant-slug">Slug</Label>
+          <Label htmlFor="tenant-slug" required>Slug</Label>
           <Input
             id="tenant-slug"
+            aria-required
             value={slug}
             onChange={(e) => setSlug(e.target.value)}
             placeholder="acme"
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="tenant-plan">Plan</Label>
+          <Label htmlFor="tenant-plan" required>Plan</Label>
           <Input
             id="tenant-plan"
+            aria-required
             value={plan}
             onChange={(e) => setPlan(e.target.value)}
             placeholder="Enterprise"
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="tenant-residency">Residency</Label>
+          <Label htmlFor="tenant-residency" required>Residency</Label>
           <Input
             id="tenant-residency"
+            aria-required
             value={residency}
             onChange={(e) => setResidency(e.target.value)}
             placeholder="ap-southeast-1"

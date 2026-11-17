@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/input-group";
 import { Spinner } from "@/components/ui/spinner";
 import { Skeleton } from "@/components/ui/skeleton";
+import { RequiredLegend } from "@/components/patterns/required-legend";
 import { ThemeToggle } from "@/components/theme-toggle";
 import * as authClient from "@/services/clients/auth";
 import { toServiceError } from "@/services/errors";
@@ -235,8 +236,9 @@ export function LoginPage() {
             ) : (
               <div className="mt-8 flex flex-col gap-5">
                 <form onSubmit={onSubmit} className="flex flex-col gap-5" noValidate>
+                  <RequiredLegend />
                   <Field data-invalid={!!error}>
-                    <FieldLabel htmlFor="login-email" className="text-sm">
+                    <FieldLabel htmlFor="login-email" className="text-sm" required>
                       Email
                     </FieldLabel>
                     <InputGroup className="h-11">
@@ -261,7 +263,7 @@ export function LoginPage() {
                   </Field>
 
                   <Field data-invalid={!!error}>
-                    <FieldLabel htmlFor="login-password" className="text-sm">
+                    <FieldLabel htmlFor="login-password" className="text-sm" required>
                       Password
                     </FieldLabel>
                     <InputGroup className="h-11">

@@ -4,6 +4,7 @@ import * as React from "react"
 import Link from "next/link"
 import { PlusIcon } from "lucide-react"
 import { CreateSheet } from "@/components/patterns/create-sheet"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
@@ -215,10 +216,12 @@ export function ClassificationPage() {
         submitting={create.status === "pending"}
         onSubmit={handleCreate}
       >
+        <RequiredLegend />
         <div className="space-y-1.5">
-          <Label htmlFor="cr-asset">Asset</Label>
+          <Label htmlFor="cr-asset" required>Asset</Label>
           <Input
             id="cr-asset"
+            aria-required
             value={asset}
             onChange={(e) => setAsset(e.target.value)}
           />

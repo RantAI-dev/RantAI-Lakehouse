@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import { Button } from "@/components/ui/button"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import {
   Dialog,
   DialogClose,
@@ -99,10 +100,12 @@ export function EditRuleDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
+          <RequiredLegend />
           <div className="grid gap-1.5">
-            <Label htmlFor="edit-rule-asset">Table</Label>
+            <Label htmlFor="edit-rule-asset" required>Table</Label>
             <Input
               id="edit-rule-asset"
+              aria-required
               className="font-mono"
               value={asset}
               onChange={(e) => setAsset(e.target.value)}
@@ -110,9 +113,10 @@ export function EditRuleDialog({
             />
           </div>
           <div className="grid gap-1.5">
-            <Label htmlFor="edit-rule-threshold">Threshold</Label>
+            <Label htmlFor="edit-rule-threshold" required>Threshold</Label>
             <Input
               id="edit-rule-threshold"
+              aria-required
               className="font-mono"
               value={threshold}
               onChange={(e) => setThreshold(e.target.value)}

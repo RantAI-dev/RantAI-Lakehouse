@@ -5,6 +5,7 @@ import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { FormReviewSummary } from "@/components/patterns/form-review-summary"
 import { FormStepLayout, type FormStep } from "@/components/patterns/form-step-layout"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { PageHeader } from "@/components/patterns/page-header"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -84,11 +85,13 @@ export function PolicyCreatePage() {
       >
         {step === 0 ? (
           <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="Policy name" className="sm:col-span-2">
-              <Input value={name} onChange={(e) => setName(e.target.value)} />
+            <RequiredLegend className="sm:col-span-2" />
+            <Field label="Policy name" htmlFor="policy-name" required className="sm:col-span-2">
+              <Input id="policy-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
             </Field>
-            <Field label="Kind" className="sm:col-span-2">
+            <Field label="Kind" htmlFor="policy-kind" className="sm:col-span-2">
               <select
+                id="policy-kind"
                 className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
                 value={kind}
                 onChange={(e) => setKind(e.target.value)}
@@ -102,15 +105,20 @@ export function PolicyCreatePage() {
         ) : null}
         {step === 1 ? (
           <div className="grid gap-3">
-            <Field label="Subjects">
+            <RequiredLegend />
+            <Field label="Subjects" htmlFor="policy-subjects" required>
               <Input
+                id="policy-subjects"
+                aria-required
                 value={subjects}
                 onChange={(e) => setSubjects(e.target.value)}
                 placeholder="All analysts"
               />
             </Field>
-            <Field label="Resources">
+            <Field label="Resources" htmlFor="policy-resources" required>
               <Input
+                id="policy-resources"
+                aria-required
                 value={resources}
                 onChange={(e) => setResources(e.target.value)}
                 placeholder="tenant-scoped tables"
@@ -120,11 +128,13 @@ export function PolicyCreatePage() {
         ) : null}
         {step === 2 ? (
           <div className="grid gap-3">
-            <Field label="Effect">
-              <Input value={effect} onChange={(e) => setEffect(e.target.value)} />
+            <RequiredLegend />
+            <Field label="Effect" htmlFor="policy-effect" required>
+              <Input id="policy-effect" aria-required value={effect} onChange={(e) => setEffect(e.target.value)} />
             </Field>
-            <Field label="Conditions">
+            <Field label="Conditions" htmlFor="policy-conditions">
               <Textarea
+                id="policy-conditions"
                 value={conditions}
                 onChange={(e) => setConditions(e.target.value)}
                 rows={3}
@@ -173,14 +183,18 @@ function Field({
   label,
   children,
   className,
+  htmlFor,
+  required,
 }: {
   label: string
   children: React.ReactNode
   className?: string
+  htmlFor?: string
+  required?: boolean
 }) {
   return (
     <div className={cn("space-y-1.5", className)}>
-      <Label>{label}</Label>
+      <Label htmlFor={htmlFor} required={required}>{label}</Label>
       {children}
     </div>
   )

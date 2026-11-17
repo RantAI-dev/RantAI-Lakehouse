@@ -5,6 +5,7 @@ import Link from "next/link"
 import { PlusIcon } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { CreateSheet } from "@/components/patterns/create-sheet"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
@@ -303,35 +304,40 @@ export function DataQualityPage() {
         submitting={create.status === "pending"}
         onSubmit={handleCreate}
       >
+        <RequiredLegend />
         <div className="space-y-1.5">
-          <Label htmlFor="qr-name">Name</Label>
+          <Label htmlFor="qr-name" required>Name</Label>
           <Input
             id="qr-name"
+            aria-required
             value={name}
             onChange={(e) => setName(e.target.value)}
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="qr-asset">Asset</Label>
+          <Label htmlFor="qr-asset" required>Asset</Label>
           <Input
             id="qr-asset"
+            aria-required
             value={asset}
             onChange={(e) => setAsset(e.target.value)}
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="qr-dim">Dimension</Label>
+          <Label htmlFor="qr-dim" required>Dimension</Label>
           <Input
             id="qr-dim"
+            aria-required
             value={formDimension}
             onChange={(e) => setFormDimension(e.target.value)}
             placeholder="completeness"
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="qr-threshold">Threshold</Label>
+          <Label htmlFor="qr-threshold" required>Threshold</Label>
           <Input
             id="qr-threshold"
+            aria-required
             value={threshold}
             onChange={(e) => setThreshold(e.target.value)}
             placeholder="email not null >= 99%"

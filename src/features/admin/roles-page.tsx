@@ -6,6 +6,7 @@ import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { CreateSheet } from "@/components/patterns/create-sheet"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -133,23 +134,26 @@ export function RolesPage() {
         submitting={create.status === "pending"}
         onSubmit={handleCreate}
       >
+        <RequiredLegend />
         <div className="space-y-1.5">
-          <Label htmlFor="role-name">Name</Label>
-          <Input id="role-name" value={name} onChange={(e) => setName(e.target.value)} />
+          <Label htmlFor="role-name" required>Name</Label>
+          <Input id="role-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="role-perms">Permissions</Label>
+          <Label htmlFor="role-perms" required>Permissions</Label>
           <Input
             id="role-perms"
+            aria-required
             value={permissions}
             onChange={(e) => setPermissions(e.target.value)}
             placeholder="catalog:read, query:run"
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="role-desc">Description</Label>
+          <Label htmlFor="role-desc" required>Description</Label>
           <Input
             id="role-desc"
+            aria-required
             value={description}
             onChange={(e) => setDescription(e.target.value)}
           />

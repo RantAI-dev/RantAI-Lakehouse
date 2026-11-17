@@ -5,6 +5,7 @@ import Link from "next/link"
 import { useParams, useRouter } from "next/navigation"
 import { BanIcon, PauseIcon, PlayIcon, PlayCircleIcon } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { EntityHeader } from "@/components/patterns/page-header"
 import {
   EmptyState,
@@ -20,6 +21,7 @@ import {
   StatusBadge,
 } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
@@ -359,9 +361,23 @@ export function EmployeeDetailPage() {
               will be refused.
             </p>
           )}
+          {!hasPrompt ? <RequiredLegend /> : null}
+          <Label htmlFor="run-prompt-override" required={!hasPrompt} className="text-xs">
+            {hasPrompt ? (
+              <>
+                Prompt override <span className="font-normal text-muted-foreground">(optional)</span>
+              </>
+            ) : (
+              "Prompt"
+            )}
+          </Label>
           <Textarea
+            id="run-prompt-override"
             value={promptOverride}
             onChange={(ev) => setPromptOverride(ev.target.value)}
+            // Required only when there is no stored prompt; a stored prompt
+            // still satisfies the run, so this override stays optional.
+            aria-required={!hasPrompt}
             placeholder={
               hasPrompt
                 ? "Optional prompt override for this run only"

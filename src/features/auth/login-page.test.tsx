@@ -112,4 +112,30 @@ describe("LoginPage lockout surface (plan T5)", () => {
     expect(alert.textContent).toBe("Invalid email or password.")
     expect(alert.textContent).not.toContain("invalid_or_expired")
   })
+
+  it("marks both credential fields required and explains the marker once (UX-1)", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    const { container } = render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    // findByLabelText proves the label still associates with its control
+    // once the decorative star is nested inside the label.
+    const email = await screen.findByLabelText("Email")
+    const password = screen.getByLabelText("Password")
+    // Native `required` stays on the controls: noValidate means it conveys
+    // semantics without changing submission behaviour.
+    expect(email.hasAttribute("required")).toBe(true)
+    expect(password.hasAttribute("required")).toBe(true)
+    // Exactly two labels opt in, each with an aria-hidden star.
+    const marked = container.querySelectorAll("label[data-required]")
+    expect(marked.length).toBe(2)
+    for (const label of marked) {
+      const star = label.querySelector("span[aria-hidden='true']")
+      expect(star?.className).toContain("before:content-['*']")
+    }
+    // The convention is stated once, not per field.
+    expect(screen.getByText(/Required/)).toBeDefined()
+  })
 })
