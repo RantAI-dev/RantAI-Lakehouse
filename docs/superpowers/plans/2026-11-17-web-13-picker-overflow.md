@@ -295,3 +295,15 @@ Final independent verification on the review-corrected code, in foreground:
 No open code-review BLOCKER. S1 corrected. Browser geometry/manual acceptance
 remains not verified; the QA owner has regression case `LH-WEB-13-01` (Not run).
 The fix is ready for PR/CI, not claimed accepted on a deployed build.
+
+### Merge record — 2026-11-17
+
+PR #565 merged as `23d111fb00714ae3a582eda7e0454a775bb1856e` after all
+applicable CI jobs passed on reviewed head `725e91901cfd81f9e982b9327172fe3d18b75383`,
+including Frontend Lint/Typecheck/Test/Build, repository lints, dependency review,
+cargo audit/deny and both secret scans. Untouched-language jobs were skipped by
+change scope. No review comments or merge conflicts were open.
+
+WEB-13 Task is Done for code delivery. Visual acceptance is still **Not run**
+(`LH-WEB-13-01`); the execution ticket remains QA Review for its assigned tester.
+This merge is not a claim of a deployed-build visual pass.
