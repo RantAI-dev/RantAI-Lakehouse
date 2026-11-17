@@ -350,6 +350,16 @@ impl Scope {
     ) -> Result<(), ApiError> {
         let folder_id = board.folder_id.clone().unwrap_or_default();
         let owner = board.owner_id.clone().unwrap_or_default();
+        // GOV-17 review R3: the AccessMap level alone ignores the table-dependency
+        // overlay, so a board hidden by an unreadable table still passed this
+        // "common board-level enforcement" for a writer. The narrowed viewer
+        // carries the deny-list and its `sees_board` is the one in-memory
+        // predicate that agrees with the SQL clauses. This only REMOVES boards
+        // the map already allows; it grants no new ACL capability, and a
+        // genuine *:* / role-union-All viewer is never narrowed.
+        if !self.viewer.sees_board(&board.id, &owner) {
+            return Err(ApiError::NotFound(BOARD_NOT_FOUND.to_owned()));
+        }
         Self::check(
             self.map.level_for_board(&board.id, &folder_id, &owner),
             needed,
@@ -1363,6 +1373,55 @@ mod tests {
             item_id: id.to_owned(),
             level,
         }
+    }
+
+    /// GOV-17 review R3: the common board-level check must honour the table
+    /// overlay. A board hidden by an unreadable table is a 404 for a narrowed
+    /// administrator AND for a caller with an explicit edit grant — the table
+    /// restriction wins without granting any new ACL capability. An
+    /// unrestricted administrator keeps their level (positive control).
+    #[test]
+    fn a_table_hidden_board_is_refused_by_the_common_board_level_check() {
+        let board: lakehouse_bi::store::Board = serde_json::from_value(json!({
+            "id": "b1", "name": "b1", "folder_id": "", "owner_id": ""
+        }))
+        .expect("a minimal board row");
+
+        let narrowed_admin = Scope {
+            viewer: Viewer::user("u9", true).narrowed_by_tables(vec!["b1".to_owned()], true),
+            map: AccessMap::new("u9", true, None, &[], &[], &[]),
+        };
+        assert!(
+            matches!(
+                narrowed_admin.require_on_board(&board, Level::Edit),
+                Err(ApiError::NotFound(_))
+            ),
+            "identity:write with narrowed grants is not a bypass"
+        );
+
+        let grants = [rule(ItemKind::Board, "b1", Level::Edit)];
+        let with_grant = Scope {
+            viewer: Viewer::user("u1", false).narrowed_by_tables(vec!["b1".to_owned()], true),
+            map: AccessMap::new("u1", false, None, &[], &grants, &[]),
+        };
+        assert!(
+            matches!(
+                with_grant.require_on_board(&board, Level::Edit),
+                Err(ApiError::NotFound(_))
+            ),
+            "an explicit edit grant does not open a table-hidden board"
+        );
+
+        let unrestricted_admin = Scope {
+            viewer: Viewer::user("u9", true),
+            map: AccessMap::new("u9", true, None, &[], &[], &[]),
+        };
+        assert!(
+            unrestricted_admin
+                .require_on_board(&board, Level::Edit)
+                .is_ok(),
+            "a genuine *:* / All caller keeps the level"
+        );
     }
 
     fn folder(id: &str, parent: &str) -> Folder {

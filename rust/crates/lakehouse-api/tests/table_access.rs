@@ -892,6 +892,102 @@ async fn a_root_sql_source_reading_a_denied_table_is_hidden_from_the_source_list
     assert!(ids.iter().any(|id| id == "s_denied"), "control: {ids:?}");
 }
 
+// ── GOV-17 review R3: the common board-level check honours the overlay ───
+
+/// A chart on a NAMED board reading `mart`, for the R3 write-adjacent test.
+fn named_board_chart(id: &str, board: &str, mart: &str) -> Value {
+    let spec = json!({
+        "id": id, "title": id, "kind": "kpi", "mart": mart,
+        "sql": format!("SELECT count() AS n FROM serving.{mart}"), "x": "", "y": "n"
+    });
+    let def = json!({
+        "title": id, "mart": mart, "kind": "kpi", "measures": ["n"], "aggregate": "count"
+    });
+    json!({
+        "id": id, "board": board, "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+        "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+    })
+}
+
+/// A `ClickHouse` stand-in holding one NAMED board whose single tile reads the
+/// denied mart, plus the board row itself.
+#[derive(Clone)]
+struct HiddenBoardFake;
+
+impl Respond for HiddenBoardFake {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        if sql.contains("FROM console.bi_chart") {
+            return rows(
+                &["id", "board", "created_by", "created_at", "spec_json"],
+                &[named_board_chart("c_hidden", "b_hidden", HIDDEN_MART)],
+            );
+        }
+        if sql.contains("FROM console.bi_board") && sql.contains("is_deleted = 0 AND id=") {
+            return rows(
+                &["id", "name", "folder_id", "owner_id"],
+                &[json!({
+                    "id": "b_hidden", "name": "Hidden", "folder_id": "", "owner_id": ""
+                })],
+            );
+        }
+        if sql.contains("FROM system.columns") {
+            return rows(
+                &[
+                    "table",
+                    "name",
+                    "type",
+                    "default_kind",
+                    "default_expression",
+                ],
+                &[],
+            );
+        }
+        if sql.starts_with("CREATE") || sql.starts_with("ALTER") || sql.starts_with("DROP") {
+            return ResponseTemplate::new(200).set_body_string("Ok.\n");
+        }
+        rows(&[], &[])
+    }
+}
+
+/// GOV-17 review R3: `require_board_level` is the ONLY visibility check on the
+/// comments route, so its `require_on_board` must honour the overlay. A caller
+/// with `identity:write` but narrowed table grants (no *:*) gets the unknown
+/// answer for a board whose tile reads a denied table; a genuine *:* caller
+/// keeps access (positive control).
+#[tokio::test]
+async fn a_table_hidden_board_is_refused_by_the_common_level_check_even_for_identity_write() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(HiddenBoardFake)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = app(&server).await;
+
+    let admin = narrowed(
+        &pool,
+        "dashboard:write, identity:write",
+        &[("serving", OK_MART)],
+    )
+    .await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let (status, body) = send_get(&router, &cookie, "/api/dashboard/comments?board=b_hidden").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let text = body.to_string();
+    assert!(!text.contains(HIDDEN_MART), "no table name: {text}");
+    assert!(!text.contains("b_hidden"), "no board id: {text}");
+
+    let star = create_principal_with_permissions(&pool, "*:*").await;
+    let star_cookie = session_cookie_for_user(&pool, star).await;
+    let (status, body) = send_get(
+        &router,
+        &star_cookie,
+        "/api/dashboard/comments?board=b_hidden",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a *:* caller keeps access: {body}");
+}
+
 // ── Combined charts: a question outside the viewer's access ─────────────
 
 /// QA `LH-BI-13-03` (`BI-51`, plan T7): a board with one bar question on

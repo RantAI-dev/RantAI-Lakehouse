@@ -355,6 +355,16 @@ impl Viewer {
         self.all
     }
 
+    /// GOV-17 review R3: whether NO table-dependency narrowing is active. A
+    /// genuine *:* / `All` caller is never narrowed; an `identity:write` caller
+    /// whose role grants are narrowed IS, even though `sees_all()` stays true.
+    /// All-reader shortcuts that copy unfiltered system rows must gate on this
+    /// as well as [`Self::sees_all`], or they expose hidden rows.
+    #[must_use]
+    pub fn is_unnarrowed(&self) -> bool {
+        self.hidden_boards.is_empty() && self.builtin_visible && self.hidden_sources.is_empty()
+    }
+
     /// Whether a board owned by `owner` (`""` = nobody) is visible.
     #[must_use]
     pub fn sees(&self, owner: &str) -> bool {
@@ -1201,6 +1211,24 @@ mod tests {
         );
         assert_eq!(admin.owner_clause(), " AND id NOT IN ('b_denied')");
         assert_eq!(admin.chart_owner_clause(), " AND board NOT IN ('b_denied')");
+    }
+
+    /// GOV-17 review R3: `sees_all` stays true for an `identity:write` caller
+    /// whose table grants were narrowed, so every all-reader shortcut must also
+    /// check `is_unnarrowed` before copying unfiltered system rows.
+    #[test]
+    fn a_narrowed_all_viewer_is_not_unnarrowed_but_a_genuine_all_one_is() {
+        let admin = Viewer::user("u", true);
+        assert!(admin.sees_all());
+        assert!(admin.is_unnarrowed());
+        assert!(Viewer::system().is_unnarrowed());
+        let narrowed = Viewer::user("u", true)
+            .narrowed_by_tables(vec!["b".to_owned()], true)
+            .with_hidden_sources(vec!["s".to_owned()]);
+        assert!(narrowed.sees_all(), "identity:write still sees every ACL");
+        assert!(!narrowed.is_unnarrowed(), "the table overlay is active");
+        let builtin_only = Viewer::user("u", true).narrowed_by_tables(Vec::new(), false);
+        assert!(!builtin_only.is_unnarrowed());
     }
 
     /// GOV-17 review R1: when built-in Main is hidden, both legacy spellings of

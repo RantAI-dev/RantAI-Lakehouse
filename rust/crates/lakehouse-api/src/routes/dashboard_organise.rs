@@ -317,7 +317,13 @@ impl Seen {
             store::list_stored_charts(ch, &system),
             store::list_boards(ch, &system)
         )?;
-        if viewer.sees_all() {
+        // GOV-17 review R3: `sees_all` is still true for a narrowed
+        // `identity:write` caller. Copying every system row as "visible" would
+        // skip the table-dependency deny-list, so the shortcut is only for a
+        // viewer the dependency resolver left completely unnarrowed (a genuine
+        // *:* / role-union-All caller). A narrowed all-viewer falls through to
+        // the filtered reads below.
+        if viewer.sees_all() && viewer.is_unnarrowed() {
             return Ok(Self {
                 charts: all_charts.clone(),
                 boards: all_boards.clone(),
@@ -963,4 +969,71 @@ pub async fn search_names(
         .await
         .map_err(|err| classify_bi_error(&err))?;
     Ok(ApiJson(json!({ "hits": hits })))
+}
+
+#[cfg(test)]
+mod seen_tests {
+    //! GOV-17 review R3: `Seen::read` must not copy every system row as
+    //! "visible" for a narrowed `identity:write` caller, whose `sees_all` stays
+    //! true. The `is_unnarrowed` gate sends those callers through the filtered
+    //! reads; a wiremock stand-in cannot evaluate SQL, so the clause the route
+    //! sends proves which path ran.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::{Arc, Mutex};
+
+    use lakehouse_clickhouse::ChClient;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl Respond for Recorder {
+        fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+            self.0
+                .lock()
+                .expect("the statement log")
+                .push(String::from_utf8_lossy(&request.body).into_owned());
+            ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [], "data": [], "rows": 0
+            }))
+        }
+    }
+
+    async fn statements_for(viewer: &Viewer) -> Vec<String> {
+        let server = MockServer::start().await;
+        let rec = Recorder(Arc::new(Mutex::new(Vec::new())));
+        Mock::given(method("POST"))
+            .respond_with(rec.clone())
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let _ = Seen::read(&ch, viewer).await.expect("the reads succeed");
+        rec.0.lock().expect("the statement log").clone()
+    }
+
+    #[tokio::test]
+    async fn a_narrowed_all_viewer_uses_the_filtered_reads_not_the_all_shortcut() {
+        let viewer = Viewer::user("u", true).narrowed_by_tables(vec!["b_hidden".to_owned()], true);
+        let statements = statements_for(&viewer).await;
+        assert!(
+            statements
+                .iter()
+                .any(|sql| sql.contains("NOT IN ('b_hidden')")),
+            "the dependency deny-list must reach the filtered reads: {statements:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_genuine_all_viewer_keeps_the_all_shortcut() {
+        let statements = statements_for(&Viewer::user("u", true)).await;
+        assert!(
+            statements.iter().all(|sql| !sql.contains("'b_hidden'")),
+            "an unrestricted *:* caller sends no deny-list: {statements:?}"
+        );
+    }
 }
