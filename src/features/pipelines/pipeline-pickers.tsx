@@ -59,6 +59,7 @@ export function ZoneField({
   zones,
   note,
   describedBy,
+  required,
 }: {
   id: string
   label: string
@@ -70,15 +71,18 @@ export function ZoneField({
   note?: string
   /** The id of a sentence about this field, when the page has one (BLD-1 part 1 S3 review R1-S10). */
   describedBy?: string
+  /** UX-1-R8: a save refuses a blank zone, so this input is starred and required. */
+  required?: boolean
 }) {
   if (zones === null) {
     return (
       <div className="space-y-1.5">
-        <Label htmlFor={id}>{label}</Label>
+        <Label htmlFor={id} required={required}>{label}</Label>
         <Input
           id={id}
           value={value}
           onChange={(e) => onChange(e.target.value)}
+          aria-required={required}
           aria-invalid={describedBy ? true : undefined}
           aria-describedby={describedBy}
         />
@@ -96,11 +100,12 @@ export function ZoneField({
   )
   return (
     <div className="space-y-1.5">
-      <Label htmlFor={id}>{label}</Label>
+      <Label htmlFor={id} required={required}>{label}</Label>
       <Select items={labels} value={value} onValueChange={(next) => onChange(next ?? "")}>
         <SelectTrigger
           id={id}
           aria-label={label}
+          aria-required={required}
           aria-invalid={describedBy ? true : undefined}
           aria-describedby={describedBy}
           className="w-full"
@@ -134,6 +139,7 @@ export function ColumnField({
   columns,
   placeholder,
   className,
+  required,
 }: {
   id?: string
   label: string
@@ -143,14 +149,17 @@ export function ColumnField({
   columns: string[] | null
   placeholder?: string
   className?: string
+  /** UX-1-R8: an operation's column argument that `draftIsComplete` refuses blank. */
+  required?: boolean
 }) {
   if (columns === null || columns.length === 0) {
     return (
       <div className={className ?? "space-y-1.5"}>
-        <Label htmlFor={id}>{label}</Label>
+        <Label htmlFor={id} required={required}>{label}</Label>
         <Input
           id={id}
           aria-label={label}
+          aria-required={required}
           value={value}
           placeholder={placeholder}
           onChange={(e) => onChange(e.target.value)}
@@ -165,9 +174,9 @@ export function ColumnField({
   )
   return (
     <div className={className ?? "space-y-1.5"}>
-      <Label htmlFor={id}>{label}</Label>
+      <Label htmlFor={id} required={required}>{label}</Label>
       <Select items={labels} value={value} onValueChange={(next) => onChange(next ?? "")}>
-        <SelectTrigger id={id} aria-label={label} className="w-full">
+        <SelectTrigger id={id} aria-label={label} aria-required={required} className="w-full">
           <SelectValue placeholder={placeholder ?? "Pick a column"} />
         </SelectTrigger>
         <SelectContent>
@@ -195,13 +204,19 @@ export function ColumnsField({
   onChange,
   columns,
   className,
+  required,
 }: {
   label: string
   value: string
   onChange: (next: string) => void
   columns: string[] | null
   className?: string
+  /** UX-1-R8: `select(...)` refuses a blank column list; the Faceted trigger is
+   *  a button, which has no supported `aria-required`, so the star is paired
+   *  with a linked sentence (the group pattern, not a false button attribute). */
+  required?: boolean
 }) {
+  const needId = React.useId()
   const chosen = React.useMemo(
     () =>
       value
@@ -210,16 +225,22 @@ export function ColumnsField({
         .filter((column) => column.length > 0),
     [value]
   )
+  const needed = required ? (
+    <p id={needId} className="text-xs text-muted-foreground">Select at least one column.</p>
+  ) : null
   if (columns === null || columns.length === 0) {
     return (
       <div className={className ?? "space-y-1.5"}>
-        <Label>{label}</Label>
+        <Label required={required}>{label}</Label>
         <Input
           aria-label={label}
+          aria-required={required}
+          aria-describedby={required ? needId : undefined}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder="id,name,amount"
         />
+        {needed}
       </div>
     )
   }
@@ -230,7 +251,7 @@ export function ColumnsField({
   }))
   return (
     <div className={className ?? "space-y-1.5"}>
-      <Label>{label}</Label>
+      <Label required={required}>{label}</Label>
       <Faceted
         multiple
         value={chosen}
@@ -241,7 +262,7 @@ export function ColumnsField({
             WEB-13 review S1: two chips may wrap, so the trigger must grow with
             its content rather than letting a second row escape its border. */}
         <FacetedTrigger asChild>
-          <Button type="button" variant="outline" size="sm" className="h-auto min-h-7 w-full min-w-0 justify-between py-1 font-normal" aria-label={label} title={value === "" ? undefined : value}>
+          <Button type="button" variant="outline" size="sm" className="h-auto min-h-7 w-full min-w-0 justify-between py-1 font-normal" aria-label={label} aria-describedby={required ? needId : undefined} title={value === "" ? undefined : value}>
             <FacetedBadgeList
               options={options}
               placeholder="Pick columns"
@@ -265,6 +286,7 @@ export function ColumnsField({
           </FacetedList>
         </FacetedContent>
       </Faceted>
+      {needed}
     </div>
   )
 }
