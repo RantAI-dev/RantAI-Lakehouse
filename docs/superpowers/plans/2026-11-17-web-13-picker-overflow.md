@@ -139,7 +139,127 @@ label fit. No deployment performed by the developer.
 
 ## Handoff
 
-Pending HY4 implementation.
+Developer: HY4 flash Free (`opencode-go/hy4-flash-free`), acting under the
+owner's one-task WEB-13 exception to the AGENTS.md planner model. Codex is
+planner/reviewer; no Lark, PR or merge action was taken by the developer.
+
+- Feature branch: `fix/web-13-picker-overflow`, created from the doc-plan base
+  `acdf607bafcbbbc1c818b55de614f35d6979d3f2` (which is based on
+  `origin/main` `34d1276a2818d1f4a88e9a937eacb8da0b66f7b9`). The prepared
+  checkout was clean at the old parent `eb9eaa18e` before branching; the base
+  had advanced by a large console build, so the branch was created from the
+  doc-plan commit rather than the old parent, as instructed. No parent,
+  worktree or main branch was reset or disturbed. No merge was required.
+
+### Commits (one task per commit, in plan order)
+
+1. `79bc70208b2cd3dfb0c746f53f024cf683ba4626` — Task 1, Roles picker
+   containment. `src/features/admin/role-table-access.tsx` and
+   `src/features/admin/role-form-page.test.tsx`.
+2. `441f8b5d1ab461e523cd5afdd8a26e5dbdaa1acb` — Task 2, sibling pickers.
+   `src/features/admin/permission-picker.tsx` + test,
+   `src/features/connectors/connector-ingest-panel.tsx` + test,
+   `src/features/governance/table-picker.tsx` + test,
+   `src/features/pipelines/pipeline-pickers.tsx` + test.
+
+No product code or tests were added in the final docs/CHANGELOG commit.
+
+### Source changes, by plan anchor
+
+- `role-table-access.tsx:393` and `:419` — the schema Label and the table row's
+  grid/Label now bound `min-w-0`/`flex-1` ancestors and wrap their name in an
+  explicit `min-w-0 break-all` span. The `Checkbox` primitive is already
+  `shrink-0`. Whole-schema, unlisted-grant, disabled and save semantics are
+  untouched; full names stay as DOM text and accessible names.
+- `permission-picker.tsx:199` — the unknown-token Badge overrides the base
+  `shrink-0`/`whitespace-nowrap`/`h-5` with `max-w-full`, `shrink`,
+  `whitespace-normal` and `h-auto` (consumer override via `cn`, no primitive
+  change); the token wraps in a `break-all` span and the remove button is
+  `shrink-0`. The known-permission grid at `:329` gets `min-w-0 flex-1` and a
+  `break-all` span for `perm.name`; descriptions, wildcard coverage and
+  disabling are unchanged.
+- `connector-ingest-panel.tsx:1154` and `:1216` — the loaded-column and key
+  checkbox labels get `min-w-0`, `shrink-0` native checkboxes and `break-all`
+  spans. The locked-column reason span is kept; exact excluded/primaryKey
+  values are unchanged.
+- `table-picker.tsx:156` — the trigger gets `min-w-0` and a `title` with the
+  full selected key; `FacetedBadgeList` gets `className="min-w-0 flex-1"` and
+  `badgeClassName="max-w-full font-mono [&>span]:min-w-0"` so the selected
+  badge truncates within its width. The option span at `:173` wraps with
+  `break-all`. Held tables not in the catalog are still offered whole.
+- `pipeline-pickers.tsx:240` — same consumer-only badge/trigger bounds for the
+  `ColumnsField` multi-select, with the exact comma-list value on the title;
+  option span at `:251` wraps with `break-all`.
+
+### Audit disposition
+
+- Ordinary `Select` controls in `pipeline-pickers.tsx` (`ZoneField`,
+  `ColumnField`) were audited against `src/components/ui/select.tsx` and left
+  unchanged: `SelectValue` already carries `min-w-0 flex-1 overflow-hidden`
+  with `line-clamp-1` on the trigger (phase 2 QA R14), `SelectItemText` carries
+  `min-w-0 flex-1`, and `SelectContent` is viewport-capped with
+  `overflow-x-hidden`. No mismatch found, so no speculative fix was made.
+- `src/components/ui/label.tsx`, `badge.tsx` and `faceted.tsx` were read but not
+  modified. All containment is consumer-side, as decided.
+- `src/features/connectors/table-finder.tsx` was used as the reference
+  (`min-w-0`/`flex-1`/`truncate` plus complete-name `title`) and not changed.
+- Fixtures use only synthetic long identifiers (no screenshot table/client
+  names). No new product dependency, secret, hostname, IP or port was added.
+  No Rust, Python, compose or migration files were touched.
+
+### Verification (foreground, this branch's final code)
+
+Baseline on the doc-plan base before any edit, for an honest comparison:
+
+```
+bun run typecheck                    -> exit 0
+bun run lint                         -> exit 0, 11 warnings, 0 errors
+bun run test                         -> 4431 pass, 1 skip, 0 fail,
+                                        13567 expect() calls, 4432 tests / 409 files
+```
+
+Final, after the two code commits and before handoff:
+
+```
+bun run typecheck                    -> exit 0
+bun run lint                         -> exit 0, 11 warnings, 0 errors
+                                        (same 11 pre-existing warnings; none added)
+bun run test                         -> 4444 pass, 1 skip, 0 fail,
+                                        13659 expect() calls, 4445 tests / 409 files
+                                        (+13 tests, +92 expect() calls vs baseline)
+git diff --check                     -> clean
+git status --short                   -> clean (nothing generated staged)
+```
+
+Scoped checks run per task: the touched suites (`role-form-page.test.tsx`
+30 pass; `permission-picker.test.tsx` 12 pass; `table-picker.test.tsx` 9 pass;
+`pipeline-pickers.test.tsx` 11 pass; `connector-ingest-panel.test.tsx` 94 pass)
+and file-scoped `eslint` on every touched file, plus a full `typecheck`.
+
+No cargo, Python, compose or migration checks were run: this is a TypeScript
+and docs-only change. No check was weakened, skipped or rerun to get green.
+The `act(...)` console warnings in the test output are pre-existing React test
+noise present at baseline; they are not failures.
+
+### Not verified / owed
+
+- **Geometry NOT VERIFIED.** At 320px and 768px the changed text and pickers
+  were not measured. No layout engine exists in this checkout: `playwright`,
+  `playwright-core`, `puppeteer`, `puppeteer-core`, `jsdom` and
+  `@playwright/test` are all absent (only `@happy-dom/global-registrator` is a
+  dev dependency, and a probe shows `offsetWidth` and
+  `getBoundingClientRect().width` are both `0` in happy-dom). DOM/class
+  assertions prove the wrapping structure and full value/behavior, not visual
+  geometry. No product dependency was installed to fake a measurement, and no
+  `preview_*` tool was used for self-verification. The manual QA checklist
+  below remains outstanding; no screenshot success is claimed.
+- Lark bug `reczz28adM9F7B5k` (QA owner Rizky) was not touched by the developer,
+  as instructed.
+- No PR was opened or merged; no branch was pushed to main or force-pushed.
+
+### Blockers
+
+None. No plan/code mismatch was found; no scope expansion was needed.
 
 ## Review
 
