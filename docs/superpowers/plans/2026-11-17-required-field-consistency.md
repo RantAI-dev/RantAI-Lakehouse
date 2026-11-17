@@ -247,6 +247,29 @@ treats as necessary, they do not strengthen validation.
 
 ## Review / Handoff
 
+### Final current-main parent review (code head 2ddafb1c1)
+
+R8–R11 resolved by independent source review. The parent additionally connected
+the required alert Metric/Mart/Measure/Dashboard/Connector labels to their
+combobox triggers in `2ddafb1c1` (R9). No open UX-1 source-review blocker.
+
+Independent foreground `bun run typecheck && bun run lint && bun run test`
+passed, exit 0: **4484 pass, 1 skip, 0 fail, 13874 expects, 415 files,
+190.32s**. Lint: zero errors, eleven existing warnings. Tests ran after the
+label-id correction; the initial typecheck preceded those string-only id
+changes. `git diff --check origin/main..HEAD` passed. No backend, dependency
+or security-policy difference against current main; no Rust/Python/Compose
+checks needed. Browser/owner/AI-15 acceptance remains not verified.
+
+PR #568 is now conflict-free and pushed. CI's required `cargo deny check (all)`
+failed on RUSTSEC-2026-0542 (humantime unmaintained) and RUSTSEC-2026-0543
+(chrono unmaintained), despite cargo audit passing. `rust/Cargo.lock`,
+`rust/deny.toml` and `.github/workflows/security.yml` are identical to main
+`cb855d5b9`; the previous main cargo-deny run was green, so a fresh baseline
+check is needed before claiming main is red. No exception, ignore, dependency
+change or protection bypass is authorized by this presentation-only task.
+Track the required-check blocker separately in UX-3; do not claim merged.
+
 ### Current-main review round 3 (head bb8861e8e)
 
 Not approved yet. Required-field coverage was lost when translating old forms.
