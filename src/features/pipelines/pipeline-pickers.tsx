@@ -237,9 +237,11 @@ export function ColumnsField({
         onValueChange={(next) => onChange((next ?? []).join(","))}
       >
         {/* WEB-13: bound the selected chips and the trigger. The comma list is
-            also the trigger's title, and the option row wraps the full name. */}
+            also the trigger's title, and the option row wraps the full name.
+            WEB-13 review S1: two chips may wrap, so the trigger must grow with
+            its content rather than letting a second row escape its border. */}
         <FacetedTrigger asChild>
-          <Button type="button" variant="outline" size="sm" className="w-full min-w-0 justify-between font-normal" aria-label={label} title={value === "" ? undefined : value}>
+          <Button type="button" variant="outline" size="sm" className="h-auto min-h-7 w-full min-w-0 justify-between py-1 font-normal" aria-label={label} title={value === "" ? undefined : value}>
             <FacetedBadgeList
               options={options}
               placeholder="Pick columns"

@@ -264,3 +264,34 @@ None. No plan/code mismatch was found; no scope expansion was needed.
 ## Review
 
 Pending independent Codex review under the owner's WEB-13 exception.
+
+### Codex review — 2026-11-17
+
+Reviewed the five consumers and added regression tests against plan commit
+`acdf607ba` and developer head `4775dd481`. No changes to grants, selection values,
+API clients or shared UI primitives. Exact identifier/save/removal behavior is
+covered. No prior tests removed or weakened.
+
+- SHOULD-FIX S1: pipeline selected-chip list allows two chips to wrap, but its
+  `size=sm` trigger inherited fixed h-7. At a narrow width a second chip row can
+  escape vertically. Corrected the consumer to h-auto/min-h-7/py-1; selection and
+  title remain unchanged. Provenance cited at the site. This small review
+  correction is authored by Codex; the implementation otherwise is HY4's.
+- Geometry remains NOT VERIFIED. DOM tests do not prove CSS dimensions. Manual
+  QA at the plan's narrow/wide fixtures is still owed before acceptance.
+
+Final independent verification on the review-corrected code, in foreground:
+
+- `bun run typecheck`: exit 0.
+- `bun run lint`: exit 0; 0 errors, 11 warnings, all in unchanged files.
+- `bun run test`: 4444 pass, 1 skip, 0 fail; 13654 expects; 4445 tests across
+  409 files, 192.95 seconds. This is the reviewer run, not copied from handoff.
+- `bun test src/features/pipelines/pipeline-pickers.test.tsx`: 11 pass, 0 fail,
+  35 expects (review correction scoped check).
+- `git diff --check`: clean. `git status --short` before commit: only the
+  pipeline consumer and this review entry; no generated artifacts staged.
+- No Rust/Python/compose commands (untouched).
+
+No open code-review BLOCKER. S1 corrected. Browser geometry/manual acceptance
+remains not verified; the QA owner has regression case `LH-WEB-13-01` (Not run).
+The fix is ready for PR/CI, not claimed accepted on a deployed build.
