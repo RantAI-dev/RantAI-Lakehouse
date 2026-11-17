@@ -10,6 +10,11 @@
 //! The only money is an estimate from rates an administrator entered, and it
 //! is `null` when no rate applies. Nothing is a constant of this code.
 //!
+//! A rate is entered as text, or as a whole number. A JSON number with digits
+//! after the point is refused: the JSON parser holds it as a double, and a
+//! double cannot be read back as the digits the caller wrote, so the money
+//! would be stored rounded without anyone noticing.
+//!
 //! # Who sees which rows
 //!
 //! All three reads need `usage:read` and the rate write `settings:write`
@@ -95,9 +100,13 @@ const BAD_GROUP: &str = "group must be day, person, engine or tenant.";
 const BAD_TENANT: &str = "tenant must be all, or left out.";
 const NOT_ALL: &str = "Only an administrator of the whole deployment may ask for all tenants.";
 const RATE_BODY_SHAPE: &str = "body must be {\"kind\": \"scan_tb\"|\"engine_hour\"|\"storage_gb_month\", \
-                               \"currency\": three capital letters, \"amount\": a number or text, \
+                               \"currency\": three capital letters, \"amount\": text or a whole number, \
                                \"effectiveFrom\": \"YYYY-MM-DD\"}.";
 const BAD_AMOUNT: &str = "amount must be a decimal number, not negative, with at most 12 digits before the point and 6 after.";
+/// A JSON number that is not a whole number. `serde_json` holds such a number
+/// as a double, and a double cannot be read back as the digits the caller
+/// wrote, so it is refused instead of stored rounded.
+const AMOUNT_AS_TEXT: &str = "amount must be written as text, so its digits are kept. A number with a point or an exponent is refused, because its digits cannot be read back as they were written.";
 const BAD_CURRENCY: &str = "currency must be three capital letters, for example USD.";
 const BAD_KIND: &str = "kind must be scan_tb, engine_hour or storage_gb_month.";
 const MIXED_CURRENCY: &str = "Rates use one currency. The rates already entered use another one, so this rate was not added.";
@@ -598,8 +607,9 @@ pub async fn list_rates(State(state): State<AppState>) -> ApiResult<ApiJson<Rate
 struct NewRateBody {
     kind: String,
     currency: String,
-    /// A JSON number or a text: both are read as the digits the caller wrote,
-    /// never through a float.
+    /// Text, or a whole number. A JSON number with digits after the point is
+    /// refused: the JSON parser holds it as a double, and a double cannot be
+    /// read back as the digits the caller wrote.
     amount: Value,
     effective_from: String,
 }
@@ -607,11 +617,26 @@ struct NewRateBody {
 /// The digits of an amount, checked: digits, then optionally a point and one
 /// to six more digits, with at most twelve before the point. A sign, an
 /// exponent, a space or an empty text is refused.
-fn amount_text(amount: &Value) -> Option<String> {
+///
+/// A JSON number is read only when it is a whole number, because `serde_json`
+/// holds a number with a point or an exponent as a double and a double cannot
+/// be read back as the digits the caller wrote (`serde_json` is built here
+/// without `arbitrary_precision`). Text keeps every digit, so the console
+/// sends the amount as text.
+///
+/// # Errors
+///
+/// 400 with [`AMOUNT_AS_TEXT`] when the amount is a JSON number that is not a
+/// whole number, and with [`BAD_AMOUNT`] when it is not a decimal of the
+/// shape above.
+fn amount_text(amount: &Value) -> Result<String, ApiError> {
     let text = match amount {
-        Value::Number(n) => n.to_string(),
         Value::String(s) => s.clone(),
-        _ => return None,
+        // A whole number is exact: `serde_json` keeps an integer literal as an
+        // integer, not as a double.
+        Value::Number(n) if n.is_i64() || n.is_u64() => n.to_string(),
+        Value::Number(_) => return Err(ApiError::BadRequest(AMOUNT_AS_TEXT.to_owned())),
+        _ => return Err(ApiError::BadRequest(BAD_AMOUNT.to_owned())),
     };
     let (whole, decimals) = match text.split_once('.') {
         Some((whole, decimals)) => (whole, Some(decimals)),
@@ -621,7 +646,11 @@ fn amount_text(amount: &Value) -> Option<String> {
     let ok = digits(whole)
         && whole.len() <= MAX_INTEGER_DIGITS
         && decimals.is_none_or(|d| digits(d) && d.len() <= MAX_DECIMALS);
-    ok.then_some(text)
+    if ok {
+        Ok(text)
+    } else {
+        Err(ApiError::BadRequest(BAD_AMOUNT.to_owned()))
+    }
 }
 
 /// `POST /api/usage/rates`: add a rate, `{kind, currency, amount,
@@ -633,9 +662,10 @@ fn amount_text(amount: &Value) -> Option<String> {
 ///
 /// 400 with a fixed sentence when the body is not that shape, the kind is not
 /// one of the three, the currency is not three capital letters, the amount is
-/// not a non-negative decimal, the date is not a day, or the currency differs
-/// from the rates already entered; 503 without a Postgres pool; 500 (a fixed
-/// sentence and a reference) when the database fails.
+/// a JSON number that is not a whole number or is not a non-negative decimal,
+/// the date is not a day, or the currency differs from the rates already
+/// entered; 503 without a Postgres pool; 500 (a fixed sentence and a
+/// reference) when the database fails.
 pub async fn create_rate(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -650,8 +680,7 @@ pub async fn create_rate(
     if parsed.currency.len() != 3 || !parsed.currency.bytes().all(|b| b.is_ascii_uppercase()) {
         return Err(ApiError::BadRequest(BAD_CURRENCY.to_owned()).into());
     }
-    let amount =
-        amount_text(&parsed.amount).ok_or_else(|| ApiError::BadRequest(BAD_AMOUNT.to_owned()))?;
+    let amount = amount_text(&parsed.amount)?;
     let effective_from = parse_day(&parsed.effective_from)
         .ok_or_else(|| ApiError::BadRequest(BAD_DATE.to_owned()))?;
     let stored = usage::add_rate(

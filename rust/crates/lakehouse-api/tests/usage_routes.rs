@@ -32,6 +32,11 @@ const TENANT_B: &str = "11111111-1111-4111-8111-000000000002";
 
 const PERIOD: &str = "from=2026-03-01&to=2026-03-31";
 
+/// The sentence that refuses a JSON number which is not a whole number: the
+/// JSON parser holds such a number as a double, and a double cannot be read
+/// back as the digits the caller wrote.
+const AMOUNT_NOT_WHOLE: &str = "amount must be written as text, so its digits are kept. A number with a point or an exponent is refused, because its digits cannot be read back as they were written.";
+
 struct Answer {
     status: StatusCode,
     headers: HeaderMap,
@@ -57,6 +62,20 @@ async fn call(
     extra_header: Option<(&str, &str)>,
     body: Option<Value>,
 ) -> Answer {
+    let text = body.map(|body| body.to_string());
+    call_text(router, cookie, method, uri, extra_header, text.as_deref()).await
+}
+
+/// The same request, with the body as raw text: a body `serde_json`'s `json!`
+/// cannot write, such as a number written with an exponent.
+async fn call_text(
+    router: &axum::Router,
+    cookie: &str,
+    method: &str,
+    uri: &str,
+    extra_header: Option<(&str, &str)>,
+    body: Option<&str>,
+) -> Answer {
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)
@@ -67,13 +86,10 @@ async fn call(
     let request = match body {
         // The central audit writer reads the field names of a body only when
         // the request declares its length, the way a browser's does.
-        Some(body) => {
-            let text = body.to_string();
-            builder
-                .header("content-type", "application/json")
-                .header("content-length", text.len())
-                .body(Body::from(text))
-        }
+        Some(text) => builder
+            .header("content-type", "application/json")
+            .header("content-length", text.len())
+            .body(Body::from(text.to_owned())),
         None => builder.body(Body::empty()),
     }
     .expect("build request");
@@ -101,6 +117,12 @@ async fn get(router: &axum::Router, cookie: &str, uri: &str) -> Answer {
 
 async fn post_rate(router: &axum::Router, cookie: &str, body: Value) -> Answer {
     call(router, cookie, "POST", "/api/usage/rates", None, Some(body)).await
+}
+
+/// A rate posted as the raw text of a body, for a body `serde_json`'s `json!`
+/// cannot write, such as a number written with an exponent.
+async fn post_rate_text(router: &axum::Router, cookie: &str, body: &str) -> Answer {
+    call_text(router, cookie, "POST", "/api/usage/rates", None, Some(body)).await
 }
 
 /// A person holding exactly `permissions`, who belongs to `tenants`.
@@ -562,6 +584,84 @@ async fn a_bad_rate_is_a_400_with_a_fixed_sentence_and_adds_nothing() {
     }
     let listed = get(&router, &admin, "/api/usage/rates").await.json();
     assert_eq!(listed["rates"].as_array().unwrap().len(), 1, "{listed}");
+}
+
+#[tokio::test]
+async fn an_amount_is_read_as_the_digits_the_caller_wrote() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = person(&pool, "usage:read,settings:write", &[TENANT_A]).await;
+
+    // A JSON number with digits after the point is held as a double, and a
+    // double cannot be read back as the digits the caller wrote.
+    let number = post_rate(
+        &router,
+        &admin,
+        json!({"kind": "scan_tb", "currency": "USD", "amount": 5.5, "effectiveFrom": "2026-03-01"}),
+    )
+    .await;
+    assert_eq!(number.status, StatusCode::BAD_REQUEST, "{}", number.text());
+    assert_eq!(number.json()["error"], json!(AMOUNT_NOT_WHOLE));
+
+    // The same for a number with more digits than a double holds, and for one
+    // written with an exponent: both go out as text, because `json!` cannot
+    // write them.
+    for (name, body) in [
+        (
+            "digits a double loses",
+            r#"{"kind":"scan_tb","currency":"USD","amount":999999999999.999999,"effectiveFrom":"2026-03-01"}"#,
+        ),
+        (
+            "an exponent",
+            r#"{"kind":"scan_tb","currency":"USD","amount":1e3,"effectiveFrom":"2026-03-01"}"#,
+        ),
+    ] {
+        let answer = post_rate_text(&router, &admin, body).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::BAD_REQUEST,
+            "{name}: {}",
+            answer.text()
+        );
+        assert_eq!(answer.json()["error"], json!(AMOUNT_NOT_WHOLE), "{name}");
+    }
+    // Nothing was added by a refused amount.
+    let listed = get(&router, &admin, "/api/usage/rates").await.json();
+    assert_eq!(listed["rates"].as_array().unwrap().len(), 0, "{listed}");
+
+    // A whole number is exact: the JSON parser holds an integer literal as an
+    // integer, not as a double.
+    let whole = post_rate(
+        &router,
+        &admin,
+        json!({"kind": "scan_tb", "currency": "USD", "amount": 999_999_999_999_i64, "effectiveFrom": "2026-03-01"}),
+    )
+    .await;
+    assert_eq!(whole.status, StatusCode::CREATED, "{}", whole.text());
+    assert_eq!(whole.json()["amount"], json!("999999999999.000000"));
+
+    // Text keeps every digit, more than a double holds.
+    let text = post_rate(
+        &router,
+        &admin,
+        json!({"kind": "scan_tb", "currency": "USD", "amount": "999999999999.999999", "effectiveFrom": "2026-03-02"}),
+    )
+    .await;
+    assert_eq!(text.status, StatusCode::CREATED, "{}", text.text());
+    assert_eq!(text.json()["amount"], json!("999999999999.999999"));
+
+    // The stored rows hold the same digits.
+    let stored: Vec<String> =
+        sqlx::query_scalar("SELECT amount::text FROM usage_rate ORDER BY effective_from")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            "999999999999.000000".to_owned(),
+            "999999999999.999999".to_owned()
+        ],
+    );
 }
 
 // ── (f) the file ─────────────────────────────────────────────────────────
