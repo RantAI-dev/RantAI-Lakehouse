@@ -404,3 +404,112 @@ the existing auth/governance QA owner for coordination. This corrects the
 handoff's earlier statement that proposed items were already filed; it does
 not claim any follow-up implementation or acceptance. R5's verification/audit
 and AI-review requirements remain open.
+
+## Handoff — GOV-17 review R1–R5 repair (HY4 developer, retry 2026-11-17)
+
+Developer is HY4 flash Free (no model substitution), same Codex-plan / HY4-build
+/ Codex-review split as WEB-13; the planner/reviewer and AI team remain separate
+agents. No subagents, no extra worktree, no PR opened/merged/watched, nothing
+pushed to `main`. Base: the reviewed, pushed commit
+`5961ae5a29ccbdcd6500b6916662afab1df606de` on
+`origin/fix/gov-17-dashboard-table-visibility` (NOT the old parent checkout).
+New branch `fix/gov-17-review-retry`; other checked-out branches preserved.
+Merged `origin/main` at `42f71a8932c35e5e4439c8d65fad03fce58073ca` with a clean
+`git merge` (no conflicts); both sides' BACKLOG/CHANGELOG entries and the GOV-17
+review text are present on the merged tree.
+
+### Commits (one review finding per commit)
+
+- **R1** `99a6a8838` — `dashboard_visibility::hide_board` path: whenever Main is
+  hidden for any reason, add both legacy board spellings (`''`, `'default'`) to
+  the dependency deny-list so `chart_owner_clause`/`sees_board` filter stored
+  Main tiles in `list_stored_charts` consumers (specs, AI, search, export).
+- **R2** `b6b5123ea` — `Viewer.hidden_sources` + resolver computation from each
+  SQL source's parsed tables (fail closed on unparseable SQL), applied in the
+  one shared `dashboard_sources::source_visible` guard used by list/detail/
+  fields/read-preview and AI `list_sql_sources`; embed carries the same list.
+- **R3** `c54379b3a` — `Scope::require_on_board` checks the narrowed viewer's
+  `sees_board` (removal only); `Seen::read` gates its `sees_all` shortcut on the
+  new `Viewer::is_unnarrowed`, so a narrowed identity:write caller uses filtered
+  reads. Genuine *:* / role-union-All callers keep both behaviours.
+- **R4** `2a6ee8ef6` — one `reports::board_still_visible` check on the CALLER's
+  narrowed viewer, wired into `validate_input`, `list`, `own_or_admin` (all
+  by-id HTTP routes) and the assistant list/own tools before any report
+  metadata/history is serialised; hidden reads get the fixed unknown answer.
+- **merge** `234d26b07` — `origin/main` (42f71a893) merged, no conflicts.
+- **R5** `ba1b81eea` — route audit matrix corrected (concrete guard + regression
+  per row, no inheritance assertions); this handoff is the final docs commit.
+
+Each fix site and commit body cites `GOV-17 review Rn (BLOCKER)`.
+
+### Commands actually run (foreground; shared CARGO_TARGET_DIR, CARGO_INCREMENTAL=0)
+
+Scoped per finding (fmt → clippy → tests):
+```
+cargo fmt --check                                              # ok each time
+cargo clippy -p lakehouse-bi --all-targets -- -D warnings       # ok
+cargo clippy -p lakehouse-api --all-targets -- -D warnings \
+  -A clippy::large_futures -A clippy::items_after_statements   # ok (baseline lints only)
+cargo test -p lakehouse-bi --lib access::tests::                # 49 passed, 0 failed
+cargo test -p lakehouse-api --lib dashboard_visibility::        # 10 passed, 0 failed
+cargo test -p lakehouse-api --lib visibility_tests::            # 2 passed, 0 failed
+cargo test -p lakehouse-api --lib seen_tests::                  # 2 passed, 0 failed
+sg docker -c 'cargo test -p lakehouse-api --test it table_access::'         # 30 passed, 0 failed
+sg docker -c 'cargo test -p lakehouse-api --test it ai_dashboard_reach::'   # 7 passed, 0 failed
+sg docker -c 'cargo test -p lakehouse-api --test it report_routes::'        # 16 passed, 0 failed
+sg docker -c 'cargo test -p lakehouse-api --test it ai_report_tools::'      # 13 passed, 0 failed
+```
+(Integration tests are modules of the one `tests/it.rs` binary; filters, not
+`--test <file>`. New tests were added to existing modules, so no `it.rs` change.)
+
+Full final gate, on the merged tree, foreground:
+```
+cd rust && cargo fmt --check                                   # exit 0
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+                                                               # exit 101: ONLY the two
+  # baseline clippy::large_futures at routes/ai/mod.rs:322,1607 (see baseline evidence)
+cargo clippy --workspace --all-targets --all-features -- -D warnings \
+  -A clippy::large_futures -A clippy::items_after_statements   # exit 0 (all other lints clean)
+sg docker -c 'cargo test --workspace'                          # 5512 passed, 1 failed,
+  # 26 ignored (per-crate: 132+3706+0+12+1662 passed)
+```
+The single failure is the documented order-dependent flake
+`ai_sql_help::a_chat_with_no_allowlist_is_offered_today_s_tools_and_today_s_prompt`
+(system-prompt hash mismatch). Re-run in isolation on this exact tree:
+`cargo test -p lakehouse-api --test it ai_sql_help::a_chat_with_no_allowlist...`
+= **1 passed, 0 failed**. It is a prompt-hash assertion, not a GOV-17 path.
+
+### Baseline evidence (reproducible, not assumed)
+
+- `rust/crates/lakehouse-api/src/routes/ai/mod.rs` producing both `large_futures`
+  errors is byte-identical to BOTH `origin/main` and the reviewed base
+  (`git diff --stat` empty against each). The two errors are in unmodified
+  `run_chat(...).await` calls at lines 322 and 1607.
+- `clippy::items_after_statements` in `tests/table_access.rs` is likewise
+  baseline (present at the reviewed base in the pre-existing board-list test).
+  My new test helpers were moved to module scope to add no new instance.
+- No lint, test, threshold or allowlist in the repository config was weakened;
+  the two `-A` flags above were used ONLY in local validation runs to see past
+  proven-baseline lints, never committed. The exact gate command's result is
+  recorded above.
+- ENOSPC occurred once mid-repair when the shared `CARGO_TARGET_DIR` filled.
+  Mitigation: removed ONLY the regenerable `debug/incremental/` compilation
+  cache (19G, all timestamps from this session's GOV-17 builds; `deps/`, the
+  registry, user and other-agent artifacts untouched), then set
+  `CARGO_INCREMENTAL=0` for all later cargo commands. No `cargo clean`, no
+  per-worktree `target/`. The full gate then completed with no ENOSPC.
+
+### Remaining review / owed items (no open BLOCKER from R1–R4)
+
+- **AI-team review** of the assistant-visibility changes (decision 9) is OWED and
+  was not fabricated. No tool schema changed, so
+  `tests/fixtures/tool_schemas.json` is unchanged.
+- **Manual QA**: run `GOV-17-AC1`…`GOV-17-AC9` on the feature page (owner Rizky,
+  ticket `GOV-17`). No Lark edits by the developer.
+- **Independent artefacts** GOV-18/19/20 remain Todo with repo rows (filed by
+  root in the base, preserved through the merge); not implemented here.
+- Baseline red lint and flaky prompt-hash test above must be named in review;
+  neither was introduced by this branch.
+- No TypeScript/Python/compose source was changed by this review repair, so no
+  TS/Python/compose checks were run (the merge's TS files are main's own,
+  already green on main).
