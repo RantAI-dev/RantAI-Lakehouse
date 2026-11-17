@@ -188,7 +188,10 @@ export function DialFormFor({
   typeName,
   dial,
   onChange,
+  showLegend = true,
 }: {
+  /** UX-1-R7: false when the parent step already shows RequiredLegend. */
+  showLegend?: boolean
   adapter: string | null
   /** `selectedType.name` — needed alongside `adapter` because Oracle
    * dials with the same `sql` adapter/`SqlDial` shape every other SQL
@@ -206,6 +209,7 @@ export function DialFormFor({
       <OracleDialForm
         value={dial as unknown as SqlDial | null}
         onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+        showLegend={showLegend}
       />
     )
   }
@@ -216,6 +220,7 @@ export function DialFormFor({
           value={dial as unknown as SqlDial | null}
           driver={driverForType(typeName)}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "cdc":
@@ -224,6 +229,7 @@ export function DialFormFor({
           value={dial as unknown as CdcDial | null}
           driver={driverForType(typeName)}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "files":
@@ -231,6 +237,7 @@ export function DialFormFor({
         <FilesDialForm
           value={dial as unknown as FilesDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "rest":
@@ -238,6 +245,7 @@ export function DialFormFor({
         <RestDialForm
           value={dial as unknown as RestDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "sheets":
@@ -245,6 +253,7 @@ export function DialFormFor({
         <SheetsDialForm
           value={dial as unknown as SheetsDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "mongodb":
@@ -252,6 +261,7 @@ export function DialFormFor({
         <MongoDialForm
           value={dial as unknown as MongoDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "kafka":
@@ -259,6 +269,7 @@ export function DialFormFor({
         <KafkaDialForm
           value={dial as unknown as KafkaDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "sftp":
@@ -266,6 +277,7 @@ export function DialFormFor({
         <SftpDialForm
           value={dial as unknown as SftpDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     default:
@@ -328,7 +340,10 @@ export function CredentialFields({
   secondaryValue,
   onSecondaryValueChange,
   problems,
+  showLegend = true,
 }: {
+  /** UX-1-R7: false when the parent step already shows RequiredLegend. */
+  showLegend?: boolean
   noCredential: boolean
   /** Edit page: blank keeps the current credential. */
   optional: boolean
@@ -350,8 +365,9 @@ export function CredentialFields({
   // change forces a replacement (see the `optional` caller).
   const required = !optional
   return (
-    <div className={cn("grid gap-3", pair && "sm:grid-cols-2")}>
-      {required ? <RequiredLegend className={pair ? "sm:col-span-2" : undefined} /> : null}
+    <div className={cn("grid gap-3", pair && "sm:col-span-2")}>
+      {/* UX-1-R7: one legend per step — the create/edit step shows its own. */}
+      {required && showLegend ? <RequiredLegend className={pair ? "sm:col-span-2" : undefined} /> : null}
       <Field
         label={slots.primary.label}
         htmlFor="credential-primary"

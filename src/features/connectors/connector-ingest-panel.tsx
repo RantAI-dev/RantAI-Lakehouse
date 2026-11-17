@@ -949,6 +949,8 @@ function KeyFields({
   onChange: (key: string[]) => void
 }) {
   const [typed, setTyped] = React.useState(value.join(", "))
+  const helpId = React.useId()
+  const inputId = React.useId()
   const origin =
     detected && detected.length > 0
       ? sameColumns(value, detected)
@@ -957,32 +959,41 @@ function KeyFields({
       : null
   return (
     <div className="space-y-1">
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
-          Key <RequiredMarker />
-        </span>
-        {columns && columns.length > 0 ? (
-          <fieldset aria-label={`Key columns for ${name}`} aria-required className="flex min-w-0 flex-wrap gap-x-3 gap-y-0.5">
-            {(value.every((c) => columns.includes(c)) ? columns : [...value.filter((c) => !columns.includes(c)), ...columns]).map(
-              (column) => (
-                <label key={column} className="flex items-center gap-1 font-mono text-xs">
-                  <input
-                    type="checkbox"
-                    aria-label={`${column} is part of the key of ${name}`}
-                    checked={value.includes(column)}
-                    onChange={(e) =>
-                      onChange(e.target.checked ? [...value, column] : value.filter((c) => c !== column))
-                    }
-                  />
-                  {column}
-                </label>
-              )
-            )}
-          </fieldset>
-        ) : (
+      {columns && columns.length > 0 ? (
+        <fieldset
+          aria-describedby={helpId}
+          className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-0.5"
+        >
+          {/* UX-1-R6: `aria-required` is not supported on a native fieldset's
+              implicit group role. Put the star on a visible legend and link
+              the requirement text; no individual checkbox is marked required. */}
+          <legend className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+            Key <RequiredMarker />
+          </legend>
+          {(value.every((c) => columns.includes(c)) ? columns : [...value.filter((c) => !columns.includes(c)), ...columns]).map(
+            (column) => (
+              <label key={column} className="flex items-center gap-1 font-mono text-xs">
+                <input
+                  type="checkbox"
+                  aria-label={`${column} is part of the key of ${name}`}
+                  checked={value.includes(column)}
+                  onChange={(e) =>
+                    onChange(e.target.checked ? [...value, column] : value.filter((c) => c !== column))
+                  }
+                />
+                {column}
+              </label>
+            )
+          )}
+        </fieldset>
+      ) : (
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <Label htmlFor={inputId} required className="shrink-0 text-xs text-muted-foreground">Key</Label>
           <Input
+            id={inputId}
             aria-label={`Key columns for ${name}`}
             aria-required
+            aria-describedby={helpId}
             value={typed}
             onChange={(e) => {
               setTyped(e.target.value)
@@ -998,8 +1009,11 @@ function KeyFields({
             aria-invalid={invalid}
             autoComplete="off"
           />
-        )}
-      </div>
+        </div>
+      )}
+      <p id={helpId} className="text-xs text-muted-foreground">
+        Select at least one key column (or type the names, separated by commas).
+      </p>
       {origin ? <p className="text-xs text-muted-foreground">{origin}</p> : null}
     </div>
   )

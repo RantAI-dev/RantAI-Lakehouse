@@ -360,7 +360,9 @@ export function ConnectorCreatePage() {
                 title="Connection details"
                 description="Where the source lives. It must be reachable from the lakehouse server, not only from your browser."
               />
-              <DialFormFor adapter={adapter} typeName={selectedType?.name ?? null} dial={dial} onChange={setDial} />
+              {/* UX-1-R7: the step's RequiredLegend above explains the
+                  marker once; the dial and credential children opt out. */}
+              <DialFormFor adapter={adapter} typeName={selectedType?.name ?? null} dial={dial} onChange={setDial} showLegend={false} />
             </section>
             <section className="space-y-3 border-t border-border pt-5">
               <StepSectionHeading
@@ -377,6 +379,7 @@ export function ConnectorCreatePage() {
                 secondaryValue={secondaryValue}
                 onSecondaryValueChange={setSecondaryValue}
                 problems={problems}
+                showLegend={false}
               />
             </section>
           </div>

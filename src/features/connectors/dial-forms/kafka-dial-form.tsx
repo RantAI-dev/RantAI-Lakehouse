@@ -32,9 +32,12 @@ function defaultAuth(type: KafkaAuth["type"]): KafkaAuth {
 export function KafkaDialForm({
   value,
   onChange,
+  showLegend = true,
 }: {
   value: KafkaDial | null
   onChange: (next: KafkaDial) => void
+  /** UX-1-R7: a parent step can opt out of its own legend. */
+  showLegend?: boolean
 }) {
   const dial: KafkaDial = value ?? {
     bootstrapServers: [""],
@@ -64,15 +67,25 @@ export function KafkaDialForm({
 
   return (
     <div className="grid gap-3">
-      <RequiredLegend />
+      {/* UX-1-R7: opt out when a parent step already explains the marker. */}
+      {showLegend ? <RequiredLegend /> : null}
       <div className="space-y-2">
         <p className="flex items-center gap-1.5 text-sm font-medium">Bootstrap servers (host:port) <RequiredMarker /></p>
+        {/* UX-1-R5: `Dial::parse` runs `check_hostname` over EVERY broker, so
+            every rendered row is required — not just the first. Each row
+            gets a visible associated label; Remove drops an unused row. */}
+        <p className="text-xs text-muted-foreground">
+          Every listed broker is dialed and must be filled in; use Remove for a row you do not need.
+        </p>
         {dial.bootstrapServers.map((broker, index) => (
           <div key={index} className="flex items-center gap-2">
+            <Label htmlFor={`kafka-dial-broker-${index}`} required className="shrink-0 text-xs">
+              Bootstrap server {index + 1}
+            </Label>
             <Input
               id={`kafka-dial-broker-${index}`}
-              aria-label={`Bootstrap server ${index + 1}`}
-              aria-required={index === 0}
+              aria-required
+              className="min-w-0 flex-1"
               value={broker}
               onChange={(e) => setBroker(index, e.target.value)}
               placeholder="kafka-0.internal:9092"
@@ -146,7 +159,7 @@ export function KafkaDialForm({
             <Label htmlFor="kafka-dial-auth-username" required>SASL username</Label>
             <Input
               id="kafka-dial-auth-username"
-            aria-required
+              aria-required
               value={dial.auth.username}
               onChange={(e) => set("auth", { type: "sasl_plain", username: e.target.value })}
               autoComplete="off"

@@ -42,9 +42,12 @@ function defaultPagination(type: RestPagination["type"]): RestPagination {
 export function RestDialForm({
   value,
   onChange,
+  showLegend = true,
 }: {
   value: RestDial | null
   onChange: (next: RestDial) => void
+  /** UX-1-R7: a parent step can opt out of its own legend. */
+  showLegend?: boolean
 }) {
   const dial: RestDial = value ?? {
     baseUrl: "",
@@ -73,7 +76,8 @@ export function RestDialForm({
 
   return (
     <div className="grid gap-3">
-      <RequiredLegend />
+      {/* UX-1-R7: opt out when a parent step already explains the marker. */}
+      {showLegend ? <RequiredLegend /> : null}
       <div className="space-y-1.5">
         <Label htmlFor="rest-dial-base-url" required>Base URL</Label>
         <Input
@@ -169,6 +173,13 @@ export function RestDialForm({
 
       <div className="space-y-2">
         <p className="text-sm font-medium">Endpoints</p>
+        {/* UX-1-R5: every endpoint path is polled at runtime (`RestDial.
+            endpoints` is a Vec with all entries used), so every rendered
+            row's Path is required — not just the first. Records path stays
+            optional; Remove drops an unused endpoint. */}
+        <p className="text-xs text-muted-foreground">
+          Every listed endpoint is polled, so each Path is required; use Remove endpoint for one you do not need.
+        </p>
         {dial.endpoints.map((endpoint, index) => (
           <div key={index} className="grid gap-2 sm:grid-cols-2">
             <div className="space-y-1.5">

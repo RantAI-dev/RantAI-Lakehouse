@@ -31,10 +31,13 @@ export function SqlDialForm({
   value,
   onChange,
   driver,
+  showLegend = true,
 }: {
   value: SqlDial | null
   onChange: (next: SqlDial) => void
   driver?: SqlDriver
+  /** UX-1-R7: a parent step can opt out of its own legend. */
+  showLegend?: boolean
 }) {
   const initialDriver = driver ?? "postgres"
   const dial: SqlDial = value ?? {
@@ -51,7 +54,8 @@ export function SqlDialForm({
   }
   return (
     <div className="grid gap-3 sm:grid-cols-2">
-      <RequiredLegend className="sm:col-span-2" />
+      {/* UX-1-R7: opt out when a parent step already explains the marker. */}
+      {showLegend ? <RequiredLegend className="sm:col-span-2" /> : null}
       {askDriver ? (
         <div className="space-y-1.5 sm:col-span-2">
           <Label htmlFor="sql-dial-driver">Driver</Label>

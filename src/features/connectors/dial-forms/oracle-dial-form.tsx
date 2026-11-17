@@ -23,9 +23,12 @@ import type { SqlDial } from "@/services/contracts/connectors"
 export function OracleDialForm({
   value,
   onChange,
+  showLegend = true,
 }: {
   value: SqlDial | null
   onChange: (next: SqlDial) => void
+  /** UX-1-R7: a parent step can opt out of its own legend. */
+  showLegend?: boolean
 }) {
   const dial: SqlDial = value ?? {
     driver: "oracle",
@@ -45,7 +48,8 @@ export function OracleDialForm({
   }
   return (
     <div className="grid gap-3">
-      <RequiredLegend />
+      {/* UX-1-R7: opt out when a parent step already explains the marker. */}
+      {showLegend ? <RequiredLegend /> : null}
       <p className="text-xs text-muted-foreground">
         Batch only — this build cannot run Oracle change-data-capture (LogMiner is refused
         regardless of configuration); a scheduled or manual batch pull is the only supported mode.
