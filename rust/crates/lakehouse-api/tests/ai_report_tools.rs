@@ -646,3 +646,162 @@ async fn listing_reports_warns_while_email_is_not_set_up() {
         "the subscriptions are still listed: {listed}"
     );
 }
+
+// ── GOV-17 review R4: the assistant's report tools recheck board visibility ─
+
+/// A stand-in holding one board whose tile reads `serving.mart_r4`. It honours
+/// the dependency deny-list like a real engine, so narrowing the owner away
+/// from that mart makes the board read as missing.
+struct R4Store;
+
+impl Respond for R4Store {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        let rows = |data: Vec<Value>| {
+            let n = data.len();
+            ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
+        };
+        if sql.contains("FROM console.bi_chart") {
+            let spec = json!({
+                "id": "c_r4", "title": "C", "kind": "kpi", "mart": "mart_r4",
+                "sql": "SELECT n FROM serving.mart_r4", "x": "", "y": "n"
+            });
+            let def = json!({
+                "title": "C", "mart": "mart_r4", "kind": "kpi", "measures": ["n"], "aggregate": "count"
+            });
+            return rows(vec![json!({
+                "id": "c_r4", "board": BOARD, "created_by": "ui",
+                "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+            })]);
+        }
+        if sql.contains("FROM console.bi_board") {
+            if sql.contains(&format!("NOT IN ('{BOARD}')")) {
+                return rows(vec![]);
+            }
+            if sql.contains(&format!("id='{BOARD}'")) {
+                return rows(vec![json!({
+                    "id": BOARD, "name": "Sales", "description": "", "created_by": "t",
+                    "layout_json": "", "filters_json": "", "public_token": "", "embed_enabled": "0",
+                    "folder_id": "", "created_at": "2026-10-10 00:00:00", "owner_id": "",
+                    "embed_revoked_before": "0", "embed_revoked_jti_json": "[]",
+                    "embed_origins_json": "[]"
+                })]);
+            }
+            return rows(vec![]);
+        }
+        ResponseTemplate::new(200).set_body_string("Ok.\n")
+    }
+}
+
+/// Narrow every role of `user` to exactly `grants` (GOV-17 R4 before/after
+/// control; no *:* role is minted, GOV-7 D4).
+async fn narrow(pool: &PgPool, user: Uuid, grants: &[(&str, &str)]) {
+    let roles: Vec<Uuid> =
+        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_ne!(
+        roles,
+        [] as [Uuid; 0],
+        "the user must hold a role to narrow"
+    );
+    for role in roles {
+        sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        for (schema, table) in grants {
+            sqlx::query(
+                "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, $2, $3)",
+            )
+            .bind(role)
+            .bind(schema)
+            .bind(table)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
+/// GOV-17 review R4: a report on a board whose tile table the owner can no
+/// longer read must disappear from `list_report_subscriptions`, and a by-id
+/// update must read as the unknown subscription. The shared check is the
+/// caller's narrowed viewer, not the owner's standing subscription right.
+#[tokio::test]
+async fn report_tools_hide_a_report_when_the_owner_loses_table_access() {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(R4Store)
+        .mount(&ch)
+        .await;
+    let env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    let app = spin_up_with_env(&env).await;
+    let me = create_assistant_principal(
+        &app.pool,
+        "dashboard:read, dashboard:write, assistant:use, assistant:ask",
+    )
+    .await;
+    let cookie = session_cookie_for_user(&app.pool, me).await;
+    let new = subs::NewSubscription {
+        board: BOARD.to_owned(),
+        owner_id: me,
+        schedule: lakehouse_store::report_schedule::Schedule::Weekly {
+            weekday: 1,
+            hour: 8,
+            minute: 0,
+        },
+        time_zone: "UTC".to_owned(),
+        attachments: json!({ "pdf": { "paper": "a4", "orientation": "portrait" }, "charts": [] }),
+        filters: None,
+        params: None,
+        grain: None,
+        skip_when_empty: false,
+        next_run_at: time::OffsetDateTime::now_utc() + time::Duration::days(1),
+        recipients: vec![subs::Recipient::User(me)],
+    };
+    let id = subs::create(&app.pool, &new).await.unwrap().id.to_string();
+    let f = F {
+        app,
+        me,
+        cookie,
+        approver: me,
+        approver_cookie: String::new(),
+        _ch: ch,
+    };
+
+    let before = tool(&f, "list_report_subscriptions", json!({})).await;
+    assert_eq!(
+        before["result"]["items"].as_array().unwrap().len(),
+        1,
+        "listed before the grant change: {before}"
+    );
+
+    narrow(&f.app.pool, me, &[("serving", "other_mart")]).await;
+
+    let after = tool(&f, "list_report_subscriptions", json!({})).await;
+    assert!(
+        after["result"]["items"].as_array().unwrap().is_empty(),
+        "a hidden board's report is omitted: {after}"
+    );
+    let updated = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": id, "paused": true, "confirmed": true }),
+    )
+    .await;
+    assert_eq!(
+        updated["result"]["error"],
+        json!("That subscription does not exist."),
+        "a hidden report is the unknown report: {updated}"
+    );
+}

@@ -320,6 +320,16 @@ async fn list(state: &AppState, owner: &Principal, args: &Map<String, Value>) ->
     };
     let mut items = Vec::new();
     for sub in rows.iter().filter(|s| board.is_empty() || s.board == board) {
+        // GOV-17 review R4: the report list is not a back door to a dashboard
+        // whose tables the caller can no longer read. The owner's own narrowed
+        // viewer decides; a store/entitlement failure omits the row (fail
+        // closed), it never widens access.
+        if !matches!(
+            reports::board_still_visible(state, owner, &sub.board).await,
+            Ok(true)
+        ) {
+            continue;
+        }
         items.push(brief(state, sub).await);
     }
     // RPT-2 (DEC-18, QA LH-RPT-1-06): the same `warning` `create` gives, so a
@@ -345,10 +355,16 @@ async fn own(
         .await
         .map_err(|_| json!({ "error": FAILED }))?
         .ok_or_else(|| json!({ "error": NO_SUCH }))?;
-    if sub.owner_id == owner.id.uuid() || owner.has("settings:write") {
-        Ok(sub)
-    } else {
-        Err(json!({ "error": NOT_YOURS }))
+    if sub.owner_id != owner.id.uuid() && !owner.has("settings:write") {
+        return Err(json!({ "error": NOT_YOURS }));
+    }
+    // GOV-17 review R4: ownership of the subscription is not a standing right
+    // to its dashboard's configuration. The caller's current table grants must
+    // still permit the board; a denied board is the unknown-subscription answer.
+    match reports::board_still_visible(state, owner, &sub.board).await {
+        Ok(true) => Ok(sub),
+        Ok(false) => Err(json!({ "error": NO_SUCH })),
+        Err(_) => Err(json!({ "error": FAILED })),
     }
 }
 

@@ -70,6 +70,12 @@ impl Respond for FakeCh {
             ]);
         }
         if sql.contains("FROM console.bi_board") {
+            // GOV-17 review R4: a narrowed viewer carries the dependency
+            // deny-list; honour it like a real engine so a hidden board reads as
+            // missing. No narrowing in the other tests means no deny-list.
+            if sql.contains(&format!("NOT IN ('{BOARD}')")) {
+                return rows(vec![]);
+            }
             if sql.contains("AND id=") && !sql.contains(&format!("AND id='{BOARD}'")) {
                 return rows(vec![]);
             }
@@ -212,6 +218,103 @@ async fn user_id(pool: &PgPool, name: &str, status: &str) -> Uuid {
 }
 
 const SUBS: &str = "/api/reports/subscriptions";
+
+/// Narrow every role of `user` to exactly `grants` (GOV-17 R4 before/after
+/// grant-change control). `*:*` roles are never minted here (GOV-7 D4).
+async fn narrow(pool: &PgPool, user: Uuid, grants: &[(&str, &str)]) {
+    let roles: Vec<Uuid> =
+        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert!(!roles.is_empty(), "the user must hold a role to narrow");
+    for role in roles {
+        sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        for (schema, table) in grants {
+            sqlx::query(
+                "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, $2, $3)",
+            )
+            .bind(role)
+            .bind(schema)
+            .bind(table)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
+/// GOV-17 review R4: by-id report metadata and history are gated on the
+/// caller's CURRENT table grants, not just subscription ownership. The board's
+/// tile reads `serving.mart_x` (the fixture's `FakeCh`), so narrowing the owner
+/// away from it after creation makes the known id read as an unknown report.
+#[tokio::test]
+async fn a_report_owner_whose_role_was_narrowed_after_creation_cannot_read_its_metadata() {
+    let f = fixture(&[]).await;
+    let colleague = user_id(&f.app.pool, "Colleague", "active").await;
+    let (status, made) = call(
+        &f,
+        "POST",
+        SUBS,
+        &f.owner_cookie,
+        Some(body(json!([{ "userId": colleague.to_string() }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    let id = made["id"].as_str().unwrap().to_owned();
+
+    let (status, before) = call(&f, "GET", &format!("{SUBS}/{id}"), &f.owner_cookie, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "readable before the grant change: {before}"
+    );
+
+    narrow(&f.app.pool, f.owner, &[("serving", "other_mart")]).await;
+
+    let (status, after) = call(&f, "GET", &format!("{SUBS}/{id}"), &f.owner_cookie, None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "hidden after the grant change: {after}"
+    );
+    let text = after.to_string();
+    assert!(!text.contains(BOARD), "no board id: {text}");
+    assert!(!text.contains("mart_x"), "no dependent table name: {text}");
+
+    let (unknown_status, unknown) = call(
+        &f,
+        "GET",
+        &format!("{SUBS}/{}", Uuid::new_v4()),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+    assert_eq!(after, unknown, "a hidden report is the unknown report");
+
+    // An administrator whose OWN grants are unrestricted keeps legitimate
+    // management of the report; the narrowed owner's grants are not borrowed.
+    let admin =
+        create_principal_with_permissions(&f.app.pool, "dashboard:read, settings:write").await;
+    let admin_cookie = session_cookie_for_user(&f.app.pool, admin).await;
+    let (status, body) = call(&f, "GET", &format!("{SUBS}/{id}"), &admin_cookie, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a fully-granted admin keeps access: {body}"
+    );
+}
 
 #[tokio::test]
 async fn a_viewer_who_may_download_subscribes_and_sees_it_listed_with_the_email_and_pdf_flags() {
