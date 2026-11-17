@@ -364,8 +364,10 @@ export function CredentialFields({
   // stored value, so the two slots are optional unless a sign-in/target
   // change forces a replacement (see the `optional` caller).
   const required = !optional
+  // UX-1-R7 review: opting out of a nested legend must preserve the paired
+  // credential grid; a column span on this container does not create columns.
   return (
-    <div className={cn("grid gap-3", pair && "sm:col-span-2")}>
+    <div className={cn("grid gap-3", pair && "sm:grid-cols-2")}>
       {/* UX-1-R7: one legend per step — the create/edit step shows its own. */}
       {required && showLegend ? <RequiredLegend className={pair ? "sm:col-span-2" : undefined} /> : null}
       <Field
