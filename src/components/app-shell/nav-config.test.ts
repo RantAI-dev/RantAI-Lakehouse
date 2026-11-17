@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test"
 import * as fs from "node:fs"
 import * as path from "node:path"
-import { canOpen, NAV_GROUPS, ROUTE_ACCESS, routeMatches } from "./nav-config"
+import { canOpen, NAV_GROUPS, pageTitleFor, ROUTE_ACCESS, routeMatches } from "./nav-config"
 
 /**
  * Normalizes a file path from `src/app` into its App Router route pattern:
@@ -230,6 +230,21 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
       expect(canOpen("/alerts", hasAlertWrite)).toBe(true)
       expect(canOpen("/alerts", hasAlertRead)).toBe(true)
       expect(canOpen("/alerts", hasNeither)).toBe(false)
+    })
+  })
+
+  describe("the page title of a path no menu item names", () => {
+    // ADM-2 decision 13: the navbar passes the workspace's own name as the
+    // fallback, so a page the menu does not name is not called after the
+    // product. The function stays pure: the fallback comes in as an
+    // argument, never from a hook inside it.
+    it("falls back to the caller's fallback, and a named page still reads its menu title", () => {
+      // Without a fallback the product's own name stands in.
+      expect(pageTitleFor("/no/such/page")).toBe("Rantai Lake")
+      expect(pageTitleFor("/no/such/page", "Acme Data")).toBe("Acme Data")
+      // A page a menu item does name still reads that item's title.
+      expect(pageTitleFor("/catalog", "Acme Data")).toBe("Catalog")
+      expect(pageTitleFor("/dashboards/browse", "Acme Data")).toBe("All Dashboards")
     })
   })
 
