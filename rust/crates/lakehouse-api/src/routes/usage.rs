@@ -201,6 +201,10 @@ fn read_request(
     headers: &HeaderMap,
     raw: &UsageParams,
 ) -> Result<Request, ApiError> {
+    // PR #564 review round 3 (SHOULD-FIX): the tenant is resolved first, so a
+    // forged `X-Tenant` is the same 404 as on every other tenant-scoped route,
+    // for the period, the group and the `tenant` parameter.
+    let own = tenant_scope::resolve(principal, headers)?;
     let today = OffsetDateTime::now_utc().date();
     let to = match non_empty(raw.to.as_ref()) {
         Some(text) => parse_day(text).ok_or_else(|| ApiError::BadRequest(BAD_DATE.to_owned()))?,
@@ -228,9 +232,6 @@ fn read_request(
         Some("all") => true,
         Some(_) => return Err(ApiError::BadRequest(BAD_TENANT.to_owned())),
     };
-    // The tenant is resolved first, so a forged `X-Tenant` is the same 404 as
-    // on every other tenant-scoped route, whatever else the request says.
-    let own = tenant_scope::resolve(principal, headers)?;
     let scope = if all {
         if !catalog::is_unrestricted(principal) {
             return Err(ApiError::PermissionDenied(NOT_ALL.to_owned()));

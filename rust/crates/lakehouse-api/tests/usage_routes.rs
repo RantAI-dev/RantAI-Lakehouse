@@ -329,6 +329,55 @@ async fn a_caller_of_tenant_b_sums_none_of_tenant_as_rows() {
     assert!(!file.text().contains("Alice of A"), "{}", file.text());
 }
 
+/// The tenant wall comes first: a forged `X-Tenant` is the same 404 whatever
+/// else the request says, so a bad date cannot turn it into a 400.
+#[tokio::test]
+async fn a_forged_tenant_is_the_same_404_even_when_the_period_is_bad() {
+    let TestApp { router, pool } = spin_up().await;
+    let bob = person(&pool, "usage:read", &[TENANT_B]).await;
+
+    for uri in ["/api/usage/queries", "/api/usage/queries/export"] {
+        let forged = call(
+            &router,
+            &bob,
+            "GET",
+            &format!("{uri}?{PERIOD}"),
+            Some(("x-tenant", TENANT_A)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            forged.status,
+            StatusCode::NOT_FOUND,
+            "{uri}: {}",
+            forged.text()
+        );
+
+        // The bad date does not turn the refusal into a 400: the tenant is
+        // resolved before the period is read.
+        let forged_and_bad = call(
+            &router,
+            &bob,
+            "GET",
+            &format!("{uri}?from=yesterday"),
+            Some(("x-tenant", TENANT_A)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            forged_and_bad.status,
+            StatusCode::NOT_FOUND,
+            "{uri}: {}",
+            forged_and_bad.text()
+        );
+        assert_eq!(
+            forged_and_bad.json()["error"],
+            forged.json()["error"],
+            "{uri}: the same refusal as the forged tenant alone"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_caller_that_belongs_to_no_tenant_gets_an_empty_answer_not_every_tenant() {
     let TestApp { router, pool } = spin_up().await;
