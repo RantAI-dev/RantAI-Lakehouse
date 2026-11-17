@@ -260,26 +260,29 @@ not a GOV-17 regression. No test, lint or threshold was weakened.
 
 ### Per-route audit matrix
 
-Guard applied = resolved request viewer (and, where marked, the combined
-`sees_builtin_board()` check) before metadata is serialised or a cache is
-read. All list/by-id paths that already took `viewer_for`/`scope_for_write`/
-`payload_scope`/`usage_viewer_of` inherit the overlay automatically; the
-call sites below were checked explicitly.
+Corrected after Codex review R5: a route is listed as guarded only where a
+concrete check runs before metadata is serialised or a cache is read, proven
+by the regression named in the row. "Resolves a viewer elsewhere" is not a
+guard and is no longer claimed as one. The R1–R4 rows below are the review
+repairs; each cites the test that fails if the guard is removed.
 
-| Area / call site | Disposition |
+| Area / call site | Disposition (guard + regression proof) |
 | --- | --- |
-| `dashboard.rs::payload_for` → `get_body` (authenticated render, `render`, PDF print view) | Guard applied via `payload_scope`; by-id in-memory `sees_board` check added before tile assembly; built-in/`all` checks added. |
-| `dashboard.rs::boards_list` (chooser/browse, `chartCount`, Main entry) | Guard applied; Main omitted when built-in deps denied; counts come from the narrowed chart list. |
-| `dashboard.rs` YAML/`format=file` export | Guard applied; Main omitted from the export with the combined check. |
-| `dashboard_organise.rs` shortcuts, board versions/trash, `require_chart_board` | Guard applied via `viewer_for`/`scope_for_write`; Main checks use `sees_builtin_board()`. |
-| `dashboard_comments.rs`, `dashboard_folders.rs`, `dashboard_file.rs`, `dashboard_sources.rs`, `public_links.rs` reads | Guard applied through the shared viewer/scope paths. |
-| `dashboard_sources.rs` source list/detail and delete-conflict count | Source folder visibility unchanged; a hidden dashboard's chart titles/counts are not named — the caller is told only "a dashboard you cannot see". Reviewed, no table/title/table-name leak; see followups. |
-| `pdf_export.rs`, `render.rs`, report owner + recipient rechecks (`report_runner.rs`) | Guard applied; built-in uses combined check; recipients resolve their own viewer at send time. |
-| `embed.rs::data` and public-link `render_board_payload` | New: resolve the effective Dashboard Viewer role's fresh grants; hidden board gets the fixed token refusal; chart list narrowed before assembly. No new privileged principal. |
-| AI `list_boards`, `list_charts`, `list_sql_sources`, dashboard page context, discovery references | Guard applied through `viewer_for`/`scope_for_write`; no tool schema changed, so `tests/fixtures/tool_schemas.json` is unchanged. AI-team review still owed below. |
+| `dashboard.rs::payload_for` → `get_body` (authenticated render, `render`, PDF print view) | Guard via `payload_scope`; in-memory `sees_board` before tile assembly; built-in/`all` checks. Proven by `a_dashboard_with_a_denied_dependency_is_hidden_entirely` and `a_grant_change_after_a_warmed_render_hides_the_board_on_the_next_request`. |
+| `dashboard.rs::boards_list` (chooser/browse, `chartCount`, Main entry) | Main omitted via combined check; counts from narrowed chart list. `the_board_list_omits_main_only_when_its_dependencies_are_denied`. |
+| **R1** `dashboard.rs::specs_list`, AI `list_charts`, search/items, file export — `list_stored_charts` consumers that bypass `get_body` | `hide_board` adds BOTH legacy Main spellings (`''`, `'default'`) to the dependency deny-list whenever Main is hidden for any reason, so `chart_owner_clause` filters stored Main tiles in SQL and `sees_board` in memory. Proven by `specs_apply_the_main_dependency_filter_to_the_chart_query` (negative + permitted-Main control) and `a_main_denial_hides_both_empty_and_default_board_spellings`. |
+| `dashboard.rs` YAML/`format=file` export | Guard applied; Main omitted from the export with the combined check (same overlay as R1). |
+| `dashboard_organise.rs` shortcuts, board versions/trash, `require_chart_board` | Guard via `viewer_for`/`scope_for_write`; Main checks use `sees_builtin_board()`. |
+| **R3** `Scope::require_on_board` / `require_board_level` (the common write check, e.g. the only check on `dashboard_comments`) | Added narrowed-viewer `sees_board` check — removal only, no new ACL capability. Proven by `a_table_hidden_board_is_refused_by_the_common_board_level_check` and `a_table_hidden_board_is_refused_by_the_common_level_check_even_for_identity_write` (explicit-grant control in the unit test, *:* positive control in the integration test). |
+| **R3** `Seen::read` `sees_all` all-reader shortcut | Shortcut now gated on `is_unnarrowed` so a narrowed identity:write caller falls through to filtered reads. Proven by `a_narrowed_all_viewer_is_not_unnarrowed_but_a_genuine_all_one_is` and `a_narrowed_all_viewer_uses_the_filtered_reads_not_the_all_shortcut` (genuine *:* control). |
+| **R2** `dashboard_sources.rs` source list/detail/fields/read-preview and AI `list_sql_sources` | `source_visible` now ANDs the folder ACL with the shared `hidden_source_ids` deny-list computed by the dependency resolver from each source's SQL (fail closed on unparseable SQL). Proven by `a_root_sql_source_reading_a_denied_table_is_hidden_from_the_source_list`, `a_narrowed_callers_list_sql_sources_omits_a_source_reading_a_denied_table` and `a_hidden_root_source_is_denied_but_a_permitted_one_is_not` — each with a permitted source as positive control. Delete-conflict counts still name no board/title/table (GOV-20 followup). |
+| `dashboard_comments.rs`, `dashboard_folders.rs`, `dashboard_file.rs`, `public_links.rs` reads | Guard via the shared viewer/scope paths; the comments route's board resolution is one of the R3 regressions above. |
+| **R4** report by-id metadata/history, HTTP `get`/`update`/`delete`/`send_now`/`deliveries` and assistant `list`/`own` | `own_or_admin` and the assistant tools now call `board_still_visible` on the CALLER's current narrowed viewer (not the owner's grants) before serialising board/filters/params/grain/recipients/history; hidden reads get the fixed unknown answer. Proven by `a_report_owner_whose_role_was_narrowed_after_creation_cannot_read_its_metadata` (before/after grant change, unknown-equivalent, fully-granted-admin control) and `report_tools_hide_a_report_when_the_owner_loses_table_access`. |
+| `pdf_export.rs`, `render.rs`, report owner + recipient rechecks (`report_runner.rs`) | Guard applied; built-in uses combined check; recipients resolve their own viewer at send time (already uses the narrowed viewer). |
+| `embed.rs::data` and public-link `render_board_payload` | Resolve the effective Dashboard Viewer role's fresh grants; hidden board gets the fixed token refusal; chart list narrowed before assembly; now also carries `hidden_sources` (R2). No new privileged principal. |
 | Favourites, recents, home references, search/items | `lakehouse-bi::search` and `items` use `sees_builtin_board()`; the rest take the narrowed viewer. |
-| Chart records/values/fields/lineage/comments, folder board counts | Reached only through the narrowed viewer for the authenticated read paths; deletion-conflict counts intentionally count every board so a delete cannot orphan one, but the response names no board, title or table (followup below). |
-| `Viewer::system()` collection shortcuts (`chart_alerts`, `used_by`, `maps`, `layout_tabs` tests) | Reviewed: used only to decide a generic "you cannot see it" answer or in test fixtures; no hidden title/table is serialised. Not replaced with a privileged request viewer. |
+| Chart records/values/fields/lineage/comments, folder board counts | Narrowed viewer for authenticated reads; deletion-conflict counts still count every board but name no id/title/table (GOV-20 followup). |
+| `Viewer::system()` collection shortcuts (`chart_alerts`, `used_by`, `maps`, `layout_tabs` tests) | Reviewed: used only to decide a generic "you cannot see it" answer or in test fixtures; no hidden title/table is serialised. Not replaced with a privileged request viewer. The R3 `Seen::read` shortcut was the one that copied system rows into a visible set and is fixed above. |
 
 ### Independent artefact audit — concrete followups, NOT claimed fixed
 
