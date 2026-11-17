@@ -67,7 +67,7 @@ requirement; defaults and unknown server constraints are called out separately.
 | Nine dial subforms | `connectors/dial-forms/sql-dial-form.tsx:70`; `cdc-dial-form.tsx:105`; `oracle-dial-form.tsx:97`; `files-dial-form.tsx:60`; `rest-dial-form.tsx:76,103,115,168`; `sheets-dial-form.tsx:33,45`; `mongo-dial-form.tsx:84`; `kafka-dial-form.tsx:94,140`; `sftp-dial-form.tsx:78,84` | No stars. Verify adapter field matrix, defaults, auth/TLS/pagination and repeated endpoint/range requirements before applying markers. SFTP fingerprint alone has native required. |
 | Upload file/check/table | `connectors/upload-file-page.tsx:141`; `upload-check-step.tsx:153,171,187,205`; `upload-table-step.tsx:45` | File and table name required; sheet/encoding/delimiter/header mostly chosen/defaulted. Mark file dropzone label as well as table input. Review step is read-only. |
 | Inline ingestion | `connectors/connector-ingest-panel.tsx:548,642,676,848,918` | Manual object, target, cursor/key and custom cron requirements depend on mode. Discovery filters and default options do not get blanket stars. |
-| Pipeline shared create/edit editor | `pipelines/pipeline-create-page.tsx:65,159,240,279,383,513,578`; `pipeline-schedule-field.tsx:74` | Name/source/target, incremental field, transform arguments and custom schedule are conditional. Shared Field needs explicit required state and control association. |
+| Pipeline shared create/edit editor | `pipelines/pipeline-create-page.tsx` (thin wrapper) → `pipeline-editor.tsx`, `pipeline-editor-panes.tsx`, `pipeline-pickers.tsx`, `pipeline-transform-rows.tsx`, `pipeline-schedule-field.tsx` | The real Label/input layer lives in the editor and pane/picker/transform files (UX-1-R8 corrected this inventory). Required: pipeline name (create only), input zone/table/name, a form step's reads, the operations group and each operation's required arguments, output zone/table; the schedule field already carries its own star/aria-required. Verb/operator/type and the fixed connector zone are defaulted/fixed and stay unstarred. |
 | Agentic Builder | `pipelines/agentic-builder-dialog.tsx:58,87,98` | Instruction is required; database is defaulted. |
 | Maintenance policy | `lakehouse/table-detail-page.tsx:235,252,271,287` | Blank numeric overrides mean Default. No required stars; preserve nullable values and range validation. |
 
@@ -280,6 +280,77 @@ No API/validation redesign is authorized. Correct these missing indicators and
 semantics, preserve all current-main behavior, add focused regression coverage,
 and rerun frontend checks. Parent re-review before push/merge remains required.
 
+### Worker handoff: round-3 findings R8–R11 (2026-11-17, Hy4)
+
+All four round-3 findings were fixed on `fix/required-field-consistency`, each
+in its own commit, with the finding id cited at the fix sites and in the commit
+body. The branch head before the parent's round-3 review was `bb8861e8e`; this
+work adds four commits on top of the documentation commit `08651fd28`.
+
+| Finding | Commit | Scope |
+| --- | --- | --- |
+| UX-1-R8 | `16ded3791` | Pipeline editor, panes, pickers and transform rows; opt-in `aria-required` on `SelectField`'s real combobox trigger (shared prerequisite for R9/R10) |
+| UX-1-R9 | `f4ff4ebc7` | Alert rule page: target, metric, mart/measure, connector, dashboard, quality/freshness TablePickers across the type predicates |
+| UX-1-R10 | `9668cfd7c` | Tenant/service-identity inputs, `PermissionPicker` group semantics, RoleFields legend, invite username-or-email group, quality `CheckFields` and custom threshold/dimension semantics |
+| UX-1-R11 | `105d36091` | `Req` delegates to `RequiredMarker`, optional dimension `ch-dimension` id, child chart-field markers and semantics |
+
+The inventory's pipeline row and the reconciliation handoff's false "no
+per-field Label/Field layer" claim were corrected above. No validation,
+submission, disabled-state, permission, dependency or API behavior was changed;
+the `SelectField` change is an opt-in prop with no effect on existing callers.
+
+**Verification (foreground, final tree, current-main tooling).** Exact commands
+and counts actually observed:
+
+- `bun run typecheck` — exit 0, no diagnostics.
+- `bun run lint` — exit 0, **0 errors and 11 warnings**. All 11 are pre-existing
+  on current main (sidebar, sso-page, alerts-page, login-page, use-copilot,
+  use-data-table, dashboard-specs, uploads.test, services/http); none is in a
+  file touched by R8–R11. No new warning.
+- `bun run test` — exit **0**, **4484 pass, 1 skip, 0 fail, 13877 expect()
+  calls, 415 files, 190.66s** (output at `/tmp/ux1-r8-r11-full-test.log`).
+  This is the full green current-main baseline plus the new regression tests;
+  no unhandled animation errors were observed.
+- Scoped foreground runs on final code: the 14 touched test files together —
+  **246 pass, 0 fail, 2372 expects**. Per finding: pipeline editor 48 pass;
+  alert rule page 16 pass; admin/quality group+semantics set 74 pass; chart
+  builder 51 pass, chart shape 30 pass, type-B builder 13 pass (94 across the
+  three chart files); `SelectField` 8 pass; shared marker 5 pass. One combined
+  run reported a single flaky failure that did not reproduce on two subsequent
+  runs (246/0 both times) or in the full suite; it is not claimed as fixed, only
+  as not reproduced.
+- `git status`: only the intended source/test files and this plan are tracked
+  changes; unrelated user-untracked files (`,`, `.claude/`, `reports/`,
+  `research_notes/`, the NDJSON/manifest pair) were left untouched. No Rust,
+  Python or Compose commands were run — the diff is frontend TypeScript and
+  documentation only.
+
+**Not verified:** real browser rendering, keyboard/screen-reader inspection,
+focus order, dark/light theme and narrow-dialog layout, AI-15 assistant smoke
+checks on touched dashboard workflows, and product-owner acceptance. The star
+is the shared CSS `::before` on an empty `aria-hidden` span; happy-dom does not
+apply `::before`, so tests assert the marker class plus `data-required` and
+control `aria-required`, not the painted glyph. Required semantics were placed
+only on supported roles (textbox, combobox); the Faceted `TablePicker`/column
+pickers keep the star-plus-sentence group pattern because their trigger is a
+button, and `PermissionPicker`/invite username-or-email groups carry a linked
+requirement sentence rather than a false `aria-required` on a group or a
+checkbox.
+
+**Unresolved gaps / review points:**
+
+- The pipeline editor's "why it cannot be saved yet" blocker list remains the
+  authoritative save-time explanation; markers are presentation only and add
+  no client validation. The fixed, disabled edit-mode pipeline name is
+  deliberately not starred (it cannot be cleared).
+- No new blank-value rejection was added anywhere; "required" markers follow
+  the current save guards, not a stronger validation policy. The catalog-backed
+  `TablePicker` and `ColumnsField` use the group pattern on a button trigger,
+  so the marker is paired with a visible sentence instead of `aria-required`.
+- Browser/AT verification and owner sign-off remain open; this is a source and
+  test-suite result only. Parent independent re-review is still required before
+  push/merge.
+
 ### Delivery update: current main reconciliation (2026-11-17)
 
 Owner requested push and merge if good. PR #568 is open. Fetched main is
@@ -332,11 +403,15 @@ Digital Employees surface is gone in main), `governance/classification-page.tsx`
   unit defaulted. Removal still needs no value.
 - Alerts → `alerts/alert-rule-page.tsx`: name and delivery target required by
   the same on-save guards; the list page is unchanged from main.
-- Pipelines → `pipelines/pipeline-editor.tsx` (the create/edit page is now a
+- ~~Pipelines → `pipelines/pipeline-editor.tsx` (the create/edit page is now a
   thin wrapper). Its current "why it cannot be saved yet" status already
   communicates the guards; no new markers were added there because the
   current editor has no per-field `Label`/`Field` layer to attach them to
-  without inventing a new form design — reported, not improvised.
+  without inventing a new form design — reported, not improvised.~~
+  **Corrected by UX-1-R8 (round 3):** this claim was false. The editor and its
+  panes/pickers/transform rows do have `Label`/`Input`/`SelectField` layers;
+  the required markers were applied there in commit `16ded3791`. The "why it
+  cannot be saved yet" status is retained, not replaced.
 - Chart Builder was rewritten by main with accordion sections and its own
   `Req()` markers. Those stars were preserved; the UX-1-R3 contribution is the
   label association and `aria-required` on `ch-source`, `ch-dimension`,
