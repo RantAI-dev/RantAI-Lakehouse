@@ -389,6 +389,7 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-61` | Task | Re-running an old file load from the Pipelines page (`POST /api/pipelines/runs/{runId}/retry` on a `file_ingest_job` run) goes around the upload checks: it can load into a table name that is dropped and still restorable (`DATA-55`), and is not seen as a load in progress. Refuse that re-run or route it through the upload's own checks. Read, not run | Data | P2 | Done | #515 | #501 review, round 1 (R4) |
 | `BI-57` | Task | `BI-55` part 2: a year column's bins (`LH-BI-2-02`) need a bin of its own for the maximum (today the last bin is closed and holds two years); alerts still round an average to a whole number (`lakehouse-alerts` `mart_statement`) while charts keep six decimals; a sum of a decimal column is still rounded | Dashboards | P2 | Done | #514 (S1: year bins, alerts keep an average's decimals), #519 (S2: a sum keeps six decimals) | #503 review, round 1 (R1, R7) |
 | `WEB-12` | Task | `WEB-11` slice S2: the other 22 console clients use the one refusal mapping (`deniedFor`), listed in the `WEB-11` plan's section 4. Waits for #504 (the dashboards client) | Platform | P2 | Done | #520 | `WEB-11` plan, section 4 |
+| `WEB-13` | Task | Long identifiers overflow Roles table-access picker; bound and wrap labels in the same-cause permission, source-column, governance-table and pipeline-column pickers while preserving exact values and controls | Platform | P2 | Done | #565 | Owner screenshot 2026-11-17; merged 2026-11-17; visual acceptance `LH-WEB-13-01` Not run; `superpowers/plans/2026-11-17-web-13-picker-overflow.md` |
 | `REL-26` | Task | Two flaky console tests: `SchemaBrowser > keeps the table's name unknown on a Trino tab until its detail loads` (`Received: "SELECT * FROM undefined.undefined"`, seen twice on 2026-11-13 on two branches that do not touch Query Studio) and `the created screen waits for the save (LH-SRC-6-39) > does not read the connection settings before the save has answered` (#503, run 43400226518). Make each wait for what it means, not for a clock | Delivery | P2 | Todo |  | CI runs of #497, #504, #503 |
 | `REL-27` | Task | A flaky Rust test: `lakehouse-api::upload_routes two_tenants_asking_for_one_new_name_at_the_same_moment_one_launches` (`left: 1, right: 2`, #486 run 43333004203). By reading, the second request can arrive after the first claimed the name and is refused before the registry lookup the test counts; the 500 ms stand-in delay does not make them simultaneous | Delivery | P3 | Todo |  | `OPS-22` plan, section 4 |
 | `GOV-16` | Task | Quality reads still not narrowed by role (after `GOV-15`): the incident list, the schedule list, a rule's run history, the learning state, the assistant's `get_quality`, and the classification kind of the governance list. Narrow each by the table access `GOV-15` uses, with the same answers for not there and not yours | Governance | P2 | Todo |  | #515 review, round 1 |
@@ -429,8 +430,8 @@ estimate (S, M, L), which the base has no field for.
 | `INT-2` | Feature | Search over documents | AI Copilot | P3 | Idea |  | PRODUCT §2 |
 | `GOV-3` | Feature | Lineage that reaches outside systems | Governance | P3 | Idea |  | PRODUCT §2 |
 | `GOV-5` | Task | The audit page lists a chat draft waiting for Confirm, and a request waiting for approval, as Denied with policy `deny`: `outcome_of` in `routes/governance.rs` maps every gate outcome that is not a success to `denied`, on purpose, so a decision that is still open cannot read as a success. Decided 2026-10-30 (product owner): both read Pending | Governance | P3 | Done | #282 | `AI-18` checklist row 11, 2026-10-14 |
-| `ADM-1` | Feature | Several organisations in one install | Administration & Security | P3 | Idea |  | PRODUCT §2 |
-| `ADM-2` | Feature | Workspace settings that can be changed. Deployment settings are covered by `ADM-6` to `ADM-10` | Administration & Security | P3 | Idea |  | `README.md` |
+| `ADM-1` | Feature | Several organisations in one install, each with its own catalog, pipelines and serving data. Today tenants exist (`ADM-18`), but the Silver and Gold catalog belongs to one tenant per install (`CATALOG_TENANT_ID`). Decided by the product owner 2026-11-15: stays P3; research and an ADR come first, with no code; **Blocked by `SEC-20`** for the build, because it changes what the tenant gate's 404 and 422 refusals mean | Administration & Security | P3 | Idea |  | PRODUCT §2; `features/queries-scoped-to-the-tenant.md` |
+| `ADM-2` | Feature | The workspace's own name, logo, dark-mode logo and browser-tab icon, set in Settings → General and shown on the sign-in page, the sidebar, the tab title and the embed footer (today "Rantai Lake" is fixed in code). Narrowed by the product owner 2026-11-15: deployment settings are `ADM-6` to `ADM-12`; time zone, week start and number format are in Settings → Reporting (`BI-9`) and making them apply to the whole console is a separate item for the Dashboards team. **Blocked by `BI-18` part D (#528), `BI-59` (#530) and `WEB-15` (#536)**; the build started on 2026-11-16 by the product owner's decision, before those three pull requests merged, and they change the sign-in page and the sidebar, so the console text is read again when they land | Administration & Security | P3 | Building |  | Spec `specs/adm-2.md`; `features/workspace-name-and-logo.md` |
 | `ADM-10` | Feature | Backup schedule, retention and S3 target set in the console. The backup job runs in its own container, which the API does not configure today | Administration & Security | P3 | Idea |  | Owner request 2026-11-06 |
 | `OPS-2` | Feature | Install with no internet access | Platform | P3 | Idea |  | Sales playbook (older; re-check) |
 | `SRC-23` | Task | `route_auth.rs` `run_history_log_and_resume_need_connector_manage_...` passes without proving its claim: the `connector:manage` principal is in no tenant, so the tenant gate answers 404 before the permission gate and `assert_ne!(.., FORBIDDEN)` holds either way. Join both principals to the seeded tenant, as the discovery and OAuth tests do (the defect `SRC-13` review 3 BLOCKER 2 fixed there). Found in the #144 review | Sources | P3 | Todo |  | #144 review |
@@ -493,7 +494,10 @@ parity), built after it.
 
 | Item | Status | Blocked by | Blocks |
 | --- | --- | --- | --- |
-| `BI-18` | Building | — | `AI-2`, `AI-9` (templates part) |
+| `BI-18` | Building | — | `AI-2`, `AI-9` (templates part), `ADM-2` (part D) |
+| `ADM-2` | Building | `BI-18` (part D, #528), `BI-59` (#530), `WEB-15` (#536); build started early, by the owner's decision, before they merged | — |
+| `ADM-1` | Idea | `SEC-20` (build only; research and ADR may start) | — |
+| `SEC-20` | In Progress | — | `ADM-1` (build) |
 | `BI-14` | In Acceptance | — | `AI-13` |
 | `BI-16` | Building | — | `AI-5` (per chart type as it lands) |
 | `BI-17` | Building | — | `AI-8` |
@@ -511,7 +515,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-10`, `ADM-1`, `ADM-2`, `ADM-5`, `AI-21`, `AI-26`, `AI-27`, `AI-28`, `AI-29`, `AI-30`, `AI-31`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-3`, `BI-42`, `BI-43`, `BI-44`, `BI-45`, `BI-46`, `BI-47`, `BI-48`, `BI-49`, `BI-50`, `BI-51`, `BI-52`, `BI-53`, `BI-54`, `BI-55`, `BIZ-1`, `BIZ-2`, `BLD-11`, `BLD-14`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-43`, `DATA-44`, `DATA-45`, `DATA-46`, `DATA-4`, `DATA-55`, `DATA-6`, `DATA-8`, `GOV-12`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-17`, `OPS-18`, `OPS-20`, `OPS-21`, `OPS-2`, `OPS-3`, `OPS-6`, `QA-2`, `QRY-1`, `QS-10`, `QS-11`, `QS-12`, `REL-12`, `REL-13`, `REL-14`, `REL-15`, `REL-16`, `REL-17`, `SEC-40`, `SEC-54`, `SEC-58`, `SEC-59`, `SEC-60`, `SEC-64`, `SEC-65`, `SEC-66`, `SEC-67`, `SRC-15`, `SRC-18`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-2`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-43`, `SRC-4`, `SRC-5`, `VER-1`, `WEB-11`, `WEB-4`, `WEB-6`, `WEB-7`, `WEB-8`
+`ADM-10`, `ADM-5`, `AI-21`, `AI-26`, `AI-27`, `AI-28`, `AI-29`, `AI-30`, `AI-31`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-3`, `BI-42`, `BI-43`, `BI-44`, `BI-45`, `BI-46`, `BI-47`, `BI-48`, `BI-49`, `BI-50`, `BI-51`, `BI-52`, `BI-53`, `BI-54`, `BI-55`, `BIZ-1`, `BIZ-2`, `BLD-11`, `BLD-14`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-43`, `DATA-44`, `DATA-45`, `DATA-46`, `DATA-4`, `DATA-55`, `DATA-6`, `DATA-8`, `GOV-12`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-17`, `OPS-18`, `OPS-20`, `OPS-21`, `OPS-2`, `OPS-3`, `OPS-6`, `QA-2`, `QRY-1`, `QS-10`, `QS-11`, `QS-12`, `REL-12`, `REL-13`, `REL-14`, `REL-15`, `REL-16`, `REL-17`, `SEC-40`, `SEC-54`, `SEC-58`, `SEC-59`, `SEC-60`, `SEC-64`, `SEC-65`, `SEC-66`, `SEC-67`, `SRC-15`, `SRC-18`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-2`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-43`, `SRC-4`, `SRC-5`, `VER-1`, `WEB-11`, `WEB-4`, `WEB-6`, `WEB-7`, `WEB-8`
 
 ## Dates
 
@@ -569,6 +573,7 @@ set by the product owner and are left empty until they are.
 | `DATA-61` | 2026-11-13 | 2026-11-13 (#515) | |
 | `BI-57` | 2026-11-13 | 2026-11-13 (#514, #519) | |
 | `WEB-12` | 2026-11-13 | 2026-11-13 (#520) | |
+| `WEB-13` | 2026-11-17 | 2026-11-17 (#565) | |
 | `DATA-55` | 2026-11-13 | 2026-11-13 (#501) | |
 | `SEC-74` | 2026-11-13 | 2026-11-13 | |
 | `BI-53` | 2026-11-13 | | |
@@ -866,6 +871,7 @@ builds it (`AGENTS.md`).
 | [`SEC-41`](specs/sec-41.md) | Connector dials can verify a CA: upgrade `sqlx` to 0.9 | Now | M |
 | [`REL-9`](specs/rel-9.md) | The Rust workspace builds on the latest stable Rust | Now | M |
 | [`ADM-6` to `ADM-9`](specs/console-settings.md) | Deployment settings in the console: status, email, sign-in limits, assistant key | Next | M |
+| [`ADM-2`](specs/adm-2.md) | The workspace's own name and logo | Later | S to M |
 
 ### Dashboards (BI)
 

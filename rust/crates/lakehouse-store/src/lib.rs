@@ -82,6 +82,7 @@ pub mod sso_settings;
 pub mod storage;
 pub mod upload_folders;
 pub mod uploads;
+pub mod workspace_settings;
 
 pub use error::StoreError;
 

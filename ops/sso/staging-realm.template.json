@@ -1,0 +1,113 @@
+{
+  "realm": "lakehouse",
+  "enabled": true,
+  "displayName": "RantAI Lakehouse (staging)",
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "editUsernameAllowed": false,
+  "accessTokenLifespan": 600,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "groups": [
+    {
+      "name": "analysts",
+      "path": "/analysts"
+    },
+    {
+      "name": "lakehouse-admins",
+      "path": "/lakehouse-admins"
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "lakehouse",
+      "name": "Lakehouse console (staging)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        ""
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "alice@staging.rantai.invalid",
+      "firstName": "Alice",
+      "lastName": "Analyst",
+      "groups": [
+        "/analysts"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "bob",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "bob@staging.rantai.invalid",
+      "firstName": "Bob",
+      "lastName": "Nobody",
+      "groups": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "carol",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "carol@staging.rantai.invalid",
+      "firstName": "Carol",
+      "lastName": "Admin",
+      "groups": [
+        "/lakehouse-admins"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

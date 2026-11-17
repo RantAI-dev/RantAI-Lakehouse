@@ -97,6 +97,30 @@ function rowOf(name: string) {
   return screen.getByText(name).closest("tr") as HTMLElement
 }
 
+/**
+ * Waits until the panel has stopped reading the list: the number of reads stays the
+ * same over two poll intervals. A panel that keeps polling never settles, so the wait
+ * ends in an error that says so. The wait gives up after 2000 ms -- about 100 polls at
+ * this test's 20 ms interval -- so a panel that polls for less than that and then stops
+ * would not be caught here. Returns the number of reads at that point.
+ */
+async function waitUntilStopped(calls: Call[], pollMs: number): Promise<number> {
+  const deadline = Date.now() + 2000
+  let last = calls.length
+  let quiet = 0
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollMs))
+    if (calls.length !== last) {
+      last = calls.length
+      quiet = 0
+      continue
+    }
+    quiet += 1
+    if (quiet >= 2) return last
+  }
+  throw new Error(`the panel kept reading the list: ${calls.length} reads and still going`)
+}
+
 describe("UploadsPanel", () => {
   it("lists each upload with its table as a link, and Not measured where there is no row count", async () => {
     stubFetch(() => [
@@ -233,13 +257,37 @@ describe("UploadsPanel", () => {
   })
 
   it("refreshes while a row is loading and stops when none is", async () => {
-    const calls = stubFetch((n) => [n < 3 ? upload({ status: "ingesting" }) : upload({ status: "ingested", bronzeTable: "stock", assetId: "stock", rows: 3 })])
+    // The panel polls the list on an interval, so the number of reads at the instant
+    // the panel shows the loaded row is a scheduling detail: a poll that was already
+    // on its way when the row reported "loaded" may still land, and the read that
+    // shows the loaded row may be followed by another read before the panel tears
+    // its poll down. The claim is about what each read answered -- the panel
+    // refreshes while a row is loading and stops once nothing is loading -- and not
+    // about how many reads fit in before the state settles.
+    const served: string[] = []
+    const calls = stubFetch((n) => {
+      const status = n < 3 ? "ingesting" : "ingested"
+      served.push(status)
+      return [
+        status === "ingesting"
+          ? upload({ status: "ingesting" })
+          : upload({ status: "ingested", bronzeTable: "stock", assetId: "stock", rows: 3 }),
+      ]
+    })
     render(<UploadsPanel pollMs={20} />)
+    await screen.findByText("stock.csv")
+    // It refreshed while the row was loading: the read after the first one is a poll,
+    // and it answered "ingesting", so the list was read again while the row was still
+    // loading. The read after it is the one that found the row loaded. A panel that
+    // never polls leaves the row loading for ever, so the wait ends in an error that
+    // shows which reads answered what.
+    await waitFor(() => expect(served.slice(0, 3)).toEqual(["ingesting", "ingesting", "ingested"]))
     await screen.findByText("Loaded")
-    const settled = calls.length
-    expect(settled).toBe(3)
+    // It stops: after the panel has torn its poll down (the helper waits for two poll
+    // intervals without a read), no read follows -- 120 ms later the count still holds.
+    const stopped = await waitUntilStopped(calls, 20)
     await new Promise((resolve) => setTimeout(resolve, 120))
-    expect(calls.length).toBe(settled)
+    expect(calls.length).toBe(stopped)
   })
 
   it("does not refresh a list that has nothing loading", async () => {

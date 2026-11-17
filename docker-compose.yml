@@ -874,6 +874,12 @@ services:
       # `process.env` directly.
       args:
         RUST_API_URL: ${CONSOLE_API_URL:-http://lakehouse-api:8080}
+        # `NEXT_PUBLIC_SSO_ENABLED` is a BUILD-time flag (the login page
+        # renders the SSO button only when it is baked into the bundle), so
+        # it is a build arg here for the same reason `RUST_API_URL` is.
+        # Unset (the default) leaves the console without an SSO button,
+        # which is the right default for a stack with no provider.
+        NEXT_PUBLIC_SSO_ENABLED: ${NEXT_PUBLIC_SSO_ENABLED:-}
     ports:
       # The console owns host port 3000. The `dagster` profile's
       # webserver is published on the host's loopback only, at
