@@ -1399,6 +1399,8 @@ pub fn router(state: AppState) -> Router {
             "/api/usage/rates",
             get(usage::list_rates).post(usage::create_rate),
         )
+        // OPS-8 part C: the size of every layer, for the platform operator.
+        .route("/api/usage/storage", get(usage::storage))
         .merge(governance_static_router())
         .route(
             "/api/governance/{kind}",

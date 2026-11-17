@@ -1,7 +1,9 @@
 //! `GET /api/usage/queries`, `GET /api/usage/queries/export`,
-//! `GET /api/usage/rates` and `POST /api/usage/rates`: the Usage page's
-//! sums of recorded runs, the same sums as a CSV file, and the rates behind
-//! the estimate in money (`OPS-8` part B, spec `docs/core/specs/ops-8.md`).
+//! `GET /api/usage/rates`, `POST /api/usage/rates` and
+//! `GET /api/usage/storage`: the Usage page's sums of recorded runs, the
+//! same sums as a CSV file, the rates behind the estimate in money
+//! (`OPS-8` part B, spec `docs/core/specs/ops-8.md`) and the size of every
+//! layer (`OPS-8` part C).
 //!
 //! # What the numbers are
 //!
@@ -54,6 +56,15 @@
 //! `usage.export` audit row before the sums are read (like `audit.export`).
 //! The rate write is a changing route: `AUDIT_TABLE` records it as
 //! `usage.rate_create`, the refusals at the gate included.
+//!
+//! # The storage of every layer
+//!
+//! `GET /api/usage/storage` reads what the daily storage job measured
+//! (`dagster/dispar_orchestrate/storage_snapshot.py`): the size of every
+//! layer, one row per layer per day. Only a caller holding `*:*` may read
+//! it, because a layer holds the tables of every tenant (SEC-20 hides
+//! another tenant's table names and counts). A tenant administrator is
+//! refused with 403 and a fixed sentence.
 
 use axum::Extension;
 use axum::body::{Body, Bytes};
@@ -62,13 +73,14 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
+use lakehouse_core::ident::SqlLiteral;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::usage::{
     self, Group, NewUsageRate, TenantScope, UsageQuery, UsageRate, UsageReport, UsageRow,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use time::{Date, Duration, Month, OffsetDateTime};
 
 use super::{QUERY_STRING_UNREADABLE, catalog};
@@ -76,6 +88,7 @@ use crate::audit_coverage;
 use crate::csv_export;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::support::{num_or_zero, str_col};
 use crate::state::AppState;
 use crate::tenant_scope;
 use crate::upstream_error;
@@ -194,17 +207,14 @@ fn read_params(params: RawParams) -> Result<UsageParams, ApiError> {
     Ok(raw)
 }
 
-/// The period, group and scope of a request, or the 400, 403 or 404 that
-/// refuses it. Nothing is read from the store here.
-fn read_request(
-    principal: &Principal,
-    headers: &HeaderMap,
-    raw: &UsageParams,
-) -> Result<Request, ApiError> {
-    // PR #564 review round 3 (SHOULD-FIX): the tenant is resolved first, so a
-    // forged `X-Tenant` is the same 404 as on every other tenant-scoped route,
-    // for the period, the group and the `tenant` parameter.
-    let own = tenant_scope::resolve(principal, headers)?;
+/// The period a request asks for: the days `from` to `to`, both included.
+/// Without them the period is the last 30 days ending today. At most 366
+/// days, and `from` may not be after `to`.
+///
+/// One rule for every route that reads a period (the sums, the export and
+/// the storage), so a period that is too long is refused the same way
+/// everywhere.
+fn read_period(raw: &UsageParams) -> Result<(Date, Date), ApiError> {
     let today = OffsetDateTime::now_utc().date();
     let to = match non_empty(raw.to.as_ref()) {
         Some(text) => parse_day(text).ok_or_else(|| ApiError::BadRequest(BAD_DATE.to_owned()))?,
@@ -220,6 +230,21 @@ fn read_request(
     if (to - from).whole_days() + 1 > MAX_DAYS {
         return Err(ApiError::BadRequest(TOO_LONG.to_owned()));
     }
+    Ok((from, to))
+}
+
+/// The period, group and scope of a request, or the 400, 403 or 404 that
+/// refuses it. Nothing is read from the store here.
+fn read_request(
+    principal: &Principal,
+    headers: &HeaderMap,
+    raw: &UsageParams,
+) -> Result<Request, ApiError> {
+    // PR #564 review round 3 (SHOULD-FIX): the tenant is resolved first, so a
+    // forged `X-Tenant` is the same 404 as on every other tenant-scoped route,
+    // for the period, the group and the `tenant` parameter.
+    let own = tenant_scope::resolve(principal, headers)?;
+    let (from, to) = read_period(raw)?;
     let group = match non_empty(raw.group.as_ref()) {
         None | Some("day") => Group::Day,
         Some("person") => Group::Person,
@@ -698,4 +723,222 @@ pub async fn create_rate(
     .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?
     .ok_or_else(|| ApiError::BadRequest(MIXED_CURRENCY.to_owned()))?;
     Ok((StatusCode::CREATED, ApiJson(stored.into())))
+}
+
+// ── Storage per layer (OPS-8 part C) ─────────────────────────────────────
+
+/// The kind of rate that prices storage: the price of a gigabyte for a
+/// month.
+const STORAGE_RATE_KIND: &str = "storage_gb_month";
+
+/// The fixed sentence that refuses the storage read to a caller that is not
+/// the platform operator. A layer holds the tables of every tenant, and
+/// SEC-20 hides another tenant's table names and counts, so the size of a
+/// layer is the platform operator's and nobody else's.
+const NOT_PLATFORM: &str = "Storage per layer is shown to the platform operator only.";
+
+/// A gibibyte in bytes: the unit the `storage_gb_month` rate is priced in.
+const BYTES_PER_GB: i128 = 1_000_000_000;
+
+/// How many decimal places a rate is stored with (`NUMERIC(18,6)`), and so
+/// how many digits of it one micro unit holds.
+const RATE_DECIMALS: usize = 6;
+
+/// A `ClickHouse` failure on the storage read: a fixed 503, never
+/// `ClickHouse`'s own text (AGENTS.md rule 4), the same posture as
+/// `routes::lakehouse`'s capacity read.
+///
+/// `bronze_meta.storage_layer_snapshot` is written once a day by a single
+/// whole-deployment job. A table that is not there means the job has never
+/// run here -- which a caller cannot tell apart from `ClickHouse` being
+/// down -- so both take this same fixed 503, never an empty `rows: []`
+/// success.
+fn classify_storage_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
+    tracing::warn!(%err, "the storage snapshot lookup failed");
+    ApiError::Unavailable("storage per layer is unavailable".to_owned())
+}
+
+/// A rate's amount as micro units (a millionth of the unit), or `None` when
+/// the text is not a decimal of the shape the table allows.
+///
+/// The digits are never read through a float: an amount is money, and a
+/// double cannot hold the digits the administrator wrote.
+fn micro_units(amount: &str) -> Option<i128> {
+    let (whole, decimals) = match amount.split_once('.') {
+        Some((whole, decimals)) => (whole, Some(decimals)),
+        None => (amount, None),
+    };
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let decimals = decimals.unwrap_or("");
+    if decimals.len() > RATE_DECIMALS || !decimals.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let whole: i128 = whole.parse().ok()?;
+    let padded = format!("{decimals:0<width$}", width = RATE_DECIMALS);
+    let fraction: i128 = padded.parse().ok()?;
+    whole.checked_mul(1_000_000)?.checked_add(fraction)
+}
+
+/// The estimate of one day's storage, in micro units of the currency: the
+/// layer's bytes as gigabytes, times the rate, spread over the days of the
+/// month the day is in.
+///
+/// `None` when no rate was in force on the day, or when the rate's amount
+/// is not a decimal the table allows: an estimate is never a guess.
+fn estimate_micro(bytes: i128, rate_micro: i128, day: Date) -> Option<i128> {
+    let days = i128::from(day.month().length(day.year()));
+    let denominator = BYTES_PER_GB.checked_mul(days)?;
+    let numerator = bytes.checked_mul(rate_micro)?;
+    Some((numerator + denominator / 2) / denominator)
+}
+
+/// Micro units as a decimal with six places: the digits, never a float.
+fn decimal_text(micro: i128) -> String {
+    let whole = micro / 1_000_000;
+    let fraction = micro % 1_000_000;
+    format!("{whole}.{fraction:06}")
+}
+
+/// The statement behind [`storage`]: the measured size of every layer for
+/// the days of the period, one row per layer per day.
+///
+/// `FINAL` gives the write-once-per-day semantics the table's
+/// `ReplacingMergeTree` engine has: a job that ran twice on the same day
+/// leaves one row per layer for that day.
+///
+/// The two dates are written as literals through [`SqlLiteral`]: they are
+/// the only values in the statement, and this module has already checked
+/// that they are days.
+fn storage_query(from: Date, to: Date) -> String {
+    format!(
+        "SELECT day, layer, toString(table_count) table_count, \
+         toString(total_bytes) total_bytes, toString(tables_skipped) tables_skipped, \
+         skipped_reason \
+         FROM lake.`bronze_meta.storage_layer_snapshot` FINAL \
+         WHERE day >= {} AND day <= {} \
+         ORDER BY day ASC, layer ASC",
+        SqlLiteral::from(day_text(from)),
+        SqlLiteral::from(day_text(to))
+    )
+}
+
+/// One measured layer for one day, as the console reads it.
+fn storage_row(row: &Map<String, Value>, rates: &[UsageRate]) -> StorageRowBody {
+    let day_text = str_col(row, "day");
+    let total_bytes = num_or_zero(Some(row), "total_bytes");
+    // The rate in force on the row's OWN day: a price that starts later does
+    // not price an earlier day, and a day before the first rate has no
+    // estimate at all.
+    let estimate = parse_day(day_text).and_then(|day| {
+        let rate = usage::rate_in_force(rates, STORAGE_RATE_KIND, day)?;
+        let rate_micro = micro_units(&rate.amount)?;
+        estimate_micro(i128::from(total_bytes), rate_micro, day)
+    });
+    let reason = str_col(row, "skipped_reason");
+    StorageRowBody {
+        day: day_text.to_owned(),
+        layer: str_col(row, "layer").to_owned(),
+        table_count: num_or_zero(Some(row), "table_count"),
+        total_bytes,
+        tables_skipped: num_or_zero(Some(row), "tables_skipped"),
+        // The reason the job wrote is a fixed sentence, and there is none
+        // when no table was skipped.
+        skipped_reason: if reason.is_empty() {
+            None
+        } else {
+            Some(reason.to_owned())
+        },
+        estimate: estimate.map(decimal_text),
+    }
+}
+
+/// One measured layer for one day.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageRowBody {
+    /// The UTC day the measurement was taken on.
+    day: String,
+    /// The layer: `bronze`, `gold`, `silver` or `serving`.
+    layer: String,
+    /// How many tables the layer holds.
+    table_count: i64,
+    /// The bytes of the tables that were measured.
+    total_bytes: i64,
+    /// How many of the layer's tables could not be measured. A layer with a
+    /// skipped table is never a layer of zero bytes.
+    tables_skipped: i64,
+    /// Why they were skipped; `null` when none was.
+    skipped_reason: Option<String>,
+    /// The month's estimate in the currency; `null` when no rate applied.
+    estimate: Option<String>,
+}
+
+/// The answer of `GET /api/usage/storage`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageBody {
+    from: String,
+    to: String,
+    /// The currency of the storage rate in force at the end of the period;
+    /// `null` while no rate applies.
+    currency: Option<String>,
+    /// One row per layer per day, oldest first.
+    rows: Vec<StorageRowBody>,
+}
+
+/// `GET /api/usage/storage?from=&to=`: the size of every layer, measured
+/// once a day by the storage job, with the estimate in money.
+///
+/// # Who may read it
+///
+/// Only a caller holding `*:*` ([`catalog::is_unrestricted`]). A layer holds
+/// the tables of every tenant, and SEC-20 hides another tenant's table names
+/// and counts, so a tenant administrator is refused with 403 and a fixed
+/// sentence.
+///
+/// # The estimate
+///
+/// The rate in force on the row's own day -- the `storage_gb_month` rate
+/// with the latest `effective_from` on or before it
+/// ([`usage::rate_in_force`]) -- times the layer's bytes as gigabytes,
+/// spread over the days of that month. A day before the first rate applies
+/// has no estimate, and says so with `null`.
+///
+/// # Errors
+///
+/// 400 with a fixed sentence for a bad date, a `from` after `to` or a period
+/// over 366 days; 403 without `*:*`; 503 without a Postgres pool or when
+/// `ClickHouse` cannot answer; 500 (a fixed sentence and a reference) when
+/// the database fails.
+pub async fn storage(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    params: RawParams,
+) -> ApiResult<ApiJson<StorageBody>> {
+    if !catalog::is_unrestricted(&principal) {
+        return Err(ApiError::PermissionDenied(NOT_PLATFORM.to_owned()));
+    }
+    let raw = read_params(params)?;
+    let (from, to) = read_period(&raw)?;
+    let rows = state
+        .clickhouse
+        .rows(&storage_query(from, to), None)
+        .await
+        .map_err(|err| classify_storage_ch_error(&err))?;
+    let rates = usage::list_rates(pool(&state)?)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    // The currency of the price the period ends on: the rate in force on the
+    // last day. `null` while no rate applies, which is also when every row
+    // has no estimate.
+    let currency =
+        usage::rate_in_force(&rates, STORAGE_RATE_KIND, to).map(|rate| rate.currency.clone());
+    Ok(ApiJson(StorageBody {
+        from: day_text(from),
+        to: day_text(to),
+        currency,
+        rows: rows.iter().map(|row| storage_row(row, &rates)).collect(),
+    }))
 }
