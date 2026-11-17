@@ -6,7 +6,7 @@
 | Backlog | `ADM-2` |
 | Status | Decisions signed by the product owner, 2026-11-15, as the planner proposed them |
 | Spec | [`specs/adm-2.md`](../specs/adm-2.md) |
-| Plan | plan `adm-112` (slice A: the API and Settings → General, 562) and plan `adm-113` (slice B: the console shows the name and logo, #NNN). `BI-18` part D (#528), `BI-59` (#530) and `WEB-15` (#536) change the same console files and merge later, so this page's text is read again when they land |
+| Plan | plan `adm-112` (slice A: the API and Settings → General, 562) and plan `adm-113` (slice B: the console shows the name and logo, #570). `BI-18` part D (#528), `BI-59` (#530) and `WEB-15` (#536) change the same console files and merge later, so this page's text is read again when they land |
 
 ## Problem
 
