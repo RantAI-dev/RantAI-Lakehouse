@@ -247,10 +247,89 @@ Planner reconciled both read-only worker audits against shared components and
 selected guards/server constraints. No code changes, tests, browser checks or
 implementation handoff yet. Existing untracked user files were left untouched.
 
-### Worker handoff (UX-1 implementation)
+### Worker handoff (UX-1 implementation, 2026-11-17)
 
-- Task 1 commit `13e7fd589` (amended to use CSS-rendered star) — shared
-  `RequiredMarker`, `Label`/`FieldLabel` `required` prop, `RequiredLegend`.
-- Task 2 commit `85a4f8686` — auth, admin, governance, employees.
-- Task 3 — this matrix (documentation only).
-- Tasks 4-6 — pending; the worker appends verification here as each slice lands.
+All six numbered tasks are complete on `fix/required-field-consistency`,
+branched from base `bcdef6bd3`. One commit per numbered task, in order:
+
+| Task | Commit | Scope |
+| --- | --- | --- |
+| 1 | `a19b464a1` | Shared `RequiredMarker`, `Label`/`FieldLabel` `required` prop, `RequiredLegend`, component tests |
+| 2 | `85a4f8686` | Auth, admin, governance, employees/approvals |
+| 3 | `c11700faf` | Adapter dial field matrix (documentation only) |
+| 4 | `467417408` | Connector create/edit, credentials, scope, nine dial forms, upload, inline ingestion, pipelines, Agentic Builder |
+| 5 | `8febdec13` | Chart Builder/SQL source consolidation, dashboards/folders, queries, catalog |
+| 6 | `d0c5cd8c3` | Alerts create/edit/resolution, Copilot composer/edit/rename |
+
+All tests were run in the foreground on this branch's final commit. Counts
+actually observed:
+
+- `bun run typecheck` — passed (no diagnostics), final slice and full block.
+- `bun run lint` — passed (no errors). A pre-existing unused-variable **warning**
+  in `src/features/catalog/open-format-card.test.tsx` remains; no warning was
+  introduced by this diff.
+- `bun run test` (full block) — **1177 pass, 1 skip, 0 failed assertions,
+  2986 expect() calls, 121 files, 278.29s**. The command exits 1 because of 24
+  *unhandled* `AbortError: The animation was canceled.` events from
+  `motion-dom`/`happy-dom` reported "between tests". These are **baseline**:
+  the same command at base `bcdef6bd3` in a temporary worktree (same `node_modules`)
+  exits 1 with **1165 pass, 1 skip, 0 failed assertions** — the same class of
+  unhandled animation errors and no failed assertions. The diff adds 12 tests
+  and introduces no failing assertion. (A later baseline rerun was OOM-killed;
+  the first baseline run is the quoted evidence.)
+- Task-scoped runs: Task 1 `bun test required.test.tsx` 5 pass / 12 expects;
+  Task 2 `bun test login-page.test.tsx required.test.tsx` 8 pass / 22 expects;
+  Task 4 `bun test src/features/connectors src/features/pipelines` 275 pass /
+  1127 expects, including the new `dial-forms-required.test.tsx` (5 pass /
+  32 expects); Task 5 `bun test src/features/queries src/features/catalog`
+  281 pass / 15 files and `sql-source-panel.test.tsx` 1 pass / 8 expects;
+  Task 6 `bun test alerts overview copilot` 59 pass / 9 files.
+
+**Design note for review.** The star is a CSS `::before` on an empty
+`aria-hidden` span. A literal `*` text node changed the label's accessible
+name and broke 206 existing exact `getByLabelText("…")` queries; the CSS glyph
+keeps the visible star while leaving label text unchanged. Tests therefore
+assert `data-required` and the marker class, not the rendered glyph (happy-dom
+does not apply `::before`). The star's actual visibility still needs a browser
+check. Required semantics use native `required` where already present (auth,
+SFTP fingerprint); elsewhere `aria-required` is used on the control with the
+right role (textbox/combobox/radiogroup/fieldset) so native submit behavior is
+unchanged. In particular the conversation-rename `<form>` uses `aria-required`
+only, and all auth forms keep `noValidate`.
+
+**Not verified (and why):**
+
+- Real browser rendering, keyboard and screen-reader inspection, focus order,
+  dark/light theme and narrow-dialog layout — no browser acceptance was
+  requested for this worker and no runtime accessibility tooling is configured;
+  the feature page's owner checklist remains pending.
+- AI-15 assistant smoke checks on touched dashboard workflows — deferred to the
+  BI/AI owner review; this is a presentation-only change with no tool/schema or
+  dashboard-context changes.
+- Rust/Python/Compose checks — not run; the diff is frontend TypeScript and this
+  documentation only.
+- Tooltip/legend placement in every dialog was checked statically, not by eye.
+
+**Gaps and review points:**
+
+- Dial "supplied" fields are marked from the form's mandatory dial shape and
+  explicit guards; serde shape presence alone does not prove nonblank rejection
+  for every string (see the Task 3 matrix). No server or client blank-value
+  validation was added.
+- The `files` Endpoint keeps its existing "needed to test the connection" note
+  with no star: it gates the Test action, not saving the ingest spec.
+- Repeated range/host/broker/endpoint groups mark the first row and the group
+  heading, not every added row as an independent requirement.
+- Chart Builder's dynamic selects carry `aria-required` on the `SelectTrigger`;
+  explicit `htmlFor` association was added for title/content/source, but not for
+  every kind-dependent measure/breakdown label. Reviewer may ask for a follow-up
+  on those id/labelledby links.
+- The resolution-note star is always shown on the shared field, with copy
+  stating it is required only for Resolve, optional for Acknowledge/Silence.
+- Generated names (quality rule, saved query/source) remain unstarred even
+  though a guard rejects an emptied value, per the plan's generated-value rule.
+- Early in the session the filesystem filled and generated `.next/` and
+  `node_modules/.cache` were removed to make room; both are regenerable build
+  artifacts. No tracked or user-untracked file was deleted. Unrelated untracked
+  files (`,`, `.claude/`, `reports/`, `research_notes/`, the NDJSON/manifest
+  pair) were left untouched throughout.
