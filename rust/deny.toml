@@ -164,6 +164,31 @@ targets = []
 # which excludes 0.28. Re-evaluate when `testcontainers` moves to a
 # maintained tar codec (the advisory suggests `tar-codec`), then drop this
 # entry.
+#
+# RUSTSEC-2026-0543 (`chrono` is unmaintained) and RUSTSEC-2026-0542
+# (`humantime` is unmaintained): both advisories were issued on 2026-11-17
+# and are `INFO`/Unmaintained, not vulnerabilities — there is no CVE, no
+# exploit path and no patched version, because the crates themselves are no
+# longer maintained (`chrono` upstream: chronotope/chrono#1768; `humantime`
+# is unmaintained only because it wraps `chrono`).
+#
+#   humantime <- object_store <- lakehouse-api, lakehouse-iceberg
+#   chrono <- arrow-arith, arrow-array, arrow-cast, arrow-ipc, ... <- iceberg, parquet <- lakehouse-api
+#   chrono <- croner (its default datetime backend), tiberius (its `chrono` feature)
+#   chrono <- lakehouse-api directly (crate::next_run's cron round trip, connector_listing's RFC 3339 stamps)
+#
+# crates.io offers no newer release of either crate: `cargo update -p chrono
+# --dry-run` and `cargo update -p humantime --dry-run` lock 0 packages, and
+# the advisory lists no patched version. The advisory names `jiff` and `time`
+# as alternatives, but dropping `chrono` means dropping `arrow` (hence
+# `iceberg` and `parquet`), `croner` and `tiberius`' `chrono` feature with
+# it, so there is no smaller fix here.
+#
+# Remove these two entries when `chrono` or `humantime` gets a maintained
+# release, or when the dependency paths that bring them in are gone:
+# `arrow` (hence `iceberg` and `parquet`), `croner`, `tiberius` and
+# `object_store` (through `lakehouse-iceberg`). Then replace the two
+# `chrono::` call sites in `lakehouse-api` and update the lockfile.
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0436",
@@ -172,6 +197,8 @@ ignore = [
     "RUSTSEC-2026-0403",
     "RUSTSEC-2026-0410",
     "RUSTSEC-2026-0440",
+    "RUSTSEC-2026-0542",
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
