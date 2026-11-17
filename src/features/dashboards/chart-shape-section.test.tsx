@@ -326,3 +326,50 @@ describe("PreviewRowsTable and the internal columns", () => {
     expect(saved.join("")).toContain("kab,v")
   })
 })
+
+/** UX-1-R11: the shared CSS ::before marker, not a literal text star. */
+function sharedMarker(el: HTMLElement | null): boolean {
+  return Boolean(el?.querySelector('span[aria-hidden="true"][class*="before:content-"]'))
+}
+
+describe("chart field required markers share the marker and their semantics (UX-1-R11)", () => {
+  it("marks only the required measure rows with the shared marker and combobox semantics", () => {
+    render(
+      <MeasureRows
+        rows={rows3}
+        onChange={() => {}}
+        labels={(i) => `Measure ${i + 1}`}
+        min={1}
+        max={4}
+        own
+        columns={["visitors", "stay", "orders"]}
+        defaultAggregate="sum"
+        disabled={false}
+        placeholder="pick"
+        wholeMeasure={new Set<string>()}
+        fieldLabel={noLabel}
+      />
+    )
+    const first = screen.getByText("Measure 1")
+    expect(sharedMarker(first.closest("label"))).toBe(true)
+    expect(screen.getByRole("combobox", { name: "Measure 1" }).getAttribute("aria-required")).toBe("true")
+    const second = screen.getByText("Measure 2")
+    expect(sharedMarker(second.closest("label"))).toBe(false)
+    expect(screen.getByRole("combobox", { name: "Measure 2" }).getAttribute("aria-required")).toBe("false")
+  })
+
+  it("shares the marker on Group by and requires its add combobox", () => {
+    render(
+      <GroupingsEditor
+        value={[]}
+        onChange={() => {}}
+        columns={[{ name: "kab", kind: "text" }]}
+        disabled={false}
+        placeholder="pick"
+        fieldLabel={noLabel}
+      />
+    )
+    expect(sharedMarker(screen.getByText(/Group by/).closest("label"))).toBe(true)
+    expect(screen.getByRole("combobox", { name: "Group by" }).getAttribute("aria-required")).toBe("true")
+  })
+})

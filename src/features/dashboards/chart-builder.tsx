@@ -16,6 +16,7 @@ import { RequiredLegend } from "@/components/patterns/required-legend";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { RequiredMarker } from "@/components/ui/required";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
@@ -254,9 +255,14 @@ function useMinWidth(px: number): boolean {
   );
 }
 
-/** Marks a field the chart cannot be drawn without. */
+/**
+ * UX-1-R11: one shared decorative marker. Delegating to `RequiredMarker`
+ * keeps the star on every chart-kind rule below while using the one CSS
+ * glyph (a hidden aria-hidden span) the rest of the console uses, so a
+ * literal `*` never leaks into a label's text content.
+ */
 function Req() {
-  return <span aria-hidden className="text-destructive">*</span>;
+  return <RequiredMarker />;
 }
 const KIND_DESCRIPTIONS: Record<ChartKind, string> = {
   bar: "Compare values across categories", hbar: "Rank categories clearly",
@@ -1508,7 +1514,9 @@ export function ChartBuilder({
                 <Label htmlFor="ch-dimension">{dimensionLabel} {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : isBullet ? <span className="font-normal text-muted-foreground">(optional, one bullet per category)</span> : <Req />}</Label>
                 {isPoints || isBullet ? (
                   <Select value={dimension || NO_BREAKDOWN} items={{ ...NO_LABEL_ITEMS, ...columnItems(fields?.dimensions ?? [], fieldLabel, dimension) }} onValueChange={(v) => setDimension(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
-                    <SelectTrigger className="w-full" title={dimension ? displayColumnFull(dimension) : undefined}><SelectValue placeholder={fields ? (isBullet ? "one bullet" : "no label") : noFieldsHint} /></SelectTrigger>
+                    {/* UX-1-R11: keep the `ch-dimension` id on the optional
+                        branch too, so the visible Label still names its control. */}
+                    <SelectTrigger id="ch-dimension" className="w-full" title={dimension ? displayColumnFull(dimension) : undefined}><SelectValue placeholder={fields ? (isBullet ? "one bullet" : "no label") : noFieldsHint} /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value={NO_BREAKDOWN}>{isBullet ? "— no category —" : "— no label —"}</SelectItem>
                       {fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
