@@ -247,6 +247,22 @@ treats as necessary, they do not strengthen validation.
 
 ## Review / Handoff
 
+### Required-check investigation after CI wake (2026-11-17)
+
+PR head `a3409698f` cargo-deny failure was inspected in run `44078730810`,
+job `134023440744`: RUSTSEC-2026-0542 and RUSTSEC-2026-0543.
+The independently requested main baseline rerun in run `44042548692`, job
+`134023623874`, also failed with those same advisory ids. This confirms the
+failure exists on current main, not just the old audit base. Lockfile, deny
+policy and security workflow are identical between PR and main. UX-3 tracks
+the existing failure. No UX-1 code correction is indicated by this CI failure.
+
+Repository policy permits unrelated baseline failures on a non-dependency PR,
+but GitHub main protection explicitly requires cargo-deny success and the PR
+is BLOCKED. No bypass or advisory suppression was performed. The requested
+merge remains unfulfilled until that required check is restored; this work
+does not quietly expand into migration of the Rust dependency graph.
+
 ### Final current-main parent review (code head 2ddafb1c1)
 
 R8–R11 resolved by independent source review. The parent additionally connected
