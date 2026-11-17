@@ -12,6 +12,8 @@
 | Acceptor | In the base |
 | Plan | Engineering plan kept by the planner |
 | Started | 2026-11-16 |
+| Shipped | — |
+| Evidence | PR #553 (the tenant on every query run); PR #564 (the usage page, the rates and the CSV export) |
 
 ## Problem
 
@@ -19,11 +21,11 @@ Nobody can see who uses the lakehouse or how much it costs to run. The data for 
 
 ## What the user can do when this is done
 
-1. Open Monitoring → Usage and pick a period. *(Built.)*
-2. See queries, scanned bytes and engine time per day, per person and per engine, for their own tenant. *(Built.)*
-3. See storage per layer, one value per day. *(Not built yet.)*
-4. Enter rates and see an estimated amount, marked as an estimate. *(Built for scanned bytes and engine time; a storage rate can be entered but prices nothing until point 3 exists.)*
-5. Export the period as CSV. *(Built.)*
+1. Open Monitoring → Usage and pick a period.
+2. See queries, scanned bytes and engine time per day, per person and per engine, for their own tenant.
+3. See storage per layer, one value per day.
+4. Enter rates and see an estimated amount, marked as an estimate.
+5. Export the period as CSV.
 
 ## Asking the assistant
 
@@ -52,6 +54,7 @@ No assistant work in this feature. `AGENTS.md` assistant parity binds BI feature
 - A stopped query counts as cancelled.
 - A tenant administrator sees only their tenant. The all-tenant administrator can also group by tenant and sees runs recorded with no tenant.
 - Storage per layer is not shown yet.
+- A storage rate can be entered but prices nothing until storage per layer is shown.
 - Queries run before the update have no tenant and are visible only to the platform operator.
 - Queries run through dashboard and chart data are not counted.
 - Queries run through the lists of filter values, and through schema and join lookups, are not counted.
