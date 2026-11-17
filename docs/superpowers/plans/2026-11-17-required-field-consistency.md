@@ -247,6 +247,20 @@ treats as necessary, they do not strengthen validation.
 
 ## Review / Handoff
 
+### Delivery update: current main reconciliation (2026-11-17)
+
+Owner requested push and merge if good. PR #568 is open. Fetched main is
+`cb855d5b923d978f14371c3e61d88f1d8be1ef8b`, with substantial changes since
+the audit base; GitHub reports conflicts. Previous source review applies to
+the old base and cannot certify the merged result. Hy4 must merge current main
+hunk by hunk, retaining its newer functionality and applying only equivalent
+UX-1 presentation/accessibility changes. Deleted/replaced forms must not be
+resurrected. Update the inventory for changed anchors/requirements and report
+any decision mismatch; do not alter APIs, validation or dependencies to resolve
+conflicts. Use current main's frontend tooling as provided, not older dependency
+versions. Re-run the frontend verification and compare any failure to the newly
+fetched main baseline. Parent re-review is mandatory before merge.
+
 ### Final parent review (2026-11-17, code head 39617ff62)
 
 All round-1 BLOCKER findings R1–R6 and SHOULD-FIX R7 are resolved by source
