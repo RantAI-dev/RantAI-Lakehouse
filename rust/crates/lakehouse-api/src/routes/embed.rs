@@ -79,20 +79,35 @@ fn token_refused() -> Response {
 async fn embed_visibility(
     state: &AppState,
     board_id: &str,
-) -> Result<crate::dashboard_visibility::TableVisibility, Response> {
+) -> Result<crate::dashboard_visibility::TableVisibility, Box<Response>> {
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let visibility = crate::dashboard_visibility::resolve_visibility_for_roles(state, &roles)
         .await
-        .map_err(|err| crate::error::ApiRejection(err).into_response())?;
+        .map_err(|err| Box::new(crate::error::ApiRejection(err).into_response()))?;
     let hidden = if board_id == store::DEFAULT_BOARD_ID {
         !visibility.builtin_visible
     } else {
         visibility.hidden_boards.iter().any(|id| id == board_id)
     };
     if hidden {
-        return Err(token_refused());
+        return Err(Box::new(token_refused()));
     }
     Ok(visibility)
+}
+
+/// The time zone and formatting settings an embed payload needs, read once.
+async fn embed_time_and_format(
+    state: &AppState,
+) -> Result<
+    (
+        lakehouse_bi::grain::TimeContext,
+        crate::routes::settings::FormatSettings,
+    ),
+    lakehouse_core::ApiError,
+> {
+    let time = crate::routes::settings::time_context(state).await?;
+    let format = crate::routes::settings::format_settings(state).await?;
+    Ok((time, format))
 }
 
 /// Take the column of a hidden filter out of every tile's `filtersSkipped`
@@ -455,22 +470,18 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         resolved.editable
     };
 
-    let time = match crate::routes::settings::time_context(&state).await {
-        Ok(t) => t,
-        Err(err) => return crate::error::ApiRejection(err).into_response(),
-    };
     // BI-17 part A: the number locale, company palette and fonts ride in the
     // payload's `reporting` object like the zone, so an embed formats as the
     // console does.
-    let format = match crate::routes::settings::format_settings(&state).await {
-        Ok(f) => f,
+    let (time, format) = match embed_time_and_format(&state).await {
+        Ok(pair) => pair,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
     // GOV-17: the embed's effective viewer role must still read every data
     // dependency of this board; a hidden board is the fixed token refusal.
     let visibility = match embed_visibility(&state, &board_id).await {
         Ok(visibility) => visibility,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let payload = crate::result_cache::scoped(
         crate::result_cache::CacheScope::new(
@@ -1055,7 +1066,7 @@ pub async fn public_dashboard(
     };
     let visibility = match embed_visibility(&state, &board_id).await {
         Ok(visibility) => visibility,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let payload = crate::result_cache::scoped(
         crate::result_cache::CacheScope::new(
