@@ -1,10 +1,11 @@
 # Required-field consistency: audit and implementation plan
 
 Date: 2026-11-17. Source base: `eb9eaa18e8ac184d5b0b00ea27b592c246e48d2f`.
-Status: audit complete at static-source level; implementation authorized 2026-11-17 under UX-1.
+Status: implemented and source-reviewed locally under UX-1; not pushed or merged; runtime acceptance pending.
 Planner/reviewer: Codex, explicitly authorized by the owner in this conversation
 to replace the repository's Claude-only role rule. Workers: `opencode-go/hy4-flash-free`.
-No product code was changed, no build or browser verification was performed.
+The initial audit changed no product code. Implementation and verification
+are recorded below; browser acceptance has not been performed.
 
 ## Owner request and scope
 
@@ -245,6 +246,45 @@ treats as necessary, they do not strengthen validation.
 - This remains a static source audit; no browser rendering was checked here.
 
 ## Review / Handoff
+
+### Final parent review (2026-11-17, code head 39617ff62)
+
+All round-1 BLOCKER findings R1–R6 and SHOULD-FIX R7 are resolved by source
+inspection. The parent independently reviewed the fix diff and the baseline-to-
+final change. No open source-review blocker remains. During this review a small
+R7 regression was fixed directly in `39617ff62`: the paired credential grid had
+accidentally changed `sm:grid-cols-2` to `sm:col-span-2`; the two-column layout
+is restored. Validation, API contracts and permissions are unchanged.
+
+Independent foreground verification:
+
+- `bun run typecheck && bun run lint && bun run test` (test output captured in
+  `/tmp/ux-1-parent-tests.log`): typecheck exit 0; lint exit 0, eight warnings;
+  test exit **1**, **1187 pass, 1 skip, 0 fail, 24 unhandled errors, 3058
+  expects, 125 files, 200.58s**. These are not reported as a green test command.
+  The tests ran after the final code correction; the initial typecheck preceded
+  that CSS-class-only correction, so `bun run typecheck` was rerun afterward,
+  exit 0.
+- Independent baseline reproduction: extracted tracked `src`, `bunfig.toml`,
+  `happydom.ts`, `testing-cleanup.ts`, `tsconfig.json`, `package.json` with
+  `git archive bcdef6bd3` to a temporary directory and linked the same installed
+  node_modules. `bun test src/features/copilot` there exited **1** with **31
+  pass, 0 fail, 24 unhandled errors, 66 expects, six files, 1.56s**. Stack
+  traces match happy-dom Animation.cancel / motion-dom NativeAnimation.stop.
+  This independently establishes the same 24 errors before UX-1, without
+  trusting the worker's full-baseline claim. Full baseline suite was not rerun
+  by the parent. The existing runner problem is now tracked as UX-2.
+- Compiled the `before:content-['*']` utility using installed
+  `@tailwindcss/node.compile` and asserted the generated star content: passed.
+  This confirms CSS generation, not rendered visual acceptance.
+- `git diff --check bcdef6bd3..HEAD`: passed; `git status --short`: no tracked
+  changes left after commits; unrelated user untracked files left untouched.
+
+Not verified: real browser appearance, keyboard/screen-reader behavior,
+light/dark/narrow layouts, AI-15 runtime checks and product-owner acceptance.
+No Rust/Python/Compose/dependency changes, so their checks were not run.
+No PR was opened, branch pushed, or merge performed. UX-1 remains In Progress
+until delivery; the owner checklist is not marked passed by this review.
 
 ### Parent review round 1 (2026-11-17, head 2ae89651a)
 
