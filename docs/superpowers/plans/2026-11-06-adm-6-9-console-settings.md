@@ -780,6 +780,68 @@ names none: the console's own fields are the console's.
 - The API image build took 18 m 56 s on this machine; a cold build on a
   machine without the cargo layer cache will take longer.
 
+### Handoff (slice 2, final verification) — developer, 2026-11-17
+
+Branch `feat/adm-8-9-console-settings`, at `1ef21c7c` (the merge of
+`origin/main` into the branch, after R6's fixes). This entry adds the
+verification of the branch's HEAD; the slice 2 work itself is the
+commits listed in the two handoffs above.
+
+**Commits.** None in this round: the branch's head is `1ef21c7c`, the
+merge of `origin/main` that the R6 round ended with. Every commit of the
+slice (`09076fb0`, `afd675af`, `48e3b8c4`, `d3a1631f`, `ccafe9e9`), of the
+R4 fix (`1d49afe7`) and of R6's three fixes (`0a2eeb13`, `8751126a`,
+`1c26ba5c`) is pushed.
+
+**Migrations.** `0129_sign_in_settings.sql` and
+`0130_assistant_settings.sql` — the numbers the slice 2 commits named
+them, and the numbers the merged tree carries (`main`'s last migration is
+still `0128_email_settings.sql`, slice 1's).
+
+**Commands run, with their counts** (foreground, on the branch's head
+`1ef21c7c`, `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target-adm67`,
+`CARGO_BUILD_JOBS=2`):
+
+- `cargo fmt --check` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  — clean (27 s, incremental).
+- `cargo test -p lakehouse-api -p lakehouse-store -p lakehouse-llm` —
+  **5593 passed, 0 failed, 25 ignored** (the three crates the slice
+  touches).
+- `git status` — clean, nothing generated staged.
+
+**Not verified, and why:**
+
+- **The console's checks were not re-run on this head.** `bun` is no longer
+  installed on this machine (it was there when the slice was built, and it
+  ran green then: `bun run typecheck` clean, `bun --bun eslint src` 0
+  errors, `bun run test` **3521 passed, 1 skipped, 0 failed** at
+  `ccafe9e9`, and **3537 passed, 1 skipped, 0 failed** at `754a4532` in
+  the R4 round). Nothing could be run because the binary is gone, not
+  because a check failed. The console's sources are unchanged between
+  `754a4532` (the last green run) and this head: `git diff 754a4532
+  1ef21c7c -- src/` is empty, and the only change under the console's
+  root is one comment line in `next.config.ts` that `main` brought. CI
+  runs the console's checks on the pull request.
+- `cargo test --workspace` (every crate) was not run: the block was
+  scoped to the three crates the slice touches, as the R4 round scoped it.
+  `cargo clippy --workspace --all-targets --all-features` covers the whole
+  workspace and is clean.
+- The Dagster suite and a real `docker compose up` were not run in this
+  round: the round changed no Python and no Compose file. The R6 round
+  proved the Compose change with a real stack (`docker compose -p adm9r6
+  up -d`) and recorded it above.
+- The console's own screens were not looked at in a browser.
+
+**Note for the next person on this machine: the disk was full.** The
+shared `CARGO_TARGET_DIR` and the main checkout's own `rust/target` (159
+GB) had filled the volume (100 %, 426 MB free), and a build failed with
+"No space left on device". The regenerable incremental-compilation cache
+of the shared target directory
+(`cargo-target-adm67/debug/incremental`, 27 GB) was removed to make room;
+no `cargo clean` was run and no dependency artifact was deleted, so the
+next build recompiles the workspace crates but reuses the dependencies.
+
 ## 5. Review
 
 ### Review of slice 1 (planner, 2026-11-06, at `b1d022fc`)
