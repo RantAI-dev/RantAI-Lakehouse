@@ -85,6 +85,8 @@ never a pass.
   not offered, and a direct call to save is refused.
 - `ADM-2-AC8` Press Reset. The product's name, logo and icon return.
 - `ADM-2-AC9` The audit trail shows each save and the reset.
+- `ADM-2-AC10` Open a public link of a dashboard. Its header shows the
+  workspace's name and logo, and its footer reads "Powered by RantAI Lakehouse".
 
 ## Not included
 
