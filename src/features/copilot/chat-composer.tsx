@@ -4,6 +4,8 @@ import * as React from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { ArrowUp, SlidersHorizontal, Square } from "lucide-react";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
+import { RequiredLegend } from "@/components/patterns/required-legend";
 import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
@@ -164,13 +166,15 @@ export function ChatComposer({
   if (compact) {
     return (
       <div className={cn("flex items-center gap-2 rounded-full border py-2 pl-4 pr-2 transition-all", glassCls)}>
+        <Label htmlFor="copilot-compact-message" className="sr-only" required>Message AI Copilot</Label>
         <input
+          id="copilot-compact-message"
+          aria-required
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onFocus={onFocus}
           onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } }}
           placeholder={placeholder ?? "Ask anything about your lakehouse…"}
-          aria-label="Message AI Copilot"
           className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
         />
         {busy && onStop ? (
@@ -195,8 +199,12 @@ export function ChatComposer({
 
   const body = (
     <>
-      <div className="relative">
+      <div className="grid gap-1">
+        <RequiredLegend />
+        <Label htmlFor="copilot-message" className="px-2" required>Message AI Copilot</Label>
         <Textarea
+          id="copilot-message"
+          aria-required
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onFocus={onFocus}
@@ -210,7 +218,6 @@ export function ChatComposer({
           // With examples the placeholder is the animated overlay below: a
           // native placeholder cannot cross-fade.
           placeholder={example ? "" : placeholder ?? "Ask anything about your lakehouse data…"}
-          aria-label="Message AI Copilot"
           className="resize-none border-0 bg-transparent px-2 py-1.5 shadow-none focus-visible:ring-0 dark:bg-transparent"
         />
         {cycling && example ? (

@@ -5,6 +5,7 @@ import { Bell, CircleCheck, CircleX, Play, Plus } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import {
   Select,
   SelectContent,
@@ -229,7 +230,7 @@ function AlertConditionFields({
     <>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div className="grid gap-1.5">
-          <Label>Mart (Gold)</Label>
+          <Label htmlFor="alert-mart" required>Mart (Gold)</Label>
           <Select
             value={f.mart ?? ""}
             onValueChange={(v) => {
@@ -238,7 +239,7 @@ function AlertConditionFields({
               void loadFields(mart)
             }}
           >
-            <SelectTrigger>
+            <SelectTrigger id="alert-mart" aria-required>
               <SelectValue placeholder="pick a mart" />
             </SelectTrigger>
             <SelectContent>
@@ -252,13 +253,13 @@ function AlertConditionFields({
           {martsError ? <p className="mt-1 text-xs text-destructive">{martsError}</p> : null}
         </div>
         <div className="grid gap-1.5">
-          <Label>Measure</Label>
+          <Label htmlFor="alert-measure" required>Measure</Label>
           <Select
             value={f.measure ?? ""}
             onValueChange={(v) => setF((prev) => ({ ...prev, measure: v ?? "" }))}
             disabled={fields.length === 0}
           >
-            <SelectTrigger>
+            <SelectTrigger id="alert-measure" aria-required>
               <SelectValue placeholder={measurePlaceholder} />
             </SelectTrigger>
             <SelectContent>
@@ -310,8 +311,10 @@ function AlertConditionFields({
           </Select>
         </div>
         <div className="grid gap-1.5">
-          <Label>Threshold</Label>
+          <Label htmlFor="alert-threshold" required>Threshold</Label>
           <Input
+            id="alert-threshold"
+            aria-required
             type="number"
             value={f.threshold ?? 0}
             onChange={(e) =>
@@ -334,12 +337,12 @@ type DigestConditionProps = {
 function DigestConditionFields({ f, setF, boards, boardsError }: DigestConditionProps) {
   return (
     <div className="grid gap-1.5">
-      <Label>Dashboard</Label>
+      <Label htmlFor="alert-board" required>Dashboard</Label>
       <Select
         value={f.board ?? ""}
         onValueChange={(v) => setF((prev) => ({ ...prev, board: v ?? "" }))}
       >
-        <SelectTrigger>
+        <SelectTrigger id="alert-board" aria-required>
           <SelectValue placeholder="pick a dashboard" />
         </SelectTrigger>
         <SelectContent>
@@ -423,9 +426,12 @@ function RuleEditDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
+          <RequiredLegend />
           <div className="grid gap-1.5">
-            <Label>Name</Label>
+            <Label htmlFor="alert-name" required>Name</Label>
             <Input
+              id="alert-name"
+              aria-required
               value={f.name}
               onChange={(e) => setF((prev) => ({ ...prev, name: e.target.value }))}
               placeholder="e.g. Foreign visitors dropped"
@@ -503,12 +509,12 @@ function RuleEditDialog({
 
           {formFields.connector ? (
             <div className="grid gap-1.5">
-              <Label>Connector</Label>
+              <Label htmlFor="alert-connector" required>Connector</Label>
               <Select
                 value={f.connector ?? ""}
                 onValueChange={(v) => setF((prev) => ({ ...prev, connector: v ?? "" }))}
               >
-                <SelectTrigger>
+                <SelectTrigger id="alert-connector" aria-required>
                   <SelectValue placeholder="pick a connector">
                     {f.connector === "*"
                       ? "All connectors"
@@ -531,8 +537,10 @@ function RuleEditDialog({
 
           {formFields.freshnessTarget ? (
             <div className="grid gap-1.5">
-              <Label>Table (namespace.table)</Label>
+              <Label htmlFor="alert-table" required>Table (namespace.table)</Label>
               <Input
+                id="alert-table"
+                aria-required
                 value={f.mart ?? ""}
                 onChange={(e) => setF((prev) => ({ ...prev, mart: e.target.value }))}
                 placeholder="bronze.orders"
@@ -553,10 +561,12 @@ function RuleEditDialog({
           ) : null}
 
           <div className="grid gap-1.5">
-            <Label>
+            <Label htmlFor="alert-target" required>
               {f.channel === "email" ? "Recipient email" : "Webhook URL"}
             </Label>
             <Input
+              id="alert-target"
+              aria-required
               value={f.target}
               onChange={(e) => setF((prev) => ({ ...prev, target: e.target.value }))}
               placeholder={targetPlaceholder}

@@ -23,6 +23,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { RequiredLegend } from "@/components/patterns/required-legend";
 import { formatRelativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { SessionMeta } from "./use-copilot";
@@ -137,12 +139,15 @@ export function RenameSessionDialog({
             <DialogTitle>Rename conversation</DialogTitle>
             <DialogDescription>Shown in your history and the Copilot header.</DialogDescription>
           </DialogHeader>
+          <RequiredLegend />
+          <Label htmlFor="conversation-title" required>Title</Label>
           <Input
+            id="conversation-title"
             autoFocus
+            aria-required
             value={title}
             maxLength={120}
             onChange={(e) => setTitle(e.target.value)}
-            aria-label="Conversation title"
           />
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
