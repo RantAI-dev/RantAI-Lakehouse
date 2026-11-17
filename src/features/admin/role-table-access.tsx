@@ -393,9 +393,13 @@ export function RoleTableAccessSection({
                         <div className="min-w-0 flex-1">
                           <Label
                             htmlFor={`${idPrefix}-whole-${slug(key)}`}
-                            className="font-mono text-sm"
+                            className="min-w-0 font-mono text-sm"
                           >
-                            {choice.schema}
+                            {/* WEB-13: Label is a flex box, so a bare text node is an
+                                anonymous flex item that keeps its intrinsic minimum
+                                and an unbroken schema name escapes the card. An
+                                explicit span may wrap inside the bounded column. */}
+                            <span className="min-w-0 break-all">{choice.schema}</span>
                           </Label>
                           <p className="text-[11px] leading-snug text-muted-foreground">{note}</p>
                         </div>
@@ -416,12 +420,18 @@ export function RoleTableAccessSection({
                                   }
                                   className="mt-0.5"
                                 />
-                                <div className="grid gap-0.5">
+                                {/* WEB-13: the grid child and its flex Label must both
+                                    be allowed to shrink; the explicit span wraps an
+                                    unbroken table name onto more than one line while
+                                    the checkbox beside it keeps its intrinsic size. */}
+                                <div className="grid min-w-0 flex-1 gap-0.5">
                                   <Label
                                     htmlFor={`${idPrefix}-table-${slug(key)}-${slug(row.table)}`}
-                                    className="font-mono text-xs"
+                                    className="min-w-0 font-mono text-xs"
                                   >
-                                    {row.table}
+                                    <span className="min-w-0 break-all leading-snug">
+                                      {row.table}
+                                    </span>
                                   </Label>
                                   {row.listed ? null : (
                                     <span className="text-[10px] text-muted-foreground">

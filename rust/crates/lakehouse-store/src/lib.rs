@@ -83,6 +83,7 @@ pub mod storage;
 pub mod upload_folders;
 pub mod uploads;
 pub mod usage;
+pub mod workspace_settings;
 
 pub use error::StoreError;
 

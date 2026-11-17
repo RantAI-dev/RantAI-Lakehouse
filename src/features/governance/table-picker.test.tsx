@@ -155,3 +155,66 @@ describe("useTableColumns", () => {
     await waitFor(() => expect(screen.getAllByTestId("columns").map((p) => p.textContent)).toEqual(["id,amount", "none"]))
   })
 })
+
+// WEB-13: a long unbroken table key must stay whole in the option and bounded
+// in the selected badge. happy-dom computes no geometry, so the wrapping is
+// asserted as structure; the measured narrow/wide fit is a manual-QA item.
+describe("TablePicker long identifiers (WEB-13)", () => {
+  const LONG_TABLE = "silver." + "extremely_long_table_name_".repeat(4) + "final"
+
+  it("keeps a long table key whole, wraps it in the option and picks it exactly", async () => {
+    spyOn(assetService, "listAssets").mockResolvedValue([
+      { id: LONG_TABLE, name: "Long table", namespace: "silver" },
+    ] as unknown as Asset[])
+    const onChange = mock<(next: string) => void>(() => {})
+    render(<CatalogPicker onChange={onChange} />)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Table" }))
+    const option = (await screen.findAllByRole("option")).find((o) => o.textContent === LONG_TABLE)
+    expect(option).toBeTruthy()
+    const optionText = screen.getByText(LONG_TABLE)
+    expect(optionText.textContent).toBe(LONG_TABLE)
+    expect(optionText.className).toContain("break-all")
+    expect(optionText.className).toContain("min-w-0")
+
+    fireEvent.click(option as HTMLElement)
+    expect(onChange.mock.calls[0][0]).toBe(LONG_TABLE)
+  })
+
+  it("bounds the selected badge and keeps the full table key on the trigger title", async () => {
+    spyOn(assetService, "listAssets").mockResolvedValue([
+      { id: LONG_TABLE, name: "Long table", namespace: "silver" },
+    ] as unknown as Asset[])
+    render(<CatalogPicker value={LONG_TABLE} />)
+
+    const trigger = await screen.findByRole("button", { name: "Table" })
+    expect(trigger.getAttribute("title")).toBe(LONG_TABLE)
+    expect(trigger.className).toContain("min-w-0")
+    const badge = trigger.querySelector('[data-slot="badge"]') as HTMLElement
+    expect(badge).toBeTruthy()
+    expect(badge.className).toContain("max-w-full")
+    // The min-w-0 is a CSS variant on the badge, applied to its child span in
+    // a real browser; happy-dom does not evaluate the generated rule.
+    expect(badge.className).toContain("[&>span]:min-w-0")
+    const badgeText = badge.querySelector("span") as HTMLElement
+    expect(badgeText.className).toContain("truncate")
+    expect(badgeText.textContent).toBe(LONG_TABLE)
+  })
+
+  it("keeps a long held table the catalog does not list, marked, rather than dropping it", async () => {
+    spyOn(assetService, "listAssets").mockResolvedValue(ASSETS)
+    render(<CatalogPicker value={LONG_TABLE} />)
+
+    const trigger = await screen.findByRole("button", { name: "Table" })
+    expect(trigger.textContent).toContain(`${LONG_TABLE} (not in the catalog)`)
+    expect(trigger.getAttribute("title")).toBe(LONG_TABLE)
+    fireEvent.click(trigger)
+    const tableOption = (await screen.findAllByRole("option")).find((o) =>
+      o.textContent === `${LONG_TABLE} (not in the catalog)`
+    )
+    expect(tableOption).toBeTruthy()
+    expect(tableOption?.querySelector(".break-all")?.textContent).toBe(
+      `${LONG_TABLE} (not in the catalog)`
+    )
+  })
+})

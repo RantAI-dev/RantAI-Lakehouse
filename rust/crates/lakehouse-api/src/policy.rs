@@ -149,7 +149,7 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY fourteen routes in the whole service. (Was "six" —
+    // ── Public: the ONLY seventeen routes in the whole service. (Was "six" —
     // corrected when the seventh was added, since Task A5's
     // `/api/auth/oidc/callback` had already made the old count stale; the
     // eighth is `POST /api/embed/frame`, SEC-12; the ninth is
@@ -158,7 +158,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // `POST /api/public/dashboard/{token}/unlock` (BI-19 part A); the twelfth
     // and the thirteenth are the public link's and the embed's map boundary
     // route, `PR #246 review BLOCKER 1`; the fourteenth is the readiness
-    // probe, REL-2 decision D7.) ───────────────────────────────────────────
+    // probe, REL-2 decision D7; the fifteenth is the password rules, ADM-11
+    // D4; the sixteenth and the seventeenth are the workspace's name and
+    // pictures, ADM-2 decision 5.) ───────────────────────────────────────────
     ("GET",  "/health",                          Policy::Public),
     // REL-2 (D7): the readiness probe an installer or an updater waits on.
     // Public because it answers only whether this stack is ready — three
@@ -195,6 +197,18 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/embed/maps/{id}/geojson",      Policy::Public),
     ("POST", "/api/auth/login",                   Policy::Public),
     ("GET",  "/api/auth/password-rules",          Policy::Public),
+    // Unauthenticated by necessity — the sign-in page shows the workspace's
+    // name and logo before any session exists. It exposes the name and each
+    // picture's type and version only (`routes::settings::get_branding`),
+    // never who saved them or when, and no other settings row.
+    ("GET",  "/api/branding",                     Policy::Public),
+    // Unauthenticated by necessity — the same page loads the pictures the
+    // answer above points to. It serves one stored picture of a fixed kind
+    // (`logo`, `logo-dark` or `icon`): a kind outside that list is a 400 and
+    // a kind inside it that was never set is a 404 (`routes::settings`).
+    // The picture is an inert file: `nosniff`, a sandboxing CSP and
+    // `inline`. Nothing else is reachable through it.
+    ("GET",  "/api/branding/images/{kind}",       Policy::Public),
     // Redirect-only, grants nothing — it only ever
     // 302s to a fixed, config-sourced IdP URL and sets a single-use flow
     // cookie. Mirrors `/api/auth/login`'s existing `Policy::Public`.
@@ -870,6 +884,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/settings/assistant",    Policy::RequiresPermission("settings:write")),
     ("PUT",    "/api/settings/assistant",    Policy::RequiresPermission("settings:write")),
     ("POST",   "/api/settings/assistant/test", Policy::RequiresPermission("settings:write")),
+    // ── The workspace's name, logo, dark-mode logo and icon (`ADM-2`,
+    //    `routes::settings`). The public side of them is `GET /api/branding`
+    //    in the Public block above; reading the admin view, saving, removing
+    //    a picture and resetting all need `settings:write`. ─────────────────
+    ("GET",    "/api/settings/general",      Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/general",      Policy::RequiresPermission("settings:write")),
+    ("DELETE", "/api/settings/general",      Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/general/images/{kind}", Policy::RequiresPermission("settings:write")),
+    ("DELETE", "/api/settings/general/images/{kind}", Policy::RequiresPermission("settings:write")),
     // ── Single sign-on (`ADM-12`, `routes::settings`): issuer, client ID,
     //    client secret, provider name, groups claim, role map, and JIT.
     //    Reading needs `settings:write` (plan D5); saving and testing also
@@ -1590,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_fifteen_public_entries_exist() {
+    fn exactly_seventeen_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -1616,7 +1639,10 @@ mod tests {
         // REL-2 decision D7 added `GET /health/ready`, the readiness probe an
         // installer or an updater waits on: 13 -> 14.
         // ADM-11 (D4) / ADM-11 review 1 B3 added `GET /api/auth/password-rules`: 14 -> 15.
-        assert_eq!(public_count, 15);
+        // ADM-2 (decision 5) added `GET /api/branding` and
+        // `GET /api/branding/images/{kind}`, the workspace's name and pictures
+        // for the sign-in page: 15 -> 17.
+        assert_eq!(public_count, 17);
     }
 
     /// SEC-23 (F1), ADM-13 (D5): adding a governance rule needs `governance:write`;
