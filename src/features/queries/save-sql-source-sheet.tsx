@@ -4,6 +4,7 @@ import * as React from "react"
 import { toast } from "sonner"
 
 import { CreateSheet } from "@/components/patterns/create-sheet"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useServiceAction } from "@/hooks/use-service"
@@ -57,10 +58,12 @@ export function SaveSqlSourceSheet({
         })
       }}
     >
+      <RequiredLegend />
       <div className="space-y-2">
-        <Label htmlFor="sql-source-title">Title</Label>
+        <Label htmlFor="sql-source-title" required>Title</Label>
         <Input
           id="sql-source-title"
+          aria-required
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           placeholder="Materials by group and type"

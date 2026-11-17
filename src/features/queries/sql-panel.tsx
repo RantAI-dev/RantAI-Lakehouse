@@ -6,6 +6,8 @@ import { BookOpen, LayoutDashboard, Play, Save, Square, WandSparkles } from "luc
 import { SqlEditor } from "@/components/sql-editor"
 import { formatSql } from "@/lib/sql-format"
 import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import {
   Select,
   SelectContent,
@@ -62,7 +64,9 @@ export function SqlPanel({
 
   return (
     <div className="space-y-3">
-      <SqlEditor value={sql} onChange={setSql} schema={sqlSchema} />
+      <RequiredLegend />
+      <Label id="query-sql-label" required>SQL</Label>
+      <SqlEditor labelledBy="query-sql-label" required value={sql} onChange={setSql} schema={sqlSchema} />
       <div className="flex flex-wrap items-center gap-2">
         <Select value={engine} onValueChange={(v) => setEngine(v as typeof engine)}>
           <SelectTrigger size="sm" className="w-32">

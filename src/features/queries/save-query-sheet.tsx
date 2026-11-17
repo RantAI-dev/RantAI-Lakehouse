@@ -3,6 +3,7 @@
 import * as React from "react"
 
 import { CreateSheet } from "@/components/patterns/create-sheet"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { sqlSummary } from "@/lib/sql-text"
@@ -64,17 +65,19 @@ export function SaveQuerySheet({
         })
       }}
     >
+      <RequiredLegend />
       <div className="space-y-2">
-        <Label htmlFor="saved-query-title">Title</Label>
+        <Label htmlFor="saved-query-title" required>Title</Label>
         <Input
           id="saved-query-title"
+          aria-required
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           placeholder="Revenue by region"
         />
       </div>
       <div className="space-y-2">
-        <Label htmlFor="saved-query-tags">Tags</Label>
+        <Label htmlFor="saved-query-tags">Tags <span className="font-normal text-muted-foreground">(optional)</span></Label>
         <Input
           id="saved-query-tags"
           value={tags}

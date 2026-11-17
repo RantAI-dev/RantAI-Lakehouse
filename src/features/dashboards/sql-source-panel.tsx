@@ -5,6 +5,7 @@ import { SqlEditor } from "@/components/sql-editor";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { RequiredLegend } from "@/components/patterns/required-legend";
 import { formatCell, sourceNameProblem, type SqlRunPhase } from "@/lib/sql-source-draft";
 import type { SqlSourcePreview } from "@/services/contracts/dashboards";
 import { cn } from "@/lib/utils";
@@ -132,9 +133,10 @@ export function SqlSourcePanel({ draft, onCancelEdit }: { draft: SqlSourceDraft;
         </p>
       ) : null}
 
+      <RequiredLegend />
       <div className="grid gap-1.5">
-        <Label>SQL <span aria-hidden className="text-destructive">*</span></Label>
-        <SqlEditor value={draft.sql} onChange={draft.setSql} minHeight="200px" wrap />
+        <Label id="sql-source-label" required>SQL</Label>
+        <SqlEditor labelledBy="sql-source-label" required value={draft.sql} onChange={draft.setSql} minHeight="200px" wrap />
         <p className="text-xs text-muted-foreground" id="sql-source-hint">
           One read-only SELECT over <span className="font-mono">serving</span> tables, written as{" "}
           <span className="font-mono">serving.&lt;table&gt;</span>. At most 2,000 rows and 30 seconds.
@@ -159,9 +161,9 @@ export function SqlSourcePanel({ draft, onCancelEdit }: { draft: SqlSourceDraft;
       ) : null}
 
       <div className="grid gap-1.5">
-        <Label htmlFor="ch-source-name">Source name <span aria-hidden className="text-destructive">*</span></Label>
+        <Label htmlFor="ch-source-name" required>Source name</Label>
         <Input
-          id="ch-source-name" value={draft.name} onChange={(e) => draft.setName(e.target.value)}
+          id="ch-source-name" aria-required value={draft.name} onChange={(e) => draft.setName(e.target.value)}
           placeholder="e.g. Visitors by region and month"
           aria-invalid={nameInvalid ? true : undefined}
         />

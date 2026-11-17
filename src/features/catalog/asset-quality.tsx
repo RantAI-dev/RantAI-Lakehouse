@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import {
   Table,
   TableBody,
@@ -158,6 +159,7 @@ function AddRuleDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
+          <RequiredLegend />
           <div className="grid gap-1.5">
             <Label htmlFor="rule-kind">Check</Label>
             <select
@@ -175,9 +177,10 @@ function AddRuleDialog({
           </div>
           {KINDS[form.kind].column ? (
             <div className="grid gap-1.5">
-              <Label htmlFor="rule-column">Column</Label>
+              <Label htmlFor="rule-column" required={KINDS[form.kind].column}>Column</Label>
               <select
                 id="rule-column"
+                aria-required={KINDS[form.kind].column}
                 className={selectClassName}
                 value={form.column}
                 onChange={(e) => set({ column: e.target.value })}
@@ -199,9 +202,10 @@ function AddRuleDialog({
           ) : null}
           {form.kind === "rows" ? (
             <div className="grid gap-1.5">
-              <Label htmlFor="rule-rows">Minimum rows</Label>
+              <Label htmlFor="rule-rows" required>Minimum rows</Label>
               <Input
                 id="rule-rows"
+                aria-required
                 inputMode="numeric"
                 value={form.rows}
                 onChange={(e) => set({ rows: e.target.value })}
@@ -210,9 +214,10 @@ function AddRuleDialog({
           ) : null}
           {form.kind === "not-null" ? (
             <div className="grid gap-1.5">
-              <Label htmlFor="rule-percent">Rows that must have a value (%)</Label>
+              <Label htmlFor="rule-percent" required>Rows that must have a value (%)</Label>
               <Input
                 id="rule-percent"
+                aria-required
                 inputMode="decimal"
                 value={form.percent}
                 onChange={(e) => set({ percent: e.target.value })}
@@ -221,6 +226,7 @@ function AddRuleDialog({
           ) : null}
           {form.kind === "range" ? (
             <div className="grid gap-3 sm:grid-cols-2">
+              <p className="text-xs text-muted-foreground sm:col-span-2">At least one bound is required; leave the other blank for no bound.</p>
               <div className="grid gap-1.5">
                 <Label htmlFor="rule-min">Minimum</Label>
                 <Input
@@ -245,7 +251,7 @@ function AddRuleDialog({
           ) : null}
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="grid gap-1.5">
-              <Label htmlFor="rule-name">Name</Label>
+              <Label htmlFor="rule-name">Name <span className="font-normal text-muted-foreground">(generated, optional to change)</span></Label>
               <Input id="rule-name" value={ruleName} onChange={(e) => setName(e.target.value)} />
             </div>
             <div className="grid gap-1.5">

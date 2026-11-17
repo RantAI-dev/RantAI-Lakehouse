@@ -23,6 +23,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import {
   Select,
   SelectContent,
@@ -186,10 +187,11 @@ export function AssetDetailPage() {
             </p>
           ) : (
             <div className="grid gap-3">
+              <RequiredLegend />
               <div className="grid gap-1.5">
-                <Label>Permission</Label>
+                <Label htmlFor="access-permission" required>Permission</Label>
                 <Select value={permission} onValueChange={(v) => setPermission(v ?? "")}>
-                  <SelectTrigger>
+                  <SelectTrigger id="access-permission" aria-required>
                     <SelectValue placeholder="pick a permission" />
                   </SelectTrigger>
                   <SelectContent>
@@ -202,8 +204,9 @@ export function AssetDetailPage() {
                 </Select>
               </div>
               <div className="grid gap-1.5">
-                <Label>Reason</Label>
+                <Label htmlFor="access-reason">Reason <span className="font-normal text-muted-foreground">(optional)</span></Label>
                 <Textarea
+                  id="access-reason"
                   value={reason}
                   onChange={(e) => setReason(e.target.value)}
                   placeholder="Why do you need this?"

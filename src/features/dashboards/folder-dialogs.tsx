@@ -8,6 +8,8 @@ import {
   Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { RequiredLegend } from "@/components/patterns/required-legend";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
@@ -83,14 +85,19 @@ export function ManageFoldersDialog({
         </DialogHeader>
 
         <div className="grid gap-2">
-          <div className="flex flex-col gap-2 sm:flex-row">
-            <Input
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") void create(); }}
-              placeholder="New folder name"
-              aria-label="New folder name"
-            />
+          <RequiredLegend />
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+            <div className="min-w-0 flex-1 space-y-1">
+              <Label htmlFor="new-folder-name" className="text-xs" required>New folder name</Label>
+              <Input
+                id="new-folder-name"
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") void create(); }}
+                placeholder="New folder name"
+                aria-required
+              />
+            </div>
             <Select value={newParent} onValueChange={(v) => setNewParent(v ?? ROOT)}>
               <SelectTrigger className="sm:w-48">
                 <SelectValue>
@@ -117,13 +124,15 @@ export function ManageFoldersDialog({
                 <Folder className="size-4 shrink-0 text-muted-foreground" aria-hidden />
                 {editing?.id === folder.id ? (
                   <>
+                    <Label htmlFor="folder-rename-name" className="sr-only" required>Folder name</Label>
                     <Input
+                      id="folder-rename-name"
                       autoFocus
                       className="h-7"
+                      aria-required
                       value={editing.name}
                       onChange={(e) => setEditing({ id: folder.id, name: e.target.value })}
                       onKeyDown={(e) => { if (e.key === "Enter") void rename(); if (e.key === "Escape") setEditing(null); }}
-                      aria-label="Folder name"
                     />
                     <Button size="icon-sm" variant="ghost" aria-label="Save name" onClick={() => void rename()} disabled={busy}>
                       <Check className="size-4" />

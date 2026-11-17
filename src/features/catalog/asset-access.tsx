@@ -19,6 +19,8 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
+import { RequiredMarker } from "@/components/ui/required"
 import { useAuth } from "@/features/auth/auth-provider"
 import { PolicyActions } from "@/features/governance/policy-actions"
 import { useServiceAction } from "@/hooks/use-service"
@@ -380,17 +382,19 @@ function AddPolicyDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
+          <RequiredLegend />
           <div className="grid gap-1.5">
-            <Label htmlFor="policy-roles">Roles it applies to</Label>
+            <Label htmlFor="policy-roles" required>Roles it applies to</Label>
             <Input
               id="policy-roles"
+              aria-required
               value={form.roles}
               onChange={(e) => setForm((f) => ({ ...f, roles: e.target.value }))}
               placeholder="Analyst, Dashboard Viewer"
             />
           </div>
           <fieldset className="grid gap-1.5">
-            <legend className="mb-1.5 text-sm font-medium">Columns to mask</legend>
+            <legend className="mb-1.5 flex items-center gap-1.5 text-sm font-medium">Columns to mask <RequiredMarker /></legend>
             <div className="flex max-h-40 flex-wrap gap-x-4 gap-y-1 overflow-y-auto">
               {a.schema.map((c) => (
                 <label key={c.name} className="flex items-center gap-1.5 text-sm">
@@ -415,8 +419,8 @@ function AddPolicyDialog({
             />
           </div>
           <div className="grid gap-1.5">
-            <Label htmlFor="policy-name">Name</Label>
-            <Input id="policy-name" value={name} onChange={(e) => setName(e.target.value)} />
+            <Label htmlFor="policy-name" required>Name</Label>
+            <Input id="policy-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
           </div>
           <label className="flex items-center gap-2 text-sm">
             <input type="checkbox" checked={activate} onChange={(e) => setActivate(e.target.checked)} />

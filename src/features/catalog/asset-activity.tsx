@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import {
   Table,
   TableBody,
@@ -238,10 +239,12 @@ function SetTargetDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-1.5">
-          <Label htmlFor="sla-amount">New data at least every</Label>
+          <RequiredLegend />
+          <Label htmlFor="sla-amount" required>New data at least every</Label>
           <div className="flex gap-2">
             <Input
               id="sla-amount"
+              aria-required
               inputMode="numeric"
               className="w-24"
               value={amount}
