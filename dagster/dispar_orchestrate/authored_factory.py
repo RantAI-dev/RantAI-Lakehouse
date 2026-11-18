@@ -120,6 +120,13 @@ from dagster import (
 from dispar_orchestrate import op_metadata
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, _ch_query_json
 from dispar_orchestrate.file_ingest import JOB_NAME as FILE_INGEST_JOB
+from dispar_orchestrate.ingest_factory import run_limit_tags
+
+# How long one run of an authored job may run, in seconds. An authored
+# pipeline is a load, so it gets the same six hours `ingest_job` gets: the
+# longest authored run measured on staging on 2026-11-16 was 59 s.
+RUN_LIMIT_ENV = "DAGSTER_RUN_LIMIT_AUTHORED_JOB_SECONDS"
+DEFAULT_RUN_LIMIT_SECONDS = 21_600
 
 
 def _env(name: str, default: str) -> str:
@@ -677,7 +684,12 @@ def build_authored_job(pipeline: dict[str, Any]) -> Any:
     op_fn = _op_for_pipeline(pipeline)
     safe_name = _dagster_safe_name(pipeline["id"])
 
-    @job(name=f"authored__{safe_name}")
+    # The `dagster/max_runtime` tag is what run monitoring enforces: a run
+    # whose process died is cancelled and failed by the daemon, so it does
+    # not hold a run-queue slot forever (`OPS-35`).
+    # `ingest_factory.run_limit_tags` says why it is a tag and not
+    # `run_monitoring.max_runtime_seconds`.
+    @job(name=f"authored__{safe_name}", tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
     def _authored_job() -> None:
         op_fn()
 

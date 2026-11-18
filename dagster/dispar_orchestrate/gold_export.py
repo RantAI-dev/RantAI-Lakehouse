@@ -100,8 +100,16 @@ from dagster import (
 )
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, record_maintenance_run
+from dispar_orchestrate.ingest_factory import run_limit_tags
 from dispar_orchestrate.maintenance import maintenance_paused
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
+
+# How long one run of this job may run, in seconds. A daily export gets
+# room for a slow day. Not measured on staging, 2026-11-16 -- the job has
+# been failing there since 13 Nov -- so the limit follows the plan's
+# default rather than a measured run.
+RUN_LIMIT_ENV = "DAGSTER_RUN_LIMIT_GOLD_EXPORT_JOB_SECONDS"
+DEFAULT_RUN_LIMIT_SECONDS = 7_200
 
 
 def _env(name: str, default: str) -> str:
@@ -994,7 +1002,11 @@ def summarize_gold_export(context, results: list[dict[str, Any]]) -> list[dict[s
     return results
 
 
-@job
+# The `dagster/max_runtime` tag is what run monitoring enforces: a run
+# whose process died is cancelled and failed by the daemon, so it does not
+# hold a run-queue slot forever (`OPS-35`). `ingest_factory.run_limit_tags`
+# says why it is a tag and not `run_monitoring.max_runtime_seconds`.
+@job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def gold_export_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `gold_export_job`. A fan-out
     op (`list_gold_marts`) yields one `DynamicOutput` per mart; the

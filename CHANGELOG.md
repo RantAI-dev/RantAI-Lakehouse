@@ -88,6 +88,7 @@ once a first release is tagged.
 
 ### Fixed
 
+- A Dagster run whose process died no longer holds the run queue (backlog `OPS-35`). Ten runs left STARTED on staging filled the concurrency limit while 570 runs waited behind them, because run monitoring only ends a run past a `dagster/max_runtime` tag and only `ingest_job` carried one. Every job of the code location now carries the tag, each with its own default and its own `DAGSTER_RUN_LIMIT_*_SECONDS` override (documented in `docs/CONFIGURATION.md`), so a run left stuck by a restart is ended and the queue moves.
 - Long, unbroken schema, table, permission and column names stay inside their pickers instead of painting past the card: the Roles table-access, permission, source-column, governance table and pipeline column controls wrap or bound the name while keeping the full identifier available and every saved value unchanged (backlog `WEB-13`).
 - A viewer who cannot change dashboards gets a refusal that names the missing permission (`dashboard:write`), and a short dashboard request written in Indonesian is answered in Indonesian (backlog `AI-1`).
 - The Overview activity feed shows everyone's actions only to people who may read the audit trail; others see their own (backlog `GOV-1`).

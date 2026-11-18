@@ -58,7 +58,15 @@ from dagster import DefaultScheduleStatus, Failure, ScheduleDefinition, job, op
 from s3fs import S3FileSystem
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_capacity_snapshot
+from dispar_orchestrate.ingest_factory import run_limit_tags
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
+
+# How long one run of this job may run, in seconds. A daily job gets room
+# for a slow day: the longest run measured on staging on 2026-11-16 was
+# 64 s, and the limit is well above it but far below the six hours a load
+# job gets.
+RUN_LIMIT_ENV = "DAGSTER_RUN_LIMIT_CAPACITY_SNAPSHOT_JOB_SECONDS"
+DEFAULT_RUN_LIMIT_SECONDS = 1_800
 
 
 def _env(name: str, default: str) -> str:
@@ -179,7 +187,11 @@ def run_capacity_snapshot(context) -> None:
     )
 
 
-@job
+# The `dagster/max_runtime` tag is what run monitoring enforces: a run
+# whose process died is cancelled and failed by the daemon, so it does not
+# hold a run-queue slot forever (`OPS-35`). `ingest_factory.run_limit_tags`
+# says why it is a tag and not `run_monitoring.max_runtime_seconds`.
+@job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def capacity_snapshot_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `capacity_snapshot_job`."""
     run_capacity_snapshot()

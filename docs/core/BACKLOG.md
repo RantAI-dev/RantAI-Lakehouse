@@ -395,6 +395,7 @@ estimate (S, M, L), which the base has no field for.
 | `REL-26` | Task | Two flaky console tests: `SchemaBrowser > keeps the table's name unknown on a Trino tab until its detail loads` (`Received: "SELECT * FROM undefined.undefined"`, seen twice on 2026-11-13 on two branches that do not touch Query Studio) and `the created screen waits for the save (LH-SRC-6-39) > does not read the connection settings before the save has answered` (#503, run 43400226518). Make each wait for what it means, not for a clock | Delivery | P2 | Todo |  | CI runs of #497, #504, #503 |
 | `REL-27` | Task | A flaky Rust test: `lakehouse-api::upload_routes two_tenants_asking_for_one_new_name_at_the_same_moment_one_launches` (`left: 1, right: 2`, #486 run 43333004203). By reading, the second request can arrive after the first claimed the name and is refused before the registry lookup the test counts; the 500 ms stand-in delay does not make them simultaneous | Delivery | P3 | Todo |  | `OPS-22` plan, section 4 |
 | `GOV-16` | Task | Quality reads still not narrowed by role (after `GOV-15`): the incident list, the schedule list, a rule's run history, the learning state, the assistant's `get_quality`, and the classification kind of the governance list. Narrow each by the table access `GOV-15` uses, with the same answers for not there and not yours | Governance | P2 | Todo |  | #515 review, round 1 |
+| `OPS-35` | Task | Every Dagster job has a run time limit, so a run whose process died cannot hold the queue | Operations | P2 | Building |  | staging Dagster blocked 13 to 16 Nov 2026, 10 runs left STARTED |
 
 ## Later (P3)
 
@@ -526,6 +527,7 @@ set by the product owner and are left empty until they are.
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
 | `OPS-8` | 2026-11-16 | 2026-11-17 (#574) | |
+| `OPS-35` | 2026-11-16 | | |
 | `ADM-2` | 2026-11-15 | 2026-11-17 (#562, #570, #572) | |
 | `SEC-76` | | | |
 | `SEC-77` | | | |

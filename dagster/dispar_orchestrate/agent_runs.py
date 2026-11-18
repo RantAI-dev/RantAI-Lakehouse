@@ -75,7 +75,15 @@ import requests
 
 from dagster import Definitions, Field, ScheduleDefinition, job, op
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_maintenance_run
+from dispar_orchestrate.ingest_factory import run_limit_tags
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
+
+# How long one run of this job may run, in seconds. One launch runs one
+# digital employee, so half an hour is room for a slow run and far below
+# the six hours a load job gets. Not measured on staging, 2026-11-16 --
+# the job had no run there to measure.
+RUN_LIMIT_ENV = "DAGSTER_RUN_LIMIT_AGENT_RUN_JOB_SECONDS"
+DEFAULT_RUN_LIMIT_SECONDS = 1_800
 
 
 def _env(name: str, default: str) -> str:
@@ -251,7 +259,11 @@ def run_agent_employee(context) -> dict[str, Any]:
     return {"employee_id": employee_id, "run_id": run_id, "status": status}
 
 
-@job
+# The `dagster/max_runtime` tag is what run monitoring enforces: a run
+# whose process died is cancelled and failed by the daemon, so it does not
+# hold a run-queue slot forever (`OPS-35`). `ingest_factory.run_limit_tags`
+# says why it is a tag and not `run_monitoring.max_runtime_seconds`.
+@job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def agent_run_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `agent_run_job`. Launch with run
     config `{"ops": {"run_agent_employee": {"config": {"employee_id": "..."}}}}`
