@@ -40,7 +40,7 @@ use lakehouse_store::uploads::{
     heal_table_drop, insert, list, list_claims, list_dropped_tables, loading_into,
     loads_under_limits, mark_finished, mark_group_within_limits, mark_ingesting,
     mark_ingesting_within_limits, record_table_drop, table_being_loaded, table_claim,
-    table_claimed, upload_in_tenants,
+    table_claimed, table_claims, upload_in_tenants,
 };
 use lakehouse_store::uploads::{
     LARGE_LOAD_BYTES, count_receiving, find_by_parts_digest, finish_receiving, insert_receiving,
@@ -956,6 +956,56 @@ async fn two_tenants_claiming_one_new_name_at_the_same_moment_one_wins(
     let recorded = claim_row(&pool, "twice_raw").await.unwrap();
     assert_eq!(recorded.0, Some(tenant_a));
     assert!(["up-1", "up-2"].contains(&recorded.1.as_str()));
+    Ok(())
+}
+
+/// `table_claims` is `table_claim` for a whole listing in one read: the same
+/// answer for every name (nobody's, the asking tenant's, someone else's, a
+/// tenant that is gone's), and a name nobody holds is simply not in the map.
+#[sqlx::test(migrations = "../../migrations")]
+async fn table_claims_answers_what_table_claim_answers_for_every_name_in_one_read(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-batch-a").await;
+    let tenant_b = tenant(&pool, "uploads-batch-b").await;
+    let gone = tenant(&pool, "uploads-batch-gone").await;
+    claim(&pool, tenant_a, "a_raw", "up-a").await;
+    claim(&pool, tenant_b, "b_raw", "up-b").await;
+    claim(&pool, gone, "gone_raw", "up-gone").await;
+    sqlx::query("DELETE FROM tenant WHERE id = $1")
+        .bind(gone)
+        .execute(&pool)
+        .await?;
+    // A listing of 250 tables the asking tenant holds, beside the three above.
+    let mut names: Vec<String> = ["a_raw", "b_raw", "gone_raw", "free_raw"]
+        .map(str::to_owned)
+        .to_vec();
+    for n in 0..250 {
+        let name = format!("many_{n}");
+        claim(&pool, tenant_a, &name, &format!("up-many-{n}")).await;
+        names.push(name);
+    }
+
+    for asking in [tenant_a, tenant_b] {
+        let batch = table_claims(&pool, asking, &names).await.unwrap();
+        for name in &names {
+            let one = table_claim(&pool, asking, name).await.unwrap();
+            assert_eq!(
+                batch.get(name).copied().unwrap_or(TableClaim::Unclaimed),
+                one,
+                "{name} as {asking}"
+            );
+        }
+        assert!(
+            !batch.contains_key("free_raw"),
+            "a name nobody holds is not in the map"
+        );
+        assert_eq!(batch.len(), names.len() - 1);
+    }
+    assert!(
+        table_claims(&pool, tenant_a, &[]).await.unwrap().is_empty(),
+        "no names, no claims"
+    );
     Ok(())
 }
 

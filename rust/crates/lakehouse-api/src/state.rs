@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lakehouse_auth::openfga::LakekeeperAdminClient;
 use lakehouse_auth::throttle::ThrottlePolicy;
@@ -54,6 +54,39 @@ pub struct AuthState {
     pub service: Arc<ServiceTokenAuthenticator>,
 }
 
+/// What a process has learned about its application database since it
+/// started (`OPS-4`, `GOV-1`).
+///
+/// One struct behind one `Arc`, not one field per fact: a new field in
+/// [`AppState`] grows every future that holds a copy of the state, and
+/// `routes::ai::chat` and its streaming twin already sit at clippy's
+/// 16384-byte limit for a future (`large_futures`, in the unit-test build,
+/// whose [`AppState`] also carries the two test seams), so one more pointer
+/// there is a lint failure in a file the assistant's team owns.
+#[derive(Debug, Default)]
+pub struct DatabaseStatus {
+    /// Whether the start-up step has confirmed the application database is
+    /// usable at this build's schema version (`OPS-4`, `main::
+    /// bring_database_up`). Starts `false`: nothing has proven the schema
+    /// yet, so `GET /health` reports the database as unavailable until
+    /// migrations applied or a later retry succeeded (fail closed,
+    /// AGENTS.md principle 3).
+    ///
+    /// Not a live probe: this is the last answer the start-up step or its
+    /// retry loop gave, so a database lost AFTER boot keeps answering
+    /// `ok` here until the process restarts. A per-request probe would
+    /// have to be a bounded `SELECT 1` on its own short timeout — `GET
+    /// /health` is polled by the ops gates, and a probe that waits on a
+    /// dead database's default 30 s acquire timeout would stall them.
+    /// `docs/OPERATIONS.md` records that limit.
+    pub ready: AtomicBool,
+    /// How many audit rows could not be written since this process started
+    /// (`GOV-1`, feature page Decision 4): the change they record stood, the
+    /// row did not. Counted by [`crate::audit_coverage::record_best_effort`];
+    /// it starts at zero on every start and says nothing about earlier runs.
+    pub audit_write_failures: AtomicU64,
+}
+
 /// State shared across all route handlers.
 ///
 /// Cheap to clone: every field is behind an [`Arc`]. `lakehouse-clickhouse`
@@ -94,21 +127,12 @@ pub struct AppState {
     /// see `routes::identity::pool`, the first (and so far only) reader of
     /// this field.
     pub pg: Option<Arc<PgPool>>,
-    /// Whether the start-up step has confirmed the application database is
-    /// usable at this build's schema version (`OPS-4`, `main::
-    /// bring_database_up`). Starts `false`: nothing has proven the schema
-    /// yet, so `GET /health` reports the database as unavailable until
-    /// migrations applied or a later retry succeeded (fail closed,
-    /// AGENTS.md principle 3).
-    ///
-    /// Not a live probe: this is the last answer the start-up step or its
-    /// retry loop gave, so a database lost AFTER boot keeps answering
-    /// `ok` here until the process restarts. A per-request probe would
-    /// have to be a bounded `SELECT 1` on its own short timeout — `GET
-    /// /health` is polled by the ops gates, and a probe that waits on a
-    /// dead database's default 30 s acquire timeout would stall them.
-    /// `docs/OPERATIONS.md` records that limit.
-    pub db_ready: Arc<AtomicBool>,
+    /// What this process knows about its application database since it
+    /// started: whether the start-up step confirmed the schema
+    /// ([`DatabaseStatus::ready`]) and how many audit rows could not be
+    /// written ([`DatabaseStatus::audit_write_failures`]). Shared across
+    /// clones.
+    pub db_status: Arc<DatabaseStatus>,
     /// Resolves a connector's `secretRef` to an actual credential value —
     /// [`crate::connector_probe`]'s only source of one, per ADR 0002 (see
     /// its "Restricting connector secretRefs" addendum). **Deliberately
@@ -250,28 +274,22 @@ pub struct AppState {
     /// The 30-second memo of the query limits (`BI-5` plan D2), so a
     /// dashboard does not read Postgres per tile. Shared across clones.
     pub query_limits: crate::query_limits::QueryLimitsMemo,
-    /// The 30-second memo of the saved email settings (`ADM-7` plan D3), so
-    /// an alert or a scheduled report does not read Postgres per send. The
-    /// email `PUT` clears it on this process. Shared across clones.
-    pub email_settings_cache: Arc<crate::runtime_settings::EmailSettingsCache>,
-    /// The 30-second memo of the saved sign-in limits (`ADM-8` plan D3), so
-    /// a sign-in does not read Postgres per try. The sign-in `PUT` clears it
-    /// on this process. Shared across clones.
-    pub sign_in_settings_cache: Arc<
-        crate::runtime_settings::SettingsCache<lakehouse_store::sign_in_settings::SignInSettings>,
-    >,
-    /// The 30-second memo of the saved assistant settings (`ADM-9` plan D3),
-    /// so an assistant message does not read Postgres per round. The
-    /// assistant `PUT` clears it on this process. Shared across clones.
-    pub assistant_settings_cache: Arc<
-        crate::runtime_settings::SettingsCache<
-            lakehouse_store::assistant_settings::AssistantSettings,
-        >,
-    >,
-    /// The 30-second memo of the saved SSO settings (`ADM-12` plan D1/D3),
-    /// so a request does not read Postgres per check. The SSO `PUT` clears it
-    /// on this process. Shared across clones.
-    pub sso_settings_cache: Arc<crate::runtime_settings::SsoSettingsCache>,
+    /// The five 30-second memos of the console's saved settings rows —
+    /// email (`ADM-7` plan D3), sign-in limits (`ADM-8` plan D3), the
+    /// workspace name and pictures (`ADM-2` decision 6), the assistant's
+    /// provider (`ADM-9` plan D3) and SSO (`ADM-12` plan D1/D3) — so a
+    /// send, a sign-in, a branding visit, a message or a check does not
+    /// read Postgres each time. The matching `PUT` clears its row's cache
+    /// on this process; another process sees the change within the TTL.
+    /// Shared across clones.
+    ///
+    /// One field, not one per row: a new field in [`AppState`] grows every
+    /// future that holds a copy of the state, and `routes/ai/mod.rs`'s chat
+    /// handler and its streaming twin already sit at clippy's 16384-byte
+    /// limit for a future (`clippy::large_future`), so one more pointer
+    /// there is a lint failure in a file the assistant's team owns. See
+    /// [`crate::runtime_settings::SettingsCaches`].
+    pub settings_caches: Arc<crate::runtime_settings::SettingsCaches>,
     /// How often each caller may ask for a test email (`ADM-7` plan D10).
     /// Shared across clones.
     pub email_test_limiter: Arc<crate::runtime_settings::TestEmailLimiter>,
@@ -855,7 +873,7 @@ impl AppState {
             llm: Arc::new(RwLock::new(llm)),
             oidc: Arc::new(RwLock::new(initial_oidc)),
             pg,
-            db_ready: Arc::new(AtomicBool::new(false)),
+            db_status: Arc::new(DatabaseStatus::default()),
             connector_secret_resolver: connector_secret_resolver(
                 EnvSecretResolver::new(),
                 &secrets_dir,
@@ -884,10 +902,7 @@ impl AppState {
                 ),
             )),
             query_limits: crate::query_limits::QueryLimitsMemo::default(),
-            email_settings_cache: crate::runtime_settings::email_cache(),
-            sign_in_settings_cache: crate::runtime_settings::sign_in_cache(),
-            assistant_settings_cache: crate::runtime_settings::assistant_cache(),
-            sso_settings_cache: crate::runtime_settings::sso_cache(),
+            settings_caches: crate::runtime_settings::settings_caches(),
             email_test_limiter: Arc::new(crate::runtime_settings::TestEmailLimiter::new()),
             #[cfg(test)]
             webhook_sender_override: None,
@@ -923,21 +938,36 @@ impl AppState {
         None
     }
 
+    /// The audit rows that could not be written since this process started
+    /// (`GOV-1`, see [`DatabaseStatus::audit_write_failures`]).
+    #[must_use]
+    pub fn audit_write_failure_count(&self) -> u64 {
+        self.db_status.audit_write_failures.load(Ordering::Relaxed)
+    }
+
+    /// Counts one audit row that could not be written
+    /// ([`crate::audit_coverage::record_best_effort`] is the caller).
+    pub(crate) fn count_audit_write_failure(&self) {
+        self.db_status
+            .audit_write_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Whether `GET /health` should report the application database as
     /// usable (`OPS-4`): no pool is never ready, and a pool is ready only
     /// after [`Self::mark_database_ready`].
     #[must_use]
     pub fn database_ready(&self) -> bool {
-        self.pg.is_some() && self.db_ready.load(Ordering::Relaxed)
+        self.pg.is_some() && self.db_status.ready.load(Ordering::Relaxed)
     }
 
     /// Records that the start-up step confirmed the application database's
     /// schema is at this build's version (`OPS-4`). Set once, from `main::
     /// bring_database_up` or its retry loop; nothing clears it, since the
     /// only way to lose the database after that is a per-request failure
-    /// this flag deliberately does not track (see [`Self::db_ready`]).
+    /// this flag deliberately does not track (see [`DatabaseStatus::ready`]).
     pub fn mark_database_ready(&self) {
-        self.db_ready.store(true, Ordering::Relaxed);
+        self.db_status.ready.store(true, Ordering::Relaxed);
     }
 }
 

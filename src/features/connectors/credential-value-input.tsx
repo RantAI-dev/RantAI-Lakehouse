@@ -43,17 +43,20 @@ export function CredentialValueInput({
   slot,
   value,
   onChange,
+  required,
 }: {
   id: string
   slot: CredentialSlot
   value: string
   onChange: (next: string) => void
+  required?: boolean
 }) {
   const [revealed, setRevealed] = React.useState(false)
   if (slot.multiline) {
     return (
       <Textarea
         id={id}
+        aria-required={required}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={slot.placeholder}
@@ -68,6 +71,7 @@ export function CredentialValueInput({
     return (
       <Input
         id={id}
+        aria-required={required}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={slot.placeholder}
@@ -81,6 +85,7 @@ export function CredentialValueInput({
     <InputGroup>
       <InputGroupInput
         id={id}
+        aria-required={required}
         type={revealed ? "text" : "password"}
         value={value}
         onChange={(e) => onChange(e.target.value)}

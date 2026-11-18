@@ -4,6 +4,7 @@ import * as React from "react"
 import Link from "next/link"
 import { useParams, useRouter, useSearchParams } from "next/navigation"
 import { FormPage } from "@/components/patterns/form-page"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -73,17 +74,20 @@ export function RoleFields({
   return (
     <>
       <div className="space-y-1.5">
-        <Label htmlFor={`${idPrefix}-name`}>Name</Label>
-        <Input id={`${idPrefix}-name`} value={name} onChange={(e) => onName(e.target.value)} />
+        <Label htmlFor={`${idPrefix}-name`} required>Name</Label>
+        <Input id={`${idPrefix}-name`} aria-required value={name} onChange={(e) => onName(e.target.value)} />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor={`${idPrefix}-perms`}>Permissions</Label>
-        <PermissionPicker id={`${idPrefix}-perms`} value={permissions} onChange={onPermissions} />
+        <Label htmlFor={`${idPrefix}-perms`} required>Permissions</Label>
+        {/* UX-1-R10: the picker is a named group whose sentence says at least
+            one permission is needed; no individual checkbox is required. */}
+        <PermissionPicker id={`${idPrefix}-perms`} label="Permissions" required value={permissions} onChange={onPermissions} />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor={`${idPrefix}-desc`}>Description</Label>
+        <Label htmlFor={`${idPrefix}-desc`} required>Description</Label>
         <Input
           id={`${idPrefix}-desc`}
+          aria-required
           value={description}
           onChange={(e) => onDescription(e.target.value)}
         />
@@ -177,6 +181,9 @@ export function RoleCreatePage() {
       onSubmit={() => void handleCreate()}
       onCancel={() => router.push(backHref)}
     >
+      {/* UX-1-R10: RoleFields is shared by create/edit; explain the stars
+          once here, in each composed form. */}
+      <RequiredLegend />
       <RoleFields
         idPrefix="role"
         name={name}
@@ -330,6 +337,8 @@ function RoleEditForm({ role }: { role: Role }) {
       onSubmit={() => void handleSave()}
       onCancel={() => router.push(backHref)}
     >
+      {/* UX-1-R10: one explanation of the shared star in this composed form. */}
+      <RequiredLegend />
       <RoleFields
         idPrefix="edit-role"
         name={name}

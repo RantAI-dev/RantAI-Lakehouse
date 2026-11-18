@@ -32,11 +32,11 @@ needs a SQL source written by someone who may write SQL.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Up to five tables in one chart | Spec *(proposed)* | Owner to confirm at QA |
-| 2 | The join belongs to the chart, not to a shared dataset | Planner default (Metabase) | Owner to confirm at QA |
-| 3 | A joined column is shown as `table.column`; when a table is joined twice the second gets a number | Planner default | Owner to confirm at QA |
-| 4 | A join the database refuses for size is reported as such on the tile; nothing is silently cut | Planner default | Owner to confirm at QA |
-| 5 | The builder warns, without blocking, when the chosen pairs do not include a key of the joined table, because rows will multiply | Planner default | Owner to confirm at QA |
+| 1 | Up to five tables in one chart | Spec *(proposed)* | Owner, 2026-11-13 |
+| 2 | The join belongs to the chart, not to a shared dataset | Planner default (Metabase) | Owner, 2026-11-13 |
+| 3 | A joined column is shown as `table.column`; when a table is joined twice the second gets a number | Planner default | Owner, 2026-11-13 |
+| 4 | A join the database refuses for size is reported as such on the tile; nothing is silently cut | Planner default | Owner, 2026-11-13 |
+| 5 | The builder warns, without blocking, when the chosen pairs do not include a key of the joined table, because rows will multiply | Planner default | Owner, 2026-11-13 |
 
 ## Limits to tell a customer
 
@@ -51,4 +51,14 @@ needs a SQL source written by someone who may write SQL.
 - `BI-7-AC2` A masked column in the joined table stays masked, and a row filter on the joined table still removes its rows.
 - `BI-7-AC3` A user without `dashboard:write` cannot save it; a failure shows a plain message.
 - `BI-7-AC4` The record list of a clicked bar and the CSV export of a raw table show the joined columns.
-- `AI-6-AC1` (the `BI-7` part) "visitors by province next to hotel capacity" is built by the assistant with a join.
+- `AI-6-AC1` (the `BI-7` part) "visitors by province next to hotel capacity" is built by the assistant with a join. Accepted by the AI owner, 2026-11-14 (staging `240d2e62`)
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-7-AC1`: pass.
+- `BI-7-AC2`: pass.
+- `BI-7-AC3`: pass.
+- `BI-7-AC4`: pass.
+- `AI-6-AC1` (BI-7 part): pass.

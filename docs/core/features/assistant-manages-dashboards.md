@@ -69,8 +69,9 @@ audit and the console's own refusals all carry through unchanged.
 - `rename_board` (`dashboard:write`, WriteLow): renames a board; the
   built-in Main board is refused.
 - `delete_board` (`dashboard:write`, WriteHigh): waits for approval; the
-  approval reason names the board and says its charts are deleted too;
-  the built-in Main board is refused.
+  approval reason names the board and says the board and its charts go
+  to the trash, restorable for 30 days (#529); the built-in Main board
+  is refused.
 - `arrange_board` (`dashboard:write`, WriteLow): takes the tiles that
   change and their boxes; the others keep their boxes, unless one
   overlaps a tile the call moved, which then moves down; the grid is 12
@@ -198,8 +199,14 @@ assistant to describe only what that line lists.
   and leaves the row unmet; no code for it.
 - Filters are validated by the same `validate_filters` the console uses;
   one board accepts at most `MAX_FILTERS` (20, from `BI-18`).
-- A delete is the only WriteHigh tool. It asks for approval, names the
-  board and says its charts go too.
+- A delete is not the only WriteHigh tool: the registry (`registry.rs`)
+  holds 17, of which a dashboard request reaches `delete_chart`,
+  `delete_tab`, `delete_board`, `delete_calculated_field`,
+  `delete_metric`, `delete_hierarchy`, `delete_parameter`,
+  `delete_alert_rule`, `delete_report_subscription`, `enable_embed`
+  and `set_embed_filter_modes`; the rest are platform tools. A delete
+  asks for approval, names the board, and the board and its charts go
+  to the trash, restorable for 30 days (#529).
 - The active filters in the page context are written as compact JSON
     within a 4,000-character budget of their own, which leaves room inside
     the page context's 6,000-character cap. When they do not, the JSON
@@ -220,8 +227,8 @@ quoted requests come from the specs.
 | `AI-1-AC1` | Ask "rename this dashboard to 'Q3 Tourism' and move the Bali chart to the top" (the spec's quoted request) | The board is renamed and the named chart's tile is at the top of its grid | Not run |
 | `AI-1-AC2` | Ask to delete a board with charts, then reject the approval | Nothing on the board or its charts changes; the board is still there with all its charts | Not run |
 | `AI-1-AC3` | As a role without `dashboard:write`, ask to rename a board, delete a board, arrange tiles, move a chart, or save filters | A plain refusal naming the missing permission; nothing changes | Not run |
-| `AI-2-AC1` | Ask "show only 2025 and only Bali" (the spec's quoted request) | The view's filters become a 2025 number filter and a Bali filter; the address carries them | Not run |
-| `AI-2-AC2` | After the step above, open the same board as another viewer | The board's saved default is unchanged; the address carries only what that viewer set, if anything | Not run |
+| `AI-2-AC1` | Ask "show only 2025 and only Bali" (the spec's quoted request) | The view's filters become a 2025 number filter and a Bali filter; the address carries them | Pass — Accepted by the AI owner, 2026-11-14 (staging `240d2e62`) |
+| `AI-2-AC2` | After the step above, open the same board as another viewer | The board's saved default is unchanged; the address carries only what that viewer set, if anything | Pass — Accepted by the AI owner, 2026-11-14 (staging `240d2e62`) |
 | `AI-20-AC1` | Open a dashboard with the filter-row grain control set to a value that is not the chart's own grain; ask the assistant about the dashboard's time grain | The answer names the override, not the chart's own grain | Not run |
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______

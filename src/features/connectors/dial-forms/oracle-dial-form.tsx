@@ -3,6 +3,7 @@
 import * as React from "react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import {
   Select,
   SelectContent,
@@ -30,9 +31,12 @@ import { ORACLE_SSL_MODES, SSL_MODE_DEFAULT, sslModeChoices, sslModeFromChoice }
 export function OracleDialForm({
   value,
   onChange,
+  showLegend = true,
 }: {
   value: SqlDial | null
   onChange: (next: SqlDial) => void
+  /** UX-1-R7: a parent step can opt out of its own legend. */
+  showLegend?: boolean
 }) {
   const dial: SqlDial = value ?? {
     driver: "oracle",
@@ -43,6 +47,10 @@ export function OracleDialForm({
     sslMode: null,
     sslServerCertDn: null,
   }
+  // ingest_spec.rs refuses an Oracle TLS connection with no DN: the thin
+  // driver verifies against an IP, so the operator must name the cert.
+  const tlsRequired =
+    dial.sslMode != null && dial.sslMode !== "" && dial.sslMode !== "disable"
   function set<K extends keyof SqlDial>(key: K, v: SqlDial[K]) {
     onChange({ ...dial, [key]: v, driver: "oracle" })
   }
@@ -50,24 +58,28 @@ export function OracleDialForm({
   const currentMode = choices.find((mode) => mode.value === (dial.sslMode ?? SSL_MODE_DEFAULT))
   return (
     <div className="grid gap-3">
+      {/* UX-1-R7: opt out when a parent step already explains the marker. */}
+      {showLegend ? <RequiredLegend /> : null}
       <p className="text-xs text-muted-foreground">
         Batch only — this build cannot run Oracle change-data-capture (LogMiner is refused
         regardless of configuration); a scheduled or manual batch pull is the only supported mode.
       </p>
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="space-y-1.5">
-          <Label htmlFor="oracle-dial-host">Host</Label>
+          <Label htmlFor="oracle-dial-host" required>Host</Label>
           <Input
             id="oracle-dial-host"
+            aria-required
             value={dial.host}
             onChange={(e) => set("host", e.target.value)}
             autoComplete="off"
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="oracle-dial-port">Port</Label>
+          <Label htmlFor="oracle-dial-port" required>Port</Label>
           <Input
             id="oracle-dial-port"
+            aria-required
             type="number"
             value={dial.port}
             onChange={(e) => set("port", Number(e.target.value))}
@@ -75,9 +87,10 @@ export function OracleDialForm({
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="oracle-dial-database">Database (service name)</Label>
+          <Label htmlFor="oracle-dial-database" required>Database (service name)</Label>
           <Input
             id="oracle-dial-database"
+            aria-required
             value={dial.database}
             onChange={(e) => set("database", e.target.value)}
             autoComplete="off"
@@ -86,9 +99,10 @@ export function OracleDialForm({
         <div className="space-y-1.5">
           {/* A literal username, never a secretRef picker -- same
               reasoning as SqlDialForm's User field. */}
-          <Label htmlFor="oracle-dial-user">User</Label>
+          <Label htmlFor="oracle-dial-user" required>User</Label>
           <Input
             id="oracle-dial-user"
+            aria-required
             value={dial.user}
             onChange={(e) => set("user", e.target.value)}
             autoComplete="off"
@@ -117,9 +131,12 @@ export function OracleDialForm({
           </Select>
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="oracle-dial-ssl-server-cert-dn">TLS server certificate DN (required for TLS)</Label>
+          <Label htmlFor="oracle-dial-ssl-server-cert-dn" required={tlsRequired}>
+            TLS server certificate DN (required for TLS)
+          </Label>
           <Input
             id="oracle-dial-ssl-server-cert-dn"
+            aria-required={tlsRequired}
             value={dial.sslServerCertDn ?? ""}
             onChange={(e) => set("sslServerCertDn", e.target.value === "" ? null : e.target.value)}
             placeholder="CN=oracle.example.com,O=Example,C=US"
