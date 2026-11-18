@@ -71,6 +71,11 @@ AGENTS.md).
 ## Limits to tell a customer
 
 - A report holds up to 30 charts.
+- Changing a report checks only the charts the change adds (PR #528 review SHOULD-FIX 1). A
+  chart already on the report stays as it was saved, even after it was deleted from its
+  dashboard or when the person editing cannot see it, so a title fix always saves. Each reader
+  still sees each chart with their own access. A chart that a change adds and that was deleted
+  is refused with its own sentence, which names the block.
 - Reports have no schedule and no version history yet.
 - Templates stay inside one deployment.
 
