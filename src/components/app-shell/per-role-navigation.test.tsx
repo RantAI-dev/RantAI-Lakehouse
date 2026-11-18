@@ -20,7 +20,7 @@ mock.module("next/image", () => ({
 
 import * as React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { AppFrame } from "@/components/app-shell/app-frame"
 import { CommandPalette } from "@/components/command-palette"
@@ -67,32 +67,42 @@ function renderWithProviders(ui: React.ReactNode) {
 }
 
 describe("ADM-13 D8: per-role navigation and route guard", () => {
-  // These spies sit on the shared notificationsService singleton; restoring
-  // them keeps every other test file in the run seeing the real service,
-  // whatever order bun discovers the files in.
-  let restoreNotificationSpies: (() => void) | undefined
-
+  // PR568 CI notification isolation: these spies sit on the shared
+  // notificationsService singleton. A hand-maintained restore closure can be
+  // left unset if one spy setup throws, and a newly added spy is easy to omit,
+  // so restore every spy unconditionally here (app-navbar.test.tsx does the
+  // same). notifications.test.ts then sees the real service whatever order
+  // bun discovers the files in; its five failures in CI run 44079246186 were
+  // the mock's resolved values, not a service regression.
   beforeEach(() => {
     mockRouter.push.mockClear()
     mockRouter.replace.mockClear()
-    const listSpy = spyOn(notificationsService, "list").mockResolvedValue({
+    spyOn(notificationsService, "list").mockResolvedValue({
       supported: true,
       openAlerts: [],
       pendingApprovals: [],
       unreadMentions: [],
       unreadMentionsUnavailable: null,
     } as never)
-    const markMentionsReadSpy = spyOn(notificationsService, "markMentionsRead").mockResolvedValue(undefined as never)
-    restoreNotificationSpies = () => {
-      listSpy.mockRestore()
-      markMentionsReadSpy.mockRestore()
-    }
+    spyOn(notificationsService, "markMentionsRead").mockResolvedValue(undefined as never)
   })
 
   afterEach(() => {
     cleanup()
     global.fetch = originalFetch
-    restoreNotificationSpies?.()
+    mock.restore()
+  })
+
+  afterAll(() => {
+    // PR568 CI notification isolation: after the last test's afterEach the
+    // singleton must be the real service again. If a future change drops the
+    // cleanup above, this fails here by name instead of as five confusing
+    // notifications.test.ts failures in a CI run whose file order differs
+    // from a developer's machine.
+    for (const method of ["list", "markMentionsRead"] as const) {
+      const fn = notificationsService[method] as unknown as { mock?: unknown }
+      expect(fn.mock).toBeUndefined()
+    }
   })
 
   it("1. Dashboard Viewer role sees only Dashboards in sidebar; no dock", async () => {

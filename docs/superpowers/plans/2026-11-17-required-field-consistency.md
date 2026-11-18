@@ -264,6 +264,69 @@ test weakening. Re-run the involved files in both orders and the full frontend
 checks, then hand off for independent parent review. Only frontend tests and
 documentation are expected to change relative to the updated main baseline.
 
+### Worker handoff: PR568 CI notification isolation repair (2026-11-18, Hy4)
+
+**Finding (PR568 CI notification isolation).** CI run `44079246186` failed all
+five `src/services/clients/notifications.test.ts` assertions: `calls[0]` was
+undefined and every expected refusal resolved. The five symptoms are exactly a
+mocked `notificationsService` (`list`/`markMentionsRead` with
+`mockResolvedValue`) answering instead of the real service reaching `fetch`.
+Those spies are installed on the shared singleton in
+`src/components/app-shell/per-role-navigation.test.tsx`'s `beforeEach`; that
+file ran ~0.8 s before `notifications.test.ts` in the failing run.
+
+**Investigation (foreground, recorded honestly).** The exact CI-era version of
+the per-role test (`cb855d5b9`, top-level hooks, no mock restore) and the
+current version with its restore removed were both run immediately before
+`notifications.test.ts` with bun `1.3.12` and `1.4.2`; both orders passed 11/0.
+Direct probes (`spyOn` on the singleton and `mock.module` on a shared module in
+file A, checked in file B) reported **ISOLATED**, as did a top-level-hook probe,
+so this Bun version gives each test file its own module registry and a
+cross-file spy leak is not reproducible here. The full suite was also run with
+the exact CI-era per-role and app-navbar files: the notifications tests still
+passed. **The CI failure itself was not reproduced locally**; the repair below
+hardens the lifecycle against the class of fault rather than claiming a local
+reproduction.
+
+**Repair (test-only).** `per-role-navigation.test.tsx` now calls
+`mock.restore()` unconditionally in `afterEach` (the same pattern as
+`app-navbar.test.tsx`) instead of a hand-maintained restore closure that is
+left `undefined` if one of the two spy setups throws and that a newly added
+spy can silently miss. An `afterAll` guard asserts both service methods are no
+longer mocks, so a future removal of the cleanup fails here by name instead of
+as five confusing failures in `notifications.test.ts`. Verified: disabling the
+`mock.restore()` makes the guard fail; restoring it makes the scoped run green.
+No assertion was weakened or skipped, and no production, dependency,
+security-policy, Rust, Python or Compose file was touched. The finding is
+cited at the fix site and in the commit body.
+
+**Scoped verification (foreground).** bun `1.3.12` (CI version, `700fc117`)
+and `1.4.2` (`744846f84`), each with per-role before notifications and the
+reverse: **11 pass, 0 fail, 51 expect() calls across 2 files** in all four
+runs. Typecheck exit 0. Lint exit 0, **0 errors and 11 pre-existing warnings**
+(the CI baseline set). `bun run build` exit **0 on the second invocation**;
+the first invocation stopped at a Next.js `SecurityFatalError` advisory nudge
+("retry the same command to continue"), which is a dependency/tooling matter
+and was not acted on — no `next upgrade` or dependency change was run.
+
+**Full frontend checks (foreground, final tree).**
+- `bun run test` (bun `1.4.2`) — exit **1**, **4550 pass, 1 skip, 1 fail,
+  14058 expect() calls, 421 files, 209.91s**. The single failure was
+  `RoleEditPage (WEB-7 D2/D4) > keeps the API's sentence when a save is
+  refused`; that file passed 30/0 on three scoped reruns.
+- `bunx --bun bun@1.3.12 test src` — exit **1**, **4550 pass, 1 fail, 14035
+  expect() calls, 421 files, 330.53s**. The single failure was the UX-1-R8
+  pipeline-editor "requires a step's reads …" test; that file passed 48/0 in
+  three of four scoped runs (one flake) under the same version.
+- These are two **different, intermittent** failures across full runs and both
+  pass when run scoped; the notifications tests passed in every full run after
+  the repair. They are recorded, not claimed fixed — fixing unrelated flaky
+  tests is outside this repair's scope.
+
+**Not verified:** real browser rendering, keyboard/screen-reader checks, and
+product-owner acceptance. Parent independent review, push, CI watch and merge
+remain pending.
+
 ### Required-check investigation after CI wake (2026-11-17)
 
 PR head `a3409698f` cargo-deny failure was inspected in run `44078730810`,
