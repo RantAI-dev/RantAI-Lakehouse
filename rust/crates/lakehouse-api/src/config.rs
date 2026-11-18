@@ -1340,6 +1340,7 @@ impl std::fmt::Debug for Config {
             .field("oidc_token_url", &self.oidc_token_url)
             .field("oidc_redirect_uri", &self.oidc_redirect_uri)
             .field("oidc_prompt", &self.oidc_prompt)
+            .field("oidc_prompt_from_env", &self.oidc_prompt_from_env)
             .field("database_url", &REDACTED)
             .field(
                 "lakekeeper_gold_export_token_file",
