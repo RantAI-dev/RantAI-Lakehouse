@@ -17,7 +17,7 @@
 
 ## Problem
 
-About 110 of the 218 routes that change something leave no audit row, among them every dashboard, saved query, alert and report subscription change. The audit page shows only the newest 200 events and cannot export.
+The guard test counts every route that changes something: 223, of which 182 are recorded (the route's handler or the central writer) and 41 are excluded, each with a listed reason. Before this feature, every dashboard, saved query, alert and report subscription change left no audit row, and the audit page showed only the newest 200 events and could not export.
 
 ## What the user can do when this is done
 
@@ -26,7 +26,7 @@ About 110 of the 218 routes that change something leave no audit row, among them
 3. Filter the audit page by person, action, object and time range and get events of any age, page by page.
 4. Export the filtered events as CSV.
 5. See, for a role, policy, table-access or grant change, the old and new value; for any other change, the names of the fields that changed.
-6. Trust that nobody, not even an administrator through the database account the console uses, can edit or delete an audit row.
+6. Trust the database to refuse every edit and delete of an audit row: the append-only trigger binds an account that neither owns `audit_event` nor is a superuser. The table's owner or a superuser can still skip it, with `ALTER TABLE audit_event DISABLE TRIGGER` or with `SET session_replication_role = replica`, which skips the trigger without changing the table. The console's database account is that owner today (on staging and in the compose default it is `lakehouse`, the image's superuser and the owner of `audit_event`), so until `SEC-78` lands that account can still turn off the trigger.
 
 ## Not included
 
@@ -45,7 +45,7 @@ No new assistant work. Its tool calls are already recorded.
 | 3 | Old and new values only for roles, policies, table access and grants; other changes record the names of changed fields only; never a secret | as written | Owner, 2026-11-14 |
 | 4 | A failed audit write does not undo the change (as today); it is logged and counted on the Operations health page | as written | Owner, 2026-11-14 |
 | 5 | CSV export limit per file | 100,000 rows | Owner, 2026-11-14 |
-| 6 | The database refuses `UPDATE` and `DELETE` on `audit_event` (trigger, in a migration) | yes | Owner, 2026-11-14 |
+| 6 | The database refuses `UPDATE` and `DELETE` on `audit_event` (trigger, in a migration), except clearing `run_id` or `approval_id` when the run or approval they point to is deleted | yes | Owner, 2026-11-14 |
 | 7 | Retention: keep forever, no setting in this feature | yes | Owner, 2026-11-14 |
 | 8 | Delivery in two parts: A, coverage plus the guard test (Decisions 1 to 4, 6); B, server-side search, paging and export (Decision 5) | yes | Owner, 2026-11-14 |
 | 9 | Who sees the audit page and export | `audit:read` only (Governance Admin, and `*:*`). Today the page needs only `governance:read`, which migration `0133` gives every role; this feature narrows it (owner, 2026-11-14) | Owner, 2026-11-14 |
@@ -53,9 +53,9 @@ No new assistant work. Its tool calls are already recorded.
 ## Limits to tell a customer
 
 - Reads and downloads are recorded as today, not every page view.
-- Events are kept forever; there is no retention setting yet.
+- Events are kept forever; there is no retention setting yet (`GOV-21`).
 - Events cannot be sent to an outside system yet; export is CSV from the audit page.
-- The database owner can still run `ALTER TABLE audit_event DISABLE TRIGGER ...` and turn off the trigger that makes the trail append-only. Nothing in the trail records that.
+- The database owner or a superuser can still skip the trigger that makes the trail append-only, with `ALTER TABLE audit_event DISABLE TRIGGER ...` or with `SET session_replication_role = replica` (which skips the trigger without changing the table). Nothing in the trail records that. By default the console's database account is that owner (`docker-compose.yml`'s `DATABASE_URL` falls back to `POSTGRES_USER`, the image's superuser); running the API as a role that owns no table and is not a superuser is `SEC-78` (P1).
 - The database allows an `UPDATE` that only clears a row's `run_id` or `approval_id`, because it clears those links when an agent run or an approval is deleted. Every other change to a row is refused.
 - A request that the service's timeout cuts off writes no row.
 - A change made through a create route does not name the new object when its id is only in the response. The row then names the kind and the action, not the object.
@@ -67,10 +67,9 @@ No new assistant work. Its tool calls are already recorded.
 - An asset page's change history shows up to 50 audit rows about that asset to anyone who can open the asset. `audit:read` does not narrow it either.
 - Machine callbacks are not audited. The pipeline run events, the schema and capture observations and the connector run reports accept a service identity or an unrestricted administrator account. A person who calls one of these routes by hand with an unrestricted account leaves no row. A pipeline run started from the console is audited as `pipeline.trigger`. The orchestrator's lag call (`POST /api/pipelines/runnable/{id}/lag-check`) is also open to an unrestricted administrator account. It advances the pipeline's lag streak and can send the behind-target alert, and it writes no audit row.
 - Marking a dashboard comment mention as read is not recorded. It counts as personal UI state, like favourites.
-- Each failed sign-in that reaches the password check adds one row with outcome `refused`. The try that makes an identifier locked adds two rows: the `auth.login_locked` row and the refused row. The row holds no email, no password and no identifier. An unknown email adds the same row, so a visitor who tries many different identifiers adds a row for each try. A try refused because that identifier is locked adds no row. Nothing removes these rows and there is no retention setting yet, so the growth is permanent. A rate limit or retention rule is a follow-up.
-- The CSV export holds the newest 100,000 matching events per file. When more match, the audit page shows a notice, and the response carries two headers, `x-audit-export-truncated` and `x-audit-export-total`. To get the rest, narrow the time range and export again.
-- The Person filter takes the person's id, not a name. A person who holds only `audit:read` cannot list users (`GET /api/identity/users` needs `identity:read`).
-- Dates in the filters are UTC days. A day in `from` starts at 00:00 UTC, and a day in `to` is included in full.
+- Each failed sign-in that reaches the password check adds one row with outcome `refused`. The try that makes an identifier locked adds two rows: the `auth.login_locked` row and the refused row. The row holds no email, no password and no identifier. `auth.login_locked` rows written before this change hold the first 12 hex characters of the identifier's SHA-256, and they stay, because the trail is append-only. An unknown email adds the same row, so a visitor who tries many different identifiers adds a row for each try. A try refused because that identifier is locked adds no row. Nothing removes these rows and there is no retention setting yet, so the growth is permanent. The follow-ups are `SEC-75` (a rate limit for failed sign-ins) and `GOV-21` (retention).
+- The CSV export holds the newest 100,000 matching events per file; the file starts with the event id and carries the same outcome words as the page, with the stored outcome beside them and the stored detail column as `reason`. When more match, the audit page shows a notice, and the response carries two headers, `x-audit-export-truncated` and `x-audit-export-total`. To get the rest, narrow the time range and export again.
+- Dates in the filters: the API takes RFC 3339 times. The console sends the UTC start of the From day and the UTC start of the day after the To day, so the To day is included in full.
 
 ## Acceptance checklist
 
@@ -86,7 +85,7 @@ No new assistant work. Its tool calls are already recorded.
 | `GOV-1-AC8` | Filter the audit page to one person and a date range older than the newest 200 events | The matching events of that range, paged | Not run |
 | `GOV-1-AC9` | Export the filtered result | A CSV with the same rows and columns | Not run |
 | `GOV-1-AC10` | As an Analyst (holds `governance:read`, not `audit:read`), open the audit page and the export link | Refused; the audit page is not in the menu | Not run |
-| `GOV-1-AC11` | (operator) Try `UPDATE audit_event ...` and `DELETE FROM audit_event ...` with the console's database account | Both refused by the database | Not run |
+| `GOV-1-AC11` | (operator) Try `UPDATE audit_event ...` and `DELETE FROM audit_event ...` with the console's database account | Both refused by the database. The Auditor's check (2026-11-16): the console account on staging and in the compose default is `lakehouse`, the image's superuser and the owner of `audit_event`, so until `SEC-78` lands that account can still turn off the trigger (`DISABLE TRIGGER`, `session_replication_role = replica`) | Pass (CI of #546/#549, `lakehouse-store/tests/audit.rs` as superuser; staging console account from deploy config; Auditor 2026-11-16) |
 | `GOV-1-AC12` | (operator) Look at the CI run of the pull request | The audit coverage test passes, and it lists every excluded route with its reason | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______

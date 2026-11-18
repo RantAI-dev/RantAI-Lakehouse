@@ -39,6 +39,7 @@ once a first release is tagged.
 
 ### Security
 
+- The audit row written when a sign-in gets locked no longer holds part of a hash of what was typed as the identifier; older rows keep it.
 - The audit trail, its CSV export, the Overview feed and the assistant's audit history show only the caller's organisation's actions (backlog `SEC-20`). A row belongs to the organisation of the person who caused it; a row with no person behind it, such as a Dagster run, belongs to the deployment and is shown only to the organisation that owns the shared catalog and to a caller that may read everything. The audit row no longer carries a tenant of its own, because every row read the deployment's own tenant id whatever organisation its actor belonged to.
 - Two `unmaintained` advisories ignored with checked rationale (backlog `SEC-79`). `RUSTSEC-2026-0543` (`chrono` is unmaintained) and `RUSTSEC-2026-0542` (`humantime` is unmaintained) were issued on 2026-11-17 and are `INFO` advisories, not vulnerabilities: there is no CVE, no exploit path and no patched version, because the crates themselves are no longer maintained (`chrono` upstream: chronotope/chrono#1768; `humantime` is unmaintained only because it wraps `chrono`). Both IDs are ignored in `rust/deny.toml` and `.github/workflows/security.yml`. `chrono` reaches the workspace through `arrow` (hence `iceberg` and `parquet`), `iceberg-catalog-rest`, `object_store`, `croner`, `tiberius`' `chrono` feature and directly from `lakehouse-api`; `humantime` reaches it through `object_store`. crates.io offers no newer release of either crate, so there is no smaller fix here. The exceptions will be dropped when `chrono` or `humantime` gets a maintained release, or when those dependency paths are gone.
 - The Iceberg table pages, the table listing, the maintenance routes and the assistant's Iceberg tools no longer show another organisation's upload tables (backlog `SEC-20`). A table no upload claimed, such as a Silver or Gold table, is now shown only to the organisation that owns the shared catalog, as in Query Studio, so a person in another organisation gets "not found" for its page and its maintenance.
@@ -72,6 +73,8 @@ once a first release is tagged.
 
 ### Changed
 
+- The audit page's person filter lists the people in the trail; settings rows name the settings that changed; the export has the event id and the same outcome words as the page.
+- Alert scheduler runs and alert tests no longer write audit rows.
 - The sign-in page, the sidebar, the browser tab and the embed footer show the workspace's own name, logo and icon when an administrator has set them (backlog `ADM-2`; feature page `docs/core/features/workspace-name-and-logo.md`).
 - A public link page shows the workspace's own name and logo, with a small "Powered by RantAI Lakehouse" line.
 - Reading the audit trail list needs the `audit:read` permission, which the Governance Admin and Platform Admin roles hold; other roles no longer see the Audit Log page or its list. The other governance pages are unchanged.
