@@ -408,7 +408,7 @@ pub async fn export_pdf(
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let missing = if board_id == store::DEFAULT_BOARD_ID {
-        !viewer.sees_builtin()
+        !viewer.sees_builtin_board()
     } else {
         board.is_none()
     };
