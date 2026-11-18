@@ -548,7 +548,7 @@ async fn signing_out_writes_one_auth_logout_row_for_the_signed_in_user() {
         .await
         .expect("seeded user");
 
-    let resp = router
+    let mut resp = router
         .clone()
         .oneshot(
             Request::builder()
@@ -560,7 +560,16 @@ async fn signing_out_writes_one_auth_logout_row_for_the_signed_in_user() {
         )
         .await
         .expect("router never fails a request outright");
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // The answer is a 200 with a body, not the 204 this route answered
+    // before: the body names the identity provider's own logout address, so
+    // the provider's session ends with this deployment's. A deployment with
+    // no provider configured names none.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let answer = body_string(&mut resp).await;
+    assert!(
+        answer.contains("providerLogoutUrl"),
+        "the answer names the provider's logout address: {answer}"
+    );
 
     let rows = audit_rows(&pool, "auth.logout").await;
     assert_eq!(rows.len(), 1, "one sign-out, one row: {rows:?}");
