@@ -70,7 +70,7 @@ function BrandLogo() {
     <div className="grid size-8 shrink-0 place-items-center" aria-hidden>
       {/* Explicit width too: a grid item centred in its slot would otherwise size to its (absolutely placed) image, i.e. 0, and the mark would not show. */}
       <span className="relative block h-6 w-[28.17px] shrink-0">
-        <Image src="/logo-light.png" alt="RantAI Lakehouse" fill sizes="28px" className="object-contain dark:hidden" priority />
+        <Image src="/logo-light.png" alt="Rantai Lake" fill sizes="28px" className="object-contain dark:hidden" priority />
         <Image src="/logo-dark.png" alt="" fill sizes="28px" className="hidden object-contain dark:block" priority />
       </span>
     </div>
@@ -95,7 +95,7 @@ export function SidebarBrand() {
       <div className="flex min-w-0 items-center justify-start gap-2">
         <BrandLogo />
         <div className={cn("grid min-w-0 flex-1 gap-0.5 whitespace-nowrap leading-none", SIDEBAR_FADE)}>
-          <span className="truncate text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">RantAI Lakehouse</span>
+          <span className="truncate text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">Rantai Lake</span>
         </div>
       </div>
     </SidebarHeader>

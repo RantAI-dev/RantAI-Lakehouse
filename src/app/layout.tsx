@@ -28,10 +28,10 @@ import "./globals.css";
 export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
-  title: "RantAI Lakehouse",
-  description: "RantAI Lakehouse - Data platform",
+  title: "Rantai Lake",
+  description: "Rantai Lake - Data platform",
   manifest: "/site.webmanifest",
-  appleWebApp: { title: "RantAI Lakehouse" },
+  appleWebApp: { title: "Rantai Lake" },
 };
 
 /**
@@ -47,7 +47,7 @@ export const metadata: Metadata = {
  * `<div className="flex-1 p-4">{children}</div>` container.
  *
  * Fonts (Geist + Geist Mono) and semantic color tokens come from the shared
- * design system so the app matches the RantAI Lakehouse visual identity.
+ * design system so the app matches the Rantai Lake visual identity.
  *
  * Note: This is a server component — keep the body free of client-only state.
  * Theme class (`dark` / light) is applied by next-themes on `<html>`.

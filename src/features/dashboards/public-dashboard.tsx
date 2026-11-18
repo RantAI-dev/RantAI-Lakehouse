@@ -122,7 +122,7 @@ export function PublicDashboard({ token }: { token: string }) {
       {/* Compact header — brand + title + theme toggle */}
       <header className="sticky top-0 z-10 flex items-center gap-3 border-b border-border bg-card/80 px-4 py-3 backdrop-blur-md sm:px-6">
         <span className="relative block h-6 w-[116px] shrink-0">
-          <Image src="/logo-light.png" alt="RantAI Lakehouse" fill sizes="116px" className="object-contain object-left dark:hidden" priority />
+          <Image src="/logo-light.png" alt="Rantai Lake" fill sizes="116px" className="object-contain object-left dark:hidden" priority />
           <Image src="/logo-dark.png" alt="" fill sizes="116px" className="hidden object-contain object-left dark:block" priority />
         </span>
         <span className="hidden h-5 w-px bg-border sm:block" />
@@ -158,7 +158,7 @@ export function PublicDashboard({ token }: { token: string }) {
       </main>
 
       <footer className="border-t border-border px-4 py-4 text-center text-[11px] text-muted-foreground sm:px-6">
-        Powered by RantAI Lakehouse
+        Powered by Rantai Lake — Enterprise Lakehouse Console
       </footer>
     </div>
     </ReportingProvider>

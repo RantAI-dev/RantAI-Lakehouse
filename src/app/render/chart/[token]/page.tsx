@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { RenderView } from "@/features/dashboards/render-view";
 
 export const metadata: Metadata = {
-  title: "Chart image · RantAI Lakehouse",
+  title: "Chart image · Rantai Lake",
   robots: { index: false, follow: false },
   referrer: "no-referrer",
 };

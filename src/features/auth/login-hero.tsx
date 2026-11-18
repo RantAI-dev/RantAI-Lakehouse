@@ -48,7 +48,7 @@ export function LoginHero() {
         <MoltenMetal
           // Brand blues reserved for canvas/WebGL surfaces
           // (`design-system/tokens/colors.css`): light refracting through
-          // deep water — the "lake" in RantAI Lakehouse.
+          // deep water — the "lake" in Rantai Lake.
           //
           // The ramp starts at `--brand-canvas-light` rather than the
           // darker `--brand-canvas-dark`. Because alpha tracks intensity,
