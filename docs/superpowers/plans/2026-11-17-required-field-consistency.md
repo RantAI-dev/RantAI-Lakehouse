@@ -247,6 +247,29 @@ treats as necessary, they do not strengthen validation.
 
 ## Review / Handoff
 
+### Parent review of CI repair (2026-11-18, code 7519100f4)
+
+Reviewed `75bc258ca`: unconditional spy cleanup and the afterAll guard are
+appropriate lifecycle hardening. The notification failure was not reproduced,
+so its cause is not asserted as proven. The parent corrected the source comment
+accordingly and repaired two concrete asynchronous test races in `7519100f4`:
+RoleEditPage's Save is disabled until table access loads, and the pipeline Key
+column picker initially renders a text fallback until metadata loads. Wait for
+the enabled Save and actual combobox, retaining every prior assertion.
+
+Independent foreground verification at that code head:
+`bun run typecheck && bun run lint && bunx --bun bun@1.3.12 test src` — exit 0;
+**4551 pass, 1 skip, 0 fail, 14040 expects, 421 files, 357.82s**.
+Typecheck had no diagnostics; lint had eleven pre-existing warnings, no errors.
+The full suite passed the notifications and both race-sensitive form tests.
+`git diff --check` passed. No open source-review blocker. Worker build succeeded
+on retry; parent relies on CI for a fresh production build. Browser/owner
+acceptance and AI-15 runtime checks remain unverified.
+
+During that verification main advanced to `5534d308e` (#574 Usage storage
+measurements). Incorporate its unrelated changes before final delivery; do not
+claim the preceding full run includes that newly merged Usage code.
+
 ### Delivery repair authorization (2026-11-18)
 
 Owner requested watch, repair and merge if done. Current main `a2130e08d`
