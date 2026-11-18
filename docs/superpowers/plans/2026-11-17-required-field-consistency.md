@@ -1,7 +1,7 @@
 # Required-field consistency: audit and implementation plan
 
 Date: 2026-11-17. Source base: `eb9eaa18e8ac184d5b0b00ea27b592c246e48d2f`.
-Status: implemented and source-reviewed locally under UX-1; not pushed or merged; runtime acceptance pending.
+Status: UX-1 merged in PR #568 on 2026-11-18; runtime acceptance pending.
 Planner/reviewer: Codex, explicitly authorized by the owner in this conversation
 to replace the repository's Claude-only role rule. Workers: `opencode-go/hy4-flash-free`.
 The initial audit changed no product code. Implementation and verification
@@ -246,6 +246,25 @@ treats as necessary, they do not strengthen validation.
 - This remains a static source audit; no browser rendering was checked here.
 
 ## Review / Handoff
+
+### Delivery record (2026-11-18)
+
+PR #568 merged at 2026-11-18T02:28:54Z as
+`4e53e41c76eddaeb28161d7c7ecc194f2053a353`, after all required checks and
+the frontend lint/typecheck/test/build job passed on exact PR head
+`d0daa16267820bcad58e4cd97928e7adb03b5951`. No protection bypass.
+
+Independent final verification on that exact code head, including main #574:
+`bun run typecheck && bun run lint && bunx --bun bun@1.3.12 test src`
+exited 0: **4554 pass, 1 skip, 0 fail, 14049 expects, 421 files, 378.69s**.
+Typecheck passed; lint had eleven existing warnings, no errors. This supersedes
+the earlier pre-#574 count. All review blockers are closed.
+
+Backlog UX-1 now records Done, PR #568 and the actual Shipped date. The feature
+page records the merge without marking any owner acceptance case as passed.
+Browser appearance, keyboard/screen-reader, theme/narrow layouts and AI-15
+runtime smoke checks remain not verified. The external Lark base mirror was
+not updated: no target base/table connection was identified in this task.
 
 ### Parent review of CI repair (2026-11-18, code 7519100f4)
 

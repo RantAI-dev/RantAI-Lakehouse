@@ -3,6 +3,10 @@
 Backlog: UX-1. Spec: [ux-1.md](../specs/ux-1.md).
 Plan: [implementation plan](../../superpowers/plans/2026-11-17-required-field-consistency.md).
 
+Delivery: merged in [PR #568](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/568)
+on 2026-11-18 (`4e53e41c76eddaeb28161d7c7ecc194f2053a353`). The tracked
+Task is Done; owner runtime acceptance below remains pending.
+
 ## Decisions
 
 The owner approved implementation on 2026-11-17 ("go ahead ask hy4 to do it
