@@ -25,12 +25,6 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-// The page header renders two `next/image` logos; `getImgProps` builds
-// an absolute loader URL that happy-dom's URL parser rejects for a
-// root-relative src. The images carry no behavior under test, so render
-// them as plain nothing at the module boundary.
-mock.module("next/image", () => ({ default: () => null }))
-
 // WEB-15: the title's face comes through `next/font/local`, which only the
 // Next compiler can evaluate (it has no runtime default export). The face
 // carries no behaviour under test, so the loader returns an empty class.
@@ -44,12 +38,13 @@ mock.module("next/font/local", () => ({
 mock.module("next/dynamic", () => ({ default: () => () => null }))
 
 import { AuthProvider } from "@/features/auth/auth-provider"
+import { PRODUCT_NAME } from "@/lib/product-branding"
 
 // WEB-15: imported after the mocks, not statically. The empty
 // `next/font/local` entry has no default export, and a static import links
 // the page's whole module graph before `mock.module` above can stand in for
-// it ("Missing 'default' export"); `next/image` never hit this because its
-// real module does have one.
+// it ("Missing 'default' export"). (The page's logos are plain `<img>`s
+// through `BrandPicture` since `ADM-2`, so `next/image` needs no stub here.)
 const { LoginPage } = await import("./login-page")
 
 const originalFetch = global.fetch
@@ -64,12 +59,19 @@ afterEach(() => {
 })
 
 /**
- * Stubs the two routes a failed login touches: `GET /api/auth/me` (the
+ * Stubs the three routes a failed login touches: `GET /api/auth/me` (the
  * provider's mount-time session check — a 401 means "no live session",
- * which is what makes the form render instead of the skeleton) and
- * `POST /api/auth/login`, which answers `status`/`body`/`headers`.
+ * which is what makes the form render instead of the skeleton),
+ * `POST /api/auth/login`, which answers `status`/`body`/`headers`, and
+ * the public `GET /api/branding`, which says the workspace's own name
+ * and pictures.
  */
-function stubLoginApi(status: number, body: unknown, headers: Record<string, string> = {}): void {
+function stubLoginApi(
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+  branding: unknown = { workspaceName: null, logo: null, logoDark: null, icon: null },
+): void {
   global.fetch = mock(
     async (input: RequestInfo | URL) => {
       const url =
@@ -85,6 +87,12 @@ function stubLoginApi(status: number, body: unknown, headers: Record<string, str
         return new Response(JSON.stringify(body), {
           status,
           headers: { "Content-Type": "application/json", ...headers },
+        })
+      }
+      if (url.includes("/api/branding")) {
+        return new Response(JSON.stringify(branding), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
         })
       }
       return new Response("{}", { status: 200 })
@@ -187,6 +195,158 @@ describe("LoginPage lockout surface (plan T5)", () => {
     // the server's non-enumeration constant ("invalid_or_expired").
     expect(alert.textContent).toBe("Wrong username or password.")
     expect(alert.textContent).not.toContain("invalid_or_expired")
+  })
+
+  it("marks both credential fields required and explains the marker once (UX-1)", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    const { container } = render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    // findByLabelText proves the label still associates with its control
+    // once the decorative star is nested inside the label.
+    const email = await screen.findByLabelText("Username or email")
+    const password = screen.getByLabelText("Password")
+    // Native `required` stays on the controls: noValidate means it conveys
+    // semantics without changing submission behaviour.
+    expect(email.hasAttribute("required")).toBe(true)
+    expect(password.hasAttribute("required")).toBe(true)
+    // Exactly two labels opt in, each with an aria-hidden star.
+    const marked = container.querySelectorAll("label[data-required]")
+    expect(marked.length).toBe(2)
+    for (const label of marked) {
+      const star = label.querySelector("span[aria-hidden='true']")
+      expect(star?.className).toContain("before:content-['*']")
+    }
+    // The convention is stated once, not per field.
+    expect(screen.getByText(/Required/)).toBeDefined()
+  })
+})
+
+describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
+  /** The header's two pictures, in the order they are drawn: light, then dark. */
+  function pictures(container: HTMLElement): HTMLImageElement[] {
+    return Array.from(container.querySelectorAll("img"))
+  }
+
+  function renderLoginPage() {
+    return render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+  }
+
+  it("shows the workspace name and logo from settings, not a fixed product name", async () => {
+    stubLoginApi(
+      401,
+      { error: "invalid_or_expired" },
+      {},
+      {
+        workspaceName: "Acme Data",
+        logo: { type: "image/png", version: "v1" },
+        logoDark: { type: "image/png", version: "v2" },
+        icon: null,
+      },
+    )
+    const { container } = renderLoginPage()
+
+    // Owner decision 2026-11-18 (`docs/core/features/login-page.md`): the
+    // title names the workspace, and so does the copyright line.
+    expect(await screen.findByRole("heading", { level: 1, name: "Sign in to Acme Data" })).toBeTruthy()
+    expect(screen.getByText(`© ${new Date().getFullYear()} Acme Data`)).toBeTruthy()
+    // The product's own name is nowhere in the title or the copyright: a
+    // workspace that set a name must not still be called by ours. (The
+    // "Powered by" byline is the one place the product keeps, decision 8.)
+    expect(screen.queryByRole("heading", { name: `Sign in to ${PRODUCT_NAME}` })).toBeNull()
+    expect(screen.queryByText(`© ${new Date().getFullYear()} ${PRODUCT_NAME}`)).toBeNull()
+
+    const shown = pictures(container)
+    expect(shown.map((p) => p.getAttribute("src"))).toEqual([
+      "/api/branding/images/logo?v=v1",
+      "/api/branding/images/logo-dark?v=v2",
+    ])
+    expect(shown.map((p) => p.getAttribute("alt"))).toEqual(["Acme Data", "Acme Data"])
+  })
+
+  it("shows the workspace's light logo in dark mode too when no dark logo is set (ADM-2-AC3)", async () => {
+    stubLoginApi(
+      401,
+      { error: "invalid_or_expired" },
+      {},
+      {
+        workspaceName: "Acme Data",
+        logo: { type: "image/png", version: "v1" },
+        logoDark: null,
+        icon: null,
+      },
+    )
+    const { container } = renderLoginPage()
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Sign in to Acme Data" })).toBeTruthy()
+    const shown = pictures(container)
+    // The second picture is the dark one: with no dark logo set, it shows
+    // the workspace's light logo rather than the product's own dark file.
+    expect(shown[1].getAttribute("src")).toBe("/api/branding/images/logo?v=v1")
+  })
+
+  it("falls back to the product's own name and logos when the workspace set none", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    const { container } = renderLoginPage()
+
+    // The fallback is `PRODUCT_NAME`, whatever the product calls itself.
+    expect(await screen.findByRole("heading", { level: 1, name: `Sign in to ${PRODUCT_NAME}` })).toBeTruthy()
+    expect(screen.getByText(`© ${new Date().getFullYear()} ${PRODUCT_NAME}`)).toBeTruthy()
+    // The official mark (`WEB-15`), at its own ratio.
+    expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
+      "/logo-light.svg",
+      "/logo-dark.svg",
+    ])
+  })
+
+  it("shows a workspace name that holds markup as plain text", async () => {
+    stubLoginApi(
+      401,
+      { error: "invalid_or_expired" },
+      {},
+      { workspaceName: "<b>x</b>", logo: null, logoDark: null, icon: null },
+    )
+    const { container } = renderLoginPage()
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Sign in to <b>x</b>" })).toBeTruthy()
+    // The name is text, never HTML: a workspace that typed markup shows
+    // the markup, it does not run it.
+    expect(container.querySelector("b")).toBeNull()
+  })
+
+  it("keeps the 'Powered by RantAI Lakehouse' line under the form", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    renderLoginPage()
+
+    expect(await screen.findByText("Powered by RantAI Lakehouse")).toBeTruthy()
+  })
+
+  it("falls back to the product's own logo when the workspace's logo fails to load", async () => {
+    stubLoginApi(
+      401,
+      { error: "invalid_or_expired" },
+      {},
+      {
+        workspaceName: "Acme Data",
+        logo: { type: "image/png", version: "v1" },
+        logoDark: null,
+        icon: null,
+      },
+    )
+    const { container } = renderLoginPage()
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Sign in to Acme Data" })).toBeTruthy()
+    const shown = pictures(container)
+    fireEvent.error(shown[0])
+    // A broken picture must never be left on the page: the product's own
+    // file stands in for it.
+    expect(shown[0].getAttribute("src")).toBe("/logo-light.svg")
   })
 })
 

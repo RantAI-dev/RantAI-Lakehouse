@@ -34,7 +34,7 @@ import { cn } from "@/lib/utils"
 import { governanceService, lakehouseService, overviewService } from "@/services"
 import type { MaintenanceRun } from "@/services/contracts/governance"
 import type { LakehouseCapacityBucket } from "@/services/contracts/lakehouse"
-import type { PlatformService } from "@/services/contracts/ops"
+import type { PlatformService, ServicesReport } from "@/services/contracts/ops"
 
 type Reloadable<T> = ServiceState<T> & { reload: () => void }
 
@@ -68,7 +68,7 @@ export function StatusSummary({
   services,
   refreshKey,
 }: {
-  services: Reloadable<PlatformService[]>
+  services: Reloadable<ServicesReport>
   refreshKey: number
 }) {
   const alerts = useService((s) => overviewService.listAlerts(s), [refreshKey])
@@ -83,7 +83,7 @@ export function StatusSummary({
             Whether the services are up could not be read. See Services below.
           </p>
         ) : (
-          <OverallLine services={services.data} />
+          <OverallLine services={services.data.services} />
         )}
       </div>
       <div className="shrink-0">
@@ -202,7 +202,7 @@ const serviceColumns: ColumnDef<PlatformService>[] = [
 ]
 
 /** Section 2: the probe table, as `GET /api/ops/services` returns it. */
-export function ServicesSection({ services }: { services: Reloadable<PlatformService[]> }) {
+export function ServicesSection({ services }: { services: Reloadable<ServicesReport> }) {
   return (
     <SectionCard
       title="Services"
@@ -213,12 +213,20 @@ export function ServicesSection({ services }: { services: Reloadable<PlatformSer
         <ErrorState error={services.error} onRetry={services.reload} className="py-6" />
       ) : null}
       {services.status === "success" ? (
-        <DataTable
-          columns={serviceColumns}
-          rows={services.data}
-          rowKey={(s) => s.id}
-          emptyMessage="The API listed no services."
-        />
+        <>
+          <DataTable
+            columns={serviceColumns}
+            rows={services.data.services}
+            rowKey={(s) => s.id}
+            emptyMessage="The API listed no services."
+          />
+          {/* GOV-1 Decision 4: a failed audit write does not fail the change it
+              records, so this count is where a person sees it. It starts at 0
+              with the process, and the sentence says so. */}
+          <p className="mt-3 text-sm text-muted-foreground">
+            Audit writes failed since the service started: {services.data.auditWriteFailures}
+          </p>
+        </>
       ) : null}
     </SectionCard>
   )

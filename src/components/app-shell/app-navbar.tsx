@@ -27,6 +27,7 @@ import { useMentionsRead } from "@/lib/mention-events"
 import { pageTitleFor } from "./nav-config"
 import { openCommandPalette } from "@/components/command-palette"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useBranding } from "@/hooks/use-branding"
 import { useService } from "@/hooks/use-service"
 import { notificationsService } from "@/services"
 import { TenantSwitcher } from "./tenant-switcher"
@@ -40,7 +41,12 @@ import { CONSOLE_VERSION } from "@/features/version/console-version"
  */
 export function AppNavbar() {
   const pathname = usePathname()
-  const pageTitle = pageTitleFor(pathname)
+  // ADM-2 decision 13: a page the menu does not name is called after the
+  // workspace, not after the product. `pageTitleFor` stays pure, so the
+  // name comes in here; the product's own name stands in for a workspace
+  // that set none.
+  const branding = useBranding()
+  const pageTitle = pageTitleFor(pathname, branding.name)
   const router = useRouter()
   const { user, logout, activeTenantId, setActiveTenant, hasPermission } = useAuth()
   const copilot = useCopilot()

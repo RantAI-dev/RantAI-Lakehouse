@@ -15,6 +15,7 @@ What the person sees before signing in (`/login`). Backlog `WEB-15`; spec [`web-
 | 1 | Layout A of four mockups: a live sample dashboard left, the form right | Owner | 2026-11-14 |
 | 2 | The sample uses no customer data and no API call; no visible "Sample data" badge (owner removed it 2026-11-14), the panel's accessible name says sample data | Planner, owner | 2026-11-14 |
 | 3 | The sample dashboard loads after the form and never delays it | Planner | 2026-11-14 |
+| 4 | The title is "Sign in to {workspace name}" (`ADM-2`), not a fixed "Sign in to Lakehouse": the logo, the title and the copyright line follow the workspace's own branding (Settings → General), and show the product's own name and mark when none is set. The "Powered by RantAI Lakehouse" byline stays (`ADM-2` decision 8). PR #536 review SHOULD-FIX 1 | Owner | 2026-11-18 |
 
 ## Limits
 
@@ -26,3 +27,4 @@ What the person sees before signing in (`/login`). Backlog `WEB-15`; spec [`web-
 - [ ] A wrong password shows the designed error; the right one signs in and goes to `next`.
 - [ ] On a phone (390×844) the form is fully visible without scrolling past the sample.
 - [ ] With reduced motion, nothing moves.
+- [ ] A workspace with its own name and logo (Settings → General) shows them on `/login`: "Sign in to {name}", its logo top-left, "© {year} {name}" in the footer.

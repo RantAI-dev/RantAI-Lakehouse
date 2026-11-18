@@ -97,7 +97,7 @@
   {
     "name": "audit:read",
     "area": "Governance",
-    "description": "Query the sensitive system tables an audit needs."
+    "description": "Read the audit trail list and query the sensitive system tables an audit needs."
   },
   {
     "name": "identity:read",
@@ -148,6 +148,11 @@
     "name": "ops:read",
     "area": "Operations",
     "description": "System status (/api/ops/{kind}, /api/ops/logs's floor)."
+  },
+  {
+    "name": "usage:read",
+    "area": "Operations",
+    "description": "The Usage page: queries, scanned bytes and engine time per day, person and engine, and the rates behind its estimate (GET /api/usage/*)."
   },
   {
     "name": "alert:read",

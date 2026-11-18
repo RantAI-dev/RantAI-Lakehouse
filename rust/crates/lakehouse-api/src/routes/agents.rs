@@ -49,11 +49,12 @@ use lakehouse_store::agents::{
     self, AgentRun, AgentWorkflow, ApprovalItem, CreateEmployeeInput, CreateWorkflowInput,
     Decision, DigitalEmployee, LinkedApprovalRequest, RunStep,
 };
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::ai::{
@@ -83,6 +84,19 @@ fn required(field: &str, value: &str) -> Result<String, ApiError> {
         return Err(ApiError::BadRequest(format!("{field} is required")));
     }
     Ok(trimmed.to_owned())
+}
+
+/// The detail a run's step, or a run's outcome, keeps of a tool's result.
+///
+/// A run's detail is read by a browser on the run page, so it takes the
+/// browser's copy of the result (`crate::routes::ai::split_tool_result`,
+/// owner rule LH-QS-2-08, 2026-11-12): an engine failure is stored as a fixed
+/// sentence and a reference, never as the engine's own text. The model that
+/// drives the run reads the model's copy, which keeps the engine's
+/// diagnosis, and that copy is never stored. A result with no engine failure
+/// is stored as the tool returned it.
+fn stored_tool_detail(shown: &Value) -> String {
+    serde_json::to_string(shown).unwrap_or_default()
 }
 
 const VALID_AUTONOMY: [&str; 4] = ["L1", "L2", "L3", "L4"];
@@ -206,13 +220,24 @@ pub struct CreateEmployeeBody {
 /// exactly the gap [`VALID_MODE`] closes here, the same way [`VALID_AUTONOMY`]
 /// already does for `autonomy`.
 ///
+/// # The permissions never exceed the creator's (`SEC-20`, plan 97)
+///
+/// A scheduled run takes its [`PermissionSet`] from the employee's own
+/// `permissions` column and needs no `agent:manage`, so an employee holding
+/// more than its creator would let the creator read what their own roles do
+/// not allow. The route needs `agent:manage` (`POLICY_TABLE`), and
+/// [`check_permission_ceiling`] refuses every permission the creator does not
+/// hold, `*:*` included.
+///
 /// # Errors
 ///
 /// 400 on a malformed body, a blank required field, an unrecognized
-/// `autonomy`, or an unrecognized `mode`; 409 if the name is taken;
-/// 503/500 as above.
+/// `autonomy`, an unrecognized `mode`, or a `permissions` token that is not
+/// `resource:action`; 403 when `permissions` names one the creator does not
+/// hold; 409 if the name is taken; 503/500 as above.
 pub async fn create_employee(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<DigitalEmployee>)> {
     let body: CreateEmployeeBody = parse_body(&body)?;
@@ -231,6 +256,7 @@ pub async fn create_employee(
         ))
         .into());
     }
+    check_permission_ceiling(&principal, body.permissions.as_deref())?;
     let input = CreateEmployeeInput {
         name: required("name", &body.name)?,
         purpose: required("purpose", &body.purpose)?,
@@ -246,6 +272,41 @@ pub async fn create_employee(
     };
     let created = agents::create_employee(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
+}
+
+/// `SEC-20`, plan 97: refuses a `permissions` value that grants more than
+/// `creator` holds.
+///
+/// Walks the tokens [`PermissionSet::parse`] yields, because a run parses the
+/// stored column the same way. A non-blank token that does not parse as
+/// `resource:action` would grant nothing when parsed and so slip past this
+/// check unseen; it is refused with a 400 instead of being stored, which keeps
+/// the stored string equal to what was checked. [`PermissionSet::has`] answers
+/// per token, so `*:*` and `resource:*` pass only for a creator whose own
+/// grant is as wide.
+///
+/// # Errors
+///
+/// 400 for a token that is not `resource:action`; 403 naming the first
+/// permission `creator` does not hold. The name comes from the request.
+fn check_permission_ceiling(creator: &Principal, asked: Option<&str>) -> Result<(), ApiError> {
+    for token in asked.unwrap_or("").split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some(permission) = PermissionSet::parse(token).as_strings().pop() else {
+            return Err(ApiError::BadRequest(
+                "permissions must be comma-separated resource:action pairs".to_owned(),
+            ));
+        };
+        if !creator.permissions.has(&permission) {
+            return Err(ApiError::PermissionDenied(format!(
+                "you cannot give an employee the permission {permission}, which you do not hold"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn map_transition_result(
@@ -379,11 +440,21 @@ fn list_tools_body(usage_counts: &[(String, i64)]) -> Vec<RegistryTool> {
 /// `agent_tool`-table "register a tool" endpoint) is removed entirely —
 /// see this module's doc comment.
 ///
+/// `SEC-20` (plan 100): the counts are the caller's own organisation's, so
+/// a count never says how often another organisation ran a tool.
+///
 /// # Errors
 ///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_tools(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<RegistryTool>>> {
-    let usage_counts = agents::tool_usage_counts_30d(pool(&state)?).await?;
+/// 404 for a forged `X-Tenant` header. 503 if no pool is configured; 500 on a
+/// database failure.
+pub async fn list_tools(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Vec<RegistryTool>>> {
+    let scope =
+        crate::routes::audit_scope::scope_for_principal(&state, &principal, &headers).await?;
+    let usage_counts = agents::tool_usage_counts_30d(pool(&state)?, &scope).await?;
     Ok(ApiJson(list_tools_body(&usage_counts)))
 }
 
@@ -589,6 +660,14 @@ fn decide_approval_audit_event(
     )
 }
 
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST
+/// /api/agents/approvals/{id}/decide`, and the action of the `refused` row
+/// `auth_gate` writes when it turns the call away (`GOV-1`). The row a
+/// decision itself writes carries the approval's own action (the tool the
+/// approval is for), which is chosen at run time and so cannot be the table's
+/// name.
+pub(crate) const APPROVAL_DECIDE_ACTION: &str = "agent.approval_decide";
+
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line sequence of terminal outcomes (reject / \
@@ -669,14 +748,7 @@ pub async fn decide_approval(
         decide_outcome,
         approval.run_id.as_deref(),
     );
-    if let Err(err) = store_audit::insert(pg, decide_audit_event).await {
-        tracing::warn!(
-            %err,
-            action = %approval.action,
-            outcome = decide_outcome,
-            "failed to record approval-decision audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, decide_audit_event).await;
 
     // Approvals the copilot creates always carry a `run_id` (see
     // `create_pending_approval`); one that doesn't (a manually-inserted or
@@ -769,6 +841,10 @@ pub async fn decide_approval(
         return Err(ApiError::PermissionDenied(detail).into());
     }
     let result = ai_tools::run_tool(&state, Some(&principal), &pending.tool, &args).await;
+    // LH-QS-2-08 (owner 2026-11-12): this run's outcome is read by a browser,
+    // and so is this route's answer, so both carry the browser's copy of an
+    // engine failure. No model reads the result here.
+    let (result, shown) = crate::routes::ai::split_tool_result(result);
     let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
     let status = if ok { "succeeded" } else { "failed" };
     if let Err(err) = agents::record_run_outcome(
@@ -776,7 +852,7 @@ pub async fn decide_approval(
         &run_id,
         status,
         "Executed after approval",
-        &serde_json::to_string(&result).unwrap_or_default(),
+        &stored_tool_detail(&shown),
     )
     .await
     {
@@ -791,14 +867,17 @@ pub async fn decide_approval(
         approval.resource.as_deref(),
         &json!({}),
         if ok { "executed" } else { "failed" },
-        None,
+        // The browser's copy of the failure, the fixed sentence and the
+        // reference (plan 111): the row says why the call failed, and the
+        // engine's own text stays out of the audit trail.
+        shown.get("error").and_then(Value::as_str),
         Some(&run_id),
         Some(&id),
     )
     .await;
 
     Ok(ApiJson(
-        json!({ "approval": approval, "executed": true, "result": result }),
+        json!({ "approval": approval, "executed": true, "result": shown }),
     ))
 }
 
@@ -918,8 +997,7 @@ fn check_employee_run_auth(
 
 /// The headless loop's own iteration cap — same value as `routes::ai`'s
 /// `MAX_ITER` (kept as an independent constant rather than importing that
-/// private one: see the module doc comment on why this route cannot reach
-/// into `routes::ai::gate`).
+/// private one: `routes::ai` keeps it to itself).
 const MAX_HEADLESS_ITER: u32 = 8;
 
 /// How one headless run's tool-calling loop ended.
@@ -981,7 +1059,7 @@ async fn append_step(pg: &PgPool, run_id: &str, id: &str, label: &str, status: &
     reason = "one flat record of what happened, mirroring routes::ai::audit::record's own justification"
 )]
 async fn write_headless_audit(
-    pg: &PgPool,
+    state: &AppState,
     principal_id: Option<String>,
     principal_kind: &str,
     actor_label: &str,
@@ -1008,9 +1086,7 @@ async fn write_headless_audit(
         approval_id: approval_id.map(str::to_owned),
         session_id: None,
     };
-    if let Err(err) = store_audit::insert(pg, event).await {
-        tracing::warn!(%err, action, outcome, "headless run: failed to write audit_event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 /// A short, deterministic system prompt for the headless loop — NOT a
@@ -1151,7 +1227,7 @@ async fn run_headless_loop(
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line reimplementation of routes::ai::chat's own tool-calling loop \
-              plus the three gate checks routes::ai::gate keeps private; splitting it up would \
+              plus the three gate checks a headless run reimplements; splitting it up would \
               scatter one sequential loop across helpers with no independent reuse, matching \
               routes::ai::chat's own identical justification"
 )]
@@ -1241,7 +1317,7 @@ async fn run_headless_loop_inner(
             )
             .await;
             write_headless_audit(
-                pg,
+                state,
                 principal_id.clone(),
                 principal_kind,
                 actor_label,
@@ -1315,7 +1391,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1348,7 +1424,7 @@ async fn run_headless_loop_inner(
             )
             .await;
             write_headless_audit(
-                pg,
+                state,
                 principal_id.clone(),
                 principal_kind,
                 actor_label,
@@ -1391,7 +1467,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1415,8 +1491,8 @@ async fn run_headless_loop_inner(
 
             // Ask-mode gate: identical semantics to `routes::ai::gate::decide`'s
             // first check, reimplemented here rather than called there — see
-            // the module doc comment on why this route cannot reach the
-            // private `routes::ai::gate` module.
+            // the module doc comment on why this route reimplements the
+            // gate's checks itself.
             if !is_build && is_write {
                 step_no += 1;
                 let detail = format!(
@@ -1433,7 +1509,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1479,7 +1555,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1533,8 +1609,13 @@ async fn run_headless_loop_inner(
                         tool: spec.name,
                         resource: resource_id.as_deref(),
                         reason: &reason,
-                        risk: "High-risk action (WriteHigh): cannot be undone once \
-                               executed.",
+                        // The sentence the chat's approval card shows for
+                        // this tool (`ai_gate::risk_for_write_high`): a
+                        // deleted chart goes to the trash and stays
+                        // restorable, so the generic "cannot be undone"
+                        // text was false on this very card (`AI-1`,
+                        // `GOV-13`).
+                        risk: ai_gate::risk_for_write_high(spec),
                         redacted_args: &redacted,
                         // SEC-57: the approval names the HUMAN who started
                         // this run, when a person started it — so the API
@@ -1554,7 +1635,7 @@ async fn run_headless_loop_inner(
                             tracing::warn!(%err, run_id, "headless run: failed to mark waiting_approval");
                         }
                         write_headless_audit(
-                            pg,
+                            state,
                             principal_id.clone(),
                             principal_kind,
                             actor_label,
@@ -1576,7 +1657,7 @@ async fn run_headless_loop_inner(
                             "headless run: failed to create WriteHigh approval"
                         );
                         write_headless_audit(
-                            pg,
+                            state,
                             principal_id.clone(),
                             principal_kind,
                             actor_label,
@@ -1611,6 +1692,11 @@ async fn run_headless_loop_inner(
             // requiring tool (`run_saved_query`) is responsible for
             // refusing `None` with a named reason rather than a bare 401.
             let result = ai_tools::run_tool(state, principal, &call.function.name, &args).await;
+            // LH-QS-2-08 (owner 2026-11-12): the step's detail is read by a
+            // browser, so it stores the browser's copy of an engine failure
+            // (`shown`), while the model that drives this run is fed the
+            // model's copy (`result`), which keeps the engine's diagnosis.
+            let (result, shown) = crate::routes::ai::split_tool_result(result);
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
             let (resource_kind, resource_id) =
                 ai_audit::resource_for(&call.function.name, &args, &result);
@@ -1620,11 +1706,11 @@ async fn run_headless_loop_inner(
                 &format!("step-{step_no}"),
                 &call.function.name,
                 if ok { "succeeded" } else { "failed" },
-                &serde_json::to_string(&result).unwrap_or_default(),
+                &stored_tool_detail(&shown),
             )
             .await;
             write_headless_audit(
-                pg,
+                state,
                 principal_id.clone(),
                 principal_kind,
                 actor_label,
@@ -1633,7 +1719,11 @@ async fn run_headless_loop_inner(
                 resource_id.as_deref(),
                 &Value::Object(args.clone()),
                 if ok { "executed" } else { "failed" },
-                None,
+                // The browser's copy of the failure, the fixed sentence and
+                // the reference (plan 111): the row says why the call
+                // failed, and the engine's own text stays out of the audit
+                // trail.
+                shown.get("error").and_then(Value::as_str),
                 run_id,
                 None,
             )
@@ -1686,17 +1776,20 @@ fn push_tool_result(
 /// # Why this can't just call into `routes::ai`
 ///
 /// `routes::ai::gate` (mode + permission gate, `WriteLow` confirmation,
-/// `WriteHigh` approval creation) is a PRIVATE module of `routes::ai`
-/// (`mod gate;`, not `pub(in crate::routes)`) — only `routes::ai::chat`
-/// and `routes::ai::tool_call` can call it. This handler reimplements the
-/// same three checks (ask-mode refusal, permission-ceiling refusal,
-/// `WriteHigh` → approval) directly in [`run_headless_loop`] rather than
-/// editing that module's visibility, and reuses everything that IS already
-/// shared across `routes::ai`'s sibling modules: [`ai_tools::run_tool`]
-/// (the actual dispatch), [`ai_registry::find`]/[`ai_registry::tool_schemas_for`]
-/// (the tool table), and [`ai_audit::redact`]/[`ai_audit::resource_for`]
-/// (the redaction/resource-inference rules) — never a second, divergent
-/// copy of THOSE.
+/// `WriteHigh` approval creation) is `pub(in crate::routes)`, so a sibling
+/// module of `routes::ai` can call it, and this route reuses its
+/// [`ai_gate::permission_granted`] and [`ai_gate::risk_for_write_high`].
+/// The three checks themselves (ask-mode refusal, permission-ceiling
+/// refusal, `WriteHigh` → approval) are reimplemented directly in
+/// [`run_headless_loop`], because a headless run has no chat turn to
+/// confirm in and creates its own linked approval. Everything that IS
+/// already shared across `routes::ai`'s sibling modules is reused:
+/// [`ai_tools::run_tool`] (the actual dispatch),
+/// [`ai_registry::find`]/[`ai_registry::tool_schemas_for`] (the tool table),
+/// and [`ai_audit::redact`]/[`ai_audit::resource_for`] (the
+/// redaction/resource-inference rules) — never a second, divergent copy of
+/// THOSE. The system prompt's constants are private to `routes::ai`, so the
+/// headless run has a prompt of its own.
 ///
 /// # Auth (see [`check_employee_run_auth`])
 ///
@@ -1946,6 +2039,58 @@ mod tests {
             comment: None,
         };
         assert!(!matches!(body.decision.as_str(), "approved" | "rejected"));
+    }
+
+    /// A run's step detail is read by a browser, so for an engine failure it
+    /// holds the fixed sentence and the reference (LH-QS-2-08), never the
+    /// engine's diagnosis, which only the model reads. The server-only key
+    /// the browser's copy travelled in is gone from it too.
+    #[test]
+    fn a_stored_tool_detail_holds_the_fixed_sentence_and_not_the_engine_diagnosis() {
+        let result = json!({
+            "error": "Unknown expression identifier 'pengunjungg' in scope. (UNKNOWN_IDENTIFIER) Reference: dc51a4b585",
+            "_browserError": "This query names a column that does not exist. Reference: dc51a4b585",
+        });
+
+        let (model, shown) = crate::routes::ai::split_tool_result(result);
+        let detail = stored_tool_detail(&shown);
+
+        let stored: Value = serde_json::from_str(&detail).expect("the detail is JSON");
+        assert_eq!(
+            stored["error"],
+            json!("This query names a column that does not exist. Reference: dc51a4b585"),
+        );
+        for text in [
+            "UNKNOWN_IDENTIFIER",
+            "Code:",
+            "pengunjungg",
+            "_browserError",
+        ] {
+            assert!(!detail.contains(text), "{text} in {detail}");
+        }
+        // The model's copy keeps the diagnosis, with the same reference.
+        assert!(
+            model["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("UNKNOWN_IDENTIFIER")
+                    && text.ends_with("Reference: dc51a4b585")),
+            "{model}"
+        );
+    }
+
+    /// A result with no browser copy (a success, or a failure whose message
+    /// is already fixed) is stored as the tool returned it.
+    #[test]
+    fn a_stored_tool_detail_of_a_result_without_a_browser_copy_is_the_result() {
+        for result in [
+            json!({ "columns": ["n"], "rows": [[5]], "rowCount": 1 }),
+            json!({ "error": "The database request failed. Reference: ab12cd34ef" }),
+        ] {
+            let (_, shown) = crate::routes::ai::split_tool_result(result.clone());
+            let stored: Value =
+                serde_json::from_str(&stored_tool_detail(&shown)).expect("the detail is JSON");
+            assert_eq!(stored, result);
+        }
     }
 
     /// A logged-in human principal — `PrincipalId::User`. Mirrors

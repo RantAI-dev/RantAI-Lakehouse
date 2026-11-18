@@ -1,0 +1,103 @@
+# Audit trail covers every console change
+
+| | |
+| --- | --- |
+| Module | Governance |
+| Backlog | `GOV-1` |
+| Kind | Feature |
+| Spec | `docs/core/specs/gov-1.md` |
+| Status | In Acceptance |
+| Priority | P1 |
+| Owner | In the base |
+| Acceptor | In the base |
+| Plan | Engineering plan kept by the planner |
+| Started | 2026-11-14 |
+| Shipped | 2026-11-15 |
+| Evidence | PR #546 (part A: coverage, central writer, append-only trail, audit:read), PR #549 (part B: server-side search, paging, CSV export) |
+
+## Problem
+
+About 110 of the 218 routes that change something leave no audit row, among them every dashboard, saved query, alert and report subscription change. The audit page shows only the newest 200 events and cannot export.
+
+## What the user can do when this is done
+
+1. Change anything in the console and find the change on the audit page: who, what, on what, when, and the outcome.
+2. Find a refused change (no permission) on the audit page, with outcome Refused.
+3. Filter the audit page by person, action, object and time range and get events of any age, page by page.
+4. Export the filtered events as CSV.
+5. See, for a role, policy, table-access or grant change, the old and new value; for any other change, the names of the fields that changed.
+6. Trust that nobody, not even an administrator through the database account the console uses, can edit or delete an audit row.
+
+## Not included
+
+Reads and downloads (as today), retention settings, sending events to another system, personal UI state.
+
+## Asking the assistant
+
+No new assistant work. Its tool calls are already recorded.
+
+## Decisions
+
+| # | Decision | Default | Signed |
+| --- | --- | --- | --- |
+| 1 | Excluded from the audit (each listed in the guard test with this reason): read-like POSTs (preview, validate, estimate, compile, lag-check, `check`, `compare`), connection and email "test" buttons, the public data and frame routes, machine callbacks from ingestion jobs, multipart upload parts, and personal UI state (favourites, recent, home layout, chat session create/rename/delete, and the read marks of mentions, `POST /api/dashboard/comments/mentions/read`; owner, 2026-11-15). Everything else is recorded | as written | Owner, 2026-11-14 |
+| 2 | A refused change is recorded (outcome `refused`) for every covered route | yes | Owner, 2026-11-14 |
+| 3 | Old and new values only for roles, policies, table access and grants; other changes record the names of changed fields only; never a secret | as written | Owner, 2026-11-14 |
+| 4 | A failed audit write does not undo the change (as today); it is logged and counted on the Operations health page | as written | Owner, 2026-11-14 |
+| 5 | CSV export limit per file | 100,000 rows | Owner, 2026-11-14 |
+| 6 | The database refuses `UPDATE` and `DELETE` on `audit_event` (trigger, in a migration) | yes | Owner, 2026-11-14 |
+| 7 | Retention: keep forever, no setting in this feature | yes | Owner, 2026-11-14 |
+| 8 | Delivery in two parts: A, coverage plus the guard test (Decisions 1 to 4, 6); B, server-side search, paging and export (Decision 5) | yes | Owner, 2026-11-14 |
+| 9 | Who sees the audit page and export | `audit:read` only (Governance Admin, and `*:*`). Today the page needs only `governance:read`, which migration `0133` gives every role; this feature narrows it (owner, 2026-11-14) | Owner, 2026-11-14 |
+
+## Limits to tell a customer
+
+- Reads and downloads are recorded as today, not every page view.
+- Events are kept forever; there is no retention setting yet.
+- Events cannot be sent to an outside system yet; export is CSV from the audit page.
+- The database owner can still run `ALTER TABLE audit_event DISABLE TRIGGER ...` and turn off the trigger that makes the trail append-only. Nothing in the trail records that.
+- The database allows an `UPDATE` that only clears a row's `run_id` or `approval_id`, because it clears those links when an agent run or an approval is deleted. Every other change to a row is refused.
+- A request that the service's timeout cuts off writes no row.
+- A change made through a create route does not name the new object when its id is only in the response. The row then names the kind and the action, not the object.
+- The row names the fields a change touched and never their values. The exceptions are the old and new values that the identity, policy, table-access and grant rows record.
+- The scheduler's alert tick (`POST /api/alerts/run`) writes one row per tick.
+- Writes through the Iceberg REST door are refused by that door and are not in the trail.
+- The assistant's audit history tool (`get_audit_history`) needs `audit:read`, like the audit page (#585).
+- The Overview page's activity feed (`POST /api/overview`) shows the 20 newest audit rows of everyone only to a person with `audit:read`. Any other person sees only the 20 newest rows of their own actions, with the action, the object and the outcome.
+- An asset page's change history shows up to 50 audit rows about that asset to anyone who can open the asset. `audit:read` does not narrow it either.
+- Machine callbacks are not audited. The pipeline run events, the schema and capture observations and the connector run reports accept a service identity or an unrestricted administrator account. A person who calls one of these routes by hand with an unrestricted account leaves no row. A pipeline run started from the console is audited as `pipeline.trigger`. The orchestrator's lag call (`POST /api/pipelines/runnable/{id}/lag-check`) is also open to an unrestricted administrator account. It advances the pipeline's lag streak and can send the behind-target alert, and it writes no audit row.
+- Marking a dashboard comment mention as read is not recorded. It counts as personal UI state, like favourites.
+- Each failed sign-in that reaches the password check adds one row with outcome `refused`. The try that makes an identifier locked adds two rows: the `auth.login_locked` row and the refused row. The row holds no email, no password and no identifier. An unknown email adds the same row, so a visitor who tries many different identifiers adds a row for each try. A try refused because that identifier is locked adds no row. Nothing removes these rows and there is no retention setting yet, so the growth is permanent. A rate limit or retention rule is a follow-up.
+- The CSV export holds the newest 100,000 matching events per file. When more match, the audit page shows a notice, and the response carries two headers, `x-audit-export-truncated` and `x-audit-export-total`. To get the rest, narrow the time range and export again.
+- The Person filter takes the person's id, not a name. A person who holds only `audit:read` cannot list users (`GET /api/identity/users` needs `identity:read`).
+- Dates in the filters are UTC days. A day in `from` starts at 00:00 UTC, and a day in `to` is included in full.
+
+## Acceptance checklist
+
+| ID | Do this | Expect | Result |
+| --- | --- | --- | --- |
+| `GOV-1-AC1` | Save, rename, move, share and delete a saved query; open the audit page | Five rows, each with you, the action, the query, the time and Executed | Not run |
+| `GOV-1-AC2` | Create a dashboard, add a chart, change a filter, delete the dashboard | One row per change | Not run |
+| `GOV-1-AC3` | Create, edit and delete an alert and a report subscription | One row per change | Not run |
+| `GOV-1-AC4` | Change the query limits and the reporting settings | One row each, naming the changed fields, no values | Not run |
+| `GOV-1-AC5` | Create a role, change its permissions | Rows with the old and new permissions | Not run |
+| `GOV-1-AC6` | As a user without the permission, try to delete someone else's dashboard | Refused in the console; a row with outcome Refused | Not run |
+| `GOV-1-AC7` | Ask the assistant to change a chart | A row with the assistant as actor (as today) | Not run |
+| `GOV-1-AC8` | Filter the audit page to one person and a date range older than the newest 200 events | The matching events of that range, paged | Not run |
+| `GOV-1-AC9` | Export the filtered result | A CSV with the same rows and columns | Not run |
+| `GOV-1-AC10` | As an Analyst (holds `governance:read`, not `audit:read`), open the audit page and the export link | Refused; the audit page is not in the menu | Not run |
+| `GOV-1-AC11` | (operator) Try `UPDATE audit_event ...` and `DELETE FROM audit_event ...` with the console's database account | Both refused by the database | Not run |
+| `GOV-1-AC12` | (operator) Look at the CI run of the pull request | The audit coverage test passes, and it lists every excluded route with its reason | Not run |
+
+**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+
+Exceptions, each with an owner and a date:
+
+## After acceptance
+
+- [ ] `PRODUCT.md` section 2 and 3 updated
+- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [ ] `BACKLOG.md` Dates has the Shipped date
+- [ ] The base row updated to match the repo; the Acceptor is recorded in the base
+- [ ] `CHANGELOG.md` entry a customer can read
+

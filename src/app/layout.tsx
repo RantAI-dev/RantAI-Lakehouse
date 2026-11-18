@@ -9,6 +9,11 @@ import { TableProviders } from "@/components/app-shell/table-providers";
 import { AuthProvider } from "@/features/auth/auth-provider";
 import { ReactGrabDev } from "@/components/app-shell/react-grab-dev";
 import { NONCE_HEADER } from "@/lib/csp";
+import {
+  readWorkspaceBranding,
+  workspaceIconLinks,
+  workspaceMetadata,
+} from "@/lib/workspace-metadata";
 import { dashboardFontVariables } from "./fonts";
 import "./globals.css";
 
@@ -27,12 +32,18 @@ import "./globals.css";
  */
 export const dynamic = "force-dynamic";
 
-export const metadata: Metadata = {
-  title: "RantAI Lakehouse",
-  description: "RantAI Lakehouse - Data platform",
-  manifest: "/site.webmanifest",
-  appleWebApp: { title: "RantAI Lakehouse" },
-};
+/**
+ * The tab title and the tab icon belong to the workspace (`ADM-2`, plan
+ * decisions 3 and 4): the root layout reads the public branding answer and
+ * shows the administrator's own name and icon, and the product's own when
+ * none is set.
+ *
+ * The name is read once per request and shared with the layout body through
+ * React's `cache`, so the page's `<head>` and its metadata cost one request.
+ */
+export async function generateMetadata(): Promise<Metadata> {
+  return workspaceMetadata(await readWorkspaceBranding());
+}
 
 /**
  * App-wide root layout.
@@ -62,6 +73,7 @@ export default async function RootLayout({
   // first paint) and only a nonce passed here lets the browser run it. Without
   // it the page paints light and only switches after hydration.
   const nonce = (await headers()).get(NONCE_HEADER) ?? undefined;
+  const iconLinks = workspaceIconLinks(await readWorkspaceBranding());
   return (
     <html
       lang="en"
@@ -70,10 +82,17 @@ export default async function RootLayout({
     >
       <head>
         <meta name="theme-color" content="#050A30" />
-        {/* The favicon follows the browser colour scheme: light = navy logo, dark = white logo. */}
-        <link rel="icon" type="image/png" href="/icon-light-32.png" media="(prefers-color-scheme: light)" />
-        <link rel="icon" type="image/png" href="/icon-dark-32.png" media="(prefers-color-scheme: dark)" />
-        <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+        {/* The favicon is the workspace's own when one is set, else the product's
+            files: one per browser colour scheme, light = navy logo, dark = white logo. */}
+        {iconLinks.map((link) => (
+          <link
+            key={`${link.rel}:${link.href}`}
+            rel={link.rel}
+            href={link.href}
+            type={link.type}
+            media={link.media}
+          />
+        ))}
       </head>
       {/* Browser extensions (Grammarly, ColorZilla, password managers) put
           their own attributes on <body> before React hydrates; in dev that

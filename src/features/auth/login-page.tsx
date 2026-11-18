@@ -2,10 +2,10 @@
 
 import * as React from "react";
 import dynamic from "next/dynamic";
-import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { CircleAlert, Eye, EyeOff, KeyRound, Lock, TriangleAlert, User } from "lucide-react";
+import { BrandPicture } from "@/components/brand-picture";
 import { Button } from "@/components/ui/button";
 import { Field, FieldLabel } from "@/components/ui/field";
 import {
@@ -17,7 +17,14 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { RequiredLegend } from "@/components/patterns/required-legend";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { useBranding, type BrandingView } from "@/hooks/use-branding";
+import {
+  PRODUCT_BYLINE,
+  PRODUCT_LOGO_DARK,
+  PRODUCT_LOGO_LIGHT,
+} from "@/lib/product-branding";
 import { cn } from "@/lib/utils";
 import * as authClient from "@/services/clients/auth";
 import { toServiceError } from "@/services/errors";
@@ -218,16 +225,29 @@ function nextPathFromQuery(): string {
 }
 
 /**
- * The official RantAI Lakehouse mark (`public/logo-*.svg`, viewBox 196 x 167),
- * drawn whole in a box with the mark's own aspect ratio, so it is never
- * letterboxed or squashed (DESIGN.md §5). Height is set by the caller; width
- * follows. Decorative: the title beside it already names the product.
+ * The workspace's own logo (`ADM-2`), or the official RantAI Lakehouse mark
+ * when it set none (`public/logo-*.svg`, viewBox 196 x 167). The box has the
+ * mark's own aspect ratio and the picture is contained in it, so the mark is
+ * never letterboxed or squashed (DESIGN.md §5) and a workspace's picture of
+ * another shape is drawn whole. Height is set by the caller; width follows.
+ * PR #536 review SHOULD-FIX 1: the picture comes from `BrandPicture`, so a
+ * workspace's logo is never replaced by the product's fixed file.
  */
-function Logo({ className }: { className?: string }) {
+function Logo({ branding, className }: { branding: BrandingView; className?: string }) {
   return (
     <span className={cn("relative inline-block aspect-[196/167] h-7 shrink-0 self-start", className)}>
-      <Image src="/logo-light.svg" alt="" fill unoptimized sizes="64px" className="object-contain dark:hidden" priority />
-      <Image src="/logo-dark.svg" alt="" fill unoptimized sizes="64px" className="hidden object-contain dark:block" priority />
+      <BrandPicture
+        src={branding.logoSrc}
+        alt={branding.name}
+        fallbackSrc={PRODUCT_LOGO_LIGHT}
+        className="absolute inset-0 size-full object-contain dark:hidden"
+      />
+      <BrandPicture
+        src={branding.logoDarkSrc}
+        alt={branding.name}
+        fallbackSrc={PRODUCT_LOGO_DARK}
+        className="absolute inset-0 hidden size-full object-contain dark:block"
+      />
     </span>
   );
 }
@@ -235,6 +255,10 @@ function Logo({ className }: { className?: string }) {
 export function LoginPage() {
   const router = useRouter();
   const { refresh, status, user } = useAuth();
+  // The workspace's own name and logo (`ADM-2`). The route is public, so
+  // the page reads it before anyone signs in; the product's own name and
+  // logos stand in until the answer arrives.
+  const branding = useBranding();
   const [email, setEmail] = React.useState("");
   const [password, setPassword] = React.useState("");
   const [submitting, setSubmitting] = React.useState(false);
@@ -395,7 +419,7 @@ export function LoginPage() {
             (`login.css`, `.login-reveal-*`); first paint only, nothing moves
             with reduced motion, and the fields take focus and typing at once. */}
         <div className="login-reveal login-reveal-0 flex items-center justify-between">
-          <Logo className="h-7" />
+          <Logo branding={branding} className="h-7" />
           <ThemeToggle className={cn(EASE, PRESS)} />
         </div>
 
@@ -415,9 +439,12 @@ export function LoginPage() {
               <SsoNotice />
             </React.Suspense>
             {/* Centred over the form column (T8, owner 2026-11-14); the
-                labels, fields and notices stay left-aligned for reading. */}
-            <h1 className={cn(LOGIN_DISPLAY, "login-reveal login-reveal-1 text-center text-[28px] leading-[1.05] text-foreground sm:text-[36px]")}>
-              Sign in to Lakehouse
+                labels, fields and notices stay left-aligned for reading.
+                The name is the workspace's own (`ADM-2`; owner decision
+                2026-11-18, `docs/core/features/login-page.md`), the product's
+                when none is set; a long one wraps at a word, balanced. */}
+            <h1 className={cn(LOGIN_DISPLAY, "login-reveal login-reveal-1 text-center text-[28px] leading-[1.05] text-balance break-words text-foreground sm:text-[36px]")}>
+              Sign in to {branding.name}
             </h1>
 
             {checkingSession ? (
@@ -438,8 +465,11 @@ export function LoginPage() {
                     if (e.target === e.currentTarget) setShaking(false);
                   }}
                 >
+                  {/* #568 (UX-1): the required marker is explained once, at
+                      the top of the form; it arrives with the first field. */}
+                  <RequiredLegend className="login-reveal login-reveal-2" />
                   <Field data-invalid={invalid} className="login-reveal login-reveal-2">
-                    <FieldLabel htmlFor="login-email" className="text-sm">
+                    <FieldLabel htmlFor="login-email" className="text-sm" required>
                       Username or email
                     </FieldLabel>
                     <InputGroup className={cn("h-11 bg-background dark:bg-input/30", FIELD_EASE)}>
@@ -471,7 +501,7 @@ export function LoginPage() {
                   </Field>
 
                   <Field data-invalid={invalid} className="login-reveal login-reveal-3">
-                    <FieldLabel htmlFor="login-password" className="text-sm">
+                    <FieldLabel htmlFor="login-password" className="text-sm" required>
                       Password
                     </FieldLabel>
                     <InputGroup className={cn("h-11 bg-background dark:bg-input/30", FIELD_EASE)}>
@@ -606,7 +636,16 @@ export function LoginPage() {
         </div>
 
         <footer className="login-reveal login-reveal-5 flex items-center justify-between gap-4 text-xs text-muted-foreground">
-          <span>© {new Date().getFullYear()} RantAI Lakehouse</span>
+          {/* PR #536 review SHOULD-FIX 1: the copyright is the workspace's
+              own (`ADM-2`), and the byline stays (ADM-2 feature decision 8:
+              the console keeps saying who built it, even when the workspace
+              has a name of its own). One short line, pieces split by a
+              middle dot, wrapping on a narrow phone. */}
+          <span className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5">
+            <span>© {new Date().getFullYear()} {branding.name}</span>
+            <span aria-hidden>·</span>
+            <span>{PRODUCT_BYLINE}</span>
+          </span>
           {/* Placeholder destination — point this at the docs site (or
               wherever support lives) once that URL exists. */}
           <Link href="#" className={cn("rounded-sm outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50", EASE)}>

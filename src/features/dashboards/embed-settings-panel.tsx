@@ -138,7 +138,7 @@ export function EmbedSettingsPanel({
           onValueChange={(next) => setTheme(next as Theme)} />
         <label className="flex items-center gap-2 text-xs">
           <input type="checkbox" checked={hideName} onChange={(e) => setHideName(e.target.checked)} />
-          Hide the RantAI Lakehouse name
+          Hide the workspace name
         </label>
         <label className="flex items-center gap-2 text-xs">
           <input type="checkbox" checked={transparent} onChange={(e) => setTransparent(e.target.checked)} />

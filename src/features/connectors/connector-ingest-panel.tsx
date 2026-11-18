@@ -19,6 +19,8 @@ import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredMarker } from "@/components/ui/required"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useRefreshable } from "@/hooks/use-refreshable"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
@@ -763,12 +765,14 @@ function IngestEditor({
       ) : null}
       {manualAdd ? (
         <div className="space-y-1.5">
-          <Label htmlFor="manual-object" className="text-xs">
+          <RequiredLegend />
+          <Label htmlFor="manual-object" className="text-xs" required>
             Add by name
           </Label>
           <div className={cn("flex gap-2", page && "max-w-md")}>
             <Input
               id="manual-object"
+              aria-required
               value={manualName}
               onChange={(e) => setManualName(e.target.value)}
               onKeyDown={(e) => {
@@ -854,6 +858,7 @@ function IngestEditor({
       <Label htmlFor="ingest-schedule" className={page ? "sr-only" : "text-xs"}>
         Schedule
       </Label>
+      {cronChoice === "custom" ? <RequiredLegend /> : null}
       {/* WEB-9 D3: the presets and the custom entry, as before; "Manual only"
           is a real choice with value "", held by `SelectField`. */}
       <SelectField
@@ -867,14 +872,21 @@ function IngestEditor({
         onValueChange={(next) => setCronChoice(next)}
       />
       {cronChoice === "custom" ? (
-        <Input
-          aria-label="Cron expression"
-          value={customCron}
-          onChange={(e) => setCustomCron(e.target.value)}
-          placeholder="30 1 * * 1-5"
-          className={cn("h-8 font-mono text-xs", page && "max-w-xs")}
-          autoComplete="off"
-        />
+        <>
+          <label htmlFor="ingest-custom-cron" className="text-xs">
+            Cron expression <RequiredMarker />
+          </label>
+          <Input
+            id="ingest-custom-cron"
+            aria-label="Cron expression"
+            aria-required
+            value={customCron}
+            onChange={(e) => setCustomCron(e.target.value)}
+            placeholder="30 1 * * 1-5"
+            className={cn("h-8 font-mono text-xs", page && "max-w-xs")}
+            autoComplete="off"
+          />
+        </>
       ) : null}
       {scheduleProblem ? (
         <p className="text-xs text-destructive">{scheduleProblem}</p>
@@ -1024,6 +1036,8 @@ function LoadModeFields({
   // silently reading as another one.
   const offered = modes.includes(selected.loadMode) ? modes : [...modes, selected.loadMode]
   const note = missingModesNote(modes, changeCapture)
+  const needsCursor =
+    selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup"
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap items-center gap-1.5">
@@ -1039,11 +1053,14 @@ function LoadModeFields({
         />
         {!changeCapture && (selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup") ? (
           <>
-            <span className="shrink-0 text-xs text-muted-foreground">by</span>
+            <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+              by {needsCursor ? <RequiredMarker /> : null}
+            </span>
             {columns && columns.length > 0 ? (
               <SelectField
                 aria-label={`New-row column for ${selected.name}`}
                 size="sm"
+                aria-required={needsCursor}
                 className="min-w-0 flex-1 px-2 font-mono text-xs"
                 value={cursor}
                 /* WEB-9 D2: "Pick a column…" was only a prompt, so it is the
@@ -1058,6 +1075,7 @@ function LoadModeFields({
             ) : (
               <Input
                 aria-label={`New-row column for ${selected.name}`}
+                aria-required={needsCursor}
                 value={cursor}
                 onChange={(e) => onChange({ incrementalKey: e.target.value })}
                 placeholder="updated_at"
@@ -1151,9 +1169,10 @@ function ColumnChoice({
                 const reason = locked.get(column)
                 return (
                   <li key={column}>
-                    <label className="flex items-center gap-1.5 font-mono text-xs">
+                    <label className="flex min-w-0 items-center gap-1.5 font-mono text-xs">
                       <input
                         type="checkbox"
+                        className="shrink-0"
                         aria-label={`Load column ${column} of ${selected.name}`}
                         checked={reason !== undefined || !excluded.includes(column)}
                         disabled={reason !== undefined}
@@ -1161,8 +1180,11 @@ function ColumnChoice({
                           onChange(e.target.checked ? excluded.filter((c) => c !== column) : [...excluded, column])
                         }
                       />
-                      {column}
-                      {reason ? <span className="font-sans text-muted-foreground">{reason}</span> : null}
+                      {/* WEB-13: a source column name is dynamic. Wrap it so an
+                          unbroken identifier folds inside the row; the checkbox
+                          and the locked-column reason stay intact. */}
+                      <span className="min-w-0 break-all leading-snug">{column}</span>
+                      {reason ? <span className="min-w-0 font-sans text-muted-foreground">{reason}</span> : null}
                     </label>
                   </li>
                 )
@@ -1199,6 +1221,7 @@ function KeyFields({
   onChange: (key: string[]) => void
 }) {
   const [typed, setTyped] = React.useState(value.join(", "))
+  const inputId = `key-${name.replace(/[^a-zA-Z0-9_-]/g, "-")}`
   const origin =
     detected && detected.length > 0
       ? sameColumns(value, detected)
@@ -1207,22 +1230,34 @@ function KeyFields({
       : null
   return (
     <div className="space-y-1">
+      {/* UX-1-R6: `aria-required` is not supported on a native fieldset's
+          implicit group role. Put the star on a visible group label and link
+          the requirement text; no individual checkbox is marked required. */}
+      <p id={`${inputId}-help`} className="text-xs text-muted-foreground">
+        Select at least one key column, or type the names separated by commas.
+      </p>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="shrink-0 text-xs text-muted-foreground">Key</span>
+        <span className="shrink-0 text-xs text-muted-foreground">
+          Key <RequiredMarker />
+        </span>
         {columns && columns.length > 0 ? (
-          <fieldset aria-label={`Key columns for ${name}`} className="flex min-w-0 flex-wrap gap-x-3 gap-y-0.5">
+          <fieldset aria-label={`Key columns for ${name}`} aria-describedby={`${inputId}-help`} className="flex min-w-0 flex-wrap gap-x-3 gap-y-0.5">
             {(value.every((c) => columns.includes(c)) ? columns : [...value.filter((c) => !columns.includes(c)), ...columns]).map(
               (column) => (
-                <label key={column} className="flex items-center gap-1 font-mono text-xs">
+                <label key={column} className="flex min-w-0 items-center gap-1 font-mono text-xs">
                   <input
                     type="checkbox"
+                    className="shrink-0"
                     aria-label={`${column} is part of the key of ${name}`}
                     checked={value.includes(column)}
                     onChange={(e) =>
                       onChange(e.target.checked ? [...value, column] : value.filter((c) => c !== column))
                     }
                   />
-                  {column}
+                  {/* WEB-13: the key column name is source data; let it wrap
+                      inside the already min-w-0 fieldset instead of widening
+                      the key row. */}
+                  <span className="min-w-0 break-all leading-snug">{column}</span>
                 </label>
               )
             )}

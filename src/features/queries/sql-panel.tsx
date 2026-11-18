@@ -16,6 +16,8 @@ import { SqlEditor } from "@/components/sql-editor"
 import { formatSql, type KeywordCase } from "@/lib/sql-format"
 import { formatDuration } from "@/lib/format"
 import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import {
   Select,
@@ -124,6 +126,8 @@ export function SqlPanel({
 
   return (
     <div className="space-y-3">
+      <RequiredLegend />
+      <Label id="query-sql-label" required>SQL</Label>
       {/* The editor gets the console's own completion source, not the
           language extension's schema: the tables and columns come from the
           catalog, under the names a query can actually use. */}
@@ -132,6 +136,8 @@ export function SqlPanel({
         onChange={setSql}
         extensions={editorExtensions}
         onView={(view) => studio.setEditorView(view)}
+        labelledBy="query-sql-label"
+        required
       />
       {/* One field per `{{name}}` in the SQL (`QS-5`); none, and nothing is drawn.
           The tab is the key: another tab starts its fields over. */}

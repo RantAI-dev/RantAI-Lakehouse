@@ -3,7 +3,9 @@
 import { Sparkles } from "lucide-react"
 
 import { SectionCard } from "@/components/patterns/section-card"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { MiniMarkdown } from "@/features/copilot/mini-markdown"
 import type { useQueryStudio } from "./use-query-studio"
@@ -24,12 +26,15 @@ export function NaturalLanguagePanel({
 
   return (
     <div className="space-y-3">
+      <RequiredLegend />
+      <Label htmlFor="nl-question" required>Question</Label>
       <Textarea
+        id="nl-question"
+        aria-required
         value={question}
         onChange={(e) => setQuestion(e.target.value)}
         rows={4}
         placeholder="e.g. What was revenue by region last quarter?"
-        aria-label="Natural language question"
       />
       <div className="flex flex-wrap items-center gap-2">
         <Button

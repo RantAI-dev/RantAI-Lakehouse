@@ -11,7 +11,7 @@ use crate::common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use lakehouse_store::audit::{AuditFilter, list};
+use lakehouse_store::audit::{AuditFilter, AuditScope, list};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -128,7 +128,7 @@ async fn approve_executes_the_tool_and_flips_run_status() {
         "the pending step plus the execution step"
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let approved: Vec<_> = events.iter().filter(|e| e.outcome == "approved").collect();
@@ -180,7 +180,7 @@ async fn reject_executes_nothing_and_flips_run_to_rejected() {
     assert_eq!(run.steps.len(), 2);
     assert_eq!(run.steps[1].status, "rejected");
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let rejected: Vec<_> = events.iter().filter(|e| e.outcome == "rejected").collect();
@@ -287,7 +287,7 @@ async fn approver_lacking_the_tools_own_permission_does_not_execute() {
         run.steps[1].detail
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     // One `approved` (the decision itself) and one `failed` (not
@@ -560,6 +560,65 @@ async fn access_decide_route_allows_a_different_access_approve_holder_and_the_gr
     assert!(after.has("catalog:write"));
 }
 
+/// An approved access request writes a grant, and its audit row names who
+/// received which permission until when, not only that a request was decided.
+/// A rejection grants nothing, so its row names no grantee.
+#[tokio::test]
+async fn an_access_decision_row_names_the_grantee_the_permission_and_the_expiry() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_to_grant = create_pending_access_request(
+        &router,
+        &pool,
+        "sari@meridian.example",
+        "cat-1",
+        "catalog:write",
+    )
+    .await;
+    let approval_to_reject = create_pending_access_request(
+        &router,
+        &pool,
+        "sari@meridian.example",
+        "cat-2",
+        "catalog:write",
+    )
+    .await;
+    let decider = create_principal_with_permissions(&pool, "access:approve, catalog:write").await;
+    let cookie = session_cookie_for_user(&pool, decider).await;
+    for (id, decision) in [
+        (&approval_to_grant, "approved"),
+        (&approval_to_reject, "rejected"),
+    ] {
+        let resp = post(
+            &router,
+            &format!("/api/catalog/access-requests/{id}/decide"),
+            Some(&cookie),
+            json!({ "decision": decision }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let (requester,): (uuid::Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+        .bind("sari@meridian.example")
+        .fetch_one(&pool)
+        .await
+        .expect("seeded user");
+    let rows = common::audit_rows(&pool, "access:catalog:write").await;
+    let row_of = |id: &str| {
+        rows.iter()
+            .find(|row| row["resource_id"] == json!(id))
+            .unwrap_or_else(|| panic!("a decision row for {id}: {rows:#?}"))
+    };
+    let granted = row_of(&approval_to_grant);
+    assert_eq!(granted["outcome"], "approved");
+    assert_eq!(granted["args"]["permission"], "catalog:write");
+    assert_eq!(granted["args"]["grantee"], json!(requester.to_string()));
+    assert!(granted["args"]["expiresAt"].is_string(), "{granted}");
+    let rejection = row_of(&approval_to_reject);
+    assert_eq!(rejection["outcome"], "rejected");
+    assert!(rejection["args"].get("grantee").is_none(), "{rejection}");
+}
+
 // ── SEC-45: an approver may only approve a permission they hold ──────────
 //
 // `access:approve` says "you may decide access requests"; it does not say
@@ -803,7 +862,7 @@ async fn delete_board_creates_a_pending_approval_and_does_not_execute() {
 
     // The gate audit row carries the board as the resource, the
     // `needs_approval` outcome, and is linked to the run/approval.
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -1011,7 +1070,7 @@ async fn agent_decide_route_refuses_the_requester_approving_their_own_tool_call(
         "only the pending step — the delete tool never ran, so the chart still exists"
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let for_this_run: Vec<_> = events

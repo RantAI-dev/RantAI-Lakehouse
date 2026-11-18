@@ -6,12 +6,12 @@
 | Backlog | `QS-1` |
 | Kind | Feature |
 | Spec | `docs/core/specs/qs-1.md` (one *(proposed)* number, the 200 ms suggestion time, is decision 2) |
-| Status | Building |
+| Status | Released: accepted by the product owner on 2026-11-14 (every row Pass; AC5 retested on 240d2e62 on the #491 text; AC13 passed on 240d2e62 with no case) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
 | Started | 2026-10-23; also in `BACKLOG.md` Dates |
-| Shipped | Not yet |
+| Shipped | 2026-10-23; fixes 2026-11-06 (#403) |
 | Evidence | |
 | Plan | Plan files are not kept in the repository. |
 
@@ -104,30 +104,32 @@ a pass.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `QS-1-AC1` | In the SQL tab, type `SELECT o. FROM <a Silver or Gold table, or a Bronze one whose detail is loaded> o` and put the cursor after `o.` | The list shows that table's columns | Not run |
-| `QS-1-AC2` | Write three statements separated by `;` and press Run all | Three result tabs, one per statement, in order | Not run |
-| `QS-1-AC3` | Open three query tabs with different SQL, close the browser, open Query Studio again | The three tabs are back with their names and SQL | Not run |
-| `QS-1-AC4` | Sign in as a user without `query:read`, open Query Studio and press Run all | Every statement is refused with a permission message, and nothing runs on the engine (`POST /api/query/run` needs `query:read`, `policy.rs:412`) | Not run |
-| `QS-1-AC5` | Write three statements where the second fails, press Run all | Tab 1 shows rows, tab 2 shows a fixed sentence for the failure and a reference (for a missing table: "This query reads a table that does not exist or that you cannot read. Reference: …"), with no engine text (`Code:`, `DB::Exception`), and tab 3 says "Not run" | Not run |
-| `QS-1-AC6` | Select the second of three statements and press ⌘/Ctrl+Enter | Only that statement runs | Not run |
-| `QS-1-AC7` | In the schema browser, expand a layer, a table, and click a column | The column name is inserted at the cursor; each column shows its type | Not run |
-| `QS-1-AC8` | Set keyword case to lower and indent to 4, press Format, reload, press Format again | Both times keywords are lower case and indented by 4 | Not run |
-| `QS-1-AC9` | Use find and replace, toggle a comment, fold a block, and open the shortcut list | Each works, and the shortcut list names the keys used | Not run |
-| `QS-1-AC10` | (operator) Make the catalog's table detail fail for one table, then type its alias and a dot | The list says the columns could not be loaded; the query still runs | Not run |
-| `QS-1-AC11` | Sign in as a user without `catalog:read` but with `query:read` | The schema browser says it needs catalog access; the editor still runs SQL | Not run |
-| `QS-1-AC12` | Paste 21 statements and press Run all | Refused before anything runs, with a message naming the limit of 20 | Not run |
-| `QS-1-AC13` | Sign in as one person, write SQL in two tabs, sign out, sign in as a second person on the same browser, open Query Studio; then sign in as the first person again | The second person sees one empty tab and none of the first person's SQL; the first person finds their two tabs | Not run |
+| `QS-1-AC1` | In the SQL tab, type `SELECT o. FROM <a Silver or Gold table, or a Bronze one whose detail is loaded> o` and put the cursor after `o.` | The list shows that table's columns | Pass (2026-11-04, f3cee927, LH-QS-1-01). Bronze on the Trino tab: Pass (2026-11-13, 8b9c297c, LH-QS-4-08) |
+| `QS-1-AC2` | Write three statements separated by `;` and press Run all | Three result tabs, one per statement, in order | Pass (2026-11-04, f3cee927, LH-QS-1-02) |
+| `QS-1-AC3` | Open three query tabs with different SQL, close the browser, open Query Studio again | The three tabs are back with their names and SQL | Pass (2026-11-05, 3409d743, LH-QS-1-03) |
+| `QS-1-AC4` | Sign in as a user without `query:read`, open Query Studio and press Run all | Every statement is refused with a permission message, and nothing runs on the engine (`POST /api/query/run` needs `query:read`, `policy.rs:412`) | Pass (2026-11-04, f3cee927, LH-QS-1-04) |
+| `QS-1-AC5` | Write three statements where the second fails, press Run all | Tab 1 shows rows, tab 2 shows a fixed sentence for the failure and a reference (for a missing table: "This query reads a table that does not exist or that you cannot read. Reference: …"), with no engine text (`Code:`, `DB::Exception`), and tab 3 says "Not run" | Pass (2026-11-14, 240d2e62, LH-QS-1-05), retested on the #491 text |
+| `QS-1-AC6` | Select the second of three statements and press ⌘/Ctrl+Enter | Only that statement runs | Pass (2026-11-04, f3cee927, LH-QS-1-06) |
+| `QS-1-AC7` | In the schema browser, expand a layer, a table, and click a column | The column name is inserted at the cursor; each column shows its type | Pass (2026-11-04, f3cee927, LH-QS-1-07) |
+| `QS-1-AC8` | Set keyword case to lower and indent to 4, press Format, reload, press Format again | Both times keywords are lower case and indented by 4 | Pass (2026-11-04, f3cee927, LH-QS-1-08) |
+| `QS-1-AC9` | Use find and replace, toggle a comment, fold a block, and open the shortcut list | Each works, and the shortcut list names the keys used | Pass (2026-11-12, 3cdd8332, LH-QS-1-09) |
+| `QS-1-AC10` | (operator) Make the catalog's table detail fail for one table, then type its alias and a dot | The list says the columns could not be loaded; the query still runs | Pass (2026-11-12, 3cdd8332, LH-QS-1-10) |
+| `QS-1-AC11` | Sign in as a user without `catalog:read` but with `query:read` | The schema browser says it needs catalog access; the editor still runs SQL | Pass (2026-11-04, f3cee927, LH-QS-1-11) |
+| `QS-1-AC12` | Paste 21 statements and press Run all | Refused before anything runs, with a message naming the limit of 20 | Pass (2026-11-04, f3cee927, LH-QS-1-12) |
+| `QS-1-AC13` | Sign in as one person, write SQL in two tabs, sign out, sign in as a second person on the same browser, open Query Studio; then sign in as the first person again | The second person sees one empty tab and none of the first person's SQL; the first person finds their two tabs | Pass (2026-11-14, 240d2e62, no case) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): product owner (recorded in the base) **Date:** 2026-11-14 **Build:** 240d2e62
 
 Exceptions, each with an owner and a date:
+
+None.
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
-- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
+- [x] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base (done by the auditor)
 - [ ] `CHANGELOG.md` entry a customer can read
 
 ## QA-1 decisions (product owner, 2026-11-02)

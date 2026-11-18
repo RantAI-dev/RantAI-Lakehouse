@@ -71,6 +71,68 @@ fn validate_warehouse(state: &AppState, warehouse: Option<&str>) -> Result<(), A
     }
 }
 
+/// `SEC-20`: the table a caller names must be one the caller's tenant may
+/// read, asked of the SAME gate Query Studio uses (`routes::query`), never a
+/// second reading of the claim table (`AGENTS.md` rule 4).
+///
+/// A table of another tenant gets Query Studio's own 404 and sentence
+/// ([`crate::routes::query::table_not_available`]), so the refusal does not
+/// say whether the table exists. It runs before the catalog is asked, so a
+/// refused caller costs the catalog nothing and learns nothing from it.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence for a table out of reach, and for an
+/// `X-Tenant` header that names a tenant the caller does not belong to;
+/// 503 when the deployment's tenant count or the table's claim cannot be
+/// read.
+async fn ensure_table_in_reach(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    ns: &str,
+    table: &str,
+) -> Result<(), ApiError> {
+    let reach = crate::routes::query::resolve_reach(state, principal, headers).await?;
+    crate::routes::query::check_tables_against_reach(state, reach, &[format!("{ns}.{table}")]).await
+}
+
+/// `SEC-20`: the tables of `namespace` the caller's tenant may read, in the
+/// order the catalog listed them.
+///
+/// A listing leaves out what the caller may not read instead of refusing
+/// the page (the console's Data page needs the caller's own tables), and the
+/// rule is Query Studio's own
+/// ([`crate::routes::query::table_is_reachable`]): another tenant's upload
+/// is never reachable, and a table nobody claimed is reachable only by the
+/// tenant that owns the shared catalog.
+///
+/// The claims are read once for the whole namespace
+/// ([`crate::routes::query::claims_on`]), not once per table: `bronze` holds
+/// hundreds of tables, and the namespace count has two seconds.
+///
+/// # Errors
+///
+/// 503 when the claims cannot be read.
+async fn leave_out_tables_out_of_reach(
+    state: &AppState,
+    reach: crate::routes::query::TenantReach,
+    namespace: &str,
+    idents: Vec<TableIdent>,
+) -> Result<Vec<TableIdent>, ApiError> {
+    let names: Vec<String> = idents
+        .iter()
+        .map(|ident| format!("{namespace}.{}", ident.name()))
+        .collect();
+    let reachable = crate::routes::query::reachable_names(state, reach, &names).await?;
+    Ok(idents
+        .into_iter()
+        .zip(names)
+        .filter(|(_, name)| reachable.contains(name))
+        .map(|(ident, _)| ident)
+        .collect())
+}
+
 /// Borrow the Postgres pool, or fail with a 503. Shared by every Postgres-
 /// backed read in this module — the maintenance-policy store and the
 /// tenant lookup [`warehouses`] needs to scope its response — hence the
@@ -526,16 +588,40 @@ pub struct NamespacesQuery {
 
 /// `GET /api/lakehouse/namespaces?warehouse=`.
 ///
+/// `SEC-20`: a namespace's `tableCount` is of the tables the caller's tenant
+/// may read (see [`leave_out_tables_out_of_reach`]), so another tenant's
+/// upload table is not counted.
+///
+/// `tableCount: null` means the count is unknown or zero. Four causes give it:
+///
+/// - the namespace's lookup did not finish within the two-second budget;
+/// - the catalog failed to list the namespace's tables, or the namespace name
+///   is not a valid identifier;
+/// - the claims that say which tables the caller's tenant may read could not
+///   be read, so [`leave_out_tables_out_of_reach`] failed;
+/// - no table is left to count after the tables the caller may not read are
+///   left out, for example because the namespace is empty or holds only
+///   other tenants' upload tables.
+///
+/// For a caller whose roles hide no table, the row is kept with `null` in
+/// every case, since it names no table. A caller whose roles do hide tables
+/// loses the row instead.
+///
 /// # Errors
-/// 404 if `warehouse` names anything other than the configured warehouse,
-/// 503 if the catalog cannot be reached, or if the reader token is
-/// unavailable.
+/// 404 if `warehouse` names anything other than the configured warehouse, or
+/// if `X-Tenant` names a tenant the caller does not belong to, 503 if the
+/// catalog cannot be reached, if the reader token is unavailable, or if the
+/// deployment's tenant count cannot be read.
 pub async fn namespaces(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Query(query): Query<NamespacesQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     validate_warehouse(&state, query.warehouse.as_deref())?;
+    // `SEC-20`: the reach is resolved once, before the catalog is asked, as
+    // `tables` does, so every namespace is counted under the same answer.
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
 
     let idents = lakehouse_catalog::call(&state, |client| async move {
         rest::list_namespaces(&client).await
@@ -559,14 +645,22 @@ pub async fn namespaces(
     // namespace with none of them is not listed at all — a hidden table does
     // not appear anywhere. A lookup that failed leaves the caller unable to
     // prove the namespace holds anything visible, so it goes too.
+    //
+    // `SEC-20`: "may read" also means in the caller's tenant's reach, so a
+    // claim that cannot be read fails the lookup like a catalog error does.
     let table_counts = bounded::run_with_budget(names.clone(), Duration::from_secs(2), 8, {
         let access = access.clone();
+        let state = state.clone();
         move |name: String| {
             let access = access.clone();
             let client = client.clone();
+            let state = state.clone();
             async move {
                 let ns = NamespaceIdent::from_strs([name.as_str()]).ok()?;
                 let idents = rest::list_table_idents(&client, &ns).await.ok()?;
+                let idents = leave_out_tables_out_of_reach(&state, reach, &name, idents)
+                    .await
+                    .ok()?;
                 let visible = idents
                     .iter()
                     .filter(|ident| access.allows(&name, ident.name()))
@@ -602,13 +696,19 @@ pub struct TablesQuery {
 
 /// `GET /api/lakehouse/tables?warehouse=&namespace=`.
 ///
+/// `SEC-20`: the listing leaves out the tables the caller's tenant may not
+/// read (see [`leave_out_tables_out_of_reach`]).
+///
 /// # Errors
 /// 400 if `namespace` is missing or not `[a-z0-9_]+`-shaped, 404 if
-/// `warehouse` names anything other than the configured warehouse or if
-/// `namespace` does not exist, 503 if the catalog cannot be reached.
+/// `warehouse` names anything other than the configured warehouse, if
+/// `namespace` does not exist, or if `X-Tenant` names a tenant the caller
+/// does not belong to, 503 if the catalog cannot be reached or a table's
+/// claim cannot be read.
 pub async fn tables(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Query(query): Query<TablesQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     validate_warehouse(&state, query.warehouse.as_deref())?;
@@ -618,6 +718,10 @@ pub async fn tables(
     validate_ident(&namespace, "namespace")?;
     let ns = NamespaceIdent::from_strs([namespace.as_str()])
         .map_err(|_| ApiError::BadRequest("namespace is invalid".to_owned()))?;
+    // `SEC-20`: the reach is resolved once, before the catalog is asked, so a
+    // header naming a tenant the caller is not in is refused like everywhere
+    // else.
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
 
     let idents = lakehouse_catalog::call(&state, {
         let ns = ns.clone();
@@ -628,6 +732,7 @@ pub async fn tables(
     })
     .await
     .map_err(|err| classify_catalog_access_error(err, "namespace"))?;
+    let idents = leave_out_tables_out_of_reach(&state, reach, &namespace, idents).await?;
 
     // GOV-7 D6: a table the caller's roles hide is not listed.
     let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
@@ -659,14 +764,20 @@ pub async fn tables(
 ///
 /// # Errors
 /// 400 if `ns`/`table` are not `[a-z0-9_]+`-shaped, 404 if the table does
-/// not exist, 503 if the catalog cannot be reached.
+/// not exist, is out of the caller's tenant's reach
+/// ([`ensure_table_in_reach`]), or if `X-Tenant` names a tenant the caller
+/// does not belong to, 503 if the catalog cannot be reached.
 pub async fn table_detail(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path((ns, table)): Path<(String, String)>,
 ) -> ApiResult<ApiJson<Value>> {
     validate_ident(&ns, "ns")?;
     validate_ident(&table, "table")?;
+    // `SEC-20`: the same order Query Studio keeps: the tenant's reach first,
+    // then what the caller's roles hide (`GOV-7`).
+    ensure_table_in_reach(&state, &principal, &headers, &ns, &table).await?;
     // GOV-7 D6: a hidden table answers the same 404 an unknown one answers.
     let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
     crate::routes::catalog::ensure_key_readable_with(&access, &format!("{ns}.{table}"))?;
@@ -711,12 +822,20 @@ fn last_run_applies(ns: &str) -> bool {
 /// `lastVerbRuns` shares that posture too, except for the one case where
 /// `bronze_meta.maintenance_verb_run` itself does not exist yet — see
 /// [`maintenance_verb_runs_or_empty`].
+///
+/// `SEC-20`: also 404 for a table out of the caller's tenant's reach, or if
+/// `X-Tenant` names a tenant the caller does not belong to
+/// ([`ensure_table_in_reach`]), before the policy store or `ClickHouse` is
+/// asked.
 pub async fn maintenance(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path((ns, table)): Path<(String, String)>,
 ) -> ApiResult<ApiJson<Value>> {
     validate_ident(&ns, "ns")?;
     validate_ident(&table, "table")?;
+    ensure_table_in_reach(&state, &principal, &headers, &ns, &table).await?;
 
     let policy = maintenance_policy::get_policy(pool(&state)?, &ns, &table).await?;
 
@@ -820,9 +939,14 @@ fn validate_maintenance_policy_body(body: &MaintenancePolicyBody) -> Result<(), 
 /// 400 if `ns`/`table` are not `[a-z0-9_]+`-shaped, the body is not JSON,
 /// or a bound (`snapshotsToKeep`/`orphanAgeHours` below 1, an unrecognized
 /// `schedule`) is out of range; 401/403 from the auth gate
-/// (`governance:write`); 503 if no Postgres pool is configured.
+/// (`governance:write`); 404 for a table out of the caller's tenant's reach,
+/// or if `X-Tenant` names a tenant the caller does not belong to
+/// ([`ensure_table_in_reach`], `SEC-20`); 503 if no Postgres pool is
+/// configured.
 pub async fn set_maintenance_policy(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path((ns, table)): Path<(String, String)>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
@@ -830,6 +954,11 @@ pub async fn set_maintenance_policy(
     validate_ident(&table, "table")?;
     let parsed = parse_maintenance_policy_body(&body)?;
     validate_maintenance_policy_body(&parsed)?;
+    // `SEC-20`: checked once the body is known to be well formed, and before
+    // anything is written. The body is the caller's own text and says
+    // nothing about the table, so its 400 is no oracle; the write is the
+    // part a table out of reach must never get.
+    ensure_table_in_reach(&state, &principal, &headers, &ns, &table).await?;
 
     let input = maintenance_policy::MaintenancePolicyInput {
         namespace: ns.clone(),
@@ -855,7 +984,7 @@ pub async fn set_maintenance_policy(
 }
 
 /// `GET /api/lakehouse/maintenance-policies` — every configured table
-/// maintenance policy.
+/// maintenance policy the caller may read.
 ///
 /// Read by `dagster/dispar_orchestrate/maintenance.py` using the
 /// scope-less `lakehouse-maintenance-policy-reader` service identity
@@ -864,11 +993,45 @@ pub async fn set_maintenance_policy(
 /// secret, only per-table retention/compaction settings, and the
 /// maintenance service identity holds no scopes to check against.
 ///
+/// # Tenant scoping
+///
+/// The list names the upload tables of every tenant, so a person
+/// ([`lakehouse_auth::PrincipalId::User`]) reads only the policies of the
+/// tables in their reach (`SEC-20`, plan 95): the rule Query Studio keeps,
+/// through [`crate::routes::query::reachable_names`].
+///
+/// A service identity ([`lakehouse_auth::PrincipalId::Service`]) reads the
+/// whole list. The maintenance job runs the policy of every table, so a list
+/// narrowed to a tenant would silently leave the other tenants' tables
+/// unmaintained. A service identity belongs to no tenant and its token is
+/// the credential of a job, never of a person, so there is no reach to
+/// narrow it by.
+///
 /// # Errors
 ///
-/// 503 if no Postgres pool is configured.
-pub async fn list_maintenance_policies(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+/// 503 if no Postgres pool is configured, or the claims cannot be read; 404
+/// if `X-Tenant` names a tenant the caller does not belong to.
+pub async fn list_maintenance_policies(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Value>> {
     let rows = maintenance_policy::list_all_policies(pool(&state)?).await?;
+    let rows = if matches!(principal.id, lakehouse_auth::PrincipalId::Service(_)) {
+        rows
+    } else {
+        let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+        let names: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{}.{}", r.namespace, r.table_name))
+            .collect();
+        let reachable = crate::routes::query::reachable_names(&state, reach, &names).await?;
+        rows.into_iter()
+            .zip(names)
+            .filter(|(_, name)| reachable.contains(name))
+            .map(|(row, _)| row)
+            .collect()
+    };
     Ok(ApiJson(json!({
         "policies": rows.iter().map(|r| json!({
             "namespace": r.namespace,
@@ -1725,6 +1888,7 @@ mod tests {
             let body = namespaces(
                 State(state),
                 Extension(principal),
+                HeaderMap::new(),
                 Query(NamespacesQuery { warehouse: None }),
             )
             .await

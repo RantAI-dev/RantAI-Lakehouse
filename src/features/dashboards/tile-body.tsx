@@ -235,6 +235,7 @@ function TileBodyOf({
     const forecastSentence = forecastNote(cell.referenceLines, lineCtx, spec.kind === "hbar") ?? clusterNote(spec, rows, style);
     const chart = (
       <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" live={live}
+        optionDeps={[style, locale, decimals, dark, reporting.timeZone, reporting.companyPalette, cell.referenceLines, measureLabels, cell.truncated]}
         onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels, bin: bins[spec.x] }) : undefined} />
     );
     if (!styled.hiddenNotes && !forecastSentence) return chart;
@@ -294,7 +295,7 @@ function TypeBBody({
     // A result as long as the server's cap may have been cut (a narrow width over a wide column); say so, as a cut-off chart does.
     return (
       <div className="flex h-full min-h-0 flex-col">
-        <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" /></div>
+        <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" optionDeps={[style, locale, decimals, dark, color, def?.labels?.show, bins]} /></div>
         {cell.rows.length >= HISTOGRAM_ROW_CAP ? (
           <p className="px-1 pt-1 text-[11px] text-muted-foreground">Only the first {HISTOGRAM_ROW_CAP} ranges are shown; choose a wider width.</p>
         ) : null}
@@ -323,7 +324,7 @@ function TypeBBody({
   }
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" /></div>
+      <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" optionDeps={[style, locale, decimals, dark, color, measureLabels]} /></div>
       {drawn.more > 0 ? (
         <p className="px-1 pt-1 text-[11px] text-muted-foreground">{drawn.more} more not shown (the first {MAX_BULLETS} are drawn)</p>
       ) : null}
@@ -356,7 +357,7 @@ function GanttBody({
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="min-h-0 flex-1">
-        <EChart option={drawn.option} height="100%" onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: cell.rows }) : undefined} />
+        <EChart option={drawn.option} height="100%" optionDeps={[reporting.timeZone, def?.todayLine, dark]} onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: cell.rows }) : undefined} />
       </div>
       {drawn.notes.map((note) => <p key={note} className="px-1 pt-1 text-[11px] text-muted-foreground">{note}.</p>)}
     </div>
@@ -437,7 +438,8 @@ function CombinedBody({
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="min-h-0 flex-1">
-        <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={click} />
+        <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={click}
+          optionDeps={[style, locale, decimals, dark, reporting.companyPalette, cell.referenceLines]} />
       </div>
       {styled.hiddenNotes ? (
         <p className="px-1 pt-1 text-[11px] text-muted-foreground">

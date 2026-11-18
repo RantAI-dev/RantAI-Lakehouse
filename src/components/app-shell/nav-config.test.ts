@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test"
 import * as fs from "node:fs"
 import * as path from "node:path"
-import { canOpen, NAV_GROUPS, ROUTE_ACCESS, routeMatches } from "./nav-config"
+import { canOpen, NAV_GROUPS, pageTitleFor, ROUTE_ACCESS, routeMatches } from "./nav-config"
 
 /**
  * Normalizes a file path from `src/app` into its App Router route pattern:
@@ -175,6 +175,53 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
       expect(canOpen("/query-studio/save-source", queryReader)).toBe(false)
     })
 
+    // GOV-1 Decision 9: `GET /api/governance/audit` answers 403 without
+    // `audit:read`, so the menu entry and the route follow that permission.
+    // `governance:read` (every role holds it) no longer opens the audit page.
+    it("shows the Audit Log entry and opens /audit only with audit:read", () => {
+      const menuEntries = (hasPermission: (p: string) => boolean) =>
+        NAV_GROUPS.flatMap((g) => g.items)
+          .filter((it) => canOpen(it.href, hasPermission))
+          .map((it) => it.title)
+      const analyst = (p: string) => p === "governance:read"
+      const auditor = (p: string) => p === "governance:read" || p === "audit:read"
+
+      expect(menuEntries(analyst)).not.toContain("Audit Log")
+      expect(canOpen("/audit", analyst)).toBe(false)
+
+      expect(menuEntries(auditor)).toContain("Audit Log")
+      expect(canOpen("/audit", auditor)).toBe(true)
+    })
+
+    it("lists the Audit Log menu item under audit:read", () => {
+      const item = NAV_GROUPS.flatMap((g) => g.items).find((it) => it.href === "/audit")
+      expect(item?.requires).toEqual(["audit:read"])
+    })
+
+    // OPS-8 part B: `GET /api/usage/queries` answers 403 without `usage:read`,
+    // so the menu entry and the route follow that permission.
+    it("shows the Usage entry and opens /usage only with usage:read", () => {
+      const menuEntries = (hasPermission: (p: string) => boolean) =>
+        NAV_GROUPS.flatMap((g) => g.items)
+          .filter((it) => canOpen(it.href, hasPermission))
+          .map((it) => it.title)
+      const analyst = (p: string) => p === "governance:read"
+      const reader = (p: string) => p === "governance:read" || p === "usage:read"
+
+      expect(menuEntries(analyst)).not.toContain("Usage")
+      expect(canOpen("/usage", analyst)).toBe(false)
+
+      expect(menuEntries(reader)).toContain("Usage")
+      expect(canOpen("/usage", reader)).toBe(true)
+    })
+
+    it("lists the Usage menu item in Monitoring under usage:read", () => {
+      const monitoring = NAV_GROUPS.find((g) => g.label === "Monitoring")
+      const item = monitoring?.items.find((it) => it.href === "/usage")
+      expect(item?.title).toBe("Usage")
+      expect(item?.requires).toEqual(["usage:read"])
+    })
+
     it("supports any-of permission checks", () => {
       const hasAlertWrite = (p: string) => p === "alert:write"
       const hasAlertRead = (p: string) => p === "alert:read"
@@ -183,6 +230,21 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
       expect(canOpen("/alerts", hasAlertWrite)).toBe(true)
       expect(canOpen("/alerts", hasAlertRead)).toBe(true)
       expect(canOpen("/alerts", hasNeither)).toBe(false)
+    })
+  })
+
+  describe("the page title of a path no menu item names", () => {
+    // ADM-2 decision 13: the navbar passes the workspace's own name as the
+    // fallback, so a page the menu does not name is not called after the
+    // product. The function stays pure: the fallback comes in as an
+    // argument, never from a hook inside it.
+    it("falls back to the caller's fallback, and a named page still reads its menu title", () => {
+      // Without a fallback the product's own name stands in.
+      expect(pageTitleFor("/no/such/page")).toBe("Rantai Lake")
+      expect(pageTitleFor("/no/such/page", "Acme Data")).toBe("Acme Data")
+      // A page a menu item does name still reads that item's title.
+      expect(pageTitleFor("/catalog", "Acme Data")).toBe("Catalog")
+      expect(pageTitleFor("/dashboards/browse", "Acme Data")).toBe("All Dashboards")
     })
   })
 

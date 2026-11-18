@@ -80,6 +80,9 @@ describe("SignInSettingsForm (ADM-8)", () => {
     const maxFailures = (await screen.findByLabelText(
       "Failed sign-ins before the lock"
     )) as HTMLInputElement
+    // The form fills the field from the server's answer in an effect: a value
+    // typed before that effect ran is overwritten by it, and no sentence shows.
+    await waitFor(() => expect(maxFailures.value).toBe("5"))
     fireEvent.change(maxFailures, { target: { value: "2" } })
     await waitFor(() =>
       expect(screen.getByText("maxFailures must be a whole number from 3 to 20.")).toBeTruthy()

@@ -13,11 +13,15 @@ use crate::common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use lakehouse_store::audit::{AuditFilter, list};
+use lakehouse_store::audit::{AuditFilter, AuditScope, list};
 use serde_json::{Value, json};
 use tower::ServiceExt;
+use wiremock::ResponseTemplate;
 
-use common::{TestApp, session_cookie_for_seeded_user, spin_up};
+use common::{
+    CLICKHOUSE_UNKNOWN_IDENTIFIER, COLUMN_DOES_NOT_EXIST, TestApp, mock_clickhouse_refusing,
+    session_cookie_for_seeded_user, spin_up, spin_up_with_env,
+};
 
 async fn post_tool(
     app: &axum::Router,
@@ -74,7 +78,7 @@ async fn ask_mode_refuses_write_low_tool_and_audits_it() {
         "ask-mode refusal carries no permission reason"
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -109,7 +113,7 @@ async fn missing_permission_refuses_and_audits_with_permission_reason() {
     assert_eq!(body["result"]["reason"], json!("permission"));
     assert_eq!(body["result"]["required"], json!("dashboard:write"));
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -179,7 +183,7 @@ async fn write_low_tool_without_confirmed_needs_confirmation_and_never_executes(
         "must carry a non-empty human-readable summary"
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -212,7 +216,7 @@ async fn write_low_tool_confirmed_passes_the_gate_and_is_audited_as_executed_or_
     assert_ne!(body["outcome"], json!("refused"));
     assert_ne!(body["outcome"], json!("needs_confirmation"));
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -276,7 +280,7 @@ async fn write_high_tool_creates_a_pending_approval_and_never_executes() {
     assert_eq!(run.status, "waiting_approval");
     assert_eq!(run.employee_id, "emp-copilot");
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -309,7 +313,7 @@ async fn secret_shaped_args_are_redacted_before_they_reach_the_audit_row() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours = events
@@ -336,7 +340,7 @@ async fn unknown_tool_name_is_a_400_and_is_not_audited() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     assert!(events.iter().all(|e| e.action != "not_a_real_tool"));
@@ -482,7 +486,7 @@ async fn rename_board_confirmed_passes_the_gate_and_is_audited_as_failed() {
     let body = json_body(resp).await;
     assert_ne!(body["outcome"], json!("refused"));
     assert_ne!(body["outcome"], json!("needs_confirmation"));
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -947,7 +951,9 @@ async fn set_cache_rule_refuses_minutes_out_of_range_with_the_console_sentence()
         body["result"]["error"],
         json!("Remember for between 1 minute and 24 hours (1 to 1440 minutes).")
     );
-    let events = list(&pool, AuditFilter::default()).await.expect("audit");
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .expect("audit");
     let ours: Vec<_> = events
         .iter()
         .filter(|e| e.action == "set_cache_rule")
@@ -974,4 +980,177 @@ async fn set_cache_rule_is_refused_without_dashboard_write() {
     .await;
     let body = json_body(resp).await;
     assert_eq!(body["outcome"], json!("refused"));
+}
+
+// ── LH-QS-2-08: the tool route answers the person's copy ─────────────────
+//
+// An engine failure reaches a person as a fixed sentence and a reference
+// (owner rule LH-QS-2-08, 2026-11-12). Only a model reads the engine's
+// diagnosis (the chat loop's or an agent run's), and it does not come
+// through this route.
+
+/// Calls `run_sql` with `sql` on a `ClickHouse` that refuses any statement
+/// naming `pengunjungg` with `answer`, and returns the answer's body.
+async fn call_run_sql(sql: &str, answer: ResponseTemplate) -> Value {
+    let ch = mock_clickhouse_refusing("pengunjungg", answer).await;
+    let mut env = std::collections::HashMap::new();
+    env.insert("CH_URL".to_owned(), ch.uri());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({ "tool": "run_sql", "args": { "sql": sql } }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    json_body(resp).await
+}
+
+/// LH-QS-2-08: `run_sql` whose statement the engine refuses answers the
+/// fixed sentence and a reference, with none of the engine's text.
+#[tokio::test]
+async fn a_failed_run_sql_answers_the_fixed_sentence_and_no_engine_text() {
+    let body = call_run_sql(
+        "SELECT pengunjungg FROM silver.orders",
+        ResponseTemplate::new(400).set_body_string(CLICKHOUSE_UNKNOWN_IDENTIFIER),
+    )
+    .await;
+
+    assert_eq!(body["outcome"], json!("failed"));
+    let error = body["result"]["error"].as_str().unwrap_or_default();
+    let reference = error
+        .strip_prefix(&format!("{COLUMN_DOES_NOT_EXIST} Reference: "))
+        .unwrap_or_else(|| panic!("the fixed sentence and a reference: {body}"));
+    assert!(!reference.is_empty(), "{body}");
+    let text = body.to_string();
+    for engine_text in [
+        "UNKNOWN_IDENTIFIER",
+        "Code:",
+        "DB::Exception",
+        "pengunjungg",
+    ] {
+        assert!(!text.contains(engine_text), "{engine_text} in {body}");
+    }
+    assert!(!text.contains("_browserError"), "{body}");
+}
+
+/// LH-QS-2-08, unchanged: a successful `run_sql` answers the rows.
+#[tokio::test]
+async fn a_successful_run_sql_answers_its_rows() {
+    let body = call_run_sql(
+        "SELECT 1 AS n FROM silver.orders",
+        ResponseTemplate::new(400).set_body_string(CLICKHOUSE_UNKNOWN_IDENTIFIER),
+    )
+    .await;
+
+    assert_eq!(body["outcome"], json!("executed"));
+    assert_eq!(body["result"]["rowCount"], json!(1), "{body}");
+    assert!(body["result"].get("error").is_none(), "{body}");
+}
+
+// ── GOV-1: the audit history tool needs `audit:read` ──────────────────────
+//
+// The audit page (`GET /api/governance/audit`) asks for `audit:read` on top
+// of the `governance:read` that opens the route, because every role holds
+// that one (`GOV-1`, feature page Decision 9). The assistant's
+// `get_audit_history` tool reads the same trail, so it asks for the same
+// permission: a person without `audit:read` is refused by name, and the
+// refusal carries no row of the trail.
+
+/// `GOV-1`: a caller with `governance:read` and no `audit:read` is refused
+/// the audit history tool by name, with no row of the trail in the answer;
+/// a caller with `audit:read` gets the trail.
+///
+/// The deployment holds no tenant here (`leave_no_seeded_tenants`), so every
+/// reader's reach is the whole trail (`SEC-20`): the test is about the
+/// permission, not about the reach.
+#[tokio::test]
+async fn the_audit_history_tool_is_refused_without_audit_read_and_answers_the_trail_with_it() {
+    let TestApp { router, pool } = spin_up().await;
+    common::leave_no_seeded_tenants(&pool).await;
+
+    let reader = common::create_assistant_principal(&pool, "governance:read").await;
+    let reader_cookie = common::session_cookie_for_user(&pool, reader).await;
+
+    let resp = post_tool(
+        &router,
+        Some(&reader_cookie),
+        json!({ "tool": "get_audit_history", "args": {}, "mode": "build" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("refused"), "{body}");
+    assert_eq!(body["result"]["reason"], json!("permission"), "{body}");
+    assert_eq!(body["result"]["required"], json!("audit:read"), "{body}");
+    assert_eq!(body["result"]["tool"], json!("get_audit_history"), "{body}");
+    assert!(
+        body["result"].get("audit").is_none(),
+        "a refused call must carry no row of the trail: {body}"
+    );
+
+    // The refusal is audited, so the trail the next reader sees holds the
+    // call that was refused.
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .expect("list audit events");
+    let ours: Vec<_> = events
+        .iter()
+        .filter(|e| e.action == "get_audit_history")
+        .collect();
+    assert_eq!(ours.len(), 1, "exactly one audit row for this call");
+    assert_eq!(ours[0].outcome, "refused");
+
+    let auditor = common::create_assistant_principal(&pool, "governance:read,audit:read").await;
+    let auditor_cookie = common::session_cookie_for_user(&pool, auditor).await;
+
+    let resp = post_tool(
+        &router,
+        Some(&auditor_cookie),
+        json!({ "tool": "get_audit_history", "args": {}, "mode": "build" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("executed"), "{body}");
+    let rows = body["result"]["audit"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an audit array: {body}"));
+    let actions: Vec<(&str, &str)> = rows
+        .iter()
+        .filter_map(|row| Some((row["action"].as_str()?, row["outcome"].as_str()?)))
+        .collect();
+    // The answer speaks the audit API's outcome union, where a stored
+    // "refused" is "denied" (`governance::outcome_of`, GOV-5). The store row
+    // keeps "refused" (asserted above), so the answer's "denied" is the
+    // same refusal, not a second one.
+    let refused = actions
+        .iter()
+        .filter(|&&(action, outcome)| action == "get_audit_history" && outcome == "denied")
+        .count();
+    assert_eq!(
+        refused, 1,
+        "the trail must hold the refused call: {actions:?}"
+    );
+}
+
+/// LH-QS-2-08, unchanged: a failure that is already a fixed message (the
+/// engine did not answer) is answered as it is.
+#[tokio::test]
+async fn a_run_sql_that_fails_for_another_reason_answers_the_same_fixed_message() {
+    let body = call_run_sql(
+        "SELECT pengunjungg FROM silver.orders",
+        ResponseTemplate::new(502).set_body_string("<html><body>502 Bad Gateway</body></html>"),
+    )
+    .await;
+
+    assert_eq!(body["outcome"], json!("failed"));
+    let error = body["result"]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.starts_with("The database request failed. Reference: "),
+        "{body}"
+    );
 }
