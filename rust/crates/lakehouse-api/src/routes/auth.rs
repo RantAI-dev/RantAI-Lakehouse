@@ -2023,10 +2023,11 @@ mod tests {
         assert_eq!(query.get("prompt").map(String::as_str), Some("consent"));
         assert_ne!(query.get("prompt").map(String::as_str), Some("login"));
 
-        // `OIDC_PROMPT` present but empty: the operator asked for no prompt,
-        // so nothing is sent and the provider decides. (Present-and-empty is
-        // not the same as absent: absent means the default applies.)
-        let state = state_with_oidc_flow_config_and(&[("OIDC_PROMPT", "")]);
+        // `OIDC_PROMPT=off`: the deployment's own spelling for "send no
+        // prompt at all", so the provider reuses the session it holds for
+        // this browser. (An empty value is the default, not an opt-out:
+        // compose always passes the variable.)
+        let state = state_with_oidc_flow_config_and(&[("OIDC_PROMPT", "off")]);
         let app = crate::routes::router(state);
         let response = app
             .oneshot(

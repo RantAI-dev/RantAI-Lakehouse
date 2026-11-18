@@ -58,12 +58,24 @@ machine it signs the next person in as the previous one, and it is why
    the account is the person's choice on every sign-in. It is the standard
    OIDC parameter, it needs no provider-side configuration, and it costs
    nothing but a click on a shared machine.
-2. **`OIDC_PROMPT` names it, and an empty value opts out.** `OIDC_PROMPT=`
-   (present but empty) sends nothing and the provider reuses its own
-   session — the comfortable behaviour on a private machine. Absent means the
-   default applies. `Config` tells the two apart with
-   `oidc_prompt_from_env` (`env.get`, not `truthy`), the same shape
-   `oidc_provider_name_from_env` already uses.
+2. **`OIDC_PROMPT` names it, and `off` opts out.** `OIDC_PROMPT=off` sends
+   nothing and the provider reuses its own session — the comfortable
+   behaviour on a private machine. Anything else is forwarded verbatim
+   (`login`, `consent`, `select_account`, and the OIDC standard's own
+   `none`, which means something else and is not this deployment's to
+   reinterpret).
+
+   **An empty value is the default, not an opt-out.** The first attempt at
+   this change made "present but empty" mean "send nothing", with the
+   default applied when the variable was absent — and that is wrong in a
+   compose deployment: `docker-compose.yml` passes every `OIDC_*` variable
+   as `${OIDC_PROMPT:-}`, so the variable is **always** present in the
+   process, empty when the operator said nothing. The default would never
+   have applied, and the whole setting would have been a no-op. `Config`
+   therefore resolves an empty value to the default (`login`), and `off` is
+   the one spelling for "send nothing". This is the same shape as every
+   other `OIDC_*` setting in this file: `truthy()` treats empty and absent
+   alike, and the deployment says what it wants by naming a value.
 3. **The `prompt` is the deployment's own setting**, read only from the
    environment: a request cannot change how the provider is asked to
    authenticate, exactly like `OIDC_AUTHORIZE_URL` and `OIDC_REDIRECT_URI`.
@@ -84,6 +96,7 @@ machine it signs the next person in as the previous one, and it is why
 | `rust/crates/lakehouse-api/src/runtime_settings.rs` | `EffectiveSso::prompt` + its source; `resolve_sso` and `draft_sso_settings` fill them. |
 | `rust/crates/lakehouse-api/src/routes/auth.rs` | `oidc_start` sends the `prompt`; the tests assert the default, another value, and "nothing sent". |
 | `rust/crates/lakehouse-api/src/routes/settings.rs` | The test's `EffectiveSso` literal carries the new fields. |
+| `docker-compose.yml` | The `lakehouse-api` service passes `OIDC_PROMPT` through, like every other `OIDC_*` setting — without it the value in `.env` never reaches the API process. |
 | `.env.example`, `docs/CONFIGURATION.md`, `docs/OPERATIONS.md` | The setting is documented, including what "sign out, then sign in again" does. |
 | `.github/workflows/deploy-staging.yml` | The staging connection writes `OIDC_PROMPT=login` explicitly. |
 | `CHANGELOG.md` | The entry. |
@@ -110,7 +123,7 @@ jar, which is what the defect is about.
 
 - With `prompt=login`, every sign-in asks the provider to authenticate
   again. On a provider behind MFA that is an MFA prompt each time. The
-  operator can turn it off (`OIDC_PROMPT=`), at the cost of the reported
+  operator can turn it off (`OIDC_PROMPT=off`), at the cost of the reported
   behaviour coming back.
 - "Sign out" still does not end the provider's session: it ends this
   deployment's session only. The next sign-in asks the provider to
