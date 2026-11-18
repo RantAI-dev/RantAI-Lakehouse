@@ -49,3 +49,12 @@ drawn on one chart.
 - `BI-13-AC2` A user without `dashboard:write` cannot save it; a question the viewer may not read shows its reason while the others draw.
 - `BI-13-AC3` Clicking a bar lists rows from the first table; clicking a point of the line lists rows from the second.
 - `AI-6-AC1` (the `BI-13` part) "visitors by month next to rooms" is built by the assistant. Accepted by the AI owner, 2026-11-14 (staging `240d2e62`)
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-13-AC1`: pass.
+- `BI-13-AC2`: pass.
+- `BI-13-AC3`: pass.
+- `AI-6-AC1` (BI-13 part): pass.

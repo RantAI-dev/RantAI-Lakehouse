@@ -52,3 +52,13 @@ needs a SQL source written by someone who may write SQL.
 - `BI-7-AC3` A user without `dashboard:write` cannot save it; a failure shows a plain message.
 - `BI-7-AC4` The record list of a clicked bar and the CSV export of a raw table show the joined columns.
 - `AI-6-AC1` (the `BI-7` part) "visitors by province next to hotel capacity" is built by the assistant with a join. Accepted by the AI owner, 2026-11-14 (staging `240d2e62`)
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-7-AC1`: pass.
+- `BI-7-AC2`: pass.
+- `BI-7-AC3`: pass.
+- `BI-7-AC4`: pass.
+- `AI-6-AC1` (BI-7 part): pass.

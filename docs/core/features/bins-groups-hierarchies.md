@@ -62,3 +62,14 @@ cities on the same chart.
 
 - Bin edges confirmed: the lower edge is included and the upper excluded, and the last bin includes the maximum (1000 falls in 1,000 – 1,500).
 - When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-10-AC1`: pass.
+- `BI-10-AC2`: pass.
+- `BI-10-AC3`: pass.
+- `BI-10-AC4`: pass.
+- `BI-10-AC5`: pass.
+- `AI-6-AC1` (BI-10 part): partial: it asked which column once; the binned chart it drafted had no limit and showed 20 of 95 bins without saying so (follow-up item).
