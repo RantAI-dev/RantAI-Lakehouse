@@ -17,6 +17,8 @@ import {
   X,
 } from "lucide-react";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import { RequiredLegend } from "@/components/patterns/required-legend";
 import { Textarea } from "@/components/ui/textarea";
 import { formatRelativeTime } from "@/lib/format";
 import { settleStreamingMarkdown } from "@/lib/stream-markdown";
@@ -300,8 +302,11 @@ export function ChatMessages({
 
                 {isEditing ? (
                   <div className="space-y-2">
+                    <RequiredLegend />
+                    <Label htmlFor="edit-message" required>Edit message</Label>
                     <Textarea
-                      aria-label="Edit message"
+                      id="edit-message"
+                      aria-required
                       value={editing.text}
                       onChange={(e) => setEditing({ index: i, text: e.target.value })}
                       className="min-h-[60px] bg-background"

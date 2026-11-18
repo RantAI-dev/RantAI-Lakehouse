@@ -17,8 +17,9 @@ limited to listed sites). What is left:
 
 - A single-chart embed is the dashboard embed with `?chart=` added to the
   address. Remove it and the whole dashboard shows.
-- The frame always says "Rantai Lake". The host cannot pick light or dark,
-  hide our name, or let its own background show through.
+- The frame always says the workspace's name — the product's own when the
+  workspace set none. The host cannot pick light or dark, hide our name, or
+  let its own background show through.
 - A filter can only be locked by the token. The viewer cannot be given a
   filter to change, and a filter cannot be kept out of sight.
 - The frame has a fixed height, so the host page gets a scroll bar inside
@@ -49,7 +50,7 @@ And ask the assistant to switch embedding on (it asks a person to approve first)
 | 1 | A token names either a dashboard or one chart. A chart token gets that chart's data and nothing else from the server; the address cannot change that | Spec | Decided by the spec |
 | 2 | A dashboard token may still show one of its charts with `?chart=`; it already grants the whole dashboard, so this hides nothing | Planner default | Owner to confirm at QA |
 | 3 | The look is set in the embed address, not the token: `theme=light`, `dark` or `dashboard`; `logo=none`; `background=transparent`. It is not secret, so the host can change it without signing a new token | Planner default (Metabase does the same) | Owner to confirm at QA |
-| 4 | Our name shows unless the address says `logo=none`. Anyone may hide it | Planner default | Signed by the owner, 2026-10-18 |
+| 4 | The workspace's name shows — the product's own when the workspace set none (`ADM-2` decision 9) — unless the address says `logo=none`. Anyone may hide it | Planner default | Signed by the owner, 2026-10-18 |
 | 5 | Each dashboard filter (known by its column, as the dashboard knows it) has an embed mode set by a manager in the Share dialog: locked, editable or hidden. A new filter is hidden until someone chooses | Spec (Metabase); the "hidden first" default is the planner's | Owner to confirm at QA |
 | 6 | A locked filter must have a value in the token. A token that leaves one out is refused, so a forgotten value never shows all rows | Planner default (fail closed) | Owner to confirm at QA |
 | 7 | Whatever value the token sets is locked, whatever the filter's mode: a locked value can only narrow what is shown, never widen it. So tokens signed today (`params: {"region": "Bali"}`) keep working unchanged | Planner default | Signed by the owner, 2026-10-18 |
@@ -58,7 +59,7 @@ And ask the assistant to switch embedding on (it asks a person to approve first)
 | 10 | An embed always reads data as the fixed viewer role, never more. A token cannot name a role or a person; such a claim is ignored. Expiry, withdrawal and allowed sites stay as `SEC-12` decided | `SEC-12`, signed 2026-10-10 | 2026-10-10 |
 | 11 | Who sets embed modes and turns embedding on: someone with manage on the dashboard (`BI-19` part B); until part B ships, `dashboard:write`, as today | Planner default | Owner to confirm at QA |
 | 12 | Public-link embeds (`/embed/dashboard/<link>`) get the look and the height messages too. Filter modes apply to signed embeds only | Planner default | Owner to confirm at QA |
-| 13 | Our name shows in both frames (a whole dashboard and one chart) as a one-line footer, "Rantai Lake" (a link, "Rantai Lake ↗", on a public link; plain text for a signed token, which has no address to link to), inside the measured root, so the height messages include it; `logo=none` hides it (`BI-26` slice 2 D1) | Planner default | Owner to confirm at QA |
+| 13 | Our name shows in both frames (a whole dashboard and one chart) as a one-line footer, the workspace's name — the product's own when the workspace set none (`ADM-2` decision 9) (a link to the console on a public link; plain text for a signed token, which has no address to link to), inside the measured root, so the height messages include it; `logo=none` hides it (`BI-26` slice 2 D1) | Planner default | Owner to confirm at QA |
 | 14 | `background=transparent` makes the page behind the tiles transparent in both frames; each tile keeps its card (`BI-26` slice 2 D2) | Planner default | Owner to confirm at QA |
 
 ## Limits to tell a customer

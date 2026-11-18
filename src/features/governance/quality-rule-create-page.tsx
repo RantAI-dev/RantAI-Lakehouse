@@ -7,6 +7,7 @@ import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useServiceAction } from "@/hooks/use-service"
 import { notifyError, withNotify } from "@/lib/notify"
@@ -95,16 +96,20 @@ export function QualityRuleCreatePage() {
       onSubmit={() => void handleCreate()}
       onCancel={() => router.push(backHref)}
     >
+      <RequiredLegend />
       <div className="space-y-1.5">
-        <Label htmlFor="qr-name">Name</Label>
-        <Input id="qr-name" value={name} onChange={(e) => setName(e.target.value)} />
+        <Label htmlFor="qr-name" required>Name</Label>
+        <Input id="qr-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
       </div>
-      <TablePicker id="qr-asset" label="Asset" value={asset} onChange={setAsset} catalog={catalog} />
+      <TablePicker id="qr-asset" label="Asset" value={asset} onChange={setAsset} catalog={catalog} required />
       {typedThreshold ? (
         <div className="space-y-1.5">
-          <Label htmlFor="qr-threshold">Threshold</Label>
+          <Label htmlFor="qr-threshold" required>Threshold</Label>
+          {/* UX-1-R10: the star on a custom threshold/dimension must be
+              matched by required semantics on the input. */}
           <Input
             id="qr-threshold"
+            aria-required
             className="font-mono"
             value={threshold}
             onChange={(e) => setThreshold(e.target.value)}
@@ -144,9 +149,10 @@ export function QualityRuleCreatePage() {
         {typedThreshold ? "Pick a check instead" : "Write the threshold myself"}
       </Button>
       <div className="space-y-1.5">
-        <Label htmlFor="qr-dim">Dimension</Label>
+        <Label htmlFor="qr-dim" required>Dimension</Label>
         <Input
           id="qr-dim"
+          aria-required
           value={formDimension}
           onChange={(e) => setFormDimension(e.target.value)}
           placeholder={typedThreshold ? "completeness" : KINDS[checkForm.kind].dimension}

@@ -4,6 +4,7 @@ import * as React from "react"
 import { Building2Icon, CheckIcon, LayersIcon, MapPinIcon, UsersIcon } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useAuth } from "@/features/auth/auth-provider"
 import { cn } from "@/lib/utils"
 import { StepSectionHeading } from "./connector-form-parts"
@@ -36,8 +37,9 @@ export function ScopeFields({
 }) {
   return (
     <div className="space-y-6">
+      <RequiredLegend />
       <section className="space-y-3">
-        <StepSectionHeading icon={<UsersIcon className="size-4" />} title="Tenant" description={tenantDescription} />
+        <StepSectionHeading icon={<UsersIcon className="size-4" />} title="Tenant" description={tenantDescription} required />
         <TenantPicker value={tenantId} onChange={onTenantChange} />
       </section>
       <section className="space-y-3 border-t border-border pt-5">
@@ -45,9 +47,10 @@ export function ScopeFields({
           icon={<LayersIcon className="size-4" />}
           title="Environment"
           description="Which stage of the source system this is. Shown and filterable in the connector list."
+          required
         />
         <div className={SCOPE_GRID}>
-          <EnvironmentInput id="connector-environment" value={environment} onChange={onEnvironmentChange} />
+          <EnvironmentInput id="connector-environment" value={environment} onChange={onEnvironmentChange} required />
         </div>
       </section>
       <section className="space-y-3 border-t border-border pt-5">
@@ -55,11 +58,13 @@ export function ScopeFields({
           icon={<MapPinIcon className="size-4" />}
           title="Residency"
           description="Where the source's data is kept, recorded with the connector for governance."
+          required
         />
         <div className={SCOPE_GRID}>
           <Input
             id="connector-residency"
             aria-label="Residency"
+            aria-required
             value={residency}
             onChange={(e) => onResidencyChange(e.target.value)}
             placeholder="e.g. in-region"
@@ -88,7 +93,7 @@ export function TenantPicker({ value, onChange }: { value: string; onChange: (te
     )
   }
   return (
-    <div role="radiogroup" aria-label="Tenant" className={SCOPE_GRID}>
+    <div role="radiogroup" aria-label="Tenant" aria-required className={SCOPE_GRID}>
       {tenants.map((tenant) => {
         const checked = tenant.id === value
         return (
@@ -141,10 +146,12 @@ export function EnvironmentInput({
   id,
   value,
   onChange,
+  required,
 }: {
   id: string
   value: string
   onChange: (value: string) => void
+  required?: boolean
 }) {
   return (
     <div className="space-y-2">
@@ -173,6 +180,7 @@ export function EnvironmentInput({
       <Input
         id={id}
         aria-label="Environment"
+        aria-required={required}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder="production"

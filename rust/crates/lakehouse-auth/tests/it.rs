@@ -25,3 +25,4 @@ mod repository;
 mod service_token;
 mod session;
 mod throttle;
+mod usage_permission_migration;

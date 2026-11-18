@@ -646,3 +646,348 @@ async fn listing_reports_warns_while_email_is_not_set_up() {
         "the subscriptions are still listed: {listed}"
     );
 }
+
+// ── GOV-17 review R4: the assistant's report tools recheck board visibility ─
+
+/// A stand-in holding one board whose tile reads `serving.mart_r4`. It honours
+/// the dependency deny-list like a real engine, so narrowing the owner away
+/// from that mart makes the board read as missing.
+struct R4Store;
+
+impl Respond for R4Store {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        let rows = |data: Vec<Value>| {
+            let n = data.len();
+            ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
+        };
+        if sql.contains("FROM console.bi_chart") {
+            let spec = json!({
+                "id": "c_r4", "title": "C", "kind": "kpi", "mart": "mart_r4",
+                "sql": "SELECT n FROM serving.mart_r4", "x": "", "y": "n"
+            });
+            let def = json!({
+                "title": "C", "mart": "mart_r4", "kind": "kpi", "measures": ["n"], "aggregate": "count"
+            });
+            return rows(vec![json!({
+                "id": "c_r4", "board": BOARD, "created_by": "ui",
+                "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+            })]);
+        }
+        if sql.contains("FROM console.bi_board") {
+            if sql.contains(&format!("NOT IN ('{BOARD}')")) {
+                return rows(vec![]);
+            }
+            if sql.contains(&format!("id='{BOARD}'")) {
+                return rows(vec![json!({
+                    "id": BOARD, "name": "Sales", "description": "", "created_by": "t",
+                    "layout_json": "", "filters_json": "", "public_token": "", "embed_enabled": "0",
+                    "folder_id": "", "created_at": "2026-10-10 00:00:00", "owner_id": "",
+                    "embed_revoked_before": "0", "embed_revoked_jti_json": "[]",
+                    "embed_origins_json": "[]"
+                })]);
+            }
+            return rows(vec![]);
+        }
+        ResponseTemplate::new(200).set_body_string("Ok.\n")
+    }
+}
+
+/// Narrow every role of `user` to exactly `grants` (GOV-17 R4 before/after
+/// control; no *:* role is minted, GOV-7 D4).
+async fn narrow(pool: &PgPool, user: Uuid, grants: &[(&str, &str)]) {
+    let roles: Vec<Uuid> =
+        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_ne!(
+        roles,
+        [] as [Uuid; 0],
+        "the user must hold a role to narrow"
+    );
+    for role in roles {
+        sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        for (schema, table) in grants {
+            sqlx::query(
+                "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, $2, $3)",
+            )
+            .bind(role)
+            .bind(schema)
+            .bind(table)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
+/// GOV-17 review R4: a report on a board whose tile table the owner can no
+/// longer read must disappear from `list_report_subscriptions`, and a by-id
+/// update must read as the unknown subscription. The shared check is the
+/// caller's narrowed viewer, not the owner's standing subscription right.
+#[tokio::test]
+async fn report_tools_hide_a_report_when_the_owner_loses_table_access() {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(R4Store)
+        .mount(&ch)
+        .await;
+    let env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    let app = spin_up_with_env(&env).await;
+    let me = create_assistant_principal(
+        &app.pool,
+        "dashboard:read, dashboard:write, assistant:use, assistant:ask",
+    )
+    .await;
+    let cookie = session_cookie_for_user(&app.pool, me).await;
+    let new = subs::NewSubscription {
+        board: BOARD.to_owned(),
+        owner_id: me,
+        schedule: lakehouse_store::report_schedule::Schedule::Weekly {
+            weekday: 1,
+            hour: 8,
+            minute: 0,
+        },
+        time_zone: "UTC".to_owned(),
+        attachments: json!({ "pdf": { "paper": "a4", "orientation": "portrait" }, "charts": [] }),
+        filters: None,
+        params: None,
+        grain: None,
+        skip_when_empty: false,
+        next_run_at: time::OffsetDateTime::now_utc() + time::Duration::days(1),
+        recipients: vec![subs::Recipient::User(me)],
+    };
+    let id = subs::create(&app.pool, &new).await.unwrap().id.to_string();
+    let f = F {
+        app,
+        me,
+        cookie,
+        approver: me,
+        approver_cookie: String::new(),
+        _ch: ch,
+    };
+
+    let before = tool(&f, "list_report_subscriptions", json!({})).await;
+    assert_eq!(
+        before["result"]["items"].as_array().unwrap().len(),
+        1,
+        "listed before the grant change: {before}"
+    );
+
+    narrow(&f.app.pool, me, &[("serving", "other_mart")]).await;
+
+    // GOV-17 review R8: another person's hidden report is unknown too.
+    let outsider =
+        create_assistant_principal(&f.app.pool, "dashboard:read, assistant:use, assistant:ask")
+            .await;
+    let outsider_cookie = session_cookie_for_user(&f.app.pool, outsider).await;
+    let args = json!({ "tool": "update_report_subscription", "args": { "id": id, "paused": true, "confirmed": true }, "mode": "build" });
+    let before_other = post(&f, "/api/ai/tool", &outsider_cookie, args.clone()).await;
+    assert_eq!(
+        before_other["result"]["error"],
+        json!(
+            "Only the person who set this report up can change it from the assistant; an administrator can use the dashboard's Subscriptions."
+        )
+    );
+    narrow(&f.app.pool, outsider, &[("serving", "other_mart")]).await;
+    let hidden_other = post(&f, "/api/ai/tool", &outsider_cookie, args).await;
+    assert_eq!(
+        hidden_other["result"]["error"],
+        json!("That subscription does not exist.")
+    );
+
+    let after = tool(&f, "list_report_subscriptions", json!({})).await;
+    assert!(
+        after["result"]["items"].as_array().unwrap().is_empty(),
+        "a hidden board's report is omitted: {after}"
+    );
+    // GOV-17 review R8: a hidden id must not yield a Confirm card while an
+    // unknown id is refused before approval, either.
+    let hidden_draft = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": id, "paused": true }),
+    )
+    .await;
+    let unknown_draft = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": Uuid::new_v4().to_string(), "paused": true }),
+    )
+    .await;
+    assert_eq!(hidden_draft["outcome"], unknown_draft["outcome"]);
+    assert_eq!(hidden_draft["result"], unknown_draft["result"]);
+    assert_eq!(
+        hidden_draft["result"]["error"],
+        json!("That subscription does not exist.")
+    );
+
+    let updated = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": id, "paused": true, "confirmed": true }),
+    )
+    .await;
+    assert_eq!(
+        updated["result"]["error"],
+        json!("That subscription does not exist."),
+        "a hidden report is the unknown report: {updated}"
+    );
+}
+
+// ── GOV-17 review R11: the approver must see Main too ────────────────────
+
+/// A stand-in where built-in Main holds one stored tile reading
+/// `serving.m11_hidden`. Narrowing a caller away from that mart hides Main in
+/// full, so `board_still_visible("default")` refuses them just as it refuses
+/// any other board whose dependency is unreadable.
+struct MainStore;
+
+impl Respond for MainStore {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        let rows = |data: Vec<Value>| {
+            let n = data.len();
+            ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
+        };
+        if sql.contains("FROM console.bi_chart") {
+            let spec = json!({
+                "id": "c_m11", "title": "M", "kind": "kpi", "mart": "m11_hidden",
+                "sql": "SELECT n FROM serving.m11_hidden", "x": "", "y": "n"
+            });
+            let def = json!({
+                "title": "M", "mart": "m11_hidden", "kind": "kpi",
+                "measures": ["n"], "aggregate": "count"
+            });
+            return rows(vec![json!({
+                "id": "c_m11", "board": "", "created_by": "ui",
+                "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+            })]);
+        }
+        if sql.contains("FROM console.bi_board") {
+            return rows(vec![]);
+        }
+        ResponseTemplate::new(200).set_body_string("Ok.\n")
+    }
+}
+
+/// GOV-17 review R11 (BLOCKER): an approver whose table grants hide built-in
+/// Main must not release a report on Main. The old check exempted
+/// `DEFAULT_BOARD_ID`; the approved run is stamped to the requester, so only
+/// the approver's own visibility check can enforce their access. A fully
+/// granted approver is the positive control. Two approvals are needed because
+/// a decided approval is consumed even when its tool call is refused.
+#[tokio::test]
+async fn an_approver_who_cannot_see_main_cannot_release_a_report_on_main() {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(MainStore)
+        .mount(&ch)
+        .await;
+    let env: HashMap<String, String> = HashMap::from([
+        ("CH_URL".to_owned(), ch.uri()),
+        (
+            "GOTENBERG_URL".to_owned(),
+            "http://gotenberg:3000".to_owned(),
+        ),
+        (
+            "CONSOLE_INTERNAL_URL".to_owned(),
+            "http://console:3000".to_owned(),
+        ),
+        (
+            "RENDER_TOKEN_SECRET".to_owned(),
+            "test-render-secret-not-real".to_owned(),
+        ),
+    ]);
+    let app = spin_up_with_env(&env).await;
+    let me = create_assistant_principal(
+        &app.pool,
+        "dashboard:read, dashboard:write, assistant:use, assistant:ask",
+    )
+    .await;
+    let cookie = session_cookie_for_user(&app.pool, me).await;
+    let approver =
+        create_principal_with_permissions(&app.pool, "dashboard:read, agent:approve").await;
+    let approver_cookie = session_cookie_for_user(&app.pool, approver).await;
+    let f = F {
+        app,
+        me,
+        cookie,
+        approver,
+        approver_cookie,
+        _ch: ch,
+    };
+    let colleague: Uuid = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Colleague', $2, $3, 'active')")
+        .bind(colleague)
+        .bind(format!("colleague-{colleague}"))
+        .bind(format!("colleague-{colleague}@test.invalid"))
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+
+    // Requester sees Main (unrestricted); naming another recipient waits for
+    // approval. "default" is `store::DEFAULT_BOARD_ID`, the built-in board.
+    let mut args = monday_pdf();
+    args["board"] = json!("default");
+    args["recipients"] = json!([{ "userId": colleague.to_string() }]);
+    args["confirmed"] = json!(true);
+    let waiting = tool(&f, "create_report_subscription", args.clone()).await;
+    assert_eq!(waiting["outcome"], "needs_approval", "{waiting}");
+    let approval = waiting["result"]["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The approver's grants hide Main: the approval is refused and nothing is
+    // created. `narrow` keeps their permissions, so the gate reaches our check.
+    narrow(&f.app.pool, approver, &[("serving", "m11_ok")]).await;
+    let decided = approve(&f, &approval, &f.approver_cookie).await;
+    assert!(
+        decided["result"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cannot see that dashboard"),
+        "{decided}"
+    );
+    assert!(
+        subs::list_for_owner(&f.app.pool, me)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no report is created while Main is hidden from the approver"
+    );
+
+    // Positive control: a fully granted approver releases a fresh report on
+    // Main. A second approval is needed because the first was consumed.
+    let good =
+        create_principal_with_permissions(&f.app.pool, "dashboard:read, agent:approve").await;
+    let good_cookie = session_cookie_for_user(&f.app.pool, good).await;
+    let waiting = tool(&f, "create_report_subscription", args).await;
+    assert_eq!(waiting["outcome"], "needs_approval", "{waiting}");
+    let approval = waiting["result"]["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let decided = approve(&f, &approval, &good_cookie).await;
+    assert_eq!(decided["executed"], json!(true), "{decided}");
+    assert!(decided["result"]["error"].is_null(), "{decided}");
+    assert_eq!(
+        subs::list_for_owner(&f.app.pool, me).await.unwrap().len(),
+        1,
+        "a fully granted approver releases the report"
+    );
+}

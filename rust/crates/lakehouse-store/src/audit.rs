@@ -140,6 +140,117 @@ impl From<AuditRow> for AuditEvent {
 const AUDIT_COLUMNS: &str = "id, at, principal_id, principal_kind, actor_label, action, \
      resource_kind, resource_id, args, outcome, detail, run_id, approval_id, session_id";
 
+/// Which rows of the audit trail one reader may see (`SEC-20`).
+///
+/// The table holds no tenant column: it is append-only
+/// (`0142_audit_event_append_only.sql`) and its rows must stay readable as
+/// they were written, so the tenant is read from the ACTOR, at read time.
+/// A row is in the reach of a tenant when the person who caused it belongs
+/// to that tenant, which `app_user_tenant` records.
+///
+/// Three reaches, and no fourth:
+///
+/// - [`All`](Self::All): every row. An unrestricted caller (`*:*`) sees
+///   everything, and so does a deployment that holds a single tenant —
+///   there is no other tenant's row to keep out of it.
+/// - [`Tenant`](Self::Tenant): the rows of the actors of one tenant, plus
+///   the deployment's own rows (the ones nobody signed in caused: a
+///   `Dagster` run, a service identity, a schedule) when that tenant owns
+///   the shared catalog. The deployment's rows belong to the deployment, so
+///   the tenant that owns the shared catalog reads them and no other does.
+/// - [`NoTenant`](Self::NoTenant): no row at all. A caller that belongs to
+///   no tenant of a deployment that holds several owns nobody's row, and it
+///   does not own the shared catalog either, so neither a tenant's rows nor
+///   the deployment's own rows are in its reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditScope {
+    /// Every row of the trail.
+    All,
+    /// The rows of the actors of one tenant, and — when that tenant owns
+    /// the shared catalog — the deployment's own rows.
+    Tenant {
+        /// The tenant the caller's own rows come from, as the text the
+        /// store compares with `app_user_tenant.tenant_id`.
+        tenant_id: String,
+        /// Whether that tenant owns the shared catalog, and so reads the
+        /// deployment's own rows.
+        owns_catalog: bool,
+    },
+    /// No row at all.
+    NoTenant,
+}
+
+impl AuditScope {
+    /// Whether the deployment's own rows — the ones nobody signed in caused
+    /// — are in this reach.
+    ///
+    /// The rule is the shared catalog's own: the tenant that owns the
+    /// shared catalog reads them, and so does an unrestricted caller. A
+    /// tenant that does not own it reads no row of the deployment.
+    #[must_use]
+    pub fn sees_deployment_rows(&self) -> bool {
+        match self {
+            Self::All => true,
+            Self::Tenant { owns_catalog, .. } => *owns_catalog,
+            Self::NoTenant => false,
+        }
+    }
+}
+
+/// The clause that narrows a read of `audit_event` to `scope`.
+///
+/// The ONE implementation of the rule [`AuditScope`] states: every reader of
+/// the trail goes through it, so no route and no store function can answer
+/// with a different reach.
+///
+/// The clause names the table, so the statement must read `audit_event`
+/// itself: an alias would not resolve `audit_event.principal_id`.
+///
+/// Every value is bound. The tenant is compared as text on both sides
+/// (`app_user_tenant.tenant_id` is a `UUID`, the scope carries text), so a
+/// scope that names no tenant matches nothing instead of failing the query.
+/// The actor is matched on `app_user.id` rendered as text, because
+/// `audit_event.principal_id` holds the person's id as text — the audit
+/// writers store `principal.id.uuid().to_string()`.
+///
+/// The deployment's own rows are the rows whose actor is not a PERSON at
+/// all: no principal, a service identity, a schedule — nobody signed in
+/// caused them, so they belong to the deployment rather than to an
+/// organisation. A person who belongs to no tenant is not one of them: the
+/// row is nobody's, and it is visible to nobody but an unrestricted reader
+/// (fail closed).
+pub(crate) fn push_scope_clause(qb: &mut QueryBuilder<Postgres>, scope: &AuditScope) {
+    match scope {
+        AuditScope::All => {}
+        AuditScope::NoTenant => {
+            // The honest clause, not a shortcut around the query: a caller
+            // that belongs to no tenant of a deployment that holds several
+            // owns nobody's row, and it does not own the shared catalog
+            // either, so the deployment's own rows are not in its reach
+            // either. The clause matches no row of the table.
+            qb.push(" AND false");
+        }
+        AuditScope::Tenant {
+            tenant_id,
+            owns_catalog,
+        } => {
+            qb.push(
+                " AND (EXISTS (SELECT 1 FROM app_user u \
+                 JOIN app_user_tenant ut ON ut.user_id = u.id \
+                 WHERE u.id::text = audit_event.principal_id \
+                 AND ut.tenant_id::text = ",
+            )
+            .push_bind(tenant_id.clone())
+            .push(") OR (")
+            .push_bind(*owns_catalog)
+            .push(
+                "::boolean AND NOT EXISTS (SELECT 1 FROM app_user u \
+                 WHERE u.id::text = audit_event.principal_id)))",
+            );
+        }
+    }
+}
+
 /// What caused an event nobody signed in caused.
 ///
 /// `audit_event.principal_kind` may only be `user`, `service`, `copilot` or
@@ -400,15 +511,20 @@ pub struct AuditPage {
 /// order and `LIMIT`, and with it the cursor condition; without it (a
 /// count) the cursor is ignored too.
 ///
+/// The reach of the reader ([`AuditScope`]) is the first narrowing, so every
+/// other filter is applied to the rows the caller may see.
+///
 /// Only constant fragments are formatted in. Every value, including the
 /// `LIKE` pattern of an action prefix, goes through `push_bind`.
 fn build_filtered(
     head: &str,
     filter: &AuditFilter,
+    scope: &AuditScope,
     page_limit: Option<i64>,
 ) -> Result<QueryBuilder<Postgres>, StoreError> {
     let mut qb = QueryBuilder::new(head);
     qb.push(" WHERE true");
+    push_scope_clause(&mut qb, scope);
     if let Some(kind) = &filter.resource_kind {
         qb.push(" AND resource_kind = ").push_bind(kind.clone());
     }
@@ -466,20 +582,25 @@ fn select_head() -> String {
     format!("SELECT {AUDIT_COLUMNS} FROM audit_event")
 }
 
-/// List audit events, newest first, narrowed by `filter`. `filter.limit` is
-/// used as given; [`search`] is the bounded, paged form.
+/// List audit events, newest first, narrowed by `filter` and by the reader's
+/// reach `scope`. `filter.limit` is used as given; [`search`] is the bounded,
+/// paged form.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn list(pool: &PgPool, filter: AuditFilter) -> Result<Vec<AuditEvent>, StoreError> {
-    let mut qb = build_filtered(&select_head(), &filter, Some(filter.limit))?;
+pub async fn list(
+    pool: &PgPool,
+    filter: AuditFilter,
+    scope: &AuditScope,
+) -> Result<Vec<AuditEvent>, StoreError> {
+    let mut qb = build_filtered(&select_head(), &filter, scope, Some(filter.limit))?;
     let rows: Vec<AuditRow> = qb.build_query_as().fetch_all(pool).await?;
     Ok(rows.into_iter().map(AuditEvent::from).collect())
 }
 
-/// One page of events, newest first, narrowed by `filter` and continuing
-/// after `filter.cursor`.
+/// One page of events, newest first, narrowed by `filter`, by the reader's
+/// reach `scope` and continuing after `filter.cursor`.
 ///
 /// The order is `(at DESC, id DESC)`, so a page boundary that falls between
 /// rows of one `at` loses and repeats nothing. `filter.limit` below 1 means
@@ -491,13 +612,17 @@ pub async fn list(pool: &PgPool, filter: AuditFilter) -> Result<Vec<AuditEvent>,
 ///
 /// Returns [`StoreError::Database`] if the query fails, and
 /// [`StoreError::Validation`] if the cursor holds a time no timestamp can.
-pub async fn search(pool: &PgPool, filter: &AuditFilter) -> Result<AuditPage, StoreError> {
+pub async fn search(
+    pool: &PgPool,
+    filter: &AuditFilter,
+    scope: &AuditScope,
+) -> Result<AuditPage, StoreError> {
     let page_size = if filter.limit < 1 {
         SEARCH_DEFAULT_LIMIT
     } else {
         filter.limit.min(SEARCH_MAX_LIMIT)
     };
-    let mut qb = build_filtered(&select_head(), filter, Some(page_size + 1))?;
+    let mut qb = build_filtered(&select_head(), filter, scope, Some(page_size + 1))?;
     let mut rows: Vec<AuditRow> = qb.build_query_as().fetch_all(pool).await?;
     let page_len = usize::try_from(page_size).unwrap_or(usize::MAX);
     let has_more = rows.len() > page_len;
@@ -520,27 +645,39 @@ pub async fn search(pool: &PgPool, filter: &AuditFilter) -> Result<AuditPage, St
 /// How many events match `filter`, ignoring its `limit` and `cursor`. The
 /// export uses it to say how many events match when the file holds fewer.
 ///
+/// The count is of the rows the reader's reach `scope` allows, so it agrees
+/// with the file the export writes.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn count_matching(pool: &PgPool, filter: &AuditFilter) -> Result<i64, StoreError> {
-    let mut qb = build_filtered("SELECT count(*) FROM audit_event", filter, None)?;
+pub async fn count_matching(
+    pool: &PgPool,
+    filter: &AuditFilter,
+    scope: &AuditScope,
+) -> Result<i64, StoreError> {
+    let mut qb = build_filtered("SELECT count(*) FROM audit_event", filter, scope, None)?;
     let count: i64 = qb.build_query_scalar().fetch_one(pool).await?;
     Ok(count)
 }
 
-/// One event by id, or `None` when no event has that id.
+/// One event by id, or `None` when no event has that id or the reader's reach
+/// `scope` keeps it out of the answer.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn get(pool: &PgPool, id: &str) -> Result<Option<AuditEvent>, StoreError> {
-    let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_event WHERE id = $1");
-    // safe: only the constant `AUDIT_COLUMNS` is formatted in; the id is bound.
-    let row: Option<AuditRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+pub async fn get(
+    pool: &PgPool,
+    id: &str,
+    scope: &AuditScope,
+) -> Result<Option<AuditEvent>, StoreError> {
+    let mut qb = QueryBuilder::<Postgres>::new(format!(
+        "SELECT {AUDIT_COLUMNS} FROM audit_event WHERE id = "
+    ));
+    qb.push_bind(id.to_owned());
+    push_scope_clause(&mut qb, scope);
+    let row: Option<AuditRow> = qb.build_query_as().fetch_optional(pool).await?;
     Ok(row.map(AuditEvent::from))
 }
 
@@ -550,7 +687,7 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<AuditEvent>, StoreErr
 ///
 /// This exists so a test can pin which index serves each filter shape. It
 /// shares [`search`]'s statement builder, so the plan it returns is the plan
-/// of the real query.
+/// of the real query — including the reach clause.
 ///
 /// # Errors
 ///
@@ -559,6 +696,7 @@ pub async fn explain_search(
     pool: &PgPool,
     filter: &AuditFilter,
     analyze: bool,
+    scope: &AuditScope,
 ) -> Result<Vec<String>, StoreError> {
     let explain = if analyze {
         "EXPLAIN (ANALYZE, BUFFERS) "
@@ -566,7 +704,7 @@ pub async fn explain_search(
         "EXPLAIN "
     };
     let head = format!("{explain}{}", select_head());
-    let mut qb = build_filtered(&head, filter, Some(SEARCH_DEFAULT_LIMIT + 1))?;
+    let mut qb = build_filtered(&head, filter, scope, Some(SEARCH_DEFAULT_LIMIT + 1))?;
     let lines: Vec<String> = qb.build_query_scalar().fetch_all(pool).await?;
     Ok(lines)
 }
@@ -574,6 +712,9 @@ pub async fn explain_search(
 /// List the audit events about any of several resources of one kind,
 /// newest first — one catalog asset is known by more than one id (its
 /// catalog id, and the table keys rules are written against).
+///
+/// The reader's reach `scope` narrows the list the same way it narrows
+/// every other read of the trail.
 ///
 /// # Errors
 ///
@@ -583,23 +724,21 @@ pub async fn list_for_resources(
     resource_kind: &str,
     resource_ids: &[String],
     limit: i64,
+    scope: &AuditScope,
 ) -> Result<Vec<AuditEvent>, StoreError> {
     if resource_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let sql = format!(
-        "SELECT {AUDIT_COLUMNS} FROM audit_event \
-         WHERE resource_kind = $1 AND resource_id = ANY($2) \
-         ORDER BY at DESC \
-         LIMIT $3"
-    );
-    // safe: only the constant `AUDIT_COLUMNS` is formatted in; values are bound.
-    let rows: Vec<AuditRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
-        .bind(resource_kind)
-        .bind(resource_ids)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+    let mut qb = QueryBuilder::<Postgres>::new(format!(
+        "SELECT {AUDIT_COLUMNS} FROM audit_event WHERE resource_kind = "
+    ));
+    qb.push_bind(resource_kind.to_owned())
+        .push(" AND resource_id = ANY(")
+        .push_bind(resource_ids.to_vec())
+        .push(")");
+    push_scope_clause(&mut qb, scope);
+    qb.push(" ORDER BY at DESC LIMIT ").push_bind(limit);
+    let rows: Vec<AuditRow> = qb.build_query_as().fetch_all(pool).await?;
     Ok(rows.into_iter().map(AuditEvent::from).collect())
 }
 

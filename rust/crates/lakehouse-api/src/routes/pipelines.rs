@@ -9612,7 +9612,7 @@ mod tests {
     mod trigger_with_config_writes_config_keys_to_audit {
         use std::collections::HashMap;
 
-        use lakehouse_store::audit::{AuditFilter, list};
+        use lakehouse_store::audit::{AuditFilter, AuditScope, list};
 
         use super::super::*;
         // The shared `tests`-level fixture, reached through `super`
@@ -9700,6 +9700,7 @@ mod tests {
                     since: None,
                     ..AuditFilter::default()
                 },
+                &AuditScope::All,
             )
             .await
             .expect("audit list");

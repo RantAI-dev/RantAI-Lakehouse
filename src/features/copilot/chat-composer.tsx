@@ -4,6 +4,8 @@ import * as React from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { ArrowUp, SlidersHorizontal, Square } from "lucide-react";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
+import { RequiredLegend } from "@/components/patterns/required-legend";
 import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
@@ -164,15 +166,33 @@ export function ChatComposer({
   if (compact) {
     return (
       <div className={cn("flex items-center gap-2 rounded-full border py-2 pl-4 pr-2 transition-all", glassCls)}>
+        {/* UX-1-R2: the compact pill keeps a VISIBLE associated required
+            label; an sr-only label hid the requested star. The convention is
+            explained in a tooltip plus a screen-reader description so the
+            narrow pill does not grow. */}
+        <Label
+          htmlFor="copilot-compact-message"
+          className="shrink-0 text-xs text-muted-foreground"
+          required
+          title="* Required — type a message to send"
+        >
+          Message
+        </Label>
         <input
+          id="copilot-compact-message"
+          aria-required
+          aria-label="Message AI Copilot"
+          aria-describedby="copilot-compact-required-help"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onFocus={onFocus}
           onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } }}
           placeholder={placeholder ?? "Ask anything about your lakehouse…"}
-          aria-label="Message AI Copilot"
           className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
         />
+        <span id="copilot-compact-required-help" className="sr-only">
+          A message is required before Copilot can send it. The star marks required fields.
+        </span>
         {busy && onStop ? (
           <button
             type="button" onClick={onStop} aria-label="Stop" title="Stop"
@@ -195,41 +215,50 @@ export function ChatComposer({
 
   const body = (
     <>
-      <div className="relative">
-        <Textarea
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onFocus={onFocus}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
-            // Tab takes the example on screen, so it can be sent or edited.
-            if (e.key === "Tab" && !e.shiftKey && cycling && example) { e.preventDefault(); setInput(example); }
-          }}
-          rows={rows}
-          autoFocus={autoFocus}
-          // With examples the placeholder is the animated overlay below: a
-          // native placeholder cannot cross-fade.
-          placeholder={example ? "" : placeholder ?? "Ask anything about your lakehouse data…"}
-          aria-label="Message AI Copilot"
-          className="resize-none border-0 bg-transparent px-2 py-1.5 shadow-none focus-visible:ring-0 dark:bg-transparent"
-        />
-        {cycling && example ? (
-          <div aria-hidden className="pointer-events-none absolute inset-x-2 top-1.5 flex items-baseline gap-2 text-base text-muted-foreground md:text-sm">
-            <AnimatePresence mode="wait" initial={false}>
-              <motion.span
-                key={example}
-                initial={reduce ? false : { opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={reduce ? undefined : { opacity: 0, y: -6 }}
-                transition={{ duration: 0.25 }}
-                className="min-w-0 truncate"
-              >
-                {example}
-              </motion.span>
-            </AnimatePresence>
-            <kbd className="hidden shrink-0 rounded border border-border px-1 font-mono text-[10px] sm:inline">Tab</kbd>
-          </div>
-        ) : null}
+      <div className="grid gap-1">
+        <RequiredLegend />
+        <Label htmlFor="copilot-message" className="px-2" required>Message AI Copilot</Label>
+        {/* UX-1-R1: the animated example is absolutely positioned, so the
+            textarea and overlay need a `relative` containing block. Keep the
+            wrapper just around them and BELOW the legend/label: a grid took
+            the ancestor away and let the overlay escape the composer. */}
+        <div className="relative">
+          <Textarea
+            id="copilot-message"
+            aria-required
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onFocus={onFocus}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
+              // Tab takes the example on screen, so it can be sent or edited.
+              if (e.key === "Tab" && !e.shiftKey && cycling && example) { e.preventDefault(); setInput(example); }
+            }}
+            rows={rows}
+            autoFocus={autoFocus}
+            // With examples the placeholder is the animated overlay below: a
+            // native placeholder cannot cross-fade.
+            placeholder={example ? "" : placeholder ?? "Ask anything about your lakehouse data…"}
+            className="resize-none border-0 bg-transparent px-2 py-1.5 shadow-none focus-visible:ring-0 dark:bg-transparent"
+          />
+          {cycling && example ? (
+            <div aria-hidden className="pointer-events-none absolute inset-x-2 top-1.5 flex items-baseline gap-2 text-base text-muted-foreground md:text-sm">
+              <AnimatePresence mode="wait" initial={false}>
+                <motion.span
+                  key={example}
+                  initial={reduce ? false : { opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reduce ? undefined : { opacity: 0, y: -6 }}
+                  transition={{ duration: 0.25 }}
+                  className="min-w-0 truncate"
+                >
+                  {example}
+                </motion.span>
+              </AnimatePresence>
+              <kbd className="hidden shrink-0 rounded border border-border px-1 font-mono text-[10px] sm:inline">Tab</kbd>
+            </div>
+          ) : null}
+        </div>
       </div>
       <div className="flex items-center gap-1.5 px-1 pb-0.5">
         <ModeToggle mode={mode} setMode={setMode} />

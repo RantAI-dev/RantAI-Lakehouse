@@ -348,9 +348,10 @@ fn args_with_kept_source(
 }
 
 /// The fields `args_with_kept_fields` leaves alone because each has its own
-/// rule: `title` and `kind` are required in every call, `board` is kept by
-/// `update_chart` itself, and `mart` and `sqlSource` go through
-/// `args_with_kept_source`.
+/// rule: `title` and `kind` are required in every call (the kind a call
+/// leaves out is read from the stored chart, by [`args_with_stored_kind`]),
+/// `board` is kept by `update_chart` itself, and `mart` and `sqlSource` go
+/// through `args_with_kept_source`.
 const NOT_CARRIED: [&str; 5] = ["title", "kind", "board", "mart", "sqlSource"];
 
 /// The only fields a kind without data carries, and the kinds that take each.
@@ -560,6 +561,22 @@ fn args_with_kept_fields(
     (merged, carried)
 }
 
+/// The call's args with the stored kind filled in when the call leaves the
+/// kind out.
+///
+/// A rename names the chart and its new title and nothing else, and `#377`'s
+/// rule is that a field the call leaves out keeps its saved value, so the
+/// kind comes from the stored chart. It comes from there only when the call
+/// does not name the kind at all: a `null` clears a field, so a call that
+/// names `null` is refused, as it was before.
+fn args_with_stored_kind(args: &Map<String, Value>, stored: &ChartInput) -> Map<String, Value> {
+    let mut merged = args.clone();
+    if !merged.contains_key("kind") {
+        merged.insert("kind".to_owned(), json!(stored.kind));
+    }
+    merged
+}
+
 /// What a call carries over from the chart it changes: the call's own
 /// arguments with the formatting, the data source and the other fields the
 /// call does not name filled in, and what was kept.
@@ -603,10 +620,17 @@ async fn kept_formatting(
         },
         None => None,
     };
+    // A call that leaves the kind out keeps the stored one: a rename names
+    // the chart and its new title and nothing else, and `#377`'s rule is
+    // that a field the call leaves out keeps its saved value.
+    let args = match stored.as_ref() {
+        Some(stored) => args_with_stored_kind(args, &stored.def),
+        None => args.clone(),
+    };
     // The call is read without its `null` keys: `null` clears a field, so
     // a field of any type may be sent as `null` (`title` and `kind` then
     // read as missing, and the call is refused).
-    let call = match parse_chart_input(&without_nulls(args)) {
+    let call = match parse_chart_input(&without_nulls(&args)) {
         Ok(i) => i,
         Err(e) => return Err(json!({ "error": e })),
     };
@@ -617,9 +641,9 @@ async fn kept_formatting(
         return Ok(KeptFormatting {
             kept: true,
             args: if id.is_some() {
-                without_nulls(args)
+                without_nulls(&args)
             } else {
-                args.clone()
+                args
             },
             source_kept: false,
             fields_kept: Vec::new(),
@@ -630,9 +654,9 @@ async fn kept_formatting(
     // charts, a second axis for a bar), so the stored formatting is dropped
     // rather than carried into a kind that would refuse it.
     let (kept, args) = if stored.def.kind == call.kind {
-        (true, args_with_kept_formatting(args, &stored.def))
+        (true, args_with_kept_formatting(&args, &stored.def))
     } else {
-        (false, args.clone())
+        (false, args)
     };
     // The data source is carried over whatever the kind becomes: a chart
     // that names no source of its own reads the one the stored chart has.
@@ -975,7 +999,16 @@ pub(super) async fn create_board(
 pub(super) async fn list_boards(ch: &ChClient, viewer: &Viewer) -> Value {
     match store::list_boards(ch, viewer).await {
         Ok(boards) => {
-            let mut out = vec![json!({ "id": "default", "name": "Main" })];
+            let mut out = Vec::new();
+            // GOV-17 review R10 (BLOCKER): Main used to be prepended
+            // unconditionally, so the assistant discovered a dashboard the
+            // caller's current table grants hide. Gate its synthesis on the
+            // same ACL-plus-dependency predicate the HTTP board chooser uses
+            // (`dashboard::boards_list`); `sees_builtin_board()` already ANDs
+            // the built-in ACL with the dependency resolver's verdict.
+            if viewer.sees_builtin_board() {
+                out.push(json!({ "id": store::DEFAULT_BOARD_ID, "name": "Main" }));
+            }
             // BI-18 part C: a board's tabs, when it has any, so the assistant can name them.
             out.extend(boards.iter().map(|b| {
                 let mut entry = json!({ "id": b.id, "name": b.name });

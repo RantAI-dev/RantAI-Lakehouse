@@ -809,3 +809,47 @@ describe("ChartBuilder radar measures (QA LH-BI-6-25)", () => {
     expect(body.measures).toEqual(["visitors", "stay"])
   })
 })
+
+/**
+ * UX-1-R3 (reconciled to the current builder): a required control's visible
+ * label must be associated by `htmlFor` with the control's `id`, and the
+ * control must carry `aria-required`. Main's builder draws its own star on
+ * the label; these checks assert association and semantics, not the glyph.
+ */
+describe("ChartBuilder required control associations (UX-1-R3)", () => {
+  function expectAssociatedRequiredLabel(id: string) {
+    const control = document.getElementById(id)
+    expect(control).not.toBeNull()
+    const label = document.querySelector(`label[for="${id}"]`)
+    expect(label).not.toBeNull()
+    // UX-1-R11: Req delegates to the shared CSS ::before marker, so the
+    // star is an empty aria-hidden span, not a literal `*` text node.
+    expect(label?.querySelector('span[aria-hidden="true"][class*="before:content-"]')).not.toBeNull()
+    expect(control?.getAttribute("aria-required")).toBe("true")
+  }
+
+  it("associates the data-source and dimension selects with visible required labels", async () => {
+    renderBuilder(barDef)
+    await screen.findByLabelText("Aggregation of visitors")
+    expectAssociatedRequiredLabel("ch-source")
+    expectAssociatedRequiredLabel("ch-dimension")
+    expect(screen.getByText(/Required/)).toBeDefined()
+  })
+
+  it("uses an associated label and required semantics for a text chart's content", () => {
+    renderBuilder({ title: "Note", kind: "text", text: "hello" })
+    const label = document.querySelector('label[for="ch-content"]')
+    expect(label?.querySelector('span[aria-hidden="true"][class*="before:content-"]')).not.toBeNull()
+    expect(document.getElementById("ch-content")?.getAttribute("aria-required")).toBe("true")
+  })
+
+  // UX-1-R11: the optional (bullet/pointmap) dimension branch rendered a
+  // SelectTrigger with no id, so its visible Label named no control.
+  it("keeps the optional dimension branch labelled by the ch-dimension id", async () => {
+    renderBuilder({ ...barDef, kind: "bullet" })
+    await waitFor(() => expect(document.getElementById("ch-dimension")).not.toBeNull())
+    const label = document.querySelector('label[for="ch-dimension"]')
+    expect(label?.textContent).toContain("optional")
+    expect(document.querySelector(`label[for="ch-dimension"]`)?.getAttribute("data-required")).toBeNull()
+  })
+})

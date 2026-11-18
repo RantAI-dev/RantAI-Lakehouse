@@ -5,6 +5,7 @@ import { ArrowDown, ArrowUp, Plus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { RequiredMarker } from "@/components/ui/required";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RowsTable } from "@/components/patterns/rows-table";
 import { formatLocaleNumber } from "@/lib/format";
@@ -77,7 +78,8 @@ export function MeasureRows({
           {/* `BI-58` T5: the move and remove buttons sit on the label's line, so in the narrow inspector
               the column picker keeps the row's width with its aggregate. */}
           <div className="flex min-h-6 items-center gap-1">
-            <Label className="mr-auto">{labels(i)} {i < min ? <span aria-hidden className="text-destructive">*</span> : null}</Label>
+            {/* UX-1-R11 (from main): the shared marker, with matching combobox semantics on the rows the chart requires. */}
+            <Label className="mr-auto">{labels(i)} {i < min ? <RequiredMarker /> : null}</Label>
             {flexible ? (
               <>
                 {rows.length > 1 ? (
@@ -93,7 +95,7 @@ export function MeasureRows({
           {/* BI-58 review round 1 (SHOULD-FIX 2): the column and its aggregate are a pair of matching widths. */}
           <div className={(own || onDefaultAggregate || fixedNote) && !isMetricColumn(row.column) && !wholeMeasure.has(row.column) ? "grid grid-cols-2 items-center gap-1.5" : "grid grid-cols-[minmax(0,1fr)] gap-1.5"}>
             <Select value={row.column} items={columnItems(columns, fieldLabel, row.column)} onValueChange={(v) => set(i, { column: v ?? "" })} disabled={disabled}>
-              <SelectTrigger className="w-full min-w-0" aria-label={labels(i)} title={row.column ? displayColumnFull(row.column) : undefined}><SelectValue placeholder={placeholder} /></SelectTrigger>
+              <SelectTrigger className="w-full min-w-0" aria-label={labels(i)} aria-required={i < min} title={row.column ? displayColumnFull(row.column) : undefined}><SelectValue placeholder={placeholder} /></SelectTrigger>
               <SelectContent>{columns.map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
             </Select>
             {fixedNote ? (
@@ -249,7 +251,8 @@ export function GroupingsEditor({
   const free = columns.filter((c) => !value.some((g) => g.column === c.name));
   return (
     <div className="grid gap-1.5">
-      <Label>Group by <span aria-hidden className="text-destructive">*</span></Label>
+      {/* UX-1-R11: shared marker, and required semantics on the add control. */}
+      <Label>Group by <RequiredMarker /></Label>
       <ul className="grid gap-1">
         {value.map((g, i) => {
           const kind = columns.find((c) => c.name === g.column)?.kind;
@@ -290,7 +293,7 @@ export function GroupingsEditor({
           // A number column is grouped in bins, as a distinct value per number would be unreadable (BI-10).
           if (v) onChange([...value, free.find((c) => c.name === v)?.kind === "number" ? { column: v, bin: { mode: "auto" } } : { column: v }]);
         }} disabled={disabled}>
-          <SelectTrigger className="w-full" aria-label="Group by"><Plus className="size-3.5 text-muted-foreground" aria-hidden /><SelectValue placeholder={value.length ? "Add another column" : placeholder} /></SelectTrigger>
+          <SelectTrigger className="w-full" aria-label="Group by" aria-required><Plus className="size-3.5 text-muted-foreground" aria-hidden /><SelectValue placeholder={value.length ? "Add another column" : placeholder} /></SelectTrigger>
           <SelectContent>{free.map((c) => <SelectItem key={c.name} value={c.name}>{fieldLabel(c.name)}</SelectItem>)}</SelectContent>
         </Select>
       ) : null}

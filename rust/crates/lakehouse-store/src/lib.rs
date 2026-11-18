@@ -29,7 +29,7 @@
 //! that was never `Some`.
 
 // `sqlx::test` embeds the migration set at compile time; touching this file
-// (adding `0033_connector_ingest_spec.sql`, WS3 item 1; `0064_connector_schema_changes.sql`, SRC-8; `0083_governed_tags.sql`, DATA-12; `0079_column_lineage.sql`, DATA-13; `0081_quality_incidents.sql`, DATA-14; `0122_connector_capture_lag.sql`, SRC-4; `0139_alert_rule_delivery.sql`, SRC-40; `0141_upload_table_drop.sql`, DATA-55; `0142_audit_event_append_only.sql`, GOV-1) forces the macro to
+// (adding `0033_connector_ingest_spec.sql`, WS3 item 1; `0064_connector_schema_changes.sql`, SRC-8; `0083_governed_tags.sql`, DATA-12; `0079_column_lineage.sql`, DATA-13; `0081_quality_incidents.sql`, DATA-14; `0122_connector_capture_lag.sql`, SRC-4; `0139_alert_rule_delivery.sql`, SRC-40; `0141_upload_table_drop.sql`, DATA-55; `0142_audit_event_append_only.sql`, GOV-1; `0148_usage_rate_and_permission.sql`, OPS-8) forces the macro to
 // re-expand and pick up the new migration for every `#[sqlx::test]` in this
 // crate's `tests/` binaries.
 pub mod agents;
@@ -82,6 +82,8 @@ pub mod sso_settings;
 pub mod storage;
 pub mod upload_folders;
 pub mod uploads;
+pub mod usage;
+pub mod workspace_settings;
 
 pub use error::StoreError;
 
