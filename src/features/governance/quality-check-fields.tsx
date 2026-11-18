@@ -2,6 +2,7 @@
 
 import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
+import { RequiredMarker } from "@/components/ui/required"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import {
@@ -45,6 +46,10 @@ const STAT_OPTIONS = [
  * `columns` is the table's column names where the table is known; `null`
  * where it is not (the Data Quality page names the table by hand), and the
  * column is typed instead.
+ *
+ * UX-1-R10: the fields already carry required stars; their controls now carry
+ * matching `aria-required` (UX-1-R10). The bounds fieldset is deliberately a
+ * group — at least one bound, but neither input required on its own.
  */
 export function CheckFields({
   form,
@@ -61,8 +66,17 @@ export function CheckFields({
   note?: (kind: Kind) => React.ReactNode
 }) {
   const id = (name: string) => `${idPrefix}-${name}`
+  // UX-1-R4: neither bound is required on its own — either one satisfies
+  // the range check. Mark the group, not both inputs.
   const bounds = (
-    <div className="grid gap-3 sm:grid-cols-2">
+    <fieldset className="grid gap-3 sm:grid-cols-2" aria-describedby={`${idPrefix}-bounds-help`}>
+      <legend className="flex items-center gap-1.5 text-sm font-medium sm:col-span-2">
+        Bounds <RequiredMarker />
+        <span className="text-xs font-normal text-muted-foreground">— at least one</span>
+      </legend>
+      <p id={`${idPrefix}-bounds-help`} className="text-xs text-muted-foreground sm:col-span-2">
+        At least one bound is required; leave the other blank for no bound.
+      </p>
       <div className="grid gap-1.5">
         <Label htmlFor={id("min")}>Minimum</Label>
         <Input
@@ -83,7 +97,7 @@ export function CheckFields({
           placeholder="no upper bound"
         />
       </div>
-    </div>
+    </fieldset>
   )
 
   return (
@@ -100,7 +114,7 @@ export function CheckFields({
       </div>
       {KINDS[form.kind].column ? (
         <div className="grid gap-1.5">
-          <Label htmlFor={id("column")}>Column</Label>
+          <Label htmlFor={id("column")} required>Column</Label>
           {columns ? (
             <SelectField
               id={id("column")}
@@ -109,6 +123,7 @@ export function CheckFields({
                  `""`, so without this the trigger is an empty box that says
                  nothing about what to pick. */
               placeholder="Pick a column"
+              aria-required
               value={form.column}
               options={[
                 /* WEB-8 D8: a column the rule already names that this table
@@ -124,6 +139,7 @@ export function CheckFields({
           ) : (
             <Input
               id={id("column")}
+              aria-required
               className="font-mono"
               value={form.column}
               onChange={(e) => onChange({ column: e.target.value })}
@@ -135,9 +151,10 @@ export function CheckFields({
       {note?.(form.kind)}
       {form.kind === "rows" ? (
         <div className="grid gap-1.5">
-          <Label htmlFor={id("rows")}>Minimum rows</Label>
+          <Label htmlFor={id("rows")} required>Minimum rows</Label>
           <Input
             id={id("rows")}
+            aria-required
             inputMode="numeric"
             value={form.rows}
             onChange={(e) => onChange({ rows: e.target.value })}
@@ -146,9 +163,10 @@ export function CheckFields({
       ) : null}
       {form.kind === "not-null" ? (
         <div className="grid gap-1.5">
-          <Label htmlFor={id("percent")}>Rows that must have a value (%)</Label>
+          <Label htmlFor={id("percent")} required>Rows that must have a value (%)</Label>
           <Input
             id={id("percent")}
+            aria-required
             inputMode="decimal"
             value={form.percent}
             onChange={(e) => onChange({ percent: e.target.value })}

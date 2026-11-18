@@ -63,6 +63,7 @@ use lakehouse_store::assistant_settings::AssistantSettings;
 use lakehouse_store::email_settings::EmailSettings;
 use lakehouse_store::sign_in_settings::SignInSettings;
 use lakehouse_store::sso_settings::SsoSettings;
+use lakehouse_store::workspace_settings::WorkspaceSettings;
 use lakehouse_store::{PgPool, StoreError};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -309,6 +310,12 @@ impl SettingsRow for SignInSettings {
     }
 }
 
+impl SettingsRow for WorkspaceSettings {
+    fn read(pool: &PgPool) -> impl Future<Output = Result<Option<Self>, StoreError>> + Send {
+        lakehouse_store::workspace_settings::get(pool)
+    }
+}
+
 impl SettingsRow for AssistantSettings {
     fn read(pool: &PgPool) -> impl Future<Output = Result<Option<Self>, StoreError>> + Send {
         lakehouse_store::assistant_settings::get(pool)
@@ -379,7 +386,7 @@ impl TestEmailLimiter {
 /// Returns [`StoreError::Database`] when the store read fails.
 pub async fn email_row(state: &AppState) -> Result<Option<EmailSettings>, StoreError> {
     match state.pg.as_deref() {
-        Some(pool) => state.email_settings_cache.row(pool).await,
+        Some(pool) => state.settings_caches.email.row(pool).await,
         None => Ok(None),
     }
 }
@@ -612,32 +619,58 @@ fn log_once(flag: &AtomicBool, message: &str) {
     }
 }
 
-/// A fresh, empty [`EmailSettingsCache`] as an [`Arc`] — the value
-/// [`crate::state::AppState`] holds.
-#[must_use]
-pub fn email_cache() -> Arc<EmailSettingsCache> {
-    Arc::new(EmailSettingsCache::new())
+/// The settings rows this API caches, one struct behind one [`Arc`] — the
+/// value [`crate::state::AppState`] holds as one field.
+///
+/// One struct, not one field per row: a new field in [`AppState`] grows
+/// every future that holds a copy of the state, and `routes/ai/mod.rs`'s
+/// chat handler and its streaming twin already sit at clippy's 16384-byte
+/// limit for a future (`clippy::large_future`), so one more pointer there
+/// is a lint failure in a file the assistant's team owns.
+#[derive(Debug)]
+pub struct SettingsCaches {
+    /// The saved email row (`ADM-7` plan D3), read by every alert or
+    /// scheduled-report send.
+    pub email: SettingsCache<EmailSettings>,
+    /// The saved sign-in limits (`ADM-8` plan D3), read by every sign-in.
+    pub sign_in: SettingsCache<SignInSettings>,
+    /// The saved workspace name and pictures (`ADM-2` decision 6), read by
+    /// the public branding routes, so a sign-in page that loads on every
+    /// visit costs the database one read per [`SETTINGS_CACHE_TTL`] and not
+    /// one per visit.
+    pub workspace: SettingsCache<WorkspaceSettings>,
+    /// The saved assistant provider settings (`ADM-9` plan D3), read by
+    /// every assistant message.
+    pub assistant: SettingsCache<AssistantSettings>,
+    /// The saved SSO settings (`ADM-12` plan D1/D3), read by every check.
+    pub sso: SettingsCache<SsoSettings>,
 }
 
-/// A fresh, empty sign-in cache as an [`Arc`] — the value
-/// [`crate::state::AppState`] holds.
-#[must_use]
-pub fn sign_in_cache() -> Arc<SettingsCache<SignInSettings>> {
-    Arc::new(SettingsCache::new())
+impl SettingsCaches {
+    /// The five caches, empty: no row has been read yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            email: SettingsCache::new(),
+            sign_in: SettingsCache::new(),
+            workspace: SettingsCache::new(),
+            assistant: SettingsCache::new(),
+            sso: SettingsCache::new(),
+        }
+    }
 }
 
-/// A fresh, empty assistant cache as an [`Arc`] — the value
-/// [`crate::state::AppState`] holds.
-#[must_use]
-pub fn assistant_cache() -> Arc<SettingsCache<AssistantSettings>> {
-    Arc::new(SettingsCache::new())
+impl Default for SettingsCaches {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-/// A fresh, empty SSO cache as an [`Arc`] — the value
+/// A fresh, empty set of the settings caches as an [`Arc`] — the value
 /// [`crate::state::AppState`] holds.
 #[must_use]
-pub fn sso_cache() -> Arc<SsoSettingsCache> {
-    Arc::new(SsoSettingsCache::new())
+pub fn settings_caches() -> Arc<SettingsCaches> {
+    Arc::new(SettingsCaches::new())
 }
 
 // ── The sign-in limits (`ADM-8`) ──────────────────────────────────────────
@@ -762,7 +795,22 @@ pub fn resolve_sign_in(config: &Config, stored: Option<&SignInSettings>) -> Effe
 /// Returns [`StoreError::Database`] when the store read fails.
 pub async fn sign_in_row(state: &AppState) -> Result<Option<SignInSettings>, StoreError> {
     match state.pg.as_deref() {
-        Some(pool) => state.sign_in_settings_cache.row(pool).await,
+        Some(pool) => state.settings_caches.sign_in.row(pool).await,
+        None => Ok(None),
+    }
+}
+
+/// The saved workspace name and pictures for a request, or `None` when no
+/// Postgres pool is configured or nothing was saved.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] when the store read fails.
+pub async fn workspace_settings_row(
+    state: &AppState,
+) -> Result<Option<WorkspaceSettings>, StoreError> {
+    match state.pg.as_deref() {
+        Some(pool) => state.settings_caches.workspace.row(pool).await,
         None => Ok(None),
     }
 }
@@ -950,7 +998,7 @@ fn open_console_key(
 /// Returns [`StoreError::Database`] when the store read fails.
 pub async fn assistant_row(state: &AppState) -> Result<Option<AssistantSettings>, StoreError> {
     match state.pg.as_deref() {
-        Some(pool) => state.assistant_settings_cache.row(pool).await,
+        Some(pool) => state.settings_caches.assistant.row(pool).await,
         None => Ok(None),
     }
 }
@@ -1495,7 +1543,7 @@ pub fn resolve_sso(
 /// Returns [`StoreError::Database`] when the store read fails.
 pub async fn sso_row(state: &AppState) -> Result<Option<SsoSettings>, StoreError> {
     match state.pg.as_deref() {
-        Some(pool) => state.sso_settings_cache.row(pool).await,
+        Some(pool) => state.settings_caches.sso.row(pool).await,
         None => Ok(None),
     }
 }
@@ -3120,7 +3168,7 @@ mod tests {
         *state.oidc.write().await = Some(first.clone());
 
         // The two lines `routes::settings::put_sso` runs after a save.
-        state.sso_settings_cache.clear().await;
+        state.settings_caches.sso.clear().await;
         *state.oidc.write().await = None;
 
         let next = cached_or_build(&state, environment_base(&state)).await;
