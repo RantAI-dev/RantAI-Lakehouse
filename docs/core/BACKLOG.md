@@ -64,7 +64,7 @@ estimate (S, M, L), which the base has no field for.
 
 | ID | Kind | Item | Module | Priority | Status | PR | Source |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `UX-1` | Task | Standardize required-field stars and accessible labels across console forms, preserving validation and optional/default values | Platform | P1 | In Progress | #568 | `features/required-field-consistency.md`; owner request 2026-11-17 |
+| `UX-1` | Task | Standardize required-field stars and accessible labels across console forms, preserving validation and optional/default values | Platform | P1 | Done | #568 | `features/required-field-consistency.md`; owner request 2026-11-17 |
 | `UX-3` | Task | Historical cargo-deny blocker for UX-1: resolved separately by `SEC-79`, merged in #569; this branch now includes that reviewed main policy fix, without adding a separate exception or bypass | Platform | P1 | Done | #569 | `SEC-79`; PR #568 Security run 44078052201; `superpowers/plans/2026-11-17-required-field-consistency.md` |
 | `UX-2` | Task | Historical happy-dom/Motion cancellation errors on UX-1's old audit base: absent after reconciliation with current main, confirmed by green full frontend runs; no UX-1 error suppression or assertion weakening | Platform | P1 | Done |  | UX-1 parent review at `bcdef6bd3` and subsequent current-main verification; `superpowers/plans/2026-11-17-required-field-consistency.md` |
 | `REL-16` | Task | *Proposed, the owner has not decided.* A truly offline install fails on first start: five init containers install packages while the stack starts (`docker-compose.yml:1296`, `:1512`, `:1999`, `:2078` `apk add curl jq`; `:3874` `apk add openssl`), and the release's air-gap proof blocks only the image registries (`release.yml`, "Cut the runner off from the registries"), not the Alpine package mirror, so it never sees this. Seen as an Alpine CDN "temporary error" failing `lakekeeper-warehouse-init` in #264's CI on 2026-11-04. Proposed fix: one small `rantai-lakehouse-init` image (Alpine with curl, jq and openssl) built in the release and shipped in the bundle, used by all five; the air-gap proof blocks all outbound traffic | Delivery | P1 | Todo |  | #264 CI, 2026-11-04 |
@@ -528,6 +528,7 @@ set by the product owner and are left empty until they are.
 
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
+| `UX-1` | 2026-11-17 | 2026-11-18 (#568) | |
 | `OPS-8` | 2026-11-16 | 2026-11-17 (#574) | |
 | `ADM-2` | 2026-11-15 | 2026-11-17 (#562, #570, #572) | |
 | `SEC-76` | | | |
