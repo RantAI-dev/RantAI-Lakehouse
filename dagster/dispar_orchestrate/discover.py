@@ -99,12 +99,23 @@ from dispar_orchestrate.adapters import oracle as oracle_adapter
 from dispar_orchestrate.adapters import rest as rest_adapter
 from dispar_orchestrate.adapters import saas as saas_adapter
 from dispar_orchestrate.adapters import sftp as sftp_adapter
-from dispar_orchestrate.ingest_factory import IngestFactoryConfig, _fetch_one_connector, kafka_security_kwargs
+from dispar_orchestrate.ingest_factory import (
+    IngestFactoryConfig,
+    _fetch_one_connector,
+    kafka_security_kwargs,
+    run_limit_tags,
+)
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 from dispar_orchestrate.saas import session as saas_session
 from dispar_orchestrate.saas import vendors as saas_vendors
 
 logger = logging.getLogger(__name__)
+
+# How long one run of this job may run, in seconds. A discovery reads one
+# source and previews its columns, so half an hour is room for a slow
+# source: the longest run measured on staging on 2026-11-16 was 139 s.
+RUN_LIMIT_ENV = "DAGSTER_RUN_LIMIT_DISCOVER_JOB_SECONDS"
+DEFAULT_RUN_LIMIT_SECONDS = 1_800
 
 # --- the contract's bounds (mirrors `lakehouse_store::connector_discovery`) ----
 
@@ -1180,7 +1191,11 @@ def run_discover(context) -> None:
     context.log.info(f"discovery {request.kind} for {request.connector_id!r} ended: {error_class or 'done'}")
 
 
-@job(name="discover_job")
+# The `dagster/max_runtime` tag is what run monitoring enforces: a run
+# whose process died is cancelled and failed by the daemon, so it does not
+# hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
+# is a tag and not `run_monitoring.max_runtime_seconds`.
+@job(name="discover_job", tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def discover_job() -> None:
     """Launched by `POST /api/connectors/{id}/discovery/{kind}` with run config
     `{"ops": {"run_discover": {"config": {...}}}}` (the API's `launch`)."""

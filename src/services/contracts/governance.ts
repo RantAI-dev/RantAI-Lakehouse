@@ -261,7 +261,6 @@ export type AuditEvent = {
   actor: string
   actorKind: ActorKind
   delegatedActor?: string
-  tenant: string
   action: string
   resource: string
   outcome: AuditOutcome

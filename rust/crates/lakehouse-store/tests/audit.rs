@@ -20,13 +20,14 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::audit::{
-    AuditCursor, AuditFilter, NewAuditEvent, count_matching, explain_search, get, insert, list,
-    list_for_resources, search,
+    AuditCursor, AuditFilter, AuditScope, NewAuditEvent, count_matching, explain_search, get,
+    insert, list, list_for_resources, search,
 };
 use serde_json::json;
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use uuid::Uuid;
 
 fn sample(action: &str) -> NewAuditEvent {
     NewAuditEvent {
@@ -53,7 +54,9 @@ async fn insert_then_read_back(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(written.args, json!({ "foo": "bar" }));
     assert_eq!(written.outcome, "executed");
 
-    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].id, written.id);
     Ok(())
@@ -65,7 +68,9 @@ async fn list_orders_newest_first(pool: PgPool) -> sqlx::Result<()> {
     let second = insert(&pool, sample("second")).await.unwrap();
     let third = insert(&pool, sample("third")).await.unwrap();
 
-    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .unwrap();
     assert_eq!(events.len(), 3);
     // All three rows are written with `at DEFAULT now()` from the same
     // statement-timestamp burst, so `id` order (insertion order) is used
@@ -101,6 +106,7 @@ async fn list_filters_by_resource(pool: PgPool) -> sqlx::Result<()> {
             resource_id: Some("conn-1".to_owned()),
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -125,6 +131,7 @@ async fn list_filters_by_principal(pool: PgPool) -> sqlx::Result<()> {
             principal_id: Some("user-2".to_owned()),
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -144,6 +151,7 @@ async fn list_respects_limit(pool: PgPool) -> sqlx::Result<()> {
             limit: 2,
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -182,7 +190,9 @@ async fn deleting_referenced_run_nulls_out_run_id(pool: PgPool) -> sqlx::Result<
         .await
         .unwrap();
 
-    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .unwrap();
     let row = events.iter().find(|e| e.id == written.id).unwrap();
     assert_eq!(row.run_id, None);
     Ok(())
@@ -214,7 +224,9 @@ async fn deleting_referenced_approval_nulls_out_approval_id(pool: PgPool) -> sql
         .await
         .unwrap();
 
-    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .unwrap();
     let row = events.iter().find(|e| e.id == written.id).unwrap();
     assert_eq!(row.approval_id, None);
     Ok(())
@@ -246,7 +258,9 @@ async fn deleting_an_audit_event_is_refused(pool: PgPool) -> sqlx::Result<()> {
             .await,
     );
 
-    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .unwrap();
     assert_eq!(events.len(), 1);
     Ok(())
 }
@@ -257,7 +271,9 @@ async fn truncating_audit_event_is_refused(pool: PgPool) -> sqlx::Result<()> {
 
     assert_refused_as_append_only(sqlx::query("TRUNCATE audit_event").execute(&pool).await);
 
-    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .unwrap();
     assert_eq!(events.len(), 1);
     Ok(())
 }
@@ -302,7 +318,9 @@ async fn updating_any_other_column_of_an_audit_event_is_refused(pool: PgPool) ->
             .await,
     );
 
-    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .unwrap();
     let row = events.iter().find(|e| e.id == written.id).unwrap();
     assert_eq!(row, &written);
     let row = events.iter().find(|e| e.id == linked.id).unwrap();
@@ -349,7 +367,9 @@ async fn an_audit_event_link_can_be_cleared_but_never_pointed_elsewhere(
         .await
         .unwrap();
 
-    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .unwrap();
     let row = events.iter().find(|e| e.id == written.id).unwrap();
     assert_eq!(row.run_id, None);
     assert_eq!(row.action, "run_tool");
@@ -396,14 +416,16 @@ async fn list_for_resources_gathers_one_kind_across_several_ids(pool: PgPool) ->
         .unwrap();
 
     let ids = ["demo-orders".to_owned(), "bronze.demo_orders".to_owned()];
-    let found = list_for_resources(&pool, "catalog", &ids, 50)
+    let found = list_for_resources(&pool, "catalog", &ids, 50, &AuditScope::All)
         .await
         .unwrap();
     let actions: Vec<&str> = found.iter().map(|e| e.action.as_str()).collect();
     assert_eq!(actions, vec!["quality.rule_create", "catalog.annotate"]);
 
     assert_eq!(
-        list_for_resources(&pool, "catalog", &[], 50).await.unwrap(),
+        list_for_resources(&pool, "catalog", &[], 50, &AuditScope::All)
+            .await
+            .unwrap(),
         [] as [lakehouse_store::audit::AuditEvent; 0]
     );
     Ok(())
@@ -483,6 +505,7 @@ async fn search_by_actor_returns_only_that_persons_events(pool: PgPool) -> sqlx:
             principal_id: Some("user-2".to_owned()),
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -511,6 +534,7 @@ async fn search_by_action_without_a_trailing_dot_matches_that_action_exactly(
             action: Some("dashboard.update".to_owned()),
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -539,6 +563,7 @@ async fn search_by_action_ending_in_a_dot_matches_every_action_with_that_prefix(
             action: Some("dashboard.".to_owned()),
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -576,6 +601,7 @@ async fn search_by_action_prefix_treats_like_wildcards_as_plain_characters(
                 action: Some(prefix.to_owned()),
                 ..AuditFilter::default()
             },
+            &AuditScope::All,
         )
         .await
         .unwrap();
@@ -603,6 +629,7 @@ async fn search_by_outcome_returns_only_that_outcome(pool: PgPool) -> sqlx::Resu
             outcome: Some("refused".to_owned()),
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -628,6 +655,7 @@ async fn search_by_resource_kind_and_id_returns_events_about_that_object(
             resource_kind: Some("dashboard".to_owned()),
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -640,6 +668,7 @@ async fn search_by_resource_kind_and_id_returns_events_about_that_object(
             resource_id: Some("d-1".to_owned()),
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -671,6 +700,7 @@ async fn search_since_is_inclusive_and_until_is_exclusive(pool: PgPool) -> sqlx:
             until: Some(ts("2026-03-01T12:00:00Z")),
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -735,6 +765,7 @@ async fn search_combines_every_filter_with_and(pool: PgPool) -> sqlx::Result<()>
             until: Some(ts("2026-03-01T11:00:00Z")),
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -781,6 +812,7 @@ async fn paging_through_rows_that_share_a_timestamp_shows_each_row_once_in_order
                     cursor: cursor.clone(),
                     ..AuditFilter::default()
                 },
+                &AuditScope::All,
             )
             .await
             .unwrap();
@@ -810,6 +842,7 @@ async fn a_page_that_ends_exactly_at_the_last_row_has_no_next_cursor(
             limit: 7,
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -822,6 +855,7 @@ async fn a_page_that_ends_exactly_at_the_last_row_has_no_next_cursor(
             limit: 6,
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -894,6 +928,7 @@ async fn count_matching_ignores_the_limit_and_the_cursor(pool: PgPool) -> sqlx::
             limit: 2,
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -905,6 +940,7 @@ async fn count_matching_ignores_the_limit_and_the_cursor(pool: PgPool) -> sqlx::
             cursor: first.next_cursor.clone(),
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -918,6 +954,7 @@ async fn count_matching_ignores_the_limit_and_the_cursor(pool: PgPool) -> sqlx::
             limit: 1,
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -929,9 +966,14 @@ async fn count_matching_ignores_the_limit_and_the_cursor(pool: PgPool) -> sqlx::
 async fn get_returns_one_event_and_none_for_an_unknown_id(pool: PgPool) -> sqlx::Result<()> {
     let written = insert(&pool, sample("query_sql")).await.unwrap();
 
-    let found = get(&pool, &written.id).await.unwrap();
+    let found = get(&pool, &written.id, &AuditScope::All).await.unwrap();
     assert_eq!(found, Some(written));
-    assert_eq!(get(&pool, "audit-no-such-id").await.unwrap(), None);
+    assert_eq!(
+        get(&pool, "audit-no-such-id", &AuditScope::All)
+            .await
+            .unwrap(),
+        None
+    );
     Ok(())
 }
 
@@ -961,6 +1003,7 @@ async fn search_uses_a_default_limit_of_100_and_caps_the_limit_at_500(
                 limit: unset,
                 ..AuditFilter::default()
             },
+            &AuditScope::All,
         )
         .await
         .unwrap();
@@ -974,6 +1017,7 @@ async fn search_uses_a_default_limit_of_100_and_caps_the_limit_at_500(
             limit: 10_000,
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -986,6 +1030,7 @@ async fn search_uses_a_default_limit_of_100_and_caps_the_limit_at_500(
             limit: 25,
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -1068,6 +1113,7 @@ async fn every_search_shape_is_served_by_an_index_on_a_large_table(
             limit: 100,
             ..AuditFilter::default()
         },
+        &AuditScope::All,
     )
     .await
     .unwrap();
@@ -1195,11 +1241,11 @@ async fn every_search_shape_is_served_by_an_index_on_a_large_table(
 
     let mut wrong = Vec::new();
     for (label, filter, index) in &shapes {
-        let plan = explain_search(&pool, filter, false)
+        let plan = explain_search(&pool, filter, false, &AuditScope::All)
             .await
             .unwrap()
             .join("\n");
-        let ran = explain_search(&pool, filter, true)
+        let ran = explain_search(&pool, filter, true, &AuditScope::All)
             .await
             .unwrap()
             .join("\n");
@@ -1213,5 +1259,127 @@ async fn every_search_shape_is_served_by_an_index_on_a_large_table(
         wrong.is_empty(),
         "a sequential scan, or not the expected index, for: {wrong:?}"
     );
+    Ok(())
+}
+
+// ── The reach over the trail (`SEC-20`, plan 100) ───────────────────────
+
+/// The two seeded tenants the reach tests use: Meridian Group and
+/// Meridian Retail.
+const GROUP_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+const RETAIL_TENANT: &str = "11111111-1111-4111-8111-000000000002";
+
+/// A person of `tenant`, as `app_user` and `app_user_tenant` hold one.
+async fn a_person_of(pool: &PgPool, name: &str, email: &str, tenant: &str) -> String {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO app_user (username, name, email) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(email)
+    .bind(name)
+    .bind(email)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(id)
+        .bind(tenant.parse::<Uuid>().unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+    id.to_string()
+}
+
+/// A row of the trail whose actor is `principal_id`.
+async fn a_row_of(pool: &PgPool, action: &str, principal_id: Option<&str>) -> String {
+    let mut event = sample(action);
+    event.principal_id = principal_id.map(str::to_owned);
+    // A row nobody signed in caused carries no actor at all.
+    event.principal_kind = principal_id.map(|_| "user".to_owned());
+    event.actor_label = principal_id.map(|_| "a person".to_owned());
+    insert(pool, event).await.unwrap().id
+}
+
+/// The reach narrows the trail to the rows of the caller's own
+/// organisation: another organisation's rows are not in the answer, and the
+/// deployment's own rows (the ones nobody signed in caused) are in the
+/// answer of the tenant that owns the shared catalog only.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_reach_narrows_the_trail_to_one_tenant(pool: PgPool) -> sqlx::Result<()> {
+    let group = a_person_of(&pool, "Ayu", "ayu@example.test", GROUP_TENANT).await;
+    let retail = a_person_of(&pool, "Rafi", "rafi@example.test", RETAIL_TENANT).await;
+    let of_group = a_row_of(&pool, "row.of.group", Some(&group)).await;
+    let of_retail = a_row_of(&pool, "row.of.retail", Some(&retail)).await;
+    // Nobody signed in for this one: it is the deployment's own row.
+    let of_the_deployment = a_row_of(&pool, "row.of.the.deployment", None).await;
+
+    let scope_of_group = AuditScope::Tenant {
+        tenant_id: GROUP_TENANT.to_owned(),
+        owns_catalog: false,
+    };
+    let scope_of_retail = AuditScope::Tenant {
+        tenant_id: RETAIL_TENANT.to_owned(),
+        owns_catalog: false,
+    };
+    let scope_of_the_owner = AuditScope::Tenant {
+        tenant_id: GROUP_TENANT.to_owned(),
+        owns_catalog: true,
+    };
+
+    // A tenant that does not own the shared catalog reads its own rows and
+    // nobody else's — not the other organisation's, not the deployment's.
+    let retail_rows = list(&pool, AuditFilter::default(), &scope_of_retail)
+        .await
+        .unwrap();
+    assert_eq!(
+        retail_rows
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect::<Vec<_>>(),
+        [of_retail.as_str()],
+        "a tenant reads its own rows only"
+    );
+
+    // The catalog owner reads its own rows and the deployment's own rows.
+    let owner_rows = list(&pool, AuditFilter::default(), &scope_of_the_owner)
+        .await
+        .unwrap();
+    let owner_ids: Vec<&str> = owner_rows.iter().map(|e| e.id.as_str()).collect();
+    assert!(
+        owner_ids.contains(&of_group.as_str()),
+        "the owner reads its own rows: {owner_ids:?}"
+    );
+    assert!(
+        owner_ids.contains(&of_the_deployment.as_str()),
+        "the owner reads the deployment's own rows: {owner_ids:?}"
+    );
+    assert!(
+        !owner_ids.contains(&of_retail.as_str()),
+        "the owner reads no other organisation's row: {owner_ids:?}"
+    );
+
+    // A caller that belongs to no tenant reads no row at all.
+    let nobody = list(&pool, AuditFilter::default(), &AuditScope::NoTenant)
+        .await
+        .unwrap();
+    assert!(nobody.is_empty(), "no tenant, no row: {nobody:?}");
+
+    // An unrestricted caller reads every row.
+    let everyone = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .unwrap();
+    assert_eq!(everyone.len(), 3, "every row of the trail");
+
+    // The count and the single read agree with the list.
+    let counted = count_matching(&pool, &AuditFilter::default(), &scope_of_retail)
+        .await
+        .unwrap();
+    assert_eq!(counted, 1, "the count agrees with the list");
+    let one = get(&pool, &of_retail, &scope_of_group).await.unwrap();
+    assert!(
+        one.is_none(),
+        "a row out of the reach is the same as no row at all"
+    );
+    let one = get(&pool, &of_retail, &scope_of_retail).await.unwrap();
+    assert_eq!(one.map(|e| e.id), Some(of_retail.clone()));
     Ok(())
 }

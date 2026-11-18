@@ -3,8 +3,9 @@
 //! `get_cdc_health`, `get_maintenance_metrics`, `draft_policy`,
 //! `draft_classification_rule`, `draft_quality_rule`.
 //!
-//! Every read here calls `routes::governance::get` (the SAME `{kind}`
-//! dispatch `GET /api/governance/{kind}` uses) via [`super::response_to_value`]
+//! Every read here except `get_audit_history` calls
+//! `routes::governance::get` (the SAME `{kind}` dispatch
+//! `GET /api/governance/{kind}` uses) via [`super::response_to_value`]
 //! — including its existing degrade-cleanly behaviour: `get_cdc_health`
 //! (`kind = "replication"`) and `get_maintenance_metrics`
 //! (`kind = "maintenance"`) read `ClickHouse` tables that only exist once
@@ -14,6 +15,14 @@
 //! into a 503 `{"error": ...}` body, which `response_to_value` reads back
 //! as a normal tool-result `{"error": ...}` — no special-casing needed
 //! here.
+//!
+//! `get_audit_history` is the exception (`SEC-20`, plan 100): it reads the
+//! trail through `routes::governance::audit_trail` — the one read of the
+//! trail `GET /api/governance/audit` uses too — with the person's own
+//! scope, so the route and the tool cannot disagree about which rows the
+//! caller may see. A headless call answers
+//! `{"error": "reading the audit trail needs a signed-in user"}` instead
+//! of rows.
 //!
 //! The three draft tools call the real `routes::governance::create_policy`/
 //! `create_quality_rule`/`create_classification_rule` handlers (via
@@ -42,8 +51,42 @@ async fn governance_kind(state: &AppState, kind: &str) -> Value {
     .await
 }
 
-pub(super) async fn get_audit_history(state: &AppState) -> Value {
-    governance_kind(state, "audit").await
+/// `SEC-20` (plan 100): the audit trail, as the person behind the chat may
+/// read it.
+///
+/// The trail is read per tenant: the person's own organisation's rows, plus
+/// the deployment's own rows when that organisation owns the shared
+/// catalog. The `audit:read` permission is NOT checked here — it stays on
+/// the route (`GET /api/governance/audit`), and the assistant's own
+/// permission is plan 99's business. The reach is resolved from the
+/// person's own tenant, the convention the other governance tools follow
+/// (the tool has no request headers of its own).
+pub(super) async fn get_audit_history(state: &AppState, principal: Option<&Principal>) -> Value {
+    let Some(principal) = principal else {
+        // A headless run has no person behind it: it belongs to no tenant
+        // and owns no row of the trail.
+        return json!({ "error": "reading the audit trail needs a signed-in user" });
+    };
+    let scope = match crate::routes::audit_scope::scope_for_principal(
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+    )
+    .await
+    {
+        Ok(scope) => scope,
+        Err(err) => {
+            tracing::warn!(error = %err, "the audit trail could not be read");
+            return json!({ "error": "the audit trail is not available" });
+        }
+    };
+    match crate::routes::governance::audit_trail(state, &scope).await {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(error = %err, "the audit trail could not be read");
+            json!({ "error": "the audit trail is not available" })
+        }
+    }
 }
 
 /// `SEC-20` (plan 96): the classification list, as the person behind the chat

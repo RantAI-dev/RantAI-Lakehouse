@@ -22,7 +22,9 @@ use std::process::Command;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
-use lakehouse_api::db_roles::{self, AppendOnlyTable, RoleSetupError, RuntimeRoleRefusal};
+use lakehouse_api::db_roles::{
+    self, AppendOnlyTable, PASSWORD_LOG_GUARD, RoleSetupError, RuntimeRoleRefusal,
+};
 use lakehouse_api::{DatabaseStartup, StartPathRefusal};
 use lakehouse_core::secret::SecretValue;
 use sqlx::PgPool;
@@ -187,10 +189,14 @@ fn schema_and_table(qualified: &str) -> (&str, &str) {
 /// CONSTANTS of this file, not a read of the catalog: an identifier that
 /// reaches SQL text must be a constant (`AGENTS.md`, "SQL values are
 /// bound and `format!` is only for constant identifiers"), and a name
-/// that came out of a database read is not one. The columns the grant
-/// admits are `run_id` and `approval_id`; these are the rest, from
-/// `rust/migrations/0024_audit_event.sql`.
+/// that came out of a database read is not one. The grant admits no
+/// column of `audit_event`: `run_id` and `approval_id` are refused too,
+/// because a grant on them would let the console unlink an audit row by a
+/// plain `UPDATE`. The list is every column of
+/// `rust/migrations/0024_audit_event.sql` and its later additions.
 const AUDIT_EVENT_REFUSED_COLUMNS: &[&str] = &[
+    "run_id",
+    "approval_id",
     "id",
     "at",
     "principal_id",
@@ -518,48 +524,71 @@ async fn the_console_role_reads_the_migration_ledger_but_cannot_write_it() {
         .execute(&fixture.app_pool)
         .await;
     assert_refused_by_privilege(updated, "the console role rewriting migration records");
+
+    let inserted = sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (999999, 'sec78 probe', true, decode('00', 'hex'), 0)",
+    )
+    .execute(&fixture.app_pool)
+    .await;
+    assert_refused_by_privilege(inserted, "the console role inserting a migration record");
 }
 
-/// On the audit trail, the console role may clear the links and nothing
-/// else: the grant and the trigger admit exactly the same change.
+/// The password statement runs under the log guard: the settings it sets
+/// must take effect inside its transaction, so the statement is not logged.
 #[tokio::test]
-async fn on_the_audit_trail_the_console_role_may_only_clear_the_links() {
+async fn the_password_statement_runs_with_its_log_guard_on() {
+    let fixture = RoleFixture::new().await;
+    let mut transaction = fixture
+        .owner_pool
+        .begin()
+        .await
+        .expect("begin a transaction as the owner");
+    for guard in PASSWORD_LOG_GUARD {
+        sqlx::query(guard)
+            .execute(&mut *transaction)
+            .await
+            .expect("the log guard statement");
+    }
+    let (statement_log, error_log): (String, String) = sqlx::query_as(
+        "SELECT current_setting('log_statement'), current_setting('log_min_error_statement')",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("read the log settings inside the transaction");
+    assert_eq!(statement_log, "none", "statements are not logged");
+    assert_eq!(error_log, "panic", "a failing statement's text is not logged");
+    transaction.rollback().await.expect("roll the probe back");
+}
+
+/// On the audit trail the console role cannot change a row at all, not even
+/// the links the trigger would admit: a grant on those columns would let
+/// it unlink an audit row directly. The `ON DELETE SET NULL` path does not
+/// need that grant (see the delete tests below).
+#[tokio::test]
+async fn on_the_audit_trail_the_console_role_cannot_change_a_row() {
     let fixture = RoleFixture::new().await;
     seed_a_run_and_an_audit_row(&fixture.owner_pool).await;
 
-    sqlx::query("UPDATE audit_event SET run_id = NULL WHERE id = 'sec78_evt'")
+    let cleared_run = sqlx::query("UPDATE audit_event SET run_id = NULL WHERE id = 'sec78_evt'")
         .execute(&fixture.app_pool)
-        .await
-        .expect("clearing the run link is what the trigger admits");
-    let run_id: Option<String> =
-        sqlx::query_scalar("SELECT run_id FROM audit_event WHERE id = 'sec78_evt'")
-            .fetch_one(&fixture.app_pool)
-            .await
-            .expect("select the audit row as the console role");
-    assert_eq!(run_id, None, "the link is cleared");
+        .await;
+    assert_refused_by_privilege(cleared_run, "the console role clearing the run link directly");
 
-    sqlx::query("UPDATE audit_event SET approval_id = NULL WHERE id = 'sec78_evt'")
-        .execute(&fixture.app_pool)
-        .await
-        .expect("clearing the approval link is what the trigger admits");
+    let cleared_approval =
+        sqlx::query("UPDATE audit_event SET approval_id = NULL WHERE id = 'sec78_evt'")
+            .execute(&fixture.app_pool)
+            .await;
+    assert_refused_by_privilege(
+        cleared_approval,
+        "the console role clearing the approval link directly",
+    );
 
     let pointed =
         sqlx::query("UPDATE audit_event SET run_id = 'sec78_other_run' WHERE id = 'sec78_evt'")
             .execute(&fixture.app_pool)
             .await;
-    assert!(
-        pointed.is_err(),
-        "pointing a link at another row is a change of the record and is refused"
-    );
-
-    let pointed_approval =
-        sqlx::query("UPDATE audit_event SET approval_id = 'sec78_appr' WHERE id = 'sec78_evt'")
-            .execute(&fixture.app_pool)
-            .await;
-    assert!(
-        pointed_approval.is_err(),
-        "pointing the approval link at another row is refused the same way"
-    );
+    assert_refused_by_privilege(pointed, "the console role pointing a run link at another row");
 
     let other_column =
         sqlx::query("UPDATE audit_event SET action = 'sec78.other' WHERE id = 'sec78_evt'")

@@ -55,11 +55,12 @@ pub struct AppendOnlyTable {
     /// The columns an `UPDATE` may change. Empty means the table refuses
     /// every change.
     ///
-    /// `audit_event` admits two, because its trigger admits two: clearing
-    /// `run_id` or `approval_id` to `NULL` is what the `ON DELETE SET NULL`
-    /// of those foreign keys does, and the audit row must survive that.
-    /// Every other change is refused by the trigger, so the grant and the
-    /// trigger agree.
+    /// `audit_event` admits none. The `ON DELETE SET NULL` of its
+    /// `run_id` and `approval_id` foreign keys runs as the owner of the
+    /// referencing table, and Postgres does not check the deleting role's
+    /// privileges on that action, so the console role needs no `UPDATE`
+    /// to keep the audit row when its run or approval is deleted. A grant
+    /// would let the console clear those links by a plain `UPDATE`.
     pub allowed_update_columns: &'static [&'static str],
 }
 
@@ -71,7 +72,7 @@ pub struct AppendOnlyTable {
 pub const APPEND_ONLY_TABLES: &[AppendOnlyTable] = &[
     AppendOnlyTable {
         table: "public.audit_event",
-        allowed_update_columns: &["run_id", "approval_id"],
+        allowed_update_columns: &[],
     },
     AppendOnlyTable {
         table: "public.usage_rate",
@@ -268,14 +269,36 @@ async fn set_role_attributes_and_password(
     .fetch_one(pool)
     .await
     .map_err(RoleSetupError::Refused)?;
+    // The statement carries the plain password as a literal. The server
+    // logs a statement's text under the default `log_min_error_statement`
+    // (a failing one) and under an operator's `log_statement`, so both are
+    // switched off for this one transaction. `SET LOCAL` ends with it, so
+    // no other statement of this session is affected. The migrate role is
+    // a superuser, which these settings require.
+    let mut transaction = pool.begin().await.map_err(RoleSetupError::Refused)?;
+    for guard in PASSWORD_LOG_GUARD {
+        sqlx::query(guard)
+            .execute(&mut *transaction)
+            .await
+            .map_err(RoleSetupError::Refused)?;
+    }
     sqlx::query(sqlx::AssertSqlSafe(statement))
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|err| RoleSetupError::PasswordRefused {
             sqlstate: sqlstate_of(&err),
         })?;
+    transaction.commit().await.map_err(RoleSetupError::Refused)?;
     Ok(())
 }
+
+/// The `SET LOCAL` statements that keep a password statement out of the
+/// server log. Constants, so the test in `tests/db_roles.rs` runs the same
+/// statements the setup runs.
+pub const PASSWORD_LOG_GUARD: [&str; 2] = [
+    "SET LOCAL log_statement = 'none'",
+    "SET LOCAL log_min_error_statement = 'panic'",
+];
 
 /// Grant the role `CONNECT` on the database the console uses.
 ///

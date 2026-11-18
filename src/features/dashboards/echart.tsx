@@ -7,6 +7,16 @@ import { readView, withView } from "@/lib/geo-view";
 import { useRenderMode } from "./render-mode";
 
 /**
+ * BI-32: a stable fingerprint of an option, for "is this the same chart?".
+ * The tile rebuilds its option on every render, so its identity says nothing;
+ * a function (a formatter) is compared by its source, since a fresh closure
+ * of the same code draws the same text.
+ */
+export function optionKey(option: unknown): string {
+  return JSON.stringify(option, (_k, v) => (typeof v === "function" ? `fn:${Function.prototype.toString.call(v)}` : v));
+}
+
+/**
  * A thin Apache ECharts wrapper for React 19 — no echarts-for-react, for
  * full control (React 19) and a single dependency. Takes a finished
  * `option` (built theme-aware in chart-option.ts) and handles
@@ -18,6 +28,7 @@ export function EChart({
   onDataClick,
   keepView,
   onChart,
+  optionDeps,
 }: {
   option: echarts.EChartsOption;
   height?: number | string;
@@ -37,6 +48,13 @@ export function EChart({
   keepView?: boolean;
   /** Receives the ECharts instance once created (and `null` on dispose), for zoom controls. */
   onChart?: (chart: echarts.ECharts | null) => void;
+  /**
+   * BI-32 review: what the option's formatter functions close over (number
+   * format, locale, decimals, theme…). Functions are compared by source, so
+   * the same code over other values would look unchanged; pass those values
+   * here and a change of them applies the option again.
+   */
+  optionDeps?: unknown;
 }) {
   const elRef = React.useRef<HTMLDivElement>(null);
   const chartRef = React.useRef<echarts.ECharts | null>(null);
@@ -47,6 +65,8 @@ export function EChart({
   const chartCbRef = React.useRef(onChart);
   React.useEffect(() => { chartCbRef.current = onChart; }, [onChart]);
   const hasOption = React.useRef(false);
+  // BI-32: the fingerprint of the option the chart now shows.
+  const appliedKey = React.useRef<string | null>(null);
   // BI-1: under the PDF print view the chart draws without animation and
   // tells the view when it has drawn (see `render-mode.tsx`).
   const renderMode = useRenderMode();
@@ -90,19 +110,28 @@ export function EChart({
       chart.dispose();
       chartRef.current = null;
       hasOption.current = false;
+      appliedKey.current = null;
     };
   }, [renderMode]);
 
   React.useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
+    // BI-32: the dashboard page re-renders with every streamed assistant
+    // message and rebuilds each tile's option, equal in content but new in
+    // identity. `setOption(…, true)` replays the entrance animation (a
+    // reference line redrawn from the left), so an option that says the same
+    // as the one on screen is not applied again.
+    const key = `${keepView ? "v" : ""}${renderMode ? "r" : ""}${optionKey(optionDeps)}|${optionKey(option)}`;
+    if (appliedKey.current === key) return;
+    appliedKey.current = key;
     // The first option has no view to keep (getOption would be empty).
     const base = keepView && hasOption.current ? withView(option, readView(chart.getOption())) : option;
     const next = renderMode ? { ...base, animation: false } : base;
     // notMerge=true so theme/option changes are clean (no stacking of old series).
     chart.setOption(next, true);
     hasOption.current = true;
-  }, [option, keepView, renderMode]);
+  }, [option, optionDeps, keepView, renderMode]);
 
   return <div ref={elRef} style={{ width: "100%", height, cursor: onDataClick ? "pointer" : "default" }} />;
 }

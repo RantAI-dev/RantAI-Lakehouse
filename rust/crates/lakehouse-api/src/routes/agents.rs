@@ -440,11 +440,21 @@ fn list_tools_body(usage_counts: &[(String, i64)]) -> Vec<RegistryTool> {
 /// `agent_tool`-table "register a tool" endpoint) is removed entirely —
 /// see this module's doc comment.
 ///
+/// `SEC-20` (plan 100): the counts are the caller's own organisation's, so
+/// a count never says how often another organisation ran a tool.
+///
 /// # Errors
 ///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_tools(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<RegistryTool>>> {
-    let usage_counts = agents::tool_usage_counts_30d(pool(&state)?).await?;
+/// 404 for a forged `X-Tenant` header. 503 if no pool is configured; 500 on a
+/// database failure.
+pub async fn list_tools(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Vec<RegistryTool>>> {
+    let scope =
+        crate::routes::audit_scope::scope_for_principal(&state, &principal, &headers).await?;
+    let usage_counts = agents::tool_usage_counts_30d(pool(&state)?, &scope).await?;
     Ok(ApiJson(list_tools_body(&usage_counts)))
 }
 
@@ -857,7 +867,10 @@ pub async fn decide_approval(
         approval.resource.as_deref(),
         &json!({}),
         if ok { "executed" } else { "failed" },
-        None,
+        // The browser's copy of the failure, the fixed sentence and the
+        // reference (plan 111): the row says why the call failed, and the
+        // engine's own text stays out of the audit trail.
+        shown.get("error").and_then(Value::as_str),
         Some(&run_id),
         Some(&id),
     )
@@ -984,8 +997,7 @@ fn check_employee_run_auth(
 
 /// The headless loop's own iteration cap — same value as `routes::ai`'s
 /// `MAX_ITER` (kept as an independent constant rather than importing that
-/// private one: see the module doc comment on why this route cannot reach
-/// into `routes::ai::gate`).
+/// private one: `routes::ai` keeps it to itself).
 const MAX_HEADLESS_ITER: u32 = 8;
 
 /// How one headless run's tool-calling loop ended.
@@ -1215,7 +1227,7 @@ async fn run_headless_loop(
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line reimplementation of routes::ai::chat's own tool-calling loop \
-              plus the three gate checks routes::ai::gate keeps private; splitting it up would \
+              plus the three gate checks a headless run reimplements; splitting it up would \
               scatter one sequential loop across helpers with no independent reuse, matching \
               routes::ai::chat's own identical justification"
 )]
@@ -1479,8 +1491,8 @@ async fn run_headless_loop_inner(
 
             // Ask-mode gate: identical semantics to `routes::ai::gate::decide`'s
             // first check, reimplemented here rather than called there — see
-            // the module doc comment on why this route cannot reach the
-            // private `routes::ai::gate` module.
+            // the module doc comment on why this route reimplements the
+            // gate's checks itself.
             if !is_build && is_write {
                 step_no += 1;
                 let detail = format!(
@@ -1597,8 +1609,13 @@ async fn run_headless_loop_inner(
                         tool: spec.name,
                         resource: resource_id.as_deref(),
                         reason: &reason,
-                        risk: "High-risk action (WriteHigh): cannot be undone once \
-                               executed.",
+                        // The sentence the chat's approval card shows for
+                        // this tool (`ai_gate::risk_for_write_high`): a
+                        // deleted chart goes to the trash and stays
+                        // restorable, so the generic "cannot be undone"
+                        // text was false on this very card (`AI-1`,
+                        // `GOV-13`).
+                        risk: ai_gate::risk_for_write_high(spec),
                         redacted_args: &redacted,
                         // SEC-57: the approval names the HUMAN who started
                         // this run, when a person started it — so the API
@@ -1702,7 +1719,11 @@ async fn run_headless_loop_inner(
                 resource_id.as_deref(),
                 &Value::Object(args.clone()),
                 if ok { "executed" } else { "failed" },
-                None,
+                // The browser's copy of the failure, the fixed sentence and
+                // the reference (plan 111): the row says why the call
+                // failed, and the engine's own text stays out of the audit
+                // trail.
+                shown.get("error").and_then(Value::as_str),
                 run_id,
                 None,
             )
@@ -1755,17 +1776,20 @@ fn push_tool_result(
 /// # Why this can't just call into `routes::ai`
 ///
 /// `routes::ai::gate` (mode + permission gate, `WriteLow` confirmation,
-/// `WriteHigh` approval creation) is a PRIVATE module of `routes::ai`
-/// (`mod gate;`, not `pub(in crate::routes)`) — only `routes::ai::chat`
-/// and `routes::ai::tool_call` can call it. This handler reimplements the
-/// same three checks (ask-mode refusal, permission-ceiling refusal,
-/// `WriteHigh` → approval) directly in [`run_headless_loop`] rather than
-/// editing that module's visibility, and reuses everything that IS already
-/// shared across `routes::ai`'s sibling modules: [`ai_tools::run_tool`]
-/// (the actual dispatch), [`ai_registry::find`]/[`ai_registry::tool_schemas_for`]
-/// (the tool table), and [`ai_audit::redact`]/[`ai_audit::resource_for`]
-/// (the redaction/resource-inference rules) — never a second, divergent
-/// copy of THOSE.
+/// `WriteHigh` approval creation) is `pub(in crate::routes)`, so a sibling
+/// module of `routes::ai` can call it, and this route reuses its
+/// [`ai_gate::permission_granted`] and [`ai_gate::risk_for_write_high`].
+/// The three checks themselves (ask-mode refusal, permission-ceiling
+/// refusal, `WriteHigh` → approval) are reimplemented directly in
+/// [`run_headless_loop`], because a headless run has no chat turn to
+/// confirm in and creates its own linked approval. Everything that IS
+/// already shared across `routes::ai`'s sibling modules is reused:
+/// [`ai_tools::run_tool`] (the actual dispatch),
+/// [`ai_registry::find`]/[`ai_registry::tool_schemas_for`] (the tool table),
+/// and [`ai_audit::redact`]/[`ai_audit::resource_for`] (the
+/// redaction/resource-inference rules) — never a second, divergent copy of
+/// THOSE. The system prompt's constants are private to `routes::ai`, so the
+/// headless run has a prompt of its own.
 ///
 /// # Auth (see [`check_employee_run_auth`])
 ///

@@ -8,7 +8,11 @@
 pub(crate) mod agents;
 pub(crate) mod ai;
 mod alerts;
+// `SEC-20` (plan 100): the ONE place that turns a caller's reach into the
+// audit trail's tenant rule, so every reader of the trail narrows the same
+// way.
 mod audit_events;
+pub(crate) mod audit_scope;
 pub mod auth;
 // `DATA-42` D7: the `ClickHouse` registry fixture the readers' tests share
 // (`governance`, `overview`, `storage`, `lineage`, `catalog_profile`).
@@ -1399,6 +1403,8 @@ pub fn router(state: AppState) -> Router {
             "/api/usage/rates",
             get(usage::list_rates).post(usage::create_rate),
         )
+        // OPS-8 part C: the size of every layer, for the platform operator.
+        .route("/api/usage/storage", get(usage::storage))
         .merge(governance_static_router())
         .route(
             "/api/governance/{kind}",

@@ -82,7 +82,7 @@ jobs:
           # a rotation of STAGING_POSTGRES_PASSWORD carries through on the
           # next deploy.
           #
-          # base64url (`tr '+/' '-_'`), not plain base64: a plain base64
+          # base64url (`urlsafe_b64encode`), not plain base64: a plain base64
           # value can hold `/` or `+`, and compose builds a DSN out of this
           # value.
           if ! command -v python3 >/dev/null 2>&1; then
@@ -202,7 +202,8 @@ jobs:
           for name in OIDC_ISSUER OIDC_CLIENT_ID OIDC_PROVIDER_NAME \
                       OIDC_AUTHORIZE_URL OIDC_TOKEN_URL OIDC_JWKS_URL \
                       OIDC_REDIRECT_URI OIDC_GROUPS_CLAIM OIDC_ROLE_MAP \
-                      OIDC_JIT_PROVISIONING OIDC_TRUST_EMAIL \
+                      OIDC_JIT_PROVISIONING OIDC_TRUST_EMAIL OIDC_PROMPT \
+                      OIDC_POST_LOGOUT_REDIRECT_URI \
                       SSO_PUBLIC_BASE_URL SSO_REALM; do
             sed -i "/^${name}=/d" .env
           done
@@ -229,6 +230,17 @@ jobs:
             # the safer default stays: a sign-in never joins an existing
             # account on an unconfirmed address.
             printf 'OIDC_TRUST_EMAIL=false\n'
+            # The provider shows its login form on every sign-in, so the
+            # account is the person's choice: without it, "sign out, then
+            # sign in" lands on whoever used that browser last, because the
+            # provider still holds the session it created for it.
+            printf 'OIDC_PROMPT=login\n'
+            # Where the provider sends the browser back to after the sign-out
+            # ends the provider's session too. The provider refuses a
+            # logout whose return address it does not know, so the realm's
+            # client carries the same address (the realm renderer injects
+            # it).
+            printf 'OIDC_POST_LOGOUT_REDIRECT_URI=%s/login\n' "$sso_console"
           } >> .env
           if [ -n "$missing" ]; then
             echo "::error::staging secrets not set:$missing (Settings > Secrets and variables > Actions)"

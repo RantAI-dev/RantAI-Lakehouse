@@ -1251,6 +1251,17 @@ pub struct EffectiveSso {
     pub redirect_uri: Option<String>,
     /// Where [`Self::redirect_uri`] came from.
     pub redirect_uri_source: Source,
+    /// The provider's RP-initiated logout endpoint (`end_session_endpoint`),
+    /// read from its discovery document. `None` when the provider publishes
+    /// none: the sign-out then ends this deployment's session only.
+    pub end_session_endpoint: Option<String>,
+    /// The `prompt` parameter the browser sign-in sends to the provider.
+    /// `None` when the operator asked for none (`OIDC_PROMPT=` present but
+    /// empty): the provider then decides whether to show its login form or
+    /// answer from the session it already holds for that browser.
+    pub prompt: Option<String>,
+    /// Where [`Self::prompt`] came from.
+    pub prompt_source: Source,
     /// Clock skew in seconds.
     pub clock_skew_seconds: u64,
 }
@@ -1427,6 +1438,24 @@ pub fn resolve_sso(
         (None, Source::Default)
     };
 
+    // The `prompt` the browser sign-in sends. It is a server-side setting
+    // (the console's SSO form does not carry it) and the value already
+    // carries the default: `Config` fills `"login"` when `OIDC_PROMPT` is
+    // empty (compose always passes it) and the deployment's own `off`
+    // means "send no prompt at all".
+    let prompt =
+        (config.oidc_prompt != crate::config::OIDC_PROMPT_OFF).then(|| config.oidc_prompt.clone());
+    let prompt_source = if config.oidc_prompt_from_env {
+        Source::Server
+    } else {
+        Source::Default
+    };
+
+    // The provider's logout endpoint is read from its discovery document
+    // (like the authorize and token addresses), not from the environment:
+    // it is the provider's own address, not an operator's setting.
+    let end_session_endpoint: Option<String> = None;
+
     let (provider_name, provider_name_source) = if config.oidc_provider_name_from_env {
         (config.oidc_provider_name.clone(), Source::Server)
     } else if let Some(name) = stored.and_then(|s| s.oidc_provider_name.as_deref()) {
@@ -1511,6 +1540,9 @@ pub fn resolve_sso(
         jwks_url_source,
         redirect_uri,
         redirect_uri_source,
+        end_session_endpoint,
+        prompt,
+        prompt_source,
         clock_skew_seconds: config.oidc_clock_skew_seconds,
     }
 }
@@ -1854,6 +1886,21 @@ pub fn draft_sso_settings(config: &Config, draft: &serde_json::Value) -> Effecti
         } else {
             Source::Default
         },
+        // The draft is a console-set connection: its addresses are read from
+        // the provider's discovery document when the draft is built, so the
+        // draft carries the same logout endpoint the saved connection has.
+        end_session_endpoint: None,
+        // The test sign-in drives the same authorize request as the real
+        // one, so it carries the same prompt: a draft tested against a
+        // provider that still holds a session must ask for the form too,
+        // or the test signs the tester in as somebody else.
+        prompt: (config.oidc_prompt != crate::config::OIDC_PROMPT_OFF)
+            .then(|| config.oidc_prompt.clone()),
+        prompt_source: if config.oidc_prompt_from_env {
+            Source::Server
+        } else {
+            Source::Default
+        },
         clock_skew_seconds: config.oidc_clock_skew_seconds,
     }
 }
@@ -2052,6 +2099,10 @@ async fn build_sso_runtime(
         .clone()
         .or_else(|| Some(endpoints.jwks_uri.clone()));
     settings.redirect_uri = Some(redirect_uri);
+    // The provider's logout endpoint, when its discovery document names
+    // one: the sign-out can then end the provider's session too, so the
+    // next sign-in does not land on the account that signed in last.
+    settings.end_session_endpoint = endpoints.end_session_endpoint.clone();
 
     // One client, pinned to every address this connection was allowed to
     // reach: the issuer, and the three the document named. A value the
@@ -2745,6 +2796,29 @@ mod tests {
         assert_eq!(eff.client_secret.expose_secret(), "env-secret");
         assert_eq!(eff.client_secret_source, Source::Server);
         assert!(eff.is_configured());
+    }
+
+    // The `prompt` the browser sign-in sends. It is the deployment's own
+    // setting (the console's SSO form does not carry it), and it does not
+    // depend on the saved row: nothing in the console can change it.
+    #[test]
+    fn the_prompt_is_the_deployments_own_and_defaults_to_login() {
+        let cfg = config(&[]);
+        let eff = resolve_sso(&cfg, None, None);
+        assert_eq!(eff.prompt.as_deref(), Some("login"));
+        assert_eq!(eff.prompt_source, Source::Default);
+
+        let cfg = config(&[("OIDC_PROMPT", "select_account")]);
+        let eff = resolve_sso(&cfg, None, None);
+        assert_eq!(eff.prompt.as_deref(), Some("select_account"));
+        assert_eq!(eff.prompt_source, Source::Server);
+
+        // `off`: the deployment's own spelling for "send no prompt at all",
+        // so the provider reuses its own session.
+        let cfg = config(&[("OIDC_PROMPT", "off")]);
+        let eff = resolve_sso(&cfg, None, None);
+        assert_eq!(eff.prompt, None);
+        assert_eq!(eff.prompt_source, Source::Server);
     }
 
     #[test]

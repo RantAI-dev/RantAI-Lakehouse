@@ -227,8 +227,8 @@ No per-item browser QA and no reviewer re-run of the suites (owner's instruction
 Open, for the product owner:
 
 1. T3, alerts on a metric, is not built: acceptance item 6 of the feature page is **not met**. Today's alert rules have no owner and run as the fixed embed viewer role. Options in the handoff: A, build it on those terms; B, give rules an owner first; C, leave it out of this phase.
-2. Whether a seeded role should hold `metric:write` by default (a seed migration, `0067`).
-3. Metric and segment definitions (name, formula, filter values, table name) are readable by anyone with `dashboard:read`, as calculated fields are; only the numbers go through the viewer's policy rewrite.
+2. Whether a seeded role should hold `metric:write` by default (a seed migration, `0067`). **Owner, 2026-11-13 (`BI-31`):** no seed change. `metric:write` follows `dashboard:write`: the only seeded role that edits dashboards is Platform Admin, which holds it through `*:*`; a role an administrator makes to edit dashboards should be given `metric:write` with `dashboard:write`.
+3. Metric and segment definitions (name, formula, filter values, table name) are readable by anyone with `dashboard:read`, as calculated fields are; only the numbers go through the viewer's policy rewrite. **Owner, 2026-11-13 (`BI-31`):** confirmed as built.
 
 The reviewer's smoke check on a running API is recorded in the next entry.
 

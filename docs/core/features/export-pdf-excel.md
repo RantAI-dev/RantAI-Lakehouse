@@ -98,3 +98,14 @@ Run by the product owner on a running console. A step not performed is never a p
 - `BI-1-AC4` A user whose roles are switched off cannot download, a deployment without Gotenberg says so, and a failure shows a plain sentence.
 - `BI-1-AC5` Excel "formatted" shows Rp 1,2 M style values that are still numbers in Excel.
 - `AI-10-AC2` "Give me this dashboard as a PDF" returns a link that downloads it.
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-1-AC1`: pass.
+- `BI-1-AC2`: pass.
+- `BI-1-AC3`: pass.
+- `BI-1-AC4`: partial: the refusals and plain failure sentences were seen; switching Gotenberg off was not done on the shared QA stack.
+- `BI-1-AC5`: pass.
+- `AI-10-AC2`: pass.

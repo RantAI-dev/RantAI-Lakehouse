@@ -23,6 +23,8 @@ import {
   type LucideIcon,
 } from "lucide-react"
 
+import { PRODUCT_NAME } from "@/lib/product-branding"
+
 export type NavItem = {
   title: string
   href: string
@@ -259,14 +261,19 @@ export function activeNavHref(pathname: string): string | undefined {
 
 /**
  * Resolves the product page title for a pathname by longest matching href.
- * Secondary routes win over their parent nav item. Falls back to "Rantai Lake".
+ * Secondary routes win over their parent nav item. A path no item names
+ * falls back to `fallback`: the workspace's own name (`ADM-2` decision 13),
+ * or the product's own name when the caller passes none.
+ *
+ * The function stays pure: the fallback comes in as an argument, never from
+ * a hook inside it, so the caller decides whose name it is.
  */
-export function pageTitleFor(pathname: string): string {
+export function pageTitleFor(pathname: string, fallback: string = PRODUCT_NAME): string {
   const match = bestMatch(pathname, [
     ...SECONDARY_ROUTES,
     ...ALL_NAV_ITEMS.map(({ title, href }) => ({ title, href })),
   ])
-  return match?.title ?? "Rantai Lake"
+  return match?.title ?? fallback
 }
 
 export type RouteAccessEntry = {

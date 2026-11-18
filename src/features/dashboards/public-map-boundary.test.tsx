@@ -71,8 +71,8 @@ beforeEach(() => {
   apiFetchCalls.length = 0
   requested.length = 0
   drawn.length = 0
-  // happy-dom starts on `about:blank`; the logo in the public header is a
-  // `next/image`, which needs a real URL to build its `srcSet`.
+  // happy-dom starts on `about:blank`; a relative URL has no base to
+  // resolve against.
   ;(window as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM.setURL(
     "http://localhost/",
   )
@@ -83,19 +83,24 @@ afterEach(() => {
 })
 
 describe("a public link reads an uploaded map through its own token", () => {
-  it("asks the link's own route for the boundary and never reaches apiFetch", async () => {
+  it("asks the link's own route for the boundary, and the only apiFetch call is the public branding one", async () => {
     serve("m_aa11bb22cc33")
     render(<PublicDashboard token="tok" />)
     await waitFor(() => expect(drawn.length).toBeGreaterThan(0))
     expect(requested).toContain("/api/public/dashboard/tok/maps/m_aa11bb22cc33/geojson")
-    expect(apiFetchCalls).toEqual([])
+    // The map's boundary is read through the link's own route, never through
+    // `apiFetch`, whose 401 sends an anonymous viewer to the login page. The
+    // workspace's own name (`ADM-2`) is a public route and does go through
+    // `apiFetch` — every fetch of the console takes that one path — so it is
+    // named here instead of being hidden.
+    expect(apiFetchCalls).toEqual(["/api/branding"])
   })
 
   it("says what happened when the boundary cannot be read, and does not redirect", async () => {
     serve("m_bb22cc33dd44", 404)
     render(<PublicDashboard token="tok" />)
     expect(await screen.findByText("This map's boundary file could not be loaded.")).toBeTruthy()
-    expect(apiFetchCalls).toEqual([])
+    expect(apiFetchCalls).toEqual(["/api/branding"])
   })
 })
 

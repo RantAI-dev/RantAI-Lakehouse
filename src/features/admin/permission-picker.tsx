@@ -16,6 +16,14 @@ export type PermissionPickerProps = {
   onChange: (value: string) => void
   disabled?: boolean
   permissions?: Permission[]
+  /** UX-1-R10: the accessible name of the checkbox group. */
+  label?: string
+  /**
+   * UX-1-R10: the group must have at least one permission, but no single
+   * checkbox is required. A `role="group"` with a linked sentence carries the
+   * rule; `aria-required` is unsupported on a group role, so it is not used.
+   */
+  required?: boolean
 }
 
 function parseTokens(raw: string): string[] {
@@ -65,7 +73,20 @@ export function PermissionPicker({
   onChange,
   disabled = false,
   permissions: permissionsProp,
+  label = "Permissions",
+  required = false,
 }: PermissionPickerProps) {
+  const helpId = `${id}-required-help`
+  // UX-1-R10: a named group with a linked requirement sentence, never an
+  // aria-required on the group or on each individual checkbox.
+  const groupA11y = {
+    role: "group" as const,
+    "aria-label": label,
+    ...(required ? { "aria-describedby": helpId } : {}),
+  }
+  const requiredNote = required ? (
+    <p id={helpId} className="text-xs text-muted-foreground">Select at least one permission.</p>
+  ) : null
   // WEB-8 review 1 B2: load through useService(identityService.listPermissions)
   const serviceState = useService(
     (signal) => identityService.listPermissions(signal),
@@ -241,7 +262,8 @@ export function PermissionPicker({
 
   if (hasFullAccess) {
     return (
-      <div className="space-y-4" id={id} data-testid="permission-picker">
+      <div {...groupA11y} className="space-y-4" id={id} data-testid="permission-picker">
+        {requiredNote}
         <div className="flex items-center gap-2 p-3 rounded-md border bg-muted/40" data-testid="full-access-box">
           <Checkbox
             id={`${id}-full-access`}
@@ -265,7 +287,8 @@ export function PermissionPicker({
   }
 
   return (
-    <div className="space-y-4" id={id} data-testid="permission-picker">
+    <div {...groupA11y} className="space-y-4" id={id} data-testid="permission-picker">
+      {requiredNote}
       {heldWildcards.length > 0 && renderHeldWildcards()}
       {unknownTokens.length > 0 && renderUnknownTokens()}
 
