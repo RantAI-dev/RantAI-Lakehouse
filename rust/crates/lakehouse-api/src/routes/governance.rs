@@ -192,8 +192,8 @@ pub(crate) async fn read_kind(
     // does not come through this function — it reads the trail itself, with
     // the person's own scope. The tool's own permission is the assistant's
     // registry's business (`GOV-1`): the tool asks the gate for the
-    // permission its spec names, and the spec is the one place that says
-    // which.
+    // permission its spec names, and the spec names `audit:read` (`GOV-1`,
+    // feature page Decision 9), so a person without it is refused there.
     if parsed == Kind::Audit
         && let Some(principal) = principal
         && !principal.has("audit:read")
