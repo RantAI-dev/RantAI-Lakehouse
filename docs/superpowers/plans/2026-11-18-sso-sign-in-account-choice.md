@@ -22,13 +22,13 @@ browser is):
 2nd sign-in (same jar, bob):   NO LOGIN FORM (silent re-auth)
 
 cookies the browser now holds:
-   192.168.18.143  KEYCLOAK_IDENTITY   path=/realms/lakehouse/
-   192.168.18.143  KEYCLOAK_SESSION    path=/realms/lakehouse/
-   192.168.18.143  AUTH_SESSION_ID     path=/realms/lakehouse/
-   192.168.18.143  KC_AUTH_SESSION_HASH path=/realms/lakehouse/
-   192.168.18.143  KC_RESTART          path=/realms/lakehouse/
-   192.168.18.143  lh_oidc_flow        path=/api/auth/oidc
-   192.168.18.143  lh_session          path=/
+   <staging-host>    KEYCLOAK_IDENTITY   path=/realms/lakehouse/
+   <staging-host>    KEYCLOAK_SESSION    path=/realms/lakehouse/
+   <staging-host>    AUTH_SESSION_ID     path=/realms/lakehouse/
+   <staging-host>    KC_AUTH_SESSION_HASH path=/realms/lakehouse/
+   <staging-host>    KC_RESTART          path=/realms/lakehouse/
+   <staging-host>    lh_oidc_flow        path=/api/auth/oidc
+   <staging-host>    lh_session          path=/
 ```
 
 The provider's cookies are the cause, and the deployment never ends them:
