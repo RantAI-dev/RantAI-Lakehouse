@@ -474,6 +474,13 @@ services:
       OIDC_AUTHORIZE_URL: ${OIDC_AUTHORIZE_URL:-}
       OIDC_TOKEN_URL: ${OIDC_TOKEN_URL:-}
       OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+      # Where the provider sends the browser back to after an RP-initiated
+      # logout. Unset (the default) means the sign-out ends this
+      # deployment's session only -- the provider keeps its own session for
+      # that browser, so the next sign-in is answered from it and lands on
+      # the account that signed in last. Must be registered with the
+      # provider as a valid post-logout redirect URI.
+      OIDC_POST_LOGOUT_REDIRECT_URI: ${OIDC_POST_LOGOUT_REDIRECT_URI:-}
       # ── Bootstrap admin: REQUIRED to be able to log in at all. There is
       #    deliberately no default credential — see docs/OPERATIONS.md. ──
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}

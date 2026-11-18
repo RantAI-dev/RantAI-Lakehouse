@@ -1,4 +1,4 @@
-import type { PasswordRulesResponse, Session } from "../contracts/auth";
+import type { LogoutResult, PasswordRulesResponse, Session } from "../contracts/auth";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
@@ -71,10 +71,17 @@ export async function login(identifier: string, password: string): Promise<Login
   return parse<LoginResult>(res, "Login failed.");
 }
 
-export async function logout(): Promise<void> {
+export async function logout(): Promise<LogoutResult | null> {
   // Best-effort: even if this fails (network blip, already-expired
   // session) the caller clears local state and navigates to /login anyway.
-  await apiFetch("/api/auth/logout", { method: "POST" }).catch(() => {});
+  // The answer names the provider's own logout address, so the provider's
+  // session ends with this deployment's — without it, the provider still
+  // holds the session it created for this browser and the next sign-in is
+  // answered from it.
+  const res = await apiFetch("/api/auth/logout", { method: "POST" }).catch(() => null);
+  if (!res || !res.ok) return null;
+  const body = (await res.json().catch(() => null)) as LogoutResult | null;
+  return body?.providerLogoutUrl ? body : null;
 }
 
 export async function me(signal?: AbortSignal): Promise<AuthUser> {
