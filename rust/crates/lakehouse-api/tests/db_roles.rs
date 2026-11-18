@@ -91,7 +91,12 @@ static ROLE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// connection, so the lock is released when the fixture is dropped.
 const CLUSTER_ROLE_LOCK_KEY: i64 = 7_800_078;
 
-struct ClusterRoleLock(sqlx::PgConnection);
+/// The session that holds the lock. Dropping it ends the session, and the
+/// session's locks with it; the field is never read, so it is named with a
+/// leading underscore.
+struct ClusterRoleLock {
+    _session: sqlx::PgConnection,
+}
 
 async fn take_cluster_role_lock() -> ClusterRoleLock {
     let mut url = url::Url::parse(&lakehouse_test_support::database_url())
@@ -105,7 +110,9 @@ async fn take_cluster_role_lock() -> ClusterRoleLock {
         .execute(&mut connection)
         .await
         .expect("take the cluster-wide console role lock");
-    ClusterRoleLock(connection)
+    ClusterRoleLock {
+        _session: connection,
+    }
 }
 
 /// A migrated database with the console's role set up on it, and a pool
