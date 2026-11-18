@@ -84,7 +84,38 @@ the reviewer, not the developer.
 
 ## Handoff
 
-(developer appends here)
+### Handoff (developer, 2026-11-18)
+
+Commits, in plan order:
+
+- `5e10388b9` fix(connectors): the console saves a Kafka connector as a stream (SRC-44)
+- `4bd20717e` fix(api): refuse a Kafka connector saved as a batch, and a stream on any other adapter (SRC-44)
+- `e3c505ac4` fix(db): move Kafka connectors saved as a batch to stream (SRC-44)
+
+Notes on the build:
+
+- T1: `ingestModeFor` in `src/lib/connectors/ingest-mode.ts` (+ test), used at the three anchors. The new create-page test (`ConnectorCreatePage, Kafka`) drives the wizard with a `kafka` type and asserts the saved spec has `ingestMode: "stream"`; with the create-page site put back to `"batch"` it fails (checked), so it guards the bug.
+- T2: `validate_ingest_mode` and `InvalidIngestMode` in `lakehouse-store::ingest_spec`, called in the ingest-spec PUT handler right after `validate_load_modes`. The test helper at `connectors.rs:5971` builds an `ingestible` with mode `batch` for non-cdc adapters; no test builds a Kafka spec through it, so it was left unchanged. The API test covers both refusals (kafka+batch, sql+stream) and checks the body is not echoed; kafka+stream acceptance is covered by the store unit test and by the existing `connector_repoint` Kafka saves (all pass).
+- T3: migration number `0149` is free (`origin/main` ends at `0148`). The `sqlx::test` re-runs the migration's SQL (`include_str!`) over seeded rows, twice, because the migration has already run on the empty test database.
+
+Commands run (foreground unless noted) and results:
+
+- `bun run typecheck`: pass (no errors).
+- `bun run lint`: 0 errors, 11 warnings (all pre-existing, none in files I touched).
+- `bun run test`: 4561 pass, 1 skip, 1 fail. The failure is `EmailSettingsForm (ADM-7) > never pre-fills the password...` (`src/features/admin/email-settings.test.tsx`); it passes in isolation (5 pass, 0 fail) and is unrelated (timing under full load).
+- `bun test src/features/connectors/connector-create-page.test.tsx`: 15 pass, 0 fail. `bun test src/lib/connectors/ingest-mode.test.ts`: 3 pass.
+- `cd rust && cargo fmt --check`: clean (rustfmt applied only to the two test files I changed).
+- `cargo clippy -p lakehouse-store --all-targets -- -D warnings` and `cargo clippy -p lakehouse-api --all-targets -- -D warnings`: clean.
+- `cargo test -p lakehouse-store`: lib 337 pass; integration 762 pass, 0 fail (includes `migration_0149_...` and `a_kafka_connector_is_saved_as_a_stream_and_only_a_kafka_connector_is`).
+- `cargo test -p lakehouse-api --test it connector_`: 127 pass, 0 fail (includes the new refusal test).
+- All cargo commands used `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-src44-target`.
+
+Not verified:
+
+- `cargo test -p lakehouse-api` as a whole (all test binaries) and `cargo test -p lakehouse-api --lib` (so `tests/route_auth.rs` and `tests/sec11_guard.rs` did not run): compiling the lakehouse-api test binaries ran for over 1.5 hours without finishing on this machine and was stopped. The change adds no route and no response text from an upstream error (the 400 sentence is a fixed string), and `clippy --all-targets` compiled every target clean, but the reviewer should run `cargo test -p lakehouse-api --test sec11_guard --test route_auth` and the lib tests.
+- Workspace-wide `cargo clippy --workspace` / `cargo test --workspace`, the Python tests and the compose checks: not run (no Python, compose or other-crate change); left to the reviewer and CI.
+- No browser or staging check of the console flow.
+
 
 ## Review
 
