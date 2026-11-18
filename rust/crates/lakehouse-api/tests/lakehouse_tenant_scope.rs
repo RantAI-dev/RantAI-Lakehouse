@@ -2224,6 +2224,22 @@ fn quality_assets(body: &Value) -> Vec<String> {
     assets
 }
 
+/// The ids of the observed quality rows of a body, in the order they came.
+///
+/// An observed row's id is `q-<n>` and numbers the rows of every tenant's
+/// observations, so it is the one field of a visible row that can say how many
+/// rows a filter dropped; an authored rule's id is a UUID and is not one.
+fn observed_quality_ids(body: &Value) -> Vec<String> {
+    body["quality"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of quality rules: {body}"))
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .filter(|id| id.starts_with("q-"))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The assets of the incidents in a body, sorted.
 fn incident_assets(body: &Value) -> Vec<String> {
     let mut assets: Vec<String> = body["incidents"]
@@ -2276,7 +2292,11 @@ async fn the_quality_list_holds_only_the_tables_the_caller_may_read() {
     let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
     claim_the_uploads(&pool).await;
     seed_the_quality_rows(&pool).await;
-    mount_observed_quality(&ch, &[GROUP_TABLE, RETAIL_TABLE]).await;
+    // The other tenant's table is mounted first on purpose: the ids of the
+    // observed rows number every tenant's rows, so a visible row that sorted
+    // after a hidden one would carry a gap in its id and say how many rows of
+    // another organisation's tables came before it.
+    mount_observed_quality(&ch, &[RETAIL_TABLE, GROUP_TABLE]).await;
     let uri = "/api/governance/quality";
     let owner = cookie_in_tenant(&pool, GOVERNANCE_READER, CATALOG_TENANT).await;
     let other = cookie_in_tenant(&pool, GOVERNANCE_READER, OTHER_TENANT).await;
@@ -2289,6 +2309,13 @@ async fn the_quality_list_holds_only_the_tables_the_caller_may_read() {
     assert_eq!(
         quality_assets(&body),
         vec![format!("bronze.{GROUP_TABLE}")],
+        "{body}"
+    );
+    // The visible row's id says nothing about the hidden row that sorted
+    // before it.
+    assert_eq!(
+        observed_quality_ids(&body),
+        vec!["q-0".to_owned()],
         "{body}"
     );
     assert_no_trace_of_the_retail_upload(uri, &body);
@@ -2309,6 +2336,13 @@ async fn the_quality_list_holds_only_the_tables_the_caller_may_read() {
             format!("bronze.{GROUP_TABLE}"),
             format!("bronze.{RETAIL_TABLE}")
         ],
+        "{body}"
+    );
+    // Nothing is hidden from an operator, so the ids are the ones every row
+    // carries.
+    assert_eq!(
+        observed_quality_ids(&body),
+        vec!["q-0".to_owned(), "q-1".to_owned()],
         "{body}"
     );
 }

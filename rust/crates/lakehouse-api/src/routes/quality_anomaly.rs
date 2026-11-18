@@ -391,7 +391,8 @@ pub async fn learning_status(
     // (`crate::routes::query::resolve_reach` and
     // `crate::routes::query::reachable_names`).
     let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
-    let readable = crate::routes::query::reachable_names(&state, reach, &[key.clone()]).await?;
+    let readable =
+        crate::routes::query::reachable_names(&state, reach, std::slice::from_ref(&key)).await?;
     if !readable.contains(&key) {
         return Err(
             ApiError::NotFound(crate::policy_engine::table_not_available_message(&key)).into(),

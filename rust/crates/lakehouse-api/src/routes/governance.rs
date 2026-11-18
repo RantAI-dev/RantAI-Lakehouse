@@ -231,6 +231,14 @@ pub(crate) async fn read_kind(
                 {
                     return ApiRejection(err).into_response();
                 }
+                // The observed rows are numbered after every filter has run,
+                // so an id says nothing about the rows a filter dropped
+                // (`GOV-15`, review round 1 (R1)). The other kinds carry ids
+                // of their own — a classification row's slug, an audit run's
+                // id, a maintenance row none — and are left as they are.
+                if parsed == Kind::Quality {
+                    renumber_observed_quality_rows(&mut body);
+                }
                 (StatusCode::OK, ApiJson(body)).into_response()
             }
             // Every branch shares one outer `catch (e)` returning
@@ -246,15 +254,18 @@ pub(crate) async fn read_kind(
 
 /// Drops every quality row whose `asset` the caller's table access hides, in
 /// place — the rule [`crate::routes::catalog::retain_visible`] applies to the
-/// catalog's own rows (`GOV-15` D6) — and gives the kept observed rows
-/// positional ids from the kept order, so an id says nothing about hidden rows
-/// (`GOV-15`, review round 1 (R1)).
+/// catalog's own rows (`GOV-15` D6).
 ///
 /// `retain_visible` itself cannot be called: it reads a row's `tableKey` or
 /// dotted `id`, while a quality row's key is its `asset` (an authored rule's
 /// `id` is a UUID, an observed row's `q-<n>`). A row with no `asset` string is
 /// hidden from a narrowed caller, as is an `asset` with no schema: nothing
 /// proves the grant covers it (fail closed).
+///
+/// The ids of the rows that are left are not renumbered here: this filter is
+/// one of the two that hide rows, and a row the other one drops would leave a
+/// gap in them. [`renumber_observed_quality_rows`] numbers them once both
+/// have run.
 fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut Value) {
     if access.is_all() {
         return;
@@ -268,10 +279,24 @@ fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut V
             .map(str::trim)
             .is_some_and(|asset| access.allows_key(asset))
     });
-    // The kept observed rows take their positional ids from the kept order
-    // (`q-0`, `q-1`, …): an id from the list before the filter would tell the
-    // caller how many hidden rows sorted before a visible one (`GOV-15`,
-    // review round 1 (R1)). An authored rule's id is a UUID and is left alone.
+}
+
+/// Numbers the observed rows of the quality list from the order they are left
+/// in, in place.
+///
+/// An observed row's id is `q-<n>`, and that number counts the observations of
+/// every tenant's tables, so an id taken before the filters ran would tell
+/// the caller how many rows of another organisation's tables sorted before a
+/// visible one (`GOV-15`, review round 1 (R1)). The numbers are therefore
+/// taken once every filter has run, so an id says nothing about what a filter
+/// dropped.
+///
+/// Only an observed row is renumbered: its id starts with `q-`, while an
+/// authored rule's id is a UUID and stays as it is.
+fn renumber_observed_quality_rows(body: &mut Value) {
+    let Some(rows) = body.get_mut("quality").and_then(Value::as_array_mut) else {
+        return;
+    };
     for (index, row) in rows
         .iter_mut()
         .filter(|row| {

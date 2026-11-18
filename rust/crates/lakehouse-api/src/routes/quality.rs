@@ -883,7 +883,8 @@ pub async fn rule_runs(
     // other tenants' rules.
     let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
     let readable =
-        crate::routes::query::reachable_names(&state, reach, &[rule.asset.clone()]).await?;
+        crate::routes::query::reachable_names(&state, reach, std::slice::from_ref(&rule.asset))
+            .await?;
     if !readable.contains(&rule.asset) {
         return Err(ApiError::NotFound("Quality rule not found".to_owned()).into());
     }
