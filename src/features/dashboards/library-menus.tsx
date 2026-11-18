@@ -226,7 +226,9 @@ export function ItemMenu({ item, actions, className }: {
                 <Plus /> Use template…
               </DropdownMenuItem>
             ) : null}
-            {actions.onDeleteTemplate ? (
+            {/* Decision T6 (PR #528 review SHOULD-FIX 2): Delete only where the
+                server allows it, the template's creator or an administrator. */}
+            {actions.onDeleteTemplate && item.template?.canDelete ? (
               <>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem variant="destructive" onClick={() => actions.onDeleteTemplate?.(item)}>
