@@ -1051,6 +1051,84 @@ async fn a_successful_run_sql_answers_its_rows() {
     assert!(body["result"].get("error").is_none(), "{body}");
 }
 
+// ── GOV-1: the audit history tool needs `audit:read` ──────────────────────
+//
+// The audit page (`GET /api/governance/audit`) asks for `audit:read` on top
+// of the `governance:read` that opens the route, because every role holds
+// that one (`GOV-1`, feature page Decision 9). The assistant's
+// `get_audit_history` tool reads the same trail, so it asks for the same
+// permission: a person without `audit:read` is refused by name, and the
+// refusal carries no row of the trail.
+
+/// `GOV-1`: a caller with `governance:read` and no `audit:read` is refused
+/// the audit history tool by name, with no row of the trail in the answer;
+/// a caller with `audit:read` gets the trail.
+///
+/// The deployment holds no tenant here (`leave_no_seeded_tenants`), so every
+/// reader's reach is the whole trail (`SEC-20`): the test is about the
+/// permission, not about the reach.
+#[tokio::test]
+async fn the_audit_history_tool_is_refused_without_audit_read_and_answers_the_trail_with_it() {
+    let TestApp { router, pool } = spin_up().await;
+    common::leave_no_seeded_tenants(&pool).await;
+
+    let reader = common::create_assistant_principal(&pool, "governance:read").await;
+    let reader_cookie = common::session_cookie_for_user(&pool, reader).await;
+
+    let resp = post_tool(
+        &router,
+        Some(&reader_cookie),
+        json!({ "tool": "get_audit_history", "args": {}, "mode": "build" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("refused"), "{body}");
+    assert_eq!(body["result"]["reason"], json!("permission"), "{body}");
+    assert_eq!(body["result"]["required"], json!("audit:read"), "{body}");
+    assert_eq!(body["result"]["tool"], json!("get_audit_history"), "{body}");
+    assert!(
+        body["result"].get("audit").is_none(),
+        "a refused call must carry no row of the trail: {body}"
+    );
+
+    // The refusal is audited, so the trail the next reader sees holds the
+    // call that was refused.
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .expect("list audit events");
+    let ours: Vec<_> = events
+        .iter()
+        .filter(|e| e.action == "get_audit_history")
+        .collect();
+    assert_eq!(ours.len(), 1, "exactly one audit row for this call");
+    assert_eq!(ours[0].outcome, "refused");
+
+    let auditor = common::create_assistant_principal(&pool, "governance:read,audit:read").await;
+    let auditor_cookie = common::session_cookie_for_user(&pool, auditor).await;
+
+    let resp = post_tool(
+        &router,
+        Some(&auditor_cookie),
+        json!({ "tool": "get_audit_history", "args": {}, "mode": "build" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("executed"), "{body}");
+    let rows = body["result"]["audit"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an audit array: {body}"));
+    let actions: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["action"].as_str())
+        .collect();
+    assert!(
+        actions.contains(&"get_audit_history"),
+        "the trail must hold the refused call: {actions:?}"
+    );
+}
+
 /// LH-QS-2-08, unchanged: a failure that is already a fixed message (the
 /// engine did not answer) is answered as it is.
 #[tokio::test]
