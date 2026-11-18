@@ -256,13 +256,14 @@ export const semanticService = semanticClientService
 // `DATA-12` part 2). Free tags are not part of this.
 export const tagKeysService = tagKeysClientService
 // The Usage page: the runs of a period summed per day, person, engine or
-// tenant, the same sums as a CSV file, and the rates behind the estimate in
-// money (`/api/usage/*`, `OPS-8` part B). No mock ever existed.
+// tenant, the same sums as a CSV file, the rates behind the estimate in
+// money, and the size of every layer (`/api/usage/*`, `OPS-8` part B and C).
+// No mock ever existed.
 export const usageService = usageClientService
 /** The usage shapes the Usage feature reads from `@/services`. */
 export type {
   NewUsageRate, UsageExport, UsageGroup, UsageQuery, UsageRate, UsageRateKind, UsageRates,
-  UsageReport, UsageRow, UsageService,
+  UsageReport, UsageRow, UsageService, UsageStorageQuery, UsageStorageReport, UsageStorageRow,
 } from "./contracts/usage"
 // The server's own health answer (`/api/health` — the API's `/health`,
 // exposed through the console's rewrite), read for the version it runs so

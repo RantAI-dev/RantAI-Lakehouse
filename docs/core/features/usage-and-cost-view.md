@@ -6,14 +6,14 @@
 | Backlog | `OPS-8` |
 | Kind | Feature |
 | Spec | `docs/core/specs/ops-8.md` |
-| Status | Building |
+| Status | In Acceptance |
 | Priority | P2 |
 | Owner | In the base |
 | Acceptor | In the base |
 | Plan | Engineering plan kept by the planner |
 | Started | 2026-11-16 |
-| Shipped | — |
-| Evidence | PR #553 (the tenant on every query run); PR #564 (the usage page, the rates and the CSV export) |
+| Shipped | 2026-11-17 |
+| Evidence | PR #553 (the tenant on every query run); PR #564 (the usage page, the rates and the CSV export); PR #574 (the measured size of every layer) |
 
 ## Problem
 
@@ -53,8 +53,7 @@ No assistant work in this feature. `AGENTS.md` assistant parity binds BI feature
 - A rate takes effect from the date entered and never changes earlier days.
 - A stopped query counts as cancelled.
 - A tenant administrator sees only their tenant. The all-tenant administrator can also group by tenant and sees runs recorded with no tenant.
-- Storage per layer is not shown yet.
-- A storage rate can be entered but prices nothing until storage per layer is shown.
+- Storage is shown to the platform operator only.
 - Queries run before the update have no tenant and are visible only to the platform operator.
 - Queries run through dashboard and chart data are not counted.
 - Queries run through the lists of filter values, and through schema and join lookups, are not counted.
@@ -79,4 +78,4 @@ No assistant work in this feature. `AGENTS.md` assistant parity binds BI feature
 | --- | --- | --- | --- |
 | `OPS-8-AC1` to `AC6` | As in the spec | As in the spec | Not run |
 
-`OPS-8-AC4` cannot run until storage per layer is built.
+Storage per layer shipped in PR #574, so `OPS-8-AC4` can now run.

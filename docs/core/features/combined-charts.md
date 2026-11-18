@@ -31,11 +31,11 @@ drawn on one chart.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Up to five questions on one chart | Spec *(proposed)* | Owner to confirm at QA |
-| 2 | Questions are matched on the values of the dimension: dates by the chart's time grain, text by exact spelling. A value one question lacks is a gap for that question, not a zero | Planner default | Owner to confirm at QA |
+| 1 | Up to five questions on one chart | Spec *(proposed)* | Owner, 2026-11-13 |
+| 2 | Questions are matched on the values of the dimension: dates by the chart's time grain, text by exact spelling. A value one question lacks is a gap for that question, not a zero | Planner default | Owner, 2026-11-13 |
 | 3 | Each question is asked on its own, with its own permissions; one that fails shows its reason in the legend and the others still draw. A question the viewer's access does not cover (a table their role or organisation does not read, or a masked column the question computes on) is listed in the legend, greyed, as "not available with your access"; no column, mask or policy is named (`BI-51`). | Planner default | changed 2026-11-12 (`BI-51`), *(proposed, not yet signed)* |
-| 4 | A dashboard filter applies to every question that has the filtered column | Planner default (as tiles today) | Owner to confirm at QA |
-| 5 | The chart's sort and limit follow the first question; the others supply values for the kept dimension values | Planner default | Owner to confirm at QA |
+| 4 | A dashboard filter applies to every question that has the filtered column | Planner default (as tiles today) | Owner, 2026-11-13 |
+| 5 | The chart's sort and limit follow the first question; the others supply values for the kept dimension values | Planner default | Owner, 2026-11-13 |
 
 ## Limits to tell a customer
 
@@ -49,3 +49,12 @@ drawn on one chart.
 - `BI-13-AC2` A user without `dashboard:write` cannot save it; a question the viewer may not read shows its reason while the others draw.
 - `BI-13-AC3` Clicking a bar lists rows from the first table; clicking a point of the line lists rows from the second.
 - `AI-6-AC1` (the `BI-13` part) "visitors by month next to rooms" is built by the assistant. Accepted by the AI owner, 2026-11-14 (staging `240d2e62`)
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-13-AC1`: pass.
+- `BI-13-AC2`: pass.
+- `BI-13-AC3`: pass.
+- `AI-6-AC1` (BI-13 part): pass.

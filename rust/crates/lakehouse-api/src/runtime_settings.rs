@@ -1251,6 +1251,13 @@ pub struct EffectiveSso {
     pub redirect_uri: Option<String>,
     /// Where [`Self::redirect_uri`] came from.
     pub redirect_uri_source: Source,
+    /// The `prompt` parameter the browser sign-in sends to the provider.
+    /// `None` when the operator asked for none (`OIDC_PROMPT=` present but
+    /// empty): the provider then decides whether to show its login form or
+    /// answer from the session it already holds for that browser.
+    pub prompt: Option<String>,
+    /// Where [`Self::prompt`] came from.
+    pub prompt_source: Source,
     /// Clock skew in seconds.
     pub clock_skew_seconds: u64,
 }
@@ -1427,6 +1434,17 @@ pub fn resolve_sso(
         (None, Source::Default)
     };
 
+    // The `prompt` the browser sign-in sends. It is a server-side setting
+    // (the console's SSO form does not carry it) and the value already
+    // carries the default: `Config` fills `"login"` when `OIDC_PROMPT` is
+    // absent, and an empty string when the operator asked for none.
+    let prompt = (!config.oidc_prompt.is_empty()).then(|| config.oidc_prompt.clone());
+    let prompt_source = if config.oidc_prompt_from_env {
+        Source::Server
+    } else {
+        Source::Default
+    };
+
     let (provider_name, provider_name_source) = if config.oidc_provider_name_from_env {
         (config.oidc_provider_name.clone(), Source::Server)
     } else if let Some(name) = stored.and_then(|s| s.oidc_provider_name.as_deref()) {
@@ -1511,6 +1529,8 @@ pub fn resolve_sso(
         jwks_url_source,
         redirect_uri,
         redirect_uri_source,
+        prompt,
+        prompt_source,
         clock_skew_seconds: config.oidc_clock_skew_seconds,
     }
 }
@@ -1850,6 +1870,16 @@ pub fn draft_sso_settings(config: &Config, draft: &serde_json::Value) -> Effecti
         jwks_url_source: Source::Default,
         redirect_uri: config.oidc_redirect_uri.clone(),
         redirect_uri_source: if config.oidc_redirect_uri.is_some() {
+            Source::Server
+        } else {
+            Source::Default
+        },
+        // The test sign-in drives the same authorize request as the real
+        // one, so it carries the same prompt: a draft tested against a
+        // provider that still holds a session must ask for the form too,
+        // or the test signs the tester in as somebody else.
+        prompt: (!config.oidc_prompt.is_empty()).then(|| config.oidc_prompt.clone()),
+        prompt_source: if config.oidc_prompt_from_env {
             Source::Server
         } else {
             Source::Default
@@ -2745,6 +2775,28 @@ mod tests {
         assert_eq!(eff.client_secret.expose_secret(), "env-secret");
         assert_eq!(eff.client_secret_source, Source::Server);
         assert!(eff.is_configured());
+    }
+
+    // The `prompt` the browser sign-in sends. It is the deployment's own
+    // setting (the console's SSO form does not carry it), and it does not
+    // depend on the saved row: nothing in the console can change it.
+    #[test]
+    fn the_prompt_is_the_deployments_own_and_defaults_to_login() {
+        let cfg = config(&[]);
+        let eff = resolve_sso(&cfg, None, None);
+        assert_eq!(eff.prompt.as_deref(), Some("login"));
+        assert_eq!(eff.prompt_source, Source::Default);
+
+        let cfg = config(&[("OIDC_PROMPT", "select_account")]);
+        let eff = resolve_sso(&cfg, None, None);
+        assert_eq!(eff.prompt.as_deref(), Some("select_account"));
+        assert_eq!(eff.prompt_source, Source::Server);
+
+        // Present but empty: the operator asked for no prompt at all.
+        let cfg = config(&[("OIDC_PROMPT", "")]);
+        let eff = resolve_sso(&cfg, None, None);
+        assert_eq!(eff.prompt, None);
+        assert_eq!(eff.prompt_source, Source::Server);
     }
 
     #[test]

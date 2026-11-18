@@ -103,6 +103,17 @@ describe("TenantCreatePage (WEB-7 D2)", () => {
     await waitFor(() => expect(pushed).toEqual(["/admin/tenants"]))
   })
 
+  // UX-1-R10: every field carried a required star but none had semantics.
+  it("marks all four fields required with matching semantics", async () => {
+    stubApi()
+    renderPage()
+    for (const label of ["Name", "Slug", "Plan", "Residency"]) {
+      const input = await screen.findByLabelText(label)
+      expect(input.getAttribute("aria-required")).toBe("true")
+      expect(input.closest("div")?.querySelector("label")?.getAttribute("data-required")).toBe("")
+    }
+  })
+
   it("keeps Create disabled until every field is filled", async () => {
     stubApi()
     renderPage()

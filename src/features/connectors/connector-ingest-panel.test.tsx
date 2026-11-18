@@ -713,6 +713,34 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     expect((screen.getByLabelText("Key columns for public.orders") as HTMLInputElement).value).toBe("id")
     expect(saveButton().disabled).toBe(true)
   })
+
+  // UX-1-R6: aria-required is unsupported on a native fieldset's implicit
+  // group role. The star belongs on a visible legend with linked instructions,
+  // and no individual checkbox should claim to be required.
+  // UX-1-R6: the star belongs on a visible group label, not on the fieldset
+  // role or any individual checkbox. The current form renders a wrapping row
+  // with a labelled span and a fieldset with aria-label.
+  it("uses a visible legend for the key group instead of aria-required on the fieldset", async () => {
+    stubFetch(SPEC, undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
+    fireEvent.click(await screen.findByLabelText(/public\.orders/))
+    chooseOption(await modeOf("public.orders"), "Replace all rows, one per key")
+
+    const checkbox = screen.getByLabelText("order_id is part of the key of public.orders")
+    const fieldset = checkbox.closest("fieldset") as HTMLFieldSetElement
+    expect(fieldset).not.toBeNull()
+    expect(fieldset.hasAttribute("aria-required")).toBe(false)
+    expect(fieldset.getAttribute("aria-label")).toContain("Key columns")
+    expect(checkbox.hasAttribute("aria-required")).toBe(false)
+
+    const keyLabel = Array.from(document.querySelectorAll("span")).find((s) =>
+      s.textContent?.trim().startsWith("Key")
+    )
+    expect(keyLabel).not.toBeNull()
+    expect(keyLabel?.querySelector('span[aria-hidden="true"][class*="before:content-"]')).not.toBeNull()
+    expect(document.querySelector('p[id$="-help"]')?.textContent).toContain("at least one")
+  })
 })
 
 /**

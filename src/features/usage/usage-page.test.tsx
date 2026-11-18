@@ -2,6 +2,8 @@
 // person or engine. The money column and its "Estimate" header appear only
 // once a rate is entered, the add-rate form shows only with settings:write,
 // and the tenant switch only with *:*, as the API demands each of them.
+// `OPS-8` part C: the storage of every layer shows only to the platform
+// operator; anybody else sees the page and a line saying who sees it.
 import { mock } from "bun:test"
 
 mock.module("next/navigation", () => ({
@@ -74,9 +76,32 @@ const RATE = {
   createdAt: "2026-10-01T08:00:00Z",
 }
 
+/** One measured layer, as the storage job wrote it. */
+const STORAGE_ROW = {
+  day: "2026-11-16",
+  layer: "bronze",
+  tableCount: 12,
+  totalBytes: 1_500_000_000,
+  tablesSkipped: 0,
+  skippedReason: null as string | null,
+  estimate: "0.322581" as string | null,
+}
+
+function storageReport(overrides: Record<string, unknown> = {}) {
+  return {
+    from: "2026-10-18",
+    to: "2026-11-16",
+    currency: "USD",
+    rows: [STORAGE_ROW],
+    ...overrides,
+  }
+}
+
 type Stub = {
   /** What the sums answer; a function can answer by request. */
   usage?: (url: URL) => Response
+  /** What the storage read answers; a function can answer by request. */
+  storage?: (url: URL) => Response
   rates?: { currency: string | null; rates: (typeof RATE)[] }
   /** The URLs of every call, in order, with their method. */
   calls: { url: URL; method: string; body: string | null }[]
@@ -84,7 +109,10 @@ type Stub = {
 }
 
 /** Answers the session with `permissions`, then the usage routes. */
-function stubApi(permissions: string[], options: Partial<Pick<Stub, "usage" | "rates">> = {}): Stub {
+function stubApi(
+  permissions: string[],
+  options: Partial<Pick<Stub, "usage" | "rates" | "storage">> = {}
+): Stub {
   let sessionDone: () => void = () => {}
   const sessionRead = new Promise<void>((resolve) => {
     sessionDone = resolve
@@ -109,6 +137,9 @@ function stubApi(permissions: string[], options: Partial<Pick<Stub, "usage" | "r
       })
     }
     if (url.pathname === "/api/usage/queries") return stub.usage ? stub.usage(url) : json(report())
+    if (url.pathname === "/api/usage/storage") {
+      return stub.storage ? stub.storage(url) : json(storageReport({ currency: null, rows: [] }))
+    }
     if (url.pathname === "/api/usage/rates") {
       if (init?.method === "POST") return json(RATE, 201)
       return json(stub.rates ?? { currency: null, rates: [] })
@@ -330,5 +361,65 @@ describe("UsagePage", () => {
       amount: "5",
       effectiveFrom: "2026-11-01",
     })
+  })
+
+  it("shows the newest measurement of every layer to the platform operator", async () => {
+    const stub = stubApi(["*:*"], {
+      storage: () =>
+        json(
+          storageReport({
+            rows: [
+              { ...STORAGE_ROW, layer: "bronze", day: "2026-11-15", totalBytes: 100 },
+              { ...STORAGE_ROW, layer: "bronze", day: "2026-11-16", totalBytes: 1_500_000_000 },
+              { ...STORAGE_ROW, layer: "silver", day: "2026-11-16", totalBytes: 2_000_000_000 },
+            ],
+          })
+        ),
+    })
+    renderPage()
+    expect(await screen.findByRole("columnheader", { name: "Layer" })).toBeTruthy()
+    // The newest measurement of each layer, not the older one beside it.
+    expect(screen.getAllByText("1.5 GB").length).toBeGreaterThan(0)
+    expect(screen.getAllByText("2 GB").length).toBeGreaterThan(0)
+    expect(screen.queryByText("100 B")).toBeNull()
+    const call = stub.calls.find((c) => c.url.pathname === "/api/usage/storage")
+    expect(Object.fromEntries(call!.url.searchParams)).toEqual({
+      from: "2026-10-18",
+      to: "2026-11-16",
+    })
+  })
+
+  it("shows a tenant administrator the page without the storage, and says who sees it", async () => {
+    const stub = stubApi(["usage:read"])
+    renderPage()
+    await screen.findByText("Rina")
+    await sessionSettled(stub)
+    expect(screen.getByText("Storage is shown to the platform operator only.")).toBeTruthy()
+    expect(screen.queryByRole("columnheader", { name: "Layer" })).toBeNull()
+    // The page does not ask for the read the API would refuse.
+    expect(stub.calls.some((c) => c.url.pathname === "/api/usage/storage")).toBe(false)
+  })
+
+  it("says how many tables of a layer could not be measured, and never shows it as a layer of zero bytes", async () => {
+    stubApi(["*:*"], {
+      storage: () =>
+        json(
+          storageReport({
+            rows: [
+              {
+                ...STORAGE_ROW,
+                layer: "gold",
+                totalBytes: 0,
+                tablesSkipped: 2,
+                skippedReason: "the catalog's metadata could not be read",
+              },
+            ],
+          })
+        ),
+    })
+    renderPage()
+    expect(await screen.findByText("2 not measured")).toBeTruthy()
+    expect(screen.getByText(/2 of its tables could not be measured/)).toBeTruthy()
+    expect(screen.getByText(/the catalog's metadata could not be read/)).toBeTruthy()
   })
 })
