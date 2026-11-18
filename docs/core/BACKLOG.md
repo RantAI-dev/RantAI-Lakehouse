@@ -406,7 +406,7 @@ estimate (S, M, L), which the base has no field for.
 | `REL-26` | Task | Two flaky console tests: `SchemaBrowser > keeps the table's name unknown on a Trino tab until its detail loads` (`Received: "SELECT * FROM undefined.undefined"`, seen twice on 2026-11-13 on two branches that do not touch Query Studio) and `the created screen waits for the save (LH-SRC-6-39) > does not read the connection settings before the save has answered` (#503, run 43400226518). Make each wait for what it means, not for a clock | Delivery | P2 | Todo |  | CI runs of #497, #504, #503 |
 | `REL-27` | Task | A flaky Rust test: `lakehouse-api::upload_routes two_tenants_asking_for_one_new_name_at_the_same_moment_one_launches` (`left: 1, right: 2`, #486 run 43333004203). By reading, the second request can arrive after the first claimed the name and is refused before the registry lookup the test counts; the 500 ms stand-in delay does not make them simultaneous | Delivery | P3 | Todo |  | `OPS-22` plan, section 4 |
 | `GOV-16` | Task | Quality reads still not narrowed by role (after `GOV-15`): the incident list, the schedule list, a rule's run history, the learning state, the assistant's `get_quality`, and the classification kind of the governance list. Narrow each by the table access `GOV-15` uses, with the same answers for not there and not yours | Governance | P2 | Todo |  | #515 review, round 1 |
-| `GOV-17` | Task | A dashboard with any unreadable table dependency is hidden as a whole, including discovery, direct readers, assistant context and delivery paths; replaces mixed-tile rendering (owner 2026-11-17) | Governance | P1 | In Progress | #571 | `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md`; `GOV-7` |
+| `GOV-17` | Task | A dashboard with any unreadable table dependency is hidden as a whole, including discovery, direct readers, assistant context and delivery paths; replaces mixed-tile rendering (owner 2026-11-17) | Governance | P1 | Done | #571 | `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md`; `GOV-7` |
 | `GOV-18` | Task | Hide saved-query and pipeline metadata whose table dependencies are unreadable | Governance | P1 | Todo |  | `GOV-17` audit; `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md` |
 | `GOV-19` | Task | Hidden chart alerts must not distinguish lost access from missing objects | Governance | P2 | Todo |  | `GOV-17` audit; `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md` |
 | `GOV-20` | Task | Folder delete refusal must not reveal counts of invisible dashboards | Governance | P2 | Todo |  | `GOV-17` audit; `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md` |
@@ -590,6 +590,7 @@ set by the product owner and are left empty until they are.
 | `DATA-61` | 2026-11-13 | 2026-11-13 (#515) | |
 | `BI-57` | 2026-11-13 | 2026-11-13 (#514, #519) | |
 | `BI-32` | 2026-11-15 | 2026-11-18 (#544) | |
+| `GOV-17` | 2026-11-17 | 2026-11-18 (#571) | |
 | `WEB-12` | 2026-11-13 | 2026-11-13 (#520) | |
 | `WEB-13` | 2026-11-17 | 2026-11-17 (#565) | |
 | `DATA-55` | 2026-11-13 | 2026-11-13 (#501) | |
