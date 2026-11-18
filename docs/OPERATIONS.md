@@ -2009,7 +2009,11 @@ sign-in to be a fresh one, and this deployment ends both:
    to the provider's own logout address as well
    (`end_session_endpoint`, read from the provider's discovery document),
    and the provider ends its session and sends the browser back to
-   `OIDC_POST_LOGOUT_REDIRECT_URI`.
+   `OIDC_POST_LOGOUT_REDIRECT_URI`. For a connection set in the
+   environment, which reads no discovery document for its addresses, the
+   sign-out reads it when it needs the logout address, waiting at most 5
+   seconds; a provider that does not answer then keeps its own session,
+   and this deployment's session ends regardless.
 
 The second one needs that address registered with the provider as a valid
 post-logout redirect URI (Keycloak: the client's **Valid post logout

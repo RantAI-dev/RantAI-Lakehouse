@@ -1930,6 +1930,55 @@ pub async fn sso(state: &AppState) -> EffectiveSso {
     sso_runtime(state).await.settings
 }
 
+/// How long the sign-out waits for the provider's discovery document before
+/// it gives up on ending the provider's session (see
+/// [`end_session_endpoint`]). Short on purpose: the person is signing out,
+/// and a provider that does not answer must not hold that up.
+const END_SESSION_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The provider's RP-initiated logout endpoint (`end_session_endpoint`) for
+/// `settings`, or `None`.
+///
+/// A console-set connection already carries it: [`build_sso_runtime`] reads
+/// the discovery document for that path and fills it in. A server-owned
+/// connection does not — the environment owns its addresses (D3), so the
+/// build reads no discovery document at all — and the sign-out reads it
+/// here instead, at the moment it is needed. Reading it now rather than at
+/// build time matters: a server-owned runtime lives as long as the process
+/// ([`is_fresh`]), so a provider that was not answering yet when the API
+/// started would otherwise leave the sign-out unable to end the provider's
+/// session until the next restart.
+///
+/// The read is best-effort and bounded by [`END_SESSION_DISCOVERY_TIMEOUT`]:
+/// when it fails, the sign-out still ends this deployment's session, and
+/// only the provider's own session is left as it was (the behaviour before
+/// the provider's logout was wired at all).
+pub async fn end_session_endpoint(state: &AppState, settings: &EffectiveSso) -> Option<String> {
+    if let Some(url) = settings.end_session_endpoint.as_deref() {
+        return Some(url.to_owned());
+    }
+    if settings.issuer_source != Source::Server {
+        // A console-set connection's discovery document was read at build
+        // time; a missing endpoint there means the provider names none.
+        return None;
+    }
+    let issuer = settings.issuer.as_deref()?;
+    let http = match state.sso_http_client() {
+        Some(client) => client,
+        None => reqwest::Client::builder()
+            .timeout(END_SESSION_DISCOVERY_TIMEOUT)
+            .build()
+            .ok()?,
+    };
+    let Ok(endpoints) = lakehouse_auth::oidc::read_discovery_endpoints(issuer, http).await else {
+        tracing::warn!(
+            "the OIDC discovery document could not be read at sign-out; the provider's own session was not ended"
+        );
+        return None;
+    };
+    endpoints.end_session_endpoint
+}
+
 /// The `OIDC` authenticator for the effective `SSO` settings, rebuilt when
 /// they change (plan D4). Present whenever the issuer and the client ID are
 /// set — the bearer-token path's fact (`ADM-12` review round 2, R2-B1),
