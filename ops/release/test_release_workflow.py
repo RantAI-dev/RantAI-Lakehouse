@@ -2847,6 +2847,20 @@ class UpdateProofTest(unittest.TestCase):
             f"services:\n  lakehouse-api:\n    image: {new}\n",
         )
 
+    def test_every_service_that_names_the_old_image_gets_the_new_one(self) -> None:
+        """The API and its one-shot migrate service run the same image
+        (SEC-78): both must name the rebuilt image, and no old reference
+        may remain."""
+        old = "localhost:5000/rantai-lakehouse-api:0.1.0@sha256:aaa"
+        new = "localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1@sha256:bbb"
+        compose = (
+            f"services:\n  lakehouse-api:\n    image: {old}\n"
+            f"  lakehouse-db-migrate:\n    image: {old}\n"
+        )
+        rebuilt = update_proof.compose_with(compose, old, new)
+        self.assertEqual(rebuilt.count(new), 2)
+        self.assertNotIn(old, rebuilt)
+
     def test_a_compose_file_that_does_not_name_the_old_image_is_refused(self) -> None:
         """A file that does not name the old reference would run the
         old image."""

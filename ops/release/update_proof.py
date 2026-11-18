@@ -111,15 +111,14 @@ def compose_with(compose: str, old: str, new: str) -> str:
     another digest — so the file has to name the new one, and the
     manifest's checksum of the file has to be computed again.
 
-    The old reference has to be there EXACTLY ONCE: a file that names
-    it twice would run two images, and a file that does not name it at
-    all would run the old one.
+    Every service that names the old reference gets the new one. Two
+    services can name the same image (the API and its one-shot migrate
+    service, SEC-78), and both must run the rebuilt image after the
+    update. A file that does not name the old reference at all would
+    run the old one, so that case is refused.
     """
-    count = compose.count(old)
-    if count == 0:
+    if compose.count(old) == 0:
         raise ProofError(f"the Compose file does not name {old}")
-    if count > 1:
-        raise ProofError(f"the Compose file names {old} {count} times")
     return compose.replace(old, new)
 
 
