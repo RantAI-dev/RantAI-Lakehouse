@@ -474,10 +474,12 @@ struct LogoutResult {
 /// built when both are there.
 async fn provider_logout_url(state: &AppState) -> Option<String> {
     let post_logout = state.config.oidc_post_logout_redirect_uri.as_deref()?;
-    let runtime = crate::runtime_settings::sso_runtime(state).await;
-    let end_session = runtime.settings.end_session_endpoint.as_deref()?;
-    let client_id = runtime.settings.client_id.as_deref()?;
-    build_provider_logout_url(end_session, client_id, post_logout)
+    let settings = crate::runtime_settings::sso(state).await;
+    let client_id = settings.client_id.as_deref()?;
+    // A server-owned connection's build reads no discovery document (the
+    // environment owns its addresses), so the endpoint is read here for it.
+    let end_session = crate::runtime_settings::end_session_endpoint(state, &settings).await?;
+    build_provider_logout_url(&end_session, client_id, post_logout)
 }
 
 /// Build the provider's logout address from its three parts.
@@ -2145,6 +2147,105 @@ mod tests {
             build_provider_logout_url("not a url", "lakehouse", "http://lake.invalid/login"),
             None
         );
+    }
+
+    /// A discovery document naming every address a sign-in needs, plus the
+    /// provider's logout endpoint.
+    async fn mount_discovery_with_logout(server: &wiremock::MockServer, issuer: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("{issuer}/token"),
+                    "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+                    "end_session_endpoint": format!("{issuer}/logout"),
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_connection_the_environment_owns_still_names_the_providers_logout_address() {
+        // The staging shape: the whole connection is in `.env`, so building
+        // the runtime reads no discovery document (D3). The sign-out must
+        // still find the provider's logout endpoint, or "sign out, then
+        // sign in" lands on the account that signed in last.
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        mount_discovery_with_logout(&server, &issuer).await;
+        let state = state_with_oidc_flow_config_and(&[
+            ("OIDC_ISSUER", &issuer),
+            ("OIDC_POST_LOGOUT_REDIRECT_URI", "http://lake.invalid/login"),
+        ]);
+
+        let url = provider_logout_url(&state)
+            .await
+            .expect("the provider's logout address");
+        let parsed = url::Url::parse(&url).expect("a URL");
+        assert_eq!(
+            parsed.path(),
+            "/logout",
+            "the provider's own endpoint: {url}"
+        );
+        let query = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("lakehouse-console")
+        );
+        assert_eq!(
+            query.get("post_logout_redirect_uri").map(String::as_str),
+            Some("http://lake.invalid/login")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_does_not_answer_leaves_only_this_deployments_sign_out() {
+        // The read is best-effort: a provider that fails its discovery
+        // document gives no logout address, and the sign-out still ends this
+        // deployment's session (the caller sends the browser to /login).
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let issuer = server.uri();
+        let state = state_with_oidc_flow_config_and(&[
+            ("OIDC_ISSUER", &issuer),
+            ("OIDC_POST_LOGOUT_REDIRECT_URI", "http://lake.invalid/login"),
+        ]);
+
+        assert_eq!(provider_logout_url(&state).await, None);
+    }
+
+    #[tokio::test]
+    async fn without_a_return_address_the_sign_out_asks_the_provider_nothing() {
+        // No `OIDC_POST_LOGOUT_REDIRECT_URI`: the provider would refuse the
+        // logout, so none is built — and its discovery document is not read
+        // for one either.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let issuer = server.uri();
+        let state = state_with_oidc_flow_config_and(&[("OIDC_ISSUER", &issuer)]);
+
+        assert_eq!(provider_logout_url(&state).await, None);
     }
 
     #[tokio::test]
