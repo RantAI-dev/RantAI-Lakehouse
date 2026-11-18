@@ -87,8 +87,12 @@ jobs:
           fi
         working-directory: rust
 
+      # RUSTSEC-2026-0543 (`chrono` is unmaintained) and RUSTSEC-2026-0542
+      # (`humantime` is unmaintained): `INFO` advisories issued 2026-11-17, no
+      # CVE and no patched version, because the crates are no longer
+      # maintained. See rust/deny.toml for the full justification.
       - name: cargo audit
-        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0410 --ignore RUSTSEC-2026-0459
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0410 --ignore RUSTSEC-2026-0459 --ignore RUSTSEC-2026-0542 --ignore RUSTSEC-2026-0543
         working-directory: rust
 
   cargo-deny:

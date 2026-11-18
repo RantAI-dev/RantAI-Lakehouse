@@ -58,8 +58,9 @@
 
 use axum::Extension;
 use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::extract::multipart::MultipartError;
+use axum::extract::{Multipart, Path, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use lakehouse_auth::Principal;
@@ -69,6 +70,7 @@ use lakehouse_bi::grain::{TimeContext, WeekStart};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::SqlLiteral;
 use lakehouse_store::audit::NewAuditEvent;
+use lakehouse_store::workspace_settings::{self, ImageKind, StoredImage, WorkspaceSettings};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Digest as _;
@@ -1227,7 +1229,7 @@ pub async fn put_email(
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     // The save is visible to the next send on this process at once (D3).
-    state.email_settings_cache.clear().await;
+    state.settings_caches.email.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
     audit_settings_update(
         &state,
@@ -1595,7 +1597,7 @@ pub async fn put_sign_in(
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     // The save is visible to the next sign-in on this process at once (D3).
-    state.sign_in_settings_cache.clear().await;
+    state.settings_caches.sign_in.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
     audit_settings_update(
         &state,
@@ -1876,7 +1878,7 @@ pub async fn put_assistant(
     .await
     .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     // The save is visible to the next message on this process at once (D3).
-    state.assistant_settings_cache.clear().await;
+    state.settings_caches.assistant.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
     audit_settings_update(
         &state,
@@ -1954,6 +1956,26 @@ async fn audit_settings_update(
     resource: &str,
     fields: &[&str],
 ) {
+    audit_settings_event(
+        state,
+        principal,
+        action,
+        resource,
+        json!({ "fields": fields }),
+    )
+    .await;
+}
+
+/// The same audit row with any `args`, for a save whose record is not a list
+/// of field names (`ADM-2`: a picture's kind, type and size). The caller owns
+/// the rule that `args` never holds a value or a secret.
+async fn audit_settings_event(
+    state: &AppState,
+    principal: &Principal,
+    action: &str,
+    resource: &str,
+    args: Value,
+) {
     let event = NewAuditEvent {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_kind: Some(principal.kind_for_audit().to_owned()),
@@ -1961,7 +1983,7 @@ async fn audit_settings_update(
         action: action.to_owned(),
         resource_kind: Some("settings".to_owned()),
         resource_id: Some(resource.to_owned()),
-        args: Some(json!({ "fields": fields })),
+        args: Some(args),
         outcome: "executed".to_owned(),
         detail: None,
         run_id: None,
@@ -2308,7 +2330,7 @@ pub async fn put_sso(
 
     // Clear runtime settings cache and swappable OIDC authenticator so the next request
     // picks up the changes immediately.
-    state.sso_settings_cache.clear().await;
+    state.settings_caches.sso.clear().await;
     *state.oidc.write().await = None;
 
     audit_settings_update(&state, &principal, "settings.sso.update", "sso", &changed).await;
@@ -2609,11 +2631,573 @@ pub async fn get_sso_test(
     Ok(ApiJson(run.result.unwrap_or(serde_json::Value::Null)))
 }
 
+// ── ADM-2: the workspace's name, logo, dark-mode logo and icon ───────────
+
+/// What the person is told when the body is not the one field.
+const GENERAL_BODY_SHAPE: &str = "body must be {\"workspaceName\": string|null}";
+
+/// What the person is told when the name is over 60 characters. There is no
+/// "too short" sentence: an empty name clears it.
+const NAME_TOO_LONG: &str = "The workspace name must be at most 60 characters.";
+
+/// What the person is told when the name holds a control character.
+const NAME_CONTROL: &str = "The workspace name cannot contain control characters.";
+
+/// What the person is told when a logo is not PNG, JPEG or WebP.
+const LOGO_TYPE_REFUSED: &str = "The logo must be a PNG, JPEG or WebP image.";
+
+/// What the person is told when a logo is over 512 KB.
+const LOGO_SIZE_REFUSED: &str = "The logo must be at most 512 KB.";
+
+/// What the person is told when the icon is not a PNG of at most 64 KB.
+const ICON_REFUSED: &str = "The icon must be a PNG image of at most 64 KB.";
+
+/// What the person is told when the form has no `file` part.
+const NO_PICTURE_PART: &str = "The form has no part named file.";
+
+/// What the person is told when the form cannot be read to its end.
+const PICTURE_UNREADABLE: &str = "The upload could not be read.";
+
+/// What the person is told for a picture kind outside the list.
+const NO_SUCH_PICTURE: &str = "No such picture.";
+
+/// What the person is told when the public route is asked for a kind outside
+/// the list.
+const KIND_REFUSED: &str = "The picture must be logo, logo-dark or icon.";
+
+/// The largest request body of the picture route, 1 MiB: the 512 KB logo
+/// limit and the form's own framing fit, and no other route takes more than
+/// the default for it (`routes/mod.rs` sets it on this route only).
+pub const PICTURE_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// The longest logo, 512 KB (migration `0147`'s `CHECK` says the same).
+const LOGO_MAX_BYTES: usize = 524_288;
+
+/// The longest icon, 64 KB (migration `0147`'s `CHECK` says the same).
+const ICON_MAX_BYTES: usize = 65_536;
+
+/// The longest name, in characters (migration `0147`'s `CHECK` says the same).
+const NAME_MAX_CHARS: usize = 60;
+
+/// The media type a file's first bytes say it is, from the three the console
+/// accepts: PNG, JPEG and WebP. The file name and the part's `Content-Type`
+/// are the sender's claim and are never read; an SVG or a text file named
+/// `logo.png` has none of these first bytes and is `None`.
+fn sniff_picture_type(bytes: &[u8]) -> Option<&'static str> {
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
+    if bytes.starts_with(PNG) {
+        Some("image/png")
+    } else if bytes.starts_with(JPEG) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice()) {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// The picture kind a path names, from the fixed list. A `match`, never
+/// text put into a path or a column name.
+fn picture_kind(kind: &str) -> Result<ImageKind, ApiError> {
+    match kind {
+        "logo" => Ok(ImageKind::Logo),
+        "logo-dark" => Ok(ImageKind::LogoDark),
+        "icon" => Ok(ImageKind::Icon),
+        _ => Err(ApiError::NotFound(NO_SUCH_PICTURE.to_owned())),
+    }
+}
+
+/// The kind as the audit trail and the address spell it.
+fn picture_label(kind: ImageKind) -> &'static str {
+    match kind {
+        ImageKind::Logo => "logo",
+        ImageKind::LogoDark => "logo-dark",
+        ImageKind::Icon => "icon",
+    }
+}
+
+/// The sentence for a picture that breaks the size rule of its kind.
+fn picture_size_sentence(kind: ImageKind) -> &'static str {
+    match kind {
+        ImageKind::Icon => ICON_REFUSED,
+        ImageKind::Logo | ImageKind::LogoDark => LOGO_SIZE_REFUSED,
+    }
+}
+
+/// The media type of an accepted picture, or the 422 that names the rule it
+/// breaks. The type comes from the first bytes only ([`sniff_picture_type`]).
+fn check_picture(kind: ImageKind, bytes: &[u8]) -> Result<&'static str, ApiError> {
+    let found = sniff_picture_type(bytes);
+    let refused = |sentence: &str| ApiError::Unprocessable(sentence.to_owned());
+    match kind {
+        ImageKind::Icon => match found {
+            Some(media_type @ "image/png") if bytes.len() <= ICON_MAX_BYTES => Ok(media_type),
+            _ => Err(refused(ICON_REFUSED)),
+        },
+        ImageKind::Logo | ImageKind::LogoDark => {
+            let media_type = found.ok_or_else(|| refused(LOGO_TYPE_REFUSED))?;
+            if bytes.len() > LOGO_MAX_BYTES {
+                return Err(refused(LOGO_SIZE_REFUSED));
+            }
+            Ok(media_type)
+        }
+    }
+}
+
+/// A form that could not be read to its end. A body over the route's limit is
+/// the size rule broken, in the sentence of the kind.
+fn refused_picture_read(err: &MultipartError, kind: ImageKind) -> ApiError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::Unprocessable(picture_size_sentence(kind).to_owned());
+    }
+    tracing::warn!(%err, "a workspace picture form could not be read");
+    ApiError::BadRequest(PICTURE_UNREADABLE.to_owned())
+}
+
+/// The bytes of the form's `file` part. Other parts are skipped, unread.
+async fn read_picture(mut form: Multipart, kind: ImageKind) -> Result<Vec<u8>, ApiError> {
+    while let Some(field) = form
+        .next_field()
+        .await
+        .map_err(|err| refused_picture_read(&err, kind))?
+    {
+        if field.name() == Some("file") {
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|err| refused_picture_read(&err, kind))?;
+            return Ok(bytes.to_vec());
+        }
+    }
+    Err(ApiError::BadRequest(NO_PICTURE_PART.to_owned()))
+}
+
+/// The name a body carries, trimmed: `None` clears it (`null`, an empty
+/// string, or spaces only), `Some` is 1 to 60 characters with no control
+/// character.
+fn parse_workspace_name(body: &Bytes) -> Result<Option<String>, ApiError> {
+    let parsed = parse_body(body, &["workspaceName"], GENERAL_BODY_SHAPE)?;
+    let sent = parsed
+        .get("workspaceName")
+        .ok_or_else(|| ApiError::BadRequest(GENERAL_BODY_SHAPE.to_owned()))?;
+    let Some(text) = string_field(GENERAL_BODY_SHAPE, sent)? else {
+        return Ok(None);
+    };
+    // The name is trimmed: the spaces around it are the sender's typing, and
+    // a name of spaces alone is the empty name, which clears it (decision 4).
+    let name = text.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if name.chars().any(char::is_control) {
+        return Err(ApiError::Unprocessable(NAME_CONTROL.to_owned()));
+    }
+    if name.chars().count() > NAME_MAX_CHARS {
+        return Err(ApiError::Unprocessable(NAME_TOO_LONG.to_owned()));
+    }
+    Ok(Some(name.to_owned()))
+}
+
+/// One picture as the administrator's answer shows it: whether it is set, its
+/// type and its size, never the file.
+fn picture_summary(image: Option<&StoredImage>) -> Value {
+    json!({
+        "set": image.is_some(),
+        "type": image.map(|image| image.content_type.as_str()),
+        "bytes": image.map(|image| image.bytes.len()),
+    })
+}
+
+/// The administrator's answer: the name, each picture's summary and when the
+/// row was last saved. Nothing saved is all-empty with a `null` date.
+fn general_settings_json(row: Option<&WorkspaceSettings>) -> Value {
+    json!({
+        "workspaceName": row.and_then(|row| row.workspace_name.as_deref()),
+        "logo": picture_summary(row.and_then(|row| row.logo.as_ref())),
+        "logoDark": picture_summary(row.and_then(|row| row.logo_dark.as_ref())),
+        "icon": picture_summary(row.and_then(|row| row.icon.as_ref())),
+        "updatedAt": row.and_then(|row| {
+            row.updated_at.format(&time::format_description::well_known::Rfc3339).ok()
+        }),
+    })
+}
+
+/// One picture as the public answer shows it: its type and a version that
+/// changes with its bytes, so the console can bypass a cached older picture.
+fn picture_public(image: Option<&StoredImage>) -> Value {
+    match image {
+        Some(image) => json!({ "type": image.content_type, "version": image.version }),
+        None => Value::Null,
+    }
+}
+
+/// The error a failed store call becomes: the raw text goes to the log under a
+/// reference id and the caller gets a fixed sentence (principle 4).
+fn workspace_store_failed(err: &lakehouse_store::StoreError) -> ApiError {
+    upstream_error::internal_error(&upstream_error::STORE, err)
+}
+
+/// The refusal when the deployment has no database to save into.
+fn workspace_needs_a_database() -> ApiError {
+    ApiError::Unavailable("Settings need a database, and none is configured.".to_owned())
+}
+
+/// `GET /api/settings/general` — the name and the three pictures as the
+/// administrator sees them (`ADM-2`): whether each picture is set, its type
+/// and its size. Needs `settings:write`. Nothing saved is the empty answer.
+///
+/// # Errors
+///
+/// 5xx through `upstream_error` when the database fails.
+pub async fn get_general(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+    let row = crate::runtime_settings::workspace_settings_row(&state)
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    Ok(ApiJson(general_settings_json(row.as_ref())))
+}
+
+/// `PUT /api/settings/general` with `{ "workspaceName": string|null }` — save
+/// the name. An empty string, spaces only or `null` clears it, so the
+/// product's own name is shown. One audit row names `workspaceName` when it
+/// changed.
+///
+/// # Errors
+///
+/// 400 when the body is not the one field; 422 with a fixed sentence when the
+/// name is over 60 characters or holds a control character; 503 without a
+/// Postgres pool; 5xx through `upstream_error` when the database fails.
+pub async fn put_general(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let name = parse_workspace_name(&body)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(workspace_needs_a_database().into());
+    };
+    let current = workspace_settings::get(pool)
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    let changed = current
+        .as_ref()
+        .and_then(|row| row.workspace_name.as_deref())
+        != name.as_deref();
+
+    let saved =
+        workspace_settings::upsert_name(pool, name.as_deref(), &principal.id.uuid().to_string())
+            .await
+            .map_err(|err| workspace_store_failed(&err))?;
+    // The save is visible to the next reader on this process at once (decision 6).
+    state.settings_caches.workspace.clear().await;
+    let fields: &[&str] = if changed { &["workspaceName"] } else { &[] };
+    audit_settings_update(
+        &state,
+        &principal,
+        "settings.general.update",
+        "general",
+        fields,
+    )
+    .await;
+    Ok(ApiJson(general_settings_json(Some(&saved))))
+}
+
+/// `PUT /api/settings/general/images/{kind}` — store one picture from a form
+/// with one part named `file`. `kind` is `logo`, `logo-dark` or `icon`. The
+/// type comes from the file's first bytes, never from its name or the part's
+/// own type; a logo is a PNG, JPEG or WebP of at most 512 KB, the icon a PNG
+/// of at most 64 KB. One audit row names the kind, the type and the size.
+///
+/// # Errors
+///
+/// 404 for a kind outside the list; 400 when the form has no `file` part or
+/// cannot be read; 422 with the sentence of the rule broken for a file that is
+/// the wrong type or too large; 503 without a Postgres pool; 5xx through
+/// `upstream_error` when the database fails.
+pub async fn put_general_image(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(kind): Path<String>,
+    form: Multipart,
+) -> ApiResult<ApiJson<Value>> {
+    let kind = picture_kind(&kind)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(workspace_needs_a_database().into());
+    };
+    let bytes = read_picture(form, kind).await?;
+    let media_type = check_picture(kind, &bytes)?;
+
+    let saved = workspace_settings::set_image(
+        pool,
+        kind,
+        media_type,
+        &bytes,
+        &principal.id.uuid().to_string(),
+    )
+    .await
+    .map_err(|err| workspace_store_failed(&err))?;
+    state.settings_caches.workspace.clear().await;
+    // The kind, the type and the size, never the picture.
+    audit_settings_event(
+        &state,
+        &principal,
+        "settings.general.image_upload",
+        "general",
+        json!({ "kind": picture_label(kind), "type": media_type, "bytes": bytes.len() }),
+    )
+    .await;
+    Ok(ApiJson(general_settings_json(Some(&saved))))
+}
+
+/// `DELETE /api/settings/general/images/{kind}` — remove one picture. Removing
+/// one that is not set is not an error. One audit row names the kind and what
+/// was removed (its type and size, or `null` and 0 when nothing was set).
+///
+/// # Errors
+///
+/// 404 for a kind outside the list; 503 without a Postgres pool; 5xx through
+/// `upstream_error` when the database fails.
+pub async fn delete_general_image(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(kind): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    let kind = picture_kind(&kind)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(workspace_needs_a_database().into());
+    };
+    let current = workspace_settings::get(pool)
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    let removed = current.as_ref().and_then(|row| match kind {
+        ImageKind::Logo => row.logo.as_ref(),
+        ImageKind::LogoDark => row.logo_dark.as_ref(),
+        ImageKind::Icon => row.icon.as_ref(),
+    });
+    let args = json!({
+        "kind": picture_label(kind),
+        "type": removed.map(|image| image.content_type.as_str()),
+        "bytes": removed.map_or(0, |image| image.bytes.len()),
+    });
+
+    let saved = workspace_settings::clear_image(pool, kind, &principal.id.uuid().to_string())
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    state.settings_caches.workspace.clear().await;
+    audit_settings_event(
+        &state,
+        &principal,
+        "settings.general.image_remove",
+        "general",
+        args,
+    )
+    .await;
+    Ok(ApiJson(general_settings_json(Some(&saved))))
+}
+
+/// `DELETE /api/settings/general` — reset: clear the name and all three
+/// pictures, so the console shows the product's own name and pictures.
+///
+/// # Errors
+///
+/// 503 without a Postgres pool; 5xx through `upstream_error` when the
+/// database fails.
+pub async fn delete_general(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<ApiJson<Value>> {
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(workspace_needs_a_database().into());
+    };
+    workspace_settings::reset(pool)
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    state.settings_caches.workspace.clear().await;
+    audit_settings_event(
+        &state,
+        &principal,
+        "settings.general.reset",
+        "general",
+        json!({}),
+    )
+    .await;
+    Ok(ApiJson(general_settings_json(None)))
+}
+
+/// `GET /api/branding` — public: the name and each picture's type and
+/// version, for the sign-in page that loads before any session exists. It
+/// holds nothing else from the settings row (not who saved it, not when) and
+/// no picture bytes. Read through the 30-second cache.
+///
+/// # Errors
+///
+/// 5xx through `upstream_error` when the database fails.
+pub async fn get_branding(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+    let row = crate::runtime_settings::workspace_settings_row(&state)
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    let row = row.as_ref();
+    Ok(ApiJson(json!({
+        "workspaceName": row.and_then(|row| row.workspace_name.as_deref()),
+        "logo": picture_public(row.and_then(|row| row.logo.as_ref())),
+        "logoDark": picture_public(row.and_then(|row| row.logo_dark.as_ref())),
+        "icon": picture_public(row.and_then(|row| row.icon.as_ref())),
+    })))
+}
+
+/// `GET /api/branding/images/{kind}` — public: one stored picture with its
+/// own type. The headers keep a stored file from being anything but a picture
+/// (`nosniff`, a sandboxing `Content-Security-Policy`, `inline`), and the
+/// `ETag` is the picture's version, so a matching `If-None-Match` answers 304.
+///
+/// # Errors
+///
+/// 400 for a kind outside the list; 404 for a picture that is not set; 5xx
+/// through `upstream_error` when the database fails.
+pub async fn get_branding_image(
+    State(state): State<AppState>,
+    Path(kind): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    // A kind outside the list is a 400 here, unlike the admin routes' 404:
+    // `routes::route_policy_tests` probes every `POLICY_TABLE` pattern with a
+    // placeholder segment and reads a 404 as "this entry is not mounted", so a
+    // public route with a `{kind}` must not answer the placeholder with one.
+    let kind = picture_kind(&kind).map_err(|_| ApiError::BadRequest(KIND_REFUSED.to_owned()))?;
+    let row = crate::runtime_settings::workspace_settings_row(&state)
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    let image = row
+        .and_then(|row| match kind {
+            ImageKind::Logo => row.logo,
+            ImageKind::LogoDark => row.logo_dark,
+            ImageKind::Icon => row.icon,
+        })
+        .ok_or_else(|| ApiError::NotFound(NO_SUCH_PICTURE.to_owned()))?;
+
+    let etag = format!("\"{}\"", image.version);
+    let cache = "public, max-age=60";
+    let unchanged = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|sent| {
+            sent.split(',')
+                .any(|tag| tag.trim().trim_start_matches("W/") == etag)
+        });
+    if unchanged {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, cache.to_owned()),
+            ],
+        )
+            .into_response());
+    }
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, image.content_type.clone()),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, cache.to_owned()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; sandbox".to_owned(),
+            ),
+            (header::CONTENT_DISPOSITION, "inline".to_owned()),
+        ],
+        Bytes::copy_from_slice(&image.bytes),
+    )
+        .into_response())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// The first bytes decide the type: the three accepted signatures, and the
+    /// near misses that must not pass for them.
+    #[test]
+    fn workspace_picture_type_comes_from_the_first_bytes_only() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+        assert_eq!(sniff_picture_type(&png), Some("image/png"));
+        assert_eq!(
+            sniff_picture_type(&[0xFF, 0xD8, 0xFF, 0xE0, 0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            sniff_picture_type(b"RIFF\x10\0\0\0WEBPVP8 "),
+            Some("image/webp")
+        );
+
+        assert_eq!(
+            sniff_picture_type(b"RIFF\x10\0\0\0WAVEfmt "),
+            None,
+            "RIFF but not WebP"
+        );
+        assert_eq!(sniff_picture_type(b"RIFF\x10\0\0\0WEB"), None, "cut short");
+        assert_eq!(
+            sniff_picture_type(b"WEBPRIFF\x10\0\0\0"),
+            None,
+            "tags swapped"
+        );
+        assert_eq!(
+            sniff_picture_type(&png[..7]),
+            None,
+            "PNG signature cut short"
+        );
+        assert_eq!(
+            sniff_picture_type(&[0xFF, 0xD8]),
+            None,
+            "JPEG signature cut short"
+        );
+        assert_eq!(sniff_picture_type(b"GIF89a"), None, "a GIF");
+        assert_eq!(
+            sniff_picture_type(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            None
+        );
+        assert_eq!(sniff_picture_type(b"<?xml version=\"1.0\"?><svg/>"), None);
+        assert_eq!(sniff_picture_type(b""), None);
+    }
+
+    #[test]
+    fn workspace_picture_rules_differ_for_the_logo_and_the_icon() {
+        let png = |len: usize| {
+            let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+            bytes.resize(len, 0);
+            bytes
+        };
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0];
+
+        assert_eq!(check_picture(ImageKind::Logo, &jpeg).unwrap(), "image/jpeg");
+        assert_eq!(
+            check_picture(ImageKind::LogoDark, &png(524_288)).unwrap(),
+            "image/png"
+        );
+        assert!(check_picture(ImageKind::Logo, &png(524_289)).is_err());
+        assert_eq!(
+            check_picture(ImageKind::Icon, &png(65_536)).unwrap(),
+            "image/png"
+        );
+        assert!(check_picture(ImageKind::Icon, &png(65_537)).is_err());
+        assert!(
+            check_picture(ImageKind::Icon, &jpeg).is_err(),
+            "the icon is PNG only"
+        );
+    }
+
+    #[test]
+    fn workspace_picture_kinds_are_the_fixed_list() {
+        assert_eq!(picture_kind("logo").unwrap(), ImageKind::Logo);
+        assert_eq!(picture_kind("logo-dark").unwrap(), ImageKind::LogoDark);
+        assert_eq!(picture_kind("icon").unwrap(), ImageKind::Icon);
+        for other in ["", "Logo", "logo_dark", "logo/../icon", "icon "] {
+            assert!(picture_kind(other).is_err(), "{other:?}");
+        }
+    }
 
     #[test]
     fn the_body_requires_both_fields_and_refuses_extra_ones() {

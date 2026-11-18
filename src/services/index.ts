@@ -24,11 +24,16 @@ import { uploadService as uploadClientService } from "./clients/uploads"
 import { homeService as homeClientService } from "./clients/home"
 import { reportService as reportClientService } from "./clients/reports"
 import { settingsService as settingsClientService } from "./clients/settings"
+import {
+  brandingImageUrl as brandingImageUrlClient,
+  brandingService as brandingClientService,
+} from "./clients/branding"
 import { mapService as mapClientService } from "./clients/maps"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
 import { chatSessionService as chatSessionClientService } from "./clients/chat-sessions"
 import { semanticService as semanticClientService } from "./clients/semantic"
 import { tagKeysService as tagKeysClientService } from "./clients/tag-keys"
+import { usageService as usageClientService } from "./clients/usage"
 import { httpVersionService } from "./clients/version"
 import * as authClient from "./clients/auth"
 
@@ -206,6 +211,32 @@ export type {
   SsoTestResult,
   SsoTestStartResult,
 } from "./contracts/settings"
+/**
+ * The workspace's own name and pictures (`ADM-2`), as the administrator reads
+ * them: the name, each picture's type and size, and when the row was saved.
+ * The contract owns the shapes, and they are exported here so a feature
+ * imports them from `@/services`.
+ */
+export type {
+  WorkspacePicture,
+  WorkspaceSettings,
+  WorkspaceSettingsInput,
+} from "./contracts/settings"
+/**
+ * The workspace's branding as everybody sees it (`ADM-2`): the name and each
+ * picture's type and version. The route is public, so the sign-in page reads
+ * it before any session exists (feature decision 6).
+ */
+export const brandingService = brandingClientService
+/**
+ * The URL of one stored picture (`GET /api/branding/images/<kind>`). The
+ * `version` busts the browser's cache for a picture that changed.
+ */
+export const brandingImageUrl = brandingImageUrlClient
+/**
+ * The branding shapes the console's features read from `@/services`.
+ */
+export type { Branding, BrandingImageKind, BrandingPicture } from "./contracts/branding"
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService
@@ -224,6 +255,15 @@ export const semanticService = semanticClientService
 // The governed tag keys and their allowed values (`/api/governance/tag-keys`,
 // `DATA-12` part 2). Free tags are not part of this.
 export const tagKeysService = tagKeysClientService
+// The Usage page: the runs of a period summed per day, person, engine or
+// tenant, the same sums as a CSV file, and the rates behind the estimate in
+// money (`/api/usage/*`, `OPS-8` part B). No mock ever existed.
+export const usageService = usageClientService
+/** The usage shapes the Usage feature reads from `@/services`. */
+export type {
+  NewUsageRate, UsageExport, UsageGroup, UsageQuery, UsageRate, UsageRateKind, UsageRates,
+  UsageReport, UsageRow, UsageService,
+} from "./contracts/usage"
 // The server's own health answer (`/api/health` — the API's `/health`,
 // exposed through the console's rewrite), read for the version it runs so
 // the console can say when it and the server are not the same build

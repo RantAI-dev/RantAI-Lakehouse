@@ -3741,7 +3741,7 @@ mod tests {
         .unwrap();
 
         // Clear cache as a console save does
-        state.sso_settings_cache.clear().await;
+        state.settings_caches.sso.clear().await;
         *state.oidc.write().await = None;
 
         // Next call reports oidc: true and provider_name without restart!

@@ -112,6 +112,7 @@ pub(crate) mod support;
 // protocol) needs this module's own sentences: a file that is too large is
 // refused with the same words wherever it is noticed (`SEC-22` D4).
 pub(crate) mod uploads;
+mod usage;
 
 use std::time::Duration;
 
@@ -1390,6 +1391,14 @@ pub fn router(state: AppState) -> Router {
             "/api/ops/workloads/{id}/cancel",
             axum::routing::post(ops::cancel_workload),
         )
+        // OPS-8 part B: the Usage page's sums, their CSV file and the rates.
+        // Static paths of their own, so no `{kind}` capture sees them.
+        .route("/api/usage/queries", get(usage::queries))
+        .route("/api/usage/queries/export", get(usage::export))
+        .route(
+            "/api/usage/rates",
+            get(usage::list_rates).post(usage::create_rate),
+        )
         .merge(governance_static_router())
         .route(
             "/api/governance/{kind}",
@@ -1783,6 +1792,32 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/settings/sign-in",
             get(settings::get_sign_in).put(settings::put_sign_in),
+        )
+        // The workspace's name, logo, dark-mode logo and icon (`ADM-2`);
+        // see `routes::settings`. Reading the admin view, saving the name,
+        // removing a picture and resetting all need `settings:write`.
+        .route(
+            "/api/settings/general",
+            get(settings::get_general)
+                .put(settings::put_general)
+                .delete(settings::delete_general),
+        )
+        // A picture arrives as a form, so this route alone takes a body of
+        // 1 MiB (the 512 KB logo limit and the form's framing); the layer on
+        // the `PUT` keeps the raised limit off every other route.
+        .route(
+            "/api/settings/general/images/{kind}",
+            put(settings::put_general_image)
+                .layer(DefaultBodyLimit::max(settings::PICTURE_BODY_LIMIT_BYTES))
+                .delete(settings::delete_general_image),
+        )
+        // The two public routes of the same feature: the sign-in page asks for
+        // the name and the pictures before any session exists (`policy.rs`
+        // says why they are public).
+        .route("/api/branding", get(settings::get_branding))
+        .route(
+            "/api/branding/images/{kind}",
+            get(settings::get_branding_image),
         )
         // The deployment's assistant provider (`ADM-9`): the address, the
         // model and the key. See `routes::settings`.

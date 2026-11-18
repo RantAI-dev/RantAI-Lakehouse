@@ -20,6 +20,7 @@ import { PasswordGate, TICKET_HEADER, openPublic, readTicket } from "./public-li
 import { DEFAULT_EMBED_LOOK, themeFor, type EmbedLook } from "@/lib/embed-look";
 import { EmbedFilterBar, type EmbedFilter, type ViewerFilter } from "./embed-filter-bar";
 import { fetchFrameOrigins, useEmbedHeight } from "./use-embed-height";
+import { useBranding } from "@/hooks/use-branding";
 
 /** BI-19 part A: the same words as the public page, for a link that does not work. */
 const LINK_GONE = "This link does not work";
@@ -28,15 +29,16 @@ const LINK_GONE = "This link does not work";
  * Our name in an embed (`BI-26` decision 4, slice 2 D1). It shows in both
  * frames unless the address says `logo=none`; a public link is linked, a
  * signed token has no address to link to, so it stays plain text as in the
- * single-chart frame.
+ * single-chart frame. The name is the workspace's own (`ADM-2`), and the
+ * product's own name stands in for a workspace that set none.
  */
-function EmbedName({ look, linkBase }: { look: EmbedLook; linkBase: string }) {
+function EmbedName({ look, linkBase, name }: { look: EmbedLook; linkBase: string; name: string }) {
   if (!look.showName) return null;
   return linkBase ? (
     <a href={linkBase} target="_blank" rel="noopener noreferrer"
-       className="text-[10px] font-medium text-muted-foreground hover:text-foreground">Rantai Lake ↗</a>
+       className="text-[10px] font-medium text-muted-foreground hover:text-foreground">{name} ↗</a>
   ) : (
-    <span className="text-[10px] font-medium text-muted-foreground">Rantai Lake</span>
+    <span className="text-[10px] font-medium text-muted-foreground">{name}</span>
   );
 }
 
@@ -73,6 +75,9 @@ export function EmbedView({
 }) {
   const { resolvedTheme } = useTheme();
   const appDark = resolvedTheme === "dark";
+  // The workspace's own name (`ADM-2`); the product's own name stands in
+  // for a workspace that set none.
+  const branding = useBranding();
   const [data, setData] = React.useState<Payload | null>(null);
   // BI-17 part A (D13): the dashboard's own theme and font apply in an embed too.
   // BI-26 (D6): `theme=light|dark` in the address lays over the board's own theme.
@@ -194,7 +199,7 @@ export function EmbedView({
           <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
             <p className="min-w-0 flex-1 truncate text-sm font-semibold">{spec?.title ?? "…"}</p>
             {/* BI-26 (D6, decision 4): `logo=none` hides our name. */}
-            <EmbedName look={look} linkBase={linkBase} />
+            <EmbedName look={look} linkBase={linkBase} name={branding.name} />
           </div>
           <div className="min-h-0 flex-1 p-2">
             {spec ? <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} loadMap={loadMap} /> : null}
@@ -239,7 +244,7 @@ export function EmbedView({
       {/* BI-26 slice 2 D1: the footer is inside the measured root, so the height
           message includes it. */}
       <footer className="mt-2 flex justify-end border-t border-border pt-1.5">
-        <EmbedName look={look} linkBase={linkBase} />
+        <EmbedName look={look} linkBase={linkBase} name={branding.name} />
       </footer>
       </div>
     </div>
