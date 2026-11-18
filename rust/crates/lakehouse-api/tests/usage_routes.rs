@@ -1165,6 +1165,6 @@ async fn the_estimate_follows_the_rate_that_was_in_force_on_the_day() {
     let rows = body["rows"].as_array().expect("rows");
     // The day before the rate starts has no estimate at all: not zero.
     assert_eq!(rows[0]["estimate"], json!(null), "{body}");
-    // One gibibyte at 10.00 for a 31-day month: 10 / 31, to six places.
+    // One gigabyte (10^9 bytes) at 10.00 for a 31-day month: 10 / 31, to six places.
     assert_eq!(rows[1]["estimate"], json!("0.322581"), "{body}");
 }

@@ -737,7 +737,7 @@ const STORAGE_RATE_KIND: &str = "storage_gb_month";
 /// layer is the platform operator's and nobody else's.
 const NOT_PLATFORM: &str = "Storage per layer is shown to the platform operator only.";
 
-/// A gibibyte in bytes: the unit the `storage_gb_month` rate is priced in.
+/// A gigabyte of `10^9` bytes: the unit the `storage_gb_month` rate is priced in.
 const BYTES_PER_GB: i128 = 1_000_000_000;
 
 /// How many decimal places a rate is stored with (`NUMERIC(18,6)`), and so

@@ -380,9 +380,10 @@ pub async fn list_rates(pool: &PgPool) -> Result<Vec<UsageRate>, StoreError> {
 /// `effective_from` on or before that day, and among rows with the same
 /// date the one entered last, then the greatest id.
 ///
-/// The same rule the `rated` CTE of [`report`] applies, in one place: two
-/// copies of "which price was in force" could disagree with each other, and
-/// the two answers would price the same day differently.
+/// The rule in one place in Rust. The same rule also lives in SQL, in the
+/// `rated` CTE of [`REPORT_SQL`]: two copies of "which price was in force"
+/// could disagree with each other, and the two answers would price the same
+/// day differently.
 ///
 /// The rates are the ones [`list_rates`] returns, or any other list of them:
 /// the rule is about the rows, not about their order.
