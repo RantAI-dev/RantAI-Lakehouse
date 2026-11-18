@@ -3567,6 +3567,11 @@ async fn save_ingest_spec(
     // than surfacing as a rejected run later.
     lakehouse_store::ingest_spec::validate_load_modes(&body.adapter, &body.source_objects)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    // `SRC-44` (QA `LH-SRC-6-41`): a Kafka connector saved as a batch, or a
+    // stream on any other adapter, has no loader and would only fail at the
+    // first run; refused here with a fixed sentence.
+    lakehouse_store::ingest_spec::validate_ingest_mode(&body.adapter, &body.ingest_mode)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
     refuse_uploaded_targets(&state, &body.source_objects).await?;
     // Parsed here, in the route, ahead of `set_ingest_spec`'s own (later,
     // authoritative-for-persistence) `Dial::parse` call: this handler

@@ -220,3 +220,58 @@ async fn saving_refused_connection_settings_answers_the_same_sentence() {
         "{answer}"
     );
 }
+
+/// `SRC-44` (QA `LH-SRC-6-41`): a Kafka connector saved as a batch, or a
+/// stream on another adapter, is refused at the save with a fixed sentence
+/// that does not echo the body. The accepted pairing (`kafka` + `stream`) is
+/// exercised by `connector_repoint.rs`, whose Kafka specs are saved as a stream.
+#[tokio::test]
+async fn saving_a_kafka_connector_as_a_batch_or_a_stream_on_another_adapter_is_refused() {
+    let fx = fixture(false).await;
+    let (status, answer) = send(
+        &fx,
+        "POST",
+        "/api/connectors",
+        Some(create_body("da-mode", "Kafka")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let id = answer["id"].as_str().expect("the created id").to_owned();
+
+    for (adapter, mode, sentence) in [
+        (
+            "kafka",
+            "batch",
+            "a Kafka connector runs as a stream: its ingestMode must be stream",
+        ),
+        (
+            "sql",
+            "stream",
+            "ingestMode stream is only for a Kafka connector",
+        ),
+    ] {
+        let put = json!({
+            "adapter": adapter,
+            "ingestMode": mode,
+            "dial": { "marker": "must-not-be-echoed" },
+            "sourceObjects": []
+        });
+        let (status, answer) = send(
+            &fx,
+            "PUT",
+            &format!("/api/connectors/{id}/ingest-spec"),
+            Some(put),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{adapter}/{mode}: {answer}"
+        );
+        assert_eq!(answer["error"], json!(sentence), "{answer}");
+        assert!(
+            !answer.to_string().contains("must-not-be-echoed"),
+            "{answer}"
+        );
+    }
+}
