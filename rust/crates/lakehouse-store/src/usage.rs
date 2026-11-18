@@ -376,6 +376,25 @@ pub async fn list_rates(pool: &PgPool) -> Result<Vec<UsageRate>, StoreError> {
         .await?)
 }
 
+/// The rate of `kind` in force on `day`: the one with the latest
+/// `effective_from` on or before that day, and among rows with the same
+/// date the one entered last, then the greatest id.
+///
+/// The rule in one place in Rust. The same rule also lives in SQL, in the
+/// `rated` CTE of [`REPORT_SQL`]: two copies of "which price was in force"
+/// could disagree with each other, and the two answers would price the same
+/// day differently.
+///
+/// The rates are the ones [`list_rates`] returns, or any other list of them:
+/// the rule is about the rows, not about their order.
+#[must_use]
+pub fn rate_in_force<'a>(rates: &'a [UsageRate], kind: &str, day: Date) -> Option<&'a UsageRate> {
+    rates
+        .iter()
+        .filter(|rate| rate.kind == kind && rate.effective_from <= day)
+        .max_by_key(|rate| (rate.effective_from, rate.created_at, rate.id))
+}
+
 /// Add a rate. Returns `None`, and writes nothing, when another stored rate
 /// has a different currency: one estimate never adds two currencies.
 ///
@@ -421,4 +440,114 @@ pub async fn add_rate(
         .await?;
     tx.commit().await?;
     Ok(stored)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    use time::Month;
+
+    fn day(month: u8, d: u8) -> Date {
+        Date::from_calendar_date(2026, Month::try_from(month).unwrap(), d).unwrap()
+    }
+
+    /// A rate as the store holds it: its kind, the day it applies from, when
+    /// it was entered and its id.
+    fn rate(kind: &str, effective_from: Date, created_at: OffsetDateTime, id: Uuid) -> UsageRate {
+        UsageRate {
+            id,
+            kind: kind.to_owned(),
+            currency: "USD".to_owned(),
+            amount: "10.000000".to_owned(),
+            effective_from,
+            created_by: "principal".to_owned(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn the_rate_in_force_is_the_latest_one_that_applies_on_the_day() {
+        let rates = vec![
+            rate(
+                "storage_gb_month",
+                day(3, 1),
+                OffsetDateTime::UNIX_EPOCH,
+                Uuid::from_u128(1),
+            ),
+            rate(
+                "storage_gb_month",
+                day(3, 10),
+                OffsetDateTime::UNIX_EPOCH,
+                Uuid::from_u128(2),
+            ),
+        ];
+        let before = rate_in_force(&rates, "storage_gb_month", day(3, 9)).expect("a rate");
+        assert_eq!(before.id, Uuid::from_u128(1));
+        let after = rate_in_force(&rates, "storage_gb_month", day(3, 10)).expect("a rate");
+        assert_eq!(after.id, Uuid::from_u128(2));
+    }
+
+    #[test]
+    fn no_rate_applies_before_the_first_one_starts() {
+        let rates = vec![rate(
+            "storage_gb_month",
+            day(3, 10),
+            OffsetDateTime::UNIX_EPOCH,
+            Uuid::from_u128(1),
+        )];
+        assert!(rate_in_force(&rates, "storage_gb_month", day(3, 9)).is_none());
+    }
+
+    #[test]
+    fn a_rate_of_another_kind_never_prices_a_day() {
+        let rates = vec![rate(
+            "scan_tb",
+            day(1, 1),
+            OffsetDateTime::UNIX_EPOCH,
+            Uuid::from_u128(1),
+        )];
+        assert!(rate_in_force(&rates, "storage_gb_month", day(3, 15)).is_none());
+    }
+
+    #[test]
+    fn of_two_rates_of_the_same_day_the_newest_entered_wins() {
+        let older = rate(
+            "storage_gb_month",
+            day(3, 1),
+            OffsetDateTime::UNIX_EPOCH,
+            Uuid::from_u128(1),
+        );
+        let newer = rate(
+            "storage_gb_month",
+            day(3, 1),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            Uuid::from_u128(2),
+        );
+        let rates = vec![older, newer];
+        let found = rate_in_force(&rates, "storage_gb_month", day(3, 15)).expect("a rate");
+        assert_eq!(found.id, Uuid::from_u128(2));
+    }
+
+    #[test]
+    fn of_two_rates_entered_at_the_same_moment_the_greatest_id_wins() {
+        let rates = vec![
+            rate(
+                "storage_gb_month",
+                day(3, 1),
+                OffsetDateTime::UNIX_EPOCH,
+                Uuid::from_u128(1),
+            ),
+            rate(
+                "storage_gb_month",
+                day(3, 1),
+                OffsetDateTime::UNIX_EPOCH,
+                Uuid::from_u128(2),
+            ),
+        ];
+        let found = rate_in_force(&rates, "storage_gb_month", day(3, 15)).expect("a rate");
+        assert_eq!(found.id, Uuid::from_u128(2));
+    }
 }

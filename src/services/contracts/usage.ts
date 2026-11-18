@@ -1,8 +1,8 @@
 /**
- * `/api/usage/queries`, `/api/usage/queries/export` and `/api/usage/rates`
- * (`OPS-8` part B): the runs of a period summed per day, person, engine or
- * tenant, the same sums as a CSV file, and the rates behind the estimate in
- * money.
+ * `/api/usage/queries`, `/api/usage/queries/export`, `/api/usage/rates` and
+ * `/api/usage/storage` (`OPS-8` part B and C): the runs of a period summed
+ * per day, person, engine or tenant, the same sums as a CSV file, the rates
+ * behind the estimate in money, and the size of every layer.
  *
  * Field names mirror the API's serde names. Reading needs `usage:read`; adding
  * a rate needs `settings:write`. Every figure is a sum of recorded values. The
@@ -91,6 +91,46 @@ export type NewUsageRate = {
   effectiveFrom: string
 }
 
+/** What a storage read asks for: `YYYY-MM-DD` UTC days, `to` included. */
+export type UsageStorageQuery = {
+  from: string
+  to: string
+}
+
+/**
+ * One layer's measured size for one day. The bytes were measured once a day
+ * by the storage job, never guessed.
+ */
+export type UsageStorageRow = {
+  /** The UTC day the measurement was taken on. */
+  day: string
+  /** The layer: `bronze`, `gold`, `silver` or `serving`. */
+  layer: string
+  /** How many tables the layer holds. */
+  tableCount: number
+  /** The bytes of the tables that were measured. */
+  totalBytes: number
+  /** How many of the layer's tables could not be measured. */
+  tablesSkipped: number
+  /** Why they were skipped; `null` when none was. */
+  skippedReason: string | null
+  /** A decimal with six places, or `null` when no rate applied on that day. */
+  estimate: string | null
+}
+
+/**
+ * The size of every layer for a period. Only a caller holding `*:*` may read
+ * it: a layer holds the tables of every tenant.
+ */
+export type UsageStorageReport = {
+  from: string
+  to: string
+  /** The currency of the storage rate; `null` while no rate is entered. */
+  currency: string | null
+  /** One row per layer per day, oldest first. */
+  rows: UsageStorageRow[]
+}
+
 /**
  * Every failure rejects with a `ServiceError` whose message is the API's own
  * fixed sentence: a bad date, a period over 366 days, `tenant=all` without
@@ -104,4 +144,9 @@ export interface UsageService {
   listRates(signal?: AbortSignal): Promise<UsageRates>
   /** Adds a rate; needs `settings:write`. */
   addRate(rate: NewUsageRate, signal?: AbortSignal): Promise<UsageRate>
+  /**
+   * The size of every layer. The server refuses it with 403 unless the
+   * caller holds `*:*`, so only the platform operator asks for it.
+   */
+  getStorage(query: UsageStorageQuery, signal?: AbortSignal): Promise<UsageStorageReport>
 }

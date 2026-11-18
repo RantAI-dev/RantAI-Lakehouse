@@ -2323,6 +2323,12 @@ services:
       # the code location, which builds the tag; the API's own copy of the
       # number is above. Not a credential.
       INGEST_RUN_MAX_RUNTIME_SECONDS: ${INGEST_RUN_MAX_RUNTIME_SECONDS:-}
+      # OPS-8 part C: the `dagster/max_runtime` tag the daily storage job
+      # carries, in seconds, which the orchestrator's run monitoring enforces.
+      # Unset or empty keeps the code's default, 1800 (thirty minutes); zero,
+      # negative or garbage does too (`run_limit_tags`). A run whose process
+      # dies would otherwise hold a concurrency slot forever. Not a credential.
+      DAGSTER_RUN_LIMIT_STORAGE_LAYER_SNAPSHOT_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_STORAGE_LAYER_SNAPSHOT_JOB_SECONDS:-}
       # SRC-12 decision 4: opens the sealed `connector_managed_*` files on the
       # read-only volume above (`secret_resolver.open_managed_credential`).
       # Same required key as `lakehouse-api`, same single value, no default;
