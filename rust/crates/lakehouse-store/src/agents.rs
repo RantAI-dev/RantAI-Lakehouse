@@ -23,11 +23,12 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::FromRow;
 use sqlx::types::Json;
+use sqlx::{FromRow, Postgres, QueryBuilder};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::audit::{AuditScope, push_scope_clause};
 use crate::{PgPool, StoreError};
 
 fn iso_millis(at: OffsetDateTime) -> String {
@@ -606,16 +607,23 @@ pub async fn revoke_employee(pool: &PgPool, id: &str) -> Result<DigitalEmployee,
 /// `routes::agents::list_tools_body` looks each registry tool's name up
 /// in.
 ///
+/// `scope` is the reader's reach over the trail ([`AuditScope`]): a caller
+/// sees how often the tools ran for its own organisation only, so a count
+/// never leaks another organisation's work.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn tool_usage_counts_30d(pool: &PgPool) -> Result<Vec<(String, i64)>, StoreError> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT action, COUNT(*) FROM audit_event WHERE at > now() - interval '30 days' \
-         GROUP BY action",
-    )
-    .fetch_all(pool)
-    .await?;
+pub async fn tool_usage_counts_30d(
+    pool: &PgPool,
+    scope: &AuditScope,
+) -> Result<Vec<(String, i64)>, StoreError> {
+    let mut qb = QueryBuilder::<Postgres>::new(
+        "SELECT action, COUNT(*) FROM audit_event WHERE at > now() - interval '30 days'",
+    );
+    push_scope_clause(&mut qb, scope);
+    qb.push(" GROUP BY action");
+    let rows: Vec<(String, i64)> = qb.build_query_as().fetch_all(pool).await?;
     Ok(rows)
 }
 

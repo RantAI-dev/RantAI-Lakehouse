@@ -12,9 +12,10 @@
 //! `POST /api/overview/alerts/{id}/silence`.
 
 use serde::Serialize;
-use sqlx::FromRow;
+use sqlx::{FromRow, Postgres, QueryBuilder};
 use time::OffsetDateTime;
 
+use crate::audit::{AuditScope, push_scope_clause};
 use crate::{PgPool, StoreError};
 
 pub(crate) fn iso_millis(at: OffsetDateTime) -> String {
@@ -614,52 +615,44 @@ impl From<ActivityRow> for ActivityItem {
 
 /// The most recent audited actions, newest first.
 ///
+/// `only_principal` narrows the feed to the rows whose `principal_id` is that
+/// value (the audit writers store the principal's id as text); `None` reads
+/// the rows of everyone. The value is bound, never formatted into the
+/// statement.
+///
+/// `scope` is the reader's reach over the trail ([`AuditScope`]): it narrows
+/// the feed to the rows of the caller's own organisation, on top of the
+/// principal filter. The two are independent, because a caller may read the
+/// trail of everybody in its organisation (`audit:read`) or only its own
+/// rows.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn recent_activity(pool: &PgPool, limit: i64) -> Result<Vec<ActivityItem>, StoreError> {
-    let rows: Vec<ActivityRow> = sqlx::query_as(
+pub async fn recent_activity(
+    pool: &PgPool,
+    limit: i64,
+    only_principal: Option<&str>,
+    scope: &AuditScope,
+) -> Result<Vec<ActivityItem>, StoreError> {
+    // The principal clause is added only when a filter is given, instead of
+    // `($2::text IS NULL OR principal_id = $2)`: after five executions of a
+    // prepared statement Postgres may pick a generic plan, which cannot use
+    // `audit_event_principal_idx` as an index condition and would scan
+    // `audit_event_at_idx` with a filter over a trail that is never pruned
+    // (`audit::build_filtered` adds its filters the same way, and migration
+    // 0143's EXPLAIN evidence for `audit_event_principal_idx` is for a plain
+    // `principal_id = value` clause).
+    let mut qb = QueryBuilder::<Postgres>::new(
         "SELECT id, at, principal_kind, actor_label, action, resource_kind, resource_id, outcome \
-         FROM audit_event ORDER BY at DESC LIMIT $1",
-    )
-    .bind(limit.clamp(1, 200))
-    .fetch_all(pool)
-    .await?;
+         FROM audit_event WHERE true",
+    );
+    if let Some(principal) = only_principal {
+        qb.push(" AND principal_id = ").push_bind(principal);
+    }
+    push_scope_clause(&mut qb, scope);
+    qb.push(" ORDER BY at DESC LIMIT ")
+        .push_bind(limit.clamp(1, 200));
+    let rows: Vec<ActivityRow> = qb.build_query_as().fetch_all(pool).await?;
     Ok(rows.into_iter().map(ActivityItem::from).collect())
-}
-
-/// Counts the overview's cards need, in one round trip.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, FromRow)]
-#[serde(rename_all = "camelCase")]
-pub struct OverviewCounts {
-    /// Approvals waiting for a human decision.
-    pub pending_approvals: i64,
-    /// Audited actions the policy gate refused, last 7 days.
-    pub policy_violations_7d: i64,
-    /// Agent runs currently executing.
-    pub active_agent_runs: i64,
-    /// Pipelines currently running.
-    pub pipelines_running: i64,
-    /// Pipelines whose last run failed.
-    pub pipelines_failed: i64,
-    /// Pipelines that missed their freshness SLA.
-    pub pipelines_delayed: i64,
-}
-
-/// # Errors
-///
-/// Returns [`StoreError::Database`] if the query fails.
-pub async fn counts(pool: &PgPool) -> Result<OverviewCounts, StoreError> {
-    let counts: OverviewCounts = sqlx::query_as(
-        "SELECT \
-           (SELECT count(*) FROM approval_item WHERE status = 'pending') AS pending_approvals, \
-           (SELECT count(*) FROM audit_event WHERE outcome = 'refused' AND at > now() - interval '7 days') AS policy_violations_7d, \
-           (SELECT count(*) FROM agent_run WHERE status IN ('running', 'queued')) AS active_agent_runs, \
-           (SELECT count(*) FROM pipeline_definition WHERE status = 'running') AS pipelines_running, \
-           (SELECT count(*) FROM pipeline_definition WHERE status = 'failed') AS pipelines_failed, \
-           (SELECT count(*) FROM pipeline_definition WHERE sla_ok = false) AS pipelines_delayed",
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok(counts)
 }

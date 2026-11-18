@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import { Input } from "@/components/ui/input"
+import { RequiredMarker } from "@/components/ui/required"
 import { cn } from "@/lib/utils"
 import { describeCron, parseSchedule } from "./pipeline-schedule"
 
@@ -50,7 +51,7 @@ export function PipelineScheduleField({
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="Schedule">
+      <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="Schedule" aria-required>
         {[...PRESETS, { value: CUSTOM, label: "Custom cron" }].map((p) => (
           <button
             key={p.value}
@@ -75,7 +76,12 @@ export function PipelineScheduleField({
       </div>
       {mode === CUSTOM ? (
         <div className="flex flex-col gap-1.5">
+          <label htmlFor="pipeline-custom-cron" className="text-xs font-medium">
+            Custom cron <RequiredMarker />
+          </label>
           <Input
+            id="pipeline-custom-cron"
+            aria-required
             value={value}
             onChange={(e) => onChange(e.target.value)}
             placeholder="30 1 * * *"

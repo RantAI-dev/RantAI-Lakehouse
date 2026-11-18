@@ -1,4 +1,4 @@
-import type { OpsService, PlatformService } from "../contracts/ops";
+import type { OpsService, ServicesReport } from "../contracts/ops";
 import { apiFetch } from "../http";
 import { ServiceError, deniedFor } from "../errors";
 
@@ -24,6 +24,6 @@ async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
 
 export const clickhouseOpsService: OpsService = {
   async listServices(s) {
-    return (await get<{ services: PlatformService[] }>("/api/ops/services", s)).services;
+    return get<ServicesReport>("/api/ops/services", s);
   },
 };

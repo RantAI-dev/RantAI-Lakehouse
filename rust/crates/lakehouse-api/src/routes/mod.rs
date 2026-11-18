@@ -5,9 +5,14 @@
 //! dashboard, ...), and — new in Phase 2 — the Postgres-backed `identity`
 //! domain under `/api/identity/*`.
 
-mod agents;
+pub(crate) mod agents;
 pub(crate) mod ai;
 mod alerts;
+// `SEC-20` (plan 100): the ONE place that turns a caller's reach into the
+// audit trail's tenant rule, so every reader of the trail narrows the same
+// way.
+mod audit_events;
+pub(crate) mod audit_scope;
 pub mod auth;
 // `DATA-42` D7: the `ClickHouse` registry fixture the readers' tests share
 // (`governance`, `overview`, `storage`, `lineage`, `catalog_profile`).
@@ -111,6 +116,7 @@ pub(crate) mod support;
 // protocol) needs this module's own sentences: a file that is too large is
 // refused with the same words wherever it is noticed (`SEC-22` D4).
 pub(crate) mod uploads;
+mod usage;
 
 use std::time::Duration;
 
@@ -673,6 +679,15 @@ fn lakehouse_router() -> Router<AppState> {
 fn governance_static_router() -> Router<AppState> {
     Router::new()
         .route("/api/governance/lineage", get(governance::lineage))
+        // GOV-1 part B: the audit trail's search, one event and CSV export.
+        // Three or more segments after `/api/governance/`, so the `{kind}`
+        // capture below, which is one segment, never sees them.
+        .route("/api/governance/audit/events", get(audit_events::search))
+        .route("/api/governance/audit/events/{id}", get(audit_events::one))
+        .route(
+            "/api/governance/audit/export.csv",
+            get(audit_events::export),
+        )
         // DATA-13: column-level lineage. A static path ahead of the
         // `{kind}` capture like `lineage` above (and four segments deep).
         .route(
@@ -1380,6 +1395,16 @@ pub fn router(state: AppState) -> Router {
             "/api/ops/workloads/{id}/cancel",
             axum::routing::post(ops::cancel_workload),
         )
+        // OPS-8 part B: the Usage page's sums, their CSV file and the rates.
+        // Static paths of their own, so no `{kind}` capture sees them.
+        .route("/api/usage/queries", get(usage::queries))
+        .route("/api/usage/queries/export", get(usage::export))
+        .route(
+            "/api/usage/rates",
+            get(usage::list_rates).post(usage::create_rate),
+        )
+        // OPS-8 part C: the size of every layer, for the platform operator.
+        .route("/api/usage/storage", get(usage::storage))
         .merge(governance_static_router())
         .route(
             "/api/governance/{kind}",
@@ -1774,6 +1799,32 @@ pub fn router(state: AppState) -> Router {
             "/api/settings/sign-in",
             get(settings::get_sign_in).put(settings::put_sign_in),
         )
+        // The workspace's name, logo, dark-mode logo and icon (`ADM-2`);
+        // see `routes::settings`. Reading the admin view, saving the name,
+        // removing a picture and resetting all need `settings:write`.
+        .route(
+            "/api/settings/general",
+            get(settings::get_general)
+                .put(settings::put_general)
+                .delete(settings::delete_general),
+        )
+        // A picture arrives as a form, so this route alone takes a body of
+        // 1 MiB (the 512 KB logo limit and the form's framing); the layer on
+        // the `PUT` keeps the raised limit off every other route.
+        .route(
+            "/api/settings/general/images/{kind}",
+            put(settings::put_general_image)
+                .layer(DefaultBodyLimit::max(settings::PICTURE_BODY_LIMIT_BYTES))
+                .delete(settings::delete_general_image),
+        )
+        // The two public routes of the same feature: the sign-in page asks for
+        // the name and the pictures before any session exists (`policy.rs`
+        // says why they are public).
+        .route("/api/branding", get(settings::get_branding))
+        .route(
+            "/api/branding/images/{kind}",
+            get(settings::get_branding_image),
+        )
         // The deployment's assistant provider (`ADM-9`): the address, the
         // model and the key. See `routes::settings`.
         .route(
@@ -1832,7 +1883,7 @@ pub fn router(state: AppState) -> Router {
 /// answers what no route serves (QA `LH-BI-13-02`, `LH-BLD-2-03`,
 /// `LH-DATA-14-04`, `LH-RPT-1-11`; `SEC-72`, decision `DEC-19`).
 ///
-/// # Why the order of these six calls is the fix
+/// # Why the order of these seven calls is the fix
 ///
 /// `.layer(auth_gate)` wraps every method handler of a path *and* the path's
 /// own "no handler for this method" fallback, which is why a request for a
@@ -1850,6 +1901,14 @@ pub fn router(state: AppState) -> Router {
 /// path registered with `axum::routing::any` (the `Iceberg` door) has a
 /// fallback of its own, which is not the default one, so it is not replaced
 /// and stays behind the gate. Do not reorder these calls.
+///
+/// `GOV-1`: `audit_gate` sits between the query scope and `auth_gate`. It
+/// needs the principal `auth_gate` puts in the request, so it must be inside
+/// it; it writes the audit row of a `Central` route after the handler answers
+/// (`crate::audit_coverage`), so it must wrap the handler, and a layer added
+/// before it (the query scope) would run per query inside the handler's
+/// response instead. Like the gate, it is added before the two fallbacks, so
+/// a `404` or `405` writes nothing.
 fn gated(routes: Router<AppState>, state: AppState) -> Router {
     routes
         // Task 3.2: the one authorization gate every route (bar the four
@@ -1866,12 +1925,34 @@ fn gated(routes: Router<AppState>, state: AppState) -> Router {
             state.clone(),
             crate::query_limits::scope_middleware,
         ))
+        // `GOV-1`: the central audit writer, inside `auth_gate` so the
+        // principal is already in the request.
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::audit_coverage::audit_gate,
+        ))
         .layer(from_fn_with_state(state.clone(), auth_gate))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(no_such_address)
         .layer(from_fn_with_state(state.clone(), timeout_middleware))
         .with_state(state)
 }
+
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST /api/ai/tool`,
+/// and the action of the `refused` row `auth_gate` writes when it turns the
+/// call away (`GOV-1`). The handler writes one row per tool call under the
+/// tool's own name, through the assistant's own gate, so the table's name is
+/// only the label of a refusal at the gate. It lives here, outside
+/// `routes::ai`, because the table's guard test looks for each `Handler`
+/// action as a literal in `src/routes/`, and the tool names that are already
+/// literals there (`create_chart`) would make a refused call read as a
+/// refused tool.
+pub(crate) const ASSISTANT_TOOL_ACTION: &str = "assistant.tool";
+
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST /api/ai/chat`;
+/// see [`ASSISTANT_TOOL_ACTION`]. A chat turn writes its rows per tool call
+/// under each tool's own name.
+pub(crate) const ASSISTANT_CHAT_ACTION: &str = "assistant.chat";
 
 /// The sentence a request for a method no route serves is told (`SEC-72`,
 /// decision `DEC-19`; QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`,

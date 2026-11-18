@@ -73,6 +73,7 @@ async fn insert_history_row(pool: &PgPool, id: &str, sql: &str, owner: Option<Uu
         cache_assisted: false,
         tables_read: &[],
         message: None,
+        tenant_id: None,
     };
     record_history(pool, &input)
         .await

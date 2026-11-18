@@ -5,6 +5,7 @@ import { ArrowDown, ArrowUp, Plus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { RequiredMarker } from "@/components/ui/required";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RowsTable } from "@/components/patterns/rows-table";
 import { filterLabel, isActiveFilter } from "@/lib/dashboard-filter-state";
@@ -73,10 +74,12 @@ export function MeasureRows({
     <div className="grid gap-2">
       {rows.map((row, i) => (
         <div key={i} className="grid gap-1.5">
-          <Label>{labels(i)} {i < min ? <span aria-hidden className="text-destructive">*</span> : null}</Label>
+          {/* UX-1-R11: shared marker, with matching combobox semantics on the
+              rows the chart requires. */}
+          <Label>{labels(i)} {i < min ? <RequiredMarker /> : null}</Label>
           <div className="flex items-center gap-1.5">
             <Select value={row.column} items={columnItems(columns, fieldLabel, row.column)} onValueChange={(v) => set(i, { column: v ?? "" })} disabled={disabled}>
-              <SelectTrigger className="w-full min-w-0 flex-1" aria-label={labels(i)} title={row.column ? displayColumnFull(row.column) : undefined}><SelectValue placeholder={placeholder} /></SelectTrigger>
+              <SelectTrigger className="w-full min-w-0 flex-1" aria-label={labels(i)} aria-required={i < min} title={row.column ? displayColumnFull(row.column) : undefined}><SelectValue placeholder={placeholder} /></SelectTrigger>
               <SelectContent>{columns.map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
             </Select>
             {fixedNote ? (
@@ -230,7 +233,8 @@ export function GroupingsEditor({
   const free = columns.filter((c) => !value.some((g) => g.column === c.name));
   return (
     <div className="grid gap-1.5">
-      <Label>Group by <span aria-hidden className="text-destructive">*</span></Label>
+      {/* UX-1-R11: shared marker, and required semantics on the add control. */}
+      <Label>Group by <RequiredMarker /></Label>
       <ul className="grid gap-1">
         {value.map((g, i) => {
           const kind = columns.find((c) => c.name === g.column)?.kind;
@@ -271,7 +275,7 @@ export function GroupingsEditor({
           // A number column is grouped in bins, as a distinct value per number would be unreadable (BI-10).
           if (v) onChange([...value, free.find((c) => c.name === v)?.kind === "number" ? { column: v, bin: { mode: "auto" } } : { column: v }]);
         }} disabled={disabled}>
-          <SelectTrigger className="w-full" aria-label="Group by"><Plus className="size-3.5 text-muted-foreground" aria-hidden /><SelectValue placeholder={value.length ? "Add another column" : placeholder} /></SelectTrigger>
+          <SelectTrigger className="w-full" aria-label="Group by" aria-required><Plus className="size-3.5 text-muted-foreground" aria-hidden /><SelectValue placeholder={value.length ? "Add another column" : placeholder} /></SelectTrigger>
           <SelectContent>{free.map((c) => <SelectItem key={c.name} value={c.name}>{fieldLabel(c.name)}</SelectItem>)}</SelectContent>
         </Select>
       ) : null}

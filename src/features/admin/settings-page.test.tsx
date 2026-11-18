@@ -9,7 +9,7 @@ mock.module("next/navigation", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
-import { AuthProvider } from "@/features/auth/auth-provider"
+import { AuthProvider, useAuth } from "@/features/auth/auth-provider"
 import { SettingsPage } from "./settings-page"
 
 afterEach(() => {
@@ -32,6 +32,16 @@ function stubApi(permissions = ["settings:write", "governance:write"]) {
     if (path.includes("/api/auth/providers")) return json({ oidc: false })
     if (path.includes("/api/governance/tag-keys")) return json([])
     if (path.includes("/api/maps")) return json({ maps: [] })
+    if (path.includes("/api/settings/general"))
+      return json({
+        workspaceName: null,
+        logo: { set: false, type: null, bytes: null },
+        logoDark: { set: false, type: null, bytes: null },
+        icon: { set: false, type: null, bytes: null },
+        updatedAt: null,
+      })
+    if (path.includes("/api/branding"))
+      return json({ workspaceName: null, logo: null, logoDark: null, icon: null })
     if (path.includes("/api/settings/deployment")) return json({ features: [] })
     if (path.includes("/api/settings/email"))
       return json({
@@ -74,19 +84,31 @@ function stubApi(permissions = ["settings:write", "governance:write"]) {
   return paths
 }
 
+/**
+ * Says when the session has been read. The permissions decide which sections
+ * exist and they arrive after the first render, so a test that asks about the
+ * sections waits for this one instead of guessing.
+ */
+function SessionStatus() {
+  const { status } = useAuth()
+  return <span>{status}</span>
+}
+
 function renderPage() {
   return render(
     <AuthProvider>
+      <SessionStatus />
       <SettingsPage />
     </AuthProvider>
   )
 }
 
 describe("Settings sections (WEB-3 S3-D6)", () => {
-  it("offers the six sections and the three administrator ones, and opens Deployment for an administrator", async () => {
+  it("offers the six sections and the four administrator ones, and opens General for an administrator", async () => {
     stubApi()
     renderPage()
     for (const name of [
+      "General",
       "Reporting",
       "Remembered results",
       "Query limits",
@@ -99,10 +121,10 @@ describe("Settings sections (WEB-3 S3-D6)", () => {
     ]) {
       expect(await screen.findByRole("tab", { name })).toBeTruthy()
     }
-    // `ADM-6`, `ADM-7`: the deployment's own sections come first, so the
-    // bare address opens the Deployment one.
+    // `ADM-2`, `ADM-6`, `ADM-7`: the workspace's own section comes first, so
+    // the bare address opens the General one.
     await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "Deployment" }).getAttribute("aria-selected")).toBe("true")
+      expect(screen.getByRole("tab", { name: "General" }).getAttribute("aria-selected")).toBe("true")
     )
   })
 
@@ -115,6 +137,27 @@ describe("Settings sections (WEB-3 S3-D6)", () => {
     await waitFor(() => expect(screen.queryByRole("tab", { name: "Deployment" })).toBeNull())
     expect(screen.queryByRole("tab", { name: "Email" })).toBeNull()
     expect(screen.queryByRole("tab", { name: "Assistant" })).toBeNull()
+  })
+
+  // `ADM-2` decision 1: the workspace's own section needs `settings:write`,
+  // so only a holder of it is offered the tab.
+  //
+  // The presence is asserted as a boolean on purpose: `expect` prints the
+  // element it received when the assertion fails, and a happy-dom element
+  // carries its whole tree in that dump (megabytes for one tab), which turns
+  // a failing assertion into a hung test.
+  it("offers the General section to a holder of settings:write", async () => {
+    stubApi(["settings:write"])
+    renderPage()
+    await screen.findByText("authenticated")
+    expect(screen.queryByRole("tab", { name: "General" }) !== null).toBe(true)
+  })
+
+  it("offers no General section to a caller without settings:write", async () => {
+    stubApi(["dashboard:read"])
+    renderPage()
+    await screen.findByText("authenticated")
+    expect(screen.queryByRole("tab", { name: "General" }) === null).toBe(true)
   })
 
   it("opens Reporting on the bare address for everybody else", async () => {

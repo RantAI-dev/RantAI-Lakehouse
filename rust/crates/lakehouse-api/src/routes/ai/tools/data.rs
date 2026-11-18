@@ -128,18 +128,28 @@ pub(super) async fn run_sql(
     }
     // The final statement, so `run_statement` and not `run`: `run` would scan
     // it again and refuse a text value that reads `'{{x}}'`.
-    let result = api_result_to_value(
-        crate::routes::query::run_statement(
-            state,
-            Some(principal),
-            &axum::http::HeaderMap::new(),
-            &sql,
-            "clickhouse",
-        )
-        .await,
+    //
+    // LH-QS-2-08 (owner 2026-11-12): a failure comes in two copies — the
+    // model's copy (the engine's trimmed diagnosis, so the model can
+    // correct its SQL) and the browser's copy (a fixed sentence and the same
+    // reference). The model's copy goes in `error`, as it always did; the
+    // browser's copy goes next to it, in the one key only the server reads.
+    let (result, browser) = match crate::routes::query::run_statement(
+        state,
+        Some(principal),
+        &axum::http::HeaderMap::new(),
+        &sql,
+        "clickhouse",
     )
-    .await;
-    compact_query_result(result)
+    .await
+    {
+        Ok(ok) => (api_result_to_value(Ok(ok)).await, None),
+        Err(failure) => {
+            let failed: ApiResult<ApiJson<Value>> = Err(failure.response.into());
+            (api_result_to_value(failed).await, Some(failure.browser))
+        }
+    };
+    compact_query_result(result, browser)
 }
 
 /// Rows a `run_sql` result hands the model.
@@ -159,19 +169,29 @@ const MAX_RESULT_ROWS: usize = 100;
 /// that names the limit which cut it — the route names it in `cutBy` — so
 /// the model is never told the wrong limit did it.
 ///
+/// `browser` is the browser's copy of a failure (owner 2026-11-12,
+/// LH-QS-2-08): a fixed sentence and the reference, which the chat loop
+/// shows to the person instead of the engine's text. It travels next to the
+/// error, in the one key only the server reads
+/// (`routes::ai::BROWSER_ERROR_KEY`); the model's copy stays in `error`.
+///
 /// `DATA-29`: the cells are handed over as the route built them, so a
 /// `NULL` cell reaches the model as `null` and an empty cell as `""` — the
 /// two are told apart, and this tool does not flatten them again on the way
 /// to the model.
-fn compact_query_result(result: Value) -> Value {
+fn compact_query_result(result: Value, browser: Option<String>) -> Value {
     let Value::Object(mut body) = result else {
         return result;
     };
     if let Some(Value::String(err)) = body.get("error") {
-        return json!({
+        let mut compact = json!({
             "error": clean_sql_error(err),
             "hint": "Check table and column names against the DATA MAP and fix the query.",
         });
+        if let Some(browser) = browser {
+            compact = crate::routes::ai::with_browser_error(compact, &browser);
+        }
+        return compact;
     }
     let rows = match body.remove("rows") {
         Some(Value::Array(rows)) => rows,
@@ -378,19 +398,161 @@ fn tier_filter(raw: &str) -> &str {
     }
 }
 
+/// The refusal of a dataset reader called with no principal (a scheduled run).
+const DATASETS_NEED_A_USER: &str = "reading datasets needs a signed-in user";
+
+/// `SEC-20`, plan 97: the tenant reach a reader of the dataset registry
+/// narrows its rows by.
+///
+/// The registry is shared, and an upload another tenant made is a registry
+/// row whose `bronze.<table_name>` that tenant claimed. A caller in the
+/// catalog-owner tenant passes [`shared_catalog_refusal`] and a role's table
+/// access ([`dataset_visible`]) and would still read the row's slug, title,
+/// description and columns. The answer to "may this caller read that table" is
+/// [`crate::routes::query::reachable_names`], the one rule the catalog routes
+/// and the maintenance readers use, so it is asked here and never copied
+/// (`AGENTS.md` rule 4; ADR 0018 moves these rules later and they must change
+/// in one place).
+#[derive(Clone, Copy)]
+pub(crate) struct RegistryReach<'a> {
+    state: &'a AppState,
+    reach: crate::routes::query::TenantReach,
+}
+
+impl<'a> RegistryReach<'a> {
+    /// The reach of `principal`, resolved as the catalog routes resolve it.
+    ///
+    /// # Errors
+    ///
+    /// The error of [`crate::routes::query::resolve_reach`]: `headers` name a
+    /// tenant the caller does not belong to, or the deployment's tenant count
+    /// cannot be read.
+    pub(crate) async fn of(
+        state: &'a AppState,
+        principal: &Principal,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<Self, ApiError> {
+        let reach = crate::routes::query::resolve_reach(state, principal, headers).await?;
+        Ok(Self { state, reach })
+    }
+
+    /// A reach that covers no table, for a reader that could not resolve one
+    /// (fail closed).
+    pub(crate) fn nothing(state: &'a AppState) -> Self {
+        Self {
+            state,
+            reach: crate::routes::query::TenantReach::NoTenant,
+        }
+    }
+
+    /// Which of the registry's Bronze `tables` this reach covers, in one
+    /// claims read. `None` when the reach is everything, so nothing is
+    /// narrowed and nothing is read.
+    ///
+    /// # Errors
+    ///
+    /// The 503 of [`crate::routes::query::claims_on`] when the claims cannot
+    /// be read.
+    pub(crate) async fn bronze_in_reach<'t>(
+        &self,
+        tables: impl IntoIterator<Item = &'t str>,
+    ) -> Result<Option<std::collections::HashSet<String>>, ApiError> {
+        if self.reach == crate::routes::query::TenantReach::All {
+            return Ok(None);
+        }
+        let tables: std::collections::BTreeSet<&str> = tables.into_iter().collect();
+        let keys: Vec<String> = tables
+            .iter()
+            .map(|table| format!("bronze.{table}"))
+            .collect();
+        let reachable =
+            crate::routes::query::reachable_names(self.state, self.reach, &keys).await?;
+        Ok(Some(
+            tables
+                .into_iter()
+                .filter(|table| reachable.contains(&format!("bronze.{table}")))
+                .map(str::to_owned)
+                .collect(),
+        ))
+    }
+}
+
+/// [`RegistryReach::bronze_in_reach`] for a tool: the tables of `rows` the
+/// reach covers, or the tool's own fixed refusal when the claims cannot be
+/// read (the cause never reaches the model).
+///
+/// # Errors
+///
+/// The tool's answer `{"error": "the dataset claims could not be read right
+/// now"}` when the claims cannot be read. `Ok(None)` means nothing narrows.
+async fn registry_rows_in_reach(
+    reach: Option<RegistryReach<'_>>,
+    rows: &[Map<String, Value>],
+) -> Result<Option<std::collections::HashSet<String>>, Value> {
+    let Some(reach) = reach else {
+        return Ok(None);
+    };
+    reach
+        .bronze_in_reach(
+            rows.iter()
+                .map(|r| r.get("table_name").and_then(Value::as_str).unwrap_or("")),
+        )
+        .await
+        .map_err(|_| json!({ "error": "the dataset claims could not be read right now" }))
+}
+
+/// [`RegistryReach::of`] for a tool, with the tool's fixed refusal when the
+/// reach cannot be resolved. The tools have no request headers, so the reach
+/// is the person's own tenant's, the convention the maintenance tool follows.
+///
+/// # Errors
+///
+/// The tool's answer `{"error": "the shared-catalog rule could not be
+/// evaluated"}` when the reach cannot be resolved.
+async fn callers_registry_reach<'a>(
+    state: &'a AppState,
+    principal: &Principal,
+) -> Result<RegistryReach<'a>, Value> {
+    RegistryReach::of(state, principal, &axum::http::HeaderMap::new())
+        .await
+        .map_err(|_| json!({ "error": "the shared-catalog rule could not be evaluated" }))
+}
+
 /// `GOV-7` D6: what the caller's roles may read, or an error sentence for the
-/// tool. No principal is a headless run with no roles, which reads everything.
+/// tool. Every caller refuses a run with no principal before asking
+/// (`SEC-20`, plan 97), so a principal is required here.
 async fn table_access(
     state: &AppState,
-    principal: Option<&Principal>,
+    principal: &Principal,
 ) -> Result<crate::table_access::TableAccess, &'static str> {
-    match principal {
-        Some(principal) => {
-            crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names)
-                .await
-                .map_err(|_| "the table access rule could not be read right now")
-        }
-        None => Ok(crate::table_access::TableAccess::All),
+    crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names)
+        .await
+        .map_err(|_| "the table access rule could not be read right now")
+}
+
+/// `SEC-20` (plan 95): the shared catalog's own rule, asked for a tool that
+/// answers from the shared catalog.
+///
+/// `None` when the caller may read it. Otherwise the answer the tool returns
+/// as it is: `supported: false` with the rule's own reason for a refused
+/// caller, or a fixed error when the rule cannot be evaluated (the cause is
+/// not forwarded, `AGENTS.md` principle 4). The tool has no request headers,
+/// so the rule reads the person's own tenant, as `run_sql` does. It is
+/// [`crate::routes::catalog::catalog_tenant_refusal`], never a second copy.
+pub(super) async fn shared_catalog_refusal(
+    state: &AppState,
+    principal: &Principal,
+) -> Option<Value> {
+    match crate::routes::catalog::catalog_tenant_refusal(
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+    )
+    .await
+    {
+        Ok(None) => None,
+        Ok(Some(reason)) => Some(json!({ "supported": false, "reason": reason })),
+        Err(_) => Some(json!({ "error": "the shared-catalog rule could not be evaluated" })),
     }
 }
 
@@ -460,18 +622,34 @@ pub(super) async fn list_datasets(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
+    // SEC-20, plan 97: no principal is a scheduled run, which has no tenant
+    // to read the shared registry as.
+    let Some(principal) = principal else {
+        return json!({ "error": DATASETS_NEED_A_USER });
+    };
+    // SEC-20, plan 95: the registry is the shared catalog's, so a tenant that
+    // does not own it is refused before the registry is read.
+    if let Some(refusal) = shared_catalog_refusal(state, principal).await {
+        return refusal;
+    }
     let access = match table_access(state, principal).await {
         Ok(access) => access,
         Err(sentence) => return json!({ "error": sentence }),
     };
-    list_datasets_with(&state.clickhouse, &access, args).await
+    let reach = match callers_registry_reach(state, principal).await {
+        Ok(reach) => reach,
+        Err(refusal) => return refusal,
+    };
+    list_datasets_with(&state.clickhouse, &access, Some(reach), args).await
 }
 
-/// [`list_datasets`] over an already resolved access rule — the body the
-/// tests drive without a `Principal`.
+/// [`list_datasets`] over an already resolved access rule and tenant reach —
+/// the body the tests drive without a `Principal`. `reach` is `None` for a
+/// caller that narrows nothing.
 pub(super) async fn list_datasets_with(
     ch: &ChClient,
     access: &crate::table_access::TableAccess,
+    reach: Option<RegistryReach<'_>>,
     args: &Map<String, Value>,
 ) -> Value {
     let Ok(rows) = ch
@@ -482,6 +660,12 @@ pub(super) async fn list_datasets_with(
         .await
     else {
         return json!({ "error": "the dataset catalog could not be read (the catalog registry is not available)" });
+    };
+    // SEC-20, plan 97: a dataset whose Bronze table another tenant holds is
+    // not listed. One claims read for the whole registry page.
+    let in_reach = match registry_rows_in_reach(reach, &rows).await {
+        Ok(in_reach) => in_reach,
+        Err(refusal) => return refusal,
     };
     let term = arg_str(args, "search").to_lowercase();
     let wanted = tier_filter(&{
@@ -498,6 +682,9 @@ pub(super) async fn list_datasets_with(
         .filter(|r| {
             let table = r.get("table_name").and_then(Value::as_str).unwrap_or("");
             if !dataset_visible(access, table) {
+                return false;
+            }
+            if in_reach.as_ref().is_some_and(|set| !set.contains(table)) {
                 return false;
             }
             let row_tier = r.get("tier").and_then(Value::as_str).unwrap_or("");
@@ -530,18 +717,31 @@ pub(super) async fn describe_dataset(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
+    // SEC-20, plans 95 and 97: as in `list_datasets`.
+    let Some(principal) = principal else {
+        return json!({ "error": DATASETS_NEED_A_USER });
+    };
+    if let Some(refusal) = shared_catalog_refusal(state, principal).await {
+        return refusal;
+    }
     let access = match table_access(state, principal).await {
         Ok(access) => access,
         Err(sentence) => return json!({ "error": sentence }),
     };
-    describe_dataset_with(&state.clickhouse, &access, args).await
+    let reach = match callers_registry_reach(state, principal).await {
+        Ok(reach) => reach,
+        Err(refusal) => return refusal,
+    };
+    describe_dataset_with(&state.clickhouse, &access, Some(reach), args).await
 }
 
-/// [`describe_dataset`] over an already resolved access rule — the body the
-/// tests drive without a `Principal`.
+/// [`describe_dataset`] over an already resolved access rule and tenant
+/// reach — the body the tests drive without a `Principal`. `reach` is `None`
+/// for a caller that narrows nothing.
 pub(super) async fn describe_dataset_with(
     ch: &ChClient,
     access: &crate::table_access::TableAccess,
+    reach: Option<RegistryReach<'_>>,
     args: &Map<String, Value>,
 ) -> Value {
     let slug_raw = arg_str(args, "slug");
@@ -565,6 +765,18 @@ pub(super) async fn describe_dataset_with(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    // SEC-20, plan 97: a dataset whose Bronze table another tenant holds is
+    // refused with the sentence a table out of reach gets everywhere else
+    // (`describe_iceberg_table`), before its columns are read. The sentence
+    // names the slug the caller asked for, never the registry's own table
+    // name, which would give away the other tenant's upload id.
+    match registry_rows_in_reach(reach, std::slice::from_ref(meta)).await {
+        Ok(Some(in_reach)) if !in_reach.contains(&table) => {
+            return json!({ "error": crate::policy_engine::table_not_available_message(&slug_raw) });
+        }
+        Ok(_) => {}
+        Err(refusal) => return refusal,
+    }
     // DATA-39 (the assistant part of `#315`): the same rule as the DATA
     // MAP's description read above. `FINAL` makes a column a re-run
     // registered one row instead of one per run, and the shared clause
@@ -631,21 +843,17 @@ pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Prin
     let Some(principal) = principal else {
         return json!({ "error": "the lakehouse overview needs a signed-in user" });
     };
-    match crate::routes::catalog::catalog_tenant_refusal(
-        state,
-        principal,
-        &axum::http::HeaderMap::new(),
-    )
-    .await
-    {
-        Ok(None) => {}
-        Ok(Some(reason)) => return json!({ "supported": false, "reason": reason }),
-        Err(_) => return json!({ "error": "the shared-catalog rule could not be evaluated" }),
+    if let Some(refusal) = shared_catalog_refusal(state, principal).await {
+        return refusal;
     }
     let ch = &state.clickhouse;
-    let access = match table_access(state, Some(principal)).await {
+    let access = match table_access(state, principal).await {
         Ok(access) => access,
         Err(sentence) => return json!({ "error": sentence }),
+    };
+    let reach = match callers_registry_reach(state, principal).await {
+        Ok(reach) => reach,
+        Err(refusal) => return refusal,
     };
     let counts = match table_rows(ch).await {
         Ok(c) => c,
@@ -659,11 +867,22 @@ pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Prin
             None,
         )
         .await;
+    // SEC-20, plan 97: a dataset whose Bronze table another tenant holds is
+    // not listed. One claims read for the whole registry page.
+    let in_reach = match &datasets {
+        Ok(rows) => match registry_rows_in_reach(Some(reach), rows).await {
+            Ok(in_reach) => in_reach,
+            Err(refusal) => return refusal,
+        },
+        Err(_) => None,
+    };
     let (bronze, catalog_note) = match &datasets {
         Ok(rows) => (
             rows.iter()
                 .filter(|r| {
-                    dataset_visible(&access, r.get("table_name").and_then(Value::as_str).unwrap_or(""))
+                    let table = r.get("table_name").and_then(Value::as_str).unwrap_or("");
+                    dataset_visible(&access, table)
+                        && in_reach.as_ref().is_none_or(|set| set.contains(table))
                 })
                 .map(|r| {
                     let table = r.get("table_name").and_then(Value::as_str).unwrap_or("");
@@ -718,6 +937,14 @@ pub(super) async fn get_lineage(
     let Some(principal) = principal else {
         return json!({ "error": "lineage needs a signed-in user" });
     };
+    // SEC-20, plan 95: a caller the shared-catalog rule refuses gets no graph
+    // at all from the tool. (`GET /api/governance/lineage` keeps drawing the
+    // tenant's own records for such a caller, and since plan 96 its builder
+    // leaves the dashboard charts out for them, so this refusal is the tool's
+    // stricter answer, not the only gate.)
+    if let Some(refusal) = shared_catalog_refusal(state, principal).await {
+        return refusal;
+    }
     let Ok(graph) =
         crate::routes::lineage::build(state, principal, &axum::http::HeaderMap::new(), &focus)
             .await
@@ -1855,7 +2082,7 @@ mod truncated_note {
 
     /// The note of a cut result.
     fn note_for(body: Value) -> String {
-        let out = compact_query_result(body);
+        let out = compact_query_result(body, None);
         out["truncated"]
             .as_str()
             .expect("a cut result carries the note")
@@ -1893,13 +2120,13 @@ mod truncated_note {
 
     #[test]
     fn a_result_that_was_not_cut_carries_no_note() {
-        let out = compact_query_result(run_body(false, None));
+        let out = compact_query_result(run_body(false, None), None);
         assert!(out.get("truncated").is_none(), "{out}");
 
         // A response without the field at all is not cut either.
         let mut body = run_body(false, None);
         body.as_object_mut().expect("an object").remove("truncated");
-        let out = compact_query_result(body);
+        let out = compact_query_result(body, None);
         assert!(out.get("truncated").is_none(), "{out}");
     }
 }
@@ -1994,6 +2221,7 @@ mod registry_clash {
         let out = describe_dataset_with(
             &ch,
             &crate::table_access::TableAccess::All,
+            None,
             &args_for("twice_columns"),
         )
         .await;
@@ -2070,6 +2298,7 @@ mod registry_clash {
         let out = describe_dataset_with(
             &ch,
             &crate::table_access::TableAccess::All,
+            None,
             &args_for("clash_columns"),
         )
         .await;
@@ -2119,6 +2348,7 @@ mod registry_clash {
         let out = describe_dataset_with(
             &ch,
             &crate::table_access::TableAccess::All,
+            None,
             &args_for("sec_only_columns"),
         )
         .await;

@@ -142,3 +142,44 @@ describe("ColumnsField", () => {
     expect(onChange.mock.calls[0][0]).toBe("id,name")
   })
 })
+
+// WEB-13: a long unbroken column name must stay whole in the option and
+// bounded in the selected chip. happy-dom computes no geometry, so the
+// wrapping is asserted as structure; the measured fit is a manual-QA item.
+describe("ColumnsField long identifiers (WEB-13)", () => {
+  const LONG_COLUMN = "extremely_long_source_column_name_" + "segment_".repeat(6) + "final"
+
+  it("keeps a long column name whole, wraps it in the option and writes it exactly", async () => {
+    const onChange = mock<(next: string) => void>(() => {})
+    render(
+      <ColumnsField label="Columns" value="" onChange={onChange} columns={[LONG_COLUMN, "id"]} />
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }))
+    const list = await screen.findByRole("listbox")
+    const optionText = within(list).getByText(LONG_COLUMN)
+    expect(optionText.textContent).toBe(LONG_COLUMN)
+    expect(optionText.className).toContain("break-all")
+    expect(optionText.className).toContain("min-w-0")
+
+    fireEvent.click(optionText)
+    expect(onChange.mock.calls[0][0]).toBe(LONG_COLUMN)
+  })
+
+  it("bounds the selected chips and keeps the full comma list on the trigger title", () => {
+    const value = `id,${LONG_COLUMN}`
+    render(
+      <ColumnsField label="Columns" value={value} onChange={() => {}} columns={["id", LONG_COLUMN]} />
+    )
+    const trigger = screen.getByRole("button", { name: "Columns" })
+    expect(trigger.getAttribute("title")).toBe(value)
+    expect(trigger.className).toContain("min-w-0")
+    const badges = trigger.querySelectorAll('[data-slot="badge"]')
+    expect(badges.length).toBe(2)
+    for (const badge of badges) {
+      expect(badge.className).toContain("max-w-full")
+      expect(badge.className).toContain("[&>span]:min-w-0")
+      expect((badge.querySelector("span") as HTMLElement).className).toContain("truncate")
+    }
+    expect(trigger.textContent).toContain(LONG_COLUMN)
+  })
+})
