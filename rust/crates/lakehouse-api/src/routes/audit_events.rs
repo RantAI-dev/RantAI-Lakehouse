@@ -42,7 +42,7 @@ use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{
-    self, AuditCursor, AuditEvent, AuditFilter, NewAuditEvent, SEARCH_DEFAULT_LIMIT,
+    self, AuditCursor, AuditEvent, AuditFilter, AuditScope, NewAuditEvent, SEARCH_DEFAULT_LIMIT,
     SEARCH_MAX_LIMIT,
 };
 use serde::{Deserialize, Serialize};
@@ -210,22 +210,29 @@ fn read_cursor(raw: Option<&str>) -> Result<Option<AuditCursor>, ApiError> {
 /// `from` (inclusive) and `to` (exclusive). `limit` is 1 to 500 and defaults to
 /// 100; `cursor` is the `nextCursor` of the page before.
 ///
+/// `SEC-20` (plan 100): the page holds the rows of the caller's own
+/// organisation only — the trail is read per tenant, and the reach is
+/// resolved by [`super::audit_scope::scope_for_principal`].
+///
 /// # Errors
 ///
 /// 400 with a fixed sentence for a query string that cannot be read, a bad
 /// date, an outcome outside the eight, a limit outside 1 to 500, a cursor that
-/// is not one this route wrote, and a `from` that is not before `to`. 503 when
-/// no database is configured; 500 (the fixed `database error`) when the read
-/// fails.
+/// is not one this route wrote, and a `from` that is not before `to`. 404 for
+/// a forged `X-Tenant` header. 503 when no database is configured; 500 (the
+/// fixed `database error`) when the read fails.
 pub async fn search(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     query: RawQuery,
 ) -> ApiResult<ApiJson<AuditEventsPage>> {
     let raw = read_query(query)?;
     let mut filter = read_filter(&raw)?;
     filter.limit = read_limit(raw.limit.as_deref())?;
     filter.cursor = read_cursor(raw.cursor.as_deref())?;
-    let page = audit::search(pool(&state)?, &filter).await?;
+    let scope = super::audit_scope::scope_for_principal(&state, &principal, &headers).await?;
+    let page = audit::search(pool(&state)?, &filter, &scope).await?;
     Ok(ApiJson(AuditEventsPage {
         events: page.events.iter().map(audit_event_row).collect(),
         next_cursor: page.next_cursor.map(|cursor| cursor.encode()),
@@ -234,12 +241,19 @@ pub async fn search(
 
 /// `GET /api/governance/audit/events/{id}`: one event, as `{ "event": ... }`.
 ///
+/// `SEC-20` (plan 100): an event of another organisation's is the same 404 an
+/// unknown id is — the row is out of the caller's reach, not missing.
+///
 /// # Errors
 ///
-/// 404 with a fixed sentence when no event has the id; 503 when no database is
-/// configured; 500 (the fixed `database error`) when the read fails.
+/// 404 with a fixed sentence when no event has the id, or when the event is
+/// out of the caller's reach; 404 for a forged `X-Tenant` header; 503 when no
+/// database is configured; 500 (the fixed `database error`) when the read
+/// fails.
 pub async fn one(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
     // GOV-1 review R-2: Postgres TEXT cannot hold a NUL byte (`%00` in the
@@ -247,7 +261,8 @@ pub async fn one(
     if id.contains('\0') {
         return Err(ApiError::NotFound(NO_SUCH_EVENT.to_owned()).into());
     }
-    let event = audit::get(pool(&state)?, &id)
+    let scope = super::audit_scope::scope_for_principal(&state, &principal, &headers).await?;
+    let event = audit::get(pool(&state)?, &id, &scope)
         .await?
         .ok_or_else(|| ApiError::NotFound(NO_SUCH_EVENT.to_owned()))?;
     Ok(ApiJson(json!({ "event": audit_event_row(&event) })))
@@ -336,10 +351,12 @@ fn export_row(event: &AuditEvent) -> Vec<String> {
 }
 
 /// Where the export's stream is: the filter with the keyset cursor that moves
-/// it down the trail, and how many events it may still send.
+/// it down the trail, the reader's reach over it, and how many events it may
+/// still send.
 struct ExportState {
     pool: Arc<PgPool>,
     filter: AuditFilter,
+    scope: AuditScope,
     remaining: usize,
     header_sent: bool,
     done: bool,
@@ -354,10 +371,12 @@ struct ExportState {
 fn export_stream(
     pool: Arc<PgPool>,
     filter: AuditFilter,
+    scope: AuditScope,
 ) -> impl futures::Stream<Item = Result<Bytes, io::Error>> {
     let start = ExportState {
         pool,
         filter,
+        scope,
         remaining: MAX_EXPORT_ROWS,
         header_sent: false,
         done: false,
@@ -373,7 +392,7 @@ fn export_stream(
         }
         let page_rows = state.remaining.min(EXPORT_PAGE_ROWS);
         state.filter.limit = i64::try_from(page_rows).unwrap_or(SEARCH_MAX_LIMIT);
-        match audit::search(&state.pool, &state.filter).await {
+        match audit::search(&state.pool, &state.filter, &state.scope).await {
             Ok(page) => {
                 state.remaining = state.remaining.saturating_sub(page.events.len());
                 state.done = page.next_cursor.is_none();
@@ -415,6 +434,9 @@ fn download_header(text: &str) -> Result<HeaderValue, ApiError> {
 /// the response carries `x-audit-export-truncated: true` and
 /// `x-audit-export-total: <how many match>`; otherwise neither header is sent.
 ///
+/// `SEC-20` (plan 100): the file holds the rows of the caller's own
+/// organisation only, and the count beside it is the count of those rows.
+///
 /// # Why this read records itself
 ///
 /// The central audit writer records changes, and `AUDIT_TABLE` lists only
@@ -429,17 +451,20 @@ fn download_header(text: &str) -> Result<HeaderValue, ApiError> {
 ///
 /// 400 with a fixed sentence for a query string that cannot be read, a bad
 /// date, an outcome outside the eight, and a `from` that is not before `to`
-/// (and then no row is written). 503 when no database is configured; 500 (the
-/// fixed `database error`) when the count fails. A store failure while the
-/// file streams ends the response early instead.
+/// (and then no row is written). 404 for a forged `X-Tenant` header. 503 when
+/// no database is configured; 500 (the fixed `database error`) when the count
+/// fails. A store failure while the file streams ends the response early
+/// instead.
 pub async fn export(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     query: RawQuery,
 ) -> ApiResult<Response> {
     let raw = read_query(query)?;
     let filter = read_filter(&raw)?;
     let pool = Arc::clone(pool(&state)?);
+    let scope = super::audit_scope::scope_for_principal(&state, &principal, &headers).await?;
 
     let (principal_id, principal_kind, actor_label) = audit_coverage::actor(Some(&principal));
     audit_coverage::record_best_effort(
@@ -457,7 +482,7 @@ pub async fn export(
     )
     .await;
 
-    let matching = audit::count_matching(&pool, &filter).await?;
+    let matching = audit::count_matching(&pool, &filter, &scope).await?;
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -481,6 +506,6 @@ pub async fn export(
             download_header(&matching.to_string())?,
         );
     }
-    let body = Body::from_stream(export_stream(pool, filter));
+    let body = Body::from_stream(export_stream(pool, filter, scope));
     Ok((StatusCode::OK, headers, body).into_response())
 }

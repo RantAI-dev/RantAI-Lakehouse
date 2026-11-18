@@ -440,11 +440,21 @@ fn list_tools_body(usage_counts: &[(String, i64)]) -> Vec<RegistryTool> {
 /// `agent_tool`-table "register a tool" endpoint) is removed entirely —
 /// see this module's doc comment.
 ///
+/// `SEC-20` (plan 100): the counts are the caller's own organisation's, so
+/// a count never says how often another organisation ran a tool.
+///
 /// # Errors
 ///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_tools(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<RegistryTool>>> {
-    let usage_counts = agents::tool_usage_counts_30d(pool(&state)?).await?;
+/// 404 for a forged `X-Tenant` header. 503 if no pool is configured; 500 on a
+/// database failure.
+pub async fn list_tools(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Vec<RegistryTool>>> {
+    let scope =
+        crate::routes::audit_scope::scope_for_principal(&state, &principal, &headers).await?;
+    let usage_counts = agents::tool_usage_counts_30d(pool(&state)?, &scope).await?;
     Ok(ApiJson(list_tools_body(&usage_counts)))
 }
 

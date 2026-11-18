@@ -18,7 +18,10 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use crate::common::{TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up};
+use crate::common::{
+    TestApp, create_principal_with_permissions, leave_no_seeded_tenants, session_cookie_for_user,
+    spin_up,
+};
 
 /// One audit row at `at` (a 2099 timestamp), written by `principal_id`.
 async fn seed(pool: &PgPool, id: &str, at: &str, principal_id: &str) {
@@ -80,6 +83,9 @@ async fn two_writers(pool: &PgPool) -> (Uuid, Uuid) {
 #[tokio::test]
 async fn a_person_without_audit_read_sees_only_their_own_actions_in_the_feed() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     let (me, _) = two_writers(&pool).await;
 
     let (status, ids) = feed_ids(&pool, &router, me).await;
@@ -92,6 +98,9 @@ async fn a_person_without_audit_read_sees_only_their_own_actions_in_the_feed() {
 #[tokio::test]
 async fn a_holder_of_audit_read_sees_every_persons_actions_in_the_feed() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     two_writers(&pool).await;
     let auditor = create_principal_with_permissions(&pool, "audit:read").await;
 
@@ -106,6 +115,9 @@ async fn a_holder_of_audit_read_sees_every_persons_actions_in_the_feed() {
 #[tokio::test]
 async fn a_person_with_no_actions_of_their_own_gets_an_empty_feed() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     two_writers(&pool).await;
     let newcomer = create_principal_with_permissions(&pool, "governance:read").await;
 
@@ -120,6 +132,9 @@ async fn a_person_with_no_actions_of_their_own_gets_an_empty_feed() {
 #[tokio::test]
 async fn the_feed_of_a_person_without_audit_read_keeps_the_limit_of_twenty() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     let me = create_principal_with_permissions(&pool, "governance:read").await;
     for day in 1..=25 {
         seed(

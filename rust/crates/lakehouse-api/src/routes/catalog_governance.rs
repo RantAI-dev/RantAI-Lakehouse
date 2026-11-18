@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 
 use lakehouse_auth::Principal;
 use lakehouse_store::PgPool;
+use lakehouse_store::audit::AuditScope;
 use lakehouse_store::governance::{self as store, ClassificationRule, Policy, QualityRule};
 use lakehouse_store::queries::HistoryMention;
 use serde_json::{Map, Value, json};
@@ -991,7 +992,14 @@ fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
 /// for it. `keys` is every id the asset is recorded under — its catalog
 /// id, and its table keys, which is what a rule names. Loads are the
 /// Snapshots list's story, not this one's.
-pub(crate) async fn change_history(state: &AppState, keys: &[String]) -> Vec<Value> {
+///
+/// `SEC-20` (plan 100): the history is read per tenant, so it holds the
+/// rows of the caller's own organisation only.
+pub(crate) async fn change_history(
+    state: &AppState,
+    scope: &AuditScope,
+    keys: &[String],
+) -> Vec<Value> {
     let Some(pg) = state.pg.as_deref() else {
         return Vec::new();
     };
@@ -1005,8 +1013,14 @@ pub(crate) async fn change_history(state: &AppState, keys: &[String]) -> Vec<Val
             }
         }
     }
-    match lakehouse_store::audit::list_for_resources(pg, "catalog", &ids, CHANGE_HISTORY_LIMIT)
-        .await
+    match lakehouse_store::audit::list_for_resources(
+        pg,
+        "catalog",
+        &ids,
+        CHANGE_HISTORY_LIMIT,
+        scope,
+    )
+    .await
     {
         Ok(events) => events.iter().map(change_entry).collect(),
         Err(err) => {

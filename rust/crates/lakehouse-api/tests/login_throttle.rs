@@ -260,6 +260,12 @@ async fn the_lock_sets_exactly_one_audit_event_naming_neither_the_email_nor_the_
 #[tokio::test]
 async fn a_lock_is_listed_in_the_audit_log_as_the_sign_in_forms_and_not_the_assistants() {
     let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the lock is a
+    // row nobody signed in caused, so it belongs to the deployment and only
+    // the tenant that owns the shared catalog reads it. This test is about
+    // the row's actor, so the deployment becomes a one-tenant one and the
+    // reach covers every row.
+    common::leave_no_seeded_tenants(&pool).await;
     seed_password_identity(&pool).await;
     // Walk the account into the lock exactly as the audit test above does.
     for _ in 0..2 {
