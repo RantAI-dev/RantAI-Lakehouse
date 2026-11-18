@@ -233,7 +233,7 @@ estimate (S, M, L), which the base has no field for.
 | `VER-1` | Task | Verify SFTP, Google Sheets and Oracle sources end to end; test row filters. The connector half is now `SRC-9`; row filters stay here | Data | P2 | Todo |  | PRODUCT §2 |
 | `BI-2` | Feature | Metrics users can define once and reuse across dashboards (a semantic layer). **Blocked by `DATA-12` (certified metrics part)** Accepted by the product owner on 2026-11-16 on the QA stack (main `0ea686e5`): the feature page's checklist passed (run notes on the page). | Dashboards | P2 | Released | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | PRODUCT §2; `reference/competitive-comparison.md` (BI matrix) |
 | `DATA-9` | Feature | Upload a file from the console | Data | P2 | In Acceptance | #71, #73 | `features/upload-file.md` |
-| `OPS-8` | Feature | Usage and cost view | Operations | P2 | In Acceptance | #553, #564, #574 | PRODUCT §2; [spec](specs/ops-8.md); `features/usage-and-cost-view.md` |
+| `OPS-8` | Feature | Usage and cost view | Operations | P2 | In Acceptance | #553, #564, #574, PR #<this PR> | PRODUCT §2; [spec](specs/ops-8.md); `features/usage-and-cost-view.md` |
 | `SEC-2` | Feature | Sign-in lockout per account after repeated wrong passwords: not rate limiting by network address, and single sign-on is not affected | Administration & Security | P2 | In Acceptance | #67 | `features/login-protection-and-session-cleanup.md` |
 | `SEC-3` | Task | Test single sign-on against a real identity provider; correct `README.md`, which says it is unbuilt | Administration & Security | P2 | Done | #181 | PRODUCT §2 |
 | `SEC-40` | Task | Sign in once through Microsoft Entra ID and once through Google with a test app registration and test user each, following `docs/OPERATIONS.md` (single sign-on), and record the date, settings (no secrets) and outcome in `docs/plans/SEC-3-RESULT.md` (`SEC-3-AC2`, `SEC-3-AC3`). Product owner's test, later | Administration & Security | P3 | Todo |  | `SEC-3` (#181) |
@@ -410,7 +410,7 @@ estimate (S, M, L), which the base has no field for.
 | `GOV-18` | Task | Hide saved-query and pipeline metadata whose table dependencies are unreadable | Governance | P1 | Todo |  | `GOV-17` audit; `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md` |
 | `GOV-19` | Task | Hidden chart alerts must not distinguish lost access from missing objects | Governance | P2 | Todo |  | `GOV-17` audit; `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md` |
 | `GOV-20` | Task | Folder delete refusal must not reveal counts of invisible dashboards | Governance | P2 | Todo |  | `GOV-17` audit; `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md` |
-| `OPS-35` | Task | Every Dagster job has a run time limit, so a run whose process died cannot hold the queue | Operations | P2 | Building | #581 | staging Dagster blocked 13 to 16 Nov 2026, 10 runs left STARTED |
+| `OPS-35` | Task | Every Dagster job has a run time limit, so a run whose process died cannot hold the queue | Operations | P2 | Done | #581 | staging Dagster blocked 13 to 16 Nov 2026, 10 runs left STARTED |
 
 ## Later (P3)
 
@@ -543,7 +543,7 @@ set by the product owner and are left empty until they are.
 | --- | --- | --- | --- |
 | `UX-1` | 2026-11-17 | 2026-11-18 (#568) | |
 | `OPS-8` | 2026-11-16 | 2026-11-17 (#574) | |
-| `OPS-35` | 2026-11-16 | | |
+| `OPS-35` | 2026-11-16 | 2026-11-18 (#581) | |
 | `ADM-2` | 2026-11-15 | 2026-11-17 (#562, #570, #572) | |
 | `SEC-76` | | | |
 | `SEC-77` | | | |
