@@ -142,4 +142,17 @@ describe("SelectField", () => {
     )
     expect(screen.getByRole("combobox", { name: "Fruit" })).toBeTruthy()
   })
+
+  // UX-1-R10: the opt-in required state must reach the combobox trigger, not
+  // the Select root, so the association above and the semantics share one id.
+  it("forwards aria-required to the combobox trigger only when asked", () => {
+    const { unmount } = render(
+      <SelectField aria-label="Fruit" aria-required value="fruit-apple" options={FRUITS} onValueChange={() => {}} />
+    )
+    expect(screen.getByRole("combobox", { name: "Fruit" }).getAttribute("aria-required")).toBe("true")
+    unmount()
+
+    render(<SelectField aria-label="Fruit" value="fruit-apple" options={FRUITS} onValueChange={() => {}} />)
+    expect(screen.getByRole("combobox", { name: "Fruit" }).hasAttribute("aria-required")).toBe(false)
+  })
 })

@@ -3,7 +3,6 @@
 import type { ColumnDef } from "@tanstack/react-table"
 import {
   Activity,
-  Building2,
   Clock,
   Copy,
   DollarSign,
@@ -134,26 +133,6 @@ export function getAuditColumns({
         placeholder: "Filter actor…",
         variant: "text",
         icon: UserIcon,
-      },
-    },
-    {
-      id: "tenant",
-      accessorKey: "tenant",
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} label="Tenant" />
-      ),
-      cell: ({ row }) => (
-        <span className="font-mono text-xs text-foreground">
-          {row.original.tenant}
-        </span>
-      ),
-      enableColumnFilter: true,
-      enableSorting: true,
-      meta: {
-        label: "Tenant",
-        placeholder: "Filter tenant…",
-        variant: "text",
-        icon: Building2,
       },
     },
     {

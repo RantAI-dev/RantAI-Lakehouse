@@ -247,7 +247,7 @@ pub(in crate::routes) async fn run_tool(
         "save_query" => queries::save_query(state, principal, args).await,
         "list_saved_queries" => queries::list_saved_queries(state, principal).await,
         "run_saved_query" => queries::run_saved_query(state, principal, args).await,
-        "get_audit_history" => governance::get_audit_history(state).await,
+        "get_audit_history" => governance::get_audit_history(state, principal).await,
         "list_classification_rules" => {
             governance::list_classification_rules(state, principal).await
         }
@@ -430,7 +430,9 @@ async fn require_chart_call_allowed(
     // `list_maps` already shows any assistant caller, so nothing new is
     // disclosed.
     // (PR #524 security review)
-    maps::require_known_map(state, name, args).await?;
+    // The update branch reads the stored chart as the caller, so a chart the
+    // caller may not see is never named in the refusal.
+    maps::require_known_map(state, name, args, &scope.viewer).await?;
     if name == "create_chart" {
         require_edit_on(state, &scope, &arg_str(args, "board")).await?;
     } else {
@@ -795,6 +797,45 @@ mod tests {
         /// The owner of `b2`: empty for a dashboard nobody owns, otherwise
         /// somebody's personal space.
         b2_owner: &'static str,
+        /// The stored chart `c1` the caller may see: `None` for a store that
+        /// holds no chart at all.
+        stored: Option<StoredChart>,
+    }
+
+    /// A stored chart the stand-in `ClickHouse` holds: the kind it was saved
+    /// with and the map it has (empty for a chart with none).
+    #[derive(Clone, Copy)]
+    struct StoredChart {
+        kind: &'static str,
+        map: &'static str,
+    }
+
+    /// The document the store keeps for the chart `c1`: its spec and the
+    /// definition the update path carries the fields over from.
+    fn stored_document(stored: &StoredChart) -> Value {
+        let mut def = json!({
+            "title": "T",
+            "kind": stored.kind,
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+        });
+        if !stored.map.is_empty() {
+            def["map"] = json!(stored.map);
+        }
+        json!({
+            "spec": {
+                "id": "c1",
+                "title": "T",
+                "kind": stored.kind,
+                "mart": "mart_x",
+                "sql": "SELECT province, sum(visitors) FROM serving.mart_x GROUP BY province",
+                "x": "province",
+                "y": "visitors",
+            },
+            "def": def,
+            "hasYear": false,
+        })
     }
 
     impl wiremock::Respond for TwoBoards {
@@ -802,6 +843,18 @@ mod tests {
             let sql = String::from_utf8_lossy(&request.body).into_owned();
             let rows: Vec<Value> = if sql.contains("FROM console.bi_chart FINAL WHERE id = 'c1'") {
                 vec![json!({ "is_deleted": 0, "board": "b1" })]
+            } else if sql.contains("FROM console.bi_chart FINAL WHERE is_deleted = 0") {
+                // `list_stored_charts`: the stored chart the caller may see.
+                match self.stored {
+                    Some(stored) => vec![json!({
+                        "id": "c1",
+                        "spec_json": stored_document(&stored).to_string(),
+                        "board": "b1",
+                        "created_by": "ai",
+                        "created_at": "2026-01-01 00:00:00",
+                    })],
+                    None => Vec::new(),
+                }
             } else if sql.contains("SELECT is_deleted, owner_id FROM console.bi_board FINAL") {
                 // `board_row_state`: the dashboard exists, live, unowned.
                 ["b1", "b2"]
@@ -958,6 +1011,45 @@ mod tests {
         assert_eq!(narrowed["classifications"], json!([]), "{narrowed}");
     }
 
+    /// `SEC-20`, plan 97: a scheduled run holds no principal, and the three
+    /// tools that read table metadata used to read every tenant's for it.
+    /// Each one now refuses with a fixed sentence and asks nothing of the
+    /// engine (the mock would count the request) or the database.
+    #[tokio::test]
+    async fn the_table_metadata_tools_refuse_a_run_with_no_principal_and_read_nothing() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "rows": 1,
+                "data": [{ "slug": "ds_a", "title": "A", "table_name": "orders_a", "tier": "bronze" }],
+            })))
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let mut args = Map::new();
+        args.insert("slug".to_owned(), json!("ds_a"));
+
+        for (tool, sentence) in [
+            ("list_datasets", "reading datasets needs a signed-in user"),
+            (
+                "describe_dataset",
+                "reading datasets needs a signed-in user",
+            ),
+            (
+                "get_maintenance_metrics",
+                "reading the maintenance history needs a signed-in user",
+            ),
+        ] {
+            let reply = run_tool(&state, None, tool, &args).await;
+            assert_eq!(reply, json!({ "error": sentence }), "{tool}");
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a refused call must not have asked the engine anything"
+        );
+    }
+
     /// The draft of a chart call gets the save's answer, whole: the same value
     /// `run_tool` gives, and no draft (`PR #391 review`, `PR #402 review`).
     async fn assert_the_draft_is_refused_as_the_save_is(
@@ -1018,6 +1110,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(TwoBoards {
                 b2_owner: "somebody-else",
+                ..Default::default()
             })
             .mount(&server)
             .await;
@@ -1191,8 +1284,9 @@ mod tests {
     }
 
     /// Only a new region map chart needs a map of its own: a chart of another
-    /// kind draws from its columns, and an update keeps the map it was saved
-    /// with, so neither is refused by the map check.
+    /// kind draws from its columns, and an update of a chart of another kind
+    /// keeps the map it was saved with, so neither is refused by the map
+    /// check.
     #[tokio::test]
     async fn a_chart_that_needs_no_map_of_its_own_is_not_refused_by_the_map_check() {
         let server = wiremock::MockServer::start().await;
@@ -1213,7 +1307,7 @@ mod tests {
             ),
             (
                 "update_chart",
-                json!({ "id": "c1", "title": "T", "kind": "geomap" }),
+                json!({ "id": "c1", "title": "T", "kind": "bar" }),
             ),
         ];
         for (tool, args) in calls {
@@ -1226,6 +1320,115 @@ mod tests {
                 "{tool}: {saved}"
             );
         }
+    }
+
+    /// `AI-6`: an update that changes a chart to a region map needs a map
+    /// too. The update keeps the map the stored chart was saved with, and a
+    /// stored chart with no map would draw no region at all, so the call is
+    /// refused: by the draft check and by the save, with the sentence a new
+    /// region map chart gets.
+    #[tokio::test]
+    async fn an_update_that_changes_a_chart_to_a_region_map_without_a_map_is_refused_as_the_save_is()
+     {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards {
+                stored: Some(StoredChart {
+                    kind: "bar",
+                    map: "",
+                }),
+                ..Default::default()
+            })
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        let args = json!({
+            "id": "c1", "title": "T", "kind": "geomap", "mart": "mart_x",
+            "dimension": "province", "measures": ["visitors"],
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let saved = assert_the_draft_is_refused_as_the_save_is(
+            &state,
+            Some(&writer),
+            "update_chart",
+            &args,
+        )
+        .await;
+        assert_eq!(
+            saved["error"],
+            json!(
+                "a geomap chart needs `map`. Use one of: dki-jakarta, id-provinces, id-regencies, world, adm1-<iso3> for a country's provinces, or an uploaded map from list_maps."
+            ),
+            "{saved}"
+        );
+    }
+
+    /// The other half: an update of a region map that has a map keeps it, so
+    /// the map check has nothing to refuse.
+    #[tokio::test]
+    async fn an_update_of_a_region_map_that_has_a_map_is_not_refused_by_the_map_check() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards {
+                stored: Some(StoredChart {
+                    kind: "geomap",
+                    map: "id-provinces",
+                }),
+                ..Default::default()
+            })
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        let args = json!({
+            "id": "c1", "title": "T", "kind": "geomap", "mart": "mart_x",
+            "dimension": "province", "measures": ["visitors"],
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let saved = run_tool(&state, Some(&writer), "update_chart", &args).await;
+        assert!(
+            !saved["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("needs `map`"),
+            "{saved}"
+        );
+    }
+
+    /// An update that names a map that exists passes the map check, whatever
+    /// the stored chart has: the map the call names is the one the chart is
+    /// drawn on.
+    #[tokio::test]
+    async fn an_update_that_names_a_map_that_exists_is_not_refused_by_the_map_check() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards {
+                stored: Some(StoredChart {
+                    kind: "bar",
+                    map: "",
+                }),
+                ..Default::default()
+            })
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        let args = json!({
+            "id": "c1", "title": "T", "kind": "geomap", "map": "id-provinces",
+            "mart": "mart_x", "dimension": "province", "measures": ["visitors"],
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let saved = run_tool(&state, Some(&writer), "update_chart", &args).await;
+        let error = saved["error"].as_str().unwrap_or_default();
+        assert!(!error.contains("needs `map`"), "{saved}");
+        assert!(!error.contains("does not exist. Use one of:"), "{saved}");
     }
 
     // PR review fix (SHOULD-FIX): `AI_ASK_BACK=false` only hid `ask_user` from

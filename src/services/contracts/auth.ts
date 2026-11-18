@@ -26,6 +26,16 @@ export type Session = {
   userAgent: string | null;
 };
 /**
+ * `POST /api/auth/logout` (`routes/auth.rs`): where the browser should also
+ * be sent, so the identity provider's own session ends with this
+ * deployment's. `null` when the deployment has no post-logout address or
+ * the provider publishes no logout endpoint — then the sign-out ends this
+ * deployment's session only.
+ */
+export type LogoutResult = {
+  providerLogoutUrl: string | null;
+};
+/**
  * `GET /api/auth/password-rules` (`ADM-11` D4): the lengths the server
  * actually enforces, so the invite form states them instead of a guess.
  */

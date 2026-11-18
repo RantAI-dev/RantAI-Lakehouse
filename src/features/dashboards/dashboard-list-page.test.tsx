@@ -72,7 +72,7 @@ const BOARDS = [
 ]
 const TEMPLATE = {
   id: "t1", name: "Sales overview", sourceBoard: "b_src", sourceBoardName: "Quarterly sales",
-  chartCount: 3, createdBy: "Rina", createdAt: "2026-11-13T00:00:00Z",
+  chartCount: 3, createdBy: "Rina", createdAt: "2026-11-13T00:00:00Z", canDelete: true,
 }
 
 function renderPage() {

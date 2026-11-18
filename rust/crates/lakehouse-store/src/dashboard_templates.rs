@@ -1,5 +1,5 @@
 //! Dashboard templates: saved copies of a dashboard's definition to start new
-//! dashboards from (`BI-18` part D, migration `0146`, plan
+//! dashboards from (`BI-18` part D, migrations `0146` and `0150`, plan
 //! `docs/superpowers/plans/2026-11-13-bi-18d-reports-templates.md` T3; feature
 //! page `docs/core/features/reports-and-templates.md`, decisions T1 to T4).
 //!
@@ -41,6 +41,11 @@ pub struct TemplateSummary {
     pub chart_count: i32,
     /// Display name of whoever saved it.
     pub created_by: String,
+    /// The account that saved it (`app_user.id`, migration `0150`); `None`
+    /// for a template saved before that column existed. The route lets only
+    /// this account or an administrator delete it (PR #528 review SHOULD-FIX
+    /// 2, owner decision D-A); the display name above decides nothing.
+    pub created_by_id: Option<Uuid>,
     /// When it was saved.
     pub created_at: OffsetDateTime,
 }
@@ -62,6 +67,7 @@ struct TemplateRow {
     source_board_name: String,
     chart_count: i32,
     created_by: String,
+    created_by_id: Option<Uuid>,
     created_at: OffsetDateTime,
     definition: Json<Value>,
 }
@@ -81,10 +87,12 @@ pub struct TemplateInput<'a> {
     pub definition: &'a Value,
     /// Display name of whoever saves it.
     pub by: &'a str,
+    /// The account that saves it (see [`TemplateSummary::created_by_id`]).
+    pub by_id: Uuid,
 }
 
 const SUMMARY_COLUMNS: &str =
-    "id, name, source_board, source_board_name, chart_count, created_by, created_at";
+    "id, name, source_board, source_board_name, chart_count, created_by, created_by_id, created_at";
 
 /// The templates, newest first, at most [`LIST_LIMIT`], and whether more exist.
 ///
@@ -126,6 +134,7 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Template>, StoreError
             source_board_name: r.source_board_name,
             chart_count: r.chart_count,
             created_by: r.created_by,
+            created_by_id: r.created_by_id,
             created_at: r.created_at,
         },
         definition: r.definition.0,
@@ -144,8 +153,8 @@ pub async fn insert(
     // safe: only the constant `SUMMARY_COLUMNS` is formatted in; values are bound (SEC-41).
     Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO dashboard_template \
-            (name, source_board, source_board_name, chart_count, definition, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING {SUMMARY_COLUMNS}"
+            (name, source_board, source_board_name, chart_count, definition, created_by, created_by_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {SUMMARY_COLUMNS}"
     )))
     .bind(input.name)
     .bind(input.source_board)
@@ -153,6 +162,7 @@ pub async fn insert(
     .bind(input.chart_count)
     .bind(Json(input.definition))
     .bind(input.by)
+    .bind(input.by_id)
     .fetch_one(pool)
     .await?)
 }

@@ -96,6 +96,8 @@ export function SqlEditor({
   wrap = false,
   onView,
   extensions,
+  labelledBy,
+  required,
 }: {
   value: string
   onChange: (v: string) => void
@@ -105,6 +107,10 @@ export function SqlEditor({
   wrap?: boolean
   onView?: (view: EditorView) => void
   extensions?: Extension[]
+  /** id of a visible label, set on CodeMirror's textbox content element. */
+  labelledBy?: string
+  /** Required semantics on the editor's textbox role (UX-1). */
+  required?: boolean
 }) {
   const { resolvedTheme } = useTheme()
   const cmTheme = resolvedTheme === "dark" ? "dark" : "light"
@@ -118,9 +124,16 @@ export function SqlEditor({
       sql(schema ? { schema, upperCaseKeywords: true } : undefined),
       foldKeys,
       ...(wrap ? [EditorView.lineWrapping] : []),
+      // Put the label and required state on the editable element (role
+      // textbox), not the wrapper div — CodeMirror renders the contenteditable
+      // itself, so HTMLAttributes on the component would be invisible to AT.
+      EditorView.contentAttributes.of({
+        ...(labelledBy ? { "aria-labelledby": labelledBy } : {}),
+        ...(required ? { "aria-required": "true" } : {}),
+      }),
       ...(extensions ?? []),
     ],
-    [schema, wrap, extensions]
+    [schema, wrap, labelledBy, required, extensions]
   )
 
   return (

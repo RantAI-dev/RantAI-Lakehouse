@@ -14,6 +14,8 @@
 
 use serde_json::{Map, Value, json};
 
+use lakehouse_bi::access::Viewer;
+use lakehouse_bi::store;
 use lakehouse_store::geo_map::GeoMap;
 
 use crate::state::AppState;
@@ -95,8 +97,13 @@ pub(super) async fn list_maps(state: &AppState) -> Value {
 ///
 /// A new region map chart (`create_chart` of kind `geomap`) has no stored map
 /// to keep, so it must name one: without a map its tile draws no region at
-/// all. An `update_chart` that names no map keeps the stored one, and a chart
-/// of another kind draws from its columns, so neither is checked.
+/// all. An `update_chart` keeps the map the stored chart was saved with, so it
+/// must name one only when the stored chart has none: a chart changed to a
+/// region map with no map of its own would draw no region either. A chart of
+/// another kind draws from its columns, so it is not checked.
+///
+/// `viewer` is the caller's own, the one the update path reads the stored
+/// chart as.
 ///
 /// # Errors
 ///
@@ -105,6 +112,7 @@ pub(super) async fn require_known_map(
     state: &AppState,
     name: &str,
     args: &Map<String, Value>,
+    viewer: &Viewer,
 ) -> Result<(), Value> {
     if name != "create_chart" && name != "update_chart" {
         return Ok(());
@@ -112,11 +120,17 @@ pub(super) async fn require_known_map(
     let map = super::arg_str(args, "map").trim().to_owned();
     if map.is_empty() {
         // A new region map chart has no stored map to keep, so it must name
-        // one; the other kinds draw from their columns and an update keeps
-        // the map it was saved with.
-        if name == "create_chart" && super::arg_str(args, "kind").trim() == "geomap" {
-            let uploaded = uploaded_maps(state).await?;
-            return Err(json!({ "error": missing_map_sentence(&uploaded) }));
+        // one; an update keeps the map the stored chart was saved with, so it
+        // must name one only when the stored chart has none.
+        if super::arg_str(args, "kind").trim() == "geomap" {
+            let keeps_a_map = name == "update_chart"
+                && stored_map(state, viewer, &super::arg_str(args, "id"))
+                    .await?
+                    .is_some();
+            if !keeps_a_map {
+                let uploaded = uploaded_maps(state).await?;
+                return Err(json!({ "error": missing_map_sentence(&uploaded) }));
+            }
         }
         return Ok(());
     }
@@ -125,6 +139,38 @@ pub(super) async fn require_known_map(
         return Ok(());
     }
     Err(json!({ "error": refusal_sentence(&map, &uploaded) }))
+}
+
+/// The map the stored chart `id` was saved with, read as the caller: the map
+/// an update keeps, so a chart that has one needs no map of its own.
+///
+/// `None` when the chart has no map, and also when it is not there for the
+/// caller (it is gone, it is in the trash, or it is on a dashboard they may
+/// not see): the check refuses in both cases, so a chart the caller may not
+/// see is never told apart from a chart that has no map.
+///
+/// The map is the stored definition's, the one the update carries over into
+/// the chart it writes.
+///
+/// # Errors
+///
+/// The classified store error, never the store's own text.
+async fn stored_map(state: &AppState, viewer: &Viewer, id: &str) -> Result<Option<String>, Value> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Ok(None);
+    }
+    match store::list_stored_charts(&state.clickhouse, viewer).await {
+        Ok(all) => Ok(all
+            .into_iter()
+            .find(|chart| chart.spec.id == id)
+            .and_then(|chart| chart.def.map)
+            .filter(|map| !map.trim().is_empty())),
+        Err(err) => {
+            let failed = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+            Err(failed.to_json())
+        }
+    }
 }
 
 /// Whether `id` names a map that exists: a built-in one, an uploaded one, or

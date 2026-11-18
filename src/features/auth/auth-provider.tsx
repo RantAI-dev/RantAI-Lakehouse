@@ -5,6 +5,11 @@ import { usePathname, useRouter } from "next/navigation";
 import * as authClient from "@/services/clients/auth";
 import type { AuthUser } from "@/services/clients/auth";
 import { clearActiveTenantId, readActiveTenantId, writeActiveTenantId } from "@/services/http";
+// The sidebar's remembered Dashboards row holds a title, so it is scoped to
+// the signed-in person here, next to the tenant key (PR #541 review
+// SHOULD-FIX 1). A browser-storage concern of the session, not a dashboard
+// read, so it is imported from its module rather than through `@/services`.
+import { forgetRow, setRowOwner } from "@/features/dashboards/dashboards-row";
 
 /**
  * Route prefixes reachable without a session. Kept in sync with
@@ -161,12 +166,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (resolved === null) clearActiveTenantId();
       else if (resolved !== stored) writeActiveTenantId(resolved);
       setStoredActiveTenantId(resolved);
+      // PR #541 review SHOULD-FIX 1: the remembered Dashboards row is this
+      // person's only; another person's left-over entry is removed before the
+      // sidebar renders.
+      setRowOwner(me.id);
       setUser(me);
       setStatus("authenticated");
     } catch {
       // D5: a failed session check (no session, or the network) changes
       // nothing in storage — the person's own choice survives their next
       // sign-in, and the next person's session check corrects it anyway.
+      // The same for the remembered Dashboards row: kept, but shown to nobody
+      // until a session names its owner (PR #541 review SHOULD-FIX 1).
+      setRowOwner(null);
       setUser(null);
       setStatus("unauthenticated");
     }
@@ -191,10 +203,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // even when that request never returns — otherwise the next person to sign
     // in on this browser would start in this person's tenant.
     clearActiveTenantId();
-    await authClient.logout();
+    // PR #541 review SHOULD-FIX 1: the remembered Dashboards row names the
+    // last dashboard or report this person opened; it goes with them, for the
+    // same reason and at the same moment.
+    forgetRow();
+    setRowOwner(null);
+    const result = await authClient.logout();
     setStoredActiveTenantId(null);
     setUser(null);
     setStatus("unauthenticated");
+    // The identity provider keeps its own session for this browser: without
+    // ending it there, the next sign-in is answered from it and lands on the
+    // account that signed in last, with no choice offered. The server names
+    // the provider's logout address when it has one; the browser goes there
+    // too, and the provider sends it back to the sign-in page.
+    if (result?.providerLogoutUrl) {
+      window.location.assign(result.providerLogoutUrl);
+      return;
+    }
     router.push("/login");
   }, [router]);
 

@@ -3,7 +3,6 @@
 import type { ReportingContext } from "@/lib/time-grain";
 import * as React from "react";
 import { useTheme } from "next-themes";
-import Image from "next/image";
 import { cn } from "@/lib/utils";
 import { dashboardLook } from "@/lib/dashboard-look";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
@@ -17,6 +16,9 @@ import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import { TabBar } from "./tab-bar";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { LinkGone, PasswordGate, TICKET_HEADER, openPublic, readTicket } from "./public-link-access";
+import { BrandPicture } from "@/components/brand-picture";
+import { useBranding } from "@/hooks/use-branding";
+import { PRODUCT_BYLINE, PRODUCT_LOGO_DARK, PRODUCT_LOGO_LIGHT } from "@/lib/product-branding";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
@@ -39,6 +41,11 @@ type Payload = {
  */
 export function PublicDashboard({ token }: { token: string }) {
   const { resolvedTheme, setTheme } = useTheme();
+  // ADM-2 decision 12: the workspace's own name and logo, on a page an
+  // anonymous viewer opens. `GET /api/branding` is a public route — it needs
+  // no session — so the product's own name and logos stand in for a
+  // workspace that set none.
+  const branding = useBranding();
   const [mounted, setMounted] = React.useState(false);
   React.useEffect(() => setMounted(true), []);
   const appDark = resolvedTheme === "dark";
@@ -121,9 +128,17 @@ export function PublicDashboard({ token }: { token: string }) {
     <div className={cn("min-h-screen bg-muted/25", look.className)} style={look.style}>
       {/* Compact header — brand + title + theme toggle */}
       <header className="sticky top-0 z-10 flex items-center gap-3 border-b border-border bg-card/80 px-4 py-3 backdrop-blur-md sm:px-6">
-        <span className="relative block h-6 w-[116px] shrink-0">
-          <Image src="/logo-light.png" alt="RantAI Lakehouse" fill sizes="116px" className="object-contain object-left dark:hidden" priority />
-          <Image src="/logo-dark.png" alt="" fill sizes="116px" className="hidden object-contain object-left dark:block" priority />
+        {/* The workspace's own logo and name (`ADM-2` decision 12), the way
+            the sign-in page shows them. The name is text, never HTML, so a
+            name that holds markup is shown and not run. */}
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="relative block size-6 shrink-0" aria-hidden>
+            <BrandPicture src={branding.logoSrc} alt={branding.name} fallbackSrc={PRODUCT_LOGO_LIGHT}
+              className="size-6 object-contain dark:hidden" />
+            <BrandPicture src={branding.logoDarkSrc} alt={branding.name} fallbackSrc={PRODUCT_LOGO_DARK}
+              className="hidden size-6 object-contain dark:block" />
+          </span>
+          <span className="truncate text-sm font-semibold">{branding.name}</span>
         </span>
         <span className="hidden h-5 w-px bg-border sm:block" />
         <div className="min-w-0 flex-1">
@@ -158,7 +173,7 @@ export function PublicDashboard({ token }: { token: string }) {
       </main>
 
       <footer className="border-t border-border px-4 py-4 text-center text-[11px] text-muted-foreground sm:px-6">
-        Powered by RantAI Lakehouse
+        {PRODUCT_BYLINE}
       </footer>
     </div>
     </ReportingProvider>
