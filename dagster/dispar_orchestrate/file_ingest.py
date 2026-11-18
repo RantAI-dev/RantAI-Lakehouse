@@ -1462,8 +1462,8 @@ def ingest_uploaded_file(context) -> dict:
 
 # The `dagster/max_runtime` tag is what run monitoring enforces: a run
 # whose process died is cancelled and failed by the daemon, so it does not
-# hold a run-queue slot forever (`OPS-35`). `ingest_factory.run_limit_tags`
-# says why it is a tag and not `run_monitoring.max_runtime_seconds`.
+# hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
+# is a tag and not `run_monitoring.max_runtime_seconds`.
 @job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def file_ingest_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `file_ingest_job`. Launched only

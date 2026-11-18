@@ -261,8 +261,8 @@ def run_agent_employee(context) -> dict[str, Any]:
 
 # The `dagster/max_runtime` tag is what run monitoring enforces: a run
 # whose process died is cancelled and failed by the daemon, so it does not
-# hold a run-queue slot forever (`OPS-35`). `ingest_factory.run_limit_tags`
-# says why it is a tag and not `run_monitoring.max_runtime_seconds`.
+# hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
+# is a tag and not `run_monitoring.max_runtime_seconds`.
 @job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def agent_run_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `agent_run_job`. Launch with run
