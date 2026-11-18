@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use lakehouse_store::audit::{AuditFilter, list as list_audit};
+use lakehouse_store::audit::{AuditFilter, AuditScope, list as list_audit};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -505,7 +505,7 @@ async fn run_employee_permission_ceiling_is_the_employees_own_not_the_triggering
 
     // The audit trail agrees: only "refused" outcomes for that action, on
     // this run, never "executed".
-    let events = list_audit(&app.pool, AuditFilter::default())
+    let events = list_audit(&app.pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let for_this_run: Vec<_> = events

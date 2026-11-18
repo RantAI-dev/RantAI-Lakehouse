@@ -243,7 +243,7 @@ pub(in crate::routes) async fn run_tool(
         "save_query" => queries::save_query(state, principal, args).await,
         "list_saved_queries" => queries::list_saved_queries(state, principal).await,
         "run_saved_query" => queries::run_saved_query(state, principal, args).await,
-        "get_audit_history" => governance::get_audit_history(state).await,
+        "get_audit_history" => governance::get_audit_history(state, principal).await,
         "list_classification_rules" => {
             governance::list_classification_rules(state, principal).await
         }

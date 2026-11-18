@@ -8,7 +8,7 @@
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
@@ -18,7 +18,7 @@ use lakehouse_store::overview::{self, AlertItem};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::error::ApiResult;
+use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::next_run::next_run_at;
 use crate::routes::catalog::NOT_IN_PRIMARY;
@@ -383,17 +383,30 @@ async fn count_delayed_schedules(
 /// `Dagster` run history is the fallback for deployments whose console
 /// Postgres is not configured. It lists the runs of every pipeline, not the
 /// person's own actions, so it is served to a holder of `audit:read` only.
+///
+/// `SEC-20` (plan 100): the feed is read per tenant. The reach is resolved
+/// before the feed is read and narrows it to the caller's own organisation,
+/// on top of the own-rows rule above: a holder of `audit:read` sees the
+/// rows of everybody in its organisation, anybody else sees its own rows
+/// only. The `Dagster` fallback is the deployment's own run list, so it
+/// follows the same rule as the deployment's own rows of the trail.
 pub async fn refresh(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
 ) -> Response {
     let reads_everyones = principal.has("audit:read");
     // The audit writers store `principal.id.uuid().to_string()` in
     // `audit_event.principal_id`, so that is the value that names "their own".
     let own_id = principal.id.uuid().to_string();
     let only_principal = (!reads_everyones).then_some(own_id.as_str());
+    let scope =
+        match crate::routes::audit_scope::scope_for_principal(&state, &principal, &headers).await {
+            Ok(scope) => scope,
+            Err(err) => return ApiRejection(err).into_response(),
+        };
     if let Some(pool) = state.pg.as_deref() {
-        match overview::recent_activity(pool, 20, only_principal).await {
+        match overview::recent_activity(pool, 20, only_principal, &scope).await {
             Ok(activity) => {
                 return (StatusCode::OK, ApiJson(json!({ "activity": activity }))).into_response();
             }
@@ -419,8 +432,9 @@ pub async fn refresh(
     // Only reached with no console Postgres (the audit read did not run, so
     // there is no failure to report) or by a holder after a failed read. The
     // run list below covers every pipeline, not the person's own actions, so
-    // a person without `audit:read` gets an empty feed instead of it.
-    if !reads_everyones {
+    // a person without `audit:read` gets an empty feed instead of it — and
+    // so does a reader the deployment's own rows are not in the reach of.
+    if !reads_everyones || !scope.sees_deployment_rows() {
         return (StatusCode::OK, ApiJson(json!({ "activity": [] }))).into_response();
     }
     match state.dagster.list_runs(20).await {

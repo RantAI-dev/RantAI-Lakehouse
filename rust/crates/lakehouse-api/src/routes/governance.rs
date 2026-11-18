@@ -17,6 +17,7 @@ use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::SqlLiteral;
 use lakehouse_store::PgPool;
+use lakehouse_store::audit::AuditScope;
 use lakehouse_store::governance::{
     self, ClassificationRule, CreateClassificationRuleInput, CreatePolicyInput,
     CreateQualityRuleInput, CreateResidencyRuleInput, Policy, QualityRule, ResidencyRule,
@@ -208,6 +209,32 @@ pub(crate) async fn read_kind(
         }
         _ => None,
     };
+    // `SEC-20` (plan 100): the audit trail is read per tenant, so the
+    // reader's reach is resolved before any row of it is read — for the
+    // same reason the table reach is: a header naming a tenant the caller
+    // does not belong to is the 404 every route answers, and no row of the
+    // trail is read before it. The other kinds do not read the trail, so
+    // their reach is never asked for.
+    if parsed == Kind::Audit {
+        let scope = if let Some(principal) = principal {
+            match crate::routes::audit_scope::scope_for_principal(state, principal, headers).await {
+                Ok(scope) => scope,
+                Err(err) => return ApiRejection(err).into_response(),
+            }
+        } else {
+            // A headless call has no person behind it: it belongs to no
+            // tenant and owns no row of the trail.
+            crate::routes::audit_scope::scope_without_principal()
+        };
+        return match audit_trail(state, &scope).await {
+            Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+            Err(message) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({ "error": message })),
+            )
+                .into_response(),
+        };
+    }
     match parsed {
         Kind::Unknown => (
             StatusCode::BAD_REQUEST,
@@ -359,12 +386,13 @@ fn ch_error_message(err: &ChError) -> String {
 async fn run(state: &AppState, kind: Kind) -> Result<Value, GovError> {
     match kind {
         Kind::Quality => quality(&state.clickhouse, state.pg.as_deref()).await,
-        Kind::Audit => audit(&state.dagster, state.pg.as_deref()).await,
         Kind::Classification => classification(&state.clickhouse, state.pg.as_deref()).await,
         Kind::Residency => residency(state.pg.as_deref()).await,
         Kind::Maintenance => maintenance(&state.clickhouse).await,
         Kind::Replication => replication(&state.clickhouse).await,
-        Kind::Unknown => unreachable!("Kind::Unknown is handled before `run` is called"),
+        Kind::Audit | Kind::Unknown => {
+            unreachable!("the audit kind is answered before `run` is called")
+        }
     }
 }
 
@@ -629,7 +657,6 @@ pub(super) fn audit_event_row(e: &lakehouse_store::audit::AuditEvent) -> Value {
             e.principal_kind.as_deref(),
         ),
         "actorKind": actor_kind_of(e.principal_kind.as_deref()),
-        "tenant": TENANT_ID.as_str(),
         "action": e.action,
         "resource": resource,
         "outcome": outcome_of(&e.outcome),
@@ -664,42 +691,58 @@ pub(super) fn audit_event_row(e: &lakehouse_store::audit::AuditEvent) -> Value {
 /// currently narrows on it). When `pg` is `None` (no `DATABASE_URL`), this
 /// degrades to the pre-fix `Dagster`-only view, matching `quality`'s and
 /// `classification`'s same-shaped gap fixes.
-async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
+///
+/// `SEC-20` (plan 100): `scope` is the reader's reach over the trail. The
+/// stored rows are the ones of the caller's own organisation, and the
+/// deployment's own rows — the `Dagster` runs, which no person signed in
+/// caused — belong to the tenant that owns the shared catalog, so they are
+/// unioned only for a reader that may read them ([`AuditScope::sees_deployment_rows`]).
+async fn audit(
+    dagster: &DgClient,
+    pg: Option<&PgPool>,
+    scope: &AuditScope,
+) -> Result<Value, GovError> {
     // Dagster is optional here. It used to be required, so with no
     // orchestrator reachable — which is every local stack, since compose
     // has no Dagster service — the whole audit trail answered 503 even
     // though the console's own events live in Postgres and were right
     // there. Losing the pipeline half of the trail is a gap; losing all
     // of it is a broken page.
-    let runs = match dagster.list_runs(50).await {
-        Ok(runs) => runs,
-        Err(err) => {
-            tracing::warn!(%err, "audit: no pipeline history (Dagster unreachable)");
-            Vec::new()
-        }
-    };
-    let mut audit: Vec<Value> = runs
-        .iter()
-        .map(|r| {
-            json!({
-                "id": r.run_id,
-                "at": r.start_time.map_or_else(String::new, iso_from_unix_seconds),
-                "actor": "Dagster",
-                "actorKind": "service",
-                "tenant": TENANT_ID.as_str(),
-                "action": format!("pipeline {}: {}", map_run_status(&r.status), r.job_name),
-                "resource": r.job_name,
-                "outcome": if r.status == "FAILURE" { "error" } else { "success" },
-                "policyDecision": "allow",
-                "obligations": [],
-                "engineCategory": "hot-store",
-                "source": "pipeline",
+    //
+    // The run list is asked for only when the reader may read the
+    // deployment's own rows: for any other reader it is a row set it is
+    // not allowed to see, and the orchestrator is not asked for it.
+    let mut audit: Vec<Value> = if scope.sees_deployment_rows() {
+        let runs = match dagster.list_runs(50).await {
+            Ok(runs) => runs,
+            Err(err) => {
+                tracing::warn!(%err, "audit: no pipeline history (Dagster unreachable)");
+                Vec::new()
+            }
+        };
+        runs.iter()
+            .map(|r| {
+                json!({
+                    "id": r.run_id,
+                    "at": r.start_time.map_or_else(String::new, iso_from_unix_seconds),
+                    "actor": "Dagster",
+                    "actorKind": "service",
+                    "action": format!("pipeline {}: {}", map_run_status(&r.status), r.job_name),
+                    "resource": r.job_name,
+                    "outcome": if r.status == "FAILURE" { "error" } else { "success" },
+                    "policyDecision": "allow",
+                    "obligations": [],
+                    "engineCategory": "hot-store",
+                    "source": "pipeline",
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        Vec::new()
+    };
     if let Some(pg) = pg {
         let events =
-            lakehouse_store::audit::list(pg, lakehouse_store::audit::AuditFilter::default())
+            lakehouse_store::audit::list(pg, lakehouse_store::audit::AuditFilter::default(), scope)
                 .await?;
         audit.extend(events.iter().map(audit_event_row));
     }
@@ -712,6 +755,25 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
         b_at.cmp(a_at)
     });
     Ok(json!({ "audit": audit }))
+}
+
+/// The audit trail, as the reader's reach reads it.
+///
+/// `SEC-20` (plan 100): the one read of the trail, shared by the route and
+/// the assistant's `get_audit_history` tool, so the two cannot disagree
+/// about which rows the caller may see.
+///
+/// # Errors
+///
+/// The message of [`gov_error_message`], when the read fails: a `Dagster`
+/// failure is a warning (the run list is optional), a `Postgres` failure
+/// is the fixed `database error`. The message is returned instead of the
+/// error type, because the type is this module's own and this function is
+/// read by the assistant's tools.
+pub(crate) async fn audit_trail(state: &AppState, scope: &AuditScope) -> Result<Value, String> {
+    audit(&state.dagster, state.pg.as_deref(), scope)
+        .await
+        .map_err(|err| gov_error_message(&err))
 }
 
 /// The product's classification levels: the four the console's badge shows
