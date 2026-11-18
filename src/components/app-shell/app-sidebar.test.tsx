@@ -5,12 +5,13 @@ mock.module("next/navigation", () => ({
 }))
 mock.module("next/image", () => ({ default: () => null }))
 
+import type { ReactNode } from "react"
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
-import { AuthProvider } from "@/features/auth/auth-provider"
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { AuthProvider, useAuth } from "@/features/auth/auth-provider"
 import { SidebarProvider } from "@/components/ui/sidebar"
 import { TooltipProvider } from "@/components/ui/tooltip"
-import { forgetRow, rememberRow } from "@/features/dashboards/dashboards-row"
+import { forgetRow, readRow, rememberRow, setRowOwner } from "@/features/dashboards/dashboards-row"
 import { readLastBoard, rememberLastBoard } from "@/features/dashboards/last-board"
 import { AppSidebar } from "./app-sidebar"
 
@@ -19,17 +20,22 @@ const json = (body: unknown, status = 200) =>
 
 const originalFetch = global.fetch
 
+// PR #541 review SHOULD-FIX 1: the remembered row is the signed-in person's, and the session
+// below is "u1"; a test that remembers a row before the session answers names "u1" as `AuthProvider` will.
+beforeEach(() => setRowOwner("u1"))
+
 afterEach(() => {
   cleanup()
   window.localStorage.clear()
   mock.restore()
   global.fetch = originalFetch
+  setRowOwner(null)
 })
 
-function renderSidebar(open: boolean) {
+function renderSidebar(open: boolean, extra?: ReactNode, userId = "u1") {
   spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
     if (String(input).includes("/api/auth/me")) {
-      return json({ id: "u1", name: "Ana", email: "ana@example.invalid", roles: ["R"], permissions: ["catalog:read", "query:read", "dashboard:read"], tenants: [] })
+      return json({ id: userId, name: "Ana", email: "ana@example.invalid", roles: ["R"], permissions: ["catalog:read", "query:read", "dashboard:read"], tenants: [] })
     }
     return json({})
   }) as unknown as typeof fetch)
@@ -37,6 +43,7 @@ function renderSidebar(open: boolean) {
     <AuthProvider>
       <SidebarProvider open={open} onOpenChange={() => {}}>
         <AppSidebar />
+        {extra}
       </SidebarProvider>
     </AuthProvider>,
   )
@@ -142,6 +149,39 @@ describe("AppSidebar, the Dashboards row names what it opens", () => {
     await screen.findByRole("link", { name: "Dashboard: Ops" })
     act(() => rememberRow("dashboard", "b2", "Operations"))
     await screen.findByRole("link", { name: "Dashboard: Operations" })
+  })
+
+  // PR #541 review SHOULD-FIX 1 (security): the row holds a title, so it never reaches the next
+  // person on the browser.
+  it("is emptied when the person signs out", async () => {
+    rememberRow("dashboard", "b1", "Q4 restructuring plan")
+    function SignOut() {
+      const { status, logout } = useAuth()
+      return status === "authenticated" ? <button type="button" onClick={() => void logout()}>Sign out now</button> : null
+    }
+    renderSidebar(true, <SignOut />)
+    await screen.findByRole("link", { name: "Dashboard: Q4 restructuring plan" })
+    fireEvent.click(screen.getByRole("button", { name: "Sign out now" }))
+    await waitFor(() => expect(window.localStorage.getItem("dashboards:menu-row")).toBeNull())
+    expect(readRow()).toBeNull()
+  })
+
+  it("is not shown to another person who signs in on the same browser, and is removed", async () => {
+    setRowOwner("u0")
+    rememberRow("dashboard", "b1", "Q4 restructuring plan")
+    // A new page load: no session has answered yet.
+    setRowOwner(null)
+    renderSidebar(true, null, "u2")
+    await waitFor(() => expect(window.localStorage.getItem("dashboards:menu-row")).toBeNull())
+    expect((await screen.findByRole("link", { name: "Dashboards" })).getAttribute("href")).toBe("/dashboards/browse")
+    expect(screen.queryByText("Q4 restructuring plan")).toBeNull()
+  })
+
+  it("does not show an entry that names no person (stored before rows had an owner)", async () => {
+    window.localStorage.setItem("dashboards:menu-row", JSON.stringify({ kind: "dashboard", id: "b1", name: "Q4 restructuring plan" }))
+    renderSidebar(true)
+    expect((await screen.findByRole("link", { name: "Dashboards" })).getAttribute("href")).toBe("/dashboards/browse")
+    expect(screen.queryByText("Q4 restructuring plan")).toBeNull()
   })
 
   it("ignores a malformed stored value", async () => {
