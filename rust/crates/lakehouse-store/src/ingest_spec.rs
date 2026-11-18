@@ -50,8 +50,10 @@ pub enum SqlDriver {
 /// the same `secretRef`-style indirection as a password: a username is
 /// not a credential, and the seeded `conn-pg-lakehouse` row already
 /// encodes its username directly in `host`
-/// (`lakehouse@postgres:5432/lakehouse`,
-/// `0022_prune_connector_seed.sql`) rather than through any resolver — see
+/// (`lakehouse_app@postgres:5432/lakehouse`,
+/// `0022_prune_connector_seed.sql`, repointed from the owner's name to
+/// the runtime role's by `0149_seed_connector_dials_as_app_role.sql`)
+/// rather than through any resolver — see
 /// `docs/adr/0013-registry-driven-ingestion.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

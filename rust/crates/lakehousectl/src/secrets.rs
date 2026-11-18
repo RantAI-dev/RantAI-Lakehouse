@@ -66,8 +66,12 @@ use rand::Rng;
 pub const ENV_EXAMPLE: &str = include_str!("../../../../.env.example");
 
 /// The keys `ops/init-env.sh` fills with hexadecimal.
-const FILLED_HEX: [&str; 8] = [
+const FILLED_HEX: [&str; 9] = [
     "POSTGRES_PASSWORD",
+    // SEC-78: the console's runtime role's password. It is a must-set
+    // setting, so an install that left it empty would write a `.env` the
+    // stack refuses to start from.
+    "LAKEHOUSE_DB_APP_PASSWORD",
     "RUSTFS_ACCESS_KEY",
     "RUSTFS_SECRET_KEY",
     "LAKEKEEPER_ENCRYPTION_KEY",
