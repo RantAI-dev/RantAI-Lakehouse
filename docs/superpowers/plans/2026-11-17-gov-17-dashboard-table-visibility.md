@@ -831,3 +831,20 @@ changed by this repair, so no TS/Python/compose check was run.
   review of R10/R11 remain the planner's next step; no tool schema changed, so
   `tests/fixtures/tool_schemas.json` is unchanged.
 - `git diff --check` clean; no generated/build output staged.
+
+## Planner re-check of R10 and R11 — 2026-11-18
+
+Read at `eaf3b0853` (fix commits `2e397d06f`, `598794fc3`).
+
+- **R10 closed.** `list_boards` (`routes/ai/tools/dashboards.rs`) adds Main only when
+  `viewer.sees_builtin_board()`, the predicate `routes/dashboard.rs` uses for the
+  HTTP board chooser (lines 1501 and 5021). The regression drives `POST /api/ai/tool`
+  with a denied mart behind a Main tile and a fully granted control.
+- **R11 closed.** The approver check (`routes/ai/tools/reports.rs`) now calls
+  `reports::board_still_visible`, which resolves the approver's viewer and answers
+  Main with `sees_builtin_board()`; the `DEFAULT_BOARD_ID` exemption is gone and an
+  error returns the fixed `FAILED` text (fails closed, no upstream text).
+- No open BLOCKER remains (R1–R4, R6–R9 resolved above; R5 is the verification
+  record). Merge once CI is green on the branch brought up to date with `main`
+  (owner's instruction 2026-11-18: review, and merge if good). Manual AC1–AC9 stay
+  owed to the owner's acceptance run.
