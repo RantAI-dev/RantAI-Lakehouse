@@ -380,6 +380,10 @@ describe("RoleEditPage (WEB-7 D2/D4)", () => {
     renderPage(<RoleEditPage />)
     const name = await screen.findByLabelText("Name")
     fireEvent.change(name, { target: { value: "Auditor" } })
+    // PR568 review: the role renders before table-access loading completes;
+    // Save deliberately stays disabled until then. Exercise an enabled Save
+    // rather than racing that independent request and silently missing a click.
+    await waitFor(() => expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
     expect(await screen.findByRole("alert")).toBeTruthy()
     expect(pushed).toEqual([])

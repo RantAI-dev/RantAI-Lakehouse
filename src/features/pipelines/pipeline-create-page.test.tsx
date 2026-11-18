@@ -1056,6 +1056,8 @@ describe("required-field indicators in the pipeline editor (UX-1-R8)", () => {
     // The default dedupe row's Key column is refused blank by `draftIsComplete`.
     const key = screen.getByText("Key column")
     expect(key.getAttribute("data-required")).toBe("")
-    expect(screen.getByRole("combobox", { name: "Key column" }).getAttribute("aria-required")).toBe("true")
+    // PR568 review: column metadata loads after the step opens. Wait for the
+    // picker to replace its free-text fallback before checking its semantics.
+    expect((await screen.findByRole("combobox", { name: "Key column" })).getAttribute("aria-required")).toBe("true")
   })
 })

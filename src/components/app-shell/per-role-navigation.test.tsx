@@ -71,9 +71,9 @@ describe("ADM-13 D8: per-role navigation and route guard", () => {
   // notificationsService singleton. A hand-maintained restore closure can be
   // left unset if one spy setup throws, and a newly added spy is easy to omit,
   // so restore every spy unconditionally here (app-navbar.test.tsx does the
-  // same). notifications.test.ts then sees the real service whatever order
-  // bun discovers the files in; its five failures in CI run 44079246186 were
-  // the mock's resolved values, not a service regression.
+  // same). CI run 44079246186 showed failures compatible with leaked mock
+  // values, but they did not reproduce locally. This makes the lifecycle
+  // explicit without claiming it proves that failure's cause.
   beforeEach(() => {
     mockRouter.push.mockClear()
     mockRouter.replace.mockClear()
