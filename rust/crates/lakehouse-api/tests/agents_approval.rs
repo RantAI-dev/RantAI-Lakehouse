@@ -11,7 +11,7 @@ use crate::common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use lakehouse_store::audit::{AuditFilter, list};
+use lakehouse_store::audit::{AuditFilter, AuditScope, list};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -128,7 +128,7 @@ async fn approve_executes_the_tool_and_flips_run_status() {
         "the pending step plus the execution step"
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let approved: Vec<_> = events.iter().filter(|e| e.outcome == "approved").collect();
@@ -180,7 +180,7 @@ async fn reject_executes_nothing_and_flips_run_to_rejected() {
     assert_eq!(run.steps.len(), 2);
     assert_eq!(run.steps[1].status, "rejected");
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let rejected: Vec<_> = events.iter().filter(|e| e.outcome == "rejected").collect();
@@ -287,7 +287,7 @@ async fn approver_lacking_the_tools_own_permission_does_not_execute() {
         run.steps[1].detail
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     // One `approved` (the decision itself) and one `failed` (not
@@ -862,7 +862,7 @@ async fn delete_board_creates_a_pending_approval_and_does_not_execute() {
 
     // The gate audit row carries the board as the resource, the
     // `needs_approval` outcome, and is linked to the run/approval.
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -1070,7 +1070,7 @@ async fn agent_decide_route_refuses_the_requester_approving_their_own_tool_call(
         "only the pending step — the delete tool never ran, so the chart still exists"
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let for_this_run: Vec<_> = events
