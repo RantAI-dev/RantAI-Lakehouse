@@ -496,6 +496,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("DELETE", "/api/alerts",      Policy::RequiresAuth),
     // `SRC-7` D9, ADM-13 D5: whether run reports can arrive; alert:read or alert:write.
     ("GET",    "/api/alerts/status", Policy::RequiresAnyPermission(&["alert:read", "alert:write"])),
+    // `BI-43` D1: signed in is the floor; the handler lists only rules the
+    // caller owns, so no permission is needed to see (and, through
+    // `DELETE /api/alerts`, remove) one's own chart alerts.
+    ("GET",    "/api/alerts/mine",  Policy::RequiresAuth),
     // `BI-40` D1/D2: a signed-in person tests one rule they may manage. The
     // handler decides (the same shape as `POST /api/alerts`): 404 for a rule
     // they cannot see, 403 without `alert:write` on a rule that is not their

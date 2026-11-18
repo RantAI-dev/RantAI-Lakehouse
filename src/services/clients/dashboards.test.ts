@@ -396,3 +396,26 @@ describe("the report editor's chart list (BI-62, D5)", () => {
     expect(calls.map((c) => c.url)).toEqual(["/api/dashboard/specs"])
   })
 })
+
+describe("clickhouseDashboardService.filterValues", () => {
+  it("asks /api/dashboard/values by board, narrowed by the other filters and the search, and stringifies the values (BI-29)", async () => {
+    const calls = stubFetch(() => json({ values: ["Bali", 7], truncated: true }))
+
+    const answer = await clickhouseDashboardService.filterValues({
+      column: "province", scope: { board: "b1" }, others: [{ column: "year", values: ["2026"] }], search: " ba ",
+    })
+
+    expect(answer).toEqual({ values: ["Bali", "7"], truncated: true })
+    const url = new URL(calls[0].url, "http://console.invalid")
+    expect(url.pathname).toBe("/api/dashboard/values")
+    expect(url.searchParams.get("board")).toBe("b1")
+    expect(url.searchParams.get("q")).toBe("ba")
+    expect(url.searchParams.get("filters")).toBe(JSON.stringify([{ column: "year", values: ["2026"] }]))
+  })
+
+  it("throws a service error on a refusal, so the hook can show its fixed sentence", async () => {
+    stubFetch(() => json({ error: "nope" }, 500))
+    await expect(clickhouseDashboardService.filterValues({ column: "c", scope: { board: "b" }, others: [], search: "" }))
+      .rejects.toBeInstanceOf(ServiceError)
+  })
+})

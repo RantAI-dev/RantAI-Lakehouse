@@ -31,6 +31,7 @@ import {
   NEW_SQL_CHOICE, fieldsFromColumns, keepIfOffered,
 } from "@/lib/sql-source-draft";
 import { dashboardService, metricService, paramService } from "@/services";
+import type { ChartClick } from "@/services";
 import type { Metric, Segment } from "@/services/contracts/metrics";
 import {
   columnSwitchParams, limitParam, numberParams, refLinesFromDef, refLinesPayload, slotParam, slotText,
@@ -38,7 +39,6 @@ import {
 } from "@/lib/params";
 import { ParamDialog } from "./param-dialog";
 import { ReferenceLinesEditor } from "./reference-lines-editor";
-import type { ChartClick } from "@/services/clients/bi-store";
 import { kindHasClickValue } from "@/lib/chart-click";
 import { clickProblem } from "@/lib/click-destination";
 import { ClickSetting } from "./click-setting";

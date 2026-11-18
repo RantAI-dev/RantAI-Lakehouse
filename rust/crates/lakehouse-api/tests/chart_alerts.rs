@@ -952,3 +952,78 @@ async fn the_rule_list_names_no_chart_the_caller_cannot_see() {
         assert!(rule.get(field).is_none(), "{field} is absent: {rule}");
     }
 }
+
+// ---- BI-43 D1: a person lists and removes only their own alerts on a chart ----
+
+/// A `DELETE /api/alerts?id=`, as `who`.
+async fn delete_alert(f: &Fixture, who: Uuid, id: &str) -> u16 {
+    let cookie = session_cookie_for_user(&f.app.pool, who).await;
+    let resp = f
+        .app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/alerts?id={id}"))
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    resp.status().as_u16()
+}
+
+/// The owner holds `dashboard:read` and nothing else (a Dashboard Viewer: no
+/// `alert:read`, so `GET /api/alerts` is closed to them), and still lists their
+/// own alert on the chart, target included.
+#[tokio::test]
+async fn a_person_without_alert_read_lists_their_own_alerts_on_a_chart() {
+    let f = fixture("owner@test.invalid").await;
+    sqlx::query("UPDATE role SET permissions = 'dashboard:read' WHERE name = 'Chart Owner'")
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+
+    let (status, _) = get_json(&f, f.owner, "/api/alerts").await;
+    assert_eq!(status, 403, "the full list stays behind alert:read");
+
+    let (status, body) = get_json(&f, f.owner, "/api/alerts/mine?chart=c_kpi").await;
+    assert_eq!(status, 200, "{body}");
+    let rules = body["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 1, "{body}");
+    assert_eq!(rules[0]["id"], json!(RULE), "{body}");
+    assert_eq!(rules[0]["target"], json!("owner@test.invalid"), "{body}");
+}
+
+/// Another person sees none of it: the rule is the owner's, so a second viewer
+/// gets an empty list for the same chart, and so does the owner for a chart the
+/// rule does not watch.
+#[tokio::test]
+async fn the_own_alert_list_holds_only_the_callers_rules_on_that_chart() {
+    let f = fixture("owner@test.invalid").await;
+    let other = common::create_principal_with_permissions(&f.app.pool, "dashboard:read").await;
+
+    let (status, body) = get_json(&f, other, "/api/alerts/mine?chart=c_kpi").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rules"], json!([]), "{body}");
+
+    let (status, body) = get_json(&f, f.owner, "/api/alerts/mine?chart=c_other").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rules"], json!([]), "{body}");
+
+    let (status, body) = get_json(&f, f.owner, "/api/alerts/mine").await;
+    assert_eq!(status, 400, "a chart is required: {body}");
+}
+
+/// Remove: the owner removes their own chart alert without `alert:write`;
+/// another person without it is refused, and nothing is written for them.
+#[tokio::test]
+async fn a_person_removes_their_own_chart_alert_and_not_anothers() {
+    let f = fixture("owner@test.invalid").await;
+    let other = common::create_principal_with_permissions(&f.app.pool, "dashboard:read").await;
+
+    assert_eq!(delete_alert(&f, other, RULE).await, 403);
+    assert_eq!(delete_alert(&f, f.owner, RULE).await, 200);
+}
