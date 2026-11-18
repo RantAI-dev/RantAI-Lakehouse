@@ -3,7 +3,7 @@ import { EmbedView } from "@/features/dashboards/embed-view";
 import { parseEmbedLook } from "@/lib/embed-look";
 
 export const metadata: Metadata = {
-  title: "Embedded dashboard · Rantai Lake",
+  title: "Embedded dashboard",
   robots: { index: false, follow: false },
 };
 
