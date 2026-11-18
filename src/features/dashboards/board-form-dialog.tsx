@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { Select, SelectContent, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { folderOptionText, isPersonalFolder } from "@/lib/dashboard-organise"
 import { buildFolderTree, flattenFolders, type FolderLike } from "@/lib/folder-tree"
@@ -74,10 +75,12 @@ export function BoardFormDialog({
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
         <div className="flex flex-col gap-3">
+          <RequiredLegend />
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="board-name">Name</Label>
+            <Label htmlFor="board-name" required>Name</Label>
             <Input
               id="board-name"
+              aria-required
               autoFocus
               value={name}
               onChange={(e) => setName(e.target.value)}

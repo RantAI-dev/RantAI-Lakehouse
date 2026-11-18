@@ -2589,11 +2589,16 @@ pub static TOOLS: &[ToolSpec] = &[
     // ── T2.1 Governance reads ──────────────────────────────────────────
     // ADM-13 (D10.1), ADM-13 review round 1, B2: returns governance and ops rows,
     // matching GET /api/governance/{kind} (governance:read) and GET /api/ops/{kind} (ops:read).
+    // `GOV-1` (feature page Decision 9) is the one exception in the group:
+    // the whole audit trail is `audit:read` — the permission the audit page
+    // asks for on top of the `governance:read` that opens the route — so the
+    // tool that reads the trail needs that one permission, even though the
+    // trail also holds the Dagster runs.
     ToolSpec {
         name: "get_audit_history",
         schema: get_audit_history_schema,
         risk: Risk::Read,
-        permission: "governance:read",
+        permission: "audit:read",
     },
     ToolSpec {
         name: "list_classification_rules",
@@ -4245,7 +4250,8 @@ mod tests {
     fn tier2_tools_have_the_documented_risk_and_permission() {
         let expected: &[(&str, Risk, &str)] = &[
             // ADM-13 (D10.1), ADM-13 review round 1, B2: governance:read and ops:read
-            ("get_audit_history", Risk::Read, "governance:read"),
+            // `GOV-1` (feature page Decision 9): the audit trail is `audit:read`.
+            ("get_audit_history", Risk::Read, "audit:read"),
             ("list_classification_rules", Risk::Read, "governance:read"),
             ("list_quality_rules", Risk::Read, "governance:read"),
             ("get_cdc_health", Risk::Read, "ops:read"),
@@ -4283,7 +4289,8 @@ mod tests {
             .collect();
 
         let d10_tools = [
-            ("get_audit_history", "governance:read"),
+            // `GOV-1` (feature page Decision 9): the audit trail is `audit:read`.
+            ("get_audit_history", "audit:read"),
             ("list_quality_rules", "governance:read"),
             ("list_classification_rules", "governance:read"),
             ("get_quality", "governance:read"),

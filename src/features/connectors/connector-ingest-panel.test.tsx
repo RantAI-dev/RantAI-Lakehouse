@@ -713,6 +713,34 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     expect((screen.getByLabelText("Key columns for public.orders") as HTMLInputElement).value).toBe("id")
     expect(saveButton().disabled).toBe(true)
   })
+
+  // UX-1-R6: aria-required is unsupported on a native fieldset's implicit
+  // group role. The star belongs on a visible legend with linked instructions,
+  // and no individual checkbox should claim to be required.
+  // UX-1-R6: the star belongs on a visible group label, not on the fieldset
+  // role or any individual checkbox. The current form renders a wrapping row
+  // with a labelled span and a fieldset with aria-label.
+  it("uses a visible legend for the key group instead of aria-required on the fieldset", async () => {
+    stubFetch(SPEC, undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
+    fireEvent.click(await screen.findByLabelText(/public\.orders/))
+    chooseOption(await modeOf("public.orders"), "Replace all rows, one per key")
+
+    const checkbox = screen.getByLabelText("order_id is part of the key of public.orders")
+    const fieldset = checkbox.closest("fieldset") as HTMLFieldSetElement
+    expect(fieldset).not.toBeNull()
+    expect(fieldset.hasAttribute("aria-required")).toBe(false)
+    expect(fieldset.getAttribute("aria-label")).toContain("Key columns")
+    expect(checkbox.hasAttribute("aria-required")).toBe(false)
+
+    const keyLabel = Array.from(document.querySelectorAll("span")).find((s) =>
+      s.textContent?.trim().startsWith("Key")
+    )
+    expect(keyLabel).not.toBeNull()
+    expect(keyLabel?.querySelector('span[aria-hidden="true"][class*="before:content-"]')).not.toBeNull()
+    expect(document.querySelector('p[id$="-help"]')?.textContent).toContain("at least one")
+  })
 })
 
 /**
@@ -1369,6 +1397,89 @@ describe("ConnectorIngestPanel column choice", () => {
     expect(screen.getByText("Key column: it identifies a row of this table.")).toBeDefined()
     expect(screen.getByText("Cursor column: it marks which rows are new.")).toBeDefined()
     expect(box("region").disabled).toBe(false)
+  })
+
+  // WEB-13: a source column name is arbitrary data. happy-dom computes no
+  // geometry, so the wrapping is asserted as structure; the measured fit is a
+  // manual-QA item (see the plan).
+  it("keeps a long loaded-column name whole, wraps it, and saves the exact exclusion", async () => {
+    const LONG_COLUMN = "source_generated_extremely_long_column_name_" + "segment_".repeat(6) + "final"
+    const found = [
+      {
+        name: "public.orders",
+        columns: [
+          { name: LONG_COLUMN, typeName: "text" },
+          { name: "id", typeName: "integer" },
+        ],
+        primaryKey: [],
+      },
+    ]
+    const calls = stubFetch(saved(), undefined, { discovered: found })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+
+    const input = screen.getByLabelText(`Load column ${LONG_COLUMN} of public.orders`) as HTMLInputElement
+    const label = input.closest("label") as HTMLElement
+    const text = within(label).getByText(LONG_COLUMN)
+    expect(text.textContent).toBe(LONG_COLUMN)
+    expect(text.className).toContain("break-all")
+    expect(label.className).toContain("min-w-0")
+    expect(input.className).toContain("shrink-0")
+
+    fireEvent.click(input)
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      { name: "public.orders", target: "northwind_orders", loadMode: "replace", excludedColumns: [LONG_COLUMN] },
+    ])
+  })
+
+  it("keeps a long key column name whole and selectable, with its locked reason", async () => {
+    const LONG_KEY = "dedup_key_extremely_long_column_name_" + "segment_".repeat(6) + "final"
+    const found = [
+      {
+        name: "public.orders",
+        columns: [
+          { name: LONG_KEY, typeName: "text" },
+          { name: "id", typeName: "integer" },
+        ],
+        primaryKey: [LONG_KEY, "id"],
+      },
+    ]
+    const calls = stubFetch(
+      saved({ loadMode: "replace_dedup", primaryKey: [LONG_KEY, "id"] }),
+      undefined,
+      { discovered: found }
+    )
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+
+    // The locked-column reason is still there for the long key column.
+    const loadedBox = box(LONG_KEY)
+    expect(loadedBox.disabled).toBe(true)
+    expect(
+      within(loadedBox.closest("label") as HTMLElement).getByText(
+        "Key column: it identifies a row of this table."
+      )
+    ).toBeTruthy()
+
+    // The key choice shows the full name and toggles to the exact value.
+    const keyInput = screen.getByLabelText(`${LONG_KEY} is part of the key of public.orders`) as HTMLInputElement
+    const keyLabel = keyInput.closest("label") as HTMLElement
+    const keyText = within(keyLabel).getByText(LONG_KEY)
+    expect(keyText.className).toContain("break-all")
+    expect(keyLabel.className).toContain("min-w-0")
+    expect(keyInput.className).toContain("shrink-0")
+    expect(keyInput.checked).toBe(true)
+    fireEvent.click(keyInput)
+    expect(keyInput.checked).toBe(false)
+
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const savedBody = (calls.find((c) => c.method === "PUT")?.body as {
+      sourceObjects: { primaryKey: string[] }[]
+    }).sourceObjects[0]
+    expect(savedBody.primaryKey).toEqual(["id"])
   })
 
   it("never sends a key or cursor column as excluded, even if it was unticked before the mode needed it", async () => {

@@ -111,6 +111,20 @@ describe("ServiceIdentityCreatePage (WEB-7 D2)", () => {
     await waitFor(() => expect(pushed).toEqual(["/admin/service-identities"]))
   })
 
+  // UX-1-R10: star and semantics must agree; the scopes group is a named
+  // group with a requirement sentence, not a required checkbox each.
+  it("marks the name and environment inputs required and scopes as a required group", async () => {
+    stubApi()
+    renderPage()
+    expect((await screen.findByLabelText("Name")).getAttribute("aria-required")).toBe("true")
+    expect(screen.getByLabelText("Environment").getAttribute("aria-required")).toBe("true")
+    const scopes = screen.getByRole("group", { name: "Scopes" })
+    expect(scopes.getAttribute("aria-describedby")).toBe("si-scopes-required-help")
+    expect(screen.getByText("Select at least one permission.")).toBeTruthy()
+    expect(scopes.hasAttribute("aria-required")).toBe(false)
+    expect(screen.getByRole("checkbox", { name: "iceberg:read" }).hasAttribute("aria-required")).toBe(false)
+  })
+
   it("keeps the page open with the API's sentence when the create is refused", async () => {
     spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)

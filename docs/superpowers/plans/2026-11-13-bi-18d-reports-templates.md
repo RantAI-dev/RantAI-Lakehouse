@@ -133,7 +133,8 @@ them. **The intermediate commits were not compiled one by one** (this machine to
 minutes per Rust build today); every check below ran on the whole tree, and the full block
 ran on the last commit.
 
-**Migrations: `0142_dashboard_reports.sql` (T1) and `0143_dashboard_templates.sql` (T3).**
+**Migrations: `0145_dashboard_reports.sql` (T1) and `0146_dashboard_templates.sql` (T3).**
+(Renumbered from 0142/0143 on 2026-11-16: main took 0142–0144 for the audit trail and query history; a database that applied the old numbers from this branch must be recreated or have its `_sqlx_migrations` rows corrected.)
 They are free because `origin/main` ends at `0141` (checked with `git fetch` and `git ls-tree
 origin/main rust/migrations/` on 2026-11-13). No open PR adds a migration: the open PRs were
 listed with
@@ -143,7 +144,7 @@ rust/migrations/` is empty for #516, #515 and #491. The rest are dependabot and 
 PR A worktree (`lakehouse-bi`, `fix/bi-export-safety`) also ends at `0141`. Both are Postgres
 tables, as `dashboard_access_rule` (0103) and `dashboard_comment` (0114) are. Boards and
 folders stay in ClickHouse; `folder_id` names a `bi_folder` row and has no foreign key, which
-the 0142 header explains.
+the 0145 header explains.
 
 **New routes** (all in `POLICY_TABLE`, both ways in `tests/route_auth.rs`):
 

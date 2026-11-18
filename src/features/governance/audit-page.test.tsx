@@ -47,7 +47,6 @@ const event = (over: Partial<AuditEvent> = {}): AuditEvent => ({
   at: "2026-11-06T08:00:00.000Z",
   actor: "Platform Admin",
   actorKind: "user",
-  tenant: "t1",
   action: "catalog.grant",
   resource: "catalog:silver.orders",
   outcome: "success",

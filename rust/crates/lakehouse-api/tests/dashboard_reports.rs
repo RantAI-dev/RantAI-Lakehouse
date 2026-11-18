@@ -35,6 +35,10 @@ const OWNER: &str = "0b0b0b0b-0000-4000-8000-000000000001";
 #[derive(Clone)]
 struct FakeCh {
     log: Arc<Mutex<Vec<String>>>,
+    /// Charts moved to the trash since the fixture was made (PR #528 review
+    /// SHOULD-FIX 1): left out of every live read, and `is_deleted = 2` in the
+    /// by-id row state.
+    trashed: Arc<Mutex<Vec<String>>>,
 }
 
 fn chart_row(id: &str, board: &str, kind: &str) -> Value {
@@ -139,17 +143,50 @@ impl Respond for FakeCh {
             ("b_locked", "f_locked", ""),
             ("b_mine", "p_owner", OWNER),
         ];
-        if sql.contains("FROM console.bi_chart") {
-            let charts = [
-                ("c_one", "b_one", "bar"),
-                ("c_two", "b_two", "bar"),
-                ("c_text", "b_one", "text"),
-                ("c_locked", "b_locked", "bar"),
-                ("c_mine", "b_mine", "bar"),
-            ];
+        let charts = [
+            ("c_one", "b_one", "bar"),
+            ("c_two", "b_two", "bar"),
+            ("c_text", "b_one", "text"),
+            ("c_locked", "b_locked", "bar"),
+            ("c_mine", "b_mine", "bar"),
+        ];
+        let trashed = self.trashed.lock().unwrap().clone();
+        // `store::chart_row_state` and `store::board_row_state`: one row by
+        // id, read as the server (no viewer fragment).
+        if let Some(id) = sql
+            .split("SELECT is_deleted, board FROM console.bi_chart FINAL WHERE id = '")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+        {
             return rows(
                 charts
                     .iter()
+                    .filter(|(chart, _, _)| *chart == id)
+                    .map(|(chart, board, _)| {
+                        let gone = trashed.iter().any(|t| t == chart);
+                        json!({ "is_deleted": if gone { 2 } else { 0 }, "board": board })
+                    })
+                    .collect(),
+            );
+        }
+        if let Some(id) = sql
+            .split("SELECT is_deleted, owner_id FROM console.bi_board FINAL WHERE id = '")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+        {
+            return rows(
+                boards
+                    .iter()
+                    .filter(|(board, _, _)| *board == id)
+                    .map(|(_, _, owner)| json!({ "is_deleted": 0, "owner_id": owner }))
+                    .collect(),
+            );
+        }
+        if sql.contains("FROM console.bi_chart") {
+            return rows(
+                charts
+                    .iter()
+                    .filter(|(id, _, _)| !trashed.iter().any(|t| t == id))
                     .filter(|(_, board, _)| {
                         let owner = boards.iter().find(|b| b.0 == *board).map_or("", |b| b.2);
                         // The chart clause hides another owner's board by a
@@ -242,6 +279,7 @@ async fn fixture() -> Fixture {
 async fn fixture_with(extra: &[(&str, &str)]) -> Fixture {
     let fake = FakeCh {
         log: Arc::new(Mutex::new(Vec::new())),
+        trashed: Arc::new(Mutex::new(Vec::new())),
     };
     let ch = MockServer::start().await;
     Mock::given(method("POST"))
@@ -612,18 +650,19 @@ async fn a_chart_the_reader_cannot_see_is_not_available_and_shows_nothing_of_its
 }
 
 /// Saving checks every chart block for the writer: a chart they cannot see and
-/// a tile that is not a chart are refused, each with its own sentence.
+/// a tile that is not a chart are refused, each with its own sentence; the
+/// sentence names the block (PR #528 review SHOULD-FIX 1).
 #[tokio::test]
 async fn saving_refuses_a_chart_the_writer_cannot_see_and_a_tile_that_is_not_a_chart() {
     let f = fixture().await;
     for (block, sentence) in [
         (
             chart("c_mine"),
-            "A chart in this report is not one you can see.",
+            "The chart in block 1 of this report is not one you can see.",
         ),
         (
             chart("c_unknown"),
-            "A chart in this report is not one you can see.",
+            "The chart in block 1 of this report is not one you can see.",
         ),
         (
             chart("c_text"),
@@ -634,6 +673,145 @@ async fn saving_refuses_a_chart_the_writer_cannot_see_and_a_tile_that_is_not_a_c
             create(&f, &f.writer, json!({ "title": "X", "blocks": [block] })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{said}");
         assert_eq!(said["error"], sentence);
+    }
+}
+
+/// PR #528 review SHOULD-FIX 1: the editor sends every block back on each
+/// save, and a chart block already on the report is kept as stored, so a
+/// report whose chart was moved to the trash still takes a title fix (it used
+/// to be refused for every change). A deleted chart that is new in a save gets
+/// its own sentence, naming its block.
+#[tokio::test]
+async fn a_report_whose_chart_was_deleted_still_saves_a_title_change() {
+    let f = fixture().await;
+    let blocks = json!([
+        chart("c_one"),
+        { "type": "paragraph", "text": "Visits rose." },
+        chart("c_two"),
+    ]);
+    let (status, made) = create(
+        &f,
+        &f.writer,
+        json!({ "title": "Q3", "folderId": "f_open", "blocks": blocks }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    let id = made["report"]["id"].as_str().unwrap().to_owned();
+    f.fake.trashed.lock().unwrap().push("c_one".to_owned());
+
+    let (status, read) = call(
+        &f.app,
+        "GET",
+        &format!("/api/dashboard/reports/{id}"),
+        &f.writer,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(
+        read["charts"]["c_one"],
+        json!({ "unavailable": "This chart is not available." })
+    );
+    let (status, saved) = call(
+        &f.app,
+        "PUT",
+        &format!("/api/dashboard/reports/{id}"),
+        &f.writer,
+        Some(json!({ "title": "Q3 visitors", "blocks": read["report"]["blocks"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["report"]["title"], "Q3 visitors");
+    assert_eq!(
+        saved["report"]["blocks"][0],
+        json!({ "type": "chart", "chart": "c_one", "board": "b_one" }),
+        "the kept block keeps the dashboard stored with it"
+    );
+
+    // Placing the deleted chart in another report is refused, and says why.
+    let (status, other) = create(
+        &f,
+        &f.writer,
+        json!({ "title": "Other", "folderId": "f_open", "blocks": [chart("c_two")] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{other}");
+    let other = other["report"]["id"].as_str().unwrap().to_owned();
+    let (status, said) = call(
+        &f.app,
+        "PUT",
+        &format!("/api/dashboard/reports/{other}"),
+        &f.writer,
+        Some(json!({ "blocks": [chart("c_two"), chart("c_one")] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{said}");
+    assert_eq!(
+        said["error"],
+        "The chart in block 2 of this report has been deleted. Remove that block and save again."
+    );
+}
+
+/// PR #528 review SHOULD-FIX 1, the second case: an editor who cannot see a
+/// chart another editor placed can still change the report, because that block
+/// is kept as stored; a chart they cannot see is refused only when their own
+/// save adds it, and a deleted chart on a dashboard they cannot see reads the
+/// same as a hidden one (an id guess learns nothing).
+#[tokio::test]
+async fn an_editor_keeps_a_chart_they_cannot_see_and_may_not_add_one() {
+    let f = fixture().await;
+    // The owner places a chart of their personal dashboard in a shared folder.
+    let (status, made) = create(
+        &f,
+        &f.owner,
+        json!({ "title": "Mixed", "folderId": "f_open", "blocks": [chart("c_mine"), chart("c_two")] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    let id = made["report"]["id"].as_str().unwrap().to_owned();
+    let (_, read) = call(
+        &f.app,
+        "GET",
+        &format!("/api/dashboard/reports/{id}"),
+        &f.writer,
+        None,
+    )
+    .await;
+    let mut blocks = read["report"]["blocks"].as_array().unwrap().clone();
+    blocks.push(json!({ "type": "paragraph", "text": "Added by the writer." }));
+    let (status, saved) = call(
+        &f.app,
+        "PUT",
+        &format!("/api/dashboard/reports/{id}"),
+        &f.writer,
+        Some(json!({ "title": "Mixed, edited", "blocks": blocks })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["report"]["blocks"][0]["chart"], "c_mine");
+    assert_eq!(saved["report"]["blocks"][0]["board"], "b_mine");
+    assert_eq!(saved["report"]["blocks"].as_array().unwrap().len(), 3);
+
+    // A chart the writer cannot see, new in their save: refused, live or deleted.
+    for trashed in [false, true] {
+        if trashed {
+            f.fake.trashed.lock().unwrap().push("c_locked".to_owned());
+        }
+        let mut more = blocks.clone();
+        more.push(chart("c_locked"));
+        let (status, said) = call(
+            &f.app,
+            "PUT",
+            &format!("/api/dashboard/reports/{id}"),
+            &f.writer,
+            Some(json!({ "blocks": more })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "trashed {trashed}: {said}");
+        assert_eq!(
+            said["error"], "The chart in block 4 of this report is not one you can see.",
+            "trashed {trashed}"
+        );
     }
 }
 

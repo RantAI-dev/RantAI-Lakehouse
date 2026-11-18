@@ -11,6 +11,8 @@ import { PencilIcon } from "lucide-react"
 import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
+import { RequiredMarker } from "@/components/ui/required"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { CdcDialForm } from "@/features/connectors/dial-forms/cdc-dial-form"
 import { CdcMongoDialForm } from "@/features/connectors/dial-forms/cdc-mongo-dial-form"
 import { FilesDialForm } from "@/features/connectors/dial-forms/files-dial-form"
@@ -268,7 +270,10 @@ export function DialFormFor({
   dial,
   onChange,
   oauthCallbackUrl,
+  showLegend = true,
 }: {
+  /** UX-1-R7: false when the parent step already shows RequiredLegend. */
+  showLegend?: boolean
   adapter: string | null
   /** `selectedType.name` — needed alongside `adapter` because Oracle
    * dials with the same `sql` adapter/`SqlDial` shape every other SQL
@@ -288,6 +293,7 @@ export function DialFormFor({
       <OracleDialForm
         value={dial as unknown as SqlDial | null}
         onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+        showLegend={showLegend}
       />
     )
   }
@@ -298,6 +304,7 @@ export function DialFormFor({
           value={dial as unknown as SqlDial | null}
           driver={driverForType(typeName)}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "cdc":
@@ -315,6 +322,7 @@ export function DialFormFor({
           value={dial as unknown as CdcDial | null}
           driver={driverForType(typeName)}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "files":
@@ -322,6 +330,7 @@ export function DialFormFor({
         <FilesDialForm
           value={dial as unknown as FilesDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "rest":
@@ -330,6 +339,7 @@ export function DialFormFor({
           value={dial as unknown as RestDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
           oauthCallbackUrl={oauthCallbackUrl}
+          showLegend={showLegend}
         />
       )
     case "saas":
@@ -346,6 +356,7 @@ export function DialFormFor({
         <SheetsDialForm
           value={dial as unknown as SheetsDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "mongodb":
@@ -353,6 +364,7 @@ export function DialFormFor({
         <MongoDialForm
           value={dial as unknown as MongoDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "kafka":
@@ -360,6 +372,7 @@ export function DialFormFor({
         <KafkaDialForm
           value={dial as unknown as KafkaDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     case "sftp":
@@ -367,6 +380,7 @@ export function DialFormFor({
         <SftpDialForm
           value={dial as unknown as SftpDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          showLegend={showLegend}
         />
       )
     default:
@@ -446,7 +460,10 @@ export function CredentialFields({
   settings = null,
   referenceMode = false,
   onReferenceModeChange,
+  showLegend = true,
 }: {
+  /** UX-1-R7: false when the parent step already shows RequiredLegend. */
+  showLegend?: boolean
   noCredential: boolean
   /** Edit page: blank keeps the current credential. */
   optional: boolean
@@ -469,6 +486,10 @@ export function CredentialFields({
   if (noCredential) {
     return <p className="text-xs text-muted-foreground">This connection authenticates with no credential.</p>
   }
+  // On create a credential must be supplied; on edit a blank one keeps the
+  // stored value, so the two slots are optional unless a sign-in/target
+  // change forces a replacement (see the `optional` caller).
+  const required = !optional
   const manager = settings?.secretManager ?? null
   // With a secret manager set up, the form offers "Reference a secret"; the
   // operator can turn typing a value off, which leaves only the reference.
@@ -479,10 +500,16 @@ export function CredentialFields({
     showReference ? (
       <SecretReferenceField key={`${id}-${credentialSlotsKey(slots)}`} manager={manager} idPrefix={id} onChange={onChange} />
     ) : (
-      <CredentialValueInput id={id} slot={slot} value={value} onChange={onChange} />
+      <CredentialValueInput id={id} slot={slot} value={value} onChange={onChange} required={required} />
     )
+  // UX-1-R7 review: one legend per step — the create/edit step shows its own.
+  // Opting out must preserve the paired credential grid: a column span on the
+  // container does not create columns, so only span when the grid is paired.
   return (
     <div className={cn("grid gap-3", pair && !showReference && "sm:grid-cols-2")}>
+      {required && showLegend ? (
+        <RequiredLegend className={pair && !showReference ? "sm:col-span-2" : undefined} />
+      ) : null}
       {manager !== null && onReferenceModeChange ? (
         <div className={cn("space-y-1", pair && !showReference && "sm:col-span-2")}>
           <div role="group" aria-label="How the credential is given" className="inline-flex gap-1">
@@ -516,6 +543,7 @@ export function CredentialFields({
       <Field
         label={showReference ? `${slots.primary.label} (reference)` : slots.primary.label}
         htmlFor={showReference ? undefined : "credential-primary"}
+        required={required}
         error={primaryValue && problems.primary ? problems.primary : undefined}
       >
         {field("credential-primary", slots.primary, primaryValue, onPrimaryValueChange)}
@@ -524,6 +552,7 @@ export function CredentialFields({
         <Field
           label={showReference ? `${typedSecondary.label} (reference)` : typedSecondary.label}
           htmlFor={showReference ? undefined : "credential-secondary"}
+          required={required}
           error={secondaryValue && problems.secondary ? problems.secondary : undefined}
         >
           {field("credential-secondary", typedSecondary, secondaryValue, onSecondaryValueChange)}
@@ -617,10 +646,13 @@ export function StepSectionHeading({
   icon,
   title,
   description,
+  required,
 }: {
   icon: React.ReactNode
   title: string
   description: string
+  /** Marks a section whose control must be supplied (UX-1). */
+  required?: boolean
 }) {
   return (
     <div className="flex items-start gap-2.5">
@@ -628,7 +660,9 @@ export function StepSectionHeading({
         {icon}
       </span>
       <div className="min-w-0">
-        <h3 className="text-sm font-medium">{title}</h3>
+        <h3 className="flex items-center gap-1.5 text-sm font-medium">
+          {title} {required ? <RequiredMarker /> : null}
+        </h3>
         <p className="text-xs text-muted-foreground">{description}</p>
       </div>
     </div>
@@ -641,16 +675,18 @@ export function Field({
   className,
   htmlFor,
   error,
+  required,
 }: {
   label: string
   children: React.ReactNode
   className?: string
   htmlFor?: string
   error?: string
+  required?: boolean
 }) {
   return (
     <div className={cn("space-y-1.5", className)}>
-      <Label htmlFor={htmlFor}>{label}</Label>
+      <Label htmlFor={htmlFor} required={required}>{label}</Label>
       {children}
       {error ? <p className="text-xs text-destructive">{error}</p> : null}
     </div>

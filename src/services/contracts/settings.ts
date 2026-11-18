@@ -1,4 +1,5 @@
 import type { CacheRule } from "@/lib/result-cache"
+import type { BrandingImageKind } from "./branding"
 
 /**
  * `GET`/`PUT /api/settings/reporting` (`BI-9`): the report time zone and the
@@ -117,6 +118,50 @@ export type QueryLimitsInput = { install: QueryLimitValues; roles: RoleTimeLimit
  */
 export type TileLimit = { kind: "time" | "rows"; value: number; source: LimitSource }
 
+/**
+ * One picture as the administrator's answer shows it (`ADM-2` decision 5):
+ * whether it is set, its type and its size, never the file.
+ */
+export type WorkspacePicture = {
+  /** Whether a picture is stored. */
+  set: boolean
+  /** The stored media type, e.g. `image/png`, or `null` when none is set. */
+  type: string | null
+  /** The size in bytes, or `null` when none is set. */
+  bytes: number | null
+}
+
+/**
+ * `GET /api/settings/general` (`ADM-2` decision 5): the workspace's own name
+ * and its three pictures, as the administrator sees them.
+ *
+ * Reading needs `settings:write` like saving does: the workspace's own name
+ * and pictures are the deployment's own. No picture bytes come back, only
+ * each one's type and size.
+ */
+export type WorkspaceSettings = {
+  /** The workspace's own name, or `null` when the product's own name is shown. */
+  workspaceName: string | null
+  /** The logo's summary. */
+  logo: WorkspacePicture
+  /** The dark-mode logo's summary. */
+  logoDark: WorkspacePicture
+  /** The browser-tab icon's summary. */
+  icon: WorkspacePicture
+  /** When the row was last saved, or `null` when nothing was saved yet. */
+  updatedAt: string | null
+}
+
+/**
+ * What a save sends (`ADM-2` decision 4): the name. `null` or an empty string
+ * clears it, so the product's own name is shown. The server refuses a name
+ * over 60 characters or one holding a control character.
+ */
+export type WorkspaceSettingsInput = {
+  /** The workspace's own name, or `null` to clear it. */
+  workspaceName: string | null
+}
+
 export interface SettingsService {
   getLimits(signal?: AbortSignal): Promise<QueryLimits>
   /** The server refuses a value outside its range with a 400 and a sentence. */
@@ -180,6 +225,41 @@ export interface SettingsService {
    * Read the result of an OIDC test sign-in run (`ADM-12`).
    */
   getSsoTestResult(id: string, signal?: AbortSignal): Promise<SsoTestResult>
+  /**
+   * The workspace's own name and its three pictures (`ADM-2`). Reading needs
+   * `settings:write`: the workspace's name and pictures are the deployment's
+   * own.
+   */
+  getGeneral(signal?: AbortSignal): Promise<WorkspaceSettings>
+  /**
+   * Save the workspace's name (`ADM-2` decision 4). The server refuses a name
+   * over 60 characters or one holding a control character with a 422 and its
+   * own sentence; `null` clears the name.
+   */
+  saveGeneralName(
+    input: WorkspaceSettingsInput,
+    signal?: AbortSignal
+  ): Promise<WorkspaceSettings>
+  /**
+   * Store one picture (`ADM-2` decision 3): a form with one part named `file`.
+   * The server reads the type from the file's first bytes and refuses a file
+   * that breaks its rule with a 422 and its own sentence.
+   */
+  uploadGeneralImage(
+    kind: BrandingImageKind,
+    file: File,
+    signal?: AbortSignal
+  ): Promise<WorkspaceSettings>
+  /**
+   * Remove one picture (`ADM-2` decision 5). Removing one that is not set is
+   * not an error.
+   */
+  removeGeneralImage(kind: BrandingImageKind, signal?: AbortSignal): Promise<WorkspaceSettings>
+  /**
+   * Reset (`ADM-2` decision 5): the name and the three pictures go back to
+   * the product's own.
+   */
+  resetGeneral(signal?: AbortSignal): Promise<WorkspaceSettings>
 }
 
 /**

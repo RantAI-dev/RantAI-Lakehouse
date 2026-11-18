@@ -135,7 +135,6 @@ describe("governanceService: audit search, one event and export (GOV-1)", () => 
     at: "2026-11-06T08:00:00.000Z",
     actor: "Platform Admin",
     actorKind: "user",
-    tenant: "t1",
     action: "dashboard.share",
     resource: "dashboard:d1",
     outcome: "success",

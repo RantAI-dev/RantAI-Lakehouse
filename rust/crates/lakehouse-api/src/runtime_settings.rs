@@ -63,6 +63,7 @@ use lakehouse_store::assistant_settings::AssistantSettings;
 use lakehouse_store::email_settings::EmailSettings;
 use lakehouse_store::sign_in_settings::SignInSettings;
 use lakehouse_store::sso_settings::SsoSettings;
+use lakehouse_store::workspace_settings::WorkspaceSettings;
 use lakehouse_store::{PgPool, StoreError};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -309,6 +310,12 @@ impl SettingsRow for SignInSettings {
     }
 }
 
+impl SettingsRow for WorkspaceSettings {
+    fn read(pool: &PgPool) -> impl Future<Output = Result<Option<Self>, StoreError>> + Send {
+        lakehouse_store::workspace_settings::get(pool)
+    }
+}
+
 impl SettingsRow for AssistantSettings {
     fn read(pool: &PgPool) -> impl Future<Output = Result<Option<Self>, StoreError>> + Send {
         lakehouse_store::assistant_settings::get(pool)
@@ -379,7 +386,7 @@ impl TestEmailLimiter {
 /// Returns [`StoreError::Database`] when the store read fails.
 pub async fn email_row(state: &AppState) -> Result<Option<EmailSettings>, StoreError> {
     match state.pg.as_deref() {
-        Some(pool) => state.email_settings_cache.row(pool).await,
+        Some(pool) => state.settings_caches.email.row(pool).await,
         None => Ok(None),
     }
 }
@@ -612,32 +619,58 @@ fn log_once(flag: &AtomicBool, message: &str) {
     }
 }
 
-/// A fresh, empty [`EmailSettingsCache`] as an [`Arc`] — the value
-/// [`crate::state::AppState`] holds.
-#[must_use]
-pub fn email_cache() -> Arc<EmailSettingsCache> {
-    Arc::new(EmailSettingsCache::new())
+/// The settings rows this API caches, one struct behind one [`Arc`] — the
+/// value [`crate::state::AppState`] holds as one field.
+///
+/// One struct, not one field per row: a new field in [`AppState`] grows
+/// every future that holds a copy of the state, and `routes/ai/mod.rs`'s
+/// chat handler and its streaming twin already sit at clippy's 16384-byte
+/// limit for a future (`clippy::large_future`), so one more pointer there
+/// is a lint failure in a file the assistant's team owns.
+#[derive(Debug)]
+pub struct SettingsCaches {
+    /// The saved email row (`ADM-7` plan D3), read by every alert or
+    /// scheduled-report send.
+    pub email: SettingsCache<EmailSettings>,
+    /// The saved sign-in limits (`ADM-8` plan D3), read by every sign-in.
+    pub sign_in: SettingsCache<SignInSettings>,
+    /// The saved workspace name and pictures (`ADM-2` decision 6), read by
+    /// the public branding routes, so a sign-in page that loads on every
+    /// visit costs the database one read per [`SETTINGS_CACHE_TTL`] and not
+    /// one per visit.
+    pub workspace: SettingsCache<WorkspaceSettings>,
+    /// The saved assistant provider settings (`ADM-9` plan D3), read by
+    /// every assistant message.
+    pub assistant: SettingsCache<AssistantSettings>,
+    /// The saved SSO settings (`ADM-12` plan D1/D3), read by every check.
+    pub sso: SettingsCache<SsoSettings>,
 }
 
-/// A fresh, empty sign-in cache as an [`Arc`] — the value
-/// [`crate::state::AppState`] holds.
-#[must_use]
-pub fn sign_in_cache() -> Arc<SettingsCache<SignInSettings>> {
-    Arc::new(SettingsCache::new())
+impl SettingsCaches {
+    /// The five caches, empty: no row has been read yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            email: SettingsCache::new(),
+            sign_in: SettingsCache::new(),
+            workspace: SettingsCache::new(),
+            assistant: SettingsCache::new(),
+            sso: SettingsCache::new(),
+        }
+    }
 }
 
-/// A fresh, empty assistant cache as an [`Arc`] — the value
-/// [`crate::state::AppState`] holds.
-#[must_use]
-pub fn assistant_cache() -> Arc<SettingsCache<AssistantSettings>> {
-    Arc::new(SettingsCache::new())
+impl Default for SettingsCaches {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-/// A fresh, empty SSO cache as an [`Arc`] — the value
+/// A fresh, empty set of the settings caches as an [`Arc`] — the value
 /// [`crate::state::AppState`] holds.
 #[must_use]
-pub fn sso_cache() -> Arc<SsoSettingsCache> {
-    Arc::new(SsoSettingsCache::new())
+pub fn settings_caches() -> Arc<SettingsCaches> {
+    Arc::new(SettingsCaches::new())
 }
 
 // ── The sign-in limits (`ADM-8`) ──────────────────────────────────────────
@@ -762,7 +795,22 @@ pub fn resolve_sign_in(config: &Config, stored: Option<&SignInSettings>) -> Effe
 /// Returns [`StoreError::Database`] when the store read fails.
 pub async fn sign_in_row(state: &AppState) -> Result<Option<SignInSettings>, StoreError> {
     match state.pg.as_deref() {
-        Some(pool) => state.sign_in_settings_cache.row(pool).await,
+        Some(pool) => state.settings_caches.sign_in.row(pool).await,
+        None => Ok(None),
+    }
+}
+
+/// The saved workspace name and pictures for a request, or `None` when no
+/// Postgres pool is configured or nothing was saved.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] when the store read fails.
+pub async fn workspace_settings_row(
+    state: &AppState,
+) -> Result<Option<WorkspaceSettings>, StoreError> {
+    match state.pg.as_deref() {
+        Some(pool) => state.settings_caches.workspace.row(pool).await,
         None => Ok(None),
     }
 }
@@ -950,7 +998,7 @@ fn open_console_key(
 /// Returns [`StoreError::Database`] when the store read fails.
 pub async fn assistant_row(state: &AppState) -> Result<Option<AssistantSettings>, StoreError> {
     match state.pg.as_deref() {
-        Some(pool) => state.assistant_settings_cache.row(pool).await,
+        Some(pool) => state.settings_caches.assistant.row(pool).await,
         None => Ok(None),
     }
 }
@@ -1203,6 +1251,17 @@ pub struct EffectiveSso {
     pub redirect_uri: Option<String>,
     /// Where [`Self::redirect_uri`] came from.
     pub redirect_uri_source: Source,
+    /// The provider's RP-initiated logout endpoint (`end_session_endpoint`),
+    /// read from its discovery document. `None` when the provider publishes
+    /// none: the sign-out then ends this deployment's session only.
+    pub end_session_endpoint: Option<String>,
+    /// The `prompt` parameter the browser sign-in sends to the provider.
+    /// `None` when the operator asked for none (`OIDC_PROMPT=` present but
+    /// empty): the provider then decides whether to show its login form or
+    /// answer from the session it already holds for that browser.
+    pub prompt: Option<String>,
+    /// Where [`Self::prompt`] came from.
+    pub prompt_source: Source,
     /// Clock skew in seconds.
     pub clock_skew_seconds: u64,
 }
@@ -1379,6 +1438,24 @@ pub fn resolve_sso(
         (None, Source::Default)
     };
 
+    // The `prompt` the browser sign-in sends. It is a server-side setting
+    // (the console's SSO form does not carry it) and the value already
+    // carries the default: `Config` fills `"login"` when `OIDC_PROMPT` is
+    // empty (compose always passes it) and the deployment's own `off`
+    // means "send no prompt at all".
+    let prompt =
+        (config.oidc_prompt != crate::config::OIDC_PROMPT_OFF).then(|| config.oidc_prompt.clone());
+    let prompt_source = if config.oidc_prompt_from_env {
+        Source::Server
+    } else {
+        Source::Default
+    };
+
+    // The provider's logout endpoint is read from its discovery document
+    // (like the authorize and token addresses), not from the environment:
+    // it is the provider's own address, not an operator's setting.
+    let end_session_endpoint: Option<String> = None;
+
     let (provider_name, provider_name_source) = if config.oidc_provider_name_from_env {
         (config.oidc_provider_name.clone(), Source::Server)
     } else if let Some(name) = stored.and_then(|s| s.oidc_provider_name.as_deref()) {
@@ -1463,6 +1540,9 @@ pub fn resolve_sso(
         jwks_url_source,
         redirect_uri,
         redirect_uri_source,
+        end_session_endpoint,
+        prompt,
+        prompt_source,
         clock_skew_seconds: config.oidc_clock_skew_seconds,
     }
 }
@@ -1475,7 +1555,7 @@ pub fn resolve_sso(
 /// Returns [`StoreError::Database`] when the store read fails.
 pub async fn sso_row(state: &AppState) -> Result<Option<SsoSettings>, StoreError> {
     match state.pg.as_deref() {
-        Some(pool) => state.sso_settings_cache.row(pool).await,
+        Some(pool) => state.settings_caches.sso.row(pool).await,
         None => Ok(None),
     }
 }
@@ -1806,6 +1886,21 @@ pub fn draft_sso_settings(config: &Config, draft: &serde_json::Value) -> Effecti
         } else {
             Source::Default
         },
+        // The draft is a console-set connection: its addresses are read from
+        // the provider's discovery document when the draft is built, so the
+        // draft carries the same logout endpoint the saved connection has.
+        end_session_endpoint: None,
+        // The test sign-in drives the same authorize request as the real
+        // one, so it carries the same prompt: a draft tested against a
+        // provider that still holds a session must ask for the form too,
+        // or the test signs the tester in as somebody else.
+        prompt: (config.oidc_prompt != crate::config::OIDC_PROMPT_OFF)
+            .then(|| config.oidc_prompt.clone()),
+        prompt_source: if config.oidc_prompt_from_env {
+            Source::Server
+        } else {
+            Source::Default
+        },
         clock_skew_seconds: config.oidc_clock_skew_seconds,
     }
 }
@@ -1833,6 +1928,55 @@ pub async fn sso_runtime(state: &AppState) -> SwappableOidc {
 /// provider's discovery document names filled in (`ADM-12` D10).
 pub async fn sso(state: &AppState) -> EffectiveSso {
     sso_runtime(state).await.settings
+}
+
+/// How long the sign-out waits for the provider's discovery document before
+/// it gives up on ending the provider's session (see
+/// [`end_session_endpoint`]). Short on purpose: the person is signing out,
+/// and a provider that does not answer must not hold that up.
+const END_SESSION_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The provider's RP-initiated logout endpoint (`end_session_endpoint`) for
+/// `settings`, or `None`.
+///
+/// A console-set connection already carries it: [`build_sso_runtime`] reads
+/// the discovery document for that path and fills it in. A server-owned
+/// connection does not — the environment owns its addresses (D3), so the
+/// build reads no discovery document at all — and the sign-out reads it
+/// here instead, at the moment it is needed. Reading it now rather than at
+/// build time matters: a server-owned runtime lives as long as the process
+/// ([`is_fresh`]), so a provider that was not answering yet when the API
+/// started would otherwise leave the sign-out unable to end the provider's
+/// session until the next restart.
+///
+/// The read is best-effort and bounded by [`END_SESSION_DISCOVERY_TIMEOUT`]:
+/// when it fails, the sign-out still ends this deployment's session, and
+/// only the provider's own session is left as it was (the behaviour before
+/// the provider's logout was wired at all).
+pub async fn end_session_endpoint(state: &AppState, settings: &EffectiveSso) -> Option<String> {
+    if let Some(url) = settings.end_session_endpoint.as_deref() {
+        return Some(url.to_owned());
+    }
+    if settings.issuer_source != Source::Server {
+        // A console-set connection's discovery document was read at build
+        // time; a missing endpoint there means the provider names none.
+        return None;
+    }
+    let issuer = settings.issuer.as_deref()?;
+    let http = match state.sso_http_client() {
+        Some(client) => client,
+        None => reqwest::Client::builder()
+            .timeout(END_SESSION_DISCOVERY_TIMEOUT)
+            .build()
+            .ok()?,
+    };
+    let Ok(endpoints) = lakehouse_auth::oidc::read_discovery_endpoints(issuer, http).await else {
+        tracing::warn!(
+            "the OIDC discovery document could not be read at sign-out; the provider's own session was not ended"
+        );
+        return None;
+    };
+    endpoints.end_session_endpoint
 }
 
 /// The `OIDC` authenticator for the effective `SSO` settings, rebuilt when
@@ -2004,6 +2148,10 @@ async fn build_sso_runtime(
         .clone()
         .or_else(|| Some(endpoints.jwks_uri.clone()));
     settings.redirect_uri = Some(redirect_uri);
+    // The provider's logout endpoint, when its discovery document names
+    // one: the sign-out can then end the provider's session too, so the
+    // next sign-in does not land on the account that signed in last.
+    settings.end_session_endpoint = endpoints.end_session_endpoint.clone();
 
     // One client, pinned to every address this connection was allowed to
     // reach: the issuer, and the three the document named. A value the
@@ -2699,6 +2847,29 @@ mod tests {
         assert!(eff.is_configured());
     }
 
+    // The `prompt` the browser sign-in sends. It is the deployment's own
+    // setting (the console's SSO form does not carry it), and it does not
+    // depend on the saved row: nothing in the console can change it.
+    #[test]
+    fn the_prompt_is_the_deployments_own_and_defaults_to_login() {
+        let cfg = config(&[]);
+        let eff = resolve_sso(&cfg, None, None);
+        assert_eq!(eff.prompt.as_deref(), Some("login"));
+        assert_eq!(eff.prompt_source, Source::Default);
+
+        let cfg = config(&[("OIDC_PROMPT", "select_account")]);
+        let eff = resolve_sso(&cfg, None, None);
+        assert_eq!(eff.prompt.as_deref(), Some("select_account"));
+        assert_eq!(eff.prompt_source, Source::Server);
+
+        // `off`: the deployment's own spelling for "send no prompt at all",
+        // so the provider reuses its own session.
+        let cfg = config(&[("OIDC_PROMPT", "off")]);
+        let eff = resolve_sso(&cfg, None, None);
+        assert_eq!(eff.prompt, None);
+        assert_eq!(eff.prompt_source, Source::Server);
+    }
+
     #[test]
     fn an_env_client_id_alone_makes_the_connection_server_owned() {
         let cfg = config(&[("OIDC_CLIENT_ID", "env-client")]);
@@ -3068,7 +3239,7 @@ mod tests {
         *state.oidc.write().await = Some(first.clone());
 
         // The two lines `routes::settings::put_sso` runs after a save.
-        state.sso_settings_cache.clear().await;
+        state.settings_caches.sso.clear().await;
         *state.oidc.write().await = None;
 
         let next = cached_or_build(&state, environment_base(&state)).await;

@@ -6,6 +6,7 @@ import { FormPage } from "@/components/patterns/form-page"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { authService, identityService } from "@/services"
@@ -95,28 +96,43 @@ export function InviteUserPage() {
       onSubmit={() => void handleCreate()}
       onCancel={() => router.push(backHref)}
     >
+      <RequiredLegend />
       <div className="space-y-1.5">
-        <Label htmlFor="user-name">Name</Label>
-        <Input id="user-name" value={name} onChange={(e) => setName(e.target.value)} />
+        <Label htmlFor="user-name" required>Name</Label>
+        <Input id="user-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
       </div>
-      <div className="space-y-1.5">
-        <Label htmlFor="user-username">Username</Label>
-        <Input
-          id="user-username"
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          placeholder="e.g. jdoe"
-        />
-      </div>
-      <div className="space-y-1.5">
-        <Label htmlFor="user-email">Email (optional)</Label>
-        <Input
-          id="user-email"
-          type="email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          placeholder="jdoe@example.com"
-        />
+      {/* UX-1-R10: the guard needs one of the two, not both and not either
+          one alone. Star the group and link the explanation; neither member
+          carries aria-required, so each stays individually optional. */}
+      <div
+        role="group"
+        aria-labelledby="user-identity-label"
+        aria-describedby="user-identity-help"
+        className="space-y-1.5"
+      >
+        <Label id="user-identity-label" required>Username or email</Label>
+        <p id="user-identity-help" className="text-xs text-muted-foreground">
+          A username or an email is required to identify the new user.
+        </p>
+        <div className="space-y-1.5">
+          <Label htmlFor="user-username">Username</Label>
+          <Input
+            id="user-username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            placeholder="e.g. jdoe"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="user-email">Email (optional)</Label>
+          <Input
+            id="user-email"
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="jdoe@example.com"
+          />
+        </div>
       </div>
       <div className="space-y-1.5">
         <Label>Roles</Label>
