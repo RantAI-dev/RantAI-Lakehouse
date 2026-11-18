@@ -647,6 +647,13 @@ fn sha256_hex(text: &str) -> String {
 #[tokio::test]
 async fn a_chat_with_no_allowlist_is_offered_today_s_tools_and_today_s_prompt() {
     for switch in ["true", "false"] {
+        // The DATA MAP cache is one entry for the whole process, kept for two
+        // minutes: a chat that ran before this one in the same process would
+        // leave its map behind, and the prompt's bytes would then be the ones
+        // of that map instead of the ones this test mocks. The cache is
+        // cleared here, so the pin is the same in one process as it is alone
+        // (`AI-32`).
+        lakehouse_api::clear_data_map_cache().await;
         let llm = mock_model(vec![model_round(Some("Hi."), &[])]).await;
         let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
 
@@ -1157,11 +1164,25 @@ async fn a_discarded_rewrite_leaves_no_trace_in_the_conversation_the_repair_roun
 /// `AI-17` review fix (BLOCKER 2): the iteration-budget path runs the same
 /// check. `MAX_ITER` (8) rounds that call a tool, then a final answer with a
 /// CJK character, then the rewrite: ten requests in all.
+///
+/// Every round calls the unknown tool with its own arguments, so the rounds
+/// are different calls: plan 111 stops the loop after three failures of the
+/// *same* call, and this test is about the rounds' budget, not about that
+/// bound.
 #[tokio::test]
 async fn a_final_answer_after_the_tool_call_limit_with_a_cjk_character_is_replaced_by_its_clean_rewrite()
  {
     let mut rounds: Vec<Value> = (1..=8)
-        .map(|n| model_round(None, &[(&format!("call_{n}"), "no_such_tool", "{}")]))
+        .map(|n| {
+            model_round(
+                None,
+                &[(
+                    &format!("call_{n}"),
+                    "no_such_tool",
+                    &format!(r#"{{"n":{n}}}"#),
+                )],
+            )
+        })
         .collect();
     rounds.push(model_round(Some("Total kunjungan adalah 吸引力."), &[]));
     rounds.push(model_round(Some("Total kunjungan tercatat."), &[]));

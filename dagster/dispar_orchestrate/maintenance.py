@@ -229,9 +229,17 @@ from dispar_orchestrate.bronze_catalog import (
     record_maintenance_run,
     record_maintenance_verb_run,
 )
+from dispar_orchestrate.ingest_factory import run_limit_tags
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 CATALOG_DB = "icecat_maintenance"
+
+# How long one run of this job may run, in seconds. A daily maintenance
+# pass fans out over every Bronze table, so it gets room for a slow day:
+# the longest run measured on staging on 2026-11-16 was 2674 s and the
+# limit is twice that, far below the six hours a load job gets.
+RUN_LIMIT_ENV = "DAGSTER_RUN_LIMIT_BRONZE_MAINTENANCE_JOB_SECONDS"
+DEFAULT_RUN_LIMIT_SECONDS = 10_800
 
 # The environment variable that pauses the maintenance jobs (REL-2 S4
 # decision D16).
@@ -339,6 +347,29 @@ def _ensure_catalog_database(cfg: MaintenanceConfig) -> None:
     ensure_catalog_database(cfg, CATALOG_DB)
 
 
+def discover_catalog_tables(cfg: MaintenanceConfig) -> list[str]:
+    """Every table the catalog knows about, as the catalog's own flat
+    two-part names (`bronze.orders`, `gold.mart_wisman`) -- discovered
+    from the catalog itself (`SHOW TABLES`), not from
+    `bronze_meta.dataset_catalog`, so a table that failed catalog
+    registration but still exists in Lakekeeper is still listed (the
+    two failure modes are independent and a caller should not silently
+    skip a table just because the OTHER P3 step didn't run for it).
+
+    `SHOW TABLES FROM {CATALOG_DB}` returns every namespace the catalog
+    knows about in one flat list -- `bronze.*` AND `gold.*` (ADR 0010's
+    Gold export target) side by side, since `DataLakeCatalog` has no
+    per-namespace listing call, only a whole-database one.
+
+    `discover_bronze_tables` (below) narrows this list to `bronze.*`;
+    this function keeps the whole list, for a caller that measures more
+    than one namespace (`storage_snapshot.py`'s per-layer job)."""
+    text = _ch_query(
+        cfg, f"SHOW TABLES FROM {CATALOG_DB} SETTINGS allow_database_iceberg=1 FORMAT TabSeparated"
+    )
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
 def discover_bronze_tables(cfg: MaintenanceConfig) -> list[str]:
     """Every table under the catalog's flat `bronze` namespace (ADR 0004) --
     discovered from the catalog itself (`SHOW TABLES`), not from
@@ -355,11 +386,7 @@ def discover_bronze_tables(cfg: MaintenanceConfig) -> list[str]:
     maintenance ran against `gold.*` too. The `bronze.` prefix filter
     below is the fix; `test_maintenance.py::DiscoverBronzeTablesTest`
     is the regression test proving a `gold.*` table is excluded."""
-    text = _ch_query(
-        cfg, f"SHOW TABLES FROM {CATALOG_DB} SETTINGS allow_database_iceberg=1 FORMAT TabSeparated"
-    )
-    all_tables = [line.strip() for line in text.splitlines() if line.strip()]
-    return [name for name in all_tables if name.startswith("bronze.")]
+    return [name for name in discover_catalog_tables(cfg) if name.startswith("bronze.")]
 
 
 _ICEBERG_MAINT_SETTINGS = "allow_database_iceberg=1, allow_insert_into_iceberg=1"
@@ -468,7 +495,7 @@ def probe_expire_snapshots_skip(cfg: MaintenanceConfig, table_name: str) -> str:
     )
 
 
-def _mint_lakekeeper_read_token(cfg: MaintenanceConfig) -> str | None:
+def mint_lakekeeper_read_token(cfg: MaintenanceConfig) -> str | None:
     """Mint a short-lived bearer token from `ops/oidc-mock`'s
     client-credentials endpoint as the `clickhouse-reader` principal — the
     SAME pattern `ops/g3a/g3a_test.py`'s `_mint_lakekeeper_read_token` uses
@@ -477,7 +504,11 @@ def _mint_lakekeeper_read_token(cfg: MaintenanceConfig) -> str | None:
     `docker-compose.yml`) rather than requesting a new one. Returns `None`
     on a pre-R1/authz-disabled stack (`ch_oauth_client_id` unset there
     too), where `measure_snapshot_growth` degrades to an honest
-    "not measured" rather than a failure."""
+    "not measured" rather than a failure.
+
+    Public because `storage_snapshot.py` reads the SAME catalog and needs
+    the SAME token: a private name of another module is a name that may
+    change under it (`AGENTS.md` rule 4)."""
     if not cfg.ch_oauth_client_id:
         return None
     resp = requests.post(
@@ -490,11 +521,14 @@ def _mint_lakekeeper_read_token(cfg: MaintenanceConfig) -> str | None:
     return token
 
 
-def _resolve_catalog_prefix(cfg: MaintenanceConfig, token: str) -> str:
+def resolve_catalog_prefix(cfg: MaintenanceConfig, token: str) -> str:
     """`GET /v1/config` resolves the warehouse NAME (`cfg.lakekeeper_warehouse`)
     to the REST catalog's own path `prefix` — the same two-step resolution
     `ops/g3a/g3a_test.py`'s `step_verify_format_version_2` already performs
-    and has proven works against this stack."""
+    and has proven works against this stack.
+
+    Public for the same reason `mint_lakekeeper_read_token` is: another
+    module (`storage_snapshot.py`) reads the SAME catalog."""
     resp = requests.get(
         f"{cfg.lakekeeper_catalog_uri}/v1/config",
         params={"warehouse": cfg.lakekeeper_warehouse},
@@ -529,11 +563,11 @@ def measure_snapshot_growth(cfg: MaintenanceConfig, table_name: str) -> dict[str
     yet has no `expire_snapshots` write path to measure a gap in either,
     so a skip here is consistent with the rest of this module's degrade-
     gracefully posture on that same condition."""
-    token = _mint_lakekeeper_read_token(cfg)
+    token = mint_lakekeeper_read_token(cfg)
     if token is None:
         return {"measured": False, "snapshot_count": 0, "metadata_log_count": 0}
 
-    prefix = _resolve_catalog_prefix(cfg, token)
+    prefix = resolve_catalog_prefix(cfg, token)
     namespace, _, table = table_name.partition(".")
     resp = requests.get(
         f"{cfg.lakekeeper_catalog_uri}/v1/{prefix}/namespaces/{namespace}/tables/{table}",
@@ -1216,7 +1250,11 @@ def summarize_bronze_maintenance(
     return results
 
 
-@job
+# The `dagster/max_runtime` tag is what run monitoring enforces: a run
+# whose process died is cancelled and failed by the daemon, so it does not
+# hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
+# is a tag and not `run_monitoring.max_runtime_seconds`.
+@job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def bronze_maintenance_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `bronze_maintenance_job`.
     PART C: `list_bronze_tables` is the fan-out (one DynamicOutput per

@@ -256,22 +256,31 @@ MAX_RUN_LIMIT_SECONDS = 4_294_967_295
 
 @dataclass(frozen=True)
 class RunLimitSettings:
-    """How long one `ingest_job` run may run, in seconds (`SRC-39`).
+    """How long one job's run may run, in seconds (`SRC-39`).
 
-    `_ingest_job_tags` reads it into the `dagster/max_runtime` tag of every
-    run. The tag is a tag on `ingest_job` alone, not
+    `run_limit_tags` reads it into the `dagster/max_runtime` tag of every
+    run. The tag is a tag on ONE job alone, not
     `run_monitoring.max_runtime_seconds`, which would cap every job of the
     instance (D9), and the orchestrator enforces it only while run monitoring
     is on (`dagster/dagster.yaml`, T10).
+
+    `from_env` takes the setting's own name and default, so a second job
+    with its own limit reuses this ONE parsing rule instead of copying it
+    (`AGENTS.md` rule 4): `ingest_job` keeps six hours, and
+    `storage_snapshot_job` (OPS-8 part C) keeps thirty minutes.
     """
 
     max_runtime_seconds: int = DEFAULT_RUN_LIMIT_SECONDS
 
     @classmethod
-    def from_env(cls) -> "RunLimitSettings":
-        raw = _env(RUN_LIMIT_ENV, "")
+    def from_env(
+        cls,
+        env_name: str = RUN_LIMIT_ENV,
+        default_seconds: int = DEFAULT_RUN_LIMIT_SECONDS,
+    ) -> "RunLimitSettings":
+        raw = _env(env_name, "")
         if not raw:
-            return cls()
+            return cls(max_runtime_seconds=default_seconds)
         # `review round 1, R9`: the API's rule (`parse_run_limit`,
         # `lakehouse-api/src/config.rs`), so both services read one setting the
         # same way: surrounding spaces trimmed (`_env` does it), ASCII digits
@@ -283,16 +292,29 @@ class RunLimitSettings:
             # not worth echoing into a log line the whole team reads.
             logger.warning(
                 "%s cannot be used (expected a whole number of seconds, 1 or more); using the default %d",
-                RUN_LIMIT_ENV,
-                DEFAULT_RUN_LIMIT_SECONDS,
+                env_name,
+                default_seconds,
             )
-            return cls()
+            return cls(max_runtime_seconds=default_seconds)
         return cls(max_runtime_seconds=seconds)
+
+
+def run_limit_tags(env_name: str, default_seconds: int) -> dict[str, str]:
+    """The `dagster/max_runtime` tag a job carries, read from `env_name`
+    with `default_seconds` as its fallback (`SRC-39`, QA `TC-1702`).
+
+    One function for every job that needs a run limit, so the parsing rule
+    above stays in one place: a job that wants a limit of its own asks for
+    it here with its own setting name, and never touches
+    `ingest_job`'s.
+    """
+    settings = RunLimitSettings.from_env(env_name, default_seconds)
+    return {"dagster/max_runtime": str(settings.max_runtime_seconds)}
 
 
 def _ingest_job_tags() -> dict[str, str]:
     """The tags every `ingest_job` run carries (`SRC-39`, QA `TC-1702`)."""
-    return {"dagster/max_runtime": str(RunLimitSettings.from_env().max_runtime_seconds)}
+    return run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS)
 
 
 def _fetch_one_connector(cfg: IngestFactoryConfig, connector_id: str) -> dict[str, Any]:

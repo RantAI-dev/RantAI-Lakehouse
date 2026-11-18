@@ -12,8 +12,11 @@ use crate::common;
 use std::collections::HashMap;
 
 use axum::body::{Body, to_bytes};
-use axum::http::Request;
-use common::{TestApp, create_assistant_principal, session_cookie_for_user, spin_up_with_env};
+use axum::http::{Request, StatusCode};
+use common::{
+    TestApp, create_assistant_principal, create_principal_with_permissions,
+    session_cookie_for_user, spin_up_with_env,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -248,6 +251,7 @@ async fn a_dashboard_starts_from_a_listed_template_after_the_confirm() {
             chart_count: 0,
             definition: &definition,
             by: "Rina",
+            by_id: Uuid::new_v4(),
         },
     )
     .await
@@ -277,6 +281,112 @@ async fn a_dashboard_starts_from_a_listed_template_after_the_confirm() {
     let board = result["board"]["id"].as_str().unwrap();
     assert_eq!(result["url"], format!("/dashboards/{board}"));
     assert_eq!(result["leftOut"], json!([]));
+}
+
+async fn templates(app: &TestApp) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM dashboard_template")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+async fn decide(app: &TestApp, cookie: &str, id: &str) -> (StatusCode, Value) {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/agents/approvals/{id}/decide"))
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+                .body(Body::from(json!({ "decision": "approved" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Decision T6 (PR #528 review SHOULD-FIX 2, owner decision D-A): the
+/// assistant's `delete_template` runs the route's own function as the person
+/// who approves it, so an approver who neither saved the template nor is an
+/// administrator is refused with the route's sentence and the template stays;
+/// an administrator's approval deletes it. `list_templates` tells the person
+/// which ones they may delete.
+#[tokio::test]
+async fn deleting_a_template_through_the_assistant_needs_its_creator_or_an_administrator() {
+    let (app, _ch) = app().await;
+    let creator = create_assistant_principal(&app.pool, WRITER).await;
+    let cookie = session_cookie_for_user(&app.pool, creator).await;
+    let definition = json!({ "file": {}, "charts": {} });
+    let saved = lakehouse_store::dashboard_templates::insert(
+        &app.pool,
+        lakehouse_store::dashboard_templates::TemplateInput {
+            name: "Team layout",
+            source_board: "b_one",
+            source_board_name: "Board b_one",
+            chart_count: 0,
+            definition: &definition,
+            by: "Rina",
+            by_id: creator,
+        },
+    )
+    .await
+    .unwrap();
+    let listed = call(&app, &cookie, "list_templates", json!({})).await;
+    assert_eq!(
+        listed["result"]["templates"][0]["canDelete"], true,
+        "{listed}"
+    );
+    let ask = json!({ "id": saved.id.to_string(), "confirmed": true });
+    // Another writer approves: refused by the route's own rule.
+    let other = create_principal_with_permissions(
+        &app.pool,
+        "dashboard:read,dashboard:write,agent:approve",
+    )
+    .await;
+    let other = session_cookie_for_user(&app.pool, other).await;
+    let pending = call(&app, &cookie, "delete_template", ask.clone()).await;
+    assert_eq!(pending["outcome"], "needs_approval", "{pending}");
+    let approval = pending["result"]["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, decided) = decide(&app, &other, &approval).await;
+    assert_eq!(status, StatusCode::OK, "{decided}");
+    assert!(
+        decided["result"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(
+                "Only the person who saved this template, or an administrator, can delete it."
+            ),
+        "{decided}"
+    );
+    assert_eq!(templates(&app).await, 1, "the template stays");
+
+    // An administrator approves: deleted.
+    let admin = create_principal_with_permissions(
+        &app.pool,
+        "dashboard:read,dashboard:write,agent:approve,identity:write",
+    )
+    .await;
+    let admin = session_cookie_for_user(&app.pool, admin).await;
+    let pending = call(&app, &cookie, "delete_template", ask.clone()).await;
+    let approval = pending["result"]["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, decided) = decide(&app, &admin, &approval).await;
+    assert_eq!(status, StatusCode::OK, "{decided}");
+    assert_eq!(decided["result"]["ok"], true, "{decided}");
+    assert_eq!(templates(&app).await, 0);
 }
 
 /// Without `dashboard:write` every one of the six is refused, and nothing is

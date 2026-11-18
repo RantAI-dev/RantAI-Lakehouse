@@ -109,6 +109,7 @@ export function TablePicker({
   catalog,
   allowEveryTable = false,
   description,
+  required = false,
 }: {
   id?: string
   label: string
@@ -117,6 +118,8 @@ export function TablePicker({
   catalog: TableCatalog
   allowEveryTable?: boolean
   description?: React.ReactNode
+  /** UX-1: show the shared required marker and required semantics. */
+  required?: boolean
 }) {
   const options = React.useMemo(() => {
     const tables = catalog.choices ?? []
@@ -133,12 +136,13 @@ export function TablePicker({
 
   return (
     <div className="grid gap-1.5">
-      <Label htmlFor={id}>{label}</Label>
+      <Label htmlFor={id} required={required}>{label}</Label>
       {catalog.choices === null ? (
         <>
           <Input
             id={id}
             aria-label={label}
+            aria-required={required}
             value={value}
             onChange={(e) => onChange(e.target.value)}
             placeholder="namespace.table"
@@ -147,19 +151,24 @@ export function TablePicker({
         </>
       ) : (
         <Faceted value={value === "" ? undefined : value} onValueChange={(next) => onChange(next ?? "")}>
+          {/* WEB-13: the selected badge is bounded and truncated, so the full
+              table key is also put on the trigger's title. The option row below
+              wraps the whole identifier rather than clipping it. */}
           <FacetedTrigger asChild>
             <Button
               id={id}
               type="button"
               variant="outline"
               size="sm"
-              className="w-full justify-between font-normal"
+              className="w-full min-w-0 justify-between font-normal"
               aria-label={label}
+              title={value === "" ? undefined : value}
             >
               <FacetedBadgeList
                 options={options}
                 placeholder="Pick a table"
-                badgeClassName="font-mono"
+                className="min-w-0 flex-1"
+                badgeClassName="max-w-full font-mono [&>span]:min-w-0"
               />
             </Button>
           </FacetedTrigger>
@@ -170,7 +179,10 @@ export function TablePicker({
               <FacetedGroup>
                 {options.map((option) => (
                   <FacetedItem key={option.value} value={option.value}>
-                    <span className="font-mono text-xs">{option.label}</span>
+                    {/* WEB-13: wrap an unbroken table key inside the option row. */}
+                    <span className="min-w-0 break-all font-mono text-xs leading-snug">
+                      {option.label}
+                    </span>
                   </FacetedItem>
                 ))}
               </FacetedGroup>

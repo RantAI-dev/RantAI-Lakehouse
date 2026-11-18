@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation"
 import { FormPage } from "@/components/patterns/form-page"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { identityService } from "@/services"
@@ -71,13 +72,15 @@ export function ServiceIdentityCreatePage() {
       onSubmit={() => void handleCreate()}
       onCancel={() => router.push(backHref)}
     >
+      <RequiredLegend />
       <div className="space-y-1.5">
-        <Label htmlFor="si-name">Name</Label>
-        <Input id="si-name" value={name} onChange={(e) => setName(e.target.value)} />
+        {/* UX-1-R10: star and semantics must agree on every marked input. */}
+        <Label htmlFor="si-name" required>Name</Label>
+        <Input id="si-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="si-scopes">Scopes</Label>
-        <PermissionPicker id="si-scopes" value={scopes} onChange={setScopes} />
+        <Label htmlFor="si-scopes" required>Scopes</Label>
+        <PermissionPicker id="si-scopes" label="Scopes" required value={scopes} onChange={setScopes} />
         <p className="text-xs text-muted-foreground">
           <code>iceberg:read</code> lets an outside tool read published Gold tables at{" "}
           <code data-testid="outside-reader-address">{consoleOrigin}/api/iceberg</code>. Use Rotate
@@ -85,9 +88,10 @@ export function ServiceIdentityCreatePage() {
         </p>
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="si-env">Environment</Label>
+        <Label htmlFor="si-env" required>Environment</Label>
         <Input
           id="si-env"
+          aria-required
           value={environment}
           onChange={(e) => setEnvironment(e.target.value)}
           placeholder="production"
