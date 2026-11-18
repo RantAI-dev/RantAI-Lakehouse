@@ -727,3 +727,107 @@ these uncovered paths. Manual GOV-17 acceptance remains Not run.
 Disposition: AI-team review performed under the owner exception; R10 and R11
 are open BLOCKERs. Keep PR #571 draft; no merge approval. The developer fixes
 these on the owning branch and cites the findings, then review repeats.
+
+## Handoff — GOV-17 review R10/R11 repair (HY4 developer, 2026-11-18)
+
+Developer is HY4 flash Free (no model substitution), same Codex-plan / HY4-build
+/ Codex-review split; planner/reviewer and the owner-authorized AI-team reviewer
+remain separate agents. No subagents, no new worktree, no PR opened/merged/
+watched, nothing pushed to `main`. Worked in the existing owning checkout
+`fix/gov-17-review-retry`, starting head `d25a9cab3`.
+
+### Commits (one finding per commit)
+
+- **merge** `e83ea971c` — merged `origin/main` (`a2130e08d`, #573 and #575)
+  after the review. One conflict in `routes/ai/mod.rs`: both sides had added a
+  comment at the same `Box::pin(run_chat(..))` HTTP and streaming boundaries
+  (GOV-17 R9 provenance vs. main's `large_futures` wording). Resolved each hunk
+  by keeping BOTH ideas in one comment; the code line is common to both sides.
+  No `--ours`/`--theirs`, no other file taken whole.
+- **R10** `2e397d06f` — `ai/tools/dashboards.rs::list_boards` now gates Main's
+  synthesis on `viewer.sees_builtin_board()` (the same ACL-plus-dependency
+  predicate HTTP `boards_list` uses) and uses `store::DEFAULT_BOARD_ID`.
+- **R11** `598794fc3` — `ai/tools/reports.rs::run` approver check now calls
+  `reports::board_still_visible` for the approver (including Main) and fails
+  closed on an error, replacing the `get_board` + `DEFAULT_BOARD_ID` exemption;
+  removed the now-unused `lakehouse_bi::store` import.
+
+Each fix site and commit body cites `GOV-17 review R10/R11 (BLOCKER)`.
+
+### Regressions (through the real tool / approval paths)
+
+- R10: `ai_dashboard_reach::assistant_list_boards_omits_main_when_its_dependencies_are_hidden`
+  — drives `list_boards` through `POST /api/ai/tool`; a Main stored tile reads
+  `serving.m10_hidden`, so a caller narrowed to `serving.m10_ok` must NOT get
+  Main (negative) while a caller granted both marts does (positive control).
+- R11: `ai_report_tools::an_approver_who_cannot_see_main_cannot_release_a_report_on_main`
+  — creates a report on `"default"` (Main) through `POST /api/ai/tool`, narrows
+  a different approver away from Main's tile table so approval is refused and
+  nothing is created (negative), then a fully granted approver releases a fresh
+  report (positive control). A second approval is used because a decided
+  approval is consumed even when its tool call is refused.
+
+### Commands actually run (foreground; shared `CARGO_TARGET_DIR`, `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=1`)
+
+Scoped per fix (from `rust`):
+```
+cargo fmt --check                                    # exit 0 (both fixes)
+cargo clippy -p lakehouse-api --all-targets -- -D warnings
+                                                     # exit 0 after each fix
+sg docker -c 'cargo test -p lakehouse-api --test it \
+  ai_dashboard_reach::assistant_list_boards_omits_main_when_its_dependencies_are_hidden'
+                                                     # 1 passed, 0 failed
+sg docker -c 'cargo test -p lakehouse-api --test it ai_dashboard_reach::'
+                                                     # 8 passed, 0 failed
+sg docker -c 'cargo test -p lakehouse-api --test it \
+  ai_report_tools::an_approver_who_cannot_see_main_cannot_release_a_report_on_main'
+                                                     # 1 passed, 0 failed
+sg docker -c 'cargo test -p lakehouse-api --test it ai_report_tools::'
+                                                     # 14 passed, 0 failed
+```
+
+Final full gate on product tree `598794fc3`. The single plain
+`cargo test --workspace --no-fail-fast` attempt could not LINK the
+`lakehouse-api (lib test)` binary: `sccache: Compile terminated by signal 9`
+(compiler OOM), exit 101, **zero tests executed** in that attempt. This is the
+known machine limit, not a test failure; no cache was wiped and no test was
+weakened. The exact gate was therefore completed in memory-safe parts, all
+from the final tree:
+
+```
+cd rust && cargo fmt --check                         # exit 0
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+                                                     # exit 0, NO allowances
+sg docker -c 'cargo test --workspace --exclude lakehouse-api --no-fail-fast'
+                                                     # exit 0; 2568 passed, 0 failed,
+                                                     # 9 ignored (33 result blocks, incl. doctests)
+sg docker -c 'CARGO_PROFILE_TEST_DEBUG=0 cargo test -p lakehouse-api --lib --no-fail-fast'
+                                                     # exit 0; 3713 passed, 0 failed, 18 ignored
+sg docker -c 'CARGO_PROFILE_TEST_DEBUG=0 cargo test -p lakehouse-api --test it --no-fail-fast'
+                                                     # exit 0; 1685 passed, 0 failed, 5 ignored
+sg docker -c 'CARGO_PROFILE_TEST_DEBUG=0 cargo test -p lakehouse-api \
+  --test hostile_uploads --test identity_password --test parity --no-fail-fast'
+                                                     # exit 0; 12 passed, 0 failed, 4 ignored
+sg docker -c 'CARGO_PROFILE_TEST_DEBUG=0 cargo test -p lakehouse-api --doc'
+                                                     # exit 0; 0 tests
+```
+`CARGO_PROFILE_TEST_DEBUG=0` only removes debug info from test binaries to fit
+the linker in memory; it changes no assertion, lint, threshold or source. Both
+new regressions ran inside the 1685-passing API integration run. The OPS-36
+prompt-snapshot flake did NOT fire in this full run; it remains a documented
+order-dependent baseline (Todo/P3), not a GOV-17 regression.
+
+Do not add these counts into a fabricated unique total: the runs partition the
+workspace (non-API excludes `lakehouse-api`; the API runs split its targets).
+No ignored annotation was added. No TypeScript, Python or compose source was
+changed by this repair, so no TS/Python/compose check was run.
+
+### Not verified / owed
+
+- The single-command `cargo test --workspace` remains *not verified* as one
+  process (compiler OOM at the API lib-test link); its parts above all passed.
+- Manual `GOV-17-AC1`…`AC9` acceptance remains Not run (owner).
+- No merge approval is claimed. Reviewer re-check and owner-authorized AI-team
+  review of R10/R11 remain the planner's next step; no tool schema changed, so
+  `tests/fixtures/tool_schemas.json` is unchanged.
+- `git diff --check` clean; no generated/build output staged.
