@@ -9,6 +9,7 @@ import { SidebarProvider } from "@/components/ui/sidebar"
 import { DashboardHeader } from "@/features/dashboards/dashboard-header"
 import { DashboardTilesSkeleton } from "@/features/dashboards/dashboard-skeleton"
 import { SOFT_TILE_FRAME } from "@/features/dashboards/tile-card"
+import { PRODUCT_NAME } from "@/lib/product-branding"
 import { AppShellSkeleton } from "./app-shell-skeleton"
 
 afterEach(cleanup)
@@ -26,13 +27,13 @@ function shell(pathname: string) {
 describe("AppShellSkeleton", () => {
   it("draws the parts that do not depend on the person for real", () => {
     shell("/dashboards/browse")
-    expect(screen.getByText("Rantai Lake")).toBeTruthy()
+    expect(screen.getByText(PRODUCT_NAME)).toBeTruthy()
     expect(screen.queryByText("Enterprise Lakehouse Console")).toBeNull()
     // The brand row is the real one: the mark first, in its own slot, then the name, left-aligned.
     // ADM-2 (merged from main): the light and the dark logo are the workspace's pictures, both named
     // after it; the light one is first.
-    const logo = screen.getAllByRole("img", { name: "Rantai Lake", hidden: true })[0]
-    const row = screen.getByText("Rantai Lake").closest("div.flex")
+    const logo = screen.getAllByRole("img", { name: PRODUCT_NAME, hidden: true })[0]
+    const row = screen.getByText(PRODUCT_NAME).closest("div.flex")
     expect(row?.className).toContain("justify-start")
     expect(row?.firstElementChild?.contains(logo)).toBe(true)
     expect(row?.firstElementChild?.className).toContain("size-8")
