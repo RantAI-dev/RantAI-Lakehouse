@@ -120,3 +120,22 @@ Not verified:
 ## Review
 
 (reviewer appends here)
+
+### Review 1 (planner, 2026-11-18, head 4bf57b8e1)
+
+Diff read against the plan and AGENTS.md: D1–D4 followed, one helper at the
+three console sites, fixed 400 text with no echo, targeted migration with a
+why-header, `SRC-44` cited at every fix site. Callers checked: the gate
+scripts (`ops/g6/g6_linklocal_test.py:229`, `g6_ingest_matrix_test.py:1326`)
+already save Kafka as `stream`; no Rust test saves Kafka as `batch` outside
+the new refusal tests.
+
+No BLOCKER. No SHOULD-FIX.
+
+Note (not a finding): the assistant's `set_ingest_spec` tool
+(`routes/ai/registry.rs:1659`) now gets a 400 for Kafka + `batch`; its
+description does not say Kafka uses `stream`. Left for the AI team, outside
+this plan's scope.
+
+Open before merge: `cargo test -p lakehouse-api` in full (route_auth,
+sec11_guard) is *not verified* locally; CI on the PR must show it green.
