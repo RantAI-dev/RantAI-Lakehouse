@@ -1123,9 +1123,13 @@ async fn the_audit_history_tool_is_refused_without_audit_read_and_answers_the_tr
         .iter()
         .filter_map(|row| Some((row["action"].as_str()?, row["outcome"].as_str()?)))
         .collect();
+    // The answer speaks the audit API's outcome union, where a stored
+    // "refused" is "denied" (`governance::outcome_of`, GOV-5). The store row
+    // keeps "refused" (asserted above), so the answer's "denied" is the
+    // same refusal, not a second one.
     let refused = actions
         .iter()
-        .filter(|&&(action, outcome)| action == "get_audit_history" && outcome == "refused")
+        .filter(|&&(action, outcome)| action == "get_audit_history" && outcome == "denied")
         .count();
     assert_eq!(
         refused, 1,
