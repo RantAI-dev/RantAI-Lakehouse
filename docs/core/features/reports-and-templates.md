@@ -67,6 +67,7 @@ AGENTS.md).
 | T3 | No built-in templates in this phase | Planner | Owner, 2026-11-13 |
 | T4 | Saving a template and starting from one need `dashboard:write`. Templates show on a "Templates" tab of the Dashboards page | Planner | Owner, 2026-11-13 |
 | T5 | The assistant lists templates and starts a dashboard from one | AGENTS.md assistant parity | Owner, 2026-11-13 |
+| T6 | A template can be deleted only by the person who saved it, or by an administrator (`identity:write`). The rule holds in the console and for the assistant's `delete_template` (which runs as the person who approves it). Deleting stays permanent: there is no trash for templates. Another writer is refused with 403: "Only the person who saved this template, or an administrator, can delete it.", and the Templates tab shows Delete only where it works. A template saved before the creator was recorded (migration `0150`) can be deleted by an administrator only | PR #528 review SHOULD-FIX 2 | Owner, 2026-11-18 (D-A) |
 
 ## Limits to tell a customer
 

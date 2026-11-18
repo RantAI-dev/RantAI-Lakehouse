@@ -91,11 +91,11 @@ pub(super) async fn run(
         "create_report" => create_report(state, principal, args).await,
         "update_report" => update_report(state, principal, args).await,
         "delete_report" => delete_report(state, principal, args).await,
-        "list_templates" => templates::list_templates(state)
+        "list_templates" => templates::list_templates(state, principal)
             .await
             .map_err(|e| error(&e)),
         "create_dashboard_from_template" => start(state, principal, args).await,
-        "delete_template" => delete_template(state, args).await,
+        "delete_template" => delete_template(state, principal, args).await,
         other => Err(json!({ "error": format!("unknown tool: {other}") })),
     };
     result.unwrap_or_else(|refusal| refusal)
@@ -271,13 +271,20 @@ async fn start(
     }))
 }
 
-async fn delete_template(state: &AppState, args: &Map<String, Value>) -> Result<Value, Value> {
+/// `delete_template`: the route's own function, so the person who runs it (the
+/// approver, after the approval) must be the template's creator or an
+/// administrator, as in the console (T6, PR #528 review SHOULD-FIX 2).
+async fn delete_template(
+    state: &AppState,
+    principal: &Principal,
+    args: &Map<String, Value>,
+) -> Result<Value, Value> {
     let raw = arg_str(args, "id");
     let id = raw
         .trim()
         .parse::<uuid::Uuid>()
         .map_err(|_| json!({ "error": templates::TEMPLATE_NOT_FOUND }))?;
-    templates::delete_template(state, id)
+    templates::delete_template(state, principal, id)
         .await
         .map_err(|e| error(&e))?;
     Ok(json!({ "ok": true, "deleted": id }))

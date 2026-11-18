@@ -8,7 +8,10 @@
 //!   dashboard from one.
 //! - `DELETE /api/dashboard/templates/{id}` — delete one for good.
 //!
-//! All four need `dashboard:write` at the router (T4, `BI-18D-AC8`).
+//! All four need `dashboard:write` at the router (T4, `BI-18D-AC8`). Deleting
+//! also needs the person who saved the template, or an administrator (T6;
+//! PR #528 review SHOULD-FIX 2; owner decision D-A of 2026-11-18): it cannot
+//! be undone, so another writer may not take a template someone else made.
 //!
 //! # What a template holds (T1)
 //!
@@ -87,6 +90,11 @@ const NEEDS_SQL: &str = "It reads a SQL source, which needs the dashboard SQL pe
 const SOURCE_UNAVAILABLE: &str = "The SQL source it reads is not available here.";
 const NOT_READABLE: &str = "Its saved definition could not be read.";
 
+/// Deleting a template somebody else saved, without being an administrator
+/// (T6, PR #528 review SHOULD-FIX 2).
+pub(crate) const NOT_YOURS_TO_DELETE: &str =
+    "Only the person who saved this template, or an administrator, can delete it.";
+
 /// The longest template name, in characters (as a report title).
 const MAX_NAME_CHARS: usize = 200;
 
@@ -111,7 +119,22 @@ fn checked_name(raw: &str, what: &str) -> Result<String, ApiError> {
     Ok(name.to_owned())
 }
 
-pub(crate) fn summary_json(t: &TemplateSummary) -> Value {
+/// Whether `principal` may delete template `t` (T6, PR #528 review
+/// SHOULD-FIX 2, owner decision D-A): the account that saved it, or an
+/// administrator. "Administrator" is `identity:write`, the permission
+/// [`scope_for_write`] turns into `manage` on every folder and dashboard; the
+/// root's own level is no test here, because every `dashboard:write` holder
+/// has `manage` there (`baseline_of`), so it would let everyone delete. A
+/// template saved before its creator was recorded (`created_by_id` NULL) is an
+/// administrator's to delete, never a display-name match.
+fn may_delete(principal: &Principal, t: &TemplateSummary) -> bool {
+    principal.has("identity:write") || t.created_by_id == Some(principal.id.uuid())
+}
+
+/// A template as the list and the assistant show it, with whether the person
+/// asking may delete it (`canDelete`, so the console offers Delete only where
+/// it works).
+pub(crate) fn summary_json(t: &TemplateSummary, principal: &Principal) -> Value {
     json!({
         "id": t.id,
         "name": t.name,
@@ -120,6 +143,7 @@ pub(crate) fn summary_json(t: &TemplateSummary) -> Value {
         "chartCount": t.chart_count,
         "createdBy": t.created_by,
         "createdAt": t.created_at.format(&Rfc3339).unwrap_or_default(),
+        "canDelete": may_delete(principal, t),
     })
 }
 
@@ -134,11 +158,14 @@ fn parse<T: serde::de::DeserializeOwned>(body: &Bytes, shape: &str) -> Result<T,
 /// # Errors
 ///
 /// 503 without the console database; the classified store error.
-pub(crate) async fn list_templates(state: &AppState) -> Result<Value, ApiError> {
+pub(crate) async fn list_templates(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<Value, ApiError> {
     let pool = pool_of(state)?;
     let (rows, truncated) = stored::list(pool).await.map_err(|e| store_failure(&e))?;
     Ok(json!({
-        "templates": rows.iter().map(summary_json).collect::<Vec<_>>(),
+        "templates": rows.iter().map(|t| summary_json(t, principal)).collect::<Vec<_>>(),
         "truncated": truncated,
     }))
 }
@@ -148,8 +175,11 @@ pub(crate) async fn list_templates(state: &AppState) -> Result<Value, ApiError> 
 /// # Errors
 ///
 /// As [`list_templates`].
-pub async fn list(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
-    Ok(ApiJson(list_templates(&state).await?))
+pub async fn list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<ApiJson<Value>> {
+    Ok(ApiJson(list_templates(&state, &principal).await?))
 }
 
 // ── Save ────────────────────────────────────────────────────────────────
@@ -220,6 +250,7 @@ pub(crate) async fn save_template(
             chart_count: i32::try_from(charts.len()).unwrap_or(i32::MAX),
             definition: &definition,
             by: &principal.display_name,
+            by_id: principal.id.uuid(),
         },
     )
     .await
@@ -242,7 +273,7 @@ pub async fn save(
     let parsed: SaveBody = parse(&body, "{ board, name }")?;
     let saved = save_template(&state, &principal, &parsed.board, &parsed.name).await?;
     Ok(ApiJson(
-        json!({ "ok": true, "template": summary_json(&saved) }),
+        json!({ "ok": true, "template": summary_json(&saved, &principal) }),
     ))
 }
 
@@ -467,14 +498,32 @@ pub async fn use_template(
 
 // ── Delete ──────────────────────────────────────────────────────────────
 
-/// Delete template `id` for good. Shared with the assistant's
-/// `delete_template`.
+/// Delete template `id` for good, for `principal`: the person who saved it or
+/// an administrator ([`may_delete`]; T6, PR #528 review SHOULD-FIX 2, owner
+/// decision D-A). Shared with the assistant's `delete_template`, which runs it
+/// as the person who approves the call, so the approver is held to the same
+/// rule.
+///
+/// Every `dashboard:write` holder sees every template (T4), so refusing with
+/// 403 names nothing they could not already list.
 ///
 /// # Errors
 ///
-/// 404 [`TEMPLATE_NOT_FOUND`]; 503 without the console database.
-pub(crate) async fn delete_template(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+/// 404 [`TEMPLATE_NOT_FOUND`]; 403 [`NOT_YOURS_TO_DELETE`]; 503 without the
+/// console database.
+pub(crate) async fn delete_template(
+    state: &AppState,
+    principal: &Principal,
+    id: Uuid,
+) -> Result<(), ApiError> {
     let pool = pool_of(state)?;
+    let template = stored::get(pool, id)
+        .await
+        .map_err(|e| store_failure(&e))?
+        .ok_or_else(not_found)?;
+    if !may_delete(principal, &template.summary) {
+        return Err(ApiError::PermissionDenied(NOT_YOURS_TO_DELETE.to_owned()));
+    }
     if stored::delete(pool, id)
         .await
         .map_err(|e| store_failure(&e))?
@@ -492,10 +541,11 @@ pub(crate) async fn delete_template(state: &AppState, id: Uuid) -> Result<(), Ap
 /// As [`delete_template`].
 pub async fn delete(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
     let id = template_id(&id)?;
-    delete_template(&state, id).await?;
+    delete_template(&state, &principal, id).await?;
     Ok(ApiJson(json!({ "ok": true, "id": id })))
 }
 

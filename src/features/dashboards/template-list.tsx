@@ -20,8 +20,11 @@ import { UseTemplateDialog } from "./template-dialogs"
  * The Templates tab of the Dashboards page (`BI-18` part D, T6, decisions T1
  * to T4): every template with its name, the dashboard it was saved from, who
  * saved it and when. "Use template" asks for a name and a folder, then opens
- * the new dashboard; Delete asks first. The page shows this tab only to a
- * holder of `dashboard:write`, and the server refuses everyone else anyway.
+ * the new dashboard; Delete asks first, and is offered only on the templates
+ * the person may delete (`canDelete`: the one who saved it, or an
+ * administrator; decision T6, PR #528 review SHOULD-FIX 2). The page shows
+ * this tab only to a holder of `dashboard:write`, and the server refuses
+ * everyone else anyway.
  */
 export function TemplateList({ folders }: { readonly folders: FolderLike[] }) {
   const router = useRouter()
@@ -62,15 +65,17 @@ export function TemplateList({ folders }: { readonly folders: FolderLike[] }) {
                     From {t.sourceBoardName || "a dashboard"}
                   </p>
                 </div>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="-mt-1.5 -mr-2 size-8 p-0"
-                  aria-label={`Delete ${t.name}`}
-                  onClick={() => setDeleting(t)}
-                >
-                  <Trash2 className="size-4" />
-                </Button>
+                {t.canDelete ? (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="-mt-1.5 -mr-2 size-8 p-0"
+                    aria-label={`Delete ${t.name}`}
+                    onClick={() => setDeleting(t)}
+                  >
+                    <Trash2 className="size-4" />
+                  </Button>
+                ) : null}
               </div>
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                 <span className="tabular-nums">

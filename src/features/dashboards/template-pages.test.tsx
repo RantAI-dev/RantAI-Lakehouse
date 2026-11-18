@@ -65,7 +65,7 @@ afterEach(() => {
 
 const template = {
   id: "t1", name: "Sales overview", sourceBoard: "b_src", sourceBoardName: "Quarterly sales",
-  chartCount: 3, createdBy: "Rina", createdAt: "2026-11-13T00:00:00Z",
+  chartCount: 3, createdBy: "Rina", createdAt: "2026-11-13T00:00:00Z", canDelete: true,
 }
 
 describe("TemplateList", () => {
@@ -124,6 +124,18 @@ describe("TemplateList", () => {
     expect(within(dialog).getByText(/deleted for good/)).toBeTruthy()
     fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }))
     await waitFor(() => expect(calls.some((c) => c.method === "DELETE")).toBe(true))
+  })
+
+  // Decision T6 (PR #528 review SHOULD-FIX 2): somebody else's template offers
+  // no Delete, because the server would refuse it.
+  it("offers Delete only on a template the person may delete", async () => {
+    serve(["dashboard:write"], {
+      "GET /api/dashboard/templates": () => json({ templates: [{ ...template, canDelete: false }], truncated: false }),
+    })
+    render(<AuthProvider><TemplateList folders={[]} /></AuthProvider>)
+    expect(await screen.findByText("Sales overview")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Delete Sales overview" })).toBeNull()
+    expect(screen.getByRole("button", { name: "Use template" })).toBeTruthy()
   })
 })
 
