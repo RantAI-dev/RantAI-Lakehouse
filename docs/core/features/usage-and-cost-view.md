@@ -12,6 +12,8 @@
 | Acceptor | In the base |
 | Plan | Engineering plan kept by the planner |
 | Started | 2026-11-16 |
+| Shipped | — |
+| Evidence | PR #553 (the tenant on every query run); PR #564 (the usage page, the rates and the CSV export) |
 
 ## Problem
 
@@ -46,6 +48,13 @@ No assistant work in this feature. `AGENTS.md` assistant parity binds BI feature
 ## Limits to tell a customer
 
 - Amounts are estimates from rates the administrator enters, not a bill.
+- Engine time is the wall-clock time of the query, not CPU time.
+- Rates are one set for the whole deployment, in one currency.
+- A rate takes effect from the date entered and never changes earlier days.
+- A stopped query counts as cancelled.
+- A tenant administrator sees only their tenant. The all-tenant administrator can also group by tenant and sees runs recorded with no tenant.
+- Storage per layer is not shown yet.
+- A storage rate can be entered but prices nothing until storage per layer is shown.
 - Queries run before the update have no tenant and are visible only to the platform operator.
 - Queries run through dashboard and chart data are not counted.
 - Queries run through the lists of filter values, and through schema and join lookups, are not counted.
@@ -69,3 +78,5 @@ No assistant work in this feature. `AGENTS.md` assistant parity binds BI feature
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
 | `OPS-8-AC1` to `AC6` | As in the spec | As in the spec | Not run |
+
+`OPS-8-AC4` cannot run until storage per layer is built.

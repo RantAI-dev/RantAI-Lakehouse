@@ -104,7 +104,7 @@ describe("EmbedSettingsPanel (BI-26 D9)", () => {
     stub()
     open()
     chooseOption(screen.getByRole("combobox", { name: "Theme" }), "Dark")
-    fireEvent.click(screen.getByLabelText("Hide the Rantai Lake name"))
+    fireEvent.click(screen.getByLabelText("Hide the workspace name"))
     fireEvent.click(screen.getByLabelText("Let the page behind show through"))
     fireEvent.click(screen.getByRole("button", { name: "Show preview" }))
     const frame = screen.getByTitle("Embed preview") as HTMLIFrameElement

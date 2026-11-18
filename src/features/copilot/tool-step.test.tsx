@@ -141,6 +141,51 @@ describe("ToolStepCard export links (BI-1, AI-10)", () => {
   })
 })
 
+describe("a failed step's reference (AI-33)", () => {
+  // Since #533 the server's fixed sentence carries the reference it logged
+  // the real error under at its end, and no step carries `errorId`, so the
+  // reference rode inside the sentence and could not be copied the way
+  // every other error allows.
+  it("shows the sentence and the reference in its own small line", () => {
+    const { container } = render(
+      <ToolStepCard
+        step={{
+          tool: "run_sql",
+          args: { sql: "SELECT nope FROM serving.mart_x" },
+          ok: false,
+          result: { error: "This query names a column that does not exist. Reference: 3fc37a0664" },
+        }}
+      />,
+    )
+    fireEvent.click(screen.getByRole("button"))
+    // The sentence, and no reference glued to it.
+    expect(container.textContent).toContain("This query names a column that does not exist.")
+    expect(container.textContent).not.toContain("does not exist. Reference:")
+    // The reference, in the small selectable line the other errors use.
+    expect(container.textContent).toContain("Reference: 3fc37a0664")
+    const referenceLine = container.querySelector(".select-text")
+    expect(referenceLine).not.toBeNull()
+    expect(referenceLine?.textContent).toBe("Reference: 3fc37a0664")
+  })
+
+  it("shows a sentence without a reference as one block, with no reference line", () => {
+    const { container } = render(
+      <ToolStepCard
+        step={{
+          tool: "run_sql",
+          args: { sql: "SELECT nope FROM serving.mart_x" },
+          ok: false,
+          result: { error: "This query names a column that does not exist." },
+        }}
+      />,
+    )
+    fireEvent.click(screen.getByRole("button"))
+    expect(container.textContent).toContain("This query names a column that does not exist.")
+    expect(container.textContent).not.toContain("Reference")
+    expect(container.querySelector(".select-text")).toBeNull()
+  })
+})
+
 describe("a step whose result was dropped from a long conversation (AI-24)", () => {
   const dropped: ToolStep = {
     tool: "run_sql",

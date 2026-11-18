@@ -112,6 +112,7 @@ pub(crate) mod support;
 // protocol) needs this module's own sentences: a file that is too large is
 // refused with the same words wherever it is noticed (`SEC-22` D4).
 pub(crate) mod uploads;
+mod usage;
 
 use std::time::Duration;
 
@@ -1389,6 +1390,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/ops/workloads/{id}/cancel",
             axum::routing::post(ops::cancel_workload),
+        )
+        // OPS-8 part B: the Usage page's sums, their CSV file and the rates.
+        // Static paths of their own, so no `{kind}` capture sees them.
+        .route("/api/usage/queries", get(usage::queries))
+        .route("/api/usage/queries/export", get(usage::export))
+        .route(
+            "/api/usage/rates",
+            get(usage::list_rates).post(usage::create_rate),
         )
         .merge(governance_static_router())
         .route(
