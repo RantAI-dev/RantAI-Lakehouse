@@ -557,8 +557,8 @@ async fn write_high_tool_call_ends_waiting_approval_with_a_linked_approval() {
 
     // The approval row itself is attributed to the REAL employee, not
     // `emp-copilot`.
-    let (employee_id, action, run_id_col): (String, String, Option<String>) =
-        sqlx::query_as("SELECT employee_id, action, run_id FROM approval_item WHERE id = $1")
+    let (employee_id, action, run_id_col, risk): (String, String, Option<String>, String) =
+        sqlx::query_as("SELECT employee_id, action, run_id, risk FROM approval_item WHERE id = $1")
             .bind(approvals[0]["id"].as_str().unwrap())
             .fetch_one(&app.pool)
             .await
@@ -566,6 +566,16 @@ async fn write_high_tool_call_ends_waiting_approval_with_a_linked_approval() {
     assert_eq!(employee_id, "emp-headless-10");
     assert_eq!(action, "delete_chart");
     assert_eq!(run_id_col.as_deref(), Some(run_id.as_str()));
+    // The risk sentence is the one the chat's approval card shows for
+    // `delete_chart`: a deleted chart goes to the trash and stays
+    // restorable, so the generic "cannot be undone" sentence would be false
+    // on this very card (`AI-1`, `GOV-13`).
+    assert_eq!(
+        risk,
+        "Tindakan berisiko tinggi (WriteHigh): chart masuk tempat sampah dan bisa dipulihkan \
+         selama 30 hari.",
+        "the headless approval stores the same risk sentence as the chat's"
+    );
 }
 
 /// LLM unavailable (transport failure — no mock mounted for this test's
