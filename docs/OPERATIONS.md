@@ -23,7 +23,11 @@ migrations directory at *compile* time, so it must exist in the build
 context or `cargo build` fails outright. The current `rust/Dockerfile`
 pins `rust:1.99.1-slim` to match `rust-toolchain.toml`, copies
 `migrations/` into the build context before the build step, installs
-`sqlx-cli`, and uses `entrypoint.api.sh` to apply migrations at boot.
+`sqlx-cli`, and the image's `entrypoint.api.sh` passes its arguments to
+the `lakehouse-api` binary. The entrypoint does **not** apply migrations
+any more (`SEC-78`): the one-shot `lakehouse-db-migrate` service runs the
+same image with the binary's `migrate` subcommand before the API starts —
+see "Database roles" below.
 
 ## Local stack: what's in `docker-compose.yml`
 
@@ -43,6 +47,7 @@ The stack:
 | Service | Image | Purpose |
 | --- | --- | --- |
 | `postgres` | `postgres:16` | OLTP store (identity, governance, pipelines, connectors, alerts, ...) |
+| `lakehouse-db-migrate` | built from `rust/Dockerfile` | One-shot: the same image as `lakehouse-api`, run with `command: ["migrate"]` — applies the schema migrations and creates the console's runtime role `lakehouse_app` with the OWNER's credentials, then exits; `lakehouse-api` starts only after it succeeded (`SEC-78`, see "Database roles" below) |
 | `clickhouse` | `clickhouse/clickhouse-server:26.8` | Analytics store (catalog, overview, governance, dashboards, ...); also the Iceberg query engine once `DataLakeCatalog` is wired up in P1b |
 | `lakehouse-api` | built from `rust/Dockerfile` | the axum API, port 8080 |
 | `console` | built from `Dockerfile.frontend` | the Next.js console, port 3000 (REL-2 S1-T2) — waits for `lakehouse-api` to report healthy, and proxies `/api/*` to it |
@@ -59,15 +64,18 @@ The stack:
 
 Both data stores have healthchecks; `lakehouse-api` waits for both to
 report healthy (`depends_on: condition: service_healthy`) before starting,
-so first-boot migrations and the bootstrap-admin seed (both of which need
-Postgres) get a real chance to run instead of racing container startup.
-This is a start-order convenience, not a hard runtime dependency — see
-"Postgres: unreachable is loud, a mismatched schema refuses to start,"
-below.
+and since `SEC-78` it also waits for `lakehouse-db-migrate` to complete —
+the migrations and the bootstrap-admin seed both need Postgres, and the
+migrate run has to have finished before the API checks the schema it is
+supposed to find. This is a start-order convenience, not a hard runtime
+dependency — see "Postgres: unreachable is loud, a mismatched schema
+refuses to start," below.
 
 `lakehouse-api` carries a healthcheck of its own (`/health`, liveness), and
 the `console` waits for it — so the console starts after the API can
-answer, not while the API is still applying migrations. The console's
+answer. The API does not apply migrations any more (`SEC-78`), so nothing
+starts while a migration is still running; the one-shot
+`lakehouse-db-migrate` does that before the API starts. The console's
 `/api/*` proxy target is baked into its image at build time
 (`RUST_API_URL`, the `lakehouse-api` service's address on the compose
 network); `CONSOLE_INTERNAL_URL` is the address the OTHER way round (the
@@ -139,12 +147,15 @@ variable while one is empty, whatever profile is active:
 
 | Variable | What it is |
 | --- | --- |
-| `POSTGRES_PASSWORD` | PostgreSQL password (also inside the connection strings compose builds for the API, Lakekeeper and OpenFGA) |
+| `POSTGRES_PASSWORD` | PostgreSQL password: the database OWNER's password. The `postgres` image itself reads it when the data directory is first created; after that it reaches only the operator-side services — `lakehouse-db-migrate` (the migrations and the console role's setup run with it), Lakekeeper's and OpenFGA's own services (init, migrate and runtime — they dial their own databases), the three Dagster services (Dagster's own instance database), the backup job and the gate runners. It is not in `lakehouse-api`'s connection string any more (`SEC-78`) |
+| `LAKEHOUSE_DB_APP_PASSWORD` | the console's runtime database role's (`lakehouse_app`) password (`SEC-78`) — see "Database roles" below |
 | `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` | RustFS root key pair |
 | `LAKEKEEPER_ENCRYPTION_KEY` | Encrypts what Lakekeeper stores in its own schema |
 
-`CONNECTOR_PG_PASSWORD` and `CONNECTOR_S3_ACCESS_KEY` / `_SECRET_KEY` fall
-back to those, never to a literal. `SEAWEEDFS_ACCESS_KEY` /
+`CONNECTOR_PG_PASSWORD` falls back to `LAKEHOUSE_DB_APP_PASSWORD` (the
+runtime role's — a connector that dials the console's own database does so
+as `lakehouse_app`, not as the owner) and `CONNECTOR_S3_ACCESS_KEY` /
+`_SECRET_KEY` fall back to the RustFS keys, never to a literal. `SEAWEEDFS_ACCESS_KEY` /
 `SEAWEEDFS_SECRET_KEY` are used only by `--profile seaweedfs`; compose
 interpolates the whole file whatever profiles are active, so `${X:?}` there
 would stop a default `up` that never starts SeaweedFS. They default to
@@ -1088,10 +1099,14 @@ its own version and says so when the two differ.
 
 `database` is what `OPS-4` added:
 
-- `ok` — the start-up step connected and applied every migration, so the
-  schema is at this build's version.
+- `ok` — the start-up step connected, found the schema at this build's
+  version (it reads the migration bookkeeping; the `lakehouse-db-migrate`
+  service applied the migrations — `SEC-78`), and the role it connected
+  as is neither a superuser nor a table owner.
 - `unavailable` — no pool at all (`DATABASE_URL` did not parse), the
-  database could not be reached, or it refused the migrations. Phase 2
+  database could not be reached, or the schema is not this build's
+  version (a pending migration; the API refuses to start on one, so this
+  answers only while the retry loop is still waiting). Phase 2
   routes (identity, auth, governance writes, pipelines, connectors,
   alerts, ...) are degraded; Phase 1 answers.
 
@@ -1507,6 +1522,92 @@ grants before and after.
   `file`, `iceberg`, …) are refused for every role, not only narrowed
   ones.
 
+## Database roles (`SEC-78`)
+
+The console does not connect to its own Postgres database as a superuser.
+A superuser, or the owner of a table, can run
+`ALTER TABLE audit_event DISABLE TRIGGER` or
+`SET session_replication_role = replica` and change or delete the audit
+trail that `0142_audit_event_append_only.sql` makes append-only in the
+database itself. So the console runs as a second role that owns no table
+and is not a superuser, and the role that applies the schema keeps the
+owner's privileges:
+
+| Role | Who holds its password | What it may do |
+| --- | --- | --- |
+| the owner (`POSTGRES_USER`, default `lakehouse`) | `POSTGRES_PASSWORD`, held by `lakehouse-db-migrate`, Lakekeeper's and OpenFGA's own services (init, migrate and runtime — they dial their own databases), the backup job, the gate runners and the Dagster services (Dagster's own instance database until it gets its own role) | everything: it applies the migrations and sets the runtime role up |
+| `lakehouse_app` | `LAKEHOUSE_DB_APP_PASSWORD`, held by `lakehouse-api`, `dagster-code-location` and the connectors that dial this database | read and write the console's tables in `public` and `bronze_meta`; nothing more |
+
+The one-shot `lakehouse-db-migrate` service runs `lakehouse-api migrate`
+with the owner's URL on every deploy, before `lakehouse-api` starts. It
+applies the migrations, then sets `lakehouse_app` up idempotently:
+`LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`,
+`CONNECT` on the database, `USAGE` on the `public` and `bronze_meta`
+schemas, the table, sequence and function grants in those schemas, the
+same grants as the owner's `ALTER DEFAULT PRIVILEGES` (so a table a later
+migration creates is covered without another grant), and the built-in
+`pg_monitor` role (read-only statistics — the queries that read this
+database as a source need them, and they cannot switch a trigger off).
+
+Two tables are narrower than those blanket grants, each matching what its
+own trigger already enforces: `audit_event` (`0142`) is append-only, and
+the role may `UPDATE` only its `run_id` and `approval_id` columns — that
+is what clearing a link through the foreign keys' `ON DELETE SET NULL`
+does; and `usage_rate` (`0148`) is append-only with no `UPDATE` at all.
+The role's grants and the triggers say the same thing.
+
+`lakehouse-api` connects as `lakehouse_app` (compose builds its
+`DATABASE_URL` from it) and refuses to start otherwise. At start it reads
+the migration bookkeeping and the role's attributes; if the schema is
+behind this build, or the role it connected as is a superuser or owns any
+table in `public` or `bronze_meta`, the process exits non-zero with
+
+> The console's database role must not be a superuser or own the tables;
+> see docs/OPERATIONS.md, 'Database roles'
+
+A deployment that overrides `DATABASE_URL` back to the owner therefore
+does not start (fail closed). A pending migration is refused too, with a
+message naming the `lakehouse-db-migrate` service.
+
+**Rotating the console's database password:** change
+`LAKEHOUSE_DB_APP_PASSWORD` in `.env`, run the migrate service once
+(`docker compose run --rm lakehouse-db-migrate` — it sets the role's
+password on every run), then restart `lakehouse-api`. `ops/init-env.sh`
+generates the role's password independently of `POSTGRES_PASSWORD`; keep
+the two different — they belong to two different roles.
+
+### What each job runs against this database
+
+Every query a job runs against the console's database, and the grant of
+`lakehouse_app` that covers it:
+
+| Job | What it runs against this database | Covered by |
+| --- | --- | --- |
+| `replication_slot_check_job` (`dagster/dispar_orchestrate/replication_metrics.py:349-355`) | one read of `pg_replication_slots` for the logical slots, plus `pg_wal_lsn_diff(pg_current_wal_lsn(), …)` | the `pg_monitor` grant; reading the view needs no `REPLICATION` attribute |
+| `cdc_apply_job` (`dagster/dispar_orchestrate/cdc_apply.py`) | nothing: it reads Kafka and the API over HTTP and writes Iceberg through Lakekeeper — logical replication lives on the connector's source database, not here | — |
+| the maintenance job (`dagster/dispar_orchestrate/maintenance.py`) | nothing: it works on ClickHouse, Trino and Lakekeeper | — |
+| the bronze ingest path (`dagster/dispar_orchestrate/dlt_pipeline.py:239-353`) | runs the dlt `sql_database` source, which reflects `information_schema` and reads the source table with `SELECT` | the schema and table grants |
+| the seeded connector's probe and discovery (`rust/crates/lakehouse-api/src/routes/connectors.rs`, `rust/crates/lakehouse-api/src/connector_probe.rs`, `rust/crates/lakehouse-api/src/connector_discover.rs`) | the probe runs `SELECT 1`; discovery reads `information_schema` only | `CONNECT` and the schema grants |
+| deprovisioning a CDC connector whose source is this database (`rust/crates/lakehouse-api/src/connector_deprovision.rs:332-447`) | drops the publication and the replication slot and terminates the backends consuming them | nothing, on purpose: it needs `REPLICATION`, publication ownership or `pg_signal_backend`, which the role has not — the limit below |
+
+Known limits, stated so nobody has to find them in a failed job:
+
+- The three Dagster services still hold `POSTGRES_PASSWORD`, because they
+  also reach Dagster's own instance database as `POSTGRES_USER`. Giving
+  Dagster its own `lakehouse_dagster` role is the second change of SEC-78
+  (the second change of SEC-78); until it lands, the code location holds the owner's
+  password for that database.
+- A CDC connector whose SOURCE is the console's own database cannot be
+  deprovisioned by the console — the last row of the table above names
+  what it would need. No seeded connector does this today
+  (`conn-pg-lakehouse` is `adapter='sql'`).
+- The role's grants cover `public` and `bronze_meta` only. A schema
+  something else creates must be granted to the role by whoever creates
+  it: in this repository, the `g3a-source-init` gate fixture grants
+  `lakehouse_app` on `ingest_demo`, and the g6 scale-test script grants it
+  on its own schema. A connector pointed at a schema nobody granted the
+  role sees no tables in it.
+
 ## Postgres: unreachable is loud, a mismatched schema refuses to start
 
 `lakehouse_store::connect_lazy` never does network I/O at startup, so a
@@ -1516,26 +1617,34 @@ overview, query, storage) do not touch Postgres, and an unreachable
 database must not take the whole console down — but makes it loud, and
 draws one hard line:
 
-- **The database is reachable but the migrations fail** (a `_sqlx_migrations`
-  row this build does not have or has changed, a failed statement):
-  `lakehouse-api` **refuses to start** and exits non-zero, logging the
-  migration error and the line `the application database is not at this
-  build's schema version`. Compose restarts it and it says the same thing
-  every time. This is deliberate: before `OPS-4` the API started anyway,
-  sqlx stopped at the first mismatch, and every newer route answered
-  `500` while the process looked healthy (PRs #106 and #199). The fix for
-  a real mismatch is to run the matching migrations, not to restart until
-  it works.
+- **The database is reachable but the schema is not this build's version**
+  (a migration this build embeds is not recorded in `_sqlx_migrations`, or
+  the bookkeeping table cannot be read): `lakehouse-api` **refuses to
+  start** and exits non-zero, logging what is pending and the line
+  `the application database is not at this build's schema version; run
+  the lakehouse-db-migrate service before lakehouse-api`. Compose
+  restarts it and it says the same thing every time. This is deliberate:
+  before `OPS-4` the API started anyway, sqlx stopped at the first
+  mismatch, and every newer route answered `500` while the process looked
+  healthy (PRs #106 and #199). The API does not apply the migrations any
+  more (`SEC-78`) — the fix for a real mismatch is to run the
+  `lakehouse-db-migrate` service, not to restart until it works.
 - **The database cannot be reached at all** (connection refused, a
   timeout, a closed pool): the API serves the Phase 1 routes and logs an
-  `error!` at start and again every 60 s until a connection succeeds, at
-  which point the migrations apply and the retries stop. `GET /health`
-  reports `"database": "unavailable"` meanwhile (see "Healthcheck"
-  above). If the database becomes reachable later with a schema that
+  `error!` at start and again every 60 s until a connection succeeds. The
+  retry loop re-checks the schema the same read-only way, never applies a
+  migration; if the database becomes reachable later with a schema that
   still does not match this build, the retry loop logs the same
   schema-mismatch line once and stops — a mismatch does not heal by
   waiting, and a background task cannot un-start a process that is
-  already serving.
+  already serving. `GET /health` reports `"database": "unavailable"`
+  meanwhile (see "Healthcheck" above).
+- **The role the API connected as is a superuser or owns a table**
+  (`SEC-78`): the API refuses to start, non-zero exit, with the fixed
+  sentence quoted under "Database roles" above. A superuser or a table
+  owner can switch off the audit trail's append-only triggers, so the
+  console never serves as one — a deployment that points `DATABASE_URL`
+  back at the owner does not start, by design.
 - **No pool at all** (`DATABASE_URL` is not a parsable Postgres URL):
   every Phase 2 route answers `503`, `/health` says the database is
   unavailable, and the log carries the reason.
