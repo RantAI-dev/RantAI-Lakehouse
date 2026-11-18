@@ -286,6 +286,10 @@ pub(crate) async fn scope_for_write(
             .map_err(|e| classify_ch_error(&e))?;
         map.viewer(&placements).map_err(too_many)?
     };
+    // GOV-17: writes use the same narrowed viewer as reads (duplicate, move,
+    // revert and the public-link/embed setup are reads in effect).
+    let visibility = crate::dashboard_visibility::resolve_visibility(state, principal).await?;
+    let viewer = crate::dashboard_visibility::narrow(viewer, &visibility)?;
     Ok(Scope { viewer, map })
 }
 
@@ -326,7 +330,9 @@ impl Scope {
         if let Some(board) = board {
             return self.require_on_board(board, needed);
         }
-        if !self.viewer.sees_builtin() {
+        // GOV-17: a build-in board hidden by an unreadable dependency is a
+        // 404 for a writer too, the same answer as for a reader.
+        if !self.viewer.sees_builtin_board() {
             return Err(ApiError::NotFound(BOARD_NOT_FOUND.to_owned()));
         }
         self.require_root(needed)
@@ -344,6 +350,16 @@ impl Scope {
     ) -> Result<(), ApiError> {
         let folder_id = board.folder_id.clone().unwrap_or_default();
         let owner = board.owner_id.clone().unwrap_or_default();
+        // GOV-17 review R3: the AccessMap level alone ignores the table-dependency
+        // overlay, so a board hidden by an unreadable table still passed this
+        // "common board-level enforcement" for a writer. The narrowed viewer
+        // carries the deny-list and its `sees_board` is the one in-memory
+        // predicate that agrees with the SQL clauses. This only REMOVES boards
+        // the map already allows; it grants no new ACL capability, and a
+        // genuine *:* / role-union-All viewer is never narrowed.
+        if !self.viewer.sees_board(&board.id, &owner) {
+            return Err(ApiError::NotFound(BOARD_NOT_FOUND.to_owned()));
+        }
         Self::check(
             self.map.level_for_board(&board.id, &folder_id, &owner),
             needed,
@@ -503,10 +519,14 @@ async fn resolve(
     if baseline.is_none() && grants.is_empty() {
         return Err(refused());
     }
-    // An administrator sees everything today, and keeps doing so; a person
-    // with a starting point and no marks anywhere has nothing taken away.
+    // An administrator sees everything the ACL says today, and keeps doing
+    // so; a person with a starting point and no marks has nothing taken away
+    // by the ACL. GOV-17 narrows BOTH cases by table dependencies below, so
+    // neither shortcut is a bypass of a narrowed role's grants.
     if principal.has("identity:write") || (baseline.is_some() && marks.is_empty()) {
-        return Ok(viewer_of(principal));
+        let viewer = viewer_of(principal);
+        let visibility = crate::dashboard_visibility::resolve_visibility(state, principal).await?;
+        return crate::dashboard_visibility::narrow(viewer, &visibility);
     }
     let ch = &state.clickhouse;
     let tree = folders::list_folders(ch, &Viewer::system())
@@ -515,7 +535,7 @@ async fn resolve(
     let placements = store::board_placements(ch)
         .await
         .map_err(|e| classify_ch_error(&e))?;
-    AccessMap::new(
+    let viewer = AccessMap::new(
         principal.id.uuid().to_string(),
         false,
         baseline,
@@ -524,7 +544,12 @@ async fn resolve(
         &marks,
     )
     .viewer(&placements)
-    .map_err(too_many)
+    .map_err(too_many)?;
+    // GOV-17: the ACL fast path above is NOT a table-grant bypass. Every
+    // request viewer is narrowed by the caller's current table dependencies,
+    // including `identity:write`; only `Viewer::system()` stays unfiltered.
+    let visibility = crate::dashboard_visibility::resolve_visibility(state, principal).await?;
+    crate::dashboard_visibility::narrow(viewer, &visibility)
 }
 
 /// Whether dashboard `board_id` is restricted ("only the people listed"):
@@ -1348,6 +1373,55 @@ mod tests {
             item_id: id.to_owned(),
             level,
         }
+    }
+
+    /// GOV-17 review R3: the common board-level check must honour the table
+    /// overlay. A board hidden by an unreadable table is a 404 for a narrowed
+    /// administrator AND for a caller with an explicit edit grant — the table
+    /// restriction wins without granting any new ACL capability. An
+    /// unrestricted administrator keeps their level (positive control).
+    #[test]
+    fn a_table_hidden_board_is_refused_by_the_common_board_level_check() {
+        let board: lakehouse_bi::store::Board = serde_json::from_value(json!({
+            "id": "b1", "name": "b1", "folder_id": "", "owner_id": ""
+        }))
+        .expect("a minimal board row");
+
+        let narrowed_admin = Scope {
+            viewer: Viewer::user("u9", true).narrowed_by_tables(vec!["b1".to_owned()], true),
+            map: AccessMap::new("u9", true, None, &[], &[], &[]),
+        };
+        assert!(
+            matches!(
+                narrowed_admin.require_on_board(&board, Level::Edit),
+                Err(ApiError::NotFound(_))
+            ),
+            "identity:write with narrowed grants is not a bypass"
+        );
+
+        let grants = [rule(ItemKind::Board, "b1", Level::Edit)];
+        let with_grant = Scope {
+            viewer: Viewer::user("u1", false).narrowed_by_tables(vec!["b1".to_owned()], true),
+            map: AccessMap::new("u1", false, None, &[], &grants, &[]),
+        };
+        assert!(
+            matches!(
+                with_grant.require_on_board(&board, Level::Edit),
+                Err(ApiError::NotFound(_))
+            ),
+            "an explicit edit grant does not open a table-hidden board"
+        );
+
+        let unrestricted_admin = Scope {
+            viewer: Viewer::user("u9", true),
+            map: AccessMap::new("u9", true, None, &[], &[], &[]),
+        };
+        assert!(
+            unrestricted_admin
+                .require_on_board(&board, Level::Edit)
+                .is_ok(),
+            "a genuine *:* / All caller keeps the level"
+        );
     }
 
     fn folder(id: &str, parent: &str) -> Folder {
