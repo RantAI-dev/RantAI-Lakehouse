@@ -691,3 +691,39 @@ https://github.com/RantAI-dev/RantAI-Lakehouse/pull/571 . They will be copied
 into this plan with the required post-merge delivery-status update. The PR
 remains draft pending CI and the applicable AI-team review; manual owner
 acceptance remains Not run.
+
+
+## AI-team review by owner-authorized Codex — 2026-11-18
+
+Owner explicitly authorized Codex to cover the AI-team review for this fix.
+Reviewed assistant code and shared visibility wiring at PR #571 head
+`2a0130c7536160f07f1524118aee843de6efb7bb`. This records the review exception,
+not approval of the result. No tool schema changes were found.
+
+- **BLOCKER R10 — assistant list_boards reintroduces hidden Main.**
+  `rust/crates/lakehouse-api/src/routes/ai/tools/dashboards.rs:979` initializes
+  the response with Main unconditionally, even when the resolved viewer has
+  `sees_builtin_board() == false`. The caller therefore discovers a dashboard
+  hidden by its current table grants. Gate synthesis with the same built-in
+  visibility predicate as HTTP. Add a denied-Main negative control and an
+  allowed-Main positive control through `/api/ai/tool`.
+- **BLOCKER R11 — report approver bypass for hidden Main.**
+  `rust/crates/lakehouse-api/src/routes/ai/tools/reports.rs:104` exempts
+  `DEFAULT_BOARD_ID` from the approver's visibility refusal. A requester who
+  can see Main can have a report approved by a different person whose table
+  grants hide it: subsequent create/update runs as the stamped requester,
+  so the requester's checks do not enforce the approver's access. Use
+  `reports::board_still_visible` for the approver, including Main, and fail
+  closed on errors. Test a different requester/approver, hidden Main and a
+  fully granted approver control through the approval flow.
+
+Verification attempted in the foreground from `rust`:
+`sg docker -c 'CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test -p lakehouse-api --test it ai_report_tools::'`.
+Exit 101 while compiling lakehouse-store: No space left on device. **Zero tests
+executed; runtime verification not verified in this attempt.** No cache was
+wiped. Prior final-head CI remains separate evidence and does not disprove
+these uncovered paths. Manual GOV-17 acceptance remains Not run.
+
+Disposition: AI-team review performed under the owner exception; R10 and R11
+are open BLOCKERs. Keep PR #571 draft; no merge approval. The developer fixes
+these on the owning branch and cites the findings, then review repeats.
