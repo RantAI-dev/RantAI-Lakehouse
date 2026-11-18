@@ -106,6 +106,7 @@ mod dashboard_comments_routes;
 mod dashboard_export;
 mod dashboard_import;
 mod dashboard_tenant_scope;
+mod db_roles;
 mod deployment_settings_route;
 mod email_settings_route;
 mod embed_tokens;

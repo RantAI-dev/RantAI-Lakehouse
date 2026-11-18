@@ -72,6 +72,32 @@ jobs:
             sed -i "/^$name=/d" .env
             printf '\n%s=%s\n' "$name" "$value" >> .env
           done
+          # SEC-78: the console's runtime role's password, DERIVED from the
+          # superuser's password instead of being a new repository secret
+          # (owner's decision): the role's password follows the
+          # superuser's, and a leak of the superuser password already opens
+          # the whole database. The derivation is one-way, so the derived
+          # value cannot be turned back into the superuser's password, and
+          # `lakehouse-db-migrate` sets the role's password on every run —
+          # a rotation of STAGING_POSTGRES_PASSWORD carries through on the
+          # next deploy.
+          #
+          # base64url (`urlsafe_b64encode`), not plain base64: a plain base64
+          # value can hold `/` or `+`, and compose builds a DSN out of this
+          # value.
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "::error::python3 is not available on this host; it derives the console's database role password (SEC-78)"
+            exit 1
+          fi
+          # The key comes from the environment, never from the command line:
+          # a command-line argument is readable by every local user through
+          # /proc while the process runs.
+          app_pw="$(printf %s lakehouse_app | python3 -c 'import base64, hashlib, hmac, os, sys; key = os.environ["STAGING_POSTGRES_PASSWORD"].encode(); print(base64.urlsafe_b64encode(hmac.new(key, sys.stdin.buffer.read(), hashlib.sha256).digest()).decode())')"
+          # Masked before anything can print it. The value itself is never
+          # echoed, and this step runs without `set -x`.
+          echo "::add-mask::$app_pw"
+          sed -i '/^LAKEHOUSE_DB_APP_PASSWORD=/d' .env
+          printf '\nLAKEHOUSE_DB_APP_PASSWORD=%s\n' "$app_pw" >> .env
           # TENANT_WAREHOUSE_S3_* are empty in the fresh-install template
           # (they used to fall back to the RustFS credentials, the same
           # value as the RustFS keys, ADR 0002 Addendum 2 "may equal, must
