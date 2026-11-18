@@ -23,10 +23,13 @@ FROM rust:1.99.1-slim AS tools
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 # `sqlx-cli`, pinned to the same version as the workspace's `sqlx`
-# dependency, for the migration step in entrypoint.api.sh. `main.rs` now
-# also applies migrations at boot via `lakehouse_store::migrate` (see
-# `main.rs`), so this is belt-and-suspenders: whichever runs first wins,
-# `sqlx migrate run` is idempotent, and neither path is fatal on failure.
+# dependency. SEC-78: nothing in this image runs it any more — the
+# migrations are applied by the API binary's own `migrate` subcommand, in
+# the one-shot `lakehouse-db-migrate` service, which holds the database
+# OWNER's credentials (the console's own role owns no table, so it must
+# not be the role that applies the schema). Dropping the tool from the
+# image is ADR 0001's follow-up; until then it costs image size and build
+# time only.
 #
 # `cargo-chef` (exact pin, `--locked`; CI-SPEED-PLAN §4.2) is what makes the
 # ~500 dependency crates a layer of their own: `prepare` reduces the

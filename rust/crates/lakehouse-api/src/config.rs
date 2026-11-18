@@ -717,6 +717,16 @@ pub struct Config {
     /// and any problem with it surfaces lazily, at first use, as an ordinary
     /// request-time error.
     pub database_url: String,
+    /// The password of the console's OWN database role
+    /// (`LAKEHOUSE_DB_APP_PASSWORD`, `SEC-78` decision 1). `None` when unset
+    /// or empty.
+    ///
+    /// Only the `migrate` command needs it: it is what sets the role's
+    /// password, and the server path never holds it (the server connects
+    /// with the role, not with its password). It is a
+    /// [`lakehouse_core::secret::SecretValue`], so it is neither logged nor
+    /// printed.
+    pub db_app_password: Option<lakehouse_core::secret::SecretValue>,
     /// ADR 0010/0011 — path to a file holding the `gold-export` Lakekeeper
     /// principal's pre-minted static bearer token (`iceberg-catalog-rest`'s
     /// `token` property — see `lakehouse-iceberg::catalog`'s module doc on
@@ -1313,6 +1323,10 @@ impl std::fmt::Debug for Config {
             .field("oidc_token_url", &self.oidc_token_url)
             .field("oidc_redirect_uri", &self.oidc_redirect_uri)
             .field("database_url", &REDACTED)
+            .field(
+                "db_app_password",
+                &self.db_app_password.as_ref().map(|_| REDACTED),
+            )
             .field(
                 "lakekeeper_gold_export_token_file",
                 &self.lakekeeper_gold_export_token_file,
@@ -1964,6 +1978,8 @@ impl Config {
             rustfs_access_key_secret_ref: truthy(env, "RUSTFS_ACCESS_KEY_SECRET_REF"),
             rustfs_secret_key_secret_ref: truthy(env, "RUSTFS_SECRET_KEY_SECRET_REF"),
             database_url: or_default(env, "DATABASE_URL", ""),
+            db_app_password: truthy(env, "LAKEHOUSE_DB_APP_PASSWORD")
+                .map(lakehouse_core::secret::SecretValue::new),
             lakekeeper_gold_export_token_file: or_default(
                 env,
                 "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
