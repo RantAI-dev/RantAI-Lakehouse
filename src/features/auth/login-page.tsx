@@ -24,6 +24,7 @@ import {
   PRODUCT_BYLINE,
   PRODUCT_LOGO_DARK,
   PRODUCT_LOGO_LIGHT,
+  PRODUCT_NAME,
 } from "@/lib/product-branding";
 import { cn } from "@/lib/utils";
 import * as authClient from "@/services/clients/auth";
@@ -637,14 +638,20 @@ export function LoginPage() {
 
         <footer className="login-reveal login-reveal-5 flex items-center justify-between gap-4 text-xs text-muted-foreground">
           {/* PR #536 review SHOULD-FIX 1: the copyright is the workspace's
-              own (`ADM-2`), and the byline stays (ADM-2 feature decision 8:
-              the console keeps saying who built it, even when the workspace
-              has a name of its own). One short line, pieces split by a
-              middle dot, wrapping on a narrow phone. */}
+              own (`ADM-2`). The byline (ADM-2 feature decision 8: the
+              console keeps saying who built it) shows when the workspace has
+              a name of its own; with none, the copyright already names the
+              product, and one piece of information is written once
+              (DESIGN.md; planner review of the merge, 2026-11-18). One short
+              line, pieces split by a middle dot, wrapping on a narrow phone. */}
           <span className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5">
             <span>© {new Date().getFullYear()} {branding.name}</span>
-            <span aria-hidden>·</span>
-            <span>{PRODUCT_BYLINE}</span>
+            {branding.name !== PRODUCT_NAME ? (
+              <>
+                <span aria-hidden>·</span>
+                <span>{PRODUCT_BYLINE}</span>
+              </>
+            ) : null}
           </span>
           {/* Placeholder destination — point this at the docs site (or
               wherever support lives) once that URL exists. */}

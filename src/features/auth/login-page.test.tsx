@@ -320,11 +320,35 @@ describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
     expect(container.querySelector("b")).toBeNull()
   })
 
-  it("keeps the 'Powered by RantAI Lakehouse' line under the form", async () => {
-    stubLoginApi(401, { error: "invalid_or_expired" })
+  it("keeps the 'Powered by RantAI Lakehouse' line under the form for a workspace with its own name", async () => {
+    // ADM-2 decision 8: a workspace that set its own name still says who
+    // built the console.
+    stubLoginApi(
+      401,
+      { error: "invalid_or_expired" },
+      {},
+      { workspaceName: "Acme Data", logo: null, logoDark: null, icon: null },
+    )
     renderLoginPage()
 
     expect(await screen.findByText("Powered by RantAI Lakehouse")).toBeTruthy()
+    expect(screen.getByText(`© ${new Date().getFullYear()} Acme Data`)).toBeTruthy()
+  })
+
+  it("names the product once in the footer when the workspace set no name", async () => {
+    // Planner review of the #536 merge (2026-11-18), DESIGN.md: one piece of
+    // information is written once. With no name of its own, the copyright
+    // already names the product, so the byline does not repeat it.
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    renderLoginPage()
+
+    const copyright = await screen.findByText(`© ${new Date().getFullYear()} ${PRODUCT_NAME}`)
+    // The name is the product's own before the branding answer and after it
+    // (the answer sets no name); waiting for the form lets that answer land
+    // before the check, so the byline is checked on the settled page.
+    await screen.findByLabelText("Username or email")
+    expect(screen.queryByText("Powered by RantAI Lakehouse")).toBeNull()
+    expect(copyright.parentElement?.textContent).not.toContain("·")
   })
 
   it("falls back to the product's own logo when the workspace's logo fails to load", async () => {
