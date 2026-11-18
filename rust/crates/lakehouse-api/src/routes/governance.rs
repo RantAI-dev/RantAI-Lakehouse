@@ -159,9 +159,17 @@ const AUDIT_READ_DENIED: &str = "reading the audit trail needs the audit:read pe
 /// history names upload tables of every tenant: see
 /// [`retain_rows_in_reach`]. The classification list is narrowed the same way
 /// (`SEC-20`, plan 96), by each row's `asset`: it names the tables of the
-/// shared catalog and the upload tables of every tenant. The other kinds are
-/// not narrowed. No principal is a system call and is not narrowed, which
-/// [`crate::routes::quality::quality_table_access`] documents.
+/// shared catalog and the upload tables of every tenant. The audit trail is
+/// narrowed per tenant (`SEC-20`, plan 100): the reader's scope is resolved
+/// with [`crate::routes::audit_scope::scope_for_principal`] and the rows are
+/// read through [`audit_trail`], so a reader sees its own organisation's rows
+/// plus the deployment's rows when that organisation owns the shared catalog.
+/// The other kinds are not narrowed. No principal is a system call: the
+/// quality list leaves one as it was, which
+/// [`crate::routes::quality::quality_table_access`] documents, while the
+/// audit list gives a headless call (no principal behind it, such as the
+/// assistant's `get_audit_history` tool) no row of the trail, through
+/// [`crate::routes::audit_scope::scope_without_principal`].
 pub(crate) async fn read_kind(
     state: &AppState,
     principal: Option<&Principal>,
@@ -174,9 +182,9 @@ pub(crate) async fn read_kind(
     // No principal is an in-process call (the assistant's
     // `get_audit_history` tool, `routes/ai/tools/governance.rs`), which this
     // check leaves as it was, like the quality list's narrowing: that tool
-    // is registered with `governance:read` only, so it still shows the trail
-    // to a person without `audit:read`, until the assistant's registry asks
-    // for the new permission too.
+    // is registered with `governance:read` only, so it still shows a person
+    // without `audit:read` its own organisation's rows of the trail, until
+    // the assistant's registry asks for the new permission too.
     if parsed == Kind::Audit
         && let Some(principal) = principal
         && !principal.has("audit:read")

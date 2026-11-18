@@ -3,8 +3,9 @@
 //! `get_cdc_health`, `get_maintenance_metrics`, `draft_policy`,
 //! `draft_classification_rule`, `draft_quality_rule`.
 //!
-//! Every read here calls `routes::governance::get` (the SAME `{kind}`
-//! dispatch `GET /api/governance/{kind}` uses) via [`super::response_to_value`]
+//! Every read here except `get_audit_history` calls
+//! `routes::governance::get` (the SAME `{kind}` dispatch
+//! `GET /api/governance/{kind}` uses) via [`super::response_to_value`]
 //! — including its existing degrade-cleanly behaviour: `get_cdc_health`
 //! (`kind = "replication"`) and `get_maintenance_metrics`
 //! (`kind = "maintenance"`) read `ClickHouse` tables that only exist once
@@ -14,6 +15,14 @@
 //! into a 503 `{"error": ...}` body, which `response_to_value` reads back
 //! as a normal tool-result `{"error": ...}` — no special-casing needed
 //! here.
+//!
+//! `get_audit_history` is the exception (`SEC-20`, plan 100): it reads the
+//! trail through `routes::governance::audit_trail` — the one read of the
+//! trail `GET /api/governance/audit` uses too — with the person's own
+//! scope, so the route and the tool cannot disagree about which rows the
+//! caller may see. A headless call answers
+//! `{"error": "reading the audit trail needs a signed-in user"}` instead
+//! of rows.
 //!
 //! The three draft tools call the real `routes::governance::create_policy`/
 //! `create_quality_rule`/`create_classification_rule` handlers (via
