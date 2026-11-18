@@ -27,6 +27,7 @@ use lakehouse_api::db_roles::{
 };
 use lakehouse_api::{DatabaseStartup, StartPathRefusal};
 use lakehouse_core::secret::SecretValue;
+use sqlx::Connection as _;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
@@ -81,23 +82,30 @@ fn encoded_repeated_byte(byte: u8) -> String {
 /// that a changed password applies.
 static ROLE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The same lock across PROCESSES: `cargo nextest` runs each partition in
-/// its own process against one shared cluster, so the mutex above does not
-/// order them. A transaction-level advisory lock does, and it is released
-/// when the transaction ends (`Drop` rolls it back).
+/// The same lock across PROCESSES. `cargo nextest` runs each partition in
+/// its own process against one shared cluster, and every test here has its
+/// own database. A PostgreSQL advisory lock is scoped to the database its
+/// session is in, so two tests on two databases never conflict. The lock
+/// is therefore taken on the cluster's `postgres` maintenance database,
+/// which every test process connects to. The session ends with the
+/// connection, so the lock is released when the fixture is dropped.
 const CLUSTER_ROLE_LOCK_KEY: i64 = 7_800_078;
 
-async fn take_cluster_role_lock(pool: &PgPool) -> sqlx::Transaction<'static, sqlx::Postgres> {
-    let mut transaction = pool
-        .begin()
+struct ClusterRoleLock(sqlx::PgConnection);
+
+async fn take_cluster_role_lock() -> ClusterRoleLock {
+    let mut url = url::Url::parse(&lakehouse_test_support::database_url())
+        .expect("the test-support database URL parses");
+    url.set_path("/postgres");
+    let mut connection = sqlx::PgConnection::connect(url.as_str())
         .await
-        .expect("begin the cluster-wide role lock");
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .expect("connect to the maintenance database for the role lock");
+    sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(CLUSTER_ROLE_LOCK_KEY)
-        .execute(&mut *transaction)
+        .execute(&mut connection)
         .await
-        .expect("take the cluster-wide role lock");
-    transaction
+        .expect("take the cluster-wide console role lock");
+    ClusterRoleLock(connection)
 }
 
 /// A migrated database with the console's role set up on it, and a pool
@@ -107,7 +115,7 @@ struct RoleFixture {
     /// in.
     _role_lock: tokio::sync::MutexGuard<'static, ()>,
     /// The same, across processes (see [`take_cluster_role_lock`]).
-    _cluster_lock: sqlx::Transaction<'static, sqlx::Postgres>,
+    _cluster_lock: ClusterRoleLock,
     /// The owner's pool: the test superuser, which owns every table.
     owner_pool: PgPool,
     /// A pool that connects as the console's role.
@@ -130,7 +138,7 @@ impl RoleFixture {
     async fn new_after(statements: &[&'static str]) -> Self {
         let (_state, owner_pool) = spin_up_state(&HashMap::new()).await;
         let role_lock = ROLE_LOCK.lock().await;
-        let cluster_lock = take_cluster_role_lock(&owner_pool).await;
+        let cluster_lock = take_cluster_role_lock().await;
         for statement in statements {
             sqlx::query(*statement)
                 .execute(&owner_pool)
@@ -1240,7 +1248,7 @@ async fn the_route_test_harness_still_builds_with_the_superuser() {
 async fn the_migrate_command_sets_the_console_role_up_and_exits() {
     let (_state, owner_pool) = spin_up_state(&HashMap::new()).await;
     let _role_lock = ROLE_LOCK.lock().await;
-    let _cluster_lock = take_cluster_role_lock(&owner_pool).await;
+    let _cluster_lock = take_cluster_role_lock().await;
     let db_name: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&owner_pool)
         .await
@@ -1293,7 +1301,7 @@ async fn the_migrate_command_sets_the_console_role_up_and_exits() {
 async fn the_migrate_command_never_writes_the_role_password_into_its_log() {
     let (_state, owner_pool) = spin_up_state(&HashMap::new()).await;
     let _role_lock = ROLE_LOCK.lock().await;
-    let _cluster_lock = take_cluster_role_lock(&owner_pool).await;
+    let _cluster_lock = take_cluster_role_lock().await;
     let db_name: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&owner_pool)
         .await

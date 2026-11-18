@@ -200,6 +200,12 @@ fn sqlstate_of(err: &sqlx::Error) -> Option<String> {
 /// 8. grant `pg_monitor`, the built-in role that carries the read-only
 ///    statistics privileges.
 ///
+/// Two runs of this at the same time, against one cluster, can fail with
+/// SQLSTATE `XX000` ("tuple concurrently updated") on the `ALTER ROLE`
+/// that sets the password. That is why the compose file runs ONE migrate
+/// service, and why a deploy must not start a second `migrate` against
+/// the same cluster.
+///
 /// # Errors
 ///
 /// Returns [`RoleSetupError`] if the database refused one of the
