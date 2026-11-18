@@ -407,6 +407,14 @@ pub async fn login(
 /// replayed copy of the old cookie value is rejected, not just the
 /// browser's copy cleared) and clear the cookie.
 ///
+/// The answer also carries the provider's own logout address, when the
+/// deployment has one (`OIDC_POST_LOGOUT_REDIRECT_URI`) and the provider
+/// publishes an `end_session_endpoint`: the browser is sent there as well,
+/// so the provider's session ends too. Without that, the provider still
+/// holds the session it created for that browser, and the next sign-in is
+/// answered from it — the person is signed in as whoever used that machine
+/// last, with no choice offered.
+///
 /// # Errors
 ///
 /// Returns a 503 if no Postgres pool is configured, or the underlying
@@ -429,12 +437,66 @@ pub async fn logout(
         )
         .await;
     }
-    let mut response = StatusCode::NO_CONTENT.into_response();
+    let mut response = (
+        StatusCode::OK,
+        ApiJson(LogoutResult {
+            provider_logout_url: provider_logout_url(&state).await,
+        }),
+    )
+        .into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
         cleared_session_cookie_header(state.config.is_dev),
     );
     Ok(response)
+}
+
+/// The answer to `POST /api/auth/logout`: where the browser should also be
+/// sent, so the provider's session ends with this deployment's.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LogoutResult {
+    /// The provider's logout address, or `None` when the deployment has no
+    /// post-logout redirect address or the provider publishes no logout
+    /// endpoint. The browser stays on this deployment's sign-in page when
+    /// it is `None`.
+    provider_logout_url: Option<String>,
+}
+
+/// The provider's RP-initiated logout address, or `None`.
+///
+/// Two things have to be in place, and both are the deployment's own doing:
+/// the provider must publish an `end_session_endpoint` (its discovery
+/// document names it), and this deployment must name an address the
+/// provider accepts back (`OIDC_POST_LOGOUT_REDIRECT_URI`, registered with
+/// the provider). Without either, the provider refuses the logout — and a
+/// logout that fails silently is worse than none, so the address is only
+/// built when both are there.
+async fn provider_logout_url(state: &AppState) -> Option<String> {
+    let post_logout = state.config.oidc_post_logout_redirect_uri.as_deref()?;
+    let runtime = crate::runtime_settings::sso_runtime(state).await;
+    let end_session = runtime.settings.end_session_endpoint.as_deref()?;
+    let client_id = runtime.settings.client_id.as_deref()?;
+    build_provider_logout_url(end_session, client_id, post_logout)
+}
+
+/// Build the provider's logout address from its three parts.
+///
+/// `client_id` and `post_logout_redirect_uri` are the two parameters the
+/// provider needs to accept the logout without an `id_token_hint` (this
+/// deployment does not keep the id token). The provider refuses a logout
+/// whose return address it does not know, so the address here is the one
+/// registered with it.
+fn build_provider_logout_url(
+    end_session: &str,
+    client_id: &str,
+    post_logout_redirect_uri: &str,
+) -> Option<String> {
+    let mut url = url::Url::parse(end_session).ok()?;
+    url.query_pairs_mut()
+        .append_pair("client_id", client_id)
+        .append_pair("post_logout_redirect_uri", post_logout_redirect_uri);
+    Some(url.to_string())
 }
 
 /// `GET /api/auth/me` response body.
@@ -2050,6 +2112,39 @@ mod tests {
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(query.get("prompt"), None, "{location}");
+    }
+
+    #[test]
+    fn the_provider_logout_address_names_the_client_and_the_return_address() {
+        let url = build_provider_logout_url(
+            "http://idp.invalid/realms/lakehouse/protocol/openid-connect/logout",
+            "lakehouse",
+            "http://lake.invalid/login",
+        )
+        .expect("a logout address");
+        assert!(
+            url.starts_with("http://idp.invalid/realms/lakehouse/protocol/openid-connect/logout?")
+        );
+        let query = url::Url::parse(&url)
+            .expect("a URL")
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("lakehouse")
+        );
+        assert_eq!(
+            query.get("post_logout_redirect_uri").map(String::as_str),
+            Some("http://lake.invalid/login")
+        );
+
+        // An address the provider does not publish is not turned into a
+        // logout the provider will refuse: no address, no logout.
+        assert_eq!(
+            build_provider_logout_url("not a url", "lakehouse", "http://lake.invalid/login"),
+            None
+        );
     }
 
     #[tokio::test]

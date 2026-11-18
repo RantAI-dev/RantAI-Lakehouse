@@ -1885,19 +1885,36 @@ client also sets `OIDC_CLIENT_SECRET`.
 | `OIDC_JIT_PROVISIONING` | no | `false` | Exactly the string `true` (not `TRUE`/`1`/`yes`) creates an `app_user` on first sign-in. |
 | `OIDC_TRUST_EMAIL` | no | `false` | Exactly the string `true` joins an existing account by email even when the token does not carry `email_verified: true` (`SEC-65`). Only for a provider that never sends the claim; check yours with the test sign-in. |
 | `OIDC_CLOCK_SKEW_SECONDS` | no | `60` | Leeway on `exp`/`nbf`; an unparseable value falls back to `60` instead of failing boot. |
+| `OIDC_POST_LOGOUT_REDIRECT_URI` | no | unset | Where the provider sends the browser back to after the sign-out ends the provider's session too. Must be registered with the provider as a valid post-logout redirect URI, or the provider refuses the logout. Unset (the default): the sign-out ends this deployment's session only. |
 | `OIDC_PROMPT` | no | `login` | The `prompt` the browser sign-in sends the provider (`login`, `consent`, `select_account`). `login` makes the provider show its **login form** on every sign-in, so the person at the keyboard picks the account. `off` sends no prompt at all and the provider reuses the session it already holds for that browser — see "Sign out, then sign in again" below. An empty value is the default. |
 
-**Sign out, then sign in again.** "Sign out" ends this deployment's session
-and nothing else: the provider still holds the session it created for that
-browser, so the next sign-in would be answered from it and the person would
-be signed in as whoever used that browser last. The sign-in therefore sends
-`prompt=login` by default (`OIDC_PROMPT`), which makes the provider show
-its **login form** again — the account is the person's choice, every time.
-Set `OIDC_PROMPT=off` to send nothing and let the provider reuse its own
-session; that is the comfortable behaviour on a private machine and the
-surprising one on a shared one. An empty value is the default, not an
-opt-out: compose always passes the variable, so "empty" cannot mean "the
-operator said nothing".
+**Sign out, then sign in again.** Two things have to end for the next
+sign-in to be a fresh one, and this deployment ends both:
+
+1. **This deployment's session.** The sign-out revokes it and clears the
+   cookie (`routes/auth.rs`'s `logout`).
+2. **The provider's session.** The provider holds one too, for that
+   browser, and it is what a sign-in is answered from when the browser
+   still has it — which is why "sign out, then sign in" used to land on
+   whoever used that machine last. The sign-out therefore sends the browser
+   to the provider's own logout address as well
+   (`end_session_endpoint`, read from the provider's discovery document),
+   and the provider ends its session and sends the browser back to
+   `OIDC_POST_LOGOUT_REDIRECT_URI`.
+
+The second one needs that address registered with the provider as a valid
+post-logout redirect URI (Keycloak: the client's **Valid post logout
+redirect URIs**); without it the provider refuses the logout, so the
+deployment does not send the browser there at all.
+
+With the provider's session gone, the next sign-in shows the provider's
+**login form** with the username field again — the account is the person's
+choice, every time. `OIDC_PROMPT=login` (the default) makes the provider
+ask again even when its session is still there; `OIDC_PROMPT=off` sends no
+prompt at all and lets the provider reuse its own session, which is the
+comfortable behaviour on a private machine and the surprising one on a
+shared one. An empty value is the default, not an opt-out: compose always
+passes the variable, so "empty" cannot mean "the operator said nothing".
 
 **Where the signing keys come from.** With `OIDC_JWKS_URL` unset, the API
 reads the provider's discovery document
