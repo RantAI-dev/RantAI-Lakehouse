@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/input-group";
 import { Spinner } from "@/components/ui/spinner";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { RequiredLegend } from "@/components/patterns/required-legend";
 import * as authClient from "@/services/clients/auth";
 import { toServiceError } from "@/services/errors";
 
@@ -56,7 +57,7 @@ function PasswordField({
   const [show, setShow] = React.useState(false);
   return (
     <Field data-invalid={invalid}>
-      <FieldLabel htmlFor={id} className="text-sm">
+      <FieldLabel htmlFor={id} className="text-sm" required>
         {label}
       </FieldLabel>
       <InputGroup className="h-11">
@@ -146,6 +147,7 @@ export function ChangePasswordStep({
         </CardHeader>
         <CardContent>
           <form onSubmit={onSubmit} className="flex flex-col gap-5" noValidate>
+            <RequiredLegend />
             {!forced ? (
               <PasswordField
                 id="old-password"

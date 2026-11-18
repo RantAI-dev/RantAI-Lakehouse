@@ -4,6 +4,7 @@ import { DatabaseIcon } from "lucide-react"
 import { trinoBronzeName } from "@/lib/asset-query"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { TABLE_NAME_RULE, rawTableFullName, tableNameFault } from "@/lib/uploads"
 import { cn } from "@/lib/utils"
 import type { UploadLoadMode } from "@/services/contracts/uploads"
@@ -45,10 +46,12 @@ export function UploadTableStep({
   const valid = tableName !== "" && problem === null
   return (
     <div className="space-y-5">
+      <RequiredLegend />
       <div className="space-y-1.5">
-        <Label htmlFor="upload-table-name">Table name</Label>
+        <Label htmlFor="upload-table-name" required>Table name</Label>
         <Input
           id="upload-table-name"
+          aria-required
           value={tableName}
           autoComplete="off"
           spellCheck={false}
