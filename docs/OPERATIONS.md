@@ -1885,6 +1885,17 @@ client also sets `OIDC_CLIENT_SECRET`.
 | `OIDC_JIT_PROVISIONING` | no | `false` | Exactly the string `true` (not `TRUE`/`1`/`yes`) creates an `app_user` on first sign-in. |
 | `OIDC_TRUST_EMAIL` | no | `false` | Exactly the string `true` joins an existing account by email even when the token does not carry `email_verified: true` (`SEC-65`). Only for a provider that never sends the claim; check yours with the test sign-in. |
 | `OIDC_CLOCK_SKEW_SECONDS` | no | `60` | Leeway on `exp`/`nbf`; an unparseable value falls back to `60` instead of failing boot. |
+| `OIDC_PROMPT` | no | `login` | The `prompt` the browser sign-in sends the provider (`login`, `consent`, `select_account`). `login` makes the provider show its **login form** on every sign-in, so the person at the keyboard picks the account. Set it **empty** (`OIDC_PROMPT=`) to send nothing and let the provider reuse the session it already holds for that browser — see "Sign out, then sign in again" below. |
+
+**Sign out, then sign in again.** "Sign out" ends this deployment's session
+and nothing else: the provider still holds the session it created for that
+browser, so the next sign-in would be answered from it and the person would
+be signed in as whoever used that browser last. The sign-in therefore sends
+`prompt=login` by default (`OIDC_PROMPT`), which makes the provider show
+its **login form** again — the account is the person's choice, every time.
+Set `OIDC_PROMPT=` (present but empty) to send nothing and let the provider
+reuse its own session; that is the comfortable behaviour on a private
+machine and the surprising one on a shared one.
 
 **Where the signing keys come from.** With `OIDC_JWKS_URL` unset, the API
 reads the provider's discovery document

@@ -3175,6 +3175,8 @@ mod tests {
             jwks_url_source: Source::Default,
             redirect_uri: None,
             redirect_uri_source: Source::Default,
+            prompt: None,
+            prompt_source: Source::Default,
             clock_skew_seconds: 60,
         };
 
