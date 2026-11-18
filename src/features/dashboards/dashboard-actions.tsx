@@ -13,6 +13,8 @@ import {
   DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { RequiredLegend } from "@/components/patterns/required-legend";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { REFRESH_OPTIONS } from "@/lib/dashboard-refresh";
@@ -260,14 +262,19 @@ export function RenameDashboardDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-sm">
         <DialogHeader><DialogTitle>Rename dashboard</DialogTitle></DialogHeader>
-        <Input
-          autoFocus
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && clean) onSave(clean); }}
-          placeholder="Dashboard name"
-          aria-label="Dashboard name"
-        />
+        <div className="grid gap-1.5">
+          <RequiredLegend />
+          <Label htmlFor="rename-dashboard-name" required>Name</Label>
+          <Input
+            id="rename-dashboard-name"
+            autoFocus
+            aria-required
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && clean) onSave(clean); }}
+            placeholder="Dashboard name"
+          />
+        </div>
         <DialogFooter>
           <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
           <Button size="sm" disabled={!clean} onClick={() => onSave(clean)}>Save</Button>

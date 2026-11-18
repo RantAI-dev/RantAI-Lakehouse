@@ -1013,3 +1013,51 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     expect(within(steps).getByRole("button", { name: /1\. paid/ }).textContent).toContain("reads orders")
   })
 })
+
+/** The shared decorative star (CSS ::before), not a text glyph. */
+function hasMarker(el: HTMLElement | null): boolean {
+  return Boolean(el?.querySelector('span[aria-hidden="true"][class*="before:content-"]'))
+}
+
+describe("required-field indicators in the pipeline editor (UX-1-R8)", () => {
+  it("stars and requires the name on create, but not the fixed name on edit", () => {
+    const { unmount } = renderEditor()
+    const created = screen.getByLabelText("Pipeline name")
+    expect(created.getAttribute("aria-required")).toBe("true")
+    expect(created.closest("div")?.querySelector("label")?.getAttribute("data-required")).toBe("")
+    expect(hasMarker(created.closest("div")?.querySelector("label") ?? null)).toBe(true)
+    expect(screen.getByText(/Required/)).toBeTruthy()
+    unmount()
+
+    renderEditor(existing())
+    const edited = screen.getByLabelText("Pipeline name")
+    expect(edited.hasAttribute("aria-required")).toBe(false)
+    expect(edited.closest("div")?.querySelector("label")?.hasAttribute("data-required")).toBe(false)
+  })
+
+  it("requires an input's zone, table and name, and the output's zone and table", async () => {
+    renderEditor()
+    await screen.findByPlaceholderText("orders_events")
+    expect((await screen.findByRole("combobox", { name: "Zone" })).getAttribute("aria-required")).toBe("true")
+    expect((screen.getByPlaceholderText("orders_events") as HTMLInputElement).getAttribute("aria-required")).toBe("true")
+    expect((screen.getByLabelText("Name in this pipeline") as HTMLInputElement).getAttribute("aria-required")).toBe("true")
+
+    selectOutput()
+    expect((await screen.findByRole("combobox", { name: "Output zone" })).getAttribute("aria-required")).toBe("true")
+    expect((screen.getByPlaceholderText("orders_hourly") as HTMLInputElement).getAttribute("aria-required")).toBe("true")
+  })
+
+  it("requires a step's reads and marks the operations group and operation arguments", async () => {
+    renderEditor(existing())
+    selectRail(/1\. transformed/)
+    await screen.findByText("Operations")
+    expect((await screen.findByRole("combobox", { name: "Reads" })).getAttribute("aria-required")).toBe("true")
+    expect(hasMarker(screen.getByText(/Operations/).closest("p"))).toBe(true)
+    // The default dedupe row's Key column is refused blank by `draftIsComplete`.
+    const key = screen.getByText("Key column")
+    expect(key.getAttribute("data-required")).toBe("")
+    // PR568 review: column metadata loads after the step opens. Wait for the
+    // picker to replace its free-text fallback before checking its semantics.
+    expect((await screen.findByRole("combobox", { name: "Key column" })).getAttribute("aria-required")).toBe("true")
+  })
+})

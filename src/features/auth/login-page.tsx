@@ -1,10 +1,10 @@
 "use client";
 
 import * as React from "react";
-import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Eye, EyeOff, Lock, Mail, TriangleAlert } from "lucide-react";
+import { BrandPicture } from "@/components/brand-picture";
 import { Button } from "@/components/ui/button";
 import { Field, FieldLabel } from "@/components/ui/field";
 import {
@@ -15,7 +15,14 @@ import {
 } from "@/components/ui/input-group";
 import { Spinner } from "@/components/ui/spinner";
 import { Skeleton } from "@/components/ui/skeleton";
+import { RequiredLegend } from "@/components/patterns/required-legend";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { useBranding } from "@/hooks/use-branding";
+import {
+  PRODUCT_BYLINE,
+  PRODUCT_LOGO_DARK,
+  PRODUCT_LOGO_LIGHT,
+} from "@/lib/product-branding";
 import * as authClient from "@/services/clients/auth";
 import { toServiceError } from "@/services/errors";
 import { useAuth } from "./auth-provider";
@@ -88,6 +95,10 @@ function nextPathFromQuery(): string {
 export function LoginPage() {
   const router = useRouter();
   const { refresh, status, user } = useAuth();
+  // The workspace's own name and logo (`ADM-2`). The route is public, so
+  // the page reads it before anyone signs in; the product's own name and
+  // logos stand in until the answer arrives.
+  const branding = useBranding();
   const [email, setEmail] = React.useState("");
   const [password, setPassword] = React.useState("");
   const [submitting, setSubmitting] = React.useState(false);
@@ -201,24 +212,20 @@ export function LoginPage() {
         <header className="flex items-center justify-between">
           <span className="flex items-center gap-2">
             <span className="relative size-7">
-              <Image
-                src="/logo-light.png"
-                alt="Rantai Lake"
-                fill
-                sizes="28px"
-                className="object-contain dark:hidden"
-                priority
+              <BrandPicture
+                src={branding.logoSrc}
+                alt={branding.name}
+                fallbackSrc={PRODUCT_LOGO_LIGHT}
+                className="size-7 object-contain dark:hidden"
               />
-              <Image
-                src="/logo-dark.png"
-                alt=""
-                fill
-                sizes="28px"
-                className="hidden object-contain dark:block"
-                priority
+              <BrandPicture
+                src={branding.logoDarkSrc}
+                alt={branding.name}
+                fallbackSrc={PRODUCT_LOGO_DARK}
+                className="hidden size-7 object-contain dark:block"
               />
             </span>
-            <span className="text-sm font-semibold">Rantai Lake</span>
+            <span className="text-sm font-semibold">{branding.name}</span>
           </span>
           <ThemeToggle />
         </header>
@@ -234,7 +241,7 @@ export function LoginPage() {
               <SsoNotice />
             </React.Suspense>
             <h1 className="text-3xl leading-[1.2] font-semibold tracking-[-0.02em] text-foreground">
-              Sign in to Rantai Lake
+              Sign in to {branding.name}
             </h1>
             <p className="mt-2 text-sm text-muted-foreground">
               Use your account credentials to continue.
@@ -249,8 +256,9 @@ export function LoginPage() {
             ) : (
               <div className="mt-8 flex flex-col gap-5">
                 <form onSubmit={onSubmit} className="flex flex-col gap-5" noValidate>
+                  <RequiredLegend />
                   <Field data-invalid={!!error}>
-                    <FieldLabel htmlFor="login-email" className="text-sm">
+                    <FieldLabel htmlFor="login-email" className="text-sm" required>
                       Username or email
                     </FieldLabel>
                     <InputGroup className="h-11">
@@ -275,7 +283,7 @@ export function LoginPage() {
                   </Field>
 
                   <Field data-invalid={!!error}>
-                    <FieldLabel htmlFor="login-password" className="text-sm">
+                    <FieldLabel htmlFor="login-password" className="text-sm" required>
                       Password
                     </FieldLabel>
                     <InputGroup className="h-11">
@@ -364,7 +372,12 @@ export function LoginPage() {
         </div>
 
         <footer className="flex flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
-          <span>© {new Date().getFullYear()} Rantai Lake</span>
+          <div className="flex flex-col gap-1">
+            {/* Feature decision 8: the console keeps saying who built it,
+                even when the workspace has a name of its own. */}
+            <span className="text-xs">{PRODUCT_BYLINE}</span>
+            <span>© {new Date().getFullYear()} {branding.name}</span>
+          </div>
           {/* Placeholder destination — point this at the docs site (or
               wherever support lives) once that URL exists. */}
           <Link href="#" className="transition-colors hover:text-foreground">

@@ -119,10 +119,6 @@ export function EventDetail({ event }: { readonly event: AuditEvent }) {
             label: "Delegated actor",
             value: event.delegatedActor ?? "—",
           },
-          {
-            label: "Tenant",
-            value: <span className="font-mono text-xs">{event.tenant}</span>,
-          },
           { label: "Action", value: event.action },
           { label: "Resource", value: event.resource },
           { label: "Policy decision", value: event.policyDecision },
