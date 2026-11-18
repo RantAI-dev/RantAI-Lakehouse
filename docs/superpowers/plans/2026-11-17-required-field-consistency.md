@@ -247,6 +247,23 @@ treats as necessary, they do not strengthen validation.
 
 ## Review / Handoff
 
+### Delivery repair authorization (2026-11-18)
+
+Owner requested watch, repair and merge if done. Current main `a2130e08d`
+includes the separately reviewed SEC-79 dependency policy fix (#569); it was
+merged into this branch without conflicts. Do not duplicate/modify that policy.
+The old cargo-deny blocker is superseded by current main's passing Security run.
+
+Frontend CI run `44079246186` failed five notifications client assertions
+(markMentionsRead requests/refusals and list refusal) that pass locally. Source
+inspection found `per-role-navigation.test.tsx` installs notificationsService
+spies in beforeEach without restoring them in afterEach. Hy4 must establish
+the test-order reproduction and repair spy lifecycle/isolation, retaining all
+production behavior and all assertion strength. No new error suppression or
+test weakening. Re-run the involved files in both orders and the full frontend
+checks, then hand off for independent parent review. Only frontend tests and
+documentation are expected to change relative to the updated main baseline.
+
 ### Required-check investigation after CI wake (2026-11-17)
 
 PR head `a3409698f` cargo-deny failure was inspected in run `44078730810`,
