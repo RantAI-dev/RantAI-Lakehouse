@@ -50,6 +50,19 @@ The assistant's data map, SQL and metric answers follow the rule. Changing a rol
 | D4 | A role holding `*:*` cannot be narrowed | As stated | Planner |
 | D5 | Embeds and public links follow the Dashboard Viewer role's tables | As stated | Planner |
 | D6 | Access check budget under 5 ms at p95 | *(proposed)* | |
+| D7 | A dashboard that depends on any table the caller cannot read is hidden **whole**, on every tab — not just the values on that table's tiles | As stated | Owner, 2026-11-17 (`GOV-17`) |
+
+### Superseded acceptance (GOV-17, owner 2026-11-17)
+
+`GOV-7-AC4` and `GOV-7-AC9` below still record what the product did when they
+were written: a mixed board showed the allowed tiles and a not-found message
+only on the tile whose table was hidden, and an embed did the same. The owner
+decided on 2026-11-17 that this is not enough — a person restricted to some
+tables must not see a dashboard that depends on any other table, so hiding just
+the values still reveals the dashboard's existence, title, chart labels,
+counts and failure text. Those two results are **historical and superseded**;
+they are not re-reported as newly passing. The new expectations are
+`GOV-17-AC1` to `GOV-17-AC9` below. All other `GOV-7-AC*` items are unchanged.
 
 ## Limits to tell a customer
 
@@ -72,12 +85,12 @@ The assistant's data map, SQL and metric answers follow the rule. Changing a rol
 | `GOV-7-AC1` | Narrow a role "Finance" to schema `finance` and give it to a user with only that role | The user's catalog and search show only `finance` tables | Not run |
 | `GOV-7-AC2` | As that user, run `SELECT * FROM silver.orders` in Query Studio | "Table not found or not available to your organisation" | Not run |
 | `GOV-7-AC3` | As that user, run a query on a `finance` table | Rows come back as before, with masks applied | Not run |
-| `GOV-7-AC4` | As that user, open a dashboard with one tile on `finance` and one on `silver.orders` | The first tile shows data; the second shows the not-found message | Not run |
+| `GOV-7-AC4` | As that user, open a dashboard with one tile on `finance` and one on `silver.orders` | **Superseded** (2026-11-17): was "the first tile shows data; the second shows the not-found message" — now the whole dashboard is not found | Superseded by `GOV-17-AC1` |
 | `GOV-7-AC5` | As that user, ask the assistant "what tables can I see" and "count rows in silver.orders" | Only `finance` tables listed; the second is refused as not found | Not run |
 | `GOV-7-AC6` | Open `/data/assets/<id>` of a hidden table by address | Not found | Not run |
 | `GOV-7-AC7` | Add a second role on "All tables" to the user | All tables visible again | Not run |
 | `GOV-7-AC8` | Try to narrow Platform Admin | Refused with a plain message | Not run |
-| `GOV-7-AC9` | Narrow Dashboard Viewer to `gold`; open an embed whose tile reads `silver` | That tile shows not found | Not run |
+| `GOV-7-AC9` | Narrow Dashboard Viewer to `gold`; open an embed whose tile reads `silver` | **Superseded** (2026-11-17): was "that tile shows not found" — now the whole embed is refused with the fixed token answer | Superseded by `GOV-17-AC7` |
 | `GOV-7-AC10` | An alert owned by the narrowed user on a hidden table runs | It fails with not found, recorded on the alert's history | Not run |
 | `GOV-7-AC11` | Look at the audit log after narrowing | An entry names the role and the before/after tables | Not run |
 | `GOV-7-AC12` | Upgrade a deployment with existing roles | Every role still reads every table | Not run |
@@ -85,6 +98,20 @@ The assistant's data map, SQL and metric answers follow the rule. Changing a rol
 | `GOV-7-AC14` | Create a role and leave "All tables" | The role is created and the Roles list says "All tables" | Not run |
 | `GOV-7-AC15` | Open Edit role for a role that a mask or row filter names | The rule is listed with its table, what it does and its status; the table links to its Access tab | Not run |
 | `GOV-7-AC16` | Open Edit role for a role no rule names | "No mask or row filter names this role" | Not run |
+
+### GOV-17 manual regressions (whole-dashboard visibility)
+
+| ID | Do this | Expect | Result |
+| --- | --- | --- | --- |
+| `GOV-17-AC1` | Narrow a role to `finance`; open a dashboard with one tile on `finance` and one on `silver.orders` | The whole dashboard is not found — no title, tile, label, count or failure text; the hidden table is never queried | Not run |
+| `GOV-17-AC2` | As a caller whose grants cover every tile, open the same dashboard | Every tile renders as before (this is the control that stops the guard being a blanket refusal) | Not run |
+| `GOV-17-AC3` | With no dashboards visible at all, open the dashboard page | An honest empty chooser; the console does not auto-open hidden Main | Not run |
+| `GOV-17-AC4` | Guess the address of the hidden dashboard by id | The same fixed "dashboard not found" as a board that does not exist | Not run |
+| `GOV-17-AC5` | Open a board whose tiles use a join, a saved SQL source or a second/combined layer on a hidden table | The whole board is hidden; the hidden table is never queried | Not run |
+| `GOV-17-AC6` | Render a dashboard, then narrow the role's tables, then reload without a new sign-in | The next request hides the board, even though tile results or an export were cached with broader access | Not run |
+| `GOV-17-AC7` | Narrow Dashboard Viewer to `gold`; open a signed embed and a public link of a board that reads `silver` | Each is refused with the fixed token answer; no board or table name is returned | Not run |
+| `GOV-17-AC8` | Ask the assistant to list boards/charts/SQL sources and open the dashboard page context as the narrowed user | Hidden boards, their charts and their sources are absent from the list and the context | Not run |
+| `GOV-17-AC9` | As a report recipient whose grant was removed since subscribing, receive a report and open its attachment | The send and the attachment download are refused; the owner is rechecked too | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 

@@ -32,6 +32,7 @@ Each commented block in `.env.example` ends by pointing here:
 - <a id="backups"></a>**Backups to S3** — "Backups" below.
 - <a id="tenant-storage"></a>**Tenant storage on outside S3** — `TENANT_WAREHOUSE_S3_*`, in the P1b table below.
 - <a id="networks"></a>**Networks you allow** — `*_ALLOW_INTERNAL_HOSTS` and `*_ALLOWED_CIDRS`, throughout the tables below.
+- <a id="dagster-run-limits"></a>**Dagster run limits** — `INGEST_RUN_MAX_RUNTIME_SECONDS` and the `DAGSTER_RUN_LIMIT_*_SECONDS` family, in the "Upload limits and ingest retry" table below.
 
 | Variable | Purpose | Default | Required? | In `.env.example` |
 | --- | --- | --- | --- | --- |
@@ -86,6 +87,7 @@ Each commented block in `.env.example` ends by pointing here:
 | `OIDC_ROLE_MAP` | `"group1=Role One,group2=Role Two"` — maps an IdP group/role claim to a local role name | empty | No | commented |
 | `OIDC_GROUPS_CLAIM` | Which token claim carries the caller's groups/roles | `groups` | No | commented |
 | `OIDC_CLOCK_SKEW_SECONDS` | Clock-skew tolerance for `exp`/`nbf` validation. Invalid values fall back to the default | `60` | No | no |
+| `OIDC_PROMPT` | The `prompt` the browser sign-in sends the provider. `login` (the default) makes the provider show its login form, so the person at the keyboard picks the account; set it **empty** to send nothing and let the provider reuse the session it holds for that browser | `login` | No | commented |
 | `OIDC_AUTHORIZE_URL` | Authorization endpoint of the OIDC provider, for the browser-redirect login flow. Read ONLY from this var, never from a request | unset (browser SSO login stays off) | No | commented |
 | `OIDC_TOKEN_URL` | Token endpoint of the OIDC provider, used to exchange an authorization code for tokens. Read ONLY from this var, never from a request | unset (browser SSO login stays off) | No | commented |
 | `OIDC_REDIRECT_URI` | This deployment's fixed callback URL, registered with the OIDC provider ahead of time. Read ONLY from this var, never from a request, so a caller can never redirect a login or override the callback URL | unset (browser SSO login stays off) | No | commented |
@@ -239,8 +241,20 @@ waits.
 | `UPLOAD_CONVERT_MEMORY_MB` | Memory limit that child sets for itself, in mebibytes; the measured peak of the largest allowed workbook times 1.5 | `1280` | No | no |
 | `CONNECTOR_AUTO_DISABLE_AFTER` | Failed runs in a row after which the API pauses a connector and raises the "connector disabled" alert once (`SRC-11`) | `30` | No | no |
 | `INGEST_RETRY_DELAYS_SECONDS` | Wait before each retry of a failing table, in seconds (one to three numbers), read by `dagster-code-location` | `60,300,900` | No | no |
-| `INGEST_RUN_MAX_RUNTIME_SECONDS` | How long a connector run may run before it is stopped and recorded as failed (`SRC-39`), read by `lakehouse-api` and `dagster-code-location` | `21600` | No | no |
+| `INGEST_RUN_MAX_RUNTIME_SECONDS` | How long a connector run may run before it is stopped and recorded as failed (`SRC-39`), read by `lakehouse-api` and `dagster-code-location` | `21600` | No | commented |
 | `INGEST_RUN_START_TIMEOUT_SECONDS` | How long a connector run the orchestrator has taken off its queue may take to start before the API stops holding the connector (`SRC-39`); a run still waiting in the queue is judged by the run limit above; must equal `start_timeout_seconds` in `dagster/dagster.yaml` | `600` | No | no |
+| `DAGSTER_RUN_LIMIT_STORAGE_LAYER_SNAPSHOT_JOB_SECONDS` | How long the daily storage-per-layer job may run before it is cancelled and recorded as failed (`OPS-8` part C), read by `dagster-code-location` | `1800` | No | commented |
+| `DAGSTER_RUN_LIMIT_ALERTS_RUN_JOB_SECONDS` | How long the alerts job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `900` | No | commented |
+| `DAGSTER_RUN_LIMIT_REPLICATION_SLOT_CHECK_JOB_SECONDS` | How long the replication-slot check job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `900` | No | commented |
+| `DAGSTER_RUN_LIMIT_CAPACITY_SNAPSHOT_JOB_SECONDS` | How long the capacity-snapshot job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `1800` | No | commented |
+| `DAGSTER_RUN_LIMIT_BRONZE_MAINTENANCE_JOB_SECONDS` | How long the Bronze maintenance job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `10800` | No | commented |
+| `DAGSTER_RUN_LIMIT_GOLD_EXPORT_JOB_SECONDS` | How long the Gold export job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `7200` | No | commented |
+| `DAGSTER_RUN_LIMIT_AGENT_RUN_JOB_SECONDS` | How long an AI employee's agent-run job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `1800` | No | commented |
+| `DAGSTER_RUN_LIMIT_DISCOVER_JOB_SECONDS` | How long the source-discovery job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `1800` | No | commented |
+| `DAGSTER_RUN_LIMIT_BRONZE_INGEST_JOB_SECONDS` | How long a connector run's Bronze load job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `21600` | No | commented |
+| `DAGSTER_RUN_LIMIT_FILE_INGEST_JOB_SECONDS` | How long a file upload's load job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `21600` | No | commented |
+| `DAGSTER_RUN_LIMIT_CDC_APPLY_JOB_SECONDS` | How long the change-capture apply job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `21600` | No | commented |
+| `DAGSTER_RUN_LIMIT_AUTHORED_JOB_SECONDS` | How long an authored pipeline's job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `21600` | No | commented |
 
 ### Secret managers and OAuth for connectors
 

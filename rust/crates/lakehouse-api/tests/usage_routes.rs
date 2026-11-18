@@ -1020,3 +1020,151 @@ async fn adding_a_rate_writes_one_audit_row_and_a_refused_one_writes_a_refused_r
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert_eq!(rows[1]["outcome"], json!("refused"));
 }
+
+// ── (i) storage per layer (OPS-8 part C) ────────────────────────────────
+
+/// One measured layer, as the daily storage job wrote it: the day, the
+/// layer, its tables, its bytes and how many of its tables were skipped.
+fn storage_row(day: &str, layer: &str, bytes: i64) -> Value {
+    json!({
+        "day": day,
+        "layer": layer,
+        "table_count": "3",
+        "total_bytes": bytes.to_string(),
+        "tables_skipped": "0",
+        "skipped_reason": "",
+    })
+}
+
+/// A `ClickHouse` that answers the storage read with `rows` and every other
+/// query with no rows.
+///
+/// The specific mock is mounted FIRST: among mocks of the same priority
+/// `wiremock` keeps the insertion order, so the first one that matches
+/// answers.
+async fn clickhouse_with_storage(rows: Vec<Value>) -> MockServer {
+    let ch = MockServer::start().await;
+    let count = rows.len();
+    Mock::given(method("POST"))
+        .and(body_string_contains("storage_layer_snapshot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [],
+            "data": rows,
+            "rows": count,
+        })))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [],
+            "data": [],
+            "rows": 0,
+        })))
+        .mount(&ch)
+        .await;
+    ch
+}
+
+/// The app of a test about the storage read, with the `ClickHouse` that
+/// answers it.
+async fn storage_app(rows: Vec<Value>) -> (axum::Router, PgPool) {
+    let ch = clickhouse_with_storage(rows).await;
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), ch.uri());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+    (router, pool)
+}
+
+/// The session of the seeded Platform Admin, the one caller that holds `*:*`.
+async fn platform_admin(pool: &PgPool) -> String {
+    session_cookie_for_seeded_user(pool, "fajar@meridian.example").await
+}
+
+#[tokio::test]
+async fn the_platform_operator_sees_the_size_of_every_layer() {
+    let (router, pool) = storage_app(vec![
+        storage_row("2026-03-15", "bronze", 1_000_000_000),
+        storage_row("2026-03-15", "silver", 2_000_000_000),
+    ])
+    .await;
+    let admin = platform_admin(&pool).await;
+
+    let answer = get(
+        &router,
+        &admin,
+        "/api/usage/storage?from=2026-03-01&to=2026-03-31",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let body = answer.json();
+    assert_eq!(body["from"], json!("2026-03-01"), "{body}");
+    assert_eq!(body["to"], json!("2026-03-31"), "{body}");
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "{body}");
+    assert_eq!(rows[0]["layer"], json!("bronze"), "{body}");
+    assert_eq!(rows[0]["day"], json!("2026-03-15"), "{body}");
+    assert_eq!(rows[0]["tableCount"], json!(3), "{body}");
+    assert_eq!(rows[0]["totalBytes"], json!(1_000_000_000), "{body}");
+    assert_eq!(rows[0]["tablesSkipped"], json!(0), "{body}");
+    assert_eq!(rows[0]["skippedReason"], json!(null), "{body}");
+    assert_eq!(rows[1]["layer"], json!("silver"), "{body}");
+    assert_eq!(rows[1]["totalBytes"], json!(2_000_000_000), "{body}");
+}
+
+#[tokio::test]
+async fn a_tenant_administrator_is_refused_the_storage_of_every_layer() {
+    let (router, pool) = storage_app(vec![storage_row("2026-03-15", "bronze", 1_000)]).await;
+    // A Governance Admin of one tenant: `usage:read` opens the Usage page,
+    // and it does not open the storage of every tenant's tables.
+    let admin = person(&pool, "usage:read", &[TENANT_A]).await;
+
+    let answer = get(
+        &router,
+        &admin,
+        "/api/usage/storage?from=2026-03-01&to=2026-03-31",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::FORBIDDEN, "{}", answer.text());
+    assert_eq!(
+        answer.json()["error"],
+        json!("permission_denied: Storage per layer is shown to the platform operator only.")
+    );
+}
+
+#[tokio::test]
+async fn the_estimate_follows_the_rate_that_was_in_force_on_the_day() {
+    let (router, pool) = storage_app(vec![
+        storage_row("2026-03-05", "bronze", 1_000_000_000),
+        storage_row("2026-03-15", "bronze", 1_000_000_000),
+    ])
+    .await;
+    let admin = platform_admin(&pool).await;
+    // The price of a gigabyte for a month, from the tenth of March.
+    let rate = post_rate(
+        &router,
+        &admin,
+        json!({
+            "kind": "storage_gb_month",
+            "currency": "USD",
+            "amount": "10",
+            "effectiveFrom": "2026-03-10",
+        }),
+    )
+    .await;
+    assert_eq!(rate.status, StatusCode::CREATED, "{}", rate.text());
+
+    let answer = get(
+        &router,
+        &admin,
+        "/api/usage/storage?from=2026-03-01&to=2026-03-31",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let body = answer.json();
+    assert_eq!(body["currency"], json!("USD"), "{body}");
+    let rows = body["rows"].as_array().expect("rows");
+    // The day before the rate starts has no estimate at all: not zero.
+    assert_eq!(rows[0]["estimate"], json!(null), "{body}");
+    // One gigabyte (10^9 bytes) at 10.00 for a 31-day month: 10 / 31, to six places.
+    assert_eq!(rows[1]["estimate"], json!("0.322581"), "{body}");
+}

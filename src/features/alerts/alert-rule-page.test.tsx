@@ -344,3 +344,84 @@ describe("a refusal on the alert rule page (LH-SRC-7-10)", () => {
     expect(document.body.textContent).not.toMatch(/permission_denied/)
   })
 })
+
+/** The label and the control beside it, for a field whose Label wraps with its input/select. */
+function field(labelText: string) {
+  const label = screen.getByText(labelText)
+  const control = label.parentElement?.querySelector('[role="combobox"], input, textarea') as HTMLElement | null
+  return { label, control }
+}
+
+function expectRequiredField(labelText: string) {
+  const { label, control } = field(labelText)
+  expect(label.getAttribute("data-required")).toBe("")
+  expect(control?.getAttribute("aria-required")).toBe("true")
+}
+
+function expectOptionalField(labelText: string) {
+  const { label, control } = field(labelText)
+  expect(label.hasAttribute("data-required")).toBe(false)
+  expect(control?.hasAttribute("aria-required")).toBe(false)
+}
+
+async function chooseRuleType(label: string) {
+  fireEvent.click(screen.getByRole("combobox", { name: "Type" }))
+  pickOption(await screen.findByRole("option", { name: label }))
+}
+
+/**
+ * UX-1-R9: the new page marked only Name. Every field a kind's save guard
+ * refuses blank must carry the shared star and required semantics, while
+ * kind-defaulted selects stay optional.
+ */
+describe("required-field indicators on the alert rule page (UX-1-R9)", () => {
+  it("requires name, target, mart and measure on a threshold alert, not the defaulted selects", async () => {
+    stubReads()
+    render(<AlertRulePage />)
+    await screen.findByPlaceholderText("e.g. Foreign visitors dropped")
+    expectRequiredField("Name")
+    expectRequiredField("Webhook URL")
+    expectRequiredField("Mart (Gold)")
+    expectRequiredField("Measure")
+    expectOptionalField("Type")
+    expectOptionalField("Delivery")
+    expectOptionalField("Severity")
+    expectOptionalField("Aggregate")
+    expectOptionalField("Operator")
+    expectOptionalField("Threshold")
+  })
+
+  it("requires a metric and drops mart/measure when watching a metric", async () => {
+    stubReads()
+    render(<AlertRulePage />)
+    await screen.findByPlaceholderText("e.g. Foreign visitors dropped")
+    fireEvent.click(screen.getByRole("combobox", { name: "Watch" }))
+    pickOption(await screen.findByRole("option", { name: "A metric" }))
+    expectRequiredField("Metric")
+    expect(screen.queryByText("Mart (Gold)")).toBeNull()
+    expect(screen.queryByText("Measure")).toBeNull()
+  })
+
+  it("requires a dashboard on a digest and a connector on a connector rule", async () => {
+    stubReads()
+    render(<AlertRulePage />)
+    await screen.findByPlaceholderText("e.g. Foreign visitors dropped")
+    await chooseRuleType("Dashboard digest")
+    expectRequiredField("Dashboard")
+    await chooseRuleType("Connector run failed")
+    expectRequiredField("Connector")
+  })
+
+  it("stars the table picker on a freshness and a quality rule without a false button attribute", async () => {
+    permissions = ["*:*"]
+    stubReads()
+    render(<AlertRulePage />)
+    await screen.findByPlaceholderText("e.g. Foreign visitors dropped")
+    await chooseRuleType("Dataset freshness")
+    // The catalog-backed TablePicker trigger is a button, which has no
+    // supported aria-required; the star is the supported indicator.
+    expect(screen.getByText("Table (namespace.table)").getAttribute("data-required")).toBe("")
+    await chooseRuleType("Quality incident opened")
+    expect(screen.getByText("Table (zone.table, or * for every table)").getAttribute("data-required")).toBe("")
+  })
+})

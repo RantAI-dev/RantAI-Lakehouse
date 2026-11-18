@@ -4,6 +4,7 @@ import * as React from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredMarker } from "@/components/ui/required"
 import { SelectField } from "@/components/patterns/select-field"
 import {
   CAST_TYPES,
@@ -63,7 +64,12 @@ export function TransformRows({
 
   return (
     <div>
-      <p className="mb-2 text-sm font-medium">Operations</p>
+      {/* UX-1-R8: a form step with no operation is refused by `editorProblems`,
+          so the group is starred once with a sentence rather than each row. */}
+      <p className="mb-2 flex items-center gap-1.5 text-sm font-medium">
+        Operations <RequiredMarker />
+        <span className="text-xs font-normal text-muted-foreground">— add at least one</span>
+      </p>
       <p className="mb-2 text-xs text-muted-foreground">
         Only the verbs and operators the server&apos;s transform grammar accepts are offered here — the request is
         still re-validated server-side on save.
@@ -124,6 +130,7 @@ export function TransformRows({
         {pendingDraft.verb === "dedupe" ? (
           <ColumnField
             label="Key column"
+            required
             value={pendingDraft.key}
             onChange={(key) => setPendingDraft({ verb: "dedupe", key })}
             columns={columns}
@@ -134,6 +141,7 @@ export function TransformRows({
           <>
             <ColumnField
               label="Column"
+              required
               value={pendingDraft.column}
               onChange={(column) => setPendingDraft({ ...pendingDraft, column })}
               columns={columns}
@@ -155,9 +163,10 @@ export function TransformRows({
                 (`filter(column op 'value')`, `renderTransformDraft`), so it
                 stays typed: it is not a column of the table. */}
             <div className="space-y-1.5">
-              <Label htmlFor="pipeline-filter-value">Value</Label>
+              <Label htmlFor="pipeline-filter-value" required>Value</Label>
               <Input
                 id="pipeline-filter-value"
+                aria-required
                 value={pendingDraft.value}
                 onChange={(e) => setPendingDraft({ ...pendingDraft, value: e.target.value })}
                 placeholder="active"
@@ -169,6 +178,7 @@ export function TransformRows({
           <>
             <ColumnField
               label="From column"
+              required
               value={pendingDraft.from}
               onChange={(from) => setPendingDraft({ ...pendingDraft, from })}
               columns={columns}
@@ -176,6 +186,7 @@ export function TransformRows({
             />
             <ColumnField
               label="To column"
+              required
               value={pendingDraft.to}
               onChange={(to) => setPendingDraft({ ...pendingDraft, to })}
               columns={columns}
@@ -187,6 +198,7 @@ export function TransformRows({
           <>
             <ColumnField
               label="Column"
+              required
               value={pendingDraft.column}
               onChange={(column) => setPendingDraft({ ...pendingDraft, column })}
               columns={columns}
@@ -209,6 +221,7 @@ export function TransformRows({
         {pendingDraft.verb === "select" ? (
           <ColumnsField
             label="Columns"
+            required
             value={pendingDraft.columns}
             onChange={(selected) => setPendingDraft({ verb: "select", columns: selected })}
             columns={columns}

@@ -362,6 +362,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/usage/queries/export",          Policy::RequiresPermission("usage:read")),
     ("GET",  "/api/usage/rates",                   Policy::RequiresPermission("usage:read")),
     ("POST", "/api/usage/rates",                   Policy::RequiresPermission("settings:write")),
+    // OPS-8 part C: the size of every layer. `usage:read` opens the route;
+    // the `*:*` check is in the handler, because the refusal there is about
+    // the data (a layer holds every tenant's tables), not about a
+    // permission the console could ask for.
+    ("GET",  "/api/usage/storage",                 Policy::RequiresPermission("usage:read")),
 
     // ── Governance: seeded `policy:*` / `lineage:read`. `{kind}` (quality,
     //    classification, audit, residency) has the same fan-out problem as

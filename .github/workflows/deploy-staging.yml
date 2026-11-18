@@ -176,7 +176,7 @@ jobs:
           for name in OIDC_ISSUER OIDC_CLIENT_ID OIDC_PROVIDER_NAME \
                       OIDC_AUTHORIZE_URL OIDC_TOKEN_URL OIDC_JWKS_URL \
                       OIDC_REDIRECT_URI OIDC_GROUPS_CLAIM OIDC_ROLE_MAP \
-                      OIDC_JIT_PROVISIONING OIDC_TRUST_EMAIL \
+                      OIDC_JIT_PROVISIONING OIDC_TRUST_EMAIL OIDC_PROMPT \
                       SSO_PUBLIC_BASE_URL SSO_REALM; do
             sed -i "/^${name}=/d" .env
           done
@@ -203,6 +203,11 @@ jobs:
             # the safer default stays: a sign-in never joins an existing
             # account on an unconfirmed address.
             printf 'OIDC_TRUST_EMAIL=false\n'
+            # The provider shows its login form on every sign-in, so the
+            # account is the person's choice: without it, "sign out, then
+            # sign in" lands on whoever used that browser last, because the
+            # provider still holds the session it created for it.
+            printf 'OIDC_PROMPT=login\n'
           } >> .env
           if [ -n "$missing" ]; then
             echo "::error::staging secrets not set:$missing (Settings > Secrets and variables > Actions)"

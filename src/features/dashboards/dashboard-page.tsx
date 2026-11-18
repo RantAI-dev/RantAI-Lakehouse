@@ -34,7 +34,7 @@ import {
 import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-store";
 import { useAuth } from "@/features/auth/auth-provider";
-import { useCopilot } from "@/features/copilot/use-copilot";
+import { useCopilotSelect } from "@/features/copilot/use-copilot";
 import { useService } from "@/hooks/use-service";
 import { dashboardService, queryService } from "@/services";
 import { newRunId, RUN_ID_HEADER } from "@/lib/run-id";
@@ -944,22 +944,20 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // the old in-place placement on the open tab is gone with the dialog.
 
   // Tell Copilot what is on this dashboard — the built-in one included.
-  const {
-    messages: messagesFromCopilot,
-    setPageContext, setMode: setCopilotMode, setExpanded: setCopilotExpanded,
-  } = useCopilot();
+  // BI-32 review: the page reads only what it needs from the assistant, so an
+  // answer streaming in (or a step landing) does not re-render the board and
+  // every tile. `messages` was read for one thing: the filters the last answer
+  // set for this board, taken here as a JSON string that changes only with them.
+  const setPageContext = useCopilotSelect((c) => c.setPageContext);
+  const setCopilotMode = useCopilotSelect((c) => c.setMode);
+  const setCopilotExpanded = useCopilotSelect((c) => c.setExpanded);
   // AI-2 (plan 20): a `set_board_view_filters` step in the most recent
   // assistant answer applies when its `board` matches the board on screen —
   // mirror what it set into the page address (`?f=`) with the same helper a
   // chip change uses. A step for another board is ignored here; the step
   // card carries the link instead.
-  const chatViewFilters = React.useMemo(
-    () => extractViewFiltersFromChat(messagesFromCopilot, board),
-    [messagesFromCopilot, board],
-  );
-  // Re-applying the same filters (a re-render of the same message) loops back
-  // through `writeAddress` and reloads the page; key on the filter JSON so a
-  // single apply is one navigation.
+  const chatViewFiltersJson = useCopilotSelect((c) => JSON.stringify(extractViewFiltersFromChat(c.messages, board)));
+  const chatViewFilters = React.useMemo<FilterDef[] | null>(() => JSON.parse(chatViewFiltersJson), [chatViewFiltersJson]);
   const chatViewFilterKey = React.useRef<string | null>(null);
   React.useEffect(() => {
     if (chatViewFilters === null) return;
