@@ -31,7 +31,6 @@
 //! ever written here, server side, into an approval's stored arguments.
 
 use lakehouse_auth::Principal;
-use lakehouse_bi::store;
 use lakehouse_core::ApiError;
 use lakehouse_store::report_subscriptions::{self as subscriptions, Subscription};
 use serde_json::{Map, Value, json};
@@ -95,14 +94,22 @@ pub(super) async fn run(
     if owner.id != caller.id
         && let Some(board) = board_of(state, name, args).await
     {
-        // BI-19 B1 review R1: the approver's resolved viewer, not the baseline.
-        let viewer = match super::viewer_for(state, Some(caller)).await {
-            Ok(viewer) => viewer,
-            Err(error) => return error,
-        };
-        let seen = store::get_board(&state.clickhouse, &board, &viewer).await;
-        if !matches!(&seen, Ok(Some(_))) && board != store::DEFAULT_BOARD_ID {
-            return json!({ "error": "You cannot see that dashboard, so you cannot approve a report of it." });
+        // GOV-17 review R11 (BLOCKER): the old check called `get_board` and
+        // exempted `DEFAULT_BOARD_ID`, so a different approver whose table
+        // grants hid built-in Main could release a report on it. The approved
+        // run is stamped to the requester, so the approver's own visibility is
+        // the only enforcement. `board_still_visible` resolves the approver's
+        // narrowed viewer and handles Main via `sees_builtin_board`, the same
+        // predicate the report routes use; a resolution/store error fails
+        // closed instead of widening access.
+        match reports::board_still_visible(state, caller, &board).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return json!({
+                    "error": "You cannot see that dashboard, so you cannot approve a report of it."
+                });
+            }
+            Err(_) => return json!({ "error": FAILED.to_owned() }),
         }
     }
     match name {
