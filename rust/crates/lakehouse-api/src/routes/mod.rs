@@ -8,7 +8,11 @@
 pub(crate) mod agents;
 pub(crate) mod ai;
 mod alerts;
+// `SEC-20` (plan 100): the ONE place that turns a caller's reach into the
+// audit trail's tenant rule, so every reader of the trail narrows the same
+// way.
 mod audit_events;
+pub(crate) mod audit_scope;
 pub mod auth;
 // `DATA-42` D7: the `ClickHouse` registry fixture the readers' tests share
 // (`governance`, `overview`, `storage`, `lineage`, `catalog_profile`).

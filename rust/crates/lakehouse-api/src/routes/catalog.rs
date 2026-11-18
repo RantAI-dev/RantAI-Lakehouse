@@ -47,6 +47,7 @@ use lakehouse_iceberg::IcebergClient;
 use lakehouse_iceberg::rest;
 use lakehouse_store::PgPool;
 use lakehouse_store::annotation::AnnotationRow;
+use lakehouse_store::audit::AuditScope;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
@@ -1799,15 +1800,21 @@ pub async fn detail(
     // GOV-7 D6: a hidden asset answers the SAME 404 an unknown id answers
     // (D2), before its columns or rows are read.
     let access = table_access_for(&state, &principal).await?;
+    // `SEC-20` (plan 100): the change history is read per tenant, so the
+    // caller's reach over the audit trail is resolved once here and travels
+    // with the request. The same reach every other reader of the trail
+    // gets, from the same helper.
+    let scope =
+        crate::routes::audit_scope::scope_for_principal(&state, &principal, &headers).await?;
     let mut body = if id.starts_with("silver.") || id.starts_with("serving.") {
         if !access.allows_key(&id) {
             return Err(asset_not_found().into());
         }
-        clickhouse_asset_detail(&state, &principal, &headers, &id).await?
+        clickhouse_asset_detail(&state, &principal, &headers, &scope, &id).await?
     } else {
         // A Bronze id is a registry slug; the body names the table it serves
         // (`tableKey`), so the registry answers the question, not a guess.
-        match bronze_asset_detail_body(&state, &principal, &headers, &id).await {
+        match bronze_asset_detail_body(&state, &principal, &headers, &scope, &id).await {
             // `SEC-20` (plan 95): the table the body names, not the slug in
             // `id`, is what an upload's claim is held under. A body that
             // names none is not an upload, and stays only where an unclaimed
@@ -2130,8 +2137,12 @@ async fn apply_annotation_rows(pool: &lakehouse_store::PgPool, body: &mut Value)
 /// annotation (`annotation`, what the edit form holds) and what the
 /// registry itself says (`registry`, what clearing a field falls back to),
 /// and the asset's `changeHistory` from the audit trail.
+///
+/// `SEC-20` (plan 100): the change history is read per tenant, so it holds
+/// the rows of the caller's own organisation only.
 async fn mark_annotation_and_history(
     state: &AppState,
+    scope: &AuditScope,
     body: &mut Value,
     id: &str,
     tables: &[String],
@@ -2167,7 +2178,7 @@ async fn mark_annotation_and_history(
     }
     let mut keys = vec![id.to_owned()];
     keys.extend(tables.iter().cloned());
-    let history = catalog_governance::change_history(state, &keys).await;
+    let history = catalog_governance::change_history(state, scope, &keys).await;
     // DATA-12 part 2: the detail carries `governedTags` on the body (the
     // overlay) and in `annotation` (what the edit form holds). A failed read
     // is logged and shows none, as the annotation read above does.
@@ -2587,6 +2598,7 @@ async fn clickhouse_asset_detail(
     state: &AppState,
     principal: &Principal,
     headers: &HeaderMap,
+    scope: &AuditScope,
     id: &str,
 ) -> ApiResult<Value> {
     let ch = &state.clickhouse;
@@ -2698,7 +2710,7 @@ async fn clickhouse_asset_detail(
     )
     .await;
     mark_schema_versions(ch, &mut body, &key).await;
-    mark_annotation_and_history(state, &mut body, id, &[key]).await;
+    mark_annotation_and_history(state, scope, &mut body, id, &[key]).await;
     Ok(body)
 }
 
@@ -2713,6 +2725,7 @@ async fn bronze_asset_detail_body(
     state: &AppState,
     principal: &Principal,
     headers: &HeaderMap,
+    scope: &AuditScope,
     id: &str,
 ) -> Result<Option<Value>, ChError> {
     let ch = &state.clickhouse;
@@ -2929,7 +2942,7 @@ async fn bronze_asset_detail_body(
     )
     .await;
     mark_badges(state, &mut body, &names).await;
-    mark_annotation_and_history(state, &mut body, slug, &tables).await;
+    mark_annotation_and_history(state, scope, &mut body, slug, &tables).await;
     Ok(Some(body))
 }
 
@@ -8590,6 +8603,7 @@ mod tests {
                 &state_for(&url),
                 &analyst(),
                 &HeaderMap::new(),
+                &AuditScope::All,
                 "clash_detail",
             )
             .await
@@ -8776,6 +8790,7 @@ mod tests {
                 &state_for(&pinned(&url)),
                 &analyst(),
                 &HeaderMap::new(),
+                &AuditScope::All,
                 "twice_detail",
             )
             .await
