@@ -288,7 +288,10 @@ async fn set_role_attributes_and_password(
         .map_err(|err| RoleSetupError::PasswordRefused {
             sqlstate: sqlstate_of(&err),
         })?;
-    transaction.commit().await.map_err(RoleSetupError::Refused)?;
+    transaction
+        .commit()
+        .await
+        .map_err(RoleSetupError::Refused)?;
     Ok(())
 }
 

@@ -557,7 +557,10 @@ async fn the_password_statement_runs_with_its_log_guard_on() {
     .await
     .expect("read the log settings inside the transaction");
     assert_eq!(statement_log, "none", "statements are not logged");
-    assert_eq!(error_log, "panic", "a failing statement's text is not logged");
+    assert_eq!(
+        error_log, "panic",
+        "a failing statement's text is not logged"
+    );
     transaction.rollback().await.expect("roll the probe back");
 }
 
@@ -573,7 +576,10 @@ async fn on_the_audit_trail_the_console_role_cannot_change_a_row() {
     let cleared_run = sqlx::query("UPDATE audit_event SET run_id = NULL WHERE id = 'sec78_evt'")
         .execute(&fixture.app_pool)
         .await;
-    assert_refused_by_privilege(cleared_run, "the console role clearing the run link directly");
+    assert_refused_by_privilege(
+        cleared_run,
+        "the console role clearing the run link directly",
+    );
 
     let cleared_approval =
         sqlx::query("UPDATE audit_event SET approval_id = NULL WHERE id = 'sec78_evt'")
@@ -588,7 +594,10 @@ async fn on_the_audit_trail_the_console_role_cannot_change_a_row() {
         sqlx::query("UPDATE audit_event SET run_id = 'sec78_other_run' WHERE id = 'sec78_evt'")
             .execute(&fixture.app_pool)
             .await;
-    assert_refused_by_privilege(pointed, "the console role pointing a run link at another row");
+    assert_refused_by_privilege(
+        pointed,
+        "the console role pointing a run link at another row",
+    );
 
     let other_column =
         sqlx::query("UPDATE audit_event SET action = 'sec78.other' WHERE id = 'sec78_evt'")
