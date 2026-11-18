@@ -109,6 +109,7 @@ export function TablePicker({
   catalog,
   allowEveryTable = false,
   description,
+  required = false,
 }: {
   id?: string
   label: string
@@ -117,6 +118,8 @@ export function TablePicker({
   catalog: TableCatalog
   allowEveryTable?: boolean
   description?: React.ReactNode
+  /** UX-1: show the shared required marker and required semantics. */
+  required?: boolean
 }) {
   const options = React.useMemo(() => {
     const tables = catalog.choices ?? []
@@ -133,12 +136,13 @@ export function TablePicker({
 
   return (
     <div className="grid gap-1.5">
-      <Label htmlFor={id}>{label}</Label>
+      <Label htmlFor={id} required={required}>{label}</Label>
       {catalog.choices === null ? (
         <>
           <Input
             id={id}
             aria-label={label}
+            aria-required={required}
             value={value}
             onChange={(e) => onChange(e.target.value)}
             placeholder="namespace.table"

@@ -62,6 +62,18 @@ pub const DEFAULT_LLM_URL: &str = "https://api.minimax.io/v1";
 /// The model the assistant uses when neither the environment's `LLM_MODEL`
 /// nor the console's saved row names one (`ADM-9`).
 pub const DEFAULT_LLM_MODEL: &str = "MiniMax-M3";
+/// The `prompt` the browser sign-in sends when `OIDC_PROMPT` says nothing
+/// (`Config::oidc_prompt`): `"login"`, so the provider shows its login form
+/// and the person in front of the browser chooses the account. See that
+/// field's doc comment for why the provider's own session is not the
+/// default answer.
+pub const DEFAULT_OIDC_PROMPT: &str = "login";
+/// `OIDC_PROMPT`'s spelling for "send no prompt parameter at all": the
+/// provider decides, and reuses the session it holds for that browser. This
+/// deployment's own word, not an OIDC value — the OIDC standard's `none`
+/// means something else (show no UI at all, fail when there is no session)
+/// and is forwarded verbatim when it is named.
+pub const OIDC_PROMPT_OFF: &str = "off";
 
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
@@ -628,6 +640,34 @@ pub struct Config {
     /// `OIDC_REDIRECT_URI` — never taken from a request, closing the open-
     /// redirect class a request-supplied `redirect_uri` would allow.
     pub oidc_redirect_uri: Option<String>,
+    /// The `prompt` parameter the browser sign-in sends to the provider
+    /// (`"login"`, `"consent"`, `"select_account"`, …). Read ONLY from
+    /// `OIDC_PROMPT` — never from a request, so a caller cannot change how
+    /// the provider is asked to authenticate.
+    ///
+    /// Default [`DEFAULT_OIDC_PROMPT`] (`"login"`): the provider shows its
+    /// login form on every sign-in, so the person in front of the browser
+    /// chooses the account. Without it a provider that still holds a session
+    /// for that browser answers the sign-in request from it and the person is
+    /// silently signed in as whoever used that browser last — a surprise on
+    /// a shared machine, and the reason "sign out, then sign in again" could
+    /// land on the previous person's account.
+    ///
+    /// [`OIDC_PROMPT_OFF`] (`"off"`) is this deployment's own spelling for
+    /// "send no prompt parameter at all": the provider then decides, and
+    /// reuses the session it holds for that browser. It is not an OIDC
+    /// value and is never forwarded — the OIDC standard's own `none` (which
+    /// asks the provider to show no UI at all, and to fail when there is no
+    /// session) is forwarded verbatim when it is named.
+    ///
+    /// An empty value is the default, not an opt-out: compose always passes
+    /// this variable (as every other `OIDC_*` one), so "empty" cannot mean
+    /// "the operator said nothing".
+    pub oidc_prompt: String,
+    /// Whether `OIDC_PROMPT` was set and non-empty in the environment — the
+    /// difference between "the operator named a prompt" and "the operator
+    /// said nothing, so the default applies".
+    pub oidc_prompt_from_env: bool,
     /// Lakekeeper Iceberg REST catalog base URI (P1,
     /// `lakehouse-iceberg::IcebergClientConfig::catalog_uri`). Default
     /// matches `docker-compose.yml`'s `lakekeeper` service port mapping.
@@ -1312,6 +1352,8 @@ impl std::fmt::Debug for Config {
             .field("oidc_authorize_url", &self.oidc_authorize_url)
             .field("oidc_token_url", &self.oidc_token_url)
             .field("oidc_redirect_uri", &self.oidc_redirect_uri)
+            .field("oidc_prompt", &self.oidc_prompt)
+            .field("oidc_prompt_from_env", &self.oidc_prompt_from_env)
             .field("database_url", &REDACTED)
             .field(
                 "lakekeeper_gold_export_token_file",
@@ -1945,6 +1987,15 @@ impl Config {
             oidc_authorize_url: truthy(env, "OIDC_AUTHORIZE_URL"),
             oidc_token_url: truthy(env, "OIDC_TOKEN_URL"),
             oidc_redirect_uri: truthy(env, "OIDC_REDIRECT_URI"),
+            // An empty value is the DEFAULT, not an opt-out: compose always
+            // passes this variable (as every other `OIDC_*` one), so empty
+            // cannot mean "the operator said nothing". `off` is the
+            // spelling for "send no prompt at all".
+            oidc_prompt: match env.get("OIDC_PROMPT") {
+                Some(value) if !value.trim().is_empty() => value.trim().to_owned(),
+                _ => DEFAULT_OIDC_PROMPT.to_owned(),
+            },
+            oidc_prompt_from_env: env.get("OIDC_PROMPT").is_some_and(|v| !v.trim().is_empty()),
             lakekeeper_catalog_uri: or_default(
                 env,
                 "LAKEKEEPER_CATALOG_URI",
@@ -2988,6 +3039,11 @@ mod tests {
         assert_eq!(cfg.oidc_authorize_url, None);
         assert_eq!(cfg.oidc_token_url, None);
         assert_eq!(cfg.oidc_redirect_uri, None);
+        // The sign-in asks the provider for its login form by default, so a
+        // shared browser does not silently sign the next person in as the
+        // previous one.
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(!cfg.oidc_prompt_from_env);
 
         let mut env = HashMap::new();
         env.insert(
@@ -3015,6 +3071,35 @@ mod tests {
             cfg.oidc_redirect_uri.as_deref(),
             Some("https://lake.invalid/api/auth/oidc/callback")
         );
+    }
+
+    // `OIDC_PROMPT` says what the browser sign-in asks the provider for.
+    // An empty value is the DEFAULT (compose always passes the variable, so
+    // empty cannot mean "the operator said nothing"); `off` is the
+    // deployment's own spelling for "send no prompt at all".
+    #[test]
+    fn oidc_prompt_defaults_to_login_and_off_is_the_deployments_own_spelling() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(!cfg.oidc_prompt_from_env);
+
+        // Empty is the default, not an opt-out.
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(!cfg.oidc_prompt_from_env);
+
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "consent")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "consent");
+        assert!(cfg.oidc_prompt_from_env);
+
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "off")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "off");
+        assert!(cfg.oidc_prompt_from_env);
+
+        // Surrounding whitespace is not part of the value.
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "  login  ")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(cfg.oidc_prompt_from_env);
     }
 
     // An operator-stated owning tenant for the shared catalog/Dagster-job

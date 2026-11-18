@@ -89,6 +89,25 @@ class ClickHouseTarget:
             password=_env("CH_PASSWORD", ""),
         )
 
+    def query_json(self, statement: str) -> list[dict]:
+        """Run `statement` (a `SELECT`) and return its rows as dicts, via
+        `FORMAT JSON`.
+
+        The PUBLIC way to read rows from the warehouse: it belongs to the
+        target, which holds the URL and the credentials, so every module
+        that reads ClickHouse asks the target instead of reaching into
+        this module's private helper (`AGENTS.md` rule 4 — use the helper
+        that already exists, and do not reach into another module's
+        private names)."""
+        resp = requests.post(
+            self.url,
+            auth=(self.user, self.password),
+            data=(statement.rstrip().rstrip(";") + "\nFORMAT JSON").encode("utf-8"),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+
 
 @dataclass(frozen=True)
 class TableSchema:
@@ -222,15 +241,13 @@ def _ch_exec(target: ClickHouseTarget, statement: str) -> None:
 
 def _ch_query_json(target: ClickHouseTarget, statement: str) -> list[dict]:
     """Run `statement` (a `SELECT`) and return its rows as dicts, via
-    `FORMAT JSON`."""
-    resp = requests.post(
-        target.url,
-        auth=(target.user, target.password),
-        data=(statement.rstrip().rstrip(";") + "\nFORMAT JSON").encode("utf-8"),
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json().get("data", [])
+    `FORMAT JSON`.
+
+    This module's own wrapper around `ClickHouseTarget.query_json`, which
+    is the public method every other module uses. It stays here because
+    this module's own callers use it — `authored_factory.py` imports this
+    name — and the two answer the same rows."""
+    return target.query_json(statement)
 
 
 def _assert_or_create_schema(target: ClickHouseTarget, schema: TableSchema) -> None:
@@ -818,3 +835,99 @@ def last_committed_offset(
         return None
     value = rows[0].get("committed_offset")
     return int(value) if value is not None else None
+
+
+# ── Storage per layer (OPS-8 part C) ─────────────────────────────────────
+#
+# `_STORAGE_LAYER_SNAPSHOT_SCHEMA` is a NEW table
+# (`storage_snapshot.py`'s daily per-layer size job), so -- like
+# `_CAPACITY_SNAPSHOT_SCHEMA` above -- it always takes
+# `_assert_or_create_schema`'s "table does not exist yet" branch (create
+# fresh) on every deployment, and it is deliberately NOT folded into the
+# top-level `EXPECTED_SCHEMAS` tuple: that tuple holds only the registry
+# tables `register_bronze_table` writes, and the ingest-run section's
+# header says the same about `_INGEST_RUN_SCHEMA`. The single-canonical-
+# schema-per-table MECHANISM `_assert_or_create_schema` enforces is what
+# this table uses; the shared tuple is not where every writer must
+# append.
+#
+# `layer` is the layer's own name (`bronze`, `gold`, `silver`, `serving`)
+# and not a namespace: `silver` and `serving` are ClickHouse databases,
+# not Iceberg namespaces, so a column named `namespace` would name
+# something that does not exist for half of the rows.
+#
+# `ReplacingMergeTree ORDER BY (layer, day)` gives the read
+# (`GET /api/usage/storage`, `FINAL`) an upsert's semantics: a job that
+# runs twice on the same day leaves one row per layer for that day.
+_STORAGE_LAYER_SNAPSHOT_SCHEMA = TableSchema(
+    table_name="bronze_meta.storage_layer_snapshot",
+    columns=(
+        ("day", "Date"),
+        ("layer", "String"),
+        ("table_count", "UInt32"),
+        ("total_bytes", "UInt64"),
+        # How many of this layer's tables could NOT be measured. A layer
+        # with a skipped table is not a layer of zero bytes: its own
+        # `total_bytes` holds only the tables that were measured, and
+        # `skipped_reason` says why the rest are missing.
+        ("tables_skipped", "UInt32"),
+        ("skipped_reason", "String"),
+        ("measured_at", "DateTime64(3, 'UTC')"),
+    ),
+    engine="ReplacingMergeTree",
+    order_by=("layer", "day"),
+)
+
+
+@dataclass(frozen=True)
+class StorageLayerRow:
+    """One layer's measured size for one day -- the shape both
+    `storage_snapshot.py`'s measurement and this module's writer speak.
+
+    `total_bytes` holds the bytes of the tables that were measured, never
+    a fabricated 0 for a table that could not be read: `tables_skipped`
+    says how many tables are missing from that total, and
+    `skipped_reason` says why.
+    """
+
+    layer: str
+    table_count: int
+    total_bytes: int
+    tables_skipped: int
+    skipped_reason: str
+
+
+def record_storage_layer_snapshot(
+    *,
+    day: str,
+    rows: list[StorageLayerRow],
+    target: "ClickHouseTarget | None" = None,
+) -> None:
+    """Insert one row per layer for `day` into
+    `lake.bronze_meta.storage_layer_snapshot` (`_STORAGE_LAYER_SNAPSHOT_SCHEMA`
+    above), via the same `_assert_or_create_all` R10 path every other
+    table in this module goes through -- the writer lives beside its
+    schema, as `record_capacity_snapshot` and `record_ingest_run` do.
+
+    One statement for the whole day: the rows are one measurement of one
+    day, and a partial write would leave a day's layers disagreeing with
+    each other.
+    """
+    if not rows:
+        return
+    ch = target or ClickHouseTarget.from_env()
+    _assert_or_create_all(ch, (_STORAGE_LAYER_SNAPSHOT_SCHEMA,))
+    measured_at = _utc_now_ch_timestamp()
+    values = ", ".join(
+        f"({_sql_string_literal(day)}, {_sql_string_literal(row.layer)}, "
+        f"{int(row.table_count)}, {int(row.total_bytes)}, "
+        f"{int(row.tables_skipped)}, {_sql_string_literal(row.skipped_reason)}, "
+        f"{_sql_string_literal(measured_at)})"
+        for row in rows
+    )
+    _ch_exec(
+        ch,
+        "INSERT INTO lake.`bronze_meta.storage_layer_snapshot` "
+        "(day, layer, table_count, total_bytes, tables_skipped, skipped_reason, "
+        "measured_at) VALUES " + values,
+    )

@@ -7,6 +7,7 @@ import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/p
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import {
   Select,
   SelectContent,
@@ -229,12 +230,13 @@ function AlertConditionFields({
       </div>
       {watching === "metric" ? (
         <div className="grid gap-1.5">
-          <Label>Metric</Label>
+          {/* UX-1-R9: `save()` refuses an empty metric for a metric rule. */}
+          <Label htmlFor="alert-rule-metric" required>Metric</Label>
           <Select
             value={f.metric ?? ""}
             onValueChange={(v) => setF((prev) => ({ ...prev, metric: v ?? "" }))}
           >
-            <SelectTrigger className="w-full" aria-label="Metric">
+            <SelectTrigger id="alert-rule-metric" className="w-full" aria-label="Metric" aria-required>
               <SelectValue placeholder={metrics.length ? "pick a metric" : "no metrics yet"} />
             </SelectTrigger>
             <SelectContent>
@@ -250,7 +252,9 @@ function AlertConditionFields({
       {watching === "metric" ? null : (
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div className="grid gap-1.5">
-          <Label>Mart (Gold)</Label>
+          {/* UX-1-R9: a column-watch rule needs both a mart and a measure
+              (the backend rejects an invalid/blank mart or measure). */}
+          <Label htmlFor="alert-rule-mart" required>Mart (Gold)</Label>
           <Select
             value={f.mart ?? ""}
             onValueChange={(v) => {
@@ -259,7 +263,7 @@ function AlertConditionFields({
               void loadFields(mart)
             }}
           >
-            <SelectTrigger className="w-full">
+            <SelectTrigger id="alert-rule-mart" className="w-full" aria-required>
               <SelectValue placeholder="pick a mart" />
             </SelectTrigger>
             <SelectContent>
@@ -273,13 +277,13 @@ function AlertConditionFields({
           {martsError ? <p className="mt-1 text-xs text-destructive">{martsError}</p> : null}
         </div>
         <div className="grid gap-1.5">
-          <Label>Measure</Label>
+          <Label htmlFor="alert-rule-measure" required>Measure</Label>
           <Select
             value={f.measure ?? ""}
             onValueChange={(v) => setF((prev) => ({ ...prev, measure: v ?? "" }))}
             disabled={fields.length === 0}
           >
-            <SelectTrigger className="w-full">
+            <SelectTrigger id="alert-rule-measure" className="w-full" aria-required>
               <SelectValue placeholder={measurePlaceholder} />
             </SelectTrigger>
             <SelectContent>
@@ -358,12 +362,13 @@ type DigestConditionProps = {
 function DigestConditionFields({ f, setF, boards, boardsError }: DigestConditionProps) {
   return (
     <div className="grid gap-1.5">
-      <Label>Dashboard</Label>
+      {/* UX-1-R9: the backend refuses a digest rule with no board. */}
+      <Label htmlFor="alert-rule-dashboard" required>Dashboard</Label>
       <Select
         value={f.board ?? ""}
         onValueChange={(v) => setF((prev) => ({ ...prev, board: v ?? "" }))}
       >
-        <SelectTrigger className="w-full">
+        <SelectTrigger id="alert-rule-dashboard" className="w-full" aria-required>
           <SelectValue placeholder="pick a dashboard" />
         </SelectTrigger>
         <SelectContent>
@@ -572,10 +577,13 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
       onCancel={() => router.push(backHref)}
       className="max-w-xl"
     >
+        <RequiredLegend />
         <div className="grid gap-3">
           <div className="grid gap-1.5">
-            <Label>Name</Label>
+            <Label htmlFor="alert-rule-name" required>Name</Label>
             <Input
+              id="alert-rule-name"
+              aria-required
               value={f.name}
               onChange={(e) => setF((prev) => ({ ...prev, name: e.target.value }))}
               placeholder="e.g. Foreign visitors dropped"
@@ -659,12 +667,13 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
 
           {formFields.connector ? (
             <div className="grid gap-1.5">
-              <Label>Connector</Label>
+              {/* UX-1-R9: `save()` refuses a connector rule with no connector. */}
+              <Label htmlFor="alert-rule-connector" required>Connector</Label>
               <Select
                 value={f.connector ?? ""}
                 onValueChange={(v) => setF((prev) => ({ ...prev, connector: v ?? "" }))}
               >
-                <SelectTrigger>
+                <SelectTrigger id="alert-rule-connector" aria-required>
                   <SelectValue placeholder="pick a connector">
                     {f.connector === "*"
                       ? "All connectors"
@@ -686,9 +695,11 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
           {formFields.note ? <p className="text-xs text-muted-foreground">{formFields.note}</p> : null}
 
           {isQualityAlertKind(f.type) ? (
+            // UX-1-R9: `save()` refuses a quality rule with no table scope.
             <TablePicker
               id="alert-rule-quality-table"
               label="Table (zone.table, or * for every table)"
+              required
               value={f.asset ?? ""}
               onChange={(asset) => setF((prev) => ({ ...prev, asset }))}
               catalog={tableCatalog}
@@ -698,9 +709,12 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
           ) : null}
 
           {formFields.freshnessTarget ? (
+            // UX-1-R9: a freshness rule's target table is mandatory; the
+            // backend validates it as <namespace>.<table> on save.
             <TablePicker
               id="alert-rule-freshness-table"
               label="Table (namespace.table)"
+              required
               value={f.mart ?? ""}
               onChange={(mart) => setF((prev) => ({ ...prev, mart }))}
               catalog={tableCatalog}
@@ -721,10 +735,14 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
           ) : null}
 
           <div className="grid gap-1.5">
-            <Label>
+            {/* UX-1-R9: `save()` refuses a rule with no delivery target
+                (guard at line 541). */}
+            <Label htmlFor="alert-rule-target" required>
               {f.channel === "email" ? "Recipient email" : "Webhook URL"}
             </Label>
             <Input
+              id="alert-rule-target"
+              aria-required
               value={f.target ?? ""}
               onChange={(e) => setF((prev) => ({ ...prev, target: e.target.value }))}
               placeholder={targetPlaceholder}

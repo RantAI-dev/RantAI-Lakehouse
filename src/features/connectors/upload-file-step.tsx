@@ -3,6 +3,8 @@
 import * as React from "react"
 import { UploadCloudIcon, XIcon } from "lucide-react"
 import { Button, buttonVariants } from "@/components/ui/button"
+import { RequiredMarker } from "@/components/ui/required"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { formatBytes } from "@/lib/format"
 import type { QueueFile } from "@/lib/upload-queue"
 import { ACCEPTED_FILES, MAX_FILES } from "@/lib/uploads"
@@ -214,12 +216,14 @@ export function FileStep({
           dragging ? "border-primary bg-primary/5" : "border-border bg-muted/20"
         )}
       >
+        <RequiredLegend />
         <input
           id={INPUT_ID}
           type="file"
           multiple
           accept={ACCEPT}
           className="sr-only"
+          aria-required
           onChange={(e) => {
             take(e.target.files)
             // The same file may be picked again after it was removed.
@@ -239,7 +243,7 @@ export function FileStep({
             {dragging ? "Release to choose these files" : "Drop files here, or choose some"}
           </p>
           <label htmlFor={INPUT_ID} className={cn(buttonVariants({ size: "sm" }), "cursor-pointer")}>
-            Choose files
+            Choose files <RequiredMarker />
           </label>
         </div>
       </div>

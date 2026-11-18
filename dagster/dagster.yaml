@@ -36,11 +36,14 @@ storage:
 #   poll_interval_seconds  how often the daemon looks.
 #
 # No `max_runtime_seconds` here on purpose: it would cap every job of the
-# instance. The running limit is the `dagster/max_runtime` tag `ingest_job`
-# carries (INGEST_RUN_MAX_RUNTIME_SECONDS, default 21600 = six hours), set in
-# `dagster/dispar_orchestrate/ingest_factory.py`. These fields cannot be read
-# from the environment (the instance schema takes plain integers), which is
-# why they are written here.
+# instance with one number. Every job now carries its own `dagster/max_runtime`
+# tag (`run_limit_tags`, OPS-35), so a run whose process died is ended by the
+# run monitoring above instead of holding the queue: `ingest_job`'s from
+# INGEST_RUN_MAX_RUNTIME_SECONDS (default 21600 = six hours, set in
+# `dagster/dispar_orchestrate/ingest_factory.py`), every other job's from its
+# own `DAGSTER_RUN_LIMIT_*_SECONDS` variable. These fields cannot be read from
+# the environment (the instance schema takes plain integers), which is why
+# they are written here.
 run_monitoring:
   enabled: true
   start_timeout_seconds: 600

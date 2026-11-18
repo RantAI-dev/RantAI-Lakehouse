@@ -7,6 +7,7 @@ import { useRouter } from "next/navigation"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { FormReviewSummary } from "@/components/patterns/form-review-summary"
 import { FormStepLayout, type FormStep } from "@/components/patterns/form-step-layout"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { PageHeader } from "@/components/patterns/page-header"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
@@ -429,11 +430,13 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
       >
         {step === 0 ? (
           <div className="space-y-5">
+            <RequiredLegend />
             <SelectedTypeSummary type={typeShown} />
             <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
-              <Field label="Name" htmlFor="connector-name">
+              <Field label="Name" htmlFor="connector-name" required>
                 <Input
                   id="connector-name"
+                  aria-required
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   autoComplete="off"
@@ -448,24 +451,28 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
         ) : null}
         {step === 1 ? (
           <div className="space-y-6">
+            <RequiredLegend />
             <section className="space-y-3">
               <StepSectionHeading
                 icon={<NetworkIcon className="size-4" />}
                 title="Connection details"
                 description="Where the source lives. It must be reachable from the lakehouse server, not only from your browser."
               />
+              {/* UX-1-R7: one RequiredLegend for the step; children opt out. */}
               <DialFormFor
                 adapter={adapter}
                 typeName={detail.type}
                 dial={dial}
                 onChange={setDial}
                 oauthCallbackUrl={settings.oauthCallbackUrl}
+                showLegend={false}
               />
             </section>
             <section className="space-y-3 border-t border-border pt-5">
               <StepSectionHeading
                 icon={<KeyRoundIcon className="size-4" />}
                 title="Credential"
+                required={signInChanged || repoints}
                 description={
                   repoints
                     ? "This points the connector at a different place, so the stored credential is not sent there. Enter it again."
@@ -488,6 +495,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
                 settings={settings}
                 referenceMode={referenceMode}
                 onReferenceModeChange={setReferenceChosen}
+                showLegend={false}
               />
             </section>
           </div>

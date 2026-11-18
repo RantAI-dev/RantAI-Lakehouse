@@ -6,15 +6,17 @@ import type {
   UsageRates,
   UsageReport,
   UsageService,
+  UsageStorageReport,
 } from "../contracts/usage"
 import { apiFetch } from "../http"
 import { ServiceError, deniedFor } from "../errors"
 import { fileNameOf } from "@/lib/browser-file"
 
 /**
- * The usage sums, their CSV file and the rates over `/api/usage/*`
- * (`OPS-8` part B). An error body's text is the route's own fixed sentence
- * (a bad date, a period over 366 days, a second currency), never database
+ * The usage sums, their CSV file, the rates and the storage of every layer
+ * over `/api/usage/*` (`OPS-8` part B and C). An error body's text is the
+ * route's own fixed sentence (a bad date, a period over 366 days, a second
+ * currency, storage shown to the platform operator only), never database
  * text, so it is safe to show as it is.
  */
 const BASE = "/api/usage"
@@ -77,5 +79,15 @@ export const usageService: UsageService = {
   },
   addRate(rate: NewUsageRate, signal) {
     return send<UsageRate>("POST", `${BASE}/rates`, rate, "Failed to add the rate", signal)
+  },
+  getStorage(query, signal) {
+    const params = new URLSearchParams({ from: query.from, to: query.to })
+    return send<UsageStorageReport>(
+      "GET",
+      `${BASE}/storage?${params.toString()}`,
+      undefined,
+      "Failed to load the storage per layer",
+      signal
+    )
   },
 }

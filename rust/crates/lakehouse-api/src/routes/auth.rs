@@ -957,6 +957,18 @@ pub async fn oidc_start(
         .append_pair("code_challenge", &code_challenge)
         .append_pair("code_challenge_method", "S256");
 
+    // The `prompt` (default `"login"`, `Config::oidc_prompt`): the provider
+    // shows its login form instead of answering from the session it already
+    // holds for this browser. Without it, "sign out" then "sign in" lands on
+    // the account that signed in last on that machine — the provider's
+    // session cookie is still there, and this service never ends it (it
+    // knows nothing about the provider's session). Read from the
+    // deployment's own configuration, never from a request, so a caller
+    // cannot change how the provider is asked to authenticate.
+    if let Some(prompt) = sso.prompt.as_deref() {
+        redirect.query_pairs_mut().append_pair("prompt", prompt);
+    }
+
     let mut response = (StatusCode::FOUND, ()).into_response();
     response.headers_mut().insert(
         header::LOCATION,
@@ -1835,6 +1847,13 @@ mod tests {
     /// `oidc_start` needs, so `AppState::new` boots with `auth.oidc` populated
     /// without a real Postgres instance or network call.
     fn state_with_oidc_flow_config() -> AppState {
+        state_with_oidc_flow_config_and(&[])
+    }
+
+    /// The same deployment as [`state_with_oidc_flow_config`], with extra
+    /// environment variables — for the settings that change what the
+    /// authorize request carries.
+    fn state_with_oidc_flow_config_and(extra: &[(&str, &str)]) -> AppState {
         let mut env = HashMap::new();
         env.insert(
             "DATABASE_URL".to_owned(),
@@ -1854,6 +1873,9 @@ mod tests {
             "OIDC_REDIRECT_URI".to_owned(),
             "https://lake.invalid/api/auth/oidc/callback".to_owned(),
         );
+        for (key, value) in extra {
+            env.insert((*key).to_owned(), (*value).to_owned());
+        }
         let config = Config::from_map(&env).expect("a valid test Config");
         AppState::new(config)
     }
@@ -1959,6 +1981,9 @@ mod tests {
         assert!(location.starts_with("http://idp.invalid/authorize?"));
         assert!(location.contains("code_challenge_method=S256"));
         assert!(location.contains("response_type=code"));
+        // The default `prompt` is `login`: the provider shows its login form
+        // instead of answering from the session it holds for this browser.
+        assert!(location.contains("prompt=login"));
         let set_cookie = response
             .headers()
             .get(header::SET_COOKIE)
@@ -1968,6 +1993,63 @@ mod tests {
         assert!(set_cookie.starts_with("lh_oidc_flow="));
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("SameSite=Lax"));
+    }
+
+    #[tokio::test]
+    async fn oidc_start_sends_the_prompt_the_deployment_asks_for() {
+        // `OIDC_PROMPT` set to another value: that value is sent.
+        let state = state_with_oidc_flow_config_and(&[("OIDC_PROMPT", "consent")]);
+        let app = crate::routes::router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let query = url::Url::parse(location)
+            .expect("the authorize redirect is a URL")
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("prompt").map(String::as_str), Some("consent"));
+        assert_ne!(query.get("prompt").map(String::as_str), Some("login"));
+
+        // `OIDC_PROMPT=off`: the deployment's own spelling for "send no
+        // prompt at all", so the provider reuses the session it holds for
+        // this browser. (An empty value is the default, not an opt-out:
+        // compose always passes the variable.)
+        let state = state_with_oidc_flow_config_and(&[("OIDC_PROMPT", "off")]);
+        let app = crate::routes::router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let query = url::Url::parse(location)
+            .expect("the authorize redirect is a URL")
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("prompt"), None, "{location}");
     }
 
     #[tokio::test]

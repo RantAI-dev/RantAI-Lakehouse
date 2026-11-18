@@ -13,7 +13,7 @@ use crate::common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use lakehouse_store::audit::{AuditFilter, list};
+use lakehouse_store::audit::{AuditFilter, AuditScope, list};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use wiremock::ResponseTemplate;
@@ -78,7 +78,7 @@ async fn ask_mode_refuses_write_low_tool_and_audits_it() {
         "ask-mode refusal carries no permission reason"
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -113,7 +113,7 @@ async fn missing_permission_refuses_and_audits_with_permission_reason() {
     assert_eq!(body["result"]["reason"], json!("permission"));
     assert_eq!(body["result"]["required"], json!("dashboard:write"));
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -183,7 +183,7 @@ async fn write_low_tool_without_confirmed_needs_confirmation_and_never_executes(
         "must carry a non-empty human-readable summary"
     );
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -216,7 +216,7 @@ async fn write_low_tool_confirmed_passes_the_gate_and_is_audited_as_executed_or_
     assert_ne!(body["outcome"], json!("refused"));
     assert_ne!(body["outcome"], json!("needs_confirmation"));
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -280,7 +280,7 @@ async fn write_high_tool_creates_a_pending_approval_and_never_executes() {
     assert_eq!(run.status, "waiting_approval");
     assert_eq!(run.employee_id, "emp-copilot");
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -313,7 +313,7 @@ async fn secret_shaped_args_are_redacted_before_they_reach_the_audit_row() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours = events
@@ -340,7 +340,7 @@ async fn unknown_tool_name_is_a_400_and_is_not_audited() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     assert!(events.iter().all(|e| e.action != "not_a_real_tool"));
@@ -486,7 +486,7 @@ async fn rename_board_confirmed_passes_the_gate_and_is_audited_as_failed() {
     let body = json_body(resp).await;
     assert_ne!(body["outcome"], json!("refused"));
     assert_ne!(body["outcome"], json!("needs_confirmation"));
-    let events = list(&pool, AuditFilter::default())
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
         .await
         .expect("list audit events");
     let ours: Vec<_> = events
@@ -951,7 +951,9 @@ async fn set_cache_rule_refuses_minutes_out_of_range_with_the_console_sentence()
         body["result"]["error"],
         json!("Remember for between 1 minute and 24 hours (1 to 1440 minutes).")
     );
-    let events = list(&pool, AuditFilter::default()).await.expect("audit");
+    let events = list(&pool, AuditFilter::default(), &AuditScope::All)
+        .await
+        .expect("audit");
     let ours: Vec<_> = events
         .iter()
         .filter(|e| e.action == "set_cache_rule")

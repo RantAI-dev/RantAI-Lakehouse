@@ -26,7 +26,14 @@ import { saveBlob } from "@/lib/browser-file"
 import { formatDuration, formatNumber } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
 import { usageService } from "@/services"
-import type { UsageQuery, UsageRate, UsageReport, UsageRow } from "@/services"
+import type {
+  UsageQuery,
+  UsageRate,
+  UsageReport,
+  UsageRow,
+  UsageStorageReport,
+  UsageStorageRow,
+} from "@/services"
 
 /**
  * Usage (`OPS-8` part B): the runs of a period summed per day, person or
@@ -38,6 +45,11 @@ import type { UsageQuery, UsageRate, UsageReport, UsageRow } from "@/services"
  * the page never shows a price nobody set. The tenant group is offered only
  * to a caller holding `*:*`, the one caller the API lets read every tenant,
  * and the add-rate form only to a caller holding `settings:write`.
+ *
+ * The size of every layer (`OPS-8` part C) is the platform operator's: a
+ * layer holds the tables of every tenant, and the API refuses the read to
+ * anybody else. A tenant administrator sees a line saying so, and no
+ * section.
  */
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -82,10 +94,11 @@ function periodProblem(from: string, to: string): string | null {
 
 /**
  * Bytes in decimal units (KB is 1,000 bytes, TB is 10^12), not the 1,024 steps
- * of `formatBytes`. The scan rate is priced per 10^12 bytes, so a reader who
- * multiplies the TB shown by the rate gets the estimate.
+ * of `formatBytes`. The scan rate is priced per 10^12 bytes and the storage
+ * rate per 10^9, so a reader who multiplies the size shown by the rate gets
+ * the estimate.
  */
-function formatScanned(bytes: number): string {
+function formatDecimalBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return "—"
   const units = ["B", "KB", "MB", "GB", "TB", "PB"]
   let value = bytes
@@ -128,7 +141,7 @@ function formatMoney(amount: string | null, maxDecimals = 4): string {
 const FIELD_LABEL = "flex flex-col gap-1 text-xs text-muted-foreground"
 
 export function UsagePage() {
-  const { hasPermission } = useAuth()
+  const { hasPermission, status: authStatus } = useAuth()
   const canReadAllTenants = hasPermission("*:*")
   const canWriteRates = hasPermission("settings:write")
 
@@ -151,6 +164,16 @@ export function UsagePage() {
     [period.from, period.to, group, problem]
   )
   const rates = useService((s) => usageService.listRates(s), [])
+  // The storage of every layer is the platform operator's: the API refuses
+  // the read to anybody else, so the page does not ask for it. `null` is the
+  // answer for a caller that may not have it.
+  const storage = useService<UsageStorageReport | null>(
+    (s) =>
+      canReadAllTenants && !problem
+        ? usageService.getStorage({ from: period.from, to: period.to }, s)
+        : Promise.resolve(null),
+    [period.from, period.to, problem, canReadAllTenants]
+  )
 
   const download = useServiceAction((signal, q: UsageQuery) => usageService.exportUsageCsv(q, signal))
   async function downloadCsv() {
@@ -234,6 +257,14 @@ export function UsagePage() {
         <UsageReportView report={usage.data} groupLabel={groupLabel} />
       ) : null}
 
+      {canReadAllTenants ? (
+        <StoragePanel state={storage} />
+      ) : authStatus === "authenticated" ? (
+        <p className="text-xs text-muted-foreground">
+          Storage is shown to the platform operator only.
+        </p>
+      ) : null}
+
       <RatesPanel
         state={rates}
         canWrite={canWriteRates}
@@ -263,7 +294,7 @@ function UsageReportView({
           value={formatNumber(totals.queries)}
           hint={`${formatNumber(totals.completed)} completed, ${formatNumber(totals.failed)} failed, ${formatNumber(totals.blocked)} blocked, ${formatNumber(totals.cancelled)} cancelled`}
         />
-        <MetricCard label="Data scanned" value={formatScanned(totals.scannedBytes)} />
+        <MetricCard label="Data scanned" value={formatDecimalBytes(totals.scannedBytes)} />
         <MetricCard
           label="Engine time (wall clock)"
           value={formatDuration(totals.engineMs)}
@@ -320,8 +351,112 @@ function UsageRowView({ row, priced }: { readonly row: UsageRow; readonly priced
       <TableCell className="text-right tabular-nums">{formatNumber(row.failed)}</TableCell>
       <TableCell className="text-right tabular-nums">{formatNumber(row.blocked)}</TableCell>
       <TableCell className="text-right tabular-nums">{formatNumber(row.cancelled)}</TableCell>
-      <TableCell className="text-right tabular-nums">{formatScanned(row.scannedBytes)}</TableCell>
+      <TableCell className="text-right tabular-nums">{formatDecimalBytes(row.scannedBytes)}</TableCell>
       <TableCell className="text-right tabular-nums">{formatDuration(row.engineMs)}</TableCell>
+      {priced ? (
+        <TableCell className="text-right tabular-nums">{formatMoney(row.estimate)}</TableCell>
+      ) : null}
+    </TableRow>
+  )
+}
+
+/**
+ * The newest measurement of every layer: the server answers one row per
+ * layer per day, and the page shows the latest day of each layer. A layer
+ * measured on no day at all is not in the list.
+ */
+function newestPerLayer(rows: UsageStorageRow[]): UsageStorageRow[] {
+  const newest = new Map<string, UsageStorageRow>()
+  for (const row of rows) {
+    const seen = newest.get(row.layer)
+    if (seen === undefined || row.day > seen.day) newest.set(row.layer, row)
+  }
+  return [...newest.values()].sort((a, b) => a.layer.localeCompare(b.layer))
+}
+
+/**
+ * The size of every layer, measured once a day by the storage job.
+ *
+ * A layer whose tables could not be measured never reads as a layer of zero
+ * bytes: the size is the bytes of the tables that were measured, and the
+ * count says how many are missing from it.
+ */
+function StoragePanel({
+  state,
+}: {
+  readonly state: ReturnType<typeof useService<UsageStorageReport | null>>
+}) {
+  const report = state.status === "success" ? state.data : null
+  const rows = report ? newestPerLayer(report.rows) : []
+  const currency = report?.currency ?? null
+  const priced = currency !== null
+  const skipped = rows.filter((row) => row.tablesSkipped > 0)
+  return (
+    <SectionCard
+      title="Storage per layer"
+      description="The size of every layer, measured once a day. A layer holds the tables of every tenant, so this is the platform operator's."
+    >
+      <div className="flex flex-col gap-3">
+        {state.status === "loading" ? <LoadingSkeleton rows={2} /> : null}
+        {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
+        {state.status === "success" && rows.length === 0 ? (
+          <EmptyState
+            title="No storage measured yet"
+            description="The storage job measures every layer once a day. Nothing was measured in these days."
+          />
+        ) : null}
+        {rows.length > 0 ? (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Layer</TableHead>
+                <TableHead>Measured on</TableHead>
+                <TableHead className="text-right">Tables</TableHead>
+                <TableHead className="text-right">Size</TableHead>
+                {priced ? <TableHead className="text-right">{`Estimate (${currency})`}</TableHead> : null}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((row) => (
+                <StorageRowView key={row.layer} row={row} priced={priced} />
+              ))}
+            </TableBody>
+          </Table>
+        ) : null}
+        {skipped.length > 0 ? (
+          <p className="text-xs text-muted-foreground">
+            {skipped
+              .map(
+                (row) =>
+                  `${row.layer}: ${row.tablesSkipped} of its tables could not be measured, so the size above is not the whole layer${
+                    row.skippedReason ? ` (${row.skippedReason})` : ""
+                  }.`
+              )
+              .join(" ")}
+          </p>
+        ) : null}
+        <p className="text-xs text-muted-foreground">
+          Sizes use decimal units: 1 GB is 10^9 bytes, the unit the storage rate is priced in.
+        </p>
+      </div>
+    </SectionCard>
+  )
+}
+
+function StorageRowView({ row, priced }: { readonly row: UsageStorageRow; readonly priced: boolean }) {
+  return (
+    <TableRow>
+      <TableCell>{row.layer}</TableCell>
+      <TableCell>{row.day}</TableCell>
+      <TableCell className="text-right tabular-nums">
+        {formatNumber(row.tableCount)}
+        {row.tablesSkipped > 0 ? (
+          <span className="block text-xs text-muted-foreground">
+            {`${formatNumber(row.tablesSkipped)} not measured`}
+          </span>
+        ) : null}
+      </TableCell>
+      <TableCell className="text-right tabular-nums">{formatDecimalBytes(row.totalBytes)}</TableCell>
       {priced ? (
         <TableCell className="text-right tabular-nums">{formatMoney(row.estimate)}</TableCell>
       ) : null}
