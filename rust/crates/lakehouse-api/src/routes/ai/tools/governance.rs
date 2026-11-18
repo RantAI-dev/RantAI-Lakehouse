@@ -56,11 +56,12 @@ async fn governance_kind(state: &AppState, kind: &str) -> Value {
 ///
 /// The trail is read per tenant: the person's own organisation's rows, plus
 /// the deployment's own rows when that organisation owns the shared
-/// catalog. The `audit:read` permission is NOT checked here — it stays on
-/// the route (`GET /api/governance/audit`), and the assistant's own
-/// permission is plan 99's business. The reach is resolved from the
-/// person's own tenant, the convention the other governance tools follow
-/// (the tool has no request headers of its own).
+/// catalog. The `audit:read` permission is not checked here: the tool's
+/// own spec asks the gate for it (`GOV-1`), the same permission the audit
+/// page asks for on top of the `governance:read` that opens its route, so
+/// a person without it is refused before this body runs. The reach is
+/// resolved from the person's own tenant, the convention the other
+/// governance tools follow (the tool has no request headers of its own).
 pub(super) async fn get_audit_history(state: &AppState, principal: Option<&Principal>) -> Value {
     let Some(principal) = principal else {
         // A headless run has no person behind it: it belongs to no tenant
