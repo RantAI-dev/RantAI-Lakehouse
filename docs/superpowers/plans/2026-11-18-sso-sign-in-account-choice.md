@@ -79,14 +79,42 @@ machine it signs the next person in as the previous one, and it is why
 3. **The `prompt` is the deployment's own setting**, read only from the
    environment: a request cannot change how the provider is asked to
    authenticate, exactly like `OIDC_AUTHORIZE_URL` and `OIDC_REDIRECT_URI`.
-4. **Not an RP-initiated logout.** Ending the provider's session at "Sign
-   out" is the other way to fix this (redirect to the provider's
-   `end_session_endpoint`), but it needs the discovery document to carry
-   that endpoint, a post-logout redirect URI registered with the provider,
-   and a frontend that follows a redirect instead of clearing state. That is
-   a bigger change with more ways to fail halfway; `prompt=login` fixes the
-   reported behaviour in one parameter. Recorded as the follow-up if the
-   product wants "sign out ends the provider's session too".
+4. **The sign-out ends the provider's session too** (RP-initiated logout).
+   `prompt=login` alone is not enough, and the measurements say so: with the
+   provider's session still in the browser, Keycloak's re-authentication page
+   carries a **password field only** (no username field — it knows the
+   session's user), so a person who types a different username is ignored
+   and the page answers with an error. Measured on the staging VM before
+   this change:
+
+   ```
+   1st sign-in (alice):  login form shown (prompt=login) -> alice
+   2nd sign-in (bob):    login form shown (prompt=login) -> alice
+                          (the form's inputs were ['password', 'credentialId']
+                           -- no username field to type bob into)
+   ```
+
+   `select_account` does not help: Keycloak ignores it and answers the
+   request from its session (measured — the authorize request went straight
+   back to the callback with a code). So the provider's session has to end,
+   and then the sign-in form carries the username field again (measured:
+   after the provider's logout, the form's inputs are
+   `['credentialId', 'password', 'username']`).
+
+   What that costs, and how it was done:
+
+   | Piece | Where |
+   | --- | --- |
+   | The provider's `end_session_endpoint`, read from its discovery document | `lakehouse-auth`'s `DiscoveryDocument` / `OidcEndpoints` |
+   | The deployment's return address, registered with the provider | `OIDC_POST_LOGOUT_REDIRECT_URI` (environment only, never from a request) |
+   | The address the browser is sent to | `routes/auth.rs`'s `logout` answers `{ providerLogoutUrl }`; the console navigates there |
+   | The provider accepting that address | the client's valid post-logout redirect URIs (Keycloak) — the realm renderer injects it |
+
+   Without `id_token_hint` Keycloak shows a short "Logging out" page whose
+   own JavaScript confirms the logout (measured: the confirmation POST
+   answers `302` to the return address and the provider's cookies are gone).
+   The deployment does not keep the id token, and a sealed copy of it in the
+   session row is a bigger change than this defect needs.
 
 ## What changed
 
@@ -125,7 +153,16 @@ jar, which is what the defect is about.
   again. On a provider behind MFA that is an MFA prompt each time. The
   operator can turn it off (`OIDC_PROMPT=off`), at the cost of the reported
   behaviour coming back.
-- "Sign out" still does not end the provider's session: it ends this
-  deployment's session only. The next sign-in asks the provider to
-  authenticate again, but the provider's session cookie is still in the
-  browser.
+- The provider's logout only happens when the deployment names a return
+  address the provider accepts (`OIDC_POST_LOGOUT_REDIRECT_URI`, registered
+  with the provider). Without it the sign-out ends this deployment's
+  session only, and the provider's session stays in the browser.
+- A realm that was imported before this change keeps the client it was
+  imported with: its valid post-logout redirect URIs still name the
+  callback, so the provider refuses the logout until the client is updated
+  in the provider's admin console (or the realm is imported again into an
+  empty one). The realm template and the renderer carry the right value for
+  a fresh realm.
+- The provider's logout is a redirect to another site: the person sees the
+  provider's "Logging out" page for a moment before the console's sign-in
+  page comes back.

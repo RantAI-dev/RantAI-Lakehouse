@@ -640,6 +640,17 @@ pub struct Config {
     /// `OIDC_REDIRECT_URI` — never taken from a request, closing the open-
     /// redirect class a request-supplied `redirect_uri` would allow.
     pub oidc_redirect_uri: Option<String>,
+    /// This deployment's address the provider sends the browser back to
+    /// after an RP-initiated logout (`OIDC_POST_LOGOUT_REDIRECT_URI`). It
+    /// must be registered with the provider as a valid post-logout redirect
+    /// URI, or the provider refuses the logout. `None` when unset: the
+    /// sign-out then ends this deployment's session only, and the provider
+    /// keeps its own session for that browser — which is why the next
+    /// sign-in would land on the account that signed in last.
+    ///
+    /// Read ONLY from the environment — never from a request, so a caller
+    /// cannot steer a sign-out to an arbitrary host.
+    pub oidc_post_logout_redirect_uri: Option<String>,
     /// The `prompt` parameter the browser sign-in sends to the provider
     /// (`"login"`, `"consent"`, `"select_account"`, …). Read ONLY from
     /// `OIDC_PROMPT` — never from a request, so a caller cannot change how
@@ -1352,6 +1363,10 @@ impl std::fmt::Debug for Config {
             .field("oidc_authorize_url", &self.oidc_authorize_url)
             .field("oidc_token_url", &self.oidc_token_url)
             .field("oidc_redirect_uri", &self.oidc_redirect_uri)
+            .field(
+                "oidc_post_logout_redirect_uri",
+                &self.oidc_post_logout_redirect_uri,
+            )
             .field("oidc_prompt", &self.oidc_prompt)
             .field("oidc_prompt_from_env", &self.oidc_prompt_from_env)
             .field("database_url", &REDACTED)
@@ -1987,6 +2002,7 @@ impl Config {
             oidc_authorize_url: truthy(env, "OIDC_AUTHORIZE_URL"),
             oidc_token_url: truthy(env, "OIDC_TOKEN_URL"),
             oidc_redirect_uri: truthy(env, "OIDC_REDIRECT_URI"),
+            oidc_post_logout_redirect_uri: truthy(env, "OIDC_POST_LOGOUT_REDIRECT_URI"),
             // An empty value is the DEFAULT, not an opt-out: compose always
             // passes this variable (as every other `OIDC_*` one), so empty
             // cannot mean "the operator said nothing". `off` is the

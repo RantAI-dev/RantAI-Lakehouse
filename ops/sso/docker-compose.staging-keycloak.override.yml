@@ -115,6 +115,7 @@ services:
       SSO_USER_B_PASSWORD: ${SSO_USER_B_PASSWORD:?SSO_USER_B_PASSWORD is required (the second Keycloak test user's password)}
       SSO_USER_C_PASSWORD: ${SSO_USER_C_PASSWORD:?SSO_USER_C_PASSWORD is required (the third Keycloak test user's password)}
       SSO_REDIRECT_URI: ${OIDC_REDIRECT_URI:?OIDC_REDIRECT_URI is required (this deployment's OIDC callback address)}
+      SSO_POST_LOGOUT_REDIRECT_URI: ${OIDC_POST_LOGOUT_REDIRECT_URI:?OIDC_POST_LOGOUT_REDIRECT_URI is required (where the provider sends the browser back to after a sign-out)}
       SSO_REALM: ${SSO_REALM:-lakehouse}
     entrypoint: ["python3", "/template/render_staging_realm.py"]
 

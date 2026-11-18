@@ -177,6 +177,7 @@ jobs:
                       OIDC_AUTHORIZE_URL OIDC_TOKEN_URL OIDC_JWKS_URL \
                       OIDC_REDIRECT_URI OIDC_GROUPS_CLAIM OIDC_ROLE_MAP \
                       OIDC_JIT_PROVISIONING OIDC_TRUST_EMAIL OIDC_PROMPT \
+                      OIDC_POST_LOGOUT_REDIRECT_URI \
                       SSO_PUBLIC_BASE_URL SSO_REALM; do
             sed -i "/^${name}=/d" .env
           done
@@ -208,6 +209,12 @@ jobs:
             # sign in" lands on whoever used that browser last, because the
             # provider still holds the session it created for it.
             printf 'OIDC_PROMPT=login\n'
+            # Where the provider sends the browser back to after the sign-out
+            # ends the provider's session too. The provider refuses a
+            # logout whose return address it does not know, so the realm's
+            # client carries the same address (the realm renderer injects
+            # it).
+            printf 'OIDC_POST_LOGOUT_REDIRECT_URI=%s/login\n' "$sso_console"
           } >> .env
           if [ -n "$missing" ]; then
             echo "::error::staging secrets not set:$missing (Settings > Secrets and variables > Actions)"

@@ -87,6 +87,7 @@ Each commented block in `.env.example` ends by pointing here:
 | `OIDC_ROLE_MAP` | `"group1=Role One,group2=Role Two"` — maps an IdP group/role claim to a local role name | empty | No | commented |
 | `OIDC_GROUPS_CLAIM` | Which token claim carries the caller's groups/roles | `groups` | No | commented |
 | `OIDC_CLOCK_SKEW_SECONDS` | Clock-skew tolerance for `exp`/`nbf` validation. Invalid values fall back to the default | `60` | No | no |
+| `OIDC_POST_LOGOUT_REDIRECT_URI` | Where the identity provider sends the browser back to after a sign-out ends the provider's session too. Must be registered with the provider as a valid post-logout redirect URI. Unset: the sign-out ends this deployment's session only | unset | No | commented |
 | `OIDC_PROMPT` | The `prompt` the browser sign-in sends the provider. `login` (the default) makes the provider show its login form, so the person at the keyboard picks the account; `off` sends no prompt at all and the provider reuses the session it holds for that browser. An empty value is the default | `login` | No | commented |
 | `OIDC_AUTHORIZE_URL` | Authorization endpoint of the OIDC provider, for the browser-redirect login flow. Read ONLY from this var, never from a request | unset (browser SSO login stays off) | No | commented |
 | `OIDC_TOKEN_URL` | Token endpoint of the OIDC provider, used to exchange an authorization code for tokens. Read ONLY from this var, never from a request | unset (browser SSO login stays off) | No | commented |
