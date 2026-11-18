@@ -29,7 +29,9 @@ describe("AppShellSkeleton", () => {
     expect(screen.getByText("Rantai Lake")).toBeTruthy()
     expect(screen.queryByText("Enterprise Lakehouse Console")).toBeNull()
     // The brand row is the real one: the mark first, in its own slot, then the name, left-aligned.
-    const logo = screen.getByRole("img", { name: "Rantai Lake", hidden: true })
+    // ADM-2 (merged from main): the light and the dark logo are the workspace's pictures, both named
+    // after it; the light one is first.
+    const logo = screen.getAllByRole("img", { name: "Rantai Lake", hidden: true })[0]
     const row = screen.getByText("Rantai Lake").closest("div.flex")
     expect(row?.className).toContain("justify-start")
     expect(row?.firstElementChild?.contains(logo)).toBe(true)
