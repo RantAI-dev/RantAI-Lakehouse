@@ -1437,8 +1437,10 @@ pub fn resolve_sso(
     // The `prompt` the browser sign-in sends. It is a server-side setting
     // (the console's SSO form does not carry it) and the value already
     // carries the default: `Config` fills `"login"` when `OIDC_PROMPT` is
-    // absent, and an empty string when the operator asked for none.
-    let prompt = (!config.oidc_prompt.is_empty()).then(|| config.oidc_prompt.clone());
+    // empty (compose always passes it) and the deployment's own `off`
+    // means "send no prompt at all".
+    let prompt =
+        (config.oidc_prompt != crate::config::OIDC_PROMPT_OFF).then(|| config.oidc_prompt.clone());
     let prompt_source = if config.oidc_prompt_from_env {
         Source::Server
     } else {
@@ -1878,7 +1880,8 @@ pub fn draft_sso_settings(config: &Config, draft: &serde_json::Value) -> Effecti
         // one, so it carries the same prompt: a draft tested against a
         // provider that still holds a session must ask for the form too,
         // or the test signs the tester in as somebody else.
-        prompt: (!config.oidc_prompt.is_empty()).then(|| config.oidc_prompt.clone()),
+        prompt: (config.oidc_prompt != crate::config::OIDC_PROMPT_OFF)
+            .then(|| config.oidc_prompt.clone()),
         prompt_source: if config.oidc_prompt_from_env {
             Source::Server
         } else {
@@ -2792,8 +2795,9 @@ mod tests {
         assert_eq!(eff.prompt.as_deref(), Some("select_account"));
         assert_eq!(eff.prompt_source, Source::Server);
 
-        // Present but empty: the operator asked for no prompt at all.
-        let cfg = config(&[("OIDC_PROMPT", "")]);
+        // `off`: the deployment's own spelling for "send no prompt at all",
+        // so the provider reuses its own session.
+        let cfg = config(&[("OIDC_PROMPT", "off")]);
         let eff = resolve_sso(&cfg, None, None);
         assert_eq!(eff.prompt, None);
         assert_eq!(eff.prompt_source, Source::Server);

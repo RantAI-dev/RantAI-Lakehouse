@@ -453,6 +453,13 @@ services:
       OIDC_ROLE_MAP: ${OIDC_ROLE_MAP:-}
       OIDC_GROUPS_CLAIM: ${OIDC_GROUPS_CLAIM:-}
       OIDC_CLOCK_SKEW_SECONDS: ${OIDC_CLOCK_SKEW_SECONDS:-}
+      # What the browser sign-in asks the provider for. Empty is the
+      # default (`login`: the provider shows its login form, so the person
+      # at the keyboard picks the account); `off` sends no prompt at all
+      # and the provider reuses the session it holds for that browser.
+      # Passed through like every other `OIDC_*` setting, so the value in
+      # `.env` reaches the API process.
+      OIDC_PROMPT: ${OIDC_PROMPT:-}
       # `routes::auth::oidc_start`/`oidc_callback` (`/api/auth/oidc/start`
       # and `/callback`) read these directly from `Config`
       # (`oidc_authorize_url`/`oidc_token_url`/`oidc_redirect_uri`), not

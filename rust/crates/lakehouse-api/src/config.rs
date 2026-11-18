@@ -68,6 +68,12 @@ pub const DEFAULT_LLM_MODEL: &str = "MiniMax-M3";
 /// field's doc comment for why the provider's own session is not the
 /// default answer.
 pub const DEFAULT_OIDC_PROMPT: &str = "login";
+/// `OIDC_PROMPT`'s spelling for "send no prompt parameter at all": the
+/// provider decides, and reuses the session it holds for that browser. This
+/// deployment's own word, not an OIDC value — the OIDC standard's `none`
+/// means something else (show no UI at all, fail when there is no session)
+/// and is forwarded verbatim when it is named.
+pub const OIDC_PROMPT_OFF: &str = "off";
 
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
@@ -647,13 +653,20 @@ pub struct Config {
     /// a shared machine, and the reason "sign out, then sign in again" could
     /// land on the previous person's account.
     ///
-    /// An operator who wants the provider's own session reused sets
-    /// `OIDC_PROMPT=` (present but empty): nothing is sent, and the
-    /// provider decides.
+    /// [`OIDC_PROMPT_OFF`] (`"off"`) is this deployment's own spelling for
+    /// "send no prompt parameter at all": the provider then decides, and
+    /// reuses the session it holds for that browser. It is not an OIDC
+    /// value and is never forwarded — the OIDC standard's own `none` (which
+    /// asks the provider to show no UI at all, and to fail when there is no
+    /// session) is forwarded verbatim when it is named.
+    ///
+    /// An empty value is the default, not an opt-out: compose always passes
+    /// this variable (as every other `OIDC_*` one), so "empty" cannot mean
+    /// "the operator said nothing".
     pub oidc_prompt: String,
-    /// Whether `OIDC_PROMPT` was present in the environment at all — the
-    /// difference between "the operator asked for no prompt" (present, empty)
-    /// and "the operator said nothing" (absent, so the default applies).
+    /// Whether `OIDC_PROMPT` was set and non-empty in the environment — the
+    /// difference between "the operator named a prompt" and "the operator
+    /// said nothing, so the default applies".
     pub oidc_prompt_from_env: bool,
     /// Lakekeeper Iceberg REST catalog base URI (P1,
     /// `lakehouse-iceberg::IcebergClientConfig::catalog_uri`). Default
@@ -1974,13 +1987,15 @@ impl Config {
             oidc_authorize_url: truthy(env, "OIDC_AUTHORIZE_URL"),
             oidc_token_url: truthy(env, "OIDC_TOKEN_URL"),
             oidc_redirect_uri: truthy(env, "OIDC_REDIRECT_URI"),
-            // Present-but-empty means "send no prompt"; absent means the
-            // default. `env.get` (not `truthy`) is what tells the two apart.
+            // An empty value is the DEFAULT, not an opt-out: compose always
+            // passes this variable (as every other `OIDC_*` one), so empty
+            // cannot mean "the operator said nothing". `off` is the
+            // spelling for "send no prompt at all".
             oidc_prompt: match env.get("OIDC_PROMPT") {
-                Some(value) => value.trim().to_owned(),
-                None => DEFAULT_OIDC_PROMPT.to_owned(),
+                Some(value) if !value.trim().is_empty() => value.trim().to_owned(),
+                _ => DEFAULT_OIDC_PROMPT.to_owned(),
             },
-            oidc_prompt_from_env: env.get("OIDC_PROMPT").is_some(),
+            oidc_prompt_from_env: env.get("OIDC_PROMPT").is_some_and(|v| !v.trim().is_empty()),
             lakekeeper_catalog_uri: or_default(
                 env,
                 "LAKEKEEPER_CATALOG_URI",
@@ -3059,12 +3074,17 @@ mod tests {
     }
 
     // `OIDC_PROMPT` says what the browser sign-in asks the provider for.
-    // Absent is not the same as present-and-empty: absent means the default
-    // (`login`), present-and-empty means "send nothing, the provider
-    // decides" — the two are told apart by `oidc_prompt_from_env`.
+    // An empty value is the DEFAULT (compose always passes the variable, so
+    // empty cannot mean "the operator said nothing"); `off` is the
+    // deployment's own spelling for "send no prompt at all".
     #[test]
-    fn oidc_prompt_defaults_to_login_and_present_empty_sends_nothing() {
+    fn oidc_prompt_defaults_to_login_and_off_is_the_deployments_own_spelling() {
         let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(!cfg.oidc_prompt_from_env);
+
+        // Empty is the default, not an opt-out.
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "")])).unwrap();
         assert_eq!(cfg.oidc_prompt, "login");
         assert!(!cfg.oidc_prompt_from_env);
 
@@ -3072,13 +3092,14 @@ mod tests {
         assert_eq!(cfg.oidc_prompt, "consent");
         assert!(cfg.oidc_prompt_from_env);
 
-        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "")])).unwrap();
-        assert_eq!(cfg.oidc_prompt, "");
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "off")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "off");
         assert!(cfg.oidc_prompt_from_env);
 
         // Surrounding whitespace is not part of the value.
         let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "  login  ")])).unwrap();
         assert_eq!(cfg.oidc_prompt, "login");
+        assert!(cfg.oidc_prompt_from_env);
     }
 
     // An operator-stated owning tenant for the shared catalog/Dagster-job
