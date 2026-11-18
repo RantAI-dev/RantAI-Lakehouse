@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { RenderView } from "@/features/dashboards/render-view";
 
 export const metadata: Metadata = {
-  title: "Dashboard PDF · Rantai Lake",
+  title: "Dashboard PDF",
   robots: { index: false, follow: false },
   referrer: "no-referrer",
 };

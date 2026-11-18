@@ -257,6 +257,11 @@ pub struct OidcEndpoints {
     pub token_endpoint: String,
     /// The key set's absolute URL (`jwks_uri`).
     pub jwks_uri: String,
+    /// The provider's RP-initiated logout endpoint (`end_session_endpoint`),
+    /// when the provider publishes one. `None` when it does not — a provider
+    /// without it cannot be asked to end its session, so a sign-out ends
+    /// this deployment's session only.
+    pub end_session_endpoint: Option<String>,
 }
 
 /// One cached discovery read: the document a provider served, with the
@@ -291,6 +296,12 @@ struct DiscoveryDocument {
     token_endpoint: Option<String>,
     /// The key set's absolute URL.
     jwks_uri: String,
+    /// The RP-initiated logout endpoint (`end_session_endpoint`), when the
+    /// provider publishes one. Optional: a provider without it cannot be
+    /// asked to end its session, so the sign-out ends this deployment's
+    /// session only.
+    #[serde(default)]
+    end_session_endpoint: Option<String>,
 }
 
 impl DiscoveryDocument {
@@ -317,6 +328,7 @@ impl DiscoveryDocument {
             authorization_endpoint,
             token_endpoint,
             jwks_uri: self.jwks_uri.clone(),
+            end_session_endpoint: self.end_session_endpoint.clone(),
         })
     }
 }
@@ -1478,6 +1490,7 @@ mod tests {
             "authorization_endpoint": "https://issuer.example/authorize",
             "token_endpoint": "https://issuer.example/token",
             "jwks_uri": "https://issuer.example/jwks",
+            "end_session_endpoint": "https://issuer.example/logout",
             "one_the_provider_added": "ignored",
         }))
         .expect("a discovery document naming all three endpoints");
@@ -1487,7 +1500,25 @@ mod tests {
                 authorization_endpoint: "https://issuer.example/authorize".to_owned(),
                 token_endpoint: "https://issuer.example/token".to_owned(),
                 jwks_uri: "https://issuer.example/jwks".to_owned(),
+                end_session_endpoint: Some("https://issuer.example/logout".to_owned()),
             }
+        );
+
+        // A provider that publishes no logout endpoint: the sign-out ends
+        // this deployment's session only, and the value says so.
+        let without_logout: DiscoveryDocument = serde_json::from_value(serde_json::json!({
+            "issuer": "https://issuer.example",
+            "authorization_endpoint": "https://issuer.example/authorize",
+            "token_endpoint": "https://issuer.example/token",
+            "jwks_uri": "https://issuer.example/jwks",
+        }))
+        .expect("a discovery document without a logout endpoint");
+        assert_eq!(
+            without_logout
+                .endpoints()
+                .expect("all three endpoints")
+                .end_session_endpoint,
+            None
         );
 
         let thin: DiscoveryDocument = serde_json::from_value(serde_json::json!({

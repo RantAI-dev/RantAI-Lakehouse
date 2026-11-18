@@ -380,6 +380,10 @@ describe("RoleEditPage (WEB-7 D2/D4)", () => {
     renderPage(<RoleEditPage />)
     const name = await screen.findByLabelText("Name")
     fireEvent.change(name, { target: { value: "Auditor" } })
+    // PR568 review: the role renders before table-access loading completes;
+    // Save deliberately stays disabled until then. Exercise an enabled Save
+    // rather than racing that independent request and silently missing a click.
+    await waitFor(() => expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
     expect(await screen.findByRole("alert")).toBeTruthy()
     expect(pushed).toEqual([])
@@ -789,5 +793,113 @@ describe("RoleEditPage: masks and row filters on this role (GOV-9 D4)", () => {
         "No mask or row filter names this role. They are added on a table's Access tab."
       )
     ).toBeTruthy()
+  })
+})
+
+// WEB-13: an unbroken identifier must stay inside the picker. The DOM keeps
+// the whole name, its label selects it, and the save sends it byte for byte.
+// happy-dom computes no geometry, so the containment is asserted as structure
+// here; the measured narrow/wide fit is a manual-QA item (see the plan).
+describe("RoleEditPage: long identifiers stay inside the picker (WEB-13)", () => {
+  // Synthetic identifiers only: no name from the owner's screenshot is copied
+  // into the fixture or the repository prose.
+  const LONG_SCHEMA = "analytics_reporting_verylongschemaname_without_anyspaces_or_breaks"
+  const LONG_TABLE = "daily_customer_activity_rollup_extremelylongtablename_without_anyspaces"
+  const LONG_UNLISTED = "archived_legacy_orders_old_old_old_old_old_old_old_old_final"
+
+  const schemaText = () => screen.getByText(LONG_SCHEMA)
+  const tableText = () => screen.getByText(LONG_TABLE)
+
+  it("keeps a long schema name full, wraps it in a bounded column, and saves it exactly", async () => {
+    const writes = stubApi({
+      access: { scope: "listed", grants: [] },
+      assets: [{ id: `${LONG_SCHEMA}.${LONG_TABLE}` }],
+    })
+    renderPage(<RoleEditPage />)
+    await screen.findByRole("radio", { name: "Only these" })
+
+    const text = schemaText()
+    expect(text.textContent).toBe(LONG_SCHEMA)
+    // WEB-13: explicit wrapping span -> flex Label -> min-w-0 flex-1 column.
+    expect(text.className).toContain("break-all")
+    expect(text.className).toContain("min-w-0")
+    expect(text.parentElement?.className).toContain("flex")
+    const column = text.parentElement?.parentElement
+    expect(column?.className).toContain("min-w-0")
+    expect(column?.className).toContain("flex-1")
+
+    // Clicking the label toggles the whole-schema checkbox it names.
+    fireEvent.click(text.parentElement as HTMLElement)
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() =>
+      expect(writes[writes.length - 1]).toEqual({
+        method: "PUT",
+        path: "/api/identity/roles/r1/table-access",
+        body: { scope: "listed", grants: [{ schema: LONG_SCHEMA, table: "*" }] },
+      })
+    )
+  })
+
+  it("keeps a long table name full and selectable, and keeps a long unlisted grant", async () => {
+    const writes = stubApi({
+      access: { scope: "listed", grants: [{ schema: "archived", table: LONG_UNLISTED }] },
+      assets: [{ id: `${LONG_SCHEMA}.${LONG_TABLE}` }],
+    })
+    renderPage(<RoleEditPage />)
+    await screen.findByRole("radio", { name: "Only these" })
+    fireEvent.click(await screen.findByRole("button", { name: `Expand ${LONG_SCHEMA}` }))
+
+    const text = tableText()
+    expect(text.textContent).toBe(LONG_TABLE)
+    expect(text.className).toContain("break-all")
+    expect(text.className).toContain("min-w-0")
+    const label = text.parentElement
+    expect(label?.tagName).toBe("LABEL")
+    expect(label?.className).toContain("min-w-0")
+    const grid = label?.parentElement
+    expect(grid?.className).toContain("min-w-0")
+    expect(grid?.className).toContain("flex-1")
+    expect(grid?.parentElement?.className).toContain("flex")
+    // The checkbox beside the wrapping text is not allowed to shrink.
+    const checkbox = screen.getByRole("checkbox", { name: `${LONG_SCHEMA}.${LONG_TABLE}` })
+    expect(checkbox.className).toContain("shrink-0")
+
+    // A grant the catalog does not list is shown whole, with its explanation.
+    expect(screen.getByText(LONG_UNLISTED).textContent).toBe(LONG_UNLISTED)
+    expect(screen.getByText("Not in the catalog (kept until removed)")).toBeTruthy()
+
+    fireEvent.click(label as HTMLElement)
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() =>
+      expect(writes[writes.length - 1]).toEqual({
+        method: "PUT",
+        path: "/api/identity/roles/r1/table-access",
+        body: {
+          scope: "listed",
+          grants: [
+            { schema: "archived", table: LONG_UNLISTED },
+            { schema: LONG_SCHEMA, table: LONG_TABLE },
+          ],
+        },
+      })
+    )
+  })
+
+  it("keeps a long identifier disabled and unwritten for a *:* role", async () => {
+    const writes = stubApi({
+      roles: [{ ...ROLE, permissions: "*:*" }],
+      access: { scope: "listed", grants: [] },
+      assets: [{ id: `${LONG_SCHEMA}.${LONG_TABLE}` }],
+    })
+    renderPage(<RoleEditPage />)
+    expect(await screen.findByText("A role with full access cannot be narrowed")).toBeTruthy()
+    expect(schemaText().textContent).toBe(LONG_SCHEMA)
+    expect(
+      screen.getByRole("checkbox", { name: `Whole schema ${LONG_SCHEMA}` }).hasAttribute("disabled")
+    ).toBe(true)
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() =>
+      expect(writes.map((write) => write.path)).toEqual(["/api/identity/roles/r1"])
+    )
   })
 })

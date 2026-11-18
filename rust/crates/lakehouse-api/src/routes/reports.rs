@@ -245,14 +245,11 @@ pub(crate) async fn validate_input(
         .ok_or_else(|| ApiError::Unavailable("the database is unavailable".to_owned()))?;
     crate::routes::settings::require_download(state, owner).await?;
 
-    // The board is one the owner can see (a trashed board and another person's
-    // personal board read as missing); the built-in board has no row.
-    // BI-19 B1 review R12: the owner's resolved viewer, not the baseline.
-    let viewer = crate::routes::dashboard_access::viewer_for(state, owner).await?;
-    let found = store::get_board(&state.clickhouse, board, &viewer)
-        .await
-        .map_err(|err| crate::routes::dashboard::classify_dashboard_ch_error(&err))?;
-    if found.is_none() && board != store::DEFAULT_BOARD_ID {
+    // The board is one the owner can see NOW, under their current table grants
+    // (GOV-17 review R4). BI-19 B1 review R12: the owner's resolved viewer, not
+    // the baseline. A trashed board, another person's personal board and one
+    // hidden by a denied dependency all read as missing.
+    if !board_still_visible(state, owner, board).await? {
         return Err(ApiError::NotFound(NO_SUCH_DASHBOARD.to_owned()));
     }
 
@@ -529,8 +526,38 @@ fn pool_of(state: &AppState) -> Result<&lakehouse_store::PgPool, ApiError> {
         .ok_or_else(|| ApiError::Unavailable("the database is unavailable".to_owned()))
 }
 
-/// The subscription, if it exists and `principal` is its owner or an
-/// administrator.
+/// GOV-17 review R4: whether `principal`'s CURRENT table grants still let them
+/// see the board a report is about. Subscription ownership or the
+/// `settings:write` admin right is NOT enough: a role narrowed after the
+/// subscription was created must not keep the dashboard's configuration
+/// (board, filters, params, grain, attachments, recipients, history) readable
+/// by known subscription id. This resolves the CALLER's own narrowed viewer —
+/// never the report owner's broader grants — so an admin whose grants were
+/// narrowed is refused just like any other caller. A genuine *:* / role-union
+/// All caller keeps access (the resolver leaves its viewer unnarrowed).
+///
+/// # Errors
+///
+/// The classified store / entitlement error; `false` (never an error) is the
+/// refusal for a board the caller cannot currently see.
+pub(crate) async fn board_still_visible(
+    state: &AppState,
+    principal: &Principal,
+    board: &str,
+) -> Result<bool, ApiError> {
+    let viewer = crate::routes::dashboard_access::viewer_for(state, principal).await?;
+    let board = board.trim();
+    if board.is_empty() || board == store::DEFAULT_BOARD_ID {
+        return Ok(viewer.sees_builtin_board());
+    }
+    let found = store::get_board(&state.clickhouse, board, &viewer)
+        .await
+        .map_err(|err| crate::routes::dashboard::classify_dashboard_ch_error(&err))?;
+    Ok(found.is_some())
+}
+
+/// The subscription, if it exists, `principal` is its owner or an administrator,
+/// AND the caller can still see the dashboard it is about (GOV-17 review R4).
 async fn own_or_admin(
     state: &AppState,
     principal: &Principal,
@@ -543,11 +570,18 @@ async fn own_or_admin(
         .await
         .map_err(|e| store_failed(&e))?
         .ok_or_else(|| ApiError::NotFound(NO_SUCH_SUBSCRIPTION.to_owned()))?;
-    if sub.owner_id == principal.id.uuid() || is_admin(principal) {
-        Ok(sub)
-    } else {
-        Err(ApiError::PermissionDenied(NOT_YOURS.to_owned()))
+    // GOV-17 review R4: the by-id metadata and history readers all go through
+    // here. An unknown-equivalent 404 keeps a guessed id from confirming that a
+    // hidden dashboard has a report.
+    if !board_still_visible(state, principal, &sub.board).await? {
+        return Err(ApiError::NotFound(NO_SUCH_SUBSCRIPTION.to_owned()));
     }
+    // GOV-17 review R8: only a visible dashboard may reveal that a report is
+    // owned by someone else. Hidden reports have the unknown-id response.
+    if sub.owner_id != principal.id.uuid() && !is_admin(principal) {
+        return Err(ApiError::PermissionDenied(NOT_YOURS.to_owned()));
+    }
+    Ok(sub)
 }
 
 /// The person a report is made as: the caller when they own it, else the owner
@@ -611,12 +645,10 @@ pub async fn list(
         .filter(|b| !b.is_empty())
         .ok_or_else(|| ApiError::BadRequest("board is required".to_owned()))?;
     let pool = pool_of(&state)?;
-    // BI-19 B1 review R12: the resolved viewer, not the baseline.
-    let viewer = crate::routes::dashboard_access::viewer_for(&state, &principal).await?;
-    let found = store::get_board(&state.clickhouse, board, &viewer)
-        .await
-        .map_err(|err| crate::routes::dashboard::classify_dashboard_ch_error(&err))?;
-    if found.is_none() && board != store::DEFAULT_BOARD_ID {
+    // BI-19 B1 review R12 / GOV-17 review R4: the caller's resolved viewer and
+    // CURRENT table grants, not the baseline. A dashboard hidden by a denied
+    // dependency (including built-in Main) leaves no report list behind.
+    if !board_still_visible(&state, &principal, board).await? {
         return Err(ApiError::NotFound(NO_SUCH_DASHBOARD.to_owned()).into());
     }
     let admin = is_admin(&principal);

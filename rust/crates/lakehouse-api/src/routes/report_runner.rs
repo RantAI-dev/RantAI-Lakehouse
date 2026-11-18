@@ -509,7 +509,7 @@ async fn deliver(
         .await
         .map_err(|_| stop(DASHBOARD_UNREADABLE))?;
     let gone = if sub.board == store::DEFAULT_BOARD_ID {
-        !viewer.sees_builtin()
+        !viewer.sees_builtin_board()
     } else {
         board.is_none()
     };
@@ -742,7 +742,7 @@ async fn users_who_may_receive(
         // only `dashboard:read`: somebody the rules leave out of a restricted
         // dashboard is not sent its report. A failure to resolve leaves them out.
         let sees_board = match viewer_for(state, &person).await {
-            Ok(viewer) if board == store::DEFAULT_BOARD_ID => viewer.sees_builtin(),
+            Ok(viewer) if board == store::DEFAULT_BOARD_ID => viewer.sees_builtin_board(),
             Ok(viewer) => store::get_board(&state.clickhouse, board, &viewer)
                 .await
                 .is_ok_and(|found| found.is_some()),
