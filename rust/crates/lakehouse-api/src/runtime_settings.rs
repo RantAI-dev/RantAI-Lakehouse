@@ -1970,15 +1970,13 @@ pub async fn end_session_endpoint(state: &AppState, settings: &EffectiveSso) -> 
             .build()
             .ok()?,
     };
-    match lakehouse_auth::oidc::read_discovery_endpoints(issuer, http).await {
-        Ok(endpoints) => endpoints.end_session_endpoint,
-        Err(_) => {
-            tracing::warn!(
-                "the OIDC discovery document could not be read at sign-out; the provider's own session was not ended"
-            );
-            None
-        }
-    }
+    let Ok(endpoints) = lakehouse_auth::oidc::read_discovery_endpoints(issuer, http).await else {
+        tracing::warn!(
+            "the OIDC discovery document could not be read at sign-out; the provider's own session was not ended"
+        );
+        return None;
+    };
+    endpoints.end_session_endpoint
 }
 
 /// The `OIDC` authenticator for the effective `SSO` settings, rebuilt when
