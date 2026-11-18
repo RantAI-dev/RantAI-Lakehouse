@@ -4,6 +4,10 @@
 // and the tenant switch only with *:*, as the API demands each of them.
 // `OPS-8` part C: the storage of every layer shows only to the platform
 // operator; anybody else sees the page and a line saying who sees it.
+// The storage table shows two numbers per Iceberg layer (the current data and
+// what the object store holds for it), a dash for the layers that are not in
+// the warehouse bucket, and one line for the rest of the bucket. Nothing
+// measured yet is an empty state, not an error.
 import { mock } from "bun:test"
 
 mock.module("next/navigation", () => ({
@@ -19,10 +23,11 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, setSystemTime, spyOn } from "bun:test"
 import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
+import { formatDateTime } from "@/lib/format"
 import { UsagePage } from "./usage-page"
 
 beforeEach(() => {
@@ -81,10 +86,19 @@ const STORAGE_ROW = {
   day: "2026-11-16",
   layer: "bronze",
   tableCount: 12,
-  totalBytes: 1_500_000_000,
+  currentBytes: 1_500_000_000,
+  storedBytes: 1_800_000_000,
   tablesSkipped: 0,
   skippedReason: null as string | null,
   estimate: "0.322581" as string | null,
+}
+
+/** The warehouse bucket, as the capacity job measured it. */
+const STORAGE_BUCKET = {
+  name: "lakehouse-warehouse",
+  bytes: 4_140_446_845,
+  measuredAt: "2026-11-16 02:01:03.000",
+  unaccountedBytes: 2_340_446_845 as number | null,
 }
 
 function storageReport(overrides: Record<string, unknown> = {}) {
@@ -92,6 +106,8 @@ function storageReport(overrides: Record<string, unknown> = {}) {
     from: "2026-10-18",
     to: "2026-11-16",
     currency: "USD",
+    measuredAt: "2026-11-16 01:00:12.000",
+    bucket: null as typeof STORAGE_BUCKET | null,
     rows: [STORAGE_ROW],
     ...overrides,
   }
@@ -138,7 +154,9 @@ function stubApi(
     }
     if (url.pathname === "/api/usage/queries") return stub.usage ? stub.usage(url) : json(report())
     if (url.pathname === "/api/usage/storage") {
-      return stub.storage ? stub.storage(url) : json(storageReport({ currency: null, rows: [] }))
+      return stub.storage
+        ? stub.storage(url)
+        : json(storageReport({ currency: null, rows: [], measuredAt: null, bucket: null }))
     }
     if (url.pathname === "/api/usage/rates") {
       if (init?.method === "POST") return json(RATE, 201)
@@ -163,6 +181,17 @@ async function sessionSettled(stub: Stub) {
 }
 
 const usageCalls = (stub: Stub) => stub.calls.filter((c) => c.url.pathname === "/api/usage/queries")
+
+/**
+ * The storage table of the page: the one whose first column is the layer.
+ * The page holds two tables, so the queries below stay inside this one.
+ */
+function storageView() {
+  const table = screen
+    .getAllByRole("table")
+    .find((t) => within(t).queryByRole("columnheader", { name: "Layer" }) !== null)!
+  return within(table)
+}
 
 describe("UsagePage", () => {
   it("asks for the last 30 days by day, ending today in UTC", async () => {
@@ -369,9 +398,15 @@ describe("UsagePage", () => {
         json(
           storageReport({
             rows: [
-              { ...STORAGE_ROW, layer: "bronze", day: "2026-11-15", totalBytes: 100 },
-              { ...STORAGE_ROW, layer: "bronze", day: "2026-11-16", totalBytes: 1_500_000_000 },
-              { ...STORAGE_ROW, layer: "silver", day: "2026-11-16", totalBytes: 2_000_000_000 },
+              { ...STORAGE_ROW, layer: "bronze", day: "2026-11-15", currentBytes: 100, storedBytes: 100 },
+              {
+                ...STORAGE_ROW,
+                layer: "bronze",
+                day: "2026-11-16",
+                currentBytes: 1_500_000_000,
+                storedBytes: 1_800_000_000,
+              },
+              { ...STORAGE_ROW, layer: "silver", day: "2026-11-16", currentBytes: 2_000_000_000, storedBytes: null },
             ],
           })
         ),
@@ -380,6 +415,7 @@ describe("UsagePage", () => {
     expect(await screen.findByRole("columnheader", { name: "Layer" })).toBeTruthy()
     // The newest measurement of each layer, not the older one beside it.
     expect(screen.getAllByText("1.5 GB").length).toBeGreaterThan(0)
+    expect(screen.getAllByText("1.8 GB").length).toBeGreaterThan(0)
     expect(screen.getAllByText("2 GB").length).toBeGreaterThan(0)
     expect(screen.queryByText("100 B")).toBeNull()
     const call = stub.calls.find((c) => c.url.pathname === "/api/usage/storage")
@@ -387,6 +423,134 @@ describe("UsagePage", () => {
       from: "2026-10-18",
       to: "2026-11-16",
     })
+  })
+
+  it("shows the current data and the stored on disk bytes of every layer, each under its own column", async () => {
+    stubApi(["*:*"], {
+      storage: () =>
+        json(
+          storageReport({
+            currency: null,
+            rows: [
+              {
+                ...STORAGE_ROW,
+                layer: "bronze",
+                currentBytes: 1_500_000_000,
+                storedBytes: 1_800_000_000,
+              },
+            ],
+          })
+        ),
+    })
+    renderPage()
+    await screen.findByRole("columnheader", { name: "Layer" })
+    const view = storageView()
+    const heads = view.getAllByRole("columnheader").map((h) => h.textContent)
+    const currentAt = heads.indexOf("Current data")
+    const storedAt = heads.indexOf("Stored on disk")
+    expect(currentAt).toBeGreaterThan(-1)
+    expect(storedAt).toBeGreaterThan(-1)
+    const row = view.getAllByRole("row").find((r) => within(r).queryByText("bronze") !== null)!
+    const cells = within(row).getAllByRole("cell")
+    // 1.5e9 bytes is 1.5 GB and 1.8e9 bytes is 1.8 GB in decimal units.
+    expect(cells[currentAt].textContent).toBe("1.5 GB")
+    expect(cells[storedAt].textContent).toBe("1.8 GB")
+  })
+
+  it("shows a dash under Stored on disk for a layer outside the bucket, and names the layers that have one number", async () => {
+    stubApi(["*:*"], {
+      storage: () =>
+        json(
+          storageReport({
+            currency: null,
+            rows: [
+              { ...STORAGE_ROW, layer: "bronze", currentBytes: 1_000_000_000, storedBytes: 1_200_000_000 },
+              { ...STORAGE_ROW, layer: "silver", currentBytes: 4096, storedBytes: null },
+              { ...STORAGE_ROW, layer: "serving", currentBytes: 8192, storedBytes: null },
+            ],
+          })
+        ),
+    })
+    renderPage()
+    await screen.findByRole("columnheader", { name: "Stored on disk" })
+    const view = storageView()
+    const storedAt = view.getAllByRole("columnheader").map((h) => h.textContent).indexOf("Stored on disk")
+    const cellsOf = (layer: string) => {
+      const row = view.getAllByRole("row").find((r) => within(r).queryByText(layer) !== null)!
+      return within(row).getAllByRole("cell")
+    }
+    expect(cellsOf("silver")[storedAt].textContent).toBe("—")
+    expect(cellsOf("serving")[storedAt].textContent).toBe("—")
+    expect(cellsOf("bronze")[storedAt].textContent).toBe("1.2 GB")
+    // One line names the layers that carry one number and says why, in the
+    // order the table lists them.
+    expect(
+      screen.getByText(
+        "serving and silver are ClickHouse layers: their bytes sit on the ClickHouse server's own disk, not in the warehouse bucket, so they have one number."
+      )
+    ).toBeTruthy()
+  })
+
+  it("names the one layer that carries a single number in the singular", async () => {
+    stubApi(["*:*"], {
+      storage: () =>
+        json(
+          storageReport({
+            currency: null,
+            rows: [{ ...STORAGE_ROW, layer: "silver", currentBytes: 4096, storedBytes: null }],
+          })
+        ),
+    })
+    renderPage()
+    expect(
+      await screen.findByText(
+        "silver is a ClickHouse layer: its bytes sit on the ClickHouse server's own disk, not in the warehouse bucket, so it has one number."
+      )
+    ).toBeTruthy()
+  })
+
+  it("shows the bytes in the bucket that no current table accounts for, with both measurement times", async () => {
+    stubApi(["*:*"], {
+      storage: () =>
+        json(
+          storageReport({
+            measuredAt: "2026-11-16 01:00:12.000",
+            bucket: { ...STORAGE_BUCKET, unaccountedBytes: 2_400_000_000 },
+          })
+        ),
+    })
+    renderPage()
+    const line = await screen.findByText(
+      `In the bucket but in no current table: 2.4 GB (bucket measured ${formatDateTime("2026-11-16 02:01:03.000")}; storage measured ${formatDateTime("2026-11-16 01:00:12.000")}).`
+    )
+    expect(line).toBeTruthy()
+  })
+
+  it("says the rest of the bucket is not comparable when the two measurements disagree", async () => {
+    stubApi(["*:*"], {
+      storage: () => json(storageReport({ bucket: { ...STORAGE_BUCKET, unaccountedBytes: null } })),
+    })
+    renderPage()
+    const line = await screen.findByText(
+      `In the bucket but in no current table: not comparable (bucket measured ${formatDateTime("2026-11-16 02:01:03.000")}; storage measured ${formatDateTime("2026-11-16 01:00:12.000")}).`
+    )
+    expect(line).toBeTruthy()
+  })
+
+  it("shows no line about the rest of the bucket when the bucket was never measured", async () => {
+    stubApi(["*:*"], { storage: () => json(storageReport({ bucket: null })) })
+    renderPage()
+    await screen.findByRole("columnheader", { name: "Layer" })
+    expect(screen.queryByText(/In the bucket but in no current table/)).toBeNull()
+  })
+
+  it("says the storage was not measured yet, and when the daily job runs, when nothing has been measured", async () => {
+    stubApi(["*:*"], {
+      storage: () => json(storageReport({ rows: [], measuredAt: null, bucket: null })),
+    })
+    renderPage()
+    expect(await screen.findByText("Not measured yet")).toBeTruthy()
+    expect(screen.getByText("The daily job runs at 01:00 UTC.")).toBeTruthy()
   })
 
   it("shows a tenant administrator the page without the storage, and says who sees it", async () => {
@@ -409,7 +573,8 @@ describe("UsagePage", () => {
               {
                 ...STORAGE_ROW,
                 layer: "gold",
-                totalBytes: 0,
+                currentBytes: 0,
+                storedBytes: 0,
                 tablesSkipped: 2,
                 skippedReason: "the catalog's metadata could not be read",
               },

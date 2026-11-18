@@ -199,6 +199,17 @@ fn rows(answer: &Answer) -> Vec<Value> {
     answer.json()["rows"].as_array().expect("rows").clone()
 }
 
+/// The row of the answer with that key.
+fn person_row(body: &Value, key: &str) -> Value {
+    body["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row["key"] == json!(key))
+        .cloned()
+        .unwrap_or_else(|| panic!("no row for {key}: {body}"))
+}
+
 // ── (a) freshness ────────────────────────────────────────────────────────
 
 fn clickhouse_with_one_row() -> ResponseTemplate {
@@ -886,6 +897,61 @@ async fn a_caller_without_identity_read_sees_a_persons_id_in_the_page_and_the_fi
     assert!(!file.text().contains("Rina Wijaya"), "{}", file.text());
 }
 
+/// The Person row is labelled with the name the user list holds for the
+/// owner. Since the query-ownership fix the run records the principal's uuid
+/// string, so the name the run carries is not a name at all.
+///
+/// A run whose owner is not in the user list any more (the user was deleted)
+/// and a run with no owner keep the name their run recorded: the first is
+/// that name, the second is its key.
+#[tokio::test]
+async fn a_person_row_is_labelled_with_the_name_the_user_list_holds() {
+    let TestApp { router, pool } = spin_up().await;
+    let owner = Uuid::new_v4();
+    let username = format!("rina-{}", owner.simple());
+    let email = format!("{}@test.invalid", owner.simple());
+    sqlx::query("INSERT INTO app_user (id, name, username, email) VALUES ($1, $2, $3, $4)")
+        .bind(owner)
+        .bind("Rina Wijaya")
+        .bind(username)
+        .bind(email)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let recorded = owner.to_string();
+    let mut run = Run::new("2026-03-02T10:00:00Z", Some(TENANT_A), &recorded);
+    run.owner = Some(owner);
+    insert(&pool, &run).await;
+
+    // An owner who is not in the user list any more: the user was deleted.
+    let deleted = Uuid::new_v4();
+    let mut gone = Run::new("2026-03-02T11:00:00Z", Some(TENANT_A), "Ghost User");
+    gone.owner = Some(deleted);
+    insert(&pool, &gone).await;
+
+    // A run with no owner at all: its recorded name is its key.
+    let mut nobody = Run::new("2026-03-02T12:00:00Z", Some(TENANT_A), "Legacy User");
+    nobody.owner = None;
+    insert(&pool, &nobody).await;
+
+    let reader = person(&pool, "usage:read,identity:read", &[TENANT_A]).await;
+    let answer = get(
+        &router,
+        &reader,
+        &format!("/api/usage/queries?{PERIOD}&group=person"),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let body = answer.json();
+    let listed = person_row(&body, &owner.to_string());
+    assert_eq!(listed["label"], json!("Rina Wijaya"), "{body}");
+    assert_eq!(listed["queries"], json!(1), "{body}");
+    let gone_row = person_row(&body, &deleted.to_string());
+    assert_eq!(gone_row["label"], json!("Ghost User"), "{body}");
+    let legacy = person_row(&body, "Legacy User");
+    assert_eq!(legacy["label"], json!("Legacy User"), "{body}");
+}
+
 // ── (g) bad input ────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1024,34 +1090,85 @@ async fn adding_a_rate_writes_one_audit_row_and_a_refused_one_writes_a_refused_r
 // ── (i) storage per layer (OPS-8 part C) ────────────────────────────────
 
 /// One measured layer, as the daily storage job wrote it: the day, the
-/// layer, its tables, its bytes and how many of its tables were skipped.
-fn storage_row(day: &str, layer: &str, bytes: i64) -> Value {
+/// layer, its tables, the bytes of the tables' current snapshots and the
+/// bytes the object store holds under them.
+///
+/// `stored_bytes` is `None` for a `ClickHouse` layer: its bytes sit on the
+/// engine's own disk, not in the warehouse bucket.
+fn layer_row(day: &str, layer: &str, current_bytes: i64, stored_bytes: Option<i64>) -> Value {
     json!({
         "day": day,
         "layer": layer,
         "table_count": "3",
-        "total_bytes": bytes.to_string(),
+        "total_bytes": current_bytes.to_string(),
+        "stored_bytes": stored_bytes.map(|bytes| bytes.to_string()),
         "tables_skipped": "0",
         "skipped_reason": "",
+        "measured_at": format!("{day} 01:00:12.000"),
     })
 }
 
-/// A `ClickHouse` that answers the storage read with `rows` and every other
-/// query with no rows.
+/// The bucket's own measurement, as the capacity job wrote it.
+fn bucket_row(measured_at: &str, name: &str, bytes: i64) -> Value {
+    json!({
+        "measured_at": measured_at,
+        "bucket_name": name,
+        "bytes": bytes.to_string(),
+        "objects": "12",
+    })
+}
+
+/// The engine's own answer when the table it was asked about is not there:
+/// the shape `ClickHouse` 26.7.3.19 writes, observed over its HTTP
+/// interface (the same text `routes/lakehouse.rs` classifies).
+fn unknown_table(what: &str) -> ResponseTemplate {
+    ResponseTemplate::new(404).set_body_string(format!(
+        "Code: 60. DB::Exception: Unknown table expression identifier \
+         'lake.bronze_meta.{what}' in scope SELECT 1 FROM \
+         lake.`bronze_meta.{what}`. (UNKNOWN_TABLE) \
+         (version 26.7.3.19 (official build))"
+    ))
+}
+
+/// Any other failure of the engine.
+fn broken_engine() -> ResponseTemplate {
+    ResponseTemplate::new(500).set_body_string(
+        "Code: 62. DB::Exception: Syntax error: failed at position 1 (SYNTAX_ERROR)",
+    )
+}
+
+/// A `ClickHouse` that answers the storage read with `layers`, the capacity
+/// read with `bucket`, and every other query with no rows.
 ///
-/// The specific mock is mounted FIRST: among mocks of the same priority
+/// The specific mocks are mounted FIRST: among mocks of the same priority
 /// `wiremock` keeps the insertion order, so the first one that matches
 /// answers.
-async fn clickhouse_with_storage(rows: Vec<Value>) -> MockServer {
+async fn clickhouse_with_storage(layers: Vec<Value>, bucket: Option<Value>) -> MockServer {
     let ch = MockServer::start().await;
-    let count = rows.len();
+    let count = layers.len();
     Mock::given(method("POST"))
         .and(body_string_contains("storage_layer_snapshot"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "meta": [],
-            "data": rows,
+            "data": layers,
             "rows": count,
         })))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("capacity_snapshot"))
+        .respond_with(match bucket {
+            Some(row) => ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "data": [row],
+                "rows": 1,
+            })),
+            None => ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "data": [],
+                "rows": 0,
+            })),
+        })
         .mount(&ch)
         .await;
     Mock::given(method("POST"))
@@ -1067,8 +1184,7 @@ async fn clickhouse_with_storage(rows: Vec<Value>) -> MockServer {
 
 /// The app of a test about the storage read, with the `ClickHouse` that
 /// answers it.
-async fn storage_app(rows: Vec<Value>) -> (axum::Router, PgPool) {
-    let ch = clickhouse_with_storage(rows).await;
+async fn storage_app(ch: MockServer) -> (axum::Router, PgPool) {
     let mut overrides = HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch.uri());
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
@@ -1082,11 +1198,15 @@ async fn platform_admin(pool: &PgPool) -> String {
 
 #[tokio::test]
 async fn the_platform_operator_sees_the_size_of_every_layer() {
-    let (router, pool) = storage_app(vec![
-        storage_row("2026-03-15", "bronze", 1_000_000_000),
-        storage_row("2026-03-15", "silver", 2_000_000_000),
-    ])
+    let ch = clickhouse_with_storage(
+        vec![
+            layer_row("2026-03-15", "bronze", 1_000_000_000, Some(1_740_446_845)),
+            layer_row("2026-03-15", "silver", 2_000_000_000, None),
+        ],
+        None,
+    )
     .await;
+    let (router, pool) = storage_app(ch).await;
     let admin = platform_admin(&pool).await;
 
     let answer = get(
@@ -1099,21 +1219,35 @@ async fn the_platform_operator_sees_the_size_of_every_layer() {
     let body = answer.json();
     assert_eq!(body["from"], json!("2026-03-01"), "{body}");
     assert_eq!(body["to"], json!("2026-03-31"), "{body}");
+    assert_eq!(
+        body["measuredAt"],
+        json!("2026-03-15 01:00:12.000"),
+        "{body}"
+    );
     let rows = body["rows"].as_array().expect("rows");
     assert_eq!(rows.len(), 2, "{body}");
     assert_eq!(rows[0]["layer"], json!("bronze"), "{body}");
     assert_eq!(rows[0]["day"], json!("2026-03-15"), "{body}");
     assert_eq!(rows[0]["tableCount"], json!(3), "{body}");
-    assert_eq!(rows[0]["totalBytes"], json!(1_000_000_000), "{body}");
+    assert_eq!(rows[0]["currentBytes"], json!(1_000_000_000), "{body}");
+    assert_eq!(rows[0]["storedBytes"], json!(1_740_446_845_i64), "{body}");
     assert_eq!(rows[0]["tablesSkipped"], json!(0), "{body}");
     assert_eq!(rows[0]["skippedReason"], json!(null), "{body}");
     assert_eq!(rows[1]["layer"], json!("silver"), "{body}");
-    assert_eq!(rows[1]["totalBytes"], json!(2_000_000_000), "{body}");
+    assert_eq!(rows[1]["currentBytes"], json!(2_000_000_000), "{body}");
+    // A `ClickHouse` layer's bytes are not in the warehouse bucket: the job
+    // wrote no number for them.
+    assert_eq!(rows[1]["storedBytes"], json!(null), "{body}");
 }
 
 #[tokio::test]
 async fn a_tenant_administrator_is_refused_the_storage_of_every_layer() {
-    let (router, pool) = storage_app(vec![storage_row("2026-03-15", "bronze", 1_000)]).await;
+    let ch = clickhouse_with_storage(
+        vec![layer_row("2026-03-15", "bronze", 1_000, Some(1_000))],
+        None,
+    )
+    .await;
+    let (router, pool) = storage_app(ch).await;
     // A Governance Admin of one tenant: `usage:read` opens the Usage page,
     // and it does not open the storage of every tenant's tables.
     let admin = person(&pool, "usage:read", &[TENANT_A]).await;
@@ -1133,11 +1267,15 @@ async fn a_tenant_administrator_is_refused_the_storage_of_every_layer() {
 
 #[tokio::test]
 async fn the_estimate_follows_the_rate_that_was_in_force_on_the_day() {
-    let (router, pool) = storage_app(vec![
-        storage_row("2026-03-05", "bronze", 1_000_000_000),
-        storage_row("2026-03-15", "bronze", 1_000_000_000),
-    ])
+    let ch = clickhouse_with_storage(
+        vec![
+            layer_row("2026-03-05", "bronze", 1_000_000_000, Some(1_000_000_000)),
+            layer_row("2026-03-15", "bronze", 1_000_000_000, Some(1_000_000_000)),
+        ],
+        None,
+    )
     .await;
+    let (router, pool) = storage_app(ch).await;
     let admin = platform_admin(&pool).await;
     // The price of a gigabyte for a month, from the tenth of March.
     let rate = post_rate(
@@ -1167,4 +1305,247 @@ async fn the_estimate_follows_the_rate_that_was_in_force_on_the_day() {
     assert_eq!(rows[0]["estimate"], json!(null), "{body}");
     // One gigabyte (10^9 bytes) at 10.00 for a 31-day month: 10 / 31, to six places.
     assert_eq!(rows[1]["estimate"], json!("0.322581"), "{body}");
+}
+
+// ── (j) the storage of the layers (OPS-125) ──────────────────────────────
+
+/// The daily job has never run here: the table it writes is not there, and
+/// that is a measurement that has not happened yet, not an outage.
+#[tokio::test]
+async fn with_no_snapshot_table_the_storage_is_an_empty_measurement_not_an_outage() {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("storage_layer_snapshot"))
+        .respond_with(unknown_table("storage_layer_snapshot"))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [],
+            "data": [],
+            "rows": 0,
+        })))
+        .mount(&ch)
+        .await;
+    let (router, pool) = storage_app(ch).await;
+    let admin = platform_admin(&pool).await;
+
+    let answer = get(
+        &router,
+        &admin,
+        "/api/usage/storage?from=2026-03-01&to=2026-03-31",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let body = answer.json();
+    assert_eq!(body["rows"], json!([]), "{body}");
+    assert_eq!(body["measuredAt"], json!(null), "{body}");
+    assert_eq!(body["bucket"], json!(null), "{body}");
+}
+
+/// Any other failure of the engine is still the fixed 503: a failure must
+/// never look like an empty result.
+#[tokio::test]
+async fn any_other_failure_of_the_engine_is_the_fixed_503() {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("storage_layer_snapshot"))
+        .respond_with(broken_engine())
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [],
+            "data": [],
+            "rows": 0,
+        })))
+        .mount(&ch)
+        .await;
+    let (router, pool) = storage_app(ch).await;
+    let admin = platform_admin(&pool).await;
+
+    let answer = get(
+        &router,
+        &admin,
+        "/api/usage/storage?from=2026-03-01&to=2026-03-31",
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        answer.text()
+    );
+    assert_eq!(
+        answer.json()["error"],
+        json!("storage per layer is unavailable")
+    );
+}
+
+/// The bucket holds what no current table accounts for: its own size minus
+/// the bytes on disk under the newest day's tables. The `ClickHouse` layers
+/// are left out of that sum, because their bytes are not in the bucket.
+#[tokio::test]
+async fn the_bucket_holds_what_no_current_table_accounts_for() {
+    let ch = clickhouse_with_storage(
+        vec![
+            layer_row("2026-03-14", "bronze", 1_000_000_000, Some(1_000_000_000)),
+            layer_row("2026-03-15", "bronze", 1_000_000_000, Some(1_740_446_845)),
+            layer_row("2026-03-15", "silver", 4_096, None),
+        ],
+        Some(bucket_row(
+            "2026-03-15 02:01:03.000",
+            "lakehouse-warehouse",
+            4_140_446_845,
+        )),
+    )
+    .await;
+    let (router, pool) = storage_app(ch).await;
+    let admin = platform_admin(&pool).await;
+
+    let answer = get(
+        &router,
+        &admin,
+        "/api/usage/storage?from=2026-03-01&to=2026-03-31",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let body = answer.json();
+    assert_eq!(
+        body["bucket"]["name"],
+        json!("lakehouse-warehouse"),
+        "{body}"
+    );
+    assert_eq!(body["bucket"]["bytes"], json!(4_140_446_845_i64), "{body}");
+    assert_eq!(
+        body["bucket"]["measuredAt"],
+        json!("2026-03-15 02:01:03.000"),
+        "{body}"
+    );
+    // The newest day's disk sum is the bronze layer's 1_740_446_845 bytes;
+    // the `ClickHouse` layer's 4_096 bytes are not in the bucket.
+    assert_eq!(
+        body["bucket"]["unaccountedBytes"],
+        json!(4_140_446_845_i64 - 1_740_446_845_i64),
+        "{body}"
+    );
+}
+
+/// Two measurements that disagree are not comparable: the page says so
+/// instead of showing a negative number.
+#[tokio::test]
+async fn a_bucket_smaller_than_the_tables_is_not_comparable() {
+    let ch = clickhouse_with_storage(
+        vec![layer_row(
+            "2026-03-15",
+            "bronze",
+            1_000_000_000,
+            Some(1_000_000_000),
+        )],
+        Some(bucket_row(
+            "2026-03-15 02:01:03.000",
+            "lakehouse-warehouse",
+            999_999_999,
+        )),
+    )
+    .await;
+    let (router, pool) = storage_app(ch).await;
+    let admin = platform_admin(&pool).await;
+
+    let answer = get(
+        &router,
+        &admin,
+        "/api/usage/storage?from=2026-03-01&to=2026-03-31",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let body = answer.json();
+    assert_eq!(body["bucket"]["bytes"], json!(999_999_999), "{body}");
+    assert_eq!(body["bucket"]["unaccountedBytes"], json!(null), "{body}");
+}
+
+/// The bucket was never measured: the capacity table is not there, and that
+/// is not a failure -- the layer rows are still the answer.
+#[tokio::test]
+async fn with_no_capacity_table_the_layers_are_still_there() {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("storage_layer_snapshot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [],
+            "data": [layer_row("2026-03-15", "bronze", 1_000_000_000, Some(1_000_000_000))],
+            "rows": 1,
+        })))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("capacity_snapshot"))
+        .respond_with(unknown_table("capacity_snapshot"))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [],
+            "data": [],
+            "rows": 0,
+        })))
+        .mount(&ch)
+        .await;
+    let (router, pool) = storage_app(ch).await;
+    let admin = platform_admin(&pool).await;
+
+    let answer = get(
+        &router,
+        &admin,
+        "/api/usage/storage?from=2026-03-01&to=2026-03-31",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let body = answer.json();
+    assert_eq!(body["rows"].as_array().expect("rows").len(), 1, "{body}");
+    assert_eq!(body["bucket"], json!(null), "{body}");
+}
+
+/// The estimate is priced on the bytes ON DISK, not on the bytes of the
+/// current snapshots: the bucket is what the warehouse costs.
+#[tokio::test]
+async fn the_estimate_is_priced_on_the_bytes_on_disk() {
+    let ch = clickhouse_with_storage(
+        vec![layer_row(
+            "2026-03-15",
+            "bronze",
+            1_000_000_000,
+            Some(2_000_000_000),
+        )],
+        None,
+    )
+    .await;
+    let (router, pool) = storage_app(ch).await;
+    let admin = platform_admin(&pool).await;
+    let rate = post_rate(
+        &router,
+        &admin,
+        json!({
+            "kind": "storage_gb_month",
+            "currency": "USD",
+            "amount": "10",
+            "effectiveFrom": "2026-03-01",
+        }),
+    )
+    .await;
+    assert_eq!(rate.status, StatusCode::CREATED, "{}", rate.text());
+
+    let answer = get(
+        &router,
+        &admin,
+        "/api/usage/storage?from=2026-03-01&to=2026-03-31",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let body = answer.json();
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows[0]["currentBytes"], json!(1_000_000_000), "{body}");
+    // Two gigabytes on disk at 10.00 for a 31-day month: 20 / 31, to six
+    // places. Priced on the current data it would have been "0.322581".
+    assert_eq!(rows[0]["estimate"], json!("0.645161"), "{body}");
 }
