@@ -449,6 +449,77 @@ async fn templates_refuse_what_they_cannot_copy_and_delete_for_good() {
     assert!(list["templates"].as_array().unwrap().is_empty(), "{list}");
 }
 
+async fn template_count(app: &App) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM dashboard_template")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+async fn delete_as(app: &App, cookie: &str, id: &str) -> (StatusCode, Value) {
+    send(
+        app,
+        cookie,
+        "DELETE",
+        &format!("/api/dashboard/templates/{id}"),
+        None,
+    )
+    .await
+}
+
+/// Decision T6 (PR #528 review SHOULD-FIX 2, owner decision D-A of
+/// 2026-11-18): a template is deleted for good, so only the person who saved
+/// it or an administrator (`identity:write`) may delete it. Another writer is
+/// refused with 403 and a sentence that says who may, and the template stays;
+/// the list says to each person whether they may (`canDelete`). A template
+/// with no recorded creator is an administrator's alone.
+#[tokio::test]
+async fn only_the_person_who_saved_a_template_or_an_administrator_deletes_it() {
+    let app = app().await;
+    let creator = person(&app, "dashboard:read, dashboard:write").await;
+    let other = person(&app, "dashboard:read, dashboard:write").await;
+    let admin = person(&app, "dashboard:read, dashboard:write, identity:write").await;
+    let id = saved_template(&app, &creator).await;
+    for (cookie, may) in [(&creator, true), (&other, false), (&admin, true)] {
+        let (status, list) = send(&app, cookie, "GET", "/api/dashboard/templates", None).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(list["templates"][0]["canDelete"], may, "{list}");
+    }
+    let (status, said) = delete_as(&app, &other, &id).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{said}");
+    assert!(
+        said["error"].as_str().unwrap().contains(
+            "Only the person who saved this template, or an administrator, can delete it."
+        ),
+        "{said}"
+    );
+    assert_eq!(
+        template_count(&app).await,
+        1,
+        "a refused delete deletes nothing"
+    );
+    let (status, said) = delete_as(&app, &creator, &id).await;
+    assert_eq!(status, StatusCode::OK, "the creator: {said}");
+    assert_eq!(template_count(&app).await, 0);
+
+    let id = saved_template(&app, &creator).await;
+    let (status, said) = delete_as(&app, &admin, &id).await;
+    assert_eq!(status, StatusCode::OK, "an administrator: {said}");
+
+    // Saved before the creator was recorded (migration `0150`).
+    let id = saved_template(&app, &creator).await;
+    sqlx::query("UPDATE dashboard_template SET created_by_id = NULL WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let (status, _) = delete_as(&app, &creator, &id).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "no display-name match");
+    let (status, said) = delete_as(&app, &admin, &id).await;
+    assert_eq!(status, StatusCode::OK, "{said}");
+    assert_eq!(template_count(&app).await, 0);
+}
+
 /// `BI-18D-AC8`: `dashboard:read` alone is refused saving and starting with 403.
 #[tokio::test]
 async fn a_reader_cannot_save_or_use_a_template() {

@@ -407,6 +407,14 @@ pub async fn login(
 /// replayed copy of the old cookie value is rejected, not just the
 /// browser's copy cleared) and clear the cookie.
 ///
+/// The answer also carries the provider's own logout address, when the
+/// deployment has one (`OIDC_POST_LOGOUT_REDIRECT_URI`) and the provider
+/// publishes an `end_session_endpoint`: the browser is sent there as well,
+/// so the provider's session ends too. Without that, the provider still
+/// holds the session it created for that browser, and the next sign-in is
+/// answered from it — the person is signed in as whoever used that machine
+/// last, with no choice offered.
+///
 /// # Errors
 ///
 /// Returns a 503 if no Postgres pool is configured, or the underlying
@@ -429,12 +437,68 @@ pub async fn logout(
         )
         .await;
     }
-    let mut response = StatusCode::NO_CONTENT.into_response();
+    let mut response = (
+        StatusCode::OK,
+        ApiJson(LogoutResult {
+            provider_logout_url: provider_logout_url(&state).await,
+        }),
+    )
+        .into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
         cleared_session_cookie_header(state.config.is_dev),
     );
     Ok(response)
+}
+
+/// The answer to `POST /api/auth/logout`: where the browser should also be
+/// sent, so the provider's session ends with this deployment's.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LogoutResult {
+    /// The provider's logout address, or `None` when the deployment has no
+    /// post-logout redirect address or the provider publishes no logout
+    /// endpoint. The browser stays on this deployment's sign-in page when
+    /// it is `None`.
+    provider_logout_url: Option<String>,
+}
+
+/// The provider's RP-initiated logout address, or `None`.
+///
+/// Two things have to be in place, and both are the deployment's own doing:
+/// the provider must publish an `end_session_endpoint` (its discovery
+/// document names it), and this deployment must name an address the
+/// provider accepts back (`OIDC_POST_LOGOUT_REDIRECT_URI`, registered with
+/// the provider). Without either, the provider refuses the logout — and a
+/// logout that fails silently is worse than none, so the address is only
+/// built when both are there.
+async fn provider_logout_url(state: &AppState) -> Option<String> {
+    let post_logout = state.config.oidc_post_logout_redirect_uri.as_deref()?;
+    let settings = crate::runtime_settings::sso(state).await;
+    let client_id = settings.client_id.as_deref()?;
+    // A server-owned connection's build reads no discovery document (the
+    // environment owns its addresses), so the endpoint is read here for it.
+    let end_session = crate::runtime_settings::end_session_endpoint(state, &settings).await?;
+    build_provider_logout_url(&end_session, client_id, post_logout)
+}
+
+/// Build the provider's logout address from its three parts.
+///
+/// `client_id` and `post_logout_redirect_uri` are the two parameters the
+/// provider needs to accept the logout without an `id_token_hint` (this
+/// deployment does not keep the id token). The provider refuses a logout
+/// whose return address it does not know, so the address here is the one
+/// registered with it.
+fn build_provider_logout_url(
+    end_session: &str,
+    client_id: &str,
+    post_logout_redirect_uri: &str,
+) -> Option<String> {
+    let mut url = url::Url::parse(end_session).ok()?;
+    url.query_pairs_mut()
+        .append_pair("client_id", client_id)
+        .append_pair("post_logout_redirect_uri", post_logout_redirect_uri);
+    Some(url.to_string())
 }
 
 /// `GET /api/auth/me` response body.
@@ -956,6 +1020,18 @@ pub async fn oidc_start(
         .append_pair("nonce", &flow.nonce)
         .append_pair("code_challenge", &code_challenge)
         .append_pair("code_challenge_method", "S256");
+
+    // The `prompt` (default `"login"`, `Config::oidc_prompt`): the provider
+    // shows its login form instead of answering from the session it already
+    // holds for this browser. Without it, "sign out" then "sign in" lands on
+    // the account that signed in last on that machine — the provider's
+    // session cookie is still there, and this service never ends it (it
+    // knows nothing about the provider's session). Read from the
+    // deployment's own configuration, never from a request, so a caller
+    // cannot change how the provider is asked to authenticate.
+    if let Some(prompt) = sso.prompt.as_deref() {
+        redirect.query_pairs_mut().append_pair("prompt", prompt);
+    }
 
     let mut response = (StatusCode::FOUND, ()).into_response();
     response.headers_mut().insert(
@@ -1835,6 +1911,13 @@ mod tests {
     /// `oidc_start` needs, so `AppState::new` boots with `auth.oidc` populated
     /// without a real Postgres instance or network call.
     fn state_with_oidc_flow_config() -> AppState {
+        state_with_oidc_flow_config_and(&[])
+    }
+
+    /// The same deployment as [`state_with_oidc_flow_config`], with extra
+    /// environment variables — for the settings that change what the
+    /// authorize request carries.
+    fn state_with_oidc_flow_config_and(extra: &[(&str, &str)]) -> AppState {
         let mut env = HashMap::new();
         env.insert(
             "DATABASE_URL".to_owned(),
@@ -1854,6 +1937,9 @@ mod tests {
             "OIDC_REDIRECT_URI".to_owned(),
             "https://lake.invalid/api/auth/oidc/callback".to_owned(),
         );
+        for (key, value) in extra {
+            env.insert((*key).to_owned(), (*value).to_owned());
+        }
         let config = Config::from_map(&env).expect("a valid test Config");
         AppState::new(config)
     }
@@ -1959,6 +2045,9 @@ mod tests {
         assert!(location.starts_with("http://idp.invalid/authorize?"));
         assert!(location.contains("code_challenge_method=S256"));
         assert!(location.contains("response_type=code"));
+        // The default `prompt` is `login`: the provider shows its login form
+        // instead of answering from the session it holds for this browser.
+        assert!(location.contains("prompt=login"));
         let set_cookie = response
             .headers()
             .get(header::SET_COOKIE)
@@ -1968,6 +2057,195 @@ mod tests {
         assert!(set_cookie.starts_with("lh_oidc_flow="));
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("SameSite=Lax"));
+    }
+
+    #[tokio::test]
+    async fn oidc_start_sends_the_prompt_the_deployment_asks_for() {
+        // `OIDC_PROMPT` set to another value: that value is sent.
+        let state = state_with_oidc_flow_config_and(&[("OIDC_PROMPT", "consent")]);
+        let app = crate::routes::router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let query = url::Url::parse(location)
+            .expect("the authorize redirect is a URL")
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("prompt").map(String::as_str), Some("consent"));
+        assert_ne!(query.get("prompt").map(String::as_str), Some("login"));
+
+        // `OIDC_PROMPT=off`: the deployment's own spelling for "send no
+        // prompt at all", so the provider reuses the session it holds for
+        // this browser. (An empty value is the default, not an opt-out:
+        // compose always passes the variable.)
+        let state = state_with_oidc_flow_config_and(&[("OIDC_PROMPT", "off")]);
+        let app = crate::routes::router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let query = url::Url::parse(location)
+            .expect("the authorize redirect is a URL")
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("prompt"), None, "{location}");
+    }
+
+    #[test]
+    fn the_provider_logout_address_names_the_client_and_the_return_address() {
+        let url = build_provider_logout_url(
+            "http://idp.invalid/realms/lakehouse/protocol/openid-connect/logout",
+            "lakehouse",
+            "http://lake.invalid/login",
+        )
+        .expect("a logout address");
+        assert!(
+            url.starts_with("http://idp.invalid/realms/lakehouse/protocol/openid-connect/logout?")
+        );
+        let query = url::Url::parse(&url)
+            .expect("a URL")
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("lakehouse")
+        );
+        assert_eq!(
+            query.get("post_logout_redirect_uri").map(String::as_str),
+            Some("http://lake.invalid/login")
+        );
+
+        // An address the provider does not publish is not turned into a
+        // logout the provider will refuse: no address, no logout.
+        assert_eq!(
+            build_provider_logout_url("not a url", "lakehouse", "http://lake.invalid/login"),
+            None
+        );
+    }
+
+    /// A discovery document naming every address a sign-in needs, plus the
+    /// provider's logout endpoint.
+    async fn mount_discovery_with_logout(server: &wiremock::MockServer, issuer: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("{issuer}/token"),
+                    "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+                    "end_session_endpoint": format!("{issuer}/logout"),
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_connection_the_environment_owns_still_names_the_providers_logout_address() {
+        // The staging shape: the whole connection is in `.env`, so building
+        // the runtime reads no discovery document (D3). The sign-out must
+        // still find the provider's logout endpoint, or "sign out, then
+        // sign in" lands on the account that signed in last.
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        mount_discovery_with_logout(&server, &issuer).await;
+        let state = state_with_oidc_flow_config_and(&[
+            ("OIDC_ISSUER", &issuer),
+            ("OIDC_POST_LOGOUT_REDIRECT_URI", "http://lake.invalid/login"),
+        ]);
+
+        let url = provider_logout_url(&state)
+            .await
+            .expect("the provider's logout address");
+        let parsed = url::Url::parse(&url).expect("a URL");
+        assert_eq!(
+            parsed.path(),
+            "/logout",
+            "the provider's own endpoint: {url}"
+        );
+        let query = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("lakehouse-console")
+        );
+        assert_eq!(
+            query.get("post_logout_redirect_uri").map(String::as_str),
+            Some("http://lake.invalid/login")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_does_not_answer_leaves_only_this_deployments_sign_out() {
+        // The read is best-effort: a provider that fails its discovery
+        // document gives no logout address, and the sign-out still ends this
+        // deployment's session (the caller sends the browser to /login).
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let issuer = server.uri();
+        let state = state_with_oidc_flow_config_and(&[
+            ("OIDC_ISSUER", &issuer),
+            ("OIDC_POST_LOGOUT_REDIRECT_URI", "http://lake.invalid/login"),
+        ]);
+
+        assert_eq!(provider_logout_url(&state).await, None);
+    }
+
+    #[tokio::test]
+    async fn without_a_return_address_the_sign_out_asks_the_provider_nothing() {
+        // No `OIDC_POST_LOGOUT_REDIRECT_URI`: the provider would refuse the
+        // logout, so none is built — and its discovery document is not read
+        // for one either.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let issuer = server.uri();
+        let state = state_with_oidc_flow_config_and(&[("OIDC_ISSUER", &issuer)]);
+
+        assert_eq!(provider_logout_url(&state).await, None);
     }
 
     #[tokio::test]
@@ -3741,7 +4019,7 @@ mod tests {
         .unwrap();
 
         // Clear cache as a console save does
-        state.sso_settings_cache.clear().await;
+        state.settings_caches.sso.clear().await;
         *state.oidc.write().await = None;
 
         // Next call reports oidc: true and provider_name without restart!

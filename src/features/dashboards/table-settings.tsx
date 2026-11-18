@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { RequiredMarker } from "@/components/ui/required";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { moveItem, PICK_LIMITS, type TableDraft } from "@/lib/table-draft";
 import { AGGREGATES, COLUMN_FORMATS, COMPARE_PERIODS, type ColumnSetting, type PivotTotals } from "@/lib/table-types";
@@ -90,7 +91,8 @@ export function ColumnList({
   const free = options.filter((o) => !value.includes(o));
   return (
     <div className="grid gap-1.5">
-      <Label>{label} {required ? <span aria-hidden className="text-destructive">*</span> : null}</Label>
+      {/* UX-1-R11: share the RequiredMarker instead of a second literal star. */}
+      <Label>{label} {required ? <RequiredMarker /> : null}</Label>
       <ul className="grid gap-1">
         {value.map((column, i) => (
           <li key={column} className="rounded-md border border-border px-2 py-1">
@@ -106,7 +108,7 @@ export function ColumnList({
       </ul>
       {value.length < max && free.length ? (
         <Select value="" onValueChange={(v) => { if (v) onChange([...value, v]); }}>
-          <SelectTrigger className="w-full" aria-label={label}><Plus className="size-3.5 text-muted-foreground" aria-hidden /><SelectValue placeholder={placeholder} /></SelectTrigger>
+          <SelectTrigger className="w-full" aria-label={label} aria-required={required}><Plus className="size-3.5 text-muted-foreground" aria-hidden /><SelectValue placeholder={placeholder} /></SelectTrigger>
           <SelectContent>{free.map((o) => <SelectItem key={o} value={o}>{o}</SelectItem>)}</SelectContent>
         </Select>
       ) : null}
@@ -222,7 +224,9 @@ export function PivotSection({ draft, onChange, columns }: {
         onChange={(next) => onChange({ ...draft, pivotColumns: next })}
       />
       <div className="grid gap-1.5">
-        <Label>Values <span aria-hidden className="text-destructive">*</span></Label>
+        {/* UX-1-R11: shared marker; the value's column combobox carries the
+            matching required semantics. */}
+        <Label>Values <RequiredMarker /></Label>
         <ul className="grid gap-1">
           {values.map((v, i) => (
             <li key={i} className="rounded-md border border-border px-2 py-1">
@@ -232,7 +236,7 @@ export function PivotSection({ draft, onChange, columns }: {
                   <SelectContent>{AGGREGATES.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
                 </Select>
                 <Select value={v.column} onValueChange={(c) => setValue(i, { column: c ?? "" })}>
-                  <SelectTrigger className="w-full min-w-0 flex-1" aria-label={`Value column ${i + 1}`}><SelectValue placeholder="pick a column" /></SelectTrigger>
+                  <SelectTrigger className="w-full min-w-0 flex-1" aria-label={`Value column ${i + 1}`} aria-required><SelectValue placeholder="pick a column" /></SelectTrigger>
                   <SelectContent>{columns.all.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
                 </Select>
                 {values.length > 1 ? <Button type="button" size="icon-xs" variant="ghost" aria-label={`Remove value ${i + 1}`} onClick={() => onChange({ ...draft, pivotValues: values.filter((_, j) => j !== i) })}><X /></Button> : null}
@@ -287,9 +291,10 @@ export function KpiCompareSection({ draft, onChange, columns, metric }: {
       {byPeriod ? (
         <div className="grid grid-cols-1 items-start gap-3 @md:grid-cols-2">
           <div className="grid gap-1.5">
-            <Label>Date column {defaultNote ? null : <span aria-hidden className="text-destructive">*</span>}</Label>
+            {/* UX-1-R11: without a metric default the date column is supplied. */}
+            <Label>Date column {defaultNote ? null : <RequiredMarker />}</Label>
             <Select value={draft.compareColumn} onValueChange={(v) => onChange({ ...draft, compareColumn: v ?? "" })}>
-              <SelectTrigger className="w-full" aria-label="Date column"><SelectValue placeholder={defaultNote || (columns.dates.length ? "pick a column" : "no date column")} /></SelectTrigger>
+              <SelectTrigger className="w-full" aria-label="Date column" aria-required={!defaultNote}><SelectValue placeholder={defaultNote || (columns.dates.length ? "pick a column" : "no date column")} /></SelectTrigger>
               <SelectContent>{columns.dates.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
             </Select>
             {defaultNote && !draft.compareColumn ? <p className="text-xs text-muted-foreground">From the metric {metric?.label}</p> : null}
@@ -305,8 +310,9 @@ export function KpiCompareSection({ draft, onChange, columns, metric }: {
       ) : null}
       {draft.compareKind === "goal" ? (
         <div className="grid gap-1.5">
-          <Label htmlFor="kpi-goal">Goal <span aria-hidden className="text-destructive">*</span></Label>
-          <Input id="kpi-goal" type="number" value={draft.goal} onChange={(e) => onChange({ ...draft, goal: e.target.value })} />
+          {/* UX-1-R11: shared marker and matching textbox semantics. */}
+          <Label htmlFor="kpi-goal">Goal <RequiredMarker /></Label>
+          <Input id="kpi-goal" aria-required type="number" value={draft.goal} onChange={(e) => onChange({ ...draft, goal: e.target.value })} />
         </div>
       ) : null}
       {draft.compareKind !== "none" ? (

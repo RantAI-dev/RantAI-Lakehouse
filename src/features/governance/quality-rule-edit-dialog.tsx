@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useServiceAction } from "@/hooks/use-service"
 import { notifySuccess } from "@/lib/notify"
 import { SEVERITY_LABEL, type Severity } from "@/lib/status"
@@ -104,17 +105,20 @@ export function EditRuleDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
+          <RequiredLegend />
           <TablePicker
             id="edit-rule-asset"
             label="Table"
             value={asset}
             onChange={setAsset}
             catalog={catalog}
+            required
           />
           <div className="grid gap-1.5">
-            <Label htmlFor="edit-rule-threshold">Threshold</Label>
+            <Label htmlFor="edit-rule-threshold" required>Threshold</Label>
             <Input
               id="edit-rule-threshold"
+              aria-required
               className="font-mono"
               value={threshold}
               onChange={(e) => setThreshold(e.target.value)}

@@ -30,7 +30,12 @@
 //!
 //! A chart block stores a chart's id and its dashboard, never data. Saving
 //! checks the writer can see the chart and that it is a chart (not a text or
-//! section tile), and takes the dashboard from the chart's own row. Reading
+//! section tile), and takes the dashboard from the chart's own row. A change
+//! checks only the charts it adds: a chart block already on the stored report
+//! keeps its stored dashboard and is not checked again (PR #528 review
+//! SHOULD-FIX 1), so a chart deleted since, or one another editor placed and
+//! this one cannot see, does not stop a title fix; the reader still re-reads
+//! every block as themselves. Reading
 //! finds the chart again among the charts the *reader* may see, then reads it
 //! through `dashboard::payload_for`, the function the dashboard page and the
 //! PDF use, with only that chart: so every mask, row filter and access rule of
@@ -81,8 +86,21 @@ pub(crate) const CHART_NOT_AVAILABLE: &str = "This chart is not available.";
 /// cause is in the log under a reference.
 pub(crate) const CHART_NOT_LOADED: &str = "This chart could not be loaded.";
 
-/// Saving a chart block the writer cannot see.
-pub(crate) const CHART_NOT_YOURS: &str = "A chart in this report is not one you can see.";
+/// Saving a new chart block the writer cannot see, naming the block (its
+/// place in the report, from 1).
+fn chart_not_yours(position: usize) -> String {
+    format!("The chart in block {position} of this report is not one you can see.")
+}
+
+/// Saving a new chart block whose chart has been deleted (PR #528 review
+/// SHOULD-FIX 1: "not one you can see" was the wrong cause for it). Only said
+/// when the writer can see the dashboard the chart was on, so an id guess still
+/// learns nothing ([`unplaceable`]).
+fn chart_deleted(position: usize) -> String {
+    format!(
+        "The chart in block {position} of this report has been deleted. Remove that block and save again."
+    )
+}
 
 /// Saving a chart block that names a text, section, image or web tile.
 pub(crate) const NOT_A_CHART: &str =
@@ -276,39 +294,127 @@ fn parse<T: serde::de::DeserializeOwned>(body: &Bytes, shape: &str) -> Result<T,
     serde_json::from_slice(body).map_err(|_| ApiError::BadRequest(format!("body must be {shape}.")))
 }
 
-/// Check the blocks and fill each chart block's dashboard from the chart's own
-/// row, refusing a chart the writer cannot see and a tile that is not a chart.
+/// The chart blocks of a stored report, chart id to the dashboard saved with
+/// it. A stored list that no longer parses gives none, so every block of the
+/// save is checked (fail closed).
+fn placed_charts(stored_blocks: &Value) -> HashMap<String, String> {
+    reports::parse_blocks(stored_blocks.clone())
+        .map(|blocks| {
+            blocks
+                .into_iter()
+                .filter_map(|block| match block {
+                    Block::Chart { chart, board, .. } => Some((chart, board)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Check the blocks and fill each chart block's dashboard, refusing a tile that
+/// is not a chart and a chart the writer cannot place.
+///
+/// PR #528 review SHOULD-FIX 1: a chart already on the stored report
+/// (`placed`, the same chart id) keeps the dashboard stored with it and is not
+/// checked again. The editor and the assistant's `update_report` send the
+/// whole list on every save, so re-checking every block meant that one chart
+/// deleted from its dashboard, or one placed by an editor who sees what this
+/// one does not, refused every later change of the report, a title fix
+/// included. Keeping a block adds nothing: readers re-read each chart as
+/// themselves, so it shows a reader only what they may see. A chart id new in
+/// this save is checked against the writer's own charts, and its dashboard is
+/// taken from the chart's row, never from the request.
 async fn resolve_blocks(
     state: &AppState,
     viewer: &Viewer,
     raw: Value,
+    placed: &HashMap<String, String>,
 ) -> Result<Vec<Block>, ApiError> {
     let blocks = reports::check_blocks(reports::parse_blocks(raw).map_err(rule)?).map_err(rule)?;
-    if reports::chart_ids(&blocks).is_empty() {
-        return Ok(blocks);
-    }
-    let charts: HashMap<String, (String, bool)> =
+    let adds_a_chart = blocks
+        .iter()
+        .filter_map(Block::chart_id)
+        .any(|id| !placed.contains_key(id));
+    let charts: HashMap<String, (String, bool)> = if adds_a_chart {
         store::list_stored_charts(&state.clickhouse, viewer)
             .await
             .map_err(|err| classify_ch_error(&err))?
             .into_iter()
             .map(|c| (c.spec.id.clone(), (c.board, c.spec.kind.is_static())))
-            .collect();
-    blocks
-        .into_iter()
-        .map(|block| match block {
-            Block::Chart { chart, width, .. } => match charts.get(&chart) {
-                None => Err(ApiError::BadRequest(CHART_NOT_YOURS.to_owned())),
-                Some((_, true)) => Err(ApiError::BadRequest(NOT_A_CHART.to_owned())),
-                Some((board, false)) => Ok(Block::Chart {
-                    chart,
-                    board: board.clone(),
-                    width,
-                }),
-            },
-            other => Ok(other),
-        })
-        .collect()
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let mut out = Vec::with_capacity(blocks.len());
+    for (at, block) in blocks.into_iter().enumerate() {
+        // `BI-62`: the width is the writer's layout choice, taken from the save
+        // as it is, for a kept block too; only the dashboard is the server's.
+        let (chart, width) = match block {
+            Block::Chart { chart, width, .. } => (chart, width),
+            other => {
+                out.push(other);
+                continue;
+            }
+        };
+        let board = if let Some(board) = placed.get(&chart) {
+            board.clone()
+        } else {
+            match charts.get(&chart) {
+                Some((board, false)) => board.clone(),
+                Some((_, true)) => return Err(ApiError::BadRequest(NOT_A_CHART.to_owned())),
+                None => return Err(unplaceable(state, viewer, &chart, at + 1).await?),
+            }
+        };
+        out.push(Block::Chart {
+            chart,
+            board,
+            width,
+        });
+    }
+    Ok(out)
+}
+
+/// Why the chart of new block `position` cannot be placed: deleted (in the
+/// trash or gone for good) from a dashboard the writer can see, which gets its
+/// own sentence (PR #528 review SHOULD-FIX 1), or otherwise not one the writer
+/// can see. A chart on a dashboard the writer cannot see, and an id that never
+/// existed, get the same "not one you can see" whether or not it was deleted,
+/// so an id guess learns nothing about other people's charts.
+///
+/// # Errors
+///
+/// The classified store error when the chart's or its dashboard's row cannot
+/// be read.
+async fn unplaceable(
+    state: &AppState,
+    viewer: &Viewer,
+    chart: &str,
+    position: usize,
+) -> Result<ApiError, ApiError> {
+    let ch = &state.clickhouse;
+    let deleted_where_visible = match store::chart_row_state(ch, chart)
+        .await
+        .map_err(|err| classify_ch_error(&err))?
+    {
+        // `is_deleted` 0 is a live row: live and not in the writer's charts
+        // means hidden from them.
+        Some((is_deleted, board)) if is_deleted != 0 => {
+            if board.is_empty() || board == store::DEFAULT_BOARD_ID {
+                viewer.sees_builtin_board()
+            } else {
+                store::board_row_state(ch, &board)
+                    .await
+                    .map_err(|err| classify_ch_error(&err))?
+                    .is_some_and(|(_, owner)| viewer.sees_board(&board, &owner))
+            }
+        }
+        _ => false,
+    };
+    Ok(ApiError::BadRequest(if deleted_where_visible {
+        chart_deleted(position)
+    } else {
+        chart_not_yours(position)
+    }))
 }
 
 fn blocks_value(blocks: &[Block]) -> Result<Value, ApiError> {
@@ -335,7 +441,7 @@ pub(crate) async fn create_report(
     let folder_id = folder_id.trim();
     ensure_folder_usable(&state.clickhouse, folder_id, &scope.viewer).await?;
     scope.require_on_folder(folder_id, Level::Edit)?;
-    let blocks = resolve_blocks(state, &scope.viewer, blocks).await?;
+    let blocks = resolve_blocks(state, &scope.viewer, blocks, &HashMap::new()).await?;
     let pool = pool_of(state)?;
     stored::insert(
         pool,
@@ -355,9 +461,10 @@ pub(crate) async fn create_report(
 /// # Errors
 ///
 /// 400 with a block rule's sentence (the 31st chart names the limit, R4), a
-/// chart the writer cannot see or a tile that is not a chart, or a folder
-/// they may not file into; 403 without `edit` on the folder; 404 for a folder
-/// they cannot see; 503 without the console database.
+/// chart the writer cannot see or that has been deleted (naming its block),
+/// or a tile that is not a chart, or a folder they may not file into; 403
+/// without `edit` on the folder; 404 for a folder they cannot see; 503 without
+/// the console database.
 pub async fn create(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -427,7 +534,12 @@ pub(crate) async fn update_report(
         _ => report.folder_id.clone(),
     };
     let blocks = match change.blocks {
-        Some(raw) => blocks_value(&resolve_blocks(state, &scope.viewer, raw).await?)?,
+        Some(raw) => {
+            // PR #528 review SHOULD-FIX 1: the charts already on the report
+            // stay as stored; only the ones this change adds are checked.
+            let placed = placed_charts(&report.blocks);
+            blocks_value(&resolve_blocks(state, &scope.viewer, raw, &placed).await?)?
+        }
         None => report.blocks.clone(),
     };
     let pool = pool_of(state)?;
@@ -452,9 +564,10 @@ pub(crate) async fn update_report(
 ///
 /// # Errors
 ///
-/// As [`create`]; 404 [`REPORT_NOT_FOUND`] for a report the caller cannot
-/// read; 403 without `edit` on its folder, or without `manage` there when the
-/// report moves.
+/// As [`create`], for the chart blocks the change adds (a chart block already
+/// on the report is kept as stored, PR #528 review SHOULD-FIX 1); 404
+/// [`REPORT_NOT_FOUND`] for a report the caller cannot read; 403 without
+/// `edit` on its folder, or without `manage` there when the report moves.
 pub async fn update(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,

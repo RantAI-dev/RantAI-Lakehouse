@@ -191,9 +191,18 @@ fn clean_title(title: &str) -> Result<String, ApiError> {
 /// entitled to dashboards, one filed in a folder is for the people who may see
 /// that folder (`BI-19` B2 review S4, owner decision 2026-10-25; the SQL text is
 /// the thing a restricted folder keeps back).
+///
+/// GOV-17 review R2: folder ACL alone is not enough. The source's own SQL can
+/// read a table the caller's current grants do not allow, and its statement and
+/// columns are serialized by the list, detail, fields, read-preview and
+/// assistant `list_sql_sources` paths. The API resolver computes the set of
+/// sources whose SQL is unreadable onto the narrowed viewer; this one guard
+/// applies it everywhere, preserving the folder ACL and the fixed unknown
+/// response. It can only REMOVE a source the ACL already allows.
 #[must_use]
 pub(crate) fn source_visible(viewer: &lakehouse_bi::access::Viewer, source: &SqlSource) -> bool {
-    source.folder_id.is_empty() || viewer.sees_folder(&source.folder_id, "")
+    let folder_ok = source.folder_id.is_empty() || viewer.sees_folder(&source.folder_id, "");
+    folder_ok && !viewer.hidden_source_ids().iter().any(|id| id == &source.id)
 }
 
 /// The same `404` for a source that does not exist and one in a folder the
@@ -917,5 +926,50 @@ mod preview_tests {
                 .all(|body| !body.contains("sum(")),
             "the chart's statement ran after its source's row read was stopped"
         );
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    //! GOV-17 review R2: `source_visible` is the ONE guard shared by the source
+    //! list, detail, fields, read-preview and assistant `list_sql_sources`. The
+    //! dependency deny-list rides on the narrowed viewer; the folder ACL still
+    //! decides what the viewer may otherwise reach.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use lakehouse_bi::access::Viewer;
+
+    fn source(id: &str, folder_id: &str) -> SqlSource {
+        SqlSource {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            sql: "SELECT 1 AS n".to_owned(),
+            columns: Vec::new(),
+            folder_id: folder_id.to_owned(),
+            created_by: String::new(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn a_hidden_root_source_is_denied_but_a_permitted_one_is_not() {
+        let viewer = Viewer::user("u", false).with_hidden_sources(vec!["s_denied".to_owned()]);
+        assert!(!source_visible(&viewer, &source("s_denied", "")));
+        assert!(source_visible(&viewer, &source("s_allowed", "")));
+    }
+
+    #[test]
+    fn the_folder_acl_still_applies_and_system_is_never_narrowed_by_a_request() {
+        // A source in a folder the viewer cannot see stays hidden even when it
+        // is not on the table deny-list; the two checks combine, they do not
+        // replace each other.
+        let only_b1 = Viewer::user("u", false);
+        // `sees_folder` uses the viewer's folder scope; a bare user sees every
+        // unowned folder, so the visible control covers the root case.
+        assert!(source_visible(&only_b1, &source("s_root", "")));
+        // A system/trusted read carries no request narrowing.
+        assert!(source_visible(&Viewer::system(), &source("s_any", "")));
     }
 }

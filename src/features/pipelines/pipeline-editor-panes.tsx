@@ -9,6 +9,7 @@ import { SqlEditor } from "@/components/sql-editor"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredMarker } from "@/components/ui/required"
 import { Switch } from "@/components/ui/switch"
 import { createSqlCompletionSource, sqlCompletionExtension } from "@/features/queries/sql-completion-source"
 import { useService } from "@/hooks/use-service"
@@ -72,9 +73,12 @@ function NameField({
 }) {
   return (
     <div className="space-y-1.5">
-      <Label htmlFor={id}>Name in this pipeline</Label>
+      {/* UX-1-R8: `nameProblem` refuses a blank input/step name, so every
+          call site of this field is a required name. */}
+      <Label htmlFor={id} required>Name in this pipeline</Label>
       <Input
         id={id}
+        aria-required
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className="font-mono"
@@ -198,6 +202,7 @@ export function InputPane({
           <ZoneField
             id={`input-zone-${input.id}`}
             label="Zone"
+            required
             value={input.zone}
             onChange={onZone}
             zones={zones}
@@ -208,7 +213,9 @@ export function InputPane({
         <div className="space-y-1.5">
           {/* R1-S10: the label names a control only while there is one; while
               the connector's tables are read there is a sentence instead. */}
-          <Label htmlFor={tableControl ? `input-table-${input.id}` : undefined}>Table</Label>
+          {/* UX-1-R8: an input's table is required whether typed or picked
+              from the connector's targets (`editorProblems` field `table`). */}
+          <Label htmlFor={tableControl ? `input-table-${input.id}` : undefined} required>Table</Label>
           {fromConnector ? (
             connector.failed ? (
               <p className="text-sm text-destructive">
@@ -239,6 +246,7 @@ export function InputPane({
                 placeholder="Choose one of the connector's tables"
                 options={connector.targets.map((target) => ({ value: target, label: target }))}
                 onValueChange={onTable}
+                aria-required
                 aria-invalid={tie(invalid, "table")["aria-invalid"]}
                 aria-describedby={tie(invalid, "table")["aria-describedby"]}
               />
@@ -249,6 +257,7 @@ export function InputPane({
                   has not caught up with can still be named by hand. */}
               <Input
                 id={`input-table-${input.id}`}
+                aria-required
                 value={input.table}
                 onChange={(e) => onTable(e.target.value)}
                 placeholder="orders_events"
@@ -370,13 +379,16 @@ export function TransformStepPane({
       <div className="grid gap-3 sm:grid-cols-2">
         <NameField id={`step-name-${step.id}`} value={step.name} onChange={onRename} invalid={invalid} />
         <div className="space-y-1.5">
-          <Label htmlFor={`step-reads-${step.id}`}>Reads</Label>
+          {/* UX-1-R8: a transform step must read an input or an earlier step
+              (`editorProblems` field `reads`). */}
+          <Label htmlFor={`step-reads-${step.id}`} required>Reads</Label>
           {/* D6a: an input or an earlier step. The value is the item's id,
               so the choice follows a rename (R1-B2). */}
           <SelectField
             id={`step-reads-${step.id}`}
             className="w-full"
             aria-label="Reads"
+            aria-required
             value={"id" in step.reads ? step.reads.id : ""}
             placeholder="Choose an input or an earlier step"
             options={readable.map((item) => ({ value: item.id, label: item.name }))}
@@ -457,8 +469,10 @@ export function SqlStepPane({
       <NameField id={`step-name-${step.id}`} value={step.name} onChange={onRename} invalid={invalid} />
       <div className="flex flex-col gap-1.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="text-sm font-medium" id={`step-sql-label-${step.id}`}>
-            SQL
+          {/* UX-1-R8: an empty SELECT is refused by `editorProblems` field
+              `sql`; the required state goes on CodeMirror's textbox. */}
+          <p className="flex items-center gap-1.5 text-sm font-medium" id={`step-sql-label-${step.id}`}>
+            SQL <RequiredMarker />
           </p>
           <Button type="button" variant="outline" size="sm" onClick={() => onSql(formatSql(step.sql))}>
             <WandSparklesIcon aria-hidden />
@@ -485,7 +499,15 @@ export function SqlStepPane({
           aria-labelledby={`step-sql-label-${step.id}`}
           aria-describedby={[tie(invalid, "sql")["aria-describedby"], hint ? hintId : undefined].filter(Boolean).join(" ") || undefined}
         >
-          <SqlEditor value={step.sql} onChange={onSql} minHeight="220px" wrap extensions={extensions} />
+          <SqlEditor
+            value={step.sql}
+            onChange={onSql}
+            minHeight="220px"
+            wrap
+            extensions={extensions}
+            labelledBy={`step-sql-label-${step.id}`}
+            required
+          />
         </div>
         <p className={length > MAX_SQL_CHARS ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>
           {length.toLocaleString("en-US")} of {MAX_SQL_CHARS.toLocaleString("en-US")} characters
@@ -581,6 +603,7 @@ export function OutputPane({
         <ZoneField
           id="pipeline-target-zone"
           label="Output zone"
+          required
           value={targetZone}
           onChange={onZone}
           zones={zones}
@@ -588,9 +611,11 @@ export function OutputPane({
           describedBy={tie(invalid, "output-zone")["aria-describedby"]}
         />
         <div className="space-y-1.5">
-          <Label htmlFor="pipeline-target-table">Output table</Label>
+          {/* UX-1-R8: both output fields are required by `editorProblems`. */}
+          <Label htmlFor="pipeline-target-table" required>Output table</Label>
           <Input
             id="pipeline-target-table"
+            aria-required
             value={targetTable}
             onChange={(e) => onTable(e.target.value)}
             placeholder="orders_hourly"

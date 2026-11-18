@@ -20,7 +20,7 @@ const report = reportItem({
 })
 const template = templateItem({
   id: "t1", name: "Sales overview", sourceBoard: "b1", sourceBoardName: "QA BI",
-  chartCount: 3, createdBy: "Rina", createdAt: "2026-11-11T00:00:00Z",
+  chartCount: 3, createdBy: "Rina", createdAt: "2026-11-11T00:00:00Z", canDelete: true,
 })
 const ALL: LibraryItem[] = [main, qa, auto, report, template]
 const pathOf = (id: string) => (id === "f_sales" ? "Sales" : "")

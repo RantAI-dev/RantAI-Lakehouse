@@ -3,6 +3,7 @@
 import * as React from "react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { RequiredMarker } from "@/components/ui/required";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { AUTO_HISTOGRAM_BINS, MAX_ALT, MAX_BANDS, MAX_GANTT_BARS, MAX_HISTOGRAM_COUNT, urlProblem, type TypeDraft } from "@/lib/type-b";
 import { columnItems } from "./builder-sections";
@@ -34,8 +35,10 @@ export function GoalFields({
   const word = kind === "progress" ? "Goal" : "Target";
   return (
     <div className="grid gap-1.5">
+      {/* UX-1-R11: shared marker; a progress goal is required, a bullet target
+          is optional, and the control carries the matching semantics. */}
       <Label>
-        {word} {kind === "bullet" ? <span className="font-normal text-muted-foreground">(optional)</span> : <span aria-hidden className="text-destructive">*</span>}
+        {word} {kind === "bullet" ? <span className="font-normal text-muted-foreground">(optional)</span> : <RequiredMarker />}
       </Label>
       {/* BI-58 review round 1 (SHOULD-FIX 2): two columns only where the inspector is wide enough (@md), so its narrow column keeps every field full width. */}
       <div className="grid grid-cols-1 gap-3 @md:grid-cols-2">
@@ -48,11 +51,11 @@ export function GoalFields({
         </Select>
         {draft.goalMode === "measure" ? (
           <Select value={draft.goalMeasure} items={columnItems(columns, fieldLabel, draft.goalMeasure)} onValueChange={(v) => onChange({ goalMeasure: v ?? "" })} disabled={disabled}>
-            <SelectTrigger className="w-full" aria-label={`${word} column`}><SelectValue placeholder={disabled ? placeholder : "pick a column"} /></SelectTrigger>
+            <SelectTrigger className="w-full" aria-label={`${word} column`} aria-required={kind === "progress"}><SelectValue placeholder={disabled ? placeholder : "pick a column"} /></SelectTrigger>
             <SelectContent>{columns.map((c) => <SelectItem key={c} value={c}>{fieldLabel(c)}</SelectItem>)}</SelectContent>
           </Select>
         ) : (
-          <Input type="number" aria-label={`${word} number`} value={draft.goalNumber} onChange={(e) => onChange({ goalNumber: e.target.value })} placeholder="e.g. 1000000" />
+          <Input type="number" aria-label={`${word} number`} aria-required={kind === "progress"} value={draft.goalNumber} onChange={(e) => onChange({ goalNumber: e.target.value })} placeholder="e.g. 1000000" />
         )}
       </div>
       {draft.goalMode === "measure" ? (
@@ -130,13 +133,14 @@ export function GanttFields({
 }) {
   const pick = (label: string, value: string, set: (v: string) => void, required: boolean) => (
     <div className="grid content-start gap-1.5">
-      <Label>{label} {required ? <span aria-hidden className="text-destructive">*</span> : <span className="font-normal text-muted-foreground">(optional, 0 to 100)</span>}</Label>
+      {/* UX-1-R11: shared marker, with matching combobox semantics. */}
+      <Label>{label} {required ? <RequiredMarker /> : <span className="font-normal text-muted-foreground">(optional, 0 to 100)</span>}</Label>
       <Select
         value={value || (required ? "" : NO_PROGRESS)}
         items={{ ...(required ? {} : { [NO_PROGRESS]: "— no progress —" }), ...columnItems(required ? dateColumns : numberColumns, fieldLabel, value) }}
         onValueChange={(v) => set(!v || v === NO_PROGRESS ? "" : v)} disabled={disabled}
       >
-        <SelectTrigger className="w-full" aria-label={label}><SelectValue placeholder={disabled ? placeholder : "pick a column"} /></SelectTrigger>
+        <SelectTrigger className="w-full" aria-label={label} aria-required={required}><SelectValue placeholder={disabled ? placeholder : "pick a column"} /></SelectTrigger>
         <SelectContent>
           {required ? null : <SelectItem value={NO_PROGRESS}>— no progress —</SelectItem>}
           {(required ? dateColumns : numberColumns).map((c) => <SelectItem key={c} value={c}>{fieldLabel(c)}</SelectItem>)}
@@ -169,9 +173,10 @@ export function CardFields({
   return (
     <>
       <div className="grid gap-1.5">
-        <Label htmlFor="ch-url">Address <span aria-hidden className="text-destructive">*</span></Label>
+        {/* UX-1-R11: shared marker and matching textbox semantics. */}
+        <Label htmlFor="ch-url">Address <RequiredMarker /></Label>
         <Input
-          id="ch-url" type="url" inputMode="url" autoComplete="off" value={draft.url} onChange={(e) => onChange({ url: e.target.value })}
+          id="ch-url" aria-required type="url" inputMode="url" autoComplete="off" value={draft.url} onChange={(e) => onChange({ url: e.target.value })}
           placeholder={sites[0] ? `${sites[0]}/${kind === "image" ? "logo.png" : "status"}` : "https://…"}
           aria-invalid={problem ? true : undefined} aria-describedby="ch-url-sites"
         />
@@ -191,8 +196,8 @@ export function CardFields({
       </div>
       {kind === "image" ? (
         <div className="grid gap-1.5">
-          <Label htmlFor="ch-alt">Description <span aria-hidden className="text-destructive">*</span></Label>
-          <Input id="ch-alt" value={draft.alt} maxLength={MAX_ALT} onChange={(e) => onChange({ alt: e.target.value })} placeholder="What the picture shows, for screen readers" />
+          <Label htmlFor="ch-alt">Description <RequiredMarker /></Label>
+          <Input id="ch-alt" aria-required value={draft.alt} maxLength={MAX_ALT} onChange={(e) => onChange({ alt: e.target.value })} placeholder="What the picture shows, for screen readers" />
         </div>
       ) : (
         <p className="text-xs text-muted-foreground">Many sites refuse to be shown inside another page; the card then stays blank and offers “Open in a new tab”.</p>

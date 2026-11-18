@@ -1,9 +1,9 @@
 // BI-61 T11 with BI-59 T5: moving ticked rows to the trash forgets the sidebar's remembered
 // Dashboards row when it is one of them, as the single delete does, so the row never opens
 // something in the trash.
-import { afterEach, describe, expect, it, spyOn } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
 import { dashboardReportService, dashboardService } from "@/services"
-import { readRow, rememberRow } from "./dashboards-row"
+import { readRow, rememberRow, setRowOwner } from "./dashboards-row"
 import { trashItems } from "./library-bulk"
 import type { LibraryItem } from "./library-items"
 
@@ -18,9 +18,13 @@ function stubDeletes(failBoard?: string) {
   spies.push(spyOn(dashboardReportService, "deleteReport").mockImplementation((async () => {}) as unknown as typeof dashboardReportService.deleteReport))
 }
 
+// PR #541 review SHOULD-FIX 1: the row is remembered only for a signed-in person.
+beforeEach(() => setRowOwner("u1"))
+
 afterEach(() => {
   for (const s of spies.splice(0)) s.mockRestore()
   window.localStorage.clear()
+  setRowOwner(null)
 })
 
 describe("trashItems and the remembered Dashboards row", () => {

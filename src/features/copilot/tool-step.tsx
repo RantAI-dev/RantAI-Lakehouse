@@ -26,6 +26,7 @@ import {
 import { cn } from "@/lib/utils";
 import { encodeFilters } from "@/lib/dashboard-filter-state";
 import { ErrorWithReference } from "@/components/error-reference";
+import { splitReference } from "@/features/dashboards/records";
 
 /**
  * One step of a turn. `confirmed` says the person confirmed it, so it saved
@@ -279,12 +280,19 @@ function StepBody({ step }: { step: ToolStep }) {
   }
 
   if ("error" in res) {
+    const raw = String(res.error);
+    // AI-33: since #533 the server's fixed sentence carries the reference it
+    // logged the real error under at its end (` Reference: <id>`) and no step
+    // carries `errorId`, so the reference rode inside the sentence and could
+    // not be copied. Split it off with the helper the dashboards use; a step
+    // that carries its own `errorId` keeps the server's pair.
+    const failure =
+      typeof res.errorId === "string"
+        ? { message: raw, errorId: res.errorId }
+        : splitReference(raw);
     return (
       <p className="mt-1 text-[11px] text-destructive">
-        <ErrorWithReference
-          message={String(res.error)}
-          errorId={typeof res.errorId === "string" ? res.errorId : undefined}
-        />
+        <ErrorWithReference message={failure.message} errorId={failure.errorId} />
       </p>
     );
   }

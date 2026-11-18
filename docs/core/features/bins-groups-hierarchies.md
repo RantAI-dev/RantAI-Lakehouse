@@ -34,12 +34,12 @@ cities on the same chart.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Automatic bins aim at about ten bins with round edges | Planner default (Metabase) | Owner to confirm at QA |
-| 2 | A bin includes its lower edge and excludes its upper edge; the last bin includes the maximum | Planner default | Owner to confirm at QA |
-| 3 | A value group is a saved field of its table, like a calculated field, with the same permissions and the same rule against deleting one in use | Planner default | Owner to confirm at QA |
-| 4 | A hierarchy has two to six levels, belongs to one table, and needs `dashboard:write` to define | Planner default | Owner to confirm at QA |
-| 5 | Drilling down is a viewer's own, temporary view: it does not change the saved chart and is not shared in the URL | Planner default | Owner to confirm at QA |
-| 6 | Grid cells are square in degrees: 0.01, 0.1, 1 or 10, or automatic | Planner default | Owner to confirm at QA |
+| 1 | Automatic bins aim at about ten bins with round edges | Planner default (Metabase) | Owner, 2026-11-13 |
+| 2 | A bin includes its lower edge and excludes its upper edge; the last bin includes the maximum | Planner default | Owner, 2026-11-13 |
+| 3 | A value group is a saved field of its table, like a calculated field, with the same permissions and the same rule against deleting one in use | Planner default | Owner, 2026-11-13 |
+| 4 | A hierarchy has two to six levels, belongs to one table, and needs `dashboard:write` to define | Planner default | Owner, 2026-11-13 |
+| 5 | Drilling down is a viewer's own, temporary view: it does not change the saved chart and is not shared in the URL | Planner default | Owner, 2026-11-13 |
+| 6 | Grid cells are square in degrees: 0.01, 0.1, 1 or 10, or automatic | Planner default | Owner, 2026-11-13 |
 | 7 | Over a column whose values are all whole numbers (a year), a bin of width 1 holds one value and the maximum has a bin of its own; such a bin reads as its value ("2020"). Automatic and counted bins of such a column are never narrower than 1, and are 2 wide when one bar per value would pass the count | Planner default (QA LH-BI-2-02) | *(proposed, not yet signed; BI-57)* |
 
 ## Limits to tell a customer
@@ -62,3 +62,14 @@ cities on the same chart.
 
 - Bin edges confirmed: the lower edge is included and the upper excluded, and the last bin includes the maximum (1000 falls in 1,000 – 1,500).
 - When a page states a rule but not its exact message, QA checks that the action is refused (or shown) and that the message names the rule. The wording itself is not tested. Defaults the planner wrote on a page count as decided unless the owner changes them.
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-10-AC1`: pass.
+- `BI-10-AC2`: pass.
+- `BI-10-AC3`: pass.
+- `BI-10-AC4`: pass.
+- `BI-10-AC5`: pass.
+- `AI-6-AC1` (BI-10 part): partial: it asked which column once; the binned chart it drafted had no limit and showed 20 of 95 bins without saying so (follow-up item).

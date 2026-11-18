@@ -1,7 +1,11 @@
 // BI-19 owner QA 2026-10-28, QA-2: the bell's mention list is a notification panel (heading,
 // newest first, relative time, "Mark all as read", footer link) whose rows open the Comments.
+// The navbar's page title depends on the path, so the mocked pathname is a
+// variable a test sets (ADM-2 decision 13).
+let pathname = "/dashboards/default"
+
 mock.module("next/navigation", () => ({
-  usePathname: () => "/dashboards/default",
+  usePathname: () => pathname,
   useSearchParams: () => new URLSearchParams(),
   useRouter: () => ({
     push: () => {},
@@ -27,6 +31,7 @@ import { CONSOLE_VERSION } from "@/features/version/console-version"
 afterEach(() => {
   cleanup()
   mock.restore()
+  pathname = "/dashboards/default"
 })
 
 const json = (body: unknown) =>
@@ -179,5 +184,48 @@ describe("AppNavbar AI Copilot entry", () => {
     expect(controls[controls.length - 1]).toBe(copilot)
     fireEvent.click(copilot)
     await waitFor(() => expect(screen.getByRole("button", { name: "Collapse AI Copilot" }).getAttribute("aria-pressed")).toBe("true"))
+  })
+})
+
+/**
+ * ADM-2 decision 13: a page the menu does not name is not called after the
+ * product any more — it is called after the workspace.
+ */
+describe("the navbar's page title", () => {
+  it("falls back to the workspace name for a page no menu item names, not a fixed product name", async () => {
+    pathname = "/no/such/page"
+    spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes("/api/auth/me")) {
+        return Promise.resolve(json({ id: "u1", name: "Analyst", email: null, roles: [], permissions: [], tenants: [] }))
+      }
+      // The public branding route: the workspace's own name.
+      if (path.includes("/api/branding")) {
+        return Promise.resolve(json({ workspaceName: "Acme Data", logo: null, logoDark: null, icon: null }))
+      }
+      return Promise.resolve(json({}))
+    }) as unknown as typeof fetch)
+    spyOn(notificationsService, "list").mockResolvedValue({
+      supported: true,
+      openAlerts: [],
+      pendingApprovals: [],
+      unreadMentions: [],
+      unreadMentionsUnavailable: null,
+    } as never)
+
+    render(
+      <AuthProvider>
+        <CopilotProvider>
+          <SidebarProvider>
+            <AppNavbar />
+          </SidebarProvider>
+        </CopilotProvider>
+      </AuthProvider>,
+    )
+
+    expect(await screen.findByText("Acme Data")).toBeTruthy()
+    // The product's own name is not the fallback any more: a workspace that
+    // set a name must not be called Rantai Lake.
+    expect(screen.queryByText("Rantai Lake")).toBeNull()
   })
 })
