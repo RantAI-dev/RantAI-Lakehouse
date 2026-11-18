@@ -359,9 +359,10 @@ pub async fn chat(
     if stream {
         return stream_chat(state, principal, run);
     }
-    // The chat's future is boxed: it carries the turn's whole state, and
-    // an unboxed future of that size overflows the stack of the request
-    // task (`clippy::large_futures`).
+    // GOV-17 review R9: table visibility adds state to nested tool futures.
+    // The chat future carries the turn's whole state, and an unboxed future of
+    // that size overflows the request task's stack (`clippy::large_futures`);
+    // heap-pin the chat state machine at the HTTP boundary to bound its stack.
     match Box::pin(run_chat(&state, principal.as_ref(), run, None)).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => llm_unavailable(&err),
@@ -1699,9 +1700,9 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
     // request's task, and handed to the spawned one.
     let query_run = crate::query_limits::QueryRun::current_or_detached();
     tokio::spawn(crate::query_limits::scope(query_run, async move {
-        // Boxed for the same reason as the unstreamed chat above: the
-        // future carries the turn's whole state, and this task's stack does
-        // not need to (`clippy::large_futures`).
+        // GOV-17 review R9: the streaming boundary needs the same bounded chat
+        // state machine; boxed for the same reason as the unstreamed chat above
+        // (`clippy::large_futures`).
         let last = match Box::pin(run_chat(&state, principal.as_ref(), run, Some(&tx))).await {
             Ok(body) => json!({ "type": "done", "body": body }),
             Err(err) => json!({
