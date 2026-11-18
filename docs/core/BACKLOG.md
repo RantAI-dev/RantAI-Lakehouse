@@ -410,6 +410,7 @@ estimate (S, M, L), which the base has no field for.
 | `GOV-18` | Task | Hide saved-query and pipeline metadata whose table dependencies are unreadable | Governance | P1 | Todo |  | `GOV-17` audit; `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md` |
 | `GOV-19` | Task | Hidden chart alerts must not distinguish lost access from missing objects | Governance | P2 | Todo |  | `GOV-17` audit; `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md` |
 | `GOV-20` | Task | Folder delete refusal must not reveal counts of invisible dashboards | Governance | P2 | Todo |  | `GOV-17` audit; `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md` |
+| `OPS-35` | Task | Every Dagster job has a run time limit, so a run whose process died cannot hold the queue | Operations | P2 | Building | #581 | staging Dagster blocked 13 to 16 Nov 2026, 10 runs left STARTED |
 
 ## Later (P3)
 
@@ -542,6 +543,7 @@ set by the product owner and are left empty until they are.
 | --- | --- | --- | --- |
 | `UX-1` | 2026-11-17 | 2026-11-18 (#568) | |
 | `OPS-8` | 2026-11-16 | 2026-11-17 (#574) | |
+| `OPS-35` | 2026-11-16 | | |
 | `ADM-2` | 2026-11-15 | 2026-11-17 (#562, #570, #572) | |
 | `SEC-76` | | | |
 | `SEC-77` | | | |

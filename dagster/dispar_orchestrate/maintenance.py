@@ -229,9 +229,17 @@ from dispar_orchestrate.bronze_catalog import (
     record_maintenance_run,
     record_maintenance_verb_run,
 )
+from dispar_orchestrate.ingest_factory import run_limit_tags
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 CATALOG_DB = "icecat_maintenance"
+
+# How long one run of this job may run, in seconds. A daily maintenance
+# pass fans out over every Bronze table, so it gets room for a slow day:
+# the longest run measured on staging on 2026-11-16 was 2674 s and the
+# limit is twice that, far below the six hours a load job gets.
+RUN_LIMIT_ENV = "DAGSTER_RUN_LIMIT_BRONZE_MAINTENANCE_JOB_SECONDS"
+DEFAULT_RUN_LIMIT_SECONDS = 10_800
 
 # The environment variable that pauses the maintenance jobs (REL-2 S4
 # decision D16).
@@ -1242,7 +1250,11 @@ def summarize_bronze_maintenance(
     return results
 
 
-@job
+# The `dagster/max_runtime` tag is what run monitoring enforces: a run
+# whose process died is cancelled and failed by the daemon, so it does not
+# hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
+# is a tag and not `run_monitoring.max_runtime_seconds`.
+@job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def bronze_maintenance_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `bronze_maintenance_job`.
     PART C: `list_bronze_tables` is the fan-out (one DynamicOutput per
