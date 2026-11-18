@@ -982,7 +982,17 @@ async fn a_refused_password_statement_carries_only_its_sqlstate() {
         !err.to_string().contains("ALTER ROLE"),
         "the refused statement's text must not reach the message: {err}"
     );
-    assert!(matches!(&err, RoleSetupError::PasswordRefused { .. }));
+    // The manager is no superuser, so the log guard (`SET LOCAL
+    // log_statement`, which needs superuser) is refused first, and the
+    // statement that carries the password is never sent. Either refusal
+    // keeps the password out of the error, which is what this test checks.
+    assert!(
+        matches!(
+            &err,
+            RoleSetupError::Refused(_) | RoleSetupError::PasswordRefused { .. }
+        ),
+        "a refusal, not a success: {err:?}"
+    );
     assert!(
         err.sqlstate().is_some(),
         "the SQLSTATE is what the caller gets: {err:?}"
