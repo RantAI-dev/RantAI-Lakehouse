@@ -198,6 +198,18 @@ pub async fn list_incidents(
     };
     let asset = query.asset.as_deref().filter(|a| !a.trim().is_empty());
     let incidents = quality::list(pool(&state)?, status, asset).await?;
+    // `SEC-20` (plan ai-118): an incident names the table it is about, and
+    // the incidents of every tenant's upload are in the list, so the ones
+    // outside the caller's reach are left out — the reach Query Studio keeps
+    // (`crate::routes::query::resolve_reach` and
+    // `crate::routes::query::reachable_names`).
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+    let assets: Vec<String> = incidents.iter().map(|i| i.asset.clone()).collect();
+    let readable = crate::routes::query::reachable_names(&state, reach, &assets).await?;
+    let incidents: Vec<_> = incidents
+        .into_iter()
+        .filter(|i| readable.contains(&i.asset))
+        .collect();
     Ok(ApiJson(json!({ "incidents": incidents })))
 }
 

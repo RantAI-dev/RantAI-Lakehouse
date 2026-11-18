@@ -856,8 +856,10 @@ struct RunRecord {
 ///
 /// # Errors
 ///
-/// `404` when no rule has that id; `503` when the store or the run table
-/// cannot be read (the cause is logged, not returned).
+/// `404` when no rule has that id, and for a rule on a table the caller may
+/// not read (the same answer, so the refusal says nothing about what the
+/// deployment holds); `503` when the store or the run table cannot be read
+/// (the cause is logged, not returned).
 pub async fn rule_runs(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -875,6 +877,17 @@ pub async fn rule_runs(
         .iter()
         .find(|r| r.id == id)
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
+    // `SEC-20` (plan ai-118): a rule names the table it checks, so a rule on
+    // a table outside the caller's reach is not there for this caller: the
+    // same 404 an unknown rule id gets, so the answer says nothing about the
+    // other tenants' rules.
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+    let readable =
+        crate::routes::query::reachable_names(&state, reach, std::slice::from_ref(&rule.asset))
+            .await?;
+    if !readable.contains(&rule.asset) {
+        return Err(ApiError::NotFound("Quality rule not found".to_owned()).into());
+    }
     let ch = &state.clickhouse;
     ensure_table(ch).await.map_err(|err| {
         tracing::warn!(?err, rule = %rule.name, "quality: the run table is unavailable");
