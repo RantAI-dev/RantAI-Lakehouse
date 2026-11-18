@@ -41,6 +41,17 @@ const nextConfig: NextConfig = {
     proxyTimeout: 310_000,
   },
 
+  // WEB-18: the History page is gone (the chats are listed in a conversation's
+  // sidebar); its old address opens the newest conversation, which
+  // `/copilot` resolves from `open=latest`. A real HTTP redirect, not a page
+  // calling `redirect()`: in this app a page's redirect only takes effect
+  // when the client renders the page, and `RouteGuard` (`app-frame.tsx`)
+  // renders "You don't have access" instead for an address it has no
+  // `ROUTE_ACCESS` entry for, so the redirect never ran.
+  async redirects() {
+    return [{ source: "/copilot/history", destination: "/copilot?open=latest", permanent: false }];
+  },
+
   // Proxy /api/* to the Rust backend service. Browser URLs stay the same;
   // Next.js only serves the UI while the Rust axum service owns the API.
   async rewrites() {
