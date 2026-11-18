@@ -92,15 +92,17 @@ def reused_images(manifest: dict[str, Any]) -> dict[str, str]:
     """Every image of the manifest that is NOT the API's.
 
     Those are the images bundle B and bundle C REUSE: every image but
-    the one that is rebuilt (D21).
+    the one that is rebuilt (D21). A service that names the rebuilt
+    image is rebuilt with it, so it is not reused either.
     """
     images = manifest.get("images")
     if not isinstance(images, dict):
         raise ProofError("the manifest names no images")
+    rebuilt = api_reference(manifest)
     return {
         service: reference
         for service, reference in images.items()
-        if service != API_SERVICE
+        if reference != rebuilt
     }
 
 
@@ -152,8 +154,14 @@ def manifest_for(
 
     old_reference = api_reference(manifest)
 
-    new_images = copy.deepcopy(images)
-    new_images[API_SERVICE] = api_reference_new
+    # Every service that runs the rebuilt image gets the new reference:
+    # the API and its one-shot migrate service name the same image
+    # (SEC-78), and a service left on the old reference would point at an
+    # image bundle B does not carry.
+    new_images = {
+        service: (api_reference_new if reference == old_reference else reference)
+        for service, reference in images.items()
+    }
 
     # The image ids are keyed by the REFERENCE, so the rebuilt image's
     # entry replaces the old one's.

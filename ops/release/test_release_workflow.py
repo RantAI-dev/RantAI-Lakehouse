@@ -2861,6 +2861,35 @@ class UpdateProofTest(unittest.TestCase):
         self.assertEqual(rebuilt.count(new), 2)
         self.assertNotIn(old, rebuilt)
 
+    def test_the_manifest_points_every_service_that_runs_the_api_image_at_the_new_one(self) -> None:
+        """The migrate service runs the API image too (SEC-78): its
+        manifest entry must name the rebuilt image, and the reuse list must
+        not carry it over as a reused image."""
+        old = "localhost:5000/rantai-lakehouse-api:0.1.0@sha256:aaa"
+        new = "localhost:5000/rantai-lakehouse-api:0.1.0-update-proof.1@sha256:bbb"
+        manifest = {
+            "schemaVersion": 1,
+            "version": "0.1.0",
+            "gitSha": "a" * 40,
+            "createdAt": "2026-11-02T00:00:00Z",
+            "minFrom": "0.0.0",
+            "stops": [],
+            "images": {"lakehouse-api": old, "lakehouse-db-migrate": old, "console": "console@sha256:ccc"},
+            "imageIds": {old: "sha256:111", "console@sha256:ccc": "sha256:222"},
+            "files": {"docker-compose.yml": "sha256:old"},
+        }
+        new_manifest = update_proof.manifest_for(
+            manifest,
+            version="0.1.0-update-proof.1",
+            compose_sha256="sha256:new",
+            api_reference_new=new,
+            api_image_id="sha256:333",
+            created_at="2026-11-02T01:00:00Z",
+        )
+        self.assertEqual(new_manifest["images"]["lakehouse-api"], new)
+        self.assertEqual(new_manifest["images"]["lakehouse-db-migrate"], new)
+        self.assertEqual(update_proof.reused_images(manifest), {"console": "console@sha256:ccc"})
+
     def test_a_compose_file_that_does_not_name_the_old_image_is_refused(self) -> None:
         """A file that does not name the old reference would run the
         old image."""
