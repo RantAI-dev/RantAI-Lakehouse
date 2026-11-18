@@ -1,0 +1,102 @@
+-- GOV-1 part B (the audit page searches the whole trail on the server, at any
+-- age, by person, action, outcome, object and time): three indexes so that a
+-- filter on one of those columns does not read the table.
+--
+-- The search statement is `lakehouse-store`'s `audit::search`:
+-- `WHERE <filters> AND (at, id) < ($cursor_at, $cursor_id)
+--  ORDER BY at DESC, id DESC LIMIT 101`. Before this migration `audit_event`
+-- had two indexes, `audit_event_at_idx (at DESC)` and
+-- `audit_event_resource_idx (resource_kind, resource_id)` (`0024`).
+--
+-- EVIDENCE. `tests/audit.rs` (`every_search_shape_is_served_by_an_index_on_a_large_table`)
+-- fills the table with 50,000 rows (50 people, 40 actions under 8 prefixes,
+-- the 8 outcomes skewed toward `executed`, `at` spread over a year) plus a
+-- person with 25 events and an action with 12, runs `ANALYZE`, and `EXPLAIN`s
+-- the real statement for each filter shape. Lines below are from that run,
+-- shortened to the node and its condition.
+--
+-- Shapes the two old indexes already serve, so NO index is added for them:
+--   * newest page, with and without a cursor, and a time range:
+--       Index Scan using audit_event_at_idx on audit_event
+--         Index Cond: ((at >= '2026-06-10 ...') AND (at < '2026-06-11 ...'))
+--     under an Incremental Sort that sorts only the 101 rows of the page.
+--   * one object (`resource_kind` and `resource_id`):
+--       Bitmap Index Scan on audit_event_resource_idx
+--         Index Cond: ((resource_kind = 'dashboard') AND (resource_id = 'res-17'))
+--
+-- Shapes the old indexes do not serve (a filter on a value that is rare in
+-- the table leaves the planner two bad choices: read every row, or walk
+-- `audit_event_at_idx` and throw most of what it finds away).
+--
+--   Person with 25 events (`principal_id = 'user-rare'`), before:
+--       Sort (Sort Key: at DESC, id DESC)
+--         ->  Seq Scan on audit_event  (cost=0.00..1370.46 rows=35 width=232)
+--               Filter: (principal_id = 'user-rare'::text)
+--               Rows Removed by Filter: 50012
+--     (745 buffers, 6.1 ms). After `audit_event_principal_idx`:
+--       Sort (Sort Key: at DESC, id DESC)
+--         ->  Bitmap Heap Scan on audit_event  (cost=4.61..91.18 rows=25 width=232)
+--               ->  Bitmap Index Scan on audit_event_principal_idx
+--                     Index Cond: (principal_id = 'user-rare'::text)
+--
+--   Person with 1 event in 50 (`user-7`), before: `Index Scan using
+--   audit_event_at_idx` with `Filter: (principal_id = 'user-7')` and `Rows
+--   Removed by Filter: 4810` to find 101 rows. After:
+--       Index Scan using audit_event_principal_idx on audit_event
+--         Index Cond: (principal_id = 'user-7'::text)
+--     with no Sort node: the index already holds `at DESC, id DESC` inside
+--     each person.
+--
+--   Action with 12 events (`action = 'billing.invoice'`), before:
+--       Seq Scan on audit_event  (cost=0.00..1370.46 rows=13 width=232)
+--         Filter: (action = 'billing.invoice'::text)
+--         Rows Removed by Filter: 50025
+--     After `audit_event_action_idx`:
+--       Bitmap Index Scan on audit_event_action_idx
+--         Index Cond: (action = 'billing.invoice'::text)
+--     The same rare action as a prefix (`action LIKE 'billing.%'`), before: a
+--     Seq Scan with `Filter: (action ~~ 'billing.%')`, 50025 rows removed.
+--     After:
+--       Bitmap Index Scan on audit_event_action_idx
+--         Index Cond: ((action ~>=~ 'billing.'::text) AND (action ~<~ 'billing/'::text))
+--     `text_pattern_ops` is what lets a btree answer the prefix (`LIKE 'x%'`)
+--     in any database collation. It serves `=` as well, so one index covers
+--     the exact and the prefix filter. An action that is common (`dashboard.update`,
+--     1 in 40) stays on `audit_event_at_idx` with a filter: it finds its 101
+--     rows after reading about 3,300 index entries (0.8 ms), and nothing is
+--     gained by a second plan for it.
+--
+--   Outcome 1 event in 100 (`outcome = 'rejected'`), before:
+--       Index Scan using audit_event_at_idx on audit_event
+--         Filter: (outcome = 'rejected'::text)
+--         Rows Removed by Filter: 10061
+--     (216 buffers, 2.3 ms; the rarer the outcome, the more of the index it
+--     reads, and `needs_approval` and `rejected` are what a reviewer of the
+--     trail looks for). After `audit_event_outcome_idx`:
+--       Index Scan using audit_event_outcome_idx on audit_event
+--         Index Cond: (outcome = 'rejected'::text)
+--
+-- Each index ends in `at DESC, id DESC`, the order `audit::search` pages in, so
+-- a filter on its first column returns the page without a Sort and a cursor
+-- is an index condition, not a filter.
+--
+-- COST. Each index adds a write to every audit insert, and `audit_event` takes
+-- a row for every change made in the console. Three small btrees on a
+-- narrow row is the price of searching a table that is never pruned
+-- (retention is keep forever).
+--
+-- LOCK. `CREATE INDEX` blocks INSERT, UPDATE and DELETE on the table until it
+-- finishes. On a fresh install, or a trail of a few hundred thousand rows,
+-- that is a moment. On a very large trail an operator can build the same
+-- indexes first with `CREATE INDEX CONCURRENTLY IF NOT EXISTS` under the names
+-- below (`CONCURRENTLY` cannot run inside a migration's transaction); the
+-- `IF NOT EXISTS` here then finds them and does nothing.
+
+CREATE INDEX IF NOT EXISTS audit_event_principal_idx
+    ON audit_event (principal_id, at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS audit_event_action_idx
+    ON audit_event (action text_pattern_ops, at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS audit_event_outcome_idx
+    ON audit_event (outcome, at DESC, id DESC);

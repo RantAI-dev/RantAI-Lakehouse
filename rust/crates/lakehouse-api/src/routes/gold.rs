@@ -71,13 +71,14 @@ use lakehouse_core::secret::SecretValue;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::gold_export::{self, GoldExportError};
 use crate::gold_export_history;
 use crate::json::ApiJson;
 use crate::state::AppState;
 use crate::upstream_error;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 
 impl From<GoldExportError> for ApiError {
     fn from(err: GoldExportError) -> Self {
@@ -1373,9 +1374,6 @@ async fn record_publication_audit(
     mart: &str,
     enabled: bool,
 ) {
-    let Some(pool) = state.pg.as_deref() else {
-        return;
-    };
     let event = NewAuditEvent {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_kind: Some(principal.kind_for_audit().to_owned()),
@@ -1390,9 +1388,7 @@ async fn record_publication_audit(
         approval_id: None,
         session_id: None,
     };
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::error!(%err, mart, "failed to record gold publication audit");
-    }
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 /// `PUT /api/gold/export/{mart}/publication` — switch one mart's

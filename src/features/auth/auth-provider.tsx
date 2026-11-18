@@ -191,10 +191,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // even when that request never returns — otherwise the next person to sign
     // in on this browser would start in this person's tenant.
     clearActiveTenantId();
-    await authClient.logout();
+    const result = await authClient.logout();
     setStoredActiveTenantId(null);
     setUser(null);
     setStatus("unauthenticated");
+    // The identity provider keeps its own session for this browser: without
+    // ending it there, the next sign-in is answered from it and lands on the
+    // account that signed in last, with no choice offered. The server names
+    // the provider's logout address when it has one; the browser goes there
+    // too, and the provider sends it back to the sign-in page.
+    if (result?.providerLogoutUrl) {
+      window.location.assign(result.providerLogoutUrl);
+      return;
+    }
     router.push("/login");
   }, [router]);
 

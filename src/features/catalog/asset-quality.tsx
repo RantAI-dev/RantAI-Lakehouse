@@ -6,6 +6,7 @@ import { Pencil, Play, Plus, Trash2 } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { SelectField } from "@/components/patterns/select-field"
 import { CheckBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
@@ -117,6 +118,7 @@ function AddRuleDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
+          <RequiredLegend />
           <CheckFields
             form={form}
             onChange={set}
@@ -135,8 +137,12 @@ function AddRuleDialog({
           />
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="grid gap-1.5">
-              <Label htmlFor="rule-name">Name</Label>
-              <Input id="rule-name" value={ruleName} onChange={(e) => setName(e.target.value)} />
+              {/* UX-1-R4: a name is pre-filled, but clearing it blocks Save
+                  (the submit guard and the disabled Add-rule button), so the
+                  input is required — not "optional to change" as it read. */}
+              <Label htmlFor="rule-name" required>Name</Label>
+              <Input id="rule-name" aria-required value={ruleName} onChange={(e) => setName(e.target.value)} />
+              <p className="text-xs text-muted-foreground">Pre-filled from the check; it must stay non-empty to save.</p>
             </div>
             <div className="grid gap-1.5">
               <Label htmlFor="rule-severity">Severity if it fails</Label>

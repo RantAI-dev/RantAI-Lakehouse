@@ -253,6 +253,7 @@ async fn insert_history_row(pool: &PgPool, id: &str, sql: &str, owner: Uuid) {
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -543,8 +544,14 @@ impl Respond for BoardFake {
     }
 }
 
+/// GOV-7 AC4 used to require this board to render the allowed tile while the
+/// tile on the hidden mart showed the tenant-gate 404 sentence. The owner
+/// superseded that decision on 2026-11-17 (GOV-17): a dashboard with ANY
+/// unreadable data dependency is hidden in full. The old result is preserved
+/// here as a superseded historical expectation, not rewritten as a new pass;
+/// the assertions below are the stronger whole-board guard.
 #[tokio::test]
-async fn a_dashboard_tile_on_a_hidden_table_is_not_found_while_the_other_tiles_render() {
+async fn a_dashboard_with_a_denied_dependency_is_hidden_entirely() {
     let fake = BoardFake::new();
     let server = fake.serve().await;
     let TestApp { router, pool } = app(&server).await;
@@ -562,26 +569,411 @@ async fn a_dashboard_tile_on_a_hidden_table_is_not_found_while_the_other_tiles_r
         )
         .await
         .expect("router never fails a request outright");
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Unknown and hidden boards have the same fixed answer.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
     let body: Value = serde_json::from_slice(&bytes).expect("a JSON body");
-
-    assert_eq!(
-        body["results"][HIDDEN_TILE]["error"],
-        format!("Table not found or not available to your organisation: serving.{HIDDEN_MART}"),
-        "{body}"
+    let text = body.to_string();
+    assert!(
+        !text.contains(HIDDEN_MART),
+        "no dependent table name: {text}"
     );
+    assert!(
+        !text.contains(OK_MART),
+        "no other tile's table name: {text}"
+    );
+    assert!(!text.contains("results"), "no tile metadata at all: {text}");
+    // Neither tile reaches the engine: hiding happens before any tile query.
+    let statements = fake.statements();
+    assert!(
+        statements.iter().all(|sql| !sql.contains("FROM serving.")),
+        "no data SQL is dispatched for a hidden board: {statements:?}"
+    );
+}
+
+/// GOV-17 positive control: the same board with every dependency granted is
+/// unchanged — both tiles still render, and the whole-board guard is not a
+/// blanket refusal of narrowed callers.
+#[tokio::test]
+async fn a_dashboard_with_all_dependencies_granted_renders_every_tile() {
+    let fake = BoardFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(
+        &pool,
+        "dashboard:read",
+        &[("serving", OK_MART), ("serving", HIDDEN_MART)],
+    )
+    .await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = dashboard_as(&router, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body["results"][OK_TILE].get("rows").is_some(),
-        "the allowed tile still renders: {body}"
+        "the allowed tile renders: {body}"
     );
     assert!(
-        fake.statements()
+        body["results"][HIDDEN_TILE].get("rows").is_some(),
+        "the once-hidden tile renders when its table is granted: {body}"
+    );
+}
+
+/// GOV-17 decision 7: a grant changed on a live session takes effect on the
+/// next request, even though a tile-result cache was warmed with broader
+/// access earlier. The second read is refused BEFORE the cache is consulted
+/// or any data SQL runs.
+#[tokio::test]
+async fn a_grant_change_after_a_warmed_render_hides_the_board_on_the_next_request() {
+    let fake = BoardFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(
+        &pool,
+        "dashboard:read",
+        &[("serving", OK_MART), ("serving", HIDDEN_MART)],
+    )
+    .await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = dashboard_as(&router, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "warm the cache first: {body}");
+    let warmed = fake.statements().len();
+
+    // Same session, same cookie; only the role's table grant changed.
+    narrow(&pool, user, &[("serving", OK_MART)]).await;
+    let (status, hidden) = dashboard_as(&router, &cookie).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+
+    let new_statements = &fake.statements()[warmed..];
+    assert!(
+        new_statements
             .iter()
-            .all(|sql| !sql.contains(&format!("FROM serving.{HIDDEN_MART}"))),
-        "the hidden tile never reaches the engine: {:?}",
+            .all(|sql| !sql.contains("FROM serving.")),
+        "no cached or fresh data read after the grant change: {new_statements:?}"
+    );
+}
+
+/// GOV-17 decision 1: a hidden board and a board that does not exist have the
+/// same fixed not-found answer, so a guessed id cannot tell them apart.
+#[tokio::test]
+async fn a_hidden_board_and_an_unknown_board_have_the_same_answer() {
+    let fake = BoardFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(&pool, "dashboard:read", &[("serving", OK_MART)]).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    // GOV-17 review R9: reuse the shared request helper instead of declaring
+    // another helper after setup statements.
+
+    let (hidden_status, hidden) = send_get(&router, &cookie, "/api/dashboard").await;
+    let (unknown_status, unknown) =
+        send_get(&router, &cookie, "/api/dashboard?board=never-existed").await;
+    assert_eq!(hidden_status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+    assert_eq!(hidden, unknown, "no oracle for a hidden board's id");
+}
+
+/// GOV-17: the board chooser omits built-in Main when one of its data
+/// dependencies is unreadable, and still offers it to a caller whose grants
+/// cover every tile (the positive control).
+#[tokio::test]
+async fn the_board_list_omits_main_only_when_its_dependencies_are_denied() {
+    // GOV-17 review R9: local items precede setup statements; no lint suppression.
+    async fn list(router: &axum::Router, cookie: &str) -> Vec<String> {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard/boards")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("a JSON body");
+        body["boards"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r["id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    let fake = BoardFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+
+    let narrowed_user = narrowed(&pool, "dashboard:read", &[("serving", OK_MART)]).await;
+    let narrowed_cookie = session_cookie_for_user(&pool, narrowed_user).await;
+    assert!(
+        !list(&router, &narrowed_cookie)
+            .await
+            .iter()
+            .any(|id| id == "default"),
+        "Main is hidden with a denied dependency"
+    );
+
+    let allowed_user = narrowed(
+        &pool,
+        "dashboard:read",
+        &[("serving", OK_MART), ("serving", HIDDEN_MART)],
+    )
+    .await;
+    let allowed_cookie = session_cookie_for_user(&pool, allowed_user).await;
+    assert!(
+        list(&router, &allowed_cookie)
+            .await
+            .iter()
+            .any(|id| id == "default"),
+        "Main is offered when every dependency is granted"
+    );
+}
+
+/// Whether a statement is the stored-chart query carrying the Main dependency
+/// deny-list. The wiremock fixture answers every `bi_chart` query with all rows
+/// (it cannot evaluate SQL), so the guard is proven by the clause the route
+/// sends: a real engine honours it and returns no Main tiles.
+fn specs_main_filter(sql: &str) -> bool {
+    sql.contains("FROM console.bi_chart") && sql.contains("NOT IN ('', 'default')")
+}
+
+/// GOV-17 review R1: `/api/dashboard/specs` reads `list_stored_charts`
+/// directly and never runs `get_body`'s built-in filter. When Main is hidden by
+/// a denied dependency, BOTH legacy board spellings must be in the chart SQL
+/// deny-list so no Main tile metadata leaves; a caller whose grants cover Main
+/// sends no such list (positive control).
+#[tokio::test]
+async fn specs_apply_the_main_dependency_filter_to_the_chart_query() {
+    let fake = BoardFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+
+    let narrowed_user = narrowed(&pool, "dashboard:read", &[("serving", OK_MART)]).await;
+    let narrowed_cookie = session_cookie_for_user(&pool, narrowed_user).await;
+    let (status, body) = send_get(&router, &narrowed_cookie, "/api/dashboard/specs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        fake.statements().iter().any(|sql| specs_main_filter(sql)),
+        "Main's stored tiles must be excluded in the specs chart SQL: {:?}",
         fake.statements()
     );
+
+    let before = fake.statements().len();
+    let allowed_user = narrowed(
+        &pool,
+        "dashboard:read",
+        &[("serving", OK_MART), ("serving", HIDDEN_MART)],
+    )
+    .await;
+    let allowed_cookie = session_cookie_for_user(&pool, allowed_user).await;
+    let (status, body) = send_get(&router, &allowed_cookie, "/api/dashboard/specs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        fake.statements()[before..]
+            .iter()
+            .all(|sql| !specs_main_filter(sql)),
+        "a permitted Main sends no Main deny-list: {:?}",
+        &fake.statements()[before..]
+    );
+}
+
+// ── GOV-17 review R2: saved SQL sources are table-gated, not just folder-gated
+
+/// A `ClickHouse` stand-in serving two ROOT-folder SQL sources: one reads an
+/// allowed mart, one reads a denied mart. Both have a visible folder, so only
+/// the table dependency can tell them apart.
+#[derive(Clone)]
+struct SourceFake;
+
+impl Respond for SourceFake {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        if sql.contains("FROM console.bi_source") {
+            return rows(
+                &[
+                    "id",
+                    "title",
+                    "sql",
+                    "columns_json",
+                    "folder_id",
+                    "created_by",
+                    "updated_at",
+                ],
+                &[
+                    json!({
+                        "id": "s_allowed", "title": "Allowed", "sql": format!("SELECT n FROM serving.{OK_MART}"),
+                        "columns_json": "[{\"name\":\"n\",\"type\":\"UInt64\"}]",
+                        "folder_id": "", "created_by": "u", "updated_at": "2026-01-01 00:00:00"
+                    }),
+                    json!({
+                        "id": "s_denied", "title": "Denied", "sql": format!("SELECT n FROM serving.{HIDDEN_MART}"),
+                        "columns_json": "[{\"name\":\"n\",\"type\":\"UInt64\"}]",
+                        "folder_id": "", "created_by": "u", "updated_at": "2026-01-01 00:00:00"
+                    }),
+                ],
+            );
+        }
+        if sql.contains("FROM console.bi_chart") || sql.contains("FROM console.bi_board") {
+            return rows(&[], &[]);
+        }
+        if sql.contains("FROM system.columns") {
+            return rows(&["name", "default_kind", "default_expression"], &[]);
+        }
+        if sql.starts_with("CREATE") || sql.starts_with("ALTER") || sql.starts_with("DROP") {
+            return ResponseTemplate::new(200).set_body_string("Ok.\n");
+        }
+        rows(&[], &[])
+    }
+}
+
+/// GOV-17 review R2: a root-folder source whose SQL reads a denied table is not
+/// listed (its SQL and columns would leak); the permitted source is the positive
+/// control. The same shared `source_visible` guard serves detail/fields and the
+/// assistant `list_sql_sources`.
+#[tokio::test]
+async fn a_root_sql_source_reading_a_denied_table_is_hidden_from_the_source_list() {
+    // GOV-17 review R9: local items precede setup statements; no lint suppression.
+    async fn source_ids(router: &axum::Router, cookie: &str) -> Vec<String> {
+        let (status, body) = send_get(router, cookie, "/api/dashboard/sources").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["sources"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r["id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(SourceFake)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = app(&server).await;
+
+    let narrowed_user = narrowed(&pool, "dashboard:read", &[("serving", OK_MART)]).await;
+    let cookie = session_cookie_for_user(&pool, narrowed_user).await;
+    let ids = source_ids(&router, &cookie).await;
+    assert!(ids.iter().any(|id| id == "s_allowed"), "control: {ids:?}");
+    assert!(
+        !ids.iter().any(|id| id == "s_denied"),
+        "a source reading a denied table must not be listed: {ids:?}"
+    );
+
+    let allowed_user = narrowed(
+        &pool,
+        "dashboard:read",
+        &[("serving", OK_MART), ("serving", HIDDEN_MART)],
+    )
+    .await;
+    let allowed_cookie = session_cookie_for_user(&pool, allowed_user).await;
+    let ids = source_ids(&router, &allowed_cookie).await;
+    assert!(ids.iter().any(|id| id == "s_allowed"), "control: {ids:?}");
+    assert!(ids.iter().any(|id| id == "s_denied"), "control: {ids:?}");
+}
+
+// ── GOV-17 review R3: the common board-level check honours the overlay ───
+
+/// A chart on a NAMED board reading `mart`, for the R3 write-adjacent test.
+fn named_board_chart(id: &str, board: &str, mart: &str) -> Value {
+    let spec = json!({
+        "id": id, "title": id, "kind": "kpi", "mart": mart,
+        "sql": format!("SELECT count() AS n FROM serving.{mart}"), "x": "", "y": "n"
+    });
+    let def = json!({
+        "title": id, "mart": mart, "kind": "kpi", "measures": ["n"], "aggregate": "count"
+    });
+    json!({
+        "id": id, "board": board, "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+        "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+    })
+}
+
+/// A `ClickHouse` stand-in holding one NAMED board whose single tile reads the
+/// denied mart, plus the board row itself.
+#[derive(Clone)]
+struct HiddenBoardFake;
+
+impl Respond for HiddenBoardFake {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        if sql.contains("FROM console.bi_chart") {
+            return rows(
+                &["id", "board", "created_by", "created_at", "spec_json"],
+                &[named_board_chart("c_hidden", "b_hidden", HIDDEN_MART)],
+            );
+        }
+        if sql.contains("FROM console.bi_board") && sql.contains("is_deleted = 0 AND id=") {
+            return rows(
+                &["id", "name", "folder_id", "owner_id"],
+                &[json!({
+                    "id": "b_hidden", "name": "Hidden", "folder_id": "", "owner_id": ""
+                })],
+            );
+        }
+        if sql.contains("FROM system.columns") {
+            return rows(
+                &[
+                    "table",
+                    "name",
+                    "type",
+                    "default_kind",
+                    "default_expression",
+                ],
+                &[],
+            );
+        }
+        if sql.starts_with("CREATE") || sql.starts_with("ALTER") || sql.starts_with("DROP") {
+            return ResponseTemplate::new(200).set_body_string("Ok.\n");
+        }
+        rows(&[], &[])
+    }
+}
+
+/// GOV-17 review R3: `require_board_level` is the ONLY visibility check on the
+/// comments route, so its `require_on_board` must honour the overlay. A caller
+/// with `identity:write` but narrowed table grants (no *:*) gets the unknown
+/// answer for a board whose tile reads a denied table; a genuine *:* caller
+/// keeps access (positive control).
+#[tokio::test]
+async fn a_table_hidden_board_is_refused_by_the_common_level_check_even_for_identity_write() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(HiddenBoardFake)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = app(&server).await;
+
+    let admin = narrowed(
+        &pool,
+        "dashboard:write, identity:write",
+        &[("serving", OK_MART)],
+    )
+    .await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let (status, body) = send_get(&router, &cookie, "/api/dashboard/comments?board=b_hidden").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let text = body.to_string();
+    assert!(!text.contains(HIDDEN_MART), "no table name: {text}");
+    assert!(!text.contains("b_hidden"), "no board id: {text}");
+
+    let star = create_principal_with_permissions(&pool, "*:*").await;
+    let star_cookie = session_cookie_for_user(&pool, star).await;
+    let (status, body) = send_get(
+        &router,
+        &star_cookie,
+        "/api/dashboard/comments?board=b_hidden",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a *:* caller keeps access: {body}");
 }
 
 // ── Combined charts: a question outside the viewer's access ─────────────
@@ -771,11 +1163,14 @@ async fn dashboard_as(router: &axum::Router, cookie: &str) -> (StatusCode, Value
     (status, body)
 }
 
-/// QA `LH-BI-13-03` (`BI-51`, D16, D18): a question on a table the viewer's
-/// role does not read is marked as access, without the gate's text, and that
-/// table is never read.
+/// QA `LH-BI-13-03` (`BI-51`, D16, D18) historically checked that a combined
+/// chart's question on an unreadable table was marked `access` while its base
+/// question still rendered. GOV-17's 2026-11-17 owner decision supersedes that
+/// partial result: a secondary/combined layer's table is a dependency of the
+/// WHOLE dashboard, so the board is hidden in full. The obligation that the
+/// denied engine read never happens is unchanged and is asserted below.
 #[tokio::test]
-async fn a_question_on_a_table_the_viewers_role_does_not_read_is_marked_as_access() {
+async fn a_combined_chart_with_a_denied_layer_hides_the_whole_dashboard() {
     let fake = LayerFake::new();
     let server = fake.serve().await;
     let TestApp { router, pool } = app(&server).await;
@@ -783,23 +1178,15 @@ async fn a_question_on_a_table_the_viewers_role_does_not_read_is_marked_as_acces
     let cookie = session_cookie_for_user(&pool, user).await;
 
     let (status, body) = dashboard_as(&router, &cookie).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let tile = &body["results"][LAYER_TILE];
-    assert!(
-        tile.get("rows").is_some(),
-        "the base question renders: {body}"
-    );
-    let layer = &tile["layers"][0];
-    assert_eq!(layer["cause"], json!("access"), "{layer}");
-    assert_eq!(layer["error"], "Not available with your access.", "{layer}");
-    assert!(layer.get("errorId").is_none(), "{layer}");
-    let text = layer.to_string();
-    assert!(!text.contains("Table not found"), "{text}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let text = body.to_string();
+    assert!(!text.contains(LAYER_MART), "no denied table name: {text}");
+    assert!(!text.contains(LAYER_BASE), "no other table's name: {text}");
     assert!(
         fake.statements()
             .iter()
-            .all(|sql| !sql.contains(&format!("FROM serving.{LAYER_MART}"))),
-        "the hidden question never reaches the engine: {:?}",
+            .all(|sql| !sql.contains("FROM serving.")),
+        "no question reaches the engine for a hidden board: {:?}",
         fake.statements()
     );
 }
@@ -989,8 +1376,11 @@ impl Respond for EmbedFake {
 }
 
 /// `GOV-7-AC9` and D5: an embed reads as the fixed `Dashboard Viewer` role, so
-/// narrowing that role narrows every embed — the hidden tile is refused with
-/// the tenant gate's sentence, the other still renders.
+/// narrowing that role narrows every embed. GOV-17 supersedes the older
+/// partial-tile result: since this board depends on a table that role cannot
+/// read, the WHOLE embed is refused with the fixed token-refusal answer. The
+/// old "hidden tile error, other tile renders" expectation is recorded as
+/// superseded, not presented as a new pass.
 #[tokio::test]
 async fn an_embed_follows_the_dashboard_viewer_roles_access() {
     use lakehouse_embed::{EmbedClaims, EmbedResource, sign_embed, unix_now};
@@ -1037,26 +1427,27 @@ async fn an_embed_follows_the_dashboard_viewer_roles_access() {
         )
         .await
         .expect("router never fails a request outright");
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Hidden and unknown tokens have the same fixed answer.
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
     let body: Value = serde_json::from_slice(&bytes).expect("a JSON body");
-
-    assert_eq!(
-        body["results"][HIDDEN_TILE]["error"],
-        format!("Table not found or not available to your organisation: serving.{HIDDEN_MART}"),
-        "{body}"
+    let text = body.to_string();
+    assert!(
+        !text.contains(HIDDEN_MART),
+        "no dependent table name: {text}"
     );
     assert!(
-        body["results"][OK_TILE].get("rows").is_some(),
-        "the allowed tile still renders in the embed: {body}"
+        !text.contains(OK_MART),
+        "no other tile's table name: {text}"
     );
+    assert!(!text.contains("results"), "no tile metadata: {text}");
     assert!(
         fake.log
             .lock()
             .expect("the statement log")
             .iter()
-            .all(|sql| !sql.contains(&format!("FROM serving.{HIDDEN_MART}"))),
-        "the hidden tile never reaches the engine"
+            .all(|sql| !sql.contains("FROM serving.")),
+        "no data SQL is dispatched for a hidden embed"
     );
 }
 

@@ -31,7 +31,7 @@ use lakehouse_dagster::{
     SensorOutcome, iso_from_unix_seconds, map_run_status,
 };
 use lakehouse_notify::EmailSender;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::pipelines::{self, CreatePipelineInput};
 use lakehouse_store::{PgPool, StoreError};
 use serde::Deserialize;
@@ -39,6 +39,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::routes::alerts::ApiSilenceSource;
@@ -1829,10 +1830,9 @@ fn pipeline_audit_event(
     }
 }
 
-/// Best-effort `pipeline_audit_event` insert — log and continue on `Err`,
-/// same non-fatal posture as `routes::connectors`'s call sites: a failed
-/// audit write must never turn an already-succeeded pipeline action into
-/// an error response.
+/// Best-effort `pipeline_audit_event` insert: a failed audit write never
+/// turns an already-succeeded pipeline action into an error response, and is
+/// logged and counted by [`audit_coverage::record_best_effort`].
 pub(super) async fn record_pipeline_audit(
     state: &AppState,
     principal: &Principal,
@@ -1840,13 +1840,8 @@ pub(super) async fn record_pipeline_audit(
     id: &str,
     args: Value,
 ) {
-    let Some(pool) = state.pg.as_deref() else {
-        return;
-    };
     let event = pipeline_audit_event(principal, action, id, args);
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, action, pipeline_id = id, "failed to record pipeline audit event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 /// F2.5 (PR #59 review): cap on the serialized size of `runConfig`.
@@ -3279,10 +3274,10 @@ pub(crate) async fn require_connector_in_tenant(
 /// `changed_by` is the principal the route had on the
 /// `Extension<Principal>`; it lands in the `created` version row's
 /// `changed_by` column (Plan R4 2b). `routes::pipelines::generate`'s
-/// own caller passes its own principal — `generate` does not audit today
-/// (WS5 item D4), but the version row still goes through `create_pipeline`
-/// so the create is captured in history without a separate route-side
-/// write.
+/// own caller passes its own principal; the version row goes through
+/// `create_pipeline`, so the create is captured in history without a separate
+/// route-side write, and `generate` writes its own audit row
+/// (`pipeline.generate`, `GOV-1 review`).
 async fn create_named_pipeline(
     pool: &PgPool,
     input: &CreatePipelineInput,
@@ -3436,6 +3431,18 @@ pub async fn generate(
         run_as: author_id(&principal),
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
+    // `GOV-1 review`: the route authors a pipeline, so it is on the audit
+    // trail like `create`, under its own action so that a pipeline a model
+    // drafted can be told from one a person wrote. The row names the
+    // pipeline and carries no argument: the instruction stays out of it.
+    record_pipeline_audit(
+        &state,
+        &principal,
+        "pipeline.generate",
+        &created.id,
+        Value::Null,
+    )
+    .await;
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
@@ -8522,15 +8529,15 @@ mod tests {
         use crate::config::Config;
         use crate::routes::pipelines::TriggerBody;
 
-        /// Wiremock-backed `Dagster` only — no Postgres pool, so audit
-        /// writes are silently skipped (the `record_pipeline_audit`
-        /// helper's `state.pg.as_deref()` check) and the trigger can be
-        /// tested in isolation.
+        /// Wiremock-backed `Dagster` only — no Postgres pool, so the audit
+        /// write fails (counted, never fatal: `record_pipeline_audit`) and
+        /// the trigger can be tested in isolation.
         fn state_with_dagster(server_uri: &str) -> AppState {
             let mut env = HashMap::new();
             env.insert("DAGSTER_URL".to_owned(), format!("{server_uri}/graphql"));
-            // No DATABASE_URL — the audit best-effort path skips when
-            // there's no pool, so we don't need a real one here.
+            // No DATABASE_URL — the best-effort audit write fails without
+            // a pool and the action still succeeds, so we don't need a
+            // real one here.
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }
@@ -9605,7 +9612,7 @@ mod tests {
     mod trigger_with_config_writes_config_keys_to_audit {
         use std::collections::HashMap;
 
-        use lakehouse_store::audit::{AuditFilter, list};
+        use lakehouse_store::audit::{AuditFilter, AuditScope, list};
 
         use super::super::*;
         // The shared `tests`-level fixture, reached through `super`
@@ -9691,7 +9698,9 @@ mod tests {
                     resource_id: Some("silver_rebuild".to_owned()),
                     principal_id: None,
                     since: None,
+                    ..AuditFilter::default()
                 },
+                &AuditScope::All,
             )
             .await
             .expect("audit list");

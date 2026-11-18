@@ -16,6 +16,7 @@ import {
   LoadingSkeleton,
 } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useDataTable } from "@/hooks/use-data-table"
@@ -420,7 +421,11 @@ export function ApprovalsPage() {
         confirming={deciding}
         onConfirm={confirmDecision}
       >
+        <Label htmlFor="approval-comment" className="text-xs">
+          Comment <span className="font-normal text-muted-foreground">(optional)</span>
+        </Label>
         <Textarea
+          id="approval-comment"
           value={comment}
           onChange={(e) => setComment(e.target.value)}
           placeholder="Optional comment for the audit trail"

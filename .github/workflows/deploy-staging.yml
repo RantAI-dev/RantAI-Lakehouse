@@ -117,7 +117,9 @@ jobs:
           missing=""
           for name in AUTH_BOOTSTRAP_PASSWORD AGENT_RUN_TOKEN GOLD_EXPORT_RUN_TOKEN \
                       INGEST_SERVICE_TOKEN ALERTS_RUN_TOKEN PIPELINE_RUN_TOKEN \
-                      LAKEHOUSE_MAINTENANCE_TOKEN EMBED_SECRET CONNECTOR_SECRETS_KEY; do
+                      LAKEHOUSE_MAINTENANCE_TOKEN EMBED_SECRET CONNECTOR_SECRETS_KEY \
+                      KEYCLOAK_ADMIN_PASSWORD OIDC_CLIENT_SECRET \
+                      SSO_USER_A_PASSWORD SSO_USER_B_PASSWORD SSO_USER_C_PASSWORD; do
             var="STAGING_${name}"
             value="${!var}"
             if [ -z "$value" ]; then
@@ -135,6 +137,85 @@ jobs:
           # here: without the repo secret PDF export is simply not set up on staging.
           printf '\nRENDER_TOKEN_SECRET=%s\n' "$STAGING_RENDER_TOKEN_SECRET" >> .env
           printf '\nCONSOLE_INTERNAL_URL=%s\n' 'http://lakehouse-frontend:3000' >> .env
+          # ── Single sign-on (Keycloak) ─────────────────────────────────────
+          # The staging deployment signs in through the Keycloak this workflow
+          # starts (`ops/sso/docker-compose.staging-keycloak.override.yml`).
+          #
+          # The ADDRESS is not a secret and not in the repository: it is this
+          # deployment's own address, and `AGENTS.md` rule 12 keeps real
+          # hostnames, IPs and ports out of the code and the docs. It comes
+          # from the `staging` environment's variable `SSO_PUBLIC_BASE_URL`.
+          # It is required, not optional: without it the stack would come up
+          # with SSO silently off, and the next person would read "the login
+          # button is missing" as a bug in the console instead of a missing
+          # address here. Fail closed instead.
+          if [ -z "$SSO_PUBLIC_BASE_URL" ]; then
+            echo "::error::the staging environment variable SSO_PUBLIC_BASE_URL is not set (Settings > Environments > staging > Configuration variables); it is the address the browser reaches Keycloak on"
+            exit 1
+          fi
+          # The realm's name is the last segment of the issuer
+          # (`{base}/realms/{realm}`), and the API compares a token's `iss`
+          # with the configured issuer byte for byte -- so the realm, the
+          # issuer and Keycloak's own hostname are all built from this one
+          # value.
+          sso_realm="${SSO_REALM:-lakehouse}"
+          sso_issuer="${SSO_PUBLIC_BASE_URL%/}/realms/${sso_realm}"
+          # The console's own address is where the browser comes back to, and
+          # the session cookie is set on THAT origin -- so the callback is
+          # the console's address, not the API's. The console proxies
+          # `/api/*` to the API (`next.config.ts`'s rewrites), so the callback
+          # reaches the API through the same origin the person signed in on.
+          sso_console="${SSO_CONSOLE_URL:-${SSO_PUBLIC_BASE_URL%/}}"
+          sso_redirect="${sso_console%/}/api/auth/oidc/callback"
+          # Every setting the browser flow needs is written here, because the
+          # console's own SSO form refuses an issuer that is not `https://`
+          # and an address that resolves inside the deployment's network
+          # (the SSRF guard) -- see "Internal IdP via .env" in
+          # docs/OPERATIONS.md. Staging is plain HTTP on the office LAN, so
+          # the connection is owned by the environment.
+          for name in OIDC_ISSUER OIDC_CLIENT_ID OIDC_PROVIDER_NAME \
+                      OIDC_AUTHORIZE_URL OIDC_TOKEN_URL OIDC_JWKS_URL \
+                      OIDC_REDIRECT_URI OIDC_GROUPS_CLAIM OIDC_ROLE_MAP \
+                      OIDC_JIT_PROVISIONING OIDC_TRUST_EMAIL OIDC_PROMPT \
+                      OIDC_POST_LOGOUT_REDIRECT_URI \
+                      SSO_PUBLIC_BASE_URL SSO_REALM; do
+            sed -i "/^${name}=/d" .env
+          done
+          {
+            printf '\nSSO_PUBLIC_BASE_URL=%s\n' "$SSO_PUBLIC_BASE_URL"
+            printf 'SSO_REALM=%s\n' "$sso_realm"
+            printf 'OIDC_ISSUER=%s\n' "$sso_issuer"
+            printf 'OIDC_CLIENT_ID=lakehouse\n'
+            printf 'OIDC_PROVIDER_NAME=keycloak\n'
+            printf 'OIDC_AUTHORIZE_URL=%s/protocol/openid-connect/auth\n' "$sso_issuer"
+            printf 'OIDC_TOKEN_URL=%s/protocol/openid-connect/token\n' "$sso_issuer"
+            # Not `{issuer}/.well-known/jwks.json`: Keycloak publishes its
+            # keys at the discovery document's `jwks_uri`.
+            printf 'OIDC_JWKS_URL=%s/protocol/openid-connect/certs\n' "$sso_issuer"
+            printf 'OIDC_REDIRECT_URI=%s\n' "$sso_redirect"
+            printf 'OIDC_GROUPS_CLAIM=groups\n'
+            # The two groups the realm's mapper emits (bare names, because the
+            # mapper runs with full.path=false) and the roles they map to.
+            printf 'OIDC_ROLE_MAP=analysts=Analyst,lakehouse-admins=Platform Admin\n'
+            # First sign-in creates the local account: the realm's users have
+            # no `auth_identity` row in the API's database.
+            printf 'OIDC_JIT_PROVISIONING=true\n'
+            # The provider confirms the email address (`email_verified`), so
+            # the safer default stays: a sign-in never joins an existing
+            # account on an unconfirmed address.
+            printf 'OIDC_TRUST_EMAIL=false\n'
+            # The provider shows its login form on every sign-in, so the
+            # account is the person's choice: without it, "sign out, then
+            # sign in" lands on whoever used that browser last, because the
+            # provider still holds the session it created for it.
+            printf 'OIDC_PROMPT=login\n'
+            # Where the provider sends the browser back to after the sign-out
+            # ends the provider's session too. The provider refuses a
+            # logout whose return address it does not know, so the realm's
+            # client carries the same address (the realm renderer injects
+            # it).
+            printf 'OIDC_POST_LOGOUT_REDIRECT_URI=%s/login\n' "$sso_console"
+          } >> .env
           if [ -n "$missing" ]; then
             echo "::error::staging secrets not set:$missing (Settings > Secrets and variables > Actions)"
             exit 1
@@ -159,15 +240,40 @@ jobs:
           STAGING_CONNECTOR_SECRETS_KEY: ${{ secrets.STAGING_CONNECTOR_SECRETS_KEY }}
           STAGING_EMBED_SECRET: ${{ secrets.STAGING_EMBED_SECRET }}
           STAGING_RENDER_TOKEN_SECRET: ${{ secrets.STAGING_RENDER_TOKEN_SECRET }}
+          # Single sign-on: the provider's admin password, the confidential
+          # client's secret (the same value the realm renderer injects), and
+          # the three test users' passwords. All required: the realm renderer
+          # refuses to render a realm without them, and compose refuses to
+          # start the provider without its admin password.
+          STAGING_KEYCLOAK_ADMIN_PASSWORD: ${{ secrets.STAGING_KEYCLOAK_ADMIN_PASSWORD }}
+          STAGING_OIDC_CLIENT_SECRET: ${{ secrets.STAGING_OIDC_CLIENT_SECRET }}
+          STAGING_SSO_USER_A_PASSWORD: ${{ secrets.STAGING_SSO_USER_A_PASSWORD }}
+          STAGING_SSO_USER_B_PASSWORD: ${{ secrets.STAGING_SSO_USER_B_PASSWORD }}
+          STAGING_SSO_USER_C_PASSWORD: ${{ secrets.STAGING_SSO_USER_C_PASSWORD }}
+          # The address the browser reaches Keycloak on (not a secret; it is
+          # an environment variable, not a repository secret).
+          SSO_PUBLIC_BASE_URL: ${{ vars.SSO_PUBLIC_BASE_URL }}
+          # The console's own address, when it differs from the provider's
+          # (the callback returns to the console's origin, so the session
+          # cookie is set where the person signed in).
+          SSO_CONSOLE_URL: ${{ vars.SSO_CONSOLE_URL }}
+          SSO_REALM: ${{ vars.SSO_REALM }}
 
-      - name: Build & start backend stack (core + seaweedfs + dagster + trino)
+      - name: Build & start backend stack (core + seaweedfs + dagster + trino + sso)
         working-directory: ${{ github.workspace }}
         # Retry: transient registry/PyPI flakes fail the whole compose build;
         # each retry reuses BuildKit layer cache, so a re-attempt is cheap.
+        #
+        # `-f docker-compose.yml` is named explicitly because `-f` REPLACES
+        # the default file list; the second `-f` is the Keycloak the staging
+        # deployment signs in through (its own services, its own profile).
         run: |
           for attempt in 1 2 3; do
             echo "=== compose up attempt ${attempt}/3 ==="
             if scripts/compose.sh \
+              -f docker-compose.yml \
+              -f ops/sso/docker-compose.staging-keycloak.override.yml \
+              --profile sso \
               --profile seaweedfs \
               --profile dagster \
               --profile trino \
@@ -192,6 +298,30 @@ jobs:
           echo "::error::lakehouse-api did not become healthy"
           exit 1
 
+      # The provider answers a browser, not the API: the API fetches the key
+      # set lazily on the first sign-in, so it is up before Keycloak is. This
+      # step waits for the realm's discovery document, which is the address
+      # the sign-in flow starts from -- a provider that never publishes it
+      # (a wrong `KC_HOSTNAME`, an import that failed) is a deploy failure,
+      # not something to discover at the login form.
+      - name: Health-check Keycloak (the SSO provider)
+        env:
+          SSO_PUBLIC_BASE_URL: ${{ vars.SSO_PUBLIC_BASE_URL }}
+          SSO_REALM: ${{ vars.SSO_REALM }}
+        run: |
+          realm="${SSO_REALM:-lakehouse}"
+          discovery="${SSO_PUBLIC_BASE_URL%/}/realms/${realm}/.well-known/openid-configuration"
+          for i in $(seq 1 60); do
+            if curl -sf "$discovery" > /dev/null; then
+              echo "keycloak discovery reachable"
+              exit 0
+            fi
+            echo "waiting for keycloak ... ${i}/60"
+            sleep 5
+          done
+          echo "::error::keycloak did not publish its discovery document at ${discovery}"
+          exit 1
+
       # Postgres gets its 20 migrations from the API entrypoint, but
       # ClickHouse has no equivalent - without this step every analytics
       # page (and the builtin BI dashboards) query tables that don't
@@ -204,8 +334,16 @@ jobs:
 
       - name: Build frontend image
         working-directory: ${{ github.workspace }}
+        # `NEXT_PUBLIC_SSO_ENABLED` is a BUILD-time flag: the login page
+        # renders the SSO button only when it is baked into the bundle
+        # (`src/features/auth/login-page.tsx`). The value is read from the
+        # `.env` this deploy wrote, so the standalone image and the compose
+        # `console` service (which reads the same variable through its build
+        # args) agree on one flag.
         run: |
-          docker build -f Dockerfile.frontend -t lakehouse-frontend:staging .
+          sso_flag="$(sed -n 's/^NEXT_PUBLIC_SSO_ENABLED=//p' .env | tail -n 1)"
+          docker build -f Dockerfile.frontend -t lakehouse-frontend:staging \
+            --build-arg NEXT_PUBLIC_SSO_ENABLED="$sso_flag" .
         timeout-minutes: 20
 
       - name: Deploy frontend

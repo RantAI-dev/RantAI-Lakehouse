@@ -86,7 +86,8 @@
 //! alongside these table entries rather than gating them behind a token
 //! nothing can hold:
 //!
-//! * `agent:manage` (`/api/agents/employees/{id}/{suspend,resume,revoke}`)
+//! * `agent:manage` (`POST /api/agents/employees` and
+//!   `/api/agents/employees/{id}/{suspend,resume,revoke}`)
 //!   — same `agent` resource family as Approver's seeded `agent:approve`,
 //!   but a different action: lifecycle control of the employee identity
 //!   itself (a kill switch), not approving one action it proposed.
@@ -148,7 +149,7 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY fourteen routes in the whole service. (Was "six" —
+    // ── Public: the ONLY seventeen routes in the whole service. (Was "six" —
     // corrected when the seventh was added, since Task A5's
     // `/api/auth/oidc/callback` had already made the old count stale; the
     // eighth is `POST /api/embed/frame`, SEC-12; the ninth is
@@ -157,7 +158,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // `POST /api/public/dashboard/{token}/unlock` (BI-19 part A); the twelfth
     // and the thirteenth are the public link's and the embed's map boundary
     // route, `PR #246 review BLOCKER 1`; the fourteenth is the readiness
-    // probe, REL-2 decision D7.) ───────────────────────────────────────────
+    // probe, REL-2 decision D7; the fifteenth is the password rules, ADM-11
+    // D4; the sixteenth and the seventeenth are the workspace's name and
+    // pictures, ADM-2 decision 5.) ───────────────────────────────────────────
     ("GET",  "/health",                          Policy::Public),
     // REL-2 (D7): the readiness probe an installer or an updater waits on.
     // Public because it answers only whether this stack is ready — three
@@ -194,6 +197,18 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/embed/maps/{id}/geojson",      Policy::Public),
     ("POST", "/api/auth/login",                   Policy::Public),
     ("GET",  "/api/auth/password-rules",          Policy::Public),
+    // Unauthenticated by necessity — the sign-in page shows the workspace's
+    // name and logo before any session exists. It exposes the name and each
+    // picture's type and version only (`routes::settings::get_branding`),
+    // never who saved them or when, and no other settings row.
+    ("GET",  "/api/branding",                     Policy::Public),
+    // Unauthenticated by necessity — the same page loads the pictures the
+    // answer above points to. It serves one stored picture of a fixed kind
+    // (`logo`, `logo-dark` or `icon`): a kind outside that list is a 400 and
+    // a kind inside it that was never set is a 404 (`routes::settings`).
+    // The picture is an inert file: `nosniff`, a sandboxing CSP and
+    // `inline`. Nothing else is reachable through it.
+    ("GET",  "/api/branding/images/{kind}",       Policy::Public),
     // Redirect-only, grants nothing — it only ever
     // 302s to a fixed, config-sourced IdP URL and sets a single-use flow
     // cookie. Mirrors `/api/auth/login`'s existing `Policy::Public`.
@@ -339,10 +354,30 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/ops/{kind}",                    Policy::RequiresPermission("ops:read")),
     ("POST", "/api/ops/workloads/{id}/cancel",     Policy::RequiresPermission("workload:cancel")),
 
+    // ── Usage (OPS-8 part B): the sums of recorded runs, their CSV file and
+    //    the rates behind the estimate. `usage:read` opens every read;
+    //    entering a rate changes what every estimate says, so it is a
+    //    settings change (`settings:write`), like the reporting settings. ──
+    ("GET",  "/api/usage/queries",                 Policy::RequiresPermission("usage:read")),
+    ("GET",  "/api/usage/queries/export",          Policy::RequiresPermission("usage:read")),
+    ("GET",  "/api/usage/rates",                   Policy::RequiresPermission("usage:read")),
+    ("POST", "/api/usage/rates",                   Policy::RequiresPermission("settings:write")),
+    // OPS-8 part C: the size of every layer. `usage:read` opens the route;
+    // the `*:*` check is in the handler, because the refusal there is about
+    // the data (a layer holds every tenant's tables), not about a
+    // permission the console could ask for.
+    ("GET",  "/api/usage/storage",                 Policy::RequiresPermission("usage:read")),
+
     // ── Governance: seeded `policy:*` / `lineage:read`. `{kind}` (quality,
     //    classification, audit, residency) has the same fan-out problem as
     //    ops — auth only for that one. ────────────────────────────────────
     ("GET",  "/api/governance/lineage",   Policy::RequiresPermission("lineage:read")),
+    // GOV-1 part B: the audit trail's search, one event and export. Each is its
+    // own route with `audit:read` and nothing else, so `governance:read`,
+    // which every role holds, opens none of them (feature page Decision 9).
+    ("GET",  "/api/governance/audit/events", Policy::RequiresPermission("audit:read")),
+    ("GET",  "/api/governance/audit/events/{id}", Policy::RequiresPermission("audit:read")),
+    ("GET",  "/api/governance/audit/export.csv", Policy::RequiresPermission("audit:read")),
     // DATA-13: column-level lineage reads the same records' lineage, so the
     // same permission; charts and dashboards in the answer are listed only
     // to `dashboard:read` inside the handler.
@@ -858,6 +893,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/settings/assistant",    Policy::RequiresPermission("settings:write")),
     ("PUT",    "/api/settings/assistant",    Policy::RequiresPermission("settings:write")),
     ("POST",   "/api/settings/assistant/test", Policy::RequiresPermission("settings:write")),
+    // ── The workspace's name, logo, dark-mode logo and icon (`ADM-2`,
+    //    `routes::settings`). The public side of them is `GET /api/branding`
+    //    in the Public block above; reading the admin view, saving, removing
+    //    a picture and resetting all need `settings:write`. ─────────────────
+    ("GET",    "/api/settings/general",      Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/general",      Policy::RequiresPermission("settings:write")),
+    ("DELETE", "/api/settings/general",      Policy::RequiresPermission("settings:write")),
+    ("PUT",    "/api/settings/general/images/{kind}", Policy::RequiresPermission("settings:write")),
+    ("DELETE", "/api/settings/general/images/{kind}", Policy::RequiresPermission("settings:write")),
     // ── Single sign-on (`ADM-12`, `routes::settings`): issuer, client ID,
     //    client secret, provider name, groups claim, role map, and JIT.
     //    Reading needs `settings:write` (plan D5); saving and testing also
@@ -1170,7 +1214,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/agents/workflows",                Policy::RequiresAuth),
     ("POST", "/api/agents/workflows",                Policy::RequiresAuth),
     ("GET",  "/api/agents/employees",                Policy::RequiresAuth),
-    ("POST", "/api/agents/employees",                Policy::RequiresAuth),
+    // SEC-20, plan 97: a scheduled run takes its permissions from the
+    // employee's own column and needs no `agent:manage`, so creating one is
+    // the gate (the handler also caps its permissions at the creator's).
+    ("POST", "/api/agents/employees",                Policy::RequiresPermission("agent:manage")),
     ("GET",  "/api/agents/employees/{id}",           Policy::RequiresAuth),
     ("POST", "/api/agents/employees/{id}/suspend",   Policy::RequiresPermission("agent:manage")),
     ("POST", "/api/agents/employees/{id}/resume",    Policy::RequiresPermission("agent:manage")),
@@ -1291,6 +1338,12 @@ fn allowed_while_must_change_password(method: &str, path: &str) -> bool {
         .any(|(m, p)| *m == method && *p == path)
 }
 
+/// What a principal that still has to rotate its password is told by every
+/// route outside [`ALLOWED_WHILE_MUST_CHANGE_PASSWORD`] (and what its audited
+/// refusal row says).
+const PASSWORD_ROTATION_REQUIRED: &str =
+    "password rotation required before this route is reachable";
+
 /// The one middleware layered onto the whole router (`routes::router`).
 /// Looks up [`POLICY_TABLE`] for the request's matched route and either
 /// lets it through (`Policy::Public`), requires and checks a
@@ -1347,23 +1400,38 @@ pub async fn auth_gate(
             let (mut parts, body) = req.into_parts();
             let AuthenticatedPrincipal(principal) =
                 AuthenticatedPrincipal::from_request_parts(&mut parts, &state).await?;
-            if let Policy::RequiresPermission(permission) = policy
-                && !principal.has(permission)
-            {
-                return Err(ApiError::PermissionDenied(permission.to_owned()).into());
-            }
-            if let Policy::RequiresAnyPermission(permissions) = policy
-                && !permissions.iter().any(|perm| principal.has(perm))
-            {
-                return Err(ApiError::PermissionDenied(permissions.join(", ")).into());
-            }
-            if principal.must_change_password
-                && !allowed_while_must_change_password(&method, matched_path.as_str())
-            {
-                return Err(ApiError::PermissionDenied(
-                    "password rotation required before this route is reachable".to_owned(),
+            // `GOV-1`: a refusal below is audited before it is returned (the
+            // handler never runs, so nothing else would). A 401 above is not:
+            // nobody is signed in.
+            let refusal = match policy {
+                Policy::RequiresPermission(permission) if !principal.has(permission) => {
+                    Some(permission.to_owned())
+                }
+                Policy::RequiresAnyPermission(permissions)
+                    if !permissions.iter().any(|perm| principal.has(perm)) =>
+                {
+                    Some(permissions.join(", "))
+                }
+                _ if principal.must_change_password
+                    && !allowed_while_must_change_password(&method, matched_path.as_str()) =>
+                {
+                    Some(PASSWORD_ROTATION_REQUIRED.to_owned())
+                }
+                _ => None,
+            };
+            if let Some(detail) = refusal {
+                let params = crate::audit_coverage::path_params(&mut parts).await;
+                crate::audit_coverage::record_gate_refusal(
+                    &state,
+                    &principal,
+                    &method,
+                    matched_path.as_str(),
+                    &params,
+                    parts.uri.query(),
+                    &detail,
                 )
-                .into());
+                .await;
+                return Err(ApiError::PermissionDenied(detail).into());
             }
             parts.extensions.insert(principal);
             let req = Request::from_parts(parts, body);
@@ -1554,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_fifteen_public_entries_exist() {
+    fn exactly_seventeen_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -1580,7 +1648,10 @@ mod tests {
         // REL-2 decision D7 added `GET /health/ready`, the readiness probe an
         // installer or an updater waits on: 13 -> 14.
         // ADM-11 (D4) / ADM-11 review 1 B3 added `GET /api/auth/password-rules`: 14 -> 15.
-        assert_eq!(public_count, 15);
+        // ADM-2 (decision 5) added `GET /api/branding` and
+        // `GET /api/branding/images/{kind}`, the workspace's name and pictures
+        // for the sign-in page: 15 -> 17.
+        assert_eq!(public_count, 17);
     }
 
     /// SEC-23 (F1), ADM-13 (D5): adding a governance rule needs `governance:write`;

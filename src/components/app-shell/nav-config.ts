@@ -23,6 +23,8 @@ import {
   type LucideIcon,
 } from "lucide-react"
 
+import { PRODUCT_NAME } from "@/lib/product-branding"
+
 export type NavItem = {
   title: string
   href: string
@@ -163,8 +165,12 @@ export const NAV_GROUPS: NavGroup[] = [
       // redirect to `/health#<section>`.
       { title: "System status", href: "/health", icon: HeartPulse, requires: ["ops:read"] },
       { title: "Alerts", href: "/alerts", icon: BellRing, requires: ["alert:read", "alert:write"] },
-      // ADM-13 review round 1, S4: governance:read only
-      { title: "Audit Log", href: "/audit", icon: FileText, requires: ["governance:read"] },
+      // GOV-1 Decision 9: the API answers 403 on `GET /api/governance/audit`
+      // without `audit:read`, so the menu follows it (every role holds
+      // `governance:read`, only Governance Admin holds `audit:read`).
+      { title: "Audit Log", href: "/audit", icon: FileText, requires: ["audit:read"] },
+      // OPS-8 part B: `GET /api/usage/queries` answers 403 without `usage:read`.
+      { title: "Usage", href: "/usage", icon: BarChart3, requires: ["usage:read"] },
     ],
   },
   {
@@ -255,14 +261,19 @@ export function activeNavHref(pathname: string): string | undefined {
 
 /**
  * Resolves the product page title for a pathname by longest matching href.
- * Secondary routes win over their parent nav item. Falls back to "Rantai Lake".
+ * Secondary routes win over their parent nav item. A path no item names
+ * falls back to `fallback`: the workspace's own name (`ADM-2` decision 13),
+ * or the product's own name when the caller passes none.
+ *
+ * The function stays pure: the fallback comes in as an argument, never from
+ * a hook inside it, so the caller decides whose name it is.
  */
-export function pageTitleFor(pathname: string): string {
+export function pageTitleFor(pathname: string, fallback: string = PRODUCT_NAME): string {
   const match = bestMatch(pathname, [
     ...SECONDARY_ROUTES,
     ...ALL_NAV_ITEMS.map(({ title, href }) => ({ title, href })),
   ])
-  return match?.title ?? "Rantai Lake"
+  return match?.title ?? fallback
 }
 
 export type RouteAccessEntry = {
@@ -338,13 +349,15 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   // (`POST /api/governance/quality`).
   { pattern: "/governance/data-quality/rules/new", requires: ["governance:write"] },
   { pattern: "/governance/approvals", requires: ["access:approve", "agent:approve"] },
-  // ADM-13 review round 1, S4: governance:read only
-  { pattern: "/audit", requires: ["governance:read"] },
+  // GOV-1 Decision 9: same permission as the API's audit list.
+  { pattern: "/audit", requires: ["audit:read"] },
   { pattern: "/lineage", requires: ["lineage:read"] },
 
   // Monitoring
   { pattern: "/health", requires: ["ops:read"] },
   { pattern: "/alerts", requires: ["alert:read", "alert:write"] },
+  // OPS-8 part B: same permission as the API's usage reads.
+  { pattern: "/usage", requires: ["usage:read"] },
   // WEB-7 D2/D7: the rule form left the list's dialog. `POST`/`PUT
   // /api/alerts` are `RequiresAuth` with the handler deciding (an owner's own
   // chart alert needs no `alert:write`, `policy.rs:424`); this page builds the

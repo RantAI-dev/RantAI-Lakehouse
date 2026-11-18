@@ -353,6 +353,12 @@ pub async fn profile(
     if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
         return Ok(unsupported(reason));
     }
+    // `SEC-20` (plan 95): an upload another tenant holds answers the same 404
+    // an unknown id answers, decided from the registry's own key before a
+    // source is resolved, so a deployment where no table is readable behind it
+    // does not answer "no readable table" for it and "not found" for an
+    // unknown id.
+    crate::routes::catalog::ensure_asset_in_reach(&state, &principal, &headers, &id).await?;
     let Some(source) = resolve_source(&state, &id).await? else {
         return Ok(unsupported(
             "No readable table backs this asset yet: no ClickHouse table, and no Iceberg \

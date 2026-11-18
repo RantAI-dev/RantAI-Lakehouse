@@ -43,6 +43,10 @@ from dispar_orchestrate.replication_metrics import (
     replication_slot_check_job,
     replication_slot_check_schedule,
 )
+from dispar_orchestrate.storage_snapshot import (
+    storage_snapshot_job,
+    storage_snapshot_schedule,
+)
 
 # P4 adds `bronze_maintenance_job` (+ its daily schedule), P5 adds
 # `replication_slot_check_job` (R5's slot-lag/WAL-retention metrics), ADR
@@ -66,6 +70,11 @@ from dispar_orchestrate.replication_metrics import (
 # measurement, into the SAME code location for the same ADR 0005 reason —
 # see `capacity_snapshot.py`'s module doc for its own design and the
 # schema-ownership split with `bronze_catalog.py`.
+#
+# `storage_snapshot_job` (+ its daily schedule) adds OPS-8 part C's
+# per-layer storage measurement, into the SAME code location for the same
+# ADR 0005 reason — see `storage_snapshot.py`'s module doc for its own
+# design and the schema-ownership split with `bronze_catalog.py`.
 #
 # WS4 items E1/E3/E4 add `authored_jobs`: one real `authored__<id>` job per
 # console-authored pipeline in status `ready` or `paused`, built from
@@ -107,6 +116,7 @@ defs = Definitions(
         agent_run_job,
         alerts_run_job,
         capacity_snapshot_job,
+        storage_snapshot_job,
         ingest_job,
         # SRC-4 slice 2: writes a change-capture connector's topics to Bronze.
         cdc_apply_job,
@@ -120,6 +130,7 @@ defs = Definitions(
         alerts_run_schedule,
         *agent_run_schedules,
         capacity_snapshot_schedule,
+        storage_snapshot_schedule,
         gold_export_schedule,
         *authored_schedules,
     ],
