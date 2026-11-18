@@ -34,11 +34,11 @@ definition for.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | A metric's formula is written in the product's formula language (`BI-8`) and must be an aggregate | Planner default | Owner to confirm at QA |
-| 2 | A metric's own filters apply only to that metric's number, so a chart can show a filtered metric beside an unfiltered measure | Planner default | Owner to confirm at QA |
-| 3 | Defining and changing metrics and segments needs a new permission, `metric:write`; using them needs only to see the dashboard | Planner default | Owner to confirm at QA |
-| 4 | A metric or segment in use cannot be deleted; changing a metric shows the charts that use it first and then applies to all of them at once | Planner default | Owner to confirm at QA |
-| 5 | The built-in metric cards from the deployment file stay as they are | Planner default | Owner to confirm at QA |
+| 1 | A metric's formula is written in the product's formula language (`BI-8`) and must be an aggregate | Planner default | Owner, 2026-11-13 |
+| 2 | A metric's own filters apply only to that metric's number, so a chart can show a filtered metric beside an unfiltered measure | Planner default | Owner, 2026-11-13 |
+| 3 | Defining and changing metrics and segments needs a new permission, `metric:write`; using them needs only to see the dashboard | Planner default | Owner, 2026-11-13 |
+| 4 | A metric or segment in use cannot be deleted; changing a metric shows the charts that use it first and then applies to all of them at once | Planner default | Owner, 2026-11-13 |
+| 5 | The built-in metric cards from the deployment file stay as they are | Planner default | Owner, 2026-11-13 |
 | 6 | The assistant prefers a named metric when one matches the question and names it in its answer; when none matches it says so before writing a query | Spec (`AI-7`) | 2026-10-11 |
 
 ## Limits to tell a customer

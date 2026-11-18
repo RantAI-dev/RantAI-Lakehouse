@@ -32,11 +32,11 @@ needs a SQL source written by someone who may write SQL.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Up to five tables in one chart | Spec *(proposed)* | Owner to confirm at QA |
-| 2 | The join belongs to the chart, not to a shared dataset | Planner default (Metabase) | Owner to confirm at QA |
-| 3 | A joined column is shown as `table.column`; when a table is joined twice the second gets a number | Planner default | Owner to confirm at QA |
-| 4 | A join the database refuses for size is reported as such on the tile; nothing is silently cut | Planner default | Owner to confirm at QA |
-| 5 | The builder warns, without blocking, when the chosen pairs do not include a key of the joined table, because rows will multiply | Planner default | Owner to confirm at QA |
+| 1 | Up to five tables in one chart | Spec *(proposed)* | Owner, 2026-11-13 |
+| 2 | The join belongs to the chart, not to a shared dataset | Planner default (Metabase) | Owner, 2026-11-13 |
+| 3 | A joined column is shown as `table.column`; when a table is joined twice the second gets a number | Planner default | Owner, 2026-11-13 |
+| 4 | A join the database refuses for size is reported as such on the tile; nothing is silently cut | Planner default | Owner, 2026-11-13 |
+| 5 | The builder warns, without blocking, when the chosen pairs do not include a key of the joined table, because rows will multiply | Planner default | Owner, 2026-11-13 |
 
 ## Limits to tell a customer
 

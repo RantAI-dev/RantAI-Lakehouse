@@ -220,13 +220,24 @@ pub struct CreateEmployeeBody {
 /// exactly the gap [`VALID_MODE`] closes here, the same way [`VALID_AUTONOMY`]
 /// already does for `autonomy`.
 ///
+/// # The permissions never exceed the creator's (`SEC-20`, plan 97)
+///
+/// A scheduled run takes its [`PermissionSet`] from the employee's own
+/// `permissions` column and needs no `agent:manage`, so an employee holding
+/// more than its creator would let the creator read what their own roles do
+/// not allow. The route needs `agent:manage` (`POLICY_TABLE`), and
+/// [`check_permission_ceiling`] refuses every permission the creator does not
+/// hold, `*:*` included.
+///
 /// # Errors
 ///
 /// 400 on a malformed body, a blank required field, an unrecognized
-/// `autonomy`, or an unrecognized `mode`; 409 if the name is taken;
-/// 503/500 as above.
+/// `autonomy`, an unrecognized `mode`, or a `permissions` token that is not
+/// `resource:action`; 403 when `permissions` names one the creator does not
+/// hold; 409 if the name is taken; 503/500 as above.
 pub async fn create_employee(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<DigitalEmployee>)> {
     let body: CreateEmployeeBody = parse_body(&body)?;
@@ -245,6 +256,7 @@ pub async fn create_employee(
         ))
         .into());
     }
+    check_permission_ceiling(&principal, body.permissions.as_deref())?;
     let input = CreateEmployeeInput {
         name: required("name", &body.name)?,
         purpose: required("purpose", &body.purpose)?,
@@ -260,6 +272,41 @@ pub async fn create_employee(
     };
     let created = agents::create_employee(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
+}
+
+/// `SEC-20`, plan 97: refuses a `permissions` value that grants more than
+/// `creator` holds.
+///
+/// Walks the tokens [`PermissionSet::parse`] yields, because a run parses the
+/// stored column the same way. A non-blank token that does not parse as
+/// `resource:action` would grant nothing when parsed and so slip past this
+/// check unseen; it is refused with a 400 instead of being stored, which keeps
+/// the stored string equal to what was checked. [`PermissionSet::has`] answers
+/// per token, so `*:*` and `resource:*` pass only for a creator whose own
+/// grant is as wide.
+///
+/// # Errors
+///
+/// 400 for a token that is not `resource:action`; 403 naming the first
+/// permission `creator` does not hold. The name comes from the request.
+fn check_permission_ceiling(creator: &Principal, asked: Option<&str>) -> Result<(), ApiError> {
+    for token in asked.unwrap_or("").split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some(permission) = PermissionSet::parse(token).as_strings().pop() else {
+            return Err(ApiError::BadRequest(
+                "permissions must be comma-separated resource:action pairs".to_owned(),
+            ));
+        };
+        if !creator.permissions.has(&permission) {
+            return Err(ApiError::PermissionDenied(format!(
+                "you cannot give an employee the permission {permission}, which you do not hold"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn map_transition_result(
@@ -810,7 +857,10 @@ pub async fn decide_approval(
         approval.resource.as_deref(),
         &json!({}),
         if ok { "executed" } else { "failed" },
-        None,
+        // The browser's copy of the failure, the fixed sentence and the
+        // reference (plan 111): the row says why the call failed, and the
+        // engine's own text stays out of the audit trail.
+        shown.get("error").and_then(Value::as_str),
         Some(&run_id),
         Some(&id),
     )
@@ -937,8 +987,7 @@ fn check_employee_run_auth(
 
 /// The headless loop's own iteration cap — same value as `routes::ai`'s
 /// `MAX_ITER` (kept as an independent constant rather than importing that
-/// private one: see the module doc comment on why this route cannot reach
-/// into `routes::ai::gate`).
+/// private one: `routes::ai` keeps it to itself).
 const MAX_HEADLESS_ITER: u32 = 8;
 
 /// How one headless run's tool-calling loop ended.
@@ -1168,7 +1217,7 @@ async fn run_headless_loop(
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line reimplementation of routes::ai::chat's own tool-calling loop \
-              plus the three gate checks routes::ai::gate keeps private; splitting it up would \
+              plus the three gate checks a headless run reimplements; splitting it up would \
               scatter one sequential loop across helpers with no independent reuse, matching \
               routes::ai::chat's own identical justification"
 )]
@@ -1432,8 +1481,8 @@ async fn run_headless_loop_inner(
 
             // Ask-mode gate: identical semantics to `routes::ai::gate::decide`'s
             // first check, reimplemented here rather than called there — see
-            // the module doc comment on why this route cannot reach the
-            // private `routes::ai::gate` module.
+            // the module doc comment on why this route reimplements the
+            // gate's checks itself.
             if !is_build && is_write {
                 step_no += 1;
                 let detail = format!(
@@ -1550,8 +1599,13 @@ async fn run_headless_loop_inner(
                         tool: spec.name,
                         resource: resource_id.as_deref(),
                         reason: &reason,
-                        risk: "High-risk action (WriteHigh): cannot be undone once \
-                               executed.",
+                        // The sentence the chat's approval card shows for
+                        // this tool (`ai_gate::risk_for_write_high`): a
+                        // deleted chart goes to the trash and stays
+                        // restorable, so the generic "cannot be undone"
+                        // text was false on this very card (`AI-1`,
+                        // `GOV-13`).
+                        risk: ai_gate::risk_for_write_high(spec),
                         redacted_args: &redacted,
                         // SEC-57: the approval names the HUMAN who started
                         // this run, when a person started it — so the API
@@ -1655,7 +1709,11 @@ async fn run_headless_loop_inner(
                 resource_id.as_deref(),
                 &Value::Object(args.clone()),
                 if ok { "executed" } else { "failed" },
-                None,
+                // The browser's copy of the failure, the fixed sentence and
+                // the reference (plan 111): the row says why the call
+                // failed, and the engine's own text stays out of the audit
+                // trail.
+                shown.get("error").and_then(Value::as_str),
                 run_id,
                 None,
             )
@@ -1708,17 +1766,20 @@ fn push_tool_result(
 /// # Why this can't just call into `routes::ai`
 ///
 /// `routes::ai::gate` (mode + permission gate, `WriteLow` confirmation,
-/// `WriteHigh` approval creation) is a PRIVATE module of `routes::ai`
-/// (`mod gate;`, not `pub(in crate::routes)`) — only `routes::ai::chat`
-/// and `routes::ai::tool_call` can call it. This handler reimplements the
-/// same three checks (ask-mode refusal, permission-ceiling refusal,
-/// `WriteHigh` → approval) directly in [`run_headless_loop`] rather than
-/// editing that module's visibility, and reuses everything that IS already
-/// shared across `routes::ai`'s sibling modules: [`ai_tools::run_tool`]
-/// (the actual dispatch), [`ai_registry::find`]/[`ai_registry::tool_schemas_for`]
-/// (the tool table), and [`ai_audit::redact`]/[`ai_audit::resource_for`]
-/// (the redaction/resource-inference rules) — never a second, divergent
-/// copy of THOSE.
+/// `WriteHigh` approval creation) is `pub(in crate::routes)`, so a sibling
+/// module of `routes::ai` can call it, and this route reuses its
+/// [`ai_gate::permission_granted`] and [`ai_gate::risk_for_write_high`].
+/// The three checks themselves (ask-mode refusal, permission-ceiling
+/// refusal, `WriteHigh` → approval) are reimplemented directly in
+/// [`run_headless_loop`], because a headless run has no chat turn to
+/// confirm in and creates its own linked approval. Everything that IS
+/// already shared across `routes::ai`'s sibling modules is reused:
+/// [`ai_tools::run_tool`] (the actual dispatch),
+/// [`ai_registry::find`]/[`ai_registry::tool_schemas_for`] (the tool table),
+/// and [`ai_audit::redact`]/[`ai_audit::resource_for`] (the
+/// redaction/resource-inference rules) — never a second, divergent copy of
+/// THOSE. The system prompt's constants are private to `routes::ai`, so the
+/// headless run has a prompt of its own.
 ///
 /// # Auth (see [`check_employee_run_auth`])
 ///
