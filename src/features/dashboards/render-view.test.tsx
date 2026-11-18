@@ -46,6 +46,11 @@ import * as React from "react"
 const { RenderView, NOT_IN_PDF, renderFailure } = await import("./render-view")
 
 const originalFetch = global.fetch
+// `quietImages` changes the window's address and the image-loading setting, which every file of the run shares
+// (one happy-dom window per `bun test` process); both are put back after each test.
+const happyDom = () => (window as unknown as { happyDOM?: { settings: Record<string, unknown>; setURL: (u: string) => void } }).happyDOM
+const originalUrl = window.location.href
+const originalImageLoading = happyDom()?.settings.disableImageLoading
 const flag = () => (window as unknown as { __lakehouseRenderReady?: boolean }).__lakehouseRenderReady
 
 beforeEach(() => {
@@ -58,15 +63,21 @@ afterEach(() => {
   loaders.length = 0
   darks.length = 0
   global.fetch = originalFetch
+  delete (window as unknown as { __lakehouseRenderReady?: boolean }).__lakehouseRenderReady
+  const dom = happyDom()
+  if (dom) {
+    dom.settings.disableImageLoading = originalImageLoading
+    dom.setURL(originalUrl)
+  }
 })
 
 // happy-dom would load (and fail) a real picture the moment it is mounted, which would fire `error`
 // before the test does; the tests fire `load` and `error` themselves.
 function quietImages() {
-  const happyDOM = (window as unknown as { happyDOM?: { settings: Record<string, unknown>; setURL: (u: string) => void } }).happyDOM
-  if (happyDOM) {
-    happyDOM.settings.disableImageLoading = true
-    happyDOM.setURL("http://localhost/")
+  const dom = happyDom()
+  if (dom) {
+    dom.settings.disableImageLoading = true
+    dom.setURL("http://localhost/")
   }
 }
 
