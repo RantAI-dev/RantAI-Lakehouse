@@ -1119,12 +1119,16 @@ async fn the_audit_history_tool_is_refused_without_audit_read_and_answers_the_tr
     let rows = body["result"]["audit"]
         .as_array()
         .unwrap_or_else(|| panic!("an audit array: {body}"));
-    let actions: Vec<&str> = rows
+    let actions: Vec<(&str, &str)> = rows
         .iter()
-        .filter_map(|row| row["action"].as_str())
+        .filter_map(|row| Some((row["action"].as_str()?, row["outcome"].as_str()?)))
         .collect();
-    assert!(
-        actions.contains(&"get_audit_history"),
+    let refused = actions
+        .iter()
+        .filter(|&&(action, outcome)| action == "get_audit_history" && outcome == "refused")
+        .count();
+    assert_eq!(
+        refused, 1,
         "the trail must hold the refused call: {actions:?}"
     );
 }
