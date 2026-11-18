@@ -284,7 +284,11 @@ const WRITE_HIGH_RISK_TRASHED_BOARD: &str = "Tindakan berisiko tinggi (WriteHigh
 /// "tidak dapat dibatalkan" sentence contradicted the reason line on the
 /// same card (`AI-1`). Every other `WriteHigh` tool keeps [`WRITE_HIGH_RISK`]
 /// word for word.
-fn risk_for_write_high(spec: &ToolSpec) -> &'static str {
+///
+/// `pub(in crate::routes)`: the headless agent run (`routes::agents`) stores
+/// the same sentence on the approval it creates, so there is one source for
+/// it (`AGENTS.md` rule 4).
+pub(in crate::routes) fn risk_for_write_high(spec: &ToolSpec) -> &'static str {
     match spec.name {
         "delete_chart" => WRITE_HIGH_RISK_TRASHED_CHART,
         "delete_board" => WRITE_HIGH_RISK_TRASHED_BOARD,

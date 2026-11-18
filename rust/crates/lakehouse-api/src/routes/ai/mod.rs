@@ -17,11 +17,15 @@
 // the shared redact/audit-record helpers, and the SAME tool dispatch
 // (`tools::run_tool`) the chat loop and `POST /api/ai/tool` use, so an
 // approved `WriteHigh` call executes through the identical code path
-// rather than a second, divergent one. `gate` stays private: approval
-// CREATION only ever happens from inside this module's own dispatch.
+// rather than a second, divergent one. `gate` is `pub(in crate::routes)` as
+// well, for the permission and risk helpers a sibling module reuses; the
+// approval CREATION itself only ever happens from inside this module's own
+// dispatch.
 pub(in crate::routes) mod audit;
 mod citations;
-mod data_map;
+// `pub(crate)`: the crate's own surface clears this module's cache for a
+// test that pins the system prompt's bytes (`AI-32`).
+pub(crate) mod data_map;
 pub(in crate::routes) mod gate;
 mod prompt;
 pub(in crate::routes) mod registry;
