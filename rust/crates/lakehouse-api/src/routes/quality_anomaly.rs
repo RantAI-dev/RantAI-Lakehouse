@@ -365,7 +365,9 @@ pub(crate) async fn tick(state: &AppState) {
 /// # Errors
 ///
 /// `400` when the table is not `bronze.`/`silver.`/`serving.` plus a plain
-/// name; `503`/`500` on a store failure.
+/// name; `404` for a table outside the caller's reach (the same sentence a
+/// table the caller may not read gets everywhere else, so the answer says
+/// nothing about the other tenants' tables); `503`/`500` on a store failure.
 pub async fn learning_status(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -383,6 +385,18 @@ pub async fn learning_status(
             "Name the table as bronze.<table>, silver.<table> or serving.<table>.".to_owned(),
         )
     })?;
+    // `SEC-20` (plan ai-118): the learning status of a table is what the
+    // deployment holds about that table, so a table outside the caller's
+    // reach is not there for this caller — the reach Query Studio keeps
+    // (`crate::routes::query::resolve_reach` and
+    // `crate::routes::query::reachable_names`).
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+    let readable = crate::routes::query::reachable_names(&state, reach, &[key.clone()]).await?;
+    if !readable.contains(&key) {
+        return Err(
+            ApiError::NotFound(crate::policy_engine::table_not_available_message(&key)).into(),
+        );
+    }
     let summary = quality::load_summary(pool(&state)?, &key).await?;
     let now = OffsetDateTime::now_utc();
     let (state_now, first, last, loads) = match &summary {

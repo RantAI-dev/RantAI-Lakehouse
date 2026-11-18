@@ -1650,6 +1650,15 @@ fn assert_no_trace_of_the_retail_upload(uri: &str, body: &Value) {
     );
 }
 
+/// The catalog's own tenant's upload is named nowhere in `body`.
+fn assert_no_trace_of_the_group_upload(uri: &str, body: &Value) {
+    let text = body.to_string();
+    assert!(
+        !text.contains(GROUP_TABLE) && !text.contains(GROUP_SLUG),
+        "the owning tenant's upload is named nowhere in {uri}: {body}"
+    );
+}
+
 #[tokio::test]
 async fn the_catalog_list_leaves_out_another_tenants_upload_asset_for_the_owning_tenant() {
     let (_ch, router, owner, operator) = registry_readers().await;
@@ -2105,4 +2114,420 @@ async fn the_classification_tool_holds_only_the_tables_the_person_may_read() {
     for hidden in [GROUP_TABLE, GROUP_SLUG, DATASET_TABLE, DATASET_SLUG] {
         assert!(!text.contains(hidden), "{hidden} must not appear: {listed}");
     }
+}
+
+// ── The quality readers and the agent run history (SEC-20, plan ai-118).
+//
+// The quality pages answer with the rows of every table a job recorded, and
+// the agent run history answers with the runs of the deployment. Both name
+// what another organisation holds, so both answer by the tenant gate: a
+// quality reader keeps the rows of the tables the caller's reach covers, and
+// the run history belongs to the deployment, so only the caller the shared
+// catalog's own rule admits reads it.
+
+/// `ClickHouse` with a quality observation for each of `tables`.
+async fn mount_observed_quality(server: &MockServer, tables: &[&str]) {
+    mount_empty_clickhouse(server).await;
+    let rows: Vec<Value> = tables
+        .iter()
+        .map(|table| {
+            json!({
+                "tabel": format!("bronze.{table}"),
+                "cek": "row_count",
+                "verdict": "warn",
+                "nilai": "10",
+                "at": "2026-11-14 03:00:00",
+            })
+        })
+        .collect();
+    clickhouse_rows(server, "_silver_meta.quality", rows).await;
+}
+
+/// `ClickHouse` with the run history of the rule `id`, which checked `table`.
+async fn mount_the_run_history(server: &MockServer, id: Uuid, table: &str) {
+    clickhouse_rows(
+        server,
+        &format!("rule_id = '{id}'"),
+        vec![json!({
+            "rule_id": id.to_string(),
+            "asset": format!("bronze.{table}"),
+            "status": "failed",
+            "value": "10 rows",
+            "run_by": "schedule",
+            "threshold": ">= 95%",
+            "at": "2026-11-14 03:00:00",
+            "ran_at": "2026-11-14T03:00:00Z",
+        })],
+    )
+    .await;
+}
+
+/// The quality rows of both tenants' upload tables: a rule, an incident, a
+/// schedule and a load each. The two rule ids come back, so a test can ask
+/// for the run history of one of them.
+async fn seed_the_quality_rows(pool: &PgPool) -> (Uuid, Uuid) {
+    let mut rules = Vec::new();
+    for table in [GROUP_TABLE, RETAIL_TABLE] {
+        let asset = format!("bronze.{table}");
+        let (id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO quality_rule (name, asset, dimension, threshold, severity) \
+             VALUES ($1, $2, 'completeness', '>= 95%', 'medium') RETURNING id",
+        )
+        .bind(format!("the rule on {table}"))
+        .bind(&asset)
+        .fetch_one(pool)
+        .await
+        .expect("add the quality rule");
+        rules.push(id);
+        sqlx::query(
+            "INSERT INTO quality_incident (asset, kind, detail) \
+             VALUES ($1, 'volume_anomaly', $2)",
+        )
+        .bind(&asset)
+        .bind(format!("the load of {table} dropped"))
+        .execute(pool)
+        .await
+        .expect("add the quality incident");
+        sqlx::query(
+            "INSERT INTO quality_schedule (asset, mode, interval_minutes) \
+             VALUES ($1, 'interval', 60)",
+        )
+        .bind(&asset)
+        .execute(pool)
+        .await
+        .expect("add the quality schedule");
+        sqlx::query("INSERT INTO table_load (asset, loaded_at, rows_after) VALUES ($1, now(), 10)")
+            .bind(&asset)
+            .execute(pool)
+            .await
+            .expect("add the load");
+    }
+    (rules[0], rules[1])
+}
+
+/// The Bronze tables the quality rules name, sorted and without repeats.
+///
+/// The rules of the shared catalog's own tables (`silver.`/`serving.`) are
+/// named too: they belong to the catalog, so the tenant that owns the
+/// catalog reads them, and they are not another organisation's upload.
+fn quality_assets(body: &Value) -> Vec<String> {
+    let mut assets: Vec<String> = body["quality"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of quality rules: {body}"))
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .filter(|asset| asset.starts_with("bronze."))
+        .map(str::to_owned)
+        .collect();
+    assets.sort();
+    assets.dedup();
+    assets
+}
+
+/// The assets of the incidents in a body, sorted.
+fn incident_assets(body: &Value) -> Vec<String> {
+    let mut assets: Vec<String> = body["incidents"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of incidents: {body}"))
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .map(str::to_owned)
+        .collect();
+    assets.sort();
+    assets
+}
+
+/// The assets of the schedules in a body, sorted.
+fn schedule_assets(body: &Value) -> Vec<String> {
+    let mut assets: Vec<String> = body["schedules"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of schedules: {body}"))
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .map(str::to_owned)
+        .collect();
+    assets.sort();
+    assets
+}
+
+/// A run of a seeded employee, so the run history has a row to show.
+async fn seed_an_agent_run(pool: &PgPool) -> String {
+    sqlx::query(
+        "INSERT INTO agent_run (id, employee_id, status, trigger, actor, started_at, steps) \
+         VALUES ('run-sec-20', 'emp-inventory', 'completed', 'Manual investigation', \
+                 'inventory-copilot', now() - interval '2 minutes', '[]'::jsonb)",
+    )
+    .execute(pool)
+    .await
+    .expect("add the agent run");
+    "run-sec-20".to_owned()
+}
+
+/// The grant of a plain reader of the agents pages: the run history is open
+/// to any login, so the grant says nothing about the gate under test.
+const AGENTS_READER: &str = "dashboard:read";
+
+#[tokio::test]
+async fn the_quality_list_holds_only_the_tables_the_caller_may_read() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    seed_the_quality_rows(&pool).await;
+    mount_observed_quality(&ch, &[GROUP_TABLE, RETAIL_TABLE]).await;
+    let uri = "/api/governance/quality";
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_READER, CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, GOVERNANCE_READER, OTHER_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    // The owning tenant: its own upload, never the upload the other tenant
+    // holds.
+    let (status, body) = get(&router, uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        quality_assets(&body),
+        vec![format!("bronze.{GROUP_TABLE}")],
+        "{body}"
+    );
+    assert_no_trace_of_the_retail_upload(uri, &body);
+
+    // Another tenant: the shared catalog's own rule refuses it, so it reads
+    // no upload row at all.
+    let (status, body) = get(&router, uri, &other, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_no_trace_of_the_retail_upload(uri, &body);
+    assert_no_trace_of_the_group_upload(uri, &body);
+
+    // An operator reaches everything.
+    let (status, body) = get(&router, uri, &operator, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        quality_assets(&body),
+        vec![
+            format!("bronze.{GROUP_TABLE}"),
+            format!("bronze.{RETAIL_TABLE}")
+        ],
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_rule_runs_of_another_tenants_upload_table_are_the_unknown_404() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let (group_rule, retail_rule) = seed_the_quality_rows(&pool).await;
+    mount_the_run_history(&ch, group_rule, GROUP_TABLE).await;
+    mount_the_run_history(&ch, retail_rule, RETAIL_TABLE).await;
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_READER, CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, GOVERNANCE_READER, OTHER_TENANT).await;
+
+    // The owning tenant reads the history of the rule on its own upload.
+    let (status, body) = get(
+        &router,
+        &format!("/api/governance/quality/{group_rule}/runs"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["runs"].as_array().map(Vec::len),
+        Some(1),
+        "the rule's own run: {body}"
+    );
+
+    // The rule on the other tenant's upload table is not there at all.
+    let (status, body) = get(
+        &router,
+        &format!("/api/governance/quality/{retail_rule}/runs"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], json!("Quality rule not found"), "{body}");
+
+    // Another tenant: the shared catalog's own rule refuses it.
+    let (status, body) = get(
+        &router,
+        &format!("/api/governance/quality/{group_rule}/runs"),
+        &other,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn the_quality_incidents_hold_only_the_tables_the_caller_may_read() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    seed_the_quality_rows(&pool).await;
+    let uri = "/api/governance/quality/incidents";
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_READER, CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, GOVERNANCE_READER, OTHER_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    // The owning tenant: its own upload, never the upload the other tenant
+    // holds.
+    let (status, body) = get(&router, uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        incident_assets(&body),
+        vec![format!("bronze.{GROUP_TABLE}")],
+        "{body}"
+    );
+    assert_no_trace_of_the_retail_upload(uri, &body);
+
+    // Another tenant: the shared catalog's own rule refuses it.
+    let (status, body) = get(&router, uri, &other, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_no_trace_of_the_group_upload(uri, &body);
+
+    // An operator reaches everything.
+    let (status, body) = get(&router, uri, &operator, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        incident_assets(&body),
+        vec![
+            format!("bronze.{GROUP_TABLE}"),
+            format!("bronze.{RETAIL_TABLE}")
+        ],
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_quality_schedules_hold_only_the_tables_the_caller_may_read() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    seed_the_quality_rows(&pool).await;
+    let uri = "/api/governance/quality/schedules";
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_READER, CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, GOVERNANCE_READER, OTHER_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    // The owning tenant: its own upload, never the upload the other tenant
+    // holds.
+    let (status, body) = get(&router, uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        schedule_assets(&body),
+        vec![format!("bronze.{GROUP_TABLE}")],
+        "{body}"
+    );
+    assert_no_trace_of_the_retail_upload(uri, &body);
+
+    // Another tenant: the shared catalog's own rule refuses it.
+    let (status, body) = get(&router, uri, &other, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_no_trace_of_the_group_upload(uri, &body);
+
+    // An operator reaches everything.
+    let (status, body) = get(&router, uri, &operator, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        schedule_assets(&body),
+        vec![
+            format!("bronze.{GROUP_TABLE}"),
+            format!("bronze.{RETAIL_TABLE}")
+        ],
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_learning_status_of_another_tenants_upload_table_is_the_unknown_404() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    seed_the_quality_rows(&pool).await;
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_READER, CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, GOVERNANCE_READER, OTHER_TENANT).await;
+
+    // The owning tenant reads the learning status of its own upload.
+    let uri = format!("/api/governance/quality/learning/bronze.{GROUP_TABLE}");
+    let (status, body) = get(&router, &uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["asset"],
+        json!(format!("bronze.{GROUP_TABLE}")),
+        "{body}"
+    );
+    assert_eq!(body["loads"], json!(1), "{body}");
+
+    // The other tenant's upload table is not there at all.
+    let uri = format!("/api/governance/quality/learning/bronze.{RETAIL_TABLE}");
+    let (status, body) = get(&router, &uri, &owner, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // Another tenant: the shared catalog's own rule refuses it.
+    let uri = format!("/api/governance/quality/learning/bronze.{GROUP_TABLE}");
+    let (status, body) = get(&router, &uri, &other, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn the_agent_run_history_is_read_by_the_catalog_owner_and_by_nobody_else() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    let run_id = seed_an_agent_run(&pool).await;
+    let owner = cookie_in_tenant(&pool, AGENTS_READER, CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, AGENTS_READER, OTHER_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    // A tenant that does not own the shared catalog: the list is empty and
+    // the run is unknown, so the refusal says nothing about what runs.
+    let (status, body) = get(&router, "/api/agents/runs", &other, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!([]), "{body}");
+    let (status, body) = get(&router, &format!("/api/agents/runs/{run_id}"), &other, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body["error"],
+        json!(format!("Run {run_id} not found")),
+        "{body}"
+    );
+
+    // The tenant that owns the shared catalog reads the runs.
+    let (status, body) = get(&router, "/api/agents/runs", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["id"], json!(run_id), "{body}");
+    let (status, body) = get(&router, &format!("/api/agents/runs/{run_id}"), &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], json!(run_id), "{body}");
+
+    // An operator reaches everything.
+    let (status, body) = get(&router, "/api/agents/runs", &operator, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["id"], json!(run_id), "{body}");
+    let (status, body) = get(
+        &router,
+        &format!("/api/agents/runs/{run_id}"),
+        &operator,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], json!(run_id), "{body}");
 }

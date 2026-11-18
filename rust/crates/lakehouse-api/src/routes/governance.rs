@@ -87,7 +87,7 @@ enum Kind {
 }
 
 impl Kind {
-    /// `SEC-20` (plan 95, plan 96): the list a kind answers with table names,
+    /// `SEC-20` (plan 95, plan 96, plan ai-118): the list a kind answers with table names,
     /// and the field of each row that holds the table, for the kinds a
     /// caller's reach narrows ([`retain_rows_in_reach`]). The match has no
     /// wildcard, so a kind added later must decide whether its rows name tables.
@@ -95,9 +95,12 @@ impl Kind {
         match self {
             Self::Classification => Some(("classifications", "asset")),
             Self::Maintenance => Some(("maintenance", "tableName")),
-            Self::Quality | Self::Audit | Self::Residency | Self::Replication | Self::Unknown => {
-                None
-            }
+            // A quality rule names the table it checks, and the rules of
+            // every tenant's upload are in the list, so the quality list is
+            // narrowed by the caller's reach like the maintenance history
+            // and the classification list (`SEC-20`, plan ai-118).
+            Self::Quality => Some(("quality", "asset")),
+            Self::Audit | Self::Residency | Self::Replication | Self::Unknown => None,
         }
     }
 
@@ -158,8 +161,10 @@ const AUDIT_READ_DENIED: &str = "reading the audit trail needs the audit:read pe
 /// history names upload tables of every tenant: see
 /// [`retain_rows_in_reach`]. The classification list is narrowed the same way
 /// (`SEC-20`, plan 96), by each row's `asset`: it names the tables of the
-/// shared catalog and the upload tables of every tenant. The other kinds are
-/// not narrowed. No principal is a system call and is not narrowed, which
+/// shared catalog and the upload tables of every tenant. The quality list is
+/// narrowed the same way (`SEC-20`, plan ai-118): every rule names the table
+/// it checks. The audit trail, the residency list and the replication list
+/// are not narrowed. No principal is a system call and is not narrowed, which
 /// [`crate::routes::quality::quality_table_access`] documents.
 pub(crate) async fn read_kind(
     state: &AppState,

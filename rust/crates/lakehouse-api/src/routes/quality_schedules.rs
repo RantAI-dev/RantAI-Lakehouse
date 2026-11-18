@@ -63,6 +63,18 @@ pub async fn list_schedules(
         return Err(ApiError::PermissionDenied(reason.to_owned()).into());
     }
     let schedules = quality::list_schedules(pool(&state)?).await?;
+    // `SEC-20` (plan ai-118): a schedule names the table it belongs to, and
+    // the schedules of every tenant's upload are in the list, so the ones
+    // outside the caller's reach are left out — the reach Query Studio keeps
+    // (`crate::routes::query::resolve_reach` and
+    // `crate::routes::query::reachable_names`).
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+    let assets: Vec<String> = schedules.iter().map(|s| s.asset.clone()).collect();
+    let readable = crate::routes::query::reachable_names(&state, reach, &assets).await?;
+    let schedules: Vec<_> = schedules
+        .into_iter()
+        .filter(|s| readable.contains(&s.asset))
+        .collect();
     Ok(ApiJson(json!({
         "schedules": schedules,
         "defaultIntervalMinutes": DEFAULT_INTERVAL_MINUTES,

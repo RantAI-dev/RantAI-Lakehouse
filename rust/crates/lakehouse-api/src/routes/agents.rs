@@ -460,13 +460,28 @@ pub struct EmployeeQuery {
 
 /// `GET /api/agents/runs?employeeId=` — mirrors `AgentService::listRuns`.
 ///
+/// `SEC-20` (plan ai-118): a run belongs to the deployment, not to a tenant
+/// — `agent_employee` has no tenant column and its `owner` is free text — so
+/// the shared catalog's own rule decides who reads the run history: the
+/// tenant that owns the shared catalog, or an unrestricted caller. A caller
+/// the rule refuses gets the empty list, so the answer says nothing about
+/// what the deployment ran.
+///
 /// # Errors
 ///
 /// 503 if no pool is configured; 500 on a database failure.
 pub async fn list_runs(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Query(query): Query<EmployeeQuery>,
 ) -> ApiResult<ApiJson<Vec<AgentRun>>> {
+    if crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
+        .await?
+        .is_some()
+    {
+        return Ok(ApiJson(Vec::new()));
+    }
     Ok(ApiJson(
         agents::list_runs(pool(&state)?, query.employee_id.as_deref()).await?,
     ))
@@ -474,13 +489,27 @@ pub async fn list_runs(
 
 /// `GET /api/agents/runs/{id}`.
 ///
+/// `SEC-20` (plan ai-118): the run history is the deployment's, so the
+/// shared catalog's own rule decides who reads it (see [`list_runs`]). A
+/// caller the rule refuses gets the unknown 404, so the answer says nothing
+/// about whether the run exists.
+///
 /// # Errors
 ///
-/// 404 if `id` is unknown; 503/500 as above.
+/// 404 if `id` is unknown, and for a caller the shared catalog's rule
+/// refuses; 503/500 as above.
 pub async fn get_run(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<AgentRun>> {
+    if crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
+        .await?
+        .is_some()
+    {
+        return Err(ApiError::NotFound(format!("Run {id} not found")).into());
+    }
     let run = agents::get_run(pool(&state)?, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Run {id} not found")))?;
