@@ -569,3 +569,98 @@ async fn a_narrowed_callers_list_sql_sources_omits_a_source_reading_a_denied_tab
     let ids = listed_source_ids(&body);
     assert!(ids.iter().any(|id| id == "s_denied"), "control: {body}");
 }
+
+// ── GOV-17 review R10: assistant list_boards gates built-in Main ───────────
+
+/// A stand-in where built-in Main holds one stored tile reading
+/// `serving.m10_hidden`. A caller narrowed away from that mart loses Main in
+/// full, exactly as the dependency resolver decides for the HTTP chooser.
+struct MainBoardStore;
+
+impl Respond for MainBoardStore {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        let rows = |data: Vec<Value>| {
+            let n = data.len();
+            ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
+        };
+        if sql.contains("FROM console.bi_chart") {
+            let spec = json!({
+                "id": "c_m10", "title": "M", "kind": "kpi", "mart": "m10_hidden",
+                "sql": "SELECT n FROM serving.m10_hidden", "x": "", "y": "n"
+            });
+            let def = json!({
+                "title": "M", "mart": "m10_hidden", "kind": "kpi",
+                "measures": ["n"], "aggregate": "count"
+            });
+            return rows(vec![json!({
+                "id": "c_m10", "board": "", "created_by": "ui",
+                "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+            })]);
+        }
+        if sql.contains("FROM console.bi_board") {
+            return rows(vec![]);
+        }
+        ResponseTemplate::new(200).set_body_string("Ok.\n")
+    }
+}
+
+fn listed_board_ids(body: &Value) -> Vec<String> {
+    body["result"]["boards"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// GOV-17 review R10 (BLOCKER): `list_boards` used to prepend Main
+/// unconditionally, so an assistant caller discovered a dashboard whose data
+/// dependencies their grants hide. The same `sees_builtin_board` predicate the
+/// HTTP chooser uses now gates it. A fully granted caller is the control.
+#[tokio::test]
+async fn assistant_list_boards_omits_main_when_its_dependencies_are_hidden() {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(MainBoardStore)
+        .mount(&ch)
+        .await;
+    let env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    let app = spin_up_with_env(&env).await;
+
+    let narrowed = create_principal_with_permissions(
+        &app.pool,
+        "dashboard:read, assistant:use, assistant:ask",
+    )
+    .await;
+    narrow_roles(&app.pool, narrowed, &[("serving", "m10_ok")]).await;
+    let cookie = session_cookie_for_user(&app.pool, narrowed).await;
+    let body = call(&app, &cookie, "list_boards", json!({}), "ask").await;
+    assert_eq!(body["outcome"], "executed", "{body}");
+    assert!(
+        !listed_board_ids(&body).iter().any(|id| id == "default"),
+        "a caller whose grants hide Main must not discover it: {body}"
+    );
+
+    let allowed = create_principal_with_permissions(
+        &app.pool,
+        "dashboard:read, assistant:use, assistant:ask",
+    )
+    .await;
+    narrow_roles(
+        &app.pool,
+        allowed,
+        &[("serving", "m10_ok"), ("serving", "m10_hidden")],
+    )
+    .await;
+    let cookie = session_cookie_for_user(&app.pool, allowed).await;
+    let body = call(&app, &cookie, "list_boards", json!({}), "ask").await;
+    assert_eq!(body["outcome"], "executed", "{body}");
+    assert!(
+        listed_board_ids(&body).iter().any(|id| id == "default"),
+        "Main is offered when every dependency is granted: {body}"
+    );
+}

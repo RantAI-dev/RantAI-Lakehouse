@@ -999,7 +999,16 @@ pub(super) async fn create_board(
 pub(super) async fn list_boards(ch: &ChClient, viewer: &Viewer) -> Value {
     match store::list_boards(ch, viewer).await {
         Ok(boards) => {
-            let mut out = vec![json!({ "id": "default", "name": "Main" })];
+            let mut out = Vec::new();
+            // GOV-17 review R10 (BLOCKER): Main used to be prepended
+            // unconditionally, so the assistant discovered a dashboard the
+            // caller's current table grants hide. Gate its synthesis on the
+            // same ACL-plus-dependency predicate the HTTP board chooser uses
+            // (`dashboard::boards_list`); `sees_builtin_board()` already ANDs
+            // the built-in ACL with the dependency resolver's verdict.
+            if viewer.sees_builtin_board() {
+                out.push(json!({ "id": store::DEFAULT_BOARD_ID, "name": "Main" }));
+            }
             // BI-18 part C: a board's tabs, when it has any, so the assistant can name them.
             out.extend(boards.iter().map(|b| {
                 let mut entry = json!({ "id": b.id, "name": b.name });
