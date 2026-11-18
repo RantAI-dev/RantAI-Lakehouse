@@ -1,6 +1,8 @@
 # SEC-18 -- no default credentials. These variables have NO fallback and
 # compose refuses to start without them (`${X:?}`): POSTGRES_PASSWORD,
-# RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY, LAKEKEEPER_ENCRYPTION_KEY.
+# RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY, LAKEKEEPER_ENCRYPTION_KEY,
+# LAKEHOUSE_DB_APP_PASSWORD (SEC-78: the console's runtime role's own
+# password; it is NOT the owner's).
 # `CONNECTOR_PG_PASSWORD` / `CONNECTOR_S3_*` fall back to those, never to a
 # literal. `ops/init-env.sh` writes a local `.env` with generated values;
 # docs/OPERATIONS.md has the upgrade note. Compose interpolates the whole
@@ -149,6 +151,67 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  # SEC-78 — the schema is applied HERE, not by the API container.
+  #
+  # The console connects as `lakehouse_app`: a role that owns no table and
+  # is not a superuser. Owning a table is enough to switch off the audit
+  # trail's append-only triggers (`ALTER TABLE audit_event DISABLE
+  # TRIGGER`, `SET session_replication_role = replica`), so the role that
+  # owns the tables must not be the role the console runs as. The
+  # migrations therefore run in this one-shot service, which holds the
+  # OWNER's credentials (`POSTGRES_USER`, the Postgres image's superuser)
+  # and is gone before the API starts.
+  lakehouse-db-migrate:
+    # The SAME image as `lakehouse-api` below: one build, one published
+    # image, one entrypoint. The release publishes it once and names it
+    # for both services (`ops/release/release-images.json`).
+    image: ${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}
+    build:
+      context: ./rust
+      dockerfile: Dockerfile
+      # WS4 item C2 — the source tree `GET /api/pipelines/{id}/source`
+      # serves from, baked into the image via a SECOND, independent build
+      # context rather than widening `context` above to the repository
+      # root (judge review V8: the repository root's `.dockerignore`
+      # excludes `rust`/`docs`/`*.md`, so a `context: .` change would
+      # break every `COPY rust/...` this file needs; that ignore file is
+      # read only by a build whose context IS the root, so it does not
+      # apply to this one — but it would apply to that change). Neither
+      # `context` nor `dockerfile` above changes at all.
+      additional_contexts:
+        pipeline_src: ./dagster/dispar_orchestrate
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+        # Must name the SAME Python package as `pipeline_src` above: the
+        # API keys op source files by the baked directory's own name,
+        # because that is what a `source_ref` is relative to. Stated here
+        # rather than left to `rust/Dockerfile`'s default so the two halves
+        # are visibly one decision (see that file's ARG comment).
+        PIPELINE_PACKAGE: dispar_orchestrate
+    # The API binary's own `migrate` subcommand: it applies the
+    # migrations, then creates the runtime role and its grants.
+    command: ["migrate"]
+    # It applies the schema once and exits; there is nothing to restart.
+    restart: "no"
+    # `postgres` is healthy when `pg_isready` answers, and the Postgres
+    # image restarts once after that first success (its temporary
+    # init-phase server is replaced by the real one), so "healthy" is not
+    # "accepts a connection from a new one". No shell retry loop is needed
+    # here: the Rust side retries the connection for about a minute.
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # The OWNER's URL, with NO override: the migrations need DDL, and
+      # only the owner has it. An ambient `DATABASE_URL` — the one the
+      # API may be pointed at — would make the migrations run as a role
+      # that cannot run them. This is the only place the owner's password
+      # reaches the console's own database.
+      DATABASE_URL: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${POSTGRES_DB:-lakehouse}
+      # The runtime role's password. Set on every run, so a rotation
+      # applies on the next deploy. MUST SET, never a default (SEC-18).
+      LAKEHOUSE_DB_APP_PASSWORD: ${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+
   lakehouse-api:
     # CI-SPEED-PLAN §4.2: a name for the image, so the `images` job in
     # .github/workflows/ci.yml can build it ONCE per run, hand it to the
@@ -187,6 +250,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # SEC-78: the schema and the console's runtime role are applied by
+      # `lakehouse-db-migrate` above, with the OWNER's credentials. The API
+      # starts only once that one-shot service succeeded: its boot check
+      # refuses a pending migration, and a superuser or a table owner, and
+      # it fails closed — starting earlier would only turn a clear message
+      # into a crash loop.
+      lakehouse-db-migrate:
+        condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
       # A single-file `subpath` volume mount (the `gold-export.jwt`/
@@ -471,7 +542,11 @@ services:
       #    deliberately no default credential — see docs/OPERATIONS.md. ──
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
-      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${POSTGRES_DB:-lakehouse}}
+      # SEC-78: the console's RUNTIME role, not the owner. `lakehouse_app`
+      # owns no table and is not a superuser, so it cannot switch off the
+      # audit trail's append-only triggers. The migrations run in
+      # `lakehouse-db-migrate` above, with the owner's credentials.
+      DATABASE_URL: ${DATABASE_URL:-postgres://lakehouse_app:${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${POSTGRES_DB:-lakehouse}}
       # ── secretRef-resolvable credentials for `connector_probe`'s real
       #    PostgreSQL/S3 connectivity tests (P6, ADR 0002). The seeded
       #    `conn-pg-lakehouse`/`conn-s3-warehouse` connectors reference
@@ -484,14 +559,19 @@ services:
       # secrets. Only these three names are on
       # `CONNECTOR_ALLOWED_SECRET_REFS`, which is what stops a
       # `connector:manage` principal creating a connector that names
-      # `env:POSTGRES_PASSWORD` (the console's own database password) with a
+      # `env:POSTGRES_PASSWORD` (the database OWNER's password) with a
       # caller-chosen external host and having the API authenticate to it.
       # They fall back to the must-set values above (SEC-18: never to a
       # literal) so the local stack still works —
       # separate NAMES, not necessarily separate values. Point them at
       # least-privilege credentials in any deployment that accepts connector
       # definitions from callers you do not fully trust.
-      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      # SEC-78: the console's own runtime role's password, not the OWNER's.
+      # The seeded `conn-pg-lakehouse` connector dials the console database
+      # as `lakehouse_app` from now on (a migration moves the seeded row's
+      # user), so a connector can never authenticate with the owner's
+      # credentials.
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       # SEC-14 part B (D5/D7): CA certificate for connector dials. Mounted
@@ -2350,6 +2430,12 @@ services:
       AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
       AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
       AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
+      # SEC-78: the OWNER's password still reaches this container for
+      # Dagster's OWN instance database (`DAGSTER_PG_*` below). That database
+      # gets its own role in the second change of SEC-78. Until it lands, this
+      # container holds the owner's password; the gap is written down here
+      # instead of hidden
+      # (principle 2: state the gap where the reader looks).
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
@@ -2386,8 +2472,16 @@ services:
       # recognize the `postgres://` scheme alias.
       BRONZE_SOURCE_DB_HOST: postgres
       BRONZE_SOURCE_DB_PORT: "5432"
-      BRONZE_SOURCE_DB_USER: ${POSTGRES_USER:-lakehouse}
-      BRONZE_SOURCE_DB_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      # SEC-78: the demo pipeline reads the console
+      # database as a SOURCE, so it connects as the console's RUNTIME
+      # role, not the owner: the owner's password must not reach this
+      # container for that. The default below is that role
+      # (`lakehouse_app`), overridable for a source role that needs
+      # more than the runtime role has — a CDC source needs
+      # `REPLICATION`, which the runtime role deliberately lacks (see
+      # docs/OPERATIONS.md, "Database roles").
+      BRONZE_SOURCE_DB_USER: ${BRONZE_SOURCE_DB_USER:-lakehouse_app}
+      BRONZE_SOURCE_DB_PASSWORD: ${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       # Verification correction: `BRONZE_SOURCE_DB_PASSWORD` above
       # only ever fed the g3a demo pipeline's OWN hardcoded credential
       # assembly (`dlt_pipeline.py`). The SEEDED `conn-pg-lakehouse`
@@ -2402,7 +2496,16 @@ services:
       # deployment of this compose file, not just the gate. Exported here
       # under its own name, same value as above, so both readers resolve
       # it.
-      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      # SEC-78: the seeded connector's row now dials the
+      # console database as the role `lakehouse_app` (the seeded row's
+      # user moves to that role in the same PR), so the secret its
+      # `secretRef` resolves to must be the ROLE's password: the default
+      # below is the role's password, not the owner's. It is the same
+      # value `BRONZE_SOURCE_DB_PASSWORD` above carries — the two readers
+      # still resolve one value — unless the operator sets
+      # `CONNECTOR_PG_PASSWORD` in the environment, which overrides this
+      # default and must then hold the role's password too.
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       BRONZE_SOURCE_DB_NAME: ${POSTGRES_DB:-lakehouse}
       BRONZE_SOURCE_SCHEMA: ${BRONZE_SOURCE_SCHEMA:-ingest_demo}
       BRONZE_SOURCE_TABLE: ${BRONZE_SOURCE_TABLE:-orders}
@@ -2739,6 +2842,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # SEC-78: the role this fixture grants to must EXIST
+      # before it can be granted to. `lakehouse-db-migrate` creates it (and
+      # the grants on the product schemas) with the owner's credentials,
+      # and it has no profile, so every stack that starts this fixture
+      # starts it too.
+      lakehouse-db-migrate:
+        condition: service_completed_successfully
     environment:
       PGHOST: postgres
       PGPORT: "5432"
@@ -2753,6 +2863,14 @@ services:
     # load it (0034's seed is applied, never edited) and the only code path
     # that loads it is that gate's own ingest-spec PUT, against this stack's
     # own instance.
+    # SEC-78: the grants for the console's runtime role
+    # (`lakehouse_app`) on this fixture's schema. `ingest_demo` is a FIXTURE
+    # schema, not a product one: the product schemas are `public` and
+    # `bronze_meta`, and the role setup in `lakehouse-db-migrate` grants
+    # those to the role. This fixture OWNS `ingest_demo` (it creates it, as
+    # the owner), so it grants the role on it here — the demo pipeline and
+    # the seeded `conn-pg-lakehouse` connector both read these tables as
+    # `lakehouse_app` (SEC-78), not as the owner.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
@@ -2778,6 +2896,8 @@ services:
         SELECT 'customer_' || g, 'customer_' || g || '@example.invalid'
         FROM generate_series(1, 20) AS g
         WHERE NOT EXISTS (SELECT 1 FROM ingest_demo.customers);
+        GRANT USAGE ON SCHEMA ingest_demo TO lakehouse_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ingest_demo TO lakehouse_app;
         "
     restart: "no"
 
