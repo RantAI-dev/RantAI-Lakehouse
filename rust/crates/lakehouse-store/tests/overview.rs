@@ -23,6 +23,7 @@
 // the linker before its ctor section is ever considered).
 use lakehouse_test_support as _;
 
+use lakehouse_store::audit::AuditScope;
 use lakehouse_store::overview::{
     DeliveryRecord, FiredRule, insert_from_fired_rule, insert_from_fired_rule_with_delivery,
     is_rule_silenced, list_alerts, recent_activity, silence_alert,
@@ -279,17 +280,19 @@ async fn recent_activity_narrows_to_one_principal_when_asked(pool: PgPool) -> sq
         items.into_iter().map(|i| i.id).collect()
     };
 
-    let own = recent_activity(&pool, 20, Some("principal-a"))
+    let own = recent_activity(&pool, 20, Some("principal-a"), &AuditScope::All)
         .await
         .unwrap();
     assert_eq!(ids(own), ["feed-a2", "feed-a1"]);
 
-    let stranger = recent_activity(&pool, 20, Some("principal-none"))
+    let stranger = recent_activity(&pool, 20, Some("principal-none"), &AuditScope::All)
         .await
         .unwrap();
     assert_eq!(ids(stranger), Vec::<String>::new());
 
-    let everyone = recent_activity(&pool, 20, None).await.unwrap();
+    let everyone = recent_activity(&pool, 20, None, &AuditScope::All)
+        .await
+        .unwrap();
     assert_eq!(ids(everyone)[..3], ["feed-a2", "feed-b1", "feed-a1"]);
     Ok(())
 }

@@ -17,7 +17,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::common::{
-    TestApp, audit_rows, create_principal_with_permissions, session_cookie_for_user, spin_up,
+    TestApp, audit_rows, create_principal_with_permissions, leave_no_seeded_tenants,
+    session_cookie_for_user, spin_up,
 };
 
 /// One `audit_event` row to seed.
@@ -178,6 +179,9 @@ const COLUMNS: [&str; 9] = [
 #[tokio::test]
 async fn the_old_list_and_the_new_routes_show_one_event_as_the_same_object() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     // The old list sits behind `/api/governance/{kind}` (`governance:read`) and
     // then asks for `audit:read` itself; the new routes need `audit:read` only.
     let user = create_principal_with_permissions(&pool, "governance:read,audit:read").await;
@@ -214,7 +218,6 @@ async fn the_old_list_and_the_new_routes_show_one_event_as_the_same_object() {
         "at": "2026-02-03T04:05:06.789Z",
         "actor": "Rina Wijaya",
         "actorKind": "user",
-        "tenant": "dispar-dki",
         "action": "catalog.grant",
         "resource": "catalog:t1",
         "outcome": "success",
@@ -229,7 +232,6 @@ async fn the_old_list_and_the_new_routes_show_one_event_as_the_same_object() {
         "at": "2026-02-03T04:05:00.000Z",
         "actor": "p-2",
         "actorKind": "agent",
-        "tenant": "dispar-dki",
         "action": "dashboard.update",
         "resource": "dashboard",
         "outcome": "pending",
@@ -296,6 +298,9 @@ async fn seed_four_kinds_of_event(pool: &PgPool) {
 #[tokio::test]
 async fn every_search_parameter_narrows_the_events_it_names() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     let (_, cookie) = auditor(&pool).await;
     seed_four_kinds_of_event(&pool).await;
 
@@ -335,6 +340,9 @@ async fn every_search_parameter_narrows_the_events_it_names() {
 #[tokio::test]
 async fn paging_across_rows_with_the_same_time_shows_each_event_once() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     let (_, cookie) = auditor(&pool).await;
     Seed::new("page-newer", "2026-04-02T00:00:00Z", "a.b")
         .insert(&pool)
@@ -396,6 +404,9 @@ async fn paging_across_rows_with_the_same_time_shows_each_event_once() {
 #[tokio::test]
 async fn events_older_than_fourteen_days_and_beyond_two_hundred_rows_are_reachable() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     let (_, cookie) = auditor(&pool).await;
     sqlx::query(
         "INSERT INTO audit_event (id, at, action, outcome) \
@@ -428,6 +439,9 @@ async fn events_older_than_fourteen_days_and_beyond_two_hundred_rows_are_reachab
 #[tokio::test]
 async fn a_bad_search_query_gets_a_fixed_sentence_that_does_not_echo_the_value() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     let (_, cookie) = auditor(&pool).await;
     let time = "from and to must be RFC 3339 times, for example 2026-11-01T00:00:00Z.";
     let outcome = "outcome must be one of allowed, executed, refused, needs_confirmation, \
@@ -491,6 +505,9 @@ async fn a_bad_search_query_gets_a_fixed_sentence_that_does_not_echo_the_value()
 #[tokio::test]
 async fn one_event_is_found_by_id_and_an_unknown_id_is_a_fixed_not_found() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     let (_, cookie) = auditor(&pool).await;
     let mut event = Seed::new("audit-one", "2026-05-01T00:00:00Z", "dashboard.update");
     event.actor_label = Some("Rina");
@@ -527,6 +544,9 @@ async fn one_event_is_found_by_id_and_an_unknown_id_is_a_fixed_not_found() {
 #[tokio::test]
 async fn the_export_is_a_csv_with_the_nine_columns_newest_first() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     let (_, cookie) = auditor(&pool).await;
     let mut old = Seed::new("x-1", "2026-06-01T08:00:00.500Z", "dashboard.update");
     old.principal_id = Some("p-1");
@@ -634,6 +654,9 @@ async fn the_export_is_a_csv_with_the_nine_columns_newest_first() {
 #[tokio::test]
 async fn a_cell_that_starts_like_a_formula_is_neutralised_in_the_export() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     let (_, cookie) = auditor(&pool).await;
     for (id, label, detail) in [
         ("fx-1", "=HYPERLINK(\"http://x\")", "=1+1"),
@@ -673,6 +696,9 @@ async fn a_cell_that_starts_like_a_formula_is_neutralised_in_the_export() {
 #[tokio::test]
 async fn a_field_with_a_comma_a_quote_or_a_line_break_is_quoted() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     let (_, cookie) = auditor(&pool).await;
     let mut seed = Seed::new("q-1", "2026-06-11T00:00:00Z", "q.event");
     seed.detail = Some("a,b \"c\"\nsecond line");
@@ -698,6 +724,9 @@ async fn a_field_with_a_comma_a_quote_or_a_line_break_is_quoted() {
 #[tokio::test]
 async fn an_export_of_more_than_one_hundred_thousand_events_keeps_the_newest_and_says_so() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     let (_, cookie) = auditor(&pool).await;
     sqlx::query(
         "INSERT INTO audit_event (id, at, action, outcome, detail) \
@@ -751,6 +780,9 @@ async fn an_export_of_more_than_one_hundred_thousand_events_keeps_the_newest_and
 #[tokio::test]
 async fn each_export_writes_one_audit_row_that_names_its_filters() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     let (user, cookie) = auditor(&pool).await;
 
     let (status, _, _) = get(
@@ -812,6 +844,9 @@ async fn each_export_writes_one_audit_row_that_names_its_filters() {
 #[tokio::test]
 async fn the_three_audit_routes_need_audit_read_both_ways() {
     let TestApp { router, pool } = spin_up().await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
+    // deployment holds four tenants, so this test makes it a one-tenant one.
+    leave_no_seeded_tenants(&pool).await;
     Seed::new("auth-1", "2026-06-20T00:00:00Z", "auth.event")
         .insert(&pool)
         .await;

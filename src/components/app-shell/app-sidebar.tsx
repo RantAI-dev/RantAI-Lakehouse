@@ -2,11 +2,12 @@
 
 import * as React from "react"
 import { createPortal } from "react-dom"
-import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { ChevronDown, ChevronRight, FileText } from "lucide-react"
+import { BrandPicture } from "@/components/brand-picture"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useBranding, type BrandingView } from "@/hooks/use-branding"
 import { rememberTableHref } from "@/hooks/use-table-memory"
 import {
   Sidebar,
@@ -27,6 +28,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useDashboardsRow } from "@/features/dashboards/dashboards-row"
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups"
+import { PRODUCT_LOGO_DARK, PRODUCT_LOGO_LIGHT } from "@/lib/product-branding"
 import { cn } from "@/lib/utils"
 import { NAV_GROUPS, activeNavHref, canOpen, type NavGroup, type NavItem } from "./nav-config"
 import {
@@ -48,16 +50,26 @@ import { UserMenu } from "./user-menu"
 /** The conversation page, where the sidebar lists the chats instead of the menu (`WEB-18`). */
 export const CONVERSATION_PATH = "/copilot"
 
-function BrandLogo() {
+function BrandLogo({ branding }: { branding: BrandingView }) {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
+  // The workspace's own logos come from `GET /api/branding`; the product's
+  // own files stand in for the ones it did not set.
   return (
-    // A 32 px slot (the rail's icon column) holds the 24 px mark, centred in it.
+    // A 32 px slot (the rail's icon column) holds the 24 px mark, centred in it (BI-61, owner QA
+    // 2026-11-14); the pictures are the workspace's own (`ADM-2`), each kept inside a 28 x 24 box.
     <div className="grid size-8 shrink-0 place-items-center" aria-hidden>
-      {/* Explicit width too: a grid item centred in its slot would otherwise size to its (absolutely placed) image, i.e. 0, and the mark would not show. */}
-      <span className="relative block h-6 w-[28.17px] shrink-0">
-        <Image src="/logo-light.png" alt="RantAI Lakehouse" fill sizes="28px" className="object-contain dark:hidden" priority />
-        <Image src="/logo-dark.png" alt="" fill sizes="28px" className="hidden object-contain dark:block" priority />
-      </span>
+      <BrandPicture
+        src={branding.logoSrc}
+        alt={branding.name}
+        fallbackSrc={PRODUCT_LOGO_LIGHT}
+        className="h-6 w-7 object-contain dark:hidden"
+      />
+      <BrandPicture
+        src={branding.logoDarkSrc}
+        alt={branding.name}
+        fallbackSrc={PRODUCT_LOGO_DARK}
+        className="hidden h-6 w-7 object-contain dark:block"
+      />
     </div>
   )
 }
@@ -69,18 +81,20 @@ function BrandLogo() {
  * does not change at all when the real sidebar mounts.
  */
 export function SidebarBrand() {
-  // `--app-navbar-h` supaya persis setinggi navbar (`app-navbar.tsx` membaca variabel yang sama),
-  // sehingga garis bawah keduanya menyambung jadi satu garis lurus di seluruh
-  // lebar layar. Sebelumnya tinggi header ini dihitung dari isinya (padding +
-  // baris logo) dan jatuh di 69px — 5px lebih rendah dari navbar, dan
-  // patahannya terlihat tepat di pertemuan sidebar dengan konten.
+  // `--app-navbar-h`, so the header is exactly as tall as the navbar (`app-navbar.tsx` reads the
+  // same variable) and their bottom borders meet in one straight line across the screen. The
+  // header used to take its height from its content (padding and the logo row), 69 px, 5 px lower
+  // than the navbar, and the break showed right where the sidebar meets the content.
+  // The workspace's own name and logo (`ADM-2`); the product's own stand in for whatever it did
+  // not set. The loading shell draws this too: the route is public, so it needs no session.
+  const branding = useBranding()
   return (
     // The logo sits 8 px in, centred on the 48 px rail, in both states; the name fades.
     <SidebarHeader className="flex h-(--app-navbar-h) shrink-0 flex-col justify-center border-b border-sidebar-border px-2 py-0">
       <div className="flex min-w-0 items-center justify-start gap-2">
-        <BrandLogo />
+        <BrandLogo branding={branding} />
         <div className={cn("grid min-w-0 flex-1 gap-0.5 whitespace-nowrap leading-none", SIDEBAR_FADE)}>
-          <span className="truncate text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">RantAI Lakehouse</span>
+          <span className="truncate text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">{branding.name}</span>
         </div>
       </div>
     </SidebarHeader>

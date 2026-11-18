@@ -189,6 +189,20 @@ describe("InviteUserPage (WEB-7 D2/D3)", () => {
     expect(screen.getByRole("button", { name: "Invite" })).toBeTruthy()
   })
 
+  // UX-1-R10: Name is mandatory; one of Username/Email satisfies a single
+  // starred group. Neither member is required on its own.
+  it("stars the name and the username-or-email group without requiring either member", async () => {
+    setupFetch()
+    renderPage()
+    expect((await screen.findByLabelText("Name")).getAttribute("aria-required")).toBe("true")
+    const group = screen.getByRole("group", { name: "Username or email" })
+    expect(group.getAttribute("aria-describedby")).toBe("user-identity-help")
+    expect(screen.getByText("A username or an email is required to identify the new user.")).toBeTruthy()
+    expect(screen.getByText("Username or email").getAttribute("data-required")).toBe("")
+    expect(screen.getByLabelText("Username").hasAttribute("aria-required")).toBe(false)
+    expect(screen.getByLabelText("Email (optional)").hasAttribute("aria-required")).toBe(false)
+  })
+
   it("states the server's password length, not a guess", async () => {
     setupFetch()
     renderPage()

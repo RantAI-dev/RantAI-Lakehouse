@@ -58,7 +58,7 @@ function payload(extra: Record<string, unknown> = {}, board: Record<string, unkn
 type Call = { url: string; body: Record<string, unknown> }
 
 /** Serves the embed's three routes and records what was asked. */
-function serve(opts: { data?: unknown; origins?: string[]; values?: string[] } = {}): Call[] {
+function serve(opts: { data?: unknown; origins?: string[]; values?: string[]; branding?: unknown } = {}): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
@@ -66,6 +66,11 @@ function serve(opts: { data?: unknown; origins?: string[]; values?: string[] } =
     calls.push({ url, body })
     if (url === "/api/embed/frame") return json({ origins: opts.origins ?? [] })
     if (url === "/api/embed/values") return json({ column: body.column, values: opts.values ?? [], truncated: false })
+    // The workspace's own branding (`ADM-2`). Nothing set unless a test
+    // says otherwise, so the product's own name is what shows.
+    if (url.includes("/api/branding")) {
+      return json(opts.branding ?? { workspaceName: null, logo: null, logoDark: null, icon: null })
+    }
     return json(opts.data ?? payload())
   }) as unknown as typeof fetch
   return calls
@@ -75,12 +80,12 @@ describe("the look in the embed address (BI-26 D6)", () => {
   it("shows our name on a single chart, and logo=none hides it", async () => {
     serve()
     render(<EmbedView jwt="j" chartId="c1" />)
-    await screen.findByText("RantAI Lakehouse")
+    await screen.findByText("Rantai Lake")
     cleanup()
     serve()
     render(<EmbedView jwt="j" chartId="c1" look={{ ...DEFAULT_EMBED_LOOK, showName: false }} />)
     await screen.findByText("Visits")
-    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
+    expect(screen.queryByText("Rantai Lake")).toBeNull()
   })
 
   it("theme=dark draws a light dashboard dark, theme=light a dark one light, 'dashboard' keeps its own", async () => {
@@ -104,19 +109,19 @@ describe("the look in the embed address (BI-26 D6)", () => {
     serve()
     render(<EmbedView jwt="j" />)
     await screen.findByTestId("tile")
-    expect(screen.getByText("RantAI Lakehouse")).toBeTruthy()
+    expect(screen.getByText("Rantai Lake")).toBeTruthy()
     cleanup()
     serve()
     render(<EmbedView jwt="j" look={{ ...DEFAULT_EMBED_LOOK, showName: false }} />)
     await screen.findByTestId("tile")
-    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
+    expect(screen.queryByText("Rantai Lake")).toBeNull()
   })
 
   it("links our name on a public-link dashboard embed, like the single chart", async () => {
     // Decision 12: a public-link embed gets the look too.
     serve()
     render(<EmbedView token="p_tok" />)
-    const name = await screen.findByText("RantAI Lakehouse ↗")
+    const name = await screen.findByText("Rantai Lake ↗")
     const link = name.closest("a")
     expect(link?.getAttribute("href")).toBe("/public/dashboard/p_tok")
     expect(link?.getAttribute("target")).toBe("_blank")
@@ -156,6 +161,39 @@ describe("the look in the embed address (BI-26 D6)", () => {
     const { container } = render(<EmbedView jwt="j" />)
     await screen.findByText("Visits")
     expect((container.firstElementChild as HTMLElement).className).toContain("h-screen")
+  })
+})
+
+describe("the embed footer shows the workspace's own name (ADM-2)", () => {
+  it("shows the workspace name from settings, not a fixed product name", async () => {
+    serve({ branding: { workspaceName: "Acme Data", logo: null, logoDark: null, icon: null } })
+    render(<EmbedView jwt="j" />)
+    expect(await screen.findByText("Acme Data")).toBeTruthy()
+    // The product's own name is nowhere in the footer: a workspace that
+    // set a name must not still be called Rantai Lake.
+    expect(screen.queryByText("Rantai Lake")).toBeNull()
+  })
+
+  it("links the workspace name on a public-link embed, like the single chart", async () => {
+    serve({ branding: { workspaceName: "Acme Data", logo: null, logoDark: null, icon: null } })
+    render(<EmbedView token="p_tok" />)
+    const name = await screen.findByText("Acme Data ↗")
+    const link = name.closest("a")
+    expect(link?.getAttribute("href")).toBe("/public/dashboard/p_tok")
+    expect(link?.getAttribute("target")).toBe("_blank")
+  })
+
+  it("falls back to the product's own name when the workspace set none", async () => {
+    serve()
+    render(<EmbedView jwt="j" />)
+    expect(await screen.findByText("Rantai Lake")).toBeTruthy()
+  })
+
+  it("hides the workspace name when the address says logo=none", async () => {
+    serve({ branding: { workspaceName: "Acme Data", logo: null, logoDark: null, icon: null } })
+    render(<EmbedView jwt="j" look={{ ...DEFAULT_EMBED_LOOK, showName: false }} />)
+    await screen.findByTestId("tile")
+    expect(screen.queryByText("Acme Data")).toBeNull()
   })
 })
 
@@ -236,7 +274,7 @@ describe("height messages (BI-26 D7, decision 9)", () => {
     await waitFor(() => expect(posted.length).toBe(1), { timeout: 2000 })
     const root = measured()
     expect(root).not.toBeNull()
-    expect(root?.contains(screen.getByText("RantAI Lakehouse"))).toBe(true)
+    expect(root?.contains(screen.getByText("Rantai Lake"))).toBe(true)
   })
 
   it("posts nothing while the payload is still loading, then the real height (BI-26 review fix R5)", async () => {

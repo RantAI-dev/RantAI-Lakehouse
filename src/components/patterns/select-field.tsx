@@ -30,6 +30,14 @@ export type SelectFieldProps = {
   size?: "sm" | "default"
   "aria-label"?: string
   "aria-invalid"?: boolean
+  /**
+   * UX-1-R10: opt-in required semantics on the actual trigger. The trigger's
+   * role is `combobox`, which supports `aria-required`; the `Select` root does
+   * not, so this is forwarded to `SelectTrigger` rather than the root. Callers
+   * pass it only for a choice a save refuses when blank, matching a visible
+   * `Label required` star.
+   */
+  "aria-required"?: boolean
   /** The id of a sentence about this choice, e.g. why it is refused. */
   "aria-describedby"?: string
 }
@@ -54,6 +62,7 @@ export function SelectField({
   size,
   "aria-label": ariaLabel,
   "aria-invalid": ariaInvalid,
+  "aria-required": ariaRequired,
   "aria-describedby": ariaDescribedBy,
 }: SelectFieldProps) {
   const entries = options.flatMap((option) => ("options" in option ? option.options : [option]))
@@ -79,6 +88,7 @@ export function SelectField({
         size={size}
         aria-label={ariaLabel}
         aria-invalid={ariaInvalid}
+        aria-required={ariaRequired}
         aria-describedby={ariaDescribedBy}
       >
         <SelectValue placeholder={placeholder} />

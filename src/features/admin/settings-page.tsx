@@ -10,6 +10,7 @@ import {
   MapIcon,
   RocketIcon,
   BotIcon,
+  SettingsIcon,
   TagsIcon,
 } from "lucide-react"
 import { LineTabsList, type LineTab } from "@/components/patterns/line-tabs"
@@ -21,6 +22,7 @@ import { TagKeysPage } from "@/features/governance/tag-keys-page"
 import { AssistantSettings } from "./assistant-settings"
 import { DeploymentSettings } from "./deployment-settings"
 import { EmailSettings } from "./email-settings"
+import { GeneralSettings } from "./general-settings"
 import { MapsPage } from "./maps-page"
 import { QueryLimitsSettings } from "./query-limits-settings"
 import { RememberedResultsSettings } from "./remembered-results-settings"
@@ -39,12 +41,12 @@ export const SETTINGS_SECTIONS = [
 export type SettingsSection = (typeof SETTINGS_SECTIONS)[number]
 
 /**
- * The sections only a holder of `settings:write` sees (`ADM-6`, `ADM-7`,
- * `ADM-9`): they name the deployment's own settings — the mail server, the
- * account, the console's address, the assistant's provider — which are not
- * every signed-in person's business.
+ * The sections only a holder of `settings:write` sees (`ADM-2`, `ADM-6`,
+ * `ADM-7`, `ADM-9`): the workspace's own name and pictures, the deployment's
+ * own settings — the mail server, the account, the console's address, the
+ * assistant's provider — which are not every signed-in person's business.
  */
-export const ADMIN_SETTINGS_SECTIONS = ["deployment", "email", "assistant"] as const
+export const ADMIN_SETTINGS_SECTIONS = ["general", "deployment", "email", "assistant"] as const
 export type AdminSettingsSection = (typeof ADMIN_SETTINGS_SECTIONS)[number]
 
 /** Every section of the page, administrator's or not. */
@@ -60,6 +62,8 @@ const TABS: LineTab[] = [
 ]
 
 const ADMIN_TABS: LineTab[] = [
+  // `ADM-2` decision 1: the workspace's own section comes first.
+  { value: "general", label: "General", icon: SettingsIcon },
   { value: "deployment", label: "Deployment", icon: RocketIcon },
   { value: "email", label: "Email", icon: MailIcon },
   { value: "assistant", label: "Assistant", icon: BotIcon },
@@ -67,7 +71,8 @@ const ADMIN_TABS: LineTab[] = [
 
 /**
  * The sections of an administrator, in the order the strip shows them: the
- * deployment's own first (`ADM-6`, `ADM-7`), then everybody's.
+ * workspace's own and the deployment's own first (`ADM-2`, `ADM-6`, `ADM-7`),
+ * then everybody's.
  */
 const ADMIN_SECTIONS: readonly AnySettingsSection[] = [
   ...ADMIN_SETTINGS_SECTIONS,
@@ -82,8 +87,9 @@ const ADMIN_SECTIONS: readonly AnySettingsSection[] = [
  * `?section=` so `/governance/tag-keys` and `/admin/maps` can redirect to
  * theirs. Every section, not the whole page, loads when it is opened.
  *
- * The Deployment and Email sections (`ADM-6`, `ADM-7`) are only there for a
- * holder of `settings:write`: they name the deployment's own settings.
+ * The General, Deployment and Email sections (`ADM-2`, `ADM-6`, `ADM-7`) are
+ * only there for a holder of `settings:write`: they name the workspace's own
+ * settings and the deployment's own.
  */
 export function SettingsPage() {
   const { hasPermission } = useAuth()
@@ -95,7 +101,7 @@ export function SettingsPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Settings"
-        description="How this deployment works for everyone: dates and reports, remembered results, query limits, sign-in, tag keys and maps."
+        description="General: the workspace's own name and logo. Then how this deployment works for everyone: dates and reports, remembered results, query limits, sign-in, tag keys and maps."
       />
       <Tabs
         value={section}
@@ -103,6 +109,11 @@ export function SettingsPage() {
         className="gap-4"
       >
         <LineTabsList tabs={tabs} active={section} />
+        {canAdminister ? (
+          <TabsContent value="general">
+            <GeneralSettings />
+          </TabsContent>
+        ) : null}
         {canAdminister ? (
           <TabsContent value="deployment">
             <DeploymentSettings

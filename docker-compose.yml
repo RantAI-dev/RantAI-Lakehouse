@@ -453,6 +453,13 @@ services:
       OIDC_ROLE_MAP: ${OIDC_ROLE_MAP:-}
       OIDC_GROUPS_CLAIM: ${OIDC_GROUPS_CLAIM:-}
       OIDC_CLOCK_SKEW_SECONDS: ${OIDC_CLOCK_SKEW_SECONDS:-}
+      # What the browser sign-in asks the provider for. Empty is the
+      # default (`login`: the provider shows its login form, so the person
+      # at the keyboard picks the account); `off` sends no prompt at all
+      # and the provider reuses the session it holds for that browser.
+      # Passed through like every other `OIDC_*` setting, so the value in
+      # `.env` reaches the API process.
+      OIDC_PROMPT: ${OIDC_PROMPT:-}
       # `routes::auth::oidc_start`/`oidc_callback` (`/api/auth/oidc/start`
       # and `/callback`) read these directly from `Config`
       # (`oidc_authorize_url`/`oidc_token_url`/`oidc_redirect_uri`), not
@@ -467,6 +474,13 @@ services:
       OIDC_AUTHORIZE_URL: ${OIDC_AUTHORIZE_URL:-}
       OIDC_TOKEN_URL: ${OIDC_TOKEN_URL:-}
       OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+      # Where the provider sends the browser back to after an RP-initiated
+      # logout. Unset (the default) means the sign-out ends this
+      # deployment's session only -- the provider keeps its own session for
+      # that browser, so the next sign-in is answered from it and lands on
+      # the account that signed in last. Must be registered with the
+      # provider as a valid post-logout redirect URI.
+      OIDC_POST_LOGOUT_REDIRECT_URI: ${OIDC_POST_LOGOUT_REDIRECT_URI:-}
       # ── Bootstrap admin: REQUIRED to be able to log in at all. There is
       #    deliberately no default credential — see docs/OPERATIONS.md. ──
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
@@ -874,6 +888,12 @@ services:
       # `process.env` directly.
       args:
         RUST_API_URL: ${CONSOLE_API_URL:-http://lakehouse-api:8080}
+        # `NEXT_PUBLIC_SSO_ENABLED` is a BUILD-time flag (the login page
+        # renders the SSO button only when it is baked into the bundle), so
+        # it is a build arg here for the same reason `RUST_API_URL` is.
+        # Unset (the default) leaves the console without an SSO button,
+        # which is the right default for a stack with no provider.
+        NEXT_PUBLIC_SSO_ENABLED: ${NEXT_PUBLIC_SSO_ENABLED:-}
     ports:
       # The console owns host port 3000. The `dagster` profile's
       # webserver is published on the host's loopback only, at
@@ -2317,6 +2337,58 @@ services:
       # the code location, which builds the tag; the API's own copy of the
       # number is above. Not a credential.
       INGEST_RUN_MAX_RUNTIME_SECONDS: ${INGEST_RUN_MAX_RUNTIME_SECONDS:-}
+      # OPS-8 part C: the `dagster/max_runtime` tag the daily storage job
+      # carries, in seconds, which the orchestrator's run monitoring enforces.
+      # Unset or empty keeps the code's default, 1800 (thirty minutes); zero,
+      # negative or garbage does too (`run_limit_tags`). A run whose process
+      # dies would otherwise hold a concurrency slot forever. Not a credential.
+      DAGSTER_RUN_LIMIT_STORAGE_LAYER_SNAPSHOT_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_STORAGE_LAYER_SNAPSHOT_JOB_SECONDS:-}
+      # OPS-35: the `dagster/max_runtime` tag `alerts_run_job` carries, in
+      # seconds, which the orchestrator's run monitoring enforces. Unset or
+      # empty keeps the code's default, 900 (fifteen minutes). Not a credential.
+      DAGSTER_RUN_LIMIT_ALERTS_RUN_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_ALERTS_RUN_JOB_SECONDS:-}
+      # OPS-35: the `dagster/max_runtime` tag `replication_slot_check_job`
+      # carries, in seconds, which the orchestrator's run monitoring enforces.
+      # Unset or empty keeps the code's default, 900 (fifteen minutes). Not a
+      # credential.
+      DAGSTER_RUN_LIMIT_REPLICATION_SLOT_CHECK_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_REPLICATION_SLOT_CHECK_JOB_SECONDS:-}
+      # OPS-35: the `dagster/max_runtime` tag `capacity_snapshot_job` carries,
+      # in seconds, which the orchestrator's run monitoring enforces. Unset or
+      # empty keeps the code's default, 1800 (thirty minutes). Not a credential.
+      DAGSTER_RUN_LIMIT_CAPACITY_SNAPSHOT_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_CAPACITY_SNAPSHOT_JOB_SECONDS:-}
+      # OPS-35: the `dagster/max_runtime` tag `bronze_maintenance_job` carries,
+      # in seconds, which the orchestrator's run monitoring enforces. Unset or
+      # empty keeps the code's default, 10800 (three hours). Not a credential.
+      DAGSTER_RUN_LIMIT_BRONZE_MAINTENANCE_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_BRONZE_MAINTENANCE_JOB_SECONDS:-}
+      # OPS-35: the `dagster/max_runtime` tag `gold_export_job` carries, in
+      # seconds, which the orchestrator's run monitoring enforces. Unset or
+      # empty keeps the code's default, 7200 (two hours). Not a credential.
+      DAGSTER_RUN_LIMIT_GOLD_EXPORT_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_GOLD_EXPORT_JOB_SECONDS:-}
+      # OPS-35: the `dagster/max_runtime` tag `agent_run_job` carries, in
+      # seconds, which the orchestrator's run monitoring enforces. Unset or
+      # empty keeps the code's default, 1800 (thirty minutes). Not a credential.
+      DAGSTER_RUN_LIMIT_AGENT_RUN_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_AGENT_RUN_JOB_SECONDS:-}
+      # OPS-35: the `dagster/max_runtime` tag `discover_job` carries, in
+      # seconds, which the orchestrator's run monitoring enforces. Unset or
+      # empty keeps the code's default, 1800 (thirty minutes). Not a credential.
+      DAGSTER_RUN_LIMIT_DISCOVER_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_DISCOVER_JOB_SECONDS:-}
+      # OPS-35: the `dagster/max_runtime` tag `bronze_ingest_job` carries, in
+      # seconds, which the orchestrator's run monitoring enforces. Unset or
+      # empty keeps the code's default, 21600 (six hours). Not a credential.
+      DAGSTER_RUN_LIMIT_BRONZE_INGEST_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_BRONZE_INGEST_JOB_SECONDS:-}
+      # OPS-35: the `dagster/max_runtime` tag `file_ingest_job` carries, in
+      # seconds, which the orchestrator's run monitoring enforces. Unset or
+      # empty keeps the code's default, 21600 (six hours). Not a credential.
+      DAGSTER_RUN_LIMIT_FILE_INGEST_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_FILE_INGEST_JOB_SECONDS:-}
+      # OPS-35: the `dagster/max_runtime` tag `cdc_apply_job` carries, in
+      # seconds, which the orchestrator's run monitoring enforces. Unset or
+      # empty keeps the code's default, 21600 (six hours). Not a credential.
+      DAGSTER_RUN_LIMIT_CDC_APPLY_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_CDC_APPLY_JOB_SECONDS:-}
+      # OPS-35: the `dagster/max_runtime` tag every authored pipeline job
+      # (`authored__<pipeline>`) carries, in seconds, which the orchestrator's
+      # run monitoring enforces. Unset or empty keeps the code's default,
+      # 21600 (six hours). Not a credential.
+      DAGSTER_RUN_LIMIT_AUTHORED_JOB_SECONDS: ${DAGSTER_RUN_LIMIT_AUTHORED_JOB_SECONDS:-}
       # SRC-12 decision 4: opens the sealed `connector_managed_*` files on the
       # read-only volume above (`secret_resolver.open_managed_credential`).
       # Same required key as `lakehouse-api`, same single value, no default;

@@ -16,6 +16,14 @@ export type PermissionPickerProps = {
   onChange: (value: string) => void
   disabled?: boolean
   permissions?: Permission[]
+  /** UX-1-R10: the accessible name of the checkbox group. */
+  label?: string
+  /**
+   * UX-1-R10: the group must have at least one permission, but no single
+   * checkbox is required. A `role="group"` with a linked sentence carries the
+   * rule; `aria-required` is unsupported on a group role, so it is not used.
+   */
+  required?: boolean
 }
 
 function parseTokens(raw: string): string[] {
@@ -65,7 +73,20 @@ export function PermissionPicker({
   onChange,
   disabled = false,
   permissions: permissionsProp,
+  label = "Permissions",
+  required = false,
 }: PermissionPickerProps) {
+  const helpId = `${id}-required-help`
+  // UX-1-R10: a named group with a linked requirement sentence, never an
+  // aria-required on the group or on each individual checkbox.
+  const groupA11y = {
+    role: "group" as const,
+    "aria-label": label,
+    ...(required ? { "aria-describedby": helpId } : {}),
+  }
+  const requiredNote = required ? (
+    <p id={helpId} className="text-xs text-muted-foreground">Select at least one permission.</p>
+  ) : null
   // WEB-8 review 1 B2: load through useService(identityService.listPermissions)
   const serviceState = useService(
     (signal) => identityService.listPermissions(signal),
@@ -199,13 +220,16 @@ export function PermissionPicker({
           <Badge
             key={token}
             variant="outline"
-            className="gap-1.5 border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400 py-1 px-2 font-mono text-xs"
+            // WEB-13: the base Badge is shrink-0/nowrap/h-5. A long unknown
+            // token is arbitrary old data, so let it wrap inside the chip and
+            // keep the remove control beside it at a narrow width.
+            className="h-auto max-w-full min-w-0 shrink gap-1.5 whitespace-normal border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400 py-1 px-2 font-mono text-xs"
           >
-            <span>{token}</span>
-            <span className="text-[10px] text-muted-foreground font-sans">(Not recognised)</span>
+            <span className="min-w-0 break-all leading-snug">{token}</span>
+            <span className="shrink-0 text-[10px] text-muted-foreground font-sans">(Not recognised)</span>
             <button
               type="button"
-              className="hover:text-foreground inline-flex items-center justify-center cursor-pointer"
+              className="hover:text-foreground inline-flex shrink-0 items-center justify-center cursor-pointer"
               onClick={() => handleRemoveUnknown(token)}
               aria-label={`Remove ${token}`}
               title={`Remove ${token}`}
@@ -238,7 +262,8 @@ export function PermissionPicker({
 
   if (hasFullAccess) {
     return (
-      <div className="space-y-4" id={id} data-testid="permission-picker">
+      <div {...groupA11y} className="space-y-4" id={id} data-testid="permission-picker">
+        {requiredNote}
         <div className="flex items-center gap-2 p-3 rounded-md border bg-muted/40" data-testid="full-access-box">
           <Checkbox
             id={`${id}-full-access`}
@@ -262,7 +287,8 @@ export function PermissionPicker({
   }
 
   return (
-    <div className="space-y-4" id={id} data-testid="permission-picker">
+    <div {...groupA11y} className="space-y-4" id={id} data-testid="permission-picker">
+      {requiredNote}
       {heldWildcards.length > 0 && renderHeldWildcards()}
       {unknownTokens.length > 0 && renderUnknownTokens()}
 
@@ -326,16 +352,19 @@ export function PermissionPicker({
                           handleTokenToggle(perm.name, Boolean(checked))
                         }
                       />
-                      <div className="grid gap-0.5 leading-none">
-                        <div className="flex items-center gap-1.5 flex-wrap">
+                      {/* WEB-13: bound the grid child and its flex Label so a
+                          long known permission token wraps instead of
+                          widening the column; the checkbox stays fixed. */}
+                      <div className="grid min-w-0 flex-1 gap-0.5 leading-none">
+                        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                           <Label
                             htmlFor={permId}
                             className={cn(
-                              "text-xs font-mono font-medium cursor-pointer",
+                              "min-w-0 text-xs font-mono font-medium cursor-pointer",
                               isCovered && "text-muted-foreground"
                             )}
                           >
-                            {perm.name}
+                            <span className="min-w-0 break-all leading-snug">{perm.name}</span>
                           </Label>
                           {coveringWildcard && (
                             <span className="text-[10px] text-muted-foreground font-sans">

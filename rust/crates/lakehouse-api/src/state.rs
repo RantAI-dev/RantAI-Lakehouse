@@ -274,28 +274,22 @@ pub struct AppState {
     /// The 30-second memo of the query limits (`BI-5` plan D2), so a
     /// dashboard does not read Postgres per tile. Shared across clones.
     pub query_limits: crate::query_limits::QueryLimitsMemo,
-    /// The 30-second memo of the saved email settings (`ADM-7` plan D3), so
-    /// an alert or a scheduled report does not read Postgres per send. The
-    /// email `PUT` clears it on this process. Shared across clones.
-    pub email_settings_cache: Arc<crate::runtime_settings::EmailSettingsCache>,
-    /// The 30-second memo of the saved sign-in limits (`ADM-8` plan D3), so
-    /// a sign-in does not read Postgres per try. The sign-in `PUT` clears it
-    /// on this process. Shared across clones.
-    pub sign_in_settings_cache: Arc<
-        crate::runtime_settings::SettingsCache<lakehouse_store::sign_in_settings::SignInSettings>,
-    >,
-    /// The 30-second memo of the saved assistant settings (`ADM-9` plan D3),
-    /// so an assistant message does not read Postgres per round. The
-    /// assistant `PUT` clears it on this process. Shared across clones.
-    pub assistant_settings_cache: Arc<
-        crate::runtime_settings::SettingsCache<
-            lakehouse_store::assistant_settings::AssistantSettings,
-        >,
-    >,
-    /// The 30-second memo of the saved SSO settings (`ADM-12` plan D1/D3),
-    /// so a request does not read Postgres per check. The SSO `PUT` clears it
-    /// on this process. Shared across clones.
-    pub sso_settings_cache: Arc<crate::runtime_settings::SsoSettingsCache>,
+    /// The five 30-second memos of the console's saved settings rows —
+    /// email (`ADM-7` plan D3), sign-in limits (`ADM-8` plan D3), the
+    /// workspace name and pictures (`ADM-2` decision 6), the assistant's
+    /// provider (`ADM-9` plan D3) and SSO (`ADM-12` plan D1/D3) — so a
+    /// send, a sign-in, a branding visit, a message or a check does not
+    /// read Postgres each time. The matching `PUT` clears its row's cache
+    /// on this process; another process sees the change within the TTL.
+    /// Shared across clones.
+    ///
+    /// One field, not one per row: a new field in [`AppState`] grows every
+    /// future that holds a copy of the state, and `routes/ai/mod.rs`'s chat
+    /// handler and its streaming twin already sit at clippy's 16384-byte
+    /// limit for a future (`clippy::large_future`), so one more pointer
+    /// there is a lint failure in a file the assistant's team owns. See
+    /// [`crate::runtime_settings::SettingsCaches`].
+    pub settings_caches: Arc<crate::runtime_settings::SettingsCaches>,
     /// How often each caller may ask for a test email (`ADM-7` plan D10).
     /// Shared across clones.
     pub email_test_limiter: Arc<crate::runtime_settings::TestEmailLimiter>,
@@ -908,10 +902,7 @@ impl AppState {
                 ),
             )),
             query_limits: crate::query_limits::QueryLimitsMemo::default(),
-            email_settings_cache: crate::runtime_settings::email_cache(),
-            sign_in_settings_cache: crate::runtime_settings::sign_in_cache(),
-            assistant_settings_cache: crate::runtime_settings::assistant_cache(),
-            sso_settings_cache: crate::runtime_settings::sso_cache(),
+            settings_caches: crate::runtime_settings::settings_caches(),
             email_test_limiter: Arc::new(crate::runtime_settings::TestEmailLimiter::new()),
             #[cfg(test)]
             webhook_sender_override: None,

@@ -12,10 +12,11 @@ const report = reportItem({
   id: "r1", title: "Wisman", folderId: "", createdBy: "Rina", updatedBy: "Rina",
   updatedAt: "2026-11-13T00:00:00Z", blockCount: 3, chartCount: 1,
 })
-const template = templateItem({
+const saved = {
   id: "t1", name: "Sales overview", sourceBoard: "b_src", sourceBoardName: "Quarterly sales",
-  chartCount: 3, createdBy: "Rina", createdAt: "2026-11-13T00:00:00Z",
-})
+  chartCount: 3, createdBy: "Rina", createdAt: "2026-11-13T00:00:00Z", canDelete: true,
+}
+const template = templateItem(saved)
 const noop = () => {}
 const reader: ItemActions = { isFavourite: () => false, onToggleFavourite: noop }
 const writer: ItemActions = {
@@ -61,5 +62,15 @@ describe("the dashboard list's ⋯ menu", () => {
     open(template, writer)
     expect(await screen.findByText("Use template…")).toBeTruthy()
     expect(screen.getByText("Delete template…")).toBeTruthy()
+  })
+
+  // Decision T6 (PR #528 review SHOULD-FIX 2): only the person who saved a
+  // template, or an administrator, may delete it, so somebody else's offers
+  // Use template and no Delete.
+  it("offers no Delete on a template the person may not delete", async () => {
+    const theirs = templateItem({ ...saved, canDelete: false })
+    open(theirs, writer)
+    expect(await screen.findByText("Use template…")).toBeTruthy()
+    expect(screen.queryByText("Delete template…")).toBeNull()
   })
 })

@@ -18,6 +18,12 @@ export type DashboardTemplate = {
   createdBy: string
   /** RFC 3339. */
   createdAt: string
+  /**
+   * Whether the signed-in person may delete it: the person who saved it, or an
+   * administrator (decision T6, PR #528 review SHOULD-FIX 2). The server
+   * refuses everyone else with 403 anyway.
+   */
+  canDelete: boolean
 }
 
 export type TemplateList = { templates: DashboardTemplate[]; truncated: boolean }

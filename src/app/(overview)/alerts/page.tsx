@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { AlertsView } from "@/features/alerts/alerts-view";
 
-export const metadata: Metadata = { title: "Alerts & Digests · RantAI Lakehouse" };
+export const metadata: Metadata = { title: "Alerts & Digests" };
 
 /** Alerts & scheduled digests (real backend: console.alert_rule + webhook/email) and platform incident triage. */
 export default function Page() {

@@ -55,7 +55,7 @@ describe("the pictures", () => {
   })
 
   it("draws a template as its count and a report as a page with its real title", () => {
-    render(<ItemPicture item={templateItem({ id: "t", name: "T", sourceBoard: "", sourceBoardName: "", chartCount: 3, createdBy: "", createdAt: "" })} charts={null} size="lg" />)
+    render(<ItemPicture item={templateItem({ id: "t", name: "T", sourceBoard: "", sourceBoardName: "", chartCount: 3, createdBy: "", createdAt: "", canDelete: false })} charts={null} size="lg" />)
     expect(screen.getByText("3 charts")).toBeTruthy()
     cleanup()
     render(<ItemPicture item={reportItem({ id: "r", title: "Wisman 2020-2024", folderId: "", createdBy: "", updatedBy: "", updatedAt: "", blockCount: 2, chartCount: 1 })} charts={null} size="md" />)

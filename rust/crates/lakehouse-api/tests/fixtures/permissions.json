@@ -150,6 +150,11 @@
     "description": "System status (/api/ops/{kind}, /api/ops/logs's floor)."
   },
   {
+    "name": "usage:read",
+    "area": "Operations",
+    "description": "The Usage page: queries, scanned bytes and engine time per day, person and engine, and the rates behind its estimate (GET /api/usage/*)."
+  },
+  {
     "name": "alert:read",
     "area": "Operations",
     "description": "The Alerts list (GET /api/alerts and its other GETs)."
