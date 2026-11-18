@@ -1292,6 +1292,20 @@ fn warn_if_catalog_tenant_unconfigured(config: &config::Config) {
     }
 }
 
+/// Drop the DATA MAP cache, so the next chat turn rebuilds it.
+///
+/// The cache is one entry for the whole process, kept for two minutes, and
+/// every chat turn reads it. A test that pins the system prompt's bytes needs
+/// the map it pins to be the one its own mocks produce, so it clears the
+/// cache before it chats (`AI-32`).
+///
+/// Production behaviour is unchanged: the same cache, the same TTL and the
+/// same cache hits. This is the seam that makes the pin deterministic in one
+/// process.
+pub async fn clear_data_map_cache() {
+    routes::ai::data_map::clear_cache().await;
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

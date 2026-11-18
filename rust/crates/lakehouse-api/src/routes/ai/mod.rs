@@ -17,11 +17,15 @@
 // the shared redact/audit-record helpers, and the SAME tool dispatch
 // (`tools::run_tool`) the chat loop and `POST /api/ai/tool` use, so an
 // approved `WriteHigh` call executes through the identical code path
-// rather than a second, divergent one. `gate` stays private: approval
-// CREATION only ever happens from inside this module's own dispatch.
+// rather than a second, divergent one. `gate` is `pub(in crate::routes)` as
+// well, for the permission and risk helpers a sibling module reuses; the
+// approval CREATION itself only ever happens from inside this module's own
+// dispatch.
 pub(in crate::routes) mod audit;
 mod citations;
-mod data_map;
+// `pub(crate)`: the crate's own surface clears this module's cache for a
+// test that pins the system prompt's bytes (`AI-32`).
+pub(crate) mod data_map;
 pub(in crate::routes) mod gate;
 mod prompt;
 pub(in crate::routes) mod registry;
@@ -29,6 +33,8 @@ pub(crate) mod semantic;
 pub(crate) mod semantic_api;
 pub(crate) mod terms;
 pub(in crate::routes) mod tools;
+
+use std::collections::HashMap;
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Query, State};
@@ -109,6 +115,40 @@ pub async fn build_status(
 // ── POST /api/ai/chat ───────────────────────────────────────────────────
 
 const MAX_ITER: u32 = 8;
+
+/// How many times the same call with the same arguments may fail before the
+/// chat loop stops calling tools (plan 111, the parking lot's item 6).
+///
+/// The same call with the same arguments on the same state gets the same
+/// answer, so a fourth try buys nothing and costs a round of the turn's 120
+/// seconds: three failures of one call are a refusal, not a hiccup. Three
+/// leave a model room to try a call twice before the loop stops it, and a
+/// call with other arguments — a fixed chart, a corrected query — is another
+/// call and is counted on its own.
+const MAX_SAME_CALL_FAILURES: u32 = 3;
+
+/// The note the answer carries when the loop stopped calling tools because
+/// the same call failed too many times (plan 111).
+const REPEATED_CALL_NOTE: &str = "the same call failed too many times";
+
+/// The key a call is counted under: the tool's name and the arguments it
+/// was called with, in a fixed order.
+///
+/// The order is fixed here because `serde_json::Map` keeps the order the
+/// model sent its arguments in (the workspace's `preserve_order` feature),
+/// and the same call is the same call whatever order its arguments came in.
+fn call_signature(tool: &str, args: &Map<String, Value>) -> String {
+    let mut keys: Vec<&str> = args.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut signature = tool.to_owned();
+    for key in keys {
+        signature.push('\u{1f}');
+        signature.push_str(key);
+        signature.push('=');
+        signature.push_str(&args[key].to_string());
+    }
+    signature
+}
 
 /// The key a tool's result carries the browser's copy of an engine failure
 /// under.
@@ -320,7 +360,9 @@ pub async fn chat(
         return stream_chat(state, principal, run);
     }
     // GOV-17 review R9: table visibility adds state to nested tool futures.
-    // Heap-pin the chat state machine at the HTTP boundary to bound its stack.
+    // The chat future carries the turn's whole state, and an unboxed future of
+    // that size overflows the request task's stack (`clippy::large_futures`);
+    // heap-pin the chat state machine at the HTTP boundary to bound its stack.
     match Box::pin(run_chat(&state, principal.as_ref(), run, None)).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => llm_unavailable(&err),
@@ -1101,6 +1143,12 @@ async fn run_chat(
     // answer nudge, the citation repair), and the budget-exhausted path
     // reads the flag too, so a turn never asks for a second rewrite.
     let mut cjk_rewritten = false;
+    // Plan 111: the failures of each call, so a model that repeats the same
+    // failing call stops calling tools before the turn's timeout instead of
+    // running out of rounds.
+    let mut failed_calls: HashMap<String, u32> = HashMap::new();
+    // Why the loop stopped calling tools, when it did.
+    let mut stop_note: Option<&'static str> = None;
     // The conversation so far, which the citation check accepts as
     // evidence (`citations::Evidence`): the system prompt, whose DATA MAP
     // row counts, ranges and distinct counts were read from the data
@@ -1118,7 +1166,7 @@ async fn run_chat(
         .collect();
     let conversation: Vec<&str> = conversation.iter().map(String::as_str).collect();
 
-    for _ in 0..MAX_ITER {
+    'rounds: for _ in 0..MAX_ITER {
         if !report(progress, json!({ "type": "status", "phase": "thinking" })) {
             return Ok(chat_response_body(
                 "",
@@ -1338,6 +1386,18 @@ async fn run_chat(
             let (result, browser_error) = take_browser_error(result);
             let (resource_kind, resource_id) =
                 audit::resource_for(&call.function.name, &args, &result);
+            // The browser's copy of the failure is the detail the audit row
+            // carries (plan 111): the fixed sentence and the reference, the
+            // text the person sees. The model's copy — the engine's own
+            // diagnosis — stays with the model and never reaches the audit
+            // trail.
+            let shown = browser_error
+                .as_deref()
+                .map_or_else(|| result.clone(), |text| browser_copy(&result, text));
+            let detail = shown
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             audit::record(
                 state.pg.as_deref(),
                 principal,
@@ -1347,18 +1407,27 @@ async fn run_chat(
                 resource_id.as_deref(),
                 &Value::Object(args.clone()),
                 outcome,
-                None,
+                detail.as_deref(),
                 run_id.as_deref(),
                 approval_id.as_deref(),
             )
             .await;
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
-            let trace_result = browser_error
-                .as_deref()
-                .map_or_else(|| result.clone(), |text| browser_copy(&result, text));
             tool_trace.push(json!({
-                "tool": call.function.name, "args": args, "ok": ok, "result": trace_result,
+                "tool": call.function.name, "args": args, "ok": ok, "result": shown,
             }));
+            // Plan 111: the same call failing again and again is a refusal,
+            // not a hiccup, so the loop stops calling tools and asks the
+            // model for its final answer, as the iteration budget does.
+            if outcome == "failed" {
+                let signature = call_signature(&call.function.name, &args);
+                let failures = failed_calls.entry(signature).or_insert(0);
+                *failures += 1;
+                if *failures >= MAX_SAME_CALL_FAILURES {
+                    stop_note = Some(REPEATED_CALL_NOTE);
+                    break 'rounds;
+                }
+            }
             // plan 14: an accepted ask ends the turn. The question is the
             // reply, so the reader sees it above the option buttons; calls
             // after it in this round are neither run nor recorded.
@@ -1429,11 +1498,26 @@ async fn run_chat(
         }
     }
 
-    // Iteration budget exhausted — ask once more for a final answer, tool-free.
+    // The iteration budget is exhausted, or the same call failed too many
+    // times — ask once more for a final answer, tool-free.
     report(progress, json!({ "type": "status", "phase": "thinking" }));
+    let stop_note = stop_note.unwrap_or("tool-call limit reached");
+    let reason = if stop_note == REPEATED_CALL_NOTE {
+        REPEATED_CALL_REASON
+    } else {
+        BUDGET_REASON
+    };
+    let final_request = if stop_note == REPEATED_CALL_NOTE {
+        format!(
+            "The same call failed {MAX_SAME_CALL_FAILURES} times with the same arguments and was \
+             not run again. Answer now from the results above, and say what went wrong."
+        )
+    } else {
+        "Give your final answer now, concisely, from the results above.".to_owned()
+    };
     messages.push(LlmMessage {
         role: LlmMessageRole::User,
-        content: Some("Give your final answer now, concisely, from the results above.".to_owned()),
+        content: Some(final_request),
         tool_calls: None,
         tool_call_id: None,
         name: None,
@@ -1456,11 +1540,11 @@ async fn run_chat(
     // leaves it whole because the text has no `NEXT:` line of its own.
     if final_answer.trim().is_empty() {
         return Ok(chat_response_body(
-            &unfinished_reply(&tool_trace),
+            &unfinished_reply(&tool_trace, reason),
             &tool_trace,
             build_run_id.as_deref(),
             chart_created,
-            Some("tool-call limit reached"),
+            Some(stop_note),
         ));
     }
     // WS7 item F2: the iteration-budget-exhausted final answer is checked
@@ -1497,24 +1581,32 @@ async fn run_chat(
         &tool_trace,
         build_run_id.as_deref(),
         chart_created,
-        Some("tool-call limit reached"),
+        Some(stop_note),
     ))
 }
 
 /// How much of a tool's refusal [`unfinished_reply`] repeats.
 const REFUSAL_MAX_CHARS: usize = 200;
 
-/// The reply of a turn that used every round and ended with an empty answer:
-/// it says the request was not finished, and names the last tool a call of
-/// which was refused, with the refusal cut to [`REFUSAL_MAX_CHARS`]. Fixed
-/// text, never a claim that something was done.
+/// The reason an unfinished turn gives when the iteration budget ran out.
+const BUDGET_REASON: &str = "the assistant ran out of steps before it could answer";
+
+/// The reason an unfinished turn gives when the same call failed too many
+/// times (plan 111).
+const REPEATED_CALL_REASON: &str =
+    "the same call failed too many times, so the assistant stopped calling tools";
+
+/// The reply of a turn that ended without an answer: it says the request was
+/// not finished and why, and names the last tool a call of which was
+/// refused, with the refusal cut to [`REFUSAL_MAX_CHARS`]. Fixed text, never
+/// a claim that something was done.
 ///
 /// A step counts as refused when its result has an `error` key, the same test
 /// the loop uses to set `ok`. The text is the tool's own refusal (the
 /// server's sentence about the model's arguments), never an upstream error's:
 /// the tools classify those before they return. An `error` that is not a
 /// string reads as "no reason given".
-fn unfinished_reply(tool_trace: &[Value]) -> String {
+fn unfinished_reply(tool_trace: &[Value], reason: &str) -> String {
     let refused = tool_trace.iter().rev().find_map(|step| {
         let refusal = step["result"].get("error")?;
         Some((
@@ -1526,10 +1618,12 @@ fn unfinished_reply(tool_trace: &[Value]) -> String {
         Some((refused_tool, refusal)) => {
             let refusal: String = refusal.chars().take(REFUSAL_MAX_CHARS).collect();
             format!(
-                "The request was not finished: the assistant ran out of steps before it could answer. The last call a tool refused was `{refused_tool}`: {refusal}"
+                "The request was not finished: {reason}. The last call a tool refused was `{refused_tool}`: {refusal}"
             )
         }
-        None => "The request was not finished: the assistant ran out of steps before it could answer, and no tool refused a call. Check what exists before asking again.".to_owned(),
+        None => format!(
+            "The request was not finished: {reason}, and no tool refused a call. Check what exists before asking again."
+        ),
     }
 }
 
@@ -1606,8 +1700,9 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
     // request's task, and handed to the spawned one.
     let query_run = crate::query_limits::QueryRun::current_or_detached();
     tokio::spawn(crate::query_limits::scope(query_run, async move {
-        // GOV-17 review R9: the streaming boundary needs the same bounded
-        // chat state machine as the ordinary HTTP path.
+        // GOV-17 review R9: the streaming boundary needs the same bounded chat
+        // state machine; boxed for the same reason as the unstreamed chat above
+        // (`clippy::large_futures`).
         let last = match Box::pin(run_chat(&state, principal.as_ref(), run, Some(&tx))).await {
             Ok(body) => json!({ "type": "done", "body": body }),
             Err(err) => json!({
@@ -1773,6 +1868,13 @@ pub async fn tool_call(
     // not come through here.
     let (result, shown) = split_tool_result(result);
     let (resource_kind, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &result);
+    // The browser's copy of the failure is the detail the audit row carries
+    // (plan 111): the fixed sentence and the reference, never the model's
+    // copy of an engine failure.
+    let detail = shown
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     audit::record(
         state.pg.as_deref(),
         principal.as_ref().map(|Extension(p)| p),
@@ -1782,7 +1884,7 @@ pub async fn tool_call(
         resource_id.as_deref(),
         &Value::Object(parsed.args.clone()),
         outcome,
-        None,
+        detail.as_deref(),
         run_id.as_deref(),
         approval_id.as_deref(),
     )
@@ -3766,7 +3868,7 @@ mod tests {
             json!({ "tool": "create_chart", "ok": false, "result": { "error": "x".repeat(250) } }),
             json!({ "tool": "list_charts", "ok": true, "result": { "charts": [] } }),
         ];
-        let reply = unfinished_reply(&trace);
+        let reply = unfinished_reply(&trace, BUDGET_REASON);
         assert!(reply.contains("`create_chart`"), "{reply}");
         assert!(!reply.contains("older refusal"), "{reply}");
         assert!(reply.ends_with(&"x".repeat(200)), "{reply}");
@@ -3778,7 +3880,7 @@ mod tests {
         let trace = vec![
             json!({ "tool": "create_chart", "ok": false, "result": { "error": { "code": 7 } } }),
         ];
-        let reply = unfinished_reply(&trace);
+        let reply = unfinished_reply(&trace, BUDGET_REASON);
         assert!(reply.contains("`create_chart`: no reason given"), "{reply}");
     }
 
