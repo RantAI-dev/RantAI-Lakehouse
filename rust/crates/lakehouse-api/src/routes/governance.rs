@@ -167,9 +167,12 @@ const AUDIT_READ_DENIED: &str = "reading the audit trail needs the audit:read pe
 /// The other kinds are not narrowed. No principal is a system call: the
 /// quality list leaves one as it was, which
 /// [`crate::routes::quality::quality_table_access`] documents, while the
-/// audit list gives a headless call (no principal behind it, such as the
-/// assistant's `get_audit_history` tool) no row of the trail, through
-/// [`crate::routes::audit_scope::scope_without_principal`].
+/// audit list gives a headless call (no principal behind it) no row of the
+/// trail, through [`crate::routes::audit_scope::scope_without_principal`].
+/// The assistant's `get_audit_history` tool is not that caller: it does not
+/// come through this function for the audit kind, and reads the trail
+/// itself (`routes/ai/tools/governance.rs`) through [`audit_trail`] with
+/// the person's own scope.
 pub(crate) async fn read_kind(
     state: &AppState,
     principal: Option<&Principal>,
@@ -178,13 +181,14 @@ pub(crate) async fn read_kind(
 ) -> Response {
     let parsed = Kind::parse(kind);
     // `GOV-1` (feature page Decision 9): every role holds `governance:read`,
-    // which opens this route, so the audit list needs `audit:read` as well.
-    // No principal is an in-process call (the assistant's
-    // `get_audit_history` tool, `routes/ai/tools/governance.rs`), which this
-    // check leaves as it was, like the quality list's narrowing: that tool
-    // is registered with `governance:read` only, so it still shows a person
-    // without `audit:read` its own organisation's rows of the trail, until
-    // the assistant's registry asks for the new permission too.
+    // which opens this route, so the console's audit list needs `audit:read`
+    // on top of it. This check guards the console route only: the
+    // assistant's `get_audit_history` tool is not refused here, because it
+    // does not come through this function — it reads the trail itself, with
+    // the person's own scope. The tool's own permission is the assistant's
+    // registry's business (`GOV-1`): the tool asks the gate for the
+    // permission its spec names, and the spec is the one place that says
+    // which.
     if parsed == Kind::Audit
         && let Some(principal) = principal
         && !principal.has("audit:read")
