@@ -4174,8 +4174,9 @@ pub(crate) fn cut_rows(written: &crate::export::Written, row_cap: u32) -> u32 {
 /// data, bad filters or sort; with `format=png` see
 /// [`crate::routes::pdf_export::export_chart_png`]; 403 when every role of the person is switched
 /// off from downloading; 404 for an unknown tile; 422 when the role rewrite
-/// refuses or the engine rejects the statement; 503 when the engine or the
-/// audit store is unavailable.
+/// refuses or the engine rejects the statement; 429 when two downloads are
+/// already running in this process (`BI-34`, PR #527 review SHOULD-FIX 1);
+/// 503 when the engine or the audit store is unavailable.
 pub async fn chart_export(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -4211,7 +4212,9 @@ pub async fn chart_export(
 ///
 /// # Errors
 ///
-/// As [`chart_export`]; 400 also for a tile that is not a raw table.
+/// As [`chart_export`], including its 429 when two downloads are already
+/// running in this process (`BI-34`); 400 also for a tile that is not a raw
+/// table.
 pub async fn table_export(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
