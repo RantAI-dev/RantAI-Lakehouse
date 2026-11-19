@@ -289,3 +289,45 @@ existing line changed.
 - The bold/italic rule is a whitespace-flanking star rule of our own (documented in
   `report-inline.ts`); CommonMark edge cases such as `**a**b**` read differently from a
   Markdown renderer. The server never needs it (it checks links only).
+
+### Handoff, PR B (T8, T9), developer (Opus), 2026-11-19
+
+**Commits** (branch `feat/bi-62-report-editor-b`, on the plan commit `102363d19`), in plan order:
+
+| Task | Commit | What |
+| --- | --- | --- |
+| T8 | `536fccdf4` | `src/lib/report-markdown.ts`: `markdownToBlocks` (the PR B anchors' list; an unsafe link keeps its words) and `blocksToMarkdown` (charts as `[chart: <title> · <dashboard>]`), with tests on every kind and on hostile input |
+| T8 | `6f01fac54` | the draft node's schema (`DRAFT_NODE_SPEC`, attrs `draft`, `chart`, `replaced`; never parsed from HTML) and `insertDraft` / `removeDraft` / `acceptDraft` in `report-editor-extensions.ts`; tests: Discard byte-identical (empty line and under a chart), the draft is not an undo step, Accept is one undo step |
+| T8 | `52fcf9f9c` | wiring: `report-editor-draft.tsx` (draft store, `useReportDrafts` controller, `DraftNode` view ported from mockup D's `draft.tsx`), `/` → Ask AI to write… (`AI_SLASH_ITEM`, first, "Write with AI"), Describe in the chart toolbar, disabled reasons, page context (`src/lib/report-editor-context.ts`), `send`'s per-call `mode`, CSS (rise, caret), no handles beside a draft |
+| T8 | `974a52a65` | `report-editor-draft.test.tsx`: the real editor page with `useCopilot` / `useCopilotStream` stubbed by a fake stream |
+| T9 | `69bfe166f` | AI-15 cases `report_editor_describe_chart` and `report_editor_write_summary` (`ops/ai_eval/dashboard_cases.json`, hand-formatted like the file); a test rebuilds their contexts with `buildReportEditorContext`; CHANGELOG entry |
+| T8 | `ea1e0bd41` | focus: a finished draft takes the focus only from someone who did not edit meanwhile (see decisions) |
+
+**Commands run, on the final commit, with counts** (each under `flock /tmp/claude-1000/lh-bun.lock systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`):
+
+- `bun run typecheck` — clean.
+- `bun test src/features/dashboards/report-editor-draft.test.tsx src/lib/report-markdown.test.ts src/lib/report-editor-context.test.ts src/lib/report-blocks.test.ts src/lib/report-inline.test.ts src/lib/report-doc.test.ts src/lib/report-autosave.test.ts src/features/dashboards/report-editor-extensions.test.ts src/features/dashboards/report-blocks.test.tsx src/features/dashboards/report-pages.test.tsx src/features/dashboards/report-chart-shelf.test.tsx src/features/dashboards/report-render-view.test.tsx src/components/app-shell/side-panel.test.tsx src/services/clients/dashboards.test.ts src/features/copilot/capabilities.test.ts src/features/copilot/use-copilot.test.tsx src/features/copilot/copilot-dock.test.tsx src/features/copilot/chat-messages.test.tsx src/features/copilot/use-copilot-select.test.tsx src/features/dashboards/chart-builder-page.test.tsx src/lib/page-context-summary.test.ts` — **270 pass, 0 fail, 21 files**, one process (the new file first, so its `mock.module` restores were exercised against the files after it). Also run once with the new file after `report-pages`, `use-copilot` and `chart-builder-page` (72 pass, 0 fail, 5 files).
+- `bun x eslint` on the 14 TS/TSX files changed since `102363d19` — 0 errors, 1 warning (`changedABoard` unused in `use-copilot.ts`, already on the base).
+- `(cd ops/ai_eval && python3 -m unittest -q test_ai_eval)` — 206 tests OK.
+- A mutation check: with `{ mode: "ask" }` removed from the draft's `send`, the page tests fail (2 of 8 then); put back.
+- The 14 "not wrapped in act" warnings of `report-pages.test.tsx` are on the base too (same count with this branch's changes set aside).
+
+**Decisions the plan left open:**
+
+- **Ask mode: `send` takes a mode for one call.** `send(text, history, { mode: "ask" })` (a new optional `mode` in its options, `use-copilot.ts`) sends that message, and picks its tools, in Ask mode; the conversation's `mode` and the session it is saved under are not changed. Switching the panel to Ask and back was not used: `send` reads `mode` from its closure, so the switch would need an extra render before sending and would flicker the panel's mode toggle. Tested in `use-copilot.test.tsx`. `NO_ANSWER_TEXT` is now exported from there so a draft can tell an empty answer from text.
+- **Sending after the context is set.** A request first calls `setPageContext` (with the chart for Describe), then sends from an effect after that render, when the provider's `pageContextRef` holds it; the context is also refreshed a second after typing stops (not on every keystroke, so `useCopilot` consumers do not re-render per key) and cleared on unmount. The last described chart stays in the context, so a follow-up in the panel still has its rows.
+- **What is sent.** "Ask AI to write…" sends `Write for this report: <prompt>`; Describe sends `Describe the chart “<title>” for this report`. The context says such a message's answer becomes a draft and asks for the text only, in the Markdown a report holds, using only numbers from the given rows or tools, and tells the assistant not to change the report with `update_report` while the editor holds it (the editor would overwrite it on its next save). Rows: up to 50 through `summarizeRows`, the chart part capped at 2,500 characters, the report's Markdown cut at its end to fit `PAGE_CONTEXT_MAX_CHARS`.
+- **Stop is not offered for Accept.** The streamed text before `done` is not the server-checked answer (the verifier may replace it), so Stop ends with "Stopped" and Retry · Discard. Mockup D's Stop showed the whole fixed text instead.
+- **Retry** replaces the failed attempt in the conversation when it is still its end (as the panel's Retry does); otherwise it asks again after what is there.
+- **The draft shows its text through `ReportBlocks`** (the one renderer, D7) parsed with `markdownToBlocks` as it streams, so the draft looks as Accept will insert it; mockup D showed plain text.
+- **`###` and deeper read as level 3** (the level the editor still reads and saves, D3), not as paragraph text with hashes. The plan's list names `#`/`##`; this is the one addition.
+- **An X (Discard · Esc) on the prompt line**, so an empty prompt can be closed on a phone, which has no Esc. An empty prompt does not block the next draft: the next one replaces it.
+- **Focus.** Mockup D focuses Accept when a draft is done (Enter accepts). Here it does so unless the person edited the document while the answer was on its way, so a long answer never turns their next Enter into an Accept.
+- **Entries for the assistant only.** Ask AI and Describe show for `assistant:use` or `assistant:ask`, the app frame's test; without it the menu and the toolbar are as in PR A.
+- **The AI Copilot tab** shows the exchange as ordinary messages of the one conversation. Mockup D's extra lines in the panel ("In the report", "Kept in the report", "Show") were not ported: the plan's anchors ask for the same conversation, not for a new panel view.
+
+**Not verified** (rule 7):
+
+- Nothing was seen in a browser: the draft's look in light and dark, the rise and caret, reduced motion, focus rings, the disabled tooltips, the phone (`/` → Ask AI and Describe from a tapped chart), and the real streaming through `CopilotProvider` and `/api/ai/chat`. The tests use a fake conversation; the provider's own `send` was tested only for the per-call mode.
+- The two AI-15 cases were not run against a model (eval stack); only their JSON shape (`test_ai_eval`) and their contexts (rebuilt by `report-editor-context.test.ts`).
+- The full `bun run test`, `bun run lint`, `next build` and a dev server were not run (VM rules). No Rust was touched, so no cargo command was needed.
