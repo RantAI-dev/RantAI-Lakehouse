@@ -11,7 +11,8 @@ import type { ParamControl } from "@/lib/params";
 import type { BoardTab, LayoutMap, PhoneTile, FilterDef } from "@/services";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
-import { RenderModeProvider, type RenderMode } from "./render-mode";
+import type { MapLoader } from "./echarts-maps";
+import { RenderModeProvider, useRenderMode, type RenderMode } from "./render-mode";
 import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
 
@@ -44,6 +45,48 @@ export const READY_SAFETY_MS = 20_000;
 /** What replaces an image or web-page card (feature decision 3): the renderer opens the console and nothing else. */
 export const NOT_IN_PDF = "Shown in the console only";
 
+/** How long the view waits for one image card's picture before it prints the placeholder (`BI-42`). */
+export const IMAGE_WAIT_MS = 12_000;
+
+const placeholder = (
+  <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{NOT_IN_PDF}</p>
+);
+
+/**
+ * An image card in the print view (`BI-42`, plan D6b). Gotenberg's Chromium may
+ * open only the console (feature decision 3), so the picture is asked from the
+ * console's own origin, `GET /api/render/image`, which has the API fetch it
+ * when it is an image card of this board on a listed site. The view waits for
+ * it like a chart, up to {@link IMAGE_WAIT_MS}; a picture that fails or is late
+ * leaves the placeholder, so a slow site cannot hold the PDF.
+ */
+function PrintImage({ token, url, title }: { token: string; url: string | undefined; title: string }) {
+  const mode = useRenderMode();
+  const [failed, setFailed] = React.useState(false);
+  const finished = React.useRef(false);
+  const finish = React.useCallback(() => {
+    if (finished.current) return;
+    finished.current = true;
+    mode?.chartFinished();
+  }, [mode]);
+  React.useEffect(() => {
+    if (!url) return;
+    mode?.chartMounted();
+    const timer = window.setTimeout(() => { setFailed(true); finish(); }, IMAGE_WAIT_MS);
+    return () => { window.clearTimeout(timer); finish(); };
+  }, [mode, url, finish]);
+  if (!url || failed) return placeholder;
+  const src = `/api/render/image?token=${encodeURIComponent(token)}&src=${encodeURIComponent(url)}`;
+  return (
+    // eslint-disable-next-line @next/next/no-img-element -- served by the console's own API route for the renderer
+    <img
+      src={src} alt={title} referrerPolicy="no-referrer" loading="eager"
+      className="h-full w-full object-contain"
+      onLoad={finish} onError={() => { setFailed(true); finish(); }}
+    />
+  );
+}
+
 /**
  * How a page that could not load its data fails the PDF (`BI-1` review fix
  * (SHOULD-FIX) R3). Gotenberg is asked for `failOnConsoleExceptions`, so an
@@ -69,7 +112,7 @@ function markReady() {
  * posted to `POST /api/render/data`, which answers the dashboard as the person
  * who asked. Every tab is drawn, one after the other, each after the first
  * starting on a new page with its title; sections are unfolded (nothing here
- * folds); image and web cards are a placeholder; charts draw without animation.
+ * folds); an image card's picture comes through the API (`PrintImage`, `BI-42`) and a web card is a placeholder; charts draw without animation.
  * `window.__lakehouseRenderReady` is set once every chart has finished and the
  * browser has painted, or after {@link READY_SAFETY_MS}. A page that cannot load
  * its data shows the sentence and raises an uncaught exception, which fails the
@@ -143,6 +186,18 @@ export function RenderView({ token, chart = false }: { token: string; chart?: bo
     return () => { cancelAnimationFrame(first); cancelAnimationFrame(second); };
   }, [state, counts]);
 
+  // BI-36: an uploaded map's boundary is read through the render token, like the
+  // data. The signed-in loader (`apiFetch`, the default) answers this view, which
+  // has no session, with a 401 and a redirect to the login page, so a map tile
+  // of a PDF did not draw. The route opens the token's own board's maps only.
+  const loadMap = React.useCallback<MapLoader>(
+    (id) => fetch(`/api/render/maps/${encodeURIComponent(id)}/geojson`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }), cache: "no-store",
+    }),
+    [token],
+  );
+
   if (state === "error") {
     return <div role="alert" className="grid h-screen place-content-center px-4 text-center text-sm">{message}</div>;
   }
@@ -162,9 +217,11 @@ export function RenderView({ token, chart = false }: { token: string; chart?: bo
     kind: spec.kind,
     title: spec.title,
     subtitle: spec.subtitle,
-    body: spec.kind === "image" || spec.kind === "web"
-      ? <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{NOT_IN_PDF}</p>
-      : <TileBody spec={spec} cell={data.results[spec.id]} dark={look.dark} loading={false} />,
+    body: spec.kind === "image"
+      ? <PrintImage token={token} url={(spec.def as { url?: string } | undefined)?.url} title={spec.title} />
+      : spec.kind === "web"
+        ? placeholder
+        : <TileBody spec={spec} cell={data.results[spec.id]} dark={look.dark} loading={false} loadMap={loadMap} />,
   }));
   const tabs = data.tabs ?? [];
 

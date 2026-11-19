@@ -240,7 +240,7 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
     // argument, never from a hook inside it.
     it("falls back to the caller's fallback, and a named page still reads its menu title", () => {
       // Without a fallback the product's own name stands in.
-      expect(pageTitleFor("/no/such/page")).toBe("Rantai Lake")
+      expect(pageTitleFor("/no/such/page")).toBe("RantAI Lakehouse")
       expect(pageTitleFor("/no/such/page", "Acme Data")).toBe("Acme Data")
       // A page a menu item does name still reads that item's title.
       expect(pageTitleFor("/catalog", "Acme Data")).toBe("Catalog")

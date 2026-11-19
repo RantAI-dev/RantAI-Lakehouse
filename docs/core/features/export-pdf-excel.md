@@ -36,7 +36,7 @@ A chart's data downloads only as CSV, only from a raw table, and only up to
 | --- | --- | --- |
 | 1 | The PDF is made by a Gotenberg container (Chromium) in the deployment, which opens a print view of the dashboard in the console over the internal network. | **Owner, 2026-10-17** |
 | 2 | The print view reads the data **as the person who asked** (their masking and row filters), not as the embed viewer role: a short-lived render token names the person, and the API re-reads that person's roles when the view asks for data. The token lives 2 minutes and is good only for that dashboard and those filter values. | Planner |
-| 3 | Every tab is printed, each starting on a new page with its title; sections print unfolded. Image and web-page cards print as "Shown in the console only": the PDF renderer may open only the console itself, so it never fetches anything from outside the deployment. | Planner |
+| 3 | Every tab is printed, each starting on a new page with its title; sections print unfolded. Image and web-page cards print as "Shown in the console only": the PDF renderer may open only the console itself, so it never fetches anything from outside the deployment. The exception is an image card whose site is in the board's content sites: the PDF asks the console's own API for the picture (`GET /api/render/image`, `BI-42`), which fetches only that card's saved address (https, no redirects, PNG/JPEG/GIF/WebP up to 5 MiB); web-page cards stay the placeholder. | Planner, owner 2026-11-15 |
 | 4 | The first page lists the dashboard's name, the filters and parameters applied, who downloaded it and when (in the report time zone). Pages are numbered. | Planner |
 | 5 | A PDF that is not ready in 60 seconds fails with a plain sentence; at most 2 PDFs are made at once per API process, a third waits its turn. | Planner |
 | 6 | When the deployment has no Gotenberg (`GOTENBERG_URL` unset), the PDF item says "PDF export is not set up on this deployment" and the browser's print stays available as before. | Planner |
@@ -54,7 +54,7 @@ A chart's data downloads only as CSV, only from a raw table, and only up to
 ## Limits to tell a customer
 
 - PDFs need the Gotenberg container; without it, only the browser's print.
-- Image and web-page cards do not appear in the PDF.
+- Web-page cards do not appear in the PDF; image cards do when their site is a content site and the picture is a PNG, JPEG, GIF or WebP up to 5 MiB.
 - 1,000,000 rows at most per download.
 - A PDF takes a few seconds per tab and fails after 60 seconds.
 
