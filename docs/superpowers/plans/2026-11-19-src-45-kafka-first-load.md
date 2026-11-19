@@ -171,3 +171,16 @@ Bronze column is named `id`.
   or one that returns the new `source_objects`), called from the handler.
   Do not add `#[allow(clippy::too_many_lines)]` (rule 2: never weaken a lint
   to get green).
+
+### Handoff (review 2 fix)
+
+- BLOCKER 1 (`PR #597 review 2`): the D1 Kafka block moved into a private
+  `fill_kafka_source_objects(state, id, &mut body) -> ApiResult<()>` in
+  `routes/connectors.rs`; `save_ingest_spec` calls it. No `allow`; behaviour
+  unchanged (same connector lookup, same `NotFound`, same
+  `kafka_source_objects` call, only for `kafka`).
+- `save_ingest_spec` code lines (blank and comment lines excluded, signature
+  included): 100 before the change counted 105 by clippy, now about 95 for the
+  body (hand count; 11 code lines replaced by 1).
+- Ran: `cd rust && cargo fmt --check -- crates/lakehouse-api/src/routes/connectors.rs`
+  (clean). *Not verified*: clippy and tests, left to CI by the owner's choice.
