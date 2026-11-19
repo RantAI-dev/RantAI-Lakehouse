@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test"
+import { readFileSync } from "node:fs"
+import { join } from "node:path"
 
 import { PAGE_CONTEXT_MAX_CHARS } from "./page-context-summary"
 import { DESCRIBE_MAX_CHARS, buildReportEditorContext, describeRequest, describedRows, writeRequest } from "./report-editor-context"
@@ -95,5 +97,53 @@ describe("describedRows", () => {
       columns: ["a"],
       rows: [{ a: 1 }],
     })
+  })
+})
+
+describe("the AI-15 cases for the editor (T9)", () => {
+  // The standard request set sends the editor's context as this builder writes it,
+  // so a change to the wording here shows up as a change to the cases too.
+  const cases = JSON.parse(readFileSync(join(import.meta.dir, "../../ops/ai_eval/dashboard_cases.json"), "utf8")) as {
+    id: string
+    context?: string
+    turns: string[]
+  }[]
+  const byId = new Map(cases.map((c) => [c.id, c]))
+  const editorLabel = (id: string) =>
+    id === "{chart}" ? { title: "Eval Report Editor Events", dashboard: "Eval Report Editor Board" } : undefined
+
+  it("describes a chart with the editor's own context and request", () => {
+    const c = byId.get("report_editor_describe_chart")!
+    expect(c.turns).toEqual([describeRequest("Eval Report Editor Events")])
+    expect(c.context).toBe(
+      buildReportEditorContext({
+        id: null,
+        title: "Eval Editor Describe",
+        blocks: [
+          { type: "heading", text: "Events", level: 1 },
+          { type: "chart", chart: "{chart}" },
+        ],
+        chartLabel: editorLabel,
+        chart: { id: "{chart}", title: "Eval Report Editor Events", dashboard: "Eval Report Editor Board", rows: { kind: "not loaded" } },
+      }),
+    )
+  })
+
+  it("writes a summary with the editor's own context and request", () => {
+    const c = byId.get("report_editor_write_summary")!
+    expect(c.turns).toEqual([writeRequest("a short summary of this report")])
+    expect(c.context).toBe(
+      buildReportEditorContext({
+        id: null,
+        title: "Eval Editor Summary",
+        blocks: [
+          { type: "heading", text: "Events", level: 1 },
+          { type: "paragraph", text: "This report follows the **events** held each year, from the events mart." },
+          { type: "quote", text: "Counts are the year's total events." },
+          { type: "chart", chart: "{chart}" },
+        ],
+        chartLabel: (id) => (id === "{chart}" ? { title: "Eval Report Summary Events", dashboard: "Eval Report Summary Board" } : undefined),
+      }),
+    )
   })
 })

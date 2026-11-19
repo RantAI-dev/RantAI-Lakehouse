@@ -1043,6 +1043,40 @@
     ]
   },
   {
+    "id": "report_editor_describe_chart",
+    "mode": "ask",
+    "lang": "en",
+    "note": "BI-62 PR B (T9, D8): the report editor's Describe on a chart. The page context is the editor's (buildReportEditorContext) with the chart's rows not loaded, so a number must come from a tool; the answer is the draft's text only (no preamble), and the report is not changed through a tool while the editor holds it.",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Report Editor Board"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Report Editor Events", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "context": "The user is writing the report \"Eval Editor Describe\" in the report editor (not saved yet, 1 of 30 charts). The editor holds this report while it is open and saves it itself: do not change it with update_report; answer with text instead. A message that starts \"Write for this report:\" or asks to describe a chart \"for this report\" is placed in the report as a draft the user accepts or discards: answer it with only the text to add, in the Markdown a report holds (paragraphs, # and ## headings, - and 1. lists, > quotes, ---, **bold**, *italic*, [words](https://\u2026) links), with no preamble, no closing question, no tables and no code. Use only numbers from the rows given here or from your tools. The chart to describe: \"Eval Report Editor Events\" (chart id {chart}) from the dashboard \"Eval Report Editor Board\". Its rows are not loaded on the page yet (rows not loaded): read them with a tool before giving any number. The report so far, as Markdown:\n# Events\n\n[chart: Eval Report Editor Events \u00b7 Eval Report Editor Board]",
+    "turns": ["Describe the chart \u201cEval Report Editor Events\u201d for this report"],
+    "expect_no_tool": ["update_report", "create_report"],
+    "facts": [
+      {"label": "latest year's events", "kind": "number", "sql": "SELECT jumlah_event FROM serving.mart_event WHERE tahun = (SELECT max(tahun) FROM serving.mart_event)", "tol": 0.006}
+    ],
+    "forbid": ["^\\s*(sure|certainly|of course|here is|here's)\\b"]
+  },
+  {
+    "id": "report_editor_write_summary",
+    "mode": "ask",
+    "lang": "en",
+    "note": "BI-62 PR B (T9, D8): the report editor's Ask AI to write\u2026 with \"a short summary of this report\". The page context holds the report as Markdown; the answer is the text to add (no preamble), about what the report holds, and the report is not changed through a tool.",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Report Summary Board"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Report Summary Events", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "context": "The user is writing the report \"Eval Editor Summary\" in the report editor (not saved yet, 1 of 30 charts). The editor holds this report while it is open and saves it itself: do not change it with update_report; answer with text instead. A message that starts \"Write for this report:\" or asks to describe a chart \"for this report\" is placed in the report as a draft the user accepts or discards: answer it with only the text to add, in the Markdown a report holds (paragraphs, # and ## headings, - and 1. lists, > quotes, ---, **bold**, *italic*, [words](https://\u2026) links), with no preamble, no closing question, no tables and no code. Use only numbers from the rows given here or from your tools. The report so far, as Markdown:\n# Events\n\nThis report follows the **events** held each year, from the events mart.\n\n> Counts are the year's total events.\n\n[chart: Eval Report Summary Events \u00b7 Eval Report Summary Board]",
+    "turns": ["Write for this report: a short summary of this report"],
+    "expect_no_tool": ["update_report", "create_report"],
+    "facts": [
+      {"label": "topic", "kind": "text", "values": ["events"]}
+    ],
+    "forbid": ["^\\s*(sure|certainly|of course|here is|here's)\\b"]
+  },
+  {
     "id": "dashboard_from_template",
     "mode": "build",
     "confirm": true,
