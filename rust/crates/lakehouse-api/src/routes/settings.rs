@@ -74,6 +74,7 @@ use lakehouse_store::workspace_settings::{self, ImageKind, StoredImage, Workspac
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Digest as _;
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use crate::audit_coverage;
@@ -599,6 +600,10 @@ pub async fn get_reporting(
 /// `PUT /api/settings/reporting` — save `{timeZone, weekStart}` and, when
 /// sent, `{numberLocale, companyPalette, fonts, contentSites}`.
 ///
+/// The route's audit rows are the handler's (plan D3): the save writes one
+/// naming the settings that changed, and a save this handler refuses writes
+/// its own `refused` row.
+///
 /// # Errors
 ///
 /// 400 with a fixed message when the body is not those fields, the first
@@ -611,6 +616,57 @@ pub async fn put_reporting(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    let reply = save_reporting(&state, &principal, body).await;
+    match reply {
+        Ok(reply) => Ok(reply),
+        Err(err) => {
+            // Plan D3: the route's refusal row is now the handler's to write;
+            // the gate's 403 row is separate and already written there.
+            if let Some(status) = handler_refusal_status(&err) {
+                audit_settings_refusal(
+                    &state,
+                    &principal,
+                    "settings.reporting.update",
+                    "reporting",
+                    status,
+                )
+                .await;
+            }
+            Err(err.into())
+        }
+    }
+}
+
+/// The settings as the console names them, under `reporting` (plan D3): the
+/// snapshot the save's row diffs against, so the paths read
+/// `reporting.resultCache.mode` the way the console's answer names them.
+fn reporting_snapshot(row: &lakehouse_store::reporting_settings::ReportingSettings) -> Value {
+    json!({
+        "reporting": {
+            "timeZone": row.time_zone,
+            "weekStart": row.week_start,
+            "numberLocale": row.number_locale,
+            "companyPalette": row.company_palette,
+            "fonts": row.fonts,
+            "contentSites": row.content_sites,
+            "downloadDeniedRoles": row.download_denied_roles,
+            "reportAllowedDomains": row.report_allowed_domains,
+            "publicLinksEnabled": row.public_links_enabled,
+            "resultCache": {
+                "mode": row.result_cache_mode,
+                "minutes": row.result_cache_minutes,
+            },
+        }
+    })
+}
+
+/// The save behind [`put_reporting`], whose errors the wrapper turns into the
+/// refusal row.
+async fn save_reporting(
+    state: &AppState,
+    principal: &Principal,
+    body: Bytes,
+) -> Result<ApiJson<Value>, ApiError> {
     // Parsed by hand so a malformed body gets this module's message.
     let parsed: SettingsBody =
         serde_json::from_slice(&body).map_err(|_| ApiError::BadRequest(BODY_SHAPE.to_owned()))?;
@@ -621,10 +677,9 @@ pub async fn put_reporting(
     let Some(pool) = state.pg.as_deref() else {
         return Err(ApiError::Unavailable(
             "Settings need a database, and none is configured.".to_owned(),
-        )
-        .into());
+        ));
     };
-    let current = format_settings(&state).await?;
+    let current = format_settings(state).await?;
     // Role names are read only when the body sends the list.
     let known_roles = if parsed.download_denied_roles.is_some() {
         Some(
@@ -639,10 +694,13 @@ pub async fn put_reporting(
         None
     };
     let format = checked_formatting(&parsed, &current, known_roles.as_deref())?;
-    if !engine_knows_zone(&state, ctx.zone()).await? {
-        return Err(ApiError::BadRequest("Unknown time zone.".to_owned()).into());
+    if !engine_knows_zone(state, ctx.zone()).await? {
+        return Err(ApiError::BadRequest("Unknown time zone.".to_owned()));
     }
-    let stored = lakehouse_store::reporting_settings::upsert(
+    // Plan D3b: the save returns the row it replaced, read in the save's own
+    // transaction, so two racing saves cannot name each other's settings as
+    // unchanged.
+    let (replaced, stored) = lakehouse_store::reporting_settings::upsert(
         pool,
         &lakehouse_store::reporting_settings::ReportingSettings {
             time_zone: ctx.zone().to_owned(),
@@ -664,6 +722,26 @@ pub async fn put_reporting(
     )
     .await
     .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    // Plan D3: the row names the settings that changed, from the row this
+    // save replaced against the row now stored — the paths only, never a
+    // value. No row existed before: the save set every part of it, so it
+    // diffs against an empty `reporting`.
+    let paths = changed_setting_paths(
+        &replaced
+            .as_ref()
+            .map_or_else(|| json!({ "reporting": {} }), reporting_snapshot),
+        &reporting_snapshot(&stored),
+    );
+    let detail = (!paths.is_empty()).then(|| paths.join(", "));
+    audit_settings_event(
+        state,
+        principal,
+        "settings.reporting.update",
+        "reporting",
+        json!({ "fields": paths }),
+        detail.as_deref(),
+    )
+    .await;
     // Echo what was stored, through the same constructor reads use.
     let echoed = WeekStart::parse(&stored.week_start)
         .and_then(|w| TimeContext::new(&stored.time_zone, w).ok())
@@ -1949,7 +2027,7 @@ pub async fn post_assistant_test(State(state): State<AppState>) -> ApiResult<Api
 /// Best effort, like every other audit write: a failed audit write never
 /// fails, or undoes, the save it records, and is counted
 /// ([`audit_coverage::record_best_effort`]).
-async fn audit_settings_update(
+pub(crate) async fn audit_settings_update(
     state: &AppState,
     principal: &Principal,
     action: &str,
@@ -1962,19 +2040,23 @@ async fn audit_settings_update(
         action,
         resource,
         json!({ "fields": fields }),
+        None,
     )
     .await;
 }
 
 /// The same audit row with any `args`, for a save whose record is not a list
 /// of field names (`ADM-2`: a picture's kind, type and size). The caller owns
-/// the rule that `args` never holds a value or a secret.
-async fn audit_settings_event(
+/// the rule that `args` never holds a value or a secret. `detail` is the row's
+/// own sentence (the names of what changed, or `None` for a save whose row
+/// needs no more than `args`).
+pub(crate) async fn audit_settings_event(
     state: &AppState,
     principal: &Principal,
     action: &str,
     resource: &str,
     args: Value,
+    detail: Option<&str>,
 ) {
     let event = NewAuditEvent {
         principal_id: Some(principal.id.uuid().to_string()),
@@ -1985,7 +2067,126 @@ async fn audit_settings_event(
         resource_id: Some(resource.to_owned()),
         args: Some(args),
         outcome: "executed".to_owned(),
-        detail: None,
+        detail: detail.map(str::to_owned),
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    };
+    audit_coverage::record_best_effort(state, event).await;
+}
+
+/// The dotted paths where two settings snapshots differ, sorted (plan D3). A
+/// key added or removed counts, an array compares whole, and a path is a
+/// name only, never a value: whoever reads the trail reads these paths.
+///
+/// A key that exists on one side only is walked key by key like any other
+/// object, so the path names the setting that changed
+/// (`roles.Viewer.timeoutSeconds`), not the object that holds it.
+///
+/// Both arguments are the settings as JSON objects with the console's
+/// camelCase names, so the paths read like the console's fields
+/// (`install.chartRows`, `roles.Analyst.timeoutSeconds`,
+/// `reporting.resultCache.mode`).
+pub(crate) fn changed_setting_paths(before: &Value, after: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    changed_paths("", before, after, &mut paths);
+    paths.sort();
+    paths
+}
+
+/// The walker behind [`changed_setting_paths`]: two objects are walked key by
+/// key, a key on one side only is walked into (its other side is nothing),
+/// and anything else — a scalar or an array — is a leaf compared whole.
+fn changed_paths(prefix: &str, before: &Value, after: &Value, out: &mut Vec<String>) {
+    let empty = serde_json::Map::new();
+    match (before, after) {
+        (Value::Object(before_map), Value::Object(after_map)) => {
+            changed_keys(prefix, before_map, after_map, out);
+        }
+        // A key that exists on one side only: the side that has it is walked
+        // key by key, so the path names the setting, not the object.
+        (Value::Object(before_map), Value::Null) => {
+            changed_keys(prefix, before_map, &empty, out);
+        }
+        (Value::Null, Value::Object(after_map)) => {
+            changed_keys(prefix, &empty, after_map, out);
+        }
+        _ if before != after => out.push(prefix.to_owned()),
+        _ => {}
+    }
+}
+
+/// The key-by-key walk behind [`changed_paths`]: every key of either side,
+/// and for each of them the two values (nothing on the side that does not
+/// have the key).
+fn changed_keys(
+    prefix: &str,
+    before: &serde_json::Map<String, Value>,
+    after: &serde_json::Map<String, Value>,
+    out: &mut Vec<String>,
+) {
+    let keys: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    for key in keys {
+        let path = if prefix.is_empty() {
+            (*key).clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        changed_paths(
+            &path,
+            before.get(key).unwrap_or(&Value::Null),
+            after.get(key).unwrap_or(&Value::Null),
+            out,
+        );
+    }
+}
+
+/// The fixed sentence of a settings save the handler refused (plan D3). It
+/// names the status the way the central writer's row named it, and nothing
+/// else: never the payload that did not parse.
+fn settings_refusal_detail(status: u16) -> String {
+    format!("The settings save was refused with HTTP {status}; the values sent were not valid.")
+}
+
+/// The status that makes a handler's own error a refusal for the trail (plan
+/// D3): the validation failures it answers with `400`/`422`. A `403` never
+/// reaches the handler (the gate writes that refusal row), and a `5xx` is a
+/// failure, not a refusal. Shared by both settings routes' save wrappers.
+pub(crate) fn handler_refusal_status(err: &ApiError) -> Option<u16> {
+    match err {
+        ApiError::BadRequest(_) | ApiError::Unprocessable(_) => {
+            Some(if matches!(err, ApiError::BadRequest(_)) {
+                400
+            } else {
+                422
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The `refused` row of a settings save the handler itself turned away with
+/// `400`/`422` (plan D3). The route's rows are now the handler's to write, so
+/// a refused save keeps its row: outcome `refused`, the paths unknown (the
+/// payload may never have parsed), and the fixed sentence in `detail` — never
+/// the payload. Best effort, like [`audit_settings_event`].
+pub(crate) async fn audit_settings_refusal(
+    state: &AppState,
+    principal: &Principal,
+    action: &str,
+    resource: &str,
+    status: u16,
+) {
+    let event = NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: action.to_owned(),
+        resource_kind: Some("settings".to_owned()),
+        resource_id: Some(resource.to_owned()),
+        args: Some(json!({ "fields": [] })),
+        outcome: "refused".to_owned(),
+        detail: Some(settings_refusal_detail(status)),
         run_id: None,
         approval_id: None,
         session_id: None,
@@ -2944,6 +3145,7 @@ pub async fn put_general_image(
         "settings.general.image_upload",
         "general",
         json!({ "kind": picture_label(kind), "type": media_type, "bytes": bytes.len() }),
+        None,
     )
     .await;
     Ok(ApiJson(general_settings_json(Some(&saved))))
@@ -2990,6 +3192,7 @@ pub async fn delete_general_image(
         "settings.general.image_remove",
         "general",
         args,
+        None,
     )
     .await;
     Ok(ApiJson(general_settings_json(Some(&saved))))
@@ -3019,6 +3222,7 @@ pub async fn delete_general(
         "settings.general.reset",
         "general",
         json!({}),
+        None,
     )
     .await;
     Ok(ApiJson(general_settings_json(None)))
@@ -3117,6 +3321,87 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// Plan D3: the helper behind the settings rows names the dotted paths
+    /// that differ — a changed leaf, a key added, a key removed, an array
+    /// compared whole — sorted, and never a value.
+    #[test]
+    fn changed_setting_paths_names_the_dotted_paths_that_differ_sorted_and_holds_no_value() {
+        let before = json!({
+            "install": { "timeoutSeconds": 60, "chartRows": 2000 },
+            "reporting": { "weekStart": "monday", "fonts": ["inter", "system"] },
+            "roles": { "Analyst": { "timeoutSeconds": 300 } },
+        });
+        let after = json!({
+            "install": { "timeoutSeconds": 60, "chartRows": 3000 },
+            "reporting": { "weekStart": "sunday", "fonts": ["inter"] },
+            "roles": { "Analyst": { "timeoutSeconds": 300 }, "Viewer": { "timeoutSeconds": 120 } },
+        });
+        assert_eq!(
+            changed_setting_paths(&before, &after),
+            vec![
+                "install.chartRows".to_owned(),
+                "reporting.fonts".to_owned(),
+                "reporting.weekStart".to_owned(),
+                "roles.Viewer.timeoutSeconds".to_owned(),
+            ],
+            "a changed leaf, a whole-array change and an added role, sorted"
+        );
+        // Removed keys count too, and the paths hold no value from either
+        // side.
+        let after_removal = json!({
+            "install": { "timeoutSeconds": 60 },
+            "reporting": { "weekStart": "monday", "fonts": ["inter", "system"] },
+            "roles": { "Analyst": { "timeoutSeconds": 300 } },
+        });
+        assert_eq!(
+            changed_setting_paths(&before, &after_removal),
+            vec!["install.chartRows".to_owned()],
+        );
+        let no_path_holds_a_value = changed_setting_paths(&before, &after).iter().all(|path| {
+            !path.contains("2000")
+                && !path.contains("3000")
+                && !path.contains("monday")
+                && !path.contains("sunday")
+        });
+        assert!(
+            no_path_holds_a_value,
+            "a path is a name: {:#?}",
+            changed_setting_paths(&before, &after)
+        );
+    }
+
+    /// A save that changes nothing records `fields: []`, so two equal
+    /// snapshots name no path (plan D3).
+    #[test]
+    fn identical_snapshots_name_no_changed_path() {
+        let one = json!({
+            "install": { "timeoutSeconds": 60, "chartRows": 2000 },
+            "roles": { "Analyst": { "timeoutSeconds": 300 } },
+        });
+        let two = json!({
+            "roles": { "Analyst": { "timeoutSeconds": 300 } },
+            "install": { "chartRows": 2000, "timeoutSeconds": 60 },
+        });
+        assert!(
+            changed_setting_paths(&one, &two).is_empty(),
+            "key order is not a change"
+        );
+    }
+
+    /// The first save diffs against an empty `reporting`, so every part of
+    /// the settings counts as set by it.
+    #[test]
+    fn a_first_save_against_no_stored_settings_names_every_part_of_them() {
+        let stored = json!({ "reporting": { "timeZone": "UTC", "weekStart": "monday" } });
+        assert_eq!(
+            changed_setting_paths(&json!({ "reporting": {} }), &stored),
+            vec![
+                "reporting.timeZone".to_owned(),
+                "reporting.weekStart".to_owned(),
+            ]
+        );
+    }
 
     /// The first bytes decide the type: the three accepted signatures, and the
     /// near misses that must not pass for them.

@@ -66,8 +66,14 @@ pub async fn get(pool: &PgPool) -> Result<Option<ReportingSettings>, StoreError>
     .await?)
 }
 
-/// Save the settings, replacing any earlier ones, and return what is stored.
-/// `updated_by` is the saving principal's id.
+/// Save the settings, replacing any earlier ones, and return the row the
+/// save replaced (`None` when the deployment never saved) together with the
+/// row now stored. `updated_by` is the saving principal's id.
+///
+/// The replaced row is read in the save's own transaction, under `FOR
+/// UPDATE`, before the write (plan D3b): two concurrent saves queue, and a
+/// save never reports values read while an uncommitted save beside it held
+/// the row.
 ///
 /// # Errors
 ///
@@ -77,8 +83,17 @@ pub async fn upsert(
     pool: &PgPool,
     settings: &ReportingSettings,
     updated_by: &str,
-) -> Result<ReportingSettings, StoreError> {
-    Ok(sqlx::query_as(
+) -> Result<(Option<ReportingSettings>, ReportingSettings), StoreError> {
+    let mut tx = pool.begin().await?;
+    let replaced: Option<ReportingSettings> = sqlx::query_as(
+        "SELECT time_zone, week_start, number_locale, company_palette, fonts, content_sites, \
+             download_denied_roles, report_allowed_domains, public_links_enabled, \
+             result_cache_mode, result_cache_minutes \
+         FROM reporting_settings WHERE singleton FOR UPDATE",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let stored: ReportingSettings = sqlx::query_as(
         "INSERT INTO reporting_settings \
              (singleton, time_zone, week_start, number_locale, company_palette, fonts, content_sites, \
               download_denied_roles, report_allowed_domains, public_links_enabled, \
@@ -109,6 +124,8 @@ pub async fn upsert(
     .bind(&settings.result_cache_mode)
     .bind(settings.result_cache_minutes)
     .bind(updated_by)
-    .fetch_one(pool)
-    .await?)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((replaced, stored))
 }

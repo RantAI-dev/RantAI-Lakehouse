@@ -339,7 +339,13 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/dashboard/comments/mentions/read", Coverage::Excluded { reason: EX_UI_STATE }),
     ("PUT", "/api/dashboard/comments/{id}", Coverage::Central { action: "dashboard_comment.update", resource_kind: "dashboard_comment", id_param: IdParam::Path("id") }),
     ("DELETE", "/api/dashboard/comments/{id}", Coverage::Central { action: "dashboard_comment.delete", resource_kind: "dashboard_comment", id_param: IdParam::Path("id") }),
-    ("PUT", "/api/settings/reporting", Coverage::Central { action: "settings.reporting.update", resource_kind: "settings", id_param: IdParam::None }),
+    // Plan D3: the save names the settings that changed, which only the
+    // handler knows — the store's save returns the row it replaced (plan
+    // D3b) and the handler diffs against it (`routes::settings`
+    // `save_reporting`, `routes::query_limits` `save_limits`). The handler
+    // also writes the row of a save it refuses with `400`/`422`; the gate
+    // keeps writing the `403` refusal.
+    ("PUT", "/api/settings/reporting", Coverage::Handler { action: "settings.reporting.update" }),
     ("POST", "/api/usage/rates", Coverage::Central { action: "usage.rate_create", resource_kind: "settings", id_param: IdParam::None }),
     ("PUT", "/api/settings/email", Coverage::Handler { action: "settings.email.update" }),
     ("POST", "/api/settings/email/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
@@ -353,7 +359,8 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("PUT", "/api/settings/sso", Coverage::Handler { action: "settings.sso.update" }),
     ("POST", "/api/settings/sso/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
     ("POST", "/api/query/cancel", Coverage::Central { action: "query.cancel", resource_kind: "query_run", id_param: IdParam::None }),
-    ("PUT", "/api/settings/limits", Coverage::Central { action: "settings.limits.update", resource_kind: "settings", id_param: IdParam::None }),
+    // Plan D3: Handler — see the settings rows above.
+    ("PUT", "/api/settings/limits", Coverage::Handler { action: "settings.limits.update" }),
     ("POST", "/api/ai/chat", Coverage::Handler { action: crate::routes::ASSISTANT_CHAT_ACTION }),
     ("POST", "/api/ai/tool", Coverage::Handler { action: crate::routes::ASSISTANT_TOOL_ACTION }),
     ("POST", "/api/ai/sessions", Coverage::Excluded { reason: EX_UI_STATE }),

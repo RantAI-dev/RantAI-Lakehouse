@@ -114,6 +114,11 @@ fn principal_audit_event(principal: &Principal, action: &str, outcome: &str) -> 
 /// wrong, the same as the response.
 const SIGN_IN_REFUSED_DETAIL: &str = "The email or the password did not match.";
 
+/// The fixed sentence of the lock row (`plan D5b`). The trail holds no
+/// identifier material on it, so the row says only what happened — never the
+/// identifier, and never any hash of it.
+const SIGN_IN_LOCKED_DETAIL: &str = "Too many failed sign-ins; this sign-in is locked for a while.";
+
 /// The `auth.login` row of a sign-in that worked. Nobody was signed in when
 /// the form was submitted, so the actor is the form; the principal is set
 /// only because the password verified. Nothing the visitor typed is in it:
@@ -136,8 +141,8 @@ fn sign_in_executed_event(user_id: Uuid, principal_kind: &str) -> NewAuditEvent 
 /// 48 bits of the unsalted SHA-256 the throttle counts by, which a reader of
 /// the trail could match against guessed emails, and which leaks a prefix of
 /// the hash of a password typed into the identifier box. An unknown email
-/// writes the identical row: the trail is not an account oracle. (The lock
-/// row, `auth.login_locked`, keeps its older key prefix.)
+/// writes the identical row: the trail is not an account oracle. The lock row
+/// keeps no identifier material either (plan D5b).
 fn sign_in_refused_event() -> NewAuditEvent {
     NewAuditEvent {
         action: "auth.login".to_owned(),
@@ -366,15 +371,21 @@ pub async fn login(
             // SEC-49: the try was already counted before hashing; the try
             // that reached the limit is the one that set the lock.
             if attempt_lock.is_some() && attempt == policy.max_failures {
+                // Plan D5b: the row holds no identifier material — the key
+                // prefix it used to carry was the first 12 hex characters of
+                // the unsalted SHA-256 of what was typed into the identifier
+                // box, and a reader of the trail could match it against
+                // guessed emails. Nobody signed in, so there is no principal
+                // and no resource either; the fixed sentence is all the row
+                // says. Rows written before this change keep their prefix:
+                // `audit_event` is append-only, so nothing rewrites them.
                 let event = NewAuditEvent {
                     action: "auth.login_locked".to_owned(),
                     outcome: "refused".to_owned(),
-                    resource_kind: Some("login_key".to_owned()),
-                    resource_id: Some(key[..12].to_owned()),
                     // QA LH-SEC-2-06 (SEC-70, decision D3): nobody signed in
-                    // yet, so the event has no principal and names the form
-                    // that produced it.
+                    // yet, so the event names the form that produced it.
                     actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
+                    detail: Some(SIGN_IN_LOCKED_DETAIL.to_owned()),
                     ..Default::default()
                 };
                 audit_coverage::record_best_effort(&state, event).await;

@@ -6,7 +6,9 @@
 use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
-use lakehouse_store::query_limits::{QueryLimits, get, role_limits, save};
+use lakehouse_store::query_limits::{
+    QueryLimits, ReplacedLimits, RoleLimit, get, role_limits, save,
+};
 use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 use uuid::Uuid;
@@ -112,9 +114,17 @@ async fn a_save_round_trips_and_replaces_the_role_set(pool: PgPool) -> sqlx::Res
         map_points: 1000,
         studio_rows: 7000,
     };
-    save(&pool, &install, &[(analyst, 300)], "user-a")
+    let replaced = save(&pool, &install, &[(analyst, 300)], "user-a")
         .await
         .expect("save");
+    assert_eq!(
+        replaced,
+        ReplacedLimits {
+            install: Some(QueryLimits::default()),
+            roles: Vec::new(),
+        },
+        "the first save replaced the seeded row and no role limits"
+    );
     assert_eq!(get(&pool).await.expect("get"), install);
     let roles = role_limits(&pool).await.expect("roles");
     assert_eq!(roles.len(), 1);
@@ -123,6 +133,103 @@ async fn a_save_round_trips_and_replaces_the_role_set(pool: PgPool) -> sqlx::Res
 
     save(&pool, &install, &[], "user-a").await.expect("save");
     assert_eq!(role_limits(&pool).await.expect("roles"), Vec::new());
+    Ok(())
+}
+
+/// Plan D3b: a save reports the values it replaced — the install limits and
+/// the role limits with their names — so the route can name what changed
+/// without reading before it saved.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_save_reports_the_install_limits_and_the_role_limits_it_replaced_with_their_names(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let analyst = role_id(&pool, "Platform Admin").await;
+    let first = QueryLimits {
+        timeout_seconds: 90,
+        chart_rows: 500,
+        map_points: 1000,
+        studio_rows: 7000,
+    };
+    save(&pool, &first, &[(analyst, 300)], "user-a")
+        .await
+        .expect("first save");
+
+    let second = QueryLimits {
+        timeout_seconds: 120,
+        chart_rows: 600,
+        map_points: 1100,
+        studio_rows: 7100,
+    };
+    let replaced = save(&pool, &second, &[], "user-b")
+        .await
+        .expect("second save");
+    assert_eq!(
+        replaced.install,
+        Some(first),
+        "the install limits the second save replaced"
+    );
+    assert_eq!(
+        replaced.roles,
+        vec![RoleLimit {
+            role_id: analyst,
+            role_name: "Platform Admin".to_owned(),
+            timeout_seconds: 300,
+        }],
+        "the role limits the second save replaced, with the role's name"
+    );
+    assert_eq!(get(&pool).await.expect("get"), second);
+    Ok(())
+}
+
+/// Plan D3b: two saves racing each other must serialise, so the second one
+/// reports the values the first committed as the ones it replaced, and never
+/// the values it would have read before the first committed. Connection A
+/// holds an uncommitted update of the install row; `save` on the pool waits
+/// for it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_save_waits_for_an_uncommitted_save_and_reports_the_values_it_committed_as_replaced(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // Another request's save, not committed yet: the install row is locked
+    // until this transaction ends. The transaction holds one connection of
+    // the pool, and the save below takes another.
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE query_limits SET chart_rows = 777 WHERE singleton")
+        .execute(&mut *tx)
+        .await?;
+
+    let new = QueryLimits {
+        timeout_seconds: 90,
+        chart_rows: 888,
+        map_points: 1000,
+        studio_rows: 7000,
+    };
+    let task_pool = pool.clone();
+    let save_task = tokio::spawn(async move {
+        save(&task_pool, &new, &[], "user-b")
+            .await
+            .expect("the save that waits")
+    });
+    // Without the lock the save reads past this uncommitted update at once;
+    // with it, the save is still waiting here.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !save_task.is_finished(),
+        "the save must wait for the uncommitted save before it"
+    );
+
+    tx.commit().await?;
+    let replaced = save_task.await.expect("the save task joins");
+    assert_eq!(
+        replaced.install.map(|limits| limits.chart_rows),
+        Some(777),
+        "the committed update is what the save reports as replaced"
+    );
+    assert_eq!(
+        get(&pool).await.expect("get"),
+        new,
+        "the save wrote its own values"
+    );
     Ok(())
 }
 
