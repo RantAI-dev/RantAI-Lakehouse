@@ -90,20 +90,35 @@ pub(super) async fn get_audit_history(state: &AppState, principal: Option<&Princ
     }
 }
 
+/// Refusal for the classification list without a person (`SEC-76`): a headless
+/// run has no person whose reach narrows the list.
+pub(super) const CLASSIFICATION_RULES_NEED_A_USER: &str =
+    "reading classification rules needs a signed-in user";
+
+/// Refusal for the quality list without a person (`SEC-76`): a headless run
+/// has no person whose reach narrows the list.
+pub(super) const QUALITY_RULES_NEED_A_USER: &str = "reading quality rules needs a signed-in user";
+
+/// Refusal for drafting a quality rule without a person (`SEC-76`): the rule
+/// is written as the person, and a headless run has none.
+pub(super) const CREATING_QUALITY_RULE_NEEDS_A_USER: &str =
+    "creating a quality rule needs a signed-in user";
+
 /// `SEC-20` (plan 96): the classification list, as the person behind the chat
 /// may read it. The rows name the tables of the shared catalog and the upload
 /// tables of every tenant, so a person's list is narrowed to the tables in
 /// their reach by [`crate::routes::governance::read_kind`], the rule
 /// `GET /api/governance/classification` applies. The tool has no request
 /// headers, so the reach is the person's own tenant's, the convention
-/// `get_maintenance_metrics` follows. No principal is a headless run and is not
-/// narrowed, exactly as it was.
+/// `get_maintenance_metrics` follows. No principal is a headless run, which has
+/// no person whose reach narrows the list: it is refused and reads nothing
+/// (`SEC-76`; it used to read the whole list).
 pub(super) async fn list_classification_rules(
     state: &AppState,
     principal: Option<&Principal>,
 ) -> Value {
     let Some(principal) = principal else {
-        return governance_kind(state, "classification").await;
+        return json!({ "error": CLASSIFICATION_RULES_NEED_A_USER });
     };
     response_to_value(
         crate::routes::governance::read_kind(
@@ -118,6 +133,11 @@ pub(super) async fn list_classification_rules(
 }
 
 pub(super) async fn list_quality_rules(state: &AppState, principal: Option<&Principal>) -> Value {
+    // SEC-76: the quality list is not narrowed for a headless run
+    // (`read_kind` leaves it whole for `None`), so a headless run is refused.
+    let Some(principal) = principal else {
+        return json!({ "error": QUALITY_RULES_NEED_A_USER });
+    };
     response_to_value(
         // The tool has no request headers of its own, so the tenant rule reads
         // the person's own tenant — the same convention `draft_quality_rule`
@@ -125,7 +145,7 @@ pub(super) async fn list_quality_rules(state: &AppState, principal: Option<&Prin
         // to the tables their roles read (`GOV-15` D7).
         crate::routes::governance::read_kind(
             state,
-            principal,
+            Some(principal),
             &axum::http::HeaderMap::new(),
             "quality",
         )
@@ -272,9 +292,10 @@ pub(super) async fn draft_classification_rule(
 /// `draft_quality_rule` creates the rule through the console's own handler, as
 /// the person behind the chat: the table they may not read is refused exactly
 /// as the form refuses it, and a table that is not there is refused too
-/// (QA `LH-DATA-14-01` F2, `DATA-54`; review round 1 R1). With no signed-in
-/// person (a headless run) there is nobody to narrow by, and `TableAccess`
-/// documents that such a call is not narrowed.
+/// (QA `LH-DATA-14-01` F2, `DATA-54`; review round 1 R1). A headless run (no
+/// signed-in person) is refused before the write (`SEC-76`): with no
+/// person there is nobody to hold the table to, and `create_quality_rule`
+/// would not narrow the check.
 pub(super) async fn draft_quality_rule(
     state: &AppState,
     principal: Option<&Principal>,
@@ -284,6 +305,9 @@ pub(super) async fn draft_quality_rule(
     if name.is_empty() {
         return json!({ "error": "name is required" });
     }
+    let Some(principal) = principal else {
+        return json!({ "error": CREATING_QUALITY_RULE_NEEDS_A_USER });
+    };
     let bytes = match serde_json::to_vec(&Value::Object(args.clone())) {
         Ok(bytes) => bytes,
         // Serialising our own `Value` (infallible in practice): not an upstream error.
@@ -292,7 +316,7 @@ pub(super) async fn draft_quality_rule(
     api_result_to_value(
         crate::routes::governance::create_quality_rule(
             State(state.clone()),
-            principal,
+            Some(principal),
             // The tool has no request headers of its own, so the tenant rule
             // reads the person's own tenant (`tenant_scope::resolve`).
             &axum::http::HeaderMap::new(),

@@ -22,22 +22,21 @@ No new assistant capability is needed for a presentation-only correction.
 UX-4, owner approved 2026-11-19 ("go ahead"): UX-1's marks were overkill.
 Stars only where a form mixes required and optional inputs — a form in which
 every visible input is required (sign-in, change password, a rename box)
-shows no star. The "`*` Required" line (`RequiredLegend`) only on a form
-that shows stars and has four or more inputs. Required semantics stay on
-every control: native `required` and `aria-required` are never removed, and
-validation, disabled buttons, defaults and error messages do not change. The
-AI chat box returns to its pre-#568 presentation (no visible "Message" label,
-no tooltip, no hidden requirement text). The shared pieces —
-`RequiredMarker`, `RequiredLegend`, the `required` prop on
-`Label`/`FieldLabel` — stay; only their call sites changed.
+shows no star. No form shows a `* Required` line (UX-5, owner
+2026-11-19). Required semantics stay on every control: native `required`
+and `aria-required` are never removed, and validation, disabled buttons,
+defaults and error messages do not change. The AI chat box returns to its
+pre-#568 presentation (no visible "Message" label, no tooltip, no hidden
+requirement text). The shared pieces — `RequiredMarker`, the `required`
+prop on `Label`/`FieldLabel` — stay; only their call sites changed.
 
 ## Acceptance checklist
 
 Owner runtime acceptance is pending; no step below has been executed.
 
 - Required inputs show `*` only on forms that mix required and optional
-  inputs; all-required and single-input forms show no star, and only a
-  starred form with four or more inputs explains `* Required`.
+  inputs; all-required and single-input forms show no star, and no form
+  shows a `* Required` line (UX-5, owner 2026-11-19).
 - Screen readers receive the label and required state for native/custom inputs.
 - Auth, admin, governance, employees and conditional run prompts follow the rule.
 - Connector create/edit credentials match auth and repoint requirements; all
