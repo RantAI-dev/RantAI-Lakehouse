@@ -121,6 +121,8 @@ export const dashboardService = clickhouseDashboardService
 export type {
   AccessKind, AccessLevel, Board, BoardChart, BoardTab, ChartOutline, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
   ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, ShortcutItem, TileBox,
+  // `BI-29`: the filter and click shapes, formerly imported from `clients/bi-store`.
+  ChartClick, FilterDef, FilterField, FilterKind, FilterOp, FilterSkip, FilterValues, FilterValuesScope, RelativeAnchor, RelativeUnit,
 } from "./contracts/dashboards"
 // Reports (BI-18 part D): written pages with live charts, in Postgres over
 // `/api/dashboard/reports`. Real from the start: no mock ever existed.
@@ -275,7 +277,8 @@ export const usageService = usageClientService
 /** The usage shapes the Usage feature reads from `@/services`. */
 export type {
   NewUsageRate, UsageExport, UsageGroup, UsageQuery, UsageRate, UsageRateKind, UsageRates,
-  UsageReport, UsageRow, UsageService, UsageStorageQuery, UsageStorageReport, UsageStorageRow,
+  UsageReport, UsageRow, UsageService, UsageStorageBucket, UsageStorageQuery, UsageStorageReport,
+  UsageStorageRow,
 } from "./contracts/usage"
 // The server's own health answer (`/api/health` — the API's `/health`,
 // exposed through the console's rewrite), read for the version it runs so

@@ -7,14 +7,15 @@ its `dagster/max_runtime` tag, and until this change only `ingest_job`
 carried one (`SRC-39`).
 
 Every job reads its own limit through the ONE helper
-`ingest_factory.run_limit_tags`: its own variable, its own default, its own
-tag. The parsing rule therefore stays in one place (`AGENTS.md` rule 4).
+`ingest_factory.job_tags`, which asks `ingest_factory.run_limit_tags` for
+the parsing rule: its own variable, its own default, its own tag. The
+parsing rule therefore stays in one place (`AGENTS.md` rule 4).
 The tag sits on ONE job, never on `run_monitoring.max_runtime_seconds`,
 which would cap every job of the instance (`dagster/dagster.yaml` keeps
 that setting unset on purpose).
 
 A job's tags are read ONCE, when its module is imported, because
-`run_limit_tags(...)` is the decorator's argument -- so a test that sets
+`job_tags(...)` is the decorator's argument -- so a test that sets
 the variable reloads the module, the way `test_storage_snapshot.py` does
 it. The original namespace is put back after every reload, so a reload
 leaves no trace for the tests that run after this one.

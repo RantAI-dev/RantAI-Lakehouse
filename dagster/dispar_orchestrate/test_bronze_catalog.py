@@ -227,3 +227,129 @@ def test_the_slug_in_the_conflict_check_is_a_bound_literal(monkeypatch):
     assert "FINAL" in check, check
     assert "WHERE slug = 'or\\'ders'" in check, check
     assert "or'ders" not in check.replace("or\\'ders", ""), check
+
+
+# ── The additive column on an EXISTING table (OPS-8) ───────────────────
+#
+# `lake.bronze_meta.storage_layer_snapshot` was created by the daily job
+# itself, with the seven columns it had before the job measured the bytes
+# stored on disk. A deployment that already ran the job holds it WITHOUT
+# the eighth column, and the R10 guard demands the EXACT column tuple -- so
+# the column is ADDED with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`:
+# the rows stay, the column is appended last, and the table is never
+# dropped. Dropping it would throw away every measurement ever taken.
+
+
+_OLD_STORAGE_LAYER_COLUMNS = [
+    {"name": "day", "type": "Date"},
+    {"name": "layer", "type": "String"},
+    {"name": "table_count", "type": "UInt32"},
+    {"name": "total_bytes", "type": "UInt64"},
+    {"name": "tables_skipped", "type": "UInt32"},
+    {"name": "skipped_reason", "type": "String"},
+    {"name": "measured_at", "type": "DateTime64(3, 'UTC')"},
+]
+
+
+def _fake_clickhouse_with_existing_table(monkeypatch, columns):
+    """A ClickHouse that already holds the storage table with `columns`.
+
+    The `ADD COLUMN` the schema path issues really adds the column to the
+    fake's column list, so the read-back the schema path does sees what
+    the server would hold after the ALTER."""
+    executed: list[str] = []
+
+    def _query_json(_target, stmt):
+        if "FROM system.tables" in stmt:
+            return [{"engine": "ReplacingMergeTree", "sorting_key": "layer, day"}]
+        if "FROM system.columns" in stmt:
+            return list(columns)
+        raise AssertionError(f"unexpected query: {stmt}")
+
+    def _exec(_target, stmt):
+        executed.append(stmt)
+        if "ADD COLUMN" in stmt:
+            columns.append({"name": "stored_bytes", "type": "Nullable(UInt64)"})
+
+    monkeypatch.setattr(bronze_catalog, "_ch_query_json", _query_json)
+    monkeypatch.setattr(bronze_catalog, "_ch_exec", _exec)
+    return executed
+
+
+def _storage_layer_row():
+    return bronze_catalog.StorageLayerRow(
+        layer="bronze",
+        table_count=2,
+        total_bytes=350,
+        tables_skipped=0,
+        skipped_reason="",
+        stored_bytes=580,
+    )
+
+
+def test_an_existing_table_gets_the_new_column_without_losing_its_rows(monkeypatch):
+    """The table already exists with the seven columns it had before: the
+    column is ADDED with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, the
+    rows stay, the column lands last (where the canonical shape puts it,
+    so the exact comparison matches again), and no `SchemaDriftError` is
+    raised."""
+    columns = list(_OLD_STORAGE_LAYER_COLUMNS)
+    executed = _fake_clickhouse_with_existing_table(monkeypatch, columns)
+
+    bronze_catalog.record_storage_layer_snapshot(
+        day="2026-11-18",
+        rows=[_storage_layer_row()],
+        target=ClickHouseTarget(url="http://ch", user="default", password=""),
+    )
+
+    alters = [s for s in executed if "ALTER TABLE" in s]
+    assert len(alters) == 1, executed
+    assert alters[0] == (
+        "ALTER TABLE lake.`bronze_meta.storage_layer_snapshot` "
+        "ADD COLUMN IF NOT EXISTS stored_bytes Nullable(UInt64)"
+    ), alters
+    assert not [s for s in executed if "DROP" in s.upper()], executed
+    assert columns[-1] == {"name": "stored_bytes", "type": "Nullable(UInt64)"}, columns
+    inserts = [s for s in executed if "INSERT INTO" in s]
+    assert len(inserts) == 1, executed
+    assert "stored_bytes" in inserts[0], inserts
+
+
+def test_the_additive_column_is_added_only_once_and_a_table_that_has_it_is_left_alone(
+    monkeypatch,
+):
+    """`IF NOT EXISTS` makes the statement idempotent: a table that already
+    holds the column is not altered again, and the write still goes
+    through."""
+    columns = list(_OLD_STORAGE_LAYER_COLUMNS)
+    columns.append({"name": "stored_bytes", "type": "Nullable(UInt64)"})
+    executed = _fake_clickhouse_with_existing_table(monkeypatch, columns)
+
+    bronze_catalog.record_storage_layer_snapshot(
+        day="2026-11-18",
+        rows=[_storage_layer_row()],
+        target=ClickHouseTarget(url="http://ch", user="default", password=""),
+    )
+
+    assert not [s for s in executed if "ALTER TABLE" in s], executed
+    assert len([s for s in executed if "INSERT INTO" in s]) == 1, executed
+
+
+def test_a_stored_bytes_column_of_another_type_is_drift_and_is_not_rewritten(monkeypatch):
+    """A column the table holds under the right NAME but with another TYPE
+    is drift: the `ADD` never runs for it (the column is not missing), and
+    the exact comparison raises `SchemaDriftError` rather than leaving a
+    silently wrong column behind."""
+    columns = list(_OLD_STORAGE_LAYER_COLUMNS)
+    columns.append({"name": "stored_bytes", "type": "UInt64"})
+    executed = _fake_clickhouse_with_existing_table(monkeypatch, columns)
+
+    with pytest.raises(bronze_catalog.SchemaDriftError):
+        bronze_catalog.record_storage_layer_snapshot(
+            day="2026-11-18",
+            rows=[_storage_layer_row()],
+            target=ClickHouseTarget(url="http://ch", user="default", password=""),
+        )
+
+    assert not [s for s in executed if "ALTER TABLE" in s], executed
+    assert not [s for s in executed if "INSERT INTO" in s], executed

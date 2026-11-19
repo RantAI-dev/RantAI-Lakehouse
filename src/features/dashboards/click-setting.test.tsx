@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
-import type { ChartClick } from "@/services/clients/bi-store"
+import type { ChartClick } from "@/services"
 import { ClickSetting } from "./click-setting"
 
 const originalFetch = global.fetch

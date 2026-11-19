@@ -13,6 +13,7 @@ import { SidebarProvider } from "@/components/ui/sidebar"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { forgetRow, readRow, rememberRow, setRowOwner } from "@/features/dashboards/dashboards-row"
 import { readLastBoard, rememberLastBoard } from "@/features/dashboards/last-board"
+import { PRODUCT_NAME } from "@/lib/product-branding"
 import { AppSidebar } from "./app-sidebar"
 
 const json = (body: unknown, status = 200) =>
@@ -250,8 +251,8 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
 
     expect(await screen.findByText("Acme Data")).toBeTruthy()
     // The product's own name is nowhere in the header: a workspace that set
-    // a name must not still be called Rantai Lake.
-    expect(screen.queryByText("Rantai Lake")).toBeNull()
+    // a name must not still be called RantAI Lakehouse.
+    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
 
     const shown = pictures(container)
     expect(shown.map((p) => p.getAttribute("src"))).toEqual([
@@ -259,6 +260,21 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
       "/api/branding/images/logo-dark?v=v2",
     ])
     expect(shown.map((p) => p.getAttribute("alt"))).toEqual(["Acme Data", "Acme Data"])
+  })
+
+  it("shows no fixed subtitle under the name, whether or not the workspace set one", async () => {
+    stubApi({ workspaceName: "Acme Data", logo: null, logoDark: null, icon: null })
+    const named = renderBranded()
+    expect(await screen.findByText("Acme Data")).toBeTruthy()
+    // `ADM-2`: the line "Enterprise Lakehouse Console" described the
+    // product, not the workspace, so it goes from the header either way.
+    expect(named.container.textContent).not.toContain("Enterprise Lakehouse Console")
+    cleanup()
+
+    stubApi({ workspaceName: null, logo: null, logoDark: null, icon: null })
+    const unnamed = renderBranded()
+    expect(await screen.findByText(PRODUCT_NAME)).toBeTruthy()
+    expect(unnamed.container.textContent).not.toContain("Enterprise Lakehouse Console")
   })
 
   it("shows the workspace's light logo in dark mode too when no dark logo is set (ADM-2-AC3)", async () => {
@@ -289,7 +305,9 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
     await waitFor(() =>
       expect(requested.some((url) => url.includes("/api/branding"))).toBe(true),
     )
-    expect(screen.getByText("Rantai Lake")).toBeTruthy()
+    // The name shows once the answer is in (`adm-121`): until then the slot
+    // is empty, so the product's name is not drawn twice by a slow answer.
+    expect(await screen.findByText(PRODUCT_NAME)).toBeTruthy()
     expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
       "/logo-light.png",
       "/logo-dark.png",

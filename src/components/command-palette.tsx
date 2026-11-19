@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { NAV_GROUPS, pageTitleFor, canOpen } from "@/components/app-shell/nav-config";
 import { useAuth } from "@/features/auth/auth-provider";
+import { useBranding } from "@/hooks/use-branding";
 import { CertificationBadge } from "@/components/patterns/status-badge";
 import { assetService, dashboardService } from "@/services";
 import { isServiceError } from "@/services/errors";
@@ -103,6 +104,9 @@ export function CommandPalette() {
   const { resolvedTheme, setTheme } = useTheme();
   // ADM-13 review round 1, S5: useAuth() with no fail-open path
   const { hasPermission } = useAuth();
+  // ADM-2 decision 13, as the navbar does: a page no menu item names is
+  // recorded under the workspace's name, not the product's.
+  const branding = useBranding();
 
   const groups = React.useMemo(() => {
     return NAV_GROUPS.map((g) => ({
@@ -241,14 +245,17 @@ export function CommandPalette() {
 
   // Record visited pages (for the Recent list).
   React.useEffect(() => {
-    const title = pageTitleFor(pathname);
+    // The name is empty until the branding answers; a title recorded now
+    // would be the empty fallback and stay in the list.
+    if (branding.loading) return;
+    const title = pageTitleFor(pathname, branding.name);
     const href = pathname;
     try {
       const prev = readRecents().filter((r) => r.href !== href);
       const next = [{ href, title }, ...prev].slice(0, 6);
       localStorage.setItem(RECENT_KEY, JSON.stringify(next));
     } catch { /* ignore */ }
-  }, [pathname]);
+  }, [pathname, branding.loading, branding.name]);
 
   // QA LH-DATA-11-06: one score for every asset row keeps the server's order.
   const paletteFilter = React.useMemo(

@@ -98,6 +98,13 @@ jobs:
           echo "::add-mask::$app_pw"
           sed -i '/^LAKEHOUSE_DB_APP_PASSWORD=/d' .env
           printf '\nLAKEHOUSE_DB_APP_PASSWORD=%s\n' "$app_pw" >> .env
+          # The same derivation for Dagster's role, with its own label. A
+          # separate password per role: one value would give the code
+          # location the console's rights too.
+          dagster_pw="$(printf %s lakehouse_dagster | python3 -c 'import base64, hashlib, hmac, os, sys; key = os.environ["STAGING_POSTGRES_PASSWORD"].encode(); print(base64.urlsafe_b64encode(hmac.new(key, sys.stdin.buffer.read(), hashlib.sha256).digest()).decode())')"
+          echo "::add-mask::$dagster_pw"
+          sed -i '/^LAKEHOUSE_DB_DAGSTER_PASSWORD=/d' .env
+          printf '\nLAKEHOUSE_DB_DAGSTER_PASSWORD=%s\n' "$dagster_pw" >> .env
           # TENANT_WAREHOUSE_S3_* are empty in the fresh-install template
           # (they used to fall back to the RustFS credentials, the same
           # value as the RustFS keys, ADR 0002 Addendum 2 "may equal, must

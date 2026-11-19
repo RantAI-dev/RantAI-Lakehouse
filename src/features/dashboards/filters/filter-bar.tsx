@@ -10,8 +10,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { cn } from "@/lib/utils";
 import { filterLabel, filtersEqual, isActiveFilter, isRequiredColumn } from "@/lib/dashboard-filter-state";
 import { withTies } from "@/lib/dashboard-tabs";
-import type { BoardTab } from "@/services";
-import type { FilterDef, FilterField } from "@/services/clients/bi-store";
+import type { BoardTab, FilterDef, FilterField } from "@/services";
 import { DateEditor, NumberEditor, TextEditor, blankFilter, type EditorProps } from "./filter-editors";
 import { ChipTrigger, chipShell } from "./chip";
 import { EASE, FOCUS } from "../dashboard-header";

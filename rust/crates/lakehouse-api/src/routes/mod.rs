@@ -1441,6 +1441,9 @@ pub fn router(state: AppState) -> Router {
                 .delete(alerts::delete),
         )
         .route("/api/alerts/status", get(alerts::status))
+        // `BI-43` D1: a person's own alerts on one chart, for the chart's alert
+        // dialog; `GET /api/alerts` itself still needs `alert:read`.
+        .route("/api/alerts/mine", get(alerts::mine))
         // `BI-40` D1: a person's door for one rule, next to the scheduler's
         // (`/api/alerts/run`, unchanged, still behind `check_run_token`).
         .route("/api/alerts/test", post(alerts::test_one))
@@ -1697,6 +1700,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
         .route("/api/render/data", axum::routing::post(render::data))
+        // BI-42: one image card's picture for the print view, behind the render token.
+        .route("/api/render/image", get(render::image))
+        // BI-36: the print view's uploaded maps, behind the same render token
+        // as the data.
+        .route(
+            "/api/render/maps/{id}/geojson",
+            axum::routing::post(render::map_geojson),
+        )
         // RPT-1 (D7): scheduled reports. Authorisation beyond `dashboard:read`
         // (owner or administrator, download right) is in the handlers.
         .route(

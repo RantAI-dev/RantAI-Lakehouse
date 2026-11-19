@@ -7,11 +7,13 @@ import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useBrandingState } from "@/hooks/use-branding"
+import { useSeededState } from "@/hooks/use-seeded-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
+import { PRODUCT_NAME } from "@/lib/product-branding"
 import {
   brandingImageUrl,
-  brandingService,
   settingsService,
   type BrandingImageKind,
   type WorkspaceSettingsInput,
@@ -76,8 +78,9 @@ const PICTURES: {
  */
 export function GeneralSettings() {
   const state = useService((signal) => settingsService.getGeneral(signal), [])
-  const branding = useService((signal) => brandingService.get(signal), [])
-  const [name, setName] = React.useState("")
+  // The shell's one branding answer (`adm-121`); only a page outside the
+  // shell makes a request of its own.
+  const branding = useBrandingState()
   const [asking, setAsking] = React.useState(false)
 
   const save = useServiceAction(
@@ -109,11 +112,15 @@ export function GeneralSettings() {
   )
 
   const loaded = state.status === "success" ? state.data : null
-  const publicView = branding.status === "success" ? branding.data : null
-
-  React.useEffect(() => {
-    if (loaded) setName(loaded.workspaceName ?? "")
-  }, [loaded])
+  const publicView = branding.branding
+  // `adm-121`: the settings fill the name field until the person first types
+  // in it, so a picture change that reads the settings again does not
+  // overwrite an unsaved name.
+  const [name, setName, reseedName] = useSeededState(
+    loaded,
+    "",
+    (settings) => settings.workspaceName ?? ""
+  )
 
   async function handleSave() {
     const text = name.trim()
@@ -141,6 +148,9 @@ export function GeneralSettings() {
     const result = await reset.run()
     if (result) {
       setAsking(false)
+      // The reset cleared the name on the server, so the next answer is the
+      // truth for the field even if the person had typed something.
+      reseedName()
       state.reload()
       branding.reload()
     }
@@ -168,7 +178,7 @@ export function GeneralSettings() {
               maxLength={NAME_MAX}
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="Rantai Lake"
+              placeholder={PRODUCT_NAME}
               autoComplete="off"
             />
             <p className="text-xs text-muted-foreground">

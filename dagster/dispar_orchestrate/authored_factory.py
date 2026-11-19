@@ -120,7 +120,7 @@ from dagster import (
 from dispar_orchestrate import op_metadata
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, _ch_query_json
 from dispar_orchestrate.file_ingest import JOB_NAME as FILE_INGEST_JOB
-from dispar_orchestrate.ingest_factory import run_limit_tags
+from dispar_orchestrate.ingest_factory import job_tags
 
 # How long one run of an authored job may run, in seconds. An authored
 # pipeline is a load, so it gets the same six hours `ingest_job` gets: the
@@ -689,7 +689,15 @@ def build_authored_job(pipeline: dict[str, Any]) -> Any:
     # not hold a run-queue slot forever (`OPS-35`).
     # `ingest_factory.py` says why it is a tag and not
     # `run_monitoring.max_runtime_seconds`.
-    @job(name=f"authored__{safe_name}", tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
+    # `job_tags` adds the `lakehouse/serial` tag only for the jobs on
+    # `SERIAL_JOB_NAMES`; `OPS-37` decision 1 fixes that list at the five
+    # jobs it names and an authored job is not one of them, so an authored
+    # job carries the run-limit tag only. That is a scope choice, not a
+    # claim the runs are safe to overlap: an authored pipeline writes a
+    # fixed `targetZone.targetTable` (`_op_for_pipeline`), so two runs of
+    # the same `authored__<name>` would write the same rows. Widening the
+    # list to `authored__*` is a follow-up idea for the planner.
+    @job(name=f"authored__{safe_name}", tags=job_tags(f"authored__{safe_name}", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
     def _authored_job() -> None:
         op_fn()
 
