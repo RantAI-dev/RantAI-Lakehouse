@@ -59,6 +59,8 @@ describe("trash entries", () => {
 
   test("a restored chart says where it will land", () => {
     expect(restoreNote({ kind: "board", boardState: "", boardName: "" })).toBe("With its charts")
+    // BI-18 part D: a report in the trash.
+    expect(restoreNote({ kind: "report", boardState: "", boardName: "" })).toBe("A report, back in its folder")
     expect(restoreNote({ kind: "chart", boardState: "live", boardName: "Sales" })).toBe("Back on Sales")
     expect(restoreNote({ kind: "chart", boardState: "trash", boardName: "Sales" })).toBe(
       "Its dashboard is in the trash too: restore the dashboard first.",
