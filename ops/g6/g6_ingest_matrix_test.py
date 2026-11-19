@@ -465,25 +465,20 @@ def _seed_mongo_fixture() -> str:
 
 
 def _produce_kafka_fixture(topic: str, *, run_id: str, interval_s: float = 1.5, max_s: float = 240.0) -> None:
-    """Produces `count` JSON messages onto `kafka-g6`, one per
-    `interval_s`, spread out AFTER the caller has already launched the
-    kafka connector's run -- never before. `adapters/kafka.py`'s
-    `KafkaConsumer` is constructed with no `auto_offset_reset` override,
-    so kafka-python's own default (`"latest"`) applies: a brand-new
-    consumer group has no committed offset and starts consuming from
-    whatever is produced from the moment it first polls onward, NOT from
-    messages already sitting in the topic. Spreading production across
-    the run's `microBatchSeconds` window (set generously below) is what
-    makes at least one message land inside the consumer's actual poll
-    loop, rather than requiring exact ordering this gate cannot control
-    (the consumer is constructed inside an async-launched Dagster run,
-    not synchronously from this script)."""
+    """Produces JSON messages onto `kafka-g6`, one per `interval_s`, while the
+    kafka connector's run is live. Since `SRC-45` the ingest consumer reads a
+    new group from the start of the topic (`auto_offset_reset="earliest"`), so
+    this live production is no longer what makes the first run load: the
+    messages `_produce_kafka_preload` put there BEFORE the run do. It is kept
+    because the run's micro-batch window is long (`microBatchSeconds`) and the
+    reload step's contract (the second run adds exactly the messages the group
+    had not committed) was written against it."""
     from kafka import KafkaProducer
     producer = KafkaProducer(bootstrap_servers=["kafka-g6:9092"], security_protocol="PLAINTEXT")
     # Keep producing until THIS run has finished, not for a fixed count: in
     # CI the kafka run sat queued behind the other adapters' runs, first
-    # polled after a fixed 45 s burst had ended, consumed nothing under
-    # "latest", and so never created its Bronze table.
+    # polled after a fixed 45 s burst had ended, and consumed nothing under
+    # "latest" (the consumer now reads from the start, `SRC-45`).
     query = "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename ... on Run { status } } }"
     deadline = time.time() + max_s
     i = 0
@@ -502,6 +497,48 @@ def _produce_kafka_fixture(topic: str, *, run_id: str, interval_s: float = 1.5, 
     finally:
         producer.close()
     print(f"[g6] produced {i} kafka messages while run {run_id} was live")
+
+
+def _produce_kafka_preload(topic: str) -> None:
+    """`SRC-45` (QA `LH-SRC-6-41`), decision D5: put `KAFKA_PRELOAD_MESSAGES`
+    messages in the topic BEFORE the connector is registered and its first run
+    launched, as a real topic already holds messages when a person connects it.
+    The first run must load them (`auto_offset_reset="earliest"`); under
+    kafka-python's old default a new group started at the end and skipped them.
+    Their ids start at `KAFKA_PRELOAD_FIRST_ID`, apart from the live producer's
+    (0..) and the reload batch's (1000..), so `_bronze_kafka_preload_count`
+    counts exactly these."""
+    from kafka import KafkaProducer
+    producer = KafkaProducer(bootstrap_servers=["kafka-g6:9092"], security_protocol="PLAINTEXT")
+    try:
+        for i in range(KAFKA_PRELOAD_MESSAGES):
+            producer.send(topic, json.dumps({"id": KAFKA_PRELOAD_FIRST_ID + i, "amount": 5.0 + i}).encode("utf-8"))
+        producer.flush()
+    finally:
+        producer.close()
+    print(f"[g6] produced {KAFKA_PRELOAD_MESSAGES} kafka messages before the connector exists")
+
+
+def _kafka_target_from_api(connector_id: str, topic: str) -> str:
+    """`SRC-45` (D1, D5): the gate saves the Kafka connector the console's way,
+    with no source object, so the Bronze table is the one the SERVER chose. It
+    is read back from `GET .../ingest-spec`, never guessed: one object named as
+    the topic, with a non-empty target."""
+    resp = API.get(f"{API_URL}/api/connectors/{connector_id}/ingest-spec", timeout=10)
+    if not resp.ok:
+        raise G6Failure(f"GET ingest-spec for g6-kafka failed: {resp.status_code} {resp.text}")
+    objects = resp.json().get("sourceObjects")
+    if (
+        not isinstance(objects, list)
+        or len(objects) != 1
+        or objects[0].get("name") != topic
+        or not objects[0].get("target")
+    ):
+        raise G6Failure(
+            "expected the server to give the g6-kafka spec exactly one source object named "
+            f"{topic!r} with a target (SRC-45), got {objects!r}"
+        )
+    return objects[0]["target"]
 
 
 def _write_credential_file(ref_name: str, value: str) -> None:
@@ -733,6 +770,17 @@ def _bronze_ingested_at_null_count(bronze_table: str) -> int:
     return int(text.strip())
 
 
+def _bronze_kafka_preload_count(bronze_table: str) -> int:
+    """Rows of the messages produced before the run (`_produce_kafka_preload`).
+    An explicit `WHERE` (R11), as `_bronze_row_count`."""
+    text = ch_query(
+        f"SELECT count() FROM {CATALOG_DB}.`bronze.{bronze_table}` "
+        f"WHERE id >= {KAFKA_PRELOAD_FIRST_ID} AND id < {KAFKA_PRELOAD_FIRST_ID + KAFKA_PRELOAD_MESSAGES} "
+        "SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
+    )
+    return int(text.strip())
+
+
 # SRC-9 task 2: the registry type each connector of the matrix stands for.
 # `ops/gates/coverage.json` is the one list of what each type is gated for;
 # this maps the gate's own connector names to its keys.
@@ -749,7 +797,10 @@ TYPE_OF = {
 }
 BRONZE_OF = {
     "g6-mysql": "g6_mysql_orders", "g6-mariadb": "g6_mariadb_orders", "g6-sftp": "g6_sftp_orders", "g6-mssql": "g6_mssql_orders", "conn-pg-lakehouse": "orders",
-    "g6-files": "g6_files_orders", "g6-mongo": "g6_mongo_orders", "g6-kafka": "g6_kafka_events",
+    "g6-files": "g6_files_orders", "g6-mongo": "g6_mongo_orders",
+    # SRC-45: the server chooses the Kafka table (no source object is sent);
+    # `step_ingest_matrix` fills this in from `GET .../ingest-spec`.
+    "g6-kafka": "",
     "g6-rest": "g6_rest_items",
 }
 # What the discovery routes (`POST .../discovery/{list,preview}`, SRC-13) must
@@ -818,6 +869,10 @@ def _group_runs(group: str) -> bool:
 # Kafka "reload" (SRC-9 task 2): this many new messages are produced between
 # the two runs, after the first run's offsets are committed.
 KAFKA_RELOAD_MESSAGES = 5
+# SRC-45 (D5): messages produced before the connector exists; see
+# `_produce_kafka_preload`.
+KAFKA_PRELOAD_MESSAGES = 3
+KAFKA_PRELOAD_FIRST_ID = 2000
 KAFKA_TOPIC = "g6-events"
 KAFKA_GROUP_ID = "g6-gate-kafka"
 
@@ -1316,24 +1371,27 @@ def step_ingest_matrix() -> None:
     # create) but no value is ever written for it; see this module's
     # docstring.
     kafka_topic = KAFKA_TOPIC
+    # SRC-45 (D5): part of the fixture is in the topic BEFORE the run exists.
+    if _active("g6-kafka"):
+        _produce_kafka_preload(kafka_topic)
     kafka_run_id = None if not _active("g6-kafka") else _register_and_run(
         name="g6-kafka", kind="Kafka", host="kafka-g6:9092",
         credential={"source": "file", "primary": "token"}, credential_values=None,
         adapter="kafka",
         dial={"bootstrapServers": ["kafka-g6:9092"], "topic": kafka_topic, "auth": {"type": "none"},
               "groupId": KAFKA_GROUP_ID, "microBatchSeconds": 60},
-        source_objects=[{"name": kafka_topic, "target": "g6_kafka_events"}],
+        # SRC-45 (D5): no source object, as the console saves it; the server gives the target.
+        source_objects=[],
         ingest_mode="stream",
         connector_ids=connector_ids,
     )
     if kafka_run_id:
         run_ids["g6-kafka"] = kafka_run_id
+        BRONZE_OF["g6-kafka"] = _kafka_target_from_api(connector_ids["g6-kafka"], kafka_topic)
         # SRC-9 task 2: before the producer below, which blocks until the run ends.
         # Its `discover` waits for the topic to hold messages (SRC-13, below).
         _check_connect("g6-kafka", connector_ids["g6-kafka"])
-        # Produced AFTER the run launches (see _produce_kafka_fixture's
-        # own docstring for why "before" would race kafka-python's
-        # default "latest" auto_offset_reset).
+        # Also produced while the run is live (see _produce_kafka_fixture).
         _produce_kafka_fixture(kafka_topic, run_id=kafka_run_id)
 
     for name, run_id in run_ids.items():
@@ -1353,7 +1411,7 @@ def step_ingest_matrix() -> None:
     for name, bronze_table in [
         ("g6-mysql", "g6_mysql_orders"), ("g6-mariadb", "g6_mariadb_orders"), ("g6-sftp", "g6_sftp_orders"), ("g6-mssql", "g6_mssql_orders"),
         ("conn-pg-lakehouse", "orders"), ("g6-files", "g6_files_orders"),
-        ("g6-mongo", "g6_mongo_orders"), ("g6-kafka", "g6_kafka_events"),
+        ("g6-mongo", "g6_mongo_orders"), ("g6-kafka", BRONZE_OF["g6-kafka"]),
         # g6-rest was missing from this list entirely -- verification
         # correction: without it, a REST run that did nothing (see the
         # `sourceObjects` fix above) and a REST run that genuinely loaded
@@ -1382,6 +1440,20 @@ def step_ingest_matrix() -> None:
         except G6Failure as exc:
             _record_fail(TYPE_OF[name], "load", str(exc))
             raise
+        if name == "g6-kafka":
+            # SRC-45 (D3): the messages already in the topic before the run
+            # must be in the table, which a consumer starting at the end of
+            # the topic would never have read.
+            try:
+                preloaded = _bronze_kafka_preload_count(bronze_table)
+                if preloaded != KAFKA_PRELOAD_MESSAGES:
+                    raise G6Failure(
+                        f"expected the {KAFKA_PRELOAD_MESSAGES} messages produced before the first run in "
+                        f"bronze.{bronze_table} (SRC-45), got {preloaded}"
+                    )
+            except G6Failure as exc:
+                _record_fail(TYPE_OF[name], "load", str(exc))
+                raise
         print(f"[g6] bronze.{bronze_table}: {count} rows, _ingested_at null count: {null_ingested_at}")
         first_counts[name] = count
         _record(TYPE_OF[name], "load", "pass", f"{count} rows in bronze.{bronze_table}")
