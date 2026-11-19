@@ -19,6 +19,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups";
 import { cn } from "@/lib/utils";
+import { SidebarBrand } from "./app-sidebar";
 import {
   ACCOUNT_CARD_CLASS,
   NAV_ROW_CLASS,
@@ -28,10 +29,11 @@ import {
   SIDEBAR_GROUP_CLASS,
   SIDEBAR_MENU_CLASS,
   SIDEBAR_SUB_CLASS,
-  SidebarBrand,
-} from "./app-sidebar";
+} from "./sidebar-classes";
 import { NAVBAR_CLASS, NAVBAR_GRID_CLASS, NAVBAR_TRIGGER_CLASS, NavbarSearch, NavbarTitle } from "./app-navbar";
 import { NAV_GROUPS, activeNavHref, pageTitleFor } from "./nav-config";
+import { SidebarChatsSkeleton } from "./chat-list-skeleton";
+import { sidebarPlaceholderFor } from "./shell-placeholder";
 import { ShellMainPlaceholder } from "./shell-main-placeholder";
 
 /**
@@ -51,6 +53,9 @@ import { ShellMainPlaceholder } from "./shell-main-placeholder";
  *   button. The sidebar rows follow the nav config's sections and the open
  *   state the person keeps (`useSidebarGroups`), with bars as long as the
  *   labels, so a full sidebar lands on rows already in place;
+ * - on a conversation (`/copilot`) the sidebar draws the chat list's shape
+ *   instead of the menu's (`SidebarChatsSkeleton`, `WEB-18`), as the real
+ *   sidebar lists the chats there;
  * - the main area draws the page's own placeholder (`shellPlaceholderFor`),
  *   the same component the page shows while its data loads, so the handoff
  *   to the page is real content replacing grey shapes, never a second
@@ -62,9 +67,14 @@ export function AppShellSkeleton({ pathname }: { pathname: string }) {
       <Sidebar collapsible="icon" side="left" className={SIDEBAR_CLASS}>
         <SidebarBrand />
         <SidebarContent className={SIDEBAR_CONTENT_CLASS}>
-          <SidebarGroup className={SIDEBAR_GROUP_CLASS}>
-            <SkeletonNav pathname={pathname} />
-          </SidebarGroup>
+          {/* WEB-18 T5: on a conversation the sidebar is the chat list, so the shell draws that. */}
+          {sidebarPlaceholderFor(pathname) === "chats" ? (
+            <SidebarChatsSkeleton />
+          ) : (
+            <SidebarGroup className={SIDEBAR_GROUP_CLASS}>
+              <SkeletonNav pathname={pathname} />
+            </SidebarGroup>
+          )}
         </SidebarContent>
         <SidebarFooter className={SIDEBAR_FOOTER_CLASS} aria-hidden>
           <SidebarMenu>
