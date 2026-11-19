@@ -271,4 +271,19 @@ confirmed against the code; rows updated in the task-1 table):
 
 ## Review
 
-(planner appends here)
+Planner review, 2026-11-19, at `ee1bc8325`.
+
+- The eight departures from the expected list (four all-required forms lose their
+  stars; four one-required-plus-optional forms keep stars without the line) follow
+  decisions 1 and 2 as written; the expected list was my estimate, the rule wins.
+- Decision 3 holds: the only removed `required` props are on labels and section
+  headings (`connector-scope-fields` Environment and Residency headings, chat labels);
+  every control keeps `required`/`aria-required`, including both chat inputs.
+- Decision 4 holds: the compact pill and the full composer have no visible label,
+  tooltip or hidden requirement text again.
+- Tests: the three removed assertions are UX-1's star count and visible chat label,
+  which this change reverses on purpose; 17 expects removed, 20 added.
+- The `SchemaBrowser` Trino-tab flake reproduces on the base (`81acc21f2`) and is not
+  caused here.
+
+No BLOCKER, no SHOULD-FIX. Merge on green CI.
