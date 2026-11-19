@@ -375,6 +375,16 @@ async function chooseRuleType(label: string) {
  * kind-defaulted selects stay optional.
  */
 describe("required-field indicators on the alert rule page (UX-1-R9)", () => {
+  // UX-5: the form explains no "* Required" convention; the star itself stays
+  // on the required Name of this mixed form.
+  it("renders no '* Required' line while the mixed form still stars Name", async () => {
+    stubReads()
+    render(<AlertRulePage />)
+    await screen.findByPlaceholderText("e.g. Foreign visitors dropped")
+    expect(screen.queryByText("Required")).toBeNull()
+    expectRequiredField("Name")
+  })
+
   it("requires name, target, mart and measure on a threshold alert, not the defaulted selects", async () => {
     stubReads()
     render(<AlertRulePage />)

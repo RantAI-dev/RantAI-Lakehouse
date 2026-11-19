@@ -36,7 +36,8 @@ describe("dial form required indicators (UX-1)", () => {
     expect(isMarked("User")).toBe(true)
     expect(screen.getByLabelText("Port").getAttribute("aria-required")).toBe("true")
     expect(hasNoMarker("SSL mode (optional)")).toBe(true)
-    expect(screen.getByText(/Required/)).toBeDefined()
+    // UX-5: no form explains the star with a "* Required" line anymore.
+    expect(screen.queryByText(/Required/)).toBeNull()
   })
 
   it("marks CDC slot and publication and leaves the driver-specific server id unmarked", () => {
@@ -186,14 +187,5 @@ describe("dial form required indicators (UX-1)", () => {
       expect(labelFor(restView.container, input as HTMLElement)?.getAttribute("data-required")).toBe("")
     }
     expect(restForm.getByText(/every listed endpoint is polled/i)).toBeDefined()
-  })
-
-  // UX-1-R7: composed connector steps show one legend; the dial's own is
-  // opt-out, so a step is not left with three copies of the same explanation.
-  it("lets a composed parent opt a dial form out of its standalone legend", () => {
-    const standalone = render(<SqlDialForm value={null} onChange={mock()} />)
-    expect(within(standalone.container).getByText(/Required/)).toBeDefined()
-    const composed = render(<SqlDialForm value={null} onChange={mock()} />)
-    expect(within(composed.container).queryByText(/Required/)).toBeNull()
   })
 })
