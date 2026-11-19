@@ -1,6 +1,7 @@
 import * as React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
+import { PRODUCT_NAME } from "@/lib/product-branding"
 
 // `AppSidebar` reads the route through `next/navigation`, which needs a
 // Next.js AppRouter context that a bare happy-dom environment does not
@@ -106,6 +107,21 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
     expect(shown.map((p) => p.getAttribute("alt"))).toEqual(["Acme Data", "Acme Data"])
   })
 
+  it("shows no fixed subtitle under the name, whether or not the workspace set one", async () => {
+    stubApi({ workspaceName: "Acme Data", logo: null, logoDark: null, icon: null })
+    const named = renderSidebar()
+    expect(await screen.findByText("Acme Data")).toBeTruthy()
+    // `ADM-2`: the line "Enterprise Lakehouse Console" described the
+    // product, not the workspace, so it goes from the header either way.
+    expect(named.container.textContent).not.toContain("Enterprise Lakehouse Console")
+    cleanup()
+
+    stubApi({ workspaceName: null, logo: null, logoDark: null, icon: null })
+    const unnamed = renderSidebar()
+    expect(await screen.findByText(PRODUCT_NAME)).toBeTruthy()
+    expect(unnamed.container.textContent).not.toContain("Enterprise Lakehouse Console")
+  })
+
   it("shows the workspace's light logo in dark mode too when no dark logo is set (ADM-2-AC3)", async () => {
     stubApi({
       workspaceName: "Acme Data",
@@ -134,7 +150,9 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
     await waitFor(() =>
       expect(requested.some((url) => url.includes("/api/branding"))).toBe(true),
     )
-    expect(screen.getByText("RantAI Lakehouse")).toBeTruthy()
+    // The name shows once the answer is in (`adm-121`): until then the slot
+    // is empty, so the product's name is not drawn twice by a slow answer.
+    expect(await screen.findByText(PRODUCT_NAME)).toBeTruthy()
     expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
       "/logo-light.png",
       "/logo-dark.png",

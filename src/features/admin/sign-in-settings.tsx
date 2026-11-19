@@ -6,6 +6,7 @@ import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useSeededState } from "@/hooks/use-seeded-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { settingsService, type SignInSettingsInput } from "@/services"
@@ -99,17 +100,19 @@ export function SignInSettingsForm({ canWrite }: { canWrite: boolean }) {
     )
   )
   const loaded = state.status === "success" ? state.data : null
-  const [values, setValues] = React.useState<Record<string, string>>({})
-
-  React.useEffect(() => {
-    if (!loaded) return
+  // `adm-121`: the saved limits fill the form until the person first edits
+  // a field; the answer that follows a save does not overwrite what is typed.
+  const [values, setValues] = useSeededState<
+    NonNullable<typeof loaded>,
+    Record<string, string>
+  >(loaded, {}, (limits) => {
     const next: Record<string, string> = {}
     for (const limit of LIMITS) {
-      const value = loaded[limit.field].value
+      const value = limits[limit.field].value
       next[limit.field] = value === null ? "" : String(value)
     }
-    setValues(next)
-  }, [loaded])
+    return next
+  })
 
   /** The value the field holds, or `null` when it is not a whole number in range. */
   function numberIn(limit: Limit): number | null {

@@ -21,7 +21,9 @@ dashboard it embeds elsewhere.
    and a browser-tab icon. Then save.
 2. Everyone sees that name and logo on the sign-in page, in the sidebar
    header, in the browser tab, on a dashboard's public link page, and as
-   the footer of embedded dashboards, from their next page load.
+   the footer of embedded dashboards, from their next page load. The
+   command palette's recent pages and the embed snippet's iframe title
+   also use the name.
 3. Press **Reset** to go back to the product's own name, logo and icon.
 
 ## Decisions
