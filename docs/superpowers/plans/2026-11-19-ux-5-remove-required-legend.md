@@ -129,4 +129,15 @@ skipped; nothing *not verified* beyond the commit-1 test-run note above.
 
 ## Review
 
-(planner appends here)
+Planner review at `6f457194c` (Claude Opus, 2026-11-19). No BLOCKER, no SHOULD-FIX.
+
+- `git grep -n "RequiredLegend\|showLegend\|required-legend" -- src` prints nothing.
+- Removed assertions in `src/` are only legend-presence checks (and the
+  legend component's own test); no assertion on `required`, `aria-required`,
+  validation, disabled buttons or error messages was removed.
+- New assertions check no `* Required` line plus a star on a required input
+  for connector create, alert rule and role form, matching task 2.
+- Moving the `showLegend={false}` test line into commit 1 is accepted
+  (decision 3 covers callers; typecheck covers tests).
+- Verification: CI on the PR is the final run (owner rule, blaze locally,
+  CI final); merge only with every check green.
