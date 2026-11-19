@@ -331,3 +331,26 @@ existing line changed.
 - Nothing was seen in a browser: the draft's look in light and dark, the rise and caret, reduced motion, focus rings, the disabled tooltips, the phone (`/` → Ask AI and Describe from a tapped chart), and the real streaming through `CopilotProvider` and `/api/ai/chat`. The tests use a fake conversation; the provider's own `send` was tested only for the per-call mode.
 - The two AI-15 cases were not run against a model (eval stack); only their JSON shape (`test_ai_eval`) and their contexts (rebuilt by `report-editor-context.test.ts`).
 - The full `bun run test`, `bun run lint`, `next build` and a dev server were not run (VM rules). No Rust was touched, so no cargo command was needed.
+
+## Review, PR B (planner, 2026-11-19, at `5e3fbe997`)
+
+No `BLOCKER`.
+
+- **SHOULD-FIX 1 (fixed in `2245a3c83`).** `src/features/copilot/use-copilot.test.tsx` mocked
+  `next/navigation` with `usePathname` only and never put it back; run in one process before the
+  report tests (`use-copilot`, `report-pages`, `report-chart-shelf`, `report-editor-draft`), three
+  files failed with "Export named 'useRouter' not found". The mock predates PR B (it is on
+  `main` since #392; CI stays green only because of the order files happen to run in), but PR B
+  adds another file it would break. The mock now keeps the real exports and is restored in
+  `afterAll`.
+- Checked and fine: the per-call `mode` on `send` leaves the panel's mode and the saved session
+  alone, and a continuation (`confirmTool` → `send(…, { continuation: true })`) cannot follow an
+  Ask draft, because Ask offers no tool that needs confirming; `markdownToBlocks` drops a
+  `javascript:` or `data:` address and keeps its words, and renders nothing as HTML; the draft is
+  outside the saved document and the autosave; the context sends rows the page already drew,
+  capped.
+- Re-run by the reviewer on `2245a3c83`: `bun run typecheck` clean; `bun test` on every
+  `src/features/copilot/*.test.ts*`, `src/features/dashboards/report-*.test.ts*` and
+  `src/lib/report-*.test.ts` file in one process, sorted: 272 pass, 0 fail (28 files);
+  `bun x eslint` on the changed TS files: 0 errors, 1 old warning.
+- *Not verified* yet: the browser (QA stack next), the AI-15 cases against a model.
