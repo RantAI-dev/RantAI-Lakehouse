@@ -36,9 +36,12 @@ type Row = Record<string, unknown>;
 
 /**
  * PR #199 review O BLOCKER 1: ECharts sets a tooltip formatter's result as
- * HTML (its own `encodeHTMLContent` is off by default), so every warehouse
- * or user text that goes into one is escaped with `escapeHtml` first — a
- * category or series name with markup would otherwise run for every viewer.
+ * HTML, so every warehouse or user text that goes into one is escaped with
+ * `escapeHtml` first — a category or series name with markup would otherwise
+ * run for every viewer. ECharts' own `encodeHTMLContent` is no protection here
+ * (`BI-33`): it is read only for a tooltip set on a graphic element
+ * (`TooltipView._showComponentItemTooltip`, echarts 6.1), never for the
+ * formatter of a series or an axis, so it is neither on nor off for these.
  * The axis and label formatters below are canvas text, not HTML, and are
  * left as they are.
  */

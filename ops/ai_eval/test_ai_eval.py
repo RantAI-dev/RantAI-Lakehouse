@@ -2002,6 +2002,16 @@ class DashboardCasesTests(unittest.TestCase):
         )
         # The tab is named in the request, so the check can name it too.
         self.assertIn("called Maps", case["turns"][0])
+        # `BI-33`: with only the map chart on the board, a sloppy "move every
+        # chart" passed, and the case failed when the assistant was right in
+        # reading "the map charts" as one of two. A second chart is in the setup
+        # and must stay off the tab.
+        self.assertEqual([s["name"] for s in case["setup"]], ["board", "map_chart", "other_chart"])
+        self.assertIn(
+            {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}"},
+             "tile_on_tab": {"chart": "{other_chart}", "tab_title": "Maps"}, "count": 0},
+            case["expect_state"],
+        )
 
     def test_the_move_tab_case_checks_the_order_the_tabs_are_in(self) -> None:
         # Two tabs and a move: the order is the result, so it is checked

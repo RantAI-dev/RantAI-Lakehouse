@@ -3,9 +3,11 @@
 The daily job `storage_snapshot_job` measured all four layers on a local
 compose stack and wrote one row per layer for 2026-11-17. The two layers
 that live in the object store (`bronze`, `gold`) match the store's own data
-files exactly and the store's whole table prefix within 1 %, which is what
-`OPS-8-AC4` needs. The whole-prefix gap has a cause, written down below,
-not hidden.
+files exactly and the store's whole table prefix within 1 %. The
+whole-prefix gap has a cause, written down below, not hidden. The local
+run measured the CURRENT-snapshot number only: the "stored on disk"
+number and the rest of the bucket did not exist then; both are new on
+2026-11-18, after the staging test at the end of this document.
 
 ## How it was measured
 
@@ -45,10 +47,15 @@ Four rows, no table skipped.
 
 ## Against the object store (`OPS-8-AC4`)
 
-`OPS-8-AC4` needs the job's `total_bytes` within 1 % of the object store's
-own size of the layer's prefix. The store's numbers are a RustFS listing:
-the size of every object under a table's `data/` prefix, and the size of
-every object under the table's whole prefix.
+`OPS-8-AC4` was reworded on 2026-11-18, after the staging test below. It
+now reads: The sum of "stored on disk" over the Iceberg layers plus "In
+the bucket but in no current table" equals the bucket within 1 %, when
+both are measured within the same hour. What this section compared was
+the wording in force when it ran, on 2026-11-17: the job's `total_bytes`
+within 1 % of the object store's own size of the layer's prefix. The
+store's numbers are a RustFS listing: the size of every object under a
+table's `data/` prefix, and the size of every object under the table's
+whole prefix.
 
 | Table | Job (`total-files-size`) | Store: data files | Store: whole prefix | Gap, data | Gap, whole prefix |
 | --- | --- | --- | --- | --- | --- |
@@ -59,8 +66,8 @@ every object under the table's whole prefix.
 | **layer `bronze`** | **5,550,367** | 5,550,367 | 5,564,524 | 0.0000 % | **0.2544 %** |
 | **layer `gold`** | **2,523,024** | 2,523,024 | 2,537,179 | 0.0000 % | **0.5579 %** |
 
-Both layers are inside the 1 % of `OPS-8-AC4` on the whole-prefix reading,
-and exact on the data files.
+Both layers are inside the 1 % of the wording of 2026-11-17 on the
+whole-prefix reading, and exact on the data files.
 
 ### The cause of the whole-prefix gap
 
@@ -120,3 +127,29 @@ matches the job's number exactly for every table.
   out of scope in the plan.
 - The object store's own total, for the layers that are not in it
   (`silver`, `serving`).
+
+## The staging test of 2026-11-18
+
+**Measured, on staging.** The Auditor retested `OPS-8` on staging
+(`5534d308`) on 2026-11-18, and `OPS-8-AC4` failed under the wording of
+that day. The job's `bronze` layer held 1,002,969,464 B over 682 tables
+(9 skipped), read as each table's CURRENT snapshot `total-files-size`, and
+the bucket `lakehouse-warehouse` held 4,140,446,845 B (a
+`capacity_snapshot` run at 02:01 UTC). The layer number is about 24 % of
+the bucket. The cause: `total-files-size` counts the live data of the
+current snapshot only, and the bucket also holds the files of old
+snapshots, orphan files, metadata, and the files of dropped tables. The
+local measurement of 2026-11-17 above could not see this: its four tables
+were fresh, with no history.
+
+**What this change does.** The job now measures a second number per
+Iceberg layer, "stored on disk": the bytes the object store holds under
+each table's own location. The page shows that number next to the current
+data, and shows the rest of the bucket as "In the bucket but in no current
+table". The reworded `OPS-8-AC4` compares the "stored on disk" sum plus
+the rest of the bucket with the bucket.
+
+**Not measured yet.** The new numbers have not been measured on staging.
+They are measured after the deploy, by the Auditor's retest, and this
+document does not carry them. Whether `OPS-8-AC4` passes under its new
+wording is not known yet.

@@ -8,13 +8,54 @@ Four layers, measured by the system that already owns each one's data:
   (`scripts/seed-clickhouse.sql` names `silver`/`serving` as ClickHouse
   databases, so they are NOT Iceberg namespaces -- the plan's "per
   namespace (bronze, silver, serving, gold)" wording was wrong about
-  two of the four). Their size is the `total-files-size` of each table's
-  CURRENT snapshot, read from the table's own metadata document -- the
-  same number `lakehouse-iceberg`'s `stats_from_summary` reads and
-  `routes/catalog.rs` already shows.
+  two of the four). Each of their tables carries TWO numbers: the
+  `total-files-size` of its CURRENT snapshot (the live data), read from
+  the table's own metadata document -- the same number
+  `lakehouse-iceberg`'s `stats_from_summary` reads and
+  `routes/catalog.rs` already shows -- and the bytes the object store
+  holds under the table's own LOCATION (the live data, the older
+  snapshots' files, the metadata and the orphan files).
 - `silver` and `serving` are ClickHouse databases. Their size is their
   own `system.parts` bytes on disk, and their table count is their own
   `system.tables` count. There is no Iceberg metadata to read for them.
+
+# Two numbers for an Iceberg layer: the current data and what is on disk
+
+The `total-files-size` of a table's current snapshot counts the LIVE
+data only: the files the current snapshot points at. The table's own
+LOCATION holds more than that -- the older snapshots' data files, the
+metadata, the manifest lists, and the files of the tables that were
+dropped. On the staging warehouse of 2026-11-18 the bucket held
+4,140,446,845 B while the bronze layer's current data was 1,002,969,464
+B over 682 tables: the two numbers measure different things, and the
+page shows both -- "current data" (the snapshot number) and "stored on
+disk" (the bytes the object store holds under the table's own
+location).
+
+A table is MEASURED only when BOTH numbers were read. A table that
+could not be measured is a skip with a fixed reason and contributes to
+NEITHER total: never a zero, and never one number without the other.
+
+# The object store is read through the capacity job's ONE setup
+
+`capacity_snapshot.py` is where this project reads the object store.
+Its `build_filesystem` (the credentials and the endpoint) and its
+`list_stored_objects` (what counts as a stored object) are the helpers
+this module uses, so there is ONE copy of that logic and not two
+(`AGENTS.md` rule 4). The configuration is the capacity job's own
+(`capacity_snapshot.CapacityConfig.from_env`), which reads the same
+`CONNECTOR_S3_*` credentials, the same endpoint and the same bucket: the
+"stored on disk" number and the bucket size are measured against the
+same bucket, or they are not comparable at all.
+
+# The object store's own failure is not a skip
+
+The bucket root is listed ONCE, before any table is measured. A failure
+there is the store's own failure -- a wrong endpoint, a refused
+credential -- and it fails the RUN with `dagster.Failure` naming the
+environment variables to set. A listing of ONE table's location that
+fails is that table's problem: a skip with its fixed reason, and the
+other tables are still measured.
 
 # Where the rows go
 
@@ -27,12 +68,13 @@ with `record_capacity_snapshot`.
 # A table that cannot be measured is never a table of zero bytes
 
 A table whose metadata cannot be read (or whose snapshot summary holds
-no size) is counted in `tables_skipped`, with a FIXED reason, and its
-bytes are left out of the layer's total. The reason is one of two
-fixed sentences for the Iceberg layers (the ClickHouse layers have
-their own, below): no upstream text (an error message from the catalog,
-a file path, a hostname) ever reaches this table, and from there the
-API.
+no size, or whose files cannot be listed, or whose location is not under
+the measured bucket) is counted in `tables_skipped`, with a FIXED reason,
+and its bytes are left out of BOTH of the layer's totals. The reason is
+one of four fixed sentences for the Iceberg layers (the ClickHouse
+layers have their own, below): no upstream text (an error message from
+the catalog, a file path, a hostname, an S3 error) ever reaches this
+table, and from there the API.
 
 # The catalog database is created by the job itself
 
@@ -91,7 +133,11 @@ rule 4). The one private helper this module still uses is
 `bronze_catalog._sql_string_literal`, because that is THE way ClickHouse
 SQL is built here (`docs/CODE-STANDARD.md`).
 
-# The run limit
+The object store is reached the same way: `capacity_snapshot.build_filesystem`
+and `capacity_snapshot.list_stored_objects` are the PUBLIC names of the
+module that owns the bucket, for the same reason.
+
+# The run limit and the serial tag
 
 The job carries its own `dagster/max_runtime` tag (thirty minutes by
 default). A run whose process dies would otherwise hold a concurrency
@@ -99,21 +145,29 @@ slot forever -- the failure the staging Dagster hit on 13 Nov 2026
 (ten runs left STARTED with a dead process, filling the ten-run
 concurrency limit and queueing 570 runs behind them). The limit is a
 tag on THIS job alone, read from its own setting, through the same
-`ingest_factory.run_limit_tags` rule `ingest_job` uses -- one parsing
-rule, two settings, two defaults (`AGENTS.md` rule 4).
+`ingest_factory.job_tags` rule `ingest_job` uses -- one parsing rule,
+two settings, two defaults (`AGENTS.md` rule 4).
+
+`job_tags` adds the `lakehouse/serial` tag too, because this job is on
+the serial list (`OPS-37`): it measures every layer and writes one row
+per layer, so two overlapping runs of it would measure the same layers
+twice and write the same rows. The tag's value is the job's own name,
+so the run queue's limit of one holds this job alone.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import requests
 from dagster import DefaultScheduleStatus, Failure, ScheduleDefinition, job, op
+from s3fs import S3FileSystem
 
-from dispar_orchestrate import bronze_catalog, maintenance
+from dispar_orchestrate import bronze_catalog, capacity_snapshot, maintenance
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, StorageLayerRow
-from dispar_orchestrate.ingest_factory import run_limit_tags
+from dispar_orchestrate.ingest_factory import job_tags
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 # The Iceberg layers: namespaces of the REST catalog, measured from each
@@ -129,10 +183,17 @@ CLICKHOUSE_LAYERS = ("silver", "serving")
 RUN_LIMIT_ENV = "DAGSTER_RUN_LIMIT_STORAGE_LAYER_SNAPSHOT_JOB_SECONDS"
 DEFAULT_RUN_LIMIT_SECONDS = 1_800
 
-# The only two reasons a table is skipped. Fixed sentences on purpose: the
-# upstream text (a catalog error, a file path) must not reach the API.
+# The reasons an Iceberg table is skipped. Fixed sentences on purpose: the
+# upstream text (a catalog error, a file path, an S3 error message) must
+# not reach the API.
+#
+# The first two are about the catalog's own metadata document; the next two
+# are about the object store the table's files live in. A table that could
+# not be measured has ONE reason, the first one that applies.
 SKIP_REASON_UNREADABLE = "the catalog's metadata could not be read"
 SKIP_REASON_NO_SIZE = "the snapshot summary holds no size"
+SKIP_REASON_NOT_LISTED = "the table's files could not be listed"
+SKIP_REASON_OUTSIDE_BUCKET = "the table lives outside the measured bucket"
 
 # The reason a ClickHouse layer's own size could not be read. Its own
 # sentence, because the two above are about the Iceberg metadata: a
@@ -199,6 +260,141 @@ def _total_files_size(document: object) -> int | None:
     return None
 
 
+def _table_location(document: object) -> str | None:
+    """The table's own location (`s3://<bucket>/<key>`), or `None`.
+
+    Read from the same metadata document `_total_files_size` reads, in the
+    shapes the Iceberg REST catalog serves it: the table's own `location`
+    field (`metadata.location`), the same field one level deeper
+    (`metadata.storage.location`), and the top-level `location` of a
+    document that carries the Iceberg fields without the `metadata`
+    wrapper -- the reader does not depend on the wrapper being there.
+
+    The location is where the table's files live, so it is the one thing
+    the "stored on disk" number is measured from; a document that does
+    not carry it cannot be measured.
+    """
+    if not isinstance(document, dict):
+        return None
+    metadata = document.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = document
+    candidates = [metadata.get("location")]
+    storage = metadata.get("storage")
+    if isinstance(storage, dict):
+        candidates.append(storage.get("location"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+@dataclass(frozen=True)
+class CatalogTable:
+    """What the catalog says about one table: the size of its CURRENT
+    snapshot, and the location its files live under.
+
+    `reason` is empty when the table was read; otherwise it is the fixed
+    sentence that says why it could not be measured, and `current_bytes`
+    is empty with it."""
+
+    current_bytes: int | None
+    location: str
+    reason: str
+
+
+def _key_in_bucket(location: str, bucket: str) -> str | None:
+    """The location's key inside `bucket`, or `None` when the location is
+    not under it.
+
+    A location is `s3://<bucket>/<key>`: the bucket says whether the
+    table's files are in the bucket this job measures at all, and the key
+    is what `s3fs` lists under. A location with another scheme, another
+    bucket, or no scheme at all cannot be listed against this store's
+    filesystem — `s3fs` would read the first segment of a scheme-less
+    path as a bucket name — so it is not a table of this bucket."""
+    scheme, separator, rest = location.partition("://")
+    if not separator or scheme != "s3":
+        return None
+    bucket_name, _, key = rest.partition("/")
+    if bucket_name != bucket or not key:
+        return None
+    return key
+
+
+class ObjectStore:
+    """The warehouse bucket, as the object store sees it.
+
+    ONE filesystem per run, built by `capacity_snapshot.build_filesystem`
+    (the one copy of the credential/endpoint logic in this project), and
+    two operations: a probe of the bucket root, and the bytes under one
+    table's location.
+
+    The two operations fail in two different ways, and the difference is
+    the whole point of this class: a failure of the PROBE is the store's
+    own failure — a wrong endpoint, a refused credential — and it fails
+    the run (`dagster.Failure`, naming the environment variables to
+    set), while a failure of ONE table's listing is that table's
+    problem: a skip with a fixed reason, and the other tables are still
+    measured (`docs/CODE-STANDARD.md`: a configuration/auth failure is a
+    `Failure`, a degraded-but-continuable failure is a skip)."""
+
+    def __init__(self, fs: S3FileSystem, bucket_name: str) -> None:
+        self._fs = fs
+        self._bucket = bucket_name
+
+    @classmethod
+    def from_capacity_config(cls, cfg: capacity_snapshot.CapacityConfig) -> "ObjectStore":
+        """The store this job reads, from the configuration the capacity
+        job reads: the same `CONNECTOR_S3_*` credentials, the same
+        endpoint and the same bucket."""
+        return cls(capacity_snapshot.build_filesystem(cfg), cfg.bucket_name)
+
+    def probe(self) -> None:
+        """The bucket root, listed ONCE, before any table is measured.
+
+        `ls` and not `find`: the root listing is the cheapest call the
+        store offers, and it is enough to tell "the store answers" from
+        "the store refuses to answer at all"."""
+        try:
+            self._fs.ls(self._bucket)
+        except Exception:  # noqa: BLE001 -- the object store raises backend-specific types
+            # The upstream text (an S3 error, a hostname) stays out of the
+            # message (`AGENTS.md`: upstream error text never reaches a
+            # response).
+            raise Failure(
+                "the warehouse bucket could not be listed — check "
+                "CONNECTOR_S3_ACCESS_KEY, CONNECTOR_S3_SECRET_KEY, "
+                "CH_RUSTFS_S3_ENDPOINT and LAKEHOUSE_WAREHOUSE_BUCKET",
+                allow_retries=False,
+            ) from None
+
+    def stored_bytes(self, location: str) -> tuple[int | None, str]:
+        """The bytes under one table's location, or `(None, reason)`.
+
+        `location` is the table's own location from the catalog's metadata
+        document (`s3://<bucket>/<key>`). A location that is not under the
+        measured bucket is not this store's business: its bytes would not
+        be comparable with the bucket's size, so the table is skipped with
+        its own reason."""
+        key = _key_in_bucket(location, self._bucket)
+        if key is None:
+            return None, SKIP_REASON_OUTSIDE_BUCKET
+        # The LISTED path carries the bucket: `s3fs` reads the FIRST
+        # segment of a scheme-less path as the bucket name, so the bare
+        # key would list a bucket named after the table's first folder
+        # (`warehouse`), not the measured one -- a bucket that does not
+        # exist, or worse one that does and holds other objects. The path
+        # has the same shape `capacity_snapshot.measure_bucket` lists the
+        # whole bucket with: the bucket, then the key.
+        path = f"{self._bucket}/{key}"
+        try:
+            bytes_, _objects = capacity_snapshot.list_stored_objects(self._fs, path)
+        except Exception:  # noqa: BLE001 -- the object store raises backend-specific types
+            return None, SKIP_REASON_NOT_LISTED
+        return bytes_, ""
+
+
 class _CatalogReader:
     """Reads one table's metadata document from the Iceberg REST catalog.
 
@@ -222,7 +418,7 @@ class _CatalogReader:
         (`docs/CODE-STANDARD.md`: a configuration/auth failure is a
         `dagster.Failure`; only a degraded-but-continuable failure is a
         skip). The two cases are kept apart on purpose -- `_mint_token`
-        and `_resolve_prefix` raise, `read_bytes` skips.
+        and `_resolve_prefix` raise, `read_table` skips.
         """
         if self._token is None:
             self._token = self._mint_token()
@@ -282,10 +478,14 @@ class _CatalogReader:
                 allow_retries=False,
             ) from None
 
-    def read_bytes(self, table_name: str) -> tuple[int | None, str]:
-        """The size of one table, or `(None, reason)` when it cannot be
-        measured. `table_name` is the catalog's own two-part name
-        (`bronze.orders`)."""
+    def read_table(self, table_name: str) -> CatalogTable:
+        """One table's current size and the location its files live under,
+        or the reason it could not be read. `table_name` is the catalog's
+        own two-part name (`bronze.orders`).
+
+        The size and the location come from the SAME document: they are
+        two facts about one table, and reading the document twice would
+        be two chances to read a different one."""
         namespace, _, table = table_name.partition(".")
         # The token and the prefix are resolved OUTSIDE the try below, so
         # that a configuration or auth failure there stays a whole-run
@@ -305,47 +505,68 @@ class _CatalogReader:
             # A per-table read failure -- a 404, a timeout, a body that is
             # not JSON -- is the same skip: the table's bytes are unknown.
             # The reason is fixed, never the upstream text.
-            return None, SKIP_REASON_UNREADABLE
+            return CatalogTable(None, "", SKIP_REASON_UNREADABLE)
         size = _total_files_size(document)
         if size is None:
-            return None, SKIP_REASON_NO_SIZE
-        return size, ""
+            return CatalogTable(None, "", SKIP_REASON_NO_SIZE)
+        location = _table_location(document)
+        if location is None:
+            # The location is part of the metadata document the table is
+            # measured from: a document that does not carry it has not
+            # given us what the measurement needs, and the table's files
+            # cannot be listed without it.
+            return CatalogTable(None, "", SKIP_REASON_UNREADABLE)
+        return CatalogTable(size, location, "")
 
 
 def measure_iceberg_layer(
     layer: str,
     tables: list[str],
-    read_bytes: Callable[[str], tuple[int | None, str]],
+    read_table: Callable[[str], CatalogTable],
+    store: ObjectStore,
 ) -> StorageLayerRow:
     """The size of one Iceberg layer: the sum of its tables' sizes.
 
-    `read_bytes` is the seam: it answers `(size, reason)` for one table,
-    and `(None, reason)` when the table cannot be measured. A table that
-    cannot be measured is counted in `tables_skipped` and left OUT of the
-    total -- a layer that could not be measured whole must never look
-    measured and empty.
+    TWO numbers per table: the CURRENT data (the current snapshot's
+    `total-files-size`, from the catalog) and the bytes STORED ON DISK
+    under the table's own location (from the object store). A table is
+    measured only when BOTH were read: a table with one of the two
+    missing is a skip with its fixed reason, and it contributes to
+    NEITHER total -- a layer that could not be measured whole must never
+    look measured and empty.
+
+    `read_table` and `store` are the seams: the catalog's read and the
+    object store's listing.
 
     `table_count` is the number of tables the catalog holds in this
     layer, measured tables and skipped ones alike: it says how many
     tables the layer HAS, and `tables_skipped` says how many of them are
-    missing from the byte total.
+    missing from the byte totals.
     """
     total = 0
+    stored = 0
     skipped = 0
     reasons: list[str] = []
     for table in tables:
-        size, reason = read_bytes(table)
-        if size is None:
+        read = read_table(table)
+        if read.current_bytes is None:
+            skipped += 1
+            reasons.append(read.reason)
+            continue
+        stored_bytes, reason = store.stored_bytes(read.location)
+        if stored_bytes is None:
             skipped += 1
             reasons.append(reason)
             continue
-        total += size
+        total += read.current_bytes
+        stored += stored_bytes
     return StorageLayerRow(
         layer=layer,
         table_count=len(tables),
         total_bytes=total,
         tables_skipped=skipped,
         skipped_reason="; ".join(dict.fromkeys(reasons)),
+        stored_bytes=stored,
     )
 
 
@@ -420,6 +641,7 @@ def measure_clickhouse_layer(layer: str, target: ClickHouseTarget) -> StorageLay
             total_bytes=0,
             tables_skipped=1,
             skipped_reason=SKIP_REASON_LAYER_UNREADABLE,
+            stored_bytes=None,
         )
     table_count = _as_int((count_rows[0] if count_rows else {}).get("table_count")) or 0
     try:
@@ -433,6 +655,7 @@ def measure_clickhouse_layer(layer: str, target: ClickHouseTarget) -> StorageLay
             total_bytes=0,
             tables_skipped=table_count,
             skipped_reason=SKIP_REASON_LAYER_UNREADABLE,
+            stored_bytes=None,
         )
     total_bytes = _as_int((bytes_rows[0] if bytes_rows else {}).get("total_bytes")) or 0
     return StorageLayerRow(
@@ -441,10 +664,17 @@ def measure_clickhouse_layer(layer: str, target: ClickHouseTarget) -> StorageLay
         total_bytes=total_bytes,
         tables_skipped=0,
         skipped_reason="",
+        # A ClickHouse layer's bytes sit on the ClickHouse server's own
+        # disk, not in the warehouse bucket: there is no location to
+        # list, so there is no second number. `None` says "not measured
+        # here", where a zero would say "this layer holds no bytes".
+        stored_bytes=None,
     )
 
 
-def measure_layers(cfg: maintenance.MaintenanceConfig) -> list[StorageLayerRow]:
+def measure_layers(
+    cfg: maintenance.MaintenanceConfig, store: ObjectStore
+) -> list[StorageLayerRow]:
     """Every layer's size, as one row per layer.
 
     The Iceberg layers come from the catalog's own table list (the whole
@@ -458,14 +688,18 @@ def measure_layers(cfg: maintenance.MaintenanceConfig) -> list[StorageLayerRow]:
     while this one runs at 01:00 -- on a fresh stack neither has run, so
     the listing would answer `UNKNOWN_DATABASE` and no row would ever be
     written.
-    """
+
+    The object store is probed ONCE, before any table is read: a bucket
+    that cannot be listed at all is the store's own failure and fails
+    the run, rather than reporting "every table skipped, zero bytes"."""
+    store.probe()
     maintenance.ensure_catalog_database(cfg)
     catalog_tables = maintenance.discover_catalog_tables(cfg)
     reader = _CatalogReader(cfg)
     rows: list[StorageLayerRow] = []
     for layer in ICEBERG_LAYERS:
         tables = [name for name in catalog_tables if name.startswith(f"{layer}.")]
-        rows.append(measure_iceberg_layer(layer, tables, reader.read_bytes))
+        rows.append(measure_iceberg_layer(layer, tables, reader.read_table, store))
     for layer in CLICKHOUSE_LAYERS:
         rows.append(measure_clickhouse_layer(layer, cfg.ch))
     return rows
@@ -483,6 +717,7 @@ def _utc_today() -> str:
         reads=[
             "Iceberg REST catalog (every table's current snapshot)",
             "ClickHouse system.tables, system.parts",
+            "RustFS warehouse bucket (every table's own location)",
         ],
         writes=["ClickHouse lake.bronze_meta.storage_layer_snapshot"],
     ),
@@ -490,10 +725,22 @@ def _utc_today() -> str:
 def run_storage_snapshot(context) -> None:
     """Measure every layer and record one row per layer for today."""
     cfg = maintenance.MaintenanceConfig.from_env()
-    rows = measure_layers(cfg)
+    # The object store's own configuration: the SAME one the capacity job
+    # reads (`CONNECTOR_S3_*`, `CH_RUSTFS_S3_ENDPOINT`,
+    # `LAKEHOUSE_WAREHOUSE_BUCKET`), so the credentials and the endpoint
+    # are read in one place and the "stored on disk" number and the
+    # bucket size are measured against the same bucket. A missing
+    # credential is a `Failure` here, before any table is read.
+    store = ObjectStore.from_capacity_config(capacity_snapshot.CapacityConfig.from_env())
+    rows = measure_layers(cfg, store)
     for row in rows:
         context.log.info(
             f"[{row.layer}] {row.table_count} table(s), {row.total_bytes} byte(s)"
+            + (
+                f", {row.stored_bytes} byte(s) on disk"
+                if row.stored_bytes is not None
+                else ""
+            )
             + (f", {row.tables_skipped} skipped" if row.tables_skipped else "")
         )
     bronze_catalog.record_storage_layer_snapshot(
@@ -501,7 +748,10 @@ def run_storage_snapshot(context) -> None:
         rows=rows,
         target=cfg.ch,
     )
-    context.add_output_metadata({row.layer: row.total_bytes for row in rows})
+    context.add_output_metadata(
+        {row.layer: row.total_bytes for row in rows}
+        | {f"{row.layer} stored on disk": row.stored_bytes for row in rows}
+    )
 
 
 # The `dagster/max_runtime` tag is what run monitoring enforces: a run
@@ -511,7 +761,7 @@ def run_storage_snapshot(context) -> None:
 # every job of the instance -- and it is `tags` and not `run_tags` for
 # the reason `ingest_factory.py` gives: both launch paths copy a job's
 # `tags` onto the run when `run_tags` is unset.
-@job(name="storage_snapshot_job", tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
+@job(name="storage_snapshot_job", tags=job_tags("storage_snapshot_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def storage_snapshot_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `storage_snapshot_job`."""
     run_storage_snapshot()

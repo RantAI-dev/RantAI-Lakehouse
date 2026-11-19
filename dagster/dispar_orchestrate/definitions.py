@@ -43,6 +43,7 @@ from dispar_orchestrate.replication_metrics import (
     replication_slot_check_job,
     replication_slot_check_schedule,
 )
+from dispar_orchestrate.run_queue_sensor import run_queue_near_limit_sensor
 from dispar_orchestrate.storage_snapshot import (
     storage_snapshot_job,
     storage_snapshot_schedule,
@@ -156,5 +157,10 @@ defs = Definitions(
         # BLD-2 D6: one lag sensor per authored pipeline with a time-based target lag
         # (named authored__<safe_id>_lag, running every 30 seconds).
         *authored_lag_sensors,
+        # OPS-37: warns when the run queue stays one below its limit for
+        # fifteen minutes. It starts no run — the warning is the skipped
+        # tick's reason — see `run_queue_sensor.py`'s module doc for why
+        # the console's System status page cannot show it instead.
+        run_queue_near_limit_sensor,
     ],
 )
