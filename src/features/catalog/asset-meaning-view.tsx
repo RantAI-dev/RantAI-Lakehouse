@@ -27,7 +27,6 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Textarea } from "@/components/ui/textarea"
@@ -490,7 +489,9 @@ function MeaningDialog({ state, target, onClose }: { state: Ready; target: Dialo
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
-          <RequiredLegend />
+          {/* UX-4: the meaning is required while synonyms and role are
+              optional, so the star stays; the form is too short for a
+              legend. */}
           <div className="grid gap-1.5">
             <div className="flex items-center justify-between gap-2">
               <Label htmlFor={`${id}-meaning`} required>Meaning</Label>

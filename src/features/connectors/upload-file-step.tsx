@@ -3,8 +3,6 @@
 import * as React from "react"
 import { UploadCloudIcon, XIcon } from "lucide-react"
 import { Button, buttonVariants } from "@/components/ui/button"
-import { RequiredMarker } from "@/components/ui/required"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { formatBytes } from "@/lib/format"
 import type { QueueFile } from "@/lib/upload-queue"
 import { ACCEPTED_FILES, MAX_FILES } from "@/lib/uploads"
@@ -216,7 +214,8 @@ export function FileStep({
           dragging ? "border-primary bg-primary/5" : "border-border bg-muted/20"
         )}
       >
-        <RequiredLegend />
+        {/* UX-4: the file picker is this box's one required input, so no
+            star and no legend; the input keeps `aria-required`. */}
         <input
           id={INPUT_ID}
           type="file"
@@ -243,7 +242,7 @@ export function FileStep({
             {dragging ? "Release to choose these files" : "Drop files here, or choose some"}
           </p>
           <label htmlFor={INPUT_ID} className={cn(buttonVariants({ size: "sm" }), "cursor-pointer")}>
-            Choose files <RequiredMarker />
+            Choose files
           </label>
         </div>
       </div>
