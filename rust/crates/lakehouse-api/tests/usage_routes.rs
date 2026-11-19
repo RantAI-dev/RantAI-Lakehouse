@@ -1213,7 +1213,15 @@ async fn clickhouse_with_storage(layers: Vec<Value>, bucket: Option<Value>) -> M
 
 /// The app of a test about the storage read, with the `ClickHouse` that
 /// answers it.
-async fn storage_app(ch: MockServer) -> (axum::Router, PgPool) {
+///
+/// The server is borrowed, not moved, because the request happens after
+/// this helper returns: a dropped `MockServer` goes back to wiremock's
+/// pool, where its old mocks are cleared when the server is handed out
+/// again, and the same address can then belong to another test in this
+/// process, which mounts its own mocks and answers this test's request.
+/// The local gate of PR #591 caught that race once: one test's fixed 503
+/// case came back with another test's fixture rows.
+async fn storage_app(ch: &MockServer) -> (axum::Router, PgPool) {
     let mut overrides = HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch.uri());
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
@@ -1235,7 +1243,7 @@ async fn the_platform_operator_sees_the_size_of_every_layer() {
         None,
     )
     .await;
-    let (router, pool) = storage_app(ch).await;
+    let (router, pool) = storage_app(&ch).await;
     let admin = platform_admin(&pool).await;
 
     let answer = get(
@@ -1276,7 +1284,7 @@ async fn a_tenant_administrator_is_refused_the_storage_of_every_layer() {
         None,
     )
     .await;
-    let (router, pool) = storage_app(ch).await;
+    let (router, pool) = storage_app(&ch).await;
     // A Governance Admin of one tenant: `usage:read` opens the Usage page,
     // and it does not open the storage of every tenant's tables.
     let admin = person(&pool, "usage:read", &[TENANT_A]).await;
@@ -1304,7 +1312,7 @@ async fn the_estimate_follows_the_rate_that_was_in_force_on_the_day() {
         None,
     )
     .await;
-    let (router, pool) = storage_app(ch).await;
+    let (router, pool) = storage_app(&ch).await;
     let admin = platform_admin(&pool).await;
     // The price of a gigabyte for a month, from the tenth of March.
     let rate = post_rate(
@@ -1356,7 +1364,7 @@ async fn with_no_snapshot_table_the_storage_is_an_empty_measurement_not_an_outag
         })))
         .mount(&ch)
         .await;
-    let (router, pool) = storage_app(ch).await;
+    let (router, pool) = storage_app(&ch).await;
     let admin = platform_admin(&pool).await;
 
     let answer = get(
@@ -1414,7 +1422,7 @@ async fn a_table_that_predates_the_disk_column_reads_as_disk_not_measured_not_as
         })))
         .mount(&ch)
         .await;
-    let (router, pool) = storage_app(ch).await;
+    let (router, pool) = storage_app(&ch).await;
     let admin = platform_admin(&pool).await;
 
     let answer = get(
@@ -1457,7 +1465,7 @@ async fn an_unknown_column_other_than_the_disk_one_is_still_the_fixed_503() {
         })))
         .mount(&ch)
         .await;
-    let (router, pool) = storage_app(ch).await;
+    let (router, pool) = storage_app(&ch).await;
     let admin = platform_admin(&pool).await;
 
     let answer = get(
@@ -1496,7 +1504,7 @@ async fn any_other_failure_of_the_engine_is_the_fixed_503() {
         })))
         .mount(&ch)
         .await;
-    let (router, pool) = storage_app(ch).await;
+    let (router, pool) = storage_app(&ch).await;
     let admin = platform_admin(&pool).await;
 
     let answer = get(
@@ -1535,7 +1543,7 @@ async fn the_bucket_holds_what_no_current_table_accounts_for() {
         )),
     )
     .await;
-    let (router, pool) = storage_app(ch).await;
+    let (router, pool) = storage_app(&ch).await;
     let admin = platform_admin(&pool).await;
 
     let answer = get(
@@ -1584,7 +1592,7 @@ async fn a_bucket_smaller_than_the_tables_is_not_comparable() {
         )),
     )
     .await;
-    let (router, pool) = storage_app(ch).await;
+    let (router, pool) = storage_app(&ch).await;
     let admin = platform_admin(&pool).await;
 
     let answer = get(
@@ -1626,7 +1634,7 @@ async fn with_no_capacity_table_the_layers_are_still_there() {
         })))
         .mount(&ch)
         .await;
-    let (router, pool) = storage_app(ch).await;
+    let (router, pool) = storage_app(&ch).await;
     let admin = platform_admin(&pool).await;
 
     let answer = get(
@@ -1655,7 +1663,7 @@ async fn the_estimate_is_priced_on_the_bytes_on_disk() {
         None,
     )
     .await;
-    let (router, pool) = storage_app(ch).await;
+    let (router, pool) = storage_app(&ch).await;
     let admin = platform_admin(&pool).await;
     let rate = post_rate(
         &router,
