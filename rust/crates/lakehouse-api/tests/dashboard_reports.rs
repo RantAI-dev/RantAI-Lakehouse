@@ -849,7 +849,64 @@ async fn markup_in_a_paragraph_comes_back_as_the_same_plain_string() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         said["error"],
-        "blocks must be a list of heading, paragraph, list, link and chart blocks."
+        "blocks must be a list of heading, paragraph, list, quote, divider, link and chart blocks."
+    );
+}
+
+/// `BI-62` (D3): the editor's blocks round-trip through the route: marked-up
+/// text is stored as typed, a quote and a divider keep their place, a wide
+/// chart keeps its width, and a link inside a text whose address could run
+/// code is refused with its own sentence.
+#[tokio::test]
+async fn the_editors_blocks_save_as_written_and_an_unsafe_inline_link_is_refused() {
+    let f = fixture().await;
+    let text = "Visits **rose** in *June*, see [the method](https://example.com/m).";
+    let (status, made) = create(
+        &f,
+        &f.writer,
+        json!({ "title": "Q3", "blocks": [
+            { "type": "paragraph", "text": text },
+            { "type": "quote", "text": "A *quoted* line." },
+            { "type": "divider" },
+            { "type": "chart", "chart": "c_one", "width": "wide" },
+            chart("c_two"),
+        ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    let id = made["report"]["id"].as_str().unwrap().to_owned();
+    let (status, read) = call(
+        &f.app,
+        "GET",
+        &format!("/api/dashboard/reports/{id}"),
+        &f.reader,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    let blocks = &read["report"]["blocks"];
+    assert_eq!(blocks[0]["text"], text);
+    assert_eq!(
+        blocks[1],
+        json!({ "type": "quote", "text": "A *quoted* line." })
+    );
+    assert_eq!(blocks[2], json!({ "type": "divider" }));
+    assert_eq!(blocks[3]["width"], "wide");
+    assert_eq!(blocks[3]["board"], "b_one");
+    assert!(blocks[4].get("width").is_none(), "{read}");
+
+    let (status, said) = create(
+        &f,
+        &f.writer,
+        json!({ "title": "X", "blocks": [
+            { "type": "paragraph", "text": "Click [here](javascript:alert(1))." },
+        ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        said["error"],
+        "A link in the text must start with https://, http://, mailto: or / (a page of this console)."
     );
 }
 

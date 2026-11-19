@@ -13,10 +13,9 @@ mock.module("next/navigation", () => ({
 }))
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
-import { afterAll, afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import * as realTileBody from "./tile-body"
 import { AuthProvider } from "@/features/auth/auth-provider"
-import { chooseOption } from "@/components/patterns/select-field.testing"
 
 // BI-18 part D (T5): the reader, the editor, the picker and the blocks. The
 // chart body is the dashboard's own `TileBody`, replaced here by a marker; the
@@ -34,6 +33,7 @@ const { ReportBlocks } = await import("./report-blocks")
 const { ReportReaderPage } = await import("./report-reader-page")
 const { ReportEditorPage } = await import("./report-editor-page")
 const { ReportChartPicker } = await import("./report-chart-picker")
+const { ReportChartsProvider } = await import("./report-charts")
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
@@ -170,96 +170,222 @@ describe("ReportReaderPage", () => {
   })
 })
 
-describe("ReportEditorPage", () => {
+/** The live editor on the page (Tiptap puts it on its element). */
+async function pageEditor(container: HTMLElement): Promise<import("@tiptap/core").Editor> {
+  const el = await waitFor(() => {
+    const found = container.querySelector(".ProseMirror") as (HTMLElement & { editor?: import("@tiptap/core").Editor }) | null
+    if (!found?.editor) throw new Error("no editor yet")
+    return found
+  })
+  return el.editor!
+}
+
+const catalogue = {
+  "GET /api/dashboard/boards": () => json({ boards: [{ id: "default", name: "Main", builtin: true }, { id: "b_1", name: "Sales" }, { id: "b_2", name: "Ops" }] }),
+  "GET /api/dashboard/specs": () =>
+    json({
+      charts: [
+        { id: "c_one", title: "Visits by month", board: "b_1", kind: "bar" },
+        { id: "c_note", title: "A note", board: "b_1", kind: "text" },
+        { id: "c_ops", title: "Tickets", board: "b_2", kind: "kpi" },
+        { id: "c_main", title: "Built in", board: "default", kind: "bar" },
+      ],
+    }),
+  "GET /api/dashboard?": (call: Call) =>
+    json({
+      charts: call.url.includes("b_2")
+        ? [{ id: "c_ops", title: "Tickets", kind: "kpi", source: "ui" }]
+        : [{ id: "c_one", title: "Visits by month", kind: "bar", source: "ui" }, { id: "c_note", title: "A note", kind: "text", source: "ui" }],
+      results: {},
+    }),
+}
+
+describe("ReportEditorPage (BI-62)", () => {
   it("tells a person without dashboard:write that they cannot write reports", async () => {
     serve(["dashboard:read"], {})
     render(<AuthProvider><ReportEditorPage /></AuthProvider>)
     expect(await screen.findByText("You cannot write reports")).toBeTruthy()
   })
 
-  it("adds blocks, saves them in order and opens the report", async () => {
+  it("opens a report as a document: the title is the first line, charts are drawn live", async () => {
+    serve(["dashboard:read", "dashboard:write"], { ...catalogue, "GET /api/dashboard/reports/r1": () => json(view("edit")) })
+    const { container } = render(<AuthProvider><ReportEditorPage id="r1" /></AuthProvider>)
+    await pageEditor(container)
+    expect(container.querySelector(".ProseMirror h1.rd-title")?.textContent).toBe("Q3 visitors")
+    expect(container.querySelector(".ProseMirror [data-level='1']")?.textContent).toBe("Summary")
+    // A chart already in the report is drawn from the report's own read.
+    expect(await screen.findByTestId("tile-c_one")).toBeTruthy()
+    expect(screen.getByText("This chart is not available.")).toBeTruthy()
+    // No labels over the text: nothing reads "Heading" or "Paragraph" on the page.
+    expect(screen.queryByText("Paragraph")).toBeNull()
+  })
+
+  it("autosaves what was written as blocks, marks as the inline subset, and makes the report once", async () => {
     const calls = serve(["dashboard:read", "dashboard:write"], {
+      ...catalogue,
       "POST /api/dashboard/reports": (call) =>
         json({ ok: true, report: { id: "r2", ...(call.body as object), createdBy: "", createdAt: "", updatedBy: "", updatedAt: "" } }),
     })
-    render(<AuthProvider><ReportEditorPage /></AuthProvider>)
-    fireEvent.change(await screen.findByLabelText("Title"), { target: { value: "  New one " } })
-    fireEvent.click(screen.getByRole("button", { name: "Add block" }))
-    fireEvent.click(await screen.findByRole("menuitem", { name: /Heading/ }))
-    fireEvent.change(screen.getByLabelText("Heading text"), { target: { value: "Intro" } })
-    fireEvent.click(screen.getByRole("button", { name: "Add block" }))
-    fireEvent.click(await screen.findByRole("menuitem", { name: /Paragraph/ }))
-    fireEvent.change(screen.getByLabelText("Paragraph text"), { target: { value: "<b>as typed</b>" } })
-    // Move the paragraph above the heading.
-    fireEvent.click(screen.getAllByRole("button", { name: "Move up" })[1])
-    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    const addresses: string[] = []
+    spyOn(window.history, "replaceState").mockImplementation((_state, _unused, url) => {
+      addresses.push(String(url))
+    })
+    const { container } = render(<AuthProvider><ReportEditorPage /></AuthProvider>)
+    const editor = await pageEditor(container)
+    editor.commands.setContent({
+      type: "doc",
+      content: [
+        { type: "title", content: [{ type: "text", text: "New one" }] },
+        { type: "heading", attrs: { level: 2 }, content: [{ type: "text", text: "Intro" }] },
+        { type: "paragraph", content: [{ type: "text", text: "<b>as typed</b> " }, { type: "text", text: "bold", marks: [{ type: "bold" }] }] },
+        { type: "chart", attrs: { chart: "c_one", width: "wide" } },
+      ],
+    })
+    // No Save button: leaving the page saves at once (the timer would, a second later).
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull()
+    window.dispatchEvent(new Event("pagehide"))
     await waitFor(() => expect(calls.some((c) => c.method === "POST")).toBe(true))
     const posted = calls.find((c) => c.method === "POST")!.body as { title: string; folderId: string; blocks: unknown[] }
     expect(posted.title).toBe("New one")
     expect(posted.folderId).toBe("")
     expect(posted.blocks).toEqual([
-      { type: "paragraph", text: "<b>as typed</b>" },
       { type: "heading", text: "Intro", level: 2 },
+      { type: "paragraph", text: "<b>as typed</b> **bold**" },
+      { type: "chart", chart: "c_one", width: "wide" },
     ])
-    await waitFor(() => expect(pushed).toContain("/dashboards/reports/r2"))
-  })
-
-  it("shows the server's refusal as it comes and keeps the page", async () => {
-    serve(["dashboard:read", "dashboard:write"], {
-      "GET /api/dashboard/reports/r1": () => json(view("edit")),
-      "PUT /api/dashboard/reports/r1": () => json({ error: "A report holds at most 30 charts." }, 400),
-    })
-    render(<AuthProvider><ReportEditorPage id="r1" /></AuthProvider>)
-    expect(await screen.findByDisplayValue("Q3 visitors")).toBeTruthy()
-    expect(screen.getByTestId("chart-count").textContent).toBe("2 of 30 charts")
-    // A chart already in the report is drawn live in the editor too.
-    expect(screen.getByTestId("tile-c_one")).toBeTruthy()
-    fireEvent.click(screen.getByRole("button", { name: "Save" }))
-    expect((await screen.findByRole("alert")).textContent).toBe("A report holds at most 30 charts.")
+    // The address becomes the edit address with no navigation, and the status says Saved.
+    await waitFor(() => expect(addresses).toEqual(["/dashboards/reports/r2/edit"]))
     expect(pushed).toHaveLength(0)
+    expect(await screen.findByText("Saved")).toBeTruthy()
+    // The next change updates the report the first save made.
+    editor.commands.insertContentAt(editor.state.doc.content.size, { type: "paragraph", content: [{ type: "text", text: "more" }] })
+    window.dispatchEvent(new Event("pagehide"))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT" && c.url.endsWith("/api/dashboard/reports/r2"))).toBe(true))
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(1)
   })
 
-  it("keeps Save off while a link's address could run code", async () => {
-    serve(["dashboard:read", "dashboard:write"], {})
-    render(<AuthProvider><ReportEditorPage /></AuthProvider>)
-    fireEvent.change(await screen.findByLabelText("Title"), { target: { value: "Links" } })
-    fireEvent.click(screen.getByRole("button", { name: "Add block" }))
-    fireEvent.click(await screen.findByRole("menuitem", { name: /Link/ }))
-    fireEvent.change(screen.getByLabelText("Link address"), { target: { value: "javascript:alert(1)" } })
-    expect(screen.getByText(/Start the address with https:\/\//)).toBeTruthy()
-    expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true)
+  it("saves nothing when a report is only opened, and an untouched new report is never made", async () => {
+    const calls = serve(["dashboard:read", "dashboard:write"], { ...catalogue, "GET /api/dashboard/reports/r1": () => json(view("edit")) })
+    const { container, unmount } = render(<AuthProvider><ReportEditorPage id="r1" /></AuthProvider>)
+    await pageEditor(container)
+    window.dispatchEvent(new Event("pagehide"))
+    unmount()
+    const fresh = render(<AuthProvider><ReportEditorPage /></AuthProvider>)
+    await pageEditor(fresh.container)
+    window.dispatchEvent(new Event("pagehide"))
+    await new Promise((r) => setTimeout(r, 50))
+    expect(calls.filter((c) => c.method === "POST" || c.method === "PUT")).toHaveLength(0)
+  })
+
+  it("opens a report made before BI-62 with its link block as a link in a paragraph", async () => {
+    const calls = serve(["dashboard:read", "dashboard:write"], {
+      ...catalogue,
+      "GET /api/dashboard/reports/r1": () =>
+        json(view("edit", { report: { ...view("edit").report, blocks: [{ type: "link", text: "Method", url: "https://example.com/m" }] } })),
+      "PUT /api/dashboard/reports/r1": (call) => json({ ok: true, report: { ...view("edit").report, ...(call.body as object) } }),
+    })
+    const { container } = render(<AuthProvider><ReportEditorPage id="r1" /></AuthProvider>)
+    const editor = await pageEditor(container)
+    expect(container.querySelector(".ProseMirror p a")?.getAttribute("href")).toBe("https://example.com/m")
+    // Opening it saves nothing; the first change saves the link as a paragraph holding it.
+    editor.commands.insertContentAt(1, " ")
+    editor.commands.deleteRange({ from: 1, to: 2 })
+    editor.commands.insertContentAt(editor.state.doc.content.size, { type: "paragraph", content: [{ type: "text", text: "Next" }] })
+    window.dispatchEvent(new Event("pagehide"))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")!.body as { blocks: unknown[] }).blocks).toEqual([
+      { type: "paragraph", text: "[Method](https://example.com/m)" },
+      { type: "paragraph", text: "Next" },
+    ])
+  })
+
+  it("shows the server's refusal beside the status, keeps the text, and Retry tries again", async () => {
+    let refuse = true
+    const calls = serve(["dashboard:read", "dashboard:write"], {
+      ...catalogue,
+      "GET /api/dashboard/reports/r1": () => json(view("edit")),
+      "PUT /api/dashboard/reports/r1": (call) =>
+        refuse ? json({ error: "A report holds at most 30 charts." }, 400) : json({ ok: true, report: { ...view("edit").report, ...(call.body as object) } }),
+    })
+    const { container } = render(<AuthProvider><ReportEditorPage id="r1" /></AuthProvider>)
+    const editor = await pageEditor(container)
+    editor.commands.insertContentAt(editor.state.doc.content.size, { type: "paragraph", content: [{ type: "text", text: "kept" }] })
+    window.dispatchEvent(new Event("pagehide"))
+    expect((await screen.findByRole("alert")).textContent).toBe("A report holds at most 30 charts.")
+    expect(screen.getByText("Couldn't save")).toBeTruthy()
+    expect(container.querySelector(".ProseMirror")?.textContent).toContain("kept")
+    refuse = false
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }))
+    expect(await screen.findByText("Saved")).toBeTruthy()
+    expect(calls.filter((c) => c.method === "PUT")).toHaveLength(2)
+  })
+
+  it("has no Preview button: the editor already shows the reader's view", async () => {
+    serve(["dashboard:read", "dashboard:write"], { ...catalogue, "GET /api/dashboard/reports/r1": () => json(view("edit")) })
+    const { container } = render(<AuthProvider><ReportEditorPage id="r1" /></AuthProvider>)
+    await pageEditor(container)
+    expect(screen.queryByRole("button", { name: "Preview" })).toBeNull()
+    expect(screen.getByRole("button", { name: "Charts" })).toBeTruthy()
   })
 })
 
-describe("ReportChartPicker", () => {
-  it("lists a dashboard's data charts and hands back the one picked", async () => {
-    serve(["dashboard:read", "dashboard:write"], {
-      "GET /api/dashboard/boards": () => json({ boards: [{ id: "default", name: "Main", builtin: true }, { id: "b_1", name: "Sales" }] }),
-      "GET /api/dashboard/specs": () =>
-        json({
-          charts: [
-            { id: "c_one", title: "Visits", board: "b_1", kind: "bar" },
-            { id: "c_note", title: "A note", board: "b_1", kind: "text" },
-            { id: "c_other", title: "Elsewhere", board: "b_2", kind: "bar" },
-          ],
-        }),
-    })
-    let picked: unknown = null
+describe("ReportChartPicker (BI-62)", () => {
+  // The pictures load when on screen; this observer says every one is. The
+  // real global is put back after each test.
+  const realObserver = globalThis.IntersectionObserver
+  beforeEach(() => {
+    globalThis.IntersectionObserver = class {
+      constructor(private readonly cb: IntersectionObserverCallback) {}
+      observe(el: Element) {
+        this.cb([{ isIntersecting: true, target: el } as IntersectionObserverEntry], this as unknown as IntersectionObserver)
+      }
+      disconnect() {}
+      unobserve() {}
+      takeRecords() {
+        return []
+      }
+    } as unknown as typeof IntersectionObserver
+  })
+  afterEach(() => {
+    globalThis.IntersectionObserver = realObserver
+  })
+
+  it("shows each dashboard's data charts as pictures, searches them, and hands back the one picked", async () => {
+    serve(["dashboard:read", "dashboard:write"], catalogue)
+    const picked: unknown[] = []
     render(
       <AuthProvider>
-        <ReportChartPicker open onOpenChange={() => {}} onPick={(p) => { picked = p }} />
+        <ReportChartsProvider>
+          <ReportChartPicker open onOpenChange={() => {}} used={new Set(["c_ops"])} count={1} onPick={(p) => { picked.push(p) }} />
+        </ReportChartsProvider>
       </AuthProvider>,
     )
-    const trigger = await screen.findByRole("combobox", { name: "Dashboard" })
-    fireEvent.click(trigger)
-    expect(screen.queryByRole("option", { name: "Main" })).toBeNull()
-    fireEvent.click(trigger)
-    chooseOption(trigger, "Sales")
-    expect(await screen.findByText("Visits")).toBeTruthy()
+    expect(await screen.findByRole("region", { name: "Sales" })).toBeTruthy()
+    expect(screen.getByRole("region", { name: "Ops" })).toBeTruthy()
+    // The built-in dashboard and a tile without data are not offered.
+    expect(screen.queryByText("Built in")).toBeNull()
     expect(screen.queryByText("A note")).toBeNull()
-    expect(screen.queryByText("Elsewhere")).toBeNull()
-    fireEvent.click(screen.getByText("Visits"))
-    fireEvent.click(screen.getByRole("button", { name: "Add chart" }))
-    expect(picked).toEqual({ chart: "c_one", board: "b_1", title: "Visits", boardName: "Sales" })
+    expect(screen.getByText("In report")).toBeTruthy()
+    // The pictures draw from each dashboard's own read.
+    expect(await screen.findByTestId("tile-c_one")).toBeTruthy()
+    fireEvent.change(screen.getByPlaceholderText("Search charts and dashboards"), { target: { value: "tick" } })
+    expect(screen.queryByRole("region", { name: "Sales" })).toBeNull()
+    fireEvent.click(screen.getByText("Tickets"))
+    expect(picked).toEqual([{ id: "c_ops", title: "Tickets", kind: "kpi", board: "b_2" }])
+    fireEvent.change(screen.getByPlaceholderText("Search charts and dashboards"), { target: { value: "zzz" } })
+    expect(screen.getByText("No charts match “zzz”")).toBeTruthy()
+  })
+
+  it("offers nothing more once the report holds 30 charts", async () => {
+    serve(["dashboard:read", "dashboard:write"], catalogue)
+    render(
+      <AuthProvider>
+        <ReportChartsProvider>
+          <ReportChartPicker open onOpenChange={() => {}} used={new Set()} count={30} onPick={() => {}} />
+        </ReportChartsProvider>
+      </AuthProvider>,
+    )
+    expect(await screen.findByText(/This report has 30 charts/)).toBeTruthy()
+    expect((screen.getByText("Visits by month").closest("button") as HTMLButtonElement).disabled).toBe(true)
   })
 })
