@@ -30,6 +30,11 @@ describe("specWithTopic (SRC-13 decision D4)", () => {
     expect("credential" in input).toBe(false)
   })
 
+  it("saves a spec with no stored ingest mode as a stream, never a batch (SRC-45)", () => {
+    expect(specWithTopic({ ...spec, ingestMode: null }, "payments").ingestMode).toBe("stream")
+    expect(specWithTopic({ ...spec, adapter: null, ingestMode: null }, "payments").ingestMode).toBe("stream")
+  })
+
   it("is not a change of target, so the save needs no credentials (SEC-14)", () => {
     const input = specWithTopic(spec, "payments")
     expect(
