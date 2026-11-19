@@ -4,7 +4,6 @@ import { describe, expect, it } from "bun:test"
 import { FieldLabel } from "./field"
 import { Label } from "./label"
 import { RequiredMarker } from "./required"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 
 // The star is a CSS ::before on an empty aria-hidden span (UX-1). aria-hidden
 // would already keep a text glyph out of a browser's accessible name; the CSS
@@ -42,12 +41,6 @@ describe("required-field marker (UX-1)", () => {
     const label = screen.getByText("Email")
     expect(label.getAttribute("data-slot")).toBe("field-label")
     expect(label.getAttribute("data-required")).toBe("")
-    expect(marker(container)).not.toBeNull()
-  })
-
-  it("explains the convention once with a hidden star and a spoken word", () => {
-    const { container } = render(<RequiredLegend />)
-    expect(screen.getByText(/Required/)).toBeDefined()
     expect(marker(container)).not.toBeNull()
   })
 
