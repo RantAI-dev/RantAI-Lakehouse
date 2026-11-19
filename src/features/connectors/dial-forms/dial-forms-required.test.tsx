@@ -129,10 +129,15 @@ describe("dial form required indicators (UX-1)", () => {
     const mongoForm = within(mongoView.container)
     for (const n of [1, 2]) {
       const input = mongoForm.getByLabelText(`Seed host ${n}`)
+      // UX-4: every input on the Mongo dial is required, so the rows keep
+      // `aria-required` and their visible labels, but no star is drawn.
       expect(input.getAttribute("aria-required")).toBe("true")
-      expect(labelFor(mongoView.container, input)?.getAttribute("data-required")).toBe("")
+      const label = labelFor(mongoView.container, input)
+      expect(label?.hasAttribute("data-required")).toBe(false)
+      expect(label?.className).not.toContain("sr-only")
     }
     expect(mongoForm.getByText(/use Remove for a row you do not need/i)).toBeDefined()
+    expect(mongoForm.queryByText(/Required/)).toBeNull()
 
     const kafka: KafkaDial = {
       bootstrapServers: ["kafka-a.internal:9092", "kafka-b.internal:9092"],
@@ -155,11 +160,14 @@ describe("dial form required indicators (UX-1)", () => {
     const sheetsForm = within(sheetsView.container)
     for (const n of [1, 2]) {
       const input = sheetsForm.getByLabelText(`Range ${n}`)
+      // UX-4: every input on the Sheets dial is required, so the rows keep
+      // `aria-required` and their visible labels, but no star is drawn.
       expect(input.getAttribute("aria-required")).toBe("true")
       const label = labelFor(sheetsView.container, input)
-      expect(label?.getAttribute("data-required")).toBe("")
+      expect(label?.hasAttribute("data-required")).toBe(false)
       expect(label?.className).not.toContain("sr-only")
     }
+    expect(sheetsForm.queryByText(/Required/)).toBeNull()
 
     const rest: RestDial = {
       baseUrl: "https://api.example.com",

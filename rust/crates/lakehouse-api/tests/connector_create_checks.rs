@@ -275,3 +275,52 @@ async fn saving_a_kafka_connector_as_a_batch_or_a_stream_on_another_adapter_is_r
         );
     }
 }
+
+/// `SRC-45` (QA `LH-SRC-6-41`): the console saves a Kafka connector with its
+/// topic in the dial and no source object; the server gives the spec the
+/// topic's default Bronze target, and a target an API caller chose stands.
+#[tokio::test]
+async fn saving_a_kafka_spec_with_no_source_object_stores_the_default_target_of_its_topic() {
+    let fx = fixture(true).await;
+    let (status, answer) = send(
+        &fx,
+        "POST",
+        "/api/connectors",
+        Some(create_body("da-kafka", "Kafka")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let id = answer["id"].as_str().expect("the created id").to_owned();
+
+    let put = |source_objects: Value| {
+        json!({
+            "adapter": "kafka",
+            "ingestMode": "stream",
+            "dial": {
+                "bootstrapServers": ["broker-a:9092"],
+                "topic": "events",
+                "auth": { "type": "none" },
+                "groupId": "lakehouse",
+                "microBatchSeconds": 30
+            },
+            "sourceObjects": source_objects
+        })
+    };
+    let path = format!("/api/connectors/{id}/ingest-spec");
+    let target = lakehouse_store::ingest_spec::default_bronze_target("da-kafka", "events");
+
+    let (status, answer) = send(&fx, "PUT", &path, Some(put(json!([])))).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let (status, answer) = send(&fx, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        answer["sourceObjects"],
+        json!([{ "name": "events", "target": target }]),
+        "{answer}"
+    );
+
+    let chosen = json!([{ "name": "events", "target": "my_events" }]);
+    let (status, answer) = send(&fx, "PUT", &path, Some(put(chosen.clone()))).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["sourceObjects"], chosen, "{answer}");
+}
