@@ -43,12 +43,15 @@ function draft(): SqlSourceDraft {
   } as unknown as SqlSourceDraft
 }
 
-describe("SQL source panel required indicators (UX-1)", () => {
-  it("associates and marks both the SQL editor and the source name", () => {
+describe("SQL source panel required indicators (UX-4)", () => {
+  // UX-4: both inputs are required and nothing on the panel is optional, so
+  // the panel shows no star and no legend; the controls keep their required
+  // semantics and associations (UX-1's fixes, unchanged).
+  it("keeps both the SQL editor and the source name required without stars", () => {
     const { container } = render(<SqlSourcePanel draft={draft()} onCancelEdit={mock()} />)
     const sqlLabel = screen.getByText("SQL").closest("label")
-    expect(sqlLabel?.getAttribute("data-required")).toBe("")
-    // The star is CSS-only, so the visible label text stays exactly "SQL".
+    expect(sqlLabel?.hasAttribute("data-required")).toBe(false)
+    // No star is spliced into the visible label text.
     expect(sqlLabel?.textContent).toBe("SQL")
     const sqlEditor = screen.getByLabelText("SQL")
     expect(sqlEditor.getAttribute("aria-required")).toBe("true")
@@ -56,9 +59,8 @@ describe("SQL source panel required indicators (UX-1)", () => {
 
     const nameInput = screen.getByLabelText("Source name")
     expect(nameInput.getAttribute("aria-required")).toBe("true")
-    expect(container.querySelector('label[for="ch-source-name"]')?.getAttribute("data-required")).toBe("")
-    // One legend for the panel, not one per field.
-    expect(screen.getByText(/Required/)).toBeDefined()
-    expect(container.querySelectorAll("label[data-required]").length).toBe(2)
+    expect(container.querySelector('label[for="ch-source-name"]')?.hasAttribute("data-required")).toBe(false)
+    expect(screen.queryByText(/Required/)).toBeNull()
+    expect(container.querySelectorAll("label[data-required]").length).toBe(0)
   })
 })

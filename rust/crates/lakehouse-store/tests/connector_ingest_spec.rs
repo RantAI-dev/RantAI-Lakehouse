@@ -581,3 +581,52 @@ async fn repoint_ingest_spec_needs_every_slot_the_new_dial_reads(pool: PgPool) -
     assert_eq!(stored_secondary.as_deref(), Some(new_secondary));
     Ok(())
 }
+
+/// `0151` (`SRC-44`, QA `LH-SRC-6-41`; renumbered from `0149`, `PR #593 review 2
+/// BLOCKER 1`, because main took `0149`) moves a Kafka connector the console saved
+/// as a batch to `stream`, and touches nothing else. The migration already ran
+/// on the empty test database, so its statement is run again over seeded rows,
+/// which also shows it is safe to repeat.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_0151_moves_only_kafka_connectors_saved_as_a_batch_to_stream(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for (id, adapter, mode) in [
+        ("src44-kafka-batch", "kafka", "batch"),
+        ("src44-kafka-stream", "kafka", "stream"),
+        ("src44-sql-batch", "sql", "batch"),
+    ] {
+        sqlx::query(
+            "INSERT INTO connector (id, name, type, direction, health, environment, tenant, \
+             host, secret_ref, adapter, ingest_mode) VALUES ($1, $1, 'x', 'source', 'unknown', \
+             'staging', 'Meridian Group', 'h', 'env:X', $2, $3)",
+        )
+        .bind(id)
+        .bind(adapter)
+        .bind(mode)
+        .execute(&pool)
+        .await?;
+    }
+
+    for _ in 0..2 {
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/0151_kafka_connectors_stream.sql"
+        ))
+        .execute(&pool)
+        .await?;
+    }
+
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, ingest_mode FROM connector WHERE id LIKE 'src44-%' ORDER BY id")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(
+        rows,
+        vec![
+            ("src44-kafka-batch".to_owned(), "stream".to_owned()),
+            ("src44-kafka-stream".to_owned(), "stream".to_owned()),
+            ("src44-sql-batch".to_owned(), "batch".to_owned()),
+        ]
+    );
+    Ok(())
+}
