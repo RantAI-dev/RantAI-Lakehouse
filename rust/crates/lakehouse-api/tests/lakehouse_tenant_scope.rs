@@ -2720,6 +2720,12 @@ async fn spin_up_for_the_quality_writers(catalog: &MockServer, ch: &MockServer) 
             .mount(ch)
             .await;
     }
+    spin_up_with_env(&quality_writers_env(catalog, ch)).await
+}
+
+/// The environment of [`spin_up_for_the_quality_writers`], without its
+/// `DESCRIBE` answers: a test that makes `ClickHouse` fail mounts its own.
+fn quality_writers_env(catalog: &MockServer, ch: &MockServer) -> HashMap<String, String> {
     let mut env = HashMap::new();
     env.insert("CH_URL".to_owned(), ch.uri());
     env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
@@ -2730,7 +2736,7 @@ async fn spin_up_for_the_quality_writers(catalog: &MockServer, ch: &MockServer) 
         "LAKEKEEPER_READ_TOKEN_FILE".to_owned(),
         token_file("read.jwt"),
     );
-    spin_up_with_env(&env).await
+    env
 }
 
 #[tokio::test]
@@ -3194,6 +3200,46 @@ async fn the_catalog_owner_sets_and_resets_a_schedule_on_its_own_table() {
         schedules_on(&pool, &format!("bronze.{GROUP_TABLE}")).await,
         0
     );
+}
+
+/// `SEC-80`: while `ClickHouse` cannot answer, a name another tenant claimed and
+/// a name no table has get the same answer, so the outage says nothing about
+/// which upload names are claimed.
+#[tokio::test]
+async fn an_outage_answers_a_claimed_schedule_name_and_an_unknown_one_alike() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    // ClickHouse fails every query, so no table can be checked.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("ClickHouse is down"))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let TestApp { router, pool } = spin_up_with_env(&quality_writers_env(&catalog, &ch)).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_WRITER, CATALOG_TENANT).await;
+    let retail = format!("bronze.{RETAIL_TABLE}");
+    let set = json!({ "mode": "interval", "intervalMinutes": 120 });
+
+    for verb in ["PUT", "DELETE"] {
+        let mut answers = Vec::new();
+        for asset in ["bronze.no_such_table", retail.as_str()] {
+            let uri = format!("/api/governance/quality/schedules/{asset}");
+            let body = (verb == "PUT").then(|| set.clone());
+            answers.push(send(&router, verb, &uri, &owner, None, body).await);
+        }
+        assert_eq!(
+            answers[0].0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{verb}: {:?}",
+            answers[0].1
+        );
+        assert_eq!(
+            answers[0], answers[1],
+            "{verb}: a claimed name and an unknown name answer alike during an outage"
+        );
+    }
 }
 
 #[tokio::test]

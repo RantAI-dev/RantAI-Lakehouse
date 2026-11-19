@@ -130,14 +130,18 @@ pub async fn put_schedule(
     // GOV-15 (GOV-12 plan, section 4): a schedule names a table, not a rule, so
     // a table the role does not read is refused with the sentence a rule on it
     // gets (D5).
-    // SEC-80: a table another tenant claimed is refused the same way, and so is
-    // a name no table has. The presence check runs after the reach, the same
-    // check a rule's table gets, so the two refusals read alike.
-    if !access.allows_key(&key)
-        || !crate::routes::quality::quality_key_in_reach(&state, Some(&principal), &headers, &key)
-            .await?
-        || !crate::routes::quality::quality_table_present(&state, &key).await?
-    {
+    if !access.allows_key(&key) {
+        return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
+    }
+    // SEC-80: presence and reach are asked for every name before anything is
+    // answered, presence first. An outage then answers a name another tenant
+    // claimed and a name no table has alike, and a refusal of either is the
+    // same 400.
+    let present = crate::routes::quality::quality_table_present(&state, &key).await?;
+    let in_reach =
+        crate::routes::quality::quality_key_in_reach(&state, Some(&principal), &headers, &key)
+            .await?;
+    if !present || !in_reach {
         return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
     }
     let mode = ScheduleMode::parse(&body.mode)
@@ -197,21 +201,23 @@ pub async fn delete_schedule(
     })?;
     // GOV-15 (GOV-12 plan, section 4): refusing first, so a reset changes
     // nothing for a table the role does not read (D8).
-    // SEC-80: and nothing for a table another tenant claimed.
-    if !access.allows_key(&key)
-        || !crate::routes::quality::quality_key_in_reach(&state, Some(&principal), &headers, &key)
-            .await?
-    {
+    if !access.allows_key(&key) {
         return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
     }
-    // SEC-80: a reset of a schedule the caller's reach covers always works, so
-    // a schedule whose table was dropped can still be removed. Any other name
-    // must be a table that is there, as for a PUT.
+    // SEC-80: presence and reach are asked for every name before anything is
+    // answered, presence first, so an outage answers a claimed name and an
+    // unknown name alike.
+    let present = crate::routes::quality::quality_table_present(&state, &key).await?;
+    let in_reach =
+        crate::routes::quality::quality_key_in_reach(&state, Some(&principal), &headers, &key)
+            .await?;
+    // A reset of a schedule the caller's reach covers always works, so a
+    // schedule whose table was dropped can still be removed.
     let scheduled = quality::list_schedules(pool(&state)?)
         .await?
         .iter()
         .any(|schedule| schedule.asset == key);
-    if !scheduled && !crate::routes::quality::quality_table_present(&state, &key).await? {
+    if !in_reach || !(present || scheduled) {
         return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
     }
     quality::delete_schedule(pool(&state)?, &key).await?;

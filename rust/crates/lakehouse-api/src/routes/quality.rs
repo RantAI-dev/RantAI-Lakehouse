@@ -1076,10 +1076,10 @@ fn canonical_table_key(key: &str) -> String {
 /// `serving.` table in `ClickHouse` or a `bronze.` Iceberg table.
 ///
 /// The one presence check the rule writers and the schedule writers share.
-/// An unknown name and a name another tenant claimed reach it only after the
-/// reach check, so both get the same refusal from the caller. A deployment
-/// with no Iceberg query database has no bronze table to find, so a bronze
-/// name is absent there.
+/// The writers ask it for every name, before they check the reach, so an
+/// outage answers a name another tenant claimed the same way as an unknown
+/// one. A deployment with no Iceberg query database has no bronze table to
+/// find, so a bronze name is absent there.
 ///
 /// # Errors
 ///
@@ -1408,8 +1408,8 @@ pub struct UpdateRuleBody {
 /// outside the tenant that owns the shared catalog — for every edit, not only
 /// one that changes the table; `404` when no rule has that id, and for a rule
 /// on a table the caller's role does not read (it answers as an unknown rule,
-/// `GOV-15`) and for a table outside the caller's reach (`SEC-80`); `503` when the table cannot be checked; `500` on a store
-/// failure.
+/// `GOV-15`) and for a table outside the caller's reach (`SEC-80`); `503` when
+/// the table cannot be checked; `500` on a store failure.
 pub async fn update_rule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
