@@ -24,7 +24,9 @@
   filled, read the worktree as it is and say so in the handoff). The mockup code is ours (same
   repository, AGPL): port it, do not copy third-party component code. Copy the look and the
   behaviour, not the fixtures.
-  - Reference commit: *(filled by the planner when the D mockup is committed)*.
+  - Reference commit: `8826424ae` on `design/chart-builder-mockups` (local branch, worktree
+    `/home/hv/mtharreq/lakehouse-mockups`), committed 2026-11-19. PR B reads `draft.tsx`,
+    `thread.ts`, `menus.tsx` and `editor.tsx` there.
 - **D2, editor library: Tiptap 3, MIT packages only, exact versions.** The mockup uses
   `@tiptap/react`, `@tiptap/pm`, `@tiptap/core`, `@tiptap/starter-kit`, `@tiptap/extensions`,
   `@tiptap/extension-typography`, `@tiptap/suggestion`, `@tiptap/extension-bubble-menu`, all
@@ -130,6 +132,51 @@ PR B (the assistant in the page, D8), on top of PR A:
    saved before Accept.
 9. **T9** AI-15 cases for the editor ("describe this chart", "write a short summary of this
    report"); handoff.
+
+### PR B anchors and rules (planner, 2026-11-19, verified at `7d6f960ea`)
+
+Branch `feat/bi-62-report-editor-b` off `feat/bi-62-report-editor` (`7d6f960ea`, PR #545), worktree
+`/home/hv/mtharreq/lakehouse-bi62b`. The PR's base is `main`; its body says "merge after #545".
+
+- **One conversation.** The page has one assistant: `useCopilot()`
+  (`src/features/copilot/use-copilot.ts`): `send(text)`, `messages`, `busy`, `stop`, `mode` /
+  `setMode`. A draft is a `send` on that conversation, so it shows in the AI Copilot tab by
+  construction; the draft reads the streaming text of the assistant message that `send` adds.
+  Do not open a second chat stream or call the chat route directly. Drafts are Ask mode: if
+  `send` cannot take a mode for one call, switch to Ask for the draft and back afterwards, and
+  say in the handoff which one you did.
+- **Busy.** While the conversation is busy (an answer streaming in the tab, or another draft), the
+  `/` item and Describe stay visible but disabled with a one-line reason in their tooltip; one
+  draft at a time.
+- **Page context.** The editor page sets `setPageContext` like `report-reader-page.tsx:54-73`,
+  but richer: title, the blocks as Markdown (headings, lists, quotes, charts as
+  `[chart: <title> · <dashboard>]`), and for Describe the chosen chart's id, title, dashboard
+  and its rows as the reader sees them (`summarizeRows` in `src/lib/page-context-summary.ts`),
+  the whole capped at `PAGE_CONTEXT_MAX_CHARS`. Cleared on unmount. Rows come from data the page
+  already loaded for that chart (the `ReportingProvider` / `TileBody` path); never a second
+  query just for the context. If the rows are not loaded yet, send the context without rows and
+  say so in it ("rows not loaded").
+- **Draft node.** Port `DraftNode` and the prompt line from the mockup (`draft.tsx`, three
+  suggestions). States: prompt → writing (streamed text, a Stop control) → done (Accept ·
+  Discard; Enter / Esc). The draft is never part of the saved document: the document → blocks
+  conversion skips it and the autosave state machine does not go dirty on it.
+- **Accept** turns the answer into blocks with a pure `markdownToBlocks` (paragraphs, `#`/`##`,
+  `-` and `1.` lists, `>` quotes, `---`, inline marks through `report-inline.ts`; anything else
+  → paragraph text; a link that fails `safeReportUrl` becomes its plain words). Unit-tested on
+  every kind and on hostile input. Accept is one undo step. **Discard** while writing calls
+  `stop` first; the document is then byte-identical to before.
+- **An error or a refusal** in the answer shows as one line in the draft with Retry; nothing is
+  inserted.
+- **Look.** `Bot` mark, no sparkles (DESIGN.md §3). Status text is one short line. Reduced motion:
+  no typing animation, the text appears as it arrives. Phone: `/` → Ask AI works; Describe from
+  the chart's tap toolbar.
+- **T9.** Add the two cases to `ops/ai_eval/dashboard_cases.json` in the existing shape; no tool
+  or schema change is expected in PR B. If one turns out to be needed, stop and report (D9 is the
+  AI team's part).
+- **Tests** (scoped, VM rules in section 3): fake stream through a stubbed `useCopilot`: draft
+  appears and streams, Accept inserts parsed blocks, Discard (also mid-stream) leaves the document
+  unchanged, nothing reaches the save service before Accept, busy disables the entries, error →
+  Retry. Restore every global and `mock.module` (CI runs all files in one process).
 
 ## 3. Verification (VM rules, 2026-11-14 and 2026-11-15)
 
