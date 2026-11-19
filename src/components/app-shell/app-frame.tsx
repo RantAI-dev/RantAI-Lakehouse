@@ -16,6 +16,7 @@ import { VersionBanner } from "@/features/version/version-banner";
 import { AppShellSkeleton } from "@/components/app-shell/app-shell-skeleton";
 
 import { RouteGuard } from "@/components/app-shell/route-guard";
+import { BrandingProvider } from "@/components/app-shell/branding-provider";
 
 /**
  * The app frame (sidebar + navbar + AI dock + command palette). For PUBLIC
@@ -37,7 +38,12 @@ export function AppFrame({ children }: Readonly<{ children: React.ReactNode }>) 
 
   return (
     <SidebarProvider>
-      <AuthenticatedShell>{children}</AuthenticatedShell>
+      {/* The workspace's name and pictures are read once for the whole
+          shell (`adm-121`); the branding route is public, so the request
+          needs no session and starts beside the session check. */}
+      <BrandingProvider>
+        <AuthenticatedShell>{children}</AuthenticatedShell>
+      </BrandingProvider>
     </SidebarProvider>
   );
 }

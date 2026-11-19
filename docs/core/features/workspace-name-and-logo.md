@@ -21,7 +21,9 @@ dashboard it embeds elsewhere.
    and a browser-tab icon. Then save.
 2. Everyone sees that name and logo on the sign-in page, in the sidebar
    header, in the browser tab, on a dashboard's public link page, and as
-   the footer of embedded dashboards, from their next page load.
+   the footer of embedded dashboards, from their next page load. The
+   command palette's recent pages and the embed snippet's iframe title
+   also use the name.
 3. Press **Reset** to go back to the product's own name, logo and icon.
 
 ## Decisions
@@ -41,6 +43,7 @@ dashboard it embeds elsewhere.
 | 11 | Every save and reset is audited, with the fields changed and the image sizes, never the bytes | As stated | Owner, 2026-11-15 |
 | 12 | The public link page (`/public/dashboard/[token]`) shows the workspace's name and logo in its header, through `useBranding()`, with the same fallbacks as slice B: the product's own name and logo when the workspace set none, the dark logo in dark mode and the light one otherwise, and a picture that fails to load falls back. Its footer reads `PRODUCT_BYLINE` ("Powered by RantAI Lakehouse"), the same small line as the sign-in page; the old "Powered by Rantai Lake — Enterprise Lakehouse Console" goes. The name renders as text, never HTML. The page is public, so it reads only the public `GET /api/branding` | As stated | Owner, 2026-11-17 |
 | 13 | `pageTitleFor` returns "Rantai Lake" for a path no menu item matches; it falls back to the workspace's name instead (the product's own when none is set). It stays a pure function: its caller passes the fallback from `useBranding()`, and no hook is called inside it | As stated | Owner, 2026-11-17 |
+| 14 | The product's own name, shown when the workspace set none (`PRODUCT_NAME` in `src/lib/product-branding.ts`), is "RantAI Lakehouse", written in full with the official casing as on every RantAI surface; it was "Rantai Lake". The home-screen short name is "Lakehouse", where the full name does not fit. | As stated | Owner, 2026-11-18 |
 
 ## Limits to tell a customer
 
