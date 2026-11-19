@@ -74,6 +74,33 @@ describe("SignInSettingsForm (ADM-8)", () => {
     expect("maxFailures" in body).toBe(false)
   })
 
+  it("keeps a limit the person typed when the server answers again after a save (adm-121)", async () => {
+    let reads = 0
+    global.fetch = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if ((init?.method ?? "GET").toUpperCase() === "GET") {
+        reads += 1
+        // The second read is what a concurrent change elsewhere would give.
+        return jsonResponse(
+          reads > 1 ? { ...SAVED, maxFailures: { value: 9, source: "default" } } : SAVED
+        )
+      }
+      return jsonResponse(SAVED)
+    }) as unknown as typeof fetch
+    render(<SignInSettingsForm canWrite />)
+    const first = (await screen.findByLabelText(
+      "Failed sign-ins before the lock"
+    )) as HTMLInputElement
+    await waitFor(() => expect(first.value).toBe("5"))
+    fireEvent.change(first, { target: { value: "8" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(reads).toBe(2))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const again = (await screen.findByLabelText(
+      "Failed sign-ins before the lock"
+    )) as HTMLInputElement
+    expect(again.value).toBe("8")
+  })
+
   it("refuses a value outside the range, with the sentence that names it", async () => {
     const calls = mockApi(SAVED)
     render(<SignInSettingsForm canWrite />)

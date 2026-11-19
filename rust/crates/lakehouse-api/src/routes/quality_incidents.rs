@@ -229,7 +229,7 @@ pub struct ResolveBody {
 /// `403` when the caller is outside the tenant that owns the shared catalog;
 /// `404` when no incident has that id, and for an incident on a table the
 /// caller's role does not read (it answers as an unknown incident,
-/// `GOV-15`); `409` when it was resolved before; `503`/`500` on a store
+/// `GOV-15`) and for an incident on a table outside the caller's reach (`SEC-80`); `409` when it was resolved before; `503`/`500` on a store
 /// failure.
 pub async fn resolve_incident(
     State(state): State<AppState>,
@@ -254,10 +254,21 @@ pub async fn resolve_incident(
         // incident on a table the caller's role does not read, and it reads as
         // an unknown id (the same 404). The incident list itself is not
         // narrowed by role (D5).
-        Some(incident) if !access.allows_key(incident.asset.trim()) => {
-            return Err(ApiError::NotFound("Quality incident not found".to_owned()).into());
+        Some(incident) => {
+            // SEC-80: an incident on a table another tenant claimed reads as an
+            // unknown id too.
+            if !access.allows_key(incident.asset.trim())
+                || !crate::routes::quality::quality_key_in_reach(
+                    &state,
+                    Some(&principal),
+                    &headers,
+                    incident.asset.trim(),
+                )
+                .await?
+            {
+                return Err(ApiError::NotFound("Quality incident not found".to_owned()).into());
+            }
         }
-        Some(_) => {}
     }
     let incident = match quality::resolve(pool(&state)?, &id, principal.id.uuid(), &body.resolution)
         .await?

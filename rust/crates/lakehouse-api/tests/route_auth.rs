@@ -4178,6 +4178,10 @@ async fn the_public_map_boundary_routes_are_not_refused_by_the_auth_gate() {
             "/api/public/dashboard/tok/maps/m_0123456789ab/geojson",
         ),
         ("POST", "/api/embed/maps/m_0123456789ab/geojson"),
+        // BI-36: the print view's own route, behind the render token.
+        ("POST", "/api/render/maps/m_0123456789ab/geojson"),
+        // BI-42: the print view's image route, behind the render token.
+        ("GET", "/api/render/image"),
     ] {
         let resp = router
             .clone()
@@ -4468,6 +4472,42 @@ async fn the_scheduler_run_door_stays_shut_to_a_person_when_the_test_door_is_ope
         "POST /api/alerts/test is a person's door, got {}",
         tested.status()
     );
+}
+
+/// `BI-43` D1, both directions: `GET /api/alerts/mine` is signed in at the
+/// router (no session is 401), and a Dashboard Viewer, who holds neither
+/// `alert:read` nor `alert:write`, is not refused: the person's own alerts are
+/// theirs to list. The same person is still refused `GET /api/alerts`.
+#[tokio::test]
+async fn listing_ones_own_chart_alerts_is_signed_in_at_the_router_and_needs_no_alert_permission() {
+    let TestApp { router, pool } = alert_test_app().await;
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/alerts/mine")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresAuth)
+    );
+
+    let no_session = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/alerts/mine?chart=c_kpi")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_session.status(), StatusCode::UNAUTHORIZED);
+
+    let viewer = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, viewer).await;
+    let own = request_with_cookie(&router, "GET", "/api/alerts/mine?chart=c_kpi", &cookie).await;
+    assert_eq!(own.status(), StatusCode::OK);
+    let list = request_with_cookie(&router, "GET", "/api/alerts", &cookie).await;
+    assert_eq!(list.status(), StatusCode::FORBIDDEN);
 }
 
 /// ADM-4 T1/T2: the four new identity write routes are in `POLICY_TABLE`
