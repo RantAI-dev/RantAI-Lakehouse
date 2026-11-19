@@ -833,7 +833,10 @@ async fn board_for_frame(state: &AppState, body: FrameBody) -> Result<Option<Boa
 /// the frame answer's content sites ([`board_content_sites`]) select the
 /// board's cards here and only here, so the page and its policy cannot
 /// disagree about which cards are on the board.
-fn board_cards<'a>(stored: &'a [StoredChartSpec], board_id: &str) -> Vec<&'a StoredChartSpec> {
+pub(crate) fn board_cards<'a>(
+    stored: &'a [StoredChartSpec],
+    board_id: &str,
+) -> Vec<&'a StoredChartSpec> {
     stored
         .iter()
         .filter(|c| {
@@ -1139,7 +1142,7 @@ pub async fn public_map_geojson(
         }
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
-    map_for_board(&state, &board.id, &id, &headers).await
+    map_for_board(&state, &board.id, &id, &headers, &Viewer::anonymous()).await
 }
 
 /// `POST /api/embed/maps/{id}/geojson` — the boundary file of a map one of
@@ -1167,7 +1170,14 @@ pub async fn embed_map_geojson(
         Ok(subject) => subject,
         Err(refusal) => return *refusal,
     };
-    map_for_board(&state, &subject.board_id, &id, &headers).await
+    map_for_board(
+        &state,
+        &subject.board_id,
+        &id,
+        &headers,
+        &Viewer::anonymous(),
+    )
+    .await
 }
 
 /// The map file `id` for a board that may open it.
@@ -1177,13 +1187,18 @@ pub async fn embed_map_geojson(
 /// answer is a 404 otherwise — the same answer for a map the board does not
 /// use, for a map that does not exist and for a map id that is not
 /// server-made, so the route is no oracle for what a board holds.
-async fn map_for_board(
+///
+/// `viewer` decides which charts count as "on the board": an embed and a public
+/// link read as nobody in particular; the print view (`BI-36`) reads as the
+/// person its token names, so a map on their own personal board is found.
+pub(crate) async fn map_for_board(
     state: &AppState,
     board_id: &str,
     id: &str,
     headers: &HeaderMap,
+    viewer: &Viewer,
 ) -> Response {
-    let maps = match board_map_ids(state, board_id).await {
+    let maps = match board_map_ids(state, board_id, viewer).await {
         Ok(maps) => maps,
         Err(err) => return database_failure(&err),
     };
@@ -1198,11 +1213,15 @@ async fn map_for_board(
 
 /// The map ids the charts on `board_id` draw on.
 ///
-/// The charts are read as nobody in particular, exactly as the embed and the
-/// public payload read them ([`board_cards`]): a chart in the trash or on a
-/// personal board is not on this board.
-async fn board_map_ids(state: &AppState, board_id: &str) -> Result<Vec<String>, ChError> {
-    let stored = store::list_stored_charts(&state.clickhouse, &Viewer::anonymous()).await?;
+/// The charts are read as `viewer`: for an embed and a public link nobody in
+/// particular, exactly as the payload reads them ([`board_cards`]), so a chart
+/// in the trash or on a personal board is not on this board.
+async fn board_map_ids(
+    state: &AppState,
+    board_id: &str,
+    viewer: &Viewer,
+) -> Result<Vec<String>, ChError> {
+    let stored = store::list_stored_charts(&state.clickhouse, viewer).await?;
     Ok(board_cards(&stored, board_id)
         .into_iter()
         .filter_map(|c| c.def.map.clone())

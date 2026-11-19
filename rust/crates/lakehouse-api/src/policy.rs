@@ -149,7 +149,7 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY seventeen routes in the whole service. (Was "six" —
+    // ── Public: the ONLY nineteen routes in the whole service. (Was "six" —
     // corrected when the seventh was added, since Task A5's
     // `/api/auth/oidc/callback` had already made the old count stale; the
     // eighth is `POST /api/embed/frame`, SEC-12; the ninth is
@@ -160,7 +160,8 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // route, `PR #246 review BLOCKER 1`; the fourteenth is the readiness
     // probe, REL-2 decision D7; the fifteenth is the password rules, ADM-11
     // D4; the sixteenth and the seventeenth are the workspace's name and
-    // pictures, ADM-2 decision 5.) ───────────────────────────────────────────
+    // pictures, ADM-2 decision 5; the eighteenth and the nineteenth are the
+    // print view's map and image routes, BI-36 and BI-42.) ────────────────
     ("GET",  "/health",                          Policy::Public),
     // REL-2 (D7): the readiness probe an installer or an updater waits on.
     // Public because it answers only whether this stack is ready — three
@@ -173,6 +174,14 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // authenticated by the signed render token in the body, and reads as the
     // person the token names (never as the embed viewer role).
     ("POST", "/api/render/data",                  Policy::Public),
+    // BI-42 (plan D6b): one image card's picture for the print view, fetched by
+    // the API because the PDF renderer may open only the console. Public
+    // because the render token is the credential; only an address saved on an
+    // image card of the token's board, on a listed site, is ever fetched.
+    ("GET",  "/api/render/image",                 Policy::Public),
+    // BI-36: an uploaded map's boundary for the print view, behind the same
+    // render token; a map no chart on the token's board draws on is a 404.
+    ("POST", "/api/render/maps/{id}/geojson",     Policy::Public),
     // SEC-12: the console's `proxy.ts` asks which sites may frame an embed
     // page, with the token the page was opened with. Public because the
     // token is the credential; it answers only an origin list, and the same
@@ -487,6 +496,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("DELETE", "/api/alerts",      Policy::RequiresAuth),
     // `SRC-7` D9, ADM-13 D5: whether run reports can arrive; alert:read or alert:write.
     ("GET",    "/api/alerts/status", Policy::RequiresAnyPermission(&["alert:read", "alert:write"])),
+    // `BI-43` D1: signed in is the floor; the handler lists only rules the
+    // caller owns, so no permission is needed to see (and, through
+    // `DELETE /api/alerts`, remove) one's own chart alerts.
+    ("GET",    "/api/alerts/mine",  Policy::RequiresAuth),
     // `BI-40` D1/D2: a signed-in person tests one rule they may manage. The
     // handler decides (the same shape as `POST /api/alerts`): 404 for a rule
     // they cannot see, 403 without `alert:write` on a rule that is not their
@@ -1638,7 +1651,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_seventeen_public_entries_exist() {
+    fn exactly_nineteen_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -1667,7 +1680,9 @@ mod tests {
         // ADM-2 (decision 5) added `GET /api/branding` and
         // `GET /api/branding/images/{kind}`, the workspace's name and pictures
         // for the sign-in page: 15 -> 17.
-        assert_eq!(public_count, 17);
+        // BI-36 and BI-42 added the print view's map and image routes, each
+        // authenticated by the render token: 17 -> 19.
+        assert_eq!(public_count, 19);
     }
 
     /// SEC-23 (F1), ADM-13 (D5): adding a governance rule needs `governance:write`;

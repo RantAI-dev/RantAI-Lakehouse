@@ -17,6 +17,7 @@ import { VersionBanner } from "@/features/version/version-banner";
 import { AppShellSkeleton } from "@/components/app-shell/app-shell-skeleton";
 
 import { RouteGuard } from "@/components/app-shell/route-guard";
+import { BrandingProvider } from "@/components/app-shell/branding-provider";
 
 /**
  * The app frame (sidebar + navbar + AI dock + command palette). For PUBLIC
@@ -41,7 +42,12 @@ export function AppFrame({ children }: Readonly<{ children: React.ReactNode }>) 
     // sidebar's logo row and every offset under the navbar (page frames, sticky strips, side panels)
     // read it, so a change of height is one edit (owner 2026-11-14: 48 px, was 64).
     <SidebarProvider className="[--app-navbar-h:3rem]">
-      <AuthenticatedShell>{children}</AuthenticatedShell>
+      {/* The workspace's name and pictures are read once for the whole
+          shell (`adm-121`); the branding route is public, so the request
+          needs no session and starts beside the session check. */}
+      <BrandingProvider>
+        <AuthenticatedShell>{children}</AuthenticatedShell>
+      </BrandingProvider>
     </SidebarProvider>
   );
 }

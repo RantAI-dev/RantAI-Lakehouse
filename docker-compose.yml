@@ -2294,6 +2294,20 @@ services:
   # `lakekeeper-db-init` exactly — separate database, not a schema mixed
   # into the `lakehouse` app database). See
   # docs/adr/0005-dagster-code-location-ownership-and-packaging.md.
+  # SEC-78 (second change): Dagster's instance database has its OWN role,
+  # `lakehouse_dagster`. It is not a superuser and owns nothing outside its
+  # database, so the code location and the daemon, which run product code and
+  # authored pipelines, cannot switch off the console's append-only triggers
+  # with the owner's password (they never see it). This one-shot service runs
+  # as the owner (`POSTGRES_USER`) on EVERY start, so the role's password
+  # follows the variable, and a `dagster` database the superuser owns (a volume
+  # from before this change) moves to the role. Objects are re-owned one by
+  # one: `REASSIGN OWNED` would also move objects of the console database and
+  # the shared catalog, which stay with the owner.
+  #
+  # The role's password is set in a transaction with statement logging off,
+  # the same guard `lakehouse-api migrate` uses (SEC-78): the plain password is
+  # a literal in that statement.
   dagster-db-init:
     profiles: ["dagster"]
     image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
@@ -2307,13 +2321,91 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      # The role's password. Set on every start, so a rotation applies on the
+      # next deploy. MUST SET, never a default (SEC-18).
+      DAGSTER_ROLE_PASSWORD: ${LAKEHOUSE_DB_DAGSTER_PASSWORD:?LAKEHOUSE_DB_DAGSTER_PASSWORD is required (Dagster's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - >
-        psql -v ON_ERROR_STOP=1 -tc
-        "SELECT 1 FROM pg_database WHERE datname = '$${DAGSTER_PG_DB}'" |
-        grep -q 1 ||
-        psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$${DAGSTER_PG_DB}\""
+      - |
+        set -eu
+        # Postgres restarts once after pg_isready first succeeds, so wait for a
+        # connection that really works (the same reason as openfga-db-init).
+        ready=0
+        for attempt in $$(seq 1 30); do
+          if psql -v ON_ERROR_STOP=1 -tAc 'SELECT 1' >/dev/null 2>&1; then ready=1; break; fi
+          sleep 2
+        done
+        if [ "$$ready" != 1 ]; then
+          echo "dagster-db-init: postgres never accepted a connection" >&2; exit 1
+        fi
+        # The password is read from the environment inside psql (`\getenv`), not
+        # passed with `-v`: a command-line argument shows up in `ps` in the container.
+        psql -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+        \getenv pw DAGSTER_ROLE_PASSWORD
+        BEGIN;
+        SET LOCAL log_statement = 'none';
+        SET LOCAL log_min_error_statement = 'panic';
+        DO $$body$$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'lakehouse_dagster') THEN
+            CREATE ROLE lakehouse_dagster LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+              NOREPLICATION NOBYPASSRLS;
+          END IF;
+        END $$body$$;
+        ALTER ROLE lakehouse_dagster LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+          NOREPLICATION NOBYPASSRLS PASSWORD :'pw';
+        COMMIT;
+        SQL
+        if ! psql -v ON_ERROR_STOP=1 -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '$$DAGSTER_PG_DB'" | grep -q 1; then
+          psql -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE \"$$DAGSTER_PG_DB\" OWNER lakehouse_dagster"
+        fi
+        psql -v ON_ERROR_STOP=1 -d postgres -c "ALTER DATABASE \"$$DAGSTER_PG_DB\" OWNER TO lakehouse_dagster"
+        psql -v ON_ERROR_STOP=1 -d "$$DAGSTER_PG_DB" <<'SQL'
+        DO $$body$$
+        DECLARE r record;
+        BEGIN
+          FOR r IN
+            SELECT n.nspname AS schema, c.relname AS name, c.relkind AS kind
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND n.nspname NOT LIKE 'pg_toast%'
+              AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+              AND pg_get_userbyid(c.relowner) <> 'lakehouse_dagster'
+              AND NOT (c.relkind = 'S' AND EXISTS (
+                SELECT 1 FROM pg_depend d
+                WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                  AND d.refclassid = 'pg_class'::regclass AND d.refobjsubid > 0
+                  AND d.deptype IN ('a', 'i')))
+          LOOP
+            EXECUTE format(
+              CASE r.kind
+                WHEN 'S' THEN 'ALTER SEQUENCE %I.%I OWNER TO lakehouse_dagster'
+                WHEN 'v' THEN 'ALTER VIEW %I.%I OWNER TO lakehouse_dagster'
+                WHEN 'm' THEN 'ALTER MATERIALIZED VIEW %I.%I OWNER TO lakehouse_dagster'
+                ELSE 'ALTER TABLE %I.%I OWNER TO lakehouse_dagster'
+              END, r.schema, r.name);
+          END LOOP;
+          FOR r IN
+            SELECT n.nspname AS schema, p.proname AS name,
+                   pg_get_function_identity_arguments(p.oid) AS args, p.prokind AS kind
+            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND p.prokind IN ('f', 'p')
+              AND pg_get_userbyid(p.proowner) <> 'lakehouse_dagster'
+          LOOP
+            EXECUTE format('ALTER %s %I.%I(%s) OWNER TO lakehouse_dagster',
+              CASE r.kind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END,
+              r.schema, r.name, r.args);
+          END LOOP;
+          FOR r IN
+            SELECT nspname FROM pg_namespace
+            WHERE nspname NOT IN ('pg_catalog', 'information_schema')
+              AND nspname NOT LIKE 'pg_toast%' AND nspname NOT LIKE 'pg_temp%'
+              AND pg_get_userbyid(nspowner) <> 'lakehouse_dagster'
+          LOOP
+            EXECUTE format('ALTER SCHEMA %I OWNER TO lakehouse_dagster', r.nspname);
+          END LOOP;
+        END $$body$$;
+        SQL
     restart: "no"
 
   # P3 (G3a) — the code location: a gRPC server serving
@@ -2504,8 +2596,8 @@ services:
       # (principle 2: state the gap where the reader looks).
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
-      DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
-      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      DAGSTER_PG_USER: lakehouse_dagster
+      DAGSTER_PG_PASSWORD: ${LAKEHOUSE_DB_DAGSTER_PASSWORD:?LAKEHOUSE_DB_DAGSTER_PASSWORD is required (Dagster's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
       # REL-2 S4 decision D16: the pause. `true` stops the jobs that
       # DELETE files — the snapshot expiry and the orphan-file removal —
@@ -2713,7 +2805,42 @@ services:
     # authored-pipeline change (`routes::authored_pipelines`), since
     # authored jobs are built at import time; `api grpc` kept serving the
     # definitions it started with.
-    command: ["dagster", "code-server", "start", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
+    #
+    # OPS-37: the code server runs UNDER a supervisor, because on staging
+    # (2026-11-18 22:15 UTC to 2026-11-19 02:58 UTC) the INNER code server
+    # died -- "No heartbeat received in 30 seconds, shutting down" -- and
+    # the `code-server start` proxy never respawned it: it starts the inner
+    # server once (`dagster/_grpc/proxy_server.py`) and the registry never
+    # restarts a dead one. The container stayed "Up" while the daemon failed
+    # 1550 times, and no schedule or sensor ran until a manual restart 4.5
+    # hours later. Dagster 1.13.20 has no option that makes the proxy exit
+    # when the inner server dies, and Docker does NOT restart an unhealthy
+    # container by itself: `restart: unless-stopped` restarts a container
+    # whose PROCESS exited. So the container's main process is now
+    # `dispar_orchestrate.code_server_guard`, which starts the very same
+    # code server as a child, pings it every 30 s (the proxy FORWARDS `Ping`
+    # to the inner server, so a missing answer means the inner server is
+    # gone) and EXITS NON-ZERO when it is: that is what makes Docker
+    # restart the container. The guard also forwards SIGTERM to the child,
+    # so `docker compose stop` still stops the container cleanly.
+    command: ["python3", "-m", "dispar_orchestrate.code_server_guard", "--host", "0.0.0.0", "--port", "4000", "--module", "dispar_orchestrate.definitions"]
+    # OPS-37: the healthcheck runs the guard's ONE probe, so the container's
+    # health state shows a dead inner server instead of staying "Up" and
+    # healthy. The proxy's own gRPC HEALTH service is hardcoded SERVING
+    # (`dagster/_grpc/server.py`), which is why `dagster api
+    # grpc-health-check` cannot see the outage; a `Ping` can.
+    # `interval: 30s` is the guard's own probe interval, so the two agree
+    # on how fast a dead server is noticed. `timeout: 15s` leaves room for
+    # the probe's own 10 s gRPC timeout. `retries: 3` needs three failed
+    # probes (~90 s) before the container is called unhealthy, so one slow
+    # probe does not flap the state. `start_period: 300s` covers the code
+    # location importing its definitions at start, which is not a failure.
+    healthcheck:
+      test: ["CMD", "python3", "-m", "dispar_orchestrate.code_server_guard", "--healthcheck", "--port", "4000"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 300s
     restart: unless-stopped
 
   # WS5 item G2 — one-shot: `pg_dump` every compose-created Postgres
@@ -2804,13 +2931,15 @@ services:
       args:
         GIT_SHA: ${GIT_SHA:-unknown}
     depends_on:
+      dagster-db-init:
+        condition: service_completed_successfully
       dagster-code-location:
         condition: service_started
     environment:
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
-      DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
-      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      DAGSTER_PG_USER: lakehouse_dagster
+      DAGSTER_PG_PASSWORD: ${LAKEHOUSE_DB_DAGSTER_PASSWORD:?LAKEHOUSE_DB_DAGSTER_PASSWORD is required (Dagster's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
       # REL-2 S4 decision D16: the pause. `true` stops the jobs that
       # DELETE files — the snapshot expiry and the orphan-file removal —
@@ -2863,13 +2992,15 @@ services:
       args:
         GIT_SHA: ${GIT_SHA:-unknown}
     depends_on:
+      dagster-db-init:
+        condition: service_completed_successfully
       dagster-code-location:
         condition: service_started
     environment:
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
-      DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
-      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      DAGSTER_PG_USER: lakehouse_dagster
+      DAGSTER_PG_PASSWORD: ${LAKEHOUSE_DB_DAGSTER_PASSWORD:?LAKEHOUSE_DB_DAGSTER_PASSWORD is required (Dagster's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
       # REL-2 S4 decision D16: the pause. `true` stops the jobs that
       # DELETE files — the snapshot expiry and the orphan-file removal —

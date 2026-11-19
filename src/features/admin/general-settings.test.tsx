@@ -122,4 +122,53 @@ describe("GeneralSettings", () => {
     expect(dark.disabled).toBe(true)
     expect(icon.disabled).toBe(true)
   })
+
+  /** Lets a read answer a name of its own from its second call on. */
+  function readsThen(later: string | null) {
+    let reads = 0
+    return (call: Call) => {
+      if (call.method === "GET" && call.url === "/api/settings/general") {
+        reads += 1
+        if (reads > 1) return json({ ...SAVED, workspaceName: later })
+      }
+      return null
+    }
+  }
+
+  it("keeps a name the person typed when a picture change makes the server answer again (adm-121)", async () => {
+    const calls = stubApi(readsThen("Changed elsewhere"))
+    render(<GeneralSettings />)
+    const first = (await screen.findByLabelText("Workspace name")) as HTMLInputElement
+    await waitFor(() => expect(first.value).toBe("Contoh Workspace"))
+    fireEvent.change(first, { target: { value: "Typed name" } })
+    // Storing a picture reads the settings again; the unsaved name is not
+    // the server's to overwrite.
+    fireEvent.change(screen.getByLabelText("Logo"), {
+      target: { files: [new File(["bytes"], "logo.png", { type: "image/png" })] },
+    })
+    // The form is drawn again from the second answer.
+    await waitFor(() =>
+      expect(
+        calls.filter((c) => c.method === "GET" && c.url === "/api/settings/general")
+      ).toHaveLength(2)
+    )
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const again = (await screen.findByLabelText("Workspace name")) as HTMLInputElement
+    expect(again.value).toBe("Typed name")
+  })
+
+  it("shows the product's empty name again after a reset, not the name typed before it (adm-121)", async () => {
+    stubApi(readsThen(null))
+    render(<GeneralSettings />)
+    const first = (await screen.findByLabelText("Workspace name")) as HTMLInputElement
+    await waitFor(() => expect(first.value).toBe("Contoh Workspace"))
+    fireEvent.change(first, { target: { value: "Typed name" } })
+    fireEvent.click(screen.getByRole("button", { name: "Reset" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Reset everything" }))
+    // The reset cleared the name on the server; the form must say so.
+    await waitFor(async () => {
+      const field = (await screen.findByLabelText("Workspace name")) as HTMLInputElement
+      expect(field.value).toBe("")
+    })
+  })
 })

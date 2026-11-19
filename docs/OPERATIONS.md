@@ -147,6 +147,7 @@ variable while one is empty, whatever profile is active:
 
 | Variable | What it is |
 | --- | --- |
+| `LAKEHOUSE_DB_DAGSTER_PASSWORD` | Dagster's instance database role (`lakehouse_dagster`) password (`SEC-78`). `dagster-db-init` sets it on every start, so a rotation applies on the next `up` of the `dagster` profile. Not the owner's, and not the console's |
 | `POSTGRES_PASSWORD` | PostgreSQL password: the database OWNER's password. The `postgres` image itself reads it when the data directory is first created; after that it reaches only the operator-side services — `lakehouse-db-migrate` (the migrations and the console role's setup run with it), Lakekeeper's and OpenFGA's own services (init, migrate and runtime — they dial their own databases), the three Dagster services (Dagster's own instance database), the backup job and the gate runners. It is not in `lakehouse-api`'s connection string any more (`SEC-78`) |
 | `LAKEHOUSE_DB_APP_PASSWORD` | the console's runtime database role's (`lakehouse_app`) password (`SEC-78`) — see "Database roles" below |
 | `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` | RustFS root key pair |
@@ -1535,8 +1536,9 @@ owner's privileges:
 
 | Role | Who holds its password | What it may do |
 | --- | --- | --- |
-| the owner (`POSTGRES_USER`, default `lakehouse`) | `POSTGRES_PASSWORD`, held by `lakehouse-db-migrate`, Lakekeeper's and OpenFGA's own services (init, migrate and runtime — they dial their own databases), the backup job, the gate runners and the Dagster services (Dagster's own instance database until it gets its own role) | everything: it applies the migrations and sets the runtime role up |
+| the owner (`POSTGRES_USER`, default `lakehouse`) | `POSTGRES_PASSWORD`, held by `lakehouse-db-migrate`, Lakekeeper's and OpenFGA's own services (init, migrate and runtime — they dial their own databases), the backup job and the gate runners | everything: it applies the migrations and sets the runtime role up |
 | `lakehouse_app` | `LAKEHOUSE_DB_APP_PASSWORD`, held by `lakehouse-api`, `dagster-code-location` and the connectors that dial this database | read and write the console's tables in `public` and `bronze_meta`; nothing more |
+| `lakehouse_dagster` | `LAKEHOUSE_DB_DAGSTER_PASSWORD`, held by `dagster-db-init` (which sets it on every start), `dagster-code-location`, `dagster-webserver` and `dagster-daemon` | owns the `dagster` database and every object in it; nothing in the console's database (`SEC-78`, second change) |
 
 The one-shot `lakehouse-db-migrate` service runs `lakehouse-api migrate`
 with the owner's URL on every deploy, before `lakehouse-api` starts. It
@@ -1576,6 +1578,25 @@ password on every run), then restart `lakehouse-api`. `ops/init-env.sh`
 generates the role's password independently of `POSTGRES_PASSWORD`; keep
 the two different — they belong to two different roles.
 
+**Dagster's role** (`lakehouse_dagster`, `SEC-78`, second change) owns the
+`dagster` database, and nothing in the console's database. The one-shot
+`dagster-db-init` service creates the role and sets its password on every
+`dagster` start, creates the database owned by the role if it is missing,
+and hands an existing `dagster` database (one a superuser owns, from
+before this change) and every object in it to the role. Objects are
+re-owned one by one: `REASSIGN OWNED` would also move objects of the
+console's database. To rotate Dagster's password: change
+`LAKEHOUSE_DB_DAGSTER_PASSWORD` in `.env`, run `dagster-db-init` again, then
+restart the three Dagster services.
+
+**The migrate owner must be a superuser.** The migrate service sets the
+console role's password inside a transaction with `log_statement` and
+`log_min_error_statement` switched off, so the plain password is not written
+to the server log. Those settings need a superuser. The owner is the image's
+`POSTGRES_USER`, which is one. A managed Postgres whose owner is not a
+superuser is not supported today: setup fails closed there, and the
+`dagster-db-init` service does the same.
+
 ### What each job runs against this database
 
 Every query a job runs against the console's database, and the grant of
@@ -1592,11 +1613,6 @@ Every query a job runs against the console's database, and the grant of
 
 Known limits, stated so nobody has to find them in a failed job:
 
-- The three Dagster services still hold `POSTGRES_PASSWORD`, because they
-  also reach Dagster's own instance database as `POSTGRES_USER`. Giving
-  Dagster its own `lakehouse_dagster` role is the second change of SEC-78
-  (the second change of SEC-78); until it lands, the code location holds the owner's
-  password for that database.
 - A CDC connector whose SOURCE is the console's own database cannot be
   deprovisioned by the console — the last row of the table above names
   what it would need. No seeded connector does this today

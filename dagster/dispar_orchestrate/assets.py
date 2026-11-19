@@ -16,7 +16,7 @@ from dagster import Failure, job, op
 
 from dispar_orchestrate.bronze_catalog import register_bronze_table
 from dispar_orchestrate.dlt_pipeline import BronzeIngestConfig, run_bronze_ingest
-from dispar_orchestrate.ingest_factory import run_limit_tags
+from dispar_orchestrate.ingest_factory import job_tags
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 # How long one run of this job may run, in seconds. A load gets the same
@@ -120,7 +120,7 @@ def _count_source_rows(cfg: BronzeIngestConfig) -> int:
 # whose process died is cancelled and failed by the daemon, so it does not
 # hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
 # is a tag and not `run_monitoring.max_runtime_seconds`.
-@job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
+@job(tags=job_tags("bronze_ingest_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def bronze_ingest_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `bronze_ingest_job`. Launched
     exactly the way `lakehouse-dagster::DgClient::launch_run` launches any
