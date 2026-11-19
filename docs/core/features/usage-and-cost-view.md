@@ -57,6 +57,7 @@ No assistant work in this feature. `AGENTS.md` assistant parity binds BI feature
 - The ClickHouse layers (`silver`, `serving`) show one number: their bytes are on the ClickHouse server's own disk, not in the warehouse bucket.
 - "Stored on disk" counts a table's history and its orphan files: it is what the object store holds under the table's location, not only the live data.
 - The page is empty until the first daily run (the storage job runs once a day at 01:00 UTC). It says "Not measured yet"; that is not an error.
+- A deployment whose daily job already ran shows the layers with their current data and "Stored on disk: not measured yet. The daily job runs at 01:00 UTC." instead of an error, until the next run appends the disk column; no line for the rest of the bucket appears in that state.
 - Queries run before the update have no tenant and are visible only to the platform operator.
 - Queries run through dashboard and chart data are not counted.
 - Queries run through the lists of filter values, and through schema and join lookups, are not counted.

@@ -880,12 +880,25 @@ fn capacity_query() -> &'static str {
 ///
 /// [`super::lakehouse::is_unknown_table_error`]'s posture, applied to one
 /// column: the engine's text is CLASSIFIED into a `bool` here and none of
-/// it leaves this function (AGENTS.md rule 4). The match is deliberately
-/// narrow -- the unknown-column code in either of its two renderings
-/// (`(UNKNOWN_IDENTIFIER)`, `Code: 47.`) AND the body naming the one column
-/// this window is about -- so a code 47 about any OTHER column is still an
-/// outage and keeps the fixed 503 (PR #591 review 1; decision 6: a
-/// measurement that has not happened yet is not an outage).
+/// it leaves this function (AGENTS.md rule 4). The match is narrow -- the
+/// unknown-column code in either of its two renderings
+/// (`(UNKNOWN_IDENTIFIER)`, `Code: 47.`) AND the body naming the disk
+/// column (PR #591 review 1; decision 6: a measurement that has not
+/// happened yet is not an outage).
+///
+/// A code 47 about ANOTHER column keeps the fixed 503, and it reaches it in
+/// one of two ways (PR #591 review 1, executor review, SHOULD-FIX 1). A
+/// body that names the missing column alone -- the shape
+/// `Unknown expression identifier 'total_bytes' in scope.` -- does not
+/// name `stored_bytes` at all, so the match does not happen and the
+/// failure is classified as it always was. A body that echoes the
+/// statement, the shape a missing column in the select list takes --
+/// `Missing columns: 'total_bytes' while processing query: ...` -- names
+/// `stored_bytes` too, because the statement names it, so the arm runs;
+/// and the re-read is what refuses it, because the fallback statement
+/// names every column the first one names except the disk one, so it
+/// fails on the same missing column, and that failure is classified into
+/// the fixed 503.
 fn is_unknown_disk_column_error(body: &str) -> bool {
     (body.contains("(UNKNOWN_IDENTIFIER)") || body.contains("Code: 47."))
         && body.contains("stored_bytes")
@@ -1258,4 +1271,48 @@ pub async fn storage(
         bucket,
         rows,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "a unit test that builds the days it reads with the crate's own parser (`parse_day`)"
+    )]
+
+    use super::*;
+
+    /// The deploy window's re-read is the layer statement with the disk
+    /// column left out and NOTHING else left out: the statement is built by
+    /// string surgery, and a fragment lost in that surgery would turn the
+    /// window back into the fixed 503 with every route test still green,
+    /// because the route test matches the wiremock on a substring (PR #591
+    /// review 1).
+    #[test]
+    fn the_deploy_window_read_leaves_out_the_disk_column_and_keeps_the_rest_of_the_statement() {
+        let from = parse_day("2026-03-01").expect("a day this crate parses");
+        let to = parse_day("2026-03-31").expect("a day this crate parses");
+
+        let with_disk = storage_query(from, to, true);
+        assert!(
+            with_disk.contains("toString(stored_bytes) stored_bytes,"),
+            "{with_disk}"
+        );
+
+        let without_disk = storage_query(from, to, false);
+        assert!(!without_disk.contains("stored_bytes"), "{without_disk}");
+        assert!(
+            !without_disk.contains("toString(stored_bytes)"),
+            "{without_disk}"
+        );
+        assert!(
+            without_disk.contains("toString(total_bytes) total_bytes,"),
+            "{without_disk}"
+        );
+        assert!(
+            without_disk.contains("toString(tables_skipped) tables_skipped"),
+            "{without_disk}"
+        );
+    }
 }
