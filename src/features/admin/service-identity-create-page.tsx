@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation"
 import { FormPage } from "@/components/patterns/form-page"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { identityService } from "@/services"
@@ -72,14 +71,16 @@ export function ServiceIdentityCreatePage() {
       onSubmit={() => void handleCreate()}
       onCancel={() => router.push(backHref)}
     >
-      <RequiredLegend />
+      {/* UX-4: every input on this form is required, so no star and no
+          legend; `aria-required` stays on each control. */}
       <div className="space-y-1.5">
-        {/* UX-1-R10: star and semantics must agree on every marked input. */}
-        <Label htmlFor="si-name" required>Name</Label>
+        <Label htmlFor="si-name">Name</Label>
         <Input id="si-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="si-scopes" required>Scopes</Label>
+        <Label htmlFor="si-scopes">Scopes</Label>
+        {/* The picker's `required` prop links the group's requirement
+            sentence, not a star; required semantics stay (UX-4 decision 3). */}
         <PermissionPicker id="si-scopes" label="Scopes" required value={scopes} onChange={setScopes} />
         <p className="text-xs text-muted-foreground">
           <code>iceberg:read</code> lets an outside tool read published Gold tables at{" "}
@@ -88,7 +89,7 @@ export function ServiceIdentityCreatePage() {
         </p>
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="si-env" required>Environment</Label>
+        <Label htmlFor="si-env">Environment</Label>
         <Input
           id="si-env"
           aria-required

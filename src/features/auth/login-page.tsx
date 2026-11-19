@@ -17,7 +17,6 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { RequiredLegend } from "@/components/patterns/required-legend";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { useBranding, type BrandingView } from "@/hooks/use-branding";
 import {
@@ -466,11 +465,10 @@ export function LoginPage() {
                     if (e.target === e.currentTarget) setShaking(false);
                   }}
                 >
-                  {/* #568 (UX-1): the required marker is explained once, at
-                      the top of the form; it arrives with the first field. */}
-                  <RequiredLegend className="login-reveal login-reveal-2" />
+                  {/* UX-4: both inputs are required, so no star and no
+                      legend; each control keeps its native `required`. */}
                   <Field data-invalid={invalid} className="login-reveal login-reveal-2">
-                    <FieldLabel htmlFor="login-email" className="text-sm" required>
+                    <FieldLabel htmlFor="login-email" className="text-sm">
                       Username or email
                     </FieldLabel>
                     <InputGroup className={cn("h-11 bg-background dark:bg-input/30", FIELD_EASE)}>
@@ -502,7 +500,7 @@ export function LoginPage() {
                   </Field>
 
                   <Field data-invalid={invalid} className="login-reveal login-reveal-3">
-                    <FieldLabel htmlFor="login-password" className="text-sm" required>
+                    <FieldLabel htmlFor="login-password" className="text-sm">
                       Password
                     </FieldLabel>
                     <InputGroup className={cn("h-11 bg-background dark:bg-input/30", FIELD_EASE)}>

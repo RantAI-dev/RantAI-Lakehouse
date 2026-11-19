@@ -230,15 +230,21 @@ export type UsedByChart = ColumnChart & { via: "direct" | "sql_source" | "metric
  * (T3 of the BI-14 plan); the field names are the console's choice and are the
  * contract for T3.
  */
-export type UsedBy = {
-  supported: boolean
-  table: string
-  charts: UsedByChart[]
-  /** Charts the caller cannot see ("and 3 more you do not have access to"). */
-  hiddenCount: number
-  /** True when more than 200 charts matched and only the first 200 are listed. */
-  truncated?: boolean
-}
+export type UsedBy =
+  | {
+      supported: true
+      table: string
+      charts: UsedByChart[]
+      /** Charts the caller cannot see ("and 3 more you do not have access to"). */
+      hiddenCount: number
+      /** True when more than 200 charts matched and only the first 200 are listed. */
+      truncated?: boolean
+    }
+  | {
+      /** The caller gets no list: `reason` says why (the shared-catalog rule, `SEC-20`). */
+      supported: false
+      reason: string
+    }
 
 export type LineageGraph = {
   focus: string

@@ -831,6 +831,65 @@ def test_a_stream_batch_records_the_runs_author_on_its_commits(monkeypatch) -> N
     assert [config.author for config in configs] == ["connector conn-x, run 9z8y"]
 
 
+def test_a_stream_spec_with_no_bronze_target_fails_classified_before_it_consumes(monkeypatch) -> None:
+    """`SRC-45` (QA `LH-SRC-6-41`): a Kafka connector saved with no source object
+    used to stop at its first message with an unclassified `IndexError`. It now
+    fails closed, as a rejected setting with a sentence that says what to do,
+    before a consumer is built or a message is read."""
+    import dispar_orchestrate.ingest_factory as f
+    from dispar_orchestrate import ingest_errors
+
+    def never(*_a, **_k):
+        raise AssertionError("nothing may be consumed or built for a spec with no target")
+
+    monkeypatch.setattr(f, "KafkaConsumer", never)
+    monkeypatch.setattr(f, "consume_one_batch", never)
+    for objects in ([], [{"name": "orders"}], [{"name": "orders", "target": ""}]):
+        with pytest.raises(ingest_errors.KafkaTargetMissing) as raised:
+            run_kafka_stream_batch(
+                connector_id="conn-x", spec={"topic": "orders"}, secrets={}, source_objects=objects
+            )
+        assert ingest_errors.classify(raised.value).error_class == ingest_errors.SETTING_REJECTED
+        assert str(raised.value) == (
+            "This Kafka connector has no Bronze table yet: pick its topic again on the Ingest tab."
+        )
+
+
+def test_the_stream_consumer_reads_a_new_group_from_the_start_of_the_topic(monkeypatch) -> None:
+    """`SRC-45` (QA `LH-SRC-6-41`): kafka-python's default `latest` made the first
+    run of a new group skip every message already in the topic."""
+    import dispar_orchestrate.ingest_factory as f
+
+    built: list = []
+
+    class _Consumer(_FakeStreamConsumer):
+        def __init__(self, **kwargs):
+            super().__init__()
+            built.append(kwargs)
+
+        def subscribe(self, topics):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(f, "KafkaConsumer", _Consumer)
+    monkeypatch.setattr(f, "consume_one_batch", lambda *a, **k: BatchResult(rows=[], offsets_to_commit={}))
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={
+            "topic": "orders",
+            "bootstrapServers": ["broker:9092"],
+            "groupId": "g",
+            "auth": {"type": "none"},
+        },
+        secrets={},
+        source_objects=[{"name": "orders", "target": "kafka_orders"}],
+    )
+    assert [kwargs["auto_offset_reset"] for kwargs in built] == ["earliest"]
+    assert built[0]["enable_auto_commit"] is False
+
+
 def _stub_stream_batch(monkeypatch, *, rows, sink) -> list:
     """A micro-batch of `rows` whose sink write is `sink`; returns the list
     the catalog registrations are collected in."""

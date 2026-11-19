@@ -4,7 +4,6 @@ import * as React from "react"
 import { Building2Icon, CheckIcon, LayersIcon, MapPinIcon, UsersIcon } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useAuth } from "@/features/auth/auth-provider"
 import { cn } from "@/lib/utils"
 import { StepSectionHeading } from "./connector-form-parts"
@@ -37,9 +36,10 @@ export function ScopeFields({
 }) {
   return (
     <div className="space-y-6">
-      <RequiredLegend />
+      {/* UX-4: every input on this step is required, so no star and no
+          legend; `aria-required` stays on the controls. */}
       <section className="space-y-3">
-        <StepSectionHeading icon={<UsersIcon className="size-4" />} title="Tenant" description={tenantDescription} required />
+        <StepSectionHeading icon={<UsersIcon className="size-4" />} title="Tenant" description={tenantDescription} />
         <TenantPicker value={tenantId} onChange={onTenantChange} />
       </section>
       <section className="space-y-3 border-t border-border pt-5">
@@ -47,7 +47,6 @@ export function ScopeFields({
           icon={<LayersIcon className="size-4" />}
           title="Environment"
           description="Which stage of the source system this is. Shown and filterable in the connector list."
-          required
         />
         <div className={SCOPE_GRID}>
           <EnvironmentInput id="connector-environment" value={environment} onChange={onEnvironmentChange} required />
@@ -58,7 +57,6 @@ export function ScopeFields({
           icon={<MapPinIcon className="size-4" />}
           title="Residency"
           description="Where the source's data is kept, recorded with the connector for governance."
-          required
         />
         <div className={SCOPE_GRID}>
           <Input

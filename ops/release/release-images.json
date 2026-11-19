@@ -1,5 +1,5 @@
 {
-  "rantai-lakehouse-api": ["lakehouse-api"],
+  "rantai-lakehouse-api": ["lakehouse-api", "lakehouse-db-migrate"],
   "rantai-lakehouse-console": ["console"],
   "rantai-lakehouse-dagster": [
     "dagster-code-location",

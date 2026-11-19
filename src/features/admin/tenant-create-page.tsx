@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation"
 import { FormPage } from "@/components/patterns/form-page"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { identityService } from "@/services"
@@ -53,14 +52,14 @@ export function TenantCreatePage() {
       onSubmit={() => void handleCreate()}
       onCancel={() => router.push(backHref)}
     >
-      <RequiredLegend />
+      {/* UX-4: every input on this form is required, so no star and no
+          legend; `aria-required` stays on each control. */}
       <div className="space-y-1.5">
-        {/* UX-1-R10: star and semantics must agree on every marked input. */}
-        <Label htmlFor="tenant-name" required>Name</Label>
+        <Label htmlFor="tenant-name">Name</Label>
         <Input id="tenant-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="tenant-slug" required>Slug</Label>
+        <Label htmlFor="tenant-slug">Slug</Label>
         <Input
           id="tenant-slug"
           aria-required
@@ -70,7 +69,7 @@ export function TenantCreatePage() {
         />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="tenant-plan" required>Plan</Label>
+        <Label htmlFor="tenant-plan">Plan</Label>
         <Input
           id="tenant-plan"
           aria-required
@@ -80,7 +79,7 @@ export function TenantCreatePage() {
         />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="tenant-residency" required>Residency</Label>
+        <Label htmlFor="tenant-residency">Residency</Label>
         <Input
           id="tenant-residency"
           aria-required

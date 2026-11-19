@@ -4,8 +4,6 @@ import * as React from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredMarker } from "@/components/ui/required"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import type { SheetsDial } from "@/services/contracts/connectors"
 
 /** `dial` for the `sheets` adapter — spreadsheet id plus a repeatable
@@ -13,12 +11,9 @@ import type { SheetsDial } from "@/services/contracts/connectors"
 export function SheetsDialForm({
   value,
   onChange,
-  showLegend = true,
 }: {
   value: SheetsDial | null
   onChange: (next: SheetsDial) => void
-  /** UX-1-R7: a parent step can opt out of its own legend. */
-  showLegend?: boolean
 }) {
   const dial: SheetsDial = value ?? { spreadsheetId: "", ranges: [""] }
 
@@ -34,10 +29,10 @@ export function SheetsDialForm({
 
   return (
     <div className="grid gap-3">
-      {/* UX-1-R7: opt out when a parent step already explains the marker. */}
-      {showLegend ? <RequiredLegend /> : null}
+      {/* UX-4: every input on this form is required (spreadsheet id, every
+          range), so no star and no legend; `aria-required` stays. */}
       <div className="space-y-1.5">
-        <Label htmlFor="sheets-dial-spreadsheet-id" required>Spreadsheet id</Label>
+        <Label htmlFor="sheets-dial-spreadsheet-id">Spreadsheet id</Label>
         <Input
           id="sheets-dial-spreadsheet-id"
           aria-required
@@ -47,7 +42,7 @@ export function SheetsDialForm({
         />
       </div>
       <div className="space-y-2">
-        <p className="flex items-center gap-1.5 text-sm font-medium">Ranges <RequiredMarker /></p>
+        <p className="text-sm font-medium">Ranges</p>
         {/* UX-1-R5: every range is read at runtime (`SheetsDial.ranges` is a
             plain Vec<String>, all entries used), so each rendered row is
             required — not just the first. Remove drops an unused row. */}
@@ -56,7 +51,7 @@ export function SheetsDialForm({
         </p>
         {dial.ranges.map((range, index) => (
           <div key={index} className="flex items-center gap-2">
-            <Label htmlFor={`sheets-dial-range-${index}`} required className="shrink-0 text-xs">
+            <Label htmlFor={`sheets-dial-range-${index}`} className="shrink-0 text-xs">
               Range {index + 1}
             </Label>
             <Input

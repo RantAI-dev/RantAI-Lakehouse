@@ -57,3 +57,43 @@ Clean clone → `docker compose up --build` → all three containers healthy →
 `GET /health` returns `ok`. All 20 migrations applied. `cargo fmt --check`,
 `cargo clippy --all-targets --all-features --locked -- -D warnings`, and
 `cargo test --all-features` (30 test targets, 0 failures) all pass.
+
+## Addendum (SEC-78, 2026-11-18)
+
+### Context
+
+The Decision and Consequences above no longer describe the image.
+`entrypoint.api.sh` no longer runs `sqlx migrate run`, and `lib.rs` no
+longer calls `lakehouse_store::migrate` at boot: at start the API reads
+the migration bookkeeping instead and refuses to serve while a pending
+migration exists. SEC-78 moved the migration out of the API process
+entirely.
+
+### Decision
+
+**The API never migrates.** A one-shot compose service,
+`lakehouse-db-migrate`, runs the same image with the binary's `migrate`
+subcommand, holds the database OWNER's credentials, and runs on every
+deploy before `lakehouse-api` starts. `sqlx-cli` stays in the image, but
+nothing runs it any more; dropping it from the image remains the follow-up
+the Consequences above call for (`rust/Dockerfile` marks the removal as
+"ADR 0001's follow-up").
+
+### Consequences
+
+- The console connects as `lakehouse_app`, a role that owns no table and
+  is not a superuser, so it cannot switch off the audit trail's
+  append-only triggers (`0142_audit_event_append_only.sql`).
+- The owner's role is kept, for the migrations and the runtime role's own
+  setup: applying the schema is the one job that needs the owner's rights,
+  and it no longer runs inside the console's process.
+- The image carries a `sqlx` binary nothing runs, until the follow-up
+  drops it.
+
+### Verification
+
+This addendum records behaviour already in the tree, not a new decision to
+build: `rust/entrypoint.api.sh` ("The API NEVER migrates"), the
+`sqlx-cli` comment in `rust/Dockerfile`, and the `lakehouse-db-migrate`
+service in `docker-compose.yml` say the same thing. The addendum itself
+changes documentation only.
