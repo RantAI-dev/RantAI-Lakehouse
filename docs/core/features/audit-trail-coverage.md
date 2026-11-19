@@ -17,7 +17,7 @@
 
 ## Problem
 
-The guard test counts every route that changes something: 223, of which 182 are recorded (the route's handler or the central writer) and 41 are excluded, each with a listed reason. Before this feature, every dashboard, saved query, alert and report subscription change left no audit row, and the audit page showed only the newest 200 events and could not export.
+The guard test counts every route that changes something: 224, of which 182 are recorded (the route's handler or the central writer) and 42 are excluded, each with a listed reason. Before this feature, every dashboard, saved query, alert and report subscription change left no audit row, and the audit page showed only the newest 200 events and could not export.
 
 ## What the user can do when this is done
 
@@ -26,7 +26,7 @@ The guard test counts every route that changes something: 223, of which 182 are 
 3. Filter the audit page by person, action, object and time range and get events of any age, page by page.
 4. Export the filtered events as CSV.
 5. See, for a role, policy, table-access or grant change, the old and new value; for any other change, the names of the fields that changed.
-6. Trust the database to refuse every edit and delete of an audit row: the append-only trigger binds an account that neither owns `audit_event` nor is a superuser. The table's owner or a superuser can still skip it, with `ALTER TABLE audit_event DISABLE TRIGGER` or with `SET session_replication_role = replica`, which skips the trigger without changing the table. The console's database account is that owner today (on staging and in the compose default it is `lakehouse`, the image's superuser and the owner of `audit_event`), so until `SEC-78` lands that account can still turn off the trigger.
+6. Trust the database to refuse every edit and delete of an audit row: the append-only trigger binds an account that neither owns `audit_event` nor is a superuser. The table's owner or a superuser can still skip it, with `ALTER TABLE audit_event DISABLE TRIGGER` or with `SET session_replication_role = replica`, which skips the trigger without changing the table. The console connects as `lakehouse_app`, which neither owns `audit_event` nor is a superuser, so it cannot turn the trigger off; only the migration owner can.
 
 ## Not included
 
@@ -55,7 +55,7 @@ No new assistant work. Its tool calls are already recorded.
 - Reads and downloads are recorded as today, not every page view.
 - Events are kept forever; there is no retention setting yet (`GOV-21`).
 - Events cannot be sent to an outside system yet; export is CSV from the audit page.
-- The database owner or a superuser can still skip the trigger that makes the trail append-only, with `ALTER TABLE audit_event DISABLE TRIGGER ...` or with `SET session_replication_role = replica` (which skips the trigger without changing the table). Nothing in the trail records that. By default the console's database account is that owner (`docker-compose.yml`'s `DATABASE_URL` falls back to `POSTGRES_USER`, the image's superuser); running the API as a role that owns no table and is not a superuser is `SEC-78` (P1).
+- The database owner or a superuser can still skip the trigger that makes the trail append-only, with `ALTER TABLE audit_event DISABLE TRIGGER ...` or with `SET session_replication_role = replica` (which skips the trigger without changing the table). Nothing in the trail records that. The console connects as `lakehouse_app`, a role that owns no table and is not a superuser (`SEC-78`), so it cannot turn the trigger off; only the migration owner can.
 - The database allows an `UPDATE` that only clears a row's `run_id` or `approval_id`, because it clears those links when an agent run or an approval is deleted. Every other change to a row is refused.
 - A request that the service's timeout cuts off writes no row.
 - A change made through a create route does not name the new object when its id is only in the response. The row then names the kind and the action, not the object.
@@ -85,7 +85,7 @@ No new assistant work. Its tool calls are already recorded.
 | `GOV-1-AC8` | Filter the audit page to one person and a date range older than the newest 200 events | The matching events of that range, paged | Not run |
 | `GOV-1-AC9` | Export the filtered result | A CSV with the same rows and columns | Not run |
 | `GOV-1-AC10` | As an Analyst (holds `governance:read`, not `audit:read`), open the audit page and the export link | Refused; the audit page is not in the menu | Not run |
-| `GOV-1-AC11` | (operator) Try `UPDATE audit_event ...` and `DELETE FROM audit_event ...` with the console's database account | Both refused by the database. The Auditor's check (2026-11-16): the console account on staging and in the compose default is `lakehouse`, the image's superuser and the owner of `audit_event`, so until `SEC-78` lands that account can still turn off the trigger (`DISABLE TRIGGER`, `session_replication_role = replica`) | Pass (CI of #546/#549, `lakehouse-store/tests/audit.rs` as superuser; staging console account from deploy config; Auditor 2026-11-16) |
+| `GOV-1-AC11` | (operator) Try `UPDATE audit_event ...` and `DELETE FROM audit_event ...` with the console's database account | Both refused by the database. The Auditor's check (2026-11-16) found the console account on staging was `lakehouse`, the image's superuser and the owner of `audit_event`, so it could still turn off the trigger (`DISABLE TRIGGER`, `session_replication_role = replica`); since `SEC-78` the console connects as `lakehouse_app`, which neither owns `audit_event` nor is a superuser, so only the migration owner can turn it off. | Pass (CI of #546/#549, `lakehouse-store/tests/audit.rs` as superuser; staging console account from deploy config; Auditor 2026-11-16) |
 | `GOV-1-AC12` | (operator) Look at the CI run of the pull request | The audit coverage test passes, and it lists every excluded route with its reason | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______

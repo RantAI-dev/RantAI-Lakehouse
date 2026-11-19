@@ -10,7 +10,7 @@
 
 ## Why
 
-The audit trail (`audit_event`, migration `0024`) records 182 of the 223 routes that change something — the route's handler or the central writer — and 41 are excluded, each with a listed reason; the guard test counts this. Before this feature the recorded kinds were identity, policies, governance, connectors, pipelines, settings (part), sharing and the assistant's tool calls; saved queries and folders, dashboards and their parts, alerts, report subscriptions, query limits and reporting settings, storage restore, workload cancel, table maintenance, role creation, service-identity creation and agent suspend/resume/revoke were not, and nothing checked that a new route records itself. The audit page loaded the newest 200 events and filtered them in the browser, so an older change could not be found, and there was no export.
+The audit trail (`audit_event`, migration `0024`) records 182 of the 224 routes that change something — the route's handler or the central writer — and 42 are excluded, each with a listed reason; the guard test counts this. Before this feature the recorded kinds were identity, policies, governance, connectors, pipelines, settings (part), sharing and the assistant's tool calls; saved queries and folders, dashboards and their parts, alerts, report subscriptions, query limits and reporting settings, storage restore, workload cancel, table maintenance, role creation, service-identity creation and agent suspend/resume/revoke were not, and nothing checked that a new route records itself. The audit page loaded the newest 200 events and filtered them in the browser, so an older change could not be found, and there was no export.
 
 ## What users get
 
@@ -20,7 +20,7 @@ Every change made in the console, by a person, the assistant, a schedule or a se
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Routes that change state and record a row | 182 of 223; 41 excluded, each with a listed reason (the guard test's count) | Every one, except a listed exclusion with its reason (Decision 1) |
+| Routes that change state and record a row | 182 of 224; 42 excluded, each with a listed reason (the guard test's count) | Every one, except a listed exclusion with its reason (Decision 1) |
 | A new route that records nothing | Not caught | A test over `POLICY_TABLE` fails until the route records a row or is added to the exclusion list with a reason, like `tests/sec11_guard.rs` |
 | A refused change (permission, validation) | Recorded by some routes | Recorded with outcome `refused` for every covered route *(proposed)* |
 | What a row says about the change | Free-form `args`, per route | The names of the fields that changed, always; old and new values only for roles, policies, table access and grants, never a secret *(proposed)* |
