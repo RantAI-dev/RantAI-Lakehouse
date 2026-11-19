@@ -140,7 +140,7 @@ create-state defaults.
 | 28 | `connectors/dial-forms/sheets-dial-form.tsx` | Sheets dial | 2+ (spreadsheet id, range rows) | all | **none** |
 | 29 | `connectors/dial-forms/sql-dial-form.tsx` | SQL dial | 5–6 (driver, host, port, database, user, SSL mode) | host, port, database, user | keep stars + line |
 | 30 | `connectors/upload-file-step.tsx` | Choose files | 1 (file picker) | it | **none** |
-| 31 | `connectors/upload-table-step.tsx` | Table name | 1 | it | **none** |
+| 31 | `connectors/upload-table-step.tsx` | Table name step | 2–3 (table name, folder picker, conditional load-mode radios) | table name | stars only |
 | 32 | `copilot/chat-composer.tsx` | Chat box (compact pill + composer) | 1 (message) | it | **none**; restore pre-#568 markup (decision 4) |
 | 33 | `copilot/chat-messages.tsx` | Edit message | 1 | it | **none** |
 | 34 | `copilot/session-parts.tsx` | Rename conversation | 1 | it | **none** |
@@ -175,6 +175,12 @@ code (the plan asked for exactly this confirmation):
   required name with optional description and folder → stars only.
 - `queries/save-query-page` — plan expected "none"; the form mixes a required
   title with optional tags and folder → stars only.
+- `connectors/upload-table-step` — correction to row 31 of this table: the
+  step also renders the optional folder picker (`folderField`,
+  `upload-file-page.tsx`) and conditional load-mode radios, so it mixes a
+  required table name with an optional folder → stars only, not none. Found
+  while implementing task 2; the row was corrected before the step's own code
+  change, which lands with the task-3 "stars only" rows.
 
 (Developer appends the rest of the handoff below.)
 
