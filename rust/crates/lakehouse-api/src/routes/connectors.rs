@@ -3553,7 +3553,7 @@ async fn save_ingest_spec(
 ) -> ApiResult<ApiJson<IngestSpecResponse>> {
     let state = state.clone();
     let id = id.to_owned();
-    let body: IngestSpecBody = parse_body(&body)?;
+    let mut body: IngestSpecBody = parse_body(&body)?;
     // Refused here rather than at the first tick: the schedule sensor
     // would otherwise skip a malformed cron without a word, forever.
     if let Some(problem) = body
@@ -3572,6 +3572,22 @@ async fn save_ingest_spec(
     // first run; refused here with a fixed sentence.
     lakehouse_store::ingest_spec::validate_ingest_mode(&body.adapter, &body.ingest_mode)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    // `SRC-45` (QA `LH-SRC-6-41`): the console sends a Kafka connector's topic
+    // in `dial.topic` and no source object, yet the loader reads its Bronze
+    // table from the first object. The server gives the spec its target here,
+    // so the console wizard, the topic picker and the assistant's
+    // `set_ingest_spec` all save a loadable connector.
+    if body.adapter == "kafka" {
+        let detail = connectors::get_connector(pool(&state)?, &id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
+        body.source_objects = lakehouse_store::ingest_spec::kafka_source_objects(
+            &body.adapter,
+            &body.dial,
+            &detail.connector.name,
+            &body.source_objects,
+        );
+    }
     refuse_uploaded_targets(&state, &body.source_objects).await?;
     // Parsed here, in the route, ahead of `set_ingest_spec`'s own (later,
     // authoritative-for-persistence) `Dial::parse` call: this handler
