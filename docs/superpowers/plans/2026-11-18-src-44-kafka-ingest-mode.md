@@ -38,7 +38,7 @@ and `stream` for any adapter.
 - D3. Rows already saved wrong are repaired by a migration:
   `UPDATE connector SET ingest_mode = 'stream' WHERE adapter = 'kafka' AND
   ingest_mode = 'batch';` (targeted `AND col = '<old>'` form). Next free
-  number is `0149` (latest on `main` is `0148_usage_rate_and_permission.sql`);
+  number was `0149`; renumbered to `0151` in review 2 (main took `0149`, open PRs `0150`);
   re-check before using it.
 - D4. No change to the loader (`dagster/`): it is right.
 
@@ -139,3 +139,16 @@ this plan's scope.
 
 Open before merge: `cargo test -p lakehouse-api` in full (route_auth,
 sec11_guard) is *not verified* locally; CI on the PR must show it green.
+
+### Review 2 (planner, 2026-11-19, PR #593 CI on 10ef7cb8a)
+
+- **BLOCKER 1.** Migration number clash. `main` gained
+  `0149_seed_connector_dials_as_app_role.sql` (SEC-78, #588) after this
+  branch was cut, so every compose gate fails at `lakehouse-db-migrate`:
+  `duplicate key value violates unique constraint "_sqlx_migrations_pkey"`
+  (G3, G3a, G6, G8, SRC-3/11/13/17, Gold export). `0150` is taken by six open
+  PRs (`0150_dashboard_template_creator.sql`). Fix: merge `origin/main` into
+  this branch (no rebase, no force push), rename ours to
+  `0151_kafka_connectors_stream.sql`, and update the test that
+  `include_str!`s it and its name (`connector_ingest_spec.rs:585-612`). D3 in
+  this plan now reads `0151`.
