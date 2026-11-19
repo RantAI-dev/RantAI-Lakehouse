@@ -66,12 +66,15 @@ use rand::Rng;
 pub const ENV_EXAMPLE: &str = include_str!("../../../../.env.example");
 
 /// The keys `ops/init-env.sh` fills with hexadecimal.
-const FILLED_HEX: [&str; 9] = [
+const FILLED_HEX: [&str; 10] = [
     "POSTGRES_PASSWORD",
     // SEC-78: the console's runtime role's password. It is a must-set
     // setting, so an install that left it empty would write a `.env` the
     // stack refuses to start from.
     "LAKEHOUSE_DB_APP_PASSWORD",
+    // SEC-78 (second change): Dagster's instance database role's password,
+    // the same rule as the console's: a must-set setting.
+    "LAKEHOUSE_DB_DAGSTER_PASSWORD",
     "RUSTFS_ACCESS_KEY",
     "RUSTFS_SECRET_KEY",
     "LAKEKEEPER_ENCRYPTION_KEY",
@@ -421,6 +424,83 @@ pub fn ensure_catalog_tenant(dir: &Path) -> Result<bool, std::io::Error> {
     rewrite_env(dir, with_the_catalog_tenant)
 }
 
+/// Fill the must-set secrets an existing `.env` lacks.
+///
+/// An install made before a secret existed has no line for it, or an
+/// empty one, and the stack refuses to start on it (`:?` in the Compose
+/// file). The update fills exactly those keys, with the same generators
+/// as a fresh install: a key that already holds a value is never changed,
+/// so an operator's own value survives.
+///
+/// Returns the names of the keys it filled, in the order of
+/// [`FILLED_HEX`] and then [`FILLED_BASE64`]. The values are never
+/// returned.
+///
+/// # Errors
+///
+/// Returns the error the operating system gave when the file could not
+/// be read or written, named with the path.
+pub fn ensure_must_set_secrets(dir: &Path) -> Result<Vec<String>, std::io::Error> {
+    let path = dir.join(".env");
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("{} could not be read: {error}", path.display()),
+        )
+    })?;
+    let mut updated = text;
+    let mut filled = Vec::new();
+    let names = FILLED_HEX
+        .iter()
+        .copied()
+        .chain(std::iter::once(FILLED_BASE64));
+    for name in names {
+        if read_value(&updated, name).is_some_and(|value| !value.is_empty()) {
+            continue;
+        }
+        let value = if name == FILLED_BASE64 {
+            base64_secret()
+        } else {
+            hex_secret()
+        };
+        // An empty line for the key is filled in place; a key with no line
+        // is appended. Both keep every other line as it was.
+        let mut found_empty = false;
+        let lines: Vec<String> = updated
+            .lines()
+            .map(|line| match line.split_once('=') {
+                Some((key, rest)) if key.trim() == name && rest.trim().is_empty() => {
+                    found_empty = true;
+                    format!("{name}={value}")
+                }
+                _ => line.to_string(),
+            })
+            .collect();
+        if found_empty {
+            updated = format!("{}\n", lines.join("\n"));
+        } else {
+            if !updated.is_empty() && !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+            updated.push_str(name);
+            updated.push('=');
+            updated.push_str(&value);
+            updated.push('\n');
+        }
+        filled.push(name.to_string());
+    }
+    if filled.is_empty() {
+        return Ok(filled);
+    }
+    write_replacing(&path, &updated).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("{} could not be written: {error}", path.display()),
+        )
+    })?;
+    Ok(filled)
+}
+
 /// Rewrite the install's `.env` with `rewrite`, when it changes it.
 ///
 /// One reader and one writer for both settings, so install and update
@@ -600,6 +680,70 @@ mod tests {
             .decode(key.as_bytes())
             .expect("the key is base64");
         assert_eq!(bytes.len(), BASE64_BYTES);
+    }
+
+    #[test]
+    fn an_existing_env_gets_the_must_set_secrets_it_lacks_and_keeps_the_operators_values() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        // An install from before the Dagster role: no Dagster line, an empty
+        // console-role line, and an operator's own owner password.
+        std::fs::write(
+            &path,
+            "POSTGRES_PASSWORD=operators-own-value\nLAKEHOUSE_DB_APP_PASSWORD=\nRUSTFS_ACCESS_KEY=a\nRUSTFS_SECRET_KEY=b\nLAKEKEEPER_ENCRYPTION_KEY=c\nSEAWEEDFS_ACCESS_KEY=d\nSEAWEEDFS_SECRET_KEY=e\nAUTH_BOOTSTRAP_PASSWORD=f\nRENDER_TOKEN_SECRET=g\nCONNECTOR_SECRETS_KEY=h\n",
+        )
+        .expect("the old .env is written");
+
+        let filled = ensure_must_set_secrets(directory.path()).expect("the secrets are filled");
+        let text = std::fs::read_to_string(&path).expect("the .env is readable");
+
+        assert_eq!(
+            filled,
+            vec![
+                "LAKEHOUSE_DB_APP_PASSWORD".to_string(),
+                "LAKEHOUSE_DB_DAGSTER_PASSWORD".to_string()
+            ]
+        );
+        assert_eq!(
+            read_value(&text, "POSTGRES_PASSWORD").as_deref(),
+            Some("operators-own-value")
+        );
+        for name in ["LAKEHOUSE_DB_APP_PASSWORD", "LAKEHOUSE_DB_DAGSTER_PASSWORD"] {
+            let value = read_value(&text, name).expect("the key is set");
+            assert!(!value.is_empty(), "{name} is filled");
+        }
+        assert_eq!(
+            text.matches("LAKEHOUSE_DB_DAGSTER_PASSWORD=").count(),
+            1,
+            "the key appears once"
+        );
+        assert_eq!(
+            text.matches("LAKEHOUSE_DB_APP_PASSWORD=").count(),
+            1,
+            "the empty line is filled, not duplicated"
+        );
+    }
+
+    #[test]
+    fn a_second_update_fills_nothing() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join(".env");
+        std::fs::write(&path, "POSTGRES_PASSWORD=x\n").expect("the .env is written");
+        let first = ensure_must_set_secrets(directory.path()).expect("the first update fills");
+        let after_first = std::fs::read_to_string(&path).expect("readable");
+        let second = ensure_must_set_secrets(directory.path()).expect("the second update runs");
+        assert!(!first.is_empty(), "the first update fills what it lacks");
+        assert!(second.is_empty(), "nothing is filled twice");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("readable"),
+            after_first
+        );
+    }
+
+    #[test]
+    fn the_dagster_password_is_a_must_set_secret_of_the_installer() {
+        assert!(FILLED_HEX.contains(&"LAKEHOUSE_DB_DAGSTER_PASSWORD"));
+        assert!(FILLED_HEX.contains(&"LAKEHOUSE_DB_APP_PASSWORD"));
     }
 
     #[test]

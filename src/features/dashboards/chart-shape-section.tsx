@@ -19,7 +19,7 @@ import { moveItem } from "@/lib/table-draft";
 import { displayColumn, displayColumnFull } from "@/lib/chart-joins";
 import { columnItems } from "./builder-sections";
 import { GRAIN_LABELS, grainChoices, type ColumnKind } from "@/lib/time-grain";
-import type { FilterDef } from "@/services/clients/bi-store";
+import type { FilterDef } from "@/services";
 import { BinPicker } from "./bin-picker";
 import { ColumnList } from "./table-settings";
 import { DateEditor, NumberEditor, TextEditor, blankFilter, type EditorProps } from "./filters/filter-editors";

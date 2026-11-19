@@ -14,6 +14,13 @@ names one the system table does not have, the way the live stack refused
 `type = 'Table'`: a fake that answers every statement with a canned row
 cannot catch a statement that names a column the server does not have.
 
+The OBJECT STORE is faked at its own boundary the same way: a filesystem
+that holds the bytes under each key and answers the recursive listing
+`capacity_snapshot.list_stored_objects` reads. A key whose listing fails
+fails the way a refused listing fails, with a backend-specific error type,
+because the module catches EVERY exception there (the object store raises
+types this package does not name).
+
 Run with:
 `~/.venvs/rantai-lakehouse/bin/python -m pytest dagster/dispar_orchestrate/test_storage_snapshot.py -q`
 """
@@ -35,20 +42,43 @@ from dagster import Failure
 # variable is cleared BEFORE that import happens.
 os.environ.pop("INGEST_RUN_MAX_RUNTIME_SECONDS", None)
 
-from dispar_orchestrate import bronze_catalog, ingest_factory, maintenance, storage_snapshot
+from dispar_orchestrate import (
+    bronze_catalog,
+    capacity_snapshot,
+    ingest_factory,
+    maintenance,
+    storage_snapshot,
+)
 
 # The tag the orchestrator's run monitoring reads (`SRC-39`).
 TAG = "dagster/max_runtime"
 
 # The table's metadata document, in the two shapes a writer may leave it:
 # the summary on the current snapshot, and the spec's own copy of it.
-def _metadata(size: str) -> dict:
-    """A table metadata document whose current snapshot holds `size` bytes."""
+# The bucket every table of these tests lives in. The "stored on disk"
+# number is the bytes under a table's own location, and the location names
+# the bucket: a table whose location names another bucket is not a table of
+# the bucket this job measures.
+BUCKET = "lakehouse-warehouse"
+
+
+def _location(table: str) -> str:
+    """The location one table's files live under."""
+    return f"s3://{BUCKET}/warehouse/bronze/{table}"
+
+
+def _metadata(size: str, table: str = "orders", location: str | None = None) -> dict:
+    """A table metadata document whose current snapshot holds `size` bytes.
+
+    The document carries the table's own LOCATION as well: the "stored on
+    disk" number is measured from that location, and a document without
+    one cannot be measured at all."""
     return {
         "metadata": {
             "current-snapshot-id": 7,
             "snapshots": [{"snapshot-id": 7, "summary": {"total-files-size": size}}],
             "snapshot-summary": {"total-files-size": size},
+            "location": location if location is not None else _location(table),
         }
     }
 
@@ -182,6 +212,78 @@ def _fake_clickhouse(
     monkeypatch.setattr(bronze_catalog.ClickHouseTarget, "query_json", _query_json)
 
 
+class _FakeFilesystem:
+    """The object store, faked the way `s3fs` reads it.
+
+    The FIRST segment of a path is the BUCKET, exactly as `s3fs` reads
+    it: `find("warehouse/bronze/orders")` lists the bucket named
+    `warehouse`, not the bucket named `lakehouse-warehouse`. The fake
+    therefore keeps its objects under the full `<bucket>/<key>` path, and
+    a path whose first segment names a bucket it does not hold FAILS the
+    listing, the way `s3fs` fails on a bucket that does not exist.
+
+    `buckets` names the buckets this store holds. A second one is the
+    DECOY: a bucket whose name is the table's first folder, so a listing
+    that lost the bucket prefix answers for THAT bucket instead of
+    failing -- the case a fake that holds one bucket cannot see.
+
+    `unlistable` names the paths whose listing fails, the way a refused
+    listing fails: with a backend-specific error type, because the module
+    catches every exception there (the object store raises types this
+    package does not name).
+
+    `find` is the recursive listing `capacity_snapshot.list_stored_objects`
+    reads and `ls` is the cheap root listing the probe does -- the two
+    calls the object store makes, and no more."""
+
+    def __init__(
+        self,
+        objects: dict[str, int],
+        unlistable: tuple[str, ...] = (),
+        buckets: tuple[str, ...] = (BUCKET,),
+    ) -> None:
+        self.objects = objects
+        self.unlistable = unlistable
+        self.buckets = set(buckets)
+        # The calls this store received: the root listing (the probe) and
+        # the recursive listing of one table's location.
+        self.listed: list[str] = []
+
+    def ls(self, path, **_kwargs):
+        self.listed.append(path)
+        if path in self.unlistable:
+            raise OSError(f"Access Denied: {path}")
+        return [{"name": path, "type": "directory"}]
+
+    def find(self, path, detail=True):
+        assert detail is True
+        self.listed.append(path)
+        if path in self.unlistable:
+            raise OSError(f"Access Denied: {path}")
+        bucket = path.partition("/")[0]
+        if bucket not in self.buckets:
+            raise FileNotFoundError(f"No such bucket: {bucket}")
+        prefix = f"{path}/"
+        return {
+            key: {"size": size, "type": "file"}
+            for key, size in self.objects.items()
+            if key.startswith(prefix)
+        }
+
+
+def _store(
+    objects: dict[str, int] | None = None,
+    unlistable: tuple[str, ...] = (),
+    buckets: tuple[str, ...] = (BUCKET,),
+    bucket: str = BUCKET,
+) -> storage_snapshot.ObjectStore:
+    """The object store this job reads, faked: the bytes under each
+    `<bucket>/<key>` path, and the paths whose listing fails."""
+    return storage_snapshot.ObjectStore(
+        _FakeFilesystem(objects or {}, unlistable, buckets), bucket
+    )
+
+
 def test_the_size_of_a_layer_is_the_sum_of_the_tables_of_that_layer(monkeypatch):
     """The catalog holds three namespaces; each layer's number is the sum of
     the tables of THAT namespace alone, and a namespace this deployment does
@@ -189,9 +291,9 @@ def test_the_size_of_a_layer_is_the_sum_of_the_tables_of_that_layer(monkeypatch)
     _fake_catalog(
         monkeypatch,
         {
-            "orders": _metadata("100"),
-            "customers": _metadata("250"),
-            "mart_wisman": _metadata("7"),
+            "orders": _metadata("100", table="orders"),
+            "customers": _metadata("250", table="customers"),
+            "mart_wisman": _metadata("7", table="mart_wisman"),
         },
     )
     _fake_clickhouse(
@@ -203,7 +305,7 @@ def test_the_size_of_a_layer_is_the_sum_of_the_tables_of_that_layer(monkeypatch)
         },
     )
 
-    rows = storage_snapshot.measure_layers(_cfg())
+    rows = storage_snapshot.measure_layers(_cfg(), _store())
     by_layer = {row.layer: row for row in rows}
     assert set(by_layer) == {"bronze", "gold", "silver", "serving"}
     assert by_layer["bronze"].total_bytes == 350
@@ -232,7 +334,7 @@ def test_a_table_whose_metadata_cannot_be_read_is_skipped_and_never_counted_as_z
         },
     )
 
-    rows = storage_snapshot.measure_layers(_cfg())
+    rows = storage_snapshot.measure_layers(_cfg(), _store())
     bronze = next(row for row in rows if row.layer == "bronze")
     assert bronze.total_bytes == 100
     assert bronze.table_count == 2
@@ -258,7 +360,7 @@ def test_the_catalog_database_is_created_before_the_catalog_is_listed(monkeypatc
         bronze_catalog.ClickHouseTarget, "query_json", lambda _target, _statement: []
     )
 
-    storage_snapshot.measure_layers(_cfg())
+    storage_snapshot.measure_layers(_cfg(), _store())
 
     created = [sql for sql in statements if "CREATE DATABASE" in sql]
     listed = [sql for sql in statements if "SHOW TABLES" in sql]
@@ -286,7 +388,7 @@ def test_a_missing_catalog_token_fails_the_run_and_is_not_a_skip(monkeypatch):
     )
 
     with pytest.raises(Failure) as err:
-        storage_snapshot.measure_layers(_cfg(ch_oauth_client_id=""))
+        storage_snapshot.measure_layers(_cfg(ch_oauth_client_id=""), _store())
 
     assert "CH_OAUTH_CLIENT_ID" in str(err.value)
 
@@ -311,7 +413,7 @@ def test_a_catalog_that_refuses_the_token_fails_the_run(monkeypatch):
     monkeypatch.setattr(requests, "post", mock.Mock(return_value=token))
 
     with pytest.raises(Failure) as err:
-        storage_snapshot.measure_layers(_cfg())
+        storage_snapshot.measure_layers(_cfg(), _store())
 
     message = str(err.value)
     assert "CH_OAUTH_SERVER_URI" in message
@@ -341,7 +443,7 @@ def test_a_catalog_without_a_warehouse_prefix_fails_the_run(monkeypatch):
     monkeypatch.setattr(requests, "get", mock.Mock(return_value=config))
 
     with pytest.raises(Failure) as err:
-        storage_snapshot.measure_layers(_cfg())
+        storage_snapshot.measure_layers(_cfg(), _store())
 
     message = str(err.value)
     assert "LAKEKEEPER_WAREHOUSE" in message
@@ -375,7 +477,7 @@ def test_the_measurement_reads_the_catalog_through_the_public_helpers(monkeypatc
     document.json.return_value = _metadata("100")
     monkeypatch.setattr(requests, "get", mock.Mock(return_value=document))
 
-    rows = storage_snapshot.measure_layers(_cfg())
+    rows = storage_snapshot.measure_layers(_cfg(), _store())
 
     assert used == ["token", "prefix"], used
     bronze = next(row for row in rows if row.layer == "bronze")
@@ -403,7 +505,7 @@ def test_the_clickhouse_layers_are_read_through_the_public_target_method(monkeyp
     monkeypatch.setattr(bronze_catalog, "_ch_query_json", _private)
     monkeypatch.setattr(maintenance, "_ch_query", lambda _cfg, sql: "")
 
-    rows = storage_snapshot.measure_layers(_cfg())
+    rows = storage_snapshot.measure_layers(_cfg(), _store())
 
     assert read, "the layers are read through the public method"
     assert private == [], "another module's private helper was used"
@@ -462,7 +564,7 @@ def test_the_clickhouse_layers_are_read_with_the_columns_clickhouse_26_8_has(mon
     )
     monkeypatch.setattr(maintenance, "_ch_query", lambda _cfg, sql: "")
 
-    rows = storage_snapshot.measure_layers(_cfg())
+    rows = storage_snapshot.measure_layers(_cfg(), _store())
 
     by_layer = {row.layer: row for row in rows}
     assert by_layer["silver"].table_count == 3
@@ -499,7 +601,7 @@ def test_a_clickhouse_layer_that_cannot_be_read_is_a_skip_and_not_a_zero_byte_la
     monkeypatch.setattr(bronze_catalog.ClickHouseTarget, "query_json", _query_json)
     monkeypatch.setattr(maintenance, "_ch_query", lambda _cfg, sql: "")
 
-    rows = storage_snapshot.measure_layers(_cfg())
+    rows = storage_snapshot.measure_layers(_cfg(), _store())
 
     by_layer = {row.layer: row for row in rows}
     silver = by_layer["silver"]
@@ -534,6 +636,7 @@ def test_the_writer_asks_for_the_canonical_schema_before_it_writes(monkeypatch):
                 total_bytes=350,
                 tables_skipped=0,
                 skipped_reason="",
+                stored_bytes=580,
             )
         ],
         target=bronze_catalog.ClickHouseTarget(
@@ -547,12 +650,60 @@ def test_the_writer_asks_for_the_canonical_schema_before_it_writes(monkeypatch):
     assert "'bronze'" in inserted[0]
 
 
+def test_the_writer_writes_the_stored_bytes_column_by_name(monkeypatch):
+    """The row carries BOTH numbers, and the INSERT names the column
+    instead of relying on the column order: the column is the LAST one of
+    the canonical shape, and a row whose bytes are not in the object store
+    (a ClickHouse layer) writes SQL `NULL` there -- not a zero, which
+    would say "this layer holds no bytes"."""
+    inserted = []
+    monkeypatch.setattr(bronze_catalog, "_assert_or_create_all", lambda target, schemas: None)
+    monkeypatch.setattr(bronze_catalog, "_ch_exec", lambda target, sql: inserted.append(sql))
+
+    bronze_catalog.record_storage_layer_snapshot(
+        day="2026-11-16",
+        rows=[
+            bronze_catalog.StorageLayerRow(
+                layer="bronze",
+                table_count=2,
+                total_bytes=350,
+                tables_skipped=0,
+                skipped_reason="",
+                stored_bytes=580,
+            ),
+            bronze_catalog.StorageLayerRow(
+                layer="silver",
+                table_count=3,
+                total_bytes=4096,
+                tables_skipped=0,
+                skipped_reason="",
+                stored_bytes=None,
+            ),
+        ],
+        target=bronze_catalog.ClickHouseTarget(
+            url="http://ch.invalid", user="default", password=""
+        ),
+    )
+
+    insert = inserted[0]
+    assert "stored_bytes" in insert, insert
+    assert "580" in insert, insert
+    assert "NULL" in insert, insert
+    # The column is named in the column list, not only in the values.
+    assert "(day, layer, table_count, total_bytes, tables_skipped, skipped_reason, " in insert
+    assert "measured_at, stored_bytes) VALUES" in insert, insert
+
+
 def test_the_schema_is_the_one_the_plan_names():
     """The table's own shape: one row per layer per day, with the day's
-    bytes, how many tables could not be measured, and why. The schema is
-    owned by `bronze_catalog` (the R10 single-owner rule) and it is NOT
-    folded into `EXPECTED_SCHEMAS`, which holds only the registry tables
-    `register_bronze_table` writes."""
+    CURRENT data, the bytes stored on disk, how many tables could not be
+    measured, and why. The schema is owned by `bronze_catalog` (the R10
+    single-owner rule) and it is NOT folded into `EXPECTED_SCHEMAS`, which
+    holds only the registry tables `register_bronze_table` writes.
+
+    `stored_bytes` is LAST, because the table already exists on the
+    deployments that ran this job before it measured the bytes on disk,
+    and ClickHouse's `ADD COLUMN` appends the new column at the end."""
     schema = bronze_catalog._STORAGE_LAYER_SNAPSHOT_SCHEMA
     assert schema.table_name == "bronze_meta.storage_layer_snapshot"
     assert schema.columns == (
@@ -563,10 +714,345 @@ def test_the_schema_is_the_one_the_plan_names():
         ("tables_skipped", "UInt32"),
         ("skipped_reason", "String"),
         ("measured_at", "DateTime64(3, 'UTC')"),
+        ("stored_bytes", "Nullable(UInt64)"),
     )
     assert schema.engine == "ReplacingMergeTree"
     assert schema.order_by == ("layer", "day")
     assert schema not in bronze_catalog.EXPECTED_SCHEMAS
+    # The column the table may be MISSING on an existing deployment is
+    # the one this plan adds, and it is the only one.
+    assert schema.additive_columns == (("stored_bytes", "Nullable(UInt64)"),)
+
+
+# ── The two numbers: the current data and the bytes on disk ───────────────
+#
+# A table's current snapshot counts the files the LIVE snapshot points at.
+# The bytes under the table's own location also hold the older snapshots'
+# files, the metadata and the orphan files, so the second number is the
+# bigger one. They are reported separately because they measure different
+# things, and the page shows both.
+
+
+def test_the_stored_number_is_bigger_than_the_current_number_when_a_table_keeps_history(
+    monkeypatch,
+):
+    """Two tables, one of them with two snapshots' worth of files: the
+    "current data" number (the current snapshot's `total-files-size`) is
+    BELOW the "stored on disk" number (the bytes under the table's own
+    location), because the location also holds the older snapshot's files
+    and the metadata."""
+    _fake_catalog(
+        monkeypatch,
+        {
+            "orders": _metadata("100", table="orders"),
+            "customers": _metadata("250", table="customers"),
+        },
+    )
+    _fake_clickhouse(
+        monkeypatch,
+        catalog_tables="bronze.orders\nbronze.customers\n",
+        parts={
+            "silver": {"table_count": "1", "total_bytes": "10"},
+            "serving": {"table_count": "1", "total_bytes": "20"},
+        },
+    )
+    store = _store(
+        {
+            # orders: the live snapshot's 100 bytes, an older snapshot's
+            # 200 bytes, and the metadata document.
+            f"{BUCKET}/warehouse/bronze/orders/data/current.parquet": 100,
+            f"{BUCKET}/warehouse/bronze/orders/data/older.parquet": 200,
+            f"{BUCKET}/warehouse/bronze/orders/metadata/v1.metadata.json": 30,
+            # customers: only the live snapshot, so its two numbers agree.
+            f"{BUCKET}/warehouse/bronze/customers/data/current.parquet": 250,
+        }
+    )
+
+    rows = storage_snapshot.measure_layers(_cfg(), store)
+
+    bronze = next(row for row in rows if row.layer == "bronze")
+    assert bronze.total_bytes == 350
+    assert bronze.stored_bytes == 580
+    assert bronze.stored_bytes > bronze.total_bytes
+    assert bronze.tables_skipped == 0
+    # ONE listing per table, and ONE probe of the bucket root before
+    # them: the run time of this job is the sum of those listings, so a
+    # second listing of the same location would double it.
+    #
+    # The listed path carries the BUCKET, because `s3fs` reads the first
+    # segment of a scheme-less path as the bucket name: the bare key
+    # would list a bucket named after the table's first folder.
+    assert store._fs.listed == [
+        BUCKET,
+        f"{BUCKET}/warehouse/bronze/orders",
+        f"{BUCKET}/warehouse/bronze/customers",
+    ], store._fs.listed
+    for path in store._fs.listed[1:]:
+        assert path.startswith(f"{BUCKET}/"), path
+
+
+def test_a_bucket_named_after_the_table_folder_does_not_answer_the_listing(monkeypatch):
+    """The listed path carries the bucket, because `s3fs` reads the FIRST
+    segment of a scheme-less path as the bucket name. A store that holds
+    a SECOND bucket named after the table's first folder (`warehouse`)
+    answers the bare-key listing with THAT bucket's objects, and the
+    "stored on disk" number would be another bucket's bytes.
+
+    The measured bucket's own bytes are the ones counted."""
+    _fake_catalog(
+        monkeypatch,
+        {"orders": _metadata("100", table="orders")},
+    )
+    _fake_clickhouse(
+        monkeypatch,
+        catalog_tables="bronze.orders\n",
+        parts={
+            "silver": {"table_count": "1", "total_bytes": "10"},
+            "serving": {"table_count": "1", "total_bytes": "20"},
+        },
+    )
+    store = _store(
+        {
+            # The measured bucket: the table's own files.
+            f"{BUCKET}/warehouse/bronze/orders/data/current.parquet": 100,
+            f"{BUCKET}/warehouse/bronze/orders/data/older.parquet": 200,
+            # The DECOY bucket, named after the table's first folder: its
+            # key is exactly what the bare-key path would list.
+            "warehouse/bronze/orders/data/decoy.parquet": 999,
+        },
+        buckets=(BUCKET, "warehouse"),
+    )
+
+    rows = storage_snapshot.measure_layers(_cfg(), store)
+
+    bronze = next(row for row in rows if row.layer == "bronze")
+    assert bronze.stored_bytes == 300
+    assert bronze.total_bytes == 100
+    assert bronze.tables_skipped == 0
+    assert store._fs.listed == [
+        BUCKET,
+        f"{BUCKET}/warehouse/bronze/orders",
+    ], store._fs.listed
+
+
+def test_a_table_whose_files_cannot_be_listed_is_skipped_and_is_in_neither_total(monkeypatch):
+    """One table's listing fails: that table is skipped with its fixed
+    reason, and its bytes are in NEITHER total -- not a zero in the stored
+    number, and not its current size in the other one. A table that could
+    not be measured whole must never look measured and empty."""
+    _fake_catalog(
+        monkeypatch,
+        {
+            "orders": _metadata("100", table="orders"),
+            "broken": _metadata("999", table="broken"),
+        },
+    )
+    _fake_clickhouse(
+        monkeypatch,
+        catalog_tables="bronze.orders\nbronze.broken\n",
+        parts={
+            "silver": {"table_count": "1", "total_bytes": "10"},
+            "serving": {"table_count": "1", "total_bytes": "20"},
+        },
+    )
+    store = _store(
+        {f"{BUCKET}/warehouse/bronze/orders/data/current.parquet": 100},
+        unlistable=(f"{BUCKET}/warehouse/bronze/broken",),
+    )
+
+    rows = storage_snapshot.measure_layers(_cfg(), store)
+
+    bronze = next(row for row in rows if row.layer == "bronze")
+    assert bronze.tables_skipped == 1
+    assert bronze.skipped_reason == storage_snapshot.SKIP_REASON_NOT_LISTED
+    assert bronze.total_bytes == 100
+    assert bronze.stored_bytes == 100
+    assert "999" not in str(bronze), bronze
+
+
+def test_a_table_outside_the_measured_bucket_is_skipped(monkeypatch):
+    """A table whose location names ANOTHER bucket cannot be measured
+    against this bucket's size: its bytes would not be comparable with the
+    bucket's, so the table is skipped with its own fixed reason and
+    contributes to neither total."""
+    _fake_catalog(
+        monkeypatch,
+        {"orders": _metadata("100", table="orders", location="s3://other-bucket/wh/orders")},
+    )
+    _fake_clickhouse(
+        monkeypatch,
+        catalog_tables="bronze.orders\n",
+        parts={
+            "silver": {"table_count": "1", "total_bytes": "10"},
+            "serving": {"table_count": "1", "total_bytes": "20"},
+        },
+    )
+
+    rows = storage_snapshot.measure_layers(_cfg(), _store())
+
+    bronze = next(row for row in rows if row.layer == "bronze")
+    assert bronze.tables_skipped == 1
+    assert bronze.skipped_reason == storage_snapshot.SKIP_REASON_OUTSIDE_BUCKET
+    assert bronze.total_bytes == 0
+    assert bronze.stored_bytes == 0
+
+
+def test_the_skip_reasons_of_the_iceberg_layers_are_fixed_sentences(monkeypatch):
+    """The reasons that reach the table (and from there the API) are four
+    fixed sentences for the Iceberg layers and one for the ClickHouse
+    layers. No upstream text -- a catalog error, a path, an S3 error --
+    ever reaches them."""
+    _fake_catalog(
+        monkeypatch,
+        {
+            "orders": _metadata("100", table="orders"),
+            "nosize": {
+                "metadata": {
+                    "current-snapshot-id": 7,
+                    "snapshots": [{"snapshot-id": 7, "summary": {}}],
+                    "location": _location("nosize"),
+                }
+            },
+            "nolocation": {
+                "metadata": {
+                    "current-snapshot-id": 7,
+                    "snapshots": [{"snapshot-id": 7, "summary": {"total-files-size": "5"}}],
+                    "snapshot-summary": {"total-files-size": "5"},
+                }
+            },
+        },
+    )
+    _fake_clickhouse(
+        monkeypatch,
+        catalog_tables="bronze.orders\nbronze.nosize\nbronze.nolocation\n",
+        parts={
+            "silver": {"table_count": "1", "total_bytes": "10"},
+            "serving": {"table_count": "1", "total_bytes": "20"},
+        },
+    )
+
+    rows = storage_snapshot.measure_layers(_cfg(), _store())
+
+    bronze = next(row for row in rows if row.layer == "bronze")
+    assert bronze.tables_skipped == 2
+    assert set(bronze.skipped_reason.split("; ")) == {
+        storage_snapshot.SKIP_REASON_NO_SIZE,
+        storage_snapshot.SKIP_REASON_UNREADABLE,
+    }
+    assert (
+        storage_snapshot.SKIP_REASON_UNREADABLE
+        == "the catalog's metadata could not be read"
+    )
+    assert storage_snapshot.SKIP_REASON_NO_SIZE == "the snapshot summary holds no size"
+    assert (
+        storage_snapshot.SKIP_REASON_NOT_LISTED == "the table's files could not be listed"
+    )
+    assert (
+        storage_snapshot.SKIP_REASON_OUTSIDE_BUCKET
+        == "the table lives outside the measured bucket"
+    )
+    assert (
+        storage_snapshot.SKIP_REASON_LAYER_UNREADABLE
+        == "the layer's own size could not be read"
+    )
+
+
+def test_the_clickhouse_layers_have_one_number_and_no_stored_number(monkeypatch):
+    """`silver` and `serving` are ClickHouse databases: their bytes sit on
+    the ClickHouse server's own disk, not in the warehouse bucket, so they
+    have ONE number and their stored number is `None` ("not measured
+    here"), never a zero ("this layer holds no bytes")."""
+    _fake_catalog(monkeypatch, {})
+    _fake_clickhouse(
+        monkeypatch,
+        catalog_tables="",
+        parts={
+            "silver": {"table_count": "3", "total_bytes": "4096"},
+            "serving": {"table_count": "6", "total_bytes": "8192"},
+        },
+    )
+
+    rows = storage_snapshot.measure_layers(_cfg(), _store())
+
+    by_layer = {row.layer: row for row in rows}
+    assert by_layer["silver"].stored_bytes is None
+    assert by_layer["serving"].stored_bytes is None
+    assert by_layer["silver"].total_bytes == 4096
+
+
+def test_an_object_store_that_refuses_the_listing_fails_the_run_and_is_not_a_skip(monkeypatch):
+    """The object store's own failure -- a wrong endpoint, a refused
+    credential -- is not a per-table skip: it fails the run with the
+    environment variables to set, rather than reporting "every table
+    skipped, zero bytes" (`docs/CODE-STANDARD.md`: a configuration/auth
+    failure is a `Failure`)."""
+    _fake_catalog(monkeypatch, {})
+    _fake_clickhouse(
+        monkeypatch,
+        catalog_tables="bronze.orders\n",
+        parts={
+            "silver": {"table_count": "1", "total_bytes": "10"},
+            "serving": {"table_count": "1", "total_bytes": "20"},
+        },
+    )
+    store = _store({}, unlistable=(BUCKET,))
+
+    with pytest.raises(Failure) as err:
+        storage_snapshot.measure_layers(_cfg(), store)
+
+    message = str(err.value)
+    assert "CONNECTOR_S3_ACCESS_KEY" in message
+    assert "CONNECTOR_S3_SECRET_KEY" in message
+    assert "CH_RUSTFS_S3_ENDPOINT" in message
+    assert "LAKEHOUSE_WAREHOUSE_BUCKET" in message
+    assert "Access Denied" not in message, f"the upstream text reached the message: {message}"
+
+
+def test_the_object_store_is_built_through_the_capacity_jobs_public_helper(monkeypatch):
+    """The "stored on disk" number and the bucket size are read through ONE
+    setup: `capacity_snapshot.build_filesystem`, the public helper of the
+    module that owns the bucket. A second copy of the credential and
+    endpoint logic would let the two numbers disagree for a reason nobody
+    could name (`AGENTS.md` rule 4)."""
+    built = []
+
+    def _build(cfg):
+        built.append(cfg)
+        return _FakeFilesystem({}, ())
+
+    monkeypatch.setattr(capacity_snapshot, "build_filesystem", _build)
+    monkeypatch.setenv("CONNECTOR_S3_ACCESS_KEY", "connector-key")
+    monkeypatch.setenv("CONNECTOR_S3_SECRET_KEY", "connector-secret")
+    monkeypatch.setenv("CH_RUSTFS_S3_ENDPOINT", "http://rustfs.invalid:9000")
+    monkeypatch.setenv("LAKEHOUSE_WAREHOUSE_BUCKET", BUCKET)
+
+    store = storage_snapshot.ObjectStore.from_capacity_config(
+        capacity_snapshot.CapacityConfig.from_env()
+    )
+
+    assert len(built) == 1, built
+    assert built[0].rustfs_access_key == "connector-key"
+    assert built[0].rustfs_secret_key == "connector-secret"
+    assert built[0].rustfs_endpoint == "http://rustfs.invalid:9000"
+    assert store._bucket == BUCKET
+
+
+def test_the_stored_objects_are_listed_through_the_capacity_jobs_public_helper(monkeypatch):
+    """The rule for "what counts as a stored object" is the capacity job's
+    own: `capacity_snapshot.list_stored_objects`. The directory marker
+    `s3fs` may return is not an object, so it is in neither the bytes nor
+    the count -- and the two callers cannot disagree about it."""
+    listed = []
+
+    def _list(fs, path):
+        listed.append(path)
+        return 42, 1
+
+    monkeypatch.setattr(capacity_snapshot, "list_stored_objects", _list)
+    store = _store()
+
+    assert store.stored_bytes(_location("orders")) == (42, "")
+    assert listed == [f"{BUCKET}/warehouse/bronze/orders"], listed
 
 
 @pytest.fixture
@@ -624,7 +1110,7 @@ def test_the_clickhouse_layers_are_measured_from_system_parts(monkeypatch):
     monkeypatch.setattr(maintenance, "_ch_query", lambda _cfg, sql: "")
     monkeypatch.setattr(bronze_catalog.ClickHouseTarget, "query_json", _query_json)
 
-    rows = storage_snapshot.measure_layers(_cfg())
+    rows = storage_snapshot.measure_layers(_cfg(), _store())
     by_layer = {row.layer: row for row in rows}
     assert by_layer["silver"].total_bytes == 1024
     assert by_layer["silver"].table_count == 4

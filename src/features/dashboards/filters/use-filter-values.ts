@@ -1,8 +1,8 @@
 "use client";
 
 import * as React from "react";
-import type { FilterDef } from "@/services/clients/bi-store";
-import { apiFetch } from "@/services/http";
+import { useService } from "@/hooks/use-service";
+import { dashboardService, type FilterDef, type FilterValuesScope } from "@/services";
 
 export type FilterValuesState = {
   values: string[];
@@ -47,6 +47,10 @@ const SEARCH_DEBOUNCE_MS = 250;
  * Either way the OTHER active filters narrow the list, and a debounced search
  * narrows it further. A newer request aborts the older one so a slow answer
  * can never overwrite a fresher list.
+ *
+ * `BI-29` D7: read through `dashboardService.filterValues` and `useService`
+ * (the abort-on-newer-request is the hook's), not a hand-rolled effect that
+ * called `apiFetch` itself.
  */
 export function useFilterValues(
   { board, column, others, search, source }: {
@@ -57,7 +61,6 @@ export function useFilterValues(
     source?: OwnSource;
   },
 ): FilterValuesState {
-  const [state, setState] = React.useState<FilterValuesState>({ values: [], truncated: false, loading: true, error: null });
   // The filters as text, so a new array with the same content is no reason to refetch.
   const othersKey = JSON.stringify(others.filter((f) => f.column !== column));
   // The source in plain text, so its own object identity is no reason either.
@@ -66,43 +69,37 @@ export function useFilterValues(
   const ownJoins = source && "mart" in source && source.joins?.length ? JSON.stringify(source.joins) : "";
   const ownSqlSource = source && "sqlSource" in source ? source.sqlSource : "";
 
+  // A typed search waits for a pause before it asks; clearing it asks at once.
+  const [asked, setAsked] = React.useState(search);
   React.useEffect(() => {
-    if (unsaved) {
-      setState({ values: [], truncated: false, loading: false, error: UNSAVED_SOURCE_SENTENCE });
-      return;
-    }
-    const ctl = new AbortController();
-    setState((s) => ({ ...s, loading: true, error: null }));
-    const timer = setTimeout(async () => {
-      try {
-        const q = new URLSearchParams({ column });
-        if (ownMart) {
-          q.set("mart", ownMart);
-          if (ownJoins) q.set("joins", ownJoins);
-        } else if (ownSqlSource) {
-          q.set("source", ownSqlSource);
-        } else {
-          q.set("board", board);
-        }
-        if (search.trim()) q.set("q", search.trim());
-        if (othersKey !== "[]") q.set("filters", othersKey);
-        const res = await apiFetch(`/api/dashboard/values?${q.toString()}`, { cache: "no-store", signal: ctl.signal });
-        if (!res.ok) throw new Error("values");
-        const json = (await res.json()) as { values?: unknown[]; truncated?: boolean };
-        if (ctl.signal.aborted) return;
-        setState({
-          values: (json.values ?? []).map(String),
-          truncated: json.truncated === true,
-          loading: false,
-          error: null,
-        });
-      } catch {
-        if (ctl.signal.aborted) return;
-        setState({ values: [], truncated: false, loading: false, error: "Could not load values." });
-      }
-    }, search ? SEARCH_DEBOUNCE_MS : 0);
-    return () => { clearTimeout(timer); ctl.abort(); };
-  }, [board, column, othersKey, search, unsaved, ownMart, ownJoins, ownSqlSource]);
+    if (search === asked) return;
+    const timer = setTimeout(() => setAsked(search), search ? SEARCH_DEBOUNCE_MS : 0);
+    return () => clearTimeout(timer);
+  }, [search, asked]);
 
-  return state;
+  const result = useService(async (signal) => {
+    // No request for an unsaved source: its list would be the old text's values.
+    if (unsaved) return { values: [] as string[], truncated: false };
+    const scope: FilterValuesScope = ownMart
+      ? { mart: ownMart, ...(ownJoins ? { joins: JSON.parse(ownJoins) as unknown[] } : {}) }
+      : ownSqlSource ? { sqlSource: ownSqlSource } : { board };
+    return dashboardService.filterValues(
+      { column, scope, others: JSON.parse(othersKey) as FilterDef[], search: asked },
+      signal,
+    );
+  }, [board, column, othersKey, asked, unsaved, ownMart, ownJoins, ownSqlSource]);
+
+  // The last list stays on screen while a newer one loads, as the list did
+  // before this read went through `useService`, so typing does not flash it.
+  const [last, setLast] = React.useState<{ values: string[]; truncated: boolean }>({ values: [], truncated: false });
+  React.useEffect(() => {
+    if (result.status === "success") setLast(result.data);
+  }, [result]);
+
+  if (unsaved) return { values: [], truncated: false, loading: false, error: UNSAVED_SOURCE_SENTENCE };
+  if (result.status === "error") return { values: [], truncated: false, loading: false, error: "Could not load values." };
+  if (result.status === "loading" || search !== asked) {
+    return { ...last, loading: true, error: null };
+  }
+  return { values: result.data.values, truncated: result.data.truncated, loading: false, error: null };
 }

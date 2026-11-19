@@ -100,7 +100,8 @@ pub struct ScheduleBody {
 /// `403` when the caller is outside the tenant that owns the shared catalog
 /// (that answer is the same for every table); `400` when the table is not
 /// `bronze.`/`silver.`/`serving.` plus a plain name, when the caller's table
-/// access hides it (the sentence a rule on that table gets, `GOV-15`), when the
+/// access hides it (the sentence a rule on that table gets, `GOV-15`), or when
+/// the table is outside the caller's reach (`SEC-80`, the same sentence), when the
 /// mode is not `on_load` or `interval`, the interval is missing for `interval`
 /// or outside 60 to 1440, or the body is malformed; `503`/`500` on a store
 /// failure. The table's existence is not checked, as before.
@@ -128,7 +129,11 @@ pub async fn put_schedule(
     // GOV-15 (GOV-12 plan, section 4): a schedule names a table, not a rule, so
     // a table the role does not read is refused with the sentence a rule on it
     // gets (D5). Existence is not checked, so the two refusals read alike.
-    if !access.allows_key(&key) {
+    // SEC-80: a table another tenant claimed is refused the same way.
+    if !access.allows_key(&key)
+        || !crate::routes::quality::quality_key_in_reach(&state, Some(&principal), &headers, &key)
+            .await?
+    {
         return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
     }
     let mode = ScheduleMode::parse(&body.mode)
@@ -167,7 +172,8 @@ pub async fn put_schedule(
 /// `403` when the caller is outside the tenant that owns the shared catalog;
 /// `400` when the table is not `bronze.`/`silver.`/`serving.` plus a plain
 /// name, or when the caller's table access hides it (the sentence a rule on
-/// that table gets, `GOV-15`); `503`/`500` on a store failure. The table's
+/// that table gets, `GOV-15`), or when the table is outside the caller's reach
+/// (`SEC-80`); `503`/`500` on a store failure. The table's
 /// existence is not checked, as before.
 pub async fn delete_schedule(
     State(state): State<AppState>,
@@ -186,7 +192,11 @@ pub async fn delete_schedule(
     })?;
     // GOV-15 (GOV-12 plan, section 4): refusing first, so a reset changes
     // nothing for a table the role does not read (D8).
-    if !access.allows_key(&key) {
+    // SEC-80: and nothing for a table another tenant claimed.
+    if !access.allows_key(&key)
+        || !crate::routes::quality::quality_key_in_reach(&state, Some(&principal), &headers, &key)
+            .await?
+    {
         return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
     }
     quality::delete_schedule(pool(&state)?, &key).await?;

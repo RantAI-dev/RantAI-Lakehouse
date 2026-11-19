@@ -7,7 +7,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { clickProblem } from "@/lib/click-destination";
 import { useService } from "@/hooks/use-service";
 import { queryService } from "@/services";
-import type { ChartClick } from "@/services/clients/bi-store";
+import type { ChartClick } from "@/services";
 import { apiFetch } from "@/services/http";
 
 type BoardOpt = { id: string; name: string };

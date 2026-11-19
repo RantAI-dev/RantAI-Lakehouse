@@ -33,7 +33,7 @@ import { brandingImageUrl, type Branding, type BrandingPicture } from "@/service
  * workspace: the workspace owns its name and its icon, not the sentence that
  * says what the console is.
  */
-const PRODUCT_DESCRIPTION = "Rantai Lake - Data platform"
+const PRODUCT_DESCRIPTION = `${PRODUCT_NAME} - Data platform`
 
 /** The API this console serves; read at call time (see the module doc). */
 function apiBase(): string {

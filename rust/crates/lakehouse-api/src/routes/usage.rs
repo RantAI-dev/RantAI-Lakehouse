@@ -36,10 +36,11 @@
 //!
 //! # A person's name
 //!
-//! `group=person` keys a row by the owner's id. Its `label` is the name
-//! recorded on the person's newest run when the caller holds `identity:read`
-//! (the permission that opens the user list), and the id otherwise. A run with
-//! no owner has only a recorded name, which is its key and its label.
+//! `group=person` keys a row by the owner's id. Its `label` is the name the
+//! user list holds for that owner (`app_user.name`) when the caller holds
+//! `identity:read` (the permission that opens the user list), and the id
+//! otherwise. A run with no owner has only a recorded name, which is its key
+//! and its label.
 //!
 //! # The period
 //!
@@ -61,10 +62,23 @@
 //!
 //! `GET /api/usage/storage` reads what the daily storage job measured
 //! (`dagster/dispar_orchestrate/storage_snapshot.py`): the size of every
-//! layer, one row per layer per day. Only a caller holding `*:*` may read
+//! layer, one row per layer per day, and the size of the object store's
+//! bucket, which another job measured. Only a caller holding `*:*` may read
 //! it, because a layer holds the tables of every tenant (SEC-20 hides
 //! another tenant's table names and counts). A tenant administrator is
 //! refused with 403 and a fixed sentence.
+//!
+//! A layer carries two numbers: the bytes of its tables' CURRENT snapshots
+//! (`currentBytes`) and the bytes the object store holds under them
+//! (`storedBytes`, `null` for a `ClickHouse` layer, whose bytes sit on the
+//! engine's own disk and not in the warehouse bucket). The estimate in money
+//! is priced on the bytes on disk, and the bucket's own number minus the
+//! disk sum of the newest day is what the bucket holds in no current table.
+//!
+//! Before the daily job has run here there is nothing to report: the route
+//! answers 200 with no rows and no measurement, never an outage. Every other
+//! `ClickHouse` failure keeps the fixed 503, because a failure must never
+//! look like an empty result.
 
 use axum::Extension;
 use axum::body::{Body, Bytes};
@@ -88,7 +102,7 @@ use crate::audit_coverage;
 use crate::csv_export;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::support::{num_or_zero, str_col};
+use crate::routes::support::{nullable_u64_col, num_or_zero, str_col};
 use crate::state::AppState;
 use crate::tenant_scope;
 use crate::upstream_error;
@@ -744,18 +758,24 @@ const BYTES_PER_GB: i128 = 1_000_000_000;
 /// how many digits of it one micro unit holds.
 const RATE_DECIMALS: usize = 6;
 
+/// The fixed sentence a `ClickHouse` failure on the storage read answers
+/// with. It is a fixed sentence and never `ClickHouse`'s own text (AGENTS.md
+/// rule 4), the same posture as `routes::lakehouse`'s capacity read.
+const STORAGE_UNAVAILABLE: &str = "storage per layer is unavailable";
+
 /// A `ClickHouse` failure on the storage read: a fixed 503, never
 /// `ClickHouse`'s own text (AGENTS.md rule 4), the same posture as
 /// `routes::lakehouse`'s capacity read.
 ///
-/// `bronze_meta.storage_layer_snapshot` is written once a day by a single
-/// whole-deployment job. A table that is not there means the job has never
-/// run here -- which a caller cannot tell apart from `ClickHouse` being
-/// down -- so both take this same fixed 503, never an empty `rows: []`
-/// success.
+/// A table that does not exist is not this: `bronze_meta.storage_layer_snapshot`
+/// is written once a day by a single whole-deployment job, so before its
+/// first run `ClickHouse` reports that it does not exist, which truthfully
+/// means "nothing has been measured here yet" and not "the engine is down".
+/// That case is answered with an empty measurement ([`storage_layers`]), never
+/// with this 503 and never with a `rows: []` success that hides a failure.
 fn classify_storage_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
     tracing::warn!(%err, "the storage snapshot lookup failed");
-    ApiError::Unavailable("storage per layer is unavailable".to_owned())
+    ApiError::Unavailable(STORAGE_UNAVAILABLE.to_owned())
 }
 
 /// A rate's amount as micro units (a millionth of the unit), or `None` when
@@ -811,11 +831,26 @@ fn decimal_text(micro: i128) -> String {
 /// The two dates are written as literals through [`SqlLiteral`]: they are
 /// the only values in the statement, and this module has already checked
 /// that they are days.
-fn storage_query(from: Date, to: Date) -> String {
+///
+/// `stored_bytes` is the bytes the object store holds under the layer's
+/// tables and `total_bytes` the bytes of their current snapshots; the second
+/// is read under its own name and travels as `currentBytes`.
+///
+/// With `with_disk` false the statement does not name `stored_bytes` at
+/// all: it is the deploy-window re-read of [`storage_layers`], against a
+/// table that predates the column, where naming it is the one thing the
+/// engine refuses.
+fn storage_query(from: Date, to: Date, with_disk: bool) -> String {
+    let disk = if with_disk {
+        "toString(stored_bytes) stored_bytes, "
+    } else {
+        ""
+    };
     format!(
         "SELECT day, layer, toString(table_count) table_count, \
-         toString(total_bytes) total_bytes, toString(tables_skipped) tables_skipped, \
-         skipped_reason \
+         toString(total_bytes) total_bytes, {disk}\
+         toString(tables_skipped) tables_skipped, skipped_reason, \
+         toString(measured_at) measured_at \
          FROM lake.`bronze_meta.storage_layer_snapshot` FINAL \
          WHERE day >= {} AND day <= {} \
          ORDER BY day ASC, layer ASC",
@@ -824,24 +859,245 @@ fn storage_query(from: Date, to: Date) -> String {
     )
 }
 
+/// The statement behind the bucket's own number: the newest row of
+/// `lake.bronze_meta.capacity_snapshot`, the daily job that measures the
+/// object store's bucket.
+///
+/// The newest row is the one with the greatest `measured_at`: the table holds
+/// one row per run of that job. `FINAL` for the same reason the layer read
+/// has it.
+fn capacity_query() -> &'static str {
+    "SELECT toString(measured_at) measured_at, bucket_name, toString(bytes) bytes \
+     FROM lake.`bronze_meta.capacity_snapshot` FINAL \
+     ORDER BY measured_at DESC LIMIT 1"
+}
+
+/// `ClickHouse` saying the disk column is not there: the table exists but
+/// predates `stored_bytes`, which is the deploy window between the route
+/// learning the column and the daily job's next 01:00 UTC run appending it
+/// with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. Staging's Dagster can
+/// keep that window open for days.
+///
+/// [`super::lakehouse::is_unknown_table_error`]'s posture, applied to one
+/// column: the engine's text is CLASSIFIED into a `bool` here and none of
+/// it leaves this function (AGENTS.md rule 4). The match is narrow -- the
+/// unknown-column code in either of its two renderings
+/// (`(UNKNOWN_IDENTIFIER)`, `Code: 47.`) AND the body naming the disk
+/// column (PR #591 review 1; decision 6: a measurement that has not
+/// happened yet is not an outage).
+///
+/// A code 47 about ANOTHER column keeps the fixed 503, and it reaches it in
+/// one of two ways (PR #591 review 1, executor review, SHOULD-FIX 1). A
+/// body that names the missing column alone -- the shape
+/// `Unknown expression identifier 'total_bytes' in scope.` -- does not
+/// name `stored_bytes` at all, so the match does not happen and the
+/// failure is classified as it always was. A body that echoes the
+/// statement, the shape a missing column in the select list takes --
+/// `Missing columns: 'total_bytes' while processing query: ...` -- names
+/// `stored_bytes` too, because the statement names it, so the arm runs;
+/// and the re-read is what refuses it, because the fallback statement
+/// names every column the first one names except the disk one, so it
+/// fails on the same missing column, and that failure is classified into
+/// the fixed 503.
+fn is_unknown_disk_column_error(body: &str) -> bool {
+    (body.contains("(UNKNOWN_IDENTIFIER)") || body.contains("Code: 47."))
+        && body.contains("stored_bytes")
+}
+
+/// The layer rows of the period, or the fact that nothing was measured yet.
+///
+/// `bronze_meta.storage_layer_snapshot` is created by the daily job, so
+/// before its first run `ClickHouse` reports that it does not exist
+/// ([`super::lakehouse::is_unknown_table_error`]). That is a measurement
+/// that has not happened yet, not an outage, so the answer is an empty one
+/// (200, no rows, no measurement).
+///
+/// The deploy window is the other not-an-outage case (PR #591 review 1):
+/// the job ran here BEFORE it had the disk column, so the table exists
+/// without `stored_bytes` and the first read fails with the
+/// unknown-column error ([`is_unknown_disk_column_error`]). The read is
+/// repeated without the column -- the rows, the days and the `measured_at`
+/// are all there -- and comes back as [`LayerRows::MeasuredWithoutDisk`].
+/// Every OTHER failure keeps the fixed 503 [`classify_storage_ch_error`]
+/// gives, because a failure must never look like an empty result (AGENTS.md
+/// principle 2).
+///
+/// # Errors
+///
+/// The fixed 503 [`classify_storage_ch_error`] produces, for any
+/// `ClickHouse` failure other than an unknown table or the deploy window's
+/// unknown disk column.
+async fn storage_layers(
+    ch: &lakehouse_clickhouse::ChClient,
+    from: Date,
+    to: Date,
+) -> Result<LayerRows, ApiError> {
+    match ch.rows(&storage_query(from, to, true), None).await {
+        Ok(rows) => Ok(LayerRows::Measured(rows)),
+        Err(lakehouse_clickhouse::ChError::Server(ref body))
+            if super::lakehouse::is_unknown_table_error(body) =>
+        {
+            tracing::debug!(
+                "bronze_meta.storage_layer_snapshot does not exist yet: nothing has been measured"
+            );
+            Ok(LayerRows::NotMeasuredYet)
+        }
+        Err(lakehouse_clickhouse::ChError::Server(ref body))
+            if is_unknown_disk_column_error(body) =>
+        {
+            tracing::debug!(
+                "bronze_meta.storage_layer_snapshot predates the disk column: re-reading without it"
+            );
+            let rows = ch
+                .rows(&storage_query(from, to, false), None)
+                .await
+                .map_err(|err| classify_storage_ch_error(&err))?;
+            Ok(LayerRows::MeasuredWithoutDisk(rows))
+        }
+        Err(err) => Err(classify_storage_ch_error(&err)),
+    }
+}
+
+/// What the layer read found: the rows of the period, nothing measured
+/// yet, or the rows of a table that predates the disk column.
+enum LayerRows {
+    /// The rows of the period.
+    Measured(Vec<Map<String, Value>>),
+    /// The table does not exist: the daily job has never run here.
+    NotMeasuredYet,
+    /// The table exists but has no `stored_bytes` yet (the deploy window,
+    /// PR #591 review 1): the rows carry the current data alone, so the
+    /// bucket comparison is meaningless and the bucket is not read.
+    MeasuredWithoutDisk(Vec<Map<String, Value>>),
+}
+
+/// A row's bytes stored on disk, or `None` when the job measured none: a
+/// `ClickHouse` layer's bytes are not in the warehouse bucket, and the job
+/// writes `NULL` for them.
+fn stored_bytes(row: &Map<String, Value>) -> Option<i64> {
+    let bytes = nullable_u64_col(row, "stored_bytes")?;
+    i64::try_from(bytes).ok()
+}
+
+/// The newest `measured_at` of the rows, the way `ClickHouse` renders it
+/// (`toString`), or `None` when no row carries one.
+///
+/// The rendered shape sorts as the time it names, so the greatest of them is
+/// the newest measurement.
+fn newest_measured_at(rows: &[Map<String, Value>]) -> Option<String> {
+    rows.iter()
+        .map(|row| str_col(row, "measured_at"))
+        .filter(|text| !text.is_empty())
+        .max()
+        .map(str::to_owned)
+}
+
+/// The bytes stored on disk under the tables of the NEWEST day of the
+/// period, or `None` when the period holds no row at all.
+///
+/// The `ClickHouse` layers are left out: their bytes are not in the
+/// warehouse bucket, so they are not part of what the bucket holds. A day
+/// whose rows carry no stored number at all (only `ClickHouse` layers) sums
+/// to zero: the bucket holds all of it.
+fn newest_day_stored_bytes(rows: &[Map<String, Value>]) -> Option<i64> {
+    let newest_day = rows.iter().map(|row| str_col(row, "day")).max()?;
+    let mut sum: i64 = 0;
+    for row in rows {
+        if str_col(row, "day") != newest_day {
+            continue;
+        }
+        let Some(bytes) = stored_bytes(row) else {
+            continue;
+        };
+        sum = sum.checked_add(bytes)?;
+    }
+    Some(sum)
+}
+
+/// The bytes of the bucket that no current table accounts for: the bucket's
+/// own size minus the bytes stored on disk under the newest day's tables.
+///
+/// `None` when the difference would be negative: the two measurements
+/// disagree, and the page says "not comparable" instead of a negative number.
+/// `None` too when the period holds no row at all, so no day's disk sum is
+/// known.
+fn unaccounted_bytes(bucket_bytes: i64, rows: &[Map<String, Value>]) -> Option<i64> {
+    let difference = bucket_bytes.checked_sub(newest_day_stored_bytes(rows)?)?;
+    (difference >= 0).then_some(difference)
+}
+
+/// The bucket's own measurement, or `None` when the bucket was never
+/// measured.
+///
+/// `lake.bronze_meta.capacity_snapshot` is written by another job, so a table
+/// that does not exist is not a failure: the bucket was never measured, and
+/// the layer rows are still the answer. Every other failure keeps the fixed
+/// 503, for the same reason the layer read keeps it.
+///
+/// # Errors
+///
+/// The fixed 503 [`classify_storage_ch_error`] produces, for any
+/// `ClickHouse` failure other than an unknown table.
+async fn bucket_body(
+    ch: &lakehouse_clickhouse::ChClient,
+    rows: &[Map<String, Value>],
+) -> Result<Option<StorageBucketBody>, ApiError> {
+    let newest = match ch.rows(capacity_query(), None).await {
+        Ok(found) => found.into_iter().next(),
+        Err(lakehouse_clickhouse::ChError::Server(ref body))
+            if super::lakehouse::is_unknown_table_error(body) =>
+        {
+            tracing::debug!("bronze_meta.capacity_snapshot does not exist yet: no bucket measured");
+            None
+        }
+        Err(err) => return Err(classify_storage_ch_error(&err)),
+    };
+    let Some(newest) = newest else {
+        return Ok(None);
+    };
+    let bytes = num_or_zero(Some(&newest), "bytes");
+    Ok(Some(StorageBucketBody {
+        name: str_col(&newest, "bucket_name").to_owned(),
+        bytes,
+        measured_at: str_col(&newest, "measured_at").to_owned(),
+        unaccounted_bytes: unaccounted_bytes(bytes, rows),
+    }))
+}
+
+/// The answer's rows from the read's rows: one [`StorageRowBody`] each.
+///
+/// The two reads map the same way: a row without a disk number -- a
+/// `ClickHouse` layer's, or any row of the deploy-window re-read, where the
+/// column was not in the statement at all -- reads `stored_bytes` as `null`
+/// and prices its estimate on the current data.
+fn storage_rows(rows: &[Map<String, Value>], rates: &[UsageRate]) -> Vec<StorageRowBody> {
+    rows.iter().map(|row| storage_row(row, rates)).collect()
+}
+
 /// One measured layer for one day, as the console reads it.
 fn storage_row(row: &Map<String, Value>, rates: &[UsageRate]) -> StorageRowBody {
     let day_text = str_col(row, "day");
-    let total_bytes = num_or_zero(Some(row), "total_bytes");
+    let current_bytes = num_or_zero(Some(row), "total_bytes");
+    let stored_bytes = stored_bytes(row);
+    // The estimate is priced on the bytes ON DISK: the bytes the object store
+    // holds when the job measured them, and the current data otherwise -- a
+    // `ClickHouse` layer's one number IS its own on-disk size.
+    let priced_bytes = stored_bytes.unwrap_or(current_bytes);
     // The rate in force on the row's OWN day: a price that starts later does
     // not price an earlier day, and a day before the first rate has no
     // estimate at all.
     let estimate = parse_day(day_text).and_then(|day| {
         let rate = usage::rate_in_force(rates, STORAGE_RATE_KIND, day)?;
         let rate_micro = micro_units(&rate.amount)?;
-        estimate_micro(i128::from(total_bytes), rate_micro, day)
+        estimate_micro(i128::from(priced_bytes), rate_micro, day)
     });
     let reason = str_col(row, "skipped_reason");
     StorageRowBody {
         day: day_text.to_owned(),
         layer: str_col(row, "layer").to_owned(),
         table_count: num_or_zero(Some(row), "table_count"),
-        total_bytes,
+        current_bytes,
+        stored_bytes,
         tables_skipped: num_or_zero(Some(row), "tables_skipped"),
         // The reason the job wrote is a fixed sentence, and there is none
         // when no table was skipped.
@@ -864,8 +1120,11 @@ pub struct StorageRowBody {
     layer: String,
     /// How many tables the layer holds.
     table_count: i64,
-    /// The bytes of the tables that were measured.
-    total_bytes: i64,
+    /// The bytes of the tables' CURRENT snapshots: today's data.
+    current_bytes: i64,
+    /// The bytes the object store holds under the layer's tables; `null` for
+    /// a `ClickHouse` layer, whose bytes are not in the warehouse bucket.
+    stored_bytes: Option<i64>,
     /// How many of the layer's tables could not be measured. A layer with a
     /// skipped table is never a layer of zero bytes.
     tables_skipped: i64,
@@ -873,6 +1132,22 @@ pub struct StorageRowBody {
     skipped_reason: Option<String>,
     /// The month's estimate in the currency; `null` when no rate applied.
     estimate: Option<String>,
+}
+
+/// The object store's bucket, as the daily capacity job measured it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageBucketBody {
+    /// The bucket's name.
+    name: String,
+    /// The bytes the bucket holds.
+    bytes: i64,
+    /// When the bucket was measured.
+    measured_at: String,
+    /// The bytes of the bucket that no current table accounts for; `null`
+    /// when the two measurements disagree, or when no day's disk sum is
+    /// known.
+    unaccounted_bytes: Option<i64>,
 }
 
 /// The answer of `GET /api/usage/storage`.
@@ -884,6 +1159,15 @@ pub struct StorageBody {
     /// The currency of the storage rate in force at the end of the period;
     /// `null` while no rate applies.
     currency: Option<String>,
+    /// When the newest measurement was taken; `null` when nothing has been
+    /// measured yet.
+    measured_at: Option<String>,
+    /// The object store's bucket and its own measurement; `null` when the
+    /// bucket was never measured, and also when the table predates the
+    /// disk column (the deploy window, PR #591 review 1): the bucket's
+    /// remainder is worked out from disk numbers, and there are none to
+    /// work it out from.
+    bucket: Option<StorageBucketBody>,
     /// One row per layer per day, oldest first.
     rows: Vec<StorageRowBody>,
 }
@@ -898,13 +1182,40 @@ pub struct StorageBody {
 /// and counts, so a tenant administrator is refused with 403 and a fixed
 /// sentence.
 ///
+/// # The two numbers of a layer
+///
+/// A row carries the bytes of the tables' current snapshots (`currentBytes`)
+/// and the bytes the object store holds under them (`storedBytes`). A
+/// `ClickHouse` layer has one number only: its bytes sit on the engine's own
+/// disk, not in the warehouse bucket, so `storedBytes` is `null` for it.
+///
 /// # The estimate
 ///
 /// The rate in force on the row's own day -- the `storage_gb_month` rate
 /// with the latest `effective_from` on or before it
 /// ([`usage::rate_in_force`]) -- times the layer's bytes as gigabytes,
-/// spread over the days of that month. A day before the first rate applies
-/// has no estimate, and says so with `null`.
+/// spread over the days of that month. The bytes are the ones ON DISK: the
+/// stored bytes when the job measured them, the current data otherwise. A
+/// day before the first rate applies has no estimate, and says so with
+/// `null`.
+///
+/// # Not measured yet
+///
+/// The daily job creates the table it writes, so before its first run
+/// `ClickHouse` reports that the table does not exist. That is a
+/// measurement that has not happened yet, not an outage: the answer is 200
+/// with no rows, no measurement and no bucket. Every other `ClickHouse`
+/// failure keeps the fixed 503, because a failure must never look like an
+/// empty result.
+///
+/// The deploy window reads the same way (PR #591 review 1): a table the job
+/// created before it had the disk column answers `ClickHouse`'s
+/// unknown-column error, and that too is a measurement that has not
+/// happened here yet (decision 6). The route re-reads without the column
+/// and answers the current data with `storedBytes: null` on every row, the
+/// `measuredAt` of those rows, and no bucket -- the bucket's remainder is
+/// meaningless without disk numbers, so the page loses the remainder line,
+/// not the report.
 ///
 /// # Errors
 ///
@@ -922,11 +1233,7 @@ pub async fn storage(
     }
     let raw = read_params(params)?;
     let (from, to) = read_period(&raw)?;
-    let rows = state
-        .clickhouse
-        .rows(&storage_query(from, to), None)
-        .await
-        .map_err(|err| classify_storage_ch_error(&err))?;
+    let layers = storage_layers(&state.clickhouse, from, to).await?;
     let rates = usage::list_rates(pool(&state)?)
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
@@ -935,10 +1242,77 @@ pub async fn storage(
     // has no estimate.
     let currency =
         usage::rate_in_force(&rates, STORAGE_RATE_KIND, to).map(|rate| rate.currency.clone());
+    let (rows, measured_at, bucket) = match layers {
+        // Nothing was ever measured here: the bucket is not read either,
+        // because there is no measurement to compare it with.
+        LayerRows::NotMeasuredYet => (Vec::new(), None, None),
+        LayerRows::Measured(found) => {
+            let measured_at = newest_measured_at(&found);
+            let bucket = bucket_body(&state.clickhouse, &found).await?;
+            (storage_rows(&found, &rates), measured_at, bucket)
+        }
+        // The deploy window (PR #591 review 1): the table predates the disk
+        // column, so every row's disk number reads as `null` and the rows
+        // are the current data alone. The bucket's remainder would be
+        // worked out from disk numbers that do not exist, which is
+        // meaningless, so the bucket is not read either -- the page loses
+        // the remainder line, not the report (decision 6: the disk
+        // measurement has not happened here yet, it has not failed).
+        LayerRows::MeasuredWithoutDisk(found) => {
+            let measured_at = newest_measured_at(&found);
+            (storage_rows(&found, &rates), measured_at, None)
+        }
+    };
     Ok(ApiJson(StorageBody {
         from: day_text(from),
         to: day_text(to),
         currency,
-        rows: rows.iter().map(|row| storage_row(row, &rates)).collect(),
+        measured_at,
+        bucket,
+        rows,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "a unit test that builds the days it reads with the crate's own parser (`parse_day`)"
+    )]
+
+    use super::*;
+
+    /// The deploy window's re-read is the layer statement with the disk
+    /// column left out and NOTHING else left out: the statement is built by
+    /// string surgery, and a fragment lost in that surgery would turn the
+    /// window back into the fixed 503 with every route test still green,
+    /// because the route test matches the wiremock on a substring (PR #591
+    /// review 1).
+    #[test]
+    fn the_deploy_window_read_leaves_out_the_disk_column_and_keeps_the_rest_of_the_statement() {
+        let from = parse_day("2026-03-01").expect("a day this crate parses");
+        let to = parse_day("2026-03-31").expect("a day this crate parses");
+
+        let with_disk = storage_query(from, to, true);
+        assert!(
+            with_disk.contains("toString(stored_bytes) stored_bytes,"),
+            "{with_disk}"
+        );
+
+        let without_disk = storage_query(from, to, false);
+        assert!(!without_disk.contains("stored_bytes"), "{without_disk}");
+        assert!(
+            !without_disk.contains("toString(stored_bytes)"),
+            "{without_disk}"
+        );
+        assert!(
+            without_disk.contains("toString(total_bytes) total_bytes,"),
+            "{without_disk}"
+        );
+        assert!(
+            without_disk.contains("toString(tables_skipped) tables_skipped"),
+            "{without_disk}"
+        );
+    }
 }
