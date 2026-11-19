@@ -497,7 +497,10 @@ describe("UsagePage", () => {
         json(
           storageReport({
             currency: null,
-            rows: [{ ...STORAGE_ROW, layer: "silver", currentBytes: 4096, storedBytes: null }],
+            rows: [
+              { ...STORAGE_ROW, layer: "bronze", currentBytes: 1_000_000_000, storedBytes: 1_200_000_000 },
+              { ...STORAGE_ROW, layer: "silver", currentBytes: 4096, storedBytes: null },
+            ],
           })
         ),
     })
@@ -507,6 +510,44 @@ describe("UsagePage", () => {
         "silver is a ClickHouse layer: its bytes sit on the ClickHouse server's own disk, not in the warehouse bucket, so it has one number."
       )
     ).toBeTruthy()
+    // A report that DOES carry disk numbers is not the deploy window: the
+    // not-measured-yet note would contradict it.
+    expect(
+      screen.queryByText("Stored on disk: not measured yet. The daily job runs at 01:00 UTC.")
+    ).toBeNull()
+  })
+
+  it("says the disk was not measured yet instead of naming ClickHouse layers when no row carries a disk number", async () => {
+    stubApi(["*:*"], {
+      storage: () =>
+        json(
+          storageReport({
+            currency: null,
+            bucket: null,
+            rows: [
+              { ...STORAGE_ROW, layer: "bronze", currentBytes: 1_000_000_000, storedBytes: null },
+              { ...STORAGE_ROW, layer: "silver", currentBytes: 4096, storedBytes: null },
+            ],
+          })
+        ),
+    })
+    renderPage()
+    // The deploy window (`PR #591 review 1`): the route re-read without the
+    // disk column, so every layer lacks the number because the job has not
+    // measured it here yet — not because the layers sit on the engine's own
+    // disk, which is what the ClickHouse line would claim.
+    expect(
+      await screen.findByText("Stored on disk: not measured yet. The daily job runs at 01:00 UTC.")
+    ).toBeTruthy()
+    expect(screen.queryByText(/is a ClickHouse layer|are ClickHouse layers/)).toBeNull()
+    // The API sends no bucket in this state, so the remainder line stays
+    // hidden.
+    expect(screen.queryByText(/In the bucket but in no current table/)).toBeNull()
+    // The column keeps its dash for the missing number.
+    const view = storageView()
+    const storedAt = view.getAllByRole("columnheader").map((h) => h.textContent).indexOf("Stored on disk")
+    const row = view.getAllByRole("row").find((r) => within(r).queryByText("bronze") !== null)!
+    expect(within(row).getAllByRole("cell")[storedAt].textContent).toBe("—")
   })
 
   it("shows the bytes in the bucket that no current table accounts for, with both measurement times", async () => {

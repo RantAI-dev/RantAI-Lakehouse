@@ -418,7 +418,9 @@ function bucketRestLine(bucket: UsageStorageBucket, storageMeasuredAt: string | 
  * Two numbers per Iceberg layer: the data that is current, and what the
  * object store holds for it. The bucket holds more than the current tables
  * — history and orphan files sit in it too — so the rest of the bucket is
- * one line of its own.
+ * one line of its own. When NO row carries a disk number, the disk was not
+ * measured here yet (the deploy window, `PR #591 review 1`) and the page
+ * says so instead of naming the layers as ClickHouse layers.
  */
 function StoragePanel({
   state,
@@ -431,6 +433,12 @@ function StoragePanel({
   const priced = currency !== null
   const skipped = rows.filter((row) => row.tablesSkipped > 0)
   const oneNumber = layersWithoutStoredBytes(rows)
+  // The deploy window (`PR #591 review 1`): the route re-read without the
+  // disk column, so EVERY row lacks the number — the job has not measured
+  // the disk here yet (decision 6), and naming the layers as ClickHouse
+  // layers, whose bytes genuinely sit on the engine's own disk, would be
+  // false.
+  const diskNotMeasured = rows.length > 0 && oneNumber.length === rows.length
   const measuredAt = report?.measuredAt ?? null
   const bucket = report?.bucket ?? null
   return (
@@ -466,7 +474,12 @@ function StoragePanel({
             </TableBody>
           </Table>
         ) : null}
-        {oneNumber.length > 0 ? (
+        {diskNotMeasured ? (
+          <p className="text-xs text-muted-foreground">
+            Stored on disk: not measured yet. The daily job runs at 01:00 UTC.
+          </p>
+        ) : null}
+        {!diskNotMeasured && oneNumber.length > 0 ? (
           <p className="text-xs text-muted-foreground">{oneNumberLine(oneNumber)}</p>
         ) : null}
         {bucket ? (

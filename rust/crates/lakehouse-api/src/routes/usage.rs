@@ -835,10 +835,20 @@ fn decimal_text(micro: i128) -> String {
 /// `stored_bytes` is the bytes the object store holds under the layer's
 /// tables and `total_bytes` the bytes of their current snapshots; the second
 /// is read under its own name and travels as `currentBytes`.
-fn storage_query(from: Date, to: Date) -> String {
+///
+/// With `with_disk` false the statement does not name `stored_bytes` at
+/// all: it is the deploy-window re-read of [`storage_layers`], against a
+/// table that predates the column, where naming it is the one thing the
+/// engine refuses.
+fn storage_query(from: Date, to: Date, with_disk: bool) -> String {
+    let disk = if with_disk {
+        "toString(stored_bytes) stored_bytes, "
+    } else {
+        ""
+    };
     format!(
         "SELECT day, layer, toString(table_count) table_count, \
-         toString(total_bytes) total_bytes, toString(stored_bytes) stored_bytes, \
+         toString(total_bytes) total_bytes, {disk}\
          toString(tables_skipped) tables_skipped, skipped_reason, \
          toString(measured_at) measured_at \
          FROM lake.`bronze_meta.storage_layer_snapshot` FINAL \
@@ -862,26 +872,54 @@ fn capacity_query() -> &'static str {
      ORDER BY measured_at DESC LIMIT 1"
 }
 
+/// `ClickHouse` saying the disk column is not there: the table exists but
+/// predates `stored_bytes`, which is the deploy window between the route
+/// learning the column and the daily job's next 01:00 UTC run appending it
+/// with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. Staging's Dagster can
+/// keep that window open for days.
+///
+/// [`super::lakehouse::is_unknown_table_error`]'s posture, applied to one
+/// column: the engine's text is CLASSIFIED into a `bool` here and none of
+/// it leaves this function (AGENTS.md rule 4). The match is deliberately
+/// narrow -- the unknown-column code in either of its two renderings
+/// (`(UNKNOWN_IDENTIFIER)`, `Code: 47.`) AND the body naming the one column
+/// this window is about -- so a code 47 about any OTHER column is still an
+/// outage and keeps the fixed 503 (PR #591 review 1; decision 6: a
+/// measurement that has not happened yet is not an outage).
+fn is_unknown_disk_column_error(body: &str) -> bool {
+    (body.contains("(UNKNOWN_IDENTIFIER)") || body.contains("Code: 47."))
+        && body.contains("stored_bytes")
+}
+
 /// The layer rows of the period, or the fact that nothing was measured yet.
 ///
 /// `bronze_meta.storage_layer_snapshot` is created by the daily job, so
 /// before its first run `ClickHouse` reports that it does not exist
-/// ([`is_unknown_table_error`]). That is a measurement that has not happened
-/// yet, not an outage, so the answer is an empty one (200, no rows, no
-/// measurement). Every OTHER failure keeps the fixed 503
-/// [`classify_storage_ch_error`] gives, because a failure must never look
-/// like an empty result (AGENTS.md principle 2).
+/// ([`super::lakehouse::is_unknown_table_error`]). That is a measurement
+/// that has not happened yet, not an outage, so the answer is an empty one
+/// (200, no rows, no measurement).
+///
+/// The deploy window is the other not-an-outage case (PR #591 review 1):
+/// the job ran here BEFORE it had the disk column, so the table exists
+/// without `stored_bytes` and the first read fails with the
+/// unknown-column error ([`is_unknown_disk_column_error`]). The read is
+/// repeated without the column -- the rows, the days and the `measured_at`
+/// are all there -- and comes back as [`LayerRows::MeasuredWithoutDisk`].
+/// Every OTHER failure keeps the fixed 503 [`classify_storage_ch_error`]
+/// gives, because a failure must never look like an empty result (AGENTS.md
+/// principle 2).
 ///
 /// # Errors
 ///
 /// The fixed 503 [`classify_storage_ch_error`] produces, for any
-/// `ClickHouse` failure other than an unknown table.
+/// `ClickHouse` failure other than an unknown table or the deploy window's
+/// unknown disk column.
 async fn storage_layers(
     ch: &lakehouse_clickhouse::ChClient,
     from: Date,
     to: Date,
 ) -> Result<LayerRows, ApiError> {
-    match ch.rows(&storage_query(from, to), None).await {
+    match ch.rows(&storage_query(from, to, true), None).await {
         Ok(rows) => Ok(LayerRows::Measured(rows)),
         Err(lakehouse_clickhouse::ChError::Server(ref body))
             if super::lakehouse::is_unknown_table_error(body) =>
@@ -891,17 +929,33 @@ async fn storage_layers(
             );
             Ok(LayerRows::NotMeasuredYet)
         }
+        Err(lakehouse_clickhouse::ChError::Server(ref body))
+            if is_unknown_disk_column_error(body) =>
+        {
+            tracing::debug!(
+                "bronze_meta.storage_layer_snapshot predates the disk column: re-reading without it"
+            );
+            let rows = ch
+                .rows(&storage_query(from, to, false), None)
+                .await
+                .map_err(|err| classify_storage_ch_error(&err))?;
+            Ok(LayerRows::MeasuredWithoutDisk(rows))
+        }
         Err(err) => Err(classify_storage_ch_error(&err)),
     }
 }
 
-/// What the layer read found: the rows of the period, or nothing measured
-/// yet.
+/// What the layer read found: the rows of the period, nothing measured
+/// yet, or the rows of a table that predates the disk column.
 enum LayerRows {
     /// The rows of the period.
     Measured(Vec<Map<String, Value>>),
     /// The table does not exist: the daily job has never run here.
     NotMeasuredYet,
+    /// The table exists but has no `stored_bytes` yet (the deploy window,
+    /// PR #591 review 1): the rows carry the current data alone, so the
+    /// bucket comparison is meaningless and the bucket is not read.
+    MeasuredWithoutDisk(Vec<Map<String, Value>>),
 }
 
 /// A row's bytes stored on disk, or `None` when the job measured none: a
@@ -997,6 +1051,16 @@ async fn bucket_body(
     }))
 }
 
+/// The answer's rows from the read's rows: one [`StorageRowBody`] each.
+///
+/// The two reads map the same way: a row without a disk number -- a
+/// `ClickHouse` layer's, or any row of the deploy-window re-read, where the
+/// column was not in the statement at all -- reads `stored_bytes` as `null`
+/// and prices its estimate on the current data.
+fn storage_rows(rows: &[Map<String, Value>], rates: &[UsageRate]) -> Vec<StorageRowBody> {
+    rows.iter().map(|row| storage_row(row, rates)).collect()
+}
+
 /// One measured layer for one day, as the console reads it.
 fn storage_row(row: &Map<String, Value>, rates: &[UsageRate]) -> StorageRowBody {
     let day_text = str_col(row, "day");
@@ -1086,7 +1150,10 @@ pub struct StorageBody {
     /// measured yet.
     measured_at: Option<String>,
     /// The object store's bucket and its own measurement; `null` when the
-    /// bucket was never measured.
+    /// bucket was never measured, and also when the table predates the
+    /// disk column (the deploy window, PR #591 review 1): the bucket's
+    /// remainder is worked out from disk numbers, and there are none to
+    /// work it out from.
     bucket: Option<StorageBucketBody>,
     /// One row per layer per day, oldest first.
     rows: Vec<StorageRowBody>,
@@ -1128,6 +1195,15 @@ pub struct StorageBody {
 /// failure keeps the fixed 503, because a failure must never look like an
 /// empty result.
 ///
+/// The deploy window reads the same way (PR #591 review 1): a table the job
+/// created before it had the disk column answers `ClickHouse`'s
+/// unknown-column error, and that too is a measurement that has not
+/// happened here yet (decision 6). The route re-reads without the column
+/// and answers the current data with `storedBytes: null` on every row, the
+/// `measuredAt` of those rows, and no bucket -- the bucket's remainder is
+/// meaningless without disk numbers, so the page loses the remainder line,
+/// not the report.
+///
 /// # Errors
 ///
 /// 400 with a fixed sentence for a bad date, a `from` after `to` or a period
@@ -1160,11 +1236,18 @@ pub async fn storage(
         LayerRows::Measured(found) => {
             let measured_at = newest_measured_at(&found);
             let bucket = bucket_body(&state.clickhouse, &found).await?;
-            let rows = found
-                .iter()
-                .map(|row| storage_row(row, &rates))
-                .collect::<Vec<StorageRowBody>>();
-            (rows, measured_at, bucket)
+            (storage_rows(&found, &rates), measured_at, bucket)
+        }
+        // The deploy window (PR #591 review 1): the table predates the disk
+        // column, so every row's disk number reads as `null` and the rows
+        // are the current data alone. The bucket's remainder would be
+        // worked out from disk numbers that do not exist, which is
+        // meaningless, so the bucket is not read either -- the page loses
+        // the remainder line, not the report (decision 6: the disk
+        // measurement has not happened here yet, it has not failed).
+        LayerRows::MeasuredWithoutDisk(found) => {
+            let measured_at = newest_measured_at(&found);
+            (storage_rows(&found, &rates), measured_at, None)
         }
     };
     Ok(ApiJson(StorageBody {

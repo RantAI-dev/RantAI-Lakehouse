@@ -1108,6 +1108,22 @@ fn layer_row(day: &str, layer: &str, current_bytes: i64, stored_bytes: Option<i6
     })
 }
 
+/// What the engine answers for the deploy-window re-read (`PR #591 review 1`):
+/// the row shape of a table that predates the disk column — the
+/// `stored_bytes` key is not in the row at all, the way a `SELECT` that
+/// cannot name the column really comes back.
+fn layer_row_without_disk_column(day: &str, layer: &str, current_bytes: i64) -> Value {
+    json!({
+        "day": day,
+        "layer": layer,
+        "table_count": "3",
+        "total_bytes": current_bytes.to_string(),
+        "tables_skipped": "0",
+        "skipped_reason": "",
+        "measured_at": format!("{day} 01:00:12.000"),
+    })
+}
+
 /// The bucket's own measurement, as the capacity job wrote it.
 fn bucket_row(measured_at: &str, name: &str, bytes: i64) -> Value {
     json!({
@@ -1135,6 +1151,19 @@ fn broken_engine() -> ResponseTemplate {
     ResponseTemplate::new(500).set_body_string(
         "Code: 62. DB::Exception: Syntax error: failed at position 1 (SYNTAX_ERROR)",
     )
+}
+
+/// The engine's own answer when the column it was asked about is not in the
+/// table: the shape `ClickHouse` writes for code 47, observed over its HTTP
+/// interface — the code, the `(UNKNOWN_IDENTIFIER)` spelling, and the
+/// column named once in the exception text.
+fn unknown_column(column: &str) -> ResponseTemplate {
+    ResponseTemplate::new(404).set_body_string(format!(
+        "Code: 47. DB::Exception: Missing columns: '{column}' while \
+         processing query: SELECT day, layer FROM \
+         lake.bronze_meta.storage_layer_snapshot. (UNKNOWN_IDENTIFIER) \
+         (version 26.7.3.19 (official build))"
+    ))
 }
 
 /// A `ClickHouse` that answers the storage read with `layers`, the capacity
@@ -1341,6 +1370,112 @@ async fn with_no_snapshot_table_the_storage_is_an_empty_measurement_not_an_outag
     assert_eq!(body["rows"], json!([]), "{body}");
     assert_eq!(body["measuredAt"], json!(null), "{body}");
     assert_eq!(body["bucket"], json!(null), "{body}");
+}
+
+/// The deploy window (`PR #591 review 1`): the daily job ran here before it
+/// had the disk column, so the table exists WITHOUT `stored_bytes` and the
+/// first read fails with `ClickHouse`'s unknown-column error. That is a
+/// measurement that has not happened yet (plan decision 6), not an outage:
+/// the route re-reads without the column and answers the current data with
+/// `storedBytes: null` on every row, `measuredAt` from the rows, and no
+/// bucket — the bucket's remainder is meaningless without disk numbers, so
+/// it is not read at all. The capacity mock answers with a real row, so a
+/// `bucket: null` here proves the route never asked for it.
+#[tokio::test]
+async fn a_table_that_predates_the_disk_column_reads_as_disk_not_measured_not_as_an_outage() {
+    let ch = MockServer::start().await;
+    // The first read names the disk column, so it is the query the engine
+    // answers with the unknown-column error. Mounted FIRST: the fallback
+    // read does not name the column, so this mock does not match it.
+    Mock::given(method("POST"))
+        .and(body_string_contains("stored_bytes"))
+        .respond_with(unknown_column("stored_bytes"))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("storage_layer_snapshot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [],
+            "data": [layer_row_without_disk_column("2026-03-15", "bronze", 1_000_000_000)],
+            "rows": 1,
+        })))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("capacity_snapshot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [],
+            "data": [bucket_row(
+                "2026-03-15 02:01:03.000",
+                "lakehouse-warehouse",
+                4_140_446_845,
+            )],
+            "rows": 1,
+        })))
+        .mount(&ch)
+        .await;
+    let (router, pool) = storage_app(ch).await;
+    let admin = platform_admin(&pool).await;
+
+    let answer = get(
+        &router,
+        &admin,
+        "/api/usage/storage?from=2026-03-01&to=2026-03-31",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let body = answer.json();
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{body}");
+    assert_eq!(rows[0]["layer"], json!("bronze"), "{body}");
+    assert_eq!(rows[0]["currentBytes"], json!(1_000_000_000), "{body}");
+    assert_eq!(rows[0]["storedBytes"], json!(null), "{body}");
+    assert_eq!(
+        body["measuredAt"],
+        json!("2026-03-15 01:00:12.000"),
+        "{body}"
+    );
+    assert_eq!(body["bucket"], json!(null), "{body}");
+}
+
+/// A code 47 about a column OTHER than the disk one is still the fixed 503:
+/// only the deploy window is not an outage, and that window is about
+/// `stored_bytes` alone (`PR #591 review 1`).
+#[tokio::test]
+async fn an_unknown_column_other_than_the_disk_one_is_still_the_fixed_503() {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("storage_layer_snapshot"))
+        .respond_with(unknown_column("total_bytes"))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [],
+            "data": [],
+            "rows": 0,
+        })))
+        .mount(&ch)
+        .await;
+    let (router, pool) = storage_app(ch).await;
+    let admin = platform_admin(&pool).await;
+
+    let answer = get(
+        &router,
+        &admin,
+        "/api/usage/storage?from=2026-03-01&to=2026-03-31",
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        answer.text()
+    );
+    assert_eq!(
+        answer.json()["error"],
+        json!("storage per layer is unavailable")
+    );
 }
 
 /// Any other failure of the engine is still the fixed 503: a failure must
