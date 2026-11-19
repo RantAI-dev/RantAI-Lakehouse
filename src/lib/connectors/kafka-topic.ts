@@ -1,4 +1,5 @@
 import type { IngestSpec, IngestSpecInput } from "@/services/contracts/connectors"
+import { ingestModeFor } from "./ingest-mode"
 
 /**
  * The ingest-spec save that makes `topic` the topic a Kafka connector reads
@@ -21,7 +22,9 @@ export function specWithTopic(spec: IngestSpec, topic: string): IngestSpecInput 
   return {
     // The caller only offers topics for a saved Kafka connector, whose spec has both.
     adapter: spec.adapter ?? "kafka",
-    ingestMode: spec.ingestMode ?? "batch",
+    // `SRC-45` (QA `LH-SRC-6-41`): the fallback is decided from the adapter
+    // (`SRC-44`), not `"batch"`, which the API refuses for a Kafka connector.
+    ingestMode: spec.ingestMode ?? ingestModeFor(spec.adapter ?? "kafka"),
     dial: { ...spec.dial, topic },
     sourceObjects: spec.sourceObjects,
     ...(spec.scheduleCron ? { scheduleCron: spec.scheduleCron } : {}),
