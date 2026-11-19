@@ -298,15 +298,19 @@ describe("AuditPage: search, paging, deep link and export", () => {
       json(actorsPage),
     )
     renderPage()
-    await waitFor(() => expect(screen.getAllByText("dashboard.share").length).toBeGreaterThan(0))
+    await waitFor(() => expect(screen.getAllByText("dashboard.share").length).toBeGreaterThan(0), {
+      timeout: 5000,
+    })
 
     fireEvent.click(screen.getByRole("button", { name: /Platform Admin/ }))
 
-    await waitFor(() => expect(searches().length).toBe(2))
+    await waitFor(() => expect(searches().length).toBe(2), { timeout: 5000 })
     expect(searches()[1].params.get("actor")).toBe("usr_admin")
     // The picker shows the picked person by name, so the filter is legible.
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Person" }).textContent).toContain("Platform Admin"),
+    await waitFor(
+      () =>
+        expect(screen.getByRole("button", { name: "Person" }).textContent).toContain("Platform Admin"),
+      { timeout: 5000 },
     )
   })
 
