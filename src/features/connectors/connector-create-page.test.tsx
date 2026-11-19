@@ -89,6 +89,18 @@ describe("ConnectorCreatePage", () => {
     expect(link.compareDocumentPosition(card)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
   })
 
+  // UX-5: no step explains the star with a "* Required" line; the star itself
+  // stays on the mixed first step's required Name field.
+  it("renders no '* Required' line while the mixed first step still stars Name", async () => {
+    stubFetch()
+    renderPage()
+    await screen.findByRole("radio", { name: /PostgreSQL/ })
+    expect(screen.queryByText("Required")).toBeNull()
+    const label = document.querySelector('label[for="connector-name"]')
+    expect(label?.getAttribute("data-required")).toBe("")
+    expect(label?.querySelector('span[aria-hidden="true"][class*="before:content-"]')).not.toBeNull()
+  })
+
   it("renders connector types from listTypes as cards, disabling unsupported ones", async () => {
     stubFetch()
     renderPage()

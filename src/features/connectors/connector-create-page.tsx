@@ -6,7 +6,6 @@ import { KeyRoundIcon, NetworkIcon } from "lucide-react"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { FormReviewSummary } from "@/components/patterns/form-review-summary"
 import { FormStepLayout, type FormStep } from "@/components/patterns/form-step-layout"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { PageHeader } from "@/components/patterns/page-header"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
@@ -448,7 +447,6 @@ export function ConnectorCreatePage() {
       >
         {step === 0 ? (
           <div className="space-y-6">
-            <RequiredLegend />
             {/* A file is not a registered source: it has its own page
                 (DATA-9, `docs/core/features/upload-file.md`). */}
             <p className="text-sm text-muted-foreground">
@@ -482,7 +480,6 @@ export function ConnectorCreatePage() {
         ) : null}
         {step === 1 ? (
           <div className="space-y-6">
-            <RequiredLegend />
             {selectedType ? <SelectedTypeSummary type={selectedType} onChange={() => setStep(0)} /> : null}
             <section className="space-y-3">
               <StepSectionHeading
@@ -490,15 +487,12 @@ export function ConnectorCreatePage() {
                 title="Connection details"
                 description="Where the source lives. It must be reachable from the lakehouse server, not only from your browser."
               />
-              {/* UX-1-R7: the step's RequiredLegend above explains the
-                  marker once; the dial and credential children opt out. */}
               <DialFormFor
                 adapter={adapter}
                 typeName={selectedType?.name ?? null}
                 dial={dial}
                 onChange={setDial}
                 oauthCallbackUrl={credentialSettings?.oauthCallbackUrl}
-                showLegend={false}
               />
               {/* Nothing red before something is typed, as for the credential
                   fields: the refusal follows what the form holds. */}
@@ -526,7 +520,6 @@ export function ConnectorCreatePage() {
                 settings={credentialSettings}
                 referenceMode={referenceMode}
                 onReferenceModeChange={setReferenceChosen}
-                showLegend={false}
               />
             </section>
           </div>

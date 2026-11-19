@@ -1026,7 +1026,8 @@ describe("required-field indicators in the pipeline editor (UX-1-R8)", () => {
     expect(created.getAttribute("aria-required")).toBe("true")
     expect(created.closest("div")?.querySelector("label")?.getAttribute("data-required")).toBe("")
     expect(hasMarker(created.closest("div")?.querySelector("label") ?? null)).toBe(true)
-    expect(screen.getByText(/Required/)).toBeTruthy()
+    // UX-5: the editor no longer explains the star with a "* Required" line.
+    expect(screen.queryByText(/Required/)).toBeNull()
     unmount()
 
     renderEditor(existing())
