@@ -19,6 +19,11 @@
  *   Couldn't save with Retry, and the server's sentence when it refused. A
  *   new report is made on its first change that holds something, and the
  *   address becomes its edit address without a reload.
+ * - The assistant writes in the page (PR B, D8): `/` → Ask AI to write… and
+ *   a chart's Describe stream a draft into the document, which Accept turns
+ *   into blocks and Discard takes out; the exchange is the page's one
+ *   conversation, so it is in the AI Copilot tab too
+ *   (`report-editor-draft.tsx`). Only for a person who may use the assistant.
  *
  * The document is a view of the report's blocks (plan D3): it is made from
  * the blocks on load and turned back into blocks to save
@@ -30,18 +35,21 @@ import * as React from "react"
 import Link from "next/link"
 import type { Editor } from "@tiptap/core"
 import { EditorContent, useEditor } from "@tiptap/react"
-import { ArrowLeft, ChartColumn, Check, ChevronRight, CircleAlert, FileDown, Heading1, Heading2, List, ListOrdered, Loader2, Minus, TextQuote, Type } from "lucide-react"
+import { ArrowLeft, Bot, ChartColumn, Check, ChevronRight, CircleAlert, FileDown, Heading1, Heading2, List, ListOrdered, Loader2, Minus, TextQuote, Type } from "lucide-react"
 
 import { EmptyState, ErrorState } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { Select, SelectContent, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { useService } from "@/hooks/use-service"
 import { useAuth } from "@/features/auth/auth-provider"
+import type { PageContext } from "@/features/copilot/page-context"
 import { folderChoices, folderOptionText, labelledFolders } from "@/lib/dashboard-organise"
 import { notifyError, notifySuccess } from "@/lib/notify"
 import { Autosave, type AutosaveState } from "@/lib/report-autosave"
 import { MAX_REPORT_CHARTS, blocksForSave } from "@/lib/report-blocks"
-import { SLASH_ITEMS, blocksToDoc, docToBlocks, nearChartLimit, type DocNode, type SlashItemId } from "@/lib/report-doc"
+import { AI_SLASH_ITEM, SLASH_ITEMS, blocksToDoc, docToBlocks, nearChartLimit, type DocNode, type SlashItemId } from "@/lib/report-doc"
+import { buildReportEditorContext, describedRows, type DescribedChart } from "@/lib/report-editor-context"
+import type { ChartLabel } from "@/lib/report-markdown"
 import { cn } from "@/lib/utils"
 import { dashboardReportService, dashboardService } from "@/services"
 import type { ReportBlock, ReportView } from "@/services"
@@ -50,8 +58,9 @@ import { rememberRow } from "./dashboards-row"
 import { FolderOptions } from "./folder-options"
 import { ReportChartPicker } from "./report-chart-picker"
 import { ChartShelfPortal, useReportChartsTab } from "./report-chart-shelf"
-import { ReportChartsProvider, type ReportChartChoice } from "./report-charts"
+import { ReportChartsProvider, useReportCharts, type ReportChartChoice } from "./report-charts"
 import { ChartNode, ReportEditorUiContext, type PickerRequest, type ReportEditorUi } from "./report-editor-chart"
+import { DraftNode, ReportDraftsContext, useReportDrafts } from "./report-editor-draft"
 import { SlashStore, insertBlock, reportExtensions, type SlashItem } from "./report-editor-extensions"
 import { BlockHandles, SelectionToolbar, SlashMenu, type LinkOpener, type SlashIcon } from "./report-editor-menus"
 import { EASE, FOCUS, IconTip } from "./report-editor-ui"
@@ -70,6 +79,7 @@ const ICONS: Record<string, SlashIcon> = {
   quote: TextQuote,
   divider: Minus,
   chart: ChartColumn,
+  ai: Bot,
 }
 
 export function ReportEditorPage({ id }: { id?: string }) {
@@ -145,6 +155,11 @@ class LiveBox {
   insertChart(id: string, pos?: number) {
     this.insert(id, pos)
   }
+  /** "/" → Ask AI to write… (PR B): whether it is offered, why it cannot start now, and what it does. */
+  ai: { enabled: boolean; blocked: string | null; open: () => void } = { enabled: false, blocked: null, open: () => {} }
+  setAi(next: { enabled: boolean; blocked: string | null; open: () => void }) {
+    this.ai = next
+  }
 }
 
 export type ReportSaveInput = { title: string; folderId: string; blocks: ReportBlock[] }
@@ -160,6 +175,9 @@ function saveReport(input: ReportSaveInput, id: string | null) {
 function ReportEditor({ view }: { view: ReportView | null }) {
   const auth = useAuth()
   const me = auth.user?.id
+  // BI-62 D8: the assistant's entries are for a person who may use it, as the app frame decides (`app-frame.tsx`).
+  const hasAssistant = auth.hasPermission("assistant:use") || auth.hasPermission("assistant:ask")
+  const charts = useReportCharts()
   const foldersState = useService((s) => dashboardService.listFolders(s), [])
   const folders = React.useMemo(() => folderChoices(labelledFolders(foldersState.data ?? [], me), me), [foldersState.data, me])
   const [folderId, setFolderId] = React.useState(view?.report.folderId || NO_FOLDER)
@@ -191,20 +209,28 @@ function ReportEditor({ view }: { view: ReportView | null }) {
         setPicker({ mode: "insert" })
       },
       divider: (e, r) => e.chain().focus().deleteRange(r).setHorizontalRule().run(),
-      // "Ask AI to write…" joins the menu in PR B (plan D8).
-      ai: () => {},
+      // BI-62 D8: the "/" text goes, then a prompt line takes its place.
+      ai: (e, r) => {
+        e.chain().focus().deleteRange(r).run()
+        live.ai.open()
+      },
     }
-    return SLASH_ITEMS.map((entry) =>
+    const list: SlashItem[] = SLASH_ITEMS.map((entry) =>
       entry.id === "chart"
         ? { ...entry, hint: `${live.count} of ${MAX_REPORT_CHARTS}`, disabled: live.count >= MAX_REPORT_CHARTS, run: run.chart }
         : { ...entry, run: run[entry.id] },
     )
+    const { ai } = live
+    if (!ai.enabled) return list
+    // Visible but disabled while a draft is open or an answer is on its way, with the reason (PR B anchors).
+    return [{ ...AI_SLASH_ITEM, disabled: ai.blocked !== null, reason: ai.blocked ?? undefined, run: run.ai }, ...list]
   }, [live])
 
   // Made once for the page's life: the plugins read what changes through `live` and `linkRef`.
   const [extensions] = React.useState(() =>
     reportExtensions({
       chartNode: ChartNode,
+      draftNode: DraftNode,
       slash: { store: slash, items },
       onShelfDrop: (id, pos) => live.insertChart(id, pos),
       onLinkKey: () => linkRef.current?.open(),
@@ -335,15 +361,68 @@ function ReportEditor({ view }: { view: ReportView | null }) {
     }
   }, [autosave])
 
-  const ui = React.useMemo<ReportEditorUi>(() => ({ readOnly: false, openPicker: setPicker }), [])
+  const savedId = saveState.id
+
+  /** A chart's title and dashboard, from what the page drew it with, else the catalogue. */
+  const chartLabel = React.useCallback(
+    (chartId: string): ChartLabel | undefined => {
+      const entry = charts.entry(chartId)
+      const drawn = entry && "spec" in entry ? entry : undefined
+      const choice = charts.choice(chartId)
+      const title = drawn?.spec.title ?? choice?.title
+      const dashboard = drawn?.boardName || (choice ? charts.boards.find((b) => b.id === choice.board)?.name : undefined) || ""
+      return title !== undefined || dashboard ? { title: title ?? "", dashboard } : undefined
+    },
+    [charts],
+  )
+  const chartTitle = React.useCallback((chartId: string) => chartLabel(chartId)?.title || "Untitled chart", [chartLabel])
+
+  /**
+   * What the assistant is told about this page (PR B anchors): the report as
+   * Markdown, and for Describe the chart with the rows the page drew it with
+   * (never a second query: rows not read yet are said to be not loaded).
+   */
+  const pageContext = React.useCallback(
+    (chartId: string | null): PageContext => {
+      const doc = docToBlocks(editor ? (editor.getJSON() as DocNode) : initial)
+      let chart: DescribedChart | null = null
+      if (chartId) {
+        const label = chartLabel(chartId)
+        chart = { id: chartId, title: label?.title || "Untitled chart", dashboard: label?.dashboard ?? "", rows: describedRows(charts.entry(chartId)) }
+      }
+      return {
+        key: "report-edit",
+        title: doc.title ? `Writing "${doc.title}"` : "Writing a report",
+        hint: "Ask about this report, or type / in the page to write with AI.",
+        suggest: { ask: ["Summarize this report", "What could this report add?"], build: [] },
+        system: buildReportEditorContext({ id: savedId, title: doc.title, blocks: doc.blocks, chartLabel, chart }),
+      }
+    },
+    [editor, initial, charts, chartLabel, savedId],
+  )
+  const drafts = useReportDrafts({ editor, context: pageContext, chartTitle })
+  const { openPrompt } = drafts
+  React.useEffect(() => {
+    live.setAi({ enabled: hasAssistant, blocked: drafts.blocked, open: openPrompt })
+  }, [live, hasAssistant, drafts.blocked, openPrompt])
+
+  const ui = React.useMemo<ReportEditorUi>(
+    () => ({
+      readOnly: false,
+      openPicker: setPicker,
+      describe: hasAssistant ? drafts.describe : undefined,
+      describeBlocked: drafts.blocked,
+    }),
+    [hasAssistant, drafts.describe, drafts.blocked],
+  )
   // D6: Charts opens on a wide screen for an empty report, else as it was left.
   const chartsTab = useReportChartsTab({ ready: editor !== null, empty: !view || view.report.blocks.length === 0 })
   const pdf = Boolean(view?.pdfSupported && view.canDownload && reportId)
-  const savedId = saveState.id
   const backHref = savedId ? `/dashboards/reports/${encodeURIComponent(savedId)}` : REPORTS_TAB_HREF
 
   return (
     <ReportEditorUiContext.Provider value={ui}>
+      <ReportDraftsContext.Provider value={drafts}>
       <div ref={area} className="rd-scroll relative flex min-h-full w-full flex-col">
         <EditorHeader
           title={info.title}
@@ -397,6 +476,7 @@ function ReportEditor({ view }: { view: ReportView | null }) {
           onPick={pick}
         />
       </div>
+      </ReportDraftsContext.Provider>
     </ReportEditorUiContext.Provider>
   )
 }

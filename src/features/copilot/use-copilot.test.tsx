@@ -744,3 +744,24 @@ describe("streaming does not re-render the whole Copilot (AI-24 D6)", () => {
     });
   });
 });
+
+describe("one message in another mode (BI-62 D8)", () => {
+  it("asks in Ask mode for that message and leaves the conversation in Build", async () => {
+    renderCopilot();
+    await act(async () => {
+      await copilot!.send("Write for this report: a short summary", undefined, { mode: "ask" });
+    });
+    const sent = JSON.parse(chatRequests[0].body) as { mode: string; tools: string[] };
+    expect(sent.mode).toBe("ask");
+    // Ask mode's tools, not Build's.
+    const { ALL_CAP_KEYS, toolsFromCaps } = await import("./capabilities");
+    expect(sent.tools).toEqual(toolsFromCaps(new Set(ALL_CAP_KEYS), "ask"));
+    expect(sent.tools).not.toEqual(toolsFromCaps(new Set(ALL_CAP_KEYS), "build"));
+    expect(copilot!.mode).toBe("build");
+    // The next message without a mode is Build again.
+    await act(async () => {
+      await copilot!.send("Build me a dashboard about events.");
+    });
+    expect((JSON.parse(chatRequests[1].body) as { mode: string }).mode).toBe("build");
+  });
+});

@@ -222,6 +222,8 @@ export function insertBlock(editor: Editor, node: JSONContent, at?: number) {
 
 export type SlashItem = SlashEntry & {
   disabled?: boolean
+  /** Why a disabled item cannot be picked now, in one line (its tooltip). */
+  reason?: string
   run: (editor: Editor, range: Range) => void
 }
 

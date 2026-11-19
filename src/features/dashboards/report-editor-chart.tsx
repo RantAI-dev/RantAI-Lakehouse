@@ -4,14 +4,15 @@
  * A chart in the report editor (`BI-62`, decision D5): a Tiptap atom block
  * that holds only which chart and how wide, drawn live by the reader's own
  * card (`ReportChart`), so what the writer sees is what the reader gets. A
- * small toolbar on hover, on focus or when the chart is selected: Swap, Text
- * width / Wide, Remove. A tap on a phone selects it, which shows the toolbar.
+ * small toolbar on hover, on focus or when the chart is selected: Describe
+ * (PR B, D8: AI Copilot drafts a few sentences under it), Swap, Text width /
+ * Wide, Remove. A tap on a phone selects it, which shows the toolbar.
  */
 import * as React from "react"
 import { Node } from "@tiptap/core"
 import { NodeViewWrapper, ReactNodeViewRenderer, type ReactNodeViewProps } from "@tiptap/react"
 import { useTheme } from "next-themes"
-import { RectangleHorizontal, Replace, StretchHorizontal, Trash2 } from "lucide-react"
+import { Bot, RectangleHorizontal, Replace, StretchHorizontal, Trash2 } from "lucide-react"
 
 import { Skeleton } from "@/components/ui/skeleton"
 import { cn } from "@/lib/utils"
@@ -26,6 +27,10 @@ export type PickerRequest = { mode: "insert"; at?: number } | { mode: "swap"; po
 export type ReportEditorUi = {
   readOnly: boolean
   openPicker: (req: PickerRequest) => void
+  /** Describe: a draft under the chart at `pos` (absent without the assistant). */
+  describe?: (chartId: string, pos: number) => void
+  /** Why Describe cannot start now, in one line; null when it can. */
+  describeBlocked?: string | null
 }
 
 export const ReportEditorUiContext = React.createContext<ReportEditorUi>({ readOnly: true, openPicker: () => {} })
@@ -59,6 +64,7 @@ function ChartView({ node, selected, updateAttributes, deleteNode, getPos, edito
         selected && "opacity-100",
       )}
     >
+      {ui.describe && id ? <DescribeButton blocked={ui.describeBlocked ?? null} onDescribe={() => ui.describe?.(id, pos())} /> : null}
       <IconTip label="Swap chart">
         <button type="button" aria-label="Swap chart" className={TOOL} onClick={() => ui.openPicker({ mode: "swap", pos: pos(), current: id })}>
           <Replace className="size-3.5" aria-hidden />
@@ -130,6 +136,27 @@ function ChartView({ node, selected, updateAttributes, deleteNode, getPos, edito
       </ReportChartBlock>
     </NodeViewWrapper>
   )
+}
+
+/** A labelled button: a tooltip only when it says why it cannot start (DESIGN.md §3). */
+function DescribeButton({ blocked, onDescribe }: { readonly blocked: string | null; readonly onDescribe: () => void }) {
+  const button = (
+    <button
+      type="button"
+      aria-disabled={blocked !== null || undefined}
+      onClick={() => {
+        if (!blocked) onDescribe()
+      }}
+      className={cn(
+        "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-foreground hover:bg-background active:scale-[0.97] aria-disabled:opacity-55 aria-disabled:active:scale-100 dark:hover:bg-muted",
+        EASE,
+        FOCUS,
+      )}
+    >
+      <Bot className="size-3.5 text-sky-700 dark:text-sky-300" aria-hidden /> Describe
+    </button>
+  )
+  return blocked ? <IconTip label={blocked}>{button}</IconTip> : button
 }
 
 export const ChartNode = Node.create({
