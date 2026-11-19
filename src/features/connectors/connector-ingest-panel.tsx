@@ -24,6 +24,7 @@ import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useRefreshable } from "@/hooks/use-refreshable"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
+import { ingestModeFor } from "@/lib/connectors/ingest-mode"
 import { specWithTopic } from "@/lib/connectors/kafka-topic"
 import { formatDateTime, formatDuration, formatRelativeTime, formatTimeUntil, parseTimestamp } from "@/lib/format"
 import { notifySuccess, withNotify } from "@/lib/notify"
@@ -481,7 +482,7 @@ function IngestEditor({
         connectorId,
         {
           adapter,
-          ingestMode: spec.ingestMode ?? "batch",
+          ingestMode: spec.ingestMode ?? ingestModeFor(adapter),
           dial: keepsDialObjects ? { ...spec.dial, objects: reports } : spec.dial,
           sourceObjects: toSourceObjects(selection, !isCdc),
           ...(cron && !isCdc ? { scheduleCron: cron } : {}),
