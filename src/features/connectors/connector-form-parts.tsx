@@ -12,7 +12,6 @@ import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { RequiredMarker } from "@/components/ui/required"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { CdcDialForm } from "@/features/connectors/dial-forms/cdc-dial-form"
 import { CdcMongoDialForm } from "@/features/connectors/dial-forms/cdc-mongo-dial-form"
 import { FilesDialForm } from "@/features/connectors/dial-forms/files-dial-form"
@@ -270,10 +269,7 @@ export function DialFormFor({
   dial,
   onChange,
   oauthCallbackUrl,
-  showLegend = true,
 }: {
-  /** UX-1-R7: false when the parent step already shows RequiredLegend. */
-  showLegend?: boolean
   adapter: string | null
   /** `selectedType.name` — needed alongside `adapter` because Oracle
    * dials with the same `sql` adapter/`SqlDial` shape every other SQL
@@ -293,7 +289,6 @@ export function DialFormFor({
       <OracleDialForm
         value={dial as unknown as SqlDial | null}
         onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
-        showLegend={showLegend}
       />
     )
   }
@@ -304,7 +299,6 @@ export function DialFormFor({
           value={dial as unknown as SqlDial | null}
           driver={driverForType(typeName)}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
-          showLegend={showLegend}
         />
       )
     case "cdc":
@@ -322,7 +316,6 @@ export function DialFormFor({
           value={dial as unknown as CdcDial | null}
           driver={driverForType(typeName)}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
-          showLegend={showLegend}
         />
       )
     case "files":
@@ -330,7 +323,6 @@ export function DialFormFor({
         <FilesDialForm
           value={dial as unknown as FilesDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
-          showLegend={showLegend}
         />
       )
     case "rest":
@@ -339,7 +331,6 @@ export function DialFormFor({
           value={dial as unknown as RestDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
           oauthCallbackUrl={oauthCallbackUrl}
-          showLegend={showLegend}
         />
       )
     case "saas":
@@ -356,7 +347,6 @@ export function DialFormFor({
         <SheetsDialForm
           value={dial as unknown as SheetsDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
-          showLegend={showLegend}
         />
       )
     case "mongodb":
@@ -364,7 +354,6 @@ export function DialFormFor({
         <MongoDialForm
           value={dial as unknown as MongoDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
-          showLegend={showLegend}
         />
       )
     case "kafka":
@@ -372,7 +361,6 @@ export function DialFormFor({
         <KafkaDialForm
           value={dial as unknown as KafkaDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
-          showLegend={showLegend}
         />
       )
     case "sftp":
@@ -380,7 +368,6 @@ export function DialFormFor({
         <SftpDialForm
           value={dial as unknown as SftpDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
-          showLegend={showLegend}
         />
       )
     default:
@@ -460,10 +447,7 @@ export function CredentialFields({
   settings = null,
   referenceMode = false,
   onReferenceModeChange,
-  showLegend = true,
 }: {
-  /** UX-1-R7: false when the parent step already shows RequiredLegend. */
-  showLegend?: boolean
   noCredential: boolean
   /** Edit page: blank keeps the current credential. */
   optional: boolean
@@ -502,14 +486,8 @@ export function CredentialFields({
     ) : (
       <CredentialValueInput id={id} slot={slot} value={value} onChange={onChange} required={required} />
     )
-  // UX-1-R7 review: one legend per step — the create/edit step shows its own.
-  // Opting out must preserve the paired credential grid: a column span on the
-  // container does not create columns, so only span when the grid is paired.
   return (
     <div className={cn("grid gap-3", pair && !showReference && "sm:grid-cols-2")}>
-      {required && showLegend ? (
-        <RequiredLegend className={pair && !showReference ? "sm:col-span-2" : undefined} />
-      ) : null}
       {manager !== null && onReferenceModeChange ? (
         <div className={cn("space-y-1", pair && !showReference && "sm:col-span-2")}>
           <div role="group" aria-label="How the credential is given" className="inline-flex gap-1">

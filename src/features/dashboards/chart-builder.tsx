@@ -8,7 +8,6 @@ import { useTheme } from "next-themes";
 import { ArrowLeft, ChartColumn, CircleAlert, Code, Database, Pencil, RefreshCw, SlidersHorizontal, Table2 } from "lucide-react";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { EmptyState } from "@/components/patterns/page-states";
-import { RequiredLegend } from "@/components/patterns/required-legend";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
@@ -1379,8 +1378,6 @@ export function ChartBuilder({
       </SettingGroup>
       {isText ? (
         <div className="grid gap-1.5">
-          {/* UX-1 (#568, merged from main): the marker explained once, where the required field is. */}
-          <RequiredLegend />
           <Label htmlFor="ch-content">Content (markdown) <Req /></Label>
           <Textarea id="ch-content" aria-required rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder="Title **bold**, - bullets, or | table | GFM |." />
         </div>
@@ -1418,9 +1415,6 @@ export function ChartBuilder({
       <div className="@container min-h-0 flex-1 overflow-y-auto">
         <TabsContent value="data">
           <div className={FORM_GRID} ref={(n) => { panelRefs.current[2] = n; }}>
-          {/* UX-1 (#568, merged from main): the required marker explained once, at the top of the tab
-              that holds the chart's required fields. */}
-          <RequiredLegend />
           {isMap ? (
             <div className="grid gap-1.5">
               <Label>Map</Label>

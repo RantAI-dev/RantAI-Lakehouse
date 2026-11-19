@@ -15,7 +15,6 @@ import {
 } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { Textarea } from "@/components/ui/textarea"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
@@ -58,8 +57,9 @@ function AlertResolutionForm(props: AlertResolutionProps) {
 
   return (
     <div className="flex flex-col gap-2">
-      <RequiredLegend />
-      <Label htmlFor="resolution-note" required>Resolution note</Label>
+      {/* UX-4: the note is this box's one required input, so no star and no
+          legend; the textarea keeps `aria-required`. */}
+      <Label htmlFor="resolution-note">Resolution note</Label>
       <Textarea
         id="resolution-note"
         aria-required

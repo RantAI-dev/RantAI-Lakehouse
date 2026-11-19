@@ -98,6 +98,7 @@ _CASES = [
     (e.UnknownAdapter("adapter=x"), e.SETTING_REJECTED),
     (schema_observer.ObservationRefused("HTTP 403"), e.SETTING_REJECTED),
     (e.ApiRefused("no"), e.SETTING_REJECTED),
+    (e.KafkaTargetMissing("no table"), e.SETTING_REJECTED),
     (ValueError("unsupported file format"), e.SETTING_REJECTED),
     # other
     (RuntimeError("nobody taught this module about this"), e.OTHER),

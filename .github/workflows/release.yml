@@ -726,6 +726,7 @@ jobs:
       - name: The rendered Compose file must be a valid one
         env:
           POSTGRES_PASSWORD: ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD: ci-only-app-password-0001
           RUSTFS_ACCESS_KEY: ci-only-rustfs-access-0001
           RUSTFS_SECRET_KEY: ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY: ci-only-lakekeeper-key-0001
@@ -735,6 +736,7 @@ jobs:
           env_file="$RUNNER_TEMP/release-check.env"
           {
             echo "POSTGRES_PASSWORD=$POSTGRES_PASSWORD"
+            echo "LAKEHOUSE_DB_APP_PASSWORD=$LAKEHOUSE_DB_APP_PASSWORD"
             echo "RUSTFS_ACCESS_KEY=$RUSTFS_ACCESS_KEY"
             echo "RUSTFS_SECRET_KEY=$RUSTFS_SECRET_KEY"
             echo "LAKEKEEPER_ENCRYPTION_KEY=$LAKEKEEPER_ENCRYPTION_KEY"
