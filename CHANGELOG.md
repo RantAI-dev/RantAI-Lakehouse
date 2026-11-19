@@ -95,6 +95,7 @@ once a first release is tagged.
 - The read-only refusal in Query Studio says which of three causes applies (backlog `QS-14`). A curly quote or a `$$` sequence gets a sentence that asks for straight quotes. A first word that is not SELECT, WITH, SHOW, DESCRIBE or EXPLAIN gets a sentence that asks the person to check it for a typo. A write keeps the sentence it had. The queries refused stay the same.
 - The audit page lists audit events only. The last 50 pipeline runs that it used to merge into the list no longer appear there and stay on the pipeline run pages.
 - Required-field marks are fewer (backlog `UX-4`; feature page `docs/core/features/required-field-consistency.md`). A star shows only where a form mixes required and optional inputs; a form whose every input is required (sign-in, change password, a rename box) and a single-input box show no star. The "`*` Required" line stays only on a starred form with four or more inputs. The AI chat box is back to how it was before #568: no visible "Message" label, no tooltip, no hidden requirement text. Required semantics do not change — every control keeps its native `required` or `aria-required`, and validation, disabled buttons, defaults and error messages are untouched.
+- The console reads the workspace's name and logo once per page load, and a page shows no name until they arrive, so the product's name does not flash before the workspace's (backlog `ADM-2`).
 
 ### Fixed
 
@@ -164,6 +165,7 @@ once a first release is tagged.
 - In Ask mode the assistant narrows the dashboard's view instead of drafting a new chart: a request to see only some of the data on the page, for example "show only 2026" or "only Bali", sets the person's own filters on the page for this visit only. Nothing is saved, so the board's default filters and every other viewer's view stay as they are; saving the board's default filters is a separate tool (`save_board_filters`) and stays in the Dashboard Builder (backlog `AI-2`).
 - The assistant's tool steps in a chat response show an engine failure as a fixed sentence and a reference, while the model still reads the engine's diagnosis (LH-QS-2-08).
 - An agent run's steps and its outcome after approval, and a direct call to `POST /api/ai/tool`, show an engine failure as a fixed sentence and a reference instead of the engine's own text, while the model that drives the run still reads the engine's diagnosis (LH-QS-2-08). The approval answer carries the same fixed sentence.
+- An address that no page answers shows the not-found page to everyone, in place of "You don't have access" (backlog `ADM-13`).
 
 ## [0.2.1] - 2026-11-04
 

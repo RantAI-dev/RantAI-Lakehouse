@@ -14,7 +14,14 @@ function json(body: unknown, status = 200) {
 
 type Call = { url: string; method: string; body: unknown }
 
-function stub(state: unknown, onWrite: (c: Call) => Response = () => json({ ok: true })): Call[] {
+/** The public branding answer of a workspace that set nothing. */
+const NO_BRANDING = { workspaceName: null, logo: null, logoDark: null, icon: null }
+
+function stub(
+  state: unknown,
+  onWrite: (c: Call) => Response = () => json({ ok: true }),
+  branding: unknown = NO_BRANDING,
+): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const call = {
@@ -23,6 +30,7 @@ function stub(state: unknown, onWrite: (c: Call) => Response = () => json({ ok: 
       body: init?.body ? JSON.parse(String(init.body)) : undefined,
     }
     calls.push(call)
+    if (call.url.includes("/api/branding")) return json(branding)
     if (call.method === "GET") return json(state)
     return onWrite(call)
   }) as unknown as typeof fetch
@@ -115,5 +123,27 @@ describe("PublicLinkPanel", () => {
     fireEvent.change(await screen.findByLabelText("Password (optional)"), { target: { value: "short" } })
     fireEvent.click(screen.getByRole("button", { name: "Make a public link" }))
     await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("8 to 128"))
+  })
+
+  it("titles the embed snippet's iframe after the workspace, not the product (adm-121)", async () => {
+    stub({ enabled: true, link: LINK }, undefined, { ...NO_BRANDING, workspaceName: "Acme Data" })
+    render(<PublicLinkPanel board="b_1" />)
+    const snippet = await screen.findByText(/<iframe /)
+    expect(snippet.textContent).toContain('title="Acme Data dashboard"')
+    expect(snippet.textContent).not.toContain("Rantai Lake")
+  })
+
+  it("titles the iframe after the product when the workspace set no name, and keeps a quote in a name out of the attribute", async () => {
+    stub({ enabled: true, link: LINK })
+    render(<PublicLinkPanel board="b_1" />)
+    expect((await screen.findByText(/<iframe /)).textContent).toContain('title="Rantai Lake dashboard"')
+    cleanup()
+
+    stub({ enabled: true, link: LINK }, undefined, { ...NO_BRANDING, workspaceName: 'A "B" <c>' })
+    render(<PublicLinkPanel board="b_1" />)
+    // A name is text: a quote in it must not end the attribute.
+    expect((await screen.findByText(/<iframe /)).textContent).toContain(
+      'title="A &quot;B&quot; &lt;c&gt; dashboard"',
+    )
   })
 })

@@ -33,7 +33,9 @@ const LINK_GONE = "This link does not work";
  * product's own name stands in for a workspace that set none.
  */
 function EmbedName({ look, linkBase, name }: { look: EmbedLook; linkBase: string; name: string }) {
-  if (!look.showName) return null;
+  // `adm-121`: the name is empty until the branding answers; a lone "↗"
+  // beside no name is a fragment, so nothing shows until it is known.
+  if (!look.showName || !name) return null;
   return linkBase ? (
     <a href={linkBase} target="_blank" rel="noopener noreferrer"
        className="text-[10px] font-medium text-muted-foreground hover:text-foreground">{name} ↗</a>

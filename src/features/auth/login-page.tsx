@@ -240,7 +240,10 @@ export function LoginPage() {
               <SsoNotice />
             </React.Suspense>
             <h1 className="text-3xl leading-[1.2] font-semibold tracking-[-0.02em] text-foreground">
-              Sign in to {branding.name}
+              {/* `adm-121`: the name is empty until the branding answers, and
+                  "Sign in to " is a broken sentence. A no-break space keeps the
+                  line's height meanwhile. */}
+              {branding.loading ? "\u00A0" : `Sign in to ${branding.name}`}
             </h1>
             <p className="mt-2 text-sm text-muted-foreground">
               Use your account credentials to continue.
@@ -376,7 +379,8 @@ export function LoginPage() {
             {/* Feature decision 8: the console keeps saying who built it,
                 even when the workspace has a name of its own. */}
             <span className="text-xs">{PRODUCT_BYLINE}</span>
-            <span>© {new Date().getFullYear()} {branding.name}</span>
+            {/* Same rule as the heading: no "© 2026 " with no name after it. */}
+            <span>{branding.loading ? "\u00A0" : `© ${new Date().getFullYear()} ${branding.name}`}</span>
           </div>
           {/* Placeholder destination — point this at the docs site (or
               wherever support lives) once that URL exists. */}
