@@ -119,8 +119,8 @@ export const dashboardService = clickhouseDashboardService
  * (`PR #199 review M SHOULD-FIX BI-16 7`).
  */
 export type {
-  AccessKind, AccessLevel, Board, BoardChart, BoardTab, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
-  ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, TileBox,
+  AccessKind, AccessLevel, Board, BoardChart, BoardTab, ChartOutline, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
+  ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, ShortcutItem, TileBox,
   // `BI-29`: the filter and click shapes, formerly imported from `clients/bi-store`.
   ChartClick, FilterDef, FilterField, FilterKind, FilterOp, FilterSkip, FilterValues, FilterValuesScope, RelativeAnchor, RelativeUnit,
 } from "./contracts/dashboards"
