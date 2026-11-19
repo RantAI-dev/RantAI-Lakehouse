@@ -141,3 +141,23 @@ Notes for the reviewer: in the API test the connector is created with `fixture(t
 ## Review
 
 (reviewer appends here)
+
+### Review 1 (planner, 2026-11-19, head ffde241de)
+
+Diff read against D1–D5 and AGENTS.md. D1: `kafka_source_objects` is a pure
+store fn beside `validate_ingest_mode`, reuses `default_bronze_target`, keeps
+an API caller's single object named as the topic; the route fetches the
+connector name only for `kafka`. D2: `KafkaTargetMissing` is raised before a
+consumer exists, classified `setting_rejected`, fixed text, and every
+`source_objects[0]` read now goes through the checked `target`. D3:
+`auto_offset_reset="earliest"` on the ingest consumer only. D4 done. D5: the
+gate preloads 3 messages before registering, saves `source_objects=[]`, reads
+the server's target back, and counts the preloaded ids; no other reference to
+the old `g6_kafka_events` remains.
+
+No BLOCKER. No SHOULD-FIX.
+
+Open before merge (*not verified* locally, by the owner's choice of CI):
+clippy and `cargo test` for the new store/API tests, and the `G6 ingest
+matrix (files, APIs, streams)` gate, including its assumption that the Kafka
+Bronze column is named `id`.
