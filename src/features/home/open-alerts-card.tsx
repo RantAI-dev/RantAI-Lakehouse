@@ -1,12 +1,13 @@
 "use client"
 
 import Link from "next/link"
+import { Bell } from "lucide-react"
 
 import { formatRelativeTime } from "@/lib/format"
 import { openAlertRows, type CardRead } from "@/lib/home-cards"
 import { SEVERITY_LABEL, type Severity } from "@/lib/status"
 import { cn } from "@/lib/utils"
-import { CardNote, CardSection, CardSkeleton, ReadNote } from "./home-ui"
+import { CardNote, CardSection, CardSkeleton, ReadNote, ROW } from "./home-ui"
 
 type Alert = {
   id: string
@@ -30,7 +31,7 @@ export function OpenAlertsCard({
 }) {
   const rows = openAlertRows(alerts)
   return (
-    <CardSection title="Open alerts" link={{ href: "/alerts", label: "All alerts" }}>
+    <CardSection title="Open alerts" icon={Bell} link={{ href: "/alerts", label: "All alerts" }}>
       {read === "loading" ? (
         <CardSkeleton />
       ) : read !== "ok" ? (
@@ -44,7 +45,7 @@ export function OpenAlertsCard({
               <Link
                 href="/alerts"
                 title={a.title}
-                className="flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm transition-colors hover:bg-muted/60"
+                className={cn(ROW, "h-9 text-[13px] leading-5")}
               >
                 <span
                   className={cn(

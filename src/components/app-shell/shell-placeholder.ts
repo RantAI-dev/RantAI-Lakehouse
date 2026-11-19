@@ -13,17 +13,21 @@
  * - `dashboard`: one dashboard, `/dashboards/<id>`, and `/dashboards` itself,
  *   which forwards to the board last opened and draws the dashboard's
  *   placeholder while it decides (`DashboardPageSkeleton`).
+ * - `home`: Home, `/` (`HomePlaceholder`, `WEB-17`): the lake band (or none,
+ *   when this browser chose Background Off), the greeting, the composer,
+ *   the chips and the bento's widgets in their loading look.
  * - `page`: everything else, including the dashboard routes that are not a
  *   board (`/dashboards/metrics`, `/dashboards/reports/…`, a chart's builder
  *   under `/dashboards/<id>/charts/…`).
  */
-export type ShellPlaceholder = "dashboard-list" | "dashboard" | "page"
+export type ShellPlaceholder = "home" | "dashboard-list" | "dashboard" | "page"
 
 /** The `/dashboards/<segment>` routes that are pages of their own, not a board id. */
 const DASHBOARD_PAGES: ReadonlySet<string> = new Set(["browse", "metrics", "reports"])
 
 export function shellPlaceholderFor(pathname: string): ShellPlaceholder {
   const path = pathname.split(/[?#]/)[0].replace(/\/+$/, "") || "/"
+  if (path === "/") return "home"
   if (path === "/dashboards/browse") return "dashboard-list"
   if (path === "/dashboards") return "dashboard"
   const board = /^\/dashboards\/([^/]+)$/.exec(path)?.[1]
