@@ -67,8 +67,8 @@ describe("the public link page shows the workspace's own branding (ADM-2)", () =
 
     expect(await screen.findByText("Acme Data")).toBeTruthy()
     // The product's own name is nowhere in the header: a workspace that set
-    // a name must not still be called Rantai Lake.
-    expect(screen.queryByText("Rantai Lake")).toBeNull()
+    // a name must not still be called RantAI Lakehouse.
+    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
     expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
 
     const shown = pictures(container)
@@ -83,7 +83,7 @@ describe("the public link page shows the workspace's own branding (ADM-2)", () =
     serve({ workspaceName: null, logo: null, logoDark: null, icon: null })
     const { container } = render(<PublicDashboard token="tok" />)
 
-    expect(await screen.findByText("Rantai Lake")).toBeTruthy()
+    expect(await screen.findByText("RantAI Lakehouse")).toBeTruthy()
     expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
       "/logo-light.png",
       "/logo-dark.png",

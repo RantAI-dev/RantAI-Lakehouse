@@ -171,7 +171,7 @@ describe("the navbar's page title", () => {
 
     expect(await screen.findByText("Acme Data")).toBeTruthy()
     // The product's own name is not the fallback any more: a workspace that
-    // set a name must not be called Rantai Lake.
-    expect(screen.queryByText("Rantai Lake")).toBeNull()
+    // set a name must not be called RantAI Lakehouse.
+    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
   })
 })
