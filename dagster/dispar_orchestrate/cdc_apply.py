@@ -144,7 +144,7 @@ from dispar_orchestrate.ingest_factory import (
     IngestFactoryConfig,
     _fetch_connector_for_run,
     _headers,
-    run_limit_tags,
+    job_tags,
 )
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
@@ -931,7 +931,7 @@ def _trigger_of(context: Any) -> str:
 # whose process died is cancelled and failed by the daemon, so it does not
 # hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
 # is a tag and not `run_monitoring.max_runtime_seconds`.
-@job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
+@job(tags=job_tags("cdc_apply_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def cdc_apply_job() -> None:
     """Config: `ops.cdc_apply_op.config.connector_id`, a change-capture connector."""
     cdc_apply_op()

@@ -51,7 +51,7 @@ An Assistant only user's chat runs in Ask mode: write tools are hidden and refus
 - Hiding a page also refuses its API, except for pages whose data is already shared with dashboards (named in the plan's handoff).
 - A person whose roles give both `assistant:use` and `assistant:ask` gets the full assistant.
 - A user with no role sees no page. Before this feature such a user could use the assistant and read the status lists.
-- A Dashboard Viewer can still save an alert on a chart, but cannot list or remove it: the Alerts page needs `alert:read` (`BI-43`).
+- A Dashboard Viewer can save an alert on a chart and, from that chart's alert dialog ("Your alerts on this chart", `GET /api/alerts/mine`), list and remove their own; the Alerts page still needs `alert:read` (`BI-43`).
 - Gold exports and agent run pages have no read permission yet; any signed-in user can open them by address, as before (`SEC-66`).
 - A refusal reads "You don't have access" and names the missing permission when the server names it, for example "This needs the connector:manage permission." (`WEB-11`; *proposed, not yet signed*). Every console page reads a refusal this way since `WEB-12`; sign-in keeps its own messages.
 

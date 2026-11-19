@@ -206,6 +206,14 @@ const tooltipCases: TooltipCase[] = [
   { name: "sankey", spec: { kind: "sankey", x: "c", y: "v", series: "g" }, rows: [{ c: XSS, g: XSS, v: 1 }], params: { name: `a:${XSS}`, value: 1, data: { source: `a:${XSS}`, target: `b:${XSS}` } } },
   { name: "sunburst", spec: { kind: "sunburst", x: "c", y: "v", series: "g" }, rows: [{ c: XSS, g: XSS, v: 1 }], params: { treePathInfo: [{ name: XSS }], value: 1 } },
   { name: "boxplot", spec: { kind: "boxplot", x: "c", y: "v" }, rows: [{ c: XSS, v: [1, 2, 3, 4, 5] }], params: { seriesType: "boxplot", data: [1, 2, 3, 4, 5], dataIndex: 0 } },
+  // BI-33 (`#199` review round O): the three branches the list above did not
+  // reach. A sankey LINK (`dataType: "edge"`) writes both ends; a boxplot's
+  // single-value dot (`seriesType: "scatter"`) writes its category; a scatter
+  // or bubble tooltip writes the measure LABELS, which a user can set to any text.
+  { name: "sankey edge", spec: { kind: "sankey", x: "c", y: "v", series: "g" }, rows: [{ c: XSS, g: XSS, v: 1 }], params: { dataType: "edge", value: 1, data: { source: `a:${XSS}`, target: `b:${XSS}` } } },
+  { name: "boxplot outlier", spec: { kind: "boxplot", x: "c", y: "v" }, rows: [{ c: XSS, v: [1, 2, 3, 4, 5] }], params: { seriesType: "scatter", data: [0, 1], dataIndex: 0 } },
+  { name: "scatter label", spec: { kind: "scatter", x: "c", y: ["v", "w"], measureLabels: { v: XSS, w: XSS } }, rows: [{ c: "p", v: 1, w: 2 }], params: { name: "p", value: [1, 2] } },
+  { name: "bubble size label", spec: { kind: "bubble", x: "c", y: ["v", "w", "s"], measureLabels: { v: "a", w: "b", s: XSS } }, rows: [{ c: "p", v: 1, w: 2, s: 3 }], params: { name: "p", value: [1, 2, 3] } },
   { name: "calendar", spec: { kind: "calendar", x: "d", y: "v" }, rows: [{ d: "2026-10-01", v: 1 }], params: { value: [XSS, 1] } },
 ]
 

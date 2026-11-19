@@ -6,7 +6,7 @@
 | Backlog | `OPS-8` |
 | Kind | Feature |
 | Spec | `docs/core/specs/ops-8.md` |
-| Status | In Acceptance |
+| Status | Released (accepted 2026-11-19; PR #591) |
 | Priority | P2 |
 | Owner | In the base |
 | Acceptor | In the base |
@@ -80,8 +80,8 @@ No assistant work in this feature. `AGENTS.md` assistant parity binds BI feature
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `OPS-8-AC1` to `AC3` | As in the spec | As in the spec | Not run |
-| `OPS-8-AC4` | Trigger `storage_snapshot_job` once and take the bucket's size from a `capacity_snapshot` run within the same hour; compare the two on the Usage page | The sum of "stored on disk" over the Iceberg layers plus "In the bucket but in no current table" equals the bucket within 1 %, when both are measured within the same hour | Not run |
-| `OPS-8-AC5` to `AC6` | As in the spec | As in the spec | Not run |
+| `OPS-8-AC1` to `AC3` | As in the spec | As in the spec | Pass 2026-11-19 |
+| `OPS-8-AC4` | Trigger `storage_snapshot_job` once and take the bucket's size from a `capacity_snapshot` run within the same hour; compare the two on the Usage page | The sum of "stored on disk" over the Iceberg layers plus "In the bucket but in no current table" equals the bucket within 1 %, when both are measured within the same hour | Pass 2026-11-19 |
+| `OPS-8-AC5` to `AC6` | As in the spec | As in the spec | Pass 2026-11-19 |
 
 Storage per layer shipped in PR #574, so `OPS-8-AC4` can now run.

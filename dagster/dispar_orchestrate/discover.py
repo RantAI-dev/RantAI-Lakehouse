@@ -102,8 +102,8 @@ from dispar_orchestrate.adapters import sftp as sftp_adapter
 from dispar_orchestrate.ingest_factory import (
     IngestFactoryConfig,
     _fetch_one_connector,
+    job_tags,
     kafka_security_kwargs,
-    run_limit_tags,
 )
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 from dispar_orchestrate.saas import session as saas_session
@@ -1195,7 +1195,7 @@ def run_discover(context) -> None:
 # whose process died is cancelled and failed by the daemon, so it does not
 # hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
 # is a tag and not `run_monitoring.max_runtime_seconds`.
-@job(name="discover_job", tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
+@job(name="discover_job", tags=job_tags("discover_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def discover_job() -> None:
     """Launched by `POST /api/connectors/{id}/discovery/{kind}` with run config
     `{"ops": {"run_discover": {"config": {...}}}}` (the API's `launch`)."""

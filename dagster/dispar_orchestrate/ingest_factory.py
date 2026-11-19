@@ -312,9 +312,57 @@ def run_limit_tags(env_name: str, default_seconds: int) -> dict[str, str]:
     return {"dagster/max_runtime": str(settings.max_runtime_seconds)}
 
 
+# The tag that keeps one job from overlapping ANOTHER RUN OF ITSELF
+# (`OPS-37`). Its value is the job's own Dagster name, so the run queue's
+# per-value limit applies to that job alone: a second `bronze_maintenance_job`
+# waits in the queue, while `gold_export_job` may run beside it.
+#
+# The rule itself lives in `dagster/dagster.yaml`
+# (`concurrency.runs.tag_concurrency_limits`), not here: this module owns
+# the tag, the instance config owns the limit.
+SERIAL_TAG = "lakehouse/serial"
+
+# The jobs that must never overlap another run of THEMSELVES. Each of them
+# writes to the same tables a second run of it would write, so two
+# overlapping runs fight over the same rows -- the staging outage of
+# 2026-11-18, where a scheduled `bronze_maintenance_job` and one started by
+# hand overlapped for an hour.
+#
+# The list is here, next to the tag, so it is read with the code that uses
+# it. A job that waits for its own previous run stays QUEUED and is never
+# dropped.
+SERIAL_JOB_NAMES = frozenset(
+    {
+        "bronze_maintenance_job",
+        "capacity_snapshot_job",
+        "discover_job",
+        "gold_export_job",
+        "storage_snapshot_job",
+    }
+)
+
+
+def job_tags(job_name: str, env_name: str, default_seconds: int) -> dict[str, str]:
+    """The tags every run of `job_name` carries: its own run limit and, for
+    a serial job, the `lakehouse/serial` tag (`OPS-37`).
+
+    ONE helper for every job of this code location, so both rules stay in
+    one place (`AGENTS.md` rule 4): a job added later carries its run limit
+    and the serial tag the same way, and neither tag is ever written by hand
+    at a call site.
+
+    `run_limit_tags` stays the ONE place that parses the limit setting; this
+    helper adds the serial tag to its result.
+    """
+    tags = run_limit_tags(env_name, default_seconds)
+    if job_name in SERIAL_JOB_NAMES:
+        tags[SERIAL_TAG] = job_name
+    return tags
+
+
 def _ingest_job_tags() -> dict[str, str]:
     """The tags every `ingest_job` run carries (`SRC-39`, QA `TC-1702`)."""
-    return run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS)
+    return job_tags("ingest_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS)
 
 
 def _fetch_one_connector(cfg: IngestFactoryConfig, connector_id: str) -> dict[str, Any]:
