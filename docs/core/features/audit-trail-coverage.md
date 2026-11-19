@@ -40,7 +40,7 @@ No new assistant work. Its tool calls are already recorded.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Excluded from the audit (each listed in the guard test with this reason): read-like POSTs (preview, validate, estimate, compile, lag-check, `check`, `compare`), connection and email "test" buttons, the public data and frame routes, machine callbacks from ingestion jobs, multipart upload parts, and personal UI state (favourites, recent, home layout, chat session create/rename/delete, and the read marks of mentions, `POST /api/dashboard/comments/mentions/read`; owner, 2026-11-15). Everything else is recorded | as written | Owner, 2026-11-14 |
+| 1 | Excluded from the audit (each listed in the guard test with this reason): read-like POSTs (preview, validate, estimate, compile, lag-check, `check`, `compare`), connection and email "test" buttons, the alert test button (`POST /api/alerts/test`), the public data and frame routes, machine callbacks from ingestion jobs, the alert scheduler's tick (`POST /api/alerts/run`), multipart upload parts, and personal UI state (favourites, recent, home layout, chat session create/rename/delete, and the read marks of mentions, `POST /api/dashboard/comments/mentions/read`; owner, 2026-11-15). Everything else is recorded | as written | Owner, 2026-11-14 |
 | 2 | A refused change is recorded (outcome `refused`) for every covered route | yes | Owner, 2026-11-14 |
 | 3 | Old and new values only for roles, policies, table access and grants; other changes record the names of changed fields only; never a secret | as written | Owner, 2026-11-14 |
 | 4 | A failed audit write does not undo the change (as today); it is logged and counted on the Operations health page | as written | Owner, 2026-11-14 |
@@ -60,7 +60,7 @@ No new assistant work. Its tool calls are already recorded.
 - A request that the service's timeout cuts off writes no row.
 - A change made through a create route does not name the new object when its id is only in the response. The row then names the kind and the action, not the object.
 - The row names the fields a change touched and never their values. The exceptions are the old and new values that the identity, policy, table-access and grant rows record.
-- The scheduler's alert tick (`POST /api/alerts/run`) writes one row per tick.
+- Neither the scheduler's alert tick (`POST /api/alerts/run`) nor the alert test button (`POST /api/alerts/test`) writes an audit row (Decision 1; the reason is in the guard test). The tick is the alert scheduler running the rule on its own, with no person behind it, and the test button sends a probe and changes no configuration.
 - Writes through the Iceberg REST door are refused by that door and are not in the trail.
 - The assistant's audit history tool (`get_audit_history`) needs `audit:read`, like the audit page (#585).
 - The Overview page's activity feed (`POST /api/overview`) shows the 20 newest audit rows of everyone only to a person with `audit:read`. Any other person sees only the 20 newest rows of their own actions, with the action, the object and the outcome.
@@ -75,18 +75,18 @@ No new assistant work. Its tool calls are already recorded.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `GOV-1-AC1` | Save, rename, move, share and delete a saved query; open the audit page | Five rows, each with you, the action, the query, the time and Executed | Not run |
-| `GOV-1-AC2` | Create a dashboard, add a chart, change a filter, delete the dashboard | One row per change | Not run |
-| `GOV-1-AC3` | Create, edit and delete an alert and a report subscription | One row per change | Not run |
-| `GOV-1-AC4` | Change the query limits and the reporting settings | One row each, naming the changed fields, no values | Not run |
-| `GOV-1-AC5` | Create a role, change its permissions | Rows with the old and new permissions | Not run |
-| `GOV-1-AC6` | As a user without the permission, try to delete someone else's dashboard | Refused in the console; a row with outcome Refused | Not run |
-| `GOV-1-AC7` | Ask the assistant to change a chart | A row with the assistant as actor (as today) | Not run |
-| `GOV-1-AC8` | Filter the audit page to one person and a date range older than the newest 200 events | The matching events of that range, paged | Not run |
-| `GOV-1-AC9` | Export the filtered result | A CSV with the same rows and columns | Not run |
-| `GOV-1-AC10` | As an Analyst (holds `governance:read`, not `audit:read`), open the audit page and the export link | Refused; the audit page is not in the menu | Not run |
+| `GOV-1-AC1` | Save, rename, move, share and delete a saved query; open the audit page | Five rows, each with you, the action, the query, the time and Executed | Pass (staging `6da7012a`, Auditor 2026-11-16) |
+| `GOV-1-AC2` | Create a dashboard, add a chart, change a filter, delete the dashboard | One row per change | Pass (staging `6da7012a`, Auditor 2026-11-16) |
+| `GOV-1-AC3` | Create, edit and delete an alert and a report subscription | One row per change | Pass (staging `6da7012a`, Auditor 2026-11-16) |
+| `GOV-1-AC4` | Change the query limits and the reporting settings | One row each, naming the changed fields, no values | Pass (staging `6da7012a`, Auditor 2026-11-16, finding fixed by D3) |
+| `GOV-1-AC5` | Create a role, change its permissions | Rows with the old and new permissions | Pass (staging `6da7012a`, Auditor 2026-11-16) |
+| `GOV-1-AC6` | As a user without the permission, try to delete someone else's dashboard | Refused in the console; a row with outcome Refused | Pass (staging `6da7012a`, Auditor 2026-11-16) |
+| `GOV-1-AC7` | Ask the assistant to change a chart | A row with the assistant as actor (as today) | Pass (staging `8fe62e349`, Auditor 2026-11-18, retest after #573) |
+| `GOV-1-AC8` | Filter the audit page to one person and a date range older than the newest 200 events | The matching events of that range, paged | Pass (staging `6da7012a`, Auditor 2026-11-16) |
+| `GOV-1-AC9` | Export the filtered result | A CSV with the same rows and columns | Pass (staging `6da7012a`, Auditor 2026-11-16) |
+| `GOV-1-AC10` | As an Analyst (holds `governance:read`, not `audit:read`), open the audit page and the export link | Refused; the audit page is not in the menu | Pass (staging `6da7012a`, Auditor 2026-11-16) |
 | `GOV-1-AC11` | (operator) Try `UPDATE audit_event ...` and `DELETE FROM audit_event ...` with the console's database account | Both refused by the database. The Auditor's check (2026-11-16) found the console account on staging was `lakehouse`, the image's superuser and the owner of `audit_event`, so it could still turn off the trigger (`DISABLE TRIGGER`, `session_replication_role = replica`); since `SEC-78` the console connects as `lakehouse_app`, which neither owns `audit_event` nor is a superuser, so only the migration owner can turn it off. | Pass (CI of #546/#549, `lakehouse-store/tests/audit.rs` as superuser; staging console account from deploy config; Auditor 2026-11-16) |
-| `GOV-1-AC12` | (operator) Look at the CI run of the pull request | The audit coverage test passes, and it lists every excluded route with its reason | Not run |
+| `GOV-1-AC12` | (operator) Look at the CI run of the pull request | The audit coverage test passes, and it lists every excluded route with its reason | Pass (staging `6da7012a`, Auditor 2026-11-16) |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 

@@ -161,7 +161,7 @@ hands-on testing.
 | Catalog and search | **Partial.** Search finds a table by its name, columns, tags, description or owner, forgives a typo and ranks (`DATA-11`, accepted 2026-10-23; speed on 10,000 tables not measured, and a typo that matches only a table's name carries no "approximate match" label, `DATA-24`, `DATA-32`). Certified and deprecated marks, governed tags, and the marks in the chart builder and Query Studio are built and accepted (`DATA-12`, 2026-10-23); per-user table visibility is not built | Yes: columns, tags, certification | `DATA-12`, `DATA-20`, `DATA-24` |
 | Lineage | **Partial** | Yes, including outside systems | Depth |
 | Data quality checks | **Partial.** Hand-written rules; freshness against a set target | Yes: ready check libraries, anomaly detection | `DATA-14` |
-| Audit trail | **Partial.** About 87 of the 218 routes that change something record an audit row (identity, policies, governance, connectors, pipelines, sharing, the assistant's actions); dashboards, saved queries, alerts and some settings do not. `GOV-1` closes it. | Yes | Full coverage |
+| Audit trail | **Partial.** 182 of the 224 routes that change something record an audit row (identity, policies, governance, connectors, pipelines, sharing, the assistant's actions, and now dashboards, saved queries, alerts, report subscriptions and the settings); the other 42 are excluded, each with a listed reason. `GOV-1` closes it. | Yes | Full coverage |
 | Single sign-on | **Partial.** The sign-in start, callback and provider-list routes exist in the API; not tested against a real identity provider. | Yes | Test it |
 
 #### Business intelligence
@@ -285,7 +285,7 @@ in `docs/KNOWN-LIMITATIONS.md` (moved from the README, 2026-11-05).
   (`SEC-15`, `SEC-10`); raw database errors reach the screen on dashboard
   tiles and embeds (`SEC-11`). The full list is `SEC-10` to `SEC-21` in
   `BACKLOG.md`.
-- The audit trail does not cover every console change.
+- The audit trail does not cover every console change: 42 of the 224 routes that change something are excluded, each with a listed reason (the audit trail's Decision 1).
 - The backend was ported and reviewed by AI agents, with no full human
   security review. A previously internal key is in the public git history
   (`SECURITY.md`).
