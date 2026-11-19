@@ -2,7 +2,7 @@
 # SEC-18 -- write a local `.env` from `.env.example` with generated secrets.
 #
 # docker-compose.yml has no default credentials: it refuses to start while
-# POSTGRES_PASSWORD, LAKEHOUSE_DB_APP_PASSWORD, RUSTFS_ACCESS_KEY,
+# POSTGRES_PASSWORD, LAKEHOUSE_DB_APP_PASSWORD, LAKEHOUSE_DB_DAGSTER_PASSWORD, RUSTFS_ACCESS_KEY,
 # RUSTFS_SECRET_KEY or LAKEKEEPER_ENCRYPTION_KEY is empty. This script is
 # the one-line way to a working local stack:
 #
@@ -61,7 +61,7 @@ gen_b64() {
 }
 
 filled=""
-for var in POSTGRES_PASSWORD LAKEHOUSE_DB_APP_PASSWORD RUSTFS_ACCESS_KEY \
+for var in POSTGRES_PASSWORD LAKEHOUSE_DB_APP_PASSWORD LAKEHOUSE_DB_DAGSTER_PASSWORD RUSTFS_ACCESS_KEY \
   RUSTFS_SECRET_KEY LAKEKEEPER_ENCRYPTION_KEY SEAWEEDFS_ACCESS_KEY \
   SEAWEEDFS_SECRET_KEY AUTH_BOOTSTRAP_PASSWORD RENDER_TOKEN_SECRET; do
   # Only an empty assignment is filled: a value already in the example is
