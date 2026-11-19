@@ -58,10 +58,14 @@ reported, not quietly lowered.
   opens, only nothing is sent.
 - A rule is written for a table that exists and that its author may read; any
   other table is refused (`DATA-54`).
-- A rule is run by hand only by a person who may read its table. Anyone else is
-  refused with the same sentence a table that is not there gets, and nothing is
-  measured or recorded. Scheduled and on-load checks run as the system and are
-  not affected. Changed 2026-11-12 (`GOV-12`), *(proposed, not yet signed)*.
+- A rule is run by hand only by a person who may read its table. A person whose
+  role does not read the table is refused with the same sentence a table that is
+  not there gets. A rule on a table another tenant claimed as its upload answers
+  `404` "Quality rule not found", the same answer as an unknown rule, so a rule
+  of another tenant cannot be told apart from a missing one. In both cases
+  nothing is measured or recorded. Scheduled and on-load checks run as the system
+  and are not affected. Changed 2026-11-12 (`GOV-12`), *(proposed, not yet
+  signed)*.
 - Editing or deleting a rule, its schedule, and resolving its incident follow
   the same rule: a person outside the tenant that owns the catalog is refused,
   and a rule or incident on a table the person's role does not read answers as

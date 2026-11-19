@@ -196,7 +196,7 @@ from dispar_orchestrate.adapters.kafka import consume_one_batch
 from dispar_orchestrate.adapters.sink import LoadPlan, UnsupportedLoadMode, load_via_sink
 from dispar_orchestrate.bronze_catalog import record_ingest_offset, record_ingest_run
 from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types
-from dispar_orchestrate.ingest_errors import UnknownAdapter, UnsupportedKafkaAuth
+from dispar_orchestrate.ingest_errors import KafkaTargetMissing, UnknownAdapter, UnsupportedKafkaAuth
 from dispar_orchestrate.op_metadata import source_metadata
 from dispar_orchestrate.saas import vendors as saas_vendors
 from dispar_orchestrate.secret_map import secret_field_names
@@ -1110,19 +1110,35 @@ def run_kafka_stream_batch(
     closes it in `finally`; a caller-supplied consumer is the caller's to
     close.
     """
+    # SRC-45 (QA `LH-SRC-6-41`): the Bronze table is the first source object's
+    # `target`. A spec with none used to stop at the first message with a bare
+    # `IndexError` ("failed, not classified"); it now fails closed, before any
+    # consumer exists, with a classified `setting_rejected` and a sentence that
+    # says what to do. `source_objects[0]` is read only through this check.
+    first = source_objects[0] if source_objects else {}
+    target = first.get("target") if isinstance(first, dict) else None
+    if not isinstance(target, str) or not target:
+        raise KafkaTargetMissing(
+            "This Kafka connector has no Bronze table yet: pick its topic again on the Ingest tab."
+        )
     owns_consumer = consumer is None
     if owns_consumer:
         consumer = KafkaConsumer(
             bootstrap_servers=spec["bootstrapServers"],
             group_id=spec["groupId"],
             enable_auto_commit=False,
+            # SRC-45 (QA `LH-SRC-6-41`): a group with no committed offset reads the
+            # topic from its start, not from its end (kafka-python's default
+            # `latest`, which loaded nothing on the first run). A group that has
+            # committed resumes where it stopped; this changes only the first run.
+            auto_offset_reset="earliest",
             value_deserializer=lambda v: v,  # raw bytes -- consume_one_batch does its own json.loads
             **kafka_security_kwargs(spec, secrets),
         )
         consumer.subscribe([spec["topic"]])
     topic = spec.get("topic", "")
     job_name = "ingest_job"
-    object_name = source_objects[0]["target"] if source_objects else topic
+    object_name = target
     started_at = datetime.now(timezone.utc).isoformat()
 
     def _record(*, rows, status, error=""):
@@ -1147,7 +1163,7 @@ def run_kafka_stream_batch(
             sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(
                 dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
             )
-            outcome = load_via_sink(batch.rows, source_objects[0]["target"], sink_config)
+            outcome = load_via_sink(batch.rows, target, sink_config)
             # Committed ONLY after the sink write above returned
             # successfully (an exception there propagates out of this
             # try block before this point is ever reached -- see this
@@ -1167,13 +1183,13 @@ def run_kafka_stream_batch(
             # failed batch wrote nothing, so they register nothing.
             _register_in_catalog(
                 connector_id,
-                {"name": source_objects[0].get("name") or topic, "target": source_objects[0]["target"]},
+                {"name": first.get("name") or topic, "target": target},
             )
             # SRC-8 (D4): a micro-batch is observed AFTER it loads, like every
             # source whose columns cannot be read first. The offsets are
             # already committed; a failed post changes nothing (see
             # `_observe_after_load`).
-            _observe_after_load(connector_id, source_objects[0].get("name") or topic, outcome.columns, run_id)
+            _observe_after_load(connector_id, first.get("name") or topic, outcome.columns, run_id)
             return outcome.rows
         except ssrf_guard.SsrfBlocked as exc:
             _record(rows=None, status="rejected", error=str(exc))

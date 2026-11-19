@@ -12,7 +12,6 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { Textarea } from "@/components/ui/textarea"
 import { Spinner } from "@/components/ui/spinner"
 import { useServiceAction } from "@/hooks/use-service"
@@ -84,7 +83,8 @@ export function AgenticBuilderDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-4">
-          <RequiredLegend />
+          {/* UX-4: the instruction is required while the database is not,
+              so the star stays; two inputs are too few for a legend. */}
           <div className="grid gap-2">
             <Label htmlFor="ab-instruction" required>Instruction</Label>
             <Textarea

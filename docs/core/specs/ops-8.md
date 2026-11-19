@@ -25,7 +25,7 @@ Best competitor per row from `plans/ops-8-research.md`.
 | Query usage by day, person, engine | None | Snowflake `QUERY_HISTORY`: user, role, warehouse, database | Day, person, engine, workload class |
 | Freshness | None | Databricks query history about 1 hour; Snowflake up to 45 minutes | A finished query counts within 5 minutes |
 | History kept | `query_history` is never trimmed | 365 days (Snowflake, Databricks query history) | At least 365 days; no trimming in this feature |
-| Storage by layer | None (the old figure was invented) | Snowflake daily average per database | Bytes per layer (Bronze, Silver, Gold, Serving) from a measured source, one value per day |
+| Storage by layer | None (the old figure was invented) | Snowflake daily average per database | Two values per Iceberg layer (Bronze, Gold): current data and stored on disk. One value per ClickHouse layer (Silver, Serving): their bytes are on the ClickHouse server's own disk, not in the warehouse bucket. From a measured source, one value per day. The sum of "stored on disk" over the Iceberg layers plus "In the bucket but in no current table" equals the bucket within 1 %, when both are measured within the same hour |
 | Money | None | Databricks: usage times admin-set rate, marked as estimate | Admin-set rate per TB scanned, per engine hour and per GB-month stored, with an effective date; shown only when set, labelled "estimate" |
 | Tenant separation | Not possible, no tenant column | One account per customer | A tenant administrator sees only their tenant; `*:*` sees all tenants and the rows with no tenant |
 | Who can see | None | Admin roles (`USAGE_VIEWER`, account admin) | A new permission `usage:read`, given to the tenant admin role |
@@ -38,7 +38,7 @@ Best competitor per row from `plans/ops-8-research.md`.
 - `OPS-8-AC1` Run three queries as one person; within 5 minutes Monitoring → Usage shows them under that person, engine and day
 - `OPS-8-AC2` Signed in as an administrator of tenant B, the page shows none of tenant A's people or queries
 - `OPS-8-AC3` With no rates set, the page shows no money column; after setting a rate per TB, an amount appears marked "estimate"
-- `OPS-8-AC4` Storage by layer shows a value per layer that matches the object store within 1 %
+- `OPS-8-AC4` The sum of "stored on disk" over the Iceberg layers plus "In the bucket but in no current table" equals the bucket within 1 %, when both are measured within the same hour
 - `OPS-8-AC5` Export a 30-day period as CSV; the totals match the page
 - `OPS-8-AC6` A person without `usage:read` gets 403 on the route and does not see the menu item
 

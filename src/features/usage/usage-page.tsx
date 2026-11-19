@@ -23,7 +23,7 @@ import {
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { saveBlob } from "@/lib/browser-file"
-import { formatDuration, formatNumber } from "@/lib/format"
+import { formatDateTime, formatDuration, formatNumber } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
 import { usageService } from "@/services"
 import type {
@@ -31,6 +31,7 @@ import type {
   UsageRate,
   UsageReport,
   UsageRow,
+  UsageStorageBucket,
   UsageStorageReport,
   UsageStorageRow,
 } from "@/services"
@@ -375,11 +376,51 @@ function newestPerLayer(rows: UsageStorageRow[]): UsageStorageRow[] {
 }
 
 /**
+ * The layers whose bytes are not in the warehouse bucket: a ClickHouse layer
+ * is measured on the ClickHouse server's own disk, so it carries one number
+ * instead of two. The rows themselves say which layers those are.
+ */
+function layersWithoutStoredBytes(rows: UsageStorageRow[]): string[] {
+  return rows.filter((row) => row.storedBytes === null).map((row) => row.layer)
+}
+
+/**
+ * The line that names the layers that carry one number, and says why: their
+ * bytes sit on the ClickHouse server's own disk, not in the warehouse bucket.
+ */
+function oneNumberLine(layers: string[]): string {
+  if (layers.length === 1) {
+    return `${layers[0]} is a ClickHouse layer: its bytes sit on the ClickHouse server's own disk, not in the warehouse bucket, so it has one number.`
+  }
+  return `${layers.join(" and ")} are ClickHouse layers: their bytes sit on the ClickHouse server's own disk, not in the warehouse bucket, so they have one number.`
+}
+
+/**
+ * The rest of the bucket: the bytes no current table accounts for, with the
+ * two measurement times it was worked out from. `null` when the two
+ * measurements disagree — the page says "not comparable" rather than a
+ * negative number.
+ */
+function bucketRestLine(bucket: UsageStorageBucket, storageMeasuredAt: string | null): string {
+  const amount =
+    bucket.unaccountedBytes === null ? "not comparable" : formatDecimalBytes(bucket.unaccountedBytes)
+  const storageWhen = storageMeasuredAt ? formatDateTime(storageMeasuredAt) : "—"
+  return `In the bucket but in no current table: ${amount} (bucket measured ${formatDateTime(bucket.measuredAt)}; storage measured ${storageWhen}).`
+}
+
+/**
  * The size of every layer, measured once a day by the storage job.
  *
  * A layer whose tables could not be measured never reads as a layer of zero
  * bytes: the size is the bytes of the tables that were measured, and the
  * count says how many are missing from it.
+ *
+ * Two numbers per Iceberg layer: the data that is current, and what the
+ * object store holds for it. The bucket holds more than the current tables
+ * — history and orphan files sit in it too — so the rest of the bucket is
+ * one line of its own. When NO row carries a disk number, the disk was not
+ * measured here yet (the deploy window, `PR #591 review 1`) and the page
+ * says so instead of naming the layers as ClickHouse layers.
  */
 function StoragePanel({
   state,
@@ -391,6 +432,15 @@ function StoragePanel({
   const currency = report?.currency ?? null
   const priced = currency !== null
   const skipped = rows.filter((row) => row.tablesSkipped > 0)
+  const oneNumber = layersWithoutStoredBytes(rows)
+  // The deploy window (`PR #591 review 1`): the route re-read without the
+  // disk column, so EVERY row lacks the number — the job has not measured
+  // the disk here yet (decision 6), and naming the layers as ClickHouse
+  // layers, whose bytes genuinely sit on the engine's own disk, would be
+  // false.
+  const diskNotMeasured = rows.length > 0 && oneNumber.length === rows.length
+  const measuredAt = report?.measuredAt ?? null
+  const bucket = report?.bucket ?? null
   return (
     <SectionCard
       title="Storage per layer"
@@ -399,11 +449,11 @@ function StoragePanel({
       <div className="flex flex-col gap-3">
         {state.status === "loading" ? <LoadingSkeleton rows={2} /> : null}
         {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
-        {state.status === "success" && rows.length === 0 ? (
-          <EmptyState
-            title="No storage measured yet"
-            description="The storage job measures every layer once a day. Nothing was measured in these days."
-          />
+        {/* A report that says nothing was measured is an empty state, not an
+            outage. `report` is `null` while the read has not answered yet, so
+            the two are not the same thing. */}
+        {state.status === "success" && report !== null && measuredAt === null ? (
+          <EmptyState title="Not measured yet" description="The daily job runs at 01:00 UTC." />
         ) : null}
         {rows.length > 0 ? (
           <Table>
@@ -412,7 +462,8 @@ function StoragePanel({
                 <TableHead>Layer</TableHead>
                 <TableHead>Measured on</TableHead>
                 <TableHead className="text-right">Tables</TableHead>
-                <TableHead className="text-right">Size</TableHead>
+                <TableHead className="text-right">Current data</TableHead>
+                <TableHead className="text-right">Stored on disk</TableHead>
                 {priced ? <TableHead className="text-right">{`Estimate (${currency})`}</TableHead> : null}
               </TableRow>
             </TableHeader>
@@ -422,6 +473,17 @@ function StoragePanel({
               ))}
             </TableBody>
           </Table>
+        ) : null}
+        {diskNotMeasured ? (
+          <p className="text-xs text-muted-foreground">
+            Stored on disk: not measured yet. The daily job runs at 01:00 UTC.
+          </p>
+        ) : null}
+        {!diskNotMeasured && oneNumber.length > 0 ? (
+          <p className="text-xs text-muted-foreground">{oneNumberLine(oneNumber)}</p>
+        ) : null}
+        {bucket ? (
+          <p className="text-xs text-muted-foreground">{bucketRestLine(bucket, measuredAt)}</p>
         ) : null}
         {skipped.length > 0 ? (
           <p className="text-xs text-muted-foreground">
@@ -456,7 +518,11 @@ function StorageRowView({ row, priced }: { readonly row: UsageStorageRow; readon
           </span>
         ) : null}
       </TableCell>
-      <TableCell className="text-right tabular-nums">{formatDecimalBytes(row.totalBytes)}</TableCell>
+      <TableCell className="text-right tabular-nums">{formatDecimalBytes(row.currentBytes)}</TableCell>
+      {/* A layer outside the warehouse bucket has no disk number of its own. */}
+      <TableCell className="text-right tabular-nums">
+        {row.storedBytes === null ? "—" : formatDecimalBytes(row.storedBytes)}
+      </TableCell>
       {priced ? (
         <TableCell className="text-right tabular-nums">{formatMoney(row.estimate)}</TableCell>
       ) : null}

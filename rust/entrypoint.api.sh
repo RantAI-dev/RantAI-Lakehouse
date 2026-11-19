@@ -1,45 +1,28 @@
 #!/bin/sh
 # Entrypoint for the rust/Dockerfile image.
 #
-# `main.rs` now applies migrations at boot via `lakehouse_store::migrate`
-# (idempotent — `sqlx` records applied versions in `_sqlx_migrations`), but
-# a failure there is logged rather than fatal, matching the "Postgres-down
-# is quiet" posture the rest of the app takes (see `lakehouse-store`'s
-# `connect_lazy` doc comment). Running `sqlx migrate run` here too, before
-# exec'ing the API binary, is belt-and-suspenders: it applies the schema
-# via a second, independent path in case the in-process migration was
-# skipped or failed, so the bootstrap admin seed (which runs
-# unconditionally on startup, see `main.rs`'s `bootstrap_admin`) doesn't
-# fail with a generic "database error" because `users` doesn't exist yet.
-# `sqlx-cli` is installed into this image at the same pinned version as
-# the workspace's `sqlx` dependency (see `rust/Dockerfile`) specifically
-# so its migration behavior matches what's compiled into the API.
+# The API NEVER migrates. The schema is applied by the `migrate`
+# subcommand of this same binary, which the one-shot `lakehouse-db-migrate`
+# compose service runs with the database OWNER's credentials: a console
+# that owns a table can switch off the audit trail's append-only triggers
+# (`ALTER TABLE audit_event DISABLE TRIGGER`, `SET
+# session_replication_role = replica`), so the role that applies the
+# schema must not be the role the console runs as. The API's boot path
+# checks the migration state instead of applying it, and fails closed on a
+# pending one.
 #
-# If DATABASE_URL is unset/unparseable, skip straight to starting the API
-# — lakehouse-api is designed to boot and serve its Postgres-independent
-# routes even without a database (see lakehouse-store's `connect_lazy`
-# doc comment), and this entrypoint should not be stricter than the
-# process it wraps.
+# `sqlx-cli` is still in this image (see `rust/Dockerfile`), but nothing
+# in it runs the tool any more.
 set -eu
 
 # SRC-12 decision 5: `docker compose run --rm lakehouse-api rotate-secrets-key`
-# passes a command through to the binary. A command is a one-off operator
-# task on the credentials volume, not a server start: no migrations, no
-# waiting on the database, and the binary decides what it accepts (it
-# refuses anything it does not know).
+# passes a command through to the binary. A command is a one-off task, not a
+# server start, and the binary decides what it accepts (it refuses anything
+# it does not know). The same path carries the `migrate` subcommand the
+# `lakehouse-db-migrate` service runs: it waits for the database and applies
+# the migrations.
 if [ "$#" -gt 0 ]; then
     exec /usr/local/bin/lakehouse-api "$@"
-fi
-
-if [ -n "${DATABASE_URL:-}" ]; then
-    echo "entrypoint: applying migrations via sqlx-cli..." >&2
-    if sqlx migrate run --source /app/migrations --database-url "$DATABASE_URL"; then
-        echo "entrypoint: migrations applied" >&2
-    else
-        echo "entrypoint: migration step failed; starting API anyway (it will surface its own Postgres errors per-request)" >&2
-    fi
-else
-    echo "entrypoint: DATABASE_URL not set; skipping migrations" >&2
 fi
 
 exec /usr/local/bin/lakehouse-api

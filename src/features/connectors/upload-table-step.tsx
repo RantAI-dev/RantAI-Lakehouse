@@ -4,7 +4,6 @@ import { DatabaseIcon } from "lucide-react"
 import { trinoBronzeName } from "@/lib/asset-query"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { TABLE_NAME_RULE, rawTableFullName, tableNameFault } from "@/lib/uploads"
 import { cn } from "@/lib/utils"
 import type { UploadLoadMode } from "@/services/contracts/uploads"
@@ -46,7 +45,9 @@ export function UploadTableStep({
   const valid = tableName !== "" && problem === null
   return (
     <div className="space-y-5">
-      <RequiredLegend />
+      {/* UX-4: the required table name sits next to an optional folder, so
+          the star stays but the "* Required" line goes: fewer than four
+          inputs on this step. */}
       <div className="space-y-1.5">
         <Label htmlFor="upload-table-name" required>Table name</Label>
         <Input

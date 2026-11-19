@@ -9,7 +9,6 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { RequiredLegend } from "@/components/patterns/required-legend";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
@@ -87,7 +86,9 @@ export function ManageFoldersDialog({
         </DialogHeader>
 
         <div className="grid gap-2">
-          <RequiredLegend />
+          {/* UX-4: the new-name and rename inputs are required while the
+              parent choice is not, so the stars stay; the dialog is too
+              short for a legend. */}
           <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
             <div className="min-w-0 flex-1 space-y-1">
               <Label htmlFor="new-folder-name" className="text-xs" required>New folder name</Label>
@@ -127,8 +128,7 @@ export function ManageFoldersDialog({
                 {editing?.id === folder.id ? (
                   <>
                     {/* UX-1-R2: a visible associated label so the required
-                        star is seen; sr-only hid it. The dialog's RequiredLegend
-                        above already explains the convention. */}
+                        star is seen; sr-only hid it. */}
                     <Label htmlFor="folder-rename-name" className="shrink-0 text-xs" required>Name</Label>
                     <Input
                       id="folder-rename-name"

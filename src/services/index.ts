@@ -265,7 +265,8 @@ export const usageService = usageClientService
 /** The usage shapes the Usage feature reads from `@/services`. */
 export type {
   NewUsageRate, UsageExport, UsageGroup, UsageQuery, UsageRate, UsageRateKind, UsageRates,
-  UsageReport, UsageRow, UsageService, UsageStorageQuery, UsageStorageReport, UsageStorageRow,
+  UsageReport, UsageRow, UsageService, UsageStorageBucket, UsageStorageQuery, UsageStorageReport,
+  UsageStorageRow,
 } from "./contracts/usage"
 // The server's own health answer (`/api/health` — the API's `/health`,
 // exposed through the console's rewrite), read for the version it runs so

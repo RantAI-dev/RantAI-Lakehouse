@@ -12,7 +12,6 @@ import {
 } from "lucide-react";
 import { EmptyState } from "@/components/patterns/page-states";
 import { FormPage } from "@/components/patterns/form-page";
-import { RequiredLegend } from "@/components/patterns/required-legend";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -1325,9 +1324,6 @@ export function ChartBuilder({
     // one long column name widened the whole form. Every grid of the form without columns of its own
     // gets a `minmax(0, 1fr)` track, which the container, not the content, sizes.
     <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 px-5 pt-1 pb-5 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]">
-      {/* UX-1: explain the required marker once for the form. The stars
-          themselves are the current chart controls' existing Req markers. */}
-      <RequiredLegend />
       {/* Phase 2 QA R11: title wide, dashboard and width narrow, on one row. */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_9rem_8rem]">
         <div className="grid gap-1.5">

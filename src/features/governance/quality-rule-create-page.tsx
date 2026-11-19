@@ -7,7 +7,6 @@ import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useServiceAction } from "@/hooks/use-service"
 import { notifyError, withNotify } from "@/lib/notify"
@@ -96,7 +95,6 @@ export function QualityRuleCreatePage() {
       onSubmit={() => void handleCreate()}
       onCancel={() => router.push(backHref)}
     >
-      <RequiredLegend />
       <div className="space-y-1.5">
         <Label htmlFor="qr-name" required>Name</Label>
         <Input id="qr-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />

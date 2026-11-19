@@ -326,6 +326,8 @@ jobs:
           set -euo pipefail
           cat > "$RUNNER_TEMP/release-check.env" <<'EOF'
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access-0001
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -879,6 +881,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -925,6 +929,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -1122,6 +1128,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -1307,6 +1315,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -1395,6 +1405,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -1560,6 +1572,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -1710,6 +1724,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -1861,6 +1877,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -2005,6 +2023,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -2164,6 +2184,8 @@ jobs:
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -2264,6 +2286,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -2415,6 +2439,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -2579,6 +2605,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -2686,6 +2714,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -2805,6 +2835,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -2953,6 +2985,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -3078,6 +3112,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -3242,6 +3278,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -3369,6 +3407,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -3475,6 +3515,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -3597,6 +3639,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -3695,6 +3739,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -3780,6 +3826,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -3901,6 +3949,8 @@ jobs:
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
@@ -3982,8 +4032,9 @@ jobs:
       - name: Load image
         run: zstd -dc "$RUNNER_TEMP"/images/lakehouse-api.tar.zst | docker load
 
-      # No DATABASE_URL: the entrypoint skips migrations when it's unset,
-      # and lakehouse-api is designed to boot and serve its
+      # No DATABASE_URL: the entrypoint never migrates — the one-shot
+      # `lakehouse-db-migrate` service applies the schema, with the owner's
+      # credentials — and lakehouse-api is designed to boot and serve its
       # Postgres/ClickHouse-independent routes (including /health) even
       # without either dependency running — see entrypoint.api.sh and
       # lakehouse_store::connect_lazy's doc comment. This intentionally
@@ -4092,6 +4143,8 @@ jobs:
           # default credentials. CI-ONLY throwaway values for this job's own
           # throwaway stack; they protect nothing and are never used outside it.
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
