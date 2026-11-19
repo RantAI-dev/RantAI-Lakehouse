@@ -13,7 +13,7 @@
 | Plan | Engineering plan kept by the planner |
 | Started | 2026-11-16 |
 | Shipped | 2026-11-17 |
-| Evidence | PR #553 (the tenant on every query run); PR #564 (the usage page, the rates and the CSV export); PR #574 (the measured size of every layer); PR #<this PR> (the person's name, the two storage numbers and the rest of the bucket) |
+| Evidence | PR #553 (the tenant on every query run); PR #564 (the usage page, the rates and the CSV export); PR #574 (the measured size of every layer); PR #591 (the person's name, the two storage numbers and the rest of the bucket) |
 
 ## Problem
 
