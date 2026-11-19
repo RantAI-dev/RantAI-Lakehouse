@@ -1092,20 +1092,26 @@ async fn generating_a_pipeline_writes_one_row_that_names_the_pipeline() {
     assert_eq!(row["principal_id"], json!(user.to_string()));
 }
 
-/// `GOV-1 review` blocker 2, second look: `POST /api/alerts/test` is not one
-/// of the "test" buttons of Decision 1. It runs the rule for real: the email
-/// or webhook goes out, the rule's state settles and a fired result is saved.
-/// It is audited like `POST /api/alerts/run`, with the id the person named.
+/// `GOV-1` acceptance follow-up (owner 2026-11-16) reversed the old decision
+/// (`GOV-1 review` blocker 2): neither `POST /api/alerts/test` nor
+/// `POST /api/alerts/run` writes an audit row. The test button sends a probe
+/// and changes no configuration, and the scheduler calls the run on its own
+/// tick with no person behind it — the rule and its schedule were audited
+/// where they were set up, and what a rule delivered is in the alert's own
+/// history, not in the trail (`Decision 1`).
 #[tokio::test]
-async fn testing_an_alert_rule_writes_a_row_that_names_the_rule() {
+async fn testing_an_alert_rule_and_the_schedulers_run_write_no_audit_row() {
     let TestApp { router, pool } = spin_up().await;
     let user = create_principal_with_permissions(&pool, "alert:write").await;
     let cookie = session_cookie_for_user(&pool, user).await;
 
+    let before = audit_event_count(&pool).await;
     let (_, _) = call(&router, "POST", "/api/alerts/test?id=rule-9", &cookie, None).await;
+    let (_, _) = call(&router, "POST", "/api/alerts/run?id=rule-9", &cookie, None).await;
 
-    let row = the_row(&pool, "alert.test").await;
-    assert_eq!(row["resource_kind"], "alert");
-    assert_eq!(row["resource_id"], json!("rule-9"));
-    assert_eq!(row["principal_id"], json!(user.to_string()));
+    assert_eq!(
+        audit_event_count(&pool).await,
+        before,
+        "an alert test and a scheduled run change nothing, so they record nothing"
+    );
 }

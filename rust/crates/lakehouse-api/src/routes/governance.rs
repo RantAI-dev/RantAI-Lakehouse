@@ -548,8 +548,10 @@ pub(crate) async fn observed_quality(
 /// no recorded principal is one nobody signed in caused — a refused sign-in,
 /// a locked public link, a refused single sign-on link — and the platform
 /// recorded it. The actor's own name comes from `actor_label`
-/// ([`actor_of`]).
-fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
+/// ([`actor_of`]). The audit page's person filter lists the same kinds
+/// (`GOV-1` acceptance follow-up, D2), so the list narrows them the same
+/// way.
+pub(super) fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
     match principal_kind {
         Some("user") => "user",
         // "copilot" and "schedule" are both non-human actors from the
@@ -620,7 +622,13 @@ fn detail_of(action: &str, args: &Value) -> Option<String> {
 /// `"denied"` — the policy refused nothing — and not to `"success"`,
 /// because a viewer scanning for problems must not read a still-pending
 /// gate as clean (`GOV-5`).
-fn outcome_of(outcome: &str) -> &'static str {
+///
+/// The one mapping for every shape that names an outcome: the events JSON,
+/// the single-event JSON (`audit_event_row`) and the CSV export
+/// (`routes::audit_events`) all call it, so the page and the file agree
+/// (`GOV-1` acceptance follow-up, D4). The stored value travels beside it
+/// as `outcomeDetail` / `outcome_detail`.
+pub(super) fn outcome_of(outcome: &str) -> &'static str {
     match outcome {
         "allowed" | "executed" | "approved" => "success",
         "failed" => "error",
@@ -634,12 +642,22 @@ fn outcome_of(outcome: &str) -> &'static str {
 /// The policy decision a row reports beside its outcome. A row whose
 /// decision is still open reports `"pending"` too: the policy allowed
 /// nothing and denied nothing, so neither `"allow"` nor `"deny"` would be
-/// true (`GOV-5`). A success row stays `"allow"`, everything else stays
-/// `"deny"`.
+/// true (`GOV-5`).
+///
+/// `failed` reports `"allow"` (`GOV-1` acceptance follow-up, D4): the policy
+/// let the call through the gate and the execution failed afterwards — the
+/// outcome says so with its own word, `error` — so a failed row must not
+/// read as a policy refusal. Only the gate's own refusals, `refused` and
+/// `rejected`, report `"deny"`; a success row stays `"allow"`.
 fn policy_decision_of(outcome: &str) -> &'static str {
     match outcome_of(outcome) {
-        "success" => "allow",
+        // `error` is in the same arm: it is the one word the four-word
+        // vocabulary derives only from `failed`, and `failed` is an
+        // execution's failure, not a policy refusal — the gate allowed
+        // the call (`GOV-1` acceptance follow-up, D4).
+        "success" | "error" => "allow",
         "pending" => "pending",
+        // "refused" | "rejected": the gate itself said no.
         _ => "deny",
     }
 }
@@ -649,6 +667,13 @@ fn policy_decision_of(outcome: &str) -> &'static str {
 /// the search and single-event routes (`routes::audit_events`) has too, so a
 /// console or a tool reads one object for one event whichever route it came
 /// from.
+///
+/// Every event also carries, beside the keys the shape has always had: the
+/// actor's id as `actorId` (`GOV-1` acceptance follow-up, D2 — null when
+/// nobody signed in caused the event), the stored outcome value as
+/// `outcomeDetail` beside the four words of `outcome` (D4), and the stored
+/// `detail` column as `reason` (D4b — null when nothing was stored; the
+/// derived grant summary below stays `detail`).
 pub(super) fn audit_event_row(e: &lakehouse_store::audit::AuditEvent) -> Value {
     let resource = match (&e.resource_kind, &e.resource_id) {
         (Some(kind), Some(id)) => format!("{kind}:{id}"),
@@ -659,6 +684,10 @@ pub(super) fn audit_event_row(e: &lakehouse_store::audit::AuditEvent) -> Value {
     let mut row = json!({
         "id": e.id,
         "at": e.at,
+        // `GOV-1` acceptance follow-up (D2): the id sits beside the
+        // name, so the person filter can send it back; an event nobody
+        // signed in caused carries null.
+        "actorId": e.principal_id,
         // AI-23 (product owner 2026-11-02): one name for the
         // assistant — "AI Copilot", for an event whose kind is
         // `copilot`; SEC-70 D4: an event nobody signed in caused
@@ -672,12 +701,20 @@ pub(super) fn audit_event_row(e: &lakehouse_store::audit::AuditEvent) -> Value {
         "action": e.action,
         "resource": resource,
         "outcome": outcome_of(&e.outcome),
+        // `GOV-1` acceptance follow-up (D4): the stored value, beside
+        // the four words above — the detail view shows both.
+        "outcomeDetail": e.outcome,
         "policyDecision": policy_decision_of(&e.outcome),
         "obligations": [],
         "approvalId": e.approval_id,
         // QA LH-DATA-15-03 F3 (plan D9): every row used to say
         // "copilot", whoever acted.
         "source": source_of(e.principal_kind.as_deref()),
+        // `GOV-1` acceptance follow-up (D4b): the stored `detail`
+        // column — a refusal reason, a status code — as `reason`, null
+        // when nothing was stored. The derived grant summary below
+        // stays `detail`.
+        "reason": e.detail.as_deref().filter(|detail| !detail.is_empty()),
     });
     // QA LH-DATA-15-03 F1 (plan D9): the row names who got which
     // permission, from the stored fields only.
@@ -3478,7 +3515,9 @@ mod tests {
 
     /// `GOV-5`: a row whose decision is still open reports `"pending"` as
     /// its policy decision as well — it allowed nothing and denied
-    /// nothing.
+    /// nothing. `failed` reports `"allow"` (`GOV-1` acceptance follow-up,
+    /// D4): the policy let the call through the gate and the execution
+    /// failed afterwards, so it must not read as a policy refusal.
     #[test]
     fn policy_decision_of_reports_pending_for_a_gate_still_waiting() {
         assert_eq!(policy_decision_of("allowed"), "allow");
@@ -3488,7 +3527,7 @@ mod tests {
         assert_eq!(policy_decision_of("needs_approval"), "pending");
         assert_eq!(policy_decision_of("refused"), "deny");
         assert_eq!(policy_decision_of("rejected"), "deny");
-        assert_eq!(policy_decision_of("failed"), "deny");
+        assert_eq!(policy_decision_of("failed"), "allow");
     }
 
     /// The merge sort in [`audit`] compares `at` strings lexicographically;
