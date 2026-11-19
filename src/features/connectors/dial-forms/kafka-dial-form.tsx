@@ -5,7 +5,6 @@ import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { RequiredMarker } from "@/components/ui/required"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import type { KafkaAuth, KafkaDial } from "@/services/contracts/connectors"
 
 const AUTH_TYPES: KafkaAuth["type"][] = ["sasl_plain", "none"]
@@ -33,12 +32,9 @@ function defaultAuth(type: KafkaAuth["type"]): KafkaAuth {
 export function KafkaDialForm({
   value,
   onChange,
-  showLegend = true,
 }: {
   value: KafkaDial | null
   onChange: (next: KafkaDial) => void
-  /** UX-1-R7: a parent step can opt out of its own legend. */
-  showLegend?: boolean
 }) {
   const dial: KafkaDial = value ?? {
     bootstrapServers: [""],
@@ -68,8 +64,6 @@ export function KafkaDialForm({
 
   return (
     <div className="grid gap-3">
-      {/* UX-1-R7: opt out when a parent step already explains the marker. */}
-      {showLegend ? <RequiredLegend /> : null}
       <div className="space-y-2">
         <p className="flex items-center gap-1.5 text-sm font-medium">Bootstrap servers (host:port) <RequiredMarker /></p>
         {/* UX-1-R5: `Dial::parse` runs `check_hostname` over EVERY broker, so

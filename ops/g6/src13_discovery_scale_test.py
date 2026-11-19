@@ -53,6 +53,8 @@ import time
 import g6_ingest_matrix_test as matrix
 
 SCHEMA = "scale_10k"
+# SEC-78: the console's runtime database role; a constant, never built from input.
+CONSOLE_ROLE = "lakehouse_app"
 TABLES = 10_000
 BATCH = 500
 # Decision D9: the listing of 10,000 tables completes within two minutes.
@@ -97,6 +99,19 @@ def _create_tables() -> None:
                     # Constant identifiers built from an integer, never from input.
                     cur.execute(f"CREATE TABLE {SCHEMA}.{_table_name(i)} (id integer PRIMARY KEY, name text)")
             conn.commit()
+        # SEC-78: this script connects as the schema's owner, but the
+        # console lists the schema as the runtime role through the seeded
+        # connector. `information_schema` hides a table's constraints from
+        # a role that holds only SELECT on it, so the listing would show
+        # the columns without their key and the gate would fail. The grant
+        # is the same one the migrate service gives product tables. Granted
+        # after the tables exist, so `ON ALL TABLES` covers them.
+        with conn.cursor() as cur:
+            cur.execute(f"GRANT USAGE ON SCHEMA {SCHEMA} TO {CONSOLE_ROLE}")
+            cur.execute(
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {SCHEMA} TO {CONSOLE_ROLE}"
+            )
+        conn.commit()
         _log(f"created {TABLES} tables in schema {SCHEMA} in {time.time() - started:.1f} s")
     finally:
         conn.close()

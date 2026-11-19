@@ -70,6 +70,14 @@ describe("UsedBy (BI-14)", () => {
     expect(await screen.findByText("Used by could not be read just now.")).toBeTruthy()
   })
 
+  it("shows the server's reason in place of the list when the answer is not supported", async () => {
+    answer({ supported: false, reason: "this deployment's shared catalog is owned by another tenant" })
+    render(<UsedBy table="serving.t" />)
+    expect(await screen.findByText("this deployment's shared catalog is owned by another tenant")).toBeTruthy()
+    expect(screen.queryByText("Used by could not be read just now.")).toBeNull()
+    expect(screen.queryByText("Chart lineage is not recorded on this deployment.")).toBeNull()
+  })
+
   it("gives a person without lineage:read the sentence and asks for nothing", () => {
     permitted = false
     answer({})

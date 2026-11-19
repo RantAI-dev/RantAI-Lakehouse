@@ -36,7 +36,8 @@ describe("dial form required indicators (UX-1)", () => {
     expect(isMarked("User")).toBe(true)
     expect(screen.getByLabelText("Port").getAttribute("aria-required")).toBe("true")
     expect(hasNoMarker("SSL mode (optional)")).toBe(true)
-    expect(screen.getByText(/Required/)).toBeDefined()
+    // UX-5: no form explains the star with a "* Required" line anymore.
+    expect(screen.queryByText(/Required/)).toBeNull()
   })
 
   it("marks CDC slot and publication and leaves the driver-specific server id unmarked", () => {
@@ -129,10 +130,15 @@ describe("dial form required indicators (UX-1)", () => {
     const mongoForm = within(mongoView.container)
     for (const n of [1, 2]) {
       const input = mongoForm.getByLabelText(`Seed host ${n}`)
+      // UX-4: every input on the Mongo dial is required, so the rows keep
+      // `aria-required` and their visible labels, but no star is drawn.
       expect(input.getAttribute("aria-required")).toBe("true")
-      expect(labelFor(mongoView.container, input)?.getAttribute("data-required")).toBe("")
+      const label = labelFor(mongoView.container, input)
+      expect(label?.hasAttribute("data-required")).toBe(false)
+      expect(label?.className).not.toContain("sr-only")
     }
     expect(mongoForm.getByText(/use Remove for a row you do not need/i)).toBeDefined()
+    expect(mongoForm.queryByText(/Required/)).toBeNull()
 
     const kafka: KafkaDial = {
       bootstrapServers: ["kafka-a.internal:9092", "kafka-b.internal:9092"],
@@ -155,11 +161,14 @@ describe("dial form required indicators (UX-1)", () => {
     const sheetsForm = within(sheetsView.container)
     for (const n of [1, 2]) {
       const input = sheetsForm.getByLabelText(`Range ${n}`)
+      // UX-4: every input on the Sheets dial is required, so the rows keep
+      // `aria-required` and their visible labels, but no star is drawn.
       expect(input.getAttribute("aria-required")).toBe("true")
       const label = labelFor(sheetsView.container, input)
-      expect(label?.getAttribute("data-required")).toBe("")
+      expect(label?.hasAttribute("data-required")).toBe(false)
       expect(label?.className).not.toContain("sr-only")
     }
+    expect(sheetsForm.queryByText(/Required/)).toBeNull()
 
     const rest: RestDial = {
       baseUrl: "https://api.example.com",
@@ -178,14 +187,5 @@ describe("dial form required indicators (UX-1)", () => {
       expect(labelFor(restView.container, input as HTMLElement)?.getAttribute("data-required")).toBe("")
     }
     expect(restForm.getByText(/every listed endpoint is polled/i)).toBeDefined()
-  })
-
-  // UX-1-R7: composed connector steps show one legend; the dial's own is
-  // opt-out, so a step is not left with three copies of the same explanation.
-  it("lets a composed parent opt a dial form out of its standalone legend", () => {
-    const standalone = render(<SqlDialForm value={null} onChange={mock()} />)
-    expect(within(standalone.container).getByText(/Required/)).toBeDefined()
-    const composed = render(<SqlDialForm value={null} onChange={mock()} showLegend={false} />)
-    expect(within(composed.container).queryByText(/Required/)).toBeNull()
   })
 })

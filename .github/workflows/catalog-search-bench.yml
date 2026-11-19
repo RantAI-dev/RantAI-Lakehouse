@@ -79,6 +79,8 @@ jobs:
           # SEC-18: no default credentials in docker-compose.yml. CI-ONLY
           # throwaway values for this job's own throwaway stack (as g9-upload).
           POSTGRES_PASSWORD=ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD=ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD=ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
