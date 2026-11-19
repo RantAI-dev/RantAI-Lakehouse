@@ -197,6 +197,10 @@ class RealTemplateTest(unittest.TestCase):
             name: f"ghcr.io/rantai-dev/rantai-lakehouse-{name}:0.2.0@{DIGEST_A}"
             for name in (
                 "lakehouse-api",
+                # SEC-78: the migration service runs the SAME published
+                # image as the API, so it is published under that image's
+                # name (`ops/release/release-images.json`).
+                "lakehouse-db-migrate",
                 "console",
                 "oidc-mock",
                 "dagster-code-location",

@@ -17,7 +17,6 @@ import { formatSql, type KeywordCase } from "@/lib/sql-format"
 import { formatDuration } from "@/lib/format"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import {
   Select,
@@ -126,8 +125,9 @@ export function SqlPanel({
 
   return (
     <div className="space-y-3">
-      <RequiredLegend />
-      <Label id="query-sql-label" required>SQL</Label>
+      {/* UX-4: the editor is this panel's one required input, so no star and
+          no legend; the editor keeps its `required` association. */}
+      <Label id="query-sql-label">SQL</Label>
       {/* The editor gets the console's own completion source, not the
           language extension's schema: the tables and columns come from the
           catalog, under the names a query can actually use. */}
