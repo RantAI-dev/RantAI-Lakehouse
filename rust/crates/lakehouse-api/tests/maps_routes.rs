@@ -762,6 +762,7 @@ fn render_token(person: uuid::Uuid, board_id: &str) -> String {
             filters: None,
             params: None,
             grain: None,
+            report: None,
             paper: "a4".to_owned(),
             orientation: "portrait".to_owned(),
             exp: now + 120.0,
