@@ -370,6 +370,39 @@ describe("Describe (BI-62 D8)", () => {
   })
 })
 
+describe("the keyboard follows a draft (BI-62 D8: Accept is Enter, Discard is Esc)", () => {
+  it("a finished Describe has Accept focused when the person did not write meanwhile", async () => {
+    const { container } = await openEditor()
+    const card = container.querySelector('[data-chart-id="c_one"]') as HTMLElement
+    act(() => {
+      fireEvent.click(within(card).getByRole("button", { name: "Describe" }))
+    })
+    await waitFor(() => expect(chat.sends).toHaveLength(1))
+    await act(async () => chat.settle!({ content: "Visits rose." }))
+    const accept = await screen.findByRole("button", { name: /Accept/ })
+    // Compared as a boolean: a failing toBe on DOM nodes prints whole trees.
+    await waitFor(() => expect(document.activeElement === accept).toBe(true))
+  })
+
+  it("but never takes the focus from someone who went on writing elsewhere", async () => {
+    const { editor, container } = await openEditor()
+    const card = container.querySelector('[data-chart-id="c_one"]') as HTMLElement
+    act(() => {
+      fireEvent.click(within(card).getByRole("button", { name: "Describe" }))
+    })
+    await waitFor(() => expect(chat.sends).toHaveLength(1))
+    // The person types in the title while the answer is on its way.
+    act(() => {
+      editor.chain().focus().setTextSelection(3).insertContent("x").run()
+    })
+    await act(async () => chat.settle!({ content: "Visits rose." }))
+    const accept = await screen.findByRole("button", { name: /Accept/ })
+    await new Promise((r) => setTimeout(r, 20))
+    expect(document.activeElement === accept).toBe(false)
+    expect(editor.state.doc.child(0).textContent).toBe("Q3x visitors")
+  })
+})
+
 describe("one draft at a time (BI-62 D8)", () => {
   it("while AI Copilot answers, Ask AI and Describe stay visible but disabled, with the reason", async () => {
     const { editor, container } = await openEditor()

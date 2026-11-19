@@ -38,7 +38,7 @@
  */
 import * as React from "react"
 import { Node, type Editor } from "@tiptap/core"
-import { TextSelection } from "@tiptap/pm/state"
+import { TextSelection, type Transaction } from "@tiptap/pm/state"
 import { NodeViewWrapper, ReactNodeViewRenderer, type ReactNodeViewProps } from "@tiptap/react"
 import { ArrowUp, Bot, Check, CornerDownLeft, RotateCcw, Square, X } from "lucide-react"
 
@@ -72,6 +72,8 @@ export type DraftRun = {
   error: string | null
   /** Where the attempt's question sits in the conversation (Retry replaces a failed attempt there). */
   base: number | null
+  /** The person changed the document while this answer was on its way: the draft does not take the focus. */
+  touched: boolean
 }
 
 /** A small external store: the controller writes it, each draft's view reads its own run. */
@@ -209,18 +211,24 @@ export function useReportDrafts({
   }, [editor, setPageContext])
   React.useEffect(() => () => setPageContext(null), [setPageContext])
 
-  // A draft taken out some other way (selected and deleted with text around it) ends its answer.
+  // A draft taken out some other way (selected and deleted with text around it) ends its answer;
+  // an edit of the person's own (not a draft going in or out, which stays out of history) marks
+  // the open drafts as touched, so they do not take the focus when they finish.
   React.useEffect(() => {
     if (!editor) return
-    const onUpdate = () => {
+    const onUpdate = ({ transaction }: { transaction: Transaction }) => {
       const ids = draftIds(editor.state.doc)
+      const edit = transaction.getMeta("addToHistory") !== false
       for (const run of store.all()) {
-        if (ids.has(run.id)) continue
-        if (flight.current?.id === run.id) {
-          flight.current = null
-          stopAnswer()
+        if (!ids.has(run.id)) {
+          if (flight.current?.id === run.id) {
+            flight.current = null
+            stopAnswer()
+          }
+          store.delete(run.id)
+        } else if (edit && !run.touched && run.phase !== "prompt") {
+          store.patch(run.id, { touched: true })
         }
-        store.delete(run.id)
       }
     }
     editor.on("update", onUpdate)
@@ -247,7 +255,7 @@ export function useReportDrafts({
       setChart(chartId)
       // The provider holds this context after the next render; the send waits for it (the effect below).
       setPageContext(live.current.context(chartId))
-      store.patch(id, { phase: "writing", ask, error: null, text: "" })
+      store.patch(id, { phase: "writing", ask, error: null, text: "", touched: false })
       outbox.current = { id, ask, history }
       setOutTick((n) => n + 1)
     },
@@ -300,7 +308,7 @@ export function useReportDrafts({
   const openPrompt = React.useCallback(() => {
     if (!editor || live.current.blocked) return
     const id = newDraftId()
-    store.put({ id, chart: null, label: "", ask: "", phase: "prompt", text: "", error: null, base: null })
+    store.put({ id, chart: null, label: "", ask: "", phase: "prompt", text: "", error: null, base: null, touched: false })
     insertDraft(editor, { draft: id })
     dropPrompts(id)
   }, [editor, store, dropPrompts])
@@ -313,7 +321,7 @@ export function useReportDrafts({
       const title = chartTitle(chartId)
       const id = newDraftId()
       const after = pos + node.nodeSize
-      store.put({ id, chart: chartId, label: `about ${title}`, ask: "", phase: "writing", text: "", error: null, base: null })
+      store.put({ id, chart: chartId, label: `about ${title}`, ask: "", phase: "writing", text: "", error: null, base: null, touched: false })
       insertDraft(editor, { draft: id, chart: chartId }, after)
       // The cursor moves past the draft, so the chart is not left selected (mockup D).
       focusNear(editor, after + 1)
@@ -518,19 +526,30 @@ function DraftPrompt({ drafts, id }: { readonly drafts: ReportDrafts; readonly i
 
 function DraftAnswer({ drafts, run }: { readonly drafts: ReportDrafts; readonly run: DraftRun }) {
   const stream = useCopilotStream()
+  const root = React.useRef<HTMLDivElement>(null)
   const accept = React.useRef<HTMLButtonElement>(null)
+  const action = React.useRef<HTMLButtonElement>(null)
   const writing = run.phase === "writing"
   const text = writing ? stream.draft : run.text
   // The draft shows what Accept will insert: the same parser, the same renderer (D7).
   const blocks = React.useMemo(() => (text ? markdownToBlocks(text) : []), [text])
 
+  // The keyboard follows the draft (Enter accepts, Esc discards, mockup D), unless the person
+  // went on writing meanwhile: a finished draft then waits for a click instead of taking the
+  // focus from their sentence. While it writes, Stop takes the focus only from nowhere.
   React.useEffect(() => {
-    if (run.phase === "done") accept.current?.focus({ preventScroll: true })
-  }, [run.phase])
+    const active = document.activeElement
+    const free = !active || active === document.body || Boolean(root.current?.contains(active))
+    if (run.phase === "done") {
+      if (free || !run.touched) accept.current?.focus({ preventScroll: true })
+    } else if (free) {
+      action.current?.focus({ preventScroll: true })
+    }
+  }, [run.phase, run.touched])
 
   const status = writing ? (stream.progress?.phase === "tool" ? "Reading the data…" : "Writing…") : run.phase === "done" ? "Draft ready" : ""
   return (
-    <div className="grid gap-2">
+    <div ref={root} className="grid gap-2">
       <p className="flex min-w-0 items-center gap-1.5 text-xs leading-4 text-muted-foreground">
         <Bot className="size-3.5 shrink-0 text-sky-700 dark:text-sky-300" aria-hidden />
         <span className="truncate" title={run.label}>
@@ -554,7 +573,7 @@ function DraftAnswer({ drafts, run }: { readonly drafts: ReportDrafts; readonly 
       ) : null}
       <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
         {writing ? (
-          <button type="button" onClick={() => drafts.stop(run.id)} className={SOFT_BTN}>
+          <button ref={action} type="button" onClick={() => drafts.stop(run.id)} className={SOFT_BTN}>
             <Square className="size-3" aria-hidden /> Stop
           </button>
         ) : run.phase === "done" ? (
@@ -576,7 +595,7 @@ function DraftAnswer({ drafts, run }: { readonly drafts: ReportDrafts; readonly 
           </>
         ) : (
           <>
-            <RetryButton drafts={drafts} id={run.id} />
+            <RetryButton drafts={drafts} id={run.id} buttonRef={action} />
             <DiscardButton drafts={drafts} id={run.id} />
           </>
         )}
@@ -593,9 +612,18 @@ function DiscardButton({ drafts, id }: { readonly drafts: ReportDrafts; readonly
   )
 }
 
-function RetryButton({ drafts, id }: { readonly drafts: ReportDrafts; readonly id: string }) {
+function RetryButton({
+  drafts,
+  id,
+  buttonRef,
+}: {
+  readonly drafts: ReportDrafts
+  readonly id: string
+  readonly buttonRef: React.Ref<HTMLButtonElement>
+}) {
   const button = (
     <button
+      ref={buttonRef}
       type="button"
       aria-disabled={drafts.busy || undefined}
       onClick={() => drafts.retry(id)}
