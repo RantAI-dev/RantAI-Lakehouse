@@ -120,6 +120,13 @@ class TableSchema:
     columns: tuple[tuple[str, str], ...]
     engine: str
     order_by: tuple[str, ...]
+    # Columns this table may be MISSING on a deployment that created it
+    # before they existed. Empty for every table that has never grown a
+    # column, so their behaviour is unchanged; a non-empty tuple is the
+    # ADDITIVE path `_assert_or_create_schema` takes for an existing
+    # table (see `_add_columns` for why it exists and what it must not
+    # do).
+    additive_columns: tuple[tuple[str, str], ...] = ()
 
     @property
     def create_ddl(self) -> str:
@@ -250,6 +257,35 @@ def _ch_query_json(target: ClickHouseTarget, statement: str) -> list[dict]:
     return target.query_json(statement)
 
 
+def _add_columns(
+    target: ClickHouseTarget, schema: TableSchema, columns: list[tuple[str, str]]
+) -> None:
+    """The `ALTER TABLE … ADD COLUMN IF NOT EXISTS` that gives an EXISTING
+    table a column it does not have yet.
+
+    WHY this exists: a table this module created earlier may hold fewer
+    columns than the canonical shape — `lake.bronze_meta.
+    storage_layer_snapshot` was created before this job measured the
+    bytes stored on disk, so a deployment that already ran the job holds
+    it WITHOUT that column, and the R10 guard demands the EXACT column
+    tuple. Dropping the table would throw away every measurement ever
+    taken, so the column is ADDED instead: ClickHouse keeps the rows and
+    appends the column LAST, which is where the canonical shape puts it,
+    so the exact comparison in `_assert_or_create_schema` matches again.
+
+    `IF NOT EXISTS` makes it idempotent: the same statement run twice is
+    a no-op. The column name and type are fixed literals of this module
+    (never end-user input) and the table name is this module's own
+    identifier, so all three are interpolated as identifiers, never as
+    string literals."""
+    for name, ty in columns:
+        _ch_exec(
+            target,
+            f"ALTER TABLE lake.`{schema.table_name}` "
+            f"ADD COLUMN IF NOT EXISTS {name} {ty}",
+        )
+
+
 def _assert_or_create_schema(target: ClickHouseTarget, schema: TableSchema) -> None:
     """R10: `schema` is the single source of truth for this table. If the
     table does not exist yet (a bare compose stack that never applied
@@ -257,7 +293,15 @@ def _assert_or_create_schema(target: ClickHouseTarget, schema: TableSchema) -> N
     (typically because `04_registry.sql` created it by hand), verify its
     ACTUAL columns/engine/sorting key match `schema` exactly and raise
     [`SchemaDriftError`] loudly if not — instead of silently trusting
-    whatever `IF NOT EXISTS` left alone."""
+    whatever `IF NOT EXISTS` left alone.
+
+    The one exception is a column the table is ALLOWED to be missing:
+    `schema.additive_columns`. An existing table that predates one of
+    them gets it through `ALTER TABLE … ADD COLUMN IF NOT EXISTS` — the
+    rows stay, the column is appended last, and the exact comparison
+    below then matches. A column that is present with a DIFFERENT type is
+    still drift: the ADD never runs for it, and the comparison raises.
+    """
     existing_tables = _ch_query_json(
         target,
         "SELECT engine, sorting_key FROM system.tables "
@@ -282,13 +326,26 @@ def _assert_or_create_schema(target: ClickHouseTarget, schema: TableSchema) -> N
             "owner and this is that owner refusing to trust a mismatched table."
         )
 
-    actual_columns = _ch_query_json(
-        target,
+    columns_statement = (
         "SELECT name, type FROM system.columns "
         f"WHERE database = 'lake' AND table = {_sql_string_literal(schema.table_name)} "
-        "ORDER BY position",
+        "ORDER BY position"
     )
+    actual_columns = _ch_query_json(target, columns_statement)
     actual_pairs = tuple((c.get("name", ""), c.get("type", "")) for c in actual_columns)
+    # The check is on the NAME, not on the (name, type) pair: a column the
+    # table already holds under this name is not missing, so no `ADD` is
+    # issued for it -- and a different type for that name stays drift,
+    # which is what the exact comparison below reports.
+    actual_names = {name for name, _type in actual_pairs}
+    missing = [column for column in schema.additive_columns if column[0] not in actual_names]
+    if missing:
+        _add_columns(target, schema, missing)
+        # The table changed under this run: read its columns back, so the
+        # comparison below is against what the server holds NOW and not
+        # against what it held a moment ago.
+        actual_columns = _ch_query_json(target, columns_statement)
+        actual_pairs = tuple((c.get("name", ""), c.get("type", "")) for c in actual_columns)
     if actual_pairs != schema.columns:
         raise SchemaDriftError(
             f"R10 schema drift: lake.`{schema.table_name}` exists with columns "
@@ -839,22 +896,27 @@ def last_committed_offset(
 
 # ── Storage per layer (OPS-8 part C) ─────────────────────────────────────
 #
-# `_STORAGE_LAYER_SNAPSHOT_SCHEMA` is a NEW table
-# (`storage_snapshot.py`'s daily per-layer size job), so -- like
-# `_CAPACITY_SNAPSHOT_SCHEMA` above -- it always takes
-# `_assert_or_create_schema`'s "table does not exist yet" branch (create
-# fresh) on every deployment, and it is deliberately NOT folded into the
-# top-level `EXPECTED_SCHEMAS` tuple: that tuple holds only the registry
-# tables `register_bronze_table` writes, and the ingest-run section's
-# header says the same about `_INGEST_RUN_SCHEMA`. The single-canonical-
-# schema-per-table MECHANISM `_assert_or_create_schema` enforces is what
-# this table uses; the shared tuple is not where every writer must
-# append.
+# `_STORAGE_LAYER_SNAPSHOT_SCHEMA` is the table
+# (`storage_snapshot.py`'s daily per-layer size job) writes, and it is
+# deliberately NOT folded into the top-level `EXPECTED_SCHEMAS` tuple:
+# that tuple holds only the registry tables `register_bronze_table`
+# writes, and the ingest-run section's header says the same about
+# `_INGEST_RUN_SCHEMA`. The single-canonical-schema-per-table MECHANISM
+# `_assert_or_create_schema` enforces is what this table uses; the shared
+# tuple is not where every writer must append.
 #
 # `layer` is the layer's own name (`bronze`, `gold`, `silver`, `serving`)
 # and not a namespace: `silver` and `serving` are ClickHouse databases,
 # not Iceberg namespaces, so a column named `namespace` would name
 # something that does not exist for half of the rows.
+#
+# `total_bytes` is the CURRENT data (the sum of the current snapshot's
+# `total-files-size` over the measured tables) and `stored_bytes` is what
+# the OBJECT STORE holds under those tables' own locations: a location
+# also holds the older snapshots' data files, the metadata and the orphan
+# files, so the second number is the bigger one. They are two columns
+# because they are two facts; one column would have to keep one of them
+# and lose the other.
 #
 # `ReplacingMergeTree ORDER BY (layer, day)` gives the read
 # (`GET /api/usage/storage`, `FINAL`) an upsert's semantics: a job that
@@ -873,9 +935,25 @@ _STORAGE_LAYER_SNAPSHOT_SCHEMA = TableSchema(
         ("tables_skipped", "UInt32"),
         ("skipped_reason", "String"),
         ("measured_at", "DateTime64(3, 'UTC')"),
+        # The bytes the object store holds under the measured tables' own
+        # locations. `NULL` for a ClickHouse layer: those bytes sit on the
+        # ClickHouse server's own disk, not in the warehouse bucket, and
+        # `NULL` says "not measured here" where a zero would say "this
+        # layer holds no bytes".
+        ("stored_bytes", "Nullable(UInt64)"),
     ),
     engine="ReplacingMergeTree",
     order_by=("layer", "day"),
+    # The table this job created BEFORE it measured the bytes stored on
+    # disk already holds the seven columns above and nothing else, and
+    # `_assert_or_create_schema` demands the exact tuple. The additive
+    # path gives that existing table the new column with `ALTER TABLE …
+    # ADD COLUMN IF NOT EXISTS`: the rows stay, the column is appended
+    # LAST -- which is where the canonical shape above puts it, so the
+    # exact comparison matches again. A deployment that never ran the job
+    # has no table at all, and the table is created from the shape above,
+    # column included.
+    additive_columns=(("stored_bytes", "Nullable(UInt64)"),),
 )
 
 
@@ -884,10 +962,15 @@ class StorageLayerRow:
     """One layer's measured size for one day -- the shape both
     `storage_snapshot.py`'s measurement and this module's writer speak.
 
-    `total_bytes` holds the bytes of the tables that were measured, never
-    a fabricated 0 for a table that could not be read: `tables_skipped`
-    says how many tables are missing from that total, and
-    `skipped_reason` says why.
+    `total_bytes` holds the CURRENT data of the tables that were
+    measured and `stored_bytes` the bytes the object store holds under
+    their locations; neither is ever a fabricated 0 for a table that
+    could not be read: `tables_skipped` says how many tables are missing
+    from those totals, and `skipped_reason` says why.
+
+    `stored_bytes` is `None` for a layer whose bytes are not in the
+    object store (a ClickHouse layer): that is "not measured here", not
+    "the layer holds zero bytes".
     """
 
     layer: str
@@ -895,6 +978,17 @@ class StorageLayerRow:
     total_bytes: int
     tables_skipped: int
     skipped_reason: str
+    stored_bytes: int | None = None
+
+
+def _stored_bytes_literal(value: int | None) -> str:
+    """The `stored_bytes` column's value: the number, or SQL `NULL`.
+
+    `NULL` is not a fabricated zero: it says "this layer's bytes are not
+    in the object store" (a ClickHouse layer's bytes sit on the
+    ClickHouse server's own disk), which is a different fact from "this
+    layer holds zero bytes"."""
+    return "NULL" if value is None else str(int(value))
 
 
 def record_storage_layer_snapshot(
@@ -908,6 +1002,8 @@ def record_storage_layer_snapshot(
     above), via the same `_assert_or_create_all` R10 path every other
     table in this module goes through -- the writer lives beside its
     schema, as `record_capacity_snapshot` and `record_ingest_run` do.
+    That path also gives an existing table the `stored_bytes` column it
+    is missing (see the schema's `additive_columns`).
 
     One statement for the whole day: the rows are one measurement of one
     day, and a partial write would leave a day's layers disagreeing with
@@ -922,12 +1018,13 @@ def record_storage_layer_snapshot(
         f"({_sql_string_literal(day)}, {_sql_string_literal(row.layer)}, "
         f"{int(row.table_count)}, {int(row.total_bytes)}, "
         f"{int(row.tables_skipped)}, {_sql_string_literal(row.skipped_reason)}, "
-        f"{_sql_string_literal(measured_at)})"
+        f"{_sql_string_literal(measured_at)}, "
+        f"{_stored_bytes_literal(row.stored_bytes)})"
         for row in rows
     )
     _ch_exec(
         ch,
         "INSERT INTO lake.`bronze_meta.storage_layer_snapshot` "
         "(day, layer, table_count, total_bytes, tables_skipped, skipped_reason, "
-        "measured_at) VALUES " + values,
+        "measured_at, stored_bytes) VALUES " + values,
     )

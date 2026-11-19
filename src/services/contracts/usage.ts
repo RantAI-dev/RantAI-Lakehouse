@@ -98,6 +98,25 @@ export type UsageStorageQuery = {
 }
 
 /**
+ * The size of the warehouse bucket, measured by the capacity job, and the
+ * part of it that no current Iceberg table accounts for.
+ */
+export type UsageStorageBucket = {
+  /** The bucket's name. */
+  name: string
+  /** The bytes the bucket holds. */
+  bytes: number
+  /** When the bucket was measured, the way ClickHouse renders a timestamp. */
+  measuredAt: string
+  /**
+   * The bytes in the bucket that no current Iceberg table accounts for;
+   * `null` when the two measurements disagree, which the page shows as
+   * "not comparable" instead of a negative number.
+   */
+  unaccountedBytes: number | null
+}
+
+/**
  * One layer's measured size for one day. The bytes were measured once a day
  * by the storage job, never guessed.
  */
@@ -108,8 +127,18 @@ export type UsageStorageRow = {
   layer: string
   /** How many tables the layer holds. */
   tableCount: number
-  /** The bytes of the tables that were measured. */
-  totalBytes: number
+  /**
+   * The "current data" bytes: the current snapshot's size of the tables
+   * that were measured. Not what the object store holds — history and
+   * orphan files sit on disk too, and `storedBytes` counts them.
+   */
+  currentBytes: number
+  /**
+   * The "stored on disk" bytes: what the object store holds under the
+   * measured tables' locations. `null` for the ClickHouse layers, whose
+   * bytes are not in the warehouse bucket.
+   */
+  storedBytes: number | null
   /** How many of the layer's tables could not be measured. */
   tablesSkipped: number
   /** Why they were skipped; `null` when none was. */
@@ -127,6 +156,16 @@ export type UsageStorageReport = {
   to: string
   /** The currency of the storage rate; `null` while no rate is entered. */
   currency: string | null
+  /**
+   * When the storage was measured, the way ClickHouse renders a timestamp;
+   * `null` while the daily job has not run yet.
+   */
+  measuredAt: string | null
+  /**
+   * The warehouse bucket's size, measured by the capacity job; `null` while
+   * the bucket has never been measured.
+   */
+  bucket: UsageStorageBucket | null
   /** One row per layer per day, oldest first. */
   rows: UsageStorageRow[]
 }
