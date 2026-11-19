@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "bun:test"
 import { chooseOption } from "@/components/patterns/select-field.testing"
-import type { FilterDef } from "@/services/clients/bi-store"
+import type { FilterDef } from "@/services"
 import { DateEditor, NumberEditor, blankFilter } from "./filter-editors"
 
 afterEach(cleanup)

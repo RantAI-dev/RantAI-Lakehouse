@@ -119,6 +119,8 @@ export const dashboardService = clickhouseDashboardService
 export type {
   AccessKind, AccessLevel, Board, BoardChart, BoardTab, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
   ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, TileBox,
+  // `BI-29`: the filter and click shapes, formerly imported from `clients/bi-store`.
+  ChartClick, FilterDef, FilterField, FilterKind, FilterOp, FilterSkip, FilterValues, FilterValuesScope, RelativeAnchor, RelativeUnit,
 } from "./contracts/dashboards"
 /** Calculated fields of a mart or SQL source (BI-8). */
 export const calcFieldService = calcFieldClientService

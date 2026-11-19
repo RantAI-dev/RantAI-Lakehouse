@@ -1,4 +1,4 @@
-import type { Board } from "../contracts/dashboards"
+import type { Board, FilterValues } from "../contracts/dashboards"
 import type {
   ChartLineage,
   CreateBoardInput,
@@ -119,6 +119,22 @@ async function writeBoard(
 const JSON_HEADERS = { "Content-Type": "application/json" }
 
 export const clickhouseDashboardService: DashboardService = {
+  async filterValues({ column, scope, others, search }, signal) {
+    const q = new URLSearchParams({ column })
+    if ("mart" in scope) {
+      q.set("mart", scope.mart)
+      if (scope.joins?.length) q.set("joins", JSON.stringify(scope.joins))
+    } else if ("sqlSource" in scope) {
+      q.set("source", scope.sqlSource)
+    } else {
+      q.set("board", scope.board)
+    }
+    if (search.trim()) q.set("q", search.trim())
+    if (others.length) q.set("filters", JSON.stringify(others))
+    const res = await apiFetch(`/api/dashboard/values?${q.toString()}`, { cache: "no-store", signal })
+    const json = await readJson<{ values?: unknown[]; truncated?: boolean }>(res)
+    return { values: (json.values ?? []).map(String), truncated: json.truncated === true } satisfies FilterValues
+  },
   async listBoards(signal) {
     const res = await apiFetch("/api/dashboard/boards", { signal })
     const json = await readJson<{ boards?: Board[] }>(res)
