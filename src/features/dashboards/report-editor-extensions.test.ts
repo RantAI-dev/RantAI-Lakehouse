@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test"
 import { Editor } from "@tiptap/core"
 
 import { SLASH_ITEMS, blocksToDoc, docToBlocks, type DocNode } from "@/lib/report-doc"
-import { moveBlock, reportExtensions } from "./report-editor-extensions"
+import { acceptDraft, draftIds, insertDraft, moveBlock, removeDraft, reportExtensions } from "./report-editor-extensions"
 
 // BI-62 (T4): the editor's Markdown shortcuts and Alt+↑/↓, on a live Tiptap
 // editor in this file's DOM (the chart's React view is left out: the schema
@@ -116,5 +116,90 @@ describe("Alt+↑/↓", () => {
     const editor = editorWith(blocksToDoc("T", start))
     editor.commands.setTextSelection(1)
     expect(moveBlock(editor, 1)).toBe(false)
+  })
+})
+
+describe("the assistant's draft (BI-62 PR B, D8)", () => {
+  const start: Parameters<typeof blocksToDoc>[1] = [
+    { type: "paragraph", text: "one" },
+    { type: "chart", chart: "c_1" },
+  ]
+  const json = (editor: Editor) => JSON.stringify(editor.getJSON())
+  /** Position of the top-level block `index` (0 is the title). */
+  const at = (editor: Editor, index: number) => {
+    let pos = 0
+    for (let i = 0; i < index; i++) pos += editor.state.doc.child(i).nodeSize
+    return pos
+  }
+
+  it("takes an empty line's place and Discard puts the line back: the document is as before", () => {
+    const editor = onFirstLine()
+    const before = json(editor)
+    insertDraft(editor, { draft: "d1" })
+    expect(editor.state.doc.child(1).type.name).toBe("aiDraft")
+    expect(editor.state.doc.childCount).toBe(2)
+    expect(draftIds(editor.state.doc)).toEqual(new Set(["d1"]))
+    // Never part of the report: nothing to save.
+    expect(blocks(editor)).toEqual([])
+    expect(removeDraft(editor, "d1")).toEqual({ pos: at(editor, 1), line: true })
+    expect(json(editor)).toBe(before)
+    expect(removeDraft(editor, "d1")).toBeNull()
+  })
+
+  it("goes under a chart and Discard leaves the document byte-identical", () => {
+    const editor = editorWith(blocksToDoc("T", start))
+    const before = json(editor)
+    insertDraft(editor, { draft: "d2", chart: "c_1" }, at(editor, 3))
+    expect(editor.state.doc.child(3).attrs).toEqual({ draft: "d2", chart: "c_1", replaced: false })
+    expect(blocks(editor)).toEqual([...start])
+    removeDraft(editor, "d2")
+    expect(json(editor)).toBe(before)
+  })
+
+  it("is not an undo step: Undo after a draft undoes the person's last edit, not the draft", () => {
+    const editor = onFirstLine()
+    type(editor, "x")
+    insertDraft(editor, { draft: "d3" }, at(editor, 2))
+    editor.commands.undo()
+    expect(blocks(editor)).toEqual([])
+    expect(draftIds(editor.state.doc)).toEqual(new Set(["d3"]))
+  })
+
+  it("Accept puts the blocks where the draft was, as one undo step", () => {
+    const editor = editorWith(blocksToDoc("T", start))
+    const before = json(editor)
+    insertDraft(editor, { draft: "d4", chart: "c_1" }, at(editor, 3))
+    const accepted = [
+      { type: "paragraph", text: "Visits **rose**." },
+      { type: "list", items: ["a", "b"] },
+    ] as const
+    expect(acceptDraft(editor, "d4", accepted as never)).toBe(true)
+    expect(blocks(editor)).toEqual([...start, ...accepted] as never)
+    expect(draftIds(editor.state.doc).size).toBe(0)
+    editor.commands.undo()
+    expect(json(editor)).toBe(before)
+  })
+
+  it("Accept in an empty line's place uses that line, and Undo brings the line back", () => {
+    const editor = onFirstLine()
+    type(editor, "x")
+    editor.commands.enter()
+    const before = json(editor)
+    insertDraft(editor, { draft: "d5" })
+    acceptDraft(editor, "d5", [{ type: "heading", text: "Hi", level: 2 }])
+    expect(blocks(editor)).toEqual([
+      { type: "paragraph", text: "x" },
+      { type: "heading", text: "Hi", level: 2 },
+    ])
+    expect(editor.state.doc.childCount).toBe(3)
+    editor.commands.undo()
+    expect(json(editor)).toBe(before)
+  })
+
+  it("a draft is never read back from pasted HTML", () => {
+    const editor = onFirstLine()
+    editor.commands.insertContent('<div data-ai-draft=""></div><p>kept</p>')
+    expect(draftIds(editor.state.doc).size).toBe(0)
+    expect(blocks(editor)).toEqual([{ type: "paragraph", text: "kept" }])
   })
 })
