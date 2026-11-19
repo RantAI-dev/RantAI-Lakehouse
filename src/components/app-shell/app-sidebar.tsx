@@ -312,7 +312,6 @@ export function AppSidebar() {
           <BrandLogo branding={branding} />
           <div className="grid min-w-0 flex-1 gap-0.5 leading-none group-data-[collapsible=icon]:hidden">
             <span className="text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">{branding.name}</span>
-            <span className="text-[11px] font-normal tracking-[-0.04px] text-sidebar-foreground/60">Enterprise Lakehouse Console</span>
           </div>
         </div>
       </SidebarHeader>

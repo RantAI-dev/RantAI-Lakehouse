@@ -7,8 +7,8 @@ import {
   canDrillFurther, climbTo, drillBlockReason, drillRequest, fixedFilters, levelAfter, nextLevel, trailOf, type Drilled,
 } from "@/lib/hierarchies";
 import { hierarchyService } from "@/services";
+import type { FilterDef } from "@/services";
 import type { Hierarchy } from "@/services/contracts/hierarchies";
-import type { FilterDef } from "@/services/clients/bi-store";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { apiFetch } from "@/services/http";
 import type { Cell } from "./tile-dialogs";

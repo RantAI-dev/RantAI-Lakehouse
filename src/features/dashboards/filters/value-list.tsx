@@ -4,7 +4,7 @@ import * as React from "react";
 import { Check } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
-import type { FilterDef } from "@/services/clients/bi-store";
+import type { FilterDef } from "@/services";
 import { useFilterValues, type OwnSource } from "./use-filter-values";
 
 /**

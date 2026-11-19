@@ -3,7 +3,7 @@
 import { Filter } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { filterLabel } from "@/lib/dashboard-filter-state";
-import type { FilterDef } from "@/services/clients/bi-store";
+import type { FilterDef } from "@/services";
 
 /**
  * Quiet mark on a tile for the filters the chart carries itself (`BI-6`): they

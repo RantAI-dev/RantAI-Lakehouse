@@ -31,12 +31,11 @@ import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import {
   TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeCopyBelow, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
-import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
-import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-store";
+import { dashboardService, queryService } from "@/services";
+import type { BoardTab, LayoutMap, PhoneTile, ChartClick, FilterDef, FilterField } from "@/services";
 import { useAuth } from "@/features/auth/auth-provider";
 import { useCopilotSelect } from "@/features/copilot/use-copilot";
 import { useService } from "@/hooks/use-service";
-import { dashboardService, queryService } from "@/services";
 import { newRunId, RUN_ID_HEADER } from "@/lib/run-id";
 import { STOPPED_SENTENCE } from "@/lib/query-limits";
 import { apiFetch } from "@/services/http";
