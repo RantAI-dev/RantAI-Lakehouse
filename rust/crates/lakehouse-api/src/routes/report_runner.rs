@@ -1029,11 +1029,16 @@ impl Collected<'_> {
             }
         };
         let title = file.chart.spec.title.clone();
-        let cap = crate::export::EXPORT_ROW_CAP;
+        // BI-27: a file the byte cap cut names the rows it holds, not the row cap.
+        let cap = crate::routes::dashboard::cut_rows(&file.written, crate::export::EXPORT_ROW_CAP);
         let cut = file.written.cut;
         let name = unique_name(
             &self.files.attachments,
-            &export_file_name(&title, file.format.extension(), cut.then_some(cap)),
+            &export_file_name(
+                &title,
+                file.format.extension(),
+                (cut.then_some(cap), file.filters_skipped),
+            ),
         );
         let len = usize::try_from(file.written.len).unwrap_or(usize::MAX);
         if !self.budget.take(len) {
