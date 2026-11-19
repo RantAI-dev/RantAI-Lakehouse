@@ -116,7 +116,27 @@ Opened by the reviewer.
 
 ## Handoff
 
-(developer appends here)
+### Handoff (developer, Sonnet 5.5)
+
+Commits, one per task, in plan order on `fix/src-45-kafka-first-load`:
+
+1. `250994e4d` T1: `kafka_source_objects` in `lakehouse-store::ingest_spec` (pure rule, store unit tests `a_kafka_spec_gets_the_default_target_of_its_topic`, `a_spec_that_is_not_kafka_or_has_no_topic_keeps_its_source_objects`); `save_ingest_spec` calls it for `adapter == "kafka"` after fetching the connector name with `connectors::get_connector`; API test `saving_a_kafka_spec_with_no_source_object_stores_the_default_target_of_its_topic` in `connector_create_checks.rs`.
+2. `0e7c3c9c0` T2: `KafkaTargetMissing` (classified `setting_rejected`) raised before the consumer is built; `auto_offset_reset="earliest"`; every `source_objects[0]["target"]` read in `run_kafka_stream_batch` goes through the one checked `target`. Tests in `test_ingest_factory.py` and a case in `test_ingest_errors.py`.
+3. `7c8ae4fca` T3: `specWithTopic` falls back to `ingestModeFor(...)`; new case in `kafka-topic.test.ts`.
+4. `e51fdc366` T4: gate registers `g6-kafka` with `source_objects=[]`, reads the target back from `GET .../ingest-spec`, produces 3 messages before the connector exists and asserts they are in the Bronze table.
+
+Commands run and results:
+
+- `cd rust && cargo fmt --check`: clean (no output), after T1.
+- Python, with a scratch dependency install outside the repo (`pip install --target`, no venv available; `pymysql` and `pyiceberg-core` were not installed there): `python3 -m pytest dispar_orchestrate -q -k "kafka or ingest_factory or ingest_errors"` gave 187 passed, 6 failed, 2410 deselected. The same 6 fail on the base commit (stashed run: 184 passed, 6 failed): 3 in `test_ingest_factory.py` need `pymysql`, 2 in `test_sink_killed_run.py` need `pyiceberg-core`, 1 more of the same family. The 3 extra passes are this change's new tests.
+- `python3 ops/lint/check_intra_package_imports.py`: OK. `python3 ops/lint/check_bare_iceberg_count.py`: no bare count found.
+- `python3 -m py_compile ops/g6/g6_ingest_matrix_test.py`: ok.
+- `bun run typecheck`: clean. `bun run lint`: 0 errors, 11 warnings (all pre-existing, none in touched files). `bun test src/lib/connectors`: 73 pass, 1 skip, 0 fail.
+
+Not verified (left to CI, per the owner's instruction): `cargo clippy`, `cargo test` (the store unit tests and the API test were never compiled or run locally), the full workspace run, and the G6 ingest matrix (`Rust · G6 ingest matrix (files, APIs, streams)`), including whether the `id` column name in the preload count query matches the Bronze table.
+
+Notes for the reviewer: in the API test the connector is created with `fixture(true)` and broker `broker-a:9092`, the same as `connector_repoint.rs`, so no DNS lookup is needed. The route fetches the connector name only for `kafka`, so other adapters pay no extra query.
+
 
 ## Review
 
