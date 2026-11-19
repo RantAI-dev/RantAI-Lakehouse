@@ -24,7 +24,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import {
   Select,
   SelectContent,
@@ -164,7 +163,8 @@ export function AssetDetailPage() {
             </p>
           ) : (
             <div className="grid gap-3">
-              <RequiredLegend />
+              {/* UX-4: permission is required and the reason is optional, so
+                  the star stays; two inputs are too few for a legend. */}
               <div className="grid gap-1.5">
                 <Label htmlFor="access-permission" required>Permission</Label>
                 <Select value={permission} onValueChange={(v) => setPermission(v ?? "")}>
