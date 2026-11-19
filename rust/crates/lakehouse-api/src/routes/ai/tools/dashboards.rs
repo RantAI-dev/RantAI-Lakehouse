@@ -1151,7 +1151,8 @@ pub(super) async fn suggest_join(
     let (left, right) = (arg_str(args, "left"), arg_str(args, "right"));
     // `GOV-7` D6: the marts the caller's roles hide are not described to the
     // model either; the route's own 404 sentence is the tool's error. No
-    // principal is a headless run with no roles, which reads everything.
+    // principal is a headless run: `SEC-76` refuses it, because the
+    // columns of every mart would be described with no role to narrow them.
     let access = match principal {
         Some(principal) => {
             match crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names).await {
@@ -1161,7 +1162,7 @@ pub(super) async fn suggest_join(
                 }
             }
         }
-        None => crate::table_access::TableAccess::All,
+        None => return json!({ "error": super::data::DATASETS_NEED_A_USER }),
     };
     match crate::routes::dashboard::join_suggestions_value(
         &state.clickhouse,

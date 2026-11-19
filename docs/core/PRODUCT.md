@@ -201,7 +201,7 @@ hands-on testing.
 | Self-hosted | **Have** | Mostly no | A strength |
 | High availability | **Missing** | Yes | Yes |
 | Backup and restore | **Partial.** Procedures exist; no tested restore time | Yes, managed | Test it |
-| Usage and cost view | **Missing.** No usage page or API route | Yes | Yes |
+| Usage and cost view | **Partial.** queries, rates, CSV and storage per layer exist; in acceptance as `OPS-8` | Yes | Yes |
 | API for everything | **Have** | Yes | — |
 | Several organisations in one install | **Partial.** One organisation's data per install | Yes | Later |
 

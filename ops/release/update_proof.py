@@ -92,15 +92,17 @@ def reused_images(manifest: dict[str, Any]) -> dict[str, str]:
     """Every image of the manifest that is NOT the API's.
 
     Those are the images bundle B and bundle C REUSE: every image but
-    the one that is rebuilt (D21).
+    the one that is rebuilt (D21). A service that names the rebuilt
+    image is rebuilt with it, so it is not reused either.
     """
     images = manifest.get("images")
     if not isinstance(images, dict):
         raise ProofError("the manifest names no images")
+    rebuilt = api_reference(manifest)
     return {
         service: reference
         for service, reference in images.items()
-        if service != API_SERVICE
+        if reference != rebuilt
     }
 
 
@@ -111,15 +113,14 @@ def compose_with(compose: str, old: str, new: str) -> str:
     another digest — so the file has to name the new one, and the
     manifest's checksum of the file has to be computed again.
 
-    The old reference has to be there EXACTLY ONCE: a file that names
-    it twice would run two images, and a file that does not name it at
-    all would run the old one.
+    Every service that names the old reference gets the new one. Two
+    services can name the same image (the API and its one-shot migrate
+    service, SEC-78), and both must run the rebuilt image after the
+    update. A file that does not name the old reference at all would
+    run the old one, so that case is refused.
     """
-    count = compose.count(old)
-    if count == 0:
+    if compose.count(old) == 0:
         raise ProofError(f"the Compose file does not name {old}")
-    if count > 1:
-        raise ProofError(f"the Compose file names {old} {count} times")
     return compose.replace(old, new)
 
 
@@ -153,8 +154,14 @@ def manifest_for(
 
     old_reference = api_reference(manifest)
 
-    new_images = copy.deepcopy(images)
-    new_images[API_SERVICE] = api_reference_new
+    # Every service that runs the rebuilt image gets the new reference:
+    # the API and its one-shot migrate service name the same image
+    # (SEC-78), and a service left on the old reference would point at an
+    # image bundle B does not carry.
+    new_images = {
+        service: (api_reference_new if reference == old_reference else reference)
+        for service, reference in images.items()
+    }
 
     # The image ids are keyed by the REFERENCE, so the rebuilt image's
     # entry replaces the old one's.

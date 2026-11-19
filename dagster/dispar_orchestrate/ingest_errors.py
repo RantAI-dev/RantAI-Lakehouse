@@ -139,6 +139,14 @@ class UnsupportedKafkaAuth(Exception):
     before any connection is attempted."""
 
 
+class KafkaTargetMissing(Exception):
+    """A Kafka stream spec names no Bronze table to load into (`SRC-45`, QA
+    `LH-SRC-6-41`): no source object carries a non-empty `target`. Raised before
+    the consumer is built, so nothing is read or committed. It is a rejected
+    setting (not retried, not `other`) and the message is fixed text that tells
+    the user what to do; it holds no source text."""
+
+
 class ApiUnreachable(Exception):
     """The product's own API could not be asked for the connector (a
     connection error or a 5xx). Transient. The message is fixed."""
@@ -486,6 +494,7 @@ def _classify_one(exc: BaseException) -> str | None:
             ssrf_guard_sftp_module.HostKeyMismatch,
             ssrf_guard_mongo_module.MongoConfigRejected,
             saas_adapter.SaasSetupRefused,
+            KafkaTargetMissing,
         ),
     ):
         return SETTING_REJECTED
