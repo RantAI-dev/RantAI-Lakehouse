@@ -268,6 +268,13 @@ describe("ADM-13 D8: per-role navigation and route guard", () => {
 // one place, the sidebar's footer card, which is a real button that opens it; the navbar
 // has no profile button any more.
 describe("the account menu in the sidebar's footer (BI-61 review round 1)", () => {
+  // PR #542/#543 CI: this describe sits outside the one above, so that one's afterEach never ran
+  // for it, and its stubAuth left a `global.fetch` mock (answering `{}` to every URL) installed
+  // for every later file in the process (save-query-page, catalog tests). Restore it here.
+  afterEach(() => {
+    global.fetch = originalFetch
+  })
+
   it("opens from the footer card with the same entries, in order, and the navbar has no account button", async () => {
     currentPathname = "/dashboards"
     stubAuth(["dashboard:read"], "Dashboard Viewer")
