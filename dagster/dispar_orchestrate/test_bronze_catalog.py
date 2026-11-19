@@ -229,7 +229,7 @@ def test_the_slug_in_the_conflict_check_is_a_bound_literal(monkeypatch):
     assert "or'ders" not in check.replace("or\\'ders", ""), check
 
 
-# ── The additive column on an EXISTING table (ops-125) ───────────────────
+# ── The additive column on an EXISTING table (OPS-8) ───────────────────
 #
 # `lake.bronze_meta.storage_layer_snapshot` was created by the daily job
 # itself, with the seven columns it had before the job measured the bytes

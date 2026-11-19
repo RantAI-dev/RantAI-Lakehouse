@@ -1307,7 +1307,7 @@ async fn the_estimate_follows_the_rate_that_was_in_force_on_the_day() {
     assert_eq!(rows[1]["estimate"], json!("0.322581"), "{body}");
 }
 
-// ── (j) the storage of the layers (OPS-125) ──────────────────────────────
+// ── (j) the storage of the layers (OPS-8) ──────────────────────────────
 
 /// The daily job has never run here: the table it writes is not there, and
 /// that is a measurement that has not happened yet, not an outage.
