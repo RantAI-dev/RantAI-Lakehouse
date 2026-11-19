@@ -184,6 +184,91 @@ code (the plan asked for exactly this confirmation):
 
 (Developer appends the rest of the handoff below.)
 
+### Handoff — GLM 5.3, 2026-11-19
+
+Commits (one per task, in order):
+
+1. `bb3c05a41` — `docs(ux-4)`: the form table (task 1), committed before any
+   code change.
+2. `3cfac94be` — `fix(ux-4)`: "none" rows + the chat-box restore (task 2),
+   plus the row-31 correction to the table (see below).
+3. `47bdff3f6` — `fix(ux-4)`: "stars only" rows (task 3), including
+   `upload-table-step` whose row-31 correction moved it from "none" to
+   "stars only".
+4. `4f794b13d` — `test(ux-4)`: tests follow the new rule (task 4).
+5. `7199676b0` — `docs(ux-4)`: feature page + CHANGELOG (task 5).
+
+Commands and counts:
+
+- After tasks 2 and 3: `bun run typecheck` — clean (exit 0) each time.
+- After task 4: `bun run test src/features/... .test.tsx` (7 files named) —
+  the script is `bun test src`, so the arguments do not scope it and the
+  whole suite ran: **4562 pass, 1 skip, 0 fail**, 4563 tests across 424
+  files. That full green run also covered the task-4 test edits.
+- Full block before handoff, in the foreground, on the final code:
+  `bun run typecheck && bun run lint && bun run test`:
+  - `bun run typecheck`: clean (exit 0).
+  - `bun run lint`: exit 0 — **0 errors, 11 warnings**, all in code this
+    branch did not change: `data-table.tsx`, `sidebar.tsx`, `sso-page.tsx`,
+    `use-copilot.ts`, `use-data-table.ts`, `dashboard-specs.ts`,
+    `uploads.test.ts`, `services/http.ts`, and — in files this branch
+    edited elsewhere — `overview/alerts-page.tsx` line 134 (a `rules`
+    useMemo) and `auth/login-page.tsx` line 76 (`window.location.assign`),
+    both untouched by the UX-4 edits. Pre-existing.
+  - `bun run test`: run 3 of 3 quoted in full: **4562 pass, 1 skip,
+    0 fail**, 4563 tests across 424 files. One earlier run failed exactly
+    one test, `SchemaBrowser > keeps the table's name unknown on a Trino
+    tab until its detail loads` (`src/features/queries/schema-browser.test.tsx`).
+    **Pre-existing flake, not caused by UX-4**: this branch touches no
+    schema-browser code, and the test fails in isolation on the base
+    commit `81acc21f2` as well (5 of 10 isolated runs fail on the base,
+    4 of 10 on this branch — a timing race the test already had). Left
+    as found and reported here rather than fixed out of scope.
+  - `git status` after the block: clean, nothing generated staged.
+
+Not verified: no Rust, Python, compose or migration checks were run —
+the plan says none apply, and no such files were touched. The happy-dom
+"Iframe page loading is disabled" / act(...) lines in test output are the
+pre-existing unhandled-error noise UX-1's handoff already recorded; they
+produce no failed assertions.
+
+Per-commit test scoping note: `bun run test <file>` cannot scope to a file
+because the package script is `bun test src`; every invocation runs the
+whole suite. The full-suite green run above covers the per-commit intent.
+
+Tests: no assertion about validation, a disabled button or an error
+message was removed. The kept forms' star/legend assertions are
+unchanged (`invite-user-page`, `alert-rule-page`, `chart-builder`,
+`pipeline-create-page`, `required-groups`, `folder-dialogs`,
+`dial-forms-required`'s SQL/Kafka/REST parts, `permission-picker`,
+`required.test.tsx`). The "none" surfaces' tests now assert no star and
+no "Required" line AND that the control is still required
+(`login-page` native `required`, `tenant-create` aria-required with the
+Create-disabled test untouched, `sql-source-panel`, Mongo/Sheets dial
+rows); `chat-composer` follows decision 4.
+
+Surfaces decided differently from the plan's expected result (all
+confirmed against the code; rows updated in the task-1 table):
+
+- `admin/service-identity-create-page` → none (3 inputs, all required;
+  plan expected keep).
+- `admin/tenant-create-page` → none (4 inputs, all required; plan
+  expected keep).
+- `dial-forms/mongo-dial-form` → none (every input required; plan
+  expected keep).
+- `dial-forms/sheets-dial-form` → none (every input required; plan
+  expected keep).
+- `catalog/asset-meaning-view` → stars only (meaning required, synonyms
+  and role optional; plan expected none).
+- `dashboards/dashboard-list-page` → stars only (name required,
+  description and folder optional; plan expected none).
+- `queries/save-query-page` → stars only (title required, tags and folder
+  optional; plan expected none).
+- `connectors/upload-table-step` → stars only (table name required,
+  the folder picker optional; plan expected none). Found while
+  implementing task 2; the table's row 31 was corrected in the task-2
+  commit and the code change landed with task 3.
+
 ## Review
 
 (planner appends here)
