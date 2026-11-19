@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use common::spin_up_state;
 use lakehouse_api::routes::report_runner::{
-    EMAIL_NOT_SET_UP, PAUSED_AFTER_FAILURES, run_subscription, tick,
+    EMAIL_NOT_SET_UP, PAUSED_AFTER_FAILURES, RUN_TOO_LONG, record_cut_run, run_subscription, tick,
 };
 use lakehouse_api::state::AppState;
 use lakehouse_notify::{Attachment, DeliverResult, MailFuture, ReportMailer};
@@ -895,6 +895,52 @@ async fn ten_left_out_charts_do_not_break_the_delivery_record() {
 /// RPT-1 review fix (SHOULD-FIX) R6: each attached file's audit entry says how
 /// many people it went to, which outside addresses, and whether the schedule or
 /// "Send now" sent it.
+/// `BI-35`: a "Send now" stopped at its time budget is a failed manual
+/// delivery with its reason in the history and an audit row with outcome
+/// `failed`, and it does not count toward the five or move the schedule.
+#[tokio::test]
+async fn a_send_now_stopped_at_its_budget_is_recorded_as_failed_in_history_and_audit() {
+    let f = fixture(ok_pdf(), true).await;
+    let sub = subscription(&f, |s| {
+        s.next_run_at = OffsetDateTime::now_utc() + Duration::days(3);
+    })
+    .await;
+    let owner = lakehouse_auth::repository::load_principal_for_user(
+        &f.pool,
+        f.owner,
+        "test".to_owned(),
+        false,
+    )
+    .await
+    .unwrap();
+    let delivery = record_cut_run(&f.state, &owner, &sub, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    assert_eq!(delivery.status, "failed");
+    assert_eq!(delivery.origin, "manual");
+    assert_eq!(delivery.reason.as_deref(), Some(RUN_TOO_LONG));
+    let history = deliveries(&f, &sub).await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].reason.as_deref(), Some(RUN_TOO_LONG));
+    let audit: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT action, outcome, detail FROM audit_event WHERE action = 'report.send_now'",
+    )
+    .fetch_all(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        audit,
+        vec![(
+            "report.send_now".to_owned(),
+            "failed".to_owned(),
+            Some(RUN_TOO_LONG.to_owned())
+        )]
+    );
+    let stored = subs::get(&f.pool, sub.id).await.unwrap().unwrap();
+    assert_eq!(stored.consecutive_failures, 0);
+    assert!(stored.next_run_at > OffsetDateTime::now_utc() + Duration::days(2));
+}
+
 #[tokio::test]
 async fn the_audit_entry_of_each_file_says_who_received_it() {
     let f = fixture(ok_pdf(), true).await;

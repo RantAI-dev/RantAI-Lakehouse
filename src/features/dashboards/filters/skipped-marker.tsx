@@ -2,7 +2,7 @@
 
 import { FilterX } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { FilterSkip } from "@/services/clients/bi-store";
+import type { FilterSkip } from "@/services";
 
 const WHY: Record<string, string> = {
   no_column: "this tile's data has no such column",

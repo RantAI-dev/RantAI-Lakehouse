@@ -25,7 +25,7 @@ import type { StyleFields } from "@/lib/chart-style";
 import { formatAxisValue, formatValue, withMetricFormats } from "@/lib/value-format";
 import { styleOption, seriesColumns } from "./style-option";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
-import type { FilterDef } from "@/services/clients/bi-store";
+import type { FilterDef } from "@/services";
 import { bucketLabel, calendarFirstDay, isGrain, labelSeriesBuckets } from "@/lib/time-grain";
 import { binsOfTile, relabelBins } from "@/lib/chart-bins";
 import { labelOtherRows, tileMeasureLabels, visibleColumns, withResolvedSlots, type ShapeDefFields } from "@/lib/chart-shape";

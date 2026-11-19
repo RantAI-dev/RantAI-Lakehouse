@@ -1,5 +1,5 @@
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
-import type { FilterDef } from "@/services/clients/bi-store";
+import type { FilterDef } from "@/services";
 import { apiFetch } from "@/services/http";
 import { fileNameOf, refusalOf, saveBlob, type TableExportResult } from "./table-export";
 
