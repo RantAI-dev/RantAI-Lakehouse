@@ -8,8 +8,7 @@ import { filterLine, issuedLine, paperContentWidth, paramLines } from "@/lib/ren
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { ReportingContext } from "@/lib/time-grain";
 import type { ParamControl } from "@/lib/params";
-import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
-import type { FilterDef } from "@/services/clients/bi-store";
+import type { BoardTab, LayoutMap, PhoneTile, FilterDef } from "@/services";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import type { MapLoader } from "./echarts-maps";
