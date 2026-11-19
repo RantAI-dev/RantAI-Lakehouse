@@ -103,8 +103,9 @@ pub struct ScheduleBody {
 /// access hides it (the sentence a rule on that table gets, `GOV-15`), or when
 /// the table is outside the caller's reach (`SEC-80`, the same sentence), when the
 /// mode is not `on_load` or `interval`, the interval is missing for `interval`
-/// or outside 60 to 1440, or the body is malformed; `503`/`500` on a store
-/// failure. The table's existence is not checked, as before.
+/// or outside 60 to 1440, or the body is malformed; `400` with the same
+/// sentence when no table has that name (`SEC-80`); `503`/`500` on a store
+/// failure.
 pub async fn put_schedule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -128,11 +129,14 @@ pub async fn put_schedule(
     })?;
     // GOV-15 (GOV-12 plan, section 4): a schedule names a table, not a rule, so
     // a table the role does not read is refused with the sentence a rule on it
-    // gets (D5). Existence is not checked, so the two refusals read alike.
-    // SEC-80: a table another tenant claimed is refused the same way.
+    // gets (D5).
+    // SEC-80: a table another tenant claimed is refused the same way, and so is
+    // a name no table has. The presence check runs after the reach, the same
+    // check a rule's table gets, so the two refusals read alike.
     if !access.allows_key(&key)
         || !crate::routes::quality::quality_key_in_reach(&state, Some(&principal), &headers, &key)
             .await?
+        || !crate::routes::quality::quality_table_present(&state, &key).await?
     {
         return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
     }
@@ -173,8 +177,9 @@ pub async fn put_schedule(
 /// `400` when the table is not `bronze.`/`silver.`/`serving.` plus a plain
 /// name, or when the caller's table access hides it (the sentence a rule on
 /// that table gets, `GOV-15`), or when the table is outside the caller's reach
-/// (`SEC-80`); `503`/`500` on a store failure. The table's
-/// existence is not checked, as before.
+/// (`SEC-80`), or when no table has that name and the schedule it would reset
+/// does not exist (`SEC-80`: a reset of a dropped table still works); `503`/`500`
+/// on a store failure.
 pub async fn delete_schedule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -197,6 +202,16 @@ pub async fn delete_schedule(
         || !crate::routes::quality::quality_key_in_reach(&state, Some(&principal), &headers, &key)
             .await?
     {
+        return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
+    }
+    // SEC-80: a reset of a schedule the caller's reach covers always works, so
+    // a schedule whose table was dropped can still be removed. Any other name
+    // must be a table that is there, as for a PUT.
+    let scheduled = quality::list_schedules(pool(&state)?)
+        .await?
+        .iter()
+        .any(|schedule| schedule.asset == key);
+    if !scheduled && !crate::routes::quality::quality_table_present(&state, &key).await? {
         return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
     }
     quality::delete_schedule(pool(&state)?, &key).await?;

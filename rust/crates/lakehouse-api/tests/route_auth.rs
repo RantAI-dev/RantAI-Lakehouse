@@ -2762,6 +2762,21 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
     let mut env = std::collections::HashMap::new();
     let catalog_tenant = "11111111-1111-4111-8111-000000000001";
     env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    // A schedule's table must be there (`SEC-80`): ClickHouse answers the
+    // columns of `silver.orders`, so a reset of it reaches the handler's answer.
+    let ch = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_string_contains("system.columns"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+                "data": [{"name": "id", "type": "String"}],
+                "rows": 1,
+            })),
+        )
+        .mount(&ch)
+        .await;
+    env.insert("CH_URL".to_owned(), ch.uri());
     let TestApp { router, pool } = common::spin_up_with_env(&env).await;
 
     let reader = create_principal_with_permissions(&pool, "catalog:read").await;

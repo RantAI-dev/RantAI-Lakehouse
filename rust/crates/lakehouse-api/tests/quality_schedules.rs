@@ -10,7 +10,9 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use common::{TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up};
+use common::{
+    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+};
 
 async fn call(
     router: &axum::Router,
@@ -40,9 +42,28 @@ async fn call(
     )
 }
 
+/// A deployment whose `ClickHouse` has every `silver.` and `serving.` table the
+/// schedules here name: each `system.columns` lookup answers one column, so
+/// the table is there. A schedule's table must exist (`SEC-80`).
+async fn spin_up_with_tables() -> (TestApp, wiremock::MockServer) {
+    let ch = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_string_contains("system.columns"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+            "data": [{"name": "id", "type": "String"}],
+            "rows": 1,
+        })))
+        .mount(&ch)
+        .await;
+    let mut env = std::collections::HashMap::new();
+    env.insert("CH_URL".to_owned(), ch.uri());
+    (spin_up_with_env(&env).await, ch)
+}
+
 #[tokio::test]
 async fn a_table_can_be_scheduled_every_n_minutes_or_on_every_load() {
-    let TestApp { router, pool } = spin_up().await;
+    let (TestApp { router, pool }, _ch) = spin_up_with_tables().await;
     // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: *:* passes catalog tenant gate
     let user = create_principal_with_permissions(&pool, "*:*,governance:write").await;
     let cookie = session_cookie_for_user(&pool, user).await;
@@ -109,7 +130,7 @@ async fn a_table_can_be_scheduled_every_n_minutes_or_on_every_load() {
 /// nothing is stored.
 #[tokio::test]
 async fn a_bad_schedule_is_refused_and_stores_nothing() {
-    let TestApp { router, pool } = spin_up().await;
+    let (TestApp { router, pool }, _ch) = spin_up_with_tables().await;
     // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: *:* passes catalog tenant gate
     let user = create_principal_with_permissions(&pool, "*:*,governance:write").await;
     let cookie = session_cookie_for_user(&pool, user).await;
@@ -170,7 +191,7 @@ async fn a_bad_schedule_is_refused_and_stores_nothing() {
 /// every table). Resetting a table that has no row is not an error.
 #[tokio::test]
 async fn a_schedule_can_go_back_to_the_default() {
-    let TestApp { router, pool } = spin_up().await;
+    let (TestApp { router, pool }, _ch) = spin_up_with_tables().await;
     let user = create_principal_with_permissions(&pool, "*:*,governance:write").await;
     let cookie = session_cookie_for_user(&pool, user).await;
     let set = "/api/governance/quality/schedules/silver.orders";

@@ -2703,15 +2703,23 @@ fn update_rule_body(table: &str, threshold: &str) -> Value {
 }
 
 /// The deployment of the quality writers: the catalog deployment with an
-/// Iceberg query database, so a rule can be written for a bronze table. Every
-/// `DESCRIBE` answers one column, so each bronze table is there.
+/// Iceberg query database, so a rule can be written for a bronze table. The
+/// `DESCRIBE` of each upload table named here answers one column, so it is
+/// there; any other bronze name answers no columns, so it is not (`SEC-80`).
 async fn spin_up_for_the_quality_writers(catalog: &MockServer, ch: &MockServer) -> TestApp {
-    clickhouse_rows(
-        ch,
-        "DESCRIBE TABLE",
-        vec![json!({ "name": MARKER_COLUMN, "type": "String" })],
-    )
-    .await;
+    for table in [GROUP_TABLE, RETAIL_TABLE, "Retail_Orders"] {
+        Mock::given(method("POST"))
+            .and(body_string_contains("DESCRIBE TABLE"))
+            .and(body_string_contains(format!("bronze.{table}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+                "data": [{"name": MARKER_COLUMN, "type": "String"}],
+                "rows": 1,
+            })))
+            .with_priority(1)
+            .mount(ch)
+            .await;
+    }
     let mut env = HashMap::new();
     env.insert("CH_URL".to_owned(), ch.uri());
     env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
@@ -3117,6 +3125,114 @@ async fn the_catalog_owner_cannot_set_or_reset_another_tenants_upload_tables_sch
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = send(&router, "DELETE", &retail, &operator, None, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// The schedules stored under `asset`, under any spelling.
+async fn schedules_on(pool: &PgPool, asset: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM quality_schedule WHERE lower(asset) = lower($1)")
+        .bind(asset)
+        .fetch_one(pool)
+        .await
+        .expect("count the quality schedules")
+}
+
+#[tokio::test]
+async fn an_unknown_table_and_another_tenants_table_get_one_schedule_refusal() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_for_the_quality_writers(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_WRITER, CATALOG_TENANT).await;
+    let retail = format!("bronze.{RETAIL_TABLE}");
+    let set = json!({ "mode": "interval", "intervalMinutes": 120 });
+
+    // A name no table has and a name another tenant claimed: the same 400 for
+    // a set and for a reset, so the answer says nothing about upload names.
+    for asset in ["bronze.no_such_table", retail.as_str()] {
+        let uri = format!("/api/governance/quality/schedules/{asset}");
+        let (status, body) = send(&router, "PUT", &uri, &owner, None, Some(set.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{asset}: {body}");
+        assert_eq!(body["error"], json!(unreadable_sentence(asset)), "{body}");
+        let (status, body) = send(&router, "DELETE", &uri, &owner, None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{asset}: {body}");
+        assert_eq!(body["error"], json!(unreadable_sentence(asset)), "{body}");
+    }
+    assert_eq!(schedules_on(&pool, "bronze.no_such_table").await, 0);
+    assert_eq!(schedules_on(&pool, &retail).await, 0);
+}
+
+#[tokio::test]
+async fn the_catalog_owner_sets_and_resets_a_schedule_on_its_own_table() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_for_the_quality_writers(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_WRITER, CATALOG_TENANT).await;
+    let group = format!("/api/governance/quality/schedules/bronze.{GROUP_TABLE}");
+
+    let (status, body) = send(
+        &router,
+        "PUT",
+        &group,
+        &owner,
+        None,
+        Some(json!({ "mode": "interval", "intervalMinutes": 120 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        schedules_on(&pool, &format!("bronze.{GROUP_TABLE}")).await,
+        1
+    );
+    let (status, body) = send(&router, "DELETE", &group, &owner, None, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(
+        schedules_on(&pool, &format!("bronze.{GROUP_TABLE}")).await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_schedule_on_a_dropped_table_can_be_reset_but_not_set_again() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_for_the_quality_writers(&catalog, &ch).await;
+    // The table was dropped after it was scheduled: no mock answers its
+    // `DESCRIBE`, so it is absent, and the schedule row is still there.
+    sqlx::query(
+        "INSERT INTO quality_schedule (asset, mode, interval_minutes) VALUES ($1, 'interval', 60)",
+    )
+    .bind("bronze.dropped_orders")
+    .execute(&pool)
+    .await
+    .expect("add the schedule");
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_WRITER, CATALOG_TENANT).await;
+    let uri = "/api/governance/quality/schedules/bronze.dropped_orders";
+
+    let (status, body) = send(
+        &router,
+        "PUT",
+        uri,
+        &owner,
+        None,
+        Some(json!({ "mode": "interval", "intervalMinutes": 120 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        json!(unreadable_sentence("bronze.dropped_orders")),
+        "{body}"
+    );
+    let (status, body) = send(&router, "DELETE", uri, &owner, None, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(schedules_on(&pool, "bronze.dropped_orders").await, 0);
 }
 
 #[tokio::test]

@@ -1072,6 +1072,48 @@ fn canonical_table_key(key: &str) -> String {
     }
 }
 
+/// `SEC-80`: whether the table `asset` names is there, a `silver.` or
+/// `serving.` table in `ClickHouse` or a `bronze.` Iceberg table.
+///
+/// The one presence check the rule writers and the schedule writers share.
+/// An unknown name and a name another tenant claimed reach it only after the
+/// reach check, so both get the same refusal from the caller. A deployment
+/// with no Iceberg query database has no bronze table to find, so a bronze
+/// name is absent there.
+///
+/// # Errors
+///
+/// [`ApiError::Unavailable`] (`503`) when the table cannot be checked because
+/// the engine or the catalog did not answer: a check that cannot be made is
+/// not a refusal.
+pub(crate) async fn quality_table_present(state: &AppState, asset: &str) -> Result<bool, ApiError> {
+    let Some((zone, table)) = asset.trim().split_once('.') else {
+        return Ok(false);
+    };
+    let zone = zone.to_lowercase();
+    let unanswered =
+        || ApiError::Unavailable("The table could not be checked. Try again.".to_owned());
+    match zone.as_str() {
+        "silver" | "serving" => {
+            match catalog_source::clickhouse_source(&state.clickhouse, &zone, table).await {
+                Ok(found) => Ok(found.is_some()),
+                Err(err) => {
+                    tracing::warn!(%err, "could not check that a quality table exists");
+                    Err(unanswered())
+                }
+            }
+        }
+        "bronze" => match catalog_source::iceberg_table_presence(state, table).await {
+            Ok(present) => Ok(present),
+            // `NoQueryDatabase` means nothing in this deployment can read a
+            // bronze table, so it is absent, as a rule on it could never run.
+            Err(catalog_source::PresenceUnknown::NoQueryDatabase) => Ok(false),
+            Err(catalog_source::PresenceUnknown::Unanswered) => Err(unanswered()),
+        },
+        _ => Ok(false),
+    }
+}
+
 /// Refuses a quality rule written for a table that is not there, or that the
 /// author's roles do not let them read (QA `LH-DATA-14-01` F2, `DATA-54`).
 ///
@@ -1171,28 +1213,10 @@ pub(crate) async fn ensure_rule_table_with(
             OutOfReach::UnknownRule => ApiError::NotFound("Quality rule not found".to_owned()),
         });
     }
-    match zone.as_str() {
-        "silver" | "serving" => {
-            match catalog_source::clickhouse_source(&state.clickhouse, &zone, table).await {
-                Ok(Some(_)) => Ok(()),
-                Ok(None) => Err(refused()),
-                Err(err) => {
-                    tracing::warn!(%err, "could not check that a quality rule's table exists");
-                    Err(ApiError::Unavailable(
-                        "The table could not be checked. Try again.".to_owned(),
-                    ))
-                }
-            }
-        }
-        _ => match catalog_source::iceberg_table_presence(state, table).await {
-            // `NoQueryDatabase` means such a rule could never run in this
-            // deployment, so it is refused like a missing table.
-            Ok(true) => Ok(()),
-            Ok(false) | Err(catalog_source::PresenceUnknown::NoQueryDatabase) => Err(refused()),
-            Err(catalog_source::PresenceUnknown::Unanswered) => Err(ApiError::Unavailable(
-                "The table could not be checked. Try again.".to_owned(),
-            )),
-        },
+    if quality_table_present(state, asset).await? {
+        Ok(())
+    } else {
+        Err(refused())
     }
 }
 
