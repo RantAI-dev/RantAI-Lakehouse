@@ -116,6 +116,21 @@ Not verified:
 - Workspace-wide `cargo clippy --workspace` / `cargo test --workspace`, the Python tests and the compose checks: not run (no Python, compose or other-crate change); left to the reviewer and CI.
 - No browser or staging check of the console flow.
 
+### Handoff (review 2 fix)
+
+- Merge commit c23c48dec (`git merge origin/main`, no conflicts, no rebase) and e2d5f6085
+  (`fix(db): renumber the Kafka stream migration 0149 to 0151 (SRC-44)`):
+  `git mv` to `0151_kafka_connectors_stream.sql`; in
+  `connector_ingest_spec.rs` the `include_str!` path, doc comment and test name
+  (`migration_0151_...`) follow. PR #593 review 2 BLOCKER 1.
+- Ran: `cd rust && cargo fmt --check` (exit 0); `git diff --stat origin/main...HEAD`
+  (13 files, all SRC-44; migration 0151 only, no 0149 of ours);
+  `git grep -n 'kafka_connectors_stream\|migration_0149'` shows no stale
+  reference (the one `migration_0149_...` mention left is in the earlier
+  handoff above, a record of what ran then).
+- *Not verified* locally, by the owner's choice to save disk: cargo build, clippy,
+  test (incl. `sqlx::test` with 0149 and 0151 together), bun tests. Left to CI on PR #593.
+
 
 ## Review
 
