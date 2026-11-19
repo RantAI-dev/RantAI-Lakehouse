@@ -22,6 +22,7 @@ import { AppFrame } from "@/components/app-shell/app-frame"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { GeneralSettings } from "@/features/admin/general-settings"
+import { PRODUCT_NAME } from "@/lib/product-branding"
 
 const originalFetch = global.fetch
 
@@ -116,11 +117,11 @@ describe("the console shell reads the workspace's branding once (adm-121)", () =
     const { container } = renderShell()
     await screen.findByLabelText("Workspace name")
     // The page is drawn and the answer is held: the sidebar's name slot is
-    // empty, not "Rantai Lake" for a moment before "Acme Data".
-    expect(container.textContent).not.toContain("Rantai Lake")
+    // empty, not the product name for a moment before "Acme Data".
+    expect(container.textContent).not.toContain(PRODUCT_NAME)
     expect(container.textContent).not.toContain("Acme Data")
     release()
     await waitFor(() => expect(container.textContent).toContain("Acme Data"))
-    expect(container.textContent).not.toContain("Rantai Lake")
+    expect(container.textContent).not.toContain(PRODUCT_NAME)
   })
 })

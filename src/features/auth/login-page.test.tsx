@@ -230,8 +230,8 @@ describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
 
     expect(await screen.findByText("Acme Data")).toBeTruthy()
     // The product's own name is nowhere on the page: a workspace that set
-    // a name must not still be called Rantai Lake.
-    expect(screen.queryByText("Rantai Lake")).toBeNull()
+    // a name must not still be called RantAI Lakehouse.
+    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
 
     const shown = pictures(container)
     expect(shown.map((p) => p.getAttribute("src"))).toEqual([
@@ -266,7 +266,7 @@ describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
     stubLoginApi(401, { error: "invalid_or_expired" })
     const { container } = renderLoginPage()
 
-    await waitFor(() => expect(screen.getByText("Rantai Lake")).toBeTruthy())
+    await waitFor(() => expect(screen.getByText("RantAI Lakehouse")).toBeTruthy())
     expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
       "/logo-light.png",
       "/logo-dark.png",

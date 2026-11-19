@@ -1,6 +1,7 @@
 import * as React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
+import { PRODUCT_NAME } from "@/lib/product-branding"
 
 // `AppSidebar` reads the route through `next/navigation`, which needs a
 // Next.js AppRouter context that a bare happy-dom environment does not
@@ -95,8 +96,8 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
 
     expect(await screen.findByText("Acme Data")).toBeTruthy()
     // The product's own name is nowhere in the header: a workspace that set
-    // a name must not still be called Rantai Lake.
-    expect(screen.queryByText("Rantai Lake")).toBeNull()
+    // a name must not still be called RantAI Lakehouse.
+    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
 
     const shown = pictures(container)
     expect(shown.map((p) => p.getAttribute("src"))).toEqual([
@@ -151,7 +152,7 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
     )
     // The name shows once the answer is in (`adm-121`): until then the slot
     // is empty, so the product's name is not drawn twice by a slow answer.
-    expect(await screen.findByText("Rantai Lake")).toBeTruthy()
+    expect(await screen.findByText(PRODUCT_NAME)).toBeTruthy()
     expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
       "/logo-light.png",
       "/logo-dark.png",

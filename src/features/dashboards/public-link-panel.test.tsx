@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { DEFAULT_EXPIRY, PublicLinkPanel, expiryFor } from "./public-link-panel"
+import { PRODUCT_NAME } from "@/lib/product-branding"
 
 const originalFetch = global.fetch
 afterEach(() => {
@@ -130,13 +131,13 @@ describe("PublicLinkPanel", () => {
     render(<PublicLinkPanel board="b_1" />)
     const snippet = await screen.findByText(/<iframe /)
     expect(snippet.textContent).toContain('title="Acme Data dashboard"')
-    expect(snippet.textContent).not.toContain("Rantai Lake")
+    expect(snippet.textContent).not.toContain(PRODUCT_NAME)
   })
 
   it("titles the iframe after the product when the workspace set no name, and keeps a quote in a name out of the attribute", async () => {
     stub({ enabled: true, link: LINK })
     render(<PublicLinkPanel board="b_1" />)
-    expect((await screen.findByText(/<iframe /)).textContent).toContain('title="Rantai Lake dashboard"')
+    expect((await screen.findByText(/<iframe /)).textContent).toContain(`title="${PRODUCT_NAME} dashboard"`)
     cleanup()
 
     stub({ enabled: true, link: LINK }, undefined, { ...NO_BRANDING, workspaceName: 'A "B" <c>' })

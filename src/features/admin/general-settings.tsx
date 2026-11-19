@@ -11,6 +11,7 @@ import { useBrandingState } from "@/hooks/use-branding"
 import { useSeededState } from "@/hooks/use-seeded-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
+import { PRODUCT_NAME } from "@/lib/product-branding"
 import {
   brandingImageUrl,
   settingsService,
@@ -177,7 +178,7 @@ export function GeneralSettings() {
               maxLength={NAME_MAX}
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="Rantai Lake"
+              placeholder={PRODUCT_NAME}
               autoComplete="off"
             />
             <p className="text-xs text-muted-foreground">
