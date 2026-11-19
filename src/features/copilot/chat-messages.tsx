@@ -18,7 +18,6 @@ import {
 } from "lucide-react";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { RequiredLegend } from "@/components/patterns/required-legend";
 import { Textarea } from "@/components/ui/textarea";
 import { formatRelativeTime } from "@/lib/format";
 import { settleStreamingMarkdown } from "@/lib/stream-markdown";
@@ -302,8 +301,9 @@ export function ChatMessages({
 
                 {isEditing ? (
                   <div className="space-y-2">
-                    <RequiredLegend />
-                    <Label htmlFor="edit-message" required>Edit message</Label>
+                    {/* UX-4: the textarea is this box's one required input, so
+                        no star and no legend; it keeps `aria-required`. */}
+                    <Label htmlFor="edit-message">Edit message</Label>
                     <Textarea
                       id="edit-message"
                       aria-required

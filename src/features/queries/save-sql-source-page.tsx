@@ -10,7 +10,6 @@ import { EmptyState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useEffectiveLimits } from "@/hooks/use-effective-limits"
 import { useServiceAction } from "@/hooks/use-service"
 import { sqlSummary } from "@/lib/sql-text"
@@ -90,9 +89,10 @@ function SaveSourceForm({ draft }: { draft: SaveSourceDraft }) {
       onSubmit={() => void handleSave()}
       onCancel={() => router.push(backHref)}
     >
-      <RequiredLegend />
+      {/* UX-4: the title is this form's one required input, so no star and
+          no legend; the input keeps `aria-required`. */}
       <div className="space-y-2">
-        <Label htmlFor="sql-source-title" required>Title</Label>
+        <Label htmlFor="sql-source-title">Title</Label>
         <Input
           id="sql-source-title"
           aria-required
