@@ -216,8 +216,8 @@ pub async fn delete_schedule(
     let in_reach =
         crate::routes::quality::quality_key_in_reach(&state, Some(&principal), &headers, &key)
             .await?;
-    // A reset of a schedule the caller's reach covers always works, so a
-    // schedule whose table was dropped can still be removed.
+    // A reset of an existing in-reach schedule answers 204 when its table was dropped.
+    // An outage that stops the presence check answers 503 for it too (SEC-80).
     let scheduled = quality::list_schedules(pool(&state)?)
         .await?
         .iter()
