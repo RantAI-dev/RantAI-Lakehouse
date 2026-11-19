@@ -12,6 +12,7 @@ import type { UsedBy,
   ColumnLineage,
   AuditEvent,
   AuditPage,
+  AuditActorsPage,
   AuditSearchQuery,
   ClassificationRule,
   MaintenanceRun,
@@ -125,6 +126,11 @@ export const clickhouseGovernanceService: GovernanceService = {
   },
   async searchAudit(query, signal) {
     return get<AuditPage>(`/api/governance/audit/events${auditQueryString(query, true)}`, signal);
+  },
+  // plan D2: the distinct principals that acted, for the person filter's
+  // picker — `audit:read`, no query string, one list.
+  async listAuditActors(signal) {
+    return get<AuditActorsPage>("/api/governance/audit/actors", signal);
   },
   async getAuditEvent(id, signal) {
     const res = await apiFetch(`/api/governance/audit/events/${encodeURIComponent(id)}`, { signal });

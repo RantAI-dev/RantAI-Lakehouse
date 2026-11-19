@@ -259,11 +259,25 @@ export type AuditEvent = {
   id: string
   at: string
   actor: string
+  /**
+   * The principal id behind `actor` (plan D2) — what the person filter
+   * sends as `actor`. `null` for an event nobody signed in caused (a
+   * sign-in form row): its actor is not a filter, so it is not clickable.
+   * Always present on the wire, `null` when empty.
+   */
+  actorId: string | null
   actorKind: ActorKind
   delegatedActor?: string
   action: string
   resource: string
   outcome: AuditOutcome
+  /**
+   * The stored outcome value behind the four-word `outcome` (plan D4):
+   * one of the eight the server filters on (`allowed`, `executed`,
+   * `refused`, `needs_confirmation`, `needs_approval`, `approved`,
+   * `rejected`, `failed`). Always present; the detail view shows it.
+   */
+  outcomeDetail: string
   policyDecision: string
   obligations: string[]
   engineCategory?: EngineCategory
@@ -276,6 +290,13 @@ export type AuditEvent = {
    * 2026-12-06"); absent for other actions (QA LH-DATA-15-03 F1, plan D9).
    */
   detail?: string
+  /**
+   * The row's stored detail column (plan D4b): a refusal reason, a
+   * Central status code, or a failed assistant tool's fixed sentence;
+   * `null` when the row stored none. The derived `detail` above is a
+   * different thing. Always present on the wire, `null` when empty.
+   */
+  reason: string | null
 }
 
 /**
@@ -305,6 +326,24 @@ export type AuditSearchQuery = {
 export type AuditPage = {
   events: AuditEvent[]
   nextCursor: string | null
+}
+
+/**
+ * One principal that acted in the trail (`GET /api/governance/audit/actors`,
+ * plan D2): the distinct `(principal_id, actor, principal_kind)` the
+ * trail records, newest-seen first, at most 500.
+ */
+export type AuditActor = {
+  /** The principal id the person filter sends as `actor`. */
+  actorId: string
+  /** The name the trail shows for it (the events' `actor`). */
+  actor: string
+  actorKind: ActorKind
+}
+
+/** The answer of the actors route: one list, no paging. */
+export type AuditActorsPage = {
+  actors: AuditActor[]
 }
 
 /**
@@ -445,6 +484,13 @@ export interface GovernanceService {
    * (`GET /api/governance/audit/events`); needs `audit:read`.
    */
   searchAudit(query: AuditSearchQuery, signal?: AbortSignal): Promise<AuditPage>
+  /**
+   * The distinct principals that acted in the trail, newest-seen first, at
+   * most 500 (`GET /api/governance/audit/actors`, plan D2); needs
+   * `audit:read`, not `identity:read`. The audit page's person filter
+   * picks from this list.
+   */
+  listAuditActors(signal?: AbortSignal): Promise<AuditActorsPage>
   /** One audit event by id, or `null` when no event has it; needs `audit:read`. */
   getAuditEvent(id: string, signal?: AbortSignal): Promise<AuditEvent | null>
   /**
