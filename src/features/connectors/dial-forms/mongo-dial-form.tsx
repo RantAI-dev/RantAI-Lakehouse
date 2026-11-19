@@ -20,9 +20,6 @@ export function MongoDialForm({
 }: {
   value: MongoDial | null
   onChange: (next: MongoDial) => void
-  /** UX-4: kept for `DialFormFor`'s shared call signature. Every input on
-   * this form is required, so it renders no legend and no stars. */
-  showLegend?: boolean
 }) {
   const dial: MongoDial = value ?? {
     hosts: [""],

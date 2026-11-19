@@ -4,19 +4,15 @@ import * as React from "react"
 import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import type { FilesDial } from "@/services/contracts/connectors"
 
 /** `dial` for the `files` (object-storage) adapter. */
 export function FilesDialForm({
   value,
   onChange,
-  showLegend = true,
 }: {
   value: FilesDial | null
   onChange: (next: FilesDial) => void
-  /** UX-1-R7: a parent step can opt out of its own legend. */
-  showLegend?: boolean
 }) {
   const dial: FilesDial = value ?? {
     protocol: "s3",
@@ -31,8 +27,6 @@ export function FilesDialForm({
   }
   return (
     <div className="grid gap-3 sm:grid-cols-2">
-      {/* UX-1-R7: opt out when a parent step already explains the marker. */}
-      {showLegend ? <RequiredLegend className="sm:col-span-2" /> : null}
       <div className="space-y-1.5">
         {/* SRC-6 F8: this adapter reads S3 only (adapters/files.py); SFTP is its
             own connector type. A stored dial that still says "sftp" is shown

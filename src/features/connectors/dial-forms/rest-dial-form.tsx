@@ -4,7 +4,6 @@ import * as React from "react"
 import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import type { RestAuth, RestDial, RestEndpoint, RestPagination } from "@/services/contracts/connectors"
 
 const AUTH_TYPES: RestAuth["type"][] = [
@@ -52,7 +51,6 @@ export function RestDialForm({
   value,
   onChange,
   oauthCallbackUrl,
-  showLegend = true,
 }: {
   value: RestDial | null
   onChange: (next: RestDial) => void
@@ -62,8 +60,6 @@ export function RestDialForm({
    * `undefined` while it is not known yet, `null` when the operator has not set it.
    */
   oauthCallbackUrl?: string | null
-  /** UX-1-R7: a parent step can opt out of its own legend. */
-  showLegend?: boolean
 }) {
   const dial: RestDial = value ?? {
     baseUrl: "",
@@ -92,8 +88,6 @@ export function RestDialForm({
 
   return (
     <div className="grid gap-3">
-      {/* UX-1-R7: opt out when a parent step already explains the marker. */}
-      {showLegend ? <RequiredLegend /> : null}
       <div className="space-y-1.5">
         <Label htmlFor="rest-dial-base-url" required>Base URL</Label>
         <Input

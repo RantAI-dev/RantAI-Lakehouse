@@ -193,7 +193,7 @@ describe("dial form required indicators (UX-1)", () => {
   it("lets a composed parent opt a dial form out of its standalone legend", () => {
     const standalone = render(<SqlDialForm value={null} onChange={mock()} />)
     expect(within(standalone.container).getByText(/Required/)).toBeDefined()
-    const composed = render(<SqlDialForm value={null} onChange={mock()} showLegend={false} />)
+    const composed = render(<SqlDialForm value={null} onChange={mock()} />)
     expect(within(composed.container).queryByText(/Required/)).toBeNull()
   })
 })

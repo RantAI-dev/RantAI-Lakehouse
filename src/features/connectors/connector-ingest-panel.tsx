@@ -20,7 +20,6 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { RequiredMarker } from "@/components/ui/required"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useRefreshable } from "@/hooks/use-refreshable"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
@@ -766,7 +765,6 @@ function IngestEditor({
       ) : null}
       {manualAdd ? (
         <div className="space-y-1.5">
-          <RequiredLegend />
           <Label htmlFor="manual-object" className="text-xs" required>
             Add by name
           </Label>
@@ -859,7 +857,6 @@ function IngestEditor({
       <Label htmlFor="ingest-schedule" className={page ? "sr-only" : "text-xs"}>
         Schedule
       </Label>
-      {cronChoice === "custom" ? <RequiredLegend /> : null}
       {/* WEB-9 D3: the presets and the custom entry, as before; "Manual only"
           is a real choice with value "", held by `SelectField`. */}
       <SelectField
