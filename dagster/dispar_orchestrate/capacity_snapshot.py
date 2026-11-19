@@ -47,6 +47,20 @@ one public name rather than reaching into `bronze_catalog`'s private
 reads ClickHouse's own `system.parts` live, so this table stores the
 bucket-measured numbers only — one source per number, never two writers
 for the same fact.
+
+# The filesystem setup and the object rule are ONE public pair, shared
+# with the storage job
+
+`build_filesystem` below is the ONLY place in this project where the
+warehouse bucket's credentials and endpoint reach `s3fs`, and
+`list_stored_objects` is the ONLY rule for what counts as a stored
+object. `storage_snapshot.py` measures the SAME bucket (each table's own
+location, for its "stored on disk" number) and builds its filesystem and
+lists its objects through THESE two helpers, so there is one copy of the
+credential/endpoint logic and one copy of the object rule, not two of
+each (`AGENTS.md` rule 4: reuse before you write). Without that, the
+bucket size and the per-table numbers could be read through two
+different setups and disagree for a reason nobody could name.
 """
 
 from __future__ import annotations
@@ -120,10 +134,26 @@ class BucketMeasurement:
     objects: int
 
 
-def measure_bucket(cfg: CapacityConfig) -> BucketMeasurement:
-    """Lists every object under `cfg.bucket_name` via `s3fs.S3FileSystem`
-    (pointed at RustFS's endpoint with this job's `CONNECTOR_S3_*`
-    credentials) and sums their sizes.
+def build_filesystem(cfg: CapacityConfig) -> S3FileSystem:
+    """The object store's filesystem for `cfg`: RustFS's own S3 API,
+    pointed at `cfg.rustfs_endpoint` and authenticated with this job's
+    `CONNECTOR_S3_*` credentials.
+
+    PUBLIC because `storage_snapshot.py` measures the SAME bucket (each
+    table's own location) and there must be ONE copy of the
+    credential/endpoint logic in this project (`AGENTS.md` rule 4).
+    `S3FileSystem` is imported at module scope so this module's own
+    tests can monkeypatch the name directly, per this module's
+    no-network testing rule."""
+    return S3FileSystem(
+        key=cfg.rustfs_access_key,
+        secret=cfg.rustfs_secret_key,
+        client_kwargs={"endpoint_url": cfg.rustfs_endpoint},
+    )
+
+
+def list_stored_objects(fs: S3FileSystem, path: str) -> tuple[int, int]:
+    """`(bytes, objects)` of every stored object under `path`, recursively.
 
     Uses `find`, NOT `ls`: `ls` is non-recursive (fsspec/s3fs return only
     the immediate children of `path` — top-level prefix "directories" and
@@ -138,19 +168,27 @@ def measure_bucket(cfg: CapacityConfig) -> BucketMeasurement:
     markers) are excluded from both the byte sum and the object count —
     a marker is not a stored object.
 
-    `S3FileSystem` is imported at module scope so this function's own
-    test can monkeypatch the name directly, per this module's
-    no-network testing rule."""
-    fs = S3FileSystem(
-        key=cfg.rustfs_access_key,
-        secret=cfg.rustfs_secret_key,
-        client_kwargs={"endpoint_url": cfg.rustfs_endpoint},
-    )
-    entries = fs.find(cfg.bucket_name, detail=True)
+    ONE rule for both callers: `measure_bucket` (the whole bucket) and
+    `storage_snapshot.py` (one table's location)."""
+    entries = fs.find(path, detail=True)
     files = [info for info in entries.values() if info.get("type") != "directory"]
+    return sum(info["size"] for info in files), len(files)
+
+
+def measure_bucket(cfg: CapacityConfig) -> BucketMeasurement:
+    """Lists every object under `cfg.bucket_name` via `s3fs.S3FileSystem`
+    (pointed at RustFS's endpoint with this job's `CONNECTOR_S3_*`
+    credentials) and sums their sizes.
+
+    The filesystem is built by `build_filesystem` and the objects are
+    listed by `list_stored_objects`: the same two helpers
+    `storage_snapshot.py` uses, so the bucket size and the per-table
+    "stored on disk" numbers are read through ONE setup and ONE object
+    rule."""
+    bytes_, objects = list_stored_objects(build_filesystem(cfg), cfg.bucket_name)
     return BucketMeasurement(
-        bytes=sum(info["size"] for info in files),
-        objects=len(files),
+        bytes=bytes_,
+        objects=objects,
     )
 
 
