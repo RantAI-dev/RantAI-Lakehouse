@@ -444,7 +444,10 @@ export function LoginPage() {
                 2026-11-18, `docs/core/features/login-page.md`), the product's
                 when none is set; a long one wraps at a word, balanced. */}
             <h1 className={cn(LOGIN_DISPLAY, "login-reveal login-reveal-1 text-center text-[28px] leading-[1.05] text-balance break-words text-foreground sm:text-[36px]")}>
-              Sign in to {branding.name}
+              {/* `adm-121`: the name is empty until the branding answers, and
+                  "Sign in to " is a broken sentence. A no-break space keeps the
+                  line's height meanwhile. */}
+              {branding.loading ? "\u00A0" : `Sign in to ${branding.name}`}
             </h1>
 
             {checkingSession ? (
@@ -641,10 +644,13 @@ export function LoginPage() {
               a name of its own; with none, the copyright already names the
               product, and one piece of information is written once
               (DESIGN.md; planner review of the merge, 2026-11-18). One short
-              line, pieces split by a middle dot, wrapping on a narrow phone. */}
+              line, pieces split by a middle dot, wrapping on a narrow phone.
+              `adm-121` (main): until the branding answers the name is empty,
+              so neither "© 2026 " nor the byline is drawn; a no-break space
+              keeps the line's height. */}
           <span className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5">
-            <span>© {new Date().getFullYear()} {branding.name}</span>
-            {branding.name !== PRODUCT_NAME ? (
+            <span>{branding.loading ? "\u00A0" : `© ${new Date().getFullYear()} ${branding.name}`}</span>
+            {!branding.loading && branding.name !== PRODUCT_NAME ? (
               <>
                 <span aria-hidden>·</span>
                 <span>{PRODUCT_BYLINE}</span>

@@ -189,6 +189,25 @@ describe("the embed footer shows the workspace's own name (ADM-2)", () => {
     expect(await screen.findByText("RantAI Lakehouse")).toBeTruthy()
   })
 
+  it("shows no lone arrow in the footer until the branding has answered", async () => {
+    let answer: (response: Response) => void = () => {}
+    const pending = new Promise<Response>((resolve) => {
+      answer = resolve
+    })
+    serve()
+    const served = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).includes("/api/branding") ? pending : served(input, init),
+    ) as unknown as typeof fetch
+    const { container } = render(<EmbedView token="p_tok" />)
+    await screen.findByTestId("tile")
+    expect(container.textContent).not.toContain("↗")
+    expect(container.querySelector("a[href='/public/dashboard/p_tok']")).toBeNull()
+
+    answer(json({ workspaceName: "Acme Data", logo: null, logoDark: null, icon: null }))
+    expect(await screen.findByText("Acme Data ↗")).toBeTruthy()
+  })
+
   it("hides the workspace name when the address says logo=none", async () => {
     serve({ branding: { workspaceName: "Acme Data", logo: null, logoDark: null, icon: null } })
     render(<EmbedView jwt="j" look={{ ...DEFAULT_EMBED_LOOK, showName: false }} />)

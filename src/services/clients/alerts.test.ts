@@ -84,3 +84,14 @@ describe("clickhouseAlertRuleService refusals (WEB-12)", () => {
     })
   })
 })
+
+describe("clickhouseAlertRuleService.listMine", () => {
+  it("reads /api/alerts/mine for one chart, not the permission-gated /api/alerts list (BI-43)", async () => {
+    const calls = stubFetch(() => json({ rules: [{ id: RULE }] }))
+
+    const rules = await clickhouseAlertRuleService.listMine("c 1")
+
+    expect(rules).toEqual([{ id: RULE } as never])
+    expect(calls.map((c) => c.url)).toEqual(["/api/alerts/mine?chart=c%201"])
+  })
+})

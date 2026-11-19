@@ -50,3 +50,36 @@ run_monitoring:
   cancel_timeout_seconds: 300
   max_resume_run_attempts: 0
   poll_interval_seconds: 60
+
+# The run queue: how many runs may be in progress at once, and which of
+# them must never overlap another run of THEMSELVES.
+#
+# `max_concurrent_runs: 10` is the value this instance already enforced:
+# Dagster's default run coordinator is `QueuedRunCoordinator`, whose
+# `max_concurrent_runs` defaults to 10. It is written here so the number
+# is the repository's own instead of a library default that a version
+# bump could change under us -- the near-limit warning reads it.
+#
+# `tag_concurrency_limits` is the serial rule (OPS-37). A run tagged
+# `lakehouse/serial` waits until no run with the SAME value is in
+# progress. The value is the job's own name
+# (`dispar_orchestrate/ingest_factory.py::job_tags`), so the limit of one
+# applies to each serial job separately: a second `bronze_maintenance_job`
+# waits in the queue, while `gold_export_job` may run beside it.
+# `applyLimitPerUniqueValue` is what makes the limit apply per value
+# instead of per key.
+#
+# A run that waits stays QUEUED and is never dropped by the daemon
+# (`QueuedRunCoordinatorDaemon`): it starts when its turn comes.
+#
+# `concurrency.runs` may not be combined with `run_queue` or
+# `run_coordinator.config` -- Dagster refuses that pair. This file has
+# neither.
+concurrency:
+  runs:
+    max_concurrent_runs: 10
+    tag_concurrency_limits:
+      - key: lakehouse/serial
+        value:
+          applyLimitPerUniqueValue: true
+        limit: 1

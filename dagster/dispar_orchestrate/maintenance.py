@@ -229,7 +229,7 @@ from dispar_orchestrate.bronze_catalog import (
     record_maintenance_run,
     record_maintenance_verb_run,
 )
-from dispar_orchestrate.ingest_factory import run_limit_tags
+from dispar_orchestrate.ingest_factory import job_tags
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 CATALOG_DB = "icecat_maintenance"
@@ -1254,7 +1254,7 @@ def summarize_bronze_maintenance(
 # whose process died is cancelled and failed by the daemon, so it does not
 # hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
 # is a tag and not `run_monitoring.max_runtime_seconds`.
-@job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
+@job(tags=job_tags("bronze_maintenance_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def bronze_maintenance_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `bronze_maintenance_job`.
     PART C: `list_bronze_tables` is the fan-out (one DynamicOutput per

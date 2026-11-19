@@ -71,6 +71,62 @@ def test_measure_bucket_lists_objects_via_s3fs(monkeypatch):
     assert result.objects == 3  # the directory marker is not an object
 
 
+def test_build_filesystem_is_the_one_setup_of_the_warehouse_bucket(monkeypatch):
+    """The credentials and the endpoint reach `s3fs` in ONE place, and
+    `storage_snapshot.py` measures the SAME bucket through it: a second
+    copy of this logic would let the bucket size and the per-table
+    "stored on disk" numbers disagree for a reason nobody could name
+    (`AGENTS.md` rule 4: reuse before you write)."""
+    built = []
+
+    class _FakeS3FileSystem:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            built.append(kwargs)
+
+    monkeypatch.setattr(capacity_snapshot, "S3FileSystem", _FakeS3FileSystem)
+
+    fs = capacity_snapshot.build_filesystem(_cfg())
+
+    assert built == [
+        {
+            "key": "test-access-key",
+            "secret": "test-secret-key",
+            "client_kwargs": {"endpoint_url": "http://rustfs.invalid:9000"},
+        }
+    ], built
+    assert isinstance(fs, _FakeS3FileSystem)
+
+
+def test_the_bucket_size_and_the_stored_objects_are_listed_by_the_same_rule(monkeypatch):
+    """`measure_bucket` and `storage_snapshot.py` ask the same question
+    ("what is stored under this path?") of the same helper, so the
+    directory marker `s3fs` may return is excluded from both -- one rule,
+    one place."""
+
+    class _FakeS3FileSystem:
+        def __init__(self, **kwargs):
+            self.paths = []
+
+        def find(self, path, detail=True):
+            self.paths.append(path)
+            return {
+                f"{path}/data/a.parquet": {"size": 100, "type": "file"},
+                f"{path}/metadata/": {"size": 0, "type": "directory"},
+            }
+
+    fake = _FakeS3FileSystem()
+    monkeypatch.setattr(capacity_snapshot, "S3FileSystem", lambda **kwargs: fake)
+
+    result = capacity_snapshot.measure_bucket(_cfg())
+    listed = capacity_snapshot.list_stored_objects(fake, "warehouse/bronze/orders")
+
+    assert fake.paths == ["lakehouse-warehouse", "warehouse/bronze/orders"], fake.paths
+    assert result.bytes == 100
+    assert result.objects == 1
+    assert listed == (100, 1)
+
+
 def test_record_capacity_snapshot_writes_one_row(monkeypatch):
     inserted = []
     monkeypatch.setattr(bronze_catalog, "_ch_exec", lambda target, sql: inserted.append(sql))

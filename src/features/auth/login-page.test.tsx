@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 
 // `LoginPage` calls `useRouter()` at the top of the component, which
@@ -298,6 +298,35 @@ describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
       "/logo-light.svg",
       "/logo-dark.svg",
     ])
+  })
+
+  it("shows no half-written heading or copyright line until the branding has answered", async () => {
+    let answer: (response: Response) => void = () => {}
+    const pending = new Promise<Response>((resolve) => {
+      answer = resolve
+    })
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes("/api/auth/me")) return new Response(null, { status: 401 })
+      if (url.includes("/api/branding")) return pending
+      return new Response("{}", { status: 200 })
+    }) as unknown as typeof fetch
+    renderLoginPage()
+
+    // The session check has resolved (the form is up) while the branding is still on its way.
+    await screen.findByLabelText("Username or email")
+    const heading = screen.getByRole("heading", { level: 1 })
+    expect(heading.textContent).not.toContain("Sign in")
+    expect(screen.queryByText(/©/)).toBeNull()
+
+    answer(
+      new Response(JSON.stringify({ workspaceName: "Acme Data", logo: null, logoDark: null, icon: null }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+    await waitFor(() => expect(heading.textContent).toBe("Sign in to Acme Data"))
+    expect(screen.getByText(/© \d{4} Acme Data$/)).toBeTruthy()
   })
 
   it("shows a workspace name that holds markup as plain text", async () => {
