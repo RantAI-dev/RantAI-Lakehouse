@@ -2,21 +2,26 @@ import * as React from "react"
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import type { BoardTab, LayoutMap } from "@/services"
+import { stubRectWidth, stubResizeObserver } from "@/lib/test-layout"
 import { DashboardGrid, type GridItem } from "./dashboard-grid"
 
 afterEach(cleanup)
 
-const realRect = Element.prototype.getBoundingClientRect
+// CI full run 2026-11-15: the canvas width is set here on every prototype that could answer
+// (`stubRectWidth`), not on `Element.prototype` alone, which a spy left over by another file in the
+// same bun process (copilot-dock.test.tsx) shadowed; and undone after each test.
+let undo: (() => void)[] = []
 function atWidth(width: number) {
-  Element.prototype.getBoundingClientRect = function () {
-    return { width, height: 0, top: 0, left: 0, right: width, bottom: 0, x: 0, y: 0, toJSON: () => ({}) } as DOMRect
-  }
+  undo.push(stubRectWidth(() => width))
 }
 beforeEach(() => {
-  ;(globalThis as { ResizeObserver?: unknown }).ResizeObserver ??= class { observe() {} disconnect() {} unobserve() {} }
+  undo.push(stubResizeObserver())
   try { window.localStorage.clear() } catch { /* no storage */ }
 })
-afterEach(() => { Element.prototype.getBoundingClientRect = realRect })
+afterEach(() => {
+  for (const u of undo.reverse()) u()
+  undo = []
+})
 
 const item = (id: string, title: string, kind?: string): GridItem => ({ id, kind, title, body: <p>{`body of ${title}`}</p> })
 const items = [item("a", "Alpha"), item("b", "Bravo"), item("s", "Region details", "section"), item("c", "Charlie"), item("h", "A heading", "heading")]
@@ -104,5 +109,69 @@ describe("dashboard grid with tabs and sections", () => {
     expect(saved.map((p) => p.id)).toEqual(["b", "a", "s", "c"])
     fireEvent.click(screen.getByLabelText("Make Alpha taller"))
     expect(saved.find((p) => p.id === "a")?.h).toBe(5)
+  })
+})
+
+// Owner QA 2026-11-15: reading, a canvas that squeezes tiles under 240 px lays that row out again
+// (2 + 2 for four 3-column KPIs at 900 px); edit mode keeps the saved grid. Small-by-design tiles
+// stay as authored (BI-61 review, reflow SHOULD-FIX 1).
+describe("dashboard grid reflow on a narrow canvas", () => {
+  const kpiItems = ["k1", "k2", "k3", "k4"].map((id) => item(id, id.toUpperCase()))
+  const kpiLayout: LayoutMap = Object.fromEntries(
+    ["k1", "k2", "k3", "k4"].map((id, i) => [id, { x: i * 3, y: 0, w: 3, h: 3 }]),
+  )
+  const boxOf = (title: string) => {
+    let el: HTMLElement | null = screen.getByText(`body of ${title}`)
+    while (el && !el.classList.contains("dash-tile")) el = el.parentElement
+    return el!.style
+  }
+
+  it("draws a row of four three-column tiles two a row at 900 px, without saving anything", () => {
+    atWidth(900)
+    let saved = false
+    render(<DashboardGrid items={kpiItems} layout={kpiLayout} editable={false} onLayoutChange={() => { saved = true }} />)
+    // 900 px: a column is 64 px, so half the canvas is 6 columns (444 px) and a row is 56 px.
+    expect(boxOf("K1").left).toBe("0px")
+    expect(boxOf("K2").left).toBe("456px")
+    expect(boxOf("K3").top).toBe("168px")
+    expect(boxOf("K3").width).toBe("444px")
+    expect(saved).toBe(false)
+  })
+
+  it("keeps the saved grid in edit mode", () => {
+    atWidth(900)
+    render(<DashboardGrid items={kpiItems} layout={kpiLayout} editable onLayoutChange={() => {}} />)
+    expect(boxOf("K2").left).toBe("228px")
+    expect(boxOf("K3").top).toBe("0px")
+    expect(boxOf("K3").width).toBe("216px")
+  })
+
+  it("keeps six 2-column KPIs as authored on a 1440 px canvas (small by design)", () => {
+    atWidth(1440)
+    const six = ["k1", "k2", "k3", "k4", "k5", "k6"].map((id) => item(id, id.toUpperCase()))
+    const sixLayout: LayoutMap = Object.fromEntries(six.map((it, i) => [it.id, { x: i * 2, y: 0, w: 2, h: 3 }]))
+    render(<DashboardGrid items={six} layout={sixLayout} editable={false} onLayoutChange={() => {}} />)
+    for (const t of ["K1", "K6"]) expect(boxOf(t).top).toBe("0px")
+  })
+
+  it("keeps the saved grid when every tile is wide enough", () => {
+    atWidth(1350)
+    render(<DashboardGrid items={kpiItems} layout={kpiLayout} editable={false} onLayoutChange={() => {}} />)
+    expect(boxOf("K4").top).toBe("0px")
+  })
+})
+
+describe("edit mode canvas", () => {
+  it("keeps every resize handle inside its tile box, so the scroll region never widens", () => {
+    atWidth(1200)
+    grid({ editable: true, tabs: undefined, tab: undefined })
+    const handles = document.querySelectorAll('[title="Drag to resize"]')
+    expect(handles.length).toBeGreaterThan(0)
+    for (const h of Array.from(handles)) {
+      const cls = h.className
+      expect(cls).not.toMatch(/-(right|bottom|left|top)-\d/)
+      expect(cls).toMatch(/\bbottom-\d/)
+      expect(cls).toMatch(/\bright-\d/)
+    }
   })
 })

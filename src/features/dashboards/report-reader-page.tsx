@@ -18,6 +18,7 @@ import { formatRelativeTime } from "@/lib/format"
 import { notifyError, notifySuccess, withNotify } from "@/lib/notify"
 import { buildReportPageContext, chartCount } from "@/lib/report-blocks"
 import { dashboardReportService, dashboardService } from "@/services"
+import { forgetRow, rememberRow } from "./dashboards-row"
 import { downloadReportPdf } from "./chart-download"
 import { ReportBlocks } from "./report-blocks"
 import { ReportingProvider } from "./reporting-context"
@@ -53,6 +54,10 @@ export function ReportReaderPage({ id }: { id: string }) {
   // screen, as the dashboard page names its board, so it can change this one.
   const { setPageContext } = useCopilot()
   const shown = state.status === "success" ? state.data.report : null
+  // BI-61 T11: the sidebar's Dashboards row names the last dashboard or report opened.
+  React.useEffect(() => {
+    if (shown) rememberRow("report", shown.id, shown.title)
+  }, [shown])
   React.useEffect(() => {
     if (!shown) return
     setPageContext({
@@ -176,6 +181,7 @@ export function ReportReaderPage({ id }: { id: string }) {
         onConfirm={() => {
           void (async () => {
             const done = await deleteAction.run()
+            if (done !== null) forgetRow({ kind: "report", id })
             setDeleting(false)
             if (done !== null) router.push(REPORTS_TAB_HREF)
           })()
