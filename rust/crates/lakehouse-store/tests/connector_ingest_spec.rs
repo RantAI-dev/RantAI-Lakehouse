@@ -582,12 +582,13 @@ async fn repoint_ingest_spec_needs_every_slot_the_new_dial_reads(pool: PgPool) -
     Ok(())
 }
 
-/// `0149` (`SRC-44`, QA `LH-SRC-6-41`) moves a Kafka connector the console saved
+/// `0151` (`SRC-44`, QA `LH-SRC-6-41`; renumbered from `0149`, `PR #593 review 2
+/// BLOCKER 1`, because main took `0149`) moves a Kafka connector the console saved
 /// as a batch to `stream`, and touches nothing else. The migration already ran
 /// on the empty test database, so its statement is run again over seeded rows,
 /// which also shows it is safe to repeat.
 #[sqlx::test(migrations = "../../migrations")]
-async fn migration_0149_moves_only_kafka_connectors_saved_as_a_batch_to_stream(
+async fn migration_0151_moves_only_kafka_connectors_saved_as_a_batch_to_stream(
     pool: PgPool,
 ) -> sqlx::Result<()> {
     for (id, adapter, mode) in [
@@ -609,7 +610,7 @@ async fn migration_0149_moves_only_kafka_connectors_saved_as_a_batch_to_stream(
 
     for _ in 0..2 {
         sqlx::raw_sql(include_str!(
-            "../../../migrations/0149_kafka_connectors_stream.sql"
+            "../../../migrations/0151_kafka_connectors_stream.sql"
         ))
         .execute(&pool)
         .await?;

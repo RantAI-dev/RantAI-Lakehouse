@@ -62,7 +62,7 @@ and `stream` for any adapter.
    (kafka+batch → 400, sql+stream → 400) and kafka+stream accepted. Fix the
    test helper at `connectors.rs:5971` if any test builds a Kafka spec.
    Check: `cd rust && cargo fmt --check && cargo clippy -p <crate> --all-targets -- -D warnings && cargo test -p <crate>`.
-3. **Migration.** `rust/migrations/0149_kafka_connectors_stream.sql` with a
+3. **Migration.** `rust/migrations/0151_kafka_connectors_stream.sql` with a
    why-header (the bug, `SRC-44`, `LH-SRC-6-41`) and the D3 `UPDATE`. Same
    sitting as task 2 (sqlx embeds migrations). Add a `sqlx::test` if the
    crate has a pattern for migration data fixes; otherwise say so in the
