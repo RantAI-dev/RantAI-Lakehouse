@@ -98,7 +98,85 @@ One PR, branch `fix/ux-4-fewer-required-marks`. The planner opens it.
 
 ## Handoff
 
-(developer appends here)
+### Task 1 — the form table (GLM 5.3, 2026-11-19)
+
+Counting rule used (decisions 1 and 2 applied to what the user sees): an
+"input shown" is any visible control the user can change — text inputs,
+selects, checkboxes, radio groups — including mode selects that always hold a
+default; a composite control (amount + unit) counts as one input. A form
+"mixes" when at least one shown input is not required. Forms confirmed against
+the code at `81acc21f2`; counts for rows with conditional fields are the
+create-state defaults.
+
+| # | File | Form | Inputs shown | Required | Decision |
+|---|------|------|-------------|----------|----------|
+| 1 | `admin/invite-user-page.tsx` | Invite user | 8 (name, username, email, roles, tenants, password mode, set-password, must-change) | name, username-or-email group, set-password when "set" | keep stars + line |
+| 2 | `admin/role-form-page.tsx` | Create role | 4+ (name, permissions, description, table-access scope + grants) | name, permissions, description | keep stars + line |
+| 3 | `admin/role-form-page.tsx` | Edit role | 4+ (same fields + access-rules read-only) | name, permissions, description | keep stars + line |
+| 4 | `admin/service-identity-create-page.tsx` | Create service identity | 3 (name, scopes, environment) | all 3 | **none** |
+| 5 | `admin/tenant-create-page.tsx` | Create tenant | 4 (name, slug, plan, residency) | all 4 | **none** |
+| 6 | `alerts/alert-rule-page.tsx` | Alert rule | 6+ (type, name, severity, channel, condition fields, target) | name, target, type-specific condition | keep stars + line |
+| 7 | `auth/change-password-step.tsx` | Change password | 2–3 (current, new, confirm) | all | **none** |
+| 8 | `auth/login-page.tsx` | Sign in | 2 (username/email, password) | both | **none** |
+| 9 | `catalog/asset-access.tsx` | Add policy | 5+ (roles, mask columns, row filter, name, enforce) | roles, restriction group, name | keep stars + line |
+| 10 | `catalog/asset-detail-page.tsx` | Request access | 2 (permission, reason) | permission | stars only |
+| 11 | `catalog/asset-meaning-view.tsx` | Meaning dialog | 2–3 (meaning, synonyms, role) | meaning | stars only |
+| 12 | `catalog/asset-quality.tsx` | Add quality rule | 4+ (check, column, check params, name, severity) | column, kind params, name | keep stars + line |
+| 13 | `connectors/connector-create-page.tsx` | New connector, step 0 | 3+ (type picker, name, direction) | type, name | keep stars + line |
+| 14 | `connectors/connector-create-page.tsx` | New connector, step 1 (connection + credential) | 4+ (dial fields, credential slots) | dial fields, credential on create | keep stars + line |
+| 15 | `connectors/connector-create-page.tsx` | New connector, step 2 (scope) | 3 — see row 20 | all 3 | **none** (row 20) |
+| 16 | `connectors/connector-create-page.tsx` | New connector, step 3 (ingest) | see row 19 | see row 19 | keep stars + line (row 19) |
+| 17 | `connectors/connector-edit-page.tsx` | Edit connector, steps 0–3 | as rows 13–16; credential optional until repoint/sign-in change | name, dial, forced credential | keep stars + line (scope step **none**) |
+| 18 | `connectors/connector-form-parts.tsx` | Shared pieces (`Field`, `StepSectionHeading`, `CredentialFields`) | — | — | shared pieces stay (decision 5); no call-site change here |
+| 19 | `connectors/connector-ingest-panel.tsx` | Tables, keys, schedule | 4+ (table checkboxes, per-table key, manual name, schedule, cron) | key, manual name, custom cron | keep stars + line |
+| 20 | `connectors/connector-scope-fields.tsx` | Scope step (tenant, environment, residency) | 3 | all 3 | **none** |
+| 21 | `connectors/dial-forms/cdc-dial-form.tsx` | CDC dial | 5–6 (driver, host, port, database, user, TLS mode; slot/publication or server id or PDB) | host, port, database, user, slot + publication | keep stars + line |
+| 22 | `connectors/dial-forms/files-dial-form.tsx` | Files dial | 5 (format, bucket, prefix, endpoint, region) | bucket | keep stars + line |
+| 23 | `connectors/dial-forms/kafka-dial-form.tsx` | Kafka dial | 5–6 (brokers, topic, group id, micro-batch, auth type, SASL username) | brokers, topic, group id, SASL username | keep stars + line |
+| 24 | `connectors/dial-forms/mongo-dial-form.tsx` | Mongo dial | 3+ (seed hosts, database, username) | all | **none** |
+| 25 | `connectors/dial-forms/oracle-dial-form.tsx` | Oracle dial | 6 (host, port, database, user, SSL mode, TLS DN) | host, port, database, user; DN for TLS | keep stars + line |
+| 26 | `connectors/dial-forms/rest-dial-form.tsx` | REST dial | 5+ (base URL, auth type + fields, pagination + params, endpoint paths, records paths) | base URL, conditional auth/pagination fields, endpoint paths | keep stars + line |
+| 27 | `connectors/dial-forms/sftp-dial-form.tsx` | SFTP dial | 6 (host, port, user, remote path, fingerprint, auth type) | 5 (all but auth type) | keep stars + line |
+| 28 | `connectors/dial-forms/sheets-dial-form.tsx` | Sheets dial | 2+ (spreadsheet id, range rows) | all | **none** |
+| 29 | `connectors/dial-forms/sql-dial-form.tsx` | SQL dial | 5–6 (driver, host, port, database, user, SSL mode) | host, port, database, user | keep stars + line |
+| 30 | `connectors/upload-file-step.tsx` | Choose files | 1 (file picker) | it | **none** |
+| 31 | `connectors/upload-table-step.tsx` | Table name | 1 | it | **none** |
+| 32 | `copilot/chat-composer.tsx` | Chat box (compact pill + composer) | 1 (message) | it | **none**; restore pre-#568 markup (decision 4) |
+| 33 | `copilot/chat-messages.tsx` | Edit message | 1 | it | **none** |
+| 34 | `copilot/session-parts.tsx` | Rename conversation | 1 | it | **none** |
+| 35 | `dashboards/chart-builder.tsx` | Chart form | many (title, dashboard, width, content/source, dimension, breakdown, measures, lat/lon) | conditional (content, source, dimension, measures) | keep stars + line |
+| 36 | `dashboards/dashboard-actions.tsx` | Rename dashboard | 1 | it | **none** |
+| 37 | `dashboards/dashboard-list-page.tsx` | Create/edit board | 3 (name, description, folder) | name | stars only |
+| 38 | `dashboards/folder-dialogs.tsx` | Folders dialog | 3 (new name, parent, inline rename) | new name, rename name | stars only |
+| 39 | `dashboards/sql-source-panel.tsx` | SQL source form | 2 (SQL, source name) | both | **none** |
+| 40 | `governance/freshness-target-dialog.tsx` | Freshness target | 2–3 (table when shown, amount + unit) | all | **none** |
+| 41 | `governance/quality-rule-create-page.tsx` | Create quality rule | 4+ (name, asset, check fields, dimension, severity) | name, asset, threshold, dimension | keep stars + line |
+| 42 | `governance/quality-rule-edit-dialog.tsx` | Edit quality rule | 3 (table, threshold, severity) | table, threshold | stars only |
+| 43 | `overview/alerts-page.tsx` | Resolution note | 1 | it (to Resolve) | **none** |
+| 44 | `pipelines/agentic-builder-dialog.tsx` | Agentic builder | 2 (instruction, database) | instruction | stars only |
+| 45 | `pipelines/pipeline-editor.tsx` | Pipeline create/edit | many (name, inputs, steps, output, schedule) | name on create, nodes, args, output | keep stars + line |
+
+45 files covered (rows 2–3 and 13–16 are the second forms of files 2, 13, 17).
+
+Decided differently from the plan's expected result, confirmed against the
+code (the plan asked for exactly this confirmation):
+
+- `admin/service-identity-create-page` — plan expected "keep"; code shows 3
+  inputs, all required (guard `name && scopes && environment`) → none.
+- `admin/tenant-create-page` — plan expected "keep"; 4 inputs, all required →
+  none.
+- `dial-forms/mongo-dial-form` — plan expected "keep"; every input (host
+  rows, database, username) is required, no optional field → none.
+- `dial-forms/sheets-dial-form` — plan expected "keep"; every input
+  (spreadsheet id, range rows) is required → none.
+- `catalog/asset-meaning-view` — plan expected "none"; the dialog mixes a
+  required meaning with optional synonyms and role → stars only.
+- `dashboards/dashboard-list-page` — plan expected "none"; the dialog mixes a
+  required name with optional description and folder → stars only.
+- `queries/save-query-page` — plan expected "none"; the form mixes a required
+  title with optional tags and folder → stars only.
+
+(Developer appends the rest of the handoff below.)
 
 ## Review
 
