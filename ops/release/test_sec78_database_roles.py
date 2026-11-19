@@ -108,5 +108,40 @@ class TemplateDatabaseRolesTest(unittest.TestCase):
         self.assertNotIn("POSTGRES_PASSWORD", environment["BRONZE_SOURCE_DB_PASSWORD"])
 
 
+    def test_the_dagster_services_reach_their_database_as_the_dagster_role_and_never_with_the_owners_password(self) -> None:
+        """Dagster's own instance database has its own role (SEC-78, second
+        change): the code location, the webserver and the daemon never see
+        the owner's password."""
+        for service in ("dagster-code-location", "dagster-webserver", "dagster-daemon"):
+            environment = self.environment_of(service)
+            self.assertEqual(environment["DAGSTER_PG_USER"], "lakehouse_dagster", service)
+            self.assertIn("LAKEHOUSE_DB_DAGSTER_PASSWORD", environment["DAGSTER_PG_PASSWORD"], service)
+            for name, value in environment.items():
+                self.assertNotIn("POSTGRES_PASSWORD", str(value), f"{service}.{name}")
+                self.assertNotIn("POSTGRES_USER", str(value), f"{service}.{name}")
+
+    def test_the_dagster_webserver_and_daemon_wait_for_the_role_to_be_set_up(self) -> None:
+        """The role and the database must exist before a Dagster service
+        connects to them, so both services wait for the init service to
+        complete (the code location already does)."""
+        for service in ("dagster-webserver", "dagster-daemon"):
+            depends_on = self.services[service]["depends_on"]
+            self.assertEqual(
+                depends_on["dagster-db-init"]["condition"],
+                "service_completed_successfully",
+                service,
+            )
+
+    def test_the_dagster_init_sets_the_role_password_without_logging_the_statement(self) -> None:
+        """The password statement is a literal, so it runs with statement
+        logging off (the same guard as `lakehouse-api migrate`)."""
+        command = "\n".join(self.services["dagster-db-init"]["command"])
+        self.assertIn("SET LOCAL log_statement = 'none'", command)
+        self.assertIn("SET LOCAL log_min_error_statement = 'panic'", command)
+        self.assertIn("PASSWORD :'pw'", command)
+        self.assertIn("ALTER DATABASE", command)
+        self.assertNotIn("REASSIGN OWNED", command)
+
+
 if __name__ == "__main__":
     unittest.main()
