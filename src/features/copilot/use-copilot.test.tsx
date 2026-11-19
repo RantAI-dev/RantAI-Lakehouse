@@ -1,5 +1,6 @@
 import { act, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import * as realNavigation from "next/navigation";
 import * as React from "react";
 import type { Msg } from "./use-copilot";
 
@@ -8,9 +9,19 @@ import type { Msg } from "./use-copilot";
  * context. The happy-dom environment does not provide it, so the module is
  * stubbed before the hook is imported.
  */
+// BI-62 PR B review SHOULD-FIX 1: `mock.module` outlives this file when CI runs
+// every test in one bun process, so the override keeps the real exports (a
+// later file importing `useRouter` must still find it) and `afterAll` puts the
+// real module back.
+const realNavigationModule = { ...realNavigation };
 mock.module("next/navigation", () => ({
+  ...realNavigationModule,
   usePathname: () => "/dashboards/main-board",
 }));
+
+afterAll(() => {
+  mock.module("next/navigation", () => realNavigationModule);
+});
 
 const {
   CopilotProvider,
