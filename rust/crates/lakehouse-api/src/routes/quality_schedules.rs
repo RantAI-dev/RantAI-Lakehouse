@@ -104,8 +104,10 @@ pub struct ScheduleBody {
 /// the table is outside the caller's reach (`SEC-80`, the same sentence), when the
 /// mode is not `on_load` or `interval`, the interval is missing for `interval`
 /// or outside 60 to 1440, or the body is malformed; `400` with the same
-/// sentence when no table has that name (`SEC-80`); `503`/`500` on a store
-/// failure.
+/// sentence when no table has that name (`SEC-80`); `503` with the text
+/// "The table could not be checked. Try again." when the presence check cannot
+/// run (`SEC-80`), for a claimed name and an unknown one alike; `503`/`500` on a
+/// store failure.
 pub async fn put_schedule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -182,8 +184,11 @@ pub async fn put_schedule(
 /// name, or when the caller's table access hides it (the sentence a rule on
 /// that table gets, `GOV-15`), or when the table is outside the caller's reach
 /// (`SEC-80`), or when no table has that name and the schedule it would reset
-/// does not exist (`SEC-80`: a reset of a dropped table still works); `503`/`500`
-/// on a store failure.
+/// does not exist (`SEC-80`: a reset of a dropped table still works); an existing
+/// schedule row in the caller's reach gives 204 even when the table is gone;
+/// `503` with the text "The table could not be checked. Try again." when the
+/// presence check cannot run (`SEC-80`), for a claimed name and an unknown one
+/// alike; `503`/`500` on a store failure.
 pub async fn delete_schedule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
