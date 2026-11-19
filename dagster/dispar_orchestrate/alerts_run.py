@@ -52,7 +52,7 @@ from typing import Any
 import requests
 from dagster import DefaultScheduleStatus, ScheduleDefinition, job, op
 
-from dispar_orchestrate.ingest_factory import run_limit_tags
+from dispar_orchestrate.ingest_factory import job_tags
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 # How long one run of this job may run, in seconds. The schedule fires
@@ -134,7 +134,7 @@ def run_alerts_op(context) -> dict[str, Any]:
 # whose process died is cancelled and failed by the daemon, so it does not
 # hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
 # is a tag and not `run_monitoring.max_runtime_seconds`.
-@job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
+@job(tags=job_tags("alerts_run_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def alerts_run_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `alerts_run_job`."""
     run_alerts_op()

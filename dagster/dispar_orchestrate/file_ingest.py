@@ -129,7 +129,7 @@ from dispar_orchestrate.bronze_catalog import record_ingest_run
 from dispar_orchestrate.connector_catalog import register_loaded_table
 from dispar_orchestrate.dlt_pipeline import BronzeIngestConfig
 from dispar_orchestrate import upload_formats
-from dispar_orchestrate.ingest_factory import run_limit_tags
+from dispar_orchestrate.ingest_factory import job_tags
 from dispar_orchestrate.upload_types import BadReport, ColumnSpec, cast_batch, check_specs, specs_from_config
 from dispar_orchestrate.parquet_ingest import UnsupportedColumn, check_types, column_names_of, open_parquet, text_batches
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
@@ -1464,7 +1464,7 @@ def ingest_uploaded_file(context) -> dict:
 # whose process died is cancelled and failed by the daemon, so it does not
 # hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
 # is a tag and not `run_monitoring.max_runtime_seconds`.
-@job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
+@job(tags=job_tags("file_ingest_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def file_ingest_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `file_ingest_job`. Launched only
     with a run config (`POST /api/uploads/{id}/ingest`): it has no schedule
