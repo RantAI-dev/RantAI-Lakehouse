@@ -30,7 +30,7 @@ Build, Governance, Monitoring, Intelligence, Administration.
 
 ## 1. Sign in
 
-1. Open the console. The page reads **Sign in to Rantai Lake**.
+1. Open the console. The page reads **Sign in to** and your workspace's name (Settings → General), or **Sign in to RantAI Lakehouse** when none is set.
 2. Enter your **Email** and **Password**, then click **Sign in**.
    - A wrong email or password shows *Invalid email or password.*
    - *Caps Lock is on* appears if it is.

@@ -88,9 +88,9 @@ const TITLED_PAGES = [
 /**
  * The product's own name, in the spellings the repository uses.
  *
- * `Rantai Lake` is the name the console falls back to when the branding
- * answer holds none; `RantAI Lakehouse` is the spelling the sign-in redesign
- * (`WEB-15`, PR #536) writes. A guard that looks for one alone misses the
+ * `RantAI Lakehouse` is the name the console falls back to when the
+ * branding answer holds none (owner decision 2026-11-18); `Rantai Lake` is
+ * the spelling it had before. A guard that looks for one alone misses the
  * other, so a page or a layout that puts either back has to fail.
  */
 const PRODUCT_NAME_SPELLINGS = ["Rantai Lake", "RantAI Lakehouse"]
@@ -118,7 +118,7 @@ describe("the browser tab title", () => {
 
     expect(metadata.title).toEqual({ default: "Acme Data", template: "%s · Acme Data" })
     expect(metadata.appleWebApp).toEqual({ title: "Acme Data" })
-    expect(JSON.stringify(metadata.title)).not.toContain("Rantai Lake")
+    expect(namesTheProduct(JSON.stringify(metadata.title))).toBe(false)
   })
 
   it("the browser tab falls back to the product's own name when the branding API is unreachable", async () => {
@@ -128,7 +128,7 @@ describe("the browser tab title", () => {
 
     const metadata = workspaceMetadata(await readWorkspaceBranding({ timeoutMs: 100 }))
 
-    expect(metadata.title).toEqual({ default: "Rantai Lake", template: "%s · Rantai Lake" })
+    expect(metadata.title).toEqual({ default: "RantAI Lakehouse", template: "%s · RantAI Lakehouse" })
   })
 
   it("the browser tab falls back to the product's own name when the branding API answers 500", async () => {
@@ -136,7 +136,7 @@ describe("the browser tab title", () => {
 
     const metadata = workspaceMetadata(await readWorkspaceBranding({ timeoutMs: 100 }))
 
-    expect(metadata.title).toEqual({ default: "Rantai Lake", template: "%s · Rantai Lake" })
+    expect(metadata.title).toEqual({ default: "RantAI Lakehouse", template: "%s · RantAI Lakehouse" })
   })
 
   it("the browser tab falls back to the product's own name when the branding answer is not the branding shape", async () => {
@@ -151,7 +151,7 @@ describe("the browser tab title", () => {
 
       const metadata = workspaceMetadata(await readWorkspaceBranding({ timeoutMs: 100 }))
 
-      expect(metadata.title).toEqual({ default: "Rantai Lake", template: "%s · Rantai Lake" })
+      expect(metadata.title).toEqual({ default: "RantAI Lakehouse", template: "%s · RantAI Lakehouse" })
     }
   })
 
@@ -162,7 +162,7 @@ describe("the browser tab title", () => {
     const metadata = workspaceMetadata(await readWorkspaceBranding({ timeoutMs: 50 }))
     const elapsed = Date.now() - startedAt
 
-    expect(metadata.title).toEqual({ default: "Rantai Lake", template: "%s · Rantai Lake" })
+    expect(metadata.title).toEqual({ default: "RantAI Lakehouse", template: "%s · RantAI Lakehouse" })
     // The reader gave up on the timeout it was given, not on the production
     // one: a tab title must not hold a page's render for three seconds.
     expect(elapsed).toBeLessThan(1_500)

@@ -95,8 +95,8 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
 
     expect(await screen.findByText("Acme Data")).toBeTruthy()
     // The product's own name is nowhere in the header: a workspace that set
-    // a name must not still be called Rantai Lake.
-    expect(screen.queryByText("Rantai Lake")).toBeNull()
+    // a name must not still be called RantAI Lakehouse.
+    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
 
     const shown = pictures(container)
     expect(shown.map((p) => p.getAttribute("src"))).toEqual([
@@ -134,7 +134,7 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
     await waitFor(() =>
       expect(requested.some((url) => url.includes("/api/branding"))).toBe(true),
     )
-    expect(screen.getByText("Rantai Lake")).toBeTruthy()
+    expect(screen.getByText("RantAI Lakehouse")).toBeTruthy()
     expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
       "/logo-light.svg",
       "/logo-dark.svg",
