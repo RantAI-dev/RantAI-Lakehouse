@@ -974,6 +974,14 @@ pub struct Config {
     /// non-load-bearing parsing posture as
     /// [`Self::gold_export_max_rows`]. Default `20_000`.
     pub gold_export_batch_size: u64,
+    /// The least number of seconds between two "Send now" presses on the same
+    /// scheduled-report subscription (`BI-35`): each press makes the whole
+    /// report (a PDF, chart files) and emails the recipients, so a double click
+    /// or a loop would send the same report over and over. The count is kept in
+    /// the process, so it resets on a restart and is per replica. `0` turns the
+    /// limit off. Not load-bearing in the sense of [`Self::port`]: an
+    /// unparsable override falls back to the default. Default `60`.
+    pub report_send_now_interval_secs: u64,
     /// Shared token gating `POST /api/agents/employees/{id}/run`
     /// (Tier 3, copilot-operations-handover plan), same D4 shape as
     /// [`Self::gold_export_run_token`]/[`Self::alerts_run_token`]: with
@@ -1441,6 +1449,10 @@ impl std::fmt::Debug for Config {
             )
             .field("gold_export_max_rows", &self.gold_export_max_rows)
             .field("gold_export_batch_size", &self.gold_export_batch_size)
+            .field(
+                "report_send_now_interval_secs",
+                &self.report_send_now_interval_secs,
+            )
             .field(
                 "agent_run_token",
                 &self.agent_run_token.as_ref().map(|_| REDACTED),
@@ -2092,6 +2104,11 @@ impl Config {
             gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
             gold_export_max_rows: parse_u64_or_default(env, "GOLD_EXPORT_MAX_ROWS", 5_000_000),
             gold_export_batch_size: parse_u64_or_default(env, "GOLD_EXPORT_BATCH_SIZE", 20_000),
+            report_send_now_interval_secs: parse_u64_or_default(
+                env,
+                "REPORT_SEND_NOW_INTERVAL_SECS",
+                60,
+            ),
             agent_run_token: truthy(env, "AGENT_RUN_TOKEN"),
             lakehouse_maintenance_token: truthy(env, "LAKEHOUSE_MAINTENANCE_TOKEN"),
             ingest_service_token: truthy(env, "INGEST_SERVICE_TOKEN"),
@@ -2529,6 +2546,20 @@ mod tests {
         let cfg = Config::from_map(&env).unwrap();
         assert_eq!(cfg.gold_export_max_rows, 123);
         assert_eq!(cfg.gold_export_batch_size, 7);
+    }
+
+    /// `BI-35`: "Send now" waits 60 seconds between presses unless told
+    /// otherwise; `0` turns it off; garbage falls back to the default.
+    #[test]
+    fn the_send_now_interval_defaults_to_sixty_seconds_and_is_overridable() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 60);
+        let cfg = Config::from_map(&map(&[("REPORT_SEND_NOW_INTERVAL_SECS", "5")])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 5);
+        let cfg = Config::from_map(&map(&[("REPORT_SEND_NOW_INTERVAL_SECS", "0")])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 0);
+        let cfg = Config::from_map(&map(&[("REPORT_SEND_NOW_INTERVAL_SECS", "soon")])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 60);
     }
 
     /// Same non-load-bearing posture as `OIDC_CLOCK_SKEW_SECONDS`: a

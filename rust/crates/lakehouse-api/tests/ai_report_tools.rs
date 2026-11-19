@@ -248,6 +248,56 @@ async fn naming_another_recipient_waits_for_approval_and_the_report_stays_the_re
     assert!(ids.contains(&Some(f.me)) && ids.contains(&Some(colleague)));
 }
 
+/// `BI-35`: a requester who holds `agent:approve` cannot decide the approval of
+/// their own report to other people (the `SEC-57` rule, held here for the report
+/// tools): 403, the approval stays pending and nothing is created; somebody
+/// else's approval still releases it.
+#[tokio::test]
+async fn a_requester_who_holds_the_approve_permission_cannot_approve_their_own_report() {
+    let f = fixture().await;
+    let requester = create_assistant_principal(
+        &f.app.pool,
+        "dashboard:read, dashboard:write, agent:approve",
+    )
+    .await;
+    let requester_cookie = session_cookie_for_user(&f.app.pool, requester).await;
+    let colleague: Uuid = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Colleague', 'colleague', 'colleague@company.example', 'active')")
+        .bind(colleague)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    let mut args = monday_pdf();
+    args["recipients"] = json!([{ "userId": colleague.to_string() }]);
+    args["confirmed"] = json!(true);
+    let waiting = post(
+        &f,
+        "/api/ai/tool",
+        &requester_cookie,
+        json!({ "tool": "create_report_subscription", "args": args, "mode": "build" }),
+    )
+    .await;
+    assert_eq!(waiting["outcome"], "needs_approval", "{waiting}");
+    let approval = waiting["result"]["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let own = approve(&f, &approval, &requester_cookie).await;
+    assert_eq!(own["__status"], json!(403), "{own}");
+    assert!(all(&f.app.pool).await.is_empty(), "nothing was created");
+    let status: String = sqlx::query_scalar("SELECT status FROM approval_item WHERE id = $1")
+        .bind(&approval)
+        .fetch_one(&f.app.pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "pending");
+
+    let other = approve(&f, &approval, &f.approver_cookie).await;
+    assert_eq!(other["executed"], json!(true), "{other}");
+    assert_eq!(all(&f.app.pool).await.len(), 1);
+}
+
 #[tokio::test]
 async fn the_requesters_rights_are_checked_before_an_approval_is_created() {
     let f = fixture().await;
