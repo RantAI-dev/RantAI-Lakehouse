@@ -137,7 +137,7 @@ The object store is reached the same way: `capacity_snapshot.build_filesystem`
 and `capacity_snapshot.list_stored_objects` are the PUBLIC names of the
 module that owns the bucket, for the same reason.
 
-# The run limit
+# The run limit and the serial tag
 
 The job carries its own `dagster/max_runtime` tag (thirty minutes by
 default). A run whose process dies would otherwise hold a concurrency
@@ -145,8 +145,14 @@ slot forever -- the failure the staging Dagster hit on 13 Nov 2026
 (ten runs left STARTED with a dead process, filling the ten-run
 concurrency limit and queueing 570 runs behind them). The limit is a
 tag on THIS job alone, read from its own setting, through the same
-`ingest_factory.run_limit_tags` rule `ingest_job` uses -- one parsing
-rule, two settings, two defaults (`AGENTS.md` rule 4).
+`ingest_factory.job_tags` rule `ingest_job` uses -- one parsing rule,
+two settings, two defaults (`AGENTS.md` rule 4).
+
+`job_tags` adds the `lakehouse/serial` tag too, because this job is on
+the serial list (`OPS-37`): it measures every layer and writes one row
+per layer, so two overlapping runs of it would measure the same layers
+twice and write the same rows. The tag's value is the job's own name,
+so the run queue's limit of one holds this job alone.
 """
 
 from __future__ import annotations
@@ -161,7 +167,7 @@ from s3fs import S3FileSystem
 
 from dispar_orchestrate import bronze_catalog, capacity_snapshot, maintenance
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, StorageLayerRow
-from dispar_orchestrate.ingest_factory import run_limit_tags
+from dispar_orchestrate.ingest_factory import job_tags
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 # The Iceberg layers: namespaces of the REST catalog, measured from each
@@ -755,7 +761,7 @@ def run_storage_snapshot(context) -> None:
 # every job of the instance -- and it is `tags` and not `run_tags` for
 # the reason `ingest_factory.py` gives: both launch paths copy a job's
 # `tags` onto the run when `run_tags` is unset.
-@job(name="storage_snapshot_job", tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
+@job(name="storage_snapshot_job", tags=job_tags("storage_snapshot_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def storage_snapshot_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `storage_snapshot_job`."""
     run_storage_snapshot()

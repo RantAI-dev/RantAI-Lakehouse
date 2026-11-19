@@ -2805,7 +2805,42 @@ services:
     # authored-pipeline change (`routes::authored_pipelines`), since
     # authored jobs are built at import time; `api grpc` kept serving the
     # definitions it started with.
-    command: ["dagster", "code-server", "start", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
+    #
+    # OPS-37: the code server runs UNDER a supervisor, because on staging
+    # (2026-11-18 22:15 UTC to 2026-11-19 02:58 UTC) the INNER code server
+    # died -- "No heartbeat received in 30 seconds, shutting down" -- and
+    # the `code-server start` proxy never respawned it: it starts the inner
+    # server once (`dagster/_grpc/proxy_server.py`) and the registry never
+    # restarts a dead one. The container stayed "Up" while the daemon failed
+    # 1550 times, and no schedule or sensor ran until a manual restart 4.5
+    # hours later. Dagster 1.13.20 has no option that makes the proxy exit
+    # when the inner server dies, and Docker does NOT restart an unhealthy
+    # container by itself: `restart: unless-stopped` restarts a container
+    # whose PROCESS exited. So the container's main process is now
+    # `dispar_orchestrate.code_server_guard`, which starts the very same
+    # code server as a child, pings it every 30 s (the proxy FORWARDS `Ping`
+    # to the inner server, so a missing answer means the inner server is
+    # gone) and EXITS NON-ZERO when it is: that is what makes Docker
+    # restart the container. The guard also forwards SIGTERM to the child,
+    # so `docker compose stop` still stops the container cleanly.
+    command: ["python3", "-m", "dispar_orchestrate.code_server_guard", "--host", "0.0.0.0", "--port", "4000", "--module", "dispar_orchestrate.definitions"]
+    # OPS-37: the healthcheck runs the guard's ONE probe, so the container's
+    # health state shows a dead inner server instead of staying "Up" and
+    # healthy. The proxy's own gRPC HEALTH service is hardcoded SERVING
+    # (`dagster/_grpc/server.py`), which is why `dagster api
+    # grpc-health-check` cannot see the outage; a `Ping` can.
+    # `interval: 30s` is the guard's own probe interval, so the two agree
+    # on how fast a dead server is noticed. `timeout: 15s` leaves room for
+    # the probe's own 10 s gRPC timeout. `retries: 3` needs three failed
+    # probes (~90 s) before the container is called unhealthy, so one slow
+    # probe does not flap the state. `start_period: 300s` covers the code
+    # location importing its definitions at start, which is not a failure.
+    healthcheck:
+      test: ["CMD", "python3", "-m", "dispar_orchestrate.code_server_guard", "--healthcheck", "--port", "4000"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 300s
     restart: unless-stopped
 
   # WS5 item G2 — one-shot: `pg_dump` every compose-created Postgres
