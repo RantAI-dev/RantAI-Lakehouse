@@ -5,7 +5,6 @@ import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
 import { AlertCircleIcon, BoxIcon, CodeIcon, DatabaseIcon, ListChecksIcon, PlayIcon, PlusIcon, TableIcon } from "lucide-react"
 import { FormPage } from "@/components/patterns/form-page"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SelectField } from "@/components/patterns/select-field"
 import { SqlColumnChips, SqlRowsTable } from "@/components/patterns/sql-rows-table"
@@ -615,9 +614,6 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
           onColumns={reportColumns}
         />
       ))}
-      {/* UX-1-R8: one explanation for the whole editor; the stars are on the
-          name, the input/source nodes, the operation args and the output. */}
-      <RequiredLegend />
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="space-y-1.5">
           {/* On edit the name is a fixed, disabled value that cannot be

@@ -10,7 +10,6 @@ import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { levelAtLeast } from "@/lib/access-level"
@@ -206,7 +205,8 @@ function SaveQueryForm({ draft }: { draft: SaveQueryDraft }) {
       onSubmit={() => void handleSave()}
       onCancel={() => router.push(backHref)}
     >
-      <RequiredLegend />
+      {/* UX-4: the title is required while tags and folder are optional, so
+          the star stays; three inputs are too few for a legend. */}
       <div className="space-y-2">
         <Label htmlFor="saved-query-title" required>Title</Label>
         <Input

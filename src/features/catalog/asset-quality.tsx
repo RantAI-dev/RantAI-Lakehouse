@@ -6,7 +6,6 @@ import { Pencil, Play, Plus, Trash2 } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { SelectField } from "@/components/patterns/select-field"
 import { CheckBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
@@ -118,7 +117,6 @@ function AddRuleDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
-          <RequiredLegend />
           <CheckFields
             form={form}
             onChange={set}

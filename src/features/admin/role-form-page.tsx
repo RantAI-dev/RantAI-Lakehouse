@@ -4,7 +4,6 @@ import * as React from "react"
 import Link from "next/link"
 import { useParams, useRouter, useSearchParams } from "next/navigation"
 import { FormPage } from "@/components/patterns/form-page"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -181,9 +180,6 @@ export function RoleCreatePage() {
       onSubmit={() => void handleCreate()}
       onCancel={() => router.push(backHref)}
     >
-      {/* UX-1-R10: RoleFields is shared by create/edit; explain the stars
-          once here, in each composed form. */}
-      <RequiredLegend />
       <RoleFields
         idPrefix="role"
         name={name}
@@ -337,8 +333,6 @@ function RoleEditForm({ role }: { role: Role }) {
       onSubmit={() => void handleSave()}
       onCancel={() => router.push(backHref)}
     >
-      {/* UX-1-R10: one explanation of the shared star in this composed form. */}
-      <RequiredLegend />
       <RoleFields
         idPrefix="edit-role"
         name={name}
