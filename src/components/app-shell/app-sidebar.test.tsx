@@ -118,7 +118,7 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
 
     stubApi({ workspaceName: null, logo: null, logoDark: null, icon: null })
     const unnamed = renderSidebar()
-    expect(await screen.findByText("Rantai Lake")).toBeTruthy()
+    expect(await screen.findByText(PRODUCT_NAME)).toBeTruthy()
     expect(unnamed.container.textContent).not.toContain("Enterprise Lakehouse Console")
   })
 
