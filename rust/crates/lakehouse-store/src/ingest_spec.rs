@@ -1902,6 +1902,39 @@ pub fn validate_oracle_change_capture_tables(
     Ok(())
 }
 
+/// Why an ingest mode cannot go with an adapter (`SRC-44`, QA `LH-SRC-6-41`).
+///
+/// The text is fixed and never echoes the request, so it is safe to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidIngestMode {
+    /// A `kafka` connector saved as anything but `stream`: the loader runs it
+    /// only as a stream, so every run would stop with `UnknownAdapter`.
+    #[error("a Kafka connector runs as a stream: its ingestMode must be stream")]
+    KafkaNeedsStream,
+    /// `stream` on an adapter other than `kafka`: only the Kafka consumer
+    /// reads as a stream, so the run would have no loader.
+    #[error("ingestMode stream is only for a Kafka connector")]
+    StreamNeedsKafka,
+}
+
+/// Check the pairing of an adapter and its `ingestMode` (`SRC-44`): `kafka`
+/// goes with `stream` and only `kafka` does. The pairing of `cdc` with its mode
+/// is not checked here (unchanged); any other mode is left to the database's
+/// `connector_ingest_mode_check`.
+///
+/// # Errors
+///
+/// Returns [`InvalidIngestMode::KafkaNeedsStream`] for a `kafka` adapter with
+/// a mode other than `stream`, and [`InvalidIngestMode::StreamNeedsKafka`] for
+/// `stream` with any other adapter.
+pub fn validate_ingest_mode(adapter: &str, ingest_mode: &str) -> Result<(), InvalidIngestMode> {
+    match (adapter == "kafka", ingest_mode == "stream") {
+        (true, false) => Err(InvalidIngestMode::KafkaNeedsStream),
+        (false, true) => Err(InvalidIngestMode::StreamNeedsKafka),
+        _ => Ok(()),
+    }
+}
+
 /// Check each source object's load mode, the one part of `sourceObjects`
 /// checked at save time: a mode the ingest job cannot run would otherwise
 /// surface only as a rejected run. Everything else in an object is left
@@ -2953,6 +2986,26 @@ mod tests {
         )
         .expect("valid");
         assert_eq!(without.load_mode, None);
+    }
+
+    #[test]
+    fn a_kafka_connector_is_saved_as_a_stream_and_only_a_kafka_connector_is() {
+        assert_eq!(validate_ingest_mode("kafka", "stream"), Ok(()));
+        assert_eq!(
+            validate_ingest_mode("kafka", "batch"),
+            Err(InvalidIngestMode::KafkaNeedsStream)
+        );
+        assert_eq!(
+            validate_ingest_mode("kafka", "cdc"),
+            Err(InvalidIngestMode::KafkaNeedsStream)
+        );
+        assert_eq!(
+            validate_ingest_mode("sql", "stream"),
+            Err(InvalidIngestMode::StreamNeedsKafka)
+        );
+        // Everything else is as it was.
+        assert_eq!(validate_ingest_mode("sql", "batch"), Ok(()));
+        assert_eq!(validate_ingest_mode("cdc", "cdc"), Ok(()));
     }
 
     #[test]

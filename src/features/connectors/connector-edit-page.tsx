@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService } from "@/hooks/use-service"
+import { ingestModeFor } from "@/lib/connectors/ingest-mode"
 import { runConnectionTest } from "@/lib/connectors/run-connection-test"
 import { targetChanged } from "@/lib/connectors/target-identity"
 import { connectorService } from "@/services"
@@ -238,7 +239,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
     }
     const specInput: IngestSpecInput = {
       adapter: adapter as NonNullable<IngestSpec["adapter"]>,
-      ingestMode: spec.ingestMode ?? (adapter === "cdc" ? "cdc" : "batch"),
+      ingestMode: spec.ingestMode ?? ingestModeFor(adapter),
       dial: (dial ?? {}) as IngestSpec["dial"],
       // Kept as they are: this page does not edit what is ingested.
       sourceObjects: spec.sourceObjects,

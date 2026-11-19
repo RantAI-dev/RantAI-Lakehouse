@@ -16,6 +16,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { connectorService } from "@/services"
 import { SECRET_MANAGER_LABEL } from "@/lib/connectors/secret-reference"
+import { ingestModeFor } from "@/lib/connectors/ingest-mode"
 import { ACCEPTED_FORMATS } from "@/lib/uploads"
 import type { Connector, CredentialSpec } from "@/services/contracts/connectors"
 import {
@@ -152,7 +153,7 @@ export function ConnectorCreatePage() {
       id,
       {
         adapter: adapter ?? "",
-        ingestMode: adapter === "cdc" ? "cdc" : "batch",
+        ingestMode: ingestModeFor(adapter),
         dial: dial ?? {},
         sourceObjects: [],
       },
