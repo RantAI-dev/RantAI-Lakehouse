@@ -7,7 +7,6 @@ import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/p
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import {
   Select,
   SelectContent,
@@ -577,7 +576,6 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
       onCancel={() => router.push(backHref)}
       className="max-w-xl"
     >
-        <RequiredLegend />
         <div className="grid gap-3">
           <div className="grid gap-1.5">
             <Label htmlFor="alert-rule-name" required>Name</Label>
