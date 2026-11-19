@@ -6,7 +6,6 @@ import { SqlEditor } from "@/components/sql-editor";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { RequiredLegend } from "@/components/patterns/required-legend";
 import { SqlColumnChips } from "@/components/patterns/sql-rows-table";
 import { sourceNameProblem, type SqlRunPhase } from "@/lib/sql-source-draft";
 import { cn } from "@/lib/utils";
@@ -69,9 +68,10 @@ export function SqlSourcePanel({ draft, onCancelEdit }: { draft: SqlSourceDraft;
         </p>
       ) : null}
 
-      <RequiredLegend />
+      {/* UX-4: both inputs on this form (SQL, source name) are required, so
+          no star and no legend; each keeps its `required` semantics. */}
       <div className="grid gap-1.5">
-        <Label id="sql-source-label" required>SQL</Label>
+        <Label id="sql-source-label">SQL</Label>
         <SqlEditor labelledBy="sql-source-label" required value={draft.sql} onChange={draft.setSql} minHeight="200px" wrap />
         <p className="text-xs text-muted-foreground" id="sql-source-hint">
           One read-only SELECT over <span className="font-mono">serving</span> tables, written as{" "}
@@ -99,7 +99,7 @@ export function SqlSourcePanel({ draft, onCancelEdit }: { draft: SqlSourceDraft;
       ) : null}
 
       <div className="grid gap-1.5">
-        <Label htmlFor="ch-source-name" required>Source name</Label>
+        <Label htmlFor="ch-source-name">Source name</Label>
         <Input
           id="ch-source-name" aria-required value={draft.name} onChange={(e) => draft.setName(e.target.value)}
           placeholder="e.g. Visitors by region and month"

@@ -6,7 +6,6 @@ import { FormPage } from "@/components/patterns/form-page"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { authService, identityService } from "@/services"
@@ -96,7 +95,6 @@ export function InviteUserPage() {
       onSubmit={() => void handleCreate()}
       onCancel={() => router.push(backHref)}
     >
-      <RequiredLegend />
       <div className="space-y-1.5">
         <Label htmlFor="user-name" required>Name</Label>
         <Input id="user-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />

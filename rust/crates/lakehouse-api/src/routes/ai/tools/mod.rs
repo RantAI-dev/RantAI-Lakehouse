@@ -978,10 +978,11 @@ mod tests {
 
     /// `SEC-20`, plan 96: the classification list names tables, so a person's
     /// list is narrowed to the tables in their reach (here there is no
-    /// database to read a reach from, so none is), and a headless run (a
-    /// scheduled agent, no person) reads the list whole, as it always has.
+    /// database to read a reach from, so none is). `SEC-76`: a
+    /// headless run (a scheduled agent, no person) used to read the list
+    /// whole. It is refused now, with no rows.
     #[tokio::test]
-    async fn the_classification_list_is_narrowed_for_a_person_and_whole_for_a_headless_run() {
+    async fn the_classification_list_is_narrowed_for_a_person_and_refused_for_a_headless_run() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
@@ -998,13 +999,11 @@ mod tests {
         let args = Map::new();
 
         let headless = run_tool(&state, None, "list_classification_rules", &args).await;
-        let assets: Vec<&str> = headless["classifications"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|row| row["asset"].as_str())
-            .collect();
-        assert_eq!(assets, ["bronze.orders_a", "bronze.orders_b"], "{headless}");
+        assert_eq!(
+            headless,
+            json!({ "error": governance::CLASSIFICATION_RULES_NEED_A_USER }),
+            "{headless}"
+        );
 
         let person = caller_with("governance:read");
         let narrowed = run_tool(&state, Some(&person), "list_classification_rules", &args).await;
@@ -1048,6 +1047,101 @@ mod tests {
             server.received_requests().await.unwrap().is_empty(),
             "a refused call must not have asked the engine anything"
         );
+    }
+
+    /// `SEC-76`: a scheduled run holds no principal, and the readers
+    /// below used to read every tenant's rows for it. Each one answers with
+    /// its sentence and asks the engine nothing. Each call boxes this future:
+    /// it holds an `AppState`, over clippy's `large_futures` limit when awaited
+    /// inline in a test.
+    async fn a_run_with_no_principal_gets_the_refusal_and_no_rows(
+        tool: &str,
+        args: &Map<String, Value>,
+        sentence: &str,
+    ) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "rows": 1,
+                "data": [{
+                    "slug": "ds_a", "title": "A", "name": "mart_a", "mart": "mart_a",
+                    "table_name": "orders_a", "asset": "bronze.orders_a", "tier": "confidential",
+                    "left": "mart_a", "right": "mart_b",
+                }],
+            })))
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let reply = run_tool(&state, None, tool, args).await;
+        assert_eq!(reply, json!({ "error": sentence }), "{tool}");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "{tool}: a refused call must not have asked the engine anything"
+        );
+    }
+
+    /// `SEC-76`: the quality list is not narrowed for a headless run,
+    /// so it is refused for one.
+    #[tokio::test]
+    async fn the_quality_list_refuses_a_run_with_no_principal_and_reads_nothing() {
+        Box::pin(a_run_with_no_principal_gets_the_refusal_and_no_rows(
+            "list_quality_rules",
+            &Map::new(),
+            governance::QUALITY_RULES_NEED_A_USER,
+        ))
+        .await;
+    }
+
+    /// `SEC-76`: a quality rule is created through the console's
+    /// handler as the person, and a headless run has none, so it writes nothing.
+    #[tokio::test]
+    async fn draft_quality_rule_refuses_a_run_with_no_principal_and_writes_nothing() {
+        let mut args = Map::new();
+        args.insert("name".to_owned(), json!("rule_a"));
+        args.insert("table".to_owned(), json!("bronze.orders_a"));
+        Box::pin(a_run_with_no_principal_gets_the_refusal_and_no_rows(
+            "draft_quality_rule",
+            &args,
+            governance::CREATING_QUALITY_RULE_NEEDS_A_USER,
+        ))
+        .await;
+    }
+
+    /// `SEC-76`: a join suggestion names the columns of two marts,
+    /// and a headless run has no role to narrow them by, so it is refused.
+    #[tokio::test]
+    async fn suggest_join_refuses_a_run_with_no_principal_and_reads_nothing() {
+        let mut args = Map::new();
+        args.insert("left".to_owned(), json!("mart_a"));
+        args.insert("right".to_owned(), json!("mart_b"));
+        Box::pin(a_run_with_no_principal_gets_the_refusal_and_no_rows(
+            "suggest_join",
+            &args,
+            "reading datasets needs a signed-in user",
+        ))
+        .await;
+    }
+
+    /// `SEC-76`: the Gold mart list and a mart's columns are read for
+    /// a person only, so a headless run gets the refusal for both shapes of
+    /// the call (the list, and one named mart).
+    #[tokio::test]
+    async fn describe_mart_refuses_a_run_with_no_principal_and_reads_nothing() {
+        Box::pin(a_run_with_no_principal_gets_the_refusal_and_no_rows(
+            "describe_mart",
+            &Map::new(),
+            "reading datasets needs a signed-in user",
+        ))
+        .await;
+        let mut named = Map::new();
+        named.insert("mart".to_owned(), json!("mart_a"));
+        Box::pin(a_run_with_no_principal_gets_the_refusal_and_no_rows(
+            "describe_mart",
+            &named,
+            "reading datasets needs a signed-in user",
+        ))
+        .await;
     }
 
     /// The draft of a chart call gets the save's answer, whole: the same value

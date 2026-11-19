@@ -399,7 +399,9 @@ fn tier_filter(raw: &str) -> &str {
 }
 
 /// The refusal of a dataset reader called with no principal (a scheduled run).
-const DATASETS_NEED_A_USER: &str = "reading datasets needs a signed-in user";
+/// `pub(super)`: the governance and dashboard readers that list tables refuse
+/// a headless run with the same sentence (`SEC-76`).
+pub(super) const DATASETS_NEED_A_USER: &str = "reading datasets needs a signed-in user";
 
 /// `SEC-20`, plan 97: the tenant reach a reader of the dataset registry
 /// narrows its rows by.
@@ -1020,13 +1022,15 @@ pub(super) async fn describe_mart(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
+    // SEC-76: a headless run has no person whose reach narrows the
+    // marts, so it reads none of them, not the whole list.
     let allowed = match principal {
         Some(p) => matches!(
             crate::routes::catalog::catalog_tenant_refusal(state, p, &axum::http::HeaderMap::new())
                 .await,
             Ok(None)
         ),
-        None => true,
+        None => return json!({ "error": DATASETS_NEED_A_USER }),
     };
     let ch = &state.clickhouse;
     let mart = strip_non_ident(&arg_str(args, "mart"));
@@ -1943,6 +1947,21 @@ mod describe_mart_marks {
         AppState::new(Config::from_map(&env).expect("valid config from a map"))
     }
 
+    /// A person with every permission. The shared-catalog gate lets an
+    /// unrestricted principal through, so these tests read the mark and not
+    /// the gate. A headless run is refused before any mark is read (`SEC-76`).
+    fn an_unrestricted_person() -> lakehouse_auth::Principal {
+        lakehouse_auth::Principal {
+            id: lakehouse_auth::PrincipalId::User(uuid::Uuid::from_u128(9)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
     async fn mark_old_deprecated(pool: &PgPool) {
         lakehouse_store::annotation::set_certification(
             pool,
@@ -1973,7 +1992,8 @@ mod describe_mart_marks {
         )
         .await;
         let state = state_for(&pool, &server);
-        let result = describe_mart(&state, None, &Map::new()).await;
+        let person = an_unrestricted_person();
+        let result = describe_mart(&state, Some(&person), &Map::new()).await;
         let marts = result["marts"].as_array().expect("marts array");
         let old = marts
             .iter()
@@ -2013,7 +2033,8 @@ mod describe_mart_marks {
         let state = state_for(&pool, &server);
         let mut args = Map::new();
         args.insert("mart".to_owned(), json!("mart_old"));
-        let result = describe_mart(&state, None, &args).await;
+        let person = an_unrestricted_person();
+        let result = describe_mart(&state, Some(&person), &args).await;
         assert_eq!(result["mart"], json!("mart_old"));
         assert_eq!(result["dimensions"], json!(["customer_id"]));
         assert_eq!(result["measures"], json!(["amount"]));

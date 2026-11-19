@@ -833,7 +833,8 @@ describe("ChartBuilder required control associations (UX-1-R3)", () => {
     await screen.findByLabelText("Aggregation of visitors")
     expectAssociatedRequiredLabel("ch-source")
     expectAssociatedRequiredLabel("ch-dimension")
-    expect(screen.getByText(/Required/)).toBeDefined()
+    // UX-5: the builder no longer explains the star with a "* Required" line.
+    expect(screen.queryByText(/Required/)).toBeNull()
   })
 
   it("uses an associated label and required semantics for a text chart's content", () => {
