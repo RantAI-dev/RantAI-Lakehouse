@@ -32,8 +32,11 @@
 //!
 //! A run is a person's through `owner_id`. A run with no owner (written before
 //! `0046_query_ownership.sql`) is grouped under its `user_name`, which is then
-//! the row's key. The row's `label` is the `user_name` of the newest run of the
-//! group, so a person who changed their name shows under the current one.
+//! the row's key. The row's `label` is the name the user list holds for the
+//! owner (`app_user.name`), so a person who changed their name shows under
+//! the current one. A run whose owner is not in the user list any more (the
+//! user was deleted) keeps the `user_name` its run recorded, which is then
+//! also the label of the row.
 //!
 //! # Money
 //!
@@ -111,8 +114,8 @@ pub struct UsageQuery {
 pub struct UsageRow {
     /// The group key: see [`Group`]. Empty on the totals row.
     pub key: String,
-    /// What to show for the key. The person's newest `user_name`, the tenant's
-    /// name or `no tenant`; for a day or an engine, the key.
+    /// What to show for the key. The owner's name from the user list, the
+    /// tenant's name or `no tenant`; for a day or an engine, the key.
     pub label: String,
     /// Runs.
     pub queries: i64,
@@ -200,7 +203,7 @@ macro_rules! report_tail {
            END AS key, \
            CASE $3::text \
                WHEN 'tenant' THEN COALESCE(t.name, 'no tenant') \
-               WHEN 'person' THEN runs.user_name \
+               WHEN 'person' THEN COALESCE(u.name, runs.user_name) \
                ELSE '' \
            END AS name, \
            runs.at, runs.status, runs.scanned_bytes, runs.duration_ms, \
@@ -208,7 +211,12 @@ macro_rules! report_tail {
            runs.duration_ms::numeric / 3600000 * rated.engine_hour AS engine_part \
       FROM runs \
       JOIN rated ON rated.day = runs.day \
-      LEFT JOIN tenant t ON t.id = runs.tenant_id \
+      LEFT JOIN tenant t ON t.id = runs.tenant_id
+      -- The name of a person is the user list's, not the run's: since the
+      -- query-ownership fix (`lakehouse-api`'s `routes/query.rs` writes the
+      -- principal's uuid string into `query_history.user_name`) that column
+      -- alone shows a uuid on the Usage page instead of a name.
+      LEFT JOIN app_user u ON u.id = runs.owner_id \
 ) \
 SELECT GROUPING(k.key) = 1 AS is_total, \
        COALESCE(k.key, '') AS key, \

@@ -1,7 +1,7 @@
 import * as React from "react"
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "bun:test"
-import type { FilterDef, FilterField } from "@/services/clients/bi-store"
+import type { FilterDef, FilterField } from "@/services"
 import { FilterBar } from "./filter-bar"
 
 afterEach(cleanup)

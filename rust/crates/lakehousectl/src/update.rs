@@ -309,6 +309,11 @@ pub fn run(dir: &Path, facts: &Facts, runner: &mut dyn Runner) -> Result<(), Too
     // (REL-10 D2, SEC-50). An operator's own value is kept.
     set_catalog_tenant(dir)?;
 
+    // And the must-set secrets an install from before a secret existed lacks
+    // (SEC-78): the stack refuses to start on an empty one. An operator's own
+    // value is kept; the update fills only the keys that have none.
+    set_must_set_secrets(dir)?;
+
     // Step 3 — the pre-flight, the staged files and the images. Nothing
     // that is RUNNING is touched before this step succeeds.
     if !facts.preflight.is_empty() {
@@ -483,6 +488,33 @@ fn set_catalog_tenant(dir: &Path) -> Result<(), ToolError> {
             "the install's catalog tenant could not be set: {error}. Every scheduled export, \
              alert and report would be refused until {} is set.",
             secrets::CATALOG_TENANT_VARIABLE
+        ))),
+    }
+}
+
+/// Fill the must-set secrets an install from before a secret existed
+/// lacks (SEC-78). The stack refuses to start on an empty one, and an
+/// operator's own value is never changed.
+///
+/// # Errors
+///
+/// Returns the error that says the secrets could not be filled: a stack
+/// that starts with an empty one refuses to start, and says why only at
+/// its own boot.
+fn set_must_set_secrets(dir: &Path) -> Result<(), ToolError> {
+    match secrets::ensure_must_set_secrets(dir) {
+        Ok(filled) if filled.is_empty() => Ok(()),
+        Ok(filled) => {
+            println!(
+                "lakehousectl: the install now has {} must-set secret(s) it lacked ({}).",
+                filled.len(),
+                filled.join(", ")
+            );
+            Ok(())
+        }
+        Err(error) => Err(ToolError::Failed(format!(
+            "the install's must-set secrets could not be filled: {error}. The stack would refuse \
+             to start on an empty one."
         ))),
     }
 }

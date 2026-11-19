@@ -388,21 +388,55 @@ async fn days_are_utc_days_and_the_last_day_is_included(pool: PgPool) {
     assert_eq!(keys, ["2026-03-02", "2026-03-03"]);
 }
 
+/// A user in the user list, as `app_user` holds it: the name the Usage page
+/// shows for that person.
+async fn user_in_the_list(pool: &PgPool, name: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let username = format!("user-{}", id.simple());
+    let email = format!("{}@test.invalid", id.simple());
+    sqlx::query("INSERT INTO app_user (id, name, username, email) VALUES ($1, $2, $3, $4)")
+        .bind(id)
+        .bind(name)
+        .bind(username)
+        .bind(email)
+        .execute(pool)
+        .await
+        .expect("insert an app_user row");
+    id
+}
+
+/// A person row is keyed by the owner's id and labelled with the name the
+/// user list holds for that owner.
+///
+/// A run whose owner is not in the user list any more (the user was deleted)
+/// and a run with no owner at all keep the name their run recorded: the
+/// first is the newest of their runs, the second is their key.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_person_is_the_owner_and_an_ownerless_run_groups_under_its_user_name(pool: PgPool) {
-    let owner = Uuid::new_v4();
-    for (at, user) in [
-        ("2026-03-02T10:00:00Z", "Rina (old name)"),
-        ("2026-03-02T11:00:00Z", "Rina"),
-    ] {
+async fn a_person_is_the_owner_and_the_label_is_the_name_the_user_list_holds(pool: PgPool) {
+    let owner = user_in_the_list(&pool, "Rina Wijaya").await;
+    // Since the query-ownership fix the run records the principal's uuid
+    // string, so the name a run carries is not a name at all.
+    let recorded = owner.to_string();
+    for at in ["2026-03-02T10:00:00Z", "2026-03-02T11:00:00Z"] {
         let mut r = Run::new(at);
         r.owner = Some(owner);
-        r.user = user;
+        r.user = &recorded;
         r.scanned_bytes = 5;
         insert(&pool, &r).await;
     }
+    // An owner who is not in the user list any more: the user was deleted.
+    let deleted = Uuid::new_v4();
+    for (at, user) in [
+        ("2026-03-02T12:00:00Z", "Ghost (old name)"),
+        ("2026-03-02T13:00:00Z", "Ghost User"),
+    ] {
+        let mut r = Run::new(at);
+        r.owner = Some(deleted);
+        r.user = user;
+        insert(&pool, &r).await;
+    }
     for _ in 0..2 {
-        let mut r = Run::new("2026-03-02T12:00:00Z");
+        let mut r = Run::new("2026-03-02T14:00:00Z");
         r.owner = None;
         r.user = "legacy-user";
         insert(&pool, &r).await;
@@ -418,10 +452,13 @@ async fn a_person_is_the_owner_and_an_ownerless_run_groups_under_its_user_name(p
     )
     .await
     .unwrap();
-    assert_eq!(report.rows.len(), 2);
+    assert_eq!(report.rows.len(), 3);
     let person = row(&report.rows, &owner.to_string());
-    assert_eq!(person.queries, 2, "one person, two names over time");
-    assert_eq!(person.label, "Rina", "the name on the newest run");
+    assert_eq!(person.queries, 2, "one person, two runs");
+    assert_eq!(person.label, "Rina Wijaya", "the name the user list holds");
+    let ghost = row(&report.rows, &deleted.to_string());
+    assert_eq!(ghost.queries, 2);
+    assert_eq!(ghost.label, "Ghost User", "the name on the newest run");
     let legacy = row(&report.rows, "legacy-user");
     assert_eq!(legacy.queries, 2);
     assert_eq!(legacy.label, "legacy-user");
