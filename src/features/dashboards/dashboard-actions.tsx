@@ -14,7 +14,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { RequiredLegend } from "@/components/patterns/required-legend";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { REFRESH_OPTIONS } from "@/lib/dashboard-refresh";
@@ -305,8 +304,9 @@ export function RenameDashboardDialog({
       <DialogContent className="sm:max-w-sm">
         <DialogHeader><DialogTitle>Rename dashboard</DialogTitle></DialogHeader>
         <div className="grid gap-1.5">
-          <RequiredLegend />
-          <Label htmlFor="rename-dashboard-name" required>Name</Label>
+          {/* UX-4: the name is this dialog's one required input, so no star
+              and no legend; the input keeps `aria-required`. */}
+          <Label htmlFor="rename-dashboard-name">Name</Label>
           <Input
             id="rename-dashboard-name"
             autoFocus

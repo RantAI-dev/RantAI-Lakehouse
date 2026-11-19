@@ -1,6 +1,9 @@
-// The required-field presentation of the composer: UX-1-R1 (the animated
-// example must keep its relative containing block) and UX-1-R2 (the compact
-// pill must show its required label instead of hiding it in sr-only).
+// The chat box is back to its pre-#568 presentation (UX-4 decision 4): no
+// visible "Message" label, no "* Required" line, no tooltip, no hidden
+// requirement text. What must survive is behaviour: the textarea/input keep
+// `aria-required` (UX-4 decision 3), the animated example still sits inside
+// a `relative` containing block with only the textarea and the overlay, and
+// the send button stays disabled until something is typed.
 import { render, within } from "@testing-library/react"
 import { describe, expect, it, mock } from "bun:test"
 
@@ -13,36 +16,35 @@ const base = {
   busy: false,
 }
 
-describe("ChatComposer required-field presentation (UX-1-R1, UX-1-R2)", () => {
-  it("puts the animated example inside a relative wrapper below the legend and label", () => {
+describe("ChatComposer after the required marks were removed (UX-4)", () => {
+  it("keeps the animated example inside a relative wrapper with the textarea", () => {
     const { container } = render(<ChatComposer {...base} examples={["one example"]} />)
     const view = within(container)
     const textarea = view.getByLabelText("Message AI Copilot")
+    expect(textarea.getAttribute("aria-required")).toBe("true")
     const wrapper = textarea.parentElement as HTMLElement
 
-    // R1: the absolutely positioned overlay needs a positioned ancestor, and
-    // that wrapper contains only the textarea and the overlay — not the label.
+    // The absolutely positioned overlay needs a positioned ancestor, and
+    // that wrapper contains only the textarea and the overlay.
     expect(wrapper.className).toContain("relative")
     const overlay = wrapper.querySelector(".absolute")
     expect(overlay).not.toBeNull()
     expect(overlay?.parentElement).toBe(wrapper)
-    const label = container.querySelector('label[for="copilot-message"]') as HTMLElement
-    expect(wrapper.contains(label)).toBe(false)
-    expect(label.getAttribute("data-required")).toBe("")
-    // The convention is still explained once above the wrapper.
-    expect(view.getByText(/Required/)).toBeDefined()
+    expect(wrapper.querySelector("label")).toBeNull()
+    // No visible label, no legend.
+    expect(container.querySelector('label[for="copilot-message"]')).toBeNull()
+    expect(view.queryByText(/Required/)).toBeNull()
   })
 
-  it("shows a visible associated required label in the compact pill", () => {
+  it("keeps the compact pill label-free but still required", () => {
     const { container } = render(<ChatComposer {...base} compact />)
     const view = within(container)
-    const input = view.getByLabelText("Message")
+    const input = view.getByLabelText("Message AI Copilot")
     expect(input.getAttribute("aria-required")).toBe("true")
-    expect(input.getAttribute("aria-describedby")).toBe("copilot-compact-required-help")
-    const label = container.querySelector('label[for="copilot-compact-message"]') as HTMLElement
-    expect(label.getAttribute("data-required")).toBe("")
-    expect(label.className).not.toContain("sr-only")
-    // R2: the compact surface explains the convention without hiding the star.
-    expect(view.getByText(/star marks required fields/i)).toBeDefined()
+    // No visible "Message" label, no tooltip, no hidden requirement text.
+    expect(container.querySelector('label[for="copilot-compact-message"]')).toBeNull()
+    expect(input.getAttribute("aria-describedby")).toBeNull()
+    expect(view.queryByText(/message is required/i)).toBeNull()
+    expect(view.queryByText(/Required/)).toBeNull()
   })
 })

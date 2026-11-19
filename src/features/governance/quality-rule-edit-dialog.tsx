@@ -14,7 +14,6 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useServiceAction } from "@/hooks/use-service"
 import { notifySuccess } from "@/lib/notify"
 import { SEVERITY_LABEL, type Severity } from "@/lib/status"
@@ -105,7 +104,8 @@ export function EditRuleDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
-          <RequiredLegend />
+          {/* UX-4: table and threshold are required while severity is not,
+              so the stars stay; three inputs are too few for a legend. */}
           <TablePicker
             id="edit-rule-asset"
             label="Table"

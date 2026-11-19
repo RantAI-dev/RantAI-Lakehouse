@@ -20,7 +20,6 @@ import {
 import { Input } from "@/components/ui/input"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { RequiredMarker } from "@/components/ui/required"
 import { useAuth } from "@/features/auth/auth-provider"
 import { PolicyActions } from "@/features/governance/policy-actions"
@@ -178,7 +177,6 @@ function AddPolicyDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
-          <RequiredLegend />
           <div className="grid gap-1.5">
             <Label htmlFor="policy-roles" required>Roles it applies to</Label>
             {roles === null ? (

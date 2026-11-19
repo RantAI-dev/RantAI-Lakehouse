@@ -13,7 +13,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { Label } from "@/components/ui/label"
 import { useServiceAction } from "@/hooks/use-service"
 import { notifyError, notifySuccess } from "@/lib/notify"
@@ -126,9 +125,10 @@ export function FreshnessTargetDialog({
             }
           />
         ) : null}
-        <RequiredLegend />
+        {/* UX-4: every input in this dialog is required, so no star and no
+            legend; the amount keeps `aria-required`. */}
         <div className="grid gap-1.5">
-          <Label htmlFor="sla-amount" required>New data at least every</Label>
+          <Label htmlFor="sla-amount">New data at least every</Label>
           <div className="flex gap-2">
             <Input
               id="sla-amount"

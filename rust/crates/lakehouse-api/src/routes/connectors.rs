@@ -3544,6 +3544,36 @@ async fn record_spec_save(
     audit_coverage::record_best_effort(state, event).await;
 }
 
+/// `SRC-45` (QA `LH-SRC-6-41`): the console sends a Kafka connector's topic
+/// in `dial.topic` and no source object, yet the loader reads its Bronze
+/// table from the first object. The server gives the spec its target here,
+/// so the console wizard, the topic picker and the assistant's
+/// `set_ingest_spec` all save a loadable connector. Kept out of
+/// [`save_ingest_spec`] so that handler stays under `clippy::too_many_lines`
+/// (`PR #597 review 2 BLOCKER 1`, `SRC-45`) without an `allow`.
+///
+/// # Errors
+/// `NotFound` when the connector does not exist, or a database error.
+async fn fill_kafka_source_objects(
+    state: &AppState,
+    id: &str,
+    body: &mut IngestSpecBody,
+) -> ApiResult<()> {
+    if body.adapter != "kafka" {
+        return Ok(());
+    }
+    let detail = connectors::get_connector(pool(state)?, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
+    body.source_objects = lakehouse_store::ingest_spec::kafka_source_objects(
+        &body.adapter,
+        &body.dial,
+        &detail.connector.name,
+        &body.source_objects,
+    );
+    Ok(())
+}
+
 /// The save behind [`ingest_spec_put`]; see its doc for the order of the answers.
 async fn save_ingest_spec(
     state: &AppState,
@@ -3553,7 +3583,7 @@ async fn save_ingest_spec(
 ) -> ApiResult<ApiJson<IngestSpecResponse>> {
     let state = state.clone();
     let id = id.to_owned();
-    let body: IngestSpecBody = parse_body(&body)?;
+    let mut body: IngestSpecBody = parse_body(&body)?;
     // Refused here rather than at the first tick: the schedule sensor
     // would otherwise skip a malformed cron without a word, forever.
     if let Some(problem) = body
@@ -3567,6 +3597,12 @@ async fn save_ingest_spec(
     // than surfacing as a rejected run later.
     lakehouse_store::ingest_spec::validate_load_modes(&body.adapter, &body.source_objects)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    // `SRC-44` (QA `LH-SRC-6-41`): a Kafka connector saved as a batch, or a
+    // stream on any other adapter, has no loader and would only fail at the
+    // first run; refused here with a fixed sentence.
+    lakehouse_store::ingest_spec::validate_ingest_mode(&body.adapter, &body.ingest_mode)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    fill_kafka_source_objects(&state, &id, &mut body).await?;
     refuse_uploaded_targets(&state, &body.source_objects).await?;
     // Parsed here, in the route, ahead of `set_ingest_spec`'s own (later,
     // authoritative-for-persistence) `Dial::parse` call: this handler
