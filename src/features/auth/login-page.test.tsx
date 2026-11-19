@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 
 // `LoginPage` calls `useRouter()` at the top of the component, which
@@ -25,8 +25,27 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
+// WEB-15: the title's face comes through `next/font/local`, which only the
+// Next compiler can evaluate (it has no runtime default export). The face
+// carries no behaviour under test, so the loader returns an empty class.
+mock.module("next/font/local", () => ({
+  default: () => ({ className: "", variable: "", style: { fontFamily: "" } }),
+}))
+
+// WEB-15 T2: the sample dashboard is a `next/dynamic` import that loads after
+// the form. Here it never loads at all, which is what proves the form needs
+// nothing from it: every test in this file signs in without the showcase.
+mock.module("next/dynamic", () => ({ default: () => () => null }))
+
 import { AuthProvider } from "@/features/auth/auth-provider"
-import { LoginPage } from "./login-page"
+import { PRODUCT_NAME } from "@/lib/product-branding"
+
+// WEB-15: imported after the mocks, not statically. The empty
+// `next/font/local` entry has no default export, and a static import links
+// the page's whole module graph before `mock.module` above can stand in for
+// it ("Missing 'default' export"). (The page's logos are plain `<img>`s
+// through `BrandPicture` since `ADM-2`, so `next/image` needs no stub here.)
+const { LoginPage } = await import("./login-page")
 
 const originalFetch = global.fetch
 
@@ -174,7 +193,7 @@ describe("LoginPage lockout surface (plan T5)", () => {
     const alert = await screen.findByRole("alert")
     // One generic message regardless of cause — the page must not leak
     // the server's non-enumeration constant ("invalid_or_expired").
-    expect(alert.textContent).toBe("Invalid username/email or password.")
+    expect(alert.textContent).toBe("Wrong username or password.")
     expect(alert.textContent).not.toContain("invalid_or_expired")
   })
 
@@ -228,10 +247,15 @@ describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
     )
     const { container } = renderLoginPage()
 
-    expect(await screen.findByText("Acme Data")).toBeTruthy()
-    // The product's own name is nowhere on the page: a workspace that set
-    // a name must not still be called RantAI Lakehouse.
-    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
+    // Owner decision 2026-11-18 (`docs/core/features/login-page.md`): the
+    // title names the workspace, and so does the copyright line.
+    expect(await screen.findByRole("heading", { level: 1, name: "Sign in to Acme Data" })).toBeTruthy()
+    expect(screen.getByText(`© ${new Date().getFullYear()} Acme Data`)).toBeTruthy()
+    // The product's own name is nowhere in the title or the copyright: a
+    // workspace that set a name must not still be called by ours. (The
+    // "Powered by" byline is the one place the product keeps, decision 8.)
+    expect(screen.queryByRole("heading", { name: `Sign in to ${PRODUCT_NAME}` })).toBeNull()
+    expect(screen.queryByText(`© ${new Date().getFullYear()} ${PRODUCT_NAME}`)).toBeNull()
 
     const shown = pictures(container)
     expect(shown.map((p) => p.getAttribute("src"))).toEqual([
@@ -255,7 +279,7 @@ describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
     )
     const { container } = renderLoginPage()
 
-    expect(await screen.findByText("Acme Data")).toBeTruthy()
+    expect(await screen.findByRole("heading", { level: 1, name: "Sign in to Acme Data" })).toBeTruthy()
     const shown = pictures(container)
     // The second picture is the dark one: with no dark logo set, it shows
     // the workspace's light logo rather than the product's own dark file.
@@ -266,10 +290,13 @@ describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
     stubLoginApi(401, { error: "invalid_or_expired" })
     const { container } = renderLoginPage()
 
-    await waitFor(() => expect(screen.getByText("RantAI Lakehouse")).toBeTruthy())
+    // The fallback is `PRODUCT_NAME`, whatever the product calls itself.
+    expect(await screen.findByRole("heading", { level: 1, name: `Sign in to ${PRODUCT_NAME}` })).toBeTruthy()
+    expect(screen.getByText(`© ${new Date().getFullYear()} ${PRODUCT_NAME}`)).toBeTruthy()
+    // The official mark (`WEB-15`), at its own ratio.
     expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
-      "/logo-light.png",
-      "/logo-dark.png",
+      "/logo-light.svg",
+      "/logo-dark.svg",
     ])
   })
 
@@ -282,17 +309,41 @@ describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
     )
     const { container } = renderLoginPage()
 
-    expect(await screen.findByText("<b>x</b>")).toBeTruthy()
+    expect(await screen.findByRole("heading", { level: 1, name: "Sign in to <b>x</b>" })).toBeTruthy()
     // The name is text, never HTML: a workspace that typed markup shows
     // the markup, it does not run it.
     expect(container.querySelector("b")).toBeNull()
   })
 
-  it("keeps the 'Powered by RantAI Lakehouse' line under the form", async () => {
-    stubLoginApi(401, { error: "invalid_or_expired" })
+  it("keeps the 'Powered by RantAI Lakehouse' line under the form for a workspace with its own name", async () => {
+    // ADM-2 decision 8: a workspace that set its own name still says who
+    // built the console.
+    stubLoginApi(
+      401,
+      { error: "invalid_or_expired" },
+      {},
+      { workspaceName: "Acme Data", logo: null, logoDark: null, icon: null },
+    )
     renderLoginPage()
 
     expect(await screen.findByText("Powered by RantAI Lakehouse")).toBeTruthy()
+    expect(screen.getByText(`© ${new Date().getFullYear()} Acme Data`)).toBeTruthy()
+  })
+
+  it("names the product once in the footer when the workspace set no name", async () => {
+    // Planner review of the #536 merge (2026-11-18), DESIGN.md: one piece of
+    // information is written once. With no name of its own, the copyright
+    // already names the product, so the byline does not repeat it.
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    renderLoginPage()
+
+    const copyright = await screen.findByText(`© ${new Date().getFullYear()} ${PRODUCT_NAME}`)
+    // The name is the product's own before the branding answer and after it
+    // (the answer sets no name); waiting for the form lets that answer land
+    // before the check, so the byline is checked on the settled page.
+    await screen.findByLabelText("Username or email")
+    expect(screen.queryByText("Powered by RantAI Lakehouse")).toBeNull()
+    expect(copyright.parentElement?.textContent).not.toContain("·")
   })
 
   it("falls back to the product's own logo when the workspace's logo fails to load", async () => {
@@ -309,11 +360,123 @@ describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
     )
     const { container } = renderLoginPage()
 
-    expect(await screen.findByText("Acme Data")).toBeTruthy()
+    expect(await screen.findByRole("heading", { level: 1, name: "Sign in to Acme Data" })).toBeTruthy()
     const shown = pictures(container)
     fireEvent.error(shown[0])
     // A broken picture must never be left on the page: the product's own
     // file stands in for it.
-    expect(shown[0].getAttribute("src")).toBe("/logo-light.png")
+    expect(shown[0].getAttribute("src")).toBe("/logo-light.svg")
+  })
+})
+
+/**
+ * A `keydown` whose `getModifierState("CapsLock")` answers `on`. happy-dom's
+ * `KeyboardEvent` reports no lock keys at all, and React's synthetic event
+ * asks the native one, so the answer is set on the instance.
+ */
+function keyWithCapsLock(type: "keydown" | "keyup", on: boolean): KeyboardEvent {
+  const event = new KeyboardEvent(type, { key: "A", bubbles: true })
+  Object.defineProperty(event, "getModifierState", {
+    value: (key: string) => (key === "CapsLock" ? on : false),
+  })
+  return event
+}
+
+describe("LoginPage form (WEB-15 T1)", () => {
+  it("opens the refusal in place, shakes the form once and selects the password for retyping", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await submitCredentials("rina@meridian.example", "wrong-password")
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe("Wrong username or password.")
+    expect(alert.id).toBe("login-error")
+
+    // WEB-15 spec: "the password is selected for retyping".
+    const password = screen.getByLabelText("Password") as HTMLInputElement
+    expect(password.getAttribute("aria-describedby")).toBe("login-error")
+    expect(document.activeElement).toBe(password)
+    expect(password.selectionStart).toBe(0)
+    expect(password.selectionEnd).toBe("wrong-password".length)
+
+    // The 240 ms shake is a class on the form (the motion itself is CSS, and
+    // sits inside `prefers-reduced-motion: no-preference`).
+    expect(password.closest("form")?.className).toContain("login-shake")
+  })
+
+  it("folds the refusal away once the person types again", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await submitCredentials("rina@meridian.example", "wrong-password")
+    await screen.findByRole("alert")
+
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "right-password" } })
+    expect(screen.queryByRole("alert")).toBeNull()
+    expect(screen.getByLabelText("Password").getAttribute("aria-invalid")).toBe("false")
+  })
+
+  it("warns while Caps Lock is on in the password field, and stops on blur", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await screen.findByLabelText("Username or email")
+    const password = screen.getByLabelText("Password")
+
+    fireEvent(password, keyWithCapsLock("keydown", true))
+    expect((await screen.findByRole("alert")).textContent).toBe("Caps Lock is on")
+
+    fireEvent(password, keyWithCapsLock("keyup", false))
+    expect(screen.queryByRole("alert")).toBeNull()
+
+    fireEvent(password, keyWithCapsLock("keydown", true))
+    expect(screen.getByRole("alert").textContent).toBe("Caps Lock is on")
+    fireEvent.blur(password)
+    expect(screen.queryByRole("alert")).toBeNull()
+  })
+
+  it("names the eye after what it does and switches the field's type", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await screen.findByLabelText("Username or email")
+    const password = screen.getByLabelText("Password") as HTMLInputElement
+    expect(password.type).toBe("password")
+
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }))
+    expect(password.type).toBe("text")
+    fireEvent.click(screen.getByRole("button", { name: "Hide password" }))
+    expect(password.type).toBe("password")
+  })
+})
+
+describe("LoginPage without the sample dashboard (WEB-15 T2)", () => {
+  it("renders a usable form while the sample dashboard has not loaded", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await submitCredentials("rina@meridian.example", "wrong-password")
+    expect((await screen.findByRole("alert")).textContent).toBe("Wrong username or password.")
+
+    // The panel and its caption are there; the dashboard inside is not.
+    const panel = screen.getByRole("region", { name: "A preview of the console (sample data)" })
+    expect(panel.textContent).toContain("Every dataset, pipeline and dashboard in one place.")
+    expect(panel.querySelector("[data-motion]")).toBeNull()
   })
 })
