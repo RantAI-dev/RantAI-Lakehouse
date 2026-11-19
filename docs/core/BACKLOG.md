@@ -240,7 +240,8 @@ estimate (S, M, L), which the base has no field for.
 | `VER-1` | Task | Verify SFTP, Google Sheets and Oracle sources end to end; test row filters. The connector half is now `SRC-9`; row filters stay here | Data | P2 | Todo |  | PRODUCT §2 |
 | `BI-2` | Feature | Metrics users can define once and reuse across dashboards (a semantic layer). **Blocked by `DATA-12` (certified metrics part)** Accepted by the product owner on 2026-11-16 on the QA stack (main `0ea686e5`): the feature page's checklist passed (run notes on the page). | Dashboards | P2 | Released | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | PRODUCT §2; `reference/competitive-comparison.md` (BI matrix) |
 | `DATA-9` | Feature | Upload a file from the console | Data | P2 | In Acceptance | #71, #73 | `features/upload-file.md` |
-| `OPS-8` | Feature | Usage and cost view | Operations | P2 | In Acceptance | #553, #564, #574, PR #591 | PRODUCT §2; [spec](specs/ops-8.md); `features/usage-and-cost-view.md` |
+| `OPS-8` | Feature | Usage and cost view. Accepted by the product owner on 2026-11-19 on staging: every AC passed (2026-11-18 and 2026-11-19, Auditor's `ops8-2026-11-19/ac1-ac4.log`). | Operations | P2 | Released | #553, #564, #574, #591 | PRODUCT §2; [spec](specs/ops-8.md); `features/usage-and-cost-view.md` |
+| `OPS-37` | Task | Dagster survives overlapping runs and a dead code server: a run of a serial job waits in the run queue instead of overlapping another run of itself, the code location restarts when its inner code server dies, and a warning names the run count when the queue is one below its limit. Staging Dagster stopped launching runs from 22:15 UTC on 2026-11-18 until a manual restart at 02:58 UTC on 2026-11-19: two `bronze_maintenance_job` runs overlapped, the inner code server died and the proxy never respawned it, and the container stayed up while the daemon failed 1550 times. | Operations | P2 | In Progress |  | staging Dagster outage 2026-11-18 22:15 to 2026-11-19 02:58 UTC |
 | `SEC-2` | Feature | Sign-in lockout per account after repeated wrong passwords: not rate limiting by network address, and single sign-on is not affected | Administration & Security | P2 | In Acceptance | #67 | `features/login-protection-and-session-cleanup.md` |
 | `SEC-3` | Task | Test single sign-on against a real identity provider; correct `README.md`, which says it is unbuilt | Administration & Security | P2 | Done | #181 | PRODUCT §2 |
 | `SEC-40` | Task | Sign in once through Microsoft Entra ID and once through Google with a test app registration and test user each, following `docs/OPERATIONS.md` (single sign-on), and record the date, settings (no secrets) and outcome in `docs/plans/SEC-3-RESULT.md` (`SEC-3-AC2`, `SEC-3-AC3`). Product owner's test, later | Administration & Security | P3 | Todo |  | `SEC-3` (#181) |
@@ -554,7 +555,8 @@ set by the product owner and are left empty until they are.
 | `UX-1` | 2026-11-17 | 2026-11-18 (#568) | |
 | `UX-4` | 2026-11-19 | 2026-11-19 (#595) | |
 | `UX-5` | 2026-11-19 | 2026-11-19 (#599) | |
-| `OPS-8` | 2026-11-16 | 2026-11-17 (#574) | |
+| `OPS-8` | 2026-11-16 | 2026-11-19 (#591) | |
+| `OPS-37` | 2026-11-19 | | |
 | `OPS-35` | 2026-11-16 | 2026-11-18 (#581) | |
 | `ADM-2` | 2026-11-15 | 2026-11-17 (#562, #570, #572) | |
 | `SEC-76` | | | |
