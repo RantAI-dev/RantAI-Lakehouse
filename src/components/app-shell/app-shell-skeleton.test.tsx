@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it, mock } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 import * as image from "next/image"
 
 // The logo is a `next/image`, which needs the Next runtime's image config; the test draws its alt.
 mock.module("next/image", () => ({ ...image, default: ({ alt }: { alt: string }) => <span role="img" aria-label={alt} /> }))
 
 import { cleanup, render, screen } from "@testing-library/react"
+import { BrandingProvider } from "@/components/app-shell/branding-provider"
 import { SidebarProvider } from "@/components/ui/sidebar"
 import { DashboardHeader } from "@/features/dashboards/dashboard-header"
 import { DashboardTilesSkeleton } from "@/features/dashboards/dashboard-skeleton"
@@ -13,12 +14,31 @@ import { HOME_BACKGROUND_SCRIPT } from "@/lib/home-background"
 import { PRODUCT_NAME } from "@/lib/product-branding"
 import { AppShellSkeleton } from "./app-shell-skeleton"
 
-afterEach(cleanup)
+const originalFetch = global.fetch
+
+// The real shell reads the branding once above the skeleton (`BrandingProvider`), so the test
+// serves the public `/api/branding` route: a workspace with no name set shows the product's name.
+beforeEach(() => {
+  global.fetch = mock(
+    async () =>
+      new Response(JSON.stringify({ workspaceName: null, logo: null, logoDark: null, icon: null }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+  ) as unknown as typeof fetch
+})
+
+afterEach(() => {
+  cleanup()
+  global.fetch = originalFetch
+})
 
 function shell(pathname: string) {
   return render(
     <SidebarProvider>
-      <AppShellSkeleton pathname={pathname} />
+      <BrandingProvider>
+        <AppShellSkeleton pathname={pathname} />
+      </BrandingProvider>
     </SidebarProvider>,
   )
 }
@@ -26,9 +46,11 @@ function shell(pathname: string) {
 // Owner QA 2026-11-14 ("kenapa kita punya dua skeleton page?"): the loading shell is the
 // real shell's parts, and its main area is the page's own placeholder for the route.
 describe("AppShellSkeleton", () => {
-  it("draws the parts that do not depend on the person for real", () => {
+  it("draws the parts that do not depend on the person for real", async () => {
     shell("/dashboards/browse")
-    expect(screen.getByText(PRODUCT_NAME)).toBeTruthy()
+    // main #602 (adm-121): the name slot stays empty until the branding answer is in, so the
+    // product's name is never drawn and then replaced by the workspace's.
+    expect(await screen.findByText(PRODUCT_NAME)).toBeTruthy()
     expect(screen.queryByText("Enterprise Lakehouse Console")).toBeNull()
     // The brand row is the real one: the mark first, in its own slot, then the name, left-aligned.
     // ADM-2 (merged from main): the light and the dark logo are the workspace's pictures, both named
