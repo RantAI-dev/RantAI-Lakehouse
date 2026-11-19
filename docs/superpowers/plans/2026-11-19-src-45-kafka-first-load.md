@@ -161,3 +161,13 @@ Open before merge (*not verified* locally, by the owner's choice of CI):
 clippy and `cargo test` for the new store/API tests, and the `G6 ingest
 matrix (files, APIs, streams)` gate, including its assumption that the Kafka
 Bronze column is named `id`.
+
+### Review 2 (planner, 2026-11-19, PR #597 CI on 2b7094c54)
+
+- **BLOCKER 1.** `Rust · clippy` fails: `clippy::too_many_lines` on
+  `save_ingest_spec` (`connectors.rs:3548`, 105/100) after the D1 block was
+  added inline. Fix: move the D1 block into a small helper in the same module
+  (e.g. `async fn with_kafka_source_objects(state, id, body) -> ApiResult<..>`
+  or one that returns the new `source_objects`), called from the handler.
+  Do not add `#[allow(clippy::too_many_lines)]` (rule 2: never weaken a lint
+  to get green).
