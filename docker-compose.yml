@@ -2338,7 +2338,10 @@ services:
         if [ "$$ready" != 1 ]; then
           echo "dagster-db-init: postgres never accepted a connection" >&2; exit 1
         fi
-        psql -v ON_ERROR_STOP=1 -v pw="$$DAGSTER_ROLE_PASSWORD" -d postgres <<'SQL'
+        # The password is read from the environment inside psql (`\getenv`), not
+        # passed with `-v`: a command-line argument shows up in `ps` in the container.
+        psql -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+        \getenv pw DAGSTER_ROLE_PASSWORD
         BEGIN;
         SET LOCAL log_statement = 'none';
         SET LOCAL log_min_error_statement = 'panic';
@@ -2367,6 +2370,11 @@ services:
               AND n.nspname NOT LIKE 'pg_toast%'
               AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
               AND pg_get_userbyid(c.relowner) <> 'lakehouse_dagster'
+              AND NOT (c.relkind = 'S' AND EXISTS (
+                SELECT 1 FROM pg_depend d
+                WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                  AND d.refclassid = 'pg_class'::regclass AND d.refobjsubid > 0
+                  AND d.deptype IN ('a', 'i')))
           LOOP
             EXECUTE format(
               CASE r.kind

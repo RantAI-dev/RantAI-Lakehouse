@@ -139,6 +139,9 @@ class TemplateDatabaseRolesTest(unittest.TestCase):
         self.assertIn("SET LOCAL log_statement = 'none'", command)
         self.assertIn("SET LOCAL log_min_error_statement = 'panic'", command)
         self.assertIn("PASSWORD :'pw'", command)
+        self.assertIn("\\getenv pw DAGSTER_ROLE_PASSWORD", command)
+        self.assertNotIn("-v pw=", command)
+        self.assertIn("d.deptype IN ('a', 'i')", command)
         self.assertIn("ALTER DATABASE", command)
         self.assertNotIn("REASSIGN OWNED", command)
 
