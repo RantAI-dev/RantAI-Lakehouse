@@ -112,6 +112,9 @@ def main() -> int:
 
     secret = _require("OIDC_CLIENT_SECRET")
     redirect_uri = _require_absolute_url("SSO_REDIRECT_URI", _require("SSO_REDIRECT_URI"))
+    post_logout_uri = _require_absolute_url(
+        "SSO_POST_LOGOUT_REDIRECT_URI", _require("SSO_POST_LOGOUT_REDIRECT_URI")
+    )
     passwords = {user: _require(var) for user, var in USER_PASSWORDS.items()}
 
     client = next(
@@ -125,6 +128,12 @@ def main() -> int:
     # callback. Replacing the whole list keeps a stale address from
     # surviving in the imported realm.
     client["redirectUris"] = [redirect_uri]
+    # The provider refuses a logout whose return address it does not know,
+    # so the client's valid post-logout redirect URIs are the deployment's
+    # own address -- filled in here, like the callback above.
+    attributes = dict(client.get("attributes") or {})
+    attributes["post.logout.redirect.uris"] = post_logout_uri
+    client["attributes"] = attributes
 
     rendered_users: set[str] = set()
     for user in realm.get("users", []):
@@ -144,6 +153,8 @@ def main() -> int:
         sys.exit("render_staging_realm: rendered client secret is empty")
     if not client.get("redirectUris"):
         sys.exit("render_staging_realm: rendered redirect URI list is empty")
+    if not (client.get("attributes") or {}).get("post.logout.redirect.uris"):
+        sys.exit("render_staging_realm: rendered post-logout redirect URI is empty")
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_text(json.dumps(realm, indent=2) + "\n", encoding="utf-8")

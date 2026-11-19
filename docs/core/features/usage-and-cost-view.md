@@ -6,14 +6,14 @@
 | Backlog | `OPS-8` |
 | Kind | Feature |
 | Spec | `docs/core/specs/ops-8.md` |
-| Status | In Acceptance |
+| Status | Released (accepted 2026-11-19; PR #591) |
 | Priority | P2 |
 | Owner | In the base |
 | Acceptor | In the base |
 | Plan | Engineering plan kept by the planner |
 | Started | 2026-11-16 |
 | Shipped | 2026-11-17 |
-| Evidence | PR #553 (the tenant on every query run); PR #564 (the usage page, the rates and the CSV export); PR #574 (the measured size of every layer) |
+| Evidence | PR #553 (the tenant on every query run); PR #564 (the usage page, the rates and the CSV export); PR #574 (the measured size of every layer); PR #591 (the person's name, the two storage numbers and the rest of the bucket) |
 
 ## Problem
 
@@ -23,7 +23,7 @@ Nobody can see who uses the lakehouse or how much it costs to run. The data for 
 
 1. Open Monitoring → Usage and pick a period.
 2. See queries, scanned bytes and engine time per day, per person and per engine, for their own tenant.
-3. See storage per layer, one value per day.
+3. See storage per layer: the current data and what is stored on disk for each Iceberg layer, one number for the ClickHouse layers, and the bytes in the bucket that no current table holds, measured once a day.
 4. Enter rates and see an estimated amount, marked as an estimate.
 5. Export the period as CSV.
 
@@ -54,6 +54,10 @@ No assistant work in this feature. `AGENTS.md` assistant parity binds BI feature
 - A stopped query counts as cancelled.
 - A tenant administrator sees only their tenant. The all-tenant administrator can also group by tenant and sees runs recorded with no tenant.
 - Storage is shown to the platform operator only.
+- The ClickHouse layers (`silver`, `serving`) show one number: their bytes are on the ClickHouse server's own disk, not in the warehouse bucket.
+- "Stored on disk" counts a table's history and its orphan files: it is what the object store holds under the table's location, not only the live data.
+- The page is empty until the first daily run (the storage job runs once a day at 01:00 UTC). It says "Not measured yet"; that is not an error.
+- A deployment whose daily job already ran shows the layers with their current data and "Stored on disk: not measured yet. The daily job runs at 01:00 UTC." instead of an error, until the next run appends the disk column; no line for the rest of the bucket appears in that state.
 - Queries run before the update have no tenant and are visible only to the platform operator.
 - Queries run through dashboard and chart data are not counted.
 - Queries run through the lists of filter values, and through schema and join lookups, are not counted.
@@ -76,6 +80,8 @@ No assistant work in this feature. `AGENTS.md` assistant parity binds BI feature
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `OPS-8-AC1` to `AC6` | As in the spec | As in the spec | Not run |
+| `OPS-8-AC1` to `AC3` | As in the spec | As in the spec | Pass 2026-11-19 |
+| `OPS-8-AC4` | Trigger `storage_snapshot_job` once and take the bucket's size from a `capacity_snapshot` run within the same hour; compare the two on the Usage page | The sum of "stored on disk" over the Iceberg layers plus "In the bucket but in no current table" equals the bucket within 1 %, when both are measured within the same hour | Pass 2026-11-19 |
+| `OPS-8-AC5` to `AC6` | As in the spec | As in the spec | Pass 2026-11-19 |
 
 Storage per layer shipped in PR #574, so `OPS-8-AC4` can now run.

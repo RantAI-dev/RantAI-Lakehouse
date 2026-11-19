@@ -640,6 +640,17 @@ pub struct Config {
     /// `OIDC_REDIRECT_URI` — never taken from a request, closing the open-
     /// redirect class a request-supplied `redirect_uri` would allow.
     pub oidc_redirect_uri: Option<String>,
+    /// This deployment's address the provider sends the browser back to
+    /// after an RP-initiated logout (`OIDC_POST_LOGOUT_REDIRECT_URI`). It
+    /// must be registered with the provider as a valid post-logout redirect
+    /// URI, or the provider refuses the logout. `None` when unset: the
+    /// sign-out then ends this deployment's session only, and the provider
+    /// keeps its own session for that browser — which is why the next
+    /// sign-in would land on the account that signed in last.
+    ///
+    /// Read ONLY from the environment — never from a request, so a caller
+    /// cannot steer a sign-out to an arbitrary host.
+    pub oidc_post_logout_redirect_uri: Option<String>,
     /// The `prompt` parameter the browser sign-in sends to the provider
     /// (`"login"`, `"consent"`, `"select_account"`, …). Read ONLY from
     /// `OIDC_PROMPT` — never from a request, so a caller cannot change how
@@ -757,6 +768,16 @@ pub struct Config {
     /// and any problem with it surfaces lazily, at first use, as an ordinary
     /// request-time error.
     pub database_url: String,
+    /// The password of the console's OWN database role
+    /// (`LAKEHOUSE_DB_APP_PASSWORD`, `SEC-78` decision 1). `None` when unset
+    /// or empty.
+    ///
+    /// Only the `migrate` command needs it: it is what sets the role's
+    /// password, and the server path never holds it (the server connects
+    /// with the role, not with its password). It is a
+    /// [`lakehouse_core::secret::SecretValue`], so it is neither logged nor
+    /// printed.
+    pub db_app_password: Option<lakehouse_core::secret::SecretValue>,
     /// ADR 0010/0011 — path to a file holding the `gold-export` Lakekeeper
     /// principal's pre-minted static bearer token (`iceberg-catalog-rest`'s
     /// `token` property — see `lakehouse-iceberg::catalog`'s module doc on
@@ -953,6 +974,14 @@ pub struct Config {
     /// non-load-bearing parsing posture as
     /// [`Self::gold_export_max_rows`]. Default `20_000`.
     pub gold_export_batch_size: u64,
+    /// The least number of seconds between two "Send now" presses on the same
+    /// scheduled-report subscription (`BI-35`): each press makes the whole
+    /// report (a PDF, chart files) and emails the recipients, so a double click
+    /// or a loop would send the same report over and over. The count is kept in
+    /// the process, so it resets on a restart and is per replica. `0` turns the
+    /// limit off. Not load-bearing in the sense of [`Self::port`]: an
+    /// unparsable override falls back to the default. Default `60`.
+    pub report_send_now_interval_secs: u64,
     /// Shared token gating `POST /api/agents/employees/{id}/run`
     /// (Tier 3, copilot-operations-handover plan), same D4 shape as
     /// [`Self::gold_export_run_token`]/[`Self::alerts_run_token`]: with
@@ -1352,9 +1381,17 @@ impl std::fmt::Debug for Config {
             .field("oidc_authorize_url", &self.oidc_authorize_url)
             .field("oidc_token_url", &self.oidc_token_url)
             .field("oidc_redirect_uri", &self.oidc_redirect_uri)
+            .field(
+                "oidc_post_logout_redirect_uri",
+                &self.oidc_post_logout_redirect_uri,
+            )
             .field("oidc_prompt", &self.oidc_prompt)
             .field("oidc_prompt_from_env", &self.oidc_prompt_from_env)
             .field("database_url", &REDACTED)
+            .field(
+                "db_app_password",
+                &self.db_app_password.as_ref().map(|_| REDACTED),
+            )
             .field(
                 "lakekeeper_gold_export_token_file",
                 &self.lakekeeper_gold_export_token_file,
@@ -1412,6 +1449,10 @@ impl std::fmt::Debug for Config {
             )
             .field("gold_export_max_rows", &self.gold_export_max_rows)
             .field("gold_export_batch_size", &self.gold_export_batch_size)
+            .field(
+                "report_send_now_interval_secs",
+                &self.report_send_now_interval_secs,
+            )
             .field(
                 "agent_run_token",
                 &self.agent_run_token.as_ref().map(|_| REDACTED),
@@ -1987,6 +2028,7 @@ impl Config {
             oidc_authorize_url: truthy(env, "OIDC_AUTHORIZE_URL"),
             oidc_token_url: truthy(env, "OIDC_TOKEN_URL"),
             oidc_redirect_uri: truthy(env, "OIDC_REDIRECT_URI"),
+            oidc_post_logout_redirect_uri: truthy(env, "OIDC_POST_LOGOUT_REDIRECT_URI"),
             // An empty value is the DEFAULT, not an opt-out: compose always
             // passes this variable (as every other `OIDC_*` one), so empty
             // cannot mean "the operator said nothing". `off` is the
@@ -2015,6 +2057,8 @@ impl Config {
             rustfs_access_key_secret_ref: truthy(env, "RUSTFS_ACCESS_KEY_SECRET_REF"),
             rustfs_secret_key_secret_ref: truthy(env, "RUSTFS_SECRET_KEY_SECRET_REF"),
             database_url: or_default(env, "DATABASE_URL", ""),
+            db_app_password: truthy(env, "LAKEHOUSE_DB_APP_PASSWORD")
+                .map(lakehouse_core::secret::SecretValue::new),
             lakekeeper_gold_export_token_file: or_default(
                 env,
                 "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
@@ -2060,6 +2104,11 @@ impl Config {
             gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
             gold_export_max_rows: parse_u64_or_default(env, "GOLD_EXPORT_MAX_ROWS", 5_000_000),
             gold_export_batch_size: parse_u64_or_default(env, "GOLD_EXPORT_BATCH_SIZE", 20_000),
+            report_send_now_interval_secs: parse_u64_or_default(
+                env,
+                "REPORT_SEND_NOW_INTERVAL_SECS",
+                60,
+            ),
             agent_run_token: truthy(env, "AGENT_RUN_TOKEN"),
             lakehouse_maintenance_token: truthy(env, "LAKEHOUSE_MAINTENANCE_TOKEN"),
             ingest_service_token: truthy(env, "INGEST_SERVICE_TOKEN"),
@@ -2497,6 +2546,20 @@ mod tests {
         let cfg = Config::from_map(&env).unwrap();
         assert_eq!(cfg.gold_export_max_rows, 123);
         assert_eq!(cfg.gold_export_batch_size, 7);
+    }
+
+    /// `BI-35`: "Send now" waits 60 seconds between presses unless told
+    /// otherwise; `0` turns it off; garbage falls back to the default.
+    #[test]
+    fn the_send_now_interval_defaults_to_sixty_seconds_and_is_overridable() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 60);
+        let cfg = Config::from_map(&map(&[("REPORT_SEND_NOW_INTERVAL_SECS", "5")])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 5);
+        let cfg = Config::from_map(&map(&[("REPORT_SEND_NOW_INTERVAL_SECS", "0")])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 0);
+        let cfg = Config::from_map(&map(&[("REPORT_SEND_NOW_INTERVAL_SECS", "soon")])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 60);
     }
 
     /// Same non-load-bearing posture as `OIDC_CLOCK_SKEW_SECONDS`: a

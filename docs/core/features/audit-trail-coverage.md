@@ -62,7 +62,7 @@ No new assistant work. Its tool calls are already recorded.
 - The row names the fields a change touched and never their values. The exceptions are the old and new values that the identity, policy, table-access and grant rows record.
 - The scheduler's alert tick (`POST /api/alerts/run`) writes one row per tick.
 - Writes through the Iceberg REST door are refused by that door and are not in the trail.
-- The assistant's own reads of the trail are not narrowed by `audit:read` yet. Its audit tool (`get_audit_history`) needs only `governance:read`. The assistant's audit history tool is narrowed separately (follow-up owned by the AI team).
+- The assistant's audit history tool (`get_audit_history`) needs `audit:read`, like the audit page (#585).
 - The Overview page's activity feed (`POST /api/overview`) shows the 20 newest audit rows of everyone only to a person with `audit:read`. Any other person sees only the 20 newest rows of their own actions, with the action, the object and the outcome.
 - An asset page's change history shows up to 50 audit rows about that asset to anyone who can open the asset. `audit:read` does not narrow it either.
 - Machine callbacks are not audited. The pipeline run events, the schema and capture observations and the connector run reports accept a service identity or an unrestricted administrator account. A person who calls one of these routes by hand with an unrestricted account leaves no row. A pipeline run started from the console is audited as `pipeline.trigger`. The orchestrator's lag call (`POST /api/pipelines/runnable/{id}/lag-check`) is also open to an unrestricted administrator account. It advances the pipeline's lag streak and can send the behind-target alert, and it writes no audit row.

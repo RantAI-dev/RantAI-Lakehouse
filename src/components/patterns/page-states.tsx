@@ -1,6 +1,6 @@
 "use client"
 
-import { AlertTriangle, Inbox, Lock, RotateCcw } from "lucide-react"
+import { AlertTriangle, Inbox, Lock, RotateCcw, SearchX } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { cn } from "@/lib/utils"
@@ -123,6 +123,22 @@ export function PermissionState({ error, className }: { error?: ServiceError; cl
           ? "Your role does not permit viewing this resource. Request access from a workspace administrator."
           : `${detail} ${ASK_ADMIN}`
       }
+      className={className}
+    />
+  )
+}
+
+/**
+ * Shown at an address no page answers (`adm-121`). It is not a refusal: a
+ * page that exists but is not for the person says "You don't have access"
+ * (`PermissionState`), and this one says nothing is there for anybody.
+ */
+export function NotFoundState({ className }: { className?: string }) {
+  return (
+    <StateShell
+      icon={<SearchX className="size-5" aria-hidden />}
+      title="Page not found"
+      description="No page exists at this address. Check the link, or use the menu to find what you were looking for."
       className={className}
     />
   )

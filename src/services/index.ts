@@ -119,6 +119,8 @@ export const dashboardService = clickhouseDashboardService
 export type {
   AccessKind, AccessLevel, Board, BoardChart, BoardTab, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
   ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, TileBox,
+  // `BI-29`: the filter and click shapes, formerly imported from `clients/bi-store`.
+  ChartClick, FilterDef, FilterField, FilterKind, FilterOp, FilterSkip, FilterValues, FilterValuesScope, RelativeAnchor, RelativeUnit,
 } from "./contracts/dashboards"
 /** Calculated fields of a mart or SQL source (BI-8). */
 export const calcFieldService = calcFieldClientService
@@ -263,7 +265,8 @@ export const usageService = usageClientService
 /** The usage shapes the Usage feature reads from `@/services`. */
 export type {
   NewUsageRate, UsageExport, UsageGroup, UsageQuery, UsageRate, UsageRateKind, UsageRates,
-  UsageReport, UsageRow, UsageService, UsageStorageQuery, UsageStorageReport, UsageStorageRow,
+  UsageReport, UsageRow, UsageService, UsageStorageBucket, UsageStorageQuery, UsageStorageReport,
+  UsageStorageRow,
 } from "./contracts/usage"
 // The server's own health answer (`/api/health` — the API's `/health`,
 // exposed through the console's rewrite), read for the version it runs so

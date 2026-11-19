@@ -23,7 +23,6 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import {
   Select,
   SelectContent,
@@ -128,7 +127,9 @@ function BoardFormDialog({
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
         <div className="flex flex-col gap-3">
-          <RequiredLegend />
+          {/* UX-4: the name is required while description and folder are
+              optional, so the star stays; three inputs are too few for a
+              legend. */}
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="board-name" required>Name</Label>
             <Input

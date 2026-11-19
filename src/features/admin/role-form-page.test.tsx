@@ -290,6 +290,20 @@ describe("RoleCreatePage (WEB-7 D2)", () => {
   })
 })
 
+// UX-5: the composed form explains no "* Required" convention; the star itself
+// stays on the required Name.
+describe("RoleCreatePage: no required legend (UX-5)", () => {
+  it("renders no '* Required' line while the form still stars its required fields", async () => {
+    stubApi()
+    renderPage(<RoleCreatePage />)
+    await screen.findByLabelText("Name")
+    expect(screen.queryByText("Required")).toBeNull()
+    const label = document.querySelector('label[for="role-name"]')
+    expect(label?.getAttribute("data-required")).toBe("")
+    expect(label?.querySelector('span[aria-hidden="true"][class*="before:content-"]')).not.toBeNull()
+  })
+})
+
 describe("RoleEditPage (WEB-7 D2/D4)", () => {
   it("loads the role by id, warns about a rename, and saves the whole role", async () => {
     const writes = stubApi()

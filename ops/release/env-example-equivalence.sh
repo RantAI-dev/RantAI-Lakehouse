@@ -39,26 +39,29 @@ done
 work=$(mktemp -d "${TMPDIR:-/tmp}/rel19-equivalence.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
-# The five settings compose reads with `${X:?}`. The values are fixed so
+# The six settings compose reads with `${X:?}`. The values are fixed so
 # the two configs are compared on what the templates decide, not on a
 # random secret; a line the template already sets is replaced, so both
 # sides start from the same value. The values are plain words on purpose
 # so the secret scanner does not read them as keys (REL-19).
 DUMMY_POSTGRES_PASSWORD=not-a-secret-postgres
+DUMMY_LAKEHOUSE_DB_APP_PASSWORD=not-a-secret-app-role
+DUMMY_LAKEHOUSE_DB_DAGSTER_PASSWORD=not-a-secret-dagster-role
 DUMMY_RUSTFS_ACCESS_KEY=not-a-secret-access
 DUMMY_RUSTFS_SECRET_KEY=not-a-secret-rustfs
 DUMMY_LAKEKEEPER_ENCRYPTION_KEY=not-a-secret-lakekeeper
 DUMMY_CONNECTOR_SECRETS_KEY=not-a-secret-connector
-export DUMMY_POSTGRES_PASSWORD DUMMY_RUSTFS_ACCESS_KEY \
-  DUMMY_RUSTFS_SECRET_KEY DUMMY_LAKEKEEPER_ENCRYPTION_KEY \
-  DUMMY_CONNECTOR_SECRETS_KEY
+export DUMMY_POSTGRES_PASSWORD DUMMY_LAKEHOUSE_DB_APP_PASSWORD \
+  DUMMY_LAKEHOUSE_DB_DAGSTER_PASSWORD \
+  DUMMY_RUSTFS_ACCESS_KEY DUMMY_RUSTFS_SECRET_KEY \
+  DUMMY_LAKEKEEPER_ENCRYPTION_KEY DUMMY_CONNECTOR_SECRETS_KEY
 
 prepare() {
   source_file=$1
   target_file=$2
   cp "$source_file" "$target_file"
-  for name in POSTGRES_PASSWORD RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY \
-    LAKEKEEPER_ENCRYPTION_KEY CONNECTOR_SECRETS_KEY; do
+  for name in POSTGRES_PASSWORD LAKEHOUSE_DB_APP_PASSWORD LAKEHOUSE_DB_DAGSTER_PASSWORD RUSTFS_ACCESS_KEY \
+    RUSTFS_SECRET_KEY LAKEKEEPER_ENCRYPTION_KEY CONNECTOR_SECRETS_KEY; do
     eval "value=\${DUMMY_$name}"
     grep -v "^$name=" "$target_file" > "$target_file.next" || true
     printf '%s=%s\n' "$name" "$value" >> "$target_file.next"

@@ -88,7 +88,7 @@ enum Kind {
 }
 
 impl Kind {
-    /// `SEC-20` (plan 95, plan 96): the list a kind answers with table names,
+    /// `SEC-20` (plan 95, plan 96, plan ai-118): the list a kind answers with table names,
     /// and the field of each row that holds the table, for the kinds a
     /// caller's reach narrows ([`retain_rows_in_reach`]). The match has no
     /// wildcard, so a kind added later must decide whether its rows name tables.
@@ -96,9 +96,12 @@ impl Kind {
         match self {
             Self::Classification => Some(("classifications", "asset")),
             Self::Maintenance => Some(("maintenance", "tableName")),
-            Self::Quality | Self::Audit | Self::Residency | Self::Replication | Self::Unknown => {
-                None
-            }
+            // A quality rule names the table it checks, and the rules of
+            // every tenant's upload are in the list, so the quality list is
+            // narrowed by the caller's reach like the maintenance history
+            // and the classification list (`SEC-20`, plan ai-118).
+            Self::Quality => Some(("quality", "asset")),
+            Self::Audit | Self::Residency | Self::Replication | Self::Unknown => None,
         }
     }
 
@@ -159,13 +162,15 @@ const AUDIT_READ_DENIED: &str = "reading the audit trail needs the audit:read pe
 /// history names upload tables of every tenant: see
 /// [`retain_rows_in_reach`]. The classification list is narrowed the same way
 /// (`SEC-20`, plan 96), by each row's `asset`: it names the tables of the
-/// shared catalog and the upload tables of every tenant. The audit trail is
-/// narrowed per tenant (`SEC-20`, plan 100): the reader's scope is resolved
-/// with [`crate::routes::audit_scope::scope_for_principal`] and the rows are
-/// read through [`audit_trail`], so a reader sees its own organisation's rows
-/// plus the deployment's rows when that organisation owns the shared catalog.
-/// The other kinds are not narrowed. No principal is a system call: the
-/// quality list leaves one as it was, which
+/// shared catalog and the upload tables of every tenant. The quality list is
+/// narrowed the same way (`SEC-20`, plan ai-118): every rule names the table
+/// it checks. The audit trail is narrowed per tenant (`SEC-20`, plan 100):
+/// the reader's scope is resolved with
+/// [`crate::routes::audit_scope::scope_for_principal`] and the rows are read
+/// through [`audit_trail`], so a reader sees its own organisation's rows plus
+/// the deployment's rows when that organisation owns the shared catalog. The
+/// residency list and the replication list are not narrowed. No principal is
+/// a system call: the quality list leaves one as it was, which
 /// [`crate::routes::quality::quality_table_access`] documents, while the
 /// audit list gives a headless call (no principal behind it) no row of the
 /// trail, through [`crate::routes::audit_scope::scope_without_principal`].
@@ -187,8 +192,8 @@ pub(crate) async fn read_kind(
     // does not come through this function — it reads the trail itself, with
     // the person's own scope. The tool's own permission is the assistant's
     // registry's business (`GOV-1`): the tool asks the gate for the
-    // permission its spec names, and the spec is the one place that says
-    // which.
+    // permission its spec names, and the spec names `audit:read` (`GOV-1`,
+    // feature page Decision 9), so a person without it is refused there.
     if parsed == Kind::Audit
         && let Some(principal) = principal
         && !principal.has("audit:read")
@@ -265,6 +270,14 @@ pub(crate) async fn read_kind(
                 {
                     return ApiRejection(err).into_response();
                 }
+                // The observed rows are numbered after every filter has run,
+                // so an id says nothing about the rows a filter dropped
+                // (`GOV-15`, review round 1 (R1)). The other kinds carry ids
+                // of their own — a classification row's slug, an audit run's
+                // id, a maintenance row none — and are left as they are.
+                if parsed == Kind::Quality {
+                    renumber_observed_quality_rows(&mut body);
+                }
                 (StatusCode::OK, ApiJson(body)).into_response()
             }
             // Every branch shares one outer `catch (e)` returning
@@ -280,15 +293,18 @@ pub(crate) async fn read_kind(
 
 /// Drops every quality row whose `asset` the caller's table access hides, in
 /// place — the rule [`crate::routes::catalog::retain_visible`] applies to the
-/// catalog's own rows (`GOV-15` D6) — and gives the kept observed rows
-/// positional ids from the kept order, so an id says nothing about hidden rows
-/// (`GOV-15`, review round 1 (R1)).
+/// catalog's own rows (`GOV-15` D6).
 ///
 /// `retain_visible` itself cannot be called: it reads a row's `tableKey` or
 /// dotted `id`, while a quality row's key is its `asset` (an authored rule's
 /// `id` is a UUID, an observed row's `q-<n>`). A row with no `asset` string is
 /// hidden from a narrowed caller, as is an `asset` with no schema: nothing
 /// proves the grant covers it (fail closed).
+///
+/// The ids of the rows that are left are not renumbered here: this filter is
+/// one of the two that hide rows, and a row the other one drops would leave a
+/// gap in them. [`renumber_observed_quality_rows`] numbers them once both
+/// have run.
 fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut Value) {
     if access.is_all() {
         return;
@@ -302,10 +318,24 @@ fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut V
             .map(str::trim)
             .is_some_and(|asset| access.allows_key(asset))
     });
-    // The kept observed rows take their positional ids from the kept order
-    // (`q-0`, `q-1`, …): an id from the list before the filter would tell the
-    // caller how many hidden rows sorted before a visible one (`GOV-15`,
-    // review round 1 (R1)). An authored rule's id is a UUID and is left alone.
+}
+
+/// Numbers the observed rows of the quality list from the order they are left
+/// in, in place.
+///
+/// An observed row's id is `q-<n>`, and that number counts the observations of
+/// every tenant's tables, so an id taken before the filters ran would tell
+/// the caller how many rows of another organisation's tables sorted before a
+/// visible one (`GOV-15`, review round 1 (R1)). The numbers are therefore
+/// taken once every filter has run, so an id says nothing about what a filter
+/// dropped.
+///
+/// Only an observed row is renumbered: its id starts with `q-`, while an
+/// authored rule's id is a UUID and stays as it is.
+fn renumber_observed_quality_rows(body: &mut Value) {
+    let Some(rows) = body.get_mut("quality").and_then(Value::as_array_mut) else {
+        return;
+    };
     for (index, row) in rows
         .iter_mut()
         .filter(|row| {

@@ -211,6 +211,12 @@ export interface AlertRuleService {
   updateRule(rule: SaveAlertRuleInput & { id: string }, signal?: AbortSignal): Promise<AlertRule>
   deleteRule(id: string, signal?: AbortSignal): Promise<void>
   /**
+   * `BI-43` D1: the signed-in person's own alerts on one chart, for the chart's
+   * alert dialog. Needs no alert permission, unlike `listRules`, which is the
+   * Alerts page's list of everything the caller may see.
+   */
+  listMine(chart: string, signal?: AbortSignal): Promise<AlertRule[]>
+  /**
    * `BI-40` D1: run one rule now, as a test. There is no "run every rule"
    * form: the whole tick belongs to the scheduler (`POST /api/alerts/run`,
    * which a person's session cannot call).

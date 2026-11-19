@@ -220,3 +220,107 @@ async fn saving_refused_connection_settings_answers_the_same_sentence() {
         "{answer}"
     );
 }
+
+/// `SRC-44` (QA `LH-SRC-6-41`): a Kafka connector saved as a batch, or a
+/// stream on another adapter, is refused at the save with a fixed sentence
+/// that does not echo the body. The accepted pairing (`kafka` + `stream`) is
+/// exercised by `connector_repoint.rs`, whose Kafka specs are saved as a stream.
+#[tokio::test]
+async fn saving_a_kafka_connector_as_a_batch_or_a_stream_on_another_adapter_is_refused() {
+    let fx = fixture(false).await;
+    let (status, answer) = send(
+        &fx,
+        "POST",
+        "/api/connectors",
+        Some(create_body("da-mode", "Kafka")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let id = answer["id"].as_str().expect("the created id").to_owned();
+
+    for (adapter, mode, sentence) in [
+        (
+            "kafka",
+            "batch",
+            "a Kafka connector runs as a stream: its ingestMode must be stream",
+        ),
+        (
+            "sql",
+            "stream",
+            "ingestMode stream is only for a Kafka connector",
+        ),
+    ] {
+        let put = json!({
+            "adapter": adapter,
+            "ingestMode": mode,
+            "dial": { "marker": "must-not-be-echoed" },
+            "sourceObjects": []
+        });
+        let (status, answer) = send(
+            &fx,
+            "PUT",
+            &format!("/api/connectors/{id}/ingest-spec"),
+            Some(put),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{adapter}/{mode}: {answer}"
+        );
+        assert_eq!(answer["error"], json!(sentence), "{answer}");
+        assert!(
+            !answer.to_string().contains("must-not-be-echoed"),
+            "{answer}"
+        );
+    }
+}
+
+/// `SRC-45` (QA `LH-SRC-6-41`): the console saves a Kafka connector with its
+/// topic in the dial and no source object; the server gives the spec the
+/// topic's default Bronze target, and a target an API caller chose stands.
+#[tokio::test]
+async fn saving_a_kafka_spec_with_no_source_object_stores_the_default_target_of_its_topic() {
+    let fx = fixture(true).await;
+    let (status, answer) = send(
+        &fx,
+        "POST",
+        "/api/connectors",
+        Some(create_body("da-kafka", "Kafka")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let id = answer["id"].as_str().expect("the created id").to_owned();
+
+    let put = |source_objects: Value| {
+        json!({
+            "adapter": "kafka",
+            "ingestMode": "stream",
+            "dial": {
+                "bootstrapServers": ["broker-a:9092"],
+                "topic": "events",
+                "auth": { "type": "none" },
+                "groupId": "lakehouse",
+                "microBatchSeconds": 30
+            },
+            "sourceObjects": source_objects
+        })
+    };
+    let path = format!("/api/connectors/{id}/ingest-spec");
+    let target = lakehouse_store::ingest_spec::default_bronze_target("da-kafka", "events");
+
+    let (status, answer) = send(&fx, "PUT", &path, Some(put(json!([])))).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let (status, answer) = send(&fx, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        answer["sourceObjects"],
+        json!([{ "name": "events", "target": target }]),
+        "{answer}"
+    );
+
+    let chosen = json!([{ "name": "events", "target": "my_events" }]);
+    let (status, answer) = send(&fx, "PUT", &path, Some(put(chosen.clone()))).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["sourceObjects"], chosen, "{answer}");
+}

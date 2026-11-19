@@ -196,7 +196,7 @@ from dispar_orchestrate.adapters.kafka import consume_one_batch
 from dispar_orchestrate.adapters.sink import LoadPlan, UnsupportedLoadMode, load_via_sink
 from dispar_orchestrate.bronze_catalog import record_ingest_offset, record_ingest_run
 from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types
-from dispar_orchestrate.ingest_errors import UnknownAdapter, UnsupportedKafkaAuth
+from dispar_orchestrate.ingest_errors import KafkaTargetMissing, UnknownAdapter, UnsupportedKafkaAuth
 from dispar_orchestrate.op_metadata import source_metadata
 from dispar_orchestrate.saas import vendors as saas_vendors
 from dispar_orchestrate.secret_map import secret_field_names
@@ -312,9 +312,57 @@ def run_limit_tags(env_name: str, default_seconds: int) -> dict[str, str]:
     return {"dagster/max_runtime": str(settings.max_runtime_seconds)}
 
 
+# The tag that keeps one job from overlapping ANOTHER RUN OF ITSELF
+# (`OPS-37`). Its value is the job's own Dagster name, so the run queue's
+# per-value limit applies to that job alone: a second `bronze_maintenance_job`
+# waits in the queue, while `gold_export_job` may run beside it.
+#
+# The rule itself lives in `dagster/dagster.yaml`
+# (`concurrency.runs.tag_concurrency_limits`), not here: this module owns
+# the tag, the instance config owns the limit.
+SERIAL_TAG = "lakehouse/serial"
+
+# The jobs that must never overlap another run of THEMSELVES. Each of them
+# writes to the same tables a second run of it would write, so two
+# overlapping runs fight over the same rows -- the staging outage of
+# 2026-11-18, where a scheduled `bronze_maintenance_job` and one started by
+# hand overlapped for an hour.
+#
+# The list is here, next to the tag, so it is read with the code that uses
+# it. A job that waits for its own previous run stays QUEUED and is never
+# dropped.
+SERIAL_JOB_NAMES = frozenset(
+    {
+        "bronze_maintenance_job",
+        "capacity_snapshot_job",
+        "discover_job",
+        "gold_export_job",
+        "storage_snapshot_job",
+    }
+)
+
+
+def job_tags(job_name: str, env_name: str, default_seconds: int) -> dict[str, str]:
+    """The tags every run of `job_name` carries: its own run limit and, for
+    a serial job, the `lakehouse/serial` tag (`OPS-37`).
+
+    ONE helper for every job of this code location, so both rules stay in
+    one place (`AGENTS.md` rule 4): a job added later carries its run limit
+    and the serial tag the same way, and neither tag is ever written by hand
+    at a call site.
+
+    `run_limit_tags` stays the ONE place that parses the limit setting; this
+    helper adds the serial tag to its result.
+    """
+    tags = run_limit_tags(env_name, default_seconds)
+    if job_name in SERIAL_JOB_NAMES:
+        tags[SERIAL_TAG] = job_name
+    return tags
+
+
 def _ingest_job_tags() -> dict[str, str]:
     """The tags every `ingest_job` run carries (`SRC-39`, QA `TC-1702`)."""
-    return run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS)
+    return job_tags("ingest_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS)
 
 
 def _fetch_one_connector(cfg: IngestFactoryConfig, connector_id: str) -> dict[str, Any]:
@@ -1110,19 +1158,35 @@ def run_kafka_stream_batch(
     closes it in `finally`; a caller-supplied consumer is the caller's to
     close.
     """
+    # SRC-45 (QA `LH-SRC-6-41`): the Bronze table is the first source object's
+    # `target`. A spec with none used to stop at the first message with a bare
+    # `IndexError` ("failed, not classified"); it now fails closed, before any
+    # consumer exists, with a classified `setting_rejected` and a sentence that
+    # says what to do. `source_objects[0]` is read only through this check.
+    first = source_objects[0] if source_objects else {}
+    target = first.get("target") if isinstance(first, dict) else None
+    if not isinstance(target, str) or not target:
+        raise KafkaTargetMissing(
+            "This Kafka connector has no Bronze table yet: pick its topic again on the Ingest tab."
+        )
     owns_consumer = consumer is None
     if owns_consumer:
         consumer = KafkaConsumer(
             bootstrap_servers=spec["bootstrapServers"],
             group_id=spec["groupId"],
             enable_auto_commit=False,
+            # SRC-45 (QA `LH-SRC-6-41`): a group with no committed offset reads the
+            # topic from its start, not from its end (kafka-python's default
+            # `latest`, which loaded nothing on the first run). A group that has
+            # committed resumes where it stopped; this changes only the first run.
+            auto_offset_reset="earliest",
             value_deserializer=lambda v: v,  # raw bytes -- consume_one_batch does its own json.loads
             **kafka_security_kwargs(spec, secrets),
         )
         consumer.subscribe([spec["topic"]])
     topic = spec.get("topic", "")
     job_name = "ingest_job"
-    object_name = source_objects[0]["target"] if source_objects else topic
+    object_name = target
     started_at = datetime.now(timezone.utc).isoformat()
 
     def _record(*, rows, status, error=""):
@@ -1147,7 +1211,7 @@ def run_kafka_stream_batch(
             sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(
                 dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
             )
-            outcome = load_via_sink(batch.rows, source_objects[0]["target"], sink_config)
+            outcome = load_via_sink(batch.rows, target, sink_config)
             # Committed ONLY after the sink write above returned
             # successfully (an exception there propagates out of this
             # try block before this point is ever reached -- see this
@@ -1167,13 +1231,13 @@ def run_kafka_stream_batch(
             # failed batch wrote nothing, so they register nothing.
             _register_in_catalog(
                 connector_id,
-                {"name": source_objects[0].get("name") or topic, "target": source_objects[0]["target"]},
+                {"name": first.get("name") or topic, "target": target},
             )
             # SRC-8 (D4): a micro-batch is observed AFTER it loads, like every
             # source whose columns cannot be read first. The offsets are
             # already committed; a failed post changes nothing (see
             # `_observe_after_load`).
-            _observe_after_load(connector_id, source_objects[0].get("name") or topic, outcome.columns, run_id)
+            _observe_after_load(connector_id, first.get("name") or topic, outcome.columns, run_id)
             return outcome.rows
         except ssrf_guard.SsrfBlocked as exc:
             _record(rows=None, status="rejected", error=str(exc))

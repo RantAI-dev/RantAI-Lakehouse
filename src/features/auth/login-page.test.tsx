@@ -178,30 +178,25 @@ describe("LoginPage lockout surface (plan T5)", () => {
     expect(alert.textContent).not.toContain("invalid_or_expired")
   })
 
-  it("marks both credential fields required and explains the marker once (UX-1)", async () => {
+  // UX-4: both fields are required and there is nothing optional on the
+  // sign-in form, so it shows no star and no "* Required" line; the controls
+  // keep their native `required` semantics (UX-1-R10, unchanged).
+  it("keeps both credential fields required without any star or legend (UX-4)", async () => {
     stubLoginApi(401, { error: "invalid_or_expired" })
     const { container } = render(
       <AuthProvider>
         <LoginPage />
       </AuthProvider>,
     )
-    // findByLabelText proves the label still associates with its control
-    // once the decorative star is nested inside the label.
     const email = await screen.findByLabelText("Username or email")
     const password = screen.getByLabelText("Password")
     // Native `required` stays on the controls: noValidate means it conveys
     // semantics without changing submission behaviour.
     expect(email.hasAttribute("required")).toBe(true)
     expect(password.hasAttribute("required")).toBe(true)
-    // Exactly two labels opt in, each with an aria-hidden star.
-    const marked = container.querySelectorAll("label[data-required]")
-    expect(marked.length).toBe(2)
-    for (const label of marked) {
-      const star = label.querySelector("span[aria-hidden='true']")
-      expect(star?.className).toContain("before:content-['*']")
-    }
-    // The convention is stated once, not per field.
-    expect(screen.getByText(/Required/)).toBeDefined()
+    // Every input is required, so no label opts in to a star.
+    expect(container.querySelectorAll("label[data-required]").length).toBe(0)
+    expect(screen.queryByText(/Required/)).toBeNull()
   })
 })
 
@@ -235,8 +230,8 @@ describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
 
     expect(await screen.findByText("Acme Data")).toBeTruthy()
     // The product's own name is nowhere on the page: a workspace that set
-    // a name must not still be called Rantai Lake.
-    expect(screen.queryByText("Rantai Lake")).toBeNull()
+    // a name must not still be called RantAI Lakehouse.
+    expect(screen.queryByText("RantAI Lakehouse")).toBeNull()
 
     const shown = pictures(container)
     expect(shown.map((p) => p.getAttribute("src"))).toEqual([
@@ -271,11 +266,40 @@ describe("the sign-in page shows the workspace's own branding (ADM-2)", () => {
     stubLoginApi(401, { error: "invalid_or_expired" })
     const { container } = renderLoginPage()
 
-    await waitFor(() => expect(screen.getByText("Rantai Lake")).toBeTruthy())
+    await waitFor(() => expect(screen.getByText("RantAI Lakehouse")).toBeTruthy())
     expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
       "/logo-light.png",
       "/logo-dark.png",
     ])
+  })
+
+  it("shows no half-written heading or copyright line until the branding has answered", async () => {
+    let answer: (response: Response) => void = () => {}
+    const pending = new Promise<Response>((resolve) => {
+      answer = resolve
+    })
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes("/api/auth/me")) return new Response(null, { status: 401 })
+      if (url.includes("/api/branding")) return pending
+      return new Response("{}", { status: 200 })
+    }) as unknown as typeof fetch
+    renderLoginPage()
+
+    // The session check has resolved (the form is up) while the branding is still on its way.
+    await screen.findByLabelText("Username or email")
+    const heading = screen.getByRole("heading", { level: 1 })
+    expect(heading.textContent).not.toContain("Sign in")
+    expect(screen.queryByText(/©/)).toBeNull()
+
+    answer(
+      new Response(JSON.stringify({ workspaceName: "Acme Data", logo: null, logoDark: null, icon: null }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+    await waitFor(() => expect(heading.textContent).toBe("Sign in to Acme Data"))
+    expect(screen.getByText(/© \d{4} Acme Data$/)).toBeTruthy()
   })
 
   it("shows a workspace name that holds markup as plain text", async () => {

@@ -3,7 +3,6 @@
 import { Sparkles } from "lucide-react"
 
 import { SectionCard } from "@/components/patterns/section-card"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
@@ -26,8 +25,9 @@ export function NaturalLanguagePanel({
 
   return (
     <div className="space-y-3">
-      <RequiredLegend />
-      <Label htmlFor="nl-question" required>Question</Label>
+      {/* UX-4: the question is this panel's one required input, so no star
+          and no legend; the textarea keeps `aria-required`. */}
+      <Label htmlFor="nl-question">Question</Label>
       <Textarea
         id="nl-question"
         aria-required
