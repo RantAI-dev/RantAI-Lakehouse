@@ -598,4 +598,94 @@ the stack is needed only for T9.
 
 ## Handoff
 
+Developer: `Hy4 flash` (OpenCode). Branch `bld-14-downstream-reupload` off
+`a438555d0` (the plan commit on `c7cd01a76`). All anchors were re-read by
+their quoted text before each task; every one matched. Migration `0153`
+was still free (highest on the branch was `0151`). No mismatch with the plan.
+Every commit was pushed after `git status` showed only the intended files;
+no generated files were staged.
+
+### Commits (one per task, in order)
+
+1. `8a7ce635b` — T1, `feat(store): record a re-upload chain step once (BLD-14, D8, P9)`.
+   Migration `0153`, `pipeline_chain.rs`, seven store tests. The module and
+   table do not exist on the parent (`git grep` on `HEAD`), so all seven
+   tests fail to compile there.
+2. `f46639c6a` — T2, `feat(api): record a re-upload chain step (BLD-14, D8)`.
+   Orchestrator-only POST route, policy floor, `EX_MACHINE` audit decision,
+   validation, 7 HTTP tests and a both-ways route-auth assertion. On the
+   parent the route is absent (confirmed with `git grep` on `HEAD`): the
+   success case is a 404 instead of 200.
+3. `922641749` — T3, `feat(api): read a pipeline's newest reupload chain step (BLD-14, D8)`.
+   GET route with `in_scope`, 3 more page-read tests, both-ways auth. Absent
+   on the parent, so the page tests get 404 instead of 200.
+4. `a6405083a` — T4, `feat(api): pause and resume the reupload chain sensor (BLD-14, D6)`.
+   `chain_sensor_name` and the stored-state toggle in `authored_status`;
+   the Dagster-mock test finds no `authored__<id>_chain` lookup/start and
+   only one `stopSensor` on the parent.
+5. `639e4ec6f` — T5, `feat(orchestrator): derive the reupload chain graph (BLD-14, D3)`.
+   Nine pure graph tests; `reupload_chain_graph` does not exist on the
+   parent, so the test module cannot import it.
+6. `26edd72d3` — T6, `feat(orchestrator): tag file loads and step aside for chain pipelines (BLD-14, D5, D7)`.
+   Five new sensor tests cannot pass the `chain` argument to
+   `build_authored_dependency_sensor` on the parent. While running them, a
+   regression I introduced (the pre-existing "never had a SUCCESS run" skip
+   moved into the new branch) broke 12 existing sensor tests; it was found
+   and restored before the commit.
+7. `ac0bc8dd2` — T7, `feat(orchestrator): poll and launch the reupload chain (BLD-14, D6-D9)`.
+   New `reupload_chain.py`, definitions wiring, 13 sensor tests. The module
+   does not exist on the parent.
+8. `c3315ad0a` — T8, `feat(console): show why a pipeline did not run after a reupload (BLD-14, D8)`.
+   Contract, client, component and 10 component/client tests. Neither the
+   method nor the component exists on the parent, so the new tests cannot
+   compile there.
+9. `48924bd73` — T9, `test(g9): prove the reupload chain in step 10 (BLD-14, D1, D2, D9)`.
+   Gate steps 1-3 and cleanup restore. The failure step uses a SQL step with
+   `SELECT *, throwIf(qty = 'boom') AS bad FROM <input>`: that is the shape
+   `check_pipeline_step_sql` accepts (one query, one named input), and the
+   uploaded row carries `boom` in `qty`.
+
+### Verification on the final commit (foreground, counts as run)
+
+`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-6`, shared and outside
+the checkout; no `cargo clean`. No `cargo test --workspace` / workspace
+clippy — CI runs that on the draft PR (developer brief). The system
+`python` has no `pytest`; the checks below use
+`/home/rismana/rantai/venv-agents-1/bin/python`, whose `dagster==1.13.20`
+matches `dagster/pyproject.toml`.
+
+- `cd rust && cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-store --all-targets -- -D warnings` — clean.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — clean.
+- `cargo test -p lakehouse-store --test it pipeline_chain::` — 7 passed, 0 failed, 771 filtered out.
+- `cargo test -p lakehouse-api --test it pipeline_reupload_chain::` — 11 passed, 0 failed, 1,776 filtered out.
+- `cargo test -p lakehouse-api --test it -- audit_coverage:: sec11_guard:: route_auth::` — 135 passed, 0 failed, 1,652 filtered out.
+- Per-task counts during the build: route_auth 102 passed; the combined
+  `pipeline_reupload_chain:: route_auth:: audit_coverage:: sec11_guard::`
+  run at T2 was 141 passed.
+- `bun run typecheck` — clean.
+- `bun run lint` — 0 errors, 12 pre-existing `react-hooks/exhaustive-deps`
+  warnings in unchanged files.
+- `bun run test` — 4,643 passed, 1 skipped, 0 failed (4,644 tests, 429 files).
+  Touched tests: `bun test -- reupload-chain-note pipelines.test` — 33 passed, 0 failed.
+- `python3 ops/lint/check_intra_package_imports.py` — OK.
+- `python3 ops/lint/check_bare_iceberg_count.py` — OK.
+- `python -m pytest dispar_orchestrate -q` (venv) — 2,692 passed, 1 skipped,
+  2 failed. The two failures are in untouched files
+  (`test_adapters_oracle.py` TLS DN, `test_parquet_ingest.py` float repr);
+  `git diff a438555d0..HEAD` confirms neither module is changed on this
+  branch. The T7 scoped runs were 116 passed (`test_authored_factory.py`
+  plus `test_reupload_chain.py`) and 22 passed (`test_reupload_chain.py`).
+- `python3 -m py_compile ops/g9/upload_test.py` — OK.
+- `git status` — clean; no generated files staged.
+
+### Not verified here
+
+- **The G9 gate itself** (`python3 ops/g9/upload_test.py`): no compose stack
+  in this environment, so only `py_compile` was run. The reviewer runs it
+  with `PIPELINE_RUN_TOKEN` and `DAGSTER_URL` set before merge (T9's check).
+- `cargo test --workspace` / workspace clippy: CI's job on the PR, per the
+  developer brief and the plan's note.
+- The two unrelated Dagster failures above are reported, not papered over.
+
 ## Review
