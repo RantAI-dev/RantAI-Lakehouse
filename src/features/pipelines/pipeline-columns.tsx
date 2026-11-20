@@ -154,7 +154,9 @@ export function getPipelineColumns({
           <TooltipContent>
             {pipelineOrigin(row.original) === "orchestrator"
               ? "A job in the orchestrator: it runs, and its history is here."
-              : "Authored in the console. No engine is attached yet, so it cannot run."}
+              : // BLD-11 F9/D12: an authored pipeline DOES run — the trigger
+                // route launches it. The old "no engine attached" was a lie.
+                "Authored in the console; the orchestrator runs it."}
           </TooltipContent>
         </Tooltip>
       ),
@@ -394,8 +396,15 @@ export function getPipelineColumns({
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="SLA" />
       ),
-      cell: ({ row }) =>
-        row.original.slaOk ? (
+      cell: ({ row }) => {
+        // BLD-11 F8/D12: `slaOk` is null for EVERY authored row (no SLA is
+        // defined per pipeline), so a falsy check labelled them all
+        // "Breached" — a false alarm. Null is "not defined", neutral.
+        const sla = row.original.slaOk
+        if (sla === null) {
+          return <span className="text-xs text-muted-foreground">Not defined</span>
+        }
+        return sla ? (
           <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
             <CheckCircle2 className="size-3.5" />
             OK
@@ -405,7 +414,8 @@ export function getPipelineColumns({
             <XCircle className="size-3.5" />
             Breached
           </span>
-        ),
+        )
+      },
       enableColumnFilter: true,
       enableSorting: true,
       meta: {
@@ -450,12 +460,20 @@ export function getPipelineColumns({
                   </DropdownMenuItem>
                 ) : null}
                 {onTrigger && pipelineOrigin(pipeline) === "authored" ? (
-                  // Shown but disabled, with the reason: hiding it makes
-                  // the menu look inconsistent between rows.
-                  <DropdownMenuItem disabled>
-                    <Play className="size-4" />
-                    <span>Trigger run — no engine attached</span>
-                  </DropdownMenuItem>
+                  // BLD-11 F9/D12: an authored row CAN be triggered once it
+                  // is ready — the same handler a Dagster row uses. A draft
+                  // is offered but disabled with the actual next step.
+                  pipeline.status === "ready" ? (
+                    <DropdownMenuItem onClick={() => onTrigger(pipeline)}>
+                      <Play className="size-4" />
+                      <span>Trigger run</span>
+                    </DropdownMenuItem>
+                  ) : (
+                    <DropdownMenuItem disabled>
+                      <Play className="size-4" />
+                      <span>Trigger run — mark it ready first</span>
+                    </DropdownMenuItem>
+                  )
                 ) : null}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
