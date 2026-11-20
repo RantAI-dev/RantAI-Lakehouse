@@ -1017,8 +1017,93 @@ is Python; nothing under `dagster/` changes.
 
 ## 11. Handoff
 
-*(the developer appends one entry per slice: commits, the exact commands run
-with their counts, and anything skipped or not verified with the reason)*
+### S1 — `bld-16-joins-aggregations` (built on one branch by agreement with the orchestrator; the plan named `feat/bld-16-form-steps-api`)
+
+Commits (T1–T6, one per task, plus one carrying a file a message claimed but
+a `git add` had missed):
+
+- `ef4dd844a` — T1 the stored shape of the three new step kinds
+- `4a3b7c908` — T2 `pipeline_forms`, the parsers and renderers
+- `57ee4312b` — T3 the compiler takes the new kinds; `step_sql`
+- `22a913ca8` — T4 the step-SQL route; save/run/preview proof
+- `6edd8fcf4` — T5 the assistant's schema, prompt line, fixture, tool tests
+- `b76b32dd0` — T5 follow-up: `ops/ai_eval/cases.json` (the T5 commit's
+  `git add` covered `rust/` only, so the case file itself was never staged;
+  committed as its own commit rather than rewritten history)
+- `efcfe63a2` — T6 the `g7` gate case
+
+Commands run, scoped per commit (the counts as they passed on this branch):
+
+- T1: `cargo fmt --check`; `cargo clippy -p lakehouse-store -p lakehouse-api
+  --all-targets -- -D warnings` (clean); `cargo test -p lakehouse-store
+  --test it pipelines::` — **80 passed, 0 failed** (6 new: the J2 join,
+  aggregate and filter JSON round trips, the `match` key, a bare new kind,
+  stored-and-read-back, no legacy transforms).
+- T2: `cargo clippy -p lakehouse-api --all-targets -- -D warnings` (clean);
+  `cargo test -p lakehouse-api --lib -- pipeline_forms transform_grammar` —
+  **60 passed, 0 failed** (39 in `pipeline_forms`, the rest the untouched
+  grammar tests).
+- T3: `cargo fmt --check`; `cargo clippy -p lakehouse-api --all-targets -- -D
+  warnings` (clean); `cargo test -p lakehouse-api --lib -- pipeline_compile
+  pipeline_forms transform_grammar sql_guard` — **143 passed, 0 failed**.
+- T4: `cargo fmt --check`; `cargo clippy -p lakehouse-api --all-targets -- -D
+  warnings` (clean); `cargo test -p lakehouse-api --test it -- route_auth::
+  pipeline_preview:: pipeline_compile_route:: pipeline_definition_save::
+  sec11_guard:: audit_coverage::` — **187 passed, 0 failed**.
+- T5: `cargo clippy -p lakehouse-api --all-targets -- -D warnings` (clean);
+  `cargo test -p lakehouse-api --lib -- routes::ai::registry
+  routes::ai::tools::pipelines routes::ai::prompt` — **118 passed, 0 failed,
+  1 ignored** (the ignored one is `write_tool_schema_fixture`, run by hand to
+  regenerate the fixture; the diff touches only `create_pipeline`, checked by
+  comparing the committed and regenerated JSON per top-level entry).
+- T6: `python3 -m py_compile ops/g7/g7_pipeline_test.py`;
+  `python3 ops/lint/check_intra_package_imports.py`;
+  `python3 ops/lint/check_bare_iceberg_count.py` — all pass.
+
+S1 verification block (final commit, foreground):
+
+- `cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets -- -D
+  warnings` — clean.
+- `cargo test -p lakehouse-store --test it pipelines::` — **80 passed,
+  0 failed**.
+- `cargo test -p lakehouse-api --lib -- pipeline_compile pipeline_forms
+  transform_grammar sql_guard routes::ai` — **764 passed, 0 failed, 1
+  ignored**.
+- `cargo test -p lakehouse-api --test it -- route_auth:: pipeline_preview::
+  pipeline_compile_route:: pipeline_definition_save::
+  column_lineage_pipeline:: sec11_guard:: audit_coverage::` — **194 passed,
+  0 failed**.
+- `python3 ops/lint/check_intra_package_imports.py`,
+  `python3 ops/lint/check_bare_iceberg_count.py`,
+  `python3 -m py_compile ops/g7/g7_pipeline_test.py` — all pass.
+- `git status` — clean.
+
+Not verified, and why:
+
+- `ops/ai_eval/test_ai_eval.py` (the plan's T5 check line): the session's
+  Python has neither `pytest` nor `requests`, which the harness imports at
+  module load. `cases.json` parses and the new case follows
+  `build_pipeline_draft`'s shape; the rescore test replays a saved run by id,
+  so a new case cannot change its numbers. CI runs the suite.
+- The `g7` gate itself: the compose stack was not brought up in this session.
+  It runs in CI's `g3a-dagster` job on the draft PR.
+- The whole workspace and the gates: CI's run on the draft PR stands in for
+  the full local `cargo test --workspace` (the plan's own rule, section 8).
+- The assistant's actual behaviour with the new kinds (the `ai_eval` case) is
+  not asserted here; it is "not run in CI" by design (J8).
+
+Notes for the reviewer:
+
+- The T5 commit message says the fixture's diff touches only
+  `create_pipeline`; that was verified programmatically (per-entry comparison
+  of the old and new fixture JSON), not by eye.
+- One deviation from the plan's letter, inside the plan's own rules: the
+  existing `step_a_two_input_sql_pipeline_matches_a_direct_query` gate case
+  now shares the new `_create_and_run_authored_pipeline` helper instead of
+  carrying a byte-identical copy of the create-activate-run sequence
+  (AGENTS.md rule 4, "a duplicated guard is a finding"). Only the inline
+  sequence moved; the assertion and the direct query are unchanged.
 
 ## 12. Review
 
