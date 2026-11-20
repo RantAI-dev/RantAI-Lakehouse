@@ -448,7 +448,7 @@ estimate (S, M, L), which the base has no field for.
 | `BLD-6` | Task | `lag_pipelines_without_readers` (the batched reader check from `BLD-5`) copies the SQL predicate of `count_lag_pipelines_reading`, and its doc says the two "cannot drift". Share the predicate, or add a store test that runs both on the same fixture, and correct the comment (AGENTS.md rule 1). Found in PR #234 review round 1, SHOULD-FIX 1 | Build | P3 | Done | #280 | `rust/crates/lakehouse-store/src/pipelines.rs` |
 | `SRC-5` | Feature | Real connection test for batch MongoDB, Kafka and SFTP sources | Data | P3 | Idea |  | `connector_probe.rs` |
 | `DOC-2` | Task | Step-by-step user guide checked against a running console. The planner writes it, later, and the landing page links to it (product owner, 2026-10-30). The guide (every label read from the source) and the footer link merged 2026-10-31; the walk-through on a running console is left | Docs | P3 | In Progress | #286 | `reference/user-guide.md` |
-| `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy. **Blocked by `DATA-4`** and a new ADR that replaces ADR 0010's direction | Build | P3 | Planned |  | ADR 0010; [spec](specs/data-3.md) |
+| `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy. **Blocked by `DATA-4`**, **`DATA-6`** (#612) and the acceptance of ADR 0019, which replaces ADR 0010's direction for these tables | Build | P3 | Planned |  | ADR 0010; [ADR 0019](../adr/0019-gold-in-iceberg-first.md) (Proposed); [feature](features/gold-in-iceberg-first.md); [plan](../superpowers/plans/2026-11-20-data-3-gold-iceberg-first.md); [spec](specs/data-3.md) |
 | `DATA-4` | Feature | Publish Silver in open format. | Build | P3 | Planned |  | `features/gold-publish-per-mart.md`; [spec](specs/data-4.md) |
 | `DATA-5` | Task | Measure outside readers of published tables. Option B (product owner, 2026-10-31; ADR 0016): outside tools read through `/api/iceberg` with an `iceberg:read` service identity, and every table load is counted | Build | P3 | Done | #292, #293 | `routes::gold::consumers` |
 | `DATA-32` | Task | A typo that matches only a table's name (not a column or a tag) gets no "approximate match" label in catalog search, while a column or tag typo does: `matchedOn` is null when the name is the best field (`rust/crates/lakehouse-api/src/routes/catalog_search.rs`; cause found by reading, not run). Found in the `DATA-11` pre-check, 2026-10-23; the product owner accepted `DATA-11` with this as an exception | Data | P3 | Done | #300 | `features/catalog-search.md` (`DATA-11-AC` row 5) |
@@ -538,6 +538,7 @@ parity), built after it.
 | `BI-17` | In Acceptance | — | `AI-8` |
 | `BLD-1` | Building | — | `REL-6` |
 | `DATA-4` | Planned | — | `DATA-3` |
+| `DATA-6` | Building | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
 | `AI-11` | Planned | `DEC-8` | — |
 | `AI-13` | Planned | `BI-14` | — |
@@ -545,7 +546,7 @@ parity), built after it.
 | `AI-5` | Released | `BI-16` (per chart type as it lands) | — |
 | `AI-8` | Released | `BI-17` | — |
 | `AI-9` | Released | `BI-18` (templates part) | — |
-| `DATA-3` | Planned | `DATA-4` | — |
+| `DATA-3` | Planned | `DATA-4`, `DATA-6` | — |
 | `REL-6` | Blocked | `BLD-1` | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
