@@ -26,6 +26,7 @@ import {
   isHexColor,
 } from "@/lib/formatting-settings"
 import { listTimeZones } from "@/lib/time-zones"
+import { TimeZoneSelect } from "@/components/patterns/time-zone-select"
 import { withNotify } from "@/lib/notify"
 import { identityService, settingsService, type ReportingSettingsInput } from "@/services"
 
@@ -51,8 +52,8 @@ export function ReportingSettingsForm({
   canWrite: boolean
   /**
    * BI-9 review fix R6: where the zone names come from. Tests pass a short
-   * list, because several hundred `<option>`s are slow to render under load;
-   * the page always uses the browser's full list.
+   * list, because several hundred items are slow to render under load; the
+   * page always uses the browser's full list.
    */
   zoneList?: (saved?: string) => string[]
 }) {
@@ -101,7 +102,6 @@ export function ReportingSettingsForm({
     }
   }, [loaded])
 
-  const zones = React.useMemo(() => zoneList(loaded?.timeZone), [zoneList, loaded?.timeZone])
   const paletteInvalid = palette.length > 0 && palette.length < COMPANY_PALETTE_MIN
   const changed =
     loaded !== null &&
@@ -198,23 +198,13 @@ export function ReportingSettingsForm({
         <div className="flex max-w-sm flex-col gap-4">
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="report-time-zone">Report time zone</Label>
-            {/* A native datalist: typing filters the 400-odd names, with no
-                popup to manage. The server still checks the name. */}
-            <Input
+            <TimeZoneSelect
               id="report-time-zone"
-              aria-label="Report time zone"
-              list="report-time-zones"
               value={zone}
-              onChange={(e) => setZone(e.target.value)}
-              placeholder="Search a time zone"
+              onValueChange={setZone}
               disabled={!canWrite}
-              autoComplete="off"
+              zones={zoneList}
             />
-            <datalist id="report-time-zones">
-              {zones.map((name) => (
-                <option key={name} value={name} />
-              ))}
-            </datalist>
           </div>
           <div className="flex flex-col gap-1.5">
             <Label>First day of the week</Label>

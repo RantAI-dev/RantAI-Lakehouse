@@ -97,6 +97,7 @@ describe("ReportingSettingsForm", () => {
     expect(screen.getByText(/Only an administrator/i)).toBeDefined()
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull()
     expect((screen.getByLabelText("Report time zone") as HTMLInputElement).disabled).toBe(true)
+    expect(document.querySelector("datalist")).toBeNull()
   })
 
   it("sends the chosen zone and first day on Save", async () => {
@@ -105,7 +106,10 @@ describe("ReportingSettingsForm", () => {
     const input = (await screen.findByLabelText("Report time zone")) as HTMLInputElement
     // The form fills the saved values after the load; edit only once it has.
     await waitFor(() => expect(input.value).toBe("Asia/Jakarta"))
-    fireEvent.change(input, { target: { value: "Europe/Berlin" } })
+    // The console's own combobox (`UX-7`): typing filters, the arrow key opens it, an option is chosen.
+    fireEvent.change(input, { target: { value: "Berlin" } })
+    fireEvent.keyDown(input, { key: "ArrowDown" })
+    fireEvent.click(await screen.findByRole("option", { name: /Europe\/Berlin/ }))
     const save = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement
     await waitFor(() => expect(save.disabled).toBe(false))
     fireEvent.click(save)
