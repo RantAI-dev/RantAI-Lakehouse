@@ -1549,6 +1549,50 @@ mod tests {
         );
     }
 
+    // DATA-57 review R2: the three remaining D7 reasons get their own test.
+
+    #[test]
+    fn a_materialized_cte_hint_is_partial() {
+        use sqlparser::dialect::PostgreSqlDialect;
+        // DATA-57 review R2: `ClickHouseDialect` does not parse a
+        // MATERIALIZED hint, so exercise the branch with the dialect that
+        // produces that AST; the mapper itself takes any dialect.
+        let sql = "WITH c AS MATERIALIZED (SELECT id FROM silver.orders) SELECT id FROM c";
+        assert_eq!(
+            map_select(sql, &ClickHouseDialect {}, &known()).unwrap_err(),
+            Unmappable("the statement does not parse".to_owned())
+        );
+        let l = map_select(sql, &PostgreSqlDialect {}, &known()).unwrap();
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_CTE_HINT.to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_duplicate_cte_name_is_partial() {
+        let l = run(
+            "WITH c AS (SELECT id FROM silver.orders), c AS (SELECT id FROM silver.users) \
+             SELECT id FROM c",
+        );
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_CTE_DUPLICATE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_cte_body_is_partial() {
+        let l = run("WITH c AS (VALUES (1)) SELECT * FROM c");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("*".to_owned(), MSG_CTE_UNREADABLE.to_owned())]
+        );
+    }
+
     // DATA-57 T2: transforms compose through a WITH (D5).
 
     #[test]
