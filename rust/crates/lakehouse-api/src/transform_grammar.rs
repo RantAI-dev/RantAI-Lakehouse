@@ -51,7 +51,25 @@ const ALLOWED_CAST_TYPES: [&str; 8] = [
 /// `filter(expr)`'s only permitted comparison operators. No `<>` (use
 /// `!=`), no `LIKE`/`IN`/boolean connectives — those would reopen the
 /// subquery/function-call injection surface the grammar exists to close.
-const ALLOWED_FILTER_OPERATORS: [&str; 6] = ["!=", "<=", ">=", "=", "<", ">"];
+///
+/// BLD-16 / J2: the same six a form step's condition accepts, consulted
+/// through [`filter_operator`] so `pipeline_forms` shares this one list
+/// rather than keeping a copy (AGENTS.md rule 4: a duplicated guard is a
+/// finding).
+pub(crate) const ALLOWED_FILTER_OPERATORS: [&str; 6] = ["!=", "<=", ">=", "=", "<", ">"];
+
+/// The one operator from [`ALLOWED_FILTER_OPERATORS`] equal to `text`
+/// (trimmed), or `None` when `text` is none of them.
+///
+/// BLD-16 / J2: the single place the list is read for a form step's
+/// condition, so `kind: "filter"` and `filter(...)` accept exactly the same
+/// operators and can never drift.
+#[must_use]
+pub(crate) fn filter_operator(text: &str) -> Option<&'static str> {
+    ALLOWED_FILTER_OPERATORS
+        .into_iter()
+        .find(|op| *op == text.trim())
+}
 
 /// One parsed, injection-safe transform step.
 #[derive(Debug, Clone, PartialEq, Eq)]
