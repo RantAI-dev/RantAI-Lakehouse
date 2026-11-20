@@ -1318,6 +1318,41 @@ describe("ConnectorIngestPanel run log follows its run (SRC-46, QA LH-SRC-6-43)"
   }, 15000)
 })
 
+describe("ConnectorIngestPanel onRunEnded (SRC-46, QA LH-SRC-6-43)", () => {
+  const ID = "run-live-00001"
+  const running = () =>
+    record({ runId: ID, status: "running", attempts: 3, startedAt: new Date().toISOString(), endedAt: null, durationSeconds: null, endReason: null })
+  const failed = () => record({ runId: ID, status: "failed", attempts: 4, endedAt: new Date().toISOString(), durationSeconds: 90, endReason: "table_failed" })
+
+  it("tells the page once, with the run as the list returned it, when a run it watched has failed", async () => {
+    const history: { runs: unknown[] } = { runs: [running()] }
+    stubFetch(SPEC, history)
+    const onRunEnded = mock((_run: { runId: string; status: string }) => {})
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" onRunEnded={onRunEnded} />)
+    await screen.findByText(/Run run-live is running/)
+    expect(onRunEnded).not.toHaveBeenCalled()
+
+    history.runs = [failed()]
+    await waitFor(() => expect(onRunEnded).toHaveBeenCalledTimes(1), { timeout: 6000 })
+    expect(onRunEnded.mock.calls[0]![0].runId).toBe(ID)
+    expect(onRunEnded.mock.calls[0]![0].status).toBe("failed")
+    // A later poll or render does not call it again.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 200))
+    })
+    expect(onRunEnded).toHaveBeenCalledTimes(1)
+  }, 15000)
+
+  it("does not throw when the panel has no handler and a run ends", async () => {
+    const history: { runs: unknown[] } = { runs: [running()] }
+    stubFetch(SPEC, history)
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText(/Run run-live is running/)
+    history.runs = [failed()]
+    await waitFor(() => expect(screen.getByText("Failed")).toBeDefined(), { timeout: 6000 })
+  }, 15000)
+})
+
 describe("ConnectorIngestPanel resume", () => {
   const AUTO = "Paused after 30 failed runs in a row"
   const panel = (props: Partial<React.ComponentProps<typeof ConnectorIngestPanel>> = {}) =>
