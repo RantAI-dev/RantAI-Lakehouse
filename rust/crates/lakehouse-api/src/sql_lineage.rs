@@ -452,11 +452,16 @@ fn outputs_of_query(
     };
 
     let mut defined = env.defined.clone();
-    let mut pending: Vec<String> = with
-        .cte_tables
-        .iter()
-        .map(|cte| cte.alias.name.value.clone())
-        .collect();
+    // DATA-57 review R1: a nested `WITH` does not start a fresh "not defined
+    // yet" scope. Carry the enclosing pending names into this one, or a
+    // reference to a later name of an enclosing `WITH` would be looked up in
+    // `defined` and become a wrong edge instead of a partial row.
+    let mut pending: Vec<String> = env.pending.clone();
+    pending.extend(
+        with.cte_tables
+            .iter()
+            .map(|cte| cte.alias.name.value.clone()),
+    );
     // A name declared twice is opaque on both definitions (D7).
     let duplicated: Vec<String> = pending
         .iter()
@@ -498,14 +503,9 @@ fn outputs_of_query(
         pending.retain(|n| n != &name);
     }
 
-    outputs_of_body(
-        &query.body,
-        &CteEnv {
-            defined,
-            pending: Vec::new(),
-        },
-        known,
-    )
+    // DATA-57 review R1: the body still sees enclosing names that have not
+    // been defined yet; only this `WITH`'s own names have been removed above.
+    outputs_of_body(&query.body, &CteEnv { defined, pending }, known)
 }
 
 /// The outputs of a query body: a `SELECT`, a parenthesized query, or a set
@@ -557,14 +557,18 @@ enum CteLookup<'a> {
 }
 
 fn cte_lookup<'a>(env: &'a CteEnv, name: &str) -> CteLookup<'a> {
+    // DATA-57 review R1: check "not defined yet" at ANY level before
+    // `defined`, even when an enclosing scope has already defined the same
+    // spelling. Which one an engine binds is then unclear, so the only safe
+    // answer is a partial row, never an edge.
+    if env.pending.iter().any(|n| n == name) {
+        return CteLookup::Forward;
+    }
     // Walk back so a nested name shadows an outer one (D2).
     for (defined_name, def) in env.defined.iter().rev() {
         if defined_name == name {
             return CteLookup::Defined(def);
         }
-    }
-    if env.pending.iter().any(|n| n == name) {
-        return CteLookup::Forward;
     }
     let case_only = env
         .defined
@@ -1383,6 +1387,31 @@ mod tests {
              SELECT id FROM s");
         assert_eq!(triples(&l), vec![t("id", "silver.orders.id", "copy")]);
         assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    // DATA-57 review R1: a nested WITH keeps the enclosing "not defined yet"
+    // names. Both statements below would otherwise produce a wrong edge.
+    #[test]
+    fn a_name_from_an_enclosing_with_that_is_defined_later_is_partial() {
+        let l = run("WITH a AS (WITH x AS (SELECT 1 AS k) SELECT id FROM b), \
+             b AS (SELECT Amount AS id FROM silver.orders) SELECT id FROM a");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_CTE_FORWARD.to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_nested_with_redefining_an_enclosing_name_is_partial() {
+        let l = run("WITH b AS (SELECT name AS id FROM silver.users), \
+             s AS (WITH a AS (SELECT id FROM b), \
+             b AS (SELECT id FROM silver.orders) SELECT id FROM a) SELECT id FROM s");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_CTE_FORWARD.to_owned())]
+        );
     }
 
     #[test]
