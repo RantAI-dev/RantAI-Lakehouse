@@ -261,6 +261,8 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/pipelines", Coverage::Handler { action: "pipeline.create" }),
     ("POST", "/api/pipelines/generate", Coverage::Handler { action: "pipeline.generate" }),
     ("POST", "/api/pipelines/preview", Coverage::Excluded { reason: EX_READ_LIKE }),
+    // BLD-16 / J6: reads no row, writes no row — the preview's own reason.
+    ("POST", "/api/pipelines/step-sql", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("PUT", "/api/pipelines/{id}", Coverage::Handler { action: "pipeline.update" }),
     ("PUT", "/api/pipelines/{id}/target-lag", Coverage::Handler { action: "pipeline.target_lag.set" }),
     ("DELETE", "/api/pipelines/{id}", Coverage::Handler { action: "pipeline.delete" }),
