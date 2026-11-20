@@ -450,6 +450,7 @@ function useCopilotState() {
           stream: true,
           tools: toolsFromCaps(enabledCaps, options?.mode ?? mode),
           context: pageContextRef.current?.system,
+          view: pageContextRef.current?.view,
           messages: chatHistory(next),
         }),
       });

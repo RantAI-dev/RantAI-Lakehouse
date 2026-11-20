@@ -650,6 +650,34 @@
     ]
   },
   {
+    "id": "dash_target_parameter_line",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "eval_target", "method": "POST", "path": "/api/dashboard/params", "body": {"name": "eval_target", "label": "Eval target", "type": "number", "default": 20000}, "id_at": "param.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Parameter Target", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"], "referenceLines": [{"value": {"param": "eval_target"}, "label": "Target"}]}, "id_at": "chart.id"}
+    ],
+    "turns": ["Add a target line at 20,000 on chart {chart}."],
+    "expect_tool": {"name": "format_chart", "args_contains": {"chart": "{chart}"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "def.referenceLines[].value.param": "eval_target"}, "count": 1},
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "def.referenceLines[].value": 20000}, "count": 1}
+    ],
+    "cleanup": [
+      {"method": "DELETE", "path": "/api/dashboard/params?id={eval_target}"}
+    ]
+  },
+  {
+    "id": "report_to_colleague",
+    "mode": "build",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Report Board"}, "id_at": "board.id"},
+      {"name": "colleague_name", "method": "POST", "path": "/api/identity/users", "body": {"name": "Eval Colleague", "username": "eval_colleague_{run_id}", "email": "eval.colleague.{run_id}@example.com", "roles": [], "tenants": []}, "id_at": "name"}
+    ],
+    "turns": ["Send dashboard {board} every Monday at 08:00 as a PDF to {colleague_name}."],
+    "expect_tool": {"name": "find_report_recipients"}
+  },
+  {
     "id": "dash_set_dashboard_theme",
     "mode": "build",
     "confirm": true,

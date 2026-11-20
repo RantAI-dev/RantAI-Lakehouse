@@ -74,6 +74,12 @@ type TileBodyProps = {
    */
   hideLegend?: boolean;
   /**
+   * The chart stays on screen while its data changes (the sign-in page's
+   * sample dashboard): it morphs to new values instead of redrawing. Only
+   * the plain bar/line/area path uses it.
+   */
+  live?: boolean;
+  /**
    * A raw table can page and sort through the records route with these
    * filters. Absent (an embed, a public link, a preview): it shows its first
    * page only (BI-16 part A).
@@ -117,7 +123,7 @@ export function TileBody(props: TileBodyProps) {
 }
 
 function TileBodyOf({
-  spec, cell, dark, loading, onDataClick, hideLegend, paging, onTableSort, loadMap,
+  spec, cell, dark, loading, onDataClick, hideLegend, live, paging, onTableSort, loadMap,
 }: TileBodyProps) {
   const reporting = useReporting();
   // `def` is the stored definition (typed `unknown` on the shared spec): the
@@ -257,7 +263,7 @@ function TileBodyOf({
     // BI-17 part B: what the chart says under itself about a forecast or about clusters.
     const forecastSentence = forecastNote(cell.referenceLines, lineCtx, spec.kind === "hbar") ?? clusterNote(spec, rows, style);
     const chart = (
-      <ChartView option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
+      <ChartView option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" live={live}
         optionDeps={[style, locale, decimals, dark, reporting.timeZone, reporting.companyPalette, cell.referenceLines, measureLabels, cell.truncated]}
         onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels, bin: bins[spec.x] }) : undefined} />
     );

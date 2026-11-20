@@ -273,6 +273,36 @@ function sentMessages(index: number): { role: string; content: string }[] {
   return JSON.parse(chatRequests[index].body).messages;
 }
 
+describe("the dashboard on screen (AI-30)", () => {
+  const view = { board: "b1", filters: [{ column: "region", values: ["West"] }] };
+
+  it("sends the dashboard page's view with the chat body", async () => {
+    renderCopilot();
+    act(() => {
+      copilot!.setPageContext({
+        key: "dashboard-view",
+        title: "Working on a dashboard",
+        hint: "",
+        suggest: { ask: [], build: [] },
+        system: "dashboard",
+        view,
+      });
+    });
+    await act(async () => {
+      await copilot!.send("Send this PDF.");
+    });
+    expect(JSON.parse(chatRequests[0].body).view).toEqual(view);
+  });
+
+  it("sends no view when the page did not set one", async () => {
+    renderCopilot();
+    await act(async () => {
+      await copilot!.send("Send this PDF.");
+    });
+    expect(JSON.parse(chatRequests[0].body).view).toBeUndefined();
+  });
+});
+
 describe("the Copilot goes on after the draft is confirmed (AI-15)", () => {
   it("sends the steps the request still has back as a message", async () => {
     renderCopilot();
