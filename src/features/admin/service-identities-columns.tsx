@@ -13,6 +13,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatRelativeTime } from "@/lib/format"
 import type { ServiceIdentity } from "@/services/contracts/identity"
 
@@ -156,7 +157,7 @@ export function getServiceIdentityColumns(options?: {
                 <DropdownMenuLabel>Identity</DropdownMenuLabel>
                 <DropdownMenuItem
                   onClick={() => {
-                    navigator.clipboard?.writeText(item.name)
+                    void copyTextWithToast(item.name)
                   }}
                 >
                   Copy identity name

@@ -4,23 +4,13 @@ import { CopyIcon } from "lucide-react"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { orderedChecks } from "@/lib/connectors/capture-lag"
-import { notifyError, notifySuccess } from "@/lib/notify"
+import { copyTextWithToast } from "@/lib/copy-text"
 import type { SetupCheck } from "@/services/contracts/connectors"
 
 const STATUS_PILL: Record<string, { label: string; tone: "success" | "warning" | "neutral" | "destructive" }> = {
   ok: { label: "OK", tone: "success" },
   missing: { label: "Missing", tone: "destructive" },
   unchecked: { label: "Not checked", tone: "neutral" },
-}
-
-async function copyCommand(command: string) {
-  try {
-    await navigator.clipboard.writeText(command)
-    notifySuccess("Command copied")
-  } catch (err) {
-    // Usually a denied clipboard permission or a non-secure origin.
-    notifyError("Failed to copy the command", err)
-  }
 }
 
 /**
@@ -59,7 +49,7 @@ export function ConnectorSetupChecks({ checks }: { checks: readonly SetupCheck[]
                     size="sm"
                     variant="outline"
                     aria-label={`Copy the command for ${check.setting}`}
-                    onClick={() => void copyCommand(check.command ?? "")}
+                    onClick={() => void copyTextWithToast(check.command ?? "", "Command copied")}
                   >
                     <CopyIcon data-icon="inline-start" />
                     Copy

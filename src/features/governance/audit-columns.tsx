@@ -23,8 +23,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatCost, formatDateTime, formatRelativeTime } from "@/lib/format"
-import { notifySuccess } from "@/lib/notify"
 import {
   ACTOR_KIND_LABEL,
   AUDIT_OUTCOME_LABEL,
@@ -287,8 +287,7 @@ export function getAuditColumns({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(item.id)
-                    notifySuccess("Audit event ID copied")
+                    void copyTextWithToast(item.id, "Audit event ID copied")
                   }}
                 >
                   <Copy className="size-4" />
@@ -296,8 +295,7 @@ export function getAuditColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(item.action)
-                    notifySuccess("Action copied")
+                    void copyTextWithToast(item.action, "Action copied")
                   }}
                 >
                   <Activity className="size-4" />
@@ -305,8 +303,7 @@ export function getAuditColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(item.resource)
-                    notifySuccess("Resource copied")
+                    void copyTextWithToast(item.resource, "Resource copied")
                   }}
                 >
                   <FileText className="size-4" />
@@ -314,8 +311,7 @@ export function getAuditColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(item.actor)
-                    notifySuccess("Actor copied")
+                    void copyTextWithToast(item.actor, "Actor copied")
                   }}
                 >
                   <UserIcon className="size-4" />

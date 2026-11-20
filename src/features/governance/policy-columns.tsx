@@ -22,6 +22,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { ENTITY_STATUS_LABEL, type EntityStatus } from "@/lib/status"
 import type { Policy } from "@/services/contracts/governance"
 import { accessTabHref, type AccessRule } from "./access-rules"
@@ -208,7 +209,7 @@ export function getAccessRuleColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(rule.name)
+                    void copyTextWithToast(rule.name)
                   }}
                 >
                   <Copy className="size-4" />
@@ -217,7 +218,7 @@ export function getAccessRuleColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(rule.id)
+                    void copyTextWithToast(rule.id)
                   }}
                 >
                   <Shield className="size-4" />
