@@ -469,3 +469,25 @@ def test_the_sink_writes_a_type_changing_replace_through_the_transaction_and_oth
     )
     assert again.rows == 3
     assert "replaced in one commit" not in again.load_info_str
+
+
+@loader
+def test_src_48_measurement_a_replace_that_leaves_a_column_out_keeps_it_in_the_table_with_nulls(local_catalog, tmp_path):
+    """`SRC-48` task 1, `QA TC-1706`: records the bug before the fix (replaced in task 3).
+    A second `replace` whose rows carry only `a` and `b` (as the before-load gate leaves
+    a column out) still has `c` in the Iceberg table, written as nulls, because `dlt`
+    keeps the column in its stored schema for the table."""
+    directory = str(tmp_path)
+    pipeline, _ = _text_table(directory)
+    second = pa.table({"a": pa.array(["3"], pa.string()), "b": pa.array(["z"], pa.string())})
+    pipeline.run(
+        _source(second, [{"name": n, "data_type": "text"} for n in "ab"]),
+        table_name="t", write_disposition="replace", loader_file_format="parquet", table_format="iceberg",
+    )
+    table = sink_module.history.open_table(pipeline, "t", sync=False)
+    table.refresh()
+    names = [f.name for f in table.schema().fields]
+    assert "c" in names, "the Iceberg table kept the column"
+    assert table.scan().to_arrow().column("c").to_pylist() == [None], "and wrote it as nulls"
+    stored = pipeline.default_schema.tables["t"]["columns"]
+    assert "c" in stored, "the stored dlt schema kept the column too"
