@@ -22,8 +22,9 @@ import {
   assetStudioTarget,
   NO_READABLE_TABLE,
 } from "@/lib/asset-query"
+import { copyText } from "@/lib/copy-text"
 import { isIcebergCandidate, snapshotRelativeTime } from "@/lib/lakehouse-view"
-import { notifyError, notifySuccess } from "@/lib/notify"
+import { notifyFailure, notifySuccess } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import type { AssetColumn, AssetDetail } from "@/services/contracts/assets"
 import { AssetAbout } from "./asset-about"
@@ -85,13 +86,20 @@ export function qualitySummary(checks: AssetDetail["qualityChecks"]) {
   return { passed, warning, failed, evaluated, unevaluated: checks.length - evaluated, lastRun }
 }
 
-async function copyText(value: string, what: string) {
-  try {
-    await navigator.clipboard.writeText(value)
+/**
+ * Copy one of the asset's values and say what happened. The success toast
+ * waits for `copyText`'s answer: over plain http there is no clipboard API
+ * and the textarea fallback can still be refused (`UX-6`).
+ */
+async function copyValue(value: string, what: string) {
+  if (await copyText(value)) {
     notifySuccess(`Copied ${what}`)
-  } catch (err) {
-    notifyError("Failed to copy", err)
+    return
   }
+  notifyFailure(
+    "Could not copy",
+    "The browser refused the copy. Select the text and copy it by hand."
+  )
 }
 
 /**
@@ -289,7 +297,7 @@ export function AssetOverview({
         action={
           readable ? (
             <div className="flex gap-1.5">
-              <Button size="sm" variant="ghost" onClick={() => void copyText(sql, "SQL")}>
+              <Button size="sm" variant="ghost" onClick={() => void copyValue(sql, "SQL")}>
                 <Copy />
                 Copy
               </Button>

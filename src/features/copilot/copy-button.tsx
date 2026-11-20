@@ -2,8 +2,8 @@
 
 import * as React from "react";
 import { Check, Copy } from "lucide-react";
-// `navigator.clipboard` is missing over plain http, so every copy goes
-// through the helper that falls back to a textarea (`UX-6`).
+// The clipboard API is missing over plain http, so every copy goes through
+// the helper that falls back to a textarea (`UX-6`).
 import { copyText } from "@/lib/copy-text";
 import { notifyFailure } from "@/lib/notify";
 import { cn } from "@/lib/utils";

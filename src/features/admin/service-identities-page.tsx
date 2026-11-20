@@ -163,7 +163,7 @@ export function ServiceIdentitiesPage() {
                 if (revealedSecret === null) return
                 // Same as the password reveal above: the fallback textarea is
                 // appended inside this dialog, so the copy works over plain
-                // http, where `navigator.clipboard` does not exist (`UX-6`).
+                // http, where the browser has no clipboard API (`UX-6`).
                 void copyText(revealedSecret).then((copied) => {
                   if (!copied) {
                     notifyFailure(

@@ -18,6 +18,8 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
+import { copyText } from "@/lib/copy-text"
+import { notifyFailure } from "@/lib/notify"
 import type { LineageEdge, LineageGraph } from "@/services/contracts/governance"
 
 export function getLineageColumns({
@@ -129,7 +131,14 @@ export function getLineageColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(fromLabel)
+                    void copyText(fromLabel).then((copied) => {
+                      if (!copied) {
+                        notifyFailure(
+                          "Could not copy",
+                          "The browser refused the copy. Select the text and copy it by hand."
+                        )
+                      }
+                    })
                   }}
                 >
                   <Copy className="size-4" />
@@ -138,7 +147,14 @@ export function getLineageColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(toLabel)
+                    void copyText(toLabel).then((copied) => {
+                      if (!copied) {
+                        notifyFailure(
+                          "Could not copy",
+                          "The browser refused the copy. Select the text and copy it by hand."
+                        )
+                      }
+                    })
                   }}
                 >
                   <Copy className="size-4" />
@@ -147,7 +163,14 @@ export function getLineageColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(edge.id)
+                    void copyText(edge.id).then((copied) => {
+                      if (!copied) {
+                        notifyFailure(
+                          "Could not copy",
+                          "The browser refused the copy. Select the text and copy it by hand."
+                        )
+                      }
+                    })
                   }}
                 >
                   <GitCommit className="size-4" />

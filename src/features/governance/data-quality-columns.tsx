@@ -24,7 +24,9 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
+import { copyText } from "@/lib/copy-text"
 import { formatRelativeTime } from "@/lib/format"
+import { notifyFailure } from "@/lib/notify"
 import {
   CHECK_STATUS_LABEL,
   SEVERITY_LABEL,
@@ -222,7 +224,14 @@ export function getDataQualityColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(rule.name)
+                    void copyText(rule.name).then((copied) => {
+                      if (!copied) {
+                        notifyFailure(
+                          "Could not copy",
+                          "The browser refused the copy. Select the text and copy it by hand."
+                        )
+                      }
+                    })
                   }}
                 >
                   <Copy className="size-4" />
@@ -231,7 +240,14 @@ export function getDataQualityColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(rule.asset)
+                    void copyText(rule.asset).then((copied) => {
+                      if (!copied) {
+                        notifyFailure(
+                          "Could not copy",
+                          "The browser refused the copy. Select the text and copy it by hand."
+                        )
+                      }
+                    })
                   }}
                 >
                   <Database className="size-4" />

@@ -26,7 +26,9 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
+import { copyText } from "@/lib/copy-text"
 import { formatRelativeTime } from "@/lib/format"
+import { notifyFailure } from "@/lib/notify"
 import type { User } from "@/services"
 
 export const USER_STATUS_OPTIONS = [
@@ -271,7 +273,14 @@ export function getUserColumns({
                 {user.email ? (
                   <DropdownMenuItem
                     onClick={() => {
-                      void navigator.clipboard.writeText(user.email ?? "")
+                      void copyText(user.email ?? "").then((copied) => {
+                        if (!copied) {
+                          notifyFailure(
+                            "Could not copy",
+                            "The browser refused the copy. Select the text and copy it by hand."
+                          )
+                        }
+                      })
                     }}
                   >
                     <Copy className="size-4" />
@@ -280,7 +289,14 @@ export function getUserColumns({
                 ) : null}
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(user.username)
+                    void copyText(user.username).then((copied) => {
+                      if (!copied) {
+                        notifyFailure(
+                          "Could not copy",
+                          "The browser refused the copy. Select the text and copy it by hand."
+                        )
+                      }
+                    })
                   }}
                 >
                   <Copy className="size-4" />
@@ -288,7 +304,14 @@ export function getUserColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(user.id)
+                    void copyText(user.id).then((copied) => {
+                      if (!copied) {
+                        notifyFailure(
+                          "Could not copy",
+                          "The browser refused the copy. Select the text and copy it by hand."
+                        )
+                      }
+                    })
                   }}
                 >
                   <UserIcon className="size-4" />

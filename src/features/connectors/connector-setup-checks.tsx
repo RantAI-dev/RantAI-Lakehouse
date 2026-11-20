@@ -4,7 +4,8 @@ import { CopyIcon } from "lucide-react"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { orderedChecks } from "@/lib/connectors/capture-lag"
-import { notifyError, notifySuccess } from "@/lib/notify"
+import { copyText } from "@/lib/copy-text"
+import { notifyFailure, notifySuccess } from "@/lib/notify"
 import type { SetupCheck } from "@/services/contracts/connectors"
 
 const STATUS_PILL: Record<string, { label: string; tone: "success" | "warning" | "neutral" | "destructive" }> = {
@@ -13,14 +14,19 @@ const STATUS_PILL: Record<string, { label: string; tone: "success" | "warning" |
   unchecked: { label: "Not checked", tone: "neutral" },
 }
 
+/**
+ * Copy the setup command. The browser may have no clipboard API at all over
+ * plain http, so the toast follows `copyText`'s answer (`UX-6`).
+ */
 async function copyCommand(command: string) {
-  try {
-    await navigator.clipboard.writeText(command)
+  if (await copyText(command)) {
     notifySuccess("Command copied")
-  } catch (err) {
-    // Usually a denied clipboard permission or a non-secure origin.
-    notifyError("Failed to copy the command", err)
+    return
   }
+  notifyFailure(
+    "Could not copy",
+    "The browser refused the copy. Select the text and copy it by hand."
+  )
 }
 
 /**

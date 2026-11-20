@@ -27,8 +27,10 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { copyText } from "@/lib/copy-text"
 import { levelAtLeast } from "@/lib/access-level"
 import { formatRelativeTime } from "@/lib/format"
+import { notifyFailure } from "@/lib/notify"
 import type { SavedQuery } from "@/services/contracts/queries"
 
 /**
@@ -172,8 +174,16 @@ export function getSavedQueryColumns(
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    navigator.clipboard.writeText(query.sql)
-                    toast.success("SQL copied to clipboard")
+                    void copyText(query.sql).then((copied) => {
+                      if (copied) {
+                        toast.success("SQL copied to clipboard")
+                      } else {
+                        notifyFailure(
+                          "Could not copy",
+                          "The browser refused the copy. Select the text and copy it by hand."
+                        )
+                      }
+                    })
                   }}
                 >
                   <CodeIcon className="size-3.5" data-icon="inline-start" />
@@ -181,8 +191,16 @@ export function getSavedQueryColumns(
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    navigator.clipboard.writeText(query.id)
-                    toast.success("Query ID copied to clipboard")
+                    void copyText(query.id).then((copied) => {
+                      if (copied) {
+                        toast.success("Query ID copied to clipboard")
+                      } else {
+                        notifyFailure(
+                          "Could not copy",
+                          "The browser refused the copy. Select the text and copy it by hand."
+                        )
+                      }
+                    })
                   }}
                 >
                   <CopyIcon className="size-3.5" data-icon="inline-start" />

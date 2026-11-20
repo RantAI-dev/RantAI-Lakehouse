@@ -19,7 +19,7 @@ import {
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-// `navigator.clipboard` is missing over plain http, so the copy goes through
+// The clipboard API is missing over plain http, so the copy goes through
 // the helper that falls back to a textarea (`UX-6`).
 import { copyText } from "@/lib/copy-text";
 import { formatRelativeTime } from "@/lib/format";

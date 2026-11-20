@@ -24,7 +24,8 @@ import { Copy, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { sortKeyColumns, valueShares } from "@/lib/column-profile"
 import { cellKind } from "@/lib/sample-grid"
-import { notifyError, notifySuccess } from "@/lib/notify"
+import { copyText } from "@/lib/copy-text"
+import { notifyFailure, notifySuccess } from "@/lib/notify"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { schemaRows, useProfile } from "./asset-column-data"
 import { ColumnDetail, EMPTY_VALUE, ProfileNote, type SchemaRow } from "./asset-columns"
@@ -33,14 +34,16 @@ import { NULL_LABEL, type Picked } from "./sample-grid"
 
 const NOT_IN_SCHEMA = "Not in the schema"
 
+/** Copy the picked value; the toast follows `copyText`'s answer (`UX-6`). */
 async function copyValue(value: string) {
-  try {
-    await navigator.clipboard.writeText(value)
+  if (await copyText(value)) {
     notifySuccess("Copied value")
-  } catch (err) {
-    // Usually a denied clipboard permission or a non-secure origin.
-    notifyError("Failed to copy", err)
+    return
   }
+  notifyFailure(
+    "Could not copy",
+    "The browser refused the copy. Select the text and copy it by hand."
+  )
 }
 
 /** The picked cell's value, in words where it is not a value. */

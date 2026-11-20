@@ -26,8 +26,9 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { copyText } from "@/lib/copy-text"
 import { formatDateTime, formatDuration, formatNumber, parseTimestamp } from "@/lib/format"
-import { withNotify } from "@/lib/notify"
+import { notifyFailure, withNotify } from "@/lib/notify"
 import { pipelineService } from "@/services"
 import type { PipelineRun, PipelineRunTrigger, RetryStrategy } from "@/services/contracts/pipelines"
 import { isLiveRun, runDurationMs } from "./pipeline-run-stats"
@@ -242,12 +243,16 @@ export function RunInspector({
               title="Copy the full run id"
               aria-label="Copy the full run id"
               onClick={async () => {
-                try {
-                  await navigator.clipboard.writeText(run.id)
+                // Over plain http there is no clipboard API (`UX-6`); the
+                // success toast waits for the fallback's answer.
+                if (await copyText(run.id)) {
                   toast.success("Run id copied")
-                } catch {
-                  toast.error("The browser refused clipboard access")
+                  return
                 }
+                notifyFailure(
+                  "Could not copy",
+                  "The browser refused the copy. Select the text and copy it by hand."
+                )
               }}
             >
               <CopyIcon className="size-3.5" />

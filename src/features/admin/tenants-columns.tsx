@@ -18,6 +18,8 @@ import {
   formatNumber,
   formatPercent,
 } from "@/lib/format"
+import { copyText } from "@/lib/copy-text"
+import { notifyFailure } from "@/lib/notify"
 import type { Tenant } from "@/services/contracts/identity"
 
 function computeQuota(r: Tenant): string {
@@ -157,7 +159,14 @@ export function getTenantColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    navigator.clipboard?.writeText(item.slug)
+                    void copyText(item.slug).then((copied) => {
+                      if (!copied) {
+                        notifyFailure(
+                          "Could not copy",
+                          "The browser refused the copy. Select the text and copy it by hand."
+                        )
+                      }
+                    })
                   }}
                 >
                   Copy tenant slug

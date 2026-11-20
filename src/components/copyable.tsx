@@ -34,8 +34,8 @@ export function Copyable({ value, children, className }: CopyableProps) {
     if (!copyValue) return;
 
     // `copyText` answers whether the copy worked; over plain http there is no
-    // `navigator.clipboard` and the textarea fallback may still be refused
-    // (`UX-6`), so the success toast is shown only on `true`.
+    // clipboard API and the textarea fallback may still be refused (`UX-6`),
+    // so the success toast is shown only on `true`.
     const copied = await copyText(copyValue);
     if (copied) {
       notifySuccess(formatCopiedToast(copyValue));
