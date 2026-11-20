@@ -51,12 +51,19 @@ export const UNVERIFIED_NUMBER_LABEL = "Could not be matched to any tool result"
  */
 export function tokenizeInline(text: string): InlineToken[] {
   const tokens: InlineToken[] = [];
+  // Adjacent text runs (a label beside its surrounding prose) stay one token,
+  // so a rendered label reads as the sentence it came from.
+  const pushText = (content: string) => {
+    const previous = tokens.at(-1);
+    if (previous?.kind === "text") previous.content += content;
+    else tokens.push({ kind: "text", content });
+  };
   const re =
-    /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\)|\*[^*\s][^*]*\*|<span data-unverified="true">[^<]+<\/span>|\[table omitted: not backed by a tool result\])/g;
+    /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\)|\[[^\]]+\]\(\/api\/dashboard\/[^)\s]+\)|\*[^*\s][^*]*\*|<span data-unverified="true">[^<]+<\/span>|\[table omitted: not backed by a tool result\])/g;
   let last = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
-    if (m.index > last) tokens.push({ kind: "text", content: text.slice(last, m.index) });
+    if (m.index > last) pushText(text.slice(last, m.index));
     const tok = m[0];
     if (tok.startsWith("**")) {
       tokens.push({ kind: "bold", content: tok.slice(2, -2) });
@@ -69,12 +76,19 @@ export function tokenizeInline(text: string): InlineToken[] {
       tokens.push({ kind: "omitted-table" });
     } else if (tok.startsWith("[")) {
       const link = /^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/.exec(tok);
-      tokens.push({ kind: "link", content: link?.[1] ?? tok, href: link?.[2] ?? "" });
+      if (link) {
+        tokens.push({ kind: "link", content: link[1], href: link[2] });
+      } else {
+        // D10: a relative /api/dashboard/ link is the export card's Download
+        // button again; raw Markdown beside that button is noise. Show the
+        // label only — the regex above matches no other relative address.
+        pushText(/^\[([^\]]+)\]\([^)]+\)$/.exec(tok)?.[1] ?? tok);
+      }
     } else {
       tokens.push({ kind: "italic", content: tok.slice(1, -1) });
     }
     last = m.index + tok.length;
   }
-  if (last < text.length) tokens.push({ kind: "text", content: text.slice(last) });
+  if (last < text.length) pushText(text.slice(last));
   return tokens;
 }
