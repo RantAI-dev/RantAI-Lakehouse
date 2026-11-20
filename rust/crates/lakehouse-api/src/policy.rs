@@ -384,9 +384,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // GOV-1 part B: the audit trail's search, one event and export. Each is its
     // own route with `audit:read` and nothing else, so `governance:read`,
     // which every role holds, opens none of them (feature page Decision 9).
+    // The actor list beside them is a read of the trail too — the audit
+    // page's person filter offers it — so it needs `audit:read` and no
+    // `identity:read` (`GOV-1` acceptance follow-up, D2).
     ("GET",  "/api/governance/audit/events", Policy::RequiresPermission("audit:read")),
     ("GET",  "/api/governance/audit/events/{id}", Policy::RequiresPermission("audit:read")),
     ("GET",  "/api/governance/audit/export.csv", Policy::RequiresPermission("audit:read")),
+    ("GET",  "/api/governance/audit/actors", Policy::RequiresPermission("audit:read")),
     // DATA-13: column-level lineage reads the same records' lineage, so the
     // same permission; charts and dashboards in the answer are listed only
     // to `dashboard:read` inside the handler.
@@ -601,6 +605,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // preview and not a read of a stored pipeline; nothing is stored, and the
     // statement runs as the CALLER (decision 13), never as a pipeline's author.
     ("POST", "/api/pipelines/preview",                Policy::RequiresPermission("pipeline:write")),
+    // BLD-16 / J6: the SQL of one form step of a definition that is not
+    // saved yet, over names, before the access rewrite. `pipeline:write`
+    // for the same reason as the preview above: it is part of authoring and
+    // not a read of a stored pipeline; nothing is stored, nothing is read
+    // from `ClickHouse`.
+    ("POST", "/api/pipelines/step-sql",              Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:read")),
     ("PUT",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:write")),
     ("PUT",  "/api/pipelines/{id}/target-lag",         Policy::RequiresPermission("pipeline:write")),

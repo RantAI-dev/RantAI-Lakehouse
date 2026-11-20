@@ -27,7 +27,7 @@ export type FlowNodeSpec = {
   /** For an op, its name; for an input or a step, its index. Used to open the side panel. */
   ref?: string
   /** For a pipeline step: SQL, the form (BLD-1 part 1 D1), or a kind this console does not know (R1-S2). */
-  stepKind?: "sql" | "transform" | "other"
+  stepKind?: "sql" | "transform" | "join" | "aggregate" | "filter" | "other"
 }
 
 export type FlowEdgeSpec = { from: string; to: string }
@@ -188,8 +188,9 @@ export function authoredFlow(
     const id = `step:${i}`
     const known = [...placed.keys()]
     // BLD-1 part 1 S3 review R1-S2: a step of a kind this console does not
-    // know is drawn with its name and kind and no edge in, because what it
-    // reads is not knowable here.
+    // know — or whose fields do not parse to its kind's shape (BLD-16's
+    // `knownStep`) — is drawn with its name and kind and no edge in,
+    // because what it reads is not knowable here.
     const step = knownStep(stored)
     const reads =
       step === null
@@ -198,9 +199,21 @@ export function authoredFlow(
           ? known.includes(step.reads)
             ? [step.reads]
             : []
-          : sqlStepReads(step.sql, known)
+          : step.kind === "sql"
+            ? sqlStepReads(step.sql, known)
+            : step.kind === "join"
+              ? // BLD-16 / J9: two edges in, one per side; a self-join reads
+                // one item, so one edge rather than two identical ones.
+                [...new Set([step.left, step.right])].filter((name) => known.includes(name))
+              : step.kind === "aggregate" || step.kind === "filter"
+                ? known.includes(step.reads)
+                  ? [step.reads]
+                  : []
+                : []
     const column = 1 + Math.max(0, ...reads.map((name) => placed.get(name)?.column ?? 0))
     const operations = step?.kind === "transform" ? step.transforms.map((raw) => describe(raw)?.verb ?? "transform") : []
+    /** J9: the join type the words use — `full` reads "full outer", as the SQL does. */
+    const joinWord = (joinType: string) => (joinType === "full" ? "full outer" : joinType === "" ? "inner" : joinType)
     nodes.push({
       id,
       column,
@@ -211,9 +224,25 @@ export function authoredFlow(
           ? `${stored.kind}, not shown here`
           : step.kind === "sql"
             ? "SQL"
-            : operations.length > 0
-              ? operations.join(", ")
-              : "no operation",
+            : step.kind === "transform"
+              ? operations.length > 0
+                ? operations.join(", ")
+                : "no operation"
+              : step.kind === "join"
+                ? `${joinWord(step.joinType)} join`
+                : step.kind === "aggregate"
+                  ? // BLD-16 review R2: a having drops groups, so the
+                    // sublabel says it is there rather than reading as
+                    // "every group kept".
+                    `${
+                      step.groupBy.length > 0 ? `group by ${step.groupBy.join(", ")}` : "aggregate"
+                    }${(step.having ?? []).length > 0
+                        ? ` · keep groups where ${(step.having ?? []).length} condition${(step.having ?? []).length === 1 ? "" : "s"}`
+                        : ""
+                    }`
+                  : step.kind === "filter"
+                    ? `${step.match === "any" ? "any" : "all"} of ${step.conditions.length} condition${step.conditions.length === 1 ? "" : "s"}`
+                    : `${stored.kind}, not shown here`,
       ref: String(i),
       stepKind: step?.kind ?? "other",
     })
