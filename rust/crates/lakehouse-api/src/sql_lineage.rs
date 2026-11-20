@@ -143,8 +143,9 @@ enum Source {
     /// A real table, by key.
     Table(String),
     /// A `WITH` name and the outputs of its query (`DATA-57` D1). The outputs
-    /// are cloned: at most 25 CTEs per statement and 20,000 characters, so
-    /// this is bounded, and it lets a nested query read a shadowing name.
+    /// are cloned so a nested query can read a shadowing name. The clone is
+    /// bounded by `MAX_OUTPUT_COLUMNS`, not by a pipeline's CTE count: SQL
+    /// sources and query-log statements have no such cap (DATA-57 review R4).
     Cte { name: String, columns: Vec<Out> },
     /// Something whose columns are not traced; the sentence says what.
     Opaque(String),
@@ -264,6 +265,12 @@ const MSG_ALIAS_CAPTURE: &str =
 // DATA-57 review R3: a FROM alias's column list renames the columns, so the
 // source's own names cannot be trusted for a read through it.
 const MSG_ALIAS_COLUMNS: &str = "read through a FROM alias with a column list, which is not traced";
+// DATA-57 review R4: only pipelines cap CTEs at 25; a SQL source or a
+// query-log statement has no such bound, and a self-joined CTE chain doubles
+// its outputs per level. Past this cap the statement is partial, not mapped.
+const MAX_OUTPUT_COLUMNS: usize = 2_000;
+const MSG_TOO_MANY_OUTPUTS: &str =
+    "the statement has more than 2,000 output columns, which is not traced";
 
 /// What one statement writes (`INSERT` and `CREATE TABLE ... AS`), an
 /// `INSERT`'s explicit column list, and the query that fills it.
@@ -530,6 +537,15 @@ fn outputs_of_body(
             for (index, item) in select.projection.iter().enumerate() {
                 scope.current_item = index;
                 outs.extend(outputs_of_item(item, &scope));
+            }
+            if outs.len() > MAX_OUTPUT_COLUMNS {
+                // DATA-57 review R4: enforce the bound at every level, so a
+                // self-joined CTE chain cannot multiply outputs (and make the
+                // duplicate-name check quadratic) before the top level.
+                return Ok(vec![unexpanded(
+                    "*".to_owned(),
+                    MSG_TOO_MANY_OUTPUTS.to_owned(),
+                )]);
             }
             Ok(outs)
         }
@@ -1615,6 +1631,29 @@ mod tests {
         assert_eq!(
             reasons(&l),
             vec![("id".to_owned(), MSG_ALIAS_COLUMNS.to_owned())]
+        );
+    }
+
+    // DATA-57 review R4: bound the output count for all producers.
+    #[test]
+    fn a_doubling_cte_chain_is_capped_instead_of_growing_without_bound() {
+        use std::fmt::Write;
+        let mut sql = String::from("WITH c0 AS (SELECT * FROM silver.users)");
+        for level in 1..=11 {
+            write!(
+                sql,
+                ", c{level} AS (SELECT * FROM c{} AS a JOIN c{} AS b ON a.id = b.id)",
+                level - 1,
+                level - 1
+            )
+            .unwrap();
+        }
+        sql.push_str(" SELECT * FROM c11");
+        let l = run(&sql);
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("*".to_owned(), MSG_TOO_MANY_OUTPUTS.to_owned())]
         );
     }
 
