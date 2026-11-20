@@ -546,7 +546,7 @@ async fn the_card_summary_of_a_chart_draft_keeps_its_text() {
     assert_eq!(
         body["result"]["summary"],
         json!(
-            "Membuat chart baru \"Sales by region and month\" (bar) dari mart mart_seeded_sales."
+            "Creates a new chart \"Sales by region and month\" (bar) from mart mart_seeded_sales."
         ),
         "{body}"
     );

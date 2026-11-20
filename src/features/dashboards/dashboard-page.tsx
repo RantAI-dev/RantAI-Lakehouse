@@ -1010,6 +1010,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         tabs: summarizeTabs(tabs, (id) => tabOf(tabs, layout, id), chartIds, selTab),
         tiles,
       }),
+      // AI-30: the server fills a PDF export of this board with these
+      // filters when the model sends no view of its own.
+      view: { board, filters: normalizeFilters(filters) },
     });
     return () => setPageContext(null);
   }, [board, dashName, charts, kpis, results, filters, grainText, filterJson, paramControls, tabs, layout, chartIds, selTab, setPageContext]);
