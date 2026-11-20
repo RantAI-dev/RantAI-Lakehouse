@@ -975,6 +975,33 @@ Not verified:
   checks only, so no `cargo test --workspace`, no `bun run test`, no full
   `docker compose up`.
 
+### Fix round 2 (developer, 2026-11-20)
+
+Round 2 findings R7 (BLOCKER) and R8 (SHOULD-FIX) fixed in
+`ops/gold_export/gold_export_test.py`, one commit each, pushed in order.
+Both cite the finding at the fix site.
+
+| SHA | Finding | Commit subject |
+| --- | --- | --- |
+| `73bbea22b` | R7 | DATA-6 review R7: attribute the metadata log growth to the replace |
+| `e8ab7ddbf` | R8 | DATA-6 review R8: check the current snapshot's operation, not a sorted list |
+
+R7 took the second option the finding prefers: keep the whole baseline
+`metadata-log`, then find the entry that introduced the new current
+snapshot (the first new entry whose `timestamp-ms` is at or after the
+current snapshot's) and assert the entry before it is the baseline's last
+entry. A delete-then-append split would put an extra commit between them
+and fail, independently of D11's expiry commit. All metadata is read
+through the gate's existing `_load_lakekeeper_metadata` helper; no new
+metadata-file reader was added. R8 replaced the sorted-list comparison
+with an assertion on the current snapshot's `summary.operation`
+(`append` or `overwrite`) and dropped the now-unused snapshot-id baseline.
+
+Checks: `python3 -m py_compile ops/gold_export/gold_export_test.py` — OK
+after each commit. The gate itself is not runnable here (no compose
+stack); it runs in CI on PR #612. No other language was touched, so no
+other scoped check applies.
+
 ## 13. Review
 
 (empty — the planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`)
