@@ -807,9 +807,113 @@ CI run.
 
 ## 12. Handoff
 
-(empty — the developer appends one entry per PR slice: commits, exact commands
-and counts, T0's measurements, anything skipped or *not verified* with the
-reason)
+One PR slice. Base `origin/main` at `6b2242ff6`; plan commit `5c84d3f73`.
+Draft PR #612, head `b6b734a3ac32a40b5c9f3a0c2808e6a9ee02ae2d` (confirmed by
+`gh pr view 612 --json headRefOid`). This handoff worker wrote no product code
+and re-ran no heavy checks.
+
+### Commits (plan, T0–T7)
+
+| SHA | Task | Commit subject |
+| --- | --- | --- |
+| `5c84d3f73` | plan | `docs(data-6): plan the latest-copy table` |
+| — | T0 | no commit — §7 says "no commit, unless a gate script"; no gate script or result file was committed (in the tree or in any branch's history) |
+| `8d7b7c2b5` | T1 | one copy identity per publish and the latest-copy marker |
+| `d339b5cb2` | T2 | launch the latest-copy job, record it, read it back |
+| `3313f2d94` | T3 | share the trim's cleanup steps, behaviour unchanged |
+| `799465b0f` | T4 | the latest-copy op, job and record |
+| `652b7ce87` | T5 | the publication card names the latest-copy table |
+| `a4221b818` | T6 | the gate proves the latest-copy table on the real stack |
+| `b6b734a3a` | T7 | document the latest-copy table |
+
+### T0 result (§7 T0, the stop gate)
+
+T0 recorded **no numbers**. There is no `docs/plans/DATA-6-RESULT.md` in the
+tree or in any branch's history, no spike/gate script was committed, and no
+commit message carries the §7 T0 readings: no metadata-log length before or
+after create or overwrite, no snapshot count, no row counts from the ClickHouse
+read, and no object-store file-removal count. **Those numbers are *not
+verified*.** The later gate's numbers are T6's, not T0's: the 209 s wall, the
+6.4 s publish-to-success delay and the 17/18 sample counts must not be read
+into T0.
+
+Two qualitative T0 findings survive in the record:
+
+- `docs/adr/0010-gold-export-to-iceberg-from-rust.md:221-225` (T7): "PyIceberg's
+  `Transaction.overwrite` stages the delete and the append and sends both in
+  ONE catalog commit — measured on this stack before any product code was
+  written (`DATA-6` T0: the overwrite grew the metadata log by exactly 1, and a
+  reader through `ClickHouse` saw the new copy only)."
+- T4's commit message: the op reads with an "`int-micros` filter, T0-proved",
+  so T0 established that an `int` literal works on the `Timestamp` column; the
+  naive-`datetime` fallback in §7 T0 step 1 was not needed.
+
+**Stop gate (§7 T0 steps 3–4): recorded as passed** — one catalog commit
+(metadata log +1) and no mixed copy through ClickHouse. That is a qualitative
+pass from the ADR/T4 records; the underlying readings were not written down,
+so the numeric gate evidence is *not verified*.
+
+### Checks each commit records (commit-message text only)
+
+- `5c84d3f73` (plan): no checks recorded — docs only.
+- T0: none recorded (above).
+- `8d7b7c2b5` (T1): no command or count in the message. It records one fixture
+  correction: the plan's `1_763_632_800_123_456` is 2025-11-20; the test
+  asserts the true epoch micros for 2026-11-20 10:00:00.123456 UTC,
+  `1_795_168_800_123_456`, so the property tested is unchanged.
+- `d339b5cb2` (T2): no command or count in the message. It records the
+  ClickHouse fallback in §7 T2: the launch tests use the shared real test
+  container, not a wiremock, because the table-ensure `OnceCell` is
+  process-wide in the one `it` binary — every module in `tests/it.rs` must
+  share one ClickHouse or the DDL gets pinned to the wrong server.
+- `3313f2d94` (T3): "every existing `GoldTrimOpTests` case passes unchanged";
+  one new fake-based test per extracted helper. No exact command or count.
+- `799465b0f` (T4): "23 tests with fakes cover the plan's seventeen cases";
+  the invalid-config rule for a missing field is tested through
+  `from_op_config`, since Dagster's own context builder refuses the config
+  before the op runs. No exact command.
+- `652b7ce87` (T5): no command or count in the message.
+- `a4221b818` (T6): "all passing on the compose stack (gold-export CI
+  sequence, 209s wall)" — AC1 (one copy, the mart's current row count, and the
+  outside tool reads the same count through the door); AC2 (reader sampled
+  every 0.2 s: counts 17 and 18, both observed, never a mix; publish answers
+  `latestCopy.status == "queued"`; follow-up run 6.4 s after the publish's
+  answer, the M1 limit); AC3 (the `<other>_latest` 422 and the human session
+  refused at the door); AC5 (switch-off stops both tables and drops neither).
+  The CI timeout rose 31 → 37 minutes: the new steps' measured wall is ~40 s
+  (~1 minute), plus 5 minutes of slack.
+- `b6b734a3a` (T7): no command or count in the message — docs only; the
+  changelog quotes the 6.4 s delay as measured on the acceptance stack.
+
+Each item above is what the commit message records. The exact commands and
+counts are **not verified** here: this handoff worker did not re-run them (no
+workspace cargo build, no compose stack, per the brief).
+
+### CI
+
+Draft PR #612 is `OPEN`/draft at head
+`b6b734a3ac32a40b5c9f3a0c2808e6a9ee02ae2d`; `gh pr checks 612` shows all
+checks pass at that head, including `Rust · fmt`, `Rust · clippy`,
+`Rust · build`, `Rust · test 1/3`, `2/3` and `3/3 (stable)`,
+`Rust · Gold export to Iceberg (ADR 0010)` (5m15s), `Dagster · unit tests`,
+`Dagster · loader tests`, `Frontend · Lint · Typecheck · Test · Build`,
+`Repo lints`, `cargo audit`, `cargo deny`, both gitleaks checks and
+`ci-required`. CI was read, not re-run by this worker.
+
+### Not verified
+
+- T0's numeric readings, and the numeric evidence for its stop gate — no
+  result file or committed measurement exists (above).
+- The §11 foreground verification block (`cargo fmt --check`, workspace
+  clippy/test, `bun run typecheck && bun run lint && bun run test`, both Python
+  lint scripts, `python -m pytest dispar_orchestrate -q`,
+  `docker compose --profile '*' config --quiet` and a clean-project
+  `docker compose up` for the gate): not run by this handoff worker — the
+  brief forbids re-running heavy checks; CI on #612 is the substitute for the
+  Rust, frontend, Python and gate jobs.
+- Plan mismatches were recorded by the worker in the T1 and T2 commit messages
+  (the fixture's epoch constant and the ClickHouse test-container fallback);
+  both are reproduced above. No other stop-and-report mismatch was recorded.
 
 ## 13. Review
 
