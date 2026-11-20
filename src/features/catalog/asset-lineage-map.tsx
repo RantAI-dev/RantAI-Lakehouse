@@ -1,8 +1,13 @@
 "use client"
 
+import * as React from "react"
 import Link from "next/link"
+import { BarChart3, ChartColumn, ChevronRight } from "lucide-react"
 import { KIND_LABEL, focusIds, nodeHref, nodeKind } from "@/features/governance/lineage-graph"
+import { useService } from "@/hooks/use-service"
 import { cn } from "@/lib/utils"
+import { dashboardService } from "@/services"
+import type { Board, ChartOutline } from "@/services/contracts/dashboards"
 import type { LineageGraph } from "@/services/contracts/governance"
 
 /** Something drawn beside the recorded graph: a dependent, or a table the catalog relates. */
@@ -19,6 +24,11 @@ export type MapNode = {
   centre: boolean
   /** Part of the recorded lineage, or tied to the asset some other way. */
   recorded: boolean
+  /**
+   * Set on a node that stands for the charts of one dashboard
+   * ([`groupCharts`]): it opens in place to list them.
+   */
+  group?: { key: string; title: string; count: number; open: boolean }
 }
 
 export type MapEdge = {
@@ -188,6 +198,124 @@ export function mindmapModel(input: {
   return { nodes, edges }
 }
 
+/**
+ * Which dashboard each chart sits on, from the viewer's own readable lists
+ * (`BI-71` decision 4): `boardOf` maps a chart id to its board id, `titleOf`
+ * a board id to its title. A board the viewer cannot read is not in
+ * `listBoards`, so its title never reaches the map.
+ */
+export type ChartPlacement = { boardOf: Map<string, string>; titleOf: Map<string, string> }
+
+export function chartPlacement(outlines: ChartOutline[], boards: Board[]): ChartPlacement {
+  return {
+    boardOf: new Map(outlines.map((c) => [c.id, c.board])),
+    titleOf: new Map(boards.map((b) => [b.id, b.name || b.id])),
+  }
+}
+
+const CHART_PREFIX = "chart:"
+
+function chartsWord(count: number): string {
+  return `${count.toLocaleString("en-US")} ${count === 1 ? "chart" : "charts"}`
+}
+const OTHER = "other"
+
+/**
+ * The charts that read the asset, one node per dashboard (`BI-71` decision
+ * 2): a table read by 111 charts drew 111 nodes, a column many screens tall.
+ * Each group reads "<dashboard> · N charts", largest first, then by title;
+ * charts the viewer cannot place on a readable dashboard go in one "Other
+ * charts" group, last. The `open` group lists its charts again, as the
+ * nodes they were, one column to its right. No other kind of node is
+ * grouped, and with no placement (it failed to load, or there are no
+ * charts) the model is returned as it came.
+ */
+export function groupCharts(
+  model: { nodes: MapNode[]; edges: MapEdge[] },
+  placement: ChartPlacement | null,
+  open: string | null
+): { nodes: MapNode[]; edges: MapEdge[] } {
+  const charts = model.nodes.filter((n) => n.id.startsWith(CHART_PREFIX) && !n.centre)
+  if (!placement || charts.length === 0) return model
+
+  const groups = new Map<string, { title: string; charts: MapNode[] }>()
+  for (const chart of charts) {
+    const board = placement.boardOf.get(chart.id.slice(CHART_PREFIX.length))
+    const title = board === undefined ? undefined : placement.titleOf.get(board)
+    const key = board !== undefined && title !== undefined ? board : OTHER
+    const group = groups.get(key) ?? { title: title ?? "Other charts", charts: [] }
+    group.charts.push(chart)
+    groups.set(key, group)
+  }
+  const ordered = [...groups.entries()].sort(([ka, a], [kb, b]) =>
+    ka === OTHER ? 1 : kb === OTHER ? -1 : b.charts.length - a.charts.length || a.title.localeCompare(b.title)
+  )
+
+  const groupOf = new Map<string, string>()
+  const grouped = new Set(charts)
+  const nodes = model.nodes.filter((n) => !grouped.has(n))
+  const extra: MapEdge[] = []
+  for (const [key, group] of ordered) {
+    const id = `group:${key}`
+    const isOpen = open === key
+    const level = Math.max(...group.charts.map((c) => c.level))
+    for (const chart of group.charts) groupOf.set(chart.id, id)
+    const count = group.charts.length
+    nodes.push({
+      id,
+      caption: key === OTHER ? "Charts" : "Dashboard",
+      label: `${group.title} · ${chartsWord(count)}`,
+      href: null,
+      level,
+      centre: false,
+      recorded: true,
+      group: { key, title: group.title, count, open: isOpen },
+    })
+    if (isOpen) {
+      for (const chart of group.charts) {
+        nodes.push({ ...chart, level: level + 1 })
+        extra.push({ id: `${id}>${chart.id}`, from: id, to: chart.id, label: "", recorded: true })
+      }
+    }
+  }
+
+  // What led into a chart now leads into its group, once.
+  const seen = new Set<string>()
+  const edges = model.edges
+    .map((e) => ({ ...e, from: groupOf.get(e.from) ?? e.from, to: groupOf.get(e.to) ?? e.to }))
+    .filter((e) => {
+      const key = `${e.from}>${e.to}`
+      if (e.from === e.to || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+  return { nodes, edges: [...edges, ...extra] }
+}
+
+/**
+ * The placement of the asset's charts, read only when the map has charts
+ * to group. Either list failing to load leaves the map ungrouped, quietly
+ * (`BI-71` decision 4): grouping is a reading aid, not something to show an
+ * error for. `loading` is true while the two reads are out.
+ */
+export function useChartPlacement(needed: boolean): { loading: boolean; placement: ChartPlacement | null } {
+  const state = useService(
+    async (s) => {
+      if (!needed) return null
+      const [outlines, boards] = await Promise.all([
+        dashboardService.listChartOutlines(s),
+        dashboardService.listBoards(s),
+      ])
+      return chartPlacement(outlines, boards)
+    },
+    [needed]
+  )
+  return {
+    loading: needed && state.status === "loading",
+    placement: state.status === "success" ? state.data : null,
+  }
+}
+
 const NODE_W = 192
 const NODE_H = 56
 const GAP_X = 88
@@ -277,8 +405,20 @@ function curve(from: Placed, to: Placed) {
  * The mind map itself. Solid branches are recorded lineage; dashed ones
  * are what reads the asset and what the catalog relates to it. Nodes are
  * a list, left to right, for a reader who cannot see the lines.
+ *
+ * With a `placement`, the charts are grouped by dashboard ([`groupCharts`]);
+ * a group opens and closes in place, one at a time.
  */
-export function LineageMindmap({ model }: { model: { nodes: MapNode[]; edges: MapEdge[] } }) {
+export function LineageMindmap({
+  model: full,
+  placement = null,
+}: {
+  model: { nodes: MapNode[]; edges: MapEdge[] }
+  placement?: ChartPlacement | null
+}) {
+  const [open, setOpen] = React.useState<string | null>(null)
+  const model = React.useMemo(() => groupCharts(full, placement, open), [full, placement, open])
+  const toggle = (key: string) => setOpen((now) => (now === key ? null : key))
   const { nodes, width, height } = mindmapLayout(model)
   const at = new Map(nodes.map((n) => [n.id, n]))
   const centre = nodes.find((n) => n.centre)
@@ -344,21 +484,15 @@ export function LineageMindmap({ model }: { model: { nodes: MapNode[]; edges: Ma
                 )}
                 style={{ left: n.x, top: n.y, width: NODE_W, height: NODE_H }}
               >
-                <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                  {n.caption}
-                </span>
-                {n.href ? (
-                  <Link
-                    href={n.href}
-                    className="truncate text-sm font-medium leading-5 text-foreground hover:text-primary"
-                    title={n.label}
-                  >
-                    {shortLabel(n)}
-                  </Link>
+                {n.group ? (
+                  <GroupToggle node={n} group={n.group} onToggle={toggle} />
                 ) : (
-                  <span className="truncate text-sm font-medium leading-5" title={n.label}>
-                    {shortLabel(n)}
-                  </span>
+                  <>
+                    <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                      {n.caption}
+                    </span>
+                    <NodeName node={n} />
+                  </>
                 )}
               </div>
             ))}
@@ -371,5 +505,68 @@ export function LineageMindmap({ model }: { model: { nodes: MapNode[]; edges: Ma
         {dashed ? " Dashed branches are not recorded lineage: they are what reads it, and tables the catalog ties to it." : ""}
       </p>
     </div>
+  )
+}
+
+/** A node's name: a link to its page when it has one. The full name is in the tooltip. */
+function NodeName({ node: n }: { node: MapNode }) {
+  return n.href ? (
+    <Link
+      href={n.href}
+      className="truncate text-sm font-medium leading-5 text-foreground hover:text-primary"
+      title={n.label}
+    >
+      {shortLabel(n)}
+    </Link>
+  ) : (
+    <span className="truncate text-sm font-medium leading-5" title={n.label}>
+      {shortLabel(n)}
+    </span>
+  )
+}
+
+/**
+ * A dashboard's charts as one node: the whole node is the button that
+ * opens them to its right, and closes them again. The chevron turns to say
+ * which way it goes.
+ */
+function GroupToggle({
+  node: n,
+  group,
+  onToggle,
+}: {
+  node: MapNode
+  group: NonNullable<MapNode["group"]>
+  onToggle: (key: string) => void
+}) {
+  const Icon = group.key === OTHER ? ChartColumn : BarChart3
+  return (
+    <button
+      type="button"
+      aria-expanded={group.open}
+      aria-label={n.label}
+      title={n.label}
+      onClick={() => onToggle(group.key)}
+      className="-mx-3 flex h-full min-w-0 items-center gap-2 rounded-[inherit] px-3 text-left outline-none transition-colors duration-150 ease-ui hover:bg-muted/60 focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <span aria-hidden className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="inline-flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+          <Icon className="size-3" />
+          {n.caption}
+        </span>
+        {/* The count never truncates: it is what the group is for. */}
+        <span className="flex min-w-0 text-sm font-medium leading-5">
+          <span className="truncate">{group.title}</span>
+          <span className="shrink-0 whitespace-pre text-muted-foreground">{` · ${chartsWord(group.count)}`}</span>
+        </span>
+      </span>
+      <ChevronRight
+        aria-hidden
+        className={cn(
+          "size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-ui",
+          group.open && "rotate-180"
+        )}
+      />
+    </button>
   )
 }
