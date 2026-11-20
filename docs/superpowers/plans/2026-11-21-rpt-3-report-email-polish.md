@@ -78,3 +78,12 @@ format capture of a `pub(crate)` const from `settings` (declared there, used
 in report_runner via full path); the new test assertions in
 `a_body_without_a_link_or_filters_says_so_and_has_no_anchor`. The PDF margin
 fix is not checked on a real Gotenberg render. No console test added.
+
+## Handoff 2
+
+PR #641 review SHOULD-FIX 1: a real Gotenberg render showed the margin is
+painted with the dark colour scheme's canvas colour (#121212), not the root's
+background. In `@media print`, `html` now also has
+`color-scheme: light !important` (white backgrounds kept) and the comment says
+why. Screen styles are unchanged. Not re-rendered by me; the CSS is not
+compiled or tested on this VM.
