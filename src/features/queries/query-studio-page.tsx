@@ -119,6 +119,17 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
           {studio.savedLinkError}
         </p>
       ) : null}
+      {/* QS-12 (LH-QS-4-07), D15: a `?run=` link whose run is outside the
+          caller's last 14 days opens no tab; say so where the saved-link
+          error appears. */}
+      {studio.runLinkError ? (
+        <p
+          role="alert"
+          className="rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+        >
+          {studio.runLinkError}
+        </p>
+      ) : null}
       <QueryStudioTabs />
       <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
         <div className="min-w-0 space-y-4">

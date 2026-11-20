@@ -48,6 +48,7 @@ import type {
   QueryParamDef,
   QueryParamInputs,
   QueryParamValue,
+  QueryHistoryItem,
   QueryResult,
   SavedQuery,
   SqlFixOutcome,
@@ -94,6 +95,13 @@ const FIRST_TAB_ID = "tab-1"
  * following it learns that the query is not there for them (`QS-3` C5).
  */
 export const SAVED_QUERY_UNAVAILABLE = "This query is not available to you."
+
+/**
+ * QS-12 (LH-QS-4-07), D15: a `/query-studio?run=<id>` link whose run is not in
+ * the caller's own last-14-day history. One sentence for "not there" and for
+ * "not yours", so the link never reveals which it was.
+ */
+export const RUN_LINK_UNAVAILABLE = "This run is not in your history of the last 14 days."
 
 /**
  * The shape of a catalog id that is a SQL table name: `silver.orders`.
@@ -1485,6 +1493,62 @@ export function useQueryStudio(draftKey: string | null) {
     setTab("sql")
   }, [hydrated, linkedSaved])
 
+  // Handoff from History: /query-studio?run=<id> asks the server for that one
+  // run (the caller's own, last 14 days — the same scope as the list) and
+  // opens its SQL on the engine it ran on. Mirrors the `?saved=` handoff,
+  // including its StrictMode read-once guard and its wait for hydration.
+  const [linkedRun, setLinkedRun] = React.useState<QueryHistoryItem | null>(null)
+  const [runLinkError, setRunLinkError] = React.useState<string | null>(null)
+  const appliedRunRef = React.useRef(false)
+  React.useEffect(() => {
+    if (appliedRunRef.current) return
+    const id = new URLSearchParams(window.location.search).get("run")
+    if (!id) return
+    appliedRunRef.current = true
+    void queryService.listHistoryPage({ id, page: 1 }).then(
+      (answer) => {
+        if (!mountedRef.current) return
+        // An id outside the caller's scope or window is answered with an
+        // empty page, not a 404 — the list and this lookup share that rule.
+        const run = answer.runs[0]
+        if (run) setLinkedRun(run)
+        else setRunLinkError(RUN_LINK_UNAVAILABLE)
+      },
+      (error: unknown) => {
+        if (!mountedRef.current) return
+        const failure = toServiceError(error)
+        setRunLinkError(
+          failure.code === "not_found" || failure.code === "invalid_request"
+            ? RUN_LINK_UNAVAILABLE
+            : readableErrorMessage(failure.message)
+        )
+      }
+    )
+  }, [])
+
+  React.useEffect(() => {
+    if (!hydrated || !linkedRun) return
+    const openedId = newTabId()
+    const takesPlaceholder = placeholderRef.current
+    placeholderRef.current = false
+    setTabs((previous) => {
+      const opened: QueryTab = {
+        id: openedId,
+        name: nextTabName(previous),
+        sql: linkedRun.sql,
+        engine: linkedRun.engine === "trino" ? "trino" : "clickhouse",
+        parameters: [],
+        values: {},
+      }
+      if (takesPlaceholder && previous.length === 1 && previous[0].id === FIRST_TAB_ID) {
+        return [opened]
+      }
+      return [...previous, opened]
+    })
+    setActiveTabId(openedId)
+    setTab("sql")
+  }, [hydrated, linkedRun])
+
   // The rows on screen for each tab: the result of the statement that is
   // open on it. The per-statement state behind it is `runs`.
   const results = React.useMemo<Record<string, QueryResult | null>>(() => {
@@ -1633,5 +1697,10 @@ export function useQueryStudio(draftKey: string | null) {
      * the query is not there for the caller, or `null` when it opened.
      */
     savedLinkError,
+    /**
+     * What a `?run=` link answered: the sentence the studio shows when the
+     * run is not in the caller's last 14 days, or `null` when it opened.
+     */
+    runLinkError,
   }
 }

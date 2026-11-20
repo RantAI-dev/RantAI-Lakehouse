@@ -6,7 +6,8 @@ import { LEGACY_QUERY_DRAFT_KEY, queryDraftKey, type QueryTabs } from "@/lib/que
 import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
-import { useQueryStudio } from "./use-query-studio"
+import type { QueryHistoryItem } from "@/services/contracts/queries"
+import { RUN_LINK_UNAVAILABLE, useQueryStudio } from "./use-query-studio"
 
 // The explain and fix actions of Query Studio: what Accept, Reject and the
 // editor do to each other, and that neither action runs the query. The
@@ -93,6 +94,74 @@ describe("useQueryStudio starter text", () => {
       hook.result.current.addTab()
     })
     expect(hook.result.current.tabs[1]?.sql).toBe("")
+  })
+})
+
+// QS-12 (LH-QS-4-07), D15: a `/query-studio?run=<id>` handoff asks for that
+// one run and opens its SQL on the engine it ran on; an id outside the
+// caller's last 14 days opens no tab and says why.
+describe("useQueryStudio run link", () => {
+  const RUN = {
+    id: "q-1",
+    sql: "SELECT * FROM iceberg.bronze.t",
+    engine: "trino",
+    user: "Rina Wijaya",
+    at: "2026-11-20T10:00:00.000Z",
+    status: "completed",
+    durationMs: 10,
+    scannedBytes: 1,
+    costUnits: 0.1,
+    workloadClass: "interactive",
+    cacheAssisted: false,
+    tablesRead: [],
+  } as unknown as QueryHistoryItem
+
+  function stubLists() {
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+  }
+
+  it("opens the run's SQL on its engine from ?run=", async () => {
+    window.localStorage.clear()
+    stubLists()
+    const list = spyOn(queryService, "listHistoryPage").mockResolvedValue({
+      runs: [RUN],
+      total: 1,
+      page: 1,
+      pageSize: 50,
+    } as never)
+    visit("/query-studio?run=q-1")
+
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(1))
+    expect(list.mock.calls[0]?.[0]).toMatchObject({ id: "q-1", page: 1 })
+    await waitFor(() =>
+      expect(hook.result.current.tabs.some((tab) => tab.sql === RUN.sql)).toBe(true)
+    )
+    const opened = hook.result.current.tabs.find((tab) => tab.sql === RUN.sql)
+    expect(opened?.engine).toBe("trino")
+    expect(hook.result.current.runLinkError).toBeNull()
+  })
+
+  it("says the run is unavailable and opens no tab when the answer is empty", async () => {
+    window.localStorage.clear()
+    stubLists()
+    spyOn(queryService, "listHistoryPage").mockResolvedValue({
+      runs: [],
+      total: 0,
+      page: 1,
+      pageSize: 50,
+    } as never)
+    visit("/query-studio?run=q-1")
+
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+
+    await waitFor(() => expect(hook.result.current.runLinkError).toBe(RUN_LINK_UNAVAILABLE))
+    expect(hook.result.current.tabs.length).toBe(1)
+    expect(hook.result.current.tabs[0]?.sql).toBe("")
   })
 })
 
