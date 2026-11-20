@@ -672,7 +672,7 @@
     "mode": "build",
     "setup": [
       {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Report Board"}, "id_at": "board.id"},
-      {"name": "colleague_name", "method": "POST", "path": "/api/identity/users", "body": {"name": "Eval Colleague", "username": "eval_colleague", "email": "eval.colleague@example.com", "roles": [], "tenants": []}, "id_at": "name"}
+      {"name": "colleague_name", "method": "POST", "path": "/api/identity/users", "body": {"name": "Eval Colleague", "username": "eval_colleague_{run_id}", "email": "eval.colleague.{run_id}@example.com", "roles": [], "tenants": []}, "id_at": "name"}
     ],
     "turns": ["Send dashboard {board} every Monday at 08:00 as a PDF to {colleague_name}."],
     "expect_tool": {"name": "find_report_recipients"}
