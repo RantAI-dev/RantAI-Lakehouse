@@ -583,3 +583,46 @@ no-author reads-as, no-target-lag labels, draft Trigger-run) pass on both.
 ## Review
 
 *(the reviewer appends one entry per round)*
+
+### Round 1 — planner review, 2026-11-20, at `26dc94c78`
+
+No BLOCKER. Holds: `last_run_at` is written by both run-event routes after
+Dagster confirms the end, with one monotonic bound `UPDATE`; the lag clock
+uses the snapshot's own `timestamp_ms`, clamped; "Up to date" shows only for
+a measured `met`; the wait uses `tokio::time::sleep`; no route, policy or
+upstream-text change; no new mocks.
+
+**R1 SHOULD-FIX: a paused target-lag pipeline cannot be resumed.**
+`src/features/pipelines/pipeline-detail-page.tsx:437` hides Resume with
+Pause. D3 is amended: hide **Pause** for a target-lag pipeline, but keep
+**Resume** while `status === "paused"`. Reword `pipeline-target-lag.md`
+row 6 (pausing does stop the lag sensor at the next reload, as F10 says).
+Test: a paused target-lag pipeline shows Resume.
+
+**R2 SHOULD-FIX: doc comments attach to the wrong item.**
+`rust/crates/lakehouse-api/src/routes/pipelines.rs:2960-2976`: the new
+constants sit between `authored_launch_target`'s `///` doc and its
+`#[allow]` reason. Move the constants and `wait_for_job` above that doc
+block.
+
+**R3 SHOULD-FIX: the 20 s bound is not a bound.** `routes/pipelines.rs:
+2970-2995`: sleeps plus untimed `list_jobs` calls can run to the 60 s
+route deadline and answer 408 instead of the 409 sentence. Wrap the wait
+in `tokio::time::timeout(Duration::from_secs(20), …)` and answer the 409 on
+expiry; fix the comment ("the first attempt is that look").
+
+**R4 SHOULD-FIX: two list sentences are still untrue.**
+`src/features/pipelines/pipeline-columns.tsx:463-475`: a `paused` authored
+row is told "mark it ready first", but the route launches it (only drafts
+are refused). Say the draft sentence only for drafts. And
+`src/features/pipelines/pipelines-page.tsx:57-59` still says "an authored
+pipeline has no engine behind it". Tests.
+
+**R5 SHOULD-FIX: D11 changes existing pipelines' output, and nobody is
+told.** A saved pipeline with a cast or rename and no select gets a
+different table on its next run (types change; a renamed column loses its
+old name and moves to the end), so a chart or a downstream pipeline reading
+the old name breaks. Add a Limits line to `pipeline-joins-and-sql.md` and a
+`CHANGELOG.md` entry saying so. Also check a rename to a name that already
+exists: if the save does not refuse it, refuse it at save with a fixed
+sentence (test), rather than let the run fail on a duplicate column.
