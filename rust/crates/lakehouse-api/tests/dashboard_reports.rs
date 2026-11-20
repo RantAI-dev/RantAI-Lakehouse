@@ -127,29 +127,13 @@ fn passes(sql: &str, column: &str, id: &str, owner: &str) -> bool {
     true
 }
 
-impl Respond for FakeCh {
-    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
-        let sql = String::from_utf8_lossy(&request.body).into_owned();
-        self.log.lock().unwrap().push(sql.clone());
-        let rows = |data: Vec<Value>| {
-            let n = data.len();
-            ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
-        };
-        if sql.contains("FROM console.bi_folder") {
-            let all = [("f_open", ""), ("f_locked", ""), ("p_owner", OWNER)];
-            return rows(
-                all.iter()
-                    .filter(|(id, owner)| passes(&sql, "id", id, owner))
-                    .map(|(id, owner)| folder_row(id, owner))
-                    .collect(),
-            );
-        }
-        let boards = [
-            ("b_one", "f_open", ""),
-            ("b_two", "", ""),
-            ("b_locked", "f_locked", ""),
-            ("b_mine", "p_owner", OWNER),
-        ];
+impl FakeCh {
+    fn json_rows(data: Vec<Value>) -> ResponseTemplate {
+        let n = data.len();
+        ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
+    }
+
+    fn charts(&self) -> Vec<(String, String, String, Option<String>)> {
         let mut charts: Vec<(String, String, String, Option<String>)> = [
             ("c_one", "b_one", "bar"),
             ("c_two", "b_two", "bar"),
@@ -168,6 +152,30 @@ impl Respond for FakeCh {
                 Some(map.clone()),
             ));
         }
+        charts
+    }
+}
+
+impl Respond for FakeCh {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        self.log.lock().unwrap().push(sql.clone());
+        if sql.contains("FROM console.bi_folder") {
+            let all = [("f_open", ""), ("f_locked", ""), ("p_owner", OWNER)];
+            return Self::json_rows(
+                all.iter()
+                    .filter(|(id, owner)| passes(&sql, "id", id, owner))
+                    .map(|(id, owner)| folder_row(id, owner))
+                    .collect(),
+            );
+        }
+        let boards = [
+            ("b_one", "f_open", ""),
+            ("b_two", "", ""),
+            ("b_locked", "f_locked", ""),
+            ("b_mine", "p_owner", OWNER),
+        ];
+        let charts = self.charts();
         let trashed = self.trashed.lock().unwrap().clone();
         // `store::chart_row_state` and `store::board_row_state`: one row by
         // id, read as the server (no viewer fragment).
@@ -176,7 +184,7 @@ impl Respond for FakeCh {
             .nth(1)
             .and_then(|rest| rest.split('\'').next())
         {
-            return rows(
+            return Self::json_rows(
                 charts
                     .iter()
                     .filter(|(chart, _, _, _)| chart.as_str() == id)
@@ -192,7 +200,7 @@ impl Respond for FakeCh {
             .nth(1)
             .and_then(|rest| rest.split('\'').next())
         {
-            return rows(
+            return Self::json_rows(
                 boards
                     .iter()
                     .filter(|(board, _, _)| *board == id)
@@ -201,7 +209,7 @@ impl Respond for FakeCh {
             );
         }
         if sql.contains("FROM console.bi_chart") {
-            return rows(
+            return Self::json_rows(
                 charts
                     .iter()
                     .filter(|(id, _, _, _)| !trashed.iter().any(|t| t == id))
@@ -224,7 +232,7 @@ impl Respond for FakeCh {
         if sql.contains("FROM console.bi_board") {
             let wanted =
                 |id: &str| sql.contains(&format!("id='{id}'")) || !sql.contains("AND id='");
-            return rows(
+            return Self::json_rows(
                 boards
                     .iter()
                     .filter(|(id, _, owner)| wanted(id) && passes(&sql, "id", id, owner))
@@ -233,7 +241,7 @@ impl Respond for FakeCh {
             );
         }
         if sql.contains("system.columns") {
-            return rows(
+            return Self::json_rows(
                 ["email", "region"]
                     .iter()
                     .map(|n| json!({"table": "mart_x", "name": n, "type": "String"}))
@@ -241,7 +249,7 @@ impl Respond for FakeCh {
             );
         }
         if sql.contains("FROM serving.mart_x") || sql.contains("replaceRegexpOne") {
-            return rows(vec![json!({"email": "a@x", "region": "north"})]);
+            return Self::json_rows(vec![json!({"email": "a@x", "region": "north"})]);
         }
         ResponseTemplate::new(200).set_body_string("Ok.\n")
     }
