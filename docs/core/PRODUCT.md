@@ -353,7 +353,7 @@ customer would hit first, not matching every feature.
 
 | Item | Why |
 | --- | --- |
-| Accept the merged features: Gold publishing (`DATA-1`), login protection (`SEC-2`, `SEC-5`), file upload (`DATA-9`) | Blocker 1; merged is not accepted |
+| Accept the merged features: login protection (`SEC-2`, `SEC-5`), file upload (`DATA-9`). Gold publishing (`DATA-1`), result caching (`BI-4`), upload formats (`DATA-17`) and upload folders (`DATA-35`) were accepted on 2026-11-20 | Blocker 1; merged is not accepted |
 | Fix the security findings under Now: `SEC-10`, `SEC-11`, `SEC-13`, `SEC-14`, `SEC-15` | Blocker 6; they come before feature work |
 | Clear blockers 2 and 4 | Small, and they are embarrassing if found |
 
