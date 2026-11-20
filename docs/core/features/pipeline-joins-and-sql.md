@@ -10,7 +10,7 @@
 | Priority | In `BACKLOG.md`, the one place it is kept |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | Reads as its author: `docs/superpowers/plans/2026-10-15-bld-1-run-as-author.md` (merged). Part 1: `docs/superpowers/plans/2026-11-12-bld-1-part-1-steps-and-sql.md`. The text form, the last slice of part 1: `docs/superpowers/plans/2026-11-13-bld-1-part-1-pipeline-as-text.md` (planned, not started). Parts 2 and 3 are not written yet. |
+| Plan | Reads as its author: `docs/superpowers/plans/2026-10-15-bld-1-run-as-author.md` (merged). Part 1: `docs/superpowers/plans/2026-11-12-bld-1-part-1-steps-and-sql.md`. The text form, the last slice of part 1: `docs/superpowers/plans/2026-11-13-bld-1-part-1-pipeline-as-text.md` (planned, not started). Part 2: `docs/superpowers/plans/2026-11-20-bld-16-joins-and-aggregations.md`. Part 3 is not written yet. |
 | Started | 2026-10-15 |
 | Shipped | |
 | Evidence | PR #173 (a pipeline reads as its author); PR #481 (part 1, S1: inputs and steps, the compiler, the check at save, the run route, the assistant); PR #500 (part 1, S2: the preview of a step); PR #499 (part 1, S3: the editor in the console) |
@@ -118,6 +118,22 @@ reviews that part.
 - At most 5 input tables and 20 steps per pipeline.
 - A SQL step is one `SELECT`. It cannot change data or tables, and it reads
   only the pipeline's inputs and earlier steps.
+- A form step (join, aggregate, filter) reads only columns whose names are
+  letters, digits and underscores (`BLD-16`). A column with another name — a
+  space, a dot, a non-ASCII letter — is left out of the pickers and needs a
+  SQL step.
+- An outer join's missing side is `0` or empty text, not blank — the same as
+  a SQL step's join, because the compiler cannot add `join_use_nulls`
+  (`BLD-16`, F3).
+- A column a form step names that does not exist is found by the preview or
+  the run, not by the save (`BLD-16`, F4): the save checks tables, not
+  columns.
+- A pipeline with a join, aggregate or filter step has no column lineage yet
+  (`DATA-57`), exactly as a SQL step or several inputs do not. Table
+  lineage shows every input.
+- "Switch to SQL step" cannot be undone, except by restoring an earlier
+  version of the pipeline (`BLD-16`, J6). The editor says so before it does
+  it.
 - Every run rebuilds the output table and gives it the columns of the last
   step. A dashboard that reads a column the pipeline no longer returns
   breaks.

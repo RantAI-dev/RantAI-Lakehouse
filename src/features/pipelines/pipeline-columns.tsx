@@ -31,6 +31,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatRelativeTime } from "@/lib/format"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { ENTITY_STATUS_LABEL, type EntityStatus } from "@/lib/status"
@@ -479,7 +480,7 @@ export function getPipelineColumns({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(pipeline.id)
+                    void copyTextWithToast(pipeline.id)
                   }}
                 >
                   <GitBranch className="size-4" />

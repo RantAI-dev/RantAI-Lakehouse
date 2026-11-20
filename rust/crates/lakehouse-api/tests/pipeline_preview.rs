@@ -633,3 +633,223 @@ async fn a_clickhouse_failure_answers_the_way_query_run_answers_the_same_failure
         }
     }
 }
+
+// ── BLD-16 (BLD-1 part 2) / J6: the step-SQL route, and the new kinds ──
+
+/// One request to the step-SQL route, as `cookie`.
+async fn step_sql(router: &axum::Router, cookie: &str, body: Value) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/pipelines/step-sql")
+        .header("cookie", cookie)
+        .header("content-type", "application/json");
+    let resp = router
+        .clone()
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// J2's join step, in the wire shape the route takes.
+fn j2_join() -> Value {
+    json!({
+        "name": "joined", "kind": "join",
+        "left": "orders", "right": "customers", "joinType": "left",
+        "on": [ { "left": "customer_id", "right": "id" } ],
+        "columns": [
+            { "side": "left",  "column": "order_id" },
+            { "side": "left",  "column": "amount" },
+            { "side": "right", "column": "country" },
+            { "side": "right", "column": "id", "name": "customer_ref" }
+        ]
+    })
+}
+
+/// J2's two inputs, which the join reads.
+fn j2_inputs() -> Value {
+    json!([
+        {"name": "orders", "zone": "silver", "table": "orders"},
+        {"name": "customers", "zone": "silver", "table": "customers"},
+    ])
+}
+
+/// J6: the route answers the body the compiler would put inside the named
+/// step's `WITH` entry — over names, exactly as the plan's contract spells
+/// it, and nothing else.
+#[tokio::test]
+async fn step_sql_answers_the_sql_of_a_join_step() {
+    let (router, pool, _engine) = app().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let (status, answer) = step_sql(
+        &router,
+        &cookie,
+        json!({ "inputs": j2_inputs(), "steps": [j2_join()], "step": "joined" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        answer["sql"].as_str(),
+        Some(
+            "SELECT `__left`.`order_id` AS `order_id`, `__left`.`amount` AS `amount`, \
+             `__right`.`country` AS `country`, `__right`.`id` AS `customer_ref` \
+             FROM `orders` AS `__left` LEFT JOIN `customers` AS `__right` \
+             ON `__left`.`customer_id` = `__right`.`id`"
+        ),
+        "{answer}"
+    );
+}
+
+/// D7, the form-step shape: a refusal names the FIELD at fault, so the
+/// editor can select the step and mark the row.
+#[tokio::test]
+async fn step_sql_answers_400_naming_the_field_at_fault() {
+    let (router, pool, _engine) = app().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let mut join = j2_join();
+    join["joinType"] = json!("cross");
+
+    let (status, answer) = step_sql(
+        &router,
+        &cookie,
+        json!({ "inputs": j2_inputs(), "steps": [join], "step": "joined" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(
+        answer["error"].as_str(),
+        Some("steps[0].joinType: a join is inner, left, right or full"),
+        "{answer}"
+    );
+}
+
+/// J6: nothing is stored and no table is read, so nothing reaches
+/// `ClickHouse` — the answer is text over names, not a run.
+#[tokio::test]
+async fn step_sql_sends_nothing_to_the_engine() {
+    let (router, pool, engine) = app().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let (status, answer) = step_sql(
+        &router,
+        &cookie,
+        json!({ "inputs": j2_inputs(), "steps": [j2_join()], "step": "joined" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let received = engine
+        .received_requests()
+        .await
+        .expect("the mock engine records requests");
+    assert!(
+        received.is_empty(),
+        "the route must not touch the engine; received: {received:?}"
+    );
+}
+
+/// Security rule 3 (plan section 3): a preview reads as the person
+/// LOOKING. A column masked for the caller stays masked through a `join`
+/// form step and an aggregate's `min` — the whole compiled statement goes
+/// through the same rewrite the preview always uses, so a new kind of
+/// step cannot dodge the caller's policies.
+#[tokio::test]
+async fn previewing_an_aggregate_step_runs_it_as_the_caller_with_their_mask() {
+    let (router, pool, engine) = app().await;
+    seed_mask(&pool, "Data Engineer", "serving.enforced_x").await;
+    mount_preview(
+        &engine,
+        describe_body(&[("id", "UInt64"), ("first_email", "String")]),
+        rows_body(
+            &[("id", "UInt64"), ("first_email", "String")],
+            &[json!({"id": 1, "first_email": "***"})],
+        ),
+    )
+    .await;
+    // Bayu is a Data Engineer, the role the mask names.
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    let (status, answer) = preview(
+        &router,
+        &cookie,
+        Some(GROUP_TENANT),
+        json!({
+            "inputs": [{"name": "users", "zone": "serving", "table": "enforced_x"}],
+            "steps": [
+                {"name": "joined", "kind": "join",
+                 "left": "users", "right": "users", "joinType": "inner",
+                 "on": [{"left": "id", "right": "id"}],
+                 "columns": [{"side": "left", "column": "id"},
+                             {"side": "left", "column": "email"}]},
+                {"name": "summary", "kind": "aggregate", "reads": "joined",
+                 "groupBy": ["id"],
+                 "measures": [{"function": "min", "column": "email", "name": "first_email"}]}
+            ],
+            "upTo": "summary",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["rows"], json!([[1, "***"]]), "{answer}");
+    let bodies = sent(&engine).await;
+    let row_query = bodies
+        .iter()
+        .find(|body| body.contains(") AS step LIMIT 101"))
+        .expect("the row query was sent");
+    assert!(
+        row_query.contains("replaceRegexpOne(toString(`email`)"),
+        "the caller's mask did not reach the engine: {row_query}"
+    );
+    assert!(
+        row_query.contains("min("),
+        "the aggregate compiled into the statement: {row_query}"
+    );
+}
+
+/// J5: a filter form step compiles into the same one statement, and its
+/// `WHERE` — with the `OR` an "any" match means — is what the engine runs.
+#[tokio::test]
+async fn previewing_a_filter_step_sends_its_where() {
+    let (router, pool, engine) = app().await;
+    mount_preview(
+        &engine,
+        describe_body(&[("amount", "UInt64")]),
+        rows_body(&[("amount", "UInt64")], &[json!({"amount": 150})]),
+    )
+    .await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let (status, answer) = preview(
+        &router,
+        &cookie,
+        Some(GROUP_TENANT),
+        json!({
+            "inputs": [{"name": "orders", "zone": "silver", "table": "orders"}],
+            "steps": [{"name": "big", "kind": "filter", "reads": "orders", "match": "any",
+                       "conditions": [{"column": "amount", "operator": ">", "value": "100"},
+                                      {"column": "status", "operator": "=", "value": "paid"}]}],
+            "upTo": "big",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let bodies = sent(&engine).await;
+    let row_query = bodies
+        .iter()
+        .find(|body| body.contains(") AS step LIMIT 101"))
+        .expect("the row query was sent");
+    assert!(
+        row_query.contains("WHERE `amount` > '100' OR `status` = 'paid'"),
+        "the filter's own WHERE did not reach the engine: {row_query}"
+    );
+}
