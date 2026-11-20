@@ -33,6 +33,20 @@ describe("tokenizeInline", () => {
     expect(tokenizeInline(OMITTED_TABLE_TEXT)).toEqual([{ kind: "omitted-table" }])
   })
 
+  it("shows a relative export link as its label only, never as a link (AI-30, D10)", () => {
+    expect(
+      tokenizeInline("Here it is: [Download PDF](/api/dashboard/export/pdf?board=b1&paper=a4)."),
+    ).toEqual([{ kind: "text", content: "Here it is: Download PDF." }])
+  })
+
+  it("still renders an absolute link as a link", () => {
+    expect(tokenizeInline("See [docs](https://example.com/a).")).toEqual([
+      { kind: "text", content: "See " },
+      { kind: "link", content: "docs", href: "https://example.com/a" },
+      { kind: "text", content: "." },
+    ])
+  })
+
   it("recognizes a verified number as plain text — no wrapper, no token", () => {
     // A verified number is left byte-for-byte unchanged by the backend
     // (citations.rs: a_verified_number_is_left_exactly_as_printed_with_no_wrapper_at_all).
