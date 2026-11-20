@@ -734,6 +734,63 @@ Not verified:
   binary, then a pre-BLD-16 `lakehouse-store` rlib); crate sources were
   touched to force fresh builds before each reported run.
 
+### Fix round 1
+
+Developer: `Hy4 flash` (OpenCode). Base: `cb3a0b409`. All five findings from
+Round 1 fixed, one commit each, in order, pushed normally (no force-push).
+`DATA-57 review R<n>` is cited at each fix site and in its commit body.
+
+| Finding | Commit |
+| --- | --- |
+| R1 BLOCKER | `2e8d401858a8875115c4cb5abf6f9ded538f4b77` |
+| R2 | `5cc56062f4f2a46d3d1141b31d9326ff31b8a464` |
+| R3 | `07f842ded981645b3490c5933bf984315dcfa1fd` |
+| R4 | `8b4772ca125e39c65a9f1706a3b3484971ffc414` |
+| R5 | `592a241cfd775eff5a24e1fe0de56c30b4434f04` |
+
+- R1: enclosing pending names are carried into a nested `WITH` and checked
+  before `defined`; the body keeps names still pending after its own
+  definitions. The two review inputs are tests: on the pre-fix code they
+  produced exactly the review's wrong edges (`id ← b.id` and
+  `id ← silver.users.name`); both now assert `MSG_CTE_FORWARD`, no edge.
+- R2: tests for `MSG_CTE_HINT`, `MSG_CTE_DUPLICATE` and `MSG_CTE_UNREADABLE`;
+  all three fail on the pre-DATA-57 base. `ClickHouseDialect` does not parse
+  `AS MATERIALIZED`, so that branch is exercised with `PostgreSqlDialect`
+  and the ClickHouse parse refusal is asserted too (no fabricated success).
+- R3: a `FROM` alias with a column list is opaque with `MSG_ALIAS_COLUMNS`;
+  the test fails on pre-fix code with `id ← silver.users.id` (the alias
+  makes `x.id` the second column, so the old edge was wrong).
+- R4: total outputs are capped at 2,000 per statement at every SELECT level;
+  past that one partial row with `MSG_TOO_MANY_OUTPUTS` is returned. The
+  doubling-chain test fails on pre-fix code with hundreds of duplicate
+  partials. The "25 CTEs" claim is removed from `Source::Cte`'s comment.
+- R5: the merged-PR qualifier is gone from the note comment. No behaviour
+  change.
+
+Commands run, in the foreground, on each commit and again on the final one
+(counts from the final commit):
+
+- `cd rust && cargo fmt --check` — clean.
+- `cd rust && cargo clippy -p lakehouse-api --all-targets -j 2 -- -D warnings`
+  — finished, no warning.
+- `cd rust && cargo test -p lakehouse-api --lib -j 2 -- sql_lineage` —
+  **56 passed**, 0 failed, 3790 filtered out.
+- `cd rust && cargo test -p lakehouse-api --lib -j 2 -- pipeline_compile` —
+  **50 passed**, 0 failed, 3796 filtered out.
+- `cd rust && cargo test -p lakehouse-api --test it -j 2 column_lineage_pipeline::`
+  — **10 passed**, 0 failed, 1780 filtered out.
+- `cd rust && cargo test -p lakehouse-api --test it -j 2 pipeline_compile_route::`
+  — **26 passed**, 0 failed, 1764 filtered out.
+
+The two `--lib` filters were run as separate commands: libtest accepts a
+single filter. The shared `CARGO_TARGET_DIR` again served stale artifacts
+(pre-BLD-16 rlib, old test binaries); crate sources were touched to force
+fresh builds before the reported runs. No lint, test or threshold was
+weakened.
+
+Not verified: the full `cargo test --workspace` / nextest partitions, the
+`g7` gate, TypeScript, Dagster and compose checks — CI's job. No PR opened.
+
 ## Review
 
 ### Round 1 — planner review, 2026-11-20, at `052bd6971`
