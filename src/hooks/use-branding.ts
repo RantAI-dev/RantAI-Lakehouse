@@ -25,9 +25,15 @@ export type BrandingView = {
   name: string
   /** True until `GET /api/branding` has answered, with data or with an error. */
   loading: boolean
-  /** The logo for a light background. */
+  /**
+   * The logo for a light background. Empty while the answer is on its way:
+   * a surface shows no picture then, not the product's own.
+   */
   logoSrc: string
-  /** The logo for a dark background. */
+  /**
+   * The logo for a dark background. Empty while the answer is on its way,
+   * like the light one.
+   */
   logoDarkSrc: string
 }
 
@@ -58,11 +64,12 @@ export function resolveBranding(branding: Branding | null): BrandingView {
 const LOADING_VIEW: BrandingView = {
   name: "",
   loading: true,
-  // The pictures stay the product's own until the answer: this change is
-  // about the name. Drawing none instead would mount each `<img>` only once
-  // the workspace's logo URL is known, and that is a separate decision.
-  logoSrc: PRODUCT_LOGO_LIGHT,
-  logoDarkSrc: PRODUCT_LOGO_DARK,
+  // No picture at all while the answer is on its way: the product's own
+  // logo must not stand on the page for a moment before the workspace's
+  // own logo lands, or the workspace's logo arrives after a flash of
+  // ours. The pictures wait the same way the name waits (`adm-121`).
+  logoSrc: "",
+  logoDarkSrc: "",
 }
 
 /** The one `GET /api/branding` answer, as the shell shares it. */
