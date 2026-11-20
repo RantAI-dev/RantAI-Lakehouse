@@ -20,9 +20,13 @@ import {
   effectiveInputs,
   errorItemId,
   errorTarget,
+  formColumns,
   hasProblems,
   isUsableName,
+  MAX_NAME_CHARS,
+  joinOutputColumns,
   knownStep,
+  measureName,
   moveStep,
   nameProblem,
   noStepLine,
@@ -41,6 +45,7 @@ import {
   sqlStepHint,
   stepCompletion,
   suggestInputName,
+  switchToSql,
   updateInput,
   updateStep,
   type EditorState,
@@ -385,11 +390,15 @@ describe("errors that name an item (D7)", () => {
       kind: "step",
       index: 1,
       transform: null,
+      field: null,
+      row: null,
     })
     expect(errorTarget("steps[0].transforms[2]: this transform is not in the supported grammar")).toEqual({
       kind: "step",
       index: 0,
       transform: 2,
+      field: "transforms",
+      row: 2,
     })
     expect(errorTarget("database error")).toBeNull()
   })
@@ -574,5 +583,241 @@ describe("saveBlockers", () => {
 
   it("is empty when the page can save", () => {
     expect(saveBlockers(stored(), editorProblems(stored(), OUTPUT), { name: "x", scheduleOk: true })).toEqual([])
+  })
+})
+
+// ── BLD-16 (BLD-1 part 2) / J9: the form kinds in the editor ────────────
+
+/** The plan's J2 example: all three new kinds, one after the other. */
+const FORM_STORED: Pick<AuthoredDefinition, "inputs" | "steps"> = {
+  inputs: [
+    { name: "orders", zone: "silver", table: "orders" },
+    { name: "customers", zone: "silver", table: "customers" },
+  ],
+  steps: [
+    {
+      name: "joined",
+      kind: "join",
+      left: "orders",
+      right: "customers",
+      joinType: "left",
+      on: [{ left: "customer_id", right: "id" }],
+      columns: [
+        { side: "left", column: "order_id" },
+        { side: "left", column: "amount" },
+        { side: "right", column: "country" },
+        { side: "right", column: "id", name: "customer_ref" },
+      ],
+    },
+    {
+      name: "by_country",
+      kind: "aggregate",
+      reads: "joined",
+      groupBy: ["country"],
+      measures: [
+        { function: "sum", column: "amount", name: "revenue" },
+        { function: "count", name: "order_count" },
+      ],
+      havingMatch: "all",
+      having: [{ column: "revenue", operator: ">", value: "1000" }],
+    },
+    {
+      name: "big_or_local",
+      kind: "filter",
+      reads: "by_country",
+      match: "any",
+      conditions: [
+        { column: "revenue", operator: ">=", value: "5000" },
+        { column: "country", operator: "=", value: "ID" },
+      ],
+    },
+  ],
+}
+
+describe("the form kinds (BLD-16, J1, J2)", () => {
+  it("opens a stored join, aggregate and filter as those kinds and sends them back equal", () => {
+    const state = editorStateFrom(FORM_STORED)
+    expect(state.steps[0]).toMatchObject({ kind: "join", left: { id: "input-1" }, right: { id: "input-2" }, joinType: "left" })
+    expect(state.steps[1]).toMatchObject({ kind: "aggregate", reads: { id: "step-3" } })
+    expect(state.steps[2]).toMatchObject({ kind: "filter", reads: { id: "step-4" } })
+    // The API's JSON, byte for byte: an unnamed output column and a count
+    // measure's absent column carry no key, exactly as stored (J2).
+    expect(definitionBody(state.inputs, state.steps).steps).toEqual(FORM_STORED.steps)
+  })
+
+  it("keeps a stored join whose `on` is not a list as unknown, and sends it back as stored", () => {
+    const broken = {
+      inputs: FORM_STORED.inputs,
+      steps: [
+        {
+          name: "joined",
+          kind: "join",
+          left: "orders",
+          right: "customers",
+          joinType: "left",
+          on: "customer_id",
+          columns: [{ side: "left", column: "order_id" }],
+        },
+      ],
+    }
+    const state = editorStateFrom(broken)
+    expect(state.steps[0]).toMatchObject({ kind: "unknown", name: "joined" })
+    expect(definitionBody(state.inputs, state.steps).steps).toEqual(broken.steps)
+  })
+
+  it("keeps a join reading its input through a rename, and follows the item by id", () => {
+    let state = editorStateFrom(FORM_STORED)
+    for (const typed of ["customer", "custom", "c", "", "clients"]) state = renameItem(state, "input-2", typed)
+    expect(state.steps[0]).toMatchObject({ kind: "join", right: { id: "input-2" } })
+    expect(definitionBody(state.inputs, state.steps).steps[0]).toMatchObject({ right: "clients" })
+  })
+
+  it("says to choose an input when a join's side reads an item that was removed", () => {
+    const state = removeItem(editorStateFrom(FORM_STORED), "input-1")
+    const problems = editorProblems(state, OUTPUT)
+    expect(problems.items["step-3"]).toMatchObject({
+      message: "Choose an input or an earlier step for the left side to read.",
+      field: "left",
+    })
+  })
+
+  it("puts each form kind's own problem on its item", () => {
+    // The three steps, emptied: a join with no pair, an aggregate with
+    // neither group-by nor measure, a filter with no condition.
+    const base = editorStateFrom(FORM_STORED)
+    const emptied = {
+      ...base,
+      steps: base.steps.map((step) =>
+        step.kind === "join"
+          ? { ...step, on: [], columns: [] }
+          : step.kind === "aggregate"
+            ? { ...step, groupBy: [], measures: [] }
+            : step.kind === "filter"
+              ? { ...step, conditions: [] }
+              : step
+      ),
+    }
+    const problems = editorProblems(emptied, OUTPUT)
+    expect(problems.items["step-3"]).toMatchObject({ field: "on", message: "Add at least one pair of columns to match on." })
+    expect(problems.items["step-4"]).toMatchObject({ field: "groupBy", message: "Add a column to group by or a measure." })
+    expect(problems.items["step-5"]).toMatchObject({ field: "conditions", message: "Add at least one condition." })
+  })
+
+  it("marks an empty column in a form kind's row", () => {
+    const base = editorStateFrom(FORM_STORED)
+    const holed = {
+      ...base,
+      steps: base.steps.map((step) =>
+        step.kind === "join"
+          ? { ...step, on: [{ left: "", right: "id" }] }
+          : step.kind === "aggregate"
+            ? { ...step, groupBy: [""] }
+            : step.kind === "filter"
+              ? { ...step, conditions: [{ column: "", operator: "", value: "1" }] }
+              : step
+      ),
+    }
+    const problems = editorProblems(holed, OUTPUT)
+    expect(problems.items["step-3"]).toMatchObject({ field: "on", message: "Choose a column on both sides of every pair." })
+    expect(problems.items["step-4"]).toMatchObject({ field: "groupBy", message: "Choose a column for every group-by entry." })
+    expect(problems.items["step-5"]).toMatchObject({ field: "conditions", message: "Choose a column for every condition." })
+  })
+
+  it("switching a form step to SQL keeps the id, the name and the place", () => {
+    const state = editorStateFrom(FORM_STORED)
+    const sql = "SELECT `__left`.`order_id` AS `order_id` FROM `orders` AS `__left`"
+    const switched = switchToSql(state, "step-3", sql)
+    expect(switched.steps[0]).toEqual({ id: "step-3", kind: "sql", name: "joined", sql })
+    expect(switched.steps[1]).toEqual(state.steps[1])
+    expect(switched.steps[2]).toEqual(state.steps[2])
+    expect(switched.inputs).toEqual(state.inputs)
+    expect(definitionBody(switched.inputs, switched.steps).steps[0]).toEqual({
+      name: "joined",
+      kind: "sql",
+      sql,
+    })
+  })
+})
+
+describe("the form kinds' fill and naming rules (J9)", () => {
+  const col = (name: string) => ({ name, type: "String" })
+
+  it("joinOutputColumns fills every left column, then every right one, renaming collisions", () => {
+    // A right column whose name a left column has becomes `<right item>_<column>`.
+    const one = joinOutputColumns("orders", [col("id"), col("amount")], "customers", [col("id"), col("country")])
+    expect(one).toEqual([
+      { side: "left", column: "id" },
+      { side: "left", column: "amount" },
+      { side: "right", column: "id", name: "customers_id" },
+      { side: "right", column: "country" },
+    ])
+    // …and `_2`, `_3` while the renamed candidate is still taken.
+    const two = joinOutputColumns("orders", [col("id"), col("customers_id")], "customers", [col("id")])
+    expect(two).toEqual([
+      { side: "left", column: "id" },
+      { side: "left", column: "customers_id" },
+      { side: "right", column: "id", name: "customers_id_2" },
+    ])
+  })
+
+  it("joinOutputColumns keeps a right column whose name no left column has", () => {
+    const out = joinOutputColumns("orders", [col("id")], "customers", [col("country")])
+    expect(out).toEqual([{ side: "left", column: "id" }, { side: "right", column: "country" }])
+  })
+
+  it("measureName gives function_column, count for a bare count, and makes them unique", () => {
+    expect(measureName("sum", "amount", [])).toBe("sum_amount")
+    expect(measureName("count", "", [])).toBe("count")
+    expect(measureName("count", "", ["count"])).toBe("count_2")
+    expect(measureName("sum", "amount", ["sum_amount"])).toBe("sum_amount_2")
+  })
+
+  // BLD-16 review R5: a name is at most 48 characters (D2), and
+  // `countDistinct_` plus a 40-character column is 54.
+  it("caps an automatic measure name at the 48 characters a name may have", () => {
+    const column = "c".repeat(40)
+    const fresh = measureName("countDistinct", column, [])
+    expect(fresh.length).toBe(MAX_NAME_CHARS)
+    expect(fresh.startsWith("countDistinct_")).toBe(true)
+    expect(isUsableName(fresh)).toBe(true)
+    // The uniqueness suffix is part of the 48, not added past it.
+    const numbered = measureName("countDistinct", column, [fresh])
+    expect(numbered.length).toBeLessThanOrEqual(MAX_NAME_CHARS)
+    expect(numbered.endsWith("_2")).toBe(true)
+    expect(isUsableName(numbered)).toBe(true)
+  })
+
+  it("formColumns drops the names the API would refuse, and says it dropped one", () => {
+    expect(formColumns([col("order date"), col("amount"), col("2nd"), col("")])).toEqual({
+      columns: [col("amount")],
+      dropped: true,
+    })
+    expect(formColumns([col("amount")])).toEqual({ columns: [col("amount")], dropped: false })
+  })
+})
+
+describe("errors that name a form kind's field (BLD-16, D7)", () => {
+  it("reads steps[i].<field>[j] as the field and the row it names", () => {
+    expect(errorTarget("steps[2].measures[1]: a measure is count, countDistinct, sum, avg, min or max")).toEqual({
+      kind: "step",
+      index: 2,
+      transform: null,
+      field: "measures",
+      row: 1,
+    })
+    expect(errorTarget("steps[0].on[0]: a column must be a plain name (letters, digits and underscores, not starting with a digit)")).toEqual({
+      kind: "step",
+      index: 0,
+      transform: null,
+      field: "on",
+      row: 0,
+    })
+    expect(errorTarget("steps[0].joinType: a join is inner, left, right or full")).toEqual({
+      kind: "step",
+      index: 0,
+      transform: null,
+      field: "joinType",
+      row: null,
+    })
   })
 })
