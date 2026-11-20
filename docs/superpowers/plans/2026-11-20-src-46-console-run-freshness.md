@@ -177,6 +177,8 @@ Notes for the reviewer:
 
 **Fix round 1.** `BLOCKER 1` (CI Lint, `react-hooks/refs`): `detailRef` (detail page) and `lastActiveRunId` (panel) are now synced in effects, not during render. Fixing it showed a second rule, `react-hooks/set-state-in-effect`, on the detail page's "counted" effect; the counted state is now derived (`countWaiting`) instead of set from an effect, with the same behaviour. `./node_modules/.bin/eslint` on the two files: exit 0, no errors. `bun test` on the panel file: 99 pass, 0 fail; on the detail page file: 46 pass, 0 fail. Full typecheck and suite: not verified locally, runs in CI.
 
+**Fix round 2.** `BLOCKER 2` (CI Unit tests, one timeout): the detail page tests' `tick` moved fake time in 1 s steps, so the 3-minute cap test ran 180 acts and outran the 5 s limit on CI. `tick` now steps by the 10 s poll interval at most (about 19 acts); the assertions and the 5 s limit are unchanged. `bun test src/features/connectors/connector-detail-page.test.tsx`: 46 pass, 0 fail. The four new tests take 0.41 s, 0.46 s, 0.08 s and 0.11 s (junit reporter, local). Full typecheck and suite: not verified locally, runs in CI.
+
 ## Review
 
 ### Round 1 (planner, 2026-11-20, head `98c978be1`)

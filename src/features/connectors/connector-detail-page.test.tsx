@@ -890,15 +890,17 @@ describe("ConnectorDetailPage after a run ends", () => {
   }
 
   /** Moves fake time on, letting the reads it starts finish inside `act`. */
-  // Bun's fake timers have no async advance, so time moves in 1 s steps, each in its own `act` so the render and
-  // the effects of one step (the next reload) have run before the next step.
+  // Bun's fake timers have no async advance, so time moves in steps, each in its own `act` so the render and the
+  // effects of one step (the next reload) have run before the next step. A step is the 10 s poll interval at most:
+  // finer steps (180 of 1 s for the 3-minute cap) made the test outrun its 5 s limit on CI (`SRC-46 review round 2, BLOCKER 2`).
   const tick = async (ms: number) => {
-    for (let left = ms; ; left -= 1000) {
+    const step = 10_000
+    for (let left = ms; ; left -= step) {
       await act(async () => {
-        jest.advanceTimersByTime(Math.min(left, 1000))
+        jest.advanceTimersByTime(Math.min(left, step))
         for (let i = 0; i < 30; i++) await Promise.resolve()
       })
-      if (left <= 1000) break
+      if (left <= step) break
     }
   }
 
