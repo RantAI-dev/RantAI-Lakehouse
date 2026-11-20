@@ -46,16 +46,24 @@ const event = (over: Partial<AuditEvent> = {}): AuditEvent => ({
   id: "audit-1",
   at: "2026-11-06T08:00:00.000Z",
   actor: "Platform Admin",
+  actorId: "usr_admin",
   actorKind: "user",
   action: "catalog.grant",
   resource: "catalog:silver.orders",
   outcome: "success",
+  outcomeDetail: "executed",
   policyDecision: "allow",
   obligations: [],
+  reason: null,
   ...over,
 })
 
 describe("EventDetail", () => {
+  /** The value cell of a metadata row, read through its label. */
+  function rowValueOf(label: string): string | null {
+    return screen.getByText(label).closest("div")?.querySelector("dd")?.textContent ?? null
+  }
+
   it("shows the detail sentence of a grant under a Detail label", () => {
     render(
       <EventDetail
@@ -71,6 +79,37 @@ describe("EventDetail", () => {
   it("shows no Detail row for an entry that has no detail", () => {
     render(<EventDetail event={event({ action: "catalog.annotate" })} />)
     expect(screen.queryByText("Detail")).toBeNull()
+  })
+
+  // plan D2, D4, D4b: the detail names the principal behind the actor, the
+  // outcome the row stored (beside the four-word one the badge shows), and
+  // the stored detail column, when it holds one.
+  it("shows the actor id, the stored outcome and the stored reason of an event that carries them", () => {
+    render(
+      <EventDetail
+        event={event({
+          actorId: "usr_admin",
+          outcomeDetail: "failed",
+          reason: "Central returned 403 while the tool ran.",
+        })}
+      />,
+    )
+    expect(screen.getByText("Actor id")).toBeDefined()
+    expect(rowValueOf("Actor id")).toBe("usr_admin")
+    expect(screen.getByText("Stored outcome")).toBeDefined()
+    expect(rowValueOf("Stored outcome")).toBe("failed")
+    expect(screen.getByText("Reason")).toBeDefined()
+    expect(rowValueOf("Reason")).toBe("Central returned 403 while the tool ran.")
+  })
+
+  it("shows a dash for the actor id of an event nobody signed in caused", () => {
+    render(<EventDetail event={event({ actorId: null })} />)
+    expect(rowValueOf("Actor id")).toBe("—")
+  })
+
+  it("shows no Reason row for an event that stored no reason", () => {
+    render(<EventDetail event={event({ reason: null })} />)
+    expect(screen.queryByText("Reason")).toBeNull()
   })
 })
 
@@ -107,21 +146,35 @@ describe("AuditPage", () => {
 // the same search as a CSV file.
 describe("AuditPage: search, paging, deep link and export", () => {
   const SEARCH = "/api/governance/audit/events"
+  const ACTORS = "/api/governance/audit/actors"
   const EXPORT = "/api/governance/audit/export.csv"
 
   /** The row the API sends: the same object as one row of the old list. */
   const row = (id: string, action: string) => event({ id, action, resource: `dashboard:${id}` })
 
+  /** The principals the actors route answers, when a test needs named people. */
+  const actorsPage = {
+    actors: [
+      { actorId: "usr_admin", actor: "Platform Admin", actorKind: "user" as const },
+      { actorId: "agt_qa", actor: "QA Runner", actorKind: "agent" as const },
+    ],
+  }
+
   type Sent = { path: string; params: URLSearchParams }
   let sent: Sent[] = []
   let saved: Blob[] = []
 
-  /** Stubs `fetch`: `answer` gets each request's path and query and returns the response. */
-  function stubApi(answer: (path: string, params: URLSearchParams) => Response) {
+  /**
+   * Stubs `fetch`: `answer` gets each request's path and query and returns
+   * the response; the actors route is answered with `actors` (an empty list
+   * unless a test passes one, or a Response to make the route fail).
+   */
+  function stubApi(answer: (path: string, params: URLSearchParams) => Response, actors?: Response) {
     sent = []
     spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
       const url = new URL(String(input), "http://localhost")
       sent.push({ path: url.pathname, params: url.searchParams })
+      if (url.pathname === ACTORS) return actors ?? json({ actors: [] })
       return answer(url.pathname, url.searchParams)
     }) as unknown as typeof fetch)
   }
@@ -177,30 +230,123 @@ describe("AuditPage: search, paging, deep link and export", () => {
     })
   })
 
-  it("Search sends what was typed, and does not filter the loaded rows in the browser", async () => {
-    stubApi(() => json({ events: [row("a1", "dashboard.share")], nextCursor: null }))
+  // plan D2: with the actors route unreadable the person field falls back to
+  // the raw id, and the search still sends what was typed.
+  it("Search sends the typed person id when the actors list cannot be read, and does not filter the loaded rows in the browser", async () => {
+    stubApi(
+      () => json({ events: [row("a1", "dashboard.share")], nextCursor: null }),
+      json({ error: "The audit trail could not be read." }, 500),
+    )
     renderPage()
     await waitFor(() => expect(screen.getAllByText("dashboard.share").length).toBeGreaterThan(0))
+    expect(screen.getByText(/Could not read the trail's people/)).toBeDefined()
 
-    fireEvent.change(screen.getByLabelText("Person"), { target: { value: "u-7" } })
+    fireEvent.change(screen.getByLabelText("Person"), { target: { value: "usr-7" } })
     fireEvent.change(screen.getByLabelText("Action"), { target: { value: "catalog." } })
     chooseOption(screen.getByRole("combobox", { name: "Outcome" }), "Failed")
     fireEvent.click(screen.getByRole("button", { name: "Search" }))
 
     await waitFor(() => expect(searches().length).toBe(2))
     expect(Object.fromEntries(searches()[1].params)).toEqual({
-      actor: "u-7",
+      actor: "usr-7",
       action: "catalog.",
       outcome: "failed",
     })
     // The filters are kept in the address, so a link reproduces the search.
     await waitFor(() =>
       expect(Object.fromEntries(new URLSearchParams(window.location.search))).toEqual({
-        actor: "u-7",
+        actor: "usr-7",
         action: "catalog.",
         outcome: "failed",
       }),
     )
+  })
+
+  // plan D2: the person filter is a picker over the trail's principals.
+  it("lists the trail's actors in the person picker, and picking one sends actor=<id> on the search", async () => {
+    stubApi(
+      () => json({ events: [row("a1", "dashboard.share")], nextCursor: null }),
+      json(actorsPage),
+    )
+    renderPage()
+    await waitFor(() => expect(screen.getAllByText("dashboard.share").length).toBeGreaterThan(0))
+
+    fireEvent.click(screen.getByRole("button", { name: "Person" }))
+    const options = await screen.findAllByRole("option")
+    expect(options.map((option) => option.textContent)).toEqual([
+      "Platform Admin · User",
+      "QA Runner · Agent",
+    ])
+    fireEvent.click(options[1] as HTMLElement)
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Person" }).textContent).toContain("QA Runner"),
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Search" }))
+    await waitFor(() => expect(searches().length).toBe(2))
+    expect(searches()[1].params.get("actor")).toBe("agt_qa")
+    await waitFor(() =>
+      expect(Object.fromEntries(new URLSearchParams(window.location.search)).actor).toBe("agt_qa"),
+    )
+  })
+
+  // plan D2: clicking the actor in a row narrows the trail to that principal,
+  // without waiting for a Search click.
+  it("sets the person filter when the actor in a row is clicked, and the next request carries that actor", async () => {
+    stubApi(
+      () => json({ events: [row("a1", "dashboard.share")], nextCursor: null }),
+      json(actorsPage),
+    )
+    renderPage()
+    await waitFor(() => expect(screen.getAllByText("dashboard.share").length).toBeGreaterThan(0), {
+      timeout: 5000,
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: /Platform Admin/ }))
+
+    await waitFor(() => expect(searches().length).toBe(2), { timeout: 5000 })
+    expect(searches()[1].params.get("actor")).toBe("usr_admin")
+    // The picker shows the picked person by name, so the filter is legible.
+    await waitFor(
+      () =>
+        expect(screen.getByRole("button", { name: "Person" }).textContent).toContain("Platform Admin"),
+      { timeout: 5000 },
+    )
+  })
+
+  // plan D2: the same from the detail drawer, whose Actor row is a button too.
+  it("sets the person filter when the actor in the open detail is clicked", async () => {
+    stubApi(
+      () => json({ events: [row("a1", "dashboard.share")], nextCursor: null }),
+      json(actorsPage),
+    )
+    renderPage()
+    await waitFor(() => expect(screen.getAllByText("dashboard.share").length).toBeGreaterThan(0))
+
+    fireEvent.click(screen.getByRole("button", { name: "dashboard.share" }))
+    expect(await screen.findByText("Audit event a1")).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Platform Admin (User)" }))
+
+    await waitFor(() => expect(searches().length).toBe(2))
+    expect(searches()[1].params.get("actor")).toBe("usr_admin")
+  })
+
+  // plan D2: a row nobody signed in caused has no principal to filter by, so
+  // its actor is plain text and not a button.
+  it("leaves the actor of an event with no actor id unclickable", async () => {
+    stubApi(() =>
+      json(
+        {
+          events: [{ ...row("a1", "auth.login"), actor: "Sign-in form", actorId: null }],
+          nextCursor: null,
+        },
+      ),
+    )
+    renderPage()
+    await waitFor(() => expect(screen.getAllByText("auth.login").length).toBeGreaterThan(0))
+
+    expect(screen.getAllByText("Sign-in form").length).toBeGreaterThan(0)
+    expect(screen.queryByRole("button", { name: /Sign-in form/ })).toBeNull()
   })
 
   it("Load more sends the cursor of the last page and appends the next one", async () => {
@@ -287,7 +433,8 @@ describe("AuditPage: search, paging, deep link and export", () => {
     renderPage()
 
     expect(await screen.findByText("Audit event a1")).toBeDefined()
-    expect(sent.every((c) => c.path === SEARCH)).toBe(true)
+    // The list and the actors list load; the one event is not fetched again.
+    expect(sent.every((c) => c.path === SEARCH || c.path === ACTORS)).toBe(true)
   })
 
   it("shows the list and a plain sentence, not a broken page, when the linked event is gone", async () => {

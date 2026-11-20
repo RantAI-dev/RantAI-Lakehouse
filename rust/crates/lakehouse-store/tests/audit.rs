@@ -20,8 +20,8 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::audit::{
-    AuditCursor, AuditFilter, AuditScope, NewAuditEvent, count_matching, explain_search, get,
-    insert, list, list_for_resources, search,
+    ACTORS_MAX, AuditCursor, AuditFilter, AuditScope, NewAuditEvent, actors, count_matching,
+    explain_search, get, insert, list, list_for_resources, search,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -1381,5 +1381,111 @@ async fn the_reach_narrows_the_trail_to_one_tenant(pool: PgPool) -> sqlx::Result
     );
     let one = get(&pool, &of_retail, &scope_of_retail).await.unwrap();
     assert_eq!(one.map(|e| e.id), Some(of_retail.clone()));
+    Ok(())
+}
+
+// ── The actors of the trail (`GOV-1` acceptance follow-up, D2) ──────────
+
+/// The person filter's list is capped: 501 actors seeded, exactly
+/// [`ACTORS_MAX`] come back, newest-seen first, and the one left out is the
+/// actor seen longest ago.
+#[sqlx::test(migrations = "../../migrations")]
+async fn actors_lists_at_most_five_hundred_actors_newest_seen_first(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO audit_event (id, at, principal_id, principal_kind, actor_label, action, \
+         outcome) \
+         SELECT 'actor-cap-' || lpad(g::text, 4, '0'), \
+                timestamptz '2026-01-01T00:00:00Z' + g * interval '1 second', \
+                'principal-' || lpad(g::text, 4, '0'), 'user', 'Actor ' || g, 'a.b', 'executed' \
+         FROM generate_series(1, 501) AS g",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let listed = actors(&pool, &AuditScope::All).await.unwrap();
+    assert_eq!(ACTORS_MAX, 500, "the cap this test pins");
+    assert_eq!(listed.len(), 500, "the list is capped at {ACTORS_MAX}");
+    assert_eq!(
+        listed[0].principal_id, "principal-0501",
+        "newest seen first"
+    );
+    assert_eq!(
+        listed[1].principal_id, "principal-0500",
+        "second newest next"
+    );
+    assert_eq!(
+        listed.last().map(|a| a.principal_id.as_str()),
+        Some("principal-0002"),
+        "the actor seen longest ago is the one left out"
+    );
+    Ok(())
+}
+
+/// A row nobody signed in caused carries no `principal_id`, and the filter
+/// sends an id back, so an id-less actor cannot be picked: it is not listed,
+/// however often it acted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn actors_leaves_out_the_rows_nobody_signed_in_caused(pool: PgPool) -> sqlx::Result<()> {
+    let mut named = sample("a.b");
+    named.principal_id = Some("principal-1".to_owned());
+    insert(&pool, named).await.unwrap();
+    let mut anonymous = sample("a.b");
+    anonymous.principal_id = None;
+    anonymous.principal_kind = None;
+    anonymous.actor_label = None;
+    insert(&pool, anonymous).await.unwrap();
+
+    let listed = actors(&pool, &AuditScope::All).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|a| a.principal_id.as_str())
+            .collect::<Vec<_>>(),
+        ["principal-1"],
+        "only the actor with an id is listed: {listed:?}"
+    );
+    Ok(())
+}
+
+/// The reach narrows the actor list the same way it narrows the trail: a
+/// tenant that does not own the shared catalog lists only its own people,
+/// and no scope lists the deployment's own rows — they carry no principal id
+/// at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_reach_narrows_the_actor_list_to_one_tenant(pool: PgPool) -> sqlx::Result<()> {
+    let group = a_person_of(&pool, "Ayu", "ayu@example.test", GROUP_TENANT).await;
+    let retail = a_person_of(&pool, "Rafi", "rafi@example.test", RETAIL_TENANT).await;
+    a_row_of(&pool, "row.of.group", Some(&group)).await;
+    a_row_of(&pool, "row.of.retail", Some(&retail)).await;
+    a_row_of(&pool, "row.of.the.deployment", None).await;
+
+    let scope_of_retail = AuditScope::Tenant {
+        tenant_id: RETAIL_TENANT.to_owned(),
+        owns_catalog: false,
+    };
+    let listed = actors(&pool, &scope_of_retail).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|a| a.principal_id.as_str())
+            .collect::<Vec<_>>(),
+        [retail.as_str()],
+        "a tenant lists its own people only"
+    );
+
+    let everyone = actors(&pool, &AuditScope::All).await.unwrap();
+    let ids: Vec<&str> = everyone.iter().map(|a| a.principal_id.as_str()).collect();
+    assert!(
+        ids.contains(&group.as_str()) && ids.contains(&retail.as_str()),
+        "{ids:?}"
+    );
+    assert_eq!(
+        ids.len(),
+        2,
+        "the deployment's own rows are no actor: {ids:?}"
+    );
     Ok(())
 }

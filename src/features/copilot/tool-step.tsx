@@ -27,6 +27,7 @@ import { cn } from "@/lib/utils";
 import { encodeFilters } from "@/lib/dashboard-filter-state";
 import { ErrorWithReference } from "@/components/error-reference";
 import { splitReference } from "@/features/dashboards/records";
+import { APPROVAL_STATE_TEXT, type ApprovalState } from "./approval-state";
 
 /**
  * One step of a turn. `confirmed` says the person confirmed it, so it saved
@@ -44,6 +45,12 @@ export type ToolStep = {
   confirmed?: boolean;
   /** The server dropped this step's `result` to fit the conversation cap. */
   resultDropped?: boolean;
+  /**
+   * What the run behind a `needs_approval` step was doing when this
+   * conversation was opened (AI-28 / LH-AI-18-09). Read from the run,
+   * never saved into the conversation — the next open reads it again.
+   */
+  approvalState?: ApprovalState;
 };
 
 export const TOOL_LABEL: Record<string, string> = {
@@ -264,10 +271,11 @@ function StepBody({ step }: { step: ToolStep }) {
     return (
       <div className="mt-1 space-y-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[11px]">
         <p className="text-foreground">{String(res.summary ?? "This action requires approval.")}</p>
-        {/* SEC-57: the person who asked for the action may not approve it
-            themselves, so the card says who has to. */}
+        {/* AI-28 / LH-AI-18-09: the line follows the run's state read on
+            open, so a decided approval no longer says someone must still
+            approve it. SEC-57's note is the `pending` line. */}
         <p className="text-muted-foreground">
-          Someone else with approval rights must approve it.
+          {APPROVAL_STATE_TEXT[step.approvalState ?? "pending"].line}
         </p>
         <Link
           href={approvalId ? `/governance/approvals?id=${encodeURIComponent(approvalId)}` : "/governance/approvals"}
@@ -521,7 +529,11 @@ export function ToolStepCard({ step }: { step: ToolStep }) {
   const tool = step.tool;
   const res = asObj(step.result);
   const needsApproval = Boolean(res.needs_approval);
-  const pending = Boolean(res.needs_confirmation) || needsApproval;
+  // AI-28 / LH-AI-18-09: only an approval still waiting gets the clock tile,
+  // the auto-opened disclosure and the amber "pending approval" pill. A
+  // decided one reads its state from the run instead.
+  const approvalState = step.approvalState ?? "pending";
+  const pending = Boolean(res.needs_confirmation) || (needsApproval && approvalState === "pending");
   const hasError = !step.ok || "error" in res;
   const [open, setOpen] = React.useState(pending);
   const [raw, setRaw] = React.useState(false);
@@ -564,7 +576,7 @@ export function ToolStepCard({ step }: { step: ToolStep }) {
           ) : null}
           {needsApproval ? (
             <span className="shrink-0 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
-              pending approval
+              {APPROVAL_STATE_TEXT[approvalState].badge}
             </span>
           ) : res.needs_confirmation ? (
             <span className="shrink-0 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
