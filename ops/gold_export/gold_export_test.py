@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import json
 import os
 import random
 import sys
@@ -316,6 +317,28 @@ def _load_lakekeeper_metadata(mart_name: str) -> dict:
     if not load.ok:
         raise GoldExportFailure(f"Lakekeeper loadTable failed: {load.status_code} {load.text}")
     return load.json().get("metadata", {})
+
+
+def _load_metadata_file(metadata_file: str) -> dict:
+    """Read one Iceberg metadata JSON named by a `metadata-log` entry.
+    The catalog's log holds file names, not documents; this uses the same
+    S3 client, endpoint and credentials as `get_s3_parquet_files`, so the
+    gate keeps one storage path and one auth path (DATA-6 review R7
+    follow-up — the evidence print needs each entry's snapshot ids and
+    operations, which are only in the file)."""
+    location_path = (
+        metadata_file.split("://", 1)[1] if "://" in metadata_file else metadata_file
+    )
+    bucket, _, key = location_path.partition("/")
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=RUSTFS_ENDPOINT,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
+        region_name="us-east-1",
+    )
+    obj = s3.get_object(Bucket=bucket or S3_BUCKET, Key=key)
+    return json.loads(obj["Body"].read())
 
 
 def get_s3_parquet_files(mart_name: str) -> list[str]:
@@ -1031,15 +1054,18 @@ def step_a_reader_during_a_publish_never_sees_a_mix() -> None:
         _wait_for("the latest-copy run to report success", run_succeeded, 120, interval_s=1.0)
 
         # DATA-6 review R1: prove the replace was ONE catalog commit (D3).
-        # DATA-6 review R7: D11's snapshot expiry is itself a catalog commit
-        # whenever an older snapshot exists, so the whole log can grow by 2
-        # on a correct run. Attribute the growth to the replace instead:
-        # find the metadata-log entry that introduced the new current
-        # snapshot and assert the entry before it is the baseline's last
-        # entry. A delete-then-append split would put an extra commit
-        # between them and fail, whatever the cleanup did afterwards.
-        # Every read here comes from `_load_lakekeeper_metadata` — no new
-        # metadata-file reader is introduced by this gate.
+        # DATA-6 review R7 (follow-up): CI run 44721191272 reported the new
+        # current snapshot at metadata-log entry 1, not 0. That entry is NOT
+        # a second commit: PyIceberg's `_update_table_metadata_log` appends an
+        # entry for the file it SUPERSEDES, stamped with THAT file's
+        # `last_updated_ms`. The entry right after the baseline is therefore
+        # the baseline's own metadata file, written before the new snapshot;
+        # the replace's own file is entry 1. Matching by timestamp mistook
+        # that bookkeeping entry for an extra commit. The baseline already
+        # measures an EXISTING latest table (AC1 ran a successful publish
+        # first), so no second publish is needed. Identify the introducing
+        # entry by what the files CONTAIN instead, and print every entry on
+        # failure so a genuine split replace is visible in the CI log.
         meta_after = _load_lakekeeper_metadata(f"{MART_NAME}_latest")
         log_after = list(meta_after.get("metadata-log") or [])
         if len(log_after) <= len(log_before):
@@ -1060,30 +1086,58 @@ def step_a_reader_during_a_publish_never_sees_a_mix() -> None:
             raise GoldExportFailure(
                 f"DATA-6 D3: gold.{MART_NAME}_latest has no current snapshot {current_id}"
             )
-        snapshot_ms = current_snapshot.get("timestamp-ms")
-        if not isinstance(snapshot_ms, int):
-            raise GoldExportFailure(
-                f"DATA-6 D3: the current snapshot has no timestamp-ms: {current_snapshot}"
-            )
+
+        old_ids = {
+            snapshot.get("snapshot-id")
+            for snapshot in (meta_before.get("snapshots") or [])
+        }
         new_entries = log_after[len(log_before):]
+        entry_docs = []
+        for entry in new_entries:
+            doc = _load_metadata_file(entry["metadata-file"])
+            snapshots = doc.get("snapshots") or []
+            entry_docs.append(
+                (
+                    entry,
+                    {s.get("snapshot-id") for s in snapshots},
+                    sorted(str((s.get("summary") or {}).get("operation")) for s in snapshots),
+                )
+            )
+
+        def entry_report() -> str:
+            """Every entry after the baseline, with its snapshot ids and
+            operations — the evidence the CI log was missing."""
+            return "\n".join(
+                f"  [{i}] timestamp-ms={entry.get('timestamp-ms')} "
+                f"metadata-file={entry.get('metadata-file')} "
+                f"snapshot-ids={sorted(ids)} operations={ops}"
+                for i, (entry, ids, ops) in enumerate(entry_docs)
+            )
+
+        print(f"[gold-export] DATA-6 D3 new metadata-log entries:\n{entry_report()}")
+        all_new_ids = set()
+        for _, ids, _ in entry_docs:
+            all_new_ids |= ids - old_ids
         introducing = next(
-            (
-                i
-                for i, entry in enumerate(new_entries)
-                if isinstance(entry.get("timestamp-ms"), int)
-                and entry["timestamp-ms"] >= snapshot_ms
-            ),
+            (i for i, (_, ids, _) in enumerate(entry_docs) if current_id in ids),
             None,
         )
-        if introducing != 0:
+        if introducing is None:
             raise GoldExportFailure(
-                f"DATA-6 D3: the new current snapshot was introduced by "
-                f"metadata-log entry {introducing} after the baseline, "
-                "expected 0 (one commit for the replace)"
+                f"DATA-6 D3: no new metadata-log entry holds the new current "
+                f"snapshot {current_id}:\n{entry_report()}"
             )
-        if log_before and log_after[len(log_before) - 1] != log_before[-1]:
+        if entry_docs[introducing][1] - old_ids != all_new_ids:
             raise GoldExportFailure(
-                "DATA-6 D3: the entry before the replace is not the baseline entry"
+                f"DATA-6 D3: new snapshots were introduced by more than one "
+                f"metadata-log entry (entry {introducing} holds only part of "
+                f"{sorted(all_new_ids)}), so the replace was not one commit:\n"
+                f"{entry_report()}"
+            )
+        if introducing > 0 and entry_docs[introducing - 1][1] != old_ids:
+            raise GoldExportFailure(
+                f"DATA-6 D3: the entry before the replace is not the baseline "
+                f"metadata file (snapshot ids {sorted(old_ids)}):\n{entry_report()}"
             )
         # DATA-6 review R8: assert on the CURRENT snapshot's operation,
         # not on a sorted list of every new snapshot id. After D11's expiry
@@ -1096,12 +1150,12 @@ def step_a_reader_during_a_publish_never_sees_a_mix() -> None:
         if operation not in ("append", "overwrite"):
             raise GoldExportFailure(
                 f"DATA-6 D3: the replace's current snapshot has operation "
-                f"{operation!r}, expected 'append' or 'overwrite'"
+                f"{operation!r}, expected 'append' or 'overwrite':\n{entry_report()}"
             )
         print(
             f"[gold-export] DATA-6 D3: metadata log {len(log_before)} -> "
-            f"{len(log_after)}; the replace introduced the current snapshot "
-            f"at entry 0 (cleanup may add entries after it); operation {operation}"
+            f"{len(log_after)}; one commit (entry {introducing}) introduced "
+            f"{sorted(all_new_ids)}; operation {operation}"
         )
 
         delay = time.time() - published_at
