@@ -1,13 +1,21 @@
 /**
  * The pipeline editor's state and its rules (BLD-1 part 1, D2, D7, D16,
- * D17, D17a), kept out of the component so each rule is tested on its own
- * (`CODE-STANDARD.md` 4.6).
+ * D17, D17a; BLD-16, J9), kept out of the component so each rule is
+ * tested on its own (`CODE-STANDARD.md` 4.6).
  *
  * A pipeline is a list of inputs, an ordered list of steps and one output
  * table (D1). The editor holds the same shape with one addition: every input
  * and step carries a client-side `id` that never changes and is never
  * reused, so the selection, a preview and an error stay attached to the item
  * while its name is being typed, renamed or moved.
+ *
+ * BLD-16 / J1 adds the `join`, `aggregate` and `filter` form kinds. Their
+ * reads follow the item by id, as `transform`'s do (R1-B2); the page checks
+ * only what it can know without a round trip (a read not chosen, a join
+ * with no pair, an empty row), and every other rule stays the API's (D7) —
+ * the console has no SQL renderer of its own (J6): "Show as SQL" asks the
+ * API, and "Switch to SQL step" writes the API's answer back as a SQL
+ * step.
  *
  * The API is the authority on every rule here (`pipeline_compile.rs`): it
  * checks the names, the limits and what a step reads on save and on preview,
@@ -23,11 +31,18 @@ import { tokenizeSql } from "./sql-text"
 import type { DataLayer } from "./status"
 import type {
   AuthoredDefinition,
+  PipelineAggregateStep,
+  PipelineFilterStep,
   PipelineInput,
+  PipelineJoinPair,
+  PipelineJoinColumn,
+  PipelineJoinStep,
+  PipelineMeasure,
   PipelinePreview,
   PipelinePreviewInput,
   PipelineSqlStep,
   PipelineStep,
+  PipelineStepCondition,
   PipelineTransformStep,
 } from "@/services/contracts/pipelines"
 
@@ -56,19 +71,77 @@ export type StepRead = { id: string } | { name: string }
  * A step being edited. `unknown` is a stored step of a kind this console
  * does not know (R1-S2): it keeps the stored object as it was, is shown and
  * can be moved or removed, and is sent back unchanged.
+ *
+ * BLD-16 / J1: the three form kinds. `left`, `right` and `reads` are
+ * [`StepRead`]s — the item by its id, so a rename follows with nothing to
+ * rewrite (R1-B2) — and are written as names only when the body is built.
  */
 export type EditorStep =
   | { id: string; kind: "transform"; name: string; reads: StepRead; transforms: string[] }
   | { id: string; kind: "sql"; name: string; sql: string }
+  | {
+      id: string
+      kind: "join"
+      name: string
+      left: StepRead
+      right: StepRead
+      joinType: string
+      on: PipelineJoinPair[]
+      columns: PipelineJoinColumn[]
+    }
+  | {
+      id: string
+      kind: "aggregate"
+      name: string
+      reads: StepRead
+      groupBy: string[]
+      measures: PipelineMeasure[]
+      havingMatch: string
+      having: PipelineStepCondition[]
+    }
+  | { id: string; kind: "filter"; name: string; reads: StepRead; match: string; conditions: PipelineStepCondition[] }
   | { id: string; kind: "unknown"; name: string; stored: PipelineStep }
 
+/** A stored step of a kind this console knows how to edit, or `null`. */
+export type KnownStep = PipelineTransformStep | PipelineSqlStep | PipelineJoinStep | PipelineAggregateStep | PipelineFilterStep
+
+/** A `join` step's `on` pair, checked by field shape. */
+function isJoinPair(pair: unknown): pair is PipelineJoinPair {
+  const fields = pair as Record<string, unknown>
+  return typeof fields.left === "string" && typeof fields.right === "string"
+}
+
+/** A join output column, checked by field shape. */
+function isJoinColumn(column: unknown): column is PipelineJoinColumn {
+  const fields = column as Record<string, unknown>
+  return typeof fields.side === "string" && typeof fields.column === "string"
+}
+
+/** A filter or `having` condition, checked by field shape. */
+function isCondition(condition: unknown): condition is PipelineStepCondition {
+  const fields = condition as Record<string, unknown>
+  return (
+    typeof fields.column === "string" && typeof fields.operator === "string" && typeof fields.value === "string"
+  )
+}
+
+/** An aggregate measure, checked by field shape. */
+function isMeasure(measure: unknown): measure is PipelineMeasure {
+  const fields = measure as Record<string, unknown>
+  return (
+    typeof fields.function === "string" &&
+    typeof fields.name === "string" &&
+    (fields.column === undefined || typeof fields.column === "string")
+  )
+}
+
 /**
- * A stored step as one of the two kinds this console knows, or `null`.
- * The fields are checked, not only `kind`: the API may add kinds (part 2),
- * and a step whose fields are not the ones its kind has is not edited as
- * if they were (R1-S2).
+ * A stored step as one of the kinds this console knows, or `null`.
+ * The fields are checked, not only `kind`: the API may add kinds, and a
+ * step whose fields are not the ones its kind has is not edited as if
+ * they were (R1-S2) — BLD-16's kinds included.
  */
-export function knownStep(step: PipelineStep): PipelineTransformStep | PipelineSqlStep | null {
+export function knownStep(step: PipelineStep): KnownStep | null {
   const fields = step as Record<string, unknown>
   if (step.kind === "sql" && typeof fields.sql === "string") return step as PipelineSqlStep
   if (
@@ -78,6 +151,38 @@ export function knownStep(step: PipelineStep): PipelineTransformStep | PipelineS
     (fields.transforms as unknown[]).every((t) => typeof t === "string")
   )
     return step as PipelineTransformStep
+  // BLD-16 / J2: each form kind only when every field has its type; a join
+  // whose `on` is not a list stays `unknown` and is sent back as stored.
+  if (
+    step.kind === "join" &&
+    typeof fields.left === "string" &&
+    typeof fields.right === "string" &&
+    typeof fields.joinType === "string" &&
+    Array.isArray(fields.on) &&
+    (fields.on as unknown[]).every(isJoinPair) &&
+    Array.isArray(fields.columns) &&
+    (fields.columns as unknown[]).every(isJoinColumn)
+  )
+    return step as PipelineJoinStep
+  if (
+    step.kind === "aggregate" &&
+    typeof fields.reads === "string" &&
+    Array.isArray(fields.groupBy) &&
+    (fields.groupBy as unknown[]).every((c) => typeof c === "string") &&
+    Array.isArray(fields.measures) &&
+    (fields.measures as unknown[]).every(isMeasure) &&
+    (fields.havingMatch === undefined || typeof fields.havingMatch === "string") &&
+    (fields.having === undefined || (Array.isArray(fields.having) && (fields.having as unknown[]).every(isCondition)))
+  )
+    return step as PipelineAggregateStep
+  if (
+    step.kind === "filter" &&
+    typeof fields.reads === "string" &&
+    (fields.match === undefined || typeof fields.match === "string") &&
+    Array.isArray(fields.conditions) &&
+    (fields.conditions as unknown[]).every(isCondition)
+  )
+    return step as PipelineFilterStep
   return null
 }
 
@@ -124,6 +229,46 @@ export function editorStateFrom(def: Pick<AuthoredDefinition, "inputs" | "steps"
     const step = knownStep(stored)
     if (step === null) return { id, kind: "unknown", name: stored.name, stored }
     if (step.kind === "sql") return { id, kind: "sql", name: step.name, sql: step.sql }
+    // BLD-16 / J2: a join reads two items, an aggregate and a filter one;
+    // each `reads`/`left`/`right` is resolved to its item's id once, here.
+    if (step.kind === "join") {
+      const leftId = byName.get(step.left)
+      const rightId = byName.get(step.right)
+      return {
+        id,
+        kind: "join",
+        name: step.name,
+        left: leftId ? { id: leftId } : { name: step.left },
+        right: rightId ? { id: rightId } : { name: step.right },
+        joinType: step.joinType,
+        on: step.on.map((pair) => ({ ...pair })),
+        columns: step.columns.map((column) => ({ ...column })),
+      }
+    }
+    if (step.kind === "aggregate") {
+      const readId = byName.get(step.reads)
+      return {
+        id,
+        kind: "aggregate",
+        name: step.name,
+        reads: readId ? { id: readId } : { name: step.reads },
+        groupBy: [...step.groupBy],
+        measures: step.measures.map((measure) => ({ ...measure })),
+        havingMatch: step.havingMatch ?? "",
+        having: (step.having ?? []).map((condition) => ({ ...condition })),
+      }
+    }
+    if (step.kind === "filter") {
+      const readId = byName.get(step.reads)
+      return {
+        id,
+        kind: "filter",
+        name: step.name,
+        reads: readId ? { id: readId } : { name: step.reads },
+        match: step.match ?? "",
+        conditions: step.conditions.map((condition) => ({ ...condition })),
+      }
+    }
     const readId = byName.get(step.reads)
     return { id, kind: "transform", name: step.name, reads: readId ? { id: readId } : { name: step.reads }, transforms: [...step.transforms] }
   })
@@ -166,10 +311,15 @@ function taken(names: readonly string[], candidate: string): boolean {
 }
 
 /** `base`, or `base_2`, `base_3`, … : the first that no other item has. */
-function firstFree(base: string, names: readonly string[]): string {
-  if (!taken(names, base)) return base
+function firstFree(base: string, names: readonly string[], maxChars = Number.POSITIVE_INFINITY): string {
+  // BLD-16 review R5: a caller whose name must fit D2's 48 characters
+  // passes `maxChars`; the cut then also covers the uniqueness suffix, so
+  // `_2` is inside the limit rather than appended past it.
+  const first = base.slice(0, maxChars)
+  if (!taken(names, first)) return first
   for (let n = 2; ; n += 1) {
-    const candidate = `${base}_${n}`
+    const suffix = `_${n}`
+    const candidate = `${first.slice(0, Math.max(0, maxChars - suffix.length))}${suffix}`
     if (!taken(names, candidate)) return candidate
   }
 }
@@ -239,18 +389,42 @@ export function addInput(state: EditorState, hasConnector = false): { state: Edi
  * Adds a step at the end. It reads what was last before it (the last step,
  * else the first input), so a new step continues the pipeline; a SQL step
  * starts as `SELECT *` from that name.
+ *
+ * BLD-16 / J9: a new `join` reads the last item on the LEFT and nothing
+ * on the right (nothing is readable until a side is chosen); a new
+ * `aggregate` or `filter` reads the last item. The rest starts empty, and
+ * the page says what is missing (`editorProblems`).
  */
-export function addStep(state: EditorState, kind: "transform" | "sql"): { state: EditorState; id: string | null } {
+export function addStep(
+  state: EditorState,
+  kind: "transform" | "sql" | "join" | "aggregate" | "filter"
+): { state: EditorState; id: string | null } {
   if (!canAddStep(state)) return { state, id: null }
   const [id, next] = nextId(state, "step")
   const names = [...state.inputs, ...state.steps].map((item) => item.name)
   const name = firstFree(`step_${state.steps.length + 1}`, names)
   const previous = readableItems(state, state.steps.length)
   const last = previous[previous.length - 1]
+  const readsLast: StepRead = last ? { id: last.id } : { name: "" }
   const step: EditorStep =
     kind === "sql"
       ? { id, kind: "sql", name, sql: last ? `SELECT *\nFROM ${last.name}` : "SELECT *\nFROM " }
-      : { id, kind: "transform", name, reads: last ? { id: last.id } : { name: "" }, transforms: [] }
+      : kind === "join"
+        ? {
+            id,
+            kind: "join",
+            name,
+            left: readsLast,
+            right: { name: "" },
+            joinType: "inner",
+            on: [],
+            columns: [],
+          }
+        : kind === "aggregate"
+          ? { id, kind: "aggregate", name, reads: readsLast, groupBy: [], measures: [], havingMatch: "all", having: [] }
+          : kind === "filter"
+            ? { id, kind: "filter", name, reads: readsLast, match: "all", conditions: [] }
+            : { id, kind: "transform", name, reads: readsLast, transforms: [] }
   return { state: { ...next, steps: [...next.steps, step] }, id }
 }
 
@@ -309,20 +483,65 @@ export function setInputTable(state: EditorState, id: string, table: string): Ed
   return followed ? renameItem(withTable, id, suggestInputName(table, others)) : withTable
 }
 
-export function updateStep(
-  state: EditorState,
-  id: string,
-  patch: { reads?: StepRead; transforms?: string[]; sql?: string }
-): EditorState {
+/**
+ * Changes one step's fields, per kind. A step of an unknown kind is not
+ * edited here (R1-S2); the API checks what this page cannot (D7).
+ */
+export type StepPatch =
+  | { reads?: StepRead; transforms?: string[] }
+  | { sql?: string }
+  | { left?: StepRead; right?: StepRead; joinType?: string; on?: PipelineJoinPair[]; columns?: PipelineJoinColumn[] }
+  | { groupBy?: string[]; measures?: PipelineMeasure[]; havingMatch?: string; having?: PipelineStepCondition[] }
+  | { match?: string; conditions?: PipelineStepCondition[] }
+
+export function updateStep(state: EditorState, id: string, patch: StepPatch): EditorState {
   return {
     ...state,
     steps: state.steps.map((step) => {
       if (step.id !== id) return step
       if (step.kind === "transform") {
-        return { ...step, reads: patch.reads ?? step.reads, transforms: patch.transforms ?? step.transforms }
+        const fields = patch as { reads?: StepRead; transforms?: string[] }
+        return { ...step, reads: fields.reads ?? step.reads, transforms: fields.transforms ?? step.transforms }
+      }
+      if (step.kind === "join") {
+        const fields = patch as {
+          left?: StepRead
+          right?: StepRead
+          joinType?: string
+          on?: PipelineJoinPair[]
+          columns?: PipelineJoinColumn[]
+        }
+        return {
+          ...step,
+          left: fields.left ?? step.left,
+          right: fields.right ?? step.right,
+          joinType: fields.joinType ?? step.joinType,
+          on: fields.on ?? step.on,
+          columns: fields.columns ?? step.columns,
+        }
+      }
+      if (step.kind === "aggregate") {
+        const fields = patch as {
+          groupBy?: string[]
+          measures?: PipelineMeasure[]
+          havingMatch?: string
+          having?: PipelineStepCondition[]
+        }
+        return {
+          ...step,
+          groupBy: fields.groupBy ?? step.groupBy,
+          measures: fields.measures ?? step.measures,
+          havingMatch: fields.havingMatch ?? step.havingMatch,
+          having: fields.having ?? step.having,
+        }
+      }
+      if (step.kind === "filter") {
+        const fields = patch as { match?: string; conditions?: PipelineStepCondition[] }
+        return { ...step, match: fields.match ?? step.match, conditions: fields.conditions ?? step.conditions }
       }
       if (step.kind === "unknown") return step
-      return { ...step, sql: patch.sql ?? step.sql }
+      const fields = patch as { sql?: string }
+      return { ...step, sql: fields.sql ?? step.sql }
     }),
   }
 }
@@ -356,7 +575,7 @@ export type OutputSettings = {
 /**
  * The control a problem is about, so the pane ties the sentence to that
  * control (`aria-describedby`, `aria-invalid`; BLD-1 part 1 S3 review
- * R1-S10).
+ * R1-S10). BLD-16 adds the form kinds' own fields.
  */
 export type ProblemField =
   | "name"
@@ -368,6 +587,17 @@ export type ProblemField =
   | "output-zone"
   | "output-table"
   | "plain-copy"
+  | "left"
+  | "right"
+  | "on"
+  // BLD-16 review R4: a join's type has no page-side rule, but the API's
+  // refusal names it (`steps[i].joinType`), so a control can be tied to it.
+  | "joinType"
+  | "columns"
+  | "groupBy"
+  | "measures"
+  | "having"
+  | "conditions"
 
 export type Problem = { message: string; field: ProblemField }
 
@@ -394,19 +624,84 @@ export function editorProblems(state: EditorState, output: OutputSettings): Edit
     // the page's to check; the API checks it on save (R1-S2).
     if (step.kind === "unknown") return
     let problem = at("name")(nameProblem(step.name, otherNames(state, step.id)))
-    if (!problem && step.kind === "transform") {
-      const reads = step.reads
+    // BLD-16 / J9: only what the page can know without the API — a read
+    // not chosen or later, an empty list, an empty row. Everything else
+    // (a duplicate output name, a measure's name a column already has, a
+    // value's length) is the API's (D7). `what === "step"` keeps the
+    // part 1 sentences byte for byte; a join's sides get their own.
+    const readProblem = (field: ProblemField, reads: StepRead, what: string): Problem | null => {
       const later = "id" in reads && state.steps.slice(index).some((other) => other.id === reads.id)
-      if (later) problem = at("reads")("This step reads a step that comes after it; reorder the steps.")
-      else if (!("id" in reads) || !readableItems(state, index).some((item) => item.id === reads.id))
-        problem = at("reads")("Choose an input or an earlier step for this step to read.")
-      // BLD-10 D2: an empty form step is a copy that was not chosen.
-      else if (step.transforms.length === 0) problem = at("operations")("Add an operation, or remove this step.")
+      if (later)
+        return at(field)(
+          what === "step"
+            ? "This step reads a step that comes after it; reorder the steps."
+            : `The ${what} reads a step that comes after it; reorder the steps.`
+        )
+      if (!("id" in reads) || !readableItems(state, index).some((item) => item.id === reads.id))
+        return at(field)(
+          what === "step" ? "Choose an input or an earlier step for this step to read." : `Choose an input or an earlier step for the ${what} to read.`
+        )
+      return null
+    }
+    if (!problem && step.kind === "transform") {
+      problem =
+        readProblem("reads", step.reads, "step") ??
+        // BLD-10 D2: an empty form step is a copy that was not chosen.
+        at("operations")(step.transforms.length === 0 ? "Add an operation, or remove this step." : null)
     }
     if (!problem && step.kind === "sql") {
       if (step.sql.trim() === "") problem = at("sql")("Write the step's SELECT.")
       else if (step.sql.length > MAX_SQL_CHARS)
         problem = at("sql")(`A SQL step is at most ${MAX_SQL_CHARS.toLocaleString("en-US")} characters.`)
+    }
+    if (!problem && step.kind === "join") {
+      problem =
+        readProblem("left", step.left, "left side") ??
+        readProblem("right", step.right, "right side") ??
+        at("on")(step.on.length === 0 ? "Add at least one pair of columns to match on." : null) ??
+        at("on")(
+          step.on.some((pair) => pair.left.trim() === "" || pair.right.trim() === "")
+            ? "Choose a column on both sides of every pair."
+            : null
+        ) ??
+        at("columns")(step.columns.length === 0 ? "Choose at least one output column." : null) ??
+        at("columns")(
+          step.columns.some((column) => column.column.trim() === "")
+            ? "Choose a column for every output column."
+            : null
+        )
+    }
+    if (!problem && step.kind === "aggregate") {
+      problem =
+        readProblem("reads", step.reads, "step") ??
+        at("groupBy")(
+          step.groupBy.length === 0 && step.measures.length === 0
+            ? "Add a column to group by or a measure."
+            : null
+        ) ??
+        at("groupBy")(
+          step.groupBy.some((column) => column.trim() === "") ? "Choose a column for every group-by entry." : null
+        ) ??
+        at("measures")(
+          step.measures.some((measure) => measure.function !== "count" && (measure.column ?? "").trim() === "")
+            ? "Choose a column for every measure."
+            : null
+        )
+    }
+    if (!problem && step.kind === "filter") {
+      problem =
+        readProblem("reads", step.reads, "step") ??
+        at("conditions")(step.conditions.length === 0 ? "Add at least one condition." : null) ??
+        at("conditions")(
+          step.conditions.some((condition) => condition.column.trim() === "")
+            ? "Choose a column for every condition."
+            : null
+        ) ??
+        at("conditions")(
+          step.conditions.some((condition) => condition.operator.trim() === "")
+            ? "Choose an operator for every condition."
+            : null
+        )
     }
     if (problem) items[step.id] = problem
   })
@@ -486,23 +781,75 @@ export function saveBlockers(
 
 /**
  * The `inputs` and `steps` a save sends (D1). Names, zones and tables are
- * trimmed; a SQL step's text goes as written (D4).
+ * trimmed; a SQL step's text goes as written (D4). BLD-16 / J2: the form
+ * kinds go as the API's serde shape — a join's unnamed output column and a
+ * `count` measure's absent column carry no key, exactly as the API writes
+ * them back, so a definition the editor did not change compares equal.
  */
 export function definitionBody(inputs: readonly EditorInput[], steps: readonly EditorStep[]): {
   inputs: PipelineInput[]
   steps: PipelineStep[]
 } {
   const state = { inputs: [...inputs], steps: [...steps] }
+  const condition = (c: PipelineStepCondition): PipelineStepCondition =>
+    ({ column: c.column.trim(), operator: c.operator, value: c.value })
+  const joinColumn = (column: PipelineJoinColumn): PipelineJoinColumn => {
+    const name = column.name?.trim() ?? ""
+    // The API treats an absent `name` as "the column's own"; sending an
+    // empty one is the same thing, but keeping the key absent matches what
+    // the API sends back, so an unchanged definition stays unchanged.
+    const out: PipelineJoinColumn = { side: column.side, column: column.column.trim() }
+    if (name !== "") out.name = name
+    return out
+  }
+  const measure = (m: PipelineMeasure): PipelineMeasure => {
+    const out: PipelineMeasure = { function: m.function, name: m.name.trim() }
+    const column = m.column?.trim() ?? ""
+    if (column !== "") out.column = column
+    return out
+  }
   return {
     inputs: inputs.map((input) => ({ name: input.name.trim(), zone: input.zone.trim(), table: input.table.trim() })),
-    steps: steps.map((step): PipelineStep =>
-      step.kind === "unknown"
-        ? // R1-S2: exactly as stored.
-          step.stored
-        : step.kind === "sql"
-          ? { name: step.name.trim(), kind: "sql", sql: step.sql }
-          : { name: step.name.trim(), kind: "transform", reads: readsName(state, step.reads).trim(), transforms: [...step.transforms] }
-    ),
+    steps: steps.map((step): PipelineStep => {
+      if (step.kind === "unknown")
+        // R1-S2: exactly as stored.
+        return step.stored
+      if (step.kind === "sql") return { name: step.name.trim(), kind: "sql", sql: step.sql }
+      if (step.kind === "join")
+        return {
+          name: step.name.trim(),
+          kind: "join",
+          left: readsName(state, step.left).trim(),
+          right: readsName(state, step.right).trim(),
+          joinType: step.joinType,
+          on: step.on.map((pair) => ({ left: pair.left.trim(), right: pair.right.trim() })),
+          columns: step.columns.map(joinColumn),
+        }
+      if (step.kind === "aggregate")
+        return {
+          name: step.name.trim(),
+          kind: "aggregate",
+          reads: readsName(state, step.reads).trim(),
+          groupBy: step.groupBy.map((column) => column.trim()),
+          measures: step.measures.map(measure),
+          havingMatch: step.havingMatch,
+          having: step.having.map(condition),
+        }
+      if (step.kind === "filter")
+        return {
+          name: step.name.trim(),
+          kind: "filter",
+          reads: readsName(state, step.reads).trim(),
+          match: step.match,
+          conditions: step.conditions.map(condition),
+        }
+      return {
+        name: step.name.trim(),
+        kind: "transform",
+        reads: readsName(state, step.reads).trim(),
+        transforms: [...step.transforms],
+      }
+    }),
   }
 }
 
@@ -520,6 +867,98 @@ export function definitionChanged(
   const storedState = editorStateFrom(stored)
   const before = definitionBody(storedState.inputs, storedState.steps)
   return JSON.stringify(now) !== JSON.stringify(before)
+}
+
+// ── BLD-16 (BLD-1 part 2) / J6, J9 ────────────────────────────────────────
+
+/**
+ * J6, "Switch to SQL step" (one way): the step becomes a SQL step that
+ * carries the API's own text for it, same id, same name, same place; every
+ * other item is untouched and nothing is saved until Save.
+ */
+export function switchToSql(state: EditorState, id: string, sql: string): EditorState {
+  return {
+    ...state,
+    steps: state.steps.map((step) => (step.id === id ? { id: step.id, kind: "sql", name: step.name, sql } : step)),
+  }
+}
+
+/**
+ * J9: the output columns a new join step (or a change of side) is filled
+ * with — every column of the left, then every column of the right. A
+ * right column whose name is already taken (without regard to case, as the
+ * API's duplicate rule reads, D2) is named `<right item name>_<column>`,
+ * then `_2`, `_3`, … while still taken. Columns the API would refuse (not
+ * letters, digits and underscores) are the pane's to leave out
+ * (`formColumns`), not this rule's.
+ */
+export function joinOutputColumns(
+  leftName: string,
+  leftColumns: readonly Column[],
+  rightName: string,
+  rightColumns: readonly Column[]
+): PipelineJoinColumn[] {
+  const names: string[] = []
+  const out: PipelineJoinColumn[] = []
+  const claim = (name: string): string => {
+    // The API refuses duplicate output names without regard to case, so
+    // the collision check reads the same way.
+    names.push(name.toLowerCase())
+    return name
+  }
+  for (const column of leftColumns) {
+    out.push({ side: "left", column: column.name })
+    claim(column.name)
+  }
+  for (const column of rightColumns) {
+    if (!taken(names, column.name)) {
+      out.push({ side: "right", column: column.name })
+      claim(column.name)
+      continue
+    }
+    const name = firstFree(`${rightName}_${column.name}`, names)
+    names.push(name.toLowerCase())
+    out.push({ side: "right", column: column.name, name })
+  }
+  return out
+}
+
+/**
+ * J9: a new measure's name — `<function>_<column>`, or `count` for a
+ * `count` with no column — made unique against `takenNames` (the step's
+ * group-by columns and earlier measure names).
+ */
+export function measureName(fn: string, column: string, takenNames: readonly string[]): string {
+  const base = column.trim() === "" && fn === "count" ? "count" : `${fn}_${column.trim()}`
+  // BLD-16 review R5: the name becomes an output column, so it lives by
+  // D2's 48 characters — `countDistinct_` plus a 48-character column is
+  // 63, which the API would refuse on a name nobody typed.
+  return firstFree(base, takenNames, MAX_NAME_CHARS)
+}
+
+/**
+ * J9: the columns a form step's pickers offer — those the API would accept
+ * (`Ident::new`, the same regular expression as [`IDENT`]) — and whether
+ * any was left out, so the pane can say why it is missing.
+ */
+export function formColumns(columns: readonly Column[]): { columns: Column[]; dropped: boolean } {
+  const kept = columns.filter((column) => IDENT.test(column.name))
+  return { columns: kept, dropped: kept.length !== columns.length }
+}
+
+/**
+ * The columns of what one read names: an input's from the lakehouse
+ * (`getTableDetail`), a step's from its last preview. `null` when they are
+ * not known, and the pane offers a "Load columns" button instead.
+ */
+export function readColumns(
+  read: StepRead,
+  inputColumns: Readonly<Record<string, Column[] | null>>,
+  stepColumns: Readonly<Record<string, Column[] | null>>
+): Column[] | null {
+  if (!("id" in read)) return null
+  const columns = inputColumns[read.id] ?? stepColumns[read.id]
+  return columns && columns.length > 0 ? columns : null
 }
 
 /**
@@ -628,20 +1067,36 @@ export function previewAsRecords(preview: PipelinePreview): {
 /** The item a refusal names. */
 export type ErrorTarget =
   | { kind: "input"; index: number }
-  | { kind: "step"; index: number; transform: number | null }
+  | {
+      kind: "step"
+      index: number
+      /** The `transforms[j]` the refusal named, or null — kept for the part 1 panes. */
+      transform: number | null
+      /** BLD-16 / J2: the `<field>` the refusal named (`on`, `columns`, `groupBy`, `measures`, `conditions`, `having`, …), or null. */
+      field: string | null
+      /** BLD-16 / J2: the `[j]` the refusal named, or null. */
+      row: number | null
+    }
 
 /**
- * The item an API message names: `inputs[i]`, `steps[i]` or
- * `steps[i].transforms[j]` (D7; `DefinitionError::path` in
- * `pipeline_compile.rs`). `null` when it names none, and the page shows the
- * message at the page level instead of guessing an item.
+ * The item an API message names: `inputs[i]`, `steps[i]`,
+ * `steps[i].transforms[j]`, or a form kind's `steps[i].<field>[j]` (D7;
+ * `DefinitionError::path` in `pipeline_compile.rs`). `null` when it names
+ * none, and the page shows the message at the page level instead of
+ * guessing an item.
  */
 export function errorTarget(message: string): ErrorTarget | null {
-  const match = /\b(inputs|steps)\[(\d+)\](?:\.transforms\[(\d+)\])?/.exec(message)
+  const match = /\b(inputs|steps)\[(\d+)\](?:\.(\w+))?(?:\[(\d+)\])?/.exec(message)
   if (!match) return null
   const index = Number(match[2])
   if (match[1] === "inputs") return { kind: "input", index }
-  return { kind: "step", index, transform: match[3] === undefined ? null : Number(match[3]) }
+  return {
+    kind: "step",
+    index,
+    transform: match[3] === "transforms" && match[4] !== undefined ? Number(match[4]) : null,
+    field: match[3] ?? null,
+    row: match[4] === undefined ? null : Number(match[4]),
+  }
 }
 
 /**
@@ -660,19 +1115,21 @@ export function errorItemId(sent: { inputIds: readonly string[]; stepIds: readon
 export type Column = { name: string; type: string }
 
 /**
- * The columns a `transform` step's pickers offer: those of what it reads.
- * An input's come from the lakehouse (`getTableDetail`); a step's come from
+ * The columns a form step's pickers offer: those of what it reads. An
+ * input's come from the lakehouse (`getTableDetail`); a step's come from
  * its last preview, when it has one. Both maps are keyed by item id. `null`
  * when they are not known, and the fields stay free text.
+ *
+ * BLD-16: every form kind with ONE read (`transform`, `aggregate`,
+ * `filter`); a `join` has two, and its panes ask [`readColumns`] per side.
  */
 export function columnsRead(
-  step: Extract<EditorStep, { kind: "transform" }>,
+  step: Extract<EditorStep, { kind: "transform" | "aggregate" | "filter" }>,
   inputColumns: Readonly<Record<string, Column[] | null>>,
   stepColumns: Readonly<Record<string, Column[] | null>>
 ): string[] | null {
-  if (!("id" in step.reads)) return null
-  const columns = inputColumns[step.reads.id] ?? stepColumns[step.reads.id]
-  return columns && columns.length > 0 ? columns.map((column) => column.name) : null
+  const columns = readColumns(step.reads, inputColumns, stepColumns)
+  return columns ? columns.map((column) => column.name) : null
 }
 
 const LAYERS: readonly string[] = ["raw", "bronze", "silver", "gold", "semantic"]
@@ -818,15 +1275,18 @@ export function sqlStepHint(sql: string, readable: readonly string[]): string | 
 }
 
 /**
- * Whether a step names the input `id`: a form step that reads it, or a SQL
- * step whose text has its name as a word (outside strings and comments).
- * Broad on purpose: it decides only whether the name may still follow the
- * table (R1-S1), and keeping a name is the safe answer.
+ * Whether a step names the input `id`: a form step that reads it — a
+ * `transform`, `aggregate` or `filter` step, or a `join` on either side —
+ * or a SQL step whose text has its name as a word (outside strings and
+ * comments). Broad on purpose: it decides only whether the name may still
+ * follow the table (R1-S1), and keeping a name is the safe answer.
  */
 function inputIsNamed(state: EditorState, id: string): boolean {
   const name = state.inputs.find((input) => input.id === id)?.name ?? ""
   return state.steps.some((step) => {
-    if (step.kind === "transform") return "id" in step.reads && step.reads.id === id
+    if (step.kind === "transform" || step.kind === "aggregate" || step.kind === "filter")
+      return "id" in step.reads && step.reads.id === id
+    if (step.kind === "join") return ("id" in step.left && step.left.id === id) || ("id" in step.right && step.right.id === id)
     if (step.kind !== "sql" || name === "") return false
     return tokenizeSql(step.sql).some(
       (token) =>

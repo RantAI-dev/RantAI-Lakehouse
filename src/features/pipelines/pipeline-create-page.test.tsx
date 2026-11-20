@@ -57,6 +57,20 @@ let previewAnswer: { status: number; body: unknown } = {
   status: 200,
   body: { columns: [{ name: "id", type: "Int64" }], rows: [[1], [2]], truncated: false },
 }
+/**
+ * BLD-16 / J6: what `POST /api/pipelines/step-sql` answers — the default is
+ * the SQL the API really compiles for `existing()`'s transform step.
+ */
+let stepSqlAnswer: { status: number; body: unknown } = {
+  status: 200,
+  body: { sql: "SELECT * FROM `orders_raw` ORDER BY id LIMIT 1 BY id" },
+}
+/**
+ * BLD-16: `bronze/orders_raw`'s schema, when a test needs columns of its
+ * own (a column a form's picker must refuse, a column to sum). `null` keeps
+ * the shared schema every other test reads.
+ */
+let ordersRawSchema: { name: string; type: string }[] | null = null
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -89,6 +103,8 @@ beforeEach(() => {
     status: 200,
     body: { columns: [{ name: "id", type: "Int64" }], rows: [[1], [2]], truncated: false },
   }
+  stepSqlAnswer = { status: 200, body: { sql: "SELECT * FROM `orders_raw` ORDER BY id LIMIT 1 BY id" } }
+  ordersRawSchema = null
   ingestTargets = [
     { name: "public.orders", target: "orders" },
     { name: "public.customers", target: "customers" },
@@ -136,6 +152,15 @@ beforeEach(() => {
     // free-text fallback covers.
     if (url.startsWith("/api/lakehouse/tables/")) {
       const name = url.split("/api/lakehouse/tables/")[1] ?? ""
+      if (name === "bronze/orders_raw" && ordersRawSchema !== null) {
+        return jsonResponse({
+          schema: ordersRawSchema.map((column, i) => ({ id: i + 1, name: column.name, type: column.type, required: false })),
+          partitionSpec: [],
+          properties: {},
+          snapshots: [],
+          stats: {},
+        })
+      }
       if (!["bronze/orders_raw", "bronze/stock_raw"].includes(name)) {
         return jsonResponse({ error: "table not found" }, 404)
       }
@@ -156,6 +181,11 @@ beforeEach(() => {
     }
     if (url.startsWith("/api/pipelines/preview")) {
       return jsonResponse(previewAnswer.body, previewAnswer.status)
+    }
+    // BLD-16 / J6: the SQL of one form step. Must come before the generic
+    // POST /api/pipelines branch, which would swallow the path.
+    if (url.startsWith("/api/pipelines/step-sql")) {
+      return jsonResponse(stepSqlAnswer.body, stepSqlAnswer.status)
     }
     if (url.startsWith("/api/pipelines") && (method === "POST" || method === "PUT")) {
       return jsonResponse(saveAnswer.body, saveAnswer.status)
@@ -240,6 +270,17 @@ function pickOption(option: HTMLElement) {
   fireEvent.click(option)
 }
 
+/**
+ * BLD-16: chooses an option when another list may still be mounted — the
+ * list just opened is the last one in the DOM, and a closed one's options
+ * can linger behind base-ui's exit animation.
+ */
+function chooseLastOption(trigger: HTMLElement, optionName: string | RegExp) {
+  fireEvent.click(trigger)
+  const options = screen.getAllByRole("option", { name: optionName })
+  pickOption(options[options.length - 1])
+}
+
 /** Opens one of the two tabs. */
 async function openTab(name: "Build" | "Schedule and settings") {
   const tab = screen.getByRole("tab", { name })
@@ -283,7 +324,7 @@ async function fillNewPipeline() {
 
 /** Adds a form step and its one dedupe operation on `id`. */
 async function addDedupeStep() {
-  fireEvent.click(screen.getByRole("button", { name: "Form step" }))
+  fireEvent.click(screen.getByRole("button", { name: "Operations" }))
   fireEvent.click(await screen.findByRole("combobox", { name: "Key column" }))
   pickOption(await screen.findByRole("option", { name: "id" }))
   fireEvent.click(screen.getByRole("button", { name: /add transform/i }))
@@ -393,7 +434,7 @@ describe("the zone and column pickers in the pipeline editor (WEB-8 D8)", () => 
     ])
     expect(screen.queryByText("Columns appear here once the table exists")).toBeNull()
     // A form step reading the input picks from those columns, not free text.
-    fireEvent.click(screen.getByRole("button", { name: "Form step" }))
+    fireEvent.click(screen.getByRole("button", { name: "Operations" }))
     const column = await screen.findByRole("combobox", { name: "Key column" })
     fireEvent.click(column)
     expect(within(await screen.findByRole("listbox")).getAllByRole("option").map((o) => o.textContent)).toEqual([
@@ -409,7 +450,7 @@ describe("the zone and column pickers in the pipeline editor (WEB-8 D8)", () => 
     // The detail read answers 404: the columns are unknown, so the page says
     // why instead of showing an empty list, and a step's field is typed.
     await waitFor(() => expect(screen.getByText("Columns appear here once the table exists")).toBeTruthy())
-    fireEvent.click(screen.getByRole("button", { name: "Form step" }))
+    fireEvent.click(screen.getByRole("button", { name: "Operations" }))
     await waitFor(() => expect(screen.getByRole("textbox", { name: "Key column" })).toBeTruthy())
     expect(screen.getByText("Columns appear here once the table exists")).toBeTruthy()
   })
@@ -455,7 +496,7 @@ describe("the connector page's Create pipeline entry (BLD-7)", () => {
 
     // The connector's table does not exist in the lakehouse listing here,
     // so the key column is typed.
-    fireEvent.click(screen.getByRole("button", { name: "Form step" }))
+    fireEvent.click(screen.getByRole("button", { name: "Operations" }))
     fireEvent.change(await screen.findByPlaceholderText("order_id"), { target: { value: "id" } })
     fireEvent.click(screen.getByRole("button", { name: /add transform/i }))
     selectOutput()
@@ -613,7 +654,7 @@ describe("FBIC and the plain copy in the pipeline editor (BLD-10)", () => {
     fireEvent.click(plainCopySwitch())
     await waitFor(() => expect(plainCopySwitch().getAttribute("aria-checked")).toBe("true"))
 
-    fireEvent.click(screen.getByRole("button", { name: "Form step" }))
+    fireEvent.click(screen.getByRole("button", { name: "Operations" }))
     selectOutput()
     await waitFor(() => expect(plainCopySwitch().getAttribute("aria-checked")).toBe("false"))
     expect(plainCopySwitch().getAttribute("aria-disabled")).toBe("true")
@@ -691,7 +732,7 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     expect(within(steps).getByRole("button", { name: /1\. transformed/ })).toBeTruthy()
 
     selectRail(/1\. transformed/)
-    expect(await screen.findByText("Step 1 · Form")).toBeTruthy()
+    expect(await screen.findByText("Step 1 · Operations")).toBeTruthy()
     expect(screen.getByRole("combobox", { name: "Reads" }).textContent).toContain("orders_raw")
     expect(within(screen.getByRole("list", { name: "Operations of this step" })).getByText("dedupe(id)")).toBeTruthy()
   })
@@ -705,7 +746,7 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
 
   it("completes a SQL step with the inputs and the earlier steps", async () => {
     renderEditor(existing())
-    fireEvent.click(screen.getByRole("button", { name: "SQL step" }))
+    fireEvent.click(screen.getByRole("button", { name: /^SQL$/ }))
     expect(await screen.findByText("Step 2 · SQL")).toBeTruthy()
     const content = await waitFor(() => {
       const found = document.querySelector(".cm-content")
@@ -819,14 +860,14 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     expect(screen.queryByText("This pipeline will read as you from now on.")).toBeNull()
 
     await openTab("Build")
-    fireEvent.click(screen.getByRole("button", { name: "SQL step" }))
+    fireEvent.click(screen.getByRole("button", { name: /^SQL$/ }))
     expect(await screen.findByText("This pipeline will read as you from now on.")).toBeTruthy()
   })
 
   it("does not say so when the pipeline already reads as you", async () => {
     renderEditor(existing({ runAs: ME }))
     await signedIn()
-    fireEvent.click(screen.getByRole("button", { name: "SQL step" }))
+    fireEvent.click(screen.getByRole("button", { name: /^SQL$/ }))
     expect(await screen.findByText("Step 2 · SQL")).toBeTruthy()
     expect(screen.queryByText("This pipeline will read as you from now on.")).toBeNull()
   })
@@ -924,7 +965,7 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     renderEditor(stored)
     fireEvent.click(saveButton(/save changes/i))
 
-    expect(await screen.findByText("Step 1 · Form")).toBeTruthy()
+    expect(await screen.findByText("Step 1 · Operations")).toBeTruthy()
     const rows = () => within(screen.getByRole("list", { name: "Operations of this step" })).getAllByRole("listitem")
     await waitFor(() => expect(rows()[1].className).toContain("border-destructive"))
     expect(rows()[0].className).not.toContain("border-destructive")
@@ -965,7 +1006,7 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     expect(saveButton(/save changes/i).disabled).toBe(true)
     const reasons = screen.getByRole("status", { name: "Why it cannot be saved yet" })
     fireEvent.click(within(reasons).getByRole("button", { name: "Step transformed: Add an operation, or remove this step." }))
-    expect(await screen.findByText("Step 1 · Form")).toBeTruthy()
+    expect(await screen.findByText("Step 1 · Operations")).toBeTruthy()
   })
 
   it("says a new pipeline needs a name", async () => {
@@ -1051,14 +1092,366 @@ describe("required-field indicators in the pipeline editor (UX-1-R8)", () => {
   it("requires a step's reads and marks the operations group and operation arguments", async () => {
     renderEditor(existing())
     selectRail(/1\. transformed/)
-    await screen.findByText("Operations")
+    // BLD-16 / J9: the rail's add buttons also say "Operations" now, so the
+    // pane's operations group is found by its own words ("— add at least
+    // one" is the group heading's tail), not by the word "Operations" alone.
+    const operationsNote = await screen.findByText("— add at least one")
     expect((await screen.findByRole("combobox", { name: "Reads" })).getAttribute("aria-required")).toBe("true")
-    expect(hasMarker(screen.getByText(/Operations/).closest("p"))).toBe(true)
+    expect(hasMarker(operationsNote.closest("p"))).toBe(true)
     // The default dedupe row's Key column is refused blank by `draftIsComplete`.
     const key = screen.getByText("Key column")
     expect(key.getAttribute("data-required")).toBe("")
     // PR568 review: column metadata loads after the step opens. Wait for the
     // picker to replace its free-text fallback before checking its semantics.
     expect((await screen.findByRole("combobox", { name: "Key column" })).getAttribute("aria-required")).toBe("true")
+  })
+})
+
+// ── BLD-16 (BLD-1 part 2) / J9: the three form panes and the rail ──────
+
+describe("the form kinds in the pipeline editor (BLD-16)", () => {
+  /** The five add buttons the rail offers (J9: with four kinds of form the word "Form" names none of them). */
+  it("offers SQL, Join, Aggregate, Filter and Operations as the add buttons", async () => {
+    renderEditor()
+    await screen.findByPlaceholderText("orders_events")
+    for (const label of ["SQL", "Join", "Aggregate", "Filter", "Operations"]) {
+      expect(screen.getByRole("button", { name: new RegExp(`^${label}$`) })).toBeTruthy()
+    }
+    // The old "Form step" label is gone: it named none of the four kinds.
+    expect(screen.queryByRole("button", { name: /form step/i })).toBeNull()
+  })
+
+  /**
+   * Two inputs whose columns the lakehouse knows (WEB-8 D8's own mock), so a
+   * join over them can fill its output columns (J9) and a form step that
+   * reads one of them offers the columns.
+   */
+  async function twoKnownInputs() {
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly_rollup"), { target: { value: "form_steps" } })
+    fireEvent.change(screen.getByPlaceholderText("orders_events"), { target: { value: "orders_raw" } })
+    fireEvent.click(screen.getByRole("button", { name: "Add input" }))
+    fireEvent.change(screen.getByPlaceholderText("orders_events"), { target: { value: "stock_raw" } })
+    // Both inputs' schemas are read in the background; a join's fill needs
+    // them both, so wait for the selected input's columns to be listed.
+    await screen.findByText("updated_at")
+  }
+
+  it("fills a join's output columns when both sides are known, and saves the J2 shape", async () => {
+    renderEditor()
+    await twoKnownInputs()
+    fireEvent.click(screen.getByRole("button", { name: /^Join$/ }))
+    expect(await screen.findByText("Step 1 · Join")).toBeTruthy()
+    // A new join reads the last item on the left and nothing on the right.
+    expect(screen.getByRole("combobox", { name: "Left" }).textContent).toContain("stock_raw")
+    chooseOption(screen.getByRole("combobox", { name: "Right" }), "orders_raw")
+    // J9's fill: every column of the left, then every column of the right;
+    // a right column whose name is taken is named after the right item.
+    expect(await screen.findByDisplayValue("orders_raw_id")).toBeTruthy()
+    expect(screen.getByDisplayValue("orders_raw_updated_at")).toBeTruthy()
+    expect(screen.getByDisplayValue("orders_raw_status")).toBeTruthy()
+    // One pair to match on, from each side's own columns.
+    fireEvent.click(screen.getByRole("button", { name: /add a pair/i }))
+    chooseLastOption(screen.getByRole("combobox", { name: /stock_raw's column/ }), "id")
+    chooseLastOption(screen.getByRole("combobox", { name: /orders_raw's column/ }), "id")
+
+    selectOutput()
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly"), { target: { value: "form_steps_out" } })
+
+    const body = await saveAndRead("POST")
+    expect(body.steps).toEqual([
+      {
+        name: "step_1",
+        kind: "join",
+        left: "stock_raw",
+        right: "orders_raw",
+        joinType: "inner",
+        on: [{ left: "id", right: "id" }],
+        columns: [
+          { side: "left", column: "id" },
+          { side: "left", column: "updated_at" },
+          { side: "left", column: "status" },
+          { side: "right", column: "id", name: "orders_raw_id" },
+          { side: "right", column: "updated_at", name: "orders_raw_updated_at" },
+          { side: "right", column: "status", name: "orders_raw_status" },
+        ],
+      },
+    ])
+  })
+
+  it("fills a join's output with only the columns the API accepts (BLD-16 review R1)", async () => {
+    ordersRawSchema = [
+      { name: "id", type: "long" },
+      { name: "order date", type: "string" },
+      { name: "amount", type: "long" },
+    ]
+    renderEditor()
+    await twoKnownInputs()
+    fireEvent.click(screen.getByRole("button", { name: /^Join$/ }))
+    await screen.findByText("Step 1 · Join")
+    // The fill runs when the right side changes, so this is the moment J9's
+    // rule applies: a column the API would refuse is not offered at all.
+    chooseOption(screen.getByRole("combobox", { name: "Right" }), "orders_raw")
+    expect(await screen.findByDisplayValue("orders_raw_id")).toBeTruthy()
+    expect(screen.queryByText("order date")).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: /add a pair/i }))
+    chooseLastOption(screen.getByRole("combobox", { name: /stock_raw's column/ }), "id")
+    chooseLastOption(screen.getByRole("combobox", { name: /orders_raw's column/ }), "id")
+
+    selectOutput()
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly"), { target: { value: "form_steps_out" } })
+
+    const body = await saveAndRead("POST")
+    expect(body.steps).toEqual([
+      {
+        name: "step_1",
+        kind: "join",
+        left: "stock_raw",
+        right: "orders_raw",
+        joinType: "inner",
+        on: [{ left: "id", right: "id" }],
+        columns: [
+          { side: "left", column: "id" },
+          { side: "left", column: "updated_at" },
+          { side: "left", column: "status" },
+          { side: "right", column: "id", name: "orders_raw_id" },
+          { side: "right", column: "amount" },
+        ],
+      },
+    ])
+  })
+
+  it("says what an outer join does to a row with no match, and says nothing for an inner join", async () => {
+    renderEditor()
+    await twoKnownInputs()
+    fireEvent.click(screen.getByRole("button", { name: /^Join$/ }))
+    await screen.findByText("Step 1 · Join")
+    const sentence = "A row with no match gets 0 or an empty text in the other side's columns, not a blank."
+    expect(screen.queryByText(sentence)).toBeNull()
+    for (const type of ["left", "right", "full"]) {
+      chooseOption(screen.getByRole("combobox", { name: "Join type" }), type)
+      expect(await screen.findByText(sentence)).toBeTruthy()
+    }
+    chooseOption(screen.getByRole("combobox", { name: "Join type" }), "inner")
+    await waitFor(() => expect(screen.queryByText(sentence)).toBeNull())
+  })
+
+  it("names a new measure after its function and column, made unique", async () => {
+    ordersRawSchema = [
+      { name: "id", type: "long" },
+      { name: "amount", type: "long" },
+    ]
+    renderEditor()
+    fireEvent.change(screen.getByPlaceholderText("orders_events"), { target: { value: "orders_raw" } })
+    fireEvent.click(screen.getByRole("button", { name: /^Aggregate$/ }))
+    await screen.findByText("Step 1 · Aggregate")
+    fireEvent.click(screen.getByRole("button", { name: /add a measure/i }))
+    chooseOption(screen.getByRole("combobox", { name: "Column (count may leave it empty)" }), "amount")
+    // J9: the name a person has not typed is `<function>_<column>`.
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("sum_amount")
+  })
+
+  it("leaves out a column the API would refuse, and says so", async () => {
+    ordersRawSchema = [
+      { name: "id", type: "long" },
+      { name: "order date", type: "string" },
+    ]
+    renderEditor()
+    fireEvent.change(screen.getByPlaceholderText("orders_events"), { target: { value: "orders_raw" } })
+    fireEvent.click(screen.getByRole("button", { name: /^Aggregate$/ }))
+    // The group-by pickers offer only the columns the API accepts.
+    await screen.findByText("Group by")
+    await screen.findByText("Columns whose names are not letters, digits and underscores are left out; use a SQL step to read them.")
+    expect(screen.queryByText("order date")).toBeNull()
+  })
+
+  it("sends a filter's any as match, and its conditions as rows", async () => {
+    renderEditor()
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly_rollup"), { target: { value: "form_filter" } })
+    fireEvent.change(screen.getByPlaceholderText("orders_events"), { target: { value: "orders_raw" } })
+    await screen.findByText("updated_at")
+    fireEvent.click(screen.getByRole("button", { name: /^Filter$/ }))
+    await screen.findByText("Step 1 · Filter")
+    chooseOption(screen.getByRole("combobox", { name: "Keep rows where" }), "any holds")
+    fireEvent.click(screen.getByRole("button", { name: /add a condition/i }))
+    chooseOption(screen.getByRole("combobox", { name: "Column" }), "id")
+    fireEvent.change(screen.getByRole("textbox", { name: /Value/ }), { target: { value: "1" } })
+
+    selectOutput()
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly"), { target: { value: "form_filter_out" } })
+
+    const body = await saveAndRead("POST")
+    expect(body.steps).toEqual([
+      {
+        name: "step_1",
+        kind: "filter",
+        reads: "orders_raw",
+        match: "any",
+        conditions: [{ column: "id", operator: "=", value: "1" }],
+      },
+    ])
+  })
+
+  it("marks the Join type select when a refusal names it, and not for a name problem (BLD-16 review R4)", async () => {
+    renderEditor()
+    await twoKnownInputs()
+    fireEvent.click(screen.getByRole("button", { name: /^Join$/ }))
+    await screen.findByText("Step 1 · Join")
+    // A step named after an input is a "name" problem; the Join type select
+    // is not what it is about.
+    const name = screen.getByLabelText("Name in this pipeline")
+    fireEvent.change(name, { target: { value: "orders_raw" } })
+    await waitFor(() => expect(name.getAttribute("aria-invalid")).toBe("true"))
+    expect(screen.getByRole("combobox", { name: "Join type" }).getAttribute("aria-invalid")).toBeNull()
+  })
+
+  it("marks the Join type select for a `steps[0].joinType` refusal (BLD-16 review R4)", async () => {
+    const message = "steps[0].joinType: joinType is one of inner, left, right or full"
+    saveAnswer = { status: 400, body: { error: message } }
+    renderEditor()
+    await twoKnownInputs()
+    fireEvent.click(screen.getByRole("button", { name: /^Join$/ }))
+    await screen.findByText("Step 1 · Join")
+    chooseOption(screen.getByRole("combobox", { name: "Right" }), "orders_raw")
+    await screen.findByDisplayValue("orders_raw_id")
+    fireEvent.click(screen.getByRole("button", { name: /add a pair/i }))
+    chooseLastOption(screen.getByRole("combobox", { name: /stock_raw's column/ }), "id")
+    chooseLastOption(screen.getByRole("combobox", { name: /orders_raw's column/ }), "id")
+    selectOutput()
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly"), { target: { value: "form_400_type_out" } })
+
+    await saveAndRead("POST")
+
+    const alerts = await screen.findAllByRole("alert")
+    expect(alerts.map((alert) => alert.textContent)).toContain(message)
+    const select = screen.getByRole("combobox", { name: "Join type" })
+    expect(select.getAttribute("aria-invalid")).toBe("true")
+    expect(select.getAttribute("aria-describedby")).toBe("pipeline-editor-item-error")
+  })
+
+  it("selects the join a 400 names, and marks the pair it names (D7)", async () => {
+    const message =
+      "steps[0].on[0]: a column must be a plain name (letters, digits and underscores, not starting with a digit)"
+    saveAnswer = { status: 400, body: { error: message } }
+    renderEditor()
+    await twoKnownInputs()
+    fireEvent.click(screen.getByRole("button", { name: /^Join$/ }))
+    await screen.findByText("Step 1 · Join")
+    chooseOption(screen.getByRole("combobox", { name: "Right" }), "orders_raw")
+    await screen.findByDisplayValue("orders_raw_id")
+    fireEvent.click(screen.getByRole("button", { name: /add a pair/i }))
+    chooseLastOption(screen.getByRole("combobox", { name: /stock_raw's column/ }), "id")
+    chooseLastOption(screen.getByRole("combobox", { name: /orders_raw's column/ }), "id")
+    selectOutput()
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly"), { target: { value: "form_400_out" } })
+
+    await saveAndRead("POST")
+
+    // The join is selected, and the refusal is shown inside the first pair:
+    // one alert is the pane's own sentence, the one that matters here is the
+    // one inside the pair's box.
+    expect(await screen.findByText("Match on")).toBeTruthy()
+    const alerts = await screen.findAllByRole("alert")
+    const pairAlert = alerts.find((alert) => (alert.closest("div")?.className ?? "").includes("rounded-md"))
+    expect(pairAlert?.textContent).toBe(message)
+    const pairRow = pairAlert?.closest("div")
+    expect(pairRow?.textContent).toContain("stock_raw's column")
+    expect(pairRow?.textContent).toContain("orders_raw's column")
+  })
+})
+
+// ── BLD-16 (BLD-1 part 2) / J6: a form step as SQL ──────────────────────
+
+describe("a form step as SQL (BLD-16, J6)", () => {
+  /** The text of the one CodeMirror on the page (the shown SQL, or the SQL editor). */
+  async function cmDoc(): Promise<string> {
+    return waitFor(() => {
+      const found = document.querySelector(".cm-content")
+      if (!found) throw new Error("no editor yet")
+      const view = EditorView.findFromDOM(found as HTMLElement)
+      if (!view) throw new Error("no editor view")
+      return view.state.doc.toString()
+    })
+  }
+  const showButton = () => screen.getByRole("button", { name: /^show as sql/i })
+  const switchButton = () => screen.getByRole("button", { name: /switch to sql step/i })
+
+  it("shows the SQL of the selected form step, asking the API for it", async () => {
+    renderEditor(existing())
+    selectRail(/1\. transformed/)
+    fireEvent.click(showButton())
+
+    const call = await waitFor(() => sent.find((c) => c.path === "/api/pipelines/step-sql"))
+    expect(call?.method).toBe("POST")
+    expect(call?.body).toEqual({
+      inputs: [{ name: "orders_raw", zone: "bronze", table: "orders_raw" }],
+      steps: [{ name: "transformed", kind: "transform", reads: "orders_raw", transforms: ["dedupe(id)"] }],
+      step: "transformed",
+    })
+    // The text is the API's own — the console renders no SQL of its own —
+    // formatted for the eye only.
+    const doc = await cmDoc()
+    expect(doc).toContain("FROM `orders_raw`")
+    expect(doc).toContain("LIMIT 1 BY id")
+  })
+
+  it("marks the shown SQL stale after an edit, as the preview is marked", async () => {
+    renderEditor(existing())
+    selectRail(/1\. transformed/)
+    fireEvent.click(showButton())
+    await cmDoc()
+    expect(screen.queryByText(/Stale: the definition changed/)).toBeNull()
+
+    fireEvent.change(screen.getByLabelText("Name in this pipeline"), { target: { value: "deduped" } })
+    expect(await screen.findByText("Stale: the definition changed since this SQL was shown.")).toBeTruthy()
+  })
+
+  it("switches a form step to a SQL step after a confirm, keeping its name and place, and saves kind sql", async () => {
+    renderEditor(existing())
+    selectRail(/1\. transformed/)
+    fireEvent.click(switchButton())
+
+    // Asked first: the confirm is open and nothing was asked or changed.
+    const dialog = await screen.findByRole("dialog")
+    expect(
+      screen.getByText("This step becomes a SQL step. It cannot be turned back into a form.")
+    ).toBeTruthy()
+    expect(sent.filter((c) => c.path === "/api/pipelines/step-sql")).toHaveLength(0)
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Switch$/ }))
+
+    // The rail and the pane show the step as SQL, at the same place, under
+    // the same name, and the SQL editor holds the ROUTE'S OWN text — the
+    // formatted one is only ever for display.
+    expect(await screen.findByText("Step 1 · SQL")).toBeTruthy()
+    expect(await waitFor(() => cmDoc())).toBe("SELECT * FROM `orders_raw` ORDER BY id LIMIT 1 BY id")
+
+    const body = await saveAndRead("PUT")
+    expect(body.steps).toEqual([
+      { name: "transformed", kind: "sql", sql: "SELECT * FROM `orders_raw` ORDER BY id LIMIT 1 BY id" },
+    ])
+  })
+
+  it("changes nothing when the switch is cancelled", async () => {
+    renderEditor(existing())
+    selectRail(/1\. transformed/)
+    fireEvent.click(switchButton())
+    const dialog = await screen.findByRole("dialog")
+    fireEvent.click(within(dialog).getByRole("button", { name: /cancel/i }))
+
+    expect(await screen.findByText("Step 1 · Operations")).toBeTruthy()
+    expect(screen.queryByRole("dialog")).toBeNull()
+    expect(sent.filter((c) => c.path === "/api/pipelines/step-sql")).toHaveLength(0)
+  })
+
+  it("shows the route's refusal in the pane, and no SQL", async () => {
+    stepSqlAnswer = { status: 400, body: { error: "steps[0].transforms[0]: this transform is not in the supported grammar" } }
+    renderEditor(existing())
+    selectRail(/1\. transformed/)
+    fireEvent.click(showButton())
+
+    expect(
+      await screen.findByText("steps[0].transforms[0]: this transform is not in the supported grammar")
+    ).toBeTruthy()
+    expect(document.querySelector(".cm-content")).toBeNull()
   })
 })
