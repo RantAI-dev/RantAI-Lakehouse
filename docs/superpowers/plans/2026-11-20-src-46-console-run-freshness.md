@@ -175,6 +175,8 @@ Notes for the reviewer:
 - Task 2: `useIngestRunState` keeps the id of the last active run in a ref; on the watching to not-watching edge it asks for one more read and calls `onRunEnded` with the run found by `runId` in the list that read returns. The effect that resolves it is declared before the edge effect, so the list that ended the watch is not taken as the "last read".
 - Task 3: Bun's fake timers have no async advance, so the tests move time in 1 s steps, each in its own `act`.
 
+**Fix round 1.** `BLOCKER 1` (CI Lint, `react-hooks/refs`): `detailRef` (detail page) and `lastActiveRunId` (panel) are now synced in effects, not during render. Fixing it showed a second rule, `react-hooks/set-state-in-effect`, on the detail page's "counted" effect; the counted state is now derived (`countWaiting`) instead of set from an effect, with the same behaviour. `./node_modules/.bin/eslint` on the two files: exit 0, no errors. `bun test` on the panel file: 99 pass, 0 fail; on the detail page file: 46 pass, 0 fail. Full typecheck and suite: not verified locally, runs in CI.
+
 ## Review
 
 ### Round 1 (planner, 2026-11-20, head `98c978be1`)

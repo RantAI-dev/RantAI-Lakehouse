@@ -1462,7 +1462,12 @@ function useIngestRunState(connectorId: string, onRunEnded?: (run: ConnectorRun)
   })
   const lastActiveRunId = React.useRef<string | null>(null)
   const endedRunId = React.useRef<string | null>(null)
-  if (activeRun) lastActiveRunId.current = activeRun.runId
+  // `SRC-46 review round 1, BLOCKER 1`: written in an effect, not during render (`react-hooks/refs`). When the run
+  // ends `activeRun` is null, so the id of the run that was going stays for the edge effect below.
+  const activeRunId = activeRun?.runId ?? null
+  React.useEffect(() => {
+    if (activeRunId !== null) lastActiveRunId.current = activeRunId
+  }, [activeRunId])
   // Declared before the edge effect below: the list that ends the watch is not the "last read", so the
   // edge must not find its own run id waiting in the same commit.
   React.useEffect(() => {

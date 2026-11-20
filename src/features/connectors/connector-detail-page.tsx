@@ -238,7 +238,11 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   // never counted (paused, or a missed sensor tick) just stops being asked about; a page load reads the truth.
   const [countWait, setCountWait] = useState<{ field: "lastRunSuccessAt" | "lastRunFailureAt"; from: string | null } | null>(null)
   const detailRef = useRef<ConnectorDetail | null>(null)
-  detailRef.current = state.data
+  // `SRC-46 review round 1, BLOCKER 1`: synced in an effect, not during render (`react-hooks/refs`). The handler
+  // runs from a later poll, after the commit, so it reads the detail as of the last render.
+  useEffect(() => {
+    detailRef.current = state.data
+  }, [state.data])
   const { reload: reloadDetail } = state
   const onRunEnded = useCallback(
     (run: ConnectorRun) => {
@@ -250,19 +254,20 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
     },
     [reloadDetail]
   )
+  // Counted when the outcome's timestamp differs from its value at the run's end. Derived, not set from an effect
+  // (`react-hooks/set-state-in-effect`, `SRC-46 review round 1, BLOCKER 1`): a counted wait stays in state, inactive,
+  // until a newer run replaces it.
+  const countedAt = countWait && state.data ? (state.data[countWait.field] ?? null) : null
+  const countWaiting = countWait !== null && countedAt === countWait.from ? countWait : null
   useEffect(() => {
-    if (!countWait) return
+    if (!countWaiting) return
     const poll = window.setInterval(reloadDetail, COUNT_POLL_MS)
     const giveUp = window.setTimeout(() => setCountWait(null), COUNT_WAIT_MAX_MS)
     return () => {
       window.clearInterval(poll)
       window.clearTimeout(giveUp)
     }
-  }, [countWait, reloadDetail])
-  const countedAt = countWait && state.data ? (state.data[countWait.field] ?? null) : null
-  useEffect(() => {
-    if (countWait && countedAt !== countWait.from) setCountWait(null)
-  }, [countWait, countedAt])
+  }, [countWaiting, reloadDetail])
   const [deleteOpen, setDeleteOpen] = useState(false)
   const urlTab = parseTab(searchParams.get("tab"))
   const [tab, setTab] = useState<ConnectorTab>(urlTab)
