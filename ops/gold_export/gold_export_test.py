@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import gzip
 import json
 import os
 import random
@@ -319,6 +320,17 @@ def _load_lakekeeper_metadata(mart_name: str) -> dict:
     return load.json().get("metadata", {})
 
 
+def _decode_metadata_json(raw: bytes) -> dict:
+    """Decode an Iceberg metadata file stored plain or gzip-compressed.
+    The catalog writes `.metadata.json.gz` here (run 44772220357 crashed on
+    the gzip magic 0x1f 0x8b), but compression is a property of the bytes,
+    not the key suffix, so sniff the magic and leave plain JSON alone
+    (DATA-6 review R7, follow-up 2)."""
+    if raw.startswith(b"\x1f\x8b"):
+        raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8"))
+
+
 def _load_metadata_file(metadata_file: str) -> dict:
     """Read one Iceberg metadata JSON named by a `metadata-log` entry.
     The catalog's log holds file names, not documents; this uses the same
@@ -338,7 +350,7 @@ def _load_metadata_file(metadata_file: str) -> dict:
         region_name="us-east-1",
     )
     obj = s3.get_object(Bucket=bucket or S3_BUCKET, Key=key)
-    return json.loads(obj["Body"].read())
+    return _decode_metadata_json(obj["Body"].read())
 
 
 def get_s3_parquet_files(mart_name: str) -> list[str]:
