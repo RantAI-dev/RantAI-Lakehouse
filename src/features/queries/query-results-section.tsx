@@ -283,7 +283,14 @@ export function QueryResultsSection(props: QueryResultsSectionProps) {
       <MetadataList
         columns={3}
         items={[
-          { label: "Rows", value: formatNumber(result.rowCount) },
+          // QS-11 (LH-QS-2-01), D12: count the rows actually on screen; the
+          // server's rowCount is what the engine sent before the cut.
+          {
+            label: "Rows",
+            value: result.truncated
+              ? `${formatNumber(result.rows.length)} shown`
+              : formatNumber(result.rows.length),
+          },
           { label: "Duration", value: formatDuration(result.metrics.durationMs) },
           { label: "Scanned", value: formatBytes(result.metrics.scannedBytes) },
           { label: "Cost", value: formatCost(result.metrics.costUnits) },
