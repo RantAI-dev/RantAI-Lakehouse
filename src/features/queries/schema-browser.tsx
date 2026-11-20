@@ -127,7 +127,9 @@ export function SchemaBrowser({
         ) : matched.length === 0 ? (
           // QS-11 (LH-QS-1-07), D10: say the search found nothing rather than
           // drawing an empty browser that looks like a broken catalog.
-          <p className="px-2 py-4 text-muted-foreground">No table matches "{search}".</p>
+          <p className="px-2 py-4 text-muted-foreground">
+            No table matches &quot;{search}&quot;.
+          </p>
         ) : (
           LAYERS.map((layer) => {
             const inLayer = matched.filter((table) => table.layer === layer)

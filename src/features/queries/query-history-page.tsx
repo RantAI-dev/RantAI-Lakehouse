@@ -111,7 +111,7 @@ function Pill({
 export function QueryHistoryPage() {
   const router = useRouter()
   // QS-12 (LH-QS-4-06), D17: the address is the source of truth on entry.
-  const initial = React.useMemo(initialAddress, [])
+  const initial = React.useMemo(() => initialAddress(), [])
   const [status, setStatus] = React.useState<QueryHistoryItem["status"] | "all">(
     initial.status as QueryHistoryItem["status"] | "all"
   )
