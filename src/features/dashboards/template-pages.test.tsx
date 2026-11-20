@@ -93,6 +93,8 @@ describe("TemplateList", () => {
     render(<AuthProvider><TemplateList folders={[]} /></AuthProvider>)
     fireEvent.click(await screen.findByRole("button", { name: "Use template" }))
     const name = await screen.findByLabelText("Name")
+    expect((name as HTMLInputElement).required).toBe(true)
+    expect(document.querySelector('label[for="template-board-name"]')?.hasAttribute("data-required")).toBe(true)
     expect((name as HTMLInputElement).value).toBe("Sales overview")
     fireEvent.change(name, { target: { value: "Q4" } })
     fireEvent.click(screen.getByRole("button", { name: "Create dashboard" }))
@@ -151,6 +153,8 @@ describe("SaveTemplateDialog", () => {
       </AuthProvider>,
     )
     const name = screen.getByLabelText("Template name")
+    expect((name as HTMLInputElement).required).toBe(true)
+    expect(document.querySelector('label[for="template-name"]')?.hasAttribute("data-required")).toBe(false)
     expect((name as HTMLInputElement).value).toBe("Quarterly sales")
     fireEvent.change(name, { target: { value: "Sales overview" } })
     fireEvent.click(screen.getByRole("button", { name: "Save template" }))
