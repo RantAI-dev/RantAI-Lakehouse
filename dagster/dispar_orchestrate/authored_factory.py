@@ -801,13 +801,21 @@ def build_authored_dependency_sensors(
     # graph gives it chain parents, so the `_after` sensor must not also
     # launch it. Both sensors are built from the SAME payload list, so
     # they derive the same D3 order rather than two copies of the rule.
-    chain_graph = reupload_chain_graph([p for p, _ in pipeline_jobs])
+    payloads = [p for p, _ in pipeline_jobs]
+    chain_graph = reupload_chain_graph(payloads)
+    # BLD-14 review R2: the chain also owns a first pipeline's launch, so
+    # `_after` must step aside for its file load too. The graph has no entry
+    # for a first pipeline without parents; add the empty one from D4. A
+    # pipeline that is both first and downstream keeps its graph entry.
+    first_entries = reupload_first_pipeline_entries(payloads)
     sensors: list[Any] = []
     for pipeline, authored_job in pipeline_jobs:
+        pipeline_id = str(pipeline.get("id"))
+        chain = {**first_entries.get(pipeline_id, {}), **chain_graph.get(pipeline_id, {})}
         sensor = build_authored_dependency_sensor(
             pipeline,
             authored_job,
-            chain=chain_graph.get(str(pipeline.get("id")), {}),
+            chain=chain,
         )
         if sensor is not None:
             sensors.append(sensor)
@@ -1583,19 +1591,12 @@ def _chain_cyclic_nodes(edges: dict[str, set[str]]) -> set[str]:
     return cyclic
 
 
-def reupload_chain_graph(
+def _reupload_chain_nodes_edges(
     pipelines: list[dict[str, Any]],
-) -> dict[str, dict[str, ChainEntry]]:
-    """Derive, per pipeline id and bronze table, its chain place (D3, P1-P2).
-
-    A node is a `ready` pipeline with no target lag and a tenant (P1). An
-    edge A -> B is D3's rule: same tenant, A != B and A's target is one of
-    B's inputs. Nodes on a cycle are dropped (P2). A chain starts at a
-    pipeline whose first input is `bronze.<T>` with `file_ingest_job` in
-    `dependsOn` (D4) and reaches everything downstream of it; a reached
-    pipeline with no parent in that reach has no entry (the switch being
-    off on the first pipeline leaves nothing below it in the chain).
-    """
+) -> tuple[dict[str, dict[str, Any]], dict[str, set[str]], dict[str, set[str]]]:
+    """P1 nodes and D3 edges, with P2's cycles removed. Shared by the
+    downstream graph and by the first-pipeline entry map (BLD-14 review R2)
+    so the two launchers derive the same order from one set of helpers."""
     nodes: dict[str, dict[str, Any]] = {}
     for pipeline in pipelines:
         pipeline_id = pipeline.get("id")
@@ -1632,6 +1633,47 @@ def reupload_chain_graph(
     for node in successors:
         successors[node] -= cyclic
         predecessors[node] -= cyclic
+    return nodes, successors, predecessors
+
+
+def reupload_first_pipeline_entries(
+    pipelines: list[dict[str, Any]],
+) -> dict[str, dict[str, ChainEntry]]:
+    """The first pipelines a re-upload reaches, each with an empty chain
+    entry (BLD-14 review R2 BLOCKER, option A). The chain sensor owns THEIR
+    launch too -- same `run_key` per re-upload and pipeline -- so a newer
+    load that ends while an older first run is queued still gets its own
+    tagged run; `_after` steps aside for the file load instead. Uses the
+    same P1/P2/D4 helpers as `reupload_chain_graph`, never a second order.
+    """
+    nodes, _successors, _predecessors = _reupload_chain_nodes_edges(pipelines)
+    entries: dict[str, dict[str, ChainEntry]] = {}
+    for pipeline_id, pipeline in nodes.items():
+        definition = pipeline.get("definition") or {}
+        if definition.get("sourceZone") != "bronze" or not definition.get("sourceTable"):
+            continue
+        if FILE_INGEST_JOB not in _pipeline_depends_on(pipeline):
+            continue
+        entries.setdefault(pipeline_id, {})[str(definition["sourceTable"])] = ChainEntry(
+            parents=(), ancestors=()
+        )
+    return entries
+
+
+def reupload_chain_graph(
+    pipelines: list[dict[str, Any]],
+) -> dict[str, dict[str, ChainEntry]]:
+    """Derive, per pipeline id and bronze table, its chain place (D3, P1-P2).
+
+    A node is a `ready` pipeline with no target lag and a tenant (P1). An
+    edge A -> B is D3's rule: same tenant, A != B and A's target is one of
+    B's inputs. Nodes on a cycle are dropped (P2). A chain starts at a
+    pipeline whose first input is `bronze.<T>` with `file_ingest_job` in
+    `dependsOn` (D4) and reaches everything downstream of it; a reached
+    pipeline with no parent in that reach has no entry (the switch being
+    off on the first pipeline leaves nothing below it in the chain).
+    """
+    nodes, successors, predecessors = _reupload_chain_nodes_edges(pipelines)
 
     first_by_table: dict[str, set[str]] = {}
     for pipeline_id, pipeline in nodes.items():

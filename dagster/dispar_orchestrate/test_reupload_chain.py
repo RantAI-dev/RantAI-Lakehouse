@@ -9,7 +9,12 @@ after the record was accepted" rule (D8, P4, P5, P10).
 
 from __future__ import annotations
 
-from dispar_orchestrate.authored_factory import FILE_INGEST_JOB, ChainEntry, reupload_chain_graph
+from dispar_orchestrate.authored_factory import (
+    FILE_INGEST_JOB,
+    ChainEntry,
+    build_authored_dependency_sensors,
+    reupload_chain_graph,
+)
 
 
 def pipeline(
@@ -323,6 +328,91 @@ def test_waiting_past_six_hours_records_wait_expired() -> None:
     )
 
 
+def test_two_reuploads_with_the_newer_load_queued_start_gold_once_for_r2() -> None:
+    """BLD-14 review R2: R2 ends while R1's first-pipeline run is still
+    queued. Option A in the review: the chain sensor owns the first
+    pipeline's launch too, so R2 gets its own tagged run; `_after` steps
+    aside for the file load. Gold then supersedes R1 and runs once for R2,
+    with no false wait_expired sentence."""
+    base = time.time() - 400
+    roots = [
+        _root_record("R2", "orders", base + 200),
+        _root_record("R1", "orders", base),
+    ]
+
+    def tagged(run_id: str, root_id: str, status: DagsterRunStatus, job: str = "authored__pl_first"):
+        run = SimpleNamespace(
+            run_id=run_id,
+            job_name=job,
+            status=status,
+            tags={REUPLOAD_ROOT_TAG: root_id, REUPLOAD_TABLE_TAG: "orders"},
+        )
+        return SimpleNamespace(dagster_run=run, end_time=base + 200)
+
+    @job(name="authored__pl_first")
+    def first_job() -> None:
+        return None
+
+    @job(name="authored__pl_gold")
+    def gold_job() -> None:
+        return None
+
+    first = first_pipeline("pl-first")
+    gold = pipeline("pl-gold", target="gold.orders_daily", inputs=[("silver", "orders_clean")])
+    jobs = [(first, first_job), (gold, gold_job)]
+    cfg = AuthoredPipelineConfig(api_url="http://api.invalid", run_token="token")
+
+    # `_after` must not also launch the first pipeline for the file load.
+    after = build_authored_dependency_sensors(jobs)[0]
+    after_out = list(
+        after._run_status_sensor_fn(
+            _StubContext(None, _StubInstance(roots), dagster_run=roots[0].dagster_run)
+        )
+    )
+    assert len(after_out) == 1 and isinstance(after_out[0], SkipReason), (
+        f"the chain owns the first pipeline's file-load launch: {after_out}"
+    )
+    assert "BLD-14" in after_out[0].skip_message
+
+    chain_sensors = {
+        s.name: s for s in build_reupload_chain_sensors(jobs, cfg)
+    }
+    first_sensor = chain_sensors["authored__pl_first_chain"]
+    first_instance = _StubInstance(roots, [tagged("first-r1", "R1", DagsterRunStatus.QUEUED)])
+    first_out = list(
+        first_sensor._raw_fn(
+            _StubContext('{"floor": 0, "settled": []}', first_instance)
+        )
+    )
+    first_requests = [item for item in first_out if isinstance(item, RunRequest)]
+    assert any(
+        r.tags and r.tags.get(REUPLOAD_ROOT_TAG) == "R2" for r in first_requests
+    ), f"the chain must launch R2's first run itself: {first_out}"
+
+    # On the tick when that run has succeeded, Gold runs once for R2.
+    gold_instance = _StubInstance(
+        roots,
+        [
+            tagged("first-r1", "R1", DagsterRunStatus.QUEUED),
+            tagged("first-r2", "R2", DagsterRunStatus.SUCCESS),
+        ],
+    )
+    gold_context = _StubContext('{"floor": 0, "settled": []}', gold_instance)
+    with patch("dispar_orchestrate.reupload_chain._post_chain_step", return_value=True) as post:
+        out = list(chain_sensors["authored__pl_gold_chain"]._raw_fn(gold_context))
+
+    run_requests = [item for item in out if isinstance(item, RunRequest)]
+    assert len(run_requests) == 1, f"Gold must run once, for R2: {out}"
+    assert run_requests[0].run_key == "reupload-chain:R2:pl-gold"
+    bodies = [call.args[2] for call in post.call_args_list]
+    assert any(
+        b.get("rootRunId") == "R1" and b.get("outcome") == "superseded" for b in bodies
+    ), f"R1 must be superseded: {bodies}"
+    assert not any(b.get("reason") == "wait_expired" for b in bodies), (
+        f"no false expiry while R2 loaded the table: {bodies}"
+    )
+
+
 def test_a_reupload_is_not_lost_behind_twenty_one_loads_of_other_tables() -> None:
     """BLD-14 review R1: a chain waits up to six hours. Twenty-one loads of
     other tables after the re-upload must not push it out of the sensor's
@@ -377,14 +467,22 @@ class _StubInstance:
                 roots = [r for r in roots if (r.end_time or 0.0) >= cutoff]
             return roots[:limit] if limit else roots
         if filters.tags and filters.tags.get(REUPLOAD_ROOT_TAG):
-            return [record for record in self.tagged if record.dagster_run.job_name == filters.job_name]
+            root_id = filters.tags[REUPLOAD_ROOT_TAG]
+            return [
+                record
+                for record in self.tagged
+                if record.dagster_run.job_name == filters.job_name
+                and (getattr(record.dagster_run, "tags", None) or {}).get(REUPLOAD_ROOT_TAG) == root_id
+            ]
         return []
 
 
 class _StubContext:
-    def __init__(self, cursor: str | None, instance: _StubInstance) -> None:
+    def __init__(self, cursor: str | None, instance: _StubInstance, dagster_run: Any = None) -> None:
         self.cursor = cursor
         self.instance = instance
+        # The `_after` run-status sensor reads the triggering run here.
+        self.dagster_run = dagster_run
         self.updated: list[str] = []
 
     def update_cursor(self, value: str) -> None:

@@ -21,6 +21,14 @@ step aside for each other (D7). The cursor's floor stops a new sensor from
 replaying last week's re-uploads (P10); its settled list makes a record
 one-shot even if the post's response was lost.
 
+BLD-14 review R2's fix is OPTION A: the chain sensor owns the FIRST
+pipeline's launch too, with the same `run_key` per re-upload and pipeline,
+and `_after` steps aside for a file load whose table starts a chain. A
+newer load ending while an older first run is queued still gets its own
+tagged run, so downstream pipelines never wait on a re-upload that was
+silently dropped. The other option offered (counting a later untagged
+first run as the newer load) was not taken.
+
 This module imports from `authored_factory`, never the reverse: the graph
 and the wire helpers live there, and this file only turns them into
 Dagster sensors. With `PIPELINE_RUN_TOKEN` unset it builds no sensors and
@@ -60,6 +68,7 @@ from dispar_orchestrate.authored_factory import (
     _dagster_safe_name,
     _run_config_value,
     reupload_chain_graph,
+    reupload_first_pipeline_entries,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -382,10 +391,17 @@ def build_reupload_chain_sensors(
             "BLD-14: PIPELINE_RUN_TOKEN is unset; no re-upload chain sensors are built"
         )
         return []
-    graph = reupload_chain_graph([pipeline for pipeline, _ in pipeline_jobs])
+    # BLD-14 review R2, option A: the chain owns the first pipeline's
+    # launch as well, with the same per-reupload run_key. Its empty entry
+    # makes `decide` launch it as soon as its parent set is empty, while a
+    # downstream pipeline keeps the graph's real parents.
+    payloads = [pipeline for pipeline, _ in pipeline_jobs]
+    graph = reupload_chain_graph(payloads)
+    first_entries = reupload_first_pipeline_entries(payloads)
     sensors: list[Any] = []
     for pipeline, job in pipeline_jobs:
-        entries = graph.get(str(pipeline.get("id")))
+        pipeline_id = str(pipeline.get("id"))
+        entries = {**first_entries.get(pipeline_id, {}), **graph.get(pipeline_id, {})}
         if not entries:
             continue
         sensors.append(build_reupload_chain_sensor(pipeline, job, entries, cfg))
