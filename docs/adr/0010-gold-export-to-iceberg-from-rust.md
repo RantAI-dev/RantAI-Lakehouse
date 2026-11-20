@@ -219,10 +219,10 @@ action trait a replace would implement (`TransactionAction`) is
 `pub(crate)`, and so is `TableCommit`'s builder. The Rust side
 *cannot* write "delete everything, add this copy" as one commit.
 `PyIceberg`'s `Transaction.overwrite` stages the delete and the append
-and sends both in ONE catalog commit — measured on this stack before any
-product code was written (`DATA-6` T0: the overwrite grew the metadata
-log by exactly 1, and a reader through `ClickHouse` saw the new copy
-only). So `routes::gold::export` launches one `gold_latest_copy_job`
+and sends both in ONE catalog commit — measured by the acceptance gate
+on the real stack (`DATA-6` T6, AC2: the overwrite grew the catalog's
+metadata log by exactly 1, and a continuous reader through `ClickHouse`
+saw only whole copies). So `routes::gold::export` launches one `gold_latest_copy_job`
 run per successful publish, and the op (`gold_latest_copy.py`) reads
 that publish's rows back out of `gold.<table>` — never out of
 `ClickHouse` — so the copy is exactly the rows the publish wrote, with
@@ -236,9 +236,10 @@ copy (so it never exists empty), `Transaction.overwrite` for every copy
 after that, never a separate delete and append (that would be two
 commits, and a reader could see the gap). Iceberg catalogs swap the
 table's metadata pointer atomically, so a reader loading the table gets
-either the old copy or the new one. The gate proves it by reading the
-table continuously during a real publish and failing on any sample that
-is not one whole copy.
+either the old copy or the new one. The gate proves it (T6, AC2) by
+reading the table continuously during a real publish and failing on any
+sample that is not one whole copy, and by asserting that the catalog's
+metadata log grew by exactly one across the replace.
 
 **The marker (D7): the two tables can never collide.** A mart may
 itself be named `<other>_latest`, and `sanitize_mart_name` would land

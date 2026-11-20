@@ -6,10 +6,10 @@ writes `gold.<table>` with cannot replace a table's contents — it offers
 only `fast_append` on a `Transaction`, the action trait a replace would
 implement is `pub(crate)`, and so is the commit builder. PyIceberg's
 `Transaction.overwrite` stages the delete and the append and sends them
-in ONE catalog commit (measured on this stack, `DATA-6` T0: the
-overwrite grew the metadata log by exactly 1, and a reader through
-ClickHouse saw the new copy only). So the latest-copy table is written
-here, by the orchestrator, never by the API.
+in ONE catalog commit — measured by the acceptance gate on the real
+stack (`DATA-6` T6, AC2: the metadata log grew by exactly 1 and a
+continuous reader saw only whole copies). So the latest-copy table is
+written here, by the orchestrator, never by the API.
 
 Who launches it (D6): the API, from `routes::gold::export` — the one
 place every publish goes through — with the publish's own facts in the
@@ -360,8 +360,10 @@ def refresh_latest_copy(
                 record("superseded", REASON_NEWER_COPY_PRESENT)
                 return {"status": "superseded", "reason": REASON_NEWER_COPY_PRESENT}
 
-    # 5. Read exactly this publish's rows (T0 proved the int-micros
-    # literal filters the Timestamp column directly).
+    # 5. Read exactly this publish's rows. The int-micros literal filters
+    # the Timestamp column directly — proved by the acceptance gate (T6,
+    # AC1), which compares the held stamp in microseconds through
+    # ClickHouse.
     from pyiceberg.expressions import EqualTo
 
     df = main.scan(

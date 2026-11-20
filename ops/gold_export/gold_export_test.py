@@ -978,6 +978,17 @@ def step_a_reader_during_a_publish_never_sees_a_mix() -> None:
             f"gold.{MART_NAME}_latest held {old_distinct} copies before the read"
         )
 
+    # DATA-6 review R1: T0 recorded no numbers, so the one-commit claim
+    # (D3) is measured here on the real stack, not asserted from a spike.
+    # Read the catalog's own metadata BEFORE the publish: the log length
+    # and the snapshot ids give us a baseline for the replace below.
+    meta_before = _load_lakekeeper_metadata(f"{MART_NAME}_latest")
+    log_before = len(meta_before.get("metadata-log") or [])
+    snapshot_ids_before = {
+        snapshot.get("snapshot-id")
+        for snapshot in (meta_before.get("snapshots") or [])
+    }
+
     reader = threading.Thread(target=read_continuously, daemon=True)
     reader.start()
     try:
@@ -1021,6 +1032,38 @@ def step_a_reader_during_a_publish_never_sees_a_mix() -> None:
             return (_latest_copy_publication().get("lastRun") or {}).get("status") == "success"
 
         _wait_for("the latest-copy run to report success", run_succeeded, 120, interval_s=1.0)
+
+        # DATA-6 review R1: prove the replace was ONE catalog commit (D3).
+        # The metadata log grows by exactly one for it; a delete-then-append
+        # split into two commits would grow it twice and could leave the
+        # reader sampling an empty table. The new snapshots' operation is
+        # read back too, so the log entry is tied to the replace, not to an
+        # unrelated metadata update.
+        meta_after = _load_lakekeeper_metadata(f"{MART_NAME}_latest")
+        log_after = len(meta_after.get("metadata-log") or [])
+        if log_after - log_before != 1:
+            raise GoldExportFailure(
+                f"DATA-6 D3: the one-commit replace of gold.{MART_NAME}_latest "
+                f"grew the metadata log by {log_after - log_before}, expected 1"
+            )
+        new_snapshots = [
+            snapshot
+            for snapshot in (meta_after.get("snapshots") or [])
+            if snapshot.get("snapshot-id") not in snapshot_ids_before
+        ]
+        operations = sorted(
+            str((snapshot.get("summary") or {}).get("operation"))
+            for snapshot in new_snapshots
+        )
+        if operations not in (["append"], ["delete", "append"], ["overwrite"]):
+            raise GoldExportFailure(
+                f"DATA-6 D3: unexpected replace snapshot operations {operations}"
+            )
+        print(
+            f"[gold-export] DATA-6 D3: metadata log {log_before} -> {log_after} "
+            f"for one replace; new snapshot operations {operations}"
+        )
+
         delay = time.time() - published_at
         print(
             f"[gold-export] the latest copy followed its publish by {delay:.1f}s "

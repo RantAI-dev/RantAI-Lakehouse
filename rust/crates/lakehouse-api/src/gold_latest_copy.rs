@@ -15,8 +15,9 @@
 //! publish wrote, masking included. The second table is written by the
 //! orchestrator through `PyIceberg`, never by the API: the Rust Iceberg
 //! library cannot write "delete everything, add this copy" as one
-//! commit, while `PyIceberg`'s `Transaction.overwrite` can (measured on
-//! this stack, `DATA-6` T0).
+//! commit, while `PyIceberg`'s `Transaction.overwrite` can — measured by
+//! the acceptance gate on the real stack (`DATA-6` T6, AC2: one metadata-log
+//! entry for the replace, no mixed samples).
 //!
 //! The run config carries the publish's own stamp and row count, so the
 //! op can refuse to move the table backwards (D9: a run that executes
