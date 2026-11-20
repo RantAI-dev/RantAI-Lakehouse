@@ -918,3 +918,57 @@ checks pass at that head, including `Rust · fmt`, `Rust · clippy`,
 ## 13. Review
 
 (empty — the planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`)
+
+### Round 1 — planner review, 2026-11-20, at `4e5599629`
+
+Holds: the copy stamp is computed once per publish under the export lock;
+out-of-order runs are `superseded` and never move the table back; a failed
+write leaves the old table intact; the trim runs on `gold.<mart>` only and
+keeps the newest copy; no new route; every `ClickHouse` error is classified;
+`latest_table` is `table + "_latest"` from a server-set name; the T3 move is
+verbatim.
+
+**R1 BLOCKER: the one-commit claim is written as measured, and nothing
+measured it.** `docs/adr/0010-gold-export-to-iceberg-from-rust.md:221-225`,
+`dagster/dispar_orchestrate/gold_latest_copy.py:9-11` and `:363`,
+`rust/crates/lakehouse-api/src/gold_latest_copy.rs:18-19` cite T0, which
+recorded no numbers (§12). The gate's AC2
+(`ops/gold_export/gold_export_test.py:943`) samples `count()` every 0.2 s,
+which would miss a delete-then-append split into two commits. Fix: in AC2,
+read the latest table's metadata-log length and the new snapshots'
+`summary.operation` with `_load_lakekeeper_metadata(f"{MART}_latest")`
+before and after the replace, and assert the log grew by exactly 1. Then the
+ADR and both module docs cite the gate (T6, AC2) instead of T0, and the
+int-micros claim cites AC1. Principles 2 and 5.
+
+**R2 SHOULD-FIX: a replace that committed is recorded as failed.**
+`gold_latest_copy.py:410-419`: a reload error after the commit records
+`failed`/`catalog_unavailable` and raises a retryable `Failure`; the retry
+then records `superseded`, and the card's "Holds" shows the previous copy
+while the table holds the new one. After a committed write, record `success`
+(with `snapshot_id` null and the cleanup skipped, said in the row). Also
+`:359`: a rerun for the copy already held (`==`) is the idempotent success,
+not `newer_copy_present`; only `>` is superseded. Tests for both.
+
+**R3 SHOULD-FIX: two reads can throw without a record row.**
+`gold_latest_copy.py:356` and `:367-369` (`scan(...).to_arrow()`) sit outside
+any `try`, so an object-store error leaves no `gold_latest_copy_run` row (D12).
+Wrap both in the fixed-reason pattern (`catalog_unavailable`); test with a
+fake that raises.
+
+**R4 SHOULD-FIX: the DATA-62 fix has no test that fails on the old code.**
+Nothing asserts that a publish of more than one batch writes one
+`_exported_at` (`gold_export.rs:878`, `:1065`). Add a test with a small batch
+size (a test-only override of the batch constant, or a unit test on the
+function that stamps the batches) asserting one distinct stamp across
+batches.
+
+**R5 SHOULD-FIX: the cleanup (D11) is unproven.** The gate runs with the
+default 3600 s orphan age, so it removes nothing. Either assert in the gate,
+with a short age, that the old copy's files are gone, or write it under Not
+verified in the handoff and in the feature page's limits.
+
+**R6 SHOULD-FIX: contract fields optional for an "older API".**
+`src/services/contracts/gold.ts:30`, `:37`, `:204`: `copyExportedAt`,
+`latestCopy` and the publication's `latestCopy` ship with the console; make
+them required (`AGENTS.md`, TypeScript: no optional-ing fields).
