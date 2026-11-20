@@ -317,7 +317,14 @@ export function PipelineDetailPage() {
   const p = state.data
   const authored = p.engine === "authored"
   const readsAsState = readsAs(p, users)
-  const authorChoicesState = authorChoices(users, p.tenantId)
+  // BLD-11 F5/D7: the panel must not say "nobody can read as it" when the
+  // masthead names an author, nor when the user list failed to load.
+  const authorChoicesState = authorChoices(
+    users,
+    p.tenantId,
+    readsAsState,
+    usersState.status === "error"
+  )
   const schedule = parseSchedule(p.schedule)
   // A Dagster job's status is its newest run's, never "paused": whether it
   // is paused lives in its schedule's state. An authored pipeline carries
