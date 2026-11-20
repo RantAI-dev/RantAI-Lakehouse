@@ -268,7 +268,11 @@
    bersih. Dipicu tombol Export → PDF (window.print()). */
 @media print {
   [data-print-hide] { display: none !important; }
-  body { background: #fff !important; }
+  /* RPT-3: the page margin (@page) is painted with the root's background, not
+     the body's. The console's <html> carries the `dark` class (color-scheme:
+     dark, dark tokens), so a PDF had a dark band around the white page; the
+     root is white too, in the print medium only. */
+  html, body { background: #fff !important; }
   @page { margin: 10mm; }
 
   .dash-canvas {
