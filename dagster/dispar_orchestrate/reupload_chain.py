@@ -33,6 +33,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,7 +53,6 @@ from dispar_orchestrate.authored_factory import (
     AuthoredPipelineConfig,
     FILE_INGEST_JOB,
     FILE_INGEST_OP_CONFIG,
-    PER_TABLE_UPSTREAM_SCAN_LIMIT,
     REUPLOAD_ROOT_TAG,
     REUPLOAD_TABLE_TAG,
     ChainEntry,
@@ -255,12 +255,20 @@ def build_reupload_chain_sensor(
             yield SkipReason("BLD-14: the first tick sets the re-upload cursor floor")
             return
 
+        # BLD-14 review R1 BLOCKER: a chain may wait six hours, so a
+        # recency-capped scan of the newest 20 loads across every table
+        # loses a re-upload behind other tables' loads: no run, no record,
+        # no expiry. Find open re-uploads by their own key instead -- the
+        # six-hour window (P5) -- with no row cap; the table filter below
+        # narrows them to this pipeline's chain.
         root_records = context.instance.get_run_records(
             filters=RunsFilter(
                 job_name=FILE_INGEST_JOB,
                 statuses=[DagsterRunStatus.SUCCESS],
+                updated_after=datetime.fromtimestamp(
+                    now - CHAIN_WAIT_LIMIT_SECONDS, tz=timezone.utc
+                ),
             ),
-            limit=PER_TABLE_UPSTREAM_SCAN_LIMIT,
         )
         roots: list[Root] = []
         for record in root_records:

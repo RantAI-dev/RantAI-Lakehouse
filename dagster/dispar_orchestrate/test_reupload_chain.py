@@ -168,11 +168,12 @@ def test_a_first_pipeline_that_also_reads_another_first_pipeline_has_parents() -
 # ── BLD-14 T7: the polling sensor ──────────────────────────────────────────
 
 import json
+import time
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-from dagster import DagsterRunStatus, SkipReason, job
+from dagster import DagsterRunStatus, RunRequest, SkipReason, job
 
 from dispar_orchestrate.authored_factory import AuthoredPipelineConfig
 from dispar_orchestrate.reupload_chain import (
@@ -322,6 +323,33 @@ def test_waiting_past_six_hours_records_wait_expired() -> None:
     )
 
 
+def test_a_reupload_is_not_lost_behind_twenty_one_loads_of_other_tables() -> None:
+    """BLD-14 review R1: a chain waits up to six hours. Twenty-one loads of
+    other tables after the re-upload must not push it out of the sensor's
+    view and leave it lost with no record. The target load is the OLDEST
+    root here, so a recency-capped scan drops it and the test fails."""
+    base = time.time() - 200
+    roots = [_root_record(f"other-{i}", "other", base + i) for i in range(21)]
+    roots.append(_root_record("root-target", "orders", base - 100))
+    parent = SimpleNamespace(
+        run_id="silver-run",
+        job_name="authored__pl_silver",
+        status=DagsterRunStatus.SUCCESS,
+        tags={REUPLOAD_ROOT_TAG: "root-target", REUPLOAD_TABLE_TAG: "orders"},
+    )
+    instance = _StubInstance(
+        roots,
+        [SimpleNamespace(dagster_run=parent, end_time=NOW)],
+    )
+    context = _StubContext('{"floor": 0, "settled": []}', instance)
+    body = _sensor({"orders": ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",))})._raw_fn
+
+    out = list(body(context))
+    requests = [item for item in out if isinstance(item, RunRequest)]
+    assert len(requests) == 1, f"the re-upload must still start Gold: {out}"
+    assert requests[0].run_key == "reupload-chain:root-target:pl-gold"
+
+
 def _root_record(run_id: str, table: str, end_time: float) -> SimpleNamespace:
     run = SimpleNamespace(
         run_id=run_id,
@@ -341,7 +369,13 @@ class _StubInstance:
 
     def get_run_records(self, filters, limit=None):
         if filters.job_name == "file_ingest_job":
-            return self.roots[:limit] if limit else self.roots
+            roots = self.roots
+            # The R1 fix finds open re-uploads by the six-hour window, not
+            # by a recency limit: the stub must answer `updated_after`.
+            if getattr(filters, "updated_after", None) is not None:
+                cutoff = filters.updated_after.timestamp()
+                roots = [r for r in roots if (r.end_time or 0.0) >= cutoff]
+            return roots[:limit] if limit else roots
         if filters.tags and filters.tags.get(REUPLOAD_ROOT_TAG):
             return [record for record in self.tagged if record.dagster_run.job_name == filters.job_name]
         return []
@@ -392,8 +426,9 @@ def test_a_root_is_settled_only_after_its_record_was_accepted() -> None:
         status=DagsterRunStatus.SUCCESS,
         tags={REUPLOAD_ROOT_TAG: "root-1", REUPLOAD_TABLE_TAG: "orders"},
     )
-    tagged = [SimpleNamespace(dagster_run=tagged_run, end_time=NOW)]
-    instance = _StubInstance([_root_record("root-1", "orders", NOW)], tagged)
+    ended = time.time() - 10
+    tagged = [SimpleNamespace(dagster_run=tagged_run, end_time=ended)]
+    instance = _StubInstance([_root_record("root-1", "orders", ended)], tagged)
     context = _StubContext('{"floor": 0, "settled": []}', instance)
     body = _sensor({"orders": ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",))})._raw_fn
 
