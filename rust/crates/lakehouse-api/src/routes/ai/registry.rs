@@ -557,6 +557,16 @@ fn format_chart_schema() -> Value {
         properties.extend(style);
     }
     properties.insert("referenceLines".to_owned(), reference_lines_schema());
+    // `AI-29`: the append field uses the same item schema, but its own
+    // description — a model must not mistake it for the replacing list.
+    let mut add_lines = reference_lines_schema();
+    if let Value::Object(schema) = &mut add_lines
+        && let Some(Value::String(description)) = schema.get_mut("description")
+    {
+        "lines to add to the chart's own, which stay (at most 5 in all). Use this to add a line; referenceLines replaces every line the chart has."
+            .clone_into(description);
+    }
+    properties.insert(super::tools::ADD_REFERENCE_LINES.to_owned(), add_lines);
     json!({ "type": "function", "function": { "name": "format_chart",
         "description": "Change only how a saved chart looks: number and date formats (rupiah, percent, compact, decimals), colours (a palette, a colour per series, colour by value), axes, data labels, reference lines (a target at 1,000, an average, a trend, a band), notes, tooltip fields and, for a table or KPI, conditional colours. Send ONLY the fields that change: a field you give replaces that field, null removes it, and everything you leave out stays as it is (the data, the title, the filters and the other formatting). list_charts gives the ids. To change what the chart shows, use update_chart.",
         "parameters": { "type": "object", "properties": properties, "required": ["chart"] } } })
@@ -1955,6 +1965,16 @@ fn list_report_subscriptions_schema() -> Value {
             "board": { "type": "string", "description": "only this dashboard's, optional" } } } } })
 }
 
+/// `AI-30`: the installation's own people picker, so the model can learn a
+/// colleague's id to pass as `recipients[].userId` instead of inventing one.
+fn find_report_recipients_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "find_report_recipients",
+        "description": "Find people of this installation to send a scheduled report to, by part of their name or email address (at most 20). Gives each person's id, name and email; pass the id as recipients[].userId on create_report_subscription or update_report_subscription.",
+        "parameters": { "type": "object", "properties": {
+            "q": { "type": "string", "description": "part of a name or an email address" } },
+            "required": ["q"] } } })
+}
+
 fn update_report_subscription_schema() -> Value {
     json!({ "type": "function", "function": { "name": "update_report_subscription",
         "description": "Change a scheduled report the person set up: the schedule, time zone, attachments, filters or recipients, or pause or resume it. Give only what changes; everything left out stays. Naming recipients in `recipients` needs a human's approval.",
@@ -2866,6 +2886,14 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "dashboard:read",
     },
+    // `AI-30`: a read over the console's own recipient picker; no dashboard is
+    // named, so this stays off `DASHBOARD_SCOPED`.
+    ToolSpec {
+        name: "find_report_recipients",
+        schema: find_report_recipients_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
     ToolSpec {
         name: "update_report_subscription",
         schema: update_report_subscription_schema,
@@ -3182,8 +3210,9 @@ mod tests {
         // + `list_maps` (`BI-16` part C2, `AI-5`) + `list_dashboard_comments`
         // (`BI-37` D8) + the four signed-embed tools (`BI-26` slice 2)
         // + the six report and template tools (`BI-18` part D, T4)
-        // + `list_reports` (`BI-18` D review round 1, SHOULD-FIX 2).
-        assert_eq!(tool_schemas().len(), 122);
+        // + `list_reports` (`BI-18` D review round 1, SHOULD-FIX 2)
+        // + `find_report_recipients` (`AI-30`).
+        assert_eq!(tool_schemas().len(), 123);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
@@ -3387,6 +3416,7 @@ mod tests {
             .collect();
         names.sort_unstable();
         let mut allowed = crate::routes::ai::tools::FORMAT_FIELDS.to_vec();
+        allowed.push(crate::routes::ai::tools::ADD_REFERENCE_LINES);
         allowed.sort_unstable();
         assert_eq!(names, allowed);
     }
