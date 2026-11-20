@@ -40,7 +40,7 @@ A chart's data downloads only as CSV, only from a raw table, and only up to
 | 4 | The first page lists the dashboard's name, the filters and parameters applied, who downloaded it and when (in the report time zone). Pages are numbered. | Planner |
 | 5 | A PDF that is not ready in 60 seconds fails with a plain sentence; at most 2 PDFs are made at once per API process, a third waits its turn. | Planner |
 | 6 | When the deployment has no Gotenberg (`GOTENBERG_URL` unset), the PDF item says "PDF export is not set up on this deployment" and the browser's print stays available as before. | Planner |
-| 7 | Excel keeps numbers as numbers: "formatted" sets each column's Excel number format from the chart's value format (`BI-17` A); "raw" writes plain values. CSV "formatted" writes the text shown on the chart; CSV "raw" the plain values. Cells that start like a formula are neutralised in both (as the CSV export does today). | Planner |
+| 7 | Excel keeps numbers as numbers: "formatted" sets each column's Excel number format from the chart's value format (`BI-17` A); "raw" writes plain values. CSV "formatted" writes the text shown on the chart; CSV "raw" the plain values. A text that starts like a formula is never run: in CSV it gets a leading apostrophe; in Excel it is a text cell and holds the text as it is (changed 2026-11-20, `BI-55`, *(proposed, not yet signed)*). | Planner; changed: planner default (QA `LH-BI-1-08`) |
 | 8 | A raw table exports up to 1,000,000 rows (Metabase's limit), also over a SQL source; a grouped chart exports its own result. A file that reached the limit says so in its name and in the download message. | Planner |
 | 9 | Downloads stay governed by `dashboard:read`. An administrator can switch them off per role in Admin > Settings ("Roles that may not download"); a user whose every role is switched off cannot download, and the menu items are hidden. Nothing changes until an administrator chooses. | Planner |
 | 10 | Every download (PDF, Excel, CSV) is written to the audit log before the file is sent, as the CSV export does today; with the audit log down, the download is refused. | Planner |
@@ -57,6 +57,7 @@ A chart's data downloads only as CSV, only from a raw table, and only up to
 - Web-page cards do not appear in the PDF; image cards do when their site is a content site and the picture is a PNG, JPEG, GIF or WebP up to 5 MiB.
 - 1,000,000 rows at most per download.
 - A PDF takes a few seconds per tab and fails after 60 seconds.
+- An Excel file keeps a text that starts with =, +, - or @ as a text cell, without an apostrophe. If the reader saves that file as CSV with their own program, the new file is not guarded. *(proposed, not yet signed; `BI-55`)*
 
 ## Switching it on
 
