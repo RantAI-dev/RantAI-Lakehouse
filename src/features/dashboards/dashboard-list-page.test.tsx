@@ -223,6 +223,22 @@ describe("the one list (BI-59 T2)", () => {
     }
     expect(screen.getByRole("button", { name: "Actions for Main" })).toBeTruthy()
   })
+
+  // PR #530 review SHOULD-FIX: without a creator user ID on the contracts,
+  // matching display names must show the stored name rather than claiming "You".
+  it("shows the stored owner name instead of claiming You by display name", async () => {
+    serveList()
+    renderPage()
+    const row = (await screen.findByText("QA BI")).closest("tr")
+    if (!row) throw new Error("no row")
+    expect(within(row).getByText("Rina")).toBeTruthy()
+    expect(within(row).queryByText("You")).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Gallery view" }))
+    const card = screen.getByText("QA BI").closest("li")
+    if (!card) throw new Error("no card")
+    expect(within(card).getByText(/Rina · 3 tiles/)).toBeTruthy()
+    expect(within(card).queryByText(/^You ·/)).toBeNull()
+  })
 })
 
 describe("the pictures and Recent (BI-59 T3)", () => {

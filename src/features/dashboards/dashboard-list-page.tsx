@@ -185,7 +185,6 @@ export function DashboardListPage() {
   const reportsState = useService((s) => dashboardReportService.listReports(s), [])
   const auth = useAuth()
   const me = auth.user?.id
-  const myName = auth.user?.name
   // The caller's own personal space is called "Personal space"; the folder
   // manager never offers one, and a dashboard is filed only in an ordinary
   // folder or the caller's own space (BI-18 part C, part 2).
@@ -595,7 +594,6 @@ export function DashboardListPage() {
                   folders={folders}
                   showEmpty={!query.trim() && folderFilter === null && (kind === "all" || kind === "dashboard")}
                   actions={actions}
-                  myName={myName}
                   pictures={pictures}
                   onOpenTemplate={(item) => item.template && setUsing(item.template)}
                   emptyFolder={(id) => <EmptyFolder compact path={pathOf(id)} personal={folderLookup.isPersonal(id)} />}
@@ -607,7 +605,6 @@ export function DashboardListPage() {
                   onSort={sortBy}
                   actions={actions}
                   folders={folderLookup}
-                  myName={myName}
                   onOpenTemplate={(item) => item.template && setUsing(item.template)}
                   pictures={pictures}
                   selection={selection}
