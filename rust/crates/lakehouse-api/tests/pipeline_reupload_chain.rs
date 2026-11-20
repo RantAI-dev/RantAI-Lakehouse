@@ -497,6 +497,62 @@ async fn pausing_a_pipeline_stops_its_chain_sensor_and_resuming_starts_it() {
     );
 }
 
+/// BLD-14 review R5: a `runId` is an orchestrator run id, not arbitrary
+/// text. The POST route validates its shape and length like `rootRunId`.
+#[tokio::test]
+async fn a_run_id_with_illegal_characters_or_over_sixty_four_bytes_is_refused() {
+    let app = spin_up().await;
+    let token = "chain-step-bad-run-token";
+    seed_orchestrator(&app.pool, token).await;
+    let id = seed_pipeline(&app.pool, "chain-step-bad-run", None).await;
+    let auth = [("authorization", format!("Bearer {token}"))];
+
+    for bad in ["not a run!", &"x".repeat(65)] {
+        let mut body = step_body("started", None, Some(bad), None);
+        body["runId"] = json!(bad);
+        let (status, response) = post_step(&app, &id, &auth, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad:?}");
+        assert!(
+            response["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("runId")),
+            "the field is named: {response}"
+        );
+    }
+}
+
+/// BLD-14 review R5: the page's GET route belongs with `runs` in
+/// `routes/pipelines.rs`, not in the orchestrator-only
+/// `authored_pipelines_router` next to `compile`/`lag-check`.
+#[test]
+fn the_reupload_chain_read_is_registered_next_to_runs() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let pipelines = std::fs::read_to_string(format!("{manifest}/src/routes/pipelines.rs"))
+        .expect("read pipelines.rs");
+    let mod_rs =
+        std::fs::read_to_string(format!("{manifest}/src/routes/mod.rs")).expect("read mod.rs");
+    let authored = std::fs::read_to_string(format!("{manifest}/src/routes/authored_pipelines.rs"))
+        .expect("read authored_pipelines.rs");
+    assert!(
+        pipelines.contains("pub async fn reupload_chain"),
+        "the chain read's handler lives with runs in pipelines.rs"
+    );
+    let runs_at = mod_rs
+        .find(".route(\"/api/pipelines/{id}/runs\"")
+        .expect("the runs route is registered");
+    let chain_at = mod_rs
+        .find("\"/api/pipelines/{id}/reupload-chain\"")
+        .expect("the chain read is registered");
+    assert!(
+        chain_at > runs_at,
+        "the chain read is registered beside runs, not in the authored-only router"
+    );
+    assert!(
+        !authored.contains("reupload-chain"),
+        "the chain read is not an orchestrator-only authored route"
+    );
+}
+
 /// An unknown authored id is a 404, not a stored orphan row.
 #[tokio::test]
 async fn an_unknown_pipeline_answers_404() {

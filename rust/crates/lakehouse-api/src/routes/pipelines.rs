@@ -424,6 +424,29 @@ pub async fn runs(
     (StatusCode::OK, ApiJson(body)).into_response()
 }
 
+/// `GET /api/pipelines/{id}/reupload-chain` — the newest chain outcome the
+/// page shows as one sentence (BLD-14 D8). It is a page read like [`runs`],
+/// so it lives here rather than in the orchestrator-only authored router.
+///
+/// BLD-14 review R5: the per-tenant gate runs first, exactly as [`runs`]
+/// does; an id in another tenant and an unknown id are the same 404.
+///
+/// # Errors
+///
+/// 404 for an unknown id or one outside the caller's tenant; 503 with no
+/// database; 500 on a store failure.
+pub async fn reupload_chain(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id).await?;
+    let pool = pool(&state)?;
+    let last = lakehouse_store::pipeline_chain::latest_chain_step(pool, &id).await?;
+    Ok(ApiJson(json!({ "last": last })))
+}
+
 async fn runs_body(state: &AppState, id: &str) -> Value {
     // An authored pipeline's runs belong to its `authored__<id>` job; the
     // `pl-` id itself names no job, so asking for it always found none.

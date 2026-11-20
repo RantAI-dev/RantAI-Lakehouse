@@ -30,8 +30,11 @@ const SOURCE_TABLE_INVALID: &str = "sourceTable must be bronze.<table> with a va
 const OUTCOME_INVALID: &str = "outcome must be started, not_run or superseded";
 /// `reason` is the closed set the table's CHECK accepts.
 const REASON_INVALID: &str = "reason must be upstream_failed, upstream_cancelled or wait_expired";
-/// A started step names the run; nothing else does.
-const RUN_ID_INVALID: &str = "runId is required only for outcome started";
+/// A started step names one well-formed run; nothing else does.
+/// BLD-14 review R5: the field's shape and length are validated, not just
+/// its presence, so a malformed id cannot enter a stored record.
+const RUN_ID_INVALID: &str =
+    "runId must be 1 to 64 letters, digits or hyphens and only for outcome started";
 /// A `not_run` step names its cause; nothing else does.
 const CAUSE_INVALID: &str = "causePipelineId is required only for outcome not_run";
 /// The cause must be in the same tenant as the pipeline whose page shows it.
@@ -86,6 +89,16 @@ impl ChainStepBody {
             return Err(ApiError::Unprocessable(REASON_INVALID.to_owned()));
         }
         if started != self.run_id.as_deref().is_some_and(|s| !s.is_empty()) {
+            return Err(ApiError::Unprocessable(RUN_ID_INVALID.to_owned()));
+        }
+        // BLD-14 review R5: validate the run id's shape and length, as the
+        // root run id is validated above. A fixed sentence names the field.
+        if let Some(run_id) = &self.run_id
+            && (run_id.len() > 64
+                || !run_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        {
             return Err(ApiError::Unprocessable(RUN_ID_INVALID.to_owned()));
         }
         if not_run
@@ -161,27 +174,4 @@ pub async fn record_chain_step(
     };
     let recorded = lakehouse_store::pipeline_chain::record_chain_step(pool, &step).await?;
     Ok(ApiJson(json!({ "recorded": recorded })))
-}
-
-/// `GET /api/pipelines/{id}/reupload-chain` — the newest outcome recorded
-/// for this pipeline. The page shows one sentence from it (section 4).
-///
-/// The per-tenant gate runs first, exactly as [`super::pipelines::runs`]
-/// does: an id in another tenant and an unknown id are the same 404, and
-/// no name from a foreign chain step reaches the reader.
-///
-/// # Errors
-///
-/// 404 for an unknown id or one outside the caller's tenant; 503 with no
-/// database; 500 on a store failure.
-pub async fn reupload_chain(
-    State(state): State<AppState>,
-    Extension(principal): Extension<Principal>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<Value>> {
-    super::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id).await?;
-    let pool = crate::routes::pipelines::pool(&state)?;
-    let last = lakehouse_store::pipeline_chain::latest_chain_step(pool, &id).await?;
-    Ok(ApiJson(json!({ "last": last })))
 }
