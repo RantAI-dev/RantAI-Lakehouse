@@ -1032,3 +1032,32 @@ verified in the handoff and in the feature page's limits.
 `src/services/contracts/gold.ts:30`, `:37`, `:204`: `copyExportedAt`,
 `latestCopy` and the publication's `latestCopy` ship with the console; make
 them required (`AGENTS.md`, TypeScript: no optional-ing fields).
+
+### Round 2 — planner review, 2026-11-20, at `6cc84b81d`
+
+R2–R6 are fixed as asked. R1's direction is right, but the new gate check
+is wrong in two ways:
+
+**R7 BLOCKER: the gate counts the cleanup's commit as part of the
+replace.** `ops/gold_export/gold_export_test.py` (the R1 block) reads
+`metadata-log` after the job has finished, and the job's D11 cleanup
+(`expire_all_but_current_snapshot`, `gold_latest_copy.py`) is itself a
+catalog commit whenever an older snapshot exists. On any run after the
+first, the log grows by 2 and the gate fails a correct replace (or, if the
+fix is to accept 2, it can no longer tell a split replace from a cleanup).
+Fix: tie the count to the run's own record. Read the run's
+`gold_latest_copy_run` row; expected growth is 1, plus 1 when its `cleanup`
+column says snapshots were expired. Better still, find the metadata-log
+entry whose metadata holds the new current snapshot and assert that the
+entry before it is the baseline (`log_before`'s last entry) — that proves
+the replace was one commit regardless of what the cleanup did after. Pick
+one, say which in the comment.
+
+**R8 SHOULD-FIX: the operations check compares a sorted list with an
+unsorted one.** `sorted(...)` of `["delete", "append"]` is
+`["append", "delete"]`, which is not in the accepted tuple, so a
+delete-then-append replace inside one commit would be refused. Compare
+sets, or sort the accepted lists too. Note that after the cleanup only the
+current snapshot survives, so the new-snapshot list is usually just the
+current one; assert on the current snapshot's `summary.operation`
+(`overwrite` or `append`) instead of on every new id.
