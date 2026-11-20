@@ -2675,12 +2675,20 @@ fn unreadable_sentence(asset: &str) -> String {
     )
 }
 
-/// How many requests the mock `ClickHouse` has answered: a refused run must
-/// add none, because nothing is measured or recorded.
+/// How many requests the mock `ClickHouse` has answered that measure or record
+/// something: a refused run must add none. A table lookup (`DESCRIBE`,
+/// `system.columns`) reads the table's shape and is not counted, since every
+/// writer asks it before the reach (`SEC-80`).
 async fn clickhouse_requests(ch: &MockServer) -> usize {
-    ch.received_requests()
-        .await
-        .map_or(0, |requests| requests.len())
+    ch.received_requests().await.map_or(0, |requests| {
+        requests
+            .iter()
+            .filter(|request| {
+                let body = String::from_utf8_lossy(&request.body);
+                !body.contains("DESCRIBE TABLE") && !body.contains("system.columns")
+            })
+            .count()
+    })
 }
 
 fn rule_body(name: &str, table: &str, threshold: &str) -> Value {
@@ -3240,6 +3248,84 @@ async fn an_outage_answers_a_claimed_schedule_name_and_an_unknown_one_alike() {
             "{verb}: a claimed name and an unknown name answer alike during an outage"
         );
     }
+}
+
+/// `SEC-80`: while `ClickHouse` cannot answer, a rule writer gives a table
+/// another tenant claimed and a table no one has the same answer, for create
+/// and for run.
+#[tokio::test]
+async fn an_outage_answers_a_claimed_rule_table_and_an_unknown_one_alike() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("ClickHouse is down"))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let TestApp { router, pool } = spin_up_with_env(&quality_writers_env(&catalog, &ch)).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_WRITER, CATALOG_TENANT).await;
+
+    // Create: the claimed table and the unknown one answer the same 503.
+    let mut creates = Vec::new();
+    for table in [RETAIL_TABLE, "no_such_table"] {
+        creates.push(
+            send(
+                &router,
+                "POST",
+                "/api/governance/quality",
+                &owner,
+                None,
+                Some(rule_body("owner in outage", table, "rows >= 0")),
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        creates[0].0,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{:?}",
+        creates[0].1
+    );
+    assert_eq!(
+        creates[0], creates[1],
+        "create: a claimed and an unknown table answer alike"
+    );
+    assert_eq!(
+        rules_on(&pool, RETAIL_TABLE).await,
+        0,
+        "a refused create stores nothing"
+    );
+
+    // Run: a rule on the claimed table and a rule on an unknown table answer
+    // the same 503, and nothing is measured.
+    let claimed_rule = add_a_rule(&pool, RETAIL_TABLE).await;
+    let unknown_rule = add_a_rule(&pool, "no_such_table").await;
+    let mut runs = Vec::new();
+    for rule in [claimed_rule, unknown_rule] {
+        runs.push(
+            send(
+                &router,
+                "POST",
+                &format!("/api/governance/quality/{rule}/run"),
+                &owner,
+                None,
+                None,
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        runs[0].0,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{:?}",
+        runs[0].1
+    );
+    assert_eq!(
+        runs[0], runs[1],
+        "run: a claimed and an unknown table answer alike"
+    );
 }
 
 #[tokio::test]

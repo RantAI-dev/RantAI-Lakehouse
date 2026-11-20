@@ -1204,20 +1204,19 @@ pub(crate) async fn ensure_rule_table_with(
     if !access.allows(&zone, table) {
         return Err(refused());
     }
-    // SEC-80: the role reads the table, but an upload claim may give it to
-    // another tenant. That table is refused as the role's refusal would be,
-    // or as an unknown rule for `run_rule`.
+    // SEC-80: presence is asked for every name first, so an outage (`503`)
+    // answers a name another tenant claimed and a name no table has alike.
+    // Then the reach: a table out of reach is refused as `out_of_reach` says,
+    // whether or not it is there, so an absent table never turns a not-found
+    // answer into a `400`. An absent table in reach is the `400`.
+    let present = quality_table_present(state, asset).await?;
     if !quality_key_in_reach(state, principal, headers, asset).await? {
         return Err(match out_of_reach {
             OutOfReach::UnreadableTable => refused(),
             OutOfReach::UnknownRule => ApiError::NotFound("Quality rule not found".to_owned()),
         });
     }
-    if quality_table_present(state, asset).await? {
-        Ok(())
-    } else {
-        Err(refused())
-    }
+    if present { Ok(()) } else { Err(refused()) }
 }
 
 /// Why a rule could not be run.
