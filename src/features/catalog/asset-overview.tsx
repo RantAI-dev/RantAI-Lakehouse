@@ -242,7 +242,7 @@ export function AssetOverview({
         <SectionCard
           size="sm"
           title="Sensitive columns"
-          description="Masked by policy or classified confidential and above."
+          description="Columns a policy masks, and columns classified confidential or above. A classification alone does not mask a column."
         >
           {sensitive.length === 0 ? (
             <EmptyState title="No sensitive columns" className="py-4" />
