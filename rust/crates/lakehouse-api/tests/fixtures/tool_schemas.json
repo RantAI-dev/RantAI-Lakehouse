@@ -2469,6 +2469,88 @@
               }
             },
             "description": "up to 5 marks on the value axis (bar, hbar, line, area, stacked, combo), for example a target at 1,000, the average, a trend or a band. Use a parameter for a line the viewer can move. A computed line describes the rows on screen"
+          },
+          "addReferenceLines": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "value",
+                    "average",
+                    "median",
+                    "min",
+                    "max",
+                    "trend",
+                    "band",
+                    "forecast"
+                  ],
+                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`; forecast: the series continued `horizon` periods ahead with a 95 % band (bar, line, area, stacked, combo with the date dimension grouped by minute to year, no breakdown, at most one per chart)"
+                },
+                "horizon": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 60,
+                  "description": "forecast only, required: how many periods ahead"
+                },
+                "value": {
+                  "oneOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    }
+                  ],
+                  "description": "where on the value axis: a number, or {param: <a number parameter>}. Required for kind value and band; leave out for a computed line"
+                },
+                "to": {
+                  "oneOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    }
+                  ],
+                  "description": "band only: the other edge"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "at most 60 characters"
+                },
+                "color": {
+                  "type": "string",
+                  "description": "#rrggbb"
+                },
+                "measure": {
+                  "type": "string",
+                  "description": "a computed line: which value of the chart it describes (a result name); default the first"
+                }
+              }
+            },
+            "description": "lines to add to the chart's own, which stay (at most 5 in all). Use this to add a line; referenceLines replaces every line the chart has."
           }
         },
         "required": [
@@ -5823,6 +5905,25 @@
             "description": "only this dashboard's, optional"
           }
         }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "find_report_recipients",
+      "description": "Find people of this installation to send a scheduled report to, by part of their name or email address (at most 20). Gives each person's id, name and email; pass the id as recipients[].userId on create_report_subscription or update_report_subscription.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "q": {
+            "type": "string",
+            "description": "part of a name or an email address"
+          }
+        },
+        "required": [
+          "q"
+        ]
       }
     }
   },
