@@ -177,4 +177,22 @@ Notes for the reviewer:
 
 ## Review
 
-(planner appends here)
+### Round 1 (planner, 2026-11-20, head `98c978be1`)
+
+The diff matches D1 to D3. Both deviations in the handoff are accepted: the
+ref that keeps the ended run's id, and 1 s fake-timer steps.
+
+- **BLOCKER 1.** CI `Lint` fails with 2 errors, `react-hooks/refs`
+  ("Cannot access refs during render"):
+  - `connector-detail-page.tsx:241`: `detailRef.current = state.data` is
+    written in the render body;
+  - `connector-ingest-panel.tsx:1465`: `if (activeRun)
+    lastActiveRunId.current = activeRun.runId` is written in the render
+    body.
+
+  Fix without writing or reading a ref during render. For example, take
+  the detail value in the `onRunEnded` callback through a state updater or
+  an effect-synced ref, and record the active run id in an effect. Keep
+  the behaviour and the tests the same. Run CI run 44667901397, job
+  `Lint`.
+
