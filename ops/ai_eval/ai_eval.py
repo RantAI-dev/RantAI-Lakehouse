@@ -91,6 +91,7 @@ import re
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -826,20 +827,36 @@ def confirm_problems(confirms: list[dict[str, Any]]) -> list[str]:
     return problems
 
 
+def new_run_id() -> str:
+    """An id unique to this setup run, for objects the API cannot delete.
+
+    A case that invites a user cannot clean it up (there is no delete-user
+    route), so a fixed username AND email would clash on the next run against
+    the same installation. `{run_id}` in a setup body keeps both distinct; it
+    is a harness substitution, not a name a setup call saves.
+    """
+    return uuid.uuid4().hex[:12]
+
+
 def run_setup(
     cfg: Config, session: requests.Session, setup: list[dict[str, Any]]
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Make the case's own objects through the API. Returns the ids saved under
     each name and the objects created, for cleanup. A call without an `id_at`
     only changes what an earlier call made: it saves no name and adds nothing
-    for the cleanup to delete."""
+    for the cleanup to delete. `{run_id}` is available to setup bodies and
+    paths but is not added to the returned names."""
     names: dict[str, str] = {}
     created: list[dict[str, str]] = []
+    run_id = new_run_id()
     for call in setup:
+        # Setup names win over nothing here; the harness's run id is reserved,
+        # so a case cannot shadow it with a setup name.
+        substitutions = {**names, "run_id": run_id}
         resp = session.request(
             call["method"],
-            f"{cfg.api_url}{fill_names(call['path'], names)}",
-            json=fill_value(call.get("body"), names),
+            f"{cfg.api_url}{fill_names(call['path'], substitutions)}",
+            json=fill_value(call.get("body"), substitutions),
             timeout=60,
         )
         if resp.status_code >= 400:

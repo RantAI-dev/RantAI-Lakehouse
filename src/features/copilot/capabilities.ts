@@ -77,7 +77,10 @@ export const CAPABILITIES: Capability[] = [
       "list_dashboard_comments",
       // RPT-1 / AI-10: scheduled reports by email. Creating one for the person alone waits for the Confirm button;
       // naming anyone else, and every delete, waits in Approvals (the composer sends this list as the allowlist, see BI-8 R1).
-      "list_report_subscriptions", "create_report_subscription", "update_report_subscription", "delete_report_subscription",
+      "list_report_subscriptions",
+      // AI-30: the report picker's people, read-only.
+      "find_report_recipients",
+      "create_report_subscription", "update_report_subscription", "delete_report_subscription",
       // BI-16 part C2 / AI-5: the maps a map chart can use, built-in and uploaded (read-only).
       "list_maps",
       // BI-26 slice 2 D4/D10 (AI-11-AC3): signed embedding. `enable_embed` and
