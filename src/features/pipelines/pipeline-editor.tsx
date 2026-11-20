@@ -5,6 +5,7 @@ import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
 import { AlertCircleIcon, BoxIcon, CodeIcon, DatabaseIcon, ListChecksIcon, PlayIcon, PlusIcon, TableIcon } from "lucide-react"
 import { FormPage } from "@/components/patterns/form-page"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SelectField } from "@/components/patterns/select-field"
 import { SqlColumnChips, SqlRowsTable } from "@/components/patterns/sql-rows-table"
@@ -50,20 +51,30 @@ import {
   removeItem,
   renameItem,
   setInputTable,
+  switchToSql,
   updateInput,
   updateStep,
   type Column,
   type EditorSelection,
   type EditorState,
+  type EditorStep,
   type SaveBlocker,
 } from "@/lib/pipeline-editor"
 import { cn } from "@/lib/utils"
 import { connectorService, lakehouseService, pipelineService } from "@/services"
-import type { Pipeline, PipelineDetail, PipelinePreview, PipelinePreviewInput, PipelineStep } from "@/services/contracts/pipelines"
+import type {
+  Pipeline,
+  PipelineDetail,
+  PipelinePreview,
+  PipelinePreviewInput,
+  PipelineStep,
+  PipelineStepSqlInput,
+} from "@/services/contracts/pipelines"
 import { connectorLoadTriggerOn, withConnectorLoadTrigger } from "./pipeline-connector-trigger"
 import {
   AggregateStepPane,
   FilterStepPane,
+  StepSqlSection,
   InputPane,
   JoinStepPane,
   OutputPane,
@@ -254,6 +265,67 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     for (const step of editor.steps) out[step.id] = results[step.id]?.data.columns ?? null
     return out
   }, [editor.steps, results])
+
+  // ── a form step as SQL (BLD-16 / J6) ─────────────────────────────────
+  const stepSql = useServiceAction((signal, body: PipelineStepSqlInput) => pipelineService.stepSql(body, signal))
+  /** The step whose SQL was shown, the body it was shown for, and the route's own text. */
+  const [shownSql, setShownSql] = React.useState<{ step: string; key: string; data: string } | null>(null)
+  /** The step a Switch was asked for; the confirm dialog is open while this is set. */
+  const [switching, setSwitching] = React.useState<string | null>(null)
+  /** The step the last route call was for, so a refusal is shown on it (D7). */
+  const [ranSql, setRanSql] = React.useState<string | null>(null)
+  /** The body a "Show as SQL" of `stepId` sends now: the definition and the step's name. */
+  function stepSqlBody(stepId: string): PipelineStepSqlInput | null {
+    const index = editor.steps.findIndex((step) => step.id === stepId)
+    if (index < 0) return null
+    return { ...definitionBody(inputs, editor.steps), step: editor.steps[index].name.trim() }
+  }
+  async function showStepSql(stepId: string) {
+    const body = stepSqlBody(stepId)
+    if (body === null) return
+    setRanSql(stepId)
+    const data = await stepSql.run(body)
+    if (data === null) return
+    setShownSql({ step: stepId, key: JSON.stringify(body), data: data.sql })
+  }
+  /**
+   * J6, the one-way switch: asked for through a confirm (the page's dialog),
+   * then the step is REPLACED with the route's own text, unformatted — same
+   * id, same name, same place — and nothing is saved until Save. The route's
+   * refusal is shown in the pane, so a person never switches into SQL the
+   * API would not accept.
+   */
+  async function switchStepToSql(stepId: string) {
+    const body = stepSqlBody(stepId)
+    if (body === null) {
+      setSwitching(null)
+      return
+    }
+    setRanSql(stepId)
+    const data = await stepSql.run(body)
+    if (data === null) return
+    setEditor((prev) => switchToSql(prev, stepId, data.sql))
+    setShownSql(null)
+    setSwitching(null)
+  }
+  /** The section every form pane carries (J6); `null` for the kinds it is not for. */
+  function sqlSectionFor(step: EditorStep): React.ReactNode {
+    if (step.kind !== "transform" && step.kind !== "join" && step.kind !== "aggregate" && step.kind !== "filter")
+      return null
+    const key = stepSqlBody(step.id)
+    const currentKey = key === null ? null : JSON.stringify(key)
+    const shown = shownSql !== null && shownSql.step === step.id ? shownSql : null
+    return (
+      <StepSqlSection
+        text={shown ? shown.data : null}
+        stale={shown !== null && currentKey !== shown.key}
+        error={ranSql === step.id && stepSql.status === "error" ? stepSql.error.message : null}
+        pending={ranSql === step.id && stepSql.status === "pending"}
+        onShow={() => void showStepSql(step.id)}
+        onSwitch={() => setSwitching(step.id)}
+      />
+    )
+  }
 
   // ── checks and the save ────────────────────────────────────────────
   const problems = editorProblems(shownState, { targetZone, targetTable, plainCopy, hasConnector })
@@ -488,29 +560,32 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
       }
       pane =
         step.kind === "transform" ? (
-          <TransformStepPane
-            key={step.id}
-            {...common}
-            step={step}
-            readable={readableItems(shownState, index)}
-            readsName={readsName(shownState, step.reads)}
-            columns={columnsRead(step, inputColumns, stepColumns)}
-            readsStep={editor.steps.some((other) => "id" in step.reads && other.id === step.reads.id)}
-            // BLD-1 part 1 S3 review R1-S7: `steps[i].transforms[j]` names a
-            // row of what was sent. Once the operations change, row j may be
-            // another one, so the row is marked only while they are the ones
-            // sent; the message stays on the step.
-            failedTransform={
-              errorItem === step.id &&
-              saveTarget?.kind === "step" &&
-              sameList(sent?.transforms[step.id], step.transforms)
-                ? saveTarget.transform
-                : null
-            }
-            failedMessage={errorItem === step.id ? saveError : null}
-            failedMessageId={errorMessageId}
-            onChange={(patch) => setEditor((prev) => updateStep(prev, step.id, patch))}
-          />
+          <React.Fragment key={step.id}>
+            <TransformStepPane
+              key={step.id}
+              {...common}
+              step={step}
+              readable={readableItems(shownState, index)}
+              readsName={readsName(shownState, step.reads)}
+              columns={columnsRead(step, inputColumns, stepColumns)}
+              readsStep={editor.steps.some((other) => "id" in step.reads && other.id === step.reads.id)}
+              // BLD-1 part 1 S3 review R1-S7: `steps[i].transforms[j]` names a
+              // row of what was sent. Once the operations change, row j may be
+              // another one, so the row is marked only while they are the ones
+              // sent; the message stays on the step.
+              failedTransform={
+                errorItem === step.id &&
+                saveTarget?.kind === "step" &&
+                sameList(sent?.transforms[step.id], step.transforms)
+                  ? saveTarget.transform
+                  : null
+              }
+              failedMessage={errorItem === step.id ? saveError : null}
+              failedMessageId={errorMessageId}
+              onChange={(patch) => setEditor((prev) => updateStep(prev, step.id, patch))}
+            />
+            {sqlSectionFor(step)}
+          </React.Fragment>
         ) : step.kind === "sql" ? (
           <SqlStepPane
             key={step.id}
@@ -522,6 +597,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
             onSql={(sql) => setEditor((prev) => updateStep(prev, step.id, { sql }))}
           />
         ) : step.kind === "join" ? (
+          <React.Fragment key={step.id}>
           <JoinStepPane
             key={step.id}
             {...common}
@@ -535,7 +611,10 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
             onChange={(patch) => setEditor((prev) => updateStep(prev, step.id, patch))}
             onPreviewItem={(itemId) => void previewReadItem(itemId)}
           />
+          {sqlSectionFor(step)}
+          </React.Fragment>
         ) : step.kind === "aggregate" ? (
+          <React.Fragment key={step.id}>
           <AggregateStepPane
             key={step.id}
             {...common}
@@ -547,7 +626,10 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
             onChange={(patch) => setEditor((prev) => updateStep(prev, step.id, patch))}
             onPreviewItem={(itemId) => void previewReadItem(itemId)}
           />
+          {sqlSectionFor(step)}
+          </React.Fragment>
         ) : step.kind === "filter" ? (
+          <React.Fragment key={step.id}>
           <FilterStepPane
             key={step.id}
             {...common}
@@ -559,6 +641,8 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
             onChange={(patch) => setEditor((prev) => updateStep(prev, step.id, patch))}
             onPreviewItem={(itemId) => void previewReadItem(itemId)}
           />
+          {sqlSectionFor(step)}
+          </React.Fragment>
         ) : (
           <UnknownStepPane key={step.id} {...common} step={step} />
         )
@@ -928,6 +1012,21 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
         <p role="status" className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">
           {READS_AS_YOU_NOTICE}
         </p>
+      ) : null}
+      {switching !== null ? (
+        // BLD-16 / J6: the one-way switch, asked for before anything changes.
+        // Spec: it cannot be turned back into a form — the sentence is the
+        // dialog's own, and cancelling leaves the step exactly as it was.
+        <ConfirmActionDialog
+          open
+          onOpenChange={(open) => (open ? undefined : setSwitching(null))}
+          title="Switch to SQL step"
+          description="This step becomes a SQL step. It cannot be turned back into a form."
+          impact="You can still edit its SQL; the form's fields are gone."
+          confirmLabel="Switch"
+          confirming={ranSql === switching && stepSql.status === "pending"}
+          onConfirm={() => void switchStepToSql(switching)}
+        />
       ) : null}
     </FormPage>
   )

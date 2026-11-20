@@ -58,6 +58,14 @@ let previewAnswer: { status: number; body: unknown } = {
   body: { columns: [{ name: "id", type: "Int64" }], rows: [[1], [2]], truncated: false },
 }
 /**
+ * BLD-16 / J6: what `POST /api/pipelines/step-sql` answers — the default is
+ * the SQL the API really compiles for `existing()`'s transform step.
+ */
+let stepSqlAnswer: { status: number; body: unknown } = {
+  status: 200,
+  body: { sql: "SELECT * FROM `orders_raw` ORDER BY id LIMIT 1 BY id" },
+}
+/**
  * BLD-16: `bronze/orders_raw`'s schema, when a test needs columns of its
  * own (a column a form's picker must refuse, a column to sum). `null` keeps
  * the shared schema every other test reads.
@@ -95,6 +103,7 @@ beforeEach(() => {
     status: 200,
     body: { columns: [{ name: "id", type: "Int64" }], rows: [[1], [2]], truncated: false },
   }
+  stepSqlAnswer = { status: 200, body: { sql: "SELECT * FROM `orders_raw` ORDER BY id LIMIT 1 BY id" } }
   ordersRawSchema = null
   ingestTargets = [
     { name: "public.orders", target: "orders" },
@@ -172,6 +181,11 @@ beforeEach(() => {
     }
     if (url.startsWith("/api/pipelines/preview")) {
       return jsonResponse(previewAnswer.body, previewAnswer.status)
+    }
+    // BLD-16 / J6: the SQL of one form step. Must come before the generic
+    // POST /api/pipelines branch, which would swallow the path.
+    if (url.startsWith("/api/pipelines/step-sql")) {
+      return jsonResponse(stepSqlAnswer.body, stepSqlAnswer.status)
     }
     if (url.startsWith("/api/pipelines") && (method === "POST" || method === "PUT")) {
       return jsonResponse(saveAnswer.body, saveAnswer.status)
@@ -1263,5 +1277,102 @@ describe("the form kinds in the pipeline editor (BLD-16)", () => {
     const pairRow = pairAlert?.closest("div")
     expect(pairRow?.textContent).toContain("stock_raw's column")
     expect(pairRow?.textContent).toContain("orders_raw's column")
+  })
+})
+
+// ── BLD-16 (BLD-1 part 2) / J6: a form step as SQL ──────────────────────
+
+describe("a form step as SQL (BLD-16, J6)", () => {
+  /** The text of the one CodeMirror on the page (the shown SQL, or the SQL editor). */
+  async function cmDoc(): Promise<string> {
+    return waitFor(() => {
+      const found = document.querySelector(".cm-content")
+      if (!found) throw new Error("no editor yet")
+      const view = EditorView.findFromDOM(found as HTMLElement)
+      if (!view) throw new Error("no editor view")
+      return view.state.doc.toString()
+    })
+  }
+  const showButton = () => screen.getByRole("button", { name: /^show as sql/i })
+  const switchButton = () => screen.getByRole("button", { name: /switch to sql step/i })
+
+  it("shows the SQL of the selected form step, asking the API for it", async () => {
+    renderEditor(existing())
+    selectRail(/1\. transformed/)
+    fireEvent.click(showButton())
+
+    const call = await waitFor(() => sent.find((c) => c.path === "/api/pipelines/step-sql"))
+    expect(call?.method).toBe("POST")
+    expect(call?.body).toEqual({
+      inputs: [{ name: "orders_raw", zone: "bronze", table: "orders_raw" }],
+      steps: [{ name: "transformed", kind: "transform", reads: "orders_raw", transforms: ["dedupe(id)"] }],
+      step: "transformed",
+    })
+    // The text is the API's own — the console renders no SQL of its own —
+    // formatted for the eye only.
+    const doc = await cmDoc()
+    expect(doc).toContain("FROM `orders_raw`")
+    expect(doc).toContain("LIMIT 1 BY id")
+  })
+
+  it("marks the shown SQL stale after an edit, as the preview is marked", async () => {
+    renderEditor(existing())
+    selectRail(/1\. transformed/)
+    fireEvent.click(showButton())
+    await cmDoc()
+    expect(screen.queryByText(/Stale: the definition changed/)).toBeNull()
+
+    fireEvent.change(screen.getByLabelText("Name in this pipeline"), { target: { value: "deduped" } })
+    expect(await screen.findByText("Stale: the definition changed since this SQL was shown.")).toBeTruthy()
+  })
+
+  it("switches a form step to a SQL step after a confirm, keeping its name and place, and saves kind sql", async () => {
+    renderEditor(existing())
+    selectRail(/1\. transformed/)
+    fireEvent.click(switchButton())
+
+    // Asked first: the confirm is open and nothing was asked or changed.
+    const dialog = await screen.findByRole("dialog")
+    expect(
+      screen.getByText("This step becomes a SQL step. It cannot be turned back into a form.")
+    ).toBeTruthy()
+    expect(sent.filter((c) => c.path === "/api/pipelines/step-sql")).toHaveLength(0)
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Switch$/ }))
+
+    // The rail and the pane show the step as SQL, at the same place, under
+    // the same name, and the SQL editor holds the ROUTE'S OWN text — the
+    // formatted one is only ever for display.
+    expect(await screen.findByText("Step 1 · SQL")).toBeTruthy()
+    expect(await waitFor(() => cmDoc())).toBe("SELECT * FROM `orders_raw` ORDER BY id LIMIT 1 BY id")
+
+    const body = await saveAndRead("PUT")
+    expect(body.steps).toEqual([
+      { name: "transformed", kind: "sql", sql: "SELECT * FROM `orders_raw` ORDER BY id LIMIT 1 BY id" },
+    ])
+  })
+
+  it("changes nothing when the switch is cancelled", async () => {
+    renderEditor(existing())
+    selectRail(/1\. transformed/)
+    fireEvent.click(switchButton())
+    const dialog = await screen.findByRole("dialog")
+    fireEvent.click(within(dialog).getByRole("button", { name: /cancel/i }))
+
+    expect(await screen.findByText("Step 1 · Operations")).toBeTruthy()
+    expect(screen.queryByRole("dialog")).toBeNull()
+    expect(sent.filter((c) => c.path === "/api/pipelines/step-sql")).toHaveLength(0)
+  })
+
+  it("shows the route's refusal in the pane, and no SQL", async () => {
+    stepSqlAnswer = { status: 400, body: { error: "steps[0].transforms[0]: this transform is not in the supported grammar" } }
+    renderEditor(existing())
+    selectRail(/1\. transformed/)
+    fireEvent.click(showButton())
+
+    expect(
+      await screen.findByText("steps[0].transforms[0]: this transform is not in the supported grammar")
+    ).toBeTruthy()
+    expect(document.querySelector(".cm-content")).toBeNull()
   })
 })

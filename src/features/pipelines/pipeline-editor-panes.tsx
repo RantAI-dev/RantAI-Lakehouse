@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { ArrowDownIcon, ArrowUpIcon, PlusIcon, Trash2Icon, WandSparklesIcon } from "lucide-react"
+import { ArrowDownIcon, ArrowUpIcon, FileCodeIcon, PlusIcon, Trash2Icon, WandSparklesIcon } from "lucide-react"
 import { CodeView } from "@/components/patterns/code-view"
 import { SelectField } from "@/components/patterns/select-field"
 import { SqlEditor } from "@/components/sql-editor"
@@ -1371,6 +1371,55 @@ export function FilterStepPane({
         Every column of {readsName || "what this step reads"} is kept; a condition only chooses the rows.
       </p>
       {problem}
+    </div>
+  )
+}
+
+/**
+ * J6, on every form pane (the three new kinds and `transform`): the step as
+ * the API compiles it. "Show as SQL" asks the API and shows the answer
+ * read-only — formatted with `formatSql` for the eye only, never saved —
+ * and the console renders no SQL of its own. "Switch to SQL step" is the
+ * one-way take-over: its confirm lives in the page, and the step is
+ * replaced with the route's own text, unformatted.
+ */
+export function StepSqlSection({
+  text,
+  stale,
+  error,
+  pending,
+  onShow,
+  onSwitch,
+}: {
+  /** The route's own text, or `null` while none was shown. */
+  text: string | null
+  /** Whether the definition changed since the text was shown (R1-S5's rule, as the preview's). */
+  stale: boolean
+  /** A refusal from the route, shown here (D7). */
+  error: string | null
+  pending: boolean
+  onShow: () => void
+  onSwitch: () => void
+}) {
+  return (
+    <div className="flex flex-col gap-2 border-t border-border pt-3">
+      <div className="flex flex-wrap gap-1">
+        <Button type="button" variant="outline" size="sm" onClick={onShow} disabled={pending}>
+          <FileCodeIcon aria-hidden />
+          {pending ? "Building the SQL…" : text !== null ? "Show as SQL again" : "Show as SQL"}
+        </Button>
+        <Button type="button" variant="outline" size="sm" onClick={onSwitch} disabled={pending}>
+          <WandSparklesIcon aria-hidden />
+          Switch to SQL step
+        </Button>
+      </div>
+      {error ? <PaneProblem message={error} tone="error" /> : null}
+      {text !== null && stale ? (
+        <p role="status" className="text-xs font-medium text-amber-700 dark:text-amber-400">
+          Stale: the definition changed since this SQL was shown.
+        </p>
+      ) : null}
+      {text !== null ? <CodeView text={formatSql(text)} language="sql" /> : null}
     </div>
   )
 }
