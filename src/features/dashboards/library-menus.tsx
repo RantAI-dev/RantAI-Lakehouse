@@ -23,7 +23,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { notifyFailure, notifySuccess } from "@/lib/notify"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { cn } from "@/lib/utils"
 import type { DashboardTemplate } from "@/services"
 import { libraryHref, type FolderFilter, type LibraryItem } from "./library-items"
@@ -179,14 +179,13 @@ export type ItemActions = {
   readonly onDeleteTemplate?: (item: LibraryItem) => void
 }
 
-/** The page's address of an item, for "Copy link". */
-async function copyLink(item: LibraryItem) {
-  try {
-    await navigator.clipboard.writeText(new URL(libraryHref(item), window.location.origin).toString())
-    notifySuccess("Link copied")
-  } catch {
-    notifyFailure("The link could not be copied", "The browser did not allow it. Open the item and copy the address instead.")
-  }
+/**
+ * The page's address of an item, for "Copy link".
+ * UX-6 / PR #530 review BLOCKER: routes through `copyTextWithToast` so it
+ * falls back when `navigator.clipboard` is absent over plain HTTP and reports refusal.
+ */
+function copyLink(item: LibraryItem): Promise<boolean> {
+  return copyTextWithToast(new URL(libraryHref(item), window.location.origin).toString(), "Link copied")
 }
 
 /** What the built-in board's menu says instead of hiding the entries it cannot offer. */

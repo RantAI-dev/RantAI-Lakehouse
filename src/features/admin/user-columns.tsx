@@ -26,6 +26,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatRelativeTime } from "@/lib/format"
 import type { User } from "@/services"
 
@@ -271,7 +272,7 @@ export function getUserColumns({
                 {user.email ? (
                   <DropdownMenuItem
                     onClick={() => {
-                      void navigator.clipboard.writeText(user.email ?? "")
+                      void copyTextWithToast(user.email ?? "")
                     }}
                   >
                     <Copy className="size-4" />
@@ -280,7 +281,7 @@ export function getUserColumns({
                 ) : null}
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(user.username)
+                    void copyTextWithToast(user.username)
                   }}
                 >
                   <Copy className="size-4" />
@@ -288,7 +289,7 @@ export function getUserColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(user.id)
+                    void copyTextWithToast(user.id)
                   }}
                 >
                   <UserIcon className="size-4" />

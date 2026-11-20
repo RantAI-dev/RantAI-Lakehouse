@@ -210,41 +210,61 @@ async fn the_lock_sets_exactly_one_audit_event_naming_neither_the_email_nor_the_
     let resp = login(&router, THROTTLED_EMAIL, WRONG_PASSWORD).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    let (count, resource_id, args): (i64, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT count(*), max(resource_id), max(args::text) FROM audit_event \
-         WHERE action = 'auth.login_locked'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query audit_event");
-    assert_eq!(count, 1, "one lock, one audit event");
+    // The row as the trail holds it: one row, and every field of it read
+    // here.
+    let rows = audit_rows(&pool, "auth.login_locked").await;
+    assert_eq!(rows.len(), 1, "one lock, one audit event");
+    let row = &rows[0];
     // QA LH-SEC-2-06 (SEC-70): the event happened before anybody signed in,
     // so it carries no principal at all and says what caused it in
     // `actor_label` instead of being handed to the assistant by the list.
-    let (actor_label, principal_kind, principal_id): (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = sqlx::query_as(
-        "SELECT max(actor_label), max(principal_kind), max(principal_id) FROM audit_event \
-         WHERE action = 'auth.login_locked'",
+    assert_eq!(
+        row["actor_label"].as_str(),
+        Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM),
+        "the lock names the sign-in form as its cause"
+    );
+    assert!(
+        row["principal_kind"].is_null(),
+        "no principal kind: nobody signed in"
+    );
+    assert!(
+        row["principal_id"].is_null(),
+        "no principal id: nobody signed in"
+    );
+    // Plan D5b: the row holds no identifier material. It used to carry the
+    // first 12 hex characters of the identifier's unsalted SHA-256 in
+    // `resource_id` — the hash a reader could match against guessed emails,
+    // and a prefix of the hash of a password typed into the identifier box.
+    // The old assertion here described that leak.
+    assert!(
+        row["resource_kind"].is_null(),
+        "the lock row names no resource kind at all"
+    );
+    assert!(
+        row["resource_id"].is_null(),
+        "the lock row holds no id, not even a hash prefix of the identifier"
+    );
+    assert_eq!(
+        row["detail"].as_str(),
+        Some("Too many failed sign-ins; this sign-in is locked for a while."),
+        "the lock row says only what happened"
+    );
+    // Nothing of the identifier or of its throttle key is anywhere in the
+    // row, and the password is in none of it either.
+    let key = lakehouse_auth::throttle::key_for(THROTTLED_EMAIL);
+    let text = row.to_string();
+    for forbidden in [THROTTLED_EMAIL, WRONG_PASSWORD, &key[..12]] {
+        assert!(
+            !text.contains(forbidden),
+            "the lock row must not carry {forbidden}: {text}"
+        );
+    }
+    let args = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT max(args::text) FROM audit_event WHERE action = 'auth.login_locked'",
     )
     .fetch_one(&pool)
     .await
     .expect("query audit_event");
-    assert_eq!(
-        actor_label.as_deref(),
-        Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM),
-        "the lock names the sign-in form as its cause"
-    );
-    assert_eq!(principal_kind, None, "no principal kind: nobody signed in");
-    assert_eq!(principal_id, None, "no principal id: nobody signed in");
-    let resource_id = resource_id.expect("resource_id on the lock event");
-    assert_eq!(resource_id.len(), 12, "resource_id is the first 12 hex");
-    assert!(
-        !resource_id.chars().any(|c| !c.is_ascii_hexdigit()),
-        "resource_id is hex, not a raw identifier"
-    );
     let args = args.unwrap_or_default();
     for forbidden in [THROTTLED_EMAIL, WRONG_PASSWORD] {
         assert!(

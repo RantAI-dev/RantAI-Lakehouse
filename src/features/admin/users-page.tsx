@@ -30,6 +30,7 @@ import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useUrlTab } from "@/hooks/use-url-tab"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { identityService } from "@/services"
@@ -343,7 +344,10 @@ export function UsersPage() {
               size="sm"
               onClick={() => {
                 if (revealedPassword === null) return
-                void navigator.clipboard.writeText(revealedPassword)
+                // The dialog lives inside `role=dialog`, which the textarea
+                // fallback already targets -- over plain http this is the
+                // only copy path there is (`UX-6`).
+                void copyTextWithToast(revealedPassword)
               }}
             >
               Copy

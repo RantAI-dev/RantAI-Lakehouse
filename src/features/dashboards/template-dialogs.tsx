@@ -68,7 +68,8 @@ export function SaveTemplateDialog({
         </DialogHeader>
         <div className="flex flex-col gap-1.5">
           <Label htmlFor="template-name">Template name</Label>
-          <Input id="template-name" autoFocus value={name} maxLength={200} onChange={(e) => setName(e.target.value)} />
+          {/* PR #528 review SHOULD-FIX (UX-1/UX-4): single-input dialog has native required without a star. */}
+          <Input id="template-name" autoFocus required value={name} maxLength={200} onChange={(e) => setName(e.target.value)} />
         </div>
         {save.status === "error" ? (
           <p role="alert" className="text-sm text-destructive">{save.error.message}</p>
@@ -141,8 +142,9 @@ export function UseTemplateDialog({
         </DialogHeader>
         <div className="flex flex-col gap-3">
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="template-board-name">Name</Label>
-            <Input id="template-board-name" autoFocus value={name} maxLength={200} onChange={(e) => setName(e.target.value)} />
+            {/* PR #528 review SHOULD-FIX (UX-1/UX-4): Name is required next to optional Folder. */}
+            <Label htmlFor="template-board-name" required>Name</Label>
+            <Input id="template-board-name" autoFocus required value={name} maxLength={200} onChange={(e) => setName(e.target.value)} />
           </div>
           <div className="flex flex-col gap-1.5">
             <Label>Folder</Label>

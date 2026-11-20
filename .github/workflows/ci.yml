@@ -295,6 +295,23 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The oidc-mock's own unit tests (no network, no containers). They
+      # import `server.py`, so they need the issuer the mock reads at
+      # import time, and the two packages its image installs -- the same
+      # pins as `ops/oidc-mock/Dockerfile`, so the tests run against the
+      # dependency versions the image actually ships.
+      #
+      # Nothing discovered these before: `ops/oidc-mock/test_authorize_flow.py`
+      # sat in the directory and no job ever ran it. That matters most for
+      # the token-refresh decision (a token on the PERSISTENT volume that
+      # is never replaced expires on its own, and the stack stops being
+      # able to authenticate) -- a decision no test covers is a decision
+      # that can silently regress.
+      - name: Unit-test the oidc-mock (token refresh)
+        run: |
+          python -m pip install --quiet "pyjwt[crypto]==2.9.0" cryptography==43.0.1
+          OIDC_MOCK_ISSUER=http://oidc-mock:8090 python -m unittest discover -s ops/oidc-mock -p 'test_*.py'
+
       - name: Unit-test the release tooling (REL-2 S2)
         run: |
           python -m pip install --upgrade pip

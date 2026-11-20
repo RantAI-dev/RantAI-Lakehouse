@@ -507,6 +507,26 @@ pub struct AuditPage {
     pub next_cursor: Option<AuditCursor>,
 }
 
+/// One actor of the trail, as the audit page's person filter lists it
+/// (`GOV-1` acceptance follow-up, D2).
+#[derive(Debug, Clone, FromRow)]
+pub struct AuditActor {
+    /// The person's id, as `audit_event.principal_id` holds it. Never empty:
+    /// [`actors`] leaves the rows nobody signed in caused out.
+    pub principal_id: String,
+    /// The label the actor was seen under, if any.
+    pub actor_label: Option<String>,
+    /// `"user" | "service" | "copilot" | "schedule"`, if known.
+    pub principal_kind: Option<String>,
+    /// When this actor was last seen in the trail.
+    pub last_seen_at: OffsetDateTime,
+}
+
+/// The most actors one [`actors`] list holds (`GOV-1` acceptance follow-up,
+/// D2). The filter narrows by typing, so the list it starts from stays
+/// bounded, and every value the store sends is bound.
+pub const ACTORS_MAX: i64 = 500;
+
 /// Builds `<head> WHERE ...` for a filter. `page_limit` adds the keyset
 /// order and `LIMIT`, and with it the cursor condition; without it (a
 /// count) the cursor is ignored too.
@@ -740,6 +760,37 @@ pub async fn list_for_resources(
     qb.push(" ORDER BY at DESC LIMIT ").push_bind(limit);
     let rows: Vec<AuditRow> = qb.build_query_as().fetch_all(pool).await?;
     Ok(rows.into_iter().map(AuditEvent::from).collect())
+}
+
+/// The trail's actors, newest seen first, at most [`ACTORS_MAX`] of them
+/// (`GOV-1` acceptance follow-up, D2) — the list the audit page's person
+/// filter offers.
+///
+/// One group is one `(principal_id, actor_label, principal_kind)` triple, so
+/// one principal that acted under two names is two rows; the caller keeps
+/// the newest, which this order puts first. Rows nobody signed in caused
+/// carry no `principal_id` and are left out: the filter sends an id back,
+/// so an actor without one cannot be picked.
+///
+/// The reader's reach [`AuditScope`] narrows the list the same way it
+/// narrows every other read of the trail ([`push_scope_clause`]).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn actors(pool: &PgPool, scope: &AuditScope) -> Result<Vec<AuditActor>, StoreError> {
+    let mut qb = QueryBuilder::<Postgres>::new(
+        "SELECT principal_id, actor_label, principal_kind, max(at) AS last_seen_at \
+         FROM audit_event WHERE true AND principal_id IS NOT NULL",
+    );
+    push_scope_clause(&mut qb, scope);
+    qb.push(
+        " GROUP BY principal_id, actor_label, principal_kind \
+              ORDER BY last_seen_at DESC LIMIT ",
+    )
+    .push_bind(ACTORS_MAX);
+    let rows: Vec<AuditActor> = qb.build_query_as().fetch_all(pool).await?;
+    Ok(rows)
 }
 
 #[cfg(test)]

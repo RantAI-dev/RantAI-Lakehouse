@@ -2675,12 +2675,19 @@ fn unreadable_sentence(asset: &str) -> String {
     )
 }
 
-/// How many requests the mock `ClickHouse` has answered: a refused run must
-/// add none, because nothing is measured or recorded.
+/// How many requests the mock `ClickHouse` has answered that measure or record
+/// something: a refused run must add none. A table lookup (`DESCRIBE`,
+/// `system.columns`) reads the table's shape and is not counted (`SEC-80`).
 async fn clickhouse_requests(ch: &MockServer) -> usize {
-    ch.received_requests()
-        .await
-        .map_or(0, |requests| requests.len())
+    let requests = ch.received_requests().await.unwrap_or_default();
+    let mut measured = 0;
+    for request in &requests {
+        let body = String::from_utf8_lossy(&request.body);
+        if !body.contains("DESCRIBE TABLE") && !body.contains("system.columns") {
+            measured += 1;
+        }
+    }
+    measured
 }
 
 fn rule_body(name: &str, table: &str, threshold: &str) -> Value {
@@ -2703,15 +2710,29 @@ fn update_rule_body(table: &str, threshold: &str) -> Value {
 }
 
 /// The deployment of the quality writers: the catalog deployment with an
-/// Iceberg query database, so a rule can be written for a bronze table. Every
-/// `DESCRIBE` answers one column, so each bronze table is there.
+/// Iceberg query database, so a rule can be written for a bronze table. The
+/// `DESCRIBE` of each upload table named here answers one column, so it is
+/// there; any other bronze name answers no columns, so it is not (`SEC-80`).
 async fn spin_up_for_the_quality_writers(catalog: &MockServer, ch: &MockServer) -> TestApp {
-    clickhouse_rows(
-        ch,
-        "DESCRIBE TABLE",
-        vec![json!({ "name": MARKER_COLUMN, "type": "String" })],
-    )
-    .await;
+    for table in [GROUP_TABLE, RETAIL_TABLE, "Retail_Orders"] {
+        Mock::given(method("POST"))
+            .and(body_string_contains("DESCRIBE TABLE"))
+            .and(body_string_contains(format!("bronze.{table}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+                "data": [{"name": MARKER_COLUMN, "type": "String"}],
+                "rows": 1,
+            })))
+            .with_priority(1)
+            .mount(ch)
+            .await;
+    }
+    spin_up_with_env(&quality_writers_env(catalog, ch)).await
+}
+
+/// The environment of [`spin_up_for_the_quality_writers`], without its
+/// `DESCRIBE` answers: a test that makes `ClickHouse` fail mounts its own.
+fn quality_writers_env(catalog: &MockServer, ch: &MockServer) -> HashMap<String, String> {
     let mut env = HashMap::new();
     env.insert("CH_URL".to_owned(), ch.uri());
     env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
@@ -2722,7 +2743,7 @@ async fn spin_up_for_the_quality_writers(catalog: &MockServer, ch: &MockServer) 
         "LAKEKEEPER_READ_TOKEN_FILE".to_owned(),
         token_file("read.jwt"),
     );
-    spin_up_with_env(&env).await
+    env
 }
 
 #[tokio::test]
@@ -3117,6 +3138,298 @@ async fn the_catalog_owner_cannot_set_or_reset_another_tenants_upload_tables_sch
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = send(&router, "DELETE", &retail, &operator, None, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// The schedules stored under `asset`, under any spelling.
+async fn schedules_on(pool: &PgPool, asset: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM quality_schedule WHERE lower(asset) = lower($1)")
+        .bind(asset)
+        .fetch_one(pool)
+        .await
+        .expect("count the quality schedules")
+}
+
+#[tokio::test]
+async fn an_unknown_table_and_another_tenants_table_get_one_schedule_refusal() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_for_the_quality_writers(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_WRITER, CATALOG_TENANT).await;
+    let retail = format!("bronze.{RETAIL_TABLE}");
+    let set = json!({ "mode": "interval", "intervalMinutes": 120 });
+
+    // A name no table has and a name another tenant claimed: the same 400 for
+    // a set and for a reset, so the answer says nothing about upload names.
+    for asset in ["bronze.no_such_table", retail.as_str()] {
+        let uri = format!("/api/governance/quality/schedules/{asset}");
+        let (status, body) = send(&router, "PUT", &uri, &owner, None, Some(set.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{asset}: {body}");
+        assert_eq!(body["error"], json!(unreadable_sentence(asset)), "{body}");
+        let (status, body) = send(&router, "DELETE", &uri, &owner, None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{asset}: {body}");
+        assert_eq!(body["error"], json!(unreadable_sentence(asset)), "{body}");
+    }
+    assert_eq!(schedules_on(&pool, "bronze.no_such_table").await, 0);
+    assert_eq!(schedules_on(&pool, &retail).await, 0);
+}
+
+#[tokio::test]
+async fn the_catalog_owner_sets_and_resets_a_schedule_on_its_own_table() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_for_the_quality_writers(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_WRITER, CATALOG_TENANT).await;
+    let group = format!("/api/governance/quality/schedules/bronze.{GROUP_TABLE}");
+
+    let (status, body) = send(
+        &router,
+        "PUT",
+        &group,
+        &owner,
+        None,
+        Some(json!({ "mode": "interval", "intervalMinutes": 120 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        schedules_on(&pool, &format!("bronze.{GROUP_TABLE}")).await,
+        1
+    );
+    let (status, body) = send(&router, "DELETE", &group, &owner, None, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(
+        schedules_on(&pool, &format!("bronze.{GROUP_TABLE}")).await,
+        0
+    );
+}
+
+/// `SEC-80`: while `ClickHouse` cannot answer, a name another tenant claimed and
+/// a name no table has get the same answer, so the outage says nothing about
+/// which upload names are claimed.
+#[tokio::test]
+async fn an_outage_answers_a_claimed_schedule_name_and_an_unknown_one_alike() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    // ClickHouse fails every query, so no table can be checked.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("ClickHouse is down"))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let TestApp { router, pool } = spin_up_with_env(&quality_writers_env(&catalog, &ch)).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_WRITER, CATALOG_TENANT).await;
+    let retail = format!("bronze.{RETAIL_TABLE}");
+    let set = json!({ "mode": "interval", "intervalMinutes": 120 });
+
+    for verb in ["PUT", "DELETE"] {
+        let mut answers = Vec::new();
+        for asset in ["bronze.no_such_table", retail.as_str()] {
+            let uri = format!("/api/governance/quality/schedules/{asset}");
+            let body = (verb == "PUT").then(|| set.clone());
+            answers.push(send(&router, verb, &uri, &owner, None, body).await);
+        }
+        assert_eq!(
+            answers[0].0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{verb}: {:?}",
+            answers[0].1
+        );
+        assert_eq!(
+            answers[0], answers[1],
+            "{verb}: a claimed name and an unknown name answer alike during an outage"
+        );
+    }
+}
+
+/// `SEC-80`: while `ClickHouse` cannot answer, a rule writer gives a table
+/// another tenant claimed and a table no one has the same answer, for create
+/// and for run.
+#[tokio::test]
+async fn an_outage_answers_a_claimed_rule_table_and_an_unknown_one_alike() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("ClickHouse is down"))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let TestApp { router, pool } = spin_up_with_env(&quality_writers_env(&catalog, &ch)).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_WRITER, CATALOG_TENANT).await;
+
+    // Create: the claimed table and the unknown one answer the same 503.
+    let mut creates = Vec::new();
+    for table in [RETAIL_TABLE, "no_such_table"] {
+        creates.push(
+            send(
+                &router,
+                "POST",
+                "/api/governance/quality",
+                &owner,
+                None,
+                Some(rule_body("owner in outage", table, "rows >= 0")),
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        creates[0].0,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{:?}",
+        creates[0].1
+    );
+    assert_eq!(
+        creates[0], creates[1],
+        "create: a claimed and an unknown table answer alike"
+    );
+    assert_eq!(
+        rules_on(&pool, RETAIL_TABLE).await,
+        0,
+        "a refused create stores nothing"
+    );
+
+    // Run: a rule on a table in the owner's reach is checked, so the outage
+    // answers 503. A rule on a claimed table is covered by the test below.
+    let unknown_rule = add_a_rule(&pool, "no_such_table").await;
+    let (status, body) = send(
+        &router,
+        "POST",
+        &format!("/api/governance/quality/{unknown_rule}/run"),
+        &owner,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+}
+
+/// `SEC-80`: a rule the caller cannot reach answers as an unknown rule id
+/// does, and during an outage it asks no table at all: a run, an edit and a
+/// delete of such a rule give the same `404` as an id that does not exist.
+#[tokio::test]
+async fn an_outage_answers_a_rule_out_of_reach_like_an_unknown_rule_id() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("ClickHouse is down"))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let TestApp { router, pool } = spin_up_with_env(&quality_writers_env(&catalog, &ch)).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_WRITER, CATALOG_TENANT).await;
+    let claimed_rule = add_a_rule(&pool, RETAIL_TABLE).await;
+    let unknown_id = Uuid::new_v4();
+    let rule_uri = |id: Uuid| format!("/api/governance/quality/{id}");
+
+    let run = |id: Uuid| {
+        let (router, owner) = (router.clone(), owner.clone());
+        async move {
+            send(
+                &router,
+                "POST",
+                &format!("{}/run", rule_uri(id)),
+                &owner,
+                None,
+                None,
+            )
+            .await
+        }
+    };
+    let (status, unknown) = run(unknown_id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+    assert_eq!(unknown["error"], json!(RULE_NOT_FOUND), "{unknown}");
+    assert_eq!(run(claimed_rule).await, (status, unknown.clone()), "run");
+
+    let update = |id: Uuid| {
+        let (router, owner) = (router.clone(), owner.clone());
+        async move {
+            send(
+                &router,
+                "PUT",
+                &rule_uri(id),
+                &owner,
+                None,
+                Some(update_rule_body(RETAIL_TABLE, "rows >= 5")),
+            )
+            .await
+        }
+    };
+    assert_eq!(
+        update(claimed_rule).await,
+        (status, unknown.clone()),
+        "update"
+    );
+    assert_eq!(
+        update(unknown_id).await,
+        (status, unknown.clone()),
+        "update"
+    );
+
+    let delete = |id: Uuid| {
+        let (router, owner) = (router.clone(), owner.clone());
+        async move { send(&router, "DELETE", &rule_uri(id), &owner, None, None).await }
+    };
+    assert_eq!(
+        delete(claimed_rule).await,
+        (status, unknown.clone()),
+        "delete"
+    );
+    assert_eq!(delete(unknown_id).await, (status, unknown), "delete");
+    assert_eq!(
+        rules_on(&pool, RETAIL_TABLE).await,
+        1,
+        "a refused delete keeps the rule"
+    );
+}
+
+#[tokio::test]
+async fn a_schedule_on_a_dropped_table_can_be_reset_but_not_set_again() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_for_the_quality_writers(&catalog, &ch).await;
+    // The table was dropped after it was scheduled: no mock answers its
+    // `DESCRIBE`, so it is absent, and the schedule row is still there.
+    sqlx::query(
+        "INSERT INTO quality_schedule (asset, mode, interval_minutes) VALUES ($1, 'interval', 60)",
+    )
+    .bind("bronze.dropped_orders")
+    .execute(&pool)
+    .await
+    .expect("add the schedule");
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_WRITER, CATALOG_TENANT).await;
+    let uri = "/api/governance/quality/schedules/bronze.dropped_orders";
+
+    let (status, body) = send(
+        &router,
+        "PUT",
+        uri,
+        &owner,
+        None,
+        Some(json!({ "mode": "interval", "intervalMinutes": 120 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        json!(unreadable_sentence("bronze.dropped_orders")),
+        "{body}"
+    );
+    let (status, body) = send(&router, "DELETE", uri, &owner, None, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(schedules_on(&pool, "bronze.dropped_orders").await, 0);
 }
 
 #[tokio::test]

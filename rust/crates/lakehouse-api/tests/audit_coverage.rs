@@ -10,7 +10,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::common::{
     TestApp, audit_rows, create_principal_with_permissions, create_zero_permission_principal,
     in_the_catalog_tenant, session_cookie_for_seeded_user, session_cookie_for_user, spin_up,
+    spin_up_with_env,
 };
 
 // ── The guard ──────────────────────────────────────────────────────────────
@@ -389,6 +390,14 @@ async fn the_row(pool: &PgPool, action: &str) -> Value {
     rows.remove(0)
 }
 
+/// The newest row for an action, when that action has written more than one
+/// (a second save writes a second row).
+async fn the_newest_row(pool: &PgPool, action: &str) -> Value {
+    let rows = audit_rows(pool, action).await;
+    assert!(!rows.is_empty(), "no {action} row, got {rows:#?}");
+    rows.last().expect("the newest row").clone()
+}
+
 /// Saves a query as the seeded Analyst and returns its id.
 async fn save_a_query(app: &axum::Router, cookie: &str, title: &str) -> String {
     let (status, saved) = call(
@@ -571,46 +580,340 @@ async fn a_refusal_at_the_gate_names_the_object_in_the_query_string() {
     assert_eq!(row["resource_id"], json!("board-7"));
 }
 
-/// AC4: the query-limits save names the fields it carried and none of the
-/// values, not a number and not the role it named.
+/// AC4, plan D3: the query-limits save names the settings that changed as
+/// dotted paths, from the values the save replaced (plan D3b), and holds no
+/// value — not a number and not the role it named.
 #[tokio::test]
-async fn the_query_limits_update_names_its_fields_and_holds_no_value() {
+async fn the_query_limits_update_names_the_settings_that_changed_and_holds_no_value() {
     let TestApp { router, pool } = spin_up().await;
     let admin = create_principal_with_permissions(&pool, "settings:write").await;
     let cookie = session_cookie_for_user(&pool, admin).await;
-    let role: Uuid = sqlx::query_scalar(
-        "SELECT r.id FROM role r JOIN app_user_role ur ON ur.role_id = r.id \
-         WHERE ur.user_id = $1 LIMIT 1",
-    )
-    .bind(admin)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let role_name = "Limits Audit Role";
+    let role: Uuid =
+        sqlx::query_scalar("INSERT INTO role (name, permissions) VALUES ($1, '') RETURNING id")
+            .bind(role_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let body = |chart_rows: i32, with_role: bool| {
+        json!({
+            "install": {"timeoutSeconds": 30, "chartRows": chart_rows, "mapPoints": 1000, "studioRows": 4000},
+            "roles": if with_role {
+                json!([{"roleId": role, "timeoutSeconds": 300}])
+            } else {
+                json!([])
+            }
+        })
+    };
     let (status, saved) = call(
         &router,
         "PUT",
         "/api/settings/limits",
         &cookie,
-        Some(json!({
-            "install": {"timeoutSeconds": 30, "chartRows": 500, "mapPoints": 1000, "studioRows": 4000},
-            "roles": [{"roleId": role, "timeoutSeconds": 300}]
-        })),
+        Some(body(500, true)),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{saved}");
 
+    // The first save replaced the seeded defaults and no role limits, so it
+    // names every install setting it moved and the role it gave a limit.
+    let expected_fields = json!([
+        "install.chartRows",
+        "install.mapPoints",
+        "install.studioRows",
+        "install.timeoutSeconds",
+        format!("roles.{role_name}.timeoutSeconds"),
+    ]);
+    let expected_detail = format!(
+        "install.chartRows, install.mapPoints, install.studioRows, install.timeoutSeconds, \
+         roles.{role_name}.timeoutSeconds"
+    );
     let row = the_row(&pool, "settings.limits.update").await;
     assert_eq!(row["outcome"], "executed");
     assert_eq!(row["resource_kind"], "settings");
-    assert_eq!(row["args"], json!({"fields": ["install", "roles"]}));
+    assert_eq!(row["resource_id"], "limits");
+    assert_eq!(row["args"], json!({"fields": expected_fields}));
+    assert_eq!(
+        row["detail"].as_str(),
+        Some(expected_detail.as_str()),
+        "the detail is the paths, sorted, comma-separated"
+    );
     assert!(
         !row.to_string().contains(&role.to_string()),
         "the role id is a value of the body and is not in the row: {row}"
     );
+
+    // A save that moves one setting names that one setting only.
+    let (status, saved) = call(
+        &router,
+        "PUT",
+        "/api/settings/limits",
+        &cookie,
+        Some(body(501, true)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let row = the_newest_row(&pool, "settings.limits.update").await;
+    assert_eq!(row["args"], json!({"fields": ["install.chartRows"]}));
+    assert_eq!(row["detail"].as_str(), Some("install.chartRows"));
     assert!(
-        !row["args"].to_string().contains("timeoutSeconds"),
-        "only top-level names are kept: {row}"
+        !row["args"].to_string().contains("501"),
+        "only paths are kept, never the value that changed: {row}"
     );
+
+    // A save that changes nothing records the empty list.
+    let (status, saved) = call(
+        &router,
+        "PUT",
+        "/api/settings/limits",
+        &cookie,
+        Some(body(501, true)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let row = the_newest_row(&pool, "settings.limits.update").await;
+    assert_eq!(row["args"], json!({"fields": []}), "nothing changed: {row}");
+}
+
+/// Plan D3b: the limits save answers with the numbers it stored and names
+/// the settings that changed, both from the save's own transaction. The row
+/// holds the paths and no value, and the answer carries the numbers the
+/// save wrote: the install's, the roles' and the caller's effective ones.
+#[tokio::test]
+async fn the_limits_save_answers_with_the_numbers_it_stored_and_names_what_changed() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let role_name = "Limits Stored Role";
+    let role: Uuid =
+        sqlx::query_scalar("INSERT INTO role (name, permissions) VALUES ($1, '') RETURNING id")
+            .bind(role_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    // The caller holds that role, so the effective limits it is told are the
+    // ones the role's own limit gives it.
+    sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
+        .bind(admin)
+        .bind(role)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let body = |chart_rows: i32| {
+        json!({
+            "install": {"timeoutSeconds": 30, "chartRows": chart_rows, "mapPoints": 1000, "studioRows": 4000},
+            "roles": [{"roleId": role, "timeoutSeconds": 300}]
+        })
+    };
+
+    // The first save sets every limit; the second moves one of them.
+    let (status, first) = call(
+        &router,
+        "PUT",
+        "/api/settings/limits",
+        &cookie,
+        Some(body(500)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, second) = call(
+        &router,
+        "PUT",
+        "/api/settings/limits",
+        &cookie,
+        Some(body(501)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+
+    // The row names the setting that changed and holds no value.
+    let row = the_newest_row(&pool, "settings.limits.update").await;
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(row["args"], json!({"fields": ["install.chartRows"]}));
+    assert_eq!(row["detail"].as_str(), Some("install.chartRows"));
+    assert!(
+        !row["args"].to_string().contains("501")
+            && !row["detail"].as_str().unwrap_or_default().contains("501"),
+        "only paths are kept, never the value that changed: {row}"
+    );
+
+    // The answer carries the numbers the save stored.
+    assert_eq!(second["install"], body(501)["install"]);
+    assert_eq!(
+        second["roles"],
+        json!([{"roleId": role.to_string(), "timeoutSeconds": 300}]),
+        "the answer carries the role limit the save stored: {second}"
+    );
+    assert_eq!(
+        second["effective"],
+        json!({
+            "timeoutSeconds": 300, "chartRows": 501, "mapPoints": 1000, "studioRows": 4000,
+            "source": {"kind": "role", "name": role_name}
+        }),
+        "the caller's effective limits come from the stored values: {second}"
+    );
+}
+
+/// Plan D3: the reporting save names the settings that changed the same way,
+/// from the row the save replaced, and never a value.
+#[tokio::test]
+async fn the_reporting_settings_update_names_the_settings_that_changed_and_holds_no_value() {
+    // The save checks the zone against the engine, so the engine is a fake
+    // that lists every zone (the same one shape `reporting_settings_route`
+    // uses).
+    let engine = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"meta":[{"name":"n","type":"UInt64"}],"data":[{"n":"1"}],"rows":1}"#,
+        ))
+        .mount(&engine)
+        .await;
+    let env = HashMap::from([("CH_URL".to_owned(), engine.uri())]);
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+
+    // The first save found nothing stored: it names every part it set.
+    let (status, saved) = call(
+        &router,
+        "PUT",
+        "/api/settings/reporting",
+        &cookie,
+        Some(json!({"timeZone": "UTC", "weekStart": "monday"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let row = the_row(&pool, "settings.reporting.update").await;
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(row["resource_kind"], "settings");
+    assert_eq!(row["resource_id"], "reporting");
+    assert_eq!(
+        row["args"],
+        json!({"fields": [
+            "reporting.companyPalette",
+            "reporting.contentSites",
+            "reporting.downloadDeniedRoles",
+            "reporting.fonts",
+            "reporting.numberLocale",
+            "reporting.publicLinksEnabled",
+            "reporting.reportAllowedDomains",
+            "reporting.resultCache.mode",
+            "reporting.timeZone",
+            "reporting.weekStart",
+        ]}),
+        "the first save set every part of the settings: {row}"
+    );
+    // `resultCache.minutes` is not among them: it stays unset, so its value
+    // did not change.
+
+    // The second save moves one setting and names that one only, and the
+    // value it moved it into is nowhere in the row.
+    let (status, saved) = call(
+        &router,
+        "PUT",
+        "/api/settings/reporting",
+        &cookie,
+        Some(json!({"timeZone": "UTC", "weekStart": "sunday"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let row = the_newest_row(&pool, "settings.reporting.update").await;
+    assert_eq!(row["args"], json!({"fields": ["reporting.weekStart"]}));
+    assert_eq!(row["detail"].as_str(), Some("reporting.weekStart"));
+    assert!(
+        !row.to_string().contains("sunday"),
+        "the row names the path, never the value: {row}"
+    );
+}
+
+/// Plan D3: a settings save the handler refuses with `400` keeps its
+/// `refused` row — written by the handler now, with the paths unknown and the
+/// fixed sentence naming the status — while a `403` stays the gate's one row.
+#[tokio::test]
+async fn a_settings_save_the_handler_refuses_writes_one_refused_row_naming_the_status() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+
+    // A body outside the limits' ranges: refused by the handler with 400.
+    let (status, body) = call(
+        &router,
+        "PUT",
+        "/api/settings/limits",
+        &cookie,
+        Some(json!({
+            "install": {"timeoutSeconds": 9, "chartRows": 2000, "mapPoints": 5000, "studioRows": 64000},
+            "roles": []
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let row = the_row(&pool, "settings.limits.update").await;
+    assert_eq!(row["outcome"], "refused");
+    assert_eq!(row["resource_kind"], "settings");
+    assert_eq!(row["resource_id"], "limits");
+    assert_eq!(row["principal_id"], json!(admin.to_string()));
+    assert_eq!(
+        row["args"],
+        json!({"fields": []}),
+        "the paths are unknown: {row}"
+    );
+    assert_eq!(
+        row["detail"].as_str(),
+        Some("The settings save was refused with HTTP 400; the values sent were not valid.")
+    );
+    assert!(
+        !row.to_string().contains("timeoutSeconds"),
+        "the refusal row never echoes the payload: {row}"
+    );
+
+    // A body the reporting save refuses (the first day is not one of the two):
+    // one row under the reporting action, the same shape.
+    let (status, body) = call(
+        &router,
+        "PUT",
+        "/api/settings/reporting",
+        &cookie,
+        Some(json!({"timeZone": "UTC", "weekStart": "friday"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let row = the_row(&pool, "settings.reporting.update").await;
+    assert_eq!(row["outcome"], "refused");
+    assert_eq!(row["resource_id"], "reporting");
+    assert_eq!(row["args"], json!({"fields": []}));
+    assert_eq!(
+        row["detail"].as_str(),
+        Some("The settings save was refused with HTTP 400; the values sent were not valid.")
+    );
+
+    // The 403 stays at the gate: a caller without `settings:write` gets one
+    // refused row with the missing permission, and the handler never ran.
+    let nobody = create_zero_permission_principal(&pool).await;
+    let outsiders = session_cookie_for_user(&pool, nobody).await;
+    let rows_before = audit_rows(&pool, "settings.limits.update").await.len();
+    let (status, body) = call(
+        &router,
+        "PUT",
+        "/api/settings/limits",
+        &outsiders,
+        Some(json!({
+            "install": {"timeoutSeconds": 60, "chartRows": 2000, "mapPoints": 5000, "studioRows": 64000},
+            "roles": []
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let rows = audit_rows(&pool, "settings.limits.update").await;
+    assert_eq!(
+        rows.len(),
+        rows_before + 1,
+        "the gate wrote the one refusal row: {rows:#?}"
+    );
+    let gate_row = &rows[rows.len() - 1];
+    assert_eq!(gate_row["outcome"], "refused");
+    assert_eq!(gate_row["detail"], "settings:write");
+    assert_eq!(gate_row["principal_id"], json!(nobody.to_string()));
 }
 
 /// AC5: creating a role leaves a row from the central writer.
@@ -1092,20 +1395,26 @@ async fn generating_a_pipeline_writes_one_row_that_names_the_pipeline() {
     assert_eq!(row["principal_id"], json!(user.to_string()));
 }
 
-/// `GOV-1 review` blocker 2, second look: `POST /api/alerts/test` is not one
-/// of the "test" buttons of Decision 1. It runs the rule for real: the email
-/// or webhook goes out, the rule's state settles and a fired result is saved.
-/// It is audited like `POST /api/alerts/run`, with the id the person named.
+/// `GOV-1` acceptance follow-up (owner 2026-11-16) reversed the old decision
+/// (`GOV-1 review` blocker 2): neither `POST /api/alerts/test` nor
+/// `POST /api/alerts/run` writes an audit row. The test button sends a probe
+/// and changes no configuration, and the scheduler calls the run on its own
+/// tick with no person behind it — the rule and its schedule were audited
+/// where they were set up, and what a rule delivered is in the alert's own
+/// history, not in the trail (`Decision 1`).
 #[tokio::test]
-async fn testing_an_alert_rule_writes_a_row_that_names_the_rule() {
+async fn testing_an_alert_rule_and_the_schedulers_run_write_no_audit_row() {
     let TestApp { router, pool } = spin_up().await;
     let user = create_principal_with_permissions(&pool, "alert:write").await;
     let cookie = session_cookie_for_user(&pool, user).await;
 
+    let before = audit_event_count(&pool).await;
     let (_, _) = call(&router, "POST", "/api/alerts/test?id=rule-9", &cookie, None).await;
+    let (_, _) = call(&router, "POST", "/api/alerts/run?id=rule-9", &cookie, None).await;
 
-    let row = the_row(&pool, "alert.test").await;
-    assert_eq!(row["resource_kind"], "alert");
-    assert_eq!(row["resource_id"], json!("rule-9"));
-    assert_eq!(row["principal_id"], json!(user.to_string()));
+    assert_eq!(
+        audit_event_count(&pool).await,
+        before,
+        "an alert test and a scheduled run change nothing, so they record nothing"
+    );
 }

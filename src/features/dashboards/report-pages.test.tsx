@@ -183,7 +183,10 @@ describe("ReportEditorPage", () => {
         json({ ok: true, report: { id: "r2", ...(call.body as object), createdBy: "", createdAt: "", updatedBy: "", updatedAt: "" } }),
     })
     render(<AuthProvider><ReportEditorPage /></AuthProvider>)
-    fireEvent.change(await screen.findByLabelText("Title"), { target: { value: "  New one " } })
+    const titleInput = await screen.findByLabelText("Title")
+    expect((titleInput as HTMLInputElement).required).toBe(true)
+    expect(document.querySelector('label[for="report-title"]')?.hasAttribute("data-required")).toBe(true)
+    fireEvent.change(titleInput, { target: { value: "  New one " } })
     fireEvent.click(screen.getByRole("button", { name: "Add block" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: /Heading/ }))
     fireEvent.change(screen.getByLabelText("Heading text"), { target: { value: "Intro" } })

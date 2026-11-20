@@ -10,7 +10,7 @@ import { knownStep } from "@/lib/pipeline-editor"
 import { describeTransform } from "@/lib/transform-draft"
 import { cn } from "@/lib/utils"
 import { pipelineService } from "@/services"
-import type { PipelineDetail, PipelineOpNode, PipelineRunStep } from "@/services/contracts/pipelines"
+import type { PipelineDetail, PipelineMeasure, PipelineOpNode, PipelineRunStep } from "@/services/contracts/pipelines"
 import { authoredFlow, dagsterFlow } from "./pipeline-flow-layout"
 import { PipelineFlowchart } from "./pipeline-flowchart"
 
@@ -224,6 +224,26 @@ export function DagsterDefinition({
  * statement a run executes (D8), since an authored pipeline has no code of
  * its own.
  */
+/** BLD-16 / J9: one measure in words — "sum of amount", "count" for a bare count. */
+function measureWords(measure: PipelineMeasure): string {
+  switch (measure.function) {
+    case "count":
+      return measure.column ? `count of ${measure.column}` : "count"
+    case "countDistinct":
+      return `count distinct of ${measure.column ?? ""}`
+    case "sum":
+      return `sum of ${measure.column ?? ""}`
+    case "avg":
+      return `average of ${measure.column ?? ""}`
+    case "min":
+      return `minimum of ${measure.column ?? ""}`
+    case "max":
+      return `maximum of ${measure.column ?? ""}`
+    default:
+      return `${measure.function} of ${measure.column ?? ""}`
+  }
+}
+
 export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
   const def = pipeline.definition
   const [selected, setSelected] = React.useState<string>("input:0")
@@ -261,12 +281,29 @@ export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
             <>
               <PanelTitle>
                 Step {(index ?? 0) + 1} of {def.steps.length} ·{" "}
-                {step === null ? stored.kind : step.kind === "sql" ? "SQL" : "Form"}
+                {
+                  // BLD-16 / J9: the same words the editor's panes use.
+                  step === null
+                    ? stored.kind
+                    : step.kind === "transform"
+                      ? "Operations"
+                      : step.kind === "sql"
+                        ? "SQL"
+                        : step.kind === "join"
+                          ? "Join"
+                          : step.kind === "aggregate"
+                            ? "Aggregate"
+                            : step.kind === "filter"
+                              ? "Filter"
+                              : stored.kind
+                }
               </PanelTitle>
               <p className="font-mono font-medium">{stored.name}</p>
               {step === null ? (
                 // BLD-1 part 1 S3 review R1-S2: a kind this console does not
-                // know. What is stored is shown as it is; nothing is guessed.
+                // know, or a stored step whose fields do not parse to its
+                // kind's shape (BLD-16's `knownStep`). What is stored is
+                // shown as it is; nothing is guessed.
                 <>
                   <p className="text-muted-foreground">
                     A step of kind <span className="font-mono text-foreground">{stored.kind}</span>, which this console
@@ -295,8 +332,86 @@ export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
                     </ol>
                   )}
                 </>
-              ) : (
+              ) : step.kind === "sql" ? (
                 <CodeView text={step.sql} language="sql" />
+              ) : step.kind === "join" ? (
+                // BLD-16 / J9: each new kind in words — "left join of
+                // orders and customers on customer_id = id", its output
+                // columns, then what the other kinds compute.
+                <>
+                  <p className="text-muted-foreground">
+                    {step.joinType === "full" ? "full outer" : step.joinType === "" ? "inner" : step.joinType} join of{" "}
+                    <span className="font-mono text-foreground">{step.left}</span> and{" "}
+                    <span className="font-mono text-foreground">{step.right}</span> on{" "}
+                    <span className="font-mono text-foreground">
+                      {step.on.map((pair) => `${pair.left} = ${pair.right}`).join(" and ")}
+                    </span>
+                  </p>
+                  <p className="text-xs text-muted-foreground">Output columns:</p>
+                  <p className="font-mono text-xs">
+                    {step.columns
+                      .map((column) => `${column.column}${column.name && column.name !== column.column ? ` as ${column.name}` : ""}`)
+                      .join(", ")}
+                  </p>
+                </>
+              ) : step.kind === "aggregate" ? (
+                <>
+                  <p className="text-muted-foreground">
+                    {step.groupBy.length > 0 ? (
+                      <>
+                        Group by <span className="font-mono text-foreground">{step.groupBy.join(", ")}</span>
+                        {step.measures.length > 0 ? ":" : ""}
+                      </>
+                    ) : (
+                      "No group-by column: one row."
+                    )}
+                  </p>
+                  {step.measures.length > 0 ? (
+                    <ol className="flex flex-col gap-1.5">
+                      {step.measures.map((measure) => (
+                        <li key={measure.name}>
+                          <span className="font-mono text-foreground">{measure.name}</span> = {measureWords(measure)}
+                        </li>
+                      ))}
+                    </ol>
+                  ) : null}
+                  {(step.having ?? []).length > 0 ? (
+                    // BLD-16 review R2: a having drops groups, and the words
+                    // said only what the step groups by.
+                    <p className="text-muted-foreground">
+                      Keep groups where{" "}
+                      <span className="font-mono text-foreground">
+                        {(step.having ?? [])
+                          .map((condition) => `${condition.column} ${condition.operator} ${condition.value}`)
+                          .join(step.havingMatch === "any" ? " or " : " and ")}
+                      </span>
+                    </p>
+                  ) : null}
+                </>
+              ) : step.kind === "filter" ? (
+                <>
+                  <p className="text-muted-foreground">
+                    Keeps the rows matching{" "}
+                    {(step.match === "any" ? "any" : "all")} of {step.conditions.length}{" "}
+                    condition{step.conditions.length === 1 ? "" : "s"}.
+                  </p>
+                  <ol className="flex flex-col gap-1.5">
+                    {step.conditions.map((condition, i) => (
+                      <li key={`${i}:${condition.column}`} className="font-mono text-xs">
+                        {condition.column} {condition.operator} {condition.value}
+                      </li>
+                    ))}
+                  </ol>
+                </>
+              ) : (
+                // A kind `knownStep` knows but this view does not spell out.
+                <>
+                  <p className="text-muted-foreground">
+                    A step of kind <span className="font-mono text-foreground">{stored.kind}</span>, which this console
+                    cannot show yet. Its stored record:
+                  </p>
+                  <CodeView text={JSON.stringify(stored, null, 2)} language="plain" />
+                </>
               )}
             </>
           ) : input ? (

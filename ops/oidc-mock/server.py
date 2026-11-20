@@ -30,7 +30,12 @@ production identity provider; see ADR 0011.
 Idempotent: if keys/tokens already exist on the shared volume (a restart,
 not a fresh volume), they are reused rather than regenerated, so already-
 granted principal identities (their `sub` claims) do not change under a
-container restart.
+container restart. A token that has expired — or that is close to
+expiring — is the one exception: it is replaced, because a volume that
+keeps an expired token forever is a stack that stops being able to
+authenticate, and the volume is persistent across restarts. The `sub`
+claim is the principal's name, so replacing a token changes when it
+expires, never who it is.
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ import http.server
 import json
 import os
 import socketserver
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -62,14 +68,30 @@ TOKENS_DIR = Path(os.environ.get("OIDC_MOCK_TOKENS_DIR", "/tokens"))
 ISSUER = os.environ["OIDC_MOCK_ISSUER"]  # e.g. http://oidc-mock:8090
 AUDIENCE = os.environ.get("OIDC_MOCK_AUDIENCE", "lakekeeper")
 KEY_ID = "oidc-mock-1"
-# 30 days, not 10 years (PR #33 review, blocker 2): this mock still has no
-# token-refresh mechanism (see module doc), so the lifetime has to outlive
-# a normal dev/CI stack's uptime without operator intervention. 30 days
-# comfortably covers a sprint-length local stack or a long-running demo
-# environment while bounding how long a leaked token stays valid to weeks,
-# not a decade. A stack left running past that needs `oidc-mock` restarted
-# with a fresh `lakehouse_oidc_tokens` volume anyway (see docs/OPERATIONS.md).
+# 30 days, not 10 years (PR #33 review, blocker 2): the lifetime has to
+# bound how long a leaked token stays valid to weeks, not a decade.
+#
+# It no longer has to outlive a stack's uptime on its own: `mint_tokens`
+# replaces a token that is expired (or that expires within
+# `TOKEN_REFRESH_MARGIN_SECONDS`), and `refresh_loop` does that hourly,
+# so a token on the volume is always replaced before it can expire. The
+# `sub` claim never changes — it is the principal's name — so a replaced
+# token keeps the identity the grants were given to.
 TOKEN_LIFETIME_SECONDS = 30 * 24 * 3600
+# How long before a token's own `exp` it is replaced. A token that is
+# replaced while it is still valid is not "revoked": the old one stays
+# valid until its own `exp` (Lakekeeper validates the signature and the
+# claim, not "is this the newest file"), so a consumer that cached it
+# keeps working. What the replacement buys is that the FILE on the volume
+# never carries an expired token, which is what the one-shot init jobs
+# read.
+#
+# 7 days is comfortably longer than the gap between two refreshes, so a
+# token is always replaced before it can expire.
+TOKEN_REFRESH_MARGIN_SECONDS = 7 * 24 * 3600
+# How often the refresher looks. The margin above is what makes the
+# lifetime safe; this only decides how close to the margin it notices.
+TOKEN_REFRESH_INTERVAL_SECONDS = 3600
 
 # Every principal this build needs Lakekeeper to recognize under
 # enforcement, plus one deliberately ungranted principal for the negative
@@ -245,6 +267,36 @@ def write_discovery() -> None:
     (well_known / "openid-configuration").write_text(json.dumps(doc))
 
 
+def token_expiry(token_path: Path) -> int | None:
+    """The `exp` claim of the token at `token_path`, or None if unknown.
+
+    None means "this file cannot be read as a token" — a missing file, a
+    truncated one, or one signed by somebody else. The caller treats that
+    as "must be replaced": the question this answers is "can the stack
+    still present this token", and a file nobody can read is a token
+    nobody can use.
+    """
+    try:
+        payload = token_path.read_text().strip().split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload).decode("ascii"))
+        return int(claims["exp"])
+    except (OSError, IndexError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def token_needs_refresh(token_path: Path) -> bool:
+    """Whether the token at `token_path` has to be replaced.
+
+    Replaced when it is already expired, when it expires within
+    [`TOKEN_REFRESH_MARGIN_SECONDS`], and when it cannot be read at all.
+    """
+    exp = token_expiry(token_path)
+    if exp is None:
+        return True
+    return exp <= int(time.time()) + TOKEN_REFRESH_MARGIN_SECONDS
+
+
 def mint_tokens(key: rsa.RSAPrivateKey) -> None:
     TOKENS_DIR.mkdir(parents=True, exist_ok=True)
     private_pem = key.private_bytes(
@@ -255,7 +307,13 @@ def mint_tokens(key: rsa.RSAPrivateKey) -> None:
     now = int(time.time())
     for sub in PRINCIPALS:
         token_path = TOKENS_DIR / f"{sub}.jwt"
-        if token_path.exists():
+        # A token that is still good is kept, so a restart does not change
+        # what the stack presents. One that is expired — or that expires
+        # within the refresh margin — is replaced: the volume is
+        # persistent, so without this the tokens minted when the volume
+        # was first created stay on it forever and the whole stack stops
+        # being able to authenticate once they expire.
+        if token_path.exists() and not token_needs_refresh(token_path):
             continue
         claims = {
             "iss": ISSUER,
@@ -268,6 +326,25 @@ def mint_tokens(key: rsa.RSAPrivateKey) -> None:
             claims, private_pem, algorithm="RS256", headers={"kid": KEY_ID}
         )
         token_path.write_text(token)
+        print(f"minted a fresh token for {sub} (expires in "
+              f"{TOKEN_LIFETIME_SECONDS // 86400} days)", flush=True)
+
+
+def refresh_loop(key: rsa.RSAPrivateKey) -> None:
+    """Replace tokens that are close to expiring, for as long as the mock runs.
+
+    A container that is never restarted would otherwise keep the tokens it
+    minted at start forever. The signing key does not change, so a replaced
+    token is indistinguishable from the old one to every consumer: the
+    `sub` stays the same, the signature stays valid, and the old token
+    remains valid until its own `exp`.
+    """
+    while True:
+        time.sleep(TOKEN_REFRESH_INTERVAL_SECONDS)
+        try:
+            mint_tokens(key)
+        except Exception as exc:  # a failed refresh must not kill the mock
+            print(f"token refresh failed: {exc!r}", flush=True)
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -478,6 +555,11 @@ def main() -> None:
 
     def handler_factory(*args, **kwargs):
         return Handler(*args, private_key=key, **kwargs)
+
+    # The refresher runs beside the server, not instead of it: the server
+    # is what the stack needs, and the refresher only replaces tokens that
+    # are close to expiring.
+    threading.Thread(target=refresh_loop, args=(key,), daemon=True).start()
 
     with socketserver.TCPServer(("0.0.0.0", port), handler_factory) as httpd:
         httpd.serve_forever()
