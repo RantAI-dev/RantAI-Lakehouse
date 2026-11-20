@@ -1243,7 +1243,7 @@ mod t1_3_tests {
     /// D9, and the new kinds' own rules) applies with no second copy.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_pipeline_accepts_join_and_aggregate_form_steps(pool: PgPool) {
-        let state = state_with_pg(&pool).await;
+        let (state, _dagster) = state_with_pg(&pool).await;
         // A seeded Platform Admin: a real `app_user` (the `run_as` key) whose
         // role is the `*:*` the save-time gate needs.
         let user: Uuid =
@@ -1329,7 +1329,7 @@ mod t1_3_tests {
     /// instead of guessing.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_pipeline_refuses_a_form_step_with_the_field_named(pool: PgPool) {
-        let state = state_with_pg(&pool).await;
+        let (state, _dagster) = state_with_pg(&pool).await;
         let user: Uuid =
             sqlx::query_scalar("SELECT id FROM app_user WHERE email = 'fajar@meridian.example'")
                 .fetch_one(&pool)
