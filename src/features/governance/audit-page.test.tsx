@@ -434,7 +434,7 @@ describe("AuditPage: search, paging, deep link and export", () => {
 
     expect(await screen.findByText("Audit event a1")).toBeDefined()
     // The list and the actors list load; the one event is not fetched again.
-    expect(sent.every((c) => !c.path.startsWith(`${SEARCH}/`))).toBe(true)
+    expect(sent.every((c) => c.path === SEARCH || c.path === ACTORS)).toBe(true)
   })
 
   it("shows the list and a plain sentence, not a broken page, when the linked event is gone", async () => {
