@@ -94,3 +94,93 @@ MemoryMax=3G -p MemorySwapMax=0 nice -n 15 …`. Per commit:
 `bun x tsc --noEmit -p .`, `bun x eslint <changed files>`, `bun test
 <the dashboards lineage panel and catalog lineage test files>`. No prettier,
 no cargo, no dev server.
+
+## Handoff
+
+Developer: Opus developer agent (console design work), 2026-11-20. Branch
+`feat/bi-71-lineage-readable`, not pushed.
+
+### Commits (plan order, one task each)
+
+- `512b69182` T1 `BI-71 feat(dashboards): chart lineage panel reads as one route`
+- `98d84e091` T2 `BI-71 feat(catalog): group the lineage map's charts by dashboard`
+- `edd5d0694` T3 `BI-71 feat(catalog): the lineage map pans, zooms and opens fitted`
+- `365ee4f57` T4 `BI-71 docs(changelog): lineage that reads at a glance`
+- this commit: the handoff.
+
+### What was built
+
+- **T1** `src/features/dashboards/chart-lineage-panel.tsx`: mockup A's
+  route on the real `ChartLineage` (steps reversed to source first; kind
+  icon per step, the chart step "This chart" with its fields as chips;
+  refresh time only via `hasRefreshTime`, relative in the line and
+  `refreshWords` in the tooltip and for screen readers; the one missing line
+  from `missingWords` with `HelpHint` holding `coverage.join(" ")`; "Open in
+  lineage" pinned under the scroll area). Motion: three `@theme` animations
+  in `src/app/globals.css` (`route-draw`, `route-pop`, `route-rise`, 240 ms,
+  `ease-ui`, transforms/opacity only; mockup's `cl-draw` was 320 ms, cut to
+  240 per decision 1), staggered 70 ms; the existing global
+  `prefers-reduced-motion` rule stops them. `src/lib/lineage-words.ts`
+  gains `hasRefreshTime` (now also used by `refreshWords`) and
+  `missingWords`. A field with several recorded columns shows the first in
+  the chip and all of them in the tooltip.
+- **T2** `src/features/catalog/asset-lineage-map.tsx`: `chartPlacement`,
+  `groupCharts` (nodes with id `chart:*` only; group level = the deepest of
+  its charts; an open group's charts one column to its right, joined to
+  it), `useChartPlacement` (both reads via `dashboardService`, only when the
+  graph has charts; any failure → `null` → ungrouped, no message), and a
+  `GroupToggle` button node (`aria-expanded`, `BarChart3` as in the nav,
+  `ChartColumn` for "Other charts"; the count never truncates).
+  `asset-lineage.tsx` `GraphCard` shows its existing loading skeleton while
+  the placement loads, so the map never draws 111 charts and then folds them.
+- **T3** `src/lib/pan-zoom.ts` (pure: `fitScale`, `fitView`, `clampView`,
+  `zoomAt`, `boxHeight`) and `PanZoomBox` in `asset-lineage-map.tsx`. No
+  existing DOM pan/zoom helper (grep: `geo-view.ts` is ECharts' 1–20 roam
+  for map tiles, a different model); no new dependency. One CSS transform on
+  one wrapper; the drawing is `React.memo`'d so a pan does not redraw nodes.
+  Safari trackpad pinch is handled through `gesturestart`/`gesturechange`
+  in addition to Ctrl+wheel.
+
+### Interpretations the reviewer should check
+
+1. **Box height (decision 3, "keeps today's height rules").** Today the
+   box is as tall as the drawing with no limit. Kept: the box is the
+   drawing's height at the zoom that fits its width, **capped at 560 px**
+   (`BOX_CAP`); without a cap a tall drawing (an opened 111-chart group)
+   could never be "opened fitted". The width-fit shrink avoids an empty band
+   under a wide map on a phone.
+2. **Fit never enlarges.** The fit is capped at 1, so a small map opens at
+   zoom 1 (as today) and cannot be zoomed out below 1.
+3. **Opening or closing a group fits again** (eased), since the drawing's
+   size changes and its new nodes may be off screen.
+4. **Touch:** the box is `touch-action: none` so one finger pans the map
+   (decision 3); on a phone the page scrolls from outside the box, which
+   the 560 px cap leaves room for.
+5. Group caption is "Dashboard", "Other charts" group caption "Charts".
+
+### Checks run (final commit of T3/T4, foreground, every bun command under
+`flock /tmp/claude-1000/lh-bun.lock systemd-run --user --scope -q -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`)
+
+- `bun x tsc --noEmit -p .` → exit 0, no output.
+- `bun x eslint` on the 10 changed `.ts`/`.tsx` files → exit 0, no output.
+- `bun test src/features/dashboards/chart-lineage-panel.test.tsx src/features/catalog/asset-lineage-map.test.ts src/features/catalog/asset-lineage-mindmap.test.tsx src/features/catalog/asset-detail-tabs.test.tsx src/features/governance/used-by.test.tsx src/lib/pan-zoom.test.ts`
+  → **210 pass, 0 fail, 689 expect() calls, 6 files**. Of these, the
+  BI-71 files: panel 11, `asset-lineage-map.test.ts` 10 (4 new),
+  `asset-lineage-mindmap.test.tsx` 6 (new), `pan-zoom.test.ts` 6 (new).
+- The same checks ran per commit, scoped to that commit's files.
+
+### Not verified
+
+- **No browser check** (this VM: no dev server, no build): the look of the
+  route and the map, the 240 ms draw, the pan/zoom feel, Safari's gesture
+  events, a real phone pinch, and the hand check T3 asks for at 1190×800
+  and 390 px. happy-dom lays nothing out, so the component tests stub the
+  box width (`@/lib/test-layout`) and test the arithmetic, not pixels.
+- **Tailwind output** of the new `@theme` animations (`animate-route-*`)
+  is not verified by a build; they follow the existing `--animate-pop`
+  pattern in the same block.
+- Full `bun run test` / `bun run lint` not run (VM memory rule); CI runs
+  them. `asset-detail-tabs.test.tsx` prints one more act() warning
+  (`GraphCard`, from `useChartPlacement`'s resolved no-op read) among its
+  many existing ones; it does not fail.
+- No cargo (no Rust touched).
