@@ -1300,10 +1300,10 @@ fn report_html(mail: &MailParts<'_>) -> String {
             html_text(link)
         ));
     }
-    blocks.push(
-        "<p style=\"color:#888;font-size:12px;margin-top:16px\">Rantai Lake, scheduled report</p>"
-            .to_owned(),
-    );
+    blocks.push(format!(
+        "<p style=\"color:#888;font-size:12px;margin-top:16px\">{}, scheduled report</p>",
+        crate::routes::settings::PRODUCT_NAME
+    ));
     format!(
         "<div style=\"font-family:system-ui,sans-serif;font-size:14px\">{}</div>",
         blocks.concat()
@@ -1856,6 +1856,9 @@ mod tests {
         assert!(html.contains("Filters: none."));
         assert!(!html.contains("<a "));
         assert!(!html.contains("Left out"));
+        // `RPT-3`: the sign-off names the product as the owner does.
+        assert!(html.contains("RantAI Lakehouse, scheduled report"));
+        assert!(!html.contains("Rantai Lake"));
     }
 
     #[test]
