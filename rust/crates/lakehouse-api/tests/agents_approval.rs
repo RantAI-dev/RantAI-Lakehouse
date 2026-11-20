@@ -243,8 +243,9 @@ async fn double_decide_does_not_execute_twice() {
 /// Plan invariant 3 / the permission rule: an approver who holds
 /// `agent:approve` but NOT the tool's own permission (`dashboard:write`
 /// for `delete_chart`) can decide the approval, but the tool is never
-/// executed — the run ends `failed`/"not executed", and the HTTP response
-/// is an explicit error, not a silent 200.
+/// executed — the run ends `failed`/"not executed". The answer is a 200
+/// with `executed: false`: `AI-28`/`LH-AI-18-07` requires a recorded
+/// decision to say it was recorded, not to answer with an error.
 #[tokio::test]
 async fn approver_lacking_the_tools_own_permission_does_not_execute() {
     let TestApp { router, pool } = spin_up().await;
@@ -260,7 +261,16 @@ async fn approver_lacking_the_tools_own_permission_does_not_execute() {
         json!({ "decision": "approved" }),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // AI-28 / LH-AI-18-07: the decision was recorded, so a 403 here was
+    // wrong — the console showed "Failed to record decision". The answer
+    // reports the recorded decision and why the action did not run.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["executed"], json!(false));
+    assert_eq!(
+        body["notExecuted"],
+        json!({ "reason": "permission", "required": "dashboard:write" })
+    );
 
     // The approval itself WAS decided (approved) — `decide_approval`'s own
     // transaction already committed by the time the permission check

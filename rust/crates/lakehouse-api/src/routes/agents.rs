@@ -622,7 +622,10 @@ pub(crate) fn refuse_own_request(
 ///    checked — `agent:approve` (this route's own policy) does NOT imply
 ///    the approver may perform the underlying action. A missing
 ///    permission means the tool is NEVER executed: the run is recorded
-///    `failed`/"not executed", audited, and this returns 403.
+///    `failed`/"not executed", audited, and this returns 200 with
+///    `executed: false` and a `notExecuted.reason` of `"permission"`
+///    (`AI-28`, `LH-AI-18-07`: the decision was recorded, so the answer
+///    must say so rather than fail).
 /// 2. The linked run's stored tool call (`lakehouse_store::agents::
 ///    pending_tool_call`, recorded verbatim by `gate::create_write_high_approval`
 ///    at request time) is replayed through the SAME tool dispatch
@@ -644,8 +647,9 @@ pub(crate) fn refuse_own_request(
 /// 403 if the approver IS the human who requested this approval
 /// (`SEC-57`: the requester may not decide their own request — refused
 /// BEFORE any write, so the approval stays `pending` and nothing runs);
-/// 403 if the approval was approved but the approver lacks the underlying
-/// tool's own permission (the tool is never executed in that case);
+/// 200 with `executed: false` if the approval was approved but the
+/// approver lacks the underlying tool's own permission (the tool is never
+/// executed, but the decision was recorded — `AI-28`, `LH-AI-18-07`);
 /// 503/500 as above.
 /// The `NewAuditEvent` [`decide_approval`]'s approval-decision audit write
 /// builds — extracted as a pure, unit-tested function (WS5 item D2),
@@ -867,7 +871,16 @@ pub async fn decide_approval(
             Some(&id),
         )
         .await;
-        return Err(ApiError::PermissionDenied(detail).into());
+        // AI-28 / LH-AI-18-07 (feature decision 5, ADR 0012 decision 3):
+        // the decision IS recorded — the approval is `approved`, the run is
+        // `failed`, both audit rows are written exactly as before — so the
+        // answer reports that, not a failure. A 403 here made the console
+        // show "Failed to record decision" for a decision it had recorded.
+        return Ok(ApiJson(json!({
+            "approval": approval,
+            "executed": false,
+            "notExecuted": { "reason": "permission", "required": spec.permission },
+        })));
     }
     let result = ai_tools::run_tool(&state, Some(&principal), &pending.tool, &args).await;
     // LH-QS-2-08 (owner 2026-11-12): this run's outcome is read by a browser,
