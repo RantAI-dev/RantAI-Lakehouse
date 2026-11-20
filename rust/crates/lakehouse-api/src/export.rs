@@ -21,10 +21,12 @@
 //! ends exactly at its cap is not cut.
 //!
 //! One rule per concern, shared with the older export: formula
-//! neutralising is `csv_export::neutralise` for a CSV cell, a tab-separated
-//! cell and an Excel text cell alike. Excel keeps numbers as numbers (feature
-//! decision 7): with "formatted", a column whose chart has a value format gets
-//! the Excel number format `lakehouse_bi::export_format::excel_number_format`
+//! neutralising is `csv_export::neutralise` for a CSV cell and a
+//! tab-separated cell. An Excel text cell is a string cell, never a formula,
+//! and holds its text as it is (`BI-55`, QA `LH-BI-1-08`). Excel keeps numbers
+//! as numbers (feature decision 7): with "formatted", a column whose chart has
+//! a value format gets the Excel number format
+//! `lakehouse_bi::export_format::excel_number_format`
 //! returns; with "raw" nothing is formatted. A CSV "formatted" file holds the
 //! text the chart shows (`format_text`).
 //!
@@ -594,7 +596,7 @@ pub(crate) fn xlsx_row_cap(caller_cap: usize) -> usize {
 fn xlsx_cell_bytes(value: &Value, numeric_column: bool) -> u64 {
     match cell_number(value, numeric_column) {
         Some(n) => n.to_string().len() as u64,
-        None => text_cell(value, numeric_column).len() as u64,
+        None => csv_export::plain_text(Some(value)).len() as u64,
     }
 }
 
@@ -644,7 +646,11 @@ impl XlsxSink {
                     },
                     (Value::Bool(b), None) => sheet.write_boolean(r, col, *b),
                     (other, None) => {
-                        let text = text_cell(other, numeric);
+                        // QA LH-BI-1-08 (BI-55, D3): an .xlsx text cell is a typed
+                        // string cell that a spreadsheet never evaluates, so it
+                        // holds the text as it is; the CSV keeps the apostrophe
+                        // (csv_export::neutralise).
+                        let text = csv_export::plain_text(Some(other));
                         if text.chars().count() > XLSX_CELL_CHARS {
                             return Err(ExportError::Xlsx(
                                 "a cell is longer than Excel allows".to_owned(),
@@ -714,7 +720,7 @@ async fn write_xlsx_file<S: RowSource>(
         let col = u16::try_from(i)
             .map_err(|_| ExportError::Xlsx("more columns than a sheet has".to_owned()))?;
         sheet
-            .write_string_with_format(0, col, csv_export::neutralise(label), &bold)
+            .write_string_with_format(0, col, label.as_str(), &bold)
             .map_err(|e| xlsx_err(&e))?;
     }
     let mut sink = Some(XlsxSink {
@@ -728,11 +734,7 @@ async fn write_xlsx_file<S: RowSource>(
     let mut batch: Vec<Vec<Value>> = Vec::with_capacity(XLSX_BATCH_ROWS);
     // The byte cap counts the text of the cells the workbook holds, the
     // workbook being compressed: the file on disk is never bigger than this.
-    let mut bytes: u64 = cols
-        .labels
-        .iter()
-        .map(|label| csv_export::neutralise(label).len() as u64)
-        .sum();
+    let mut bytes: u64 = cols.labels.iter().map(|label| label.len() as u64).sum();
     let cap = xlsx_row_cap(options.cap);
     loop {
         match next_capped(source, rows, cap).await? {
@@ -1186,7 +1188,7 @@ mod tests {
             .unwrap();
         // The amount is a numeric cell, not a string.
         assert!(sheet.contains("<v>1234567</v>"), "{sheet}");
-        // The formula-looking text is a string cell with an apostrophe in front.
+        // The formula-looking text is a string cell holding the text as it is (QA `LH-BI-1-08`).
         assert!(!sheet.contains("<f>"), "{sheet}");
         let mut shared = String::new();
         zip.by_name("xl/sharedStrings.xml")
@@ -1199,9 +1201,98 @@ mod tests {
             .unwrap();
         assert!(styles.contains("Rp"), "{styles}");
         assert!(
-            sheet.contains("'=HYPERLINK") || shared.contains("'=HYPERLINK"),
+            (sheet.contains("=HYPERLINK") || shared.contains("=HYPERLINK"))
+                && !sheet.contains("'=HYPERLINK")
+                && !shared.contains("'=HYPERLINK")
+                && !sheet.contains("&apos;=HYPERLINK")
+                && !shared.contains("&apos;=HYPERLINK"),
             "{sheet} {shared}"
         );
+    }
+
+    /// QA `LH-BI-1-08` (`BI-55`): every text that looks like a formula is a
+    /// typed string cell in the workbook, so it holds the text as it is — no
+    /// guarding apostrophe and no formula element anywhere in the sheet.
+    #[tokio::test]
+    async fn a_text_that_starts_like_a_formula_is_a_string_cell_in_the_workbook_with_no_apostrophe_and_no_formula()
+     {
+        const TEXTS: [&str; 5] = [
+            "=1+1",
+            "+SUM(1,2)",
+            "-2+3",
+            "@SUM(1)",
+            "=HYPERLINK(\"http://example.invalid\",\"x\")",
+        ];
+        let labels = HashMap::from([("name".to_owned(), "=Name".to_owned())]);
+        let formats = HashMap::new();
+        let make = |i: usize| vec![json!(TEXTS[i - 1]), json!(i)];
+        let w = write_export(
+            &mut source(5, make),
+            &options(FileFormat::Xlsx, Values::Raw, 10, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        assert_eq!(w.rows, 5);
+        let bytes = read_all(w).await;
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut sheet = String::new();
+        zip.by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut sheet)
+            .unwrap();
+        let mut shared = String::new();
+        zip.by_name("xl/sharedStrings.xml")
+            .map_or_else(|_| Ok(0), |mut f| f.read_to_string(&mut shared))
+            .unwrap();
+        let all = format!("{sheet}{shared}");
+        assert!(!sheet.contains("<f>") && !sheet.contains("<f "), "{sheet}");
+        assert!(
+            sheet.contains("t=\"inlineStr\"") || sheet.contains("t=\"s\""),
+            "{sheet}"
+        );
+        for text in [
+            "=1+1",
+            "+SUM(1,2)",
+            "-2+3",
+            "@SUM(1)",
+            "=HYPERLINK(",
+            "=Name",
+        ] {
+            assert!(all.contains(text), "{text} in {all}");
+        }
+        for guarded in [
+            "'=1+1",
+            "'+SUM",
+            "'-2+3",
+            "'@SUM",
+            "'=HYPERLINK",
+            "'=Name",
+            "&apos;=",
+            "&apos;+",
+            "&apos;-",
+            "&apos;@",
+        ] {
+            assert!(!all.contains(guarded), "{guarded} in {all}");
+        }
+    }
+
+    /// `BI-55` D5: a workbook's byte cap counts the text the cell holds, so a
+    /// formula-looking text costs its own bytes, not the guarded CSV ones.
+    #[tokio::test]
+    async fn a_formula_looking_text_costs_its_own_bytes_in_the_workbook_cap() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |i: usize| vec![json!("=x"), json!(i)];
+        // The header holds 10 bytes (`name` + `amount`); a row holds `=x` and
+        // one digit: 3 bytes. Three rows fit in 19, the fourth is cut.
+        let w = write_export_with_byte_cap(
+            &mut source(10, make),
+            &options(FileFormat::Xlsx, Values::Raw, 10, &labels, &formats),
+            Some(10 + 3 * 3),
+        )
+        .await
+        .unwrap();
+        assert!(w.cut);
+        assert_eq!(w.rows, 3);
     }
 
     #[test]

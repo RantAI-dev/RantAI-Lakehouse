@@ -7,8 +7,11 @@
 //! is prefixed with a single quote so a spreadsheet shows it as text instead
 //! of running it as a formula (OWASP CSV-injection guidance); a JSON number
 //! stays a number and is written as the digits the engine sent. This is the
-//! only place the export neutralises cells, so the rule cannot drift between
-//! callers. The tab-separated file is the comma file's twin: the same mark,
+//! only place the comma and tab-separated files neutralise cells, so the rule
+//! cannot drift between those callers. An `.xlsx` text cell does not need the
+//! mark: it is a typed string cell a spreadsheet never evaluates, so it holds
+//! its text as it is (QA `LH-BI-1-08`, `BI-55`). The tab-separated file is the
+//! comma file's twin: the same mark,
 //! the same line ends and the same formula guard, with a tab as the separator
 //! and a field quoted when it holds a tab, a line break or a quote.
 
@@ -16,22 +19,33 @@ use serde_json::Value;
 
 use crate::csv_safe::{self, BOM};
 
-/// A cell as the text that goes in the file, before quoting.
-pub(crate) fn cell_text(value: Option<&Value>) -> String {
+/// A cell's text as it is, with no formula guard: the text an `.xlsx` string
+/// cell holds (QA `LH-BI-1-08`, `BI-55`).
+pub(crate) fn plain_text(value: Option<&Value>) -> String {
     match value {
         None | Some(Value::Null) => String::new(),
         Some(Value::Number(n)) => n.to_string(),
         Some(Value::Bool(b)) => b.to_string(),
-        Some(Value::String(s)) => neutralise(s),
-        Some(other) => neutralise(&other.to_string()),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
     }
 }
 
-/// Prefix a text that a spreadsheet could read as a formula. The one rule for
-/// every download: the CSV writer below and the `.xlsx` writer
-/// (`export.rs`) both call it (`BI-1` D6, AGENTS.md rule 4). It is
-/// [`csv_safe::neutralise`], which owns the rule (`BI-30`): a plain number in
-/// a text column (`-1`, `+3.2e4`) is not a formula and stays as it is.
+/// A cell as the text that goes in the file, before quoting.
+pub(crate) fn cell_text(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null | Value::Number(_) | Value::Bool(_)) => plain_text(value),
+        Some(_) => neutralise(&plain_text(value)),
+    }
+}
+
+/// Prefix a text that a spreadsheet could read as a formula. The rule for the
+/// comma file and the tab-separated file, which both call it (`BI-1` D6,
+/// AGENTS.md rule 4). An `.xlsx` text cell does not: it is a typed string cell
+/// a spreadsheet never evaluates, so it holds the text as it is (QA
+/// `LH-BI-1-08`, `BI-55`). It is [`csv_safe::neutralise`], which owns the rule
+/// (`BI-30`): a plain number in a text column (`-1`, `+3.2e4`) is not a
+/// formula and stays as it is.
 pub(crate) fn neutralise(text: &str) -> String {
     csv_safe::neutralise(text)
 }
