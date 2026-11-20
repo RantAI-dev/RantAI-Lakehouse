@@ -879,3 +879,251 @@ async fn an_old_snapshot_restores_through_the_route_into_todays_shape() {
     assert_eq!(definition["steps"][0]["reads"], "orders", "{detail}");
     assert_eq!(definition["steps"][0]["kind"], "transform", "{detail}");
 }
+
+// ── BLD-16 (BLD-1 part 2): the form kinds through the save path ─────────
+
+/// D9, the form-step twin of the governed case above: a `join` step
+/// reading a table the author may not read is refused when the pipeline
+/// is SAVED, naming the input — the form step goes into the same one
+/// compiled statement, so the save-time check sees the input's table
+/// exactly as it does for a SQL step.
+#[tokio::test]
+async fn a_join_step_reading_a_table_the_author_may_not_read_is_422_naming_the_input() {
+    let (router, pool, _ch) = app().await;
+    // A person who may build pipelines and read only one table.
+    let user = create_principal_with_permissions(&pool, "pipeline:write, query:read").await;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(user)
+        .bind(Uuid::parse_str(GROUP_TENANT).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let role: Uuid = sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+        .bind(role)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO role_read_grant (role_id, schema_name, table_name) \
+         VALUES ($1, 'silver', 'allowed')",
+    )
+    .bind(role)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, answer) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &cookie,
+            Some(GROUP_TENANT),
+            Some(json!({
+                "name": "save-governed-join",
+                "kind": "batch",
+                "inputs": [{"name": "hidden", "zone": "silver", "table": "orders"}],
+                "steps": [{"name": "joined", "kind": "join",
+                           "left": "hidden", "right": "hidden", "joinType": "inner",
+                           "on": [{"left": "id", "right": "id"}],
+                           "columns": [{"side": "left", "column": "id"}]}],
+                "targetZone": "silver",
+                "targetTable": "save_governed_join_out",
+                "schedule": "manual",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    let message = answer["error"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("inputs[0]: "),
+        "the refusal must name the input at fault: {message}"
+    );
+}
+
+/// D7, the form-step shape: a bad column of a form step is a 400 naming
+/// the field and the row — `steps[0].on[0]` — never serde's or the
+/// parser's own words.
+#[tokio::test]
+async fn a_join_step_with_a_bad_column_is_400_naming_the_column() {
+    let (router, pool, _ch) = app().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let (status, answer) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &cookie,
+            Some(GROUP_TENANT),
+            Some(json!({
+                "name": "save-bad-column",
+                "kind": "batch",
+                "inputs": [{"name": "orders", "zone": "silver", "table": "orders"}],
+                "steps": [{"name": "joined", "kind": "join",
+                           "left": "orders", "right": "orders", "joinType": "inner",
+                           "on": [{"left": "id; DROP TABLE x", "right": "id"}],
+                           "columns": [{"side": "left", "column": "id"}]}],
+                "targetZone": "silver",
+                "targetTable": "save_bad_column_out",
+                "schedule": "manual",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(
+        answer["error"].as_str(),
+        Some(concat!(
+            "steps[0].on[0]: a column must be a plain name ",
+            "(letters, digits and underscores, not starting with a digit)"
+        )),
+        "{answer}"
+    );
+}
+
+/// J2: a definition of all three new kinds is saved and read back with its
+/// steps equal to what was sent — the store keeps what the route accepted,
+/// byte for byte in the API's own shape.
+#[tokio::test]
+async fn a_pipeline_with_join_aggregate_and_filter_steps_is_saved_and_read_back() {
+    let (router, pool, _ch) = app().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let steps = json!([
+        {"name": "joined", "kind": "join",
+         "left": "orders", "right": "customers", "joinType": "left",
+         "on": [ { "left": "customer_id", "right": "id" } ],
+         "columns": [
+             { "side": "left",  "column": "order_id" },
+             { "side": "left",  "column": "amount" },
+             { "side": "right", "column": "country" },
+             { "side": "right", "column": "id", "name": "customer_ref" } ] },
+        {"name": "by_country", "kind": "aggregate", "reads": "joined",
+         "groupBy": ["country"],
+         "measures": [ { "function": "sum",   "column": "amount", "name": "revenue" },
+                       { "function": "count", "name": "order_count" } ],
+         "havingMatch": "all",
+         "having": [ { "column": "revenue", "operator": ">", "value": "1000" } ] },
+        {"name": "big_or_local", "kind": "filter", "reads": "by_country",
+         "match": "any",
+         "conditions": [ { "column": "revenue", "operator": ">=", "value": "5000" },
+                         { "column": "country", "operator": "=",  "value": "ID" } ] }
+    ]);
+    let body = json!({
+        "name": "save-three-kinds",
+        "kind": "batch",
+        "inputs": [
+            {"name": "orders", "zone": "silver", "table": "orders"},
+            {"name": "customers", "zone": "silver", "table": "customers"},
+        ],
+        "steps": steps,
+        "targetZone": "silver",
+        "targetTable": "save_three_kinds_out",
+        "schedule": "manual",
+    });
+    let (status, created) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &cookie,
+            Some(GROUP_TENANT),
+            Some(body.clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let (status, detail) = send(
+        &router,
+        request(
+            "GET",
+            &format!("/api/pipelines/{id}"),
+            &cookie,
+            Some(GROUP_TENANT),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["definition"]["steps"], steps, "{detail}");
+    assert_eq!(detail["definition"]["transforms"], json!([]), "{detail}");
+}
+
+/// D10 (`SEC-71`), the form-step twin: an edit of the STEPS by someone
+/// other than the author makes that person the author, and the edit is
+/// checked as them — the new kinds change nothing about the rule.
+#[tokio::test]
+async fn an_edit_of_a_form_step_by_another_user_moves_the_author() {
+    let (router, pool, _ch) = app().await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let body = json!({
+        "name": "save-form-moves-author",
+        "kind": "batch",
+        "inputs": [
+            {"name": "orders", "zone": "silver", "table": "orders"},
+            {"name": "customers", "zone": "silver", "table": "customers"},
+        ],
+        "steps": [{"name": "joined", "kind": "join",
+                   "left": "orders", "right": "customers", "joinType": "inner",
+                   "on": [{"left": "customer_id", "right": "id"}],
+                   "columns": [{"side": "left", "column": "id"},
+                               {"side": "right", "column": "country"}]}],
+        "targetZone": "silver",
+        "targetTable": "save_form_moves_out",
+        "schedule": "manual",
+    });
+    let (status, created) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &admin,
+            Some(GROUP_TENANT),
+            Some(body.clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    let author_before = created["runAs"].as_str().unwrap().to_owned();
+
+    // A Data Engineer of the same tenant edits the steps.
+    let engineer = session_cookie_for_seeded_user(&pool, "yoga@meridian.example").await;
+    let mut edited_body = body;
+    edited_body["steps"] = json!([
+        {"name": "joined", "kind": "join",
+         "left": "orders", "right": "customers", "joinType": "left",
+         "on": [{"left": "customer_id", "right": "id"}],
+         "columns": [{"side": "left", "column": "id"},
+                     {"side": "right", "column": "country"}]}
+    ]);
+    let (status, edited) = send(
+        &router,
+        request(
+            "PUT",
+            &format!("/api/pipelines/{id}"),
+            &engineer,
+            Some(GROUP_TENANT),
+            Some(edited_body),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    let author_after = edited["runAs"].as_str().unwrap_or_default().to_owned();
+    assert_ne!(author_after, author_before, "the edit must move the author");
+    let yoga: Uuid = sqlx::query_scalar("SELECT id FROM app_user WHERE email = $1")
+        .bind("yoga@meridian.example")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(author_after, yoga.to_string());
+}

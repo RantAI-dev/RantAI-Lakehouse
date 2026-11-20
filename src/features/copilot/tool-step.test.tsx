@@ -214,3 +214,48 @@ describe("a step whose result was dropped from a long conversation (AI-24)", () 
     expect(screen.getByRole("button").className).toContain("text-destructive")
   })
 })
+
+describe("a reopened approval step shows what the run did (AI-28, LH-AI-18-09)", () => {
+  const step: ToolStep = {
+    tool: "delete_chart",
+    args: { id: "c1" },
+    ok: true,
+    result: {
+      needs_approval: true,
+      approval_id: "appr-1",
+      run_id: "r1",
+      summary: "Moves chart c1 from its dashboard to the trash.",
+    },
+    approvalState: "ran",
+  }
+
+  it("shows the decided badge and line, never pending approval", () => {
+    const { container } = render(<ToolStepCard step={step} />)
+    expect(container.textContent).toContain("approved")
+    expect(container.textContent).not.toContain("pending approval")
+    fireEvent.click(container.querySelector("button")!)
+    expect(container.textContent).toContain("Approved and run.")
+    expect(container.textContent).not.toContain(
+      "Someone else with approval rights must approve it."
+    )
+  })
+
+  it("reads 'the action ran and failed' for an executed failure (AI-28 review R1)", () => {
+    const { container } = render(
+      <ToolStepCard step={{ ...step, approvalState: "failed" }} />
+    )
+    expect(container.textContent).toContain("approved, action failed")
+    fireEvent.click(container.querySelector("button")!)
+    expect(container.textContent).toContain("Approved; the action ran and failed.")
+    expect(container.textContent).not.toContain("Approved, but it did not run.")
+  })
+
+  it("keeps the pending wording for a step that is still waiting", () => {
+    const { container } = render(<ToolStepCard step={{ ...step, approvalState: "pending" }} />)
+    // A pending step starts open, so the line is already on screen.
+    expect(container.textContent).toContain("pending approval")
+    expect(container.textContent).toContain(
+      "Someone else with approval rights must approve it."
+    )
+  })
+})
