@@ -534,6 +534,48 @@ fn render_step(step: &PipelineStep, index: usize) -> Result<String, DefinitionEr
     }
 }
 
+/// Build the projection for a transform step that has no explicit `select`
+/// (BLD-11 F7, D11). A plain `*` would ignore `cast`/`rename` entirely, so
+/// renamed columns are cut from `*` with `EXCEPT` and appended at the end as
+/// `<old> AS <new>` (cast under the new name when it is also cast), while
+/// casts on columns that keep their name go into `REPLACE`. `EXCEPT` comes
+/// before `REPLACE` — the order `sqlparser`'s `ClickHouse` dialect parses. With
+/// neither transform this is the unchanged `*`.
+fn render_star_with_transforms(renames: &[(String, String)], casts: &[(String, String)]) -> String {
+    use std::fmt::Write as _;
+
+    if renames.is_empty() && casts.is_empty() {
+        return "*".to_owned();
+    }
+    let mut projection = "*".to_owned();
+    if !renames.is_empty() {
+        let excluded = renames
+            .iter()
+            .map(|(from, _)| from.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(projection, " EXCEPT ({excluded})");
+    }
+    // A cast on a renamed column is applied to the appended expression, not
+    // to `*`; only the columns that keep their name are replaced in place.
+    let in_place = casts
+        .iter()
+        .filter(|(column, _)| !renames.iter().any(|(from, _)| from == column))
+        .map(|(column, ty)| format!("CAST({column} AS {ty}) AS {column}"))
+        .collect::<Vec<_>>();
+    if !in_place.is_empty() {
+        let _ = write!(projection, " REPLACE ({})", in_place.join(", "));
+    }
+    for (from, to) in renames {
+        let expression = casts
+            .iter()
+            .find(|(column, _)| column == from)
+            .map_or_else(|| from.clone(), |(_, ty)| format!("CAST({from} AS {ty})"));
+        let _ = write!(projection, ", {expression} AS {to}");
+    }
+    projection
+}
+
 /// Render one `transform` step as `SELECT ... FROM <reads> [WHERE ...]
 /// [ORDER BY k LIMIT 1 BY k]`.
 ///
@@ -542,6 +584,14 @@ fn render_step(step: &PipelineStep, index: usize) -> Result<String, DefinitionEr
 /// rename), filters are joined by `AND`, and the last `dedupe` key gives
 /// `ORDER BY k LIMIT 1 BY k`. Every dynamic piece is rendered through
 /// [`Transform::render_clickhouse`], never string-interpolated here.
+///
+/// BLD-11 F7 (D11): with an explicit `select`, nothing below changes. With no
+/// `select` the step used to be plain `SELECT *`, silently dropping every
+/// `cast`/`rename` (the Gold table kept the source type). Now a cast or
+/// rename with no select is applied to all columns through `ClickHouse`'s
+/// `* EXCEPT`/`* REPLACE`: renamed columns are excluded from `*` and appended
+/// at the end as `<old> AS <new>` (or `CAST(<old> AS T) AS <new>` when cast),
+/// while cast columns that keep their name are replaced in place.
 #[must_use]
 pub fn render_transform_step(from: &str, transforms: &[Transform]) -> String {
     let mut columns: Option<Vec<String>> = None;
@@ -566,7 +616,7 @@ pub fn render_transform_step(from: &str, transforms: &[Transform]) -> String {
     }
 
     let select_columns = columns.map_or_else(
-        || "*".to_owned(),
+        || render_star_with_transforms(&renames, &casts),
         |columns| {
             columns
                 .iter()
@@ -741,6 +791,79 @@ mod tests {
             "SELECT id, CAST(amount AS Float64) AS amount_usd FROM silver.`orders` \
              WHERE status = 'active' ORDER BY id LIMIT 1 BY id"
         );
+    }
+
+    fn render_from(from: &str, transforms: &[&str]) -> String {
+        let parsed: Vec<crate::transform_grammar::Transform> = transforms
+            .iter()
+            .map(|text| crate::transform_grammar::parse_transform(text).expect("a valid transform"))
+            .collect();
+        super::render_transform_step(from, &parsed)
+    }
+
+    fn render(transforms: &[&str]) -> String {
+        render_from("silver.`orders`", transforms)
+    }
+
+    /// BLD-11 F7 (D11): a cast with no `select` used to be dropped (plain
+    /// `SELECT *`), leaving the Gold column at the source type. It now goes
+    /// into `* REPLACE`, replacing the column in place.
+    #[test]
+    fn a_cast_with_no_select_replaces_the_column_in_place() {
+        assert_eq!(
+            render(&["cast(amount,Float64)"]),
+            "SELECT * REPLACE (CAST(amount AS Float64) AS amount) FROM silver.`orders`"
+        );
+    }
+
+    /// BLD-11 F7 (D11): a rename with no `select` used to be dropped. It now
+    /// cuts the old name from `*` and appends the renamed column at the end.
+    #[test]
+    fn a_rename_with_no_select_moves_the_column_to_the_end() {
+        assert_eq!(
+            render(&["rename(amount,amount_usd)"]),
+            "SELECT * EXCEPT (amount), amount AS amount_usd FROM silver.`orders`"
+        );
+    }
+
+    /// BLD-11 F7 (D11): a column cast and renamed with no `select` is cast
+    /// under its new name, appended at the end.
+    #[test]
+    fn a_cast_and_rename_of_one_column_with_no_select_cast_it_under_its_new_name() {
+        assert_eq!(
+            render(&["rename(amount,amount_usd)", "cast(amount,Float64)"]),
+            "SELECT * EXCEPT (amount), CAST(amount AS Float64) AS amount_usd FROM silver.`orders`"
+        );
+    }
+
+    /// BLD-11 F7: a filter or dedupe with no `select` still selects every
+    /// column — this is today's behaviour and stays unchanged.
+    #[test]
+    fn a_filter_or_dedupe_alone_still_selects_star() {
+        assert_eq!(
+            render(&["filter(status = 'active')", "dedupe(id)"]),
+            "SELECT * FROM silver.`orders` WHERE status = 'active' ORDER BY id LIMIT 1 BY id"
+        );
+    }
+
+    /// BLD-11 F7 (D11): the rendered `* EXCEPT`/`* REPLACE` statements must
+    /// be SQL the access rewrite can parse; otherwise a transform step would
+    /// compile to text no tenant gate or lineage pass can read.
+    #[test]
+    fn a_no_select_cast_or_rename_statement_parses_and_names_its_input() {
+        let dialect = sqlparser::dialect::ClickHouseDialect {};
+        for transforms in [
+            vec!["cast(amount,Float64)"],
+            vec!["rename(amount,amount_usd)"],
+            vec!["rename(amount,amount_usd)", "cast(amount,Float64)"],
+        ] {
+            let sql = render_from("orders", &transforms);
+            assert_eq!(
+                crate::sql_rewrite::referenced_tables(&sql, &dialect),
+                Some(vec!["orders".to_owned()]),
+                "statement parses and reads its input: {sql}"
+            );
+        }
     }
 
     #[test]
