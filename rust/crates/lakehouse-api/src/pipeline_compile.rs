@@ -84,7 +84,10 @@ pub struct DefinitionError {
 }
 
 impl DefinitionError {
-    fn at(path: String, message: &'static str) -> Self {
+    /// BLD-16: `pub(crate)` so `pipeline_forms` refuses with the same two
+    /// fields (path + fixed text) instead of growing a second constructor
+    /// the routes would have to understand as well.
+    pub(crate) fn at(path: String, message: &'static str) -> Self {
         Self { path, message }
     }
 
@@ -124,7 +127,9 @@ const TOO_MANY_STEPS: &str = "a pipeline may have at most 20 steps";
 /// input, which the pipeline copies. Several inputs and no step would compile
 /// to a copy of the first and silently ignore the others.
 const NO_STEP_WITH_MANY_INPUTS: &str = "with more than one input, add a step that reads them";
-const INVALID_NAME: &str = "a name must be letters, digits and underscores (not starting with a digit or __), \
+/// BLD-16 / J2: `pub(crate)` so `pipeline_forms` reuses D2's own sentence for
+/// a measure's name rather than writing a near-copy of it.
+pub(crate) const INVALID_NAME: &str = "a name must be letters, digits and underscores (not starting with a digit or __), \
      at most 48 characters";
 const DUPLICATE_NAME: &str = "this name is already used by another input or step";
 const INVALID_TABLE: &str =
@@ -143,7 +148,11 @@ const BRONZE_NEEDS_CATALOG: &str =
 const UP_TO_UNKNOWN: &str = "upTo must name an input or a step of this pipeline";
 
 /// Whether `name` is one D2 allows for an input or a step.
-fn valid_name(name: &str) -> bool {
+///
+/// BLD-16 / J2: `pub(crate)` so `pipeline_forms` applies the SAME rule to a
+/// measure's name (a group-by column and a measure become output columns, so
+/// their names live in the same namespace as a step's).
+pub(crate) fn valid_name(name: &str) -> bool {
     name.chars().count() <= MAX_NAME_CHARS && !name.starts_with("__") && Ident::new(name).is_ok()
 }
 
