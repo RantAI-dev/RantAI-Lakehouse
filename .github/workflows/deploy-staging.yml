@@ -72,11 +72,26 @@ jobs:
       # `zstd` and `compression-level: 0`: the artifact service would
       # otherwise deflate an already-compressed file a second time for
       # nothing.
+      #
+      # `-o` names the output EXPLICITLY. It is not decoration: zstd's
+      # positional arguments are all INPUT files, and the output name is
+      # derived from the input. Writing `zstd --rm a.tar a.tar.zst` asks
+      # zstd to compress TWO inputs -- `a.tar` and `a.tar.zst` -- and the
+      # second one is the output of the first, so it gets compressed a
+      # second time into `a.tar.zst.zst` and `--rm` then deletes the
+      # `a.tar.zst` the artifact step needs. That is exactly what the
+      # first run of this workflow did (run 44686403380): the archive
+      # compressed fine, the file it produced was gone, and the deploy
+      # job never started.
       - name: Compress the image archive
         run: |
           cd "$RUNNER_TEMP"
-          zstd -T0 -3 --rm lakehouse-api.tar lakehouse-api.tar.zst
+          zstd -T0 -3 --rm -o lakehouse-api.tar.zst lakehouse-api.tar
           ls -l lakehouse-api.tar.zst
+          # The archive has to survive the round trip: the VM pipes it
+          # straight into `docker load`, and a truncated archive there
+          # looks like a corrupt image rather than a broken upload.
+          zstd -dc lakehouse-api.tar.zst | wc -c
 
       - name: Upload the API image
         uses: actions/upload-artifact@v7
