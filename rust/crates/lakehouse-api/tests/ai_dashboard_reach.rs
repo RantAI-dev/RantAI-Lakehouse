@@ -423,7 +423,7 @@ async fn an_approved_delete_chart_runs_for_an_approver_with_a_rule_on_that_dashb
 }
 
 #[tokio::test]
-async fn an_approver_with_no_rule_is_refused_and_the_run_records_it() {
+async fn an_approver_with_no_rule_records_the_decision_and_the_run_does_not_run() {
     let (app, _ch, _llm) = app().await;
     let requester = create_assistant_principal(&app.pool, "").await;
     replace_item(&app.pool, "board", "b1", &[manage(requester)], false, None)
@@ -451,7 +451,10 @@ async fn an_approver_with_no_rule_is_refused_and_the_run_records_it() {
     let approver = create_principal_with_permissions(&app.pool, "agent:approve").await;
     let approver_cookie = session_cookie_for_user(&app.pool, approver).await;
     let decided = decide(&app, &approver_cookie, &approval_id).await;
-    assert_eq!(decided.0, StatusCode::FORBIDDEN, "{}", decided.1);
+    // AI-28 / LH-AI-18-07: the decision is recorded, so the answer is a
+    // 200 with executed:false rather than a 403.
+    assert_eq!(decided.0, StatusCode::OK, "{}", decided.1);
+    assert_eq!(decided.1["executed"], json!(false), "{}", decided.1);
     let run = lakehouse_store::agents::get_run(&app.pool, &run_id)
         .await
         .unwrap()

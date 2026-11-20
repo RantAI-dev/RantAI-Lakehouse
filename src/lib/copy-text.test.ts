@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it, mock } from "bun:test"
-import { copyText } from "./copy-text"
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { toast } from "sonner"
+import { copyText, copyTextWithToast } from "./copy-text"
 
 const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard")
 const originalExec = document.execCommand
@@ -57,5 +58,65 @@ describe("copyText", () => {
     document.execCommand = mock(() => { throw new Error("no") }) as unknown as typeof document.execCommand
     expect(await copyText("x")).toBe(false)
     expect(document.querySelector("textarea")).toBeNull()
+  })
+})
+
+/**
+ * `UX-6` review R1: every copy site wrote the same pair -- a success toast
+ * when the copy worked, the fixed "Could not copy" toast when it did not.
+ * This is that pair stated once, so these three cases are the contract the
+ * sites now rely on. `navigator.clipboard` is absent here, as it is on the
+ * console opened over plain http; `document.execCommand` is the browser's
+ * answer.
+ */
+describe("copyTextWithToast", () => {
+  it("shows the caller's success toast when the copy worked, and no failure toast", async () => {
+    setClipboard(undefined)
+    document.execCommand = mock(() => true) as unknown as typeof document.execCommand
+    const successes = spyOn(toast, "success").mockImplementation(() => 1)
+    const errors = spyOn(toast, "error").mockImplementation(() => 1)
+
+    const copied = await copyTextWithToast("tenant_slug", "Copied “tenant_slug”")
+
+    expect(copied).toBe(true)
+    expect(successes).toHaveBeenCalledTimes(1)
+    expect(successes.mock.calls[0]?.[0]).toBe("Copied “tenant_slug”")
+    expect(errors).not.toHaveBeenCalled()
+    successes.mockRestore()
+    errors.mockRestore()
+  })
+
+  it("stays silent on success when the site has no success toast to give", async () => {
+    setClipboard(undefined)
+    document.execCommand = mock(() => true) as unknown as typeof document.execCommand
+    const successes = spyOn(toast, "success").mockImplementation(() => 1)
+    const errors = spyOn(toast, "error").mockImplementation(() => 1)
+
+    const copied = await copyTextWithToast("row-1")
+
+    expect(copied).toBe(true)
+    expect(successes).not.toHaveBeenCalled()
+    expect(errors).not.toHaveBeenCalled()
+    successes.mockRestore()
+    errors.mockRestore()
+  })
+
+  it("shows the fixed failure toast and no success toast when the browser refuses", async () => {
+    setClipboard(undefined)
+    document.execCommand = mock(() => false) as unknown as typeof document.execCommand
+    const successes = spyOn(toast, "success").mockImplementation(() => 1)
+    const errors = spyOn(toast, "error").mockImplementation(() => 1)
+
+    const copied = await copyTextWithToast("row-1", "Copied row 1")
+
+    expect(copied).toBe(false)
+    expect(errors).toHaveBeenCalledTimes(1)
+    expect(errors.mock.calls[0]?.[0]).toBe("Could not copy")
+    expect(errors.mock.calls[0]?.[1]?.description).toBe(
+      "The browser refused the copy. Select the text and copy it by hand.",
+    )
+    expect(successes).not.toHaveBeenCalled()
+    successes.mockRestore()
+    errors.mockRestore()
   })
 })

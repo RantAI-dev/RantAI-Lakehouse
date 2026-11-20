@@ -218,6 +218,59 @@ describe("ServiceIdentitiesPage rotate (new secret shown once, never persisted)"
     expect(screen.getByText(/will not be shown again/i)).toBeDefined()
   })
 
+  it("copies the once-shown secret over plain http, from inside the dialog", async () => {
+    setupFetch({
+      rotateBody: {
+        secret: "c".repeat(64),
+        identity: ROW,
+      },
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText("ingestion-worker")).toBeDefined())
+    await clickRotate()
+    await screen.findByTestId("revealed-secret")
+
+    // `UX-6`: a console opened by IP over http has no `navigator.clipboard`,
+    // so the Copy button depends on the textarea fallback -- and the textarea
+    // must land inside the open dialog, whose surroundings are inert.
+    const clipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard")
+    const execCommand = Object.getOwnPropertyDescriptor(document, "execCommand")
+    Object.defineProperty(navigator, "clipboard", {
+      value: undefined,
+      configurable: true,
+      writable: true,
+    })
+    const captured: { value: string; inDialog: boolean }[] = []
+    Object.defineProperty(document, "execCommand", {
+      value: mock((command: string) => {
+        const area = document.activeElement as HTMLTextAreaElement | null
+        captured.push({
+          value: area?.value ?? "",
+          inDialog: area?.closest('[role="dialog"]') !== null,
+        })
+        return command === "copy"
+      }),
+      configurable: true,
+      writable: true,
+    })
+
+    try {
+      // `fireEvent.click` does not move focus in happy-dom, while a real
+      // click on the button does; the helper picks the textarea's host from
+      // the active element.
+      const copyButton = screen.getByRole("button", { name: "Copy" })
+      copyButton.focus()
+      fireEvent.click(copyButton)
+      await waitFor(() => expect(captured).toHaveLength(1))
+      expect(captured[0]).toEqual({ value: "c".repeat(64), inDialog: true })
+    } finally {
+      if (clipboard) Object.defineProperty(navigator, "clipboard", clipboard)
+      else delete (navigator as unknown as Record<string, unknown>).clipboard
+      if (execCommand) Object.defineProperty(document, "execCommand", execCommand)
+      else delete (document as unknown as Record<string, unknown>).execCommand
+    }
+  })
+
   it("the secret is never written to localStorage", async () => {
     setupFetch({
       rotateBody: {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { StyleFields } from "./chart-style"
-import { NOTE_KINDS, effectivePalette, formatRules, formatUsed, styleFromDef, stylePayload, withCompanyPalette, withNote } from "./style-draft"
+import { NOTE_KINDS, effectivePalette, formatRules, styleFromDef, stylePayload, withCompanyPalette, withNote } from "./style-draft"
 
 const FULL: StyleFields = {
   format: { style: "compact", currency: "IDR", decimals: 2, thousands: false, currencyDisplay: "code", prefix: "~", suffix: " x" },
@@ -62,7 +62,6 @@ describe("stylePayload", () => {
       axes: { x: { show: true }, y: { title: "" } }, labels: { show: false }, annotations: [{ x: "Bali", text: " " }], tooltip: { fields: [] },
     }
     expect(stylePayload(draft, rules)).toEqual({})
-    expect(formatUsed({}, 0)).toBe(false)
   })
 
   test("a currency code is sent only with the currency or compact style", () => {
@@ -84,10 +83,6 @@ describe("stylePayload", () => {
     ])
   })
 
-  test("the Format section opens by itself for a chart that uses it", () => {
-    expect(formatUsed({ labels: { show: true } }, 0)).toBe(true)
-    expect(formatUsed({}, 2)).toBe(true)
-  })
 })
 
 describe("withNote", () => {
