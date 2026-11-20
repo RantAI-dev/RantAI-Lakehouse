@@ -792,9 +792,17 @@ export function JoinStepPane({
     const nextRight = side === "right" ? next : step.right
     const nextLeftColumns = readItemColumns(nextLeft)
     const nextRightColumns = readItemColumns(nextRight)
+    // BLD-16 review R1: the fill gets the SAME lists the pickers offer —
+    // `formColumns` — or a column the API refuses (`order date`) would be
+    // filled in and the save, the preview and Show as SQL would all fail.
     const columns =
       nextLeftColumns !== null && nextRightColumns !== null
-        ? joinOutputColumns(itemName(nextLeft), nextLeftColumns, itemName(nextRight), nextRightColumns)
+        ? joinOutputColumns(
+            itemName(nextLeft),
+            formColumns(nextLeftColumns).columns,
+            itemName(nextRight),
+            formColumns(nextRightColumns).columns
+          )
         : step.columns
     onChange(side === "left" ? { left: next, columns } : { right: next, columns })
   }

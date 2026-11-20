@@ -1178,6 +1178,48 @@ describe("the form kinds in the pipeline editor (BLD-16)", () => {
     ])
   })
 
+  it("fills a join's output with only the columns the API accepts (BLD-16 review R1)", async () => {
+    ordersRawSchema = [
+      { name: "id", type: "long" },
+      { name: "order date", type: "string" },
+      { name: "amount", type: "long" },
+    ]
+    renderEditor()
+    await twoKnownInputs()
+    fireEvent.click(screen.getByRole("button", { name: /^Join$/ }))
+    await screen.findByText("Step 1 · Join")
+    // The fill runs when the right side changes, so this is the moment J9's
+    // rule applies: a column the API would refuse is not offered at all.
+    chooseOption(screen.getByRole("combobox", { name: "Right" }), "orders_raw")
+    expect(await screen.findByDisplayValue("orders_raw_id")).toBeTruthy()
+    expect(screen.queryByText("order date")).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: /add a pair/i }))
+    chooseLastOption(screen.getByRole("combobox", { name: /stock_raw's column/ }), "id")
+    chooseLastOption(screen.getByRole("combobox", { name: /orders_raw's column/ }), "id")
+
+    selectOutput()
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly"), { target: { value: "form_steps_out" } })
+
+    const body = await saveAndRead("POST")
+    expect(body.steps).toEqual([
+      {
+        name: "step_1",
+        kind: "join",
+        left: "stock_raw",
+        right: "orders_raw",
+        joinType: "inner",
+        on: [{ left: "id", right: "id" }],
+        columns: [
+          { side: "left", column: "id" },
+          { side: "left", column: "updated_at" },
+          { side: "left", column: "status" },
+          { side: "right", column: "id", name: "orders_raw_id" },
+          { side: "right", column: "amount" },
+        ],
+      },
+    ])
+  })
+
   it("says what an outer join does to a row with no match, and says nothing for an inner join", async () => {
     renderEditor()
     await twoKnownInputs()
