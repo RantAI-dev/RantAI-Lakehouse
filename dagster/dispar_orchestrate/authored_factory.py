@@ -1446,6 +1446,164 @@ def _pipeline_depends_on(p: dict[str, Any]) -> list[str]:
     return [str(d) for d in deps]
 
 
+# ── BLD-14: the re-upload chain graph ──────────────────────────────────────
+#
+# `DEC-22` says a re-upload runs the pipelines DOWNSTREAM of the ones that
+# read the loaded table, not just those. The order already exists as data:
+# `_pipeline_target(A)` in `_pipeline_sources(B)` (BLD-1 part 1 D11, the same
+# rule as the store's `input_tables_of`). This pure module derives nothing
+# new from the wire: it reuses those two helpers and applies D3's rule.
+REUPLOAD_ROOT_TAG = "lakehouse/reupload-root"
+REUPLOAD_TABLE_TAG = "lakehouse/reupload-table"
+# P5: waiting for a chain's parents ends at the authored run limit.
+CHAIN_WAIT_LIMIT_SECONDS = DEFAULT_RUN_LIMIT_SECONDS
+
+
+@dataclass(frozen=True)
+class ChainEntry:
+    """One pipeline's place in one bronze table's re-upload chain.
+
+    `parents` are the direct predecessors inside the chain; `ancestors` are
+    every node that can reach it, so a failure two steps up can be named as
+    the cause (D9). Both are sorted tuples so two callers that derive the
+    graph from different payload orders agree byte for byte.
+    """
+
+    parents: tuple[str, ...]
+    ancestors: tuple[str, ...]
+
+
+def _chain_cyclic_nodes(edges: dict[str, set[str]]) -> set[str]:
+    """Every node on a directed cycle (Tarjan's SCC), or nothing.
+
+    P2 leaves a cycle out rather than refusing to save such pipelines: a
+    node that waits on itself would never launch. An edge out of a cycle is
+    also gone once the cycle's nodes are dropped, so anything reachable
+    only through the loop is left out with it.
+    """
+    index = 0
+    indices: dict[str, int] = {}
+    low: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    cyclic: set[str] = set()
+
+    def visit(node: str) -> None:
+        nonlocal index
+        indices[node] = low[node] = index
+        index += 1
+        stack.append(node)
+        on_stack.add(node)
+        for nxt in edges[node]:
+            if nxt not in indices:
+                visit(nxt)
+                low[node] = min(low[node], low[nxt])
+            elif nxt in on_stack:
+                low[node] = min(low[node], indices[nxt])
+        if low[node] == indices[node]:
+            component: list[str] = []
+            while True:
+                member = stack.pop()
+                on_stack.discard(member)
+                component.append(member)
+                if member == node:
+                    break
+            if len(component) > 1:
+                cyclic.update(component)
+
+    for node in edges:
+        if node not in indices:
+            visit(node)
+    return cyclic
+
+
+def reupload_chain_graph(
+    pipelines: list[dict[str, Any]],
+) -> dict[str, dict[str, ChainEntry]]:
+    """Derive, per pipeline id and bronze table, its chain place (D3, P1-P2).
+
+    A node is a `ready` pipeline with no target lag and a tenant (P1). An
+    edge A -> B is D3's rule: same tenant, A != B and A's target is one of
+    B's inputs. Nodes on a cycle are dropped (P2). A chain starts at a
+    pipeline whose first input is `bronze.<T>` with `file_ingest_job` in
+    `dependsOn` (D4) and reaches everything downstream of it; a reached
+    pipeline with no parent in that reach has no entry (the switch being
+    off on the first pipeline leaves nothing below it in the chain).
+    """
+    nodes: dict[str, dict[str, Any]] = {}
+    for pipeline in pipelines:
+        pipeline_id = pipeline.get("id")
+        if not isinstance(pipeline_id, str) or not pipeline_id:
+            continue
+        if (
+            pipeline.get("status") != "ready"
+            or pipeline.get("targetLag") is not None
+            or _pipeline_tenant(pipeline) is None
+        ):
+            continue
+        nodes[pipeline_id] = pipeline
+
+    successors: dict[str, set[str]] = {pid: set() for pid in nodes}
+    predecessors: dict[str, set[str]] = {pid: set() for pid in nodes}
+    for upstream_id, upstream in nodes.items():
+        target = _pipeline_target(upstream)
+        if not target:
+            continue
+        for downstream_id, downstream in nodes.items():
+            if upstream_id == downstream_id:
+                continue
+            if _pipeline_tenant(upstream) != _pipeline_tenant(downstream):
+                continue
+            if target in _pipeline_sources(downstream):
+                successors[upstream_id].add(downstream_id)
+                predecessors[downstream_id].add(upstream_id)
+
+    cyclic = _chain_cyclic_nodes(successors)
+    for node in cyclic:
+        nodes.pop(node, None)
+        successors.pop(node, None)
+        predecessors.pop(node, None)
+    for node in successors:
+        successors[node] -= cyclic
+        predecessors[node] -= cyclic
+
+    first_by_table: dict[str, set[str]] = {}
+    for pipeline_id, pipeline in nodes.items():
+        definition = pipeline.get("definition") or {}
+        if definition.get("sourceZone") != "bronze" or not definition.get("sourceTable"):
+            continue
+        if FILE_INGEST_JOB not in _pipeline_depends_on(pipeline):
+            continue
+        table = str(definition["sourceTable"])
+        first_by_table.setdefault(table, set()).add(pipeline_id)
+
+    graph: dict[str, dict[str, ChainEntry]] = {}
+    for table, first_pipelines in first_by_table.items():
+        reach: set[str] = set()
+        pending = list(first_pipelines)
+        while pending:
+            current = pending.pop()
+            if current in reach:
+                continue
+            reach.add(current)
+            pending.extend(successors.get(current, set()) - reach)
+        for pipeline_id in reach:
+            parents = tuple(sorted(predecessors[pipeline_id] & reach))
+            if not parents:
+                continue
+            ancestors: set[str] = set()
+            pending = list(parents)
+            while pending:
+                current = pending.pop()
+                if current in ancestors:
+                    continue
+                ancestors.add(current)
+                pending.extend(predecessors.get(current, set()) & reach)
+            entry = ChainEntry(parents=parents, ancestors=tuple(sorted(ancestors)))
+            graph.setdefault(pipeline_id, {})[table] = entry
+    return graph
+
+
 def build_authored_lag_sensors(
     pipeline_jobs: list[tuple[dict[str, Any], Any]],
     cfg: AuthoredPipelineConfig | None = None,
