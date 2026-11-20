@@ -7,6 +7,7 @@ import { LayoutGrid, Lock } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { safeReportUrl } from "@/lib/report-blocks"
 import type { ReportBlock, ReportChartEntry } from "@/services/contracts/dashboard-reports"
+import type { MapLoader } from "./echarts-maps"
 import { TileBody } from "./tile-body"
 
 /**
@@ -30,17 +31,20 @@ export function ReportBlocks({
   charts,
   dark,
   print = false,
+  loadMap,
 }: {
   readonly blocks: readonly ReportBlock[]
   readonly charts: Readonly<Record<string, ReportChartEntry>>
   readonly dark: boolean
   /** The PDF's print view: no links out of the page, charts drawn without animation by `RenderMode`. */
   readonly print?: boolean
+  /** Map boundary loader for headless print views with no session (`PR #528 review BLOCKER`). */
+  readonly loadMap?: MapLoader
 }) {
   return (
     <div className="flex flex-col gap-4" data-report-blocks>
       {blocks.map((block, i) => (
-        <ReportBlockView key={i} block={block} charts={charts} dark={dark} print={print} />
+        <ReportBlockView key={i} block={block} charts={charts} dark={dark} print={print} loadMap={loadMap} />
       ))}
     </div>
   )
@@ -57,11 +61,13 @@ function ReportBlockView({
   charts,
   dark,
   print,
+  loadMap,
 }: {
   readonly block: ReportBlock
   readonly charts: Readonly<Record<string, ReportChartEntry>>
   readonly dark: boolean
   readonly print: boolean
+  readonly loadMap?: MapLoader
 }) {
   switch (block.type) {
     case "heading": {
@@ -101,7 +107,7 @@ function ReportBlockView({
       )
     }
     case "chart":
-      return <ReportChart entry={charts[block.chart]} dark={dark} print={print} />
+      return <ReportChart entry={charts[block.chart]} dark={dark} print={print} loadMap={loadMap} />
     default:
       return null
   }
@@ -112,10 +118,12 @@ export function ReportChart({
   entry,
   dark,
   print = false,
+  loadMap,
 }: {
   readonly entry: ReportChartEntry | undefined
   readonly dark: boolean
   readonly print?: boolean
+  readonly loadMap?: MapLoader
 }) {
   if (!entry || entry.unavailable !== undefined) {
     return (
@@ -153,7 +161,7 @@ export function ReportChart({
         ) : null}
       </figcaption>
       <div className={cn(spec.kind === "kpi" || spec.kind === "gauge" || spec.kind === "progress" ? "h-40" : "h-80")}>
-        <TileBody spec={spec} cell={cell ?? undefined} dark={dark} loading={false} />
+        <TileBody spec={spec} cell={cell ?? undefined} dark={dark} loading={false} loadMap={loadMap} />
       </div>
     </figure>
   )
