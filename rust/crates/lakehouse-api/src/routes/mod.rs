@@ -641,10 +641,15 @@ fn target_lag_routes() -> Router<AppState> {
 /// `BLD-14` D8: the chain sensor's one write per (re-upload, pipeline).
 /// Orchestrator-only like `lag-check`, hence under `/runnable/`.
 fn pipeline_chain_routes() -> Router<AppState> {
-    Router::new().route(
-        "/api/pipelines/runnable/{id}/chain-step",
-        post(pipeline_chain::record_chain_step),
-    )
+    Router::new()
+        .route(
+            "/api/pipelines/runnable/{id}/chain-step",
+            post(pipeline_chain::record_chain_step),
+        )
+        .route(
+            "/api/pipelines/{id}/reupload-chain",
+            get(pipeline_chain::reupload_chain),
+        )
 }
 
 /// The `/api/storage/*` sub-router (Task 2.6), split out for the same

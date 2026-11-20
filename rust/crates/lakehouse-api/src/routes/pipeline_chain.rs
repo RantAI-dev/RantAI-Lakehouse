@@ -162,3 +162,26 @@ pub async fn record_chain_step(
     let recorded = lakehouse_store::pipeline_chain::record_chain_step(pool, &step).await?;
     Ok(ApiJson(json!({ "recorded": recorded })))
 }
+
+/// `GET /api/pipelines/{id}/reupload-chain` — the newest outcome recorded
+/// for this pipeline. The page shows one sentence from it (section 4).
+///
+/// The per-tenant gate runs first, exactly as [`super::pipelines::runs`]
+/// does: an id in another tenant and an unknown id are the same 404, and
+/// no name from a foreign chain step reaches the reader.
+///
+/// # Errors
+///
+/// 404 for an unknown id or one outside the caller's tenant; 503 with no
+/// database; 500 on a store failure.
+pub async fn reupload_chain(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    super::authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id).await?;
+    let pool = crate::routes::pipelines::pool(&state)?;
+    let last = lakehouse_store::pipeline_chain::latest_chain_step(pool, &id).await?;
+    Ok(ApiJson(json!({ "last": last })))
+}

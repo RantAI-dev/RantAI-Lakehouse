@@ -637,6 +637,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/pipelines/runnable/{id}/chain-step", Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/source",             Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),
+    // BLD-14 D8: the pipeline page reads the chain's newest outcome. Same
+    // read floor as `runs`, with the same `in_scope` gate in the handler:
+    // another tenant's id is a 404, not an empty answer.
+    ("GET",  "/api/pipelines/{id}/reupload-chain",    Policy::RequiresPermission("pipeline:read")),
     // Plan 1c (R2, day-1): runs × steps matrix for the recovery UI.
     // `pipeline:read` matches `{id}/runs` and `{runId}/steps` — the
     // matrix is "runs for this pipeline" + "steps for each run"
