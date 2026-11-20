@@ -42,7 +42,9 @@ How the copy is kept honest:
   expired and the orphan files removed (the trim's own two helpers, T3),
   so the table's storage does not grow one copy per publish; a failed
   cleanup is recorded in its own `cleanup` column and never fails the
-  copy, which WAS replaced.
+  copy, which WAS replaced. Two fixed values say when no cleanup was due:
+  `already_present` (an idempotent rerun) and `reload_failed` (the
+  committed table could not be read back — DATA-6 review R2).
 - D12: every run writes exactly one row to
   `console.gold_latest_copy_run` — the same DDL the API's
   `gold_latest_copy.rs` holds, identical text — with a `status` from a
@@ -100,6 +102,13 @@ REASON_NEWER_COPY_PRESENT = "newer_copy_present"
 REASON_COPY_INCOMPLETE = "copy_incomplete"
 REASON_COMMIT_CONFLICT = "commit_conflict"
 REASON_WRITE_FAILED = "write_failed"
+
+# DATA-6 review R2: the `cleanup` column says why no cleanup ran when the
+# replace had already committed but its post-commit snapshot read failed,
+# or when the requested copy was already in place. Fixed strings, never
+# exception text (D12).
+CLEANUP_RELOAD_FAILED = "reload_failed"
+CLEANUP_ALREADY_PRESENT = "already_present"
 
 # `failed` reasons a retry can heal; every other failure is a fact about
 # the request or the deployment that a retry would re-meet.
@@ -356,9 +365,21 @@ def refresh_latest_copy(
         held = latest.scan(selected_fields=("_exported_at",), limit=1).to_arrow()
         if held.num_rows:
             held_micros = _exported_at_as_micros(held.column("_exported_at").to_pylist()[0])
-            if held_micros >= req.copy_exported_at_micros:
+            if held_micros > req.copy_exported_at_micros:
                 record("superseded", REASON_NEWER_COPY_PRESENT)
                 return {"status": "superseded", "reason": REASON_NEWER_COPY_PRESENT}
+            if held_micros == req.copy_exported_at_micros:
+                # DATA-6 review R2: this exact copy is already in place —
+                # an idempotent rerun, not a move backwards. Record the
+                # success with what is held; no second write and no cleanup
+                # are owed, and the row says so.
+                record(
+                    "success",
+                    copy_exported_at_micros=req.copy_exported_at_micros,
+                    rows=req.rows,
+                    cleanup=CLEANUP_ALREADY_PRESENT,
+                )
+                return {"status": "success", "cleanup": CLEANUP_ALREADY_PRESENT}
 
     # 5. Read exactly this publish's rows. The int-micros literal filters
     # the Timestamp column directly — proved by the acceptance gate (T6,
@@ -409,16 +430,28 @@ def refresh_latest_copy(
         record("failed", REASON_WRITE_FAILED)
         return {"status": "failed", "reason": REASON_WRITE_FAILED}
 
-    # 7. The committed snapshot id, off a freshly loaded table.
+    # 7. The committed snapshot id, off a freshly loaded table. DATA-6
+    # review R2: the write has ALREADY committed here. A reload failure can
+    # never be recorded as a failed replace — the retry would then see the
+    # copy held and report `superseded`, while the card still showed the
+    # previous copy. Record the success with what is known, skip the
+    # cleanup (there is no table handle to clean) and say so in the row.
+    snapshot_id: int | None = None
     try:
         latest = catalog.load_table(f"gold.{req.latest_table}")
         current = latest.current_snapshot()
         snapshot_id = current.snapshot_id if current else None
     except Exception as exc:  # noqa: BLE001
         if log:
-            log.error(f"gold.{req.latest_table} could not be reloaded: {exc}")
-        record("failed", REASON_CATALOG_UNAVAILABLE)
-        return {"status": "failed", "reason": REASON_CATALOG_UNAVAILABLE}
+            log.error(f"gold.{req.latest_table} could not be reloaded after the commit: {exc}")
+        record(
+            "success",
+            copy_exported_at_micros=req.copy_exported_at_micros,
+            rows=req.rows,
+            snapshot_id=None,
+            cleanup=CLEANUP_RELOAD_FAILED,
+        )
+        return {"status": "success", "cleanup": CLEANUP_RELOAD_FAILED}
 
     # 8. Cleanup (D11): expire every older snapshot, then remove the
     # orphan files (the trim's own helpers, T3). A failed cleanup never

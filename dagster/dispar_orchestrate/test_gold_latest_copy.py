@@ -186,6 +186,23 @@ class _Catalog:
         return tx
 
 
+class _ReloadFailingCatalog(_Catalog):
+    """DATA-6 review R2: the write commits, then the post-commit reload of
+    the latest table fails. The table is already replaced; only the
+    snapshot read is unavailable, so the run must still be a success."""
+
+    def __init__(self, main: _MainTable, latest: _LatestTable | None) -> None:
+        super().__init__(main, latest)
+        self.latest_loads = 0
+
+    def load_table(self, ident: str) -> object:
+        if ident == f"gold.{LATEST_TABLE}":
+            self.latest_loads += 1
+            if self.latest_loads >= 2:
+                raise RuntimeError("catalog went away after the commit")
+        return super().load_table(ident)
+
+
 @contextlib.contextmanager
 def _common_patches(catalog: _Catalog, recorded: list[dict]):
     """The fixture every refresh test needs: the publication list says
@@ -331,26 +348,88 @@ class LatestCopyRefreshTests(unittest.TestCase):
         self.assertIsNone(latest.tx, "nothing was written")
         self.assertEqual(recorded[0]["reason"], "schema_incompatible")
 
-    def test_an_older_or_equal_request_is_superseded_and_writes_nothing(self) -> None:
-        for held in (COPY_MICROS, COPY_MICROS + 1):
-            with self.subTest(held=held):
-                latest = _LatestTable(
-                    properties={gold_latest_copy.LATEST_COPY_OF_PROPERTY: TABLE},
-                    schema_=_MAIN_SCHEMA,
-                    held_micros=held,
-                )
-                main = _MainTable(_MAIN_SCHEMA, copy_frame=_arrow_frame(COPY_MICROS, 5))
-                catalog = _Catalog(main, latest)
-                recorded: list[dict] = []
+    def test_an_older_request_is_superseded_and_writes_nothing(self) -> None:
+        # DATA-6 review R2: only a STRICTLY newer held copy supersedes.
+        # `==` is the idempotent success tested just below.
+        latest = _LatestTable(
+            properties={gold_latest_copy.LATEST_COPY_OF_PROPERTY: TABLE},
+            schema_=_MAIN_SCHEMA,
+            held_micros=COPY_MICROS + 1,
+        )
+        main = _MainTable(_MAIN_SCHEMA, copy_frame=_arrow_frame(COPY_MICROS, 5))
+        catalog = _Catalog(main, latest)
+        recorded: list[dict] = []
 
-                result = self._refresh(_cfg(), _req(), catalog, recorded)
+        result = self._refresh(_cfg(), _req(), catalog, recorded)
 
-                self.assertEqual(
-                    result, {"status": "superseded", "reason": "newer_copy_present"}
-                )
-                self.assertIsNone(latest.tx, "the table never moves backwards")
-                self.assertEqual(recorded[0]["status"], "superseded")
-                self.assertEqual(recorded[0]["reason"], "newer_copy_present")
+        self.assertEqual(
+            result, {"status": "superseded", "reason": "newer_copy_present"}
+        )
+        self.assertIsNone(latest.tx, "the table never moves backwards")
+        self.assertEqual(recorded[0]["status"], "superseded")
+        self.assertEqual(recorded[0]["reason"], "newer_copy_present")
+
+    def test_a_rerun_for_the_copy_already_held_is_an_idempotent_success(self) -> None:
+        """DATA-6 review R2: a rerun for the exact copy in place is a
+        success, not a `newer_copy_present` supersede — the table already
+        holds what the publish asked for, and writing it again would only
+        risk moving the table backwards."""
+        latest = _LatestTable(
+            properties={gold_latest_copy.LATEST_COPY_OF_PROPERTY: TABLE},
+            schema_=_MAIN_SCHEMA,
+            held_micros=COPY_MICROS,
+        )
+        main = _MainTable(_MAIN_SCHEMA, copy_frame=_arrow_frame(COPY_MICROS, 5))
+        catalog = _Catalog(main, latest)
+        recorded: list[dict] = []
+
+        result = self._refresh(_cfg(), _req(), catalog, recorded)
+
+        self.assertEqual(
+            result,
+            {
+                "status": "success",
+                "cleanup": gold_latest_copy.CLEANUP_ALREADY_PRESENT,
+            },
+        )
+        self.assertIsNone(latest.tx, "no second write for the copy already held")
+        self.assertEqual(len(recorded), 1)
+        row = recorded[0]
+        self.assertEqual(row["status"], "success")
+        self.assertIsNone(row["reason"])
+        self.assertEqual(row["copy_exported_at_micros"], COPY_MICROS)
+        self.assertEqual(row["cleanup"], gold_latest_copy.CLEANUP_ALREADY_PRESENT)
+
+    def test_a_reload_failure_after_the_commit_is_a_success_with_no_snapshot_id(self) -> None:
+        """DATA-6 review R2: a reload error AFTER the one-commit write must
+        not be recorded as `failed`/`catalog_unavailable` — the retry would
+        then report `superseded` while the card still showed the old copy.
+        The copy was replaced: record success, a null snapshot id and a
+        cleanup value that says why no cleanup ran."""
+        latest = _LatestTable(
+            properties={gold_latest_copy.LATEST_COPY_OF_PROPERTY: TABLE},
+            schema_=_MAIN_SCHEMA,
+            held_micros=COPY_MICROS - 2_000_000,
+        )
+        main = _MainTable(_MAIN_SCHEMA, copy_frame=_arrow_frame(COPY_MICROS, 5))
+        catalog = _ReloadFailingCatalog(main, latest)
+        recorded: list[dict] = []
+
+        result = self._refresh(_cfg(), _req(), catalog, recorded)
+
+        self.assertEqual(
+            result,
+            {"status": "success", "cleanup": gold_latest_copy.CLEANUP_RELOAD_FAILED},
+        )
+        self.assertEqual(latest.tx.events[0][0], "enter", "the write committed")
+        self.assertEqual(len(recorded), 1)
+        row = recorded[0]
+        self.assertEqual(row["status"], "success")
+        self.assertIsNone(row["reason"])
+        self.assertEqual(row["copy_exported_at_micros"], COPY_MICROS)
+        self.assertEqual(row["rows"], 5)
+        self.assertIsNone(row["snapshot_id"])
+        self.assertEqual(row["cleanup"], gold_latest_copy.CLEANUP_RELOAD_FAILED)
 
     def test_a_row_count_that_differs_from_the_publish_records_copy_incomplete(self) -> None:
         for rows in (0, 4):
