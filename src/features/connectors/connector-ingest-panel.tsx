@@ -1745,7 +1745,11 @@ function RunCard({
                 : null}
         </p>
         {logOpen ? (
-          <RunLog connectorId={connectorId} runId={run.runId} />
+          <RunLog
+            connectorId={connectorId}
+            runId={run.runId}
+            followKey={`${run.status}|${run.attempts}|${run.endedAt ?? ""}`}
+          />
         ) : (
           <Button type="button" size="xs" variant="outline" onClick={() => setLogOpen(true)}>
             Show log
@@ -1767,8 +1771,21 @@ function waitLabel(seconds: number): string {
  * writes the lines from a closed list and never carries the source's or the
  * driver's error text; this view only words the closed event and error class.
  */
-function RunLog({ connectorId, runId }: { connectorId: string; runId: string }) {
-  const log = useService((s) => connectorService.getConnectorRunLog(connectorId, runId, s), [connectorId, runId])
+function RunLog({ connectorId, runId, followKey }: { connectorId: string; runId: string; followKey: string }) {
+  // `SRC-46` (`QA LH-SRC-6-43`): a log opened while the run was going stayed at
+  // the attempts it first read. `keepDataOnReload` holds the lines on screen
+  // only for a reload with the same deps, so `followKey` (the run's status,
+  // attempts and end) is not a dep: an effect calls `reload()` when it changes.
+  const log = useService((s) => connectorService.getConnectorRunLog(connectorId, runId, s), [connectorId, runId], {
+    keepDataOnReload: true,
+  })
+  const { reload } = log
+  const seenKey = React.useRef(followKey)
+  React.useEffect(() => {
+    if (seenKey.current === followKey) return
+    seenKey.current = followKey
+    reload()
+  }, [followKey, reload])
   const download = useServiceAction(async (signal) => {
     const text = await connectorService.downloadConnectorRunLog(connectorId, runId, signal)
     if (signal.aborted) return text
