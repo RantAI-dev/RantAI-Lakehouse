@@ -40,8 +40,13 @@ No; publishing is not one of the assistant's dashboard tools.
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
 | 1 | Built, before `DATA-3` | Yes | Product owner, 2026-10-14 |
-| 2 | Row limit | Same as Gold, 5,000,000 by default | Planner, from `DATA-1` |
-| 3 | Copies kept | Same as Gold (`DATA-2`, 7) | Product owner, 2026-10-14 |
+| 2 | Row limit | Same as Gold, 5,000,000 by default (`GOLD_EXPORT_MAX_ROWS`, one setting for both layers) | Product owner, 2026-11-20 (the spec's defaults accepted) |
+| 3 | Copies kept | Same as Gold (`DATA-2`, 7; `GOLD_KEEP_COPIES`, one setting for both layers) | Product owner, 2026-10-14 |
+| 4 | Status, history, skip when unchanged, masking | Exactly Gold's: the same states (including "Last publish failed", `DATA-49`), the same content fingerprint (`DATA-10`), masking applied when the copy is made | Product owner, 2026-11-20 (the spec's defaults accepted) |
+| 5 | Who may switch publishing on or off, and press "Publish now" | Holders of the existing `gold:export` permission, as for Gold; no new permission | Product owner, 2026-11-20 (the spec's "as for Gold" default) |
+| 6 | Who can read the published Silver table | The tenant that owns the shared catalog, as for the Silver table itself (`SEC-20`): the copy is in that tenant's warehouse, in the `silver` namespace, under the same name, so the same tenant gate, role access and masking rules apply inside the product. Outside tools do not read it through the API's door (`/api/iceberg`, ADR 0016 serves `gold` only); that is a follow-up | Planner, 2026-11-20, from `SEC-20` and ADR 0016 |
+| 7 | A Silver table built from another organisation's data | Refused: when the install holds more than one tenant, a Silver table that an upload of another tenant claims, or that a pipeline of another tenant writes, is not published (switch refused; a scheduled publish fails with the reason) | Planner, 2026-11-20, from `SEC-20` and `SEC-80` |
+| 8 | The overview of all published tables | Stays Gold-only in this build; Silver tables are published and shown on their own page only | Planner, 2026-11-20 (see the plan's Mismatch section) |
 
 ## Limits to tell a customer
 
