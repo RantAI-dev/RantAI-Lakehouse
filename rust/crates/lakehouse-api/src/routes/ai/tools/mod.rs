@@ -38,6 +38,7 @@ mod connectors;
 mod dashboards;
 mod embed;
 mod export;
+pub(super) use export::with_screen_filters;
 mod maps;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
 // SIBLING module of `routes::ai`, not a descendant — can reuse
