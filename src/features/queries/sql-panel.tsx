@@ -93,6 +93,7 @@ export function SqlPanel({
     estimateSupported,
     runnable,
     targetStatement,
+    batchRefusal,
     runQuery,
     runSelectionOrAll,
     reEstimate,
@@ -316,6 +317,13 @@ export function SqlPanel({
           ⌘/Ctrl+Enter to run
         </span>
       </div>
+      {/* QS-11 (LH-QS-1-12), D9: a batch over the limit is refused here, in
+          the page, not in a toast that disappears before it is read. */}
+      {batchRefusal ? (
+        <p role="alert" className="text-sm text-destructive">
+          {batchRefusal}
+        </p>
+      ) : null}
     </div>
   )
 }

@@ -11,7 +11,6 @@ import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { levelAtLeast } from "@/lib/access-level"
 import { catalogRefusal } from "@/lib/catalog-refusal"
-import { notifyInfo } from "@/lib/notify"
 import { readableErrorMessage } from "@/lib/notify-message"
 import { newRunId } from "@/lib/run-id"
 import {
@@ -357,6 +356,10 @@ export function useQueryStudio(draftKey: string | null) {
   const [explainResult, setExplainResult] = React.useState<string | null>(null)
   const [explainBusy, setExplainBusy] = React.useState(false)
   const [explainError, setExplainError] = React.useState<ServiceError | null>(null)
+  // QS-11 (LH-QS-1-12), D9: a refused batch is said on the page until the
+  // person changes the SQL or opens another tab — a toast would be gone by
+  // the time they look for the reason nothing ran.
+  const [batchRefusal, setBatchRefusal] = React.useState<string | null>(null)
   const setSql = React.useCallback(
     (next: string) => {
       setTabs((previous) =>
@@ -372,6 +375,7 @@ export function useQueryStudio(draftKey: string | null) {
       )
       setFixResult(null)
       setFixStatement(null)
+      setBatchRefusal(null)
     },
     [activeTabId]
   )
@@ -1076,6 +1080,7 @@ export function useQueryStudio(draftKey: string | null) {
   const setActiveTab = React.useCallback((id: string) => {
     setActiveTabId(id)
     setFixResult(null)
+    setBatchRefusal(null)
   }, [])
 
   const generate = React.useCallback(async () => {
@@ -1236,12 +1241,13 @@ export function useQueryStudio(draftKey: string | null) {
   const runQuery = React.useCallback(async () => {
     if (statements.length === 0) return
     if (statements.length > MAX_STATEMENTS_PER_RUN) {
-      notifyInfo(
-        `At most ${MAX_STATEMENTS_PER_RUN} statements are run at once`,
-        "Split the buffer into smaller queries and run them one after another."
+      // QS-11 (LH-QS-1-12), D9: the refusal stays on the page, beside Run.
+      setBatchRefusal(
+        `At most ${MAX_STATEMENTS_PER_RUN} statements are run at once. Split the buffer into smaller queries and run them one after another.`
       )
       return
     }
+    setBatchRefusal(null)
     await runBatch(activeTabId, statements, engine, runInputs)
   }, [statements, activeTabId, engine, runBatch, runInputs])
 
@@ -1535,6 +1541,8 @@ export function useQueryStudio(draftKey: string | null) {
     saveParameters,
     tabs,
     activeTabId,
+    /** Why a batch of too many statements was refused, until the SQL changes. */
+    batchRefusal,
     addTab,
     renameTab,
     closeTab,

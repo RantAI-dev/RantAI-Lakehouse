@@ -645,3 +645,23 @@ describe("QueryStudioPage draft owner", () => {
     expect(JSON.parse(firstKey ?? "{}").tabs?.[0]?.sql).toBe("SELECT {{first}}")
   })
 })
+
+// QS-11 (LH-QS-1-12), D9: a batch over the limit is refused in the page,
+// beside Run, with no request sent — not in a toast that vanishes.
+describe("QueryStudioPage batch refusal", () => {
+  it("shows the statement-limit alert and sends nothing when Run all is pressed", async () => {
+    stubNetwork()
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT)
+    seedDraft(Array.from({ length: 21 }, (_, i) => `SELECT ${i}`).join("; "))
+    renderPage()
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /Run all/ })).toBeTruthy())
+    fireEvent.click(screen.getByRole("button", { name: /Run all/ }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe(
+      "At most 20 statements are run at once. Split the buffer into smaller queries and run them one after another."
+    )
+    expect(run).not.toHaveBeenCalled()
+  })
+})

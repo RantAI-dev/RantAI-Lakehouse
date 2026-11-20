@@ -2,7 +2,6 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { EditorView } from "@codemirror/view"
 import * as React from "react"
-import * as notify from "@/lib/notify"
 import { LEGACY_QUERY_DRAFT_KEY, queryDraftKey, type QueryTabs } from "@/lib/query-draft"
 import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
@@ -693,9 +692,11 @@ describe("useQueryStudio statements", () => {
     expect(runs[2]?.status === "error" && runs[2].error.code).toBe("permission_denied")
   })
 
-  it("refuses a batch of more than twenty statements before anything runs", async () => {
+  // QS-11 (LH-QS-1-12), D9: the refusal is state the page renders beside Run,
+  // cleared when the SQL changes — not a toast. This replaces the toast-pinning
+  // test because the rule changed, not because the behaviour is now untested.
+  it("refuses a batch of more than twenty statements and clears the notice when the SQL changes", async () => {
     const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
-    const notifyInfo = spyOn(notify, "notifyInfo")
     const many = Array.from({ length: 21 }, (_, index) => `SELECT ${index}`).join("; ")
     const { result } = mountWith(many)
 
@@ -704,8 +705,11 @@ describe("useQueryStudio statements", () => {
     })
 
     expect(run).not.toHaveBeenCalled()
-    expect(notifyInfo).toHaveBeenCalledTimes(1)
-    expect(String(notifyInfo.mock.calls[0]?.[0] ?? "")).toContain("20")
+    expect(result.current.batchRefusal).toBe(
+      "At most 20 statements are run at once. Split the buffer into smaller queries and run them one after another."
+    )
+    act(() => result.current.setSql("SELECT 1"))
+    expect(result.current.batchRefusal).toBeNull()
   })
 
   it("marks the statement in flight and the ones after it as not run when the batch is stopped", async () => {
