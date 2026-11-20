@@ -80,6 +80,18 @@ is `DATA-19`
     Finally it asks the lineage route for the Silver table and expects the
     chain `upload:<id> -> bronze.<table> -> silver.<table>_clean`.
 
+    `BLD-14` grows step 10 with a Gold pipeline that reads the Silver
+    pipeline's output and has no `dependsOn` of its own: after another
+    re-upload the Silver run is followed by exactly one Gold run, started
+    after the Silver run ended and recorded as `started` on Gold's
+    `reupload-chain` route; waiting two sensor intervals must not add a
+    second run. Then the Silver pipeline's step is changed to throw on a
+    `boom` value, a file with that value is re-uploaded, and the gate
+    expects the Silver run to fail, no Gold run after two intervals, and
+    Gold's chain record to read `not_run` / `upstream_failed` naming the
+    Silver pipeline. The Silver step is restored at the end and on the
+    cleanup path.
+
 8. SEC-17: it uploads a CSV file with 1,001 columns. Its preview answers 400
    with "The file has more than 1,000 columns." and the same file read with
    another delimiter previews again; a load request for it answers 400 with the
@@ -182,6 +194,7 @@ import secrets
 import sys
 import time
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "uploads"
@@ -1532,6 +1545,275 @@ def step_reupload_reruns_the_pipeline(api, table: str, silver_table: str, pipeli
     return upload_id
 
 
+# BLD-14: two sensor intervals after a chain launch, the count must still
+# be one. The sensors poll every 30 seconds; 75 s covers two ticks and the
+# run-launch delay without making the gate much slower.
+CHAIN_QUIET_S = 75
+
+
+def _dagster_lists_sensor(requests, sensor_name: str) -> bool:
+    """Whether the code location's sensor list holds `sensor_name`.
+    `authored__<id>_chain` must exist before a re-upload can start a chain."""
+    query = "{ repositoriesOrError { ... on RepositoryConnection { nodes { sensors { name } } } } }"
+    resp = requests.post(DAGSTER_URL, json={"query": query}, timeout=10)
+    resp.raise_for_status()
+    nodes = (resp.json().get("data") or {}).get("repositoriesOrError", {}).get("nodes") or []
+    return any(s.get("name") == sensor_name for node in nodes for s in node.get("sensors", []))
+
+
+def step_create_gold_after_silver(api, requests, silver_table: str, gold_table: str) -> tuple[str, str]:
+    """Author a `silver.<table>_clean` -> `gold.<table>_daily` pipeline with
+    NO `dependsOn`: only BLD-14's chain can start it on a re-upload. Wait
+    for both its job and its `_chain` sensor to be built (BLD-14 D6)."""
+    resp = api.post(
+        f"{API_URL}/api/pipelines",
+        json={
+            "name": f"g9_gold_{secrets.token_hex(3)}",
+            "kind": "batch",
+            "sourceZone": "silver",
+            "sourceTable": silver_table,
+            "incrementalColumn": "",
+            "transforms": [],
+            "targetZone": "gold",
+            "targetTable": gold_table,
+            "schedule": "manual",
+            "dependsOn": [],
+        },
+        timeout=60,
+    )
+    created = _expect(resp, 201, "POST /api/pipelines (chain Gold)").json()
+    pipeline_id = created.get("id")
+    name = created.get("name")
+    if not pipeline_id or created.get("source") != f"silver.{silver_table}":
+        raise G9Failure(f"the Gold pipeline should read silver.{silver_table}, got {created}")
+    _expect(
+        api.post(f"{API_URL}/api/pipelines/{pipeline_id}/status", json={"status": "ready"}, timeout=60),
+        200,
+        "POST /api/pipelines/{id}/status (Gold)",
+    )
+    safe = pipeline_id.replace("-", "_")
+    _wait_for(
+        f"the orchestrator built authored__{safe}",
+        lambda: _dagster_lists_job(requests, f"authored__{safe}"),
+        JOB_BUILT_TIMEOUT_S,
+    )
+    _wait_for(
+        f"the orchestrator built authored__{safe}_chain",
+        lambda: _dagster_lists_sensor(requests, f"authored__{safe}_chain"),
+        JOB_BUILT_TIMEOUT_S,
+    )
+    print(f"[g9] chain: Gold pipeline {pipeline_id} ({name}) and its chain sensor are built")
+    return pipeline_id, name or ""
+
+
+def _chain_step(api, pipeline_id: str) -> dict | None:
+    body = _expect(
+        api.get(f"{API_URL}/api/pipelines/{pipeline_id}/reupload-chain", timeout=60),
+        200,
+        "GET /api/pipelines/{id}/reupload-chain",
+    ).json()
+    return body.get("last")
+
+
+def _new_runs(api, pipeline_id: str, before_ids: set[str]) -> list[dict]:
+    return [r for r in _pipeline_runs(api, pipeline_id) if r.get("id") not in before_ids]
+
+
+def step_reupload_runs_the_chain(
+    api,
+    requests,
+    table: str,
+    silver_table: str,
+    gold_table: str,
+    silver_pipeline_id: str,
+    gold_pipeline_id: str,
+    using: dict,
+    expected: dict,
+    state: dict,
+) -> None:
+    """BLD-14 D1/D2: a re-upload runs Silver and THEN exactly one Gold run,
+    whose queue time is not before Silver's end; Gold's table and chain
+    record agree, and two more sensor ticks add no second run."""
+    before_silver = {r.get("id") for r in _pipeline_runs(api, silver_pipeline_id)}
+    before_gold = {r.get("id") for r in _pipeline_runs(api, gold_pipeline_id)}
+    upload_id = upload_changed_copy(api, expected, state)
+    step_load(api, upload_id, table, "replace", using, len(expected["rows"]), table_rows=len(expected["rows"]))
+
+    _wait_for(
+        "Silver ran again after the re-upload",
+        lambda: bool(_new_runs(api, silver_pipeline_id, before_silver)),
+        PIPELINE_RUN_TIMEOUT_S,
+    )
+    silver_runs = _new_runs(api, silver_pipeline_id, before_silver)
+    silver_run = silver_runs[0]
+    if silver_run.get("status") != RUN_COMPLETED:
+        raise G9Failure(f"the Silver chain run did not succeed: {silver_run}")
+
+    _wait_for(
+        "Gold ran once after the Silver run",
+        lambda: bool(_new_runs(api, gold_pipeline_id, before_gold)),
+        PIPELINE_RUN_TIMEOUT_S,
+    )
+    gold_runs = _new_runs(api, gold_pipeline_id, before_gold)
+    if len(gold_runs) != 1:
+        raise G9Failure(f"the chain should start exactly one Gold run, got {gold_runs}")
+    run = gold_runs[0]
+    queued, ended = run.get("queuedAt"), silver_run.get("endedAt")
+    if not queued or not ended:
+        raise G9Failure(f"the runs must carry their times to prove the order: {silver_run} {run}")
+    if datetime.fromisoformat(queued.replace("Z", "+00:00")) < datetime.fromisoformat(
+        ended.replace("Z", "+00:00")
+    ):
+        raise G9Failure(f"the Gold run was queued before the Silver run ended: {ended} > {queued}")
+
+    columns = ["plnt", "material", "description", "qty"]
+
+    def gold_shows_change() -> bool:
+        body = run_query(
+            api,
+            f"SELECT {', '.join(columns)} FROM gold.`{gold_table}` WHERE 1 ORDER BY material",
+        )
+        return any(row.get("qty") == CHANGED_QTY for row in body["rows"])
+
+    _wait_for(f"gold.{gold_table} shows the changed row", gold_shows_change, VISIBLE_TIMEOUT_S)
+
+    def recorded_started() -> bool:
+        step = _chain_step(api, gold_pipeline_id)
+        return bool(step and step.get("outcome") == "started" and step.get("runId") == run.get("id"))
+
+    _wait_for("Gold's chain record names its run", recorded_started, VISIBLE_TIMEOUT_S)
+
+    time.sleep(CHAIN_QUIET_S)
+    later = _new_runs(api, gold_pipeline_id, before_gold)
+    if len(later) != 1:
+        raise G9Failure(f"two sensor intervals started more than one Gold run: {later}")
+    print(
+        f"[g9] chain: re-upload ran Silver ({silver_run.get('id')}) then one Gold run "
+        f"({run.get('id')}) after it; no second run after two intervals"
+    )
+    _delete_upload(api, upload_id, state)
+
+
+def _silver_update_body(api, silver_pipeline_id: str, silver_table: str, qty: str) -> dict:
+    """The stored definition, with a SQL step that throws on `qty = <qty>`.
+    A SQL step must parse as one SELECT and name only the pipeline's input
+    (`pipeline_compile::check_pipeline_step_sql`, D5/D6), so the throw is a
+    `throwIf` in the SELECT list rather than a statement of its own."""
+    current = _expect(
+        api.get(f"{API_URL}/api/pipelines/{silver_pipeline_id}", timeout=60),
+        200,
+        "GET /api/pipelines/{id} (Silver)",
+    ).json()
+    definition = current.get("definition") or {}
+    inputs = definition.get("inputs") or []
+    if not inputs or not inputs[0].get("name"):
+        raise G9Failure(f"the Silver definition has no named input: {definition}")
+    return {
+        "kind": current.get("kind") or "batch",
+        "sourceZone": definition.get("sourceZone") or "bronze",
+        "sourceTable": definition.get("sourceTable") or "",
+        "incrementalColumn": definition.get("incrementalColumn") or "",
+        "transforms": [],
+        "inputs": inputs,
+        "steps": [
+            {
+                "name": "boom",
+                "kind": "sql",
+                "sql": f"SELECT *, throwIf(qty = '{qty}') AS bad FROM {inputs[0]['name']}",
+            }
+        ],
+        "fbicEnabled": bool(definition.get("fbicEnabled")),
+        "targetZone": definition.get("targetZone") or "silver",
+        "targetTable": definition.get("targetTable") or silver_table,
+        "schedule": current.get("schedule") or "manual",
+        "dependsOn": current.get("dependsOn") or ["file_ingest_job"],
+    }
+
+
+def step_failed_silver_stops_the_chain(
+    api,
+    silver_table: str,
+    gold_table: str,
+    silver_pipeline_id: str,
+    gold_pipeline_id: str,
+    silver_name: str,
+    using: dict,
+    expected: dict,
+    state: dict,
+) -> None:
+    """BLD-14 D2/D9: a failed Silver run stops Gold and records the cause
+    on Gold's chain route. The Silver step is restored on every path.
+
+    The failure is a SQL step with `throwIf(qty = 'boom')` (a SELECT, which
+    is the only shape `check_pipeline_step_sql` accepts), and the upload
+    carries `boom` in the row the gate changes."""
+    original = _silver_update_body(api, silver_pipeline_id, silver_table, CHANGED_QTY)
+    restore = dict(original)
+    restore["steps"] = []
+    state["silver_step_restore"] = (silver_pipeline_id, restore)
+    try:
+        _expect(
+            api.put(f"{API_URL}/api/pipelines/{silver_pipeline_id}", json=original, timeout=60),
+            200,
+            "PUT /api/pipelines/{id} (Silver boom step)",
+        )
+        before_silver = {r.get("id") for r in _pipeline_runs(api, silver_pipeline_id)}
+        before_gold = {r.get("id") for r in _pipeline_runs(api, gold_pipeline_id)}
+        upload_id = upload_changed_copy(api, expected, state, qty="boom")
+        step_load(
+            api,
+            upload_id,
+            silver_table.replace("_clean", ""),
+            "replace",
+            using,
+            len(expected["rows"]),
+            table_rows=len(expected["rows"]),
+        )
+
+        def silver_failed() -> bool:
+            runs = _new_runs(api, silver_pipeline_id, before_silver)
+            return any(r.get("status") == RUN_FAILED for r in runs)
+
+        _wait_for("the Silver chain run failed", silver_failed, PIPELINE_RUN_TIMEOUT_S)
+        time.sleep(CHAIN_QUIET_S)
+        later_gold = _new_runs(api, gold_pipeline_id, before_gold)
+        if later_gold:
+            raise G9Failure(f"a failed Silver run still started Gold: {later_gold}")
+
+        def recorded_failure() -> bool:
+            step = _chain_step(api, gold_pipeline_id)
+            return bool(
+                step
+                and step.get("outcome") == "not_run"
+                and step.get("reason") == "upstream_failed"
+                and step.get("causePipelineName") == silver_name
+            )
+
+        _wait_for("Gold's chain record names the failed Silver pipeline", recorded_failure, VISIBLE_TIMEOUT_S)
+        print(f"[g9] chain: failed Silver run stopped Gold and named {silver_name} on its chain record")
+        _delete_upload(api, upload_id, state)
+    finally:
+        _restore_silver_step(api, state)
+
+
+def _restore_silver_step(api, state: dict) -> None:
+    """Best effort: put the Silver pipeline's step back after BLD-14's
+    failure step, whether it passed, failed, or the gate was interrupted."""
+    saved = state.pop("silver_step_restore", None)
+    if not saved:
+        return
+    pipeline_id, body = saved
+    try:
+        _expect(
+            api.put(f"{API_URL}/api/pipelines/{pipeline_id}", json=body, timeout=60),
+            200,
+            "PUT /api/pipelines/{id} (restore Silver step)",
+        )
+        print(f"[g9] cleanup: restored Silver pipeline {pipeline_id}'s step", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 -- the gate's own failure is the one to report
+        print(f"[g9] cleanup: Silver step was not restored ({exc})", file=sys.stderr)
+
+
 # The quantity the changed copy of `sap_report_utf16.xls` carries in the
 # row the gate asserts on. The original says `4`; the changed copy says
 # `9001`, which no other fixture and no earlier step mentions.
@@ -1540,7 +1822,7 @@ CHANGED_QTY = "9001"
 _CHANGED_ROW = ["8250", "0000200", "PP BAND", CHANGED_QTY]
 
 
-def changed_fixture_bytes(expected: dict) -> bytes:
+def changed_fixture_bytes(expected: dict, qty: str = CHANGED_QTY) -> bytes:
     """`sap_report_utf16.xls` with its last data row's quantity changed.
 
     Built from the fixture's OWN expected rows, so the header, the title
@@ -1559,15 +1841,16 @@ def changed_fixture_bytes(expected: dict) -> bytes:
     for index in range(len(lines) - 1, -1, -1):
         cells = lines[index].split("\t")
         if len(cells) == len(header) and cells[0] == expected["rows"][-1][0] and cells[1] == expected["rows"][-1][1]:
-            lines[index] = "\t".join(_CHANGED_ROW)
+            lines[index] = "\t".join(["8250", "0000200", "PP BAND", qty])
             return b"\xff\xfe" + "\r\n".join(lines).encode("utf-16-le")
     raise G9Failure("the fixture's last data row could not be found, so it cannot be changed")
 
 
-def upload_changed_copy(api, expected: dict, state: dict) -> str:
+def upload_changed_copy(api, expected: dict, state: dict, qty: str = CHANGED_QTY) -> str:
     """Upload the changed copy of the fixture as a new upload of its own
-    (the same bytes would be refused as a duplicate)."""
-    raw = changed_fixture_bytes(expected)
+    (the same bytes would be refused as a duplicate). `qty` is what the
+    last data row carries; BLD-14's failure step uploads `"boom"`. """
+    raw = changed_fixture_bytes(expected, qty)
     resp = api.post(
         f"{API_URL}/api/uploads",
         files={"file": (f"{FIXTURE}_corrected.xls", raw, "application/vnd.ms-excel")},
@@ -1682,16 +1965,30 @@ def step_feeds_a_pipeline(
     records the FIRST upload to ask for a table name, and the corrected
     copy of step 3 keeps that claim (a claim is never taken away)."""
     silver_table = f"{table}_clean"
+    gold_table = f"{table}_daily"
     pipeline_id = step_create_pipeline_over_uploaded_table(api, requests, table, silver_table)
     # The table holds the `replace` load AND the `append` of it that step
     # 4 made, so the pipeline copies twice the file's rows. The re-upload
     # below replaces them again, which is the point: a re-upload that
     # changes nothing would not show anything downstream either.
     step_first_pipeline_run(api, pipeline_id, silver_table, 2 * len(expected["rows"]))
+    silver_name = (
+        _expect(api.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=60), 200, "GET /api/pipelines/{id} (Silver)").json().get("name") or ""
+    )
     step_reupload_reruns_the_pipeline(api, table, silver_table, pipeline_id, using, expected, state)
     step_other_table_does_not_rerun(api, table, pipeline_id, state)
     step_lineage_shows_the_upload(api, first_upload_id, table, silver_table)
-    print("[g9] pipeline: PASS (uploaded table -> pipeline, re-upload re-ran it, another upload did not)")
+    # BLD-14: the rest of step 10 -- a Gold pipeline with no `dependsOn`
+    # follows Silver on a re-upload, and a failed Silver stops it with a
+    # reason on Gold's chain route.
+    gold_id, _gold_name = step_create_gold_after_silver(api, requests, silver_table, gold_table)
+    step_reupload_runs_the_chain(
+        api, requests, table, silver_table, gold_table, pipeline_id, gold_id, using, expected, state
+    )
+    step_failed_silver_stops_the_chain(
+        api, silver_table, gold_table, pipeline_id, gold_id, silver_name, using, expected, state
+    )
+    print("[g9] pipeline: PASS (uploaded table -> pipeline, re-upload re-ran it and the chain, a failed Silver stopped Gold, another upload did not)")
 
 
 # DATA-35: folders for uploaded files.
@@ -1835,7 +2132,9 @@ def _clean_up_upload(api, state: dict) -> None:
     """Best effort after a failed run: take the upload (its object and row) back
     out, so a failed gate does not leave a file in the bucket and a row in the
     list. The table and its claim stay, as after a pass. An upload that is
-    still loading answers 409 and stays."""
+    still loading answers 409 and stays. BLD-14: a changed Silver step is
+    restored here too, in case the chain step failed before its `finally`."""
+    _restore_silver_step(api, state)
     # DATA-17 slice 5: the files of a load of several are in `others`.
     pending = [] if not state["upload_id"] or state["deleted"] else [state["upload_id"]]
     for upload_id in pending + list(state.get("others", [])):
