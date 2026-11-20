@@ -1294,3 +1294,13 @@ capture a qualified `ON` column is unverified; the `g7` case uses `id AS id`
 only. Add a `g7` variant where an output alias equals the other side's join
 key, if it fits in this PR; otherwise a line in the J3 module doc.
 
+
+### Round 2 — planner review, 2026-11-20, at `89bda5288`
+
+R1–R5 are fixed as asked, each cited at its site, each with a test shown
+to fail before its fix (R3 by disabling the guard, since its fix is a
+comment). The `g7` alias question is recorded in the J3 module doc, which
+the round-1 note allowed. **No open BLOCKER or SHOULD-FIX.** Merge waits for
+CI on the PR and for the owner to sign decisions J1–J10 (section 2): the
+plan's own gate, which this build went ahead of on the owner's instruction
+of 2026-11-20 ("build").
