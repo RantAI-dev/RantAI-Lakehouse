@@ -353,6 +353,25 @@ describe("the header and toolbar controls (BI-59 AC1)", () => {
     // Collapsed: the one search is an icon button (listed above), not an input.
     expect(screen.queryAllByRole("searchbox")).toHaveLength(0)
   })
+
+  // PR #530 review SHOULD-FIX: reader permissions hide Templates and New / New report.
+  it("offers a reader no Templates filter and no New or New report", async () => {
+    const calls = serve(["dashboard:read"])
+    renderPage()
+    await screen.findByText("QA BI")
+    const typeGroup = screen.getByRole("group", { name: "Type" })
+    expect(within(typeGroup).queryByRole("button", { name: "Templates" })).toBeNull()
+    for (const label of ["All", "Dashboards", "Reports"]) {
+      expect(within(typeGroup).getByRole("button", { name: label })).toBeTruthy()
+    }
+    expect(screen.queryByRole("button", { name: "New" })).toBeNull()
+    expect(screen.queryByText("New report")).toBeNull()
+    fireEvent.click(within(typeGroup).getByRole("button", { name: "Reports" }))
+    expect(await screen.findByText("Nobody has shared a report with you yet.")).toBeTruthy()
+    expect(screen.queryByText("New report")).toBeNull()
+    expect(screen.queryByRole("link", { name: "New report" })).toBeNull()
+    expect(calls.some((c) => c.url.includes("/api/dashboard/templates"))).toBe(false)
+  })
 })
 
 describe("bulk actions, facts and empty states (BI-59 T5)", () => {
