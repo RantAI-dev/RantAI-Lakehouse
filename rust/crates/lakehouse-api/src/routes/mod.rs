@@ -85,6 +85,7 @@ mod notifications;
 mod ops;
 mod overview;
 pub(crate) mod params;
+pub(crate) mod pipeline_chain;
 mod pipeline_preview;
 mod pipelines;
 mod quality;
@@ -452,7 +453,11 @@ fn pipeline_preview_router() -> Router<AppState> {
 /// [`crate::policy`], and keeping them together makes that pairing the
 /// thing a reader sees first.
 fn authored_pipelines_router() -> Router<AppState> {
-    pipeline_compile_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+    pipeline_compile_router()
+        .route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+        // BLD-14: the chain-step write is orchestrator-only here as well as
+        // in `POLICY_TABLE`, so it sits with `runnable` and `compile`.
+        .merge(pipeline_chain_routes())
 }
 
 /// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]
@@ -631,6 +636,15 @@ fn target_lag_routes() -> Router<AppState> {
             "/api/pipelines/{id}/target-lag",
             put(authored_pipelines::set_target_lag),
         )
+}
+
+/// `BLD-14` D8: the chain sensor's one write per (re-upload, pipeline).
+/// Orchestrator-only like `lag-check`, hence under `/runnable/`.
+fn pipeline_chain_routes() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/runnable/{id}/chain-step",
+        post(pipeline_chain::record_chain_step),
+    )
 }
 
 /// The `/api/storage/*` sub-router (Task 2.6), split out for the same

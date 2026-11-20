@@ -277,6 +277,7 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("DELETE", "/api/pipelines/{id}", Coverage::Handler { action: "pipeline.delete" }),
     ("POST", "/api/pipelines/runnable/{id}/lag-check", Coverage::Excluded { reason: EX_LAG_CHECK }),
     ("POST", "/api/pipelines/runnable/{id}/compile", Coverage::Excluded { reason: EX_READ_LIKE }),
+    ("POST", "/api/pipelines/runnable/{id}/chain-step", Coverage::Excluded { reason: EX_MACHINE }),
     ("POST", "/api/pipelines/{id}/trigger", Coverage::Handler { action: "pipeline.trigger" }),
     ("POST", "/api/pipelines/{id}/status", Coverage::Central { action: "pipeline.status_set", resource_kind: "pipeline", id_param: IdParam::Path("id") }),
     ("POST", "/api/pipelines/{id}/pause", Coverage::Handler { action: "pipeline.pause" }),

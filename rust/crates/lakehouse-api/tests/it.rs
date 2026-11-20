@@ -134,6 +134,7 @@ mod pipeline_definition_save;
 mod pipeline_lag_check;
 mod pipeline_lag_page;
 mod pipeline_preview;
+mod pipeline_reupload_chain;
 mod pipeline_routing;
 mod public_links;
 mod quality_anomalies;

@@ -630,6 +630,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // any tenant, so it cannot be reachable by someone who merely holds
     // `pipeline:read`.
     ("POST", "/api/pipelines/runnable/{id}/compile",   Policy::RequiresPermission("pipeline:read")),
+    // BLD-14 D8: the chain sensor posts one outcome per re-upload and
+    // pipeline. Same floor as `lag-check`/`compile` above (`pipeline:read`),
+    // with the same handler-side refusal: only the orchestrator's service
+    // identity (or a Platform Admin) may record a step.
+    ("POST", "/api/pipelines/runnable/{id}/chain-step", Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/source",             Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),
     // Plan 1c (R2, day-1): runs × steps matrix for the recovery UI.
