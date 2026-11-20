@@ -306,7 +306,8 @@ function StepHeader({
     <div className="flex items-start justify-between gap-3">
       <div>
         <p className="font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
-          Step {index + 1} · {step.kind === "sql" ? "SQL" : step.kind === "transform" ? "Form" : step.stored.kind}
+          Step {index + 1} ·{" "}
+          {step.kind === "sql" ? "SQL" : step.kind === "transform" ? "Form" : step.kind === "unknown" ? step.stored.kind : step.kind}
         </p>
         <p className="font-mono text-sm font-semibold">{step.name || "Unnamed step"}</p>
       </div>
@@ -524,6 +525,10 @@ export function SqlStepPane({
  * R1-S2; part 2 adds kinds). It is shown, it can be moved or removed as a
  * step of the pipeline, and it is saved back exactly as stored; nothing in
  * it is edited here, because its fields are not known here.
+ *
+ * BLD-16: until each new kind's own pane lands (S2-T9), a `join`,
+ * `aggregate` or `filter` step opens here too, reading its own editor
+ * shape — shown, not edited, exactly as `unknown` is.
  */
 export function UnknownStepPane({
   step,
@@ -533,7 +538,7 @@ export function UnknownStepPane({
   onMove,
   onRemove,
 }: {
-  step: Extract<EditorStep, { kind: "unknown" }>
+  step: EditorStep
   index: number
   count: number
   problem: React.ReactNode
@@ -542,14 +547,16 @@ export function UnknownStepPane({
   onMove: (delta: -1 | 1) => void
   onRemove: () => void
 }) {
+  const stored = step.kind === "unknown" ? step.stored : null
+  const kind = step.kind === "unknown" ? step.stored.kind : step.kind
   return (
     <div className="flex flex-col gap-4">
       <StepHeader step={step} index={index} count={count} onMove={onMove} onRemove={onRemove} />
       <p className="text-sm text-muted-foreground">
-        This step is of kind <span className="font-mono text-foreground">{step.stored.kind}</span>, which this console
+        This step is of kind <span className="font-mono text-foreground">{kind}</span>, which this console
         cannot edit yet. It is saved back exactly as it is stored.
       </p>
-      <CodeView text={JSON.stringify(step.stored, null, 2)} language="plain" />
+      <CodeView text={JSON.stringify(stored ?? step, null, 2)} language="plain" />
       {problem}
     </div>
   )

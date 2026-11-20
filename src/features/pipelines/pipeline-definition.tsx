@@ -261,7 +261,7 @@ export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
             <>
               <PanelTitle>
                 Step {(index ?? 0) + 1} of {def.steps.length} ·{" "}
-                {step === null ? stored.kind : step.kind === "sql" ? "SQL" : "Form"}
+                {step === null ? stored.kind : step.kind === "transform" ? "Form" : step.kind === "sql" ? "SQL" : stored.kind}
               </PanelTitle>
               <p className="font-mono font-medium">{stored.name}</p>
               {step === null ? (
@@ -295,8 +295,19 @@ export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
                     </ol>
                   )}
                 </>
-              ) : (
+              ) : step.kind === "sql" ? (
                 <CodeView text={step.sql} language="sql" />
+              ) : (
+                // BLD-16 / J9: a new form kind whose own words view lands with
+                // S2-T11; until then what is stored is shown, as for an
+                // unknown kind, and nothing is guessed.
+                <>
+                  <p className="text-muted-foreground">
+                    A step of kind <span className="font-mono text-foreground">{stored.kind}</span>, which this console
+                    cannot show yet. Its stored record:
+                  </p>
+                  <CodeView text={JSON.stringify(stored, null, 2)} language="plain" />
+                </>
               )}
             </>
           ) : input ? (

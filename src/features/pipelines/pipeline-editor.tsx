@@ -682,7 +682,9 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                         : step.kind === "transform"
                           ? `Form · reads ${readsName(shownState, step.reads) || "…"}`
                           : // R1-S2: a kind this console does not know.
-                            `${step.stored.kind} · not editable here`
+                            step.kind === "unknown"
+                            ? `${step.stored.kind} · not editable here`
+                            : `${step.kind} · not editable here`
                     }
                     selected={selection.kind === "step" && selection.id === step.id}
                     description={railDescription(step.id)}

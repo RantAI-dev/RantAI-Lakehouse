@@ -27,7 +27,7 @@ export type FlowNodeSpec = {
   /** For an op, its name; for an input or a step, its index. Used to open the side panel. */
   ref?: string
   /** For a pipeline step: SQL, the form (BLD-1 part 1 D1), or a kind this console does not know (R1-S2). */
-  stepKind?: "sql" | "transform" | "other"
+  stepKind?: "sql" | "transform" | "join" | "aggregate" | "filter" | "other"
 }
 
 export type FlowEdgeSpec = { from: string; to: string }
@@ -198,7 +198,11 @@ export function authoredFlow(
           ? known.includes(step.reads)
             ? [step.reads]
             : []
-          : sqlStepReads(step.sql, known)
+          : step.kind === "sql"
+            ? sqlStepReads(step.sql, known)
+            : // BLD-16 / J9: a form step's own edges land with S2-T11; until
+              // then it is drawn with no edge in, as an unknown kind is.
+              []
     const column = 1 + Math.max(0, ...reads.map((name) => placed.get(name)?.column ?? 0))
     const operations = step?.kind === "transform" ? step.transforms.map((raw) => describe(raw)?.verb ?? "transform") : []
     nodes.push({
