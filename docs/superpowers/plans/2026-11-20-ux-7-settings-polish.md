@@ -169,3 +169,16 @@ kept, the console's `Combobox`), and the copy are as planned.
   a plain `h2`, and "Number format" back to a plain `Label` with the hint on
   its help line. Decision 4 is replaced by this. Keep one test that a
   Reporting hint opens and shows its detail.
+
+## Handoff 2
+
+Fixes PR UX-7 review SHOULD-FIX 1 in one commit: `HelpTip` and its test are
+deleted; Reporting, query limits and "Tables this role can read" put the
+existing `HelpHint` at the end of each one-line help (constants in a template
+literal), headings are plain `h2`, "Number format" is a plain `Label` with the
+hint on its help line. The Reporting tests open the hint by its detail name.
+
+Commands (wrapped): `bun x tsc --noEmit -p .` clean; `bun x eslint src/features/admin/*.tsx`
+0 errors (1 existing warning in untouched `sso-page.tsx`); `bun test` on the
+same set as before minus the deleted HelpTip test: 461 pass, 0 fail, 44 files.
+Not verified: browser/phone check; the one-line fit at 384 px.
