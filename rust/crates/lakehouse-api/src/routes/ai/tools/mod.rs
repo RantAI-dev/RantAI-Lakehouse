@@ -50,6 +50,7 @@ mod ingest;
 mod lakehouse;
 mod limits;
 mod look;
+pub(super) use look::ADD_REFERENCE_LINES;
 #[cfg(test)]
 pub(super) use look::FORMAT_FIELDS;
 mod metrics;

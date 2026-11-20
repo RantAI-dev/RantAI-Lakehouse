@@ -557,6 +557,16 @@ fn format_chart_schema() -> Value {
         properties.extend(style);
     }
     properties.insert("referenceLines".to_owned(), reference_lines_schema());
+    // `AI-29`: the append field uses the same item schema, but its own
+    // description — a model must not mistake it for the replacing list.
+    let mut add_lines = reference_lines_schema();
+    if let Value::Object(schema) = &mut add_lines
+        && let Some(Value::String(description)) = schema.get_mut("description")
+    {
+        "lines to add to the chart's own, which stay (at most 5 in all). Use this to add a line; referenceLines replaces every line the chart has."
+            .clone_into(description);
+    }
+    properties.insert(super::tools::ADD_REFERENCE_LINES.to_owned(), add_lines);
     json!({ "type": "function", "function": { "name": "format_chart",
         "description": "Change only how a saved chart looks: number and date formats (rupiah, percent, compact, decimals), colours (a palette, a colour per series, colour by value), axes, data labels, reference lines (a target at 1,000, an average, a trend, a band), notes, tooltip fields and, for a table or KPI, conditional colours. Send ONLY the fields that change: a field you give replaces that field, null removes it, and everything you leave out stays as it is (the data, the title, the filters and the other formatting). list_charts gives the ids. To change what the chart shows, use update_chart.",
         "parameters": { "type": "object", "properties": properties, "required": ["chart"] } } })
@@ -3174,6 +3184,7 @@ mod tests {
             .collect();
         names.sort_unstable();
         let mut allowed = crate::routes::ai::tools::FORMAT_FIELDS.to_vec();
+        allowed.push(crate::routes::ai::tools::ADD_REFERENCE_LINES);
         allowed.sort_unstable();
         assert_eq!(names, allowed);
     }
