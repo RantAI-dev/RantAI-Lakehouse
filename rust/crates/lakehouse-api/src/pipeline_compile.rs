@@ -134,6 +134,10 @@ const READS_LATER_STEP: &str = "this step reads a step that comes after it; reor
 const TRANSFORM_REFUSED: &str = "this transform is not in the supported grammar";
 const OUTPUT_IS_INPUT: &str =
     "the output table is one of the inputs; the output cannot be one of the inputs";
+/// BLD-16 T1: `join`, `aggregate` and `filter` steps reach the compiler with
+/// this message only until T3 wires their parsers in — "unsupported,
+/// honestly" (AGENTS.md rule 14), never a half-rendered statement.
+const KIND_NOT_BUILT: &str = "this kind of step is not supported yet";
 const BRONZE_NEEDS_CATALOG: &str =
     "a bronze input is read through the catalog database, which this deployment has not configured";
 const UP_TO_UNKNOWN: &str = "upTo must name an input or a step of this pipeline";
@@ -374,6 +378,13 @@ fn validate(
                 // D6: every table it names is an input or an earlier step.
                 check_step_tables(sql, index, inputs, steps)?;
             }
+            // BLD-16 T1: the kinds land with their parsers in T3; until then
+            // a definition carrying one is refused rather than half-rendered.
+            PipelineStep::Join { .. }
+            | PipelineStep::Aggregate { .. }
+            | PipelineStep::Filter { .. } => {
+                return Err(DefinitionError::step(index, KIND_NOT_BUILT));
+            }
         }
     }
     Ok((limit, last))
@@ -531,6 +542,12 @@ fn render_step(step: &PipelineStep, index: usize) -> Result<String, DefinitionEr
             ))
         }
         PipelineStep::Sql { name, sql } => Ok(format!("  `{name}` AS (\n{sql}\n)")),
+        // BLD-16 T1: unreachable while `validate` refuses the new kinds
+        // (KIND_NOT_BUILT); kept honest rather than guessed at. T3 replaces
+        // this arm with the three renderers.
+        PipelineStep::Join { .. }
+        | PipelineStep::Aggregate { .. }
+        | PipelineStep::Filter { .. } => Err(DefinitionError::step(index, KIND_NOT_BUILT)),
     }
 }
 
