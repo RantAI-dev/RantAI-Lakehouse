@@ -47,10 +47,15 @@ jobs:
       #     so a per-commit value would invalidate every layer below it and
       #     the cache would never hit. The image therefore carries
       #     `GIT_SHA=unknown`, and the deploy sets the real commit at RUN
-      #     time -- compose's `environment:` overrides the image's `ENV`,
-      #     and `check_commit` reads the run-time value, not the baked one.
-      #     The API and the code location therefore still agree, and the
-      #     console's op-source view still matches.
+      #     time: `docker-compose.yml`'s `lakehouse-api` service carries
+      #     `GIT_SHA` in its `environment:` block, which overrides the
+      #     image's `ENV`, and `check_commit` reads the run-time value, not
+      #     the baked one. `scripts/compose.sh` exports
+      #     `GIT_SHA=$(git rev-parse HEAD)` -- the SAME value the code
+      #     location's image is built with -- so the API and the code
+      #     location agree, and the console's op-source view still matches.
+      #     The "Verify the API and the code location run the same commit"
+      #     step below proves that on the VM instead of assuming it.
       #   * `CARGO_TARGET_DIR` and the `pipeline_src` build context are the
       #     same as in `ci.yml` and in `docker-compose.yml`, so the GHA
       #     cache hits. The cache is READ here and never written: the
@@ -600,6 +605,60 @@ jobs:
           done
           echo "::error::lakehouse-api did not become healthy"
           exit 1
+
+      # The API and the code location have to carry the SAME commit: the
+      # console's pipeline page serves an op's source text only when the
+      # commit the code location stamped on the op equals the API's own
+      # `GIT_SHA` (`rust/crates/lakehouse-api/src/pipeline_source.rs`'s
+      # `check_commit`; "unknown" on either side means "no real commit was
+      # ever recorded here", and the route refuses).
+      #
+      # The API's image is built in CI WITHOUT a `GIT_SHA`, so the commit
+      # reaches the API through compose's `environment:` block, while the
+      # code location carries it in its own image. Two different paths for
+      # one value -- and they drift apart silently: the symptom is a
+      # console that says "source unavailable" on every pipeline, which
+      # reads as a missing feature rather than as a broken deployment.
+      # (It already happened once: the first CI-built deploy left the API
+      # with `GIT_SHA=unknown` while the code location ran the real
+      # commit, because nothing put the commit into the API's container.)
+      #
+      # This compares the two values on the RUNNING containers and fails
+      # the deploy when they differ or when neither carries a real one.
+      - name: Verify the API and the code location run the same commit
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          compose() {
+            scripts/compose.sh \
+              -f docker-compose.yml \
+              -f ops/sso/docker-compose.staging-keycloak.override.yml \
+              --profile sso \
+              --profile seaweedfs \
+              --profile dagster \
+              --profile trino \
+              "$@"
+          }
+          api_container="$(compose ps -q lakehouse-api | head -1)"
+          code_container="$(compose ps -q dagster-code-location | head -1)"
+          if [ -z "$api_container" ] || [ -z "$code_container" ]; then
+            echo "::error::the API or the code location is not running; cannot compare the commits they run"
+            exit 1
+          fi
+          api_sha="$(docker exec "$api_container" printenv GIT_SHA || true)"
+          code_sha="$(docker exec "$code_container" printenv GIT_SHA || true)"
+          echo "checkout                $(git rev-parse HEAD)"
+          echo "lakehouse-api           ${api_sha}"
+          echo "dagster-code-location   ${code_sha}"
+          if [ "$api_sha" != "$code_sha" ]; then
+            echo "::error::the API (${api_sha}) and the code location (${code_sha}) do not run the same commit; the console's op-source view will refuse to serve source"
+            exit 1
+          fi
+          if [ -z "$api_sha" ] || [ "$api_sha" = "unknown" ]; then
+            echo "::error::neither image carries a real commit (GIT_SHA='${api_sha}'); the console's op-source view will refuse to serve source"
+            exit 1
+          fi
+          echo "the API and the code location both run ${api_sha}"
 
       # The provider answers a browser, not the API: the API fetches the key
       # set lazily on the first sign-in, so it is up before Keycloak is. This
