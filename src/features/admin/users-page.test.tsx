@@ -364,6 +364,59 @@ describe("UsersPage reset password (a new password shown once)", () => {
     expect(call).toBeDefined()
   })
 
+  it("copies the once-shown password over plain http, from inside the dialog", async () => {
+    setupFetch({})
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    await resetPassword()
+    const password = await screen.findByTestId("revealed-password")
+
+    // The staging console is opened by IP over http, where
+    // `navigator.clipboard` does not exist (`UX-6`). The copy must fall back
+    // to the textarea, and the textarea must be appended inside the open
+    // dialog: everything outside it is inert, so a textarea on `document.body`
+    // would not be selectable and the copy would fail.
+    const clipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard")
+    const execCommand = Object.getOwnPropertyDescriptor(document, "execCommand")
+    Object.defineProperty(navigator, "clipboard", {
+      value: undefined,
+      configurable: true,
+      writable: true,
+    })
+    const captured: { value: string; inDialog: boolean }[] = []
+    Object.defineProperty(document, "execCommand", {
+      value: mock((command: string) => {
+        const area = document.activeElement as HTMLTextAreaElement | null
+        captured.push({
+          value: area?.value ?? "",
+          inDialog: area?.closest('[role="dialog"]') !== null,
+        })
+        return command === "copy"
+      }),
+      configurable: true,
+      writable: true,
+    })
+
+    try {
+      // `fireEvent.click` does not move focus in happy-dom, while a real
+      // click on the button does (Chrome and Firefox focus a button on
+      // mousedown), and the helper picks the textarea's host from the active
+      // element. Focusing first reproduces the real click.
+      const copyButton = screen.getByRole("button", { name: "Copy" })
+      copyButton.focus()
+      fireEvent.click(copyButton)
+      await waitFor(() => expect(captured).toHaveLength(1))
+      expect(captured[0]).toEqual({ value: RESET_PASSWORD, inDialog: true })
+    } finally {
+      if (clipboard) Object.defineProperty(navigator, "clipboard", clipboard)
+      else delete (navigator as unknown as Record<string, unknown>).clipboard
+      if (execCommand) Object.defineProperty(document, "execCommand", execCommand)
+      else delete (document as unknown as Record<string, unknown>).execCommand
+    }
+    // The password is still on screen with the dialog open.
+    expect(password.textContent).toBe(RESET_PASSWORD)
+  })
+
   it("a failed reset does NOT open the dialog", async () => {
     setupFetch({ resetStatus: 500 })
     renderPage()

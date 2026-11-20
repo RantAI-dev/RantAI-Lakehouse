@@ -65,6 +65,23 @@ let sessionOpens: Record<string, { status: number; json: unknown }> = {};
 /** What the list and the writes answer. */
 let sessionList: unknown = { sessions: [], hasMore: false, nextOffset: null, counts: {} };
 let sessionSave: unknown = { ok: true, id: "s1", title: "A saved conversation" };
+/** The bodies of the writes to /api/ai/sessions, so a test can read what was saved. */
+const sessionSaveBodies: string[] = [];
+/** What GET /api/agents/runs/{id} answers, per run id (AI-28). */
+let runOpens: Record<string, unknown> = {};
+/**
+ * A controllable pause for the run lookups, so a test can change the chat
+ * while they are in flight (AI-28 review R2).
+ */
+type RunGate = { promise: Promise<void>; release: () => void };
+function deferredRunGate(): RunGate {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+let runGate: RunGate | null = null;
 let sessionRename: unknown = null;
 let sessionDeleteStatus = 200;
 /** The ids `DELETE /api/ai/sessions?id=` was sent, in order. */
@@ -152,6 +169,9 @@ beforeEach(() => {
   sessionOpens = {};
   sessionList = { sessions: [], hasMore: false, nextOffset: null, counts: {} };
   sessionSave = { ok: true, id: "s1", title: "A saved conversation" };
+  sessionSaveBodies.length = 0;
+  runOpens = {};
+  runGate = null;
   sessionRename = null;
   sessionDeleteStatus = 200;
   deletedSessions.length = 0;
@@ -167,10 +187,24 @@ beforeEach(() => {
       const sent = body ? (JSON.parse(body) as { tool?: string }) : {};
       return fakeResponse("{}", toolResults[sent.tool ?? ""] ?? toolResult);
     }
+    if (url.startsWith("/api/agents/runs/")) {
+      const runId = url.slice("/api/agents/runs/".length);
+      if (runGate) await runGate.promise;
+      // The real getRun body always carries the run id and its approvals;
+      // matching the step by those ids is what the lookup does (AI-28 R2).
+      return fakeJson(200, {
+        id: runId,
+        approvals: [],
+        ...(runOpens[runId] ?? { status: "succeeded" }),
+      });
+    }
     if (url.startsWith("/api/ai/sessions")) {
       const method = init?.method ?? "GET";
       const id = new URL(url, "http://test.invalid").searchParams.get("id");
-      if (method === "POST") return fakeJson(200, sessionSave);
+      if (method === "POST") {
+        sessionSaveBodies.push(body);
+        return fakeJson(200, sessionSave);
+      }
       if (method === "PATCH") {
         const sent = body ? (JSON.parse(body) as { title?: string }) : {};
         return fakeJson(200, sessionRename ?? { ok: true, id, title: sent.title });
@@ -771,6 +805,244 @@ describe("streaming does not re-render the whole Copilot (AI-24 D6)", () => {
       await stream.send(JSON.stringify({ type: "done", body: { answer: "The answer." } }));
       stream.end();
       await sending;
+    });
+  });
+});
+
+describe("a reopened conversation shows what happened to its approvals (AI-28, LH-AI-18-09)", () => {
+  it("reads the run on open and never saves the state back into the chat", async () => {
+    sessionOpens = {
+      appr: {
+        status: 200,
+        json: {
+          session: {
+            id: "appr",
+            title: "Delete a chart",
+            mode: "build",
+            messages: [
+              {
+                id: "m1",
+                role: "assistant",
+                content: "The action needs approval.",
+                tools: [
+                  {
+                    tool: "delete_chart",
+                    args: { id: "c1" },
+                    ok: true,
+                    result: {
+                      needs_approval: true,
+                      approval_id: "appr-1",
+                      run_id: "r1",
+                      summary: "Moves chart c1 from its dashboard to the trash.",
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    };
+    runOpens = { r1: { status: "succeeded" } };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.loadSession("appr");
+    });
+    await waitFor(() => {
+      expect(copilot!.messages[0]?.tools?.[0]?.approvalState).toBe("ran");
+    });
+
+    // The next save carries no approvalState: it is read from the run on
+    // every open, not written into the conversation.
+    await act(async () => {
+      await copilot!.send("And now?");
+    });
+    expect(sessionSaveBodies.length).toBeGreaterThan(0);
+    const saved = JSON.parse(sessionSaveBodies.at(-1)!) as {
+      messages: { tools?: Record<string, unknown>[] }[];
+    };
+    expect(saved.messages[0].tools?.[0]?.approvalState).toBeUndefined();
+  });
+
+  it("uses the run's last step so an executed failure is not shown as not run (AI-28 review R1)", async () => {
+    sessionOpens = {
+      appr2: {
+        status: 200,
+        json: {
+          session: {
+            id: "appr2",
+            title: "Delete a chart",
+            mode: "build",
+            messages: [
+              {
+                id: "m1",
+                role: "assistant",
+                content: "The action needs approval.",
+                tools: [
+                  {
+                    tool: "delete_chart",
+                    args: { id: "c1" },
+                    ok: true,
+                    result: {
+                      needs_approval: true,
+                      approval_id: "appr-2",
+                      run_id: "r2",
+                      summary: "Moves chart c1 from its dashboard to the trash.",
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    };
+    runOpens = {
+      r2: {
+        status: "failed",
+        steps: [{ label: "Executed after approval", status: "failed", detail: "x" }],
+      },
+    };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.loadSession("appr2");
+    });
+    await waitFor(() => {
+      expect(copilot!.messages[0]?.tools?.[0]?.approvalState).toBe("failed");
+    });
+  });
+
+  it("keeps a message sent while the run lookups are in flight (AI-28 review R2)", async () => {
+    runGate = deferredRunGate();
+    sessionOpens = {
+      appr3: {
+        status: 200,
+        json: {
+          session: {
+            id: "appr3",
+            title: "Delete a chart",
+            mode: "build",
+            messages: [
+              {
+                id: "m1",
+                role: "assistant",
+                content: "The action needs approval.",
+                tools: [
+                  {
+                    tool: "delete_chart",
+                    args: { id: "c1" },
+                    ok: true,
+                    result: {
+                      needs_approval: true,
+                      approval_id: "appr-3",
+                      run_id: "r3",
+                      summary: "Moves chart c1 from its dashboard to the trash.",
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    };
+    runOpens = { r3: { status: "succeeded" } };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.loadSession("appr3");
+    });
+    // Both the send and the lookup now read the same pre-render snapshot:
+    // whichever writes last must not drop the other's update.
+    await act(async () => {
+      const sending = copilot!.send("And now?");
+      runGate!.release();
+      await sending;
+    });
+    await waitFor(() => {
+      expect(
+        copilot!.messages.some((m) => m.role === "user" && m.content === "And now?")
+      ).toBe(true);
+      expect(copilot!.messages[0]?.tools?.[0]?.approvalState).toBe("ran");
+    });
+  });
+
+  it("tags the step by run id, not its position at load time (AI-28 review R2)", async () => {
+    runGate = deferredRunGate();
+    sessionOpens = {
+      appr4: {
+        status: 200,
+        json: {
+          session: {
+            id: "appr4",
+            title: "Two approvals",
+            mode: "build",
+            messages: [
+              {
+                id: "m1",
+                role: "assistant",
+                content: "First approval.",
+                tools: [
+                  {
+                    tool: "delete_chart",
+                    args: { id: "c1" },
+                    ok: true,
+                    result: {
+                      needs_approval: true,
+                      approval_id: "appr-4a",
+                      run_id: "r4a",
+                      summary: "First chart.",
+                    },
+                  },
+                ],
+              },
+              {
+                id: "m2",
+                role: "assistant",
+                content: "Second approval.",
+                tools: [
+                  {
+                    tool: "delete_chart",
+                    args: { id: "c2" },
+                    ok: true,
+                    result: {
+                      needs_approval: true,
+                      approval_id: "appr-4b",
+                      run_id: "r4b",
+                      summary: "Second chart.",
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    };
+    runOpens = {
+      r4a: { status: "succeeded" },
+      r4b: { status: "rejected" },
+    };
+    // Keep the open id across the delete's save: otherwise the lookup's
+    // "same session still open" guard would skip, hiding what we test here.
+    sessionSave = { ok: true, id: "appr4", title: "Two approvals" };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.loadSession("appr4");
+    });
+    // The first message (and its step) is gone before the lookups resolve;
+    // index 0 now points at the second step, which must still get r4b's state.
+    await act(async () => {
+      copilot!.deleteMessage(0);
+    });
+    await act(async () => {
+      runGate!.release();
+    });
+    await waitFor(() => {
+      expect(copilot!.messages[0]?.tools?.[0]?.approvalState).toBe("rejected");
     });
   });
 });

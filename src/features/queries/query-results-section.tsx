@@ -11,10 +11,9 @@ import { Pill } from "@/components/patterns/status-badge"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
 import { useDataTable } from "@/hooks/use-data-table"
-import { copyText } from "@/lib/copy-text"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { toTsv } from "@/lib/csv"
 import { formatBytes, formatCost, formatDuration, formatNumber } from "@/lib/format"
-import { notifyFailure, notifySuccess } from "@/lib/notify"
 import { queryEngineLabel, WORKLOAD_CLASS_LABEL } from "@/lib/status"
 import type {
   QueryCell,
@@ -187,18 +186,8 @@ export function QueryResultsSection(props: QueryResultsSectionProps) {
   })
 
   async function copyAsTsv() {
-    const copied = await copyText(toTsvText(result.columns, rows))
-    if (copied) {
-      notifySuccess(
-        "Copied the rows as TSV",
-        `${formatNumber(rows.length)} rows copied to the clipboard.`
-      )
-    } else {
-      notifyFailure(
-        "Could not copy the rows",
-        "The browser refused the copy."
-      )
-    }
+    // The one toast pair every copy site shares (`UX-6` review R1).
+    await copyTextWithToast(toTsvText(result.columns, rows), "Copied the rows as TSV")
   }
 
   // QA LH-QS-2-06 (QS-9), decision 10: the copy is an export of the rows like
