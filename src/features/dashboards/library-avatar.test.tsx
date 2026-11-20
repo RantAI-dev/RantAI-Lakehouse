@@ -1,7 +1,7 @@
 import { cleanup, render } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "bun:test"
 
-import { Avatar } from "./library-parts"
+import { Avatar, ownerLabel } from "./library-parts"
 
 afterEach(cleanup)
 
@@ -25,5 +25,14 @@ describe("Avatar", () => {
   it("keeps the built-in box centred too", () => {
     const { container } = render(<Avatar owner="" builtin />)
     expect(container.querySelector("span")?.className).toContain("leading-none")
+  })
+})
+
+// PR #530 review SHOULD-FIX: do not claim "You" from display-name equality.
+describe("ownerLabel", () => {
+  it("shows the owner display name, Built-in for builtin, and an em dash when empty", () => {
+    expect(ownerLabel({ owner: "Rina", builtin: false })).toBe("Rina")
+    expect(ownerLabel({ owner: "", builtin: true })).toBe("Built-in")
+    expect(ownerLabel({ owner: "", builtin: false })).toBe("—")
   })
 })

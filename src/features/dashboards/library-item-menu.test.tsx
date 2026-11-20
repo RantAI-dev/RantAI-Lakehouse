@@ -1,10 +1,22 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it } from "bun:test"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { toast } from "sonner"
 
 import { boardItem, reportItem, templateItem } from "./library-items"
 import { BUILTIN_NOTE, ItemMenu, type ItemActions } from "./library-menus"
 
-afterEach(cleanup)
+const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard")
+const originalUrl = window.location.href
+const happyDom = () => (window as unknown as { happyDOM?: { setURL: (u: string) => void } }).happyDOM
+
+afterEach(() => {
+  cleanup()
+  mock.restore()
+  happyDom()?.setURL(originalUrl)
+  if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard)
+  else delete (navigator as unknown as Record<string, unknown>).clipboard
+  delete (document as unknown as Record<string, unknown>).execCommand
+})
 
 const board = boardItem({ id: "b1", name: "Sales" })
 const main = boardItem({ id: "default", name: "Main", builtin: true })
@@ -56,6 +68,45 @@ describe("the dashboard list's ⋯ menu", () => {
     open(report, writer)
     for (const label of ["Open", "Copy link", "Edit", "Move to folder…", "Move to trash"]) expect(await screen.findByText(label)).toBeTruthy()
     expect(screen.queryByText("Add to favourites")).toBeNull()
+  })
+
+  // PR #530 review BLOCKER (UX-6): Copy link routes through copyTextWithToast
+  // so it works without navigator.clipboard over plain HTTP and reports refusal.
+  it("copies the item link via copyTextWithToast even without navigator.clipboard", async () => {
+    happyDom()?.setURL("http://10.0.0.5/dashboards/browse")
+    Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true, writable: true })
+    let copied = ""
+    const exec = mock((cmd: string) => {
+      copied = (document.activeElement as HTMLTextAreaElement)?.value ?? ""
+      return cmd === "copy"
+    })
+    ;(document as unknown as Record<string, unknown>).execCommand = exec
+    const successes = spyOn(toast, "success").mockImplementation(() => 1)
+    const errors = spyOn(toast, "error").mockImplementation(() => 1)
+
+    open(report, reader)
+    fireEvent.click(await screen.findByText("Copy link"))
+
+    await waitFor(() => expect(successes).toHaveBeenCalled())
+    expect(successes.mock.calls[0]?.[0]).toBe("Link copied")
+    expect(exec).toHaveBeenCalledWith("copy")
+    expect(copied).toBe("http://10.0.0.5/dashboards/reports/r1")
+    expect(errors).not.toHaveBeenCalled()
+  })
+
+  it("shows the copy failure toast when the browser refuses Copy link", async () => {
+    happyDom()?.setURL("http://10.0.0.5/dashboards/browse")
+    Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true, writable: true })
+    ;(document as unknown as Record<string, unknown>).execCommand = mock(() => false)
+    const successes = spyOn(toast, "success").mockImplementation(() => 1)
+    const errors = spyOn(toast, "error").mockImplementation(() => 1)
+
+    open(board, reader)
+    fireEvent.click(await screen.findByText("Copy link"))
+
+    await waitFor(() => expect(errors).toHaveBeenCalled())
+    expect(errors.mock.calls[0]?.[0]).toBe("Could not copy")
+    expect(successes).not.toHaveBeenCalled()
   })
 
   it("offers a template Use template and Delete template", async () => {

@@ -29,7 +29,6 @@ type RowProps = {
   readonly item: LibraryItem
   readonly actions: ItemActions
   readonly folders: FolderLookup
-  readonly myName: string | undefined
   /** Opening a template asks for a name first; the page owns that dialog. */
   readonly onOpenTemplate: (item: LibraryItem) => void
   readonly pictures: PictureSource
@@ -46,14 +45,13 @@ export type Selection = {
 }
 
 export function LibraryTable({
-  items, sort, onSort, actions, folders, myName, onOpenTemplate, pictures, selection, phone,
+  items, sort, onSort, actions, folders, onOpenTemplate, pictures, selection, phone,
 }: {
   readonly items: readonly LibraryItem[]
   readonly sort: SortState
   readonly onSort: (column: SortColumn) => void
   readonly actions: ItemActions
   readonly folders: FolderLookup
-  readonly myName: string | undefined
   readonly onOpenTemplate: (item: LibraryItem) => void
   readonly pictures: PictureSource
   readonly selection?: Selection
@@ -72,7 +70,7 @@ export function LibraryTable({
       {phone ? (
         <ul className="divide-y divide-border/60" aria-label="Dashboards, reports and templates">
           {items.map((item) => (
-            <PhoneRow key={item.key} item={item} actions={actions} folders={folders} myName={myName} onOpenTemplate={onOpenTemplate} pictures={pictures} selection={selection} />
+            <PhoneRow key={item.key} item={item} actions={actions} folders={folders} onOpenTemplate={onOpenTemplate} pictures={pictures} selection={selection} />
           ))}
         </ul>
       ) : (
@@ -101,7 +99,7 @@ export function LibraryTable({
           </thead>
           <tbody>
             {items.map((item) => (
-              <TableRow key={item.key} item={item} actions={actions} folders={folders} myName={myName} onOpenTemplate={onOpenTemplate} pictures={pictures} selection={selection} />
+              <TableRow key={item.key} item={item} actions={actions} folders={folders} onOpenTemplate={onOpenTemplate} pictures={pictures} selection={selection} />
             ))}
           </tbody>
         </table>
@@ -170,7 +168,7 @@ export function FolderCell({ item, folders }: { readonly item: LibraryItem; read
   )
 }
 
-function TableRow({ item, actions, folders, myName, onOpenTemplate, pictures, selection }: RowProps) {
+function TableRow({ item, actions, folders, onOpenTemplate, pictures, selection }: RowProps) {
   const fav = item.kind === "dashboard" && actions.isFavourite(item)
   const ticked = selection?.selected.has(item.key) ?? false
   return (
@@ -199,7 +197,7 @@ function TableRow({ item, actions, folders, myName, onOpenTemplate, pictures, se
       <td className="py-2 pr-3">
         <span className="inline-flex min-w-0 max-w-full items-center gap-2 text-muted-foreground">
           <Avatar owner={item.owner} builtin={item.builtin} />
-          <span className="truncate">{ownerLabel(item, myName)}</span>
+          <span className="truncate">{ownerLabel(item)}</span>
         </span>
       </td>
       <td className="py-2 pr-3 text-muted-foreground tabular-nums">
@@ -228,11 +226,11 @@ function TableRow({ item, actions, folders, myName, onOpenTemplate, pictures, se
  * table's columns say (type, size, folder, when), then the star and the ⋯.
  * Nothing scrolls sideways.
  */
-function PhoneRow({ item, actions, folders, myName, onOpenTemplate, pictures, selection }: RowProps) {
+function PhoneRow({ item, actions, folders, onOpenTemplate, pictures, selection }: RowProps) {
   const fav = item.kind === "dashboard" && actions.isFavourite(item)
   const ticked = selection?.selected.has(item.key) ?? false
   const folder = item.folderId ? folders.pathOf(item.folderId) : ""
-  const owner = ownerLabel(item, myName)
+  const owner = ownerLabel(item)
   const facts = [
     KIND_LABEL[item.kind],
     countLabel(item),

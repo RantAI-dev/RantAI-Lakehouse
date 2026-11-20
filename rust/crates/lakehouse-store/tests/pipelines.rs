@@ -3715,6 +3715,225 @@ async fn an_update_carrying_inputs_and_steps_rewrites_every_legacy_column(
     Ok(())
 }
 
+// ── BLD-16 (BLD-1 part 2) / J1, J2: the three new step kinds ───────────
+
+/// The join JSON of the plan's J2 example, byte for byte the shape the API
+/// contract (section 4) defines.
+fn j2_join_json() -> serde_json::Value {
+    serde_json::json!({
+        "name": "joined", "kind": "join",
+        "left": "orders", "right": "customers", "joinType": "left",
+        "on": [ { "left": "customer_id", "right": "id" } ],
+        "columns": [
+            { "side": "left",  "column": "order_id" },
+            { "side": "left",  "column": "amount" },
+            { "side": "right", "column": "country" },
+            { "side": "right", "column": "id", "name": "customer_ref" }
+        ]
+    })
+}
+
+/// J2: the stored shape is strings and lists of strings with serde defaults,
+/// and it round-trips through the API's own JSON shape — no second mapping
+/// can drift between what a route accepted and what the column holds.
+#[test]
+fn a_join_step_round_trips_through_json_in_the_api_shape() {
+    let step: pipelines::PipelineStep =
+        serde_json::from_value(j2_join_json()).expect("J2's join JSON decodes");
+    assert_eq!(
+        step,
+        pipelines::PipelineStep::Join {
+            name: "joined".to_owned(),
+            left: "orders".to_owned(),
+            right: "customers".to_owned(),
+            join_type: "left".to_owned(),
+            on: vec![pipelines::JoinPair {
+                left: "customer_id".to_owned(),
+                right: "id".to_owned(),
+            }],
+            columns: vec![
+                pipelines::JoinColumn {
+                    side: "left".to_owned(),
+                    column: "order_id".to_owned(),
+                    name: String::new(),
+                },
+                pipelines::JoinColumn {
+                    side: "left".to_owned(),
+                    column: "amount".to_owned(),
+                    name: String::new(),
+                },
+                pipelines::JoinColumn {
+                    side: "right".to_owned(),
+                    column: "country".to_owned(),
+                    name: String::new(),
+                },
+                pipelines::JoinColumn {
+                    side: "right".to_owned(),
+                    column: "id".to_owned(),
+                    name: "customer_ref".to_owned(),
+                },
+            ],
+        }
+    );
+    // An output column with no name holds `""` (the default) and serializes
+    // without the key, so the wire value round-trips exactly.
+    assert_eq!(
+        serde_json::to_value(&step).expect("serializes"),
+        j2_join_json()
+    );
+}
+
+/// J2: the aggregate JSON of the plan's example, decoded to the typed shape
+/// and encoded back to the same JSON value — a measure with no column keeps
+/// its `""` (skipped on serialize), and `having`/`havingMatch` ride along.
+#[test]
+fn an_aggregate_step_round_trips_through_json_in_the_api_shape() {
+    let json = serde_json::json!({
+        "name": "by_country", "kind": "aggregate", "reads": "joined",
+        "groupBy": ["country"],
+        "measures": [
+            { "function": "sum",   "column": "amount", "name": "revenue" },
+            { "function": "count", "name": "order_count" }
+        ],
+        "havingMatch": "all",
+        "having": [ { "column": "revenue", "operator": ">", "value": "1000" } ]
+    });
+    let step: pipelines::PipelineStep =
+        serde_json::from_value(json.clone()).expect("the aggregate JSON decodes");
+    assert_eq!(
+        step,
+        pipelines::PipelineStep::Aggregate {
+            name: "by_country".to_owned(),
+            reads: "joined".to_owned(),
+            group_by: vec!["country".to_owned()],
+            measures: vec![
+                pipelines::Measure {
+                    function: "sum".to_owned(),
+                    column: "amount".to_owned(),
+                    name: "revenue".to_owned(),
+                },
+                pipelines::Measure {
+                    function: "count".to_owned(),
+                    column: String::new(),
+                    name: "order_count".to_owned(),
+                },
+            ],
+            having_match: "all".to_owned(),
+            having: vec![pipelines::StepCondition {
+                column: "revenue".to_owned(),
+                operator: ">".to_owned(),
+                value: "1000".to_owned(),
+            }],
+        }
+    );
+    assert_eq!(serde_json::to_value(&step).expect("serializes"), json);
+}
+
+/// J2: the filter's mode lives under the `match` key (not `matchMode`), so a
+/// step stored with "any" keeps it through a save from a console that knows
+/// the kind (J1's reason for a kind of its own).
+#[test]
+fn a_filter_step_reads_match_from_the_match_key() {
+    let json = serde_json::json!({
+        "name": "big_or_local", "kind": "filter", "reads": "by_country",
+        "match": "any",
+        "conditions": [
+            { "column": "revenue", "operator": ">=", "value": "5000" },
+            { "column": "country", "operator": "=",  "value": "ID" }
+        ]
+    });
+    let step: pipelines::PipelineStep =
+        serde_json::from_value(json.clone()).expect("the filter JSON decodes");
+    assert_eq!(
+        step,
+        pipelines::PipelineStep::Filter {
+            name: "big_or_local".to_owned(),
+            reads: "by_country".to_owned(),
+            match_mode: "any".to_owned(),
+            conditions: vec![
+                pipelines::StepCondition {
+                    column: "revenue".to_owned(),
+                    operator: ">=".to_owned(),
+                    value: "5000".to_owned(),
+                },
+                pipelines::StepCondition {
+                    column: "country".to_owned(),
+                    operator: "=".to_owned(),
+                    value: "ID".to_owned(),
+                },
+            ],
+        }
+    );
+    assert_eq!(serde_json::to_value(&step).expect("serializes"), json);
+}
+
+/// J2: every field has `#[serde(default)]`, so a step that names a new kind
+/// but carries none of its fields decodes with empty ones — the compiler, not
+/// serde, refuses it with a path (D7).
+#[test]
+fn a_new_kind_with_missing_fields_decodes_with_empty_fields() {
+    let step: pipelines::PipelineStep =
+        serde_json::from_value(serde_json::json!({"name": "j", "kind": "join"}))
+            .expect("a bare join decodes with empty fields");
+    assert_eq!(
+        step,
+        pipelines::PipelineStep::Join {
+            name: "j".to_owned(),
+            left: String::new(),
+            right: String::new(),
+            join_type: String::new(),
+            on: Vec::new(),
+            columns: Vec::new(),
+        }
+    );
+}
+
+/// The `steps` JSONB column holds the new kinds with no migration (the
+/// column has no check on `kind`), and `get_definition` reads back exactly
+/// what `create_pipeline` wrote.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_definition_with_a_join_step_is_stored_and_read_back(pool: PgPool) -> sqlx::Result<()> {
+    let mut body = input();
+    body.inputs = vec![
+        pipelines::PipelineInput {
+            name: "orders".to_owned(),
+            zone: "silver".to_owned(),
+            table: "orders".to_owned(),
+        },
+        pipelines::PipelineInput {
+            name: "customers".to_owned(),
+            zone: "silver".to_owned(),
+            table: "customers".to_owned(),
+        },
+    ];
+    body.steps = vec![serde_json::from_value(j2_join_json()).expect("J2's join decodes")];
+    let created = pipelines::create_pipeline(&pool, &body, None)
+        .await
+        .expect("create should succeed");
+    let definition = pipelines::get_definition(&pool, &created.id)
+        .await
+        .expect("get_definition should succeed")
+        .expect("definition should exist");
+    assert_eq!(definition.steps, body.steps);
+    Ok(())
+}
+
+/// J1: `definition_columns`' `_` arm gives a new kind no `transforms`, so
+/// the legacy column cannot describe part of a join as if it were the whole
+/// pipeline (D3's reason for the narrow arm).
+#[test]
+fn a_definition_with_a_new_kind_writes_no_legacy_transforms() {
+    let inputs = vec![pipelines::PipelineInput {
+        name: "orders".to_owned(),
+        zone: "silver".to_owned(),
+        table: "orders".to_owned(),
+    }];
+    let join: pipelines::PipelineStep =
+        serde_json::from_value(j2_join_json()).expect("J2's join decodes");
+    let columns = pipelines::definition_columns(&inputs, &[join]);
+    assert_eq!(columns.transforms, Vec::<String>::new());
+}
+
 // ── BLD-1 part 1 D11: target lag follows every input ─────────────────
 
 /// A pipeline whose definition reads `inputs`, created in `tenant`, with an

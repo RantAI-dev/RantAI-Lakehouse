@@ -18,6 +18,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
+import { copyTextWithToast } from "@/lib/copy-text"
 import type { LineageEdge, LineageGraph } from "@/services/contracts/governance"
 
 export function getLineageColumns({
@@ -129,7 +130,7 @@ export function getLineageColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(fromLabel)
+                    void copyTextWithToast(fromLabel)
                   }}
                 >
                   <Copy className="size-4" />
@@ -138,7 +139,7 @@ export function getLineageColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(toLabel)
+                    void copyTextWithToast(toLabel)
                   }}
                 >
                   <Copy className="size-4" />
@@ -147,7 +148,7 @@ export function getLineageColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(edge.id)
+                    void copyTextWithToast(edge.id)
                   }}
                 >
                   <GitCommit className="size-4" />

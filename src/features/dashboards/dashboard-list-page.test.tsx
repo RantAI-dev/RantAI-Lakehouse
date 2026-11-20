@@ -223,6 +223,22 @@ describe("the one list (BI-59 T2)", () => {
     }
     expect(screen.getByRole("button", { name: "Actions for Main" })).toBeTruthy()
   })
+
+  // PR #530 review SHOULD-FIX: without a creator user ID on the contracts,
+  // matching display names must show the stored name rather than claiming "You".
+  it("shows the stored owner name instead of claiming You by display name", async () => {
+    serveList()
+    renderPage()
+    const row = (await screen.findByText("QA BI")).closest("tr")
+    if (!row) throw new Error("no row")
+    expect(within(row).getByText("Rina")).toBeTruthy()
+    expect(within(row).queryByText("You")).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Gallery view" }))
+    const card = screen.getByText("QA BI").closest("li")
+    if (!card) throw new Error("no card")
+    expect(within(card).getByText(/Rina · 3 tiles/)).toBeTruthy()
+    expect(within(card).queryByText(/^You ·/)).toBeNull()
+  })
 })
 
 describe("the pictures and Recent (BI-59 T3)", () => {
@@ -336,6 +352,25 @@ describe("the header and toolbar controls (BI-59 AC1)", () => {
     )
     // Collapsed: the one search is an icon button (listed above), not an input.
     expect(screen.queryAllByRole("searchbox")).toHaveLength(0)
+  })
+
+  // PR #530 review SHOULD-FIX: reader permissions hide Templates and New / New report.
+  it("offers a reader no Templates filter and no New or New report", async () => {
+    const calls = serve(["dashboard:read"])
+    renderPage()
+    await screen.findByText("QA BI")
+    const typeGroup = screen.getByRole("group", { name: "Type" })
+    expect(within(typeGroup).queryByRole("button", { name: "Templates" })).toBeNull()
+    for (const label of ["All", "Dashboards", "Reports"]) {
+      expect(within(typeGroup).getByRole("button", { name: label })).toBeTruthy()
+    }
+    expect(screen.queryByRole("button", { name: "New" })).toBeNull()
+    expect(screen.queryByText("New report")).toBeNull()
+    fireEvent.click(within(typeGroup).getByRole("button", { name: "Reports" }))
+    expect(await screen.findByText("Nobody has shared a report with you yet.")).toBeTruthy()
+    expect(screen.queryByText("New report")).toBeNull()
+    expect(screen.queryByRole("link", { name: "New report" })).toBeNull()
+    expect(calls.some((c) => c.url.includes("/api/dashboard/templates"))).toBe(false)
   })
 })
 
@@ -592,5 +627,21 @@ describe("the page while it loads", () => {
     expect(screen.getByRole("button", { name: "Gallery view" }).getAttribute("aria-pressed")).toBe("true")
     release()
     await screen.findByText("QA BI")
+  })
+
+  // PR #530 review SHOULD-FIX: the list renders as soon as boards/reports/templates
+  // land, without waiting on GET /api/dashboard/specs.
+  it("renders the list rows while /api/dashboard/specs is still pending", async () => {
+    let releaseSpecs = () => {}
+    const pendingSpecs = new Promise<void>((resolve) => { releaseSpecs = resolve })
+    serve(["dashboard:read", "dashboard:write"], {
+      "GET /api/dashboard/specs": (() => pendingSpecs.then(() => json({ charts: [{ id: "u1", board: "b1", kind: "bar" }] }))) as unknown as () => Response,
+    })
+    renderPage()
+    await screen.findByText("QA BI")
+    expect(screen.queryByRole("status", { name: "Loading dashboards" })).toBeNull()
+    expect(document.querySelectorAll('svg[role="presentation"]')).toHaveLength(0)
+    releaseSpecs()
+    await waitFor(() => expect(document.querySelectorAll('svg[role="presentation"]').length).toBeGreaterThan(0))
   })
 })

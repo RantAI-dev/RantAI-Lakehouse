@@ -39,6 +39,7 @@ import { ConnectorOverview } from "./connector-overview"
 import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
 import { ConnectorSchemaChangesPanel } from "./connector-schema-changes-panel"
 import { ConnectorSetupChecks } from "./connector-setup-checks"
+import { useRunCountWait } from "./use-run-count-wait"
 import { DIRECTION_LABEL } from "./connectors-columns"
 import { usesNoCredential } from "./connector-form-parts"
 
@@ -227,6 +228,8 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   const state = useService((s) => connectorService.getConnector(id, s), [id], {
     keepDataOnReload: true,
   })
+  // `SRC-46` D2: read the detail again after a run ends, until the run is counted (see the hook).
+  const onRunEnded = useRunCountWait(state.data, state.reload)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const urlTab = parseTab(searchParams.get("tab"))
   const [tab, setTab] = useState<ConnectorTab>(urlTab)
@@ -462,6 +465,7 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
               pausedReason={c.pausedReason}
               waitingTables={waiting.tables}
               onResumed={state.reload}
+              onRunEnded={onRunEnded}
             />
           </TabsContent>
           {capturesChanges ? (

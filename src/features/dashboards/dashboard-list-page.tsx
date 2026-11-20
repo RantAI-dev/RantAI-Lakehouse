@@ -189,7 +189,6 @@ export function DashboardListPage() {
   const reportsState = useService((s) => dashboardReportService.listReports(s), [])
   const auth = useAuth()
   const me = auth.user?.id
-  const myName = auth.user?.name
   // The caller's own personal space is called "Personal space"; the folder
   // manager never offers one, and a dashboard is filed only in an ordinary
   // folder or the caller's own space (BI-18 part C, part 2).
@@ -427,7 +426,10 @@ export function DashboardListPage() {
   // leaves the dashboards usable.
   // Until the session is known the templates read is a stand-in (`canFile` is
   // still false), so the list also waits for it.
-  const loading = auth.status === "loading" || state.status === "loading" || reportsState.status === "loading" || !templatesReady || outlinesState.status === "loading"
+  // PR #530 review SHOULD-FIX: outlines (`GET /api/dashboard/specs`) stay out
+  // of `loading` so the table does not block on every chart spec; thumbnails
+  // fall back to glyphs until outlines arrive or when they fail.
+  const loading = auth.status === "loading" || state.status === "loading" || reportsState.status === "loading" || !templatesReady
   const tabs = tabValues.map((v) => ({ value: v, label: TAB_LABEL[v] }))
   const setTab = (next: TabValue) => {
     setTabRaw(next)
@@ -596,7 +598,6 @@ export function DashboardListPage() {
                   folders={folders}
                   showEmpty={!query.trim() && folderFilter === null && (kind === "all" || kind === "dashboard")}
                   actions={actions}
-                  myName={myName}
                   pictures={pictures}
                   onOpenTemplate={(item) => item.template && setUsing(item.template)}
                   emptyFolder={(id) => <EmptyFolder compact path={pathOf(id)} personal={folderLookup.isPersonal(id)} />}
@@ -608,7 +609,6 @@ export function DashboardListPage() {
                   onSort={sortBy}
                   actions={actions}
                   folders={folderLookup}
-                  myName={myName}
                   onOpenTemplate={(item) => item.template && setUsing(item.template)}
                   pictures={pictures}
                   selection={selection}
