@@ -31,9 +31,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { copyText } from "@/lib/copy-text"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatRelativeTime } from "@/lib/format"
-import { notifyFailure } from "@/lib/notify"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { ENTITY_STATUS_LABEL, type EntityStatus } from "@/lib/status"
 import type { Pipeline, PipelineKind } from "@/services/contracts/pipelines"
@@ -456,14 +455,7 @@ export function getPipelineColumns({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={() => {
-                    void copyText(pipeline.id).then((copied) => {
-                      if (!copied) {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(pipeline.id)
                   }}
                 >
                   <GitBranch className="size-4" />

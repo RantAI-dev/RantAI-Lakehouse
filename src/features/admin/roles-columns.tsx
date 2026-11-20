@@ -13,9 +13,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { copyText } from "@/lib/copy-text"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatNumber } from "@/lib/format"
-import { notifyFailure } from "@/lib/notify"
 import type { Role } from "@/services/contracts/identity"
 
 /**
@@ -136,14 +135,7 @@ export function getRoleColumns({
                 <DropdownMenuLabel>Role</DropdownMenuLabel>
                 <DropdownMenuItem
                   onClick={() => {
-                    void copyText(item.name).then((copied) => {
-                      if (!copied) {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(item.name)
                   }}
                 >
                   Copy role name

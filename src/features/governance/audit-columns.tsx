@@ -23,9 +23,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
-import { copyText } from "@/lib/copy-text"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatCost, formatDateTime, formatRelativeTime } from "@/lib/format"
-import { notifyFailure, notifySuccess } from "@/lib/notify"
 import {
   ACTOR_KIND_LABEL,
   AUDIT_OUTCOME_LABEL,
@@ -264,16 +263,7 @@ export function getAuditColumns({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={() => {
-                    void copyText(item.id).then((copied) => {
-                      if (copied) {
-                        notifySuccess("Audit event ID copied")
-                      } else {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(item.id, "Audit event ID copied")
                   }}
                 >
                   <Copy className="size-4" />
@@ -281,16 +271,7 @@ export function getAuditColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    void copyText(item.action).then((copied) => {
-                      if (copied) {
-                        notifySuccess("Action copied")
-                      } else {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(item.action, "Action copied")
                   }}
                 >
                   <Activity className="size-4" />
@@ -298,16 +279,7 @@ export function getAuditColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    void copyText(item.resource).then((copied) => {
-                      if (copied) {
-                        notifySuccess("Resource copied")
-                      } else {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(item.resource, "Resource copied")
                   }}
                 >
                   <FileText className="size-4" />
@@ -315,16 +287,7 @@ export function getAuditColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    void copyText(item.actor).then((copied) => {
-                      if (copied) {
-                        notifySuccess("Actor copied")
-                      } else {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(item.actor, "Actor copied")
                   }}
                 >
                   <UserIcon className="size-4" />

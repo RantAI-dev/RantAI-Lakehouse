@@ -13,9 +13,8 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { copyText } from "@/lib/copy-text"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatRelativeTime } from "@/lib/format"
-import { notifyFailure } from "@/lib/notify"
 import type { ServiceIdentity } from "@/services/contracts/identity"
 
 const ROTATION_STATUS_OPTIONS = [
@@ -158,14 +157,7 @@ export function getServiceIdentityColumns(options?: {
                 <DropdownMenuLabel>Identity</DropdownMenuLabel>
                 <DropdownMenuItem
                   onClick={() => {
-                    void copyText(item.name).then((copied) => {
-                      if (!copied) {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(item.name)
                   }}
                 >
                   Copy identity name

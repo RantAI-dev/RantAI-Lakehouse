@@ -11,8 +11,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
-import { copyText } from "@/lib/copy-text"
-import { notifyFailure, notifySuccess } from "@/lib/notify"
+import { copyTextWithToast } from "@/lib/copy-text"
 import type { Asset } from "@/services/contracts/assets"
 
 /**
@@ -38,22 +37,6 @@ export interface AssetAction {
   separatorBefore?: boolean
 }
 
-/**
- * Copy one value and say what happened. `copyText` answers whether the copy
- * worked, which matters on a console opened over plain http: the clipboard
- * API does not exist there and the fallback can still be refused (`UX-6`).
- */
-async function copyToClipboard(value: string, label: string) {
-  if (await copyText(value)) {
-    notifySuccess(`${label} copied`)
-    return
-  }
-  notifyFailure(
-    "Could not copy",
-    "The browser refused the copy. Select the text and copy it by hand."
-  )
-}
-
 export function getAssetActions(
   asset: Asset,
   { onOpen }: { onOpen: (asset: Asset) => void }
@@ -70,13 +53,13 @@ export function getAssetActions(
       label: "Copy asset ID",
       icon: Copy,
       separatorBefore: true,
-      onSelect: () => void copyToClipboard(asset.id, "Asset ID"),
+      onSelect: () => void copyTextWithToast(asset.id, "Asset ID copied"),
     },
     {
       id: "copy-namespace",
       label: "Copy namespace",
       icon: Boxes,
-      onSelect: () => void copyToClipboard(asset.namespace, "Namespace"),
+      onSelect: () => void copyTextWithToast(asset.namespace, "Namespace copied"),
     },
   ]
 }

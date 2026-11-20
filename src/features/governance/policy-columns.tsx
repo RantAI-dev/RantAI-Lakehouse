@@ -22,9 +22,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
-import { copyText } from "@/lib/copy-text"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { ENTITY_STATUS_LABEL, type EntityStatus } from "@/lib/status"
-import { notifyFailure } from "@/lib/notify"
 import type { Policy } from "@/services/contracts/governance"
 import { accessTabHref, type AccessRule } from "./access-rules"
 import { POLICY_NOT_ENFORCEABLE } from "./policy-actions"
@@ -210,14 +209,7 @@ export function getAccessRuleColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void copyText(rule.name).then((copied) => {
-                      if (!copied) {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(rule.name)
                   }}
                 >
                   <Copy className="size-4" />
@@ -226,14 +218,7 @@ export function getAccessRuleColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void copyText(rule.id).then((copied) => {
-                      if (!copied) {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(rule.id)
                   }}
                 >
                   <Shield className="size-4" />

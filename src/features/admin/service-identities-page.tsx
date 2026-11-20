@@ -18,9 +18,8 @@ import {
 } from "@/components/ui/dialog"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useDataTable } from "@/hooks/use-data-table"
-import { copyText } from "@/lib/copy-text"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { filterDataClientSide } from "@/lib/data-table"
-import { notifyFailure } from "@/lib/notify"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { identityService } from "@/services"
@@ -161,17 +160,10 @@ export function ServiceIdentitiesPage() {
               size="sm"
               onClick={() => {
                 if (revealedSecret === null) return
-                // Same as the password reveal above: the fallback textarea is
+                // Same as the password reveal above: the textarea fallback is
                 // appended inside this dialog, so the copy works over plain
                 // http, where the browser has no clipboard API (`UX-6`).
-                void copyText(revealedSecret).then((copied) => {
-                  if (!copied) {
-                    notifyFailure(
-                      "Could not copy",
-                      "The browser refused the copy. Select the text and copy it by hand."
-                    )
-                  }
-                })
+                void copyTextWithToast(revealedSecret)
               }}
             >
               Copy

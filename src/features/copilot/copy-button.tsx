@@ -4,8 +4,7 @@ import * as React from "react";
 import { Check, Copy } from "lucide-react";
 // The clipboard API is missing over plain http, so every copy goes through
 // the helper that falls back to a textarea (`UX-6`).
-import { copyText } from "@/lib/copy-text";
-import { notifyFailure } from "@/lib/notify";
+import { copyTextWithToast } from "@/lib/copy-text";
 import { cn } from "@/lib/utils";
 
 /** Copies `text`; the icon turns into a check for a moment to confirm it. */
@@ -33,15 +32,8 @@ export function CopyButton({
         // The check mark means "on the clipboard", so it flips only when the
         // helper says the copy worked; a refusal gets the failure toast
         // instead of a success icon (`UX-6` D2).
-        void copyText(text).then((copied) => {
-          if (copied) {
-            setCopied(true);
-            return;
-          }
-          notifyFailure(
-            "Could not copy",
-            "The browser refused the copy. Select the text and copy it by hand."
-          );
+        void copyTextWithToast(text).then((copied) => {
+          if (copied) setCopied(true);
         });
       }}
       aria-label={copied ? "Copied" : label}

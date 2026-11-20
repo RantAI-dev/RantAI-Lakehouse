@@ -30,10 +30,9 @@ import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useUrlTab } from "@/hooks/use-url-tab"
-import { copyText } from "@/lib/copy-text"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
-import { notifyFailure } from "@/lib/notify"
 import { identityService } from "@/services"
 import type { Role, Tenant, User } from "@/services"
 import { takeInvitePassword } from "./invite-password"
@@ -345,17 +344,10 @@ export function UsersPage() {
               size="sm"
               onClick={() => {
                 if (revealedPassword === null) return
-                // The dialog lives inside `role=dialog`, which `copyText`'s
-                // textarea fallback already targets -- over plain http this
-                // is the only copy path there is (`UX-6`).
-                void copyText(revealedPassword).then((copied) => {
-                  if (!copied) {
-                    notifyFailure(
-                      "Could not copy",
-                      "The browser refused the copy. Select the text and copy it by hand."
-                    )
-                  }
-                })
+                // The dialog lives inside `role=dialog`, which the textarea
+                // fallback already targets -- over plain http this is the
+                // only copy path there is (`UX-6`).
+                void copyTextWithToast(revealedPassword)
               }}
             >
               Copy

@@ -15,9 +15,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { accessGrantState, selfApprovalTooltip } from "@/lib/access-requests"
-import { copyText } from "@/lib/copy-text"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatRelativeTime } from "@/lib/format"
-import { notifyFailure } from "@/lib/notify"
 import type { ApprovalItem } from "@/services/contracts/agents"
 import { APPROVAL_STATUS_LABEL } from "@/lib/status"
 
@@ -198,14 +197,7 @@ export function getApprovalColumns({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={() => {
-                    void copyText(item.action).then((copied) => {
-                      if (!copied) {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(item.action)
                   }}
                 >
                   Copy action

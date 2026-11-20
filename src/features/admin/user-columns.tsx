@@ -26,9 +26,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
-import { copyText } from "@/lib/copy-text"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatRelativeTime } from "@/lib/format"
-import { notifyFailure } from "@/lib/notify"
 import type { User } from "@/services"
 
 export const USER_STATUS_OPTIONS = [
@@ -273,14 +272,7 @@ export function getUserColumns({
                 {user.email ? (
                   <DropdownMenuItem
                     onClick={() => {
-                      void copyText(user.email ?? "").then((copied) => {
-                        if (!copied) {
-                          notifyFailure(
-                            "Could not copy",
-                            "The browser refused the copy. Select the text and copy it by hand."
-                          )
-                        }
-                      })
+                      void copyTextWithToast(user.email ?? "")
                     }}
                   >
                     <Copy className="size-4" />
@@ -289,14 +281,7 @@ export function getUserColumns({
                 ) : null}
                 <DropdownMenuItem
                   onClick={() => {
-                    void copyText(user.username).then((copied) => {
-                      if (!copied) {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(user.username)
                   }}
                 >
                   <Copy className="size-4" />
@@ -304,14 +289,7 @@ export function getUserColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    void copyText(user.id).then((copied) => {
-                      if (!copied) {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(user.id)
                   }}
                 >
                   <UserIcon className="size-4" />

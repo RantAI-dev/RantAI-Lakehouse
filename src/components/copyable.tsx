@@ -3,11 +3,11 @@
 import { Copy } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { copyText } from "@/lib/copy-text";
-// `lib/notify` is this codebase's single door to `sonner` — going straight
-// to `toast()` (as the upstream version of this file did) would sidestep
-// the shared error-message translation and the `aborted` suppression.
-import { notifyFailure, notifySuccess } from "@/lib/notify";
+// `lib/notify` is this codebase's single door to `sonner` and `copyText`'s
+// companion shows its toasts; going straight to `toast()` (as the upstream
+// version of this file did) would sidestep the shared error-message
+// translation and the `aborted` suppression.
+import { copyTextWithToast } from "@/lib/copy-text";
 import { cn } from "@/lib/utils";
 
 const TOAST_VALUE_MAX = 48;
@@ -33,18 +33,9 @@ export function Copyable({ value, children, className }: CopyableProps) {
     event.preventDefault();
     if (!copyValue) return;
 
-    // `copyText` answers whether the copy worked; over plain http there is no
-    // clipboard API and the textarea fallback may still be refused (`UX-6`),
-    // so the success toast is shown only on `true`.
-    const copied = await copyText(copyValue);
-    if (copied) {
-      notifySuccess(formatCopiedToast(copyValue));
-    } else {
-      notifyFailure(
-        "Could not copy",
-        "The browser refused the copy. Select the text and copy it by hand."
-      );
-    }
+    // The confirmation shows only when the copy worked, and a refusal gets
+    // the helper's one failure sentence (`UX-6` D2).
+    await copyTextWithToast(copyValue, formatCopiedToast(copyValue));
   };
 
   return (

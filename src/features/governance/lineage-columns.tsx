@@ -18,8 +18,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
-import { copyText } from "@/lib/copy-text"
-import { notifyFailure } from "@/lib/notify"
+import { copyTextWithToast } from "@/lib/copy-text"
 import type { LineageEdge, LineageGraph } from "@/services/contracts/governance"
 
 export function getLineageColumns({
@@ -131,14 +130,7 @@ export function getLineageColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void copyText(fromLabel).then((copied) => {
-                      if (!copied) {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(fromLabel)
                   }}
                 >
                   <Copy className="size-4" />
@@ -147,14 +139,7 @@ export function getLineageColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void copyText(toLabel).then((copied) => {
-                      if (!copied) {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(toLabel)
                   }}
                 >
                   <Copy className="size-4" />
@@ -163,14 +148,7 @@ export function getLineageColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void copyText(edge.id).then((copied) => {
-                      if (!copied) {
-                        notifyFailure(
-                          "Could not copy",
-                          "The browser refused the copy. Select the text and copy it by hand."
-                        )
-                      }
-                    })
+                    void copyTextWithToast(edge.id)
                   }}
                 >
                   <GitCommit className="size-4" />
