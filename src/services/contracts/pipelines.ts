@@ -172,6 +172,70 @@ export type PipelineTransformStep = { name: string; kind: "transform"; reads: st
 export type PipelineSqlStep = { name: string; kind: "sql"; sql: string }
 
 /**
+ * BLD-16 / J2: one equality pair a join matches on — `left` is a column of
+ * the join's left side, `right` of its right side. The API's compiler
+ * checks and names the field at fault (`steps[i].on[j]`), never serde.
+ */
+export type PipelineJoinPair = { left: string; right: string }
+
+/**
+ * BLD-16 / J2: one output column of a join — a column of one side, under an
+ * output name that defaults to `column` when `name` is absent.
+ */
+export type PipelineJoinColumn = { side: "left" | "right" | string; column: string; name?: string }
+
+/**
+ * BLD-16 / J2: one condition of a filter or a `having`. The `operator` is
+ * the six the transform grammar allows (`| string` widened per
+ * `CODE-STANDARD.md` 4.2); `value` is compared as `ClickHouse` compares a
+ * column with a string literal, except a count, sum or average takes a
+ * number.
+ */
+export type PipelineStepCondition = { column: string; operator: string; value: string }
+
+/**
+ * BLD-16 / J2: one measure of an aggregate. `column` is optional for
+ * `count` only; a name may not be a column the step reads (the API refuses
+ * it at `steps[i].measures[j]`).
+ */
+export type PipelineMeasure = {
+  function: "count" | "countDistinct" | "sum" | "avg" | "min" | "max" | string
+  column?: string
+  name: string
+}
+
+/** BLD-16 / J1, J3: a join of two inputs or earlier steps on equality pairs, projecting the listed output columns. */
+export type PipelineJoinStep = {
+  name: string
+  kind: "join"
+  left: string
+  right: string
+  joinType: "inner" | "left" | "right" | "full" | string
+  on: PipelineJoinPair[]
+  columns: PipelineJoinColumn[]
+}
+
+/** BLD-16 / J1, J4: group-by columns and measures over one input or earlier step, with optional `having` conditions. */
+export type PipelineAggregateStep = {
+  name: string
+  kind: "aggregate"
+  reads: string
+  groupBy: string[]
+  measures: PipelineMeasure[]
+  havingMatch?: "all" | "any" | string
+  having?: PipelineStepCondition[]
+}
+
+/** BLD-16 / J1, J5: keep the rows of one input or earlier step that meet all — or any — of the conditions. */
+export type PipelineFilterStep = {
+  name: string
+  kind: "filter"
+  reads: string
+  match?: "all" | "any" | string
+  conditions: PipelineStepCondition[]
+}
+
+/**
  * A step of a kind this console does not know (`CODE-STANDARD.md` 4.2's
  * `| string` widening; BLD-1 part 2 adds kinds). Its other fields are not
  * known here, so the console shows it, does not edit it, and sends it back
@@ -184,9 +248,16 @@ export type PipelineOtherStep = { name: string; kind: string; [field: string]: u
 /**
  * BLD-1 part 1 / D1: one named step, a table later steps read by `name`.
  * Mirrors `lakehouse_store::pipelines::PipelineStep`, serde's internally
- * tagged union on `kind`. The last step is the output.
+ * tagged union on `kind`. The last step is the output. BLD-16 / J1 adds
+ * the `join`, `aggregate` and `filter` form kinds.
  */
-export type PipelineStep = PipelineTransformStep | PipelineSqlStep | PipelineOtherStep
+export type PipelineStep =
+  | PipelineTransformStep
+  | PipelineSqlStep
+  | PipelineJoinStep
+  | PipelineAggregateStep
+  | PipelineFilterStep
+  | PipelineOtherStep
 
 /**
  * An authored pipeline's stored definition, exactly the fields
@@ -385,6 +456,17 @@ export type PipelinePreviewInput = {
 }
 
 /**
+ * `POST /api/pipelines/step-sql`'s body (BLD-16 / J6): the definition —
+ * which need not be saved — and the name of the step whose SQL is asked
+ * for. Nothing is stored and no table is read.
+ */
+export type PipelineStepSqlInput = {
+  inputs: PipelineInput[]
+  steps: PipelineStep[]
+  step: string
+}
+
+/**
  * `POST /api/pipelines/preview`'s answer: at most 100 rows (decision 5),
  * each an array in the order of `columns`; `truncated` says the step
  * returned more.
@@ -476,4 +558,12 @@ export interface PipelineService {
    * `steps[i]` (D7); a 422 is a refusal by the access check.
    */
   previewPipelineStep(input: PipelinePreviewInput, signal?: AbortSignal): Promise<PipelinePreview>
+  /**
+   * `POST /api/pipelines/step-sql` — the SQL of one form step of a
+   * definition that need not be saved (BLD-16 / J6, `pipeline:write`): the
+   * body the compiler puts inside that step's `WITH` entry, over names,
+   * before the access rewrite. A 400 names the item at fault as
+   * `steps[i].<field>[j]` (D7).
+   */
+  stepSql(input: PipelineStepSqlInput, signal?: AbortSignal): Promise<{ sql: string }>
 }

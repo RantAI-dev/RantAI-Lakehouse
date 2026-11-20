@@ -44,6 +44,7 @@ once a first release is tagged.
 
 ### Security
 
+- The audit row written when a sign-in gets locked no longer holds part of a hash of what was typed as the identifier; older rows keep it.
 - Dagster's instance database has its own role, `lakehouse_dagster`, which is not a superuser and owns nothing outside its database. The code location, the webserver and the daemon no longer hold the owner's password (`SEC-78`, second change). New required setting: `LAKEHOUSE_DB_DAGSTER_PASSWORD`.
 - The console connects to Postgres as a role that owns no table and is not a superuser (`SEC-78`), so it cannot switch off the audit trail's append-only rule; the migrations and the role's setup run in a separate one-shot `lakehouse-db-migrate` service with the owner's credentials, and `lakehouse-api` refuses to start as a superuser or a table owner. New required setting: `LAKEHOUSE_DB_APP_PASSWORD` (`ops/init-env.sh` generates it); `CONNECTOR_PG_PASSWORD` now falls back to it, the seeded `conn-pg-lakehouse` connector dials as `lakehouse_app` (migration `0149`), and the API container holds no `POSTGRES_PASSWORD`.
 - The assistant reads the audit history only for a person holding `audit:read` (backlog `GOV-1`). Its audit history tool needs the same permission as the audit page, so a person who may read the audit page and a person who may not get the same answer from the assistant and from the console.
@@ -83,6 +84,8 @@ once a first release is tagged.
 
 ### Changed
 
+- The audit page's person filter lists the people in the trail; settings rows name the settings that changed; the export has the event id and the same outcome words as the page.
+- Alert scheduler runs and alert tests no longer write audit rows.
 - The sign-in page, the sidebar, the browser tab and the embed footer show the workspace's own name, logo and icon when an administrator has set them (backlog `ADM-2`; feature page `docs/core/features/workspace-name-and-logo.md`).
 - A public link page shows the workspace's own name and logo, with a small "Powered by RantAI Lakehouse" line.
 - Reading the audit trail list needs the `audit:read` permission, which the Governance Admin and Platform Admin roles hold; other roles no longer see the Audit Log page or its list. The other governance pages are unchanged.

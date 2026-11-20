@@ -40,14 +40,13 @@ export function gallerySections(items: readonly LibraryItem[], folders: FolderLi
 }
 
 export function LibraryGallery({
-  items, folders, showEmpty, actions, myName, pictures, onOpenTemplate, emptyFolder,
+  items, folders, showEmpty, actions, pictures, onOpenTemplate, emptyFolder,
 }: {
   readonly items: readonly LibraryItem[]
   readonly folders: FolderLike[]
   /** Show folders that hold nothing (only while no search or filter narrows the list). */
   readonly showEmpty: boolean
   readonly actions: ItemActions
-  readonly myName: string | undefined
   readonly pictures: PictureSource
   readonly onOpenTemplate: (item: LibraryItem) => void
   /** What an empty folder's section says. */
@@ -85,7 +84,7 @@ export function LibraryGallery({
               ) : (
                 <ul className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
                   {s.items.map((item) => (
-                    <Card key={item.key} item={item} actions={actions} myName={myName} pictures={pictures} onOpenTemplate={onOpenTemplate} />
+                    <Card key={item.key} item={item} actions={actions} pictures={pictures} onOpenTemplate={onOpenTemplate} />
                   ))}
                 </ul>
               )
@@ -98,16 +97,15 @@ export function LibraryGallery({
 }
 
 /** The card: the picture on top (badges and the star over it), then the name and ⋯, then who, how big and when, then one fact. */
-function Card({ item, actions, myName, pictures, onOpenTemplate }: {
+function Card({ item, actions, pictures, onOpenTemplate }: {
   readonly item: LibraryItem
   readonly actions: ItemActions
-  readonly myName: string | undefined
   readonly pictures: PictureSource
   readonly onOpenTemplate: (item: LibraryItem) => void
 }) {
   const fav = item.kind === "dashboard" && actions.isFavourite(item)
   const fact = factOf(item)
-  const owner = ownerLabel(item, myName)
+  const owner = ownerLabel(item)
   const when = item.builtin || !item.updatedAt ? null : `${item.kind === "template" ? "Saved" : "Updated"} ${formatRelativeTime(item.updatedAt)}`
   return (
     <li

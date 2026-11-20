@@ -48,6 +48,44 @@ export async function moveItems(items: readonly LibraryItem[], folderId: string,
  * one-dashboard dialog does). A personal space holds dashboards only, so it is
  * not offered while a report is among the items.
  */
+const PREVIEW_CONCURRENCY = 4
+
+/**
+ * PR #530 review SHOULD-FIX: cap concurrent `previewMove` checks so moving
+ * many dashboards does not fire an unbounded burst on every folder change, and
+ * return how many previews failed so the dialog can say so rather than silently
+ * dropping failures.
+ */
+async function previewBoards(
+  boards: readonly LibraryItem[],
+  destination: string,
+  signal: AbortSignal,
+): Promise<{ effects: { name: string; effect: MoveEffect }[]; failed: number }> {
+  const results = new Array<{ name: string; effect: MoveEffect } | null>(boards.length).fill(null)
+  let next = 0
+  let failed = 0
+  async function worker() {
+    while (!signal.aborted) {
+      const idx = next
+      next += 1
+      if (idx >= boards.length) return
+      const b = boards[idx]
+      try {
+        const effect = await dashboardService.previewMove(b.id, destination, signal)
+        if (!signal.aborted && changes(effect)) results[idx] = { name: b.name, effect }
+      } catch {
+        if (signal.aborted) return
+        failed += 1
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(PREVIEW_CONCURRENCY, boards.length) }, () => worker()))
+  return {
+    effects: results.filter((e): e is { name: string; effect: MoveEffect } => e !== null),
+    failed,
+  }
+}
+
 export function MoveItemsDialog({
   items, folders, onOpenChange, onDone,
 }: {
@@ -66,21 +104,17 @@ export function MoveItemsDialog({
   const destination = target === ROOT ? "" : target
 
   const [effects, setEffects] = React.useState<{ name: string; effect: MoveEffect }[]>([])
+  const [previewFailed, setPreviewFailed] = React.useState(0)
   React.useEffect(() => {
     setEffects([])
+    setPreviewFailed(0)
     const boards = items.filter((i) => i.kind === "dashboard" && i.folderId !== destination)
     if (boards.length === 0) return
     const ctl = new AbortController()
-    void Promise.all(
-      boards.map((b) =>
-        dashboardService
-          .previewMove(b.id, destination, ctl.signal)
-          .then((effect) => ({ name: b.name, effect }))
-          .catch(() => null),
-      ),
-    ).then((all) => {
+    void previewBoards(boards, destination, ctl.signal).then(({ effects: nextEffects, failed }) => {
       if (ctl.signal.aborted) return
-      setEffects(all.filter((e): e is { name: string; effect: MoveEffect } => e !== null && changes(e.effect)))
+      setEffects(nextEffects)
+      setPreviewFailed(failed)
     })
     return () => ctl.abort()
   }, [items, destination])
@@ -125,6 +159,12 @@ export function MoveItemsDialog({
             <MoveEffectNote effect={effect} />
           </div>
         ))}
+        {previewFailed > 0 ? (
+          <p role="status" className="text-xs text-muted-foreground">
+            Access change could not be checked for {previewFailed.toLocaleString("en-US")}{" "}
+            {previewFailed === 1 ? "dashboard" : "dashboards"}.
+          </p>
+        ) : null}
         {refused.length > 0 ? (
           <ul role="alert" className="grid gap-1 text-sm text-destructive">
             {refused.map((r) => <li key={r.name}>{r.name}: {r.reason}</li>)}

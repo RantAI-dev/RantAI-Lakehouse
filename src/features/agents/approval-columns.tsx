@@ -15,6 +15,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { accessGrantState, selfApprovalTooltip } from "@/lib/access-requests"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatRelativeTime } from "@/lib/format"
 import type { ApprovalItem } from "@/services/contracts/agents"
 import { APPROVAL_STATUS_LABEL } from "@/lib/status"
@@ -196,7 +197,7 @@ export function getApprovalColumns({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={() => {
-                    navigator.clipboard?.writeText(item.action)
+                    void copyTextWithToast(item.action)
                   }}
                 >
                   Copy action
