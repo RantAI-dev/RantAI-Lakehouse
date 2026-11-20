@@ -193,3 +193,15 @@ describe("FormatSection Gantt today line (BI-16 part C1)", () => {
     expect(styleFromDef({ todayLine: false })).toEqual({ todayLine: false })
   })
 })
+
+describe("the series name field (UX-7)", () => {
+  it("suggests the chart's values from the console's own list, and keeps a name typed by hand", async () => {
+    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: false, measures: 1 })} style={{}} onChange={() => {}} valueNames={["visitors", "revenue"]} paletteValue="default" />)
+    const field = screen.getByLabelText("Series name") as HTMLInputElement
+    fireEvent.keyDown(field, { key: "ArrowDown" })
+    expect((await screen.findAllByRole("option")).map((o) => o.textContent)).toEqual(["visitors", "revenue"])
+    expect(document.querySelector("datalist")).toBeNull()
+    fireEvent.change(field, { target: { value: "typed by hand" } })
+    expect(field.value).toBe("typed by hand")
+  })
+})

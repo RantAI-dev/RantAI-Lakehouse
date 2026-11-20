@@ -25,7 +25,7 @@ import type {
 import type { ReadState } from "./chart-download";
 import { clock, describeAttachments, describeNotSent, describeSchedule, describeStatus, WEEKDAYS } from "./report-words";
 import { ReportRecipientsField, type ChosenRecipient } from "./report-recipients-field";
-import { TimeZoneSelect } from "./time-zone-select";
+import { TimeZoneSelect } from "@/components/patterns/time-zone-select";
 
 /**
  * What a report is made as (feature decision 1). Shown above the recipient list
