@@ -297,6 +297,26 @@ services:
     environment:
       PORT: "8080"
       APP_ENV: ${APP_ENV:-local}
+      # The commit this deployment runs.
+      #
+      # `check_commit` (`rust/crates/lakehouse-api/src/pipeline_source.rs`)
+      # compares it with the commit the Dagster code location stamped on
+      # the op, and the console's pipeline page serves the op's source
+      # text only when the two agree. "unknown" on EITHER side means "no
+      # real commit was ever recorded here", so the route refuses instead
+      # of serving source it cannot verify.
+      #
+      # It is set HERE, at RUN time, and not only as the image's build
+      # arg: the API image is built in CI WITHOUT `GIT_SHA` (a per-commit
+      # build arg sits near the top of `rust/Dockerfile`, so it would
+      # invalidate every layer below it and the layer cache would never
+      # hit), which means the image itself carries `GIT_SHA=unknown`. A
+      # container's `environment:` overrides the image's `ENV`, so the
+      # value the API reads is the one the deploy exports --
+      # `scripts/compose.sh` exports `GIT_SHA=$(git rev-parse HEAD)`, the
+      # SAME value the code location's image is built with, and the two
+      # agree.
+      GIT_SHA: ${GIT_SHA:-unknown}
       # ── ClickHouse: points at the compose service by default ──
       CH_URL: ${CH_URL:-http://clickhouse:8123}
       CH_USER: ${CH_USER:-default}
