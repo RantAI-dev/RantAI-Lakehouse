@@ -5,7 +5,6 @@ import * as React from "react"
 import {
   Faceted,
   FacetedBadgeList,
-  FacetedEmpty,
   FacetedGroup,
   FacetedInput,
   FacetedItem,
@@ -149,8 +148,8 @@ export function AuditActorPicker({
           />
           <FacetedList>
             {visible.length === 0 ? (
-              // cmdk's `FacetedEmpty` keys on its own filtered count, which
-              // is off here; the picker's own count is the truth.
+              // cmdk's empty component keys on its own filtered count,
+              // which is off here; the picker's own count is the truth.
               <p className="py-6 text-center text-sm text-muted-foreground">
                 No person matches.
               </p>
