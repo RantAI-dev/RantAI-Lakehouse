@@ -8,6 +8,7 @@ import { ErrorWithReference } from "@/components/error-reference";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
+import { thumbnailOption } from "@/lib/thumbnail-option";
 import { buildOption, clusterNote, fmtInt, forecastNote, withReferenceLines } from "./chart-option";
 import { NOT_AVAILABLE_WITH_YOUR_ACCESS, buildCombinedOption, cutLayers, failedLayers, unavailableLayers } from "./combined-option";
 import { takesLayers, type LayerDef } from "@/lib/chart-layers";
@@ -39,6 +40,19 @@ import { limitSentence } from "@/lib/query-limits";
 import { dataFromLabel } from "@/lib/result-cache";
 
 type Cell = Rows | TileFailure;
+
+/**
+ * Owner QA 2026-11-14, gallery pictures centred: inside a gallery picture every chart this body draws
+ * gets `thumbnailOption` (equal margins, no axes, legend or colour bar), so it sits centred in its
+ * card. The chart-type gallery provides it; everywhere else it is off and nothing changes.
+ */
+export const ThumbnailContext = React.createContext(false);
+
+/** The chart, as the gallery's picture when inside one. */
+function ChartView(props: React.ComponentProps<typeof EChart>) {
+  const thumbnail = React.useContext(ThumbnailContext);
+  return <EChart {...props} option={thumbnail ? thumbnailOption(props.option) : props.option} />;
+}
 function hasRows(c: Cell | undefined): c is Rows {
   return !!c && "rows" in c;
 }
@@ -234,7 +248,7 @@ function TileBodyOf({
     // BI-17 part B: what the chart says under itself about a forecast or about clusters.
     const forecastSentence = forecastNote(cell.referenceLines, lineCtx, spec.kind === "hbar") ?? clusterNote(spec, rows, style);
     const chart = (
-      <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" live={live}
+      <ChartView option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" live={live}
         optionDeps={[style, locale, decimals, dark, reporting.timeZone, reporting.companyPalette, cell.referenceLines, measureLabels, cell.truncated]}
         onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels, bin: bins[spec.x] }) : undefined} />
     );
@@ -295,7 +309,7 @@ function TypeBBody({
     // A result as long as the server's cap may have been cut (a narrow width over a wide column); say so, as a cut-off chart does.
     return (
       <div className="flex h-full min-h-0 flex-col">
-        <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" optionDeps={[style, locale, decimals, dark, color, def?.labels?.show, bins]} /></div>
+        <div className="min-h-0 flex-1"><ChartView option={drawn.option} height="100%" optionDeps={[style, locale, decimals, dark, color, def?.labels?.show, bins]} /></div>
         {cell.rows.length >= HISTOGRAM_ROW_CAP ? (
           <p className="px-1 pt-1 text-[11px] text-muted-foreground">Only the first {HISTOGRAM_ROW_CAP} ranges are shown; choose a wider width.</p>
         ) : null}
@@ -324,7 +338,7 @@ function TypeBBody({
   }
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" optionDeps={[style, locale, decimals, dark, color, measureLabels]} /></div>
+      <div className="min-h-0 flex-1"><ChartView option={drawn.option} height="100%" optionDeps={[style, locale, decimals, dark, color, measureLabels]} /></div>
       {drawn.more > 0 ? (
         <p className="px-1 pt-1 text-[11px] text-muted-foreground">{drawn.more} more not shown (the first {MAX_BULLETS} are drawn)</p>
       ) : null}
@@ -357,7 +371,7 @@ function GanttBody({
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="min-h-0 flex-1">
-        <EChart option={drawn.option} height="100%" optionDeps={[reporting.timeZone, def?.todayLine, dark]} onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: cell.rows }) : undefined} />
+        <ChartView option={drawn.option} height="100%" optionDeps={[reporting.timeZone, def?.todayLine, dark]} onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: cell.rows }) : undefined} />
       </div>
       {drawn.notes.map((note) => <p key={note} className="px-1 pt-1 text-[11px] text-muted-foreground">{note}.</p>)}
     </div>
@@ -438,7 +452,7 @@ function CombinedBody({
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="min-h-0 flex-1">
-        <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={click}
+        <ChartView option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={click}
           optionDeps={[style, locale, decimals, dark, reporting.companyPalette, cell.referenceLines]} />
       </div>
       {styled.hiddenNotes ? (

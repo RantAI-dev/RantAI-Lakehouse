@@ -110,3 +110,17 @@ export function missingSection(label: string): SectionNumber {
   if (/^(Step|Question) \d/.test(label) || label === "Date column" || label === "Goal") return 4
   return 2
 }
+
+/**
+ * `BI-58` T4: where a missing field is now. Section 1 (the source, its joins)
+ * is the data panel; a step is under "Sort & filter"; everything else that a
+ * save needs (what to show, a second source, a KPI's comparison, a goal) is
+ * under the inspector's "Data" tab.
+ */
+export type MissingPlace = "source" | "data" | "sort"
+
+export function missingPlace(label: string): MissingPlace {
+  const section = missingSection(label)
+  if (section === 1) return "source"
+  return /^Step \d/.test(label) ? "sort" : "data"
+}

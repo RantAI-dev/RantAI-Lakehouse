@@ -154,7 +154,8 @@ export function ChartBuilderPage({ boardId, chartId }: { boardId: string; chartI
       initial={initial}
       editId={chartId}
       paramValues={chartParamValues(searchParams.toString())}
-      backHref={backHref}
+      // BI-58 review round 1, SHOULD-FIX 4 (owner): the builder's back arrow leaves through here,
+      // after its own "Discard changes?" when something changed.
       onCancel={() => router.push(backHref)}
       // `WEB-7` D6: the board is reloaded by going back to it, which is what
       // the dialog's `onSaved` did by re-fetching in place. A draft the
