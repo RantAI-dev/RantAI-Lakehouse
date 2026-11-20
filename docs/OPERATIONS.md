@@ -259,6 +259,29 @@ mint an admin-bypass token for anyone who could reach it with no
 credential. Reach it via `docker compose exec` or a container on the
 compose network for debugging, not by republishing `OIDC_MOCK_HOST_PORT`.
 
+#### oidc-mock: token lifetime
+
+The tokens the mock pre-mints live on the `lakehouse_oidc_tokens` volume,
+and that volume is PERSISTENT: they survive a container restart and every
+deploy. They are therefore **replaced** when they get close to expiring —
+`mint_tokens` re-mints a principal whose token has expired or that expires
+within `TOKEN_REFRESH_MARGIN_SECONDS` (7 days), and a background thread
+runs that check hourly. A replaced token is not revoked: the old one stays
+valid until its own `exp`, and the `sub` claim (the identity Lakekeeper's
+grants were given to) never changes.
+
+This is what the volume did NOT do: a token volume that is only ever
+written when it is first created keeps the tokens it minted that day, and
+they expire on their own `exp` with nothing replacing them. On the staging
+VM that expiry was **2026-12-05 07:04 UTC**, and the one-shot init jobs
+that read `admin.jwt` off the volume (`lakekeeper-warehouse-init`,
+`lakekeeper-authz-init`) would have failed from that moment on — `admin`
+is the one principal the on-demand `/token` endpoint refuses to mint, so
+there was no way to renew it without touching the volume by hand.
+
+If the mock is replaced with a real IdP, none of this applies — see ADR
+0011's "what a real IdP swap has to account for".
+
 ### SeaweedFS (opt-in, P2 — storage-compatibility matrix only)
 
 `seaweedfs`, `seaweedfs-bucket-init`, and
@@ -393,6 +416,19 @@ compose up`. Brings up `dagster-db-init` (one-shot: creates Dagster's own
 `dagster/Dockerfile` — see ADR 0005), `dagster-webserver` (GraphQL API +
 UI, container port `3000`), and `dagster-daemon` (schedules/sensors/run
 queueing).
+
+**How many steps the code location runs at once**
+(`DAGSTER_MULTIPROCESS_EXECUTOR_MAX_CONCURRENT`, compose default `2`). The
+code location's multiprocess executor defaults to the CPU count of the machine
+(`multiprocessing.cpu_count()`), and every step it runs is a spawned Python
+process of its own (~235 MB RSS). On the 8-vCPU staging VM that was eight
+steps at once: the container was measured at 1012 MiB and 268% CPU while
+`bronze_maintenance_job` fanned out over its 513 bronze tables — and a deploy
+running `cargo build --release` on the same 8 cores starved next to it until
+the build stalled. Two keeps every table in the fan-out and bounds the
+footprint; the host cannot give the VM more RAM (the Proxmox host is at 96% of
+its 62 GiB), so the bound comes from here. Raise it in `.env` on a machine
+with more cores to spare.
 
 **The Dagster UI is published on the host's loopback only**
 (`127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000`, REL-2 S4b review

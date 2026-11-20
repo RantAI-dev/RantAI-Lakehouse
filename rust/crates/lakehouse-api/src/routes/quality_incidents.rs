@@ -229,7 +229,8 @@ pub struct ResolveBody {
 /// `403` when the caller is outside the tenant that owns the shared catalog;
 /// `404` when no incident has that id, and for an incident on a table the
 /// caller's role does not read (it answers as an unknown incident,
-/// `GOV-15`) and for an incident on a table outside the caller's reach (`SEC-80`); `409` when it was resolved before; `503`/`500` on a store
+/// `GOV-15`) and for an incident on a table outside the caller's reach
+/// (`SEC-80`); `409` when it was resolved before; `503`/`500` on a store
 /// failure.
 pub async fn resolve_incident(
     State(state): State<AppState>,

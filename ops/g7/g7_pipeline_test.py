@@ -1226,10 +1226,11 @@ def step_a_two_input_sql_pipeline_matches_a_direct_query() -> None:
     compiled statement that reads somewhere else shows up as a difference
     rather than a pass.
     """
-    target = "g7_two_input_out"
-    create = API.post(
-        f"{API_URL}/api/pipelines",
-        json={
+    # BLD-16: the create-activate-run sequence is
+    # `_create_and_run_authored_pipeline`, shared with the form-step case
+    # below (AGENTS.md rule 4).
+    _create_and_run_authored_pipeline(
+        {
             "name": "g7_two_input_join",
             "kind": "batch",
             "inputs": [
@@ -1249,16 +1250,42 @@ def step_a_two_input_sql_pipeline_matches_a_direct_query() -> None:
                 }
             ],
             "targetZone": "silver",
-            "targetTable": target,
+            "targetTable": "g7_two_input_out",
             "schedule": "manual",
         },
-        timeout=30,
+        "two-input SQL step",
     )
-    if not create.ok:
+
+    # R1-S5: the direct query is the SAME join the pipeline runs, against the
+    # catalog database, and it carries the Iceberg read setting every other
+    # read of that database in this file carries.
+    direct = ch_query(
+        f"SELECT l.customer, sum(l.amount) FROM {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS l "
+        f"JOIN {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS r ON l.id = r.id "
+        "GROUP BY l.customer ORDER BY l.customer "
+        "SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
+    ).strip()
+    written = ch_query(
+        f"SELECT customer, total FROM silver.`g7_two_input_out` ORDER BY customer FORMAT TabSeparated"
+    ).strip()
+    if direct != written:
         raise G7Failure(
-            f"POST /api/pipelines with inputs and a SQL step failed: "
-            f"{create.status_code} {create.text}"
+            f"the SQL step's output differs from the same query run directly:\n"
+            f"direct:\n{direct}\nwritten:\n{written}"
         )
+    print(f"[g7] two-input SQL step output equals the direct query ({len(written.splitlines())} rows)")
+
+
+def _create_and_run_authored_pipeline(body: dict, label: str) -> None:
+    """Create an authored pipeline from `body`, mark it ready, run it once,
+    and fail the gate on any failed step.
+
+    The create-activate-wait-trigger-wait sequence the two pipeline cases
+    below share, in one place so the two stay byte-identical in every step
+    but the definition itself."""
+    create = API.post(f"{API_URL}/api/pipelines", json=body, timeout=30)
+    if not create.ok:
+        raise G7Failure(f"POST /api/pipelines ({label}) failed: {create.status_code} {create.text}")
     pipeline_id = create.json()["id"]
     activate = API.post(
         f"{API_URL}/api/pipelines/{pipeline_id}/status",
@@ -1269,8 +1296,6 @@ def step_a_two_input_sql_pipeline_matches_a_direct_query() -> None:
         raise G7Failure(f"POST .../status failed: {activate.status_code} {activate.text}")
     job = f"authored__{pipeline_id.replace('-', '_')}"
     _wait_for(f"{job} to load", lambda: _dagster_job_is_loaded(job), 180)
-    # The same trigger-and-wait the fixture pipeline's step uses, with this
-    # pipeline's own job as the start-up-race fallback name.
     trigger = _post_trigger(f"{API_URL}/api/pipelines/{pipeline_id}/trigger", job)
     if not trigger.ok:
         raise G7Failure(f"POST .../trigger failed: {trigger.status_code} {trigger.text}")
@@ -1296,28 +1321,141 @@ def step_a_two_input_sql_pipeline_matches_a_direct_query() -> None:
     failed = [s for s in steps if s.get("status") == "failed"]
     if failed:
         raise G7Failure(
-            f"the two-input run FAILED on step(s) {[s.get('stepKey') for s in failed]}:\n"
+            f"the {label} run FAILED on step(s) {[s.get('stepKey') for s in failed]}:\n"
             f"{_run_failure_message(pipeline_id, run_id)}"
         )
 
-    # R1-S5: the direct query is the SAME join the pipeline runs, against the
-    # catalog database, and it carries the Iceberg read setting every other
-    # read of that database in this file carries.
-    direct = ch_query(
-        f"SELECT l.customer, sum(l.amount) FROM {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS l "
-        f"JOIN {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS r ON l.id = r.id "
-        "GROUP BY l.customer ORDER BY l.customer "
-        "SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
-    ).strip()
-    written = ch_query(
-        f"SELECT customer, total FROM silver.`{target}` ORDER BY customer FORMAT TabSeparated"
-    ).strip()
-    if direct != written:
-        raise G7Failure(
-            f"the SQL step's output differs from the same query run directly:\n"
-            f"direct:\n{direct}\nwritten:\n{written}"
+
+def step_a_form_step_pipeline_matches_its_sql_twin_and_a_direct_query() -> None:
+    """BLD-16 (`BLD-1` part 2): a pipeline written as form steps -- a join,
+    an aggregate and a filter -- runs the statement the API compiles, its
+    output equals a pipeline whose steps are the same bodies as SQL steps
+    (exactly what "Switch to SQL step" writes), and both equal the same
+    query run directly against the Bronze source.
+
+    The join names the right side's `id` `id` -- an output name equal to a
+    join key, the alias question of F2 for joins -- and the filter's
+    `match: "any"` is the OR the compiler renders.
+
+    The stack this gate runs on guarantees ONE loaded Bronze table, so the
+    two inputs are that table under two names, exactly as the two-input
+    SQL-step case above.
+    """
+    inputs = [
+        {"name": "left_orders", "zone": "bronze", "table": BRONZE_TABLE_NAME},
+        {"name": "right_orders", "zone": "bronze", "table": BRONZE_TABLE_NAME},
+    ]
+    form_steps = [
+        {
+            "name": "joined",
+            "kind": "join",
+            "left": "left_orders",
+            "right": "right_orders",
+            "joinType": "inner",
+            "on": [{"left": "id", "right": "id"}],
+            "columns": [
+                {"side": "left", "column": "customer"},
+                {"side": "left", "column": "amount"},
+                {"side": "right", "column": "id", "name": "id"},
+            ],
+        },
+        {
+            "name": "by_customer",
+            "kind": "aggregate",
+            "reads": "joined",
+            "groupBy": ["customer"],
+            "measures": [
+                {"function": "sum", "column": "amount", "name": "total"},
+                {"function": "count", "name": "rows_n"},
+            ],
+            "havingMatch": "all",
+            "having": [{"column": "rows_n", "operator": ">=", "value": "1"}],
+        },
+        {
+            "name": "big_or_local",
+            "kind": "filter",
+            "reads": "by_customer",
+            "match": "any",
+            "conditions": [
+                {"column": "total", "operator": ">", "value": "0"},
+                {"column": "customer", "operator": "!=", "value": ""},
+            ],
+        },
+    ]
+    _create_and_run_authored_pipeline(
+        {
+            "name": "g7_form_steps",
+            "kind": "batch",
+            "inputs": inputs,
+            "steps": form_steps,
+            "targetZone": "silver",
+            "targetTable": "g7_form_steps_out",
+            "schedule": "manual",
+        },
+        "form-steps",
+    )
+
+    # J6: the SQL of each form step, as the console's "Switch to SQL step"
+    # would take it over. Nothing is stored on the way.
+    sql_steps = []
+    for step in form_steps:
+        answer = API.post(
+            f"{API_URL}/api/pipelines/step-sql",
+            json={"inputs": inputs, "steps": form_steps, "step": step["name"]},
+            timeout=30,
         )
-    print(f"[g7] two-input SQL step output equals the direct query ({len(written.splitlines())} rows)")
+        if not answer.ok:
+            raise G7Failure(
+                f"POST /api/pipelines/step-sql for {step['name']} failed: "
+                f"{answer.status_code} {answer.text}"
+            )
+        sql_steps.append({"name": step["name"], "kind": "sql", "sql": answer.json()["sql"]})
+
+    _create_and_run_authored_pipeline(
+        {
+            "name": "g7_form_steps_sql_twin",
+            "kind": "batch",
+            "inputs": inputs,
+            "steps": sql_steps,
+            "targetZone": "silver",
+            "targetTable": "g7_form_steps_sql_out",
+            "schedule": "manual",
+        },
+        "SQL-twin",
+    )
+
+    # The same query the three steps compute, against the catalog database
+    # and with the Iceberg read setting every other read of that database in
+    # this file carries (the pattern of the two-input case above).
+    direct = ch_query(
+        "SELECT customer, sum(amount) AS total, count() AS rows_n "
+        f"FROM {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS l "
+        f"JOIN {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS r ON l.id = r.id "
+        "GROUP BY customer HAVING count() >= 1 AND (sum(amount) > 0 OR customer != '') "
+        "ORDER BY customer SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
+    ).strip()
+    written_form = ch_query(
+        "SELECT customer, total, rows_n FROM silver.`g7_form_steps_out` "
+        "ORDER BY customer FORMAT TabSeparated"
+    ).strip()
+    written_sql = ch_query(
+        "SELECT customer, total, rows_n FROM silver.`g7_form_steps_sql_out` "
+        "ORDER BY customer FORMAT TabSeparated"
+    ).strip()
+    if written_form != written_sql:
+        raise G7Failure(
+            "the form-step pipeline and its SQL twin wrote different outputs:\n"
+            f"form:\n{written_form}\nSQL twin:\n{written_sql}"
+        )
+    if direct != written_form:
+        raise G7Failure(
+            "the form-step pipeline's output differs from the same query run directly:\n"
+            f"direct:\n{direct}\nwritten:\n{written_form}"
+        )
+    print(
+        f"[g7] form steps, their SQL twin and the direct query agree "
+        f"({len(written_form.splitlines())} rows)"
+    )
 
 
 def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
@@ -1533,6 +1671,7 @@ def main() -> int:
         step_verify_graph_and_source()
         step_verify_target_lag_bronze_to_silver(pipeline_id)
         step_a_two_input_sql_pipeline_matches_a_direct_query()
+        step_a_form_step_pipeline_matches_its_sql_twin_and_a_direct_query()
     except G7Failure as exc:
         print(f"[g7] FAILED: {exc}", file=sys.stderr)
         return 1
