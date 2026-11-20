@@ -83,6 +83,7 @@ once a first release is tagged.
 
 ### Changed
 
+- Lineage reads at a glance (backlog `BI-71`; plan `docs/superpowers/plans/2026-11-21-bi-71-lineage-readable.md`). A chart's **Where does this come from** panel is one route read from the source down to the chart, each step a kind icon on one line with its name and kind; a refresh time shows only on a step that has one, the chart's fields sit as chips on the chart step (a recorded mapping as `field ← column`, the full `table.column` in its tooltip), and what is missing is said once under the route, with the server's coverage notes in a help hint. The Catalog **Lineage** map draws the charts that read an asset as one node per dashboard ("QA Auto · 50 charts", largest first; charts the viewer cannot place on a dashboard they can read go under "Other charts"), and a dashboard's node opens in place to list its charts. The map opens fitted to its box and pans and zooms: drag to move, Ctrl/⌘ + wheel or a pinch to zoom, and `+`, `−` and Fit in its corner (`+`, `-`, `0` from the keyboard). No API change.
 - The audit page's person filter lists the people in the trail; settings rows name the settings that changed; the export has the event id and the same outcome words as the page.
 - Alert scheduler runs and alert tests no longer write audit rows.
 - The sign-in page, the sidebar, the browser tab and the embed footer show the workspace's own name, logo and icon when an administrator has set them (backlog `ADM-2`; feature page `docs/core/features/workspace-name-and-logo.md`).
