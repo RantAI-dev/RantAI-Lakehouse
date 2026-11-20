@@ -1911,6 +1911,44 @@ async fn the_audit_list_needs_audit_read_and_a_governance_reader_without_it_is_r
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// The audit trail's actor list — the person filter's source (`GOV-1`
+/// acceptance follow-up, D2) — is its own route with `audit:read` and nothing
+/// else, asserted both ways: no session is 401, a `governance:read` holder
+/// without `audit:read` is 403 with the permission named, and a holder gets
+/// in.
+#[tokio::test]
+async fn the_audit_actors_route_needs_audit_read_and_a_governance_reader_without_it_is_refused() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/governance/audit/actors";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == uri)
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("audit:read")),
+    );
+
+    let none = request_with_cookie(&router, "GET", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+
+    let analyst = create_principal_with_permissions(&pool, "query:read,governance:read").await;
+    let analyst_cookie = session_cookie_for_user(&pool, analyst).await;
+    let refused = request_with_cookie(&router, "GET", uri, &analyst_cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(
+        body.contains("audit:read"),
+        "the refusal names the permission: {body}"
+    );
+
+    let auditor = create_principal_with_permissions(&pool, "governance:read,audit:read").await;
+    let cookie = session_cookie_for_user(&pool, auditor).await;
+    let allowed = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+}
+
 /// `WEB-8` S2 T8 (D8): `GET /api/governance/row-filter-grammar` needs
 /// `policy:read` and nothing less, asserted both ways: no session is 401, a
 /// principal with another permission is 403, and a `policy:read` holder gets

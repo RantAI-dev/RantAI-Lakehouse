@@ -183,6 +183,13 @@ const EX_READ_LIKE: &str = "Decision 1: read-like POST (preview, validate, estim
 const EX_LAG_CHECK: &str = "Decision 1 lists lag-check among the read-like POSTs, but it changes state: the orchestrator calls it on a schedule, it advances the pipeline's lag streak and can send the behind-target alert, and no console user's change is behind it (the run a `run` decision asks for is launched by the orchestrator and kept in its run history)";
 const EX_OVERVIEW: &str = "Read-like POST: `POST /api/overview` takes no body and only reads the latest audit rows (the orchestrator's run list when there is no database); it is a POST for historical reasons, not for a change";
 const EX_TEST_BUTTON: &str = "Decision 1: a connection, email or notification \"test\" button; it sends a probe and changes no configuration";
+/// `POST /api/alerts/run` (`GOV-1` acceptance follow-up, Decision 1). This is
+/// not [`EX_MACHINE`]'s case: the route is closed to persons
+/// (`tests/route_auth.rs`), and the caller is the alert scheduler on its own
+/// tick, so no person's change is behind the run. The rule and its schedule
+/// were audited where they were set up, and what the rule delivered is in
+/// the alert's own delivery history, not in the trail.
+const EX_ALERT_SCHEDULER: &str = "Decision 1: the alert scheduler runs the rule on its own tick, and no person is behind the run; the rule and its schedule were audited where they were set up, and what the rule delivered is in the alert's own history";
 const EX_MACHINE: &str = "Decision 1: machine callback from an ingestion or orchestrator job; the console user's change it reports is audited where the job was started";
 const EX_PART: &str =
     "Decision 1: one part of a multipart upload; the finished upload is audited by `upload.create`";
@@ -241,8 +248,12 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/alerts", Coverage::Central { action: "alert.create", resource_kind: "alert", id_param: IdParam::None }),
     ("PUT", "/api/alerts", Coverage::Central { action: "alert.update", resource_kind: "alert", id_param: IdParam::None }),
     ("DELETE", "/api/alerts", Coverage::Central { action: "alert.delete", resource_kind: "alert", id_param: IdParam::Query("id") }),
-    ("POST", "/api/alerts/test", Coverage::Central { action: "alert.test", resource_kind: "alert", id_param: IdParam::Query("id") }),
-    ("POST", "/api/alerts/run", Coverage::Central { action: "alert.run", resource_kind: "alert", id_param: IdParam::Query("id") }),
+    // `GOV-1` acceptance follow-up (Decision 1): the alert test is a probe
+    // button, and the scheduler's run has no person behind it — see
+    // `EX_TEST_BUTTON` and `EX_ALERT_SCHEDULER`. The rule itself and its
+    // schedule were audited where they were set up.
+    ("POST", "/api/alerts/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
+    ("POST", "/api/alerts/run", Coverage::Excluded { reason: EX_ALERT_SCHEDULER }),
     ("POST", "/api/gold/export/{mart}", Coverage::Central { action: "gold.export", resource_kind: "gold_mart", id_param: IdParam::Path("mart") }),
     ("PUT", "/api/gold/export/{mart}/publication", Coverage::Handler { action: "gold.publication_set" }),
     ("POST", "/api/query/run", Coverage::Handler { action: "query.run" }),
@@ -329,7 +340,13 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/dashboard/comments/mentions/read", Coverage::Excluded { reason: EX_UI_STATE }),
     ("PUT", "/api/dashboard/comments/{id}", Coverage::Central { action: "dashboard_comment.update", resource_kind: "dashboard_comment", id_param: IdParam::Path("id") }),
     ("DELETE", "/api/dashboard/comments/{id}", Coverage::Central { action: "dashboard_comment.delete", resource_kind: "dashboard_comment", id_param: IdParam::Path("id") }),
-    ("PUT", "/api/settings/reporting", Coverage::Central { action: "settings.reporting.update", resource_kind: "settings", id_param: IdParam::None }),
+    // Plan D3: the save names the settings that changed, which only the
+    // handler knows — the store's save returns the row it replaced (plan
+    // D3b) and the handler diffs against it (`routes::settings`
+    // `save_reporting`, `routes::query_limits` `save_limits`). The handler
+    // also writes the row of a save it refuses with `400`/`422`; the gate
+    // keeps writing the `403` refusal.
+    ("PUT", "/api/settings/reporting", Coverage::Handler { action: "settings.reporting.update" }),
     ("POST", "/api/usage/rates", Coverage::Central { action: "usage.rate_create", resource_kind: "settings", id_param: IdParam::None }),
     ("PUT", "/api/settings/email", Coverage::Handler { action: "settings.email.update" }),
     ("POST", "/api/settings/email/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
@@ -343,7 +360,8 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("PUT", "/api/settings/sso", Coverage::Handler { action: "settings.sso.update" }),
     ("POST", "/api/settings/sso/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
     ("POST", "/api/query/cancel", Coverage::Central { action: "query.cancel", resource_kind: "query_run", id_param: IdParam::None }),
-    ("PUT", "/api/settings/limits", Coverage::Central { action: "settings.limits.update", resource_kind: "settings", id_param: IdParam::None }),
+    // Plan D3: Handler — see the settings rows above.
+    ("PUT", "/api/settings/limits", Coverage::Handler { action: "settings.limits.update" }),
     ("POST", "/api/ai/chat", Coverage::Handler { action: crate::routes::ASSISTANT_CHAT_ACTION }),
     ("POST", "/api/ai/tool", Coverage::Handler { action: crate::routes::ASSISTANT_TOOL_ACTION }),
     ("POST", "/api/ai/sessions", Coverage::Excluded { reason: EX_UI_STATE }),

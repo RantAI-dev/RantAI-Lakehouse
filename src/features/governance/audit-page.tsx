@@ -22,6 +22,7 @@ import {
 import { governanceService } from "@/services"
 import { toServiceError } from "@/services/errors"
 import type { AuditEvent, AuditSearchQuery } from "@/services/contracts/governance"
+import { AuditActorPicker, useAuditActors } from "./audit-actor-picker"
 import { getAuditColumns } from "./audit-columns"
 
 /** The eight outcomes an audit row stores, as the server filters on them. */
@@ -100,7 +101,16 @@ function exportCutSentence(total: number | null): string {
   return `The export holds the newest 100,000 of ${matching} matching events. Narrow the time range to get the rest.`
 }
 
-export function EventDetail({ event }: { readonly event: AuditEvent }) {
+export function EventDetail({
+  event,
+  onPickActor,
+}: {
+  readonly event: AuditEvent
+  /** plan D2: filters the trail to the event's principal; absent for readers that only display. */
+  readonly onPickActor?: (actorId: string) => void
+}) {
+  const actorId = event.actorId
+  const actorText = `${event.actor} (${ACTOR_KIND_LABEL[event.actorKind]})`
   return (
     <>
       <div className="flex flex-wrap items-center gap-2">
@@ -113,7 +123,26 @@ export function EventDetail({ event }: { readonly event: AuditEvent }) {
         items={[
           {
             label: "Actor",
-            value: `${event.actor} (${ACTOR_KIND_LABEL[event.actorKind]})`,
+            // plan D2: the actor filters the trail like it does in the table,
+            // unless the event names no principal.
+            value:
+              actorId !== null && onPickActor !== undefined ? (
+                <button
+                  type="button"
+                  className="text-left font-medium text-foreground hover:underline focus:outline-none"
+                  onClick={() => onPickActor(actorId)}
+                >
+                  {actorText}
+                </button>
+              ) : (
+                actorText
+              ),
+          },
+          {
+            // plan D2: the principal id the person filter sends, when there
+            // is one behind the name above.
+            label: "Actor id",
+            value: actorId ?? "—",
           },
           {
             label: "Delegated actor",
@@ -122,9 +151,16 @@ export function EventDetail({ event }: { readonly event: AuditEvent }) {
           { label: "Action", value: event.action },
           { label: "Resource", value: event.resource },
           { label: "Policy decision", value: event.policyDecision },
+          // plan D4: the outcome the row stored, beside the four-word one the
+          // badge shows.
+          { label: "Stored outcome", value: event.outcomeDetail },
           // QA LH-DATA-15-03 F1 (plan D9): a grant's entry says who got
           // which permission; only the rows that carry a detail show it.
           ...(event.detail ? [{ label: "Detail", value: event.detail }] : []),
+          // plan D4b: the row's stored detail column — a refusal reason, a
+          // Central status code, a failed tool's sentence; shown only when
+          // the row holds one.
+          ...(event.reason ? [{ label: "Reason", value: event.reason }] : []),
           ...(event.engineCategory
             ? [
                 {
@@ -190,6 +226,9 @@ export function AuditPage() {
   const first = useService((s) => governanceService.searchAudit(query, s), [
     filtersKey,
   ])
+  // plan D2: the person filter's options come from the trail's own actors
+  // route, so picking a person needs no `identity:read`.
+  const auditActors = useAuditActors()
   const [more, setMore] = React.useState<{
     key: string
     events: AuditEvent[]
@@ -257,7 +296,12 @@ export function AuditPage() {
       : null
 
   const columns = React.useMemo(
-    () => getAuditColumns({ onSelect: (e) => void setUrl({ event: e.id }) }),
+    () =>
+      getAuditColumns({
+        onSelect: (e) => void setUrl({ event: e.id }),
+        // plan D2: clicking the actor narrows the trail to that principal.
+        onPickActor: (actorId) => void setUrl({ actor: actorId }),
+      }),
     // GOV-1 review T-1: `setUrl` is stable, so this still builds once.
     [setUrl]
   )
@@ -336,12 +380,12 @@ export function AuditPage() {
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <label className={FIELD_LABEL}>
             Person
-            <Input
-              aria-label="Person"
+            <AuditActorPicker
+              label="Person"
               value={draft.actor}
-              onChange={(e) => set("actor")(e.target.value)}
-              placeholder="Person id"
-              className="h-8 text-xs"
+              onChange={set("actor")}
+              actors={auditActors.actors}
+              note={auditActors.note}
             />
           </label>
           <label className={FIELD_LABEL}>
@@ -431,10 +475,11 @@ export function AuditPage() {
           </div>
         </div>
         <p className="text-xs text-muted-foreground">
-          Person is the id of a user, service or agent. An action matches whole;
-          end it with a dot (<span className="font-mono">dashboard.</span>) to
-          match every action of that family. Dates are UTC days, and the To day
-          is included.
+          Person is picked from the people, services and agents the trail
+          records; when the list cannot be read, the id can be typed. An
+          action matches whole; end it with a dot (
+          <span className="font-mono">dashboard.</span>) to match every action
+          of that family. Dates are UTC days, and the To day is included.
         </p>
       </form>
       {exportNote ? (
@@ -505,7 +550,12 @@ export function AuditPage() {
         description={selected ? `Audit event ${selected.id}` : undefined}
         wide
       >
-        {selected ? <EventDetail event={selected} /> : null}
+        {selected ? (
+          <EventDetail
+            event={selected}
+            onPickActor={(actorId) => void setUrl({ actor: actorId })}
+          />
+        ) : null}
       </DetailDrawer>
     </div>
   )
