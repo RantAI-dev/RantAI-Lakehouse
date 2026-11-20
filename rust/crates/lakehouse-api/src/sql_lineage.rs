@@ -261,6 +261,9 @@ const MSG_CTE_CASE: &str =
     "the name differs from a WITH name only in letter case, which is not traced";
 const MSG_ALIAS_CAPTURE: &str =
     "the name is also an alias in this SELECT, and ClickHouse reads the alias; rename one";
+// DATA-57 review R3: a FROM alias's column list renames the columns, so the
+// source's own names cannot be trusted for a read through it.
+const MSG_ALIAS_COLUMNS: &str = "read through a FROM alias with a column list, which is not traced";
 
 /// What one statement writes (`INSERT` and `CREATE TABLE ... AS`), an
 /// `INSERT`'s explicit column list, and the query that fills it.
@@ -606,6 +609,16 @@ fn push_factor(factor: &TableFactor, env: &CteEnv, entries: &mut Vec<Entry>) {
                 entries.push(Entry {
                     names,
                     source: Source::Opaque(MSG_TABLE_FUNCTION.to_owned()),
+                });
+                return;
+            }
+            // DATA-57 review R3: `FROM t AS x(a, b)` renames the columns in
+            // the alias list. Mapping by the source's own names would give a
+            // wrong edge, so the entry is opaque with a fixed reason.
+            if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
+                entries.push(Entry {
+                    names,
+                    source: Source::Opaque(MSG_ALIAS_COLUMNS.to_owned()),
                 });
                 return;
             }
@@ -1590,6 +1603,18 @@ mod tests {
         assert_eq!(
             reasons(&l),
             vec![("*".to_owned(), MSG_CTE_UNREADABLE.to_owned())]
+        );
+    }
+
+    // DATA-57 review R3: a FROM alias with a column list renames columns.
+    #[test]
+    fn a_from_alias_with_a_column_list_is_partial() {
+        let l = run("WITH c AS (SELECT id, name FROM silver.users) \
+             SELECT x.id FROM c AS x(name, id)");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_ALIAS_COLUMNS.to_owned())]
         );
     }
 
