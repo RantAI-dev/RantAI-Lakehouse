@@ -290,6 +290,16 @@ struct IncomingMessage {
     content: String,
 }
 
+/// The dashboard on screen, sent only by the dashboard page (`AI-30`). The
+/// server uses it to fill a PDF export's filters; it is never handed to the
+/// model as arguments it could change.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ScreenView {
+    board: String,
+    #[serde(default)]
+    filters: Vec<Value>,
+}
+
 /// `POST /api/ai/chat` request body.
 #[derive(Debug, Default, Deserialize)]
 struct ChatBody {
@@ -299,6 +309,9 @@ struct ChatBody {
     tools: Option<Vec<String>>,
     #[serde(default)]
     context: Option<String>,
+    /// The dashboard on screen; only the dashboard page sends it (`AI-30`).
+    #[serde(default)]
+    view: Option<ScreenView>,
     #[serde(default)]
     messages: Vec<IncomingMessage>,
     /// Answer as an NDJSON progress stream instead of one JSON body; see
@@ -385,6 +398,8 @@ struct PreparedChat {
     /// so what the loop pushes mid-turn cannot change which questions are
     /// checked.
     latest_user: String,
+    /// The dashboard on screen, when the caller was the dashboard page.
+    view: Option<ScreenView>,
 }
 
 /// Hard cap on the page context a client may add to the system prompt, in
@@ -906,6 +921,7 @@ async fn prepare_chat(
         // The same message `system_prompt` read for the closing line: the
         // latest user message of the request, before any loop message.
         latest_user: recent_user.last().copied().unwrap_or_default().to_owned(),
+        view: parsed.view,
     })
 }
 
@@ -1132,6 +1148,7 @@ async fn run_chat(
         is_build,
         allowlisted,
         latest_user,
+        view,
     } = run;
     let mut tool_trace: Vec<Value> = Vec::new();
     let mut build_run_id: Option<String> = None;
@@ -1299,6 +1316,15 @@ async fn run_chat(
             let args = gate::strip_confirmed(
                 &serde_json::from_str::<Map<String, Value>>(&call.function.arguments)
                     .unwrap_or_default(),
+            );
+            // `AI-30`: a PDF of the dashboard on screen takes that screen's
+            // filters when the call sends no view of its own. Server-side and
+            // before the gate — the model cannot name the screen's filters.
+            let args = tools::with_screen_filters(
+                &call.function.name,
+                &args,
+                view.as_ref()
+                    .map(|v| (v.board.as_str(), v.filters.as_slice())),
             );
             // plan 14: an ask after any tool that ran in this turn is refused
             // before the gate, unless the step just before it was another
@@ -3273,6 +3299,26 @@ mod tests {
         }
     }
 
+    /// `AI-30`: the dashboard page's view is read into the chat body, and a
+    /// body without one (every other page, and older clients) still parses.
+    #[test]
+    fn a_chat_body_reads_the_dashboard_on_screen_and_one_without_it_still_parses() {
+        let with: ChatBody = serde_json::from_value(json!({
+            "messages": [{ "role": "user", "content": "Send this PDF" }],
+            "view": { "board": "b1", "filters": [{ "column": "region", "values": ["West"] }] }
+        }))
+        .expect("a body with a view");
+        let view = with.view.expect("a screen view");
+        assert_eq!(view.board, "b1");
+        assert_eq!(view.filters.len(), 1);
+
+        let without: ChatBody = serde_json::from_value(json!({
+            "messages": [{ "role": "user", "content": "Send this PDF" }]
+        }))
+        .expect("a body without a view");
+        assert!(without.view.is_none());
+    }
+
     async fn offered(state: &AppState, tools: Option<&[&str]>) -> Vec<String> {
         let who = analyst(1);
         let prepared = prepare_chat(
@@ -3413,24 +3459,26 @@ mod tests {
                 chat.messages[0].content.clone().unwrap_or_default()
             }
         };
+        // `AI-29..31` review R1: T9 (D13) reworded this note away from the
+        // technical permission and ids. All three checks must read the new
+        // sentence; the old `find` returned None and passed the order check
+        // vacuously (`None < Some`), which hid the drift from a filtered run.
+        let refusal = "tells the person, in the language of the person's message and in plain words, that their account may not change dashboards";
         let viewer = system(analyst(1)).await;
+        assert!(viewer.contains(refusal), "{viewer}");
+        let refusal_at = viewer
+            .find(refusal)
+            .expect("the refusal sentence is present for a viewer");
+        let closing_at = viewer
+            .find(&prompt::closing("Move the map charts to a new tab.", None))
+            .expect("the language line is present");
         assert!(
-            viewer.contains(
-                "tells the person, in the language of the person's message, that the account does not have the dashboard:write permission, so it cannot change dashboards, and asks for an editor or an administrator"
-            ),
-            "{viewer}"
-        );
-        assert!(
-            viewer.find(
-                "tells the person, in the language of the person's message, that the account does not have the dashboard:write permission, so it cannot change dashboards"
-            ) < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
+            refusal_at < closing_at,
             "the sentence comes before the language line"
         );
         let mut editor = analyst(2);
         editor.permissions = lakehouse_auth::PermissionSet::parse("dashboard:write, query:read");
-        assert!(!system(editor).await.contains(
-            "does not have the dashboard:write permission, so it cannot change dashboards"
-        ));
+        assert!(!system(editor).await.contains(refusal));
     }
 
     #[tokio::test]

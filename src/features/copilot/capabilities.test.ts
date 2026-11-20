@@ -169,6 +169,16 @@ describe("the scheduled-report tools", () => {
     for (const tool of [...writers, "list_report_subscriptions"]) expect(serverTools).toContain(tool)
   })
 
+  // AI-30: assistant parity runs both ways — a tool the server added must be
+  // in the console's allowlist or the model can never call it.
+  it("offers every report and recipient tool the server has", () => {
+    const reportTools = serverTools.filter((n) => n.includes("report") || n.includes("recipient"))
+    expect(reportTools).toContain("find_report_recipients")
+    for (const name of reportTools) {
+      expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain(name)
+    }
+  })
+
   it("lists in both modes, and creates, changes and deletes in build mode only", () => {
     for (const mode of ["ask", "build"] as const) {
       expect(toolsFromCaps(new Set(["data"]), mode)).toContain("list_report_subscriptions")
