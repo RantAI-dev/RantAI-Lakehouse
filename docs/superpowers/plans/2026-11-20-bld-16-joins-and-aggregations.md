@@ -1184,3 +1184,51 @@ Notes for the reviewer:
 
 *(the reviewer appends findings per slice and round, tagged `BLOCKER` or
 `SHOULD-FIX`)*
+
+### Round 1 — planner review, 2026-11-20, at `e6922be05`
+
+The Rust side holds: every identifier goes through `Ident::new` and is
+backticked, values through `SqlLiteral`, `left`/`right`/`reads` must name an
+input or an earlier step, the step-SQL route reads no engine and answers with
+the caller's own definition, the route is in `POLICY_TABLE` (`pipeline:write`)
+and asserted both ways in `route_auth.rs`, no `unwrap`/`expect` outside tests.
+The `REL-26` flake commit `fa360bef0` removes no assertion. Accepted.
+
+**R1 BLOCKER: the join pane's automatic output list offers columns the API
+refuses.** `src/features/pipelines/pipeline-editor-panes.tsx:791-798`
+(`setSide`) passes the unfiltered `readItemColumns(...)` to
+`joinOutputColumns`, not the filtered `formColumns(...).columns`. J9: a
+column name the API would refuse is not offered; `lib/pipeline-editor.ts`
+says the pane filters. A side with a column `order date` fills the output
+with it, and save, preview and Show as SQL all fail. Fix: pass the filtered
+lists; add a page test with a column whose name has a space.
+
+**R2 SHOULD-FIX: the read view and the flow never show an aggregate's
+having.** `pipeline-definition.tsx` (aggregate branch) and
+`pipeline-flow-layout.ts` do not mention `having`; the J2 example reads as
+"every group kept" while groups are dropped. Show the having conditions in
+the read view (one line, e.g. "Keep groups where revenue > 1000"), and a
+marker in the flow sublabel; test both.
+
+**R3 SHOULD-FIX: a test doc claims the opposite of the code (rule 1).**
+`rust/crates/lakehouse-api/src/pipeline_forms.rs`, the doc on
+`a_measure_name_that_is_no_column_is_accepted` says a measure reading
+another measure's name is accepted; `read_keys` refuses it with
+`MEASURE_NAME_IS_COLUMN`. Fix the comment and add that case asserting the
+refusal.
+
+**R4 SHOULD-FIX: the Join type select is tied to the wrong field.**
+`pipeline-editor-panes.tsx:830` uses `tie(invalid, "name")`. Tie it to
+`joinType` (add it to `ProblemField` if needed) so a `steps[i].joinType`
+refusal marks the select and a duplicate name does not.
+
+**R5 SHOULD-FIX: an automatic measure name can exceed 48 characters.**
+`src/lib/pipeline-editor.ts:923` `measureName` builds
+`<function>_<column>` with no cap; `valid_name` allows 48. Truncate to 48
+(keep it a valid name) and test with a 40-character column.
+
+Noted, not a finding: whether `ClickHouse`'s analyzer lets a join output alias
+capture a qualified `ON` column is unverified; the `g7` case uses `id AS id`
+only. Add a `g7` variant where an output alias equals the other side's join
+key, if it fits in this PR; otherwise a line in the J3 module doc.
+
