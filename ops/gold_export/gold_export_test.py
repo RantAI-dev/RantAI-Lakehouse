@@ -985,10 +985,6 @@ def step_a_reader_during_a_publish_never_sees_a_mix() -> None:
     # replace below (DATA-6 review R7).
     meta_before = _load_lakekeeper_metadata(f"{MART_NAME}_latest")
     log_before = list(meta_before.get("metadata-log") or [])
-    snapshot_ids_before = {
-        snapshot.get("snapshot-id")
-        for snapshot in (meta_before.get("snapshots") or [])
-    }
 
     reader = threading.Thread(target=read_continuously, daemon=True)
     reader.start()
@@ -1089,23 +1085,23 @@ def step_a_reader_during_a_publish_never_sees_a_mix() -> None:
             raise GoldExportFailure(
                 "DATA-6 D3: the entry before the replace is not the baseline entry"
             )
-        new_snapshots = [
-            snapshot
-            for snapshot in (meta_after.get("snapshots") or [])
-            if snapshot.get("snapshot-id") not in snapshot_ids_before
-        ]
-        operations = sorted(
-            str((snapshot.get("summary") or {}).get("operation"))
-            for snapshot in new_snapshots
-        )
-        if operations not in (["append"], ["delete", "append"], ["overwrite"]):
+        # DATA-6 review R8: assert on the CURRENT snapshot's operation,
+        # not on a sorted list of every new snapshot id. After D11's expiry
+        # only the current snapshot survives, and PyIceberg stages a delete
+        # and an append in the one commit: sorting `["delete", "append"]`
+        # and comparing it to an unsorted tuple would refuse a correct
+        # replace. A writer that emits one `overwrite` snapshot is accepted
+        # too.
+        operation = str((current_snapshot.get("summary") or {}).get("operation") or "")
+        if operation not in ("append", "overwrite"):
             raise GoldExportFailure(
-                f"DATA-6 D3: unexpected replace snapshot operations {operations}"
+                f"DATA-6 D3: the replace's current snapshot has operation "
+                f"{operation!r}, expected 'append' or 'overwrite'"
             )
         print(
             f"[gold-export] DATA-6 D3: metadata log {len(log_before)} -> "
             f"{len(log_after)}; the replace introduced the current snapshot "
-            f"at entry 0 (cleanup may add entries after it); operations {operations}"
+            f"at entry 0 (cleanup may add entries after it); operation {operation}"
         )
 
         delay = time.time() - published_at
