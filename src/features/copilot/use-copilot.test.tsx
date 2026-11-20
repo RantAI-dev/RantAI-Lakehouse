@@ -65,6 +65,10 @@ let sessionOpens: Record<string, { status: number; json: unknown }> = {};
 /** What the list and the writes answer. */
 let sessionList: unknown = { sessions: [], hasMore: false, nextOffset: null, counts: {} };
 let sessionSave: unknown = { ok: true, id: "s1", title: "A saved conversation" };
+/** The bodies of the writes to /api/ai/sessions, so a test can read what was saved. */
+const sessionSaveBodies: string[] = [];
+/** What GET /api/agents/runs/{id} answers, per run id (AI-28). */
+let runOpens: Record<string, unknown> = {};
 let sessionRename: unknown = null;
 let sessionDeleteStatus = 200;
 /** The ids `DELETE /api/ai/sessions?id=` was sent, in order. */
@@ -152,6 +156,8 @@ beforeEach(() => {
   sessionOpens = {};
   sessionList = { sessions: [], hasMore: false, nextOffset: null, counts: {} };
   sessionSave = { ok: true, id: "s1", title: "A saved conversation" };
+  sessionSaveBodies.length = 0;
+  runOpens = {};
   sessionRename = null;
   sessionDeleteStatus = 200;
   deletedSessions.length = 0;
@@ -167,10 +173,17 @@ beforeEach(() => {
       const sent = body ? (JSON.parse(body) as { tool?: string }) : {};
       return fakeResponse("{}", toolResults[sent.tool ?? ""] ?? toolResult);
     }
+    if (url.startsWith("/api/agents/runs/")) {
+      const runId = url.slice("/api/agents/runs/".length);
+      return fakeJson(200, runOpens[runId] ?? { status: "succeeded" });
+    }
     if (url.startsWith("/api/ai/sessions")) {
       const method = init?.method ?? "GET";
       const id = new URL(url, "http://test.invalid").searchParams.get("id");
-      if (method === "POST") return fakeJson(200, sessionSave);
+      if (method === "POST") {
+        sessionSaveBodies.push(body);
+        return fakeJson(200, sessionSave);
+      }
       if (method === "PATCH") {
         const sent = body ? (JSON.parse(body) as { title?: string }) : {};
         return fakeJson(200, sessionRename ?? { ok: true, id, title: sent.title });
@@ -742,5 +755,62 @@ describe("streaming does not re-render the whole Copilot (AI-24 D6)", () => {
       stream.end();
       await sending;
     });
+  });
+});
+
+describe("a reopened conversation shows what happened to its approvals (AI-28, LH-AI-18-09)", () => {
+  it("reads the run on open and never saves the state back into the chat", async () => {
+    sessionOpens = {
+      appr: {
+        status: 200,
+        json: {
+          session: {
+            id: "appr",
+            title: "Delete a chart",
+            mode: "build",
+            messages: [
+              {
+                id: "m1",
+                role: "assistant",
+                content: "The action needs approval.",
+                tools: [
+                  {
+                    tool: "delete_chart",
+                    args: { id: "c1" },
+                    ok: true,
+                    result: {
+                      needs_approval: true,
+                      approval_id: "appr-1",
+                      run_id: "r1",
+                      summary: "Moves chart c1 from its dashboard to the trash.",
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    };
+    runOpens = { r1: { status: "succeeded" } };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.loadSession("appr");
+    });
+    await waitFor(() => {
+      expect(copilot!.messages[0]?.tools?.[0]?.approvalState).toBe("ran");
+    });
+
+    // The next save carries no approvalState: it is read from the run on
+    // every open, not written into the conversation.
+    await act(async () => {
+      await copilot!.send("And now?");
+    });
+    expect(sessionSaveBodies.length).toBeGreaterThan(0);
+    const saved = JSON.parse(sessionSaveBodies.at(-1)!) as {
+      messages: { tools?: Record<string, unknown>[] }[];
+    };
+    expect(saved.messages[0].tools?.[0]?.approvalState).toBeUndefined();
   });
 });

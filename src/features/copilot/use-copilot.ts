@@ -9,10 +9,11 @@ import { notifyDashboardsChanged } from "@/features/dashboards/dashboard-events"
 import { changedABoard, takeNewBoardChanges } from "./board-change";
 import { readNdjson } from "@/lib/ndjson";
 import { notifyError, notifySuccess } from "@/lib/notify";
-import { chatSessionService, chatTermService } from "@/services";
+import { agentService, chatSessionService, chatTermService } from "@/services";
 import { isServiceError } from "@/services/errors";
 import { apiFetch } from "@/services/http";
 import { answerAsk, type AskAnswer } from "./answer-ask";
+import { approvalStateOf } from "./approval-state";
 
 export type Mode = "ask" | "build";
 export type DockPosition = "bottom" | "right";
@@ -193,7 +194,18 @@ export const MAX_CONTINUATIONS = 3;
  * left out of the JSON, so a reopened conversation shows its answers whole.
  */
 function savedMessages(msgs: Msg[]): Msg[] {
-  return msgs.map((m) => ({ ...m, streamed: undefined }));
+  // AI-28 / LH-AI-18-09: `approvalState` is read from the run on open,
+  // never stored, so a later open reads the run again instead of showing
+  // a state that has since changed.
+  return msgs.map((m) => ({
+    ...m,
+    streamed: undefined,
+    tools: m.tools?.map((s) => {
+      const copy = { ...s };
+      delete copy.approvalState;
+      return copy;
+    }),
+  }));
 }
 
 /** A copy of `messages` with one tool step swapped out; `null` if it no longer exists. */
@@ -251,6 +263,10 @@ function useCopilotState() {
   /** A line about the last picked answer (not remembered); any later send, new chat or opened chat clears it. */
   const [askNotice, setAskNotice] = React.useState<string | null>(null);
   const [sessionId, setSessionId] = React.useState<string | null>(null);
+  // AI-28 / LH-AI-18-09: the run lookups started by `loadSession` resolve
+  // later; this says which conversation is still open when they do.
+  const sessionIdRef = React.useRef(sessionId);
+  sessionIdRef.current = sessionId;
   /**
    * The open conversation's title, from the server — not from `sessions`,
    * which holds only the newest 20 (`AI-24` D2). A conversation reopened
@@ -624,10 +640,53 @@ function useCopilotState() {
     setAskNotice(null);
     try {
       const session = await chatSessionService.get(id);
-      setMessages(((session.messages ?? []) as Msg[]).map((m) => (m.id ? m : { ...m, id: newMsgId() })));
+      const loaded = ((session.messages ?? []) as Msg[]).map((m) =>
+        m.id ? m : { ...m, id: newMsgId() }
+      );
+      setMessages(loaded);
       if (session.mode === "build" || session.mode === "ask") setMode(session.mode);
       setSessionId(session.id);
       setSessionTitle(session.title);
+
+      // AI-28 / LH-AI-18-09: a saved step holds the approval request, not
+      // its outcome. Read each run again on open (at most 20) and show
+      // what happened; the state is never persisted back into the chat.
+      const approvals: { messageIndex: number; stepIndex: number; runId: string }[] = [];
+      loaded.forEach((m, messageIndex) => {
+        m.tools?.forEach((step, stepIndex) => {
+          const result = step.result as
+            | { needs_approval?: unknown; run_id?: unknown }
+            | null
+            | undefined;
+          if (
+            result?.needs_approval === true &&
+            typeof result.run_id === "string" &&
+            approvals.length < 20
+          ) {
+            approvals.push({ messageIndex, stepIndex, runId: result.run_id });
+          }
+        });
+      });
+      if (approvals.length > 0) {
+        void Promise.allSettled(approvals.map((a) => agentService.getRun(a.runId))).then(
+          (results) => {
+            // Another conversation (or a new chat) was opened meanwhile.
+            if (sessionIdRef.current !== session.id) return;
+            let next = messagesRef.current;
+            results.forEach((r, i) => {
+              // A failed lookup leaves the step as it was stored.
+              if (r.status !== "fulfilled") return;
+              const a = approvals[i];
+              const updated = replaceToolStep(next, a.messageIndex, a.stepIndex, (msg, step) => ({
+                step: { ...step, approvalState: approvalStateOf(r.value.status) },
+                chartCreated: Boolean(msg.chartCreated),
+              }));
+              if (updated) next = updated;
+            });
+            if (next !== messagesRef.current) setMessages(next);
+          }
+        );
+      }
     } catch (e) {
       // AI-24 D3: a plain sentence, never the API's own text (its 404 body
       // says "sesi tidak ditemukan", which is not something to show).
