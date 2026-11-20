@@ -1105,6 +1105,81 @@ Notes for the reviewer:
   (AGENTS.md rule 4, "a duplicated guard is a finding"). Only the inline
   sequence moved; the assertion and the direct query are unchanged.
 
+### S2 — `bld-16-joins-aggregations`
+
+Same branch as S1, one commit per task, on top of `efcfe63a2`:
+
+- `0257667f2` — T7 contracts and client for the three step kinds and `stepSql`
+- `02e0f518d` — T8 the editor's rules (`EditorStep` kinds, `knownStep`,
+  `joinOutputColumns`, `measureName`, `formColumns`, `switchToSql`,
+  `errorTarget` fields and rows)
+- `e346a4292` — T9 the `Join`, `Aggregate` and `Filter` panes, `ConditionRows`,
+  the rail's add buttons and pane switch
+- `6389f864e` — T10 Show as SQL and Switch to SQL step on all four form panes
+- `8a7e44d83` — T11 the read view's words and the flow's two-in edges
+- `49749aded` — T12 the feature page's limits and plan row, module docs
+- `290e50371` — an intermediate fix to one `REL-26` flake, reverted by
+  `488b4e646` on scope grounds (it fixed one half of another task's item
+  while the sibling flake was still open)
+- `fa360bef0` — both `REL-26` flakes, after finding the second one's cause
+  (see below)
+
+Commands run on the final commit, foreground, from the repo root:
+
+- `bun run typecheck` — clean.
+- `bun run lint` — **0 errors, 11 warnings**, all pre-existing and all in
+  files this slice does not touch (`data-table.tsx`, `sidebar.tsx`,
+  `sso-page.tsx`, `alerts-page.tsx`, `login-page.tsx`, `use-copilot.ts`,
+  `use-data-table.ts`, `dashboard-specs.ts`, `uploads.test.ts`, `http.ts`).
+- `bun test src/lib/ src/features/pipelines/ src/services/clients/pipelines.test.ts`
+  — **1581 pass, 1 skip, 0 fail**, 2498 `expect()` calls, 144 files.
+- `bun run test` — **4641 pass, 1 skip, 0 fail**, 14403 `expect()` calls,
+  4642 tests in 426 files; run twice on the final commit, green both times
+  (90 s and 91 s).
+- `python3 ops/lint/check_bare_iceberg_count.py` and
+  `python3 ops/lint/check_intra_package_imports.py` — both pass.
+- `git status` — clean. No Rust, Python or compose file is touched by S2,
+  so no cargo and no `docker compose` was run, as section 8 says.
+
+Not verified, and why:
+
+- **How the panes look in a browser.** Not verified at all: no API was
+  running in this session, so none of the three new panes, the SQL preview
+  or the Switch-to-SQL confirm was opened, in either theme. The page tests
+  drive the real components through happy-dom (rendered, clicked, asserted),
+  which is not the same claim as "it looks right".
+- The assistant's behaviour with the new kinds (J8) — S1's item, still
+  "not run in CI" by design; S2 does not change it.
+- Rust, `ops/g7`, dagster: untouched by S2; CI's run on the PR stands in,
+  per section 8.
+
+Notes for the reviewer:
+
+- The two full-suite failures seen while verifying were both `REL-26`
+  (`docs/core/BACKLOG.md`), in files BLD-16 does not touch, and I
+  reproduced the `SchemaBrowser` one on this slice's base commit
+  `efcfe63a2` (one of three full-suite runs there), so neither is caused
+  by the three new panes. They are fixed in `fa360bef0` because CI cannot
+  stay red two runs in three, and the rule is that such a check is named,
+  not inherited:
+  - `SchemaBrowser > keeps the table's name unknown on a Trino tab until
+    its detail loads` asserted "the click inserted nothing" immediately,
+    but let the stub's resolved `getAsset` settle first. The studio then
+    recorded a target from a detail carrying no name, the row stopped
+    being "Trino only", and the click inserted the placeholder
+    `undefined.undefined`. The test now holds that read open — the state
+    under test — asserts, then releases it; isolation 10/10 afterwards.
+  - `the created screen waits for the save (LH-SRC-6-39) > does not read
+    the connection settings before the save has answered` asserted
+    synchronously that the ingest panel had read its settings right after
+    the success sentence, while that read is issued by its mount effect.
+    The same assertion now runs in a `waitFor`.
+  No assertion was removed or loosened and no lint rule was touched. The
+  planner should settle `REL-26`'s row on this evidence: both halves are
+  addressed here, in commits the item's own slice did not write.
+- T9's commit body names the tests whose label expectation moved from
+  "Form step" / "· Form" to "Operations", as the plan requires.
+
 ## 12. Review
 
 *(the reviewer appends findings per slice and round, tagged `BLOCKER` or
