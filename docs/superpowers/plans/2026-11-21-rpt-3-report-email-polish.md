@@ -48,3 +48,33 @@ Console: `bun x tsc --noEmit -p .` is not needed for a CSS-only change; run
 `bun x eslint` on any changed TS file. Wrap bun commands in
 `flock /tmp/claude-1000/lh-bun.lock systemd-run --user --scope -q -p
 MemoryMax=3G -p MemorySwapMax=0 nice -n 15 …`. CHANGELOG entry.
+
+## Handoff
+
+Commits: d4c971ccb (constant, sign-off, test, CHANGELOG), a686d1a57 (print
+root white), plus this handoff.
+
+Commands: `rustfmt --edition 2024 --check` on report_runner.rs, settings.rs
+and lakehouse-notify/src/lib.rs: clean. No cargo build/check/clippy/test, no
+eslint (CSS-only console change).
+
+"Rantai Lake" strings a person can read, found in `rust/crates/*/src`:
+1. `report_runner.rs` report email sign-off: fixed (uses `settings::PRODUCT_NAME`).
+2. `lakehouse-notify/src/lib.rs` alert email footer "Rantai Lake — Enterprise
+   Lakehouse Console": fixed to "RantAI Lakehouse" (literal; the notify crate
+   cannot reach the api crate's constant). No test pinned it.
+Not changed: `0018_seed_agents.sql` (applied migration), code comments, and
+docs. There is no plain-text email part; the emails are HTML only, so the
+"text part" has nothing to fix. The test email already said "RantAI Lakehouse";
+its body now uses the constant (same text).
+
+Why the root was dark: the theme provider puts the `dark` class on `<html>`
+(`color-scheme: dark`, dark tokens). The `@page` margin is painted with the
+root/canvas background, while the print rule whitened only `body`. This is
+inferred from the code, not observed in a PDF.
+
+Not verified: Rust is not compiled (CI does it): `{PRODUCT_NAME}` is an inline
+format capture of a `pub(crate)` const from `settings` (declared there, used
+in report_runner via full path); the new test assertions in
+`a_body_without_a_link_or_filters_says_so_and_has_no_anchor`. The PDF margin
+fix is not checked on a real Gotenberg render. No console test added.
