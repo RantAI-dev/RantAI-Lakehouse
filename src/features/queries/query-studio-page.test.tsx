@@ -152,6 +152,24 @@ describe("QueryStudioPage Fix with AI", () => {
     await waitFor(() => expect(run).toHaveBeenCalledTimes(2))
     expect(await screen.findByRole("button", { name: /Fix with AI/ })).toBeTruthy()
   })
+
+  // QS-11 (LH-QS-1-04 F2), D11: a permission refusal is not a broken
+  // statement; changing the SQL cannot help, so no Fix with AI is offered.
+  it("does not offer Fix with AI for a permission refusal", async () => {
+    stubNetwork()
+    spyOn(queryService, "run").mockRejectedValueOnce(
+      new ServiceError("permission_denied", "You may not read this table.")
+    )
+    seedDraft("SELECT amont FROM t")
+    renderPage()
+
+    const runButton = await screen.findByRole("button", { name: "Run query" })
+    await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(runButton)
+
+    expect(await screen.findByText("You don't have access")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /Fix with AI/ })).toBeNull()
+  })
 })
 
 describe("QueryStudioPage format settings", () => {

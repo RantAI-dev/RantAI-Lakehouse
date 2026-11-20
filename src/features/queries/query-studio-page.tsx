@@ -206,15 +206,21 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
                 onRetry={() => void studio.runQuery()}
               />
               {/*
-               * Fix with AI works for ClickHouse only: the check that makes a
-               * proposal safe to show runs as EXPLAIN PLAN, which Trino lacks.
-               * Plan 16 lifts this. The reason is the button's title.
+               * QS-11 (LH-QS-1-04 F2), decision 13: Fix with AI is only for a
+               * statement the person can fix — the server's 400/422 that says
+               * something in the SQL is wrong. A permission refusal, a hidden
+               * table, an outage or a rate limit need a different action;
+               * changing the SQL cannot help. Fix with AI also works for
+               * ClickHouse only: the check that makes a proposal safe to show
+               * runs as EXPLAIN PLAN, which Trino lacks (plan 16 lifts this).
                */}
-              <FixWithAiButton
-                engine={studio.engine}
-                busy={studio.fix.busy}
-                onFix={() => void studio.fix.run(openRun.error.message, openRun.statement)}
-              />
+              {openRun.error.code === "invalid_request" ? (
+                <FixWithAiButton
+                  engine={studio.engine}
+                  busy={studio.fix.busy}
+                  onFix={() => void studio.fix.run(openRun.error.message, openRun.statement)}
+                />
+              ) : null}
             </div>
           ) : null}
           {openRun?.status === "not-run" ? (
