@@ -259,6 +259,29 @@ mint an admin-bypass token for anyone who could reach it with no
 credential. Reach it via `docker compose exec` or a container on the
 compose network for debugging, not by republishing `OIDC_MOCK_HOST_PORT`.
 
+#### oidc-mock: token lifetime
+
+The tokens the mock pre-mints live on the `lakehouse_oidc_tokens` volume,
+and that volume is PERSISTENT: they survive a container restart and every
+deploy. They are therefore **replaced** when they get close to expiring —
+`mint_tokens` re-mints a principal whose token has expired or that expires
+within `TOKEN_REFRESH_MARGIN_SECONDS` (7 days), and a background thread
+runs that check hourly. A replaced token is not revoked: the old one stays
+valid until its own `exp`, and the `sub` claim (the identity Lakekeeper's
+grants were given to) never changes.
+
+This is what the volume did NOT do: a token volume that is only ever
+written when it is first created keeps the tokens it minted that day, and
+they expire on their own `exp` with nothing replacing them. On the staging
+VM that expiry was **2026-12-05 07:04 UTC**, and the one-shot init jobs
+that read `admin.jwt` off the volume (`lakekeeper-warehouse-init`,
+`lakekeeper-authz-init`) would have failed from that moment on — `admin`
+is the one principal the on-demand `/token` endpoint refuses to mint, so
+there was no way to renew it without touching the volume by hand.
+
+If the mock is replaced with a real IdP, none of this applies — see ADR
+0011's "what a real IdP swap has to account for".
+
 ### SeaweedFS (opt-in, P2 — storage-compatibility matrix only)
 
 `seaweedfs`, `seaweedfs-bucket-init`, and
