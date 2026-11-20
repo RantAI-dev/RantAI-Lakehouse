@@ -36,7 +36,7 @@ shows the name.
 | Capability | Today | Target |
 | --- | --- | --- |
 | Workspace name | "Rantai Lake", fixed in code | Set in Settings → General, at most 60 characters *(proposed)* |
-| Logo | `public/logo-light.png` and `logo-dark.png` | Uploaded in Settings → General: one logo, plus an optional second one for dark mode |
+| Logo | `public/logo-light.svg` and `logo-dark.svg` (the official mark, `WEB-15`; were the `.png` files) | Uploaded in Settings → General: one logo, plus an optional second one for dark mode |
 | Browser-tab icon | `public/icon-*-32.png` | Uploaded, optional; without one, the product's icon stays |
 | Logo file | n/a | PNG, JPEG or WebP, at most 512 KB *(proposed)*. The server checks the file's first bytes, not its name. SVG is refused, because an SVG can carry a script |
 | Icon file | n/a | PNG, at most 64 KB *(proposed)* |
