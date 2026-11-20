@@ -3071,8 +3071,10 @@ mod tests {
         // `update_report_subscription` and `delete_report_subscription`
         // (`AI-10`, with `RPT-1`) + `set_cache_rule` (`BI-4` part B)
         // + `list_maps` (`BI-16` part C2, `AI-5`) + `list_dashboard_comments`
-        // (`BI-37` D8) + the four signed-embed tools (`BI-26` slice 2).
-        assert_eq!(tool_schemas().len(), 115);
+        // (`BI-37` D8) + the four signed-embed tools (`BI-26` slice 2)
+        // + `find_report_recipients` (`AI-30`). `AI-29..31` review R1: the
+        // whole-lib run caught the count still pinned at main's 115.
+        assert_eq!(tool_schemas().len(), 116);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,

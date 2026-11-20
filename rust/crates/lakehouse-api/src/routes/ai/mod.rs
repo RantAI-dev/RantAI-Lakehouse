@@ -3459,24 +3459,26 @@ mod tests {
                 chat.messages[0].content.clone().unwrap_or_default()
             }
         };
+        // `AI-29..31` review R1: T9 (D13) reworded this note away from the
+        // technical permission and ids. All three checks must read the new
+        // sentence; the old `find` returned None and passed the order check
+        // vacuously (`None < Some`), which hid the drift from a filtered run.
+        let refusal = "tells the person, in the language of the person's message and in plain words, that their account may not change dashboards";
         let viewer = system(analyst(1)).await;
+        assert!(viewer.contains(refusal), "{viewer}");
+        let refusal_at = viewer
+            .find(refusal)
+            .expect("the refusal sentence is present for a viewer");
+        let closing_at = viewer
+            .find(&prompt::closing("Move the map charts to a new tab.", None))
+            .expect("the language line is present");
         assert!(
-            viewer.contains(
-                "tells the person, in the language of the person's message, that the account does not have the dashboard:write permission, so it cannot change dashboards, and asks for an editor or an administrator"
-            ),
-            "{viewer}"
-        );
-        assert!(
-            viewer.find(
-                "tells the person, in the language of the person's message, that the account does not have the dashboard:write permission, so it cannot change dashboards"
-            ) < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
+            refusal_at < closing_at,
             "the sentence comes before the language line"
         );
         let mut editor = analyst(2);
         editor.permissions = lakehouse_auth::PermissionSet::parse("dashboard:write, query:read");
-        assert!(!system(editor).await.contains(
-            "does not have the dashboard:write permission, so it cannot change dashboards"
-        ));
+        assert!(!system(editor).await.contains(refusal));
     }
 
     #[tokio::test]
