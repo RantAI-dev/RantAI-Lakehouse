@@ -1651,6 +1651,73 @@ mod tests {
         );
     }
 
+    // DATA-57 T4: the form steps of #619, by their byte-for-byte rendered
+    // text. No #619 code is needed here; these pin the shapes T5 unblocks.
+
+    #[test]
+    fn a_join_an_aggregate_and_a_filter_as_compiled_are_traced() {
+        let l = run("WITH \
+             `orders` AS (SELECT * FROM silver.`orders`), \
+             `users` AS (SELECT * FROM silver.`users`), \
+             `joined` AS (SELECT `__left`.`id` AS `id`, `__left`.`Amount` AS `amount`, \
+             `__right`.`name` AS `name` FROM `orders` AS `__left` LEFT JOIN `users` AS `__right` \
+             ON `__left`.`id` = `__right`.`id`), \
+             `by_name` AS (SELECT `name`, sum(`amount`) AS `revenue`, count() AS `order_count`, \
+             count(DISTINCT `id`) AS `ids` FROM `joined` GROUP BY `name` HAVING sum(`amount`) > 1000), \
+             `big` AS (SELECT * FROM `by_name` WHERE `revenue` >= '5000' OR `name` = 'ID') \
+             SELECT * FROM `big`");
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("name", "silver.users.name", "copy"),
+                t("revenue", "silver.orders.Amount", "expression"),
+                t("ids", "silver.orders.id", "expression"),
+            ]
+        );
+        assert_eq!(l.constants, vec!["order_count".to_owned()]);
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn a_self_join_as_compiled_maps_both_sides_to_the_one_table() {
+        let l = run("WITH \
+             `orders` AS (SELECT * FROM silver.`orders`), \
+             `tree` AS (SELECT `__left`.`id` AS `id`, `__right`.`id` AS `parent` \
+             FROM `orders` AS `__left` INNER JOIN `orders` AS `__right` \
+             ON `__left`.`id` = `__right`.`region`) \
+             SELECT * FROM `tree`");
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("id", "silver.orders.id", "copy"),
+                t("parent", "silver.orders.id", "copy"),
+            ]
+        );
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn every_measure_function_as_rendered_reads_its_column() {
+        for expr in [
+            "count(`id`)",
+            "count(DISTINCT `id`)",
+            "sum(`id`)",
+            "avg(`id`)",
+            "min(`id`)",
+            "max(`id`)",
+        ] {
+            let sql = format!(
+                "WITH `o` AS (SELECT * FROM silver.`orders`), \
+                 `m` AS (SELECT {expr} AS `x` FROM `o`) SELECT * FROM `m`"
+            );
+            assert_eq!(
+                triples(&run(&sql)),
+                vec![t("x", "silver.orders.id", "expression")],
+                "{expr}"
+            );
+        }
+    }
+
     #[test]
     fn a_union_makes_every_output_of_the_left_branch_partial() {
         let l = run("SELECT id, name FROM silver.users UNION ALL SELECT id, id FROM silver.orders");
