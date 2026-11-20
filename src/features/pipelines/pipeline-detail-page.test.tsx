@@ -312,7 +312,8 @@ describe("the pipeline page's flow of inputs and steps (BLD-1 part 1)", () => {
 
     const chart = await screen.findByRole("group", { name: "Pipeline flowchart" })
     within(chart).getByText("paid").closest("button")?.click()
-    expect(await screen.findByText("Step 1 of 2 · Form")).toBeTruthy()
+    // BLD-16 / J9: the read view says the editor's word for the kind.
+    expect(await screen.findByText("Step 1 of 2 · Operations")).toBeTruthy()
     expect(screen.getByText("filter(status = 'paid')")).toBeTruthy()
   })
 })
@@ -334,5 +335,119 @@ describe("the pipeline page's lineage link (WEB-3 S3-D9)", () => {
     renderPage()
     const link = await screen.findByRole("link", { name: "open in Lineage" })
     expect(link.getAttribute("href")).toBe("/lineage?focus=pl-connector-1")
+  })
+})
+
+// ── BLD-16 (BLD-1 part 2) / J9: the new kinds in words ───────────────────
+
+describe("the pipeline page's form steps in words (BLD-16)", () => {
+  const SQL_BASE = {
+    sourceZone: "bronze",
+    sourceTable: "orders_raw",
+    incrementalColumn: null,
+    transforms: [],
+    fbicEnabled: false,
+    targetZone: "silver",
+    targetTable: "sales_by_country",
+    connectorId: null,
+  }
+
+  /** The plan's J2 example: the three new kinds, one after the other. */
+  const formSteps: PipelineDetail = {
+    ...PIPELINE,
+    definition: {
+      ...SQL_BASE,
+      inputs: [
+        { name: "orders", zone: "bronze", table: "orders_raw" },
+        { name: "customers", zone: "bronze", table: "customers" },
+      ],
+      steps: [
+        {
+          name: "joined",
+          kind: "join",
+          left: "orders",
+          right: "customers",
+          joinType: "left",
+          on: [{ left: "customer_id", right: "id" }],
+          columns: [
+            { side: "left", column: "order_id" },
+            { side: "left", column: "amount" },
+            { side: "right", column: "country" },
+            { side: "right", column: "id", name: "customer_ref" },
+          ],
+        },
+        {
+          name: "by_country",
+          kind: "aggregate",
+          reads: "joined",
+          groupBy: ["country"],
+          measures: [
+            { function: "sum", column: "amount", name: "revenue" },
+            { function: "count", name: "order_count" },
+          ],
+          havingMatch: "all",
+          having: [{ column: "revenue", operator: ">", value: "1000" }],
+        },
+        {
+          name: "big_or_local",
+          kind: "filter",
+          reads: "by_country",
+          match: "any",
+          conditions: [
+            { column: "revenue", operator: ">=", value: "5000" },
+            { column: "country", operator: "=", value: "ID" },
+          ],
+        },
+      ],
+    },
+  }
+
+  it("shows each of the three kinds in words, with what it computes", async () => {
+    search = "tab=definition"
+    stubApi({ status: () => "completed", pipeline: formSteps })
+    renderPage()
+
+    const chart = await screen.findByRole("group", { name: "Pipeline flowchart" })
+    within(chart).getByText("joined").closest("button")?.click()
+    expect(await screen.findByText("Step 1 of 3 · Join")).toBeTruthy()
+    // J9's own words: "left join of orders and customers on customer_id = id".
+    // (The paragraph marks the names in spans, so the sentence is read from
+    // the page's text, not from one element.)
+    await waitFor(() => expect(document.body.textContent).toContain("left join of orders and customers on"))
+    expect(document.body.textContent).toContain("customer_id = id")
+    expect(document.body.textContent).toContain("id as customer_ref")
+
+    within(chart).getByText("by_country").closest("button")?.click()
+    expect(await screen.findByText("Step 2 of 3 · Aggregate")).toBeTruthy()
+    await waitFor(() => expect(document.body.textContent).toContain("Group by country"))
+    expect(document.body.textContent).toContain("revenue = sum of amount")
+    expect(document.body.textContent).toContain("order_count = count")
+    // BLD-16 review R2: a having drops groups, so the words say it does.
+    expect(document.body.textContent).toContain("Keep groups where revenue > 1000")
+
+    within(chart).getByText("big_or_local").closest("button")?.click()
+    expect(await screen.findByText("Step 3 of 3 · Filter")).toBeTruthy()
+    await waitFor(() => expect(document.body.textContent).toContain("any of 2 conditions"))
+    expect(document.body.textContent).toContain("revenue >= 5000")
+    expect(document.body.textContent).toContain("country = ID")
+  })
+
+  it("still shows a stored record for a kind it cannot show — a join whose fields do not parse", async () => {
+    search = "tab=definition"
+    const broken: PipelineDetail = {
+      ...PIPELINE,
+      definition: {
+        ...SQL_BASE,
+        inputs: [{ name: "orders", zone: "bronze", table: "orders_raw" }],
+        steps: [{ name: "joined", kind: "join", left: "orders" }],
+      },
+    }
+    stubApi({ status: () => "completed", pipeline: broken })
+    renderPage()
+
+    const chart = await screen.findByRole("group", { name: "Pipeline flowchart" })
+    within(chart).getByText("joined").closest("button")?.click()
+    expect(await screen.findByText("Step 1 of 1 · join")).toBeTruthy()
+    expect(document.body.textContent).toContain('"left": "orders"')
   })
 })

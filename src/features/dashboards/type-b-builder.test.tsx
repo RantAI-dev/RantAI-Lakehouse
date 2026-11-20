@@ -108,7 +108,7 @@ describe("ChartBuilder histogram (BI-16 part B)", () => {
     // One number column, no breakdown, no measure rows.
     expect(screen.getByText("Number column")).toBeTruthy()
     expect(document.querySelector('[data-slot="breakdown-field"]')).toBeNull()
-    expect(screen.queryByText("Measure (Y)")).toBeNull()
+    expect(screen.queryByText("Value", { selector: "label" })).toBeNull()
     expect(screen.getByLabelText("Ranges").textContent).toContain("A number of ranges")
     expect((screen.getByLabelText("Number of ranges") as HTMLInputElement).value).toBe("10")
   })

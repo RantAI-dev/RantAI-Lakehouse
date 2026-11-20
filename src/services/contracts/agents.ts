@@ -142,10 +142,15 @@ export type DecideApprovalInput = {
  * and for an approve where the approver lacked the underlying tool's own
  * permission (the approval itself still gets decided; the tool never
  * runs).
+ *
+ * `notExecuted` is the 200 answer's way of saying why a recorded decision
+ * did not run (AI-28 / LH-AI-18-07): the approver lacked the action's own
+ * permission. It is absent when the tool ran or the decision was a reject.
  */
 export type DecideApprovalResult = {
   approval: ApprovalItem
   executed: boolean
+  notExecuted?: { reason: "permission" | string; required: string }
   result?: unknown
 }
 

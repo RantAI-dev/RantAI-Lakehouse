@@ -310,9 +310,10 @@ export function AppSidebar() {
       <SidebarHeader className="flex h-16 shrink-0 flex-col justify-center border-b border-sidebar-border px-3 py-0 group-data-[collapsible=icon]:px-2">
         <div className="flex min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:justify-center">
           <BrandLogo branding={branding} />
-          <div className="grid min-w-0 flex-1 gap-0.5 leading-none group-data-[collapsible=icon]:hidden">
-            <span className="text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">{branding.name}</span>
-          </div>
+          {/* Owner QA 2026-11-14, sidebar width: at 14rem the name stands alone, on one line. */}
+          <span className="min-w-0 flex-1 text-sm leading-none font-semibold tracking-[-0.084px] whitespace-nowrap text-sidebar-foreground group-data-[collapsible=icon]:hidden">
+            {branding.name}
+          </span>
         </div>
       </SidebarHeader>
 
