@@ -114,3 +114,38 @@ Never the full `bun run test` or `bun run lint`. Wrap every bun command in
 MemoryMax=3G -p MemorySwapMax=0 nice -n 15 …`. Per commit:
 `bun x tsc --noEmit -p .`, `bun x eslint <changed files>`, and
 `bun test <the test files of the changed features>`. No prettier.
+
+## Handoff
+
+Developer: Claude Sonnet. Branch `fix/ux-7-settings-polish`, not pushed.
+
+Commits (one per task):
+
+```
+  ee3a4ef3f UX-7 docs(changelog): Settings help and no browser-drawn lists
+  6d19f13dc UX-7 feat(ui): the other datalists become the console's own suggestion field
+  1e33939ce UX-7 feat(settings): one-line help on the other Settings pages
+  fa36a02b2 UX-7 feat(settings): one-line help and one label per field on Reporting
+  744f13f66 UX-7 feat(ui): HelpTip, a help popover that opens on hover, focus and tap
+  614c59b09 UX-7 feat(settings): the report time zone uses TimeZoneSelect, moved to patterns
+  59250aeb7 UX-7 chore(lint): refuse a native datalist, use Combobox
+```
+
+T1 lint selector, T2 `TimeZoneSelect` moved + `disabled` + `zones`, T3 `HelpTip` + test, T4 Reporting copy and Number format, T5 other Settings pages, T6 four datalists, T7 CHANGELOG.
+
+Commands (each wrapped in flock + systemd-run, MemoryMax=3G), on the final commit:
+
+- `bun x tsc --noEmit -p .`: clean.
+- `bun x eslint <every changed src file> eslint.config.mjs`: 0 errors, 0 warnings.
+- `bun test src/features/admin src/features/dashboards/subscriptions-dialog.test.tsx src/features/dashboards/format-section.test.tsx src/features/connectors/table-finder.test.tsx src/features/governance/lineage-page.test.tsx src/features/pipelines src/components/patterns`: 464 pass, 0 fail, 45 files.
+- T1 check: eslint on a scratch `<datalist>` file reported the `UX-7` message (scratch file not committed).
+- `grep "<datalist" src` (non-test): only a doc comment remains.
+
+Notes and deviations:
+
+- `HelpHint` (`patterns/help-hint.tsx`) already exists with the same popover; `HelpTip` follows the plan (accessible name "More about <heading>", 20 px) and its doc comment says when to use which. Not merged, per the plan.
+- T6 adds one shared `src/components/patterns/suggest-input.tsx` (free text + the console's `Combobox`) used by all four sites instead of four copies. A field that already holds one of the names lists them all when opened.
+- Line numbers in the T5 table had moved; edits were matched by their text. The `query-limits` line at "205" has no heading, so its `HelpTip` sits at the end of that line (heading name "the time limit").
+- Existing tests that read the old long paragraphs or the `datalist` were updated (download-switch paragraph, "Numbers" heading, schema and pipeline-table suggestions). Added: HelpTip test, a Reporting help-tip test, series-name test, lineage-page test.
+- Not verified: no browser or phone check of the popover and the combobox (happy-dom only); one-line fit of the copy at 384 px was not measured. `bun run lint` and the full `bun run test` were not run (VM memory); CI runs them.
+- `node_modules` symlink used as is; no `bun install`.
