@@ -482,6 +482,37 @@ def test_two_reuploads_with_the_newer_load_queued_start_gold_once_for_r2() -> No
     )
 
 
+def test_a_tick_that_launches_a_run_yields_no_skip_reason() -> None:
+    """BLD-14 G9: Dagster refuses a tick that yields both a RunRequest and
+    a SkipReason (CheckError on the chain sensor). With one root ready and
+    another still waiting, this tick must yield ONLY the RunRequest; the
+    waiting root's explanation goes to the log, not to a SkipReason."""
+    base = time.time() - 400
+    roots = [
+        _root_record("R-ready", "orders", base + 200),
+        _root_record("R-wait", "other", base + 100),
+    ]
+    parent = SimpleNamespace(
+        run_id="silver-ready",
+        job_name="authored__pl_silver",
+        status=DagsterRunStatus.SUCCESS,
+        tags={REUPLOAD_ROOT_TAG: "R-ready", REUPLOAD_TABLE_TAG: "orders"},
+    )
+    instance = _StubInstance(roots, [SimpleNamespace(dagster_run=parent, end_time=base + 200)])
+    context = _StubContext('{"floor": 0, "settled": []}', instance)
+    entries = {
+        "orders": ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",)),
+        "other": ChainEntry(parents=("pl-other-parent",), ancestors=("pl-other-parent",)),
+    }
+    body = _sensor(entries)._raw_fn
+
+    with patch("dispar_orchestrate.reupload_chain._post_chain_step", return_value=True):
+        out = list(body(context))
+
+    assert len(out) == 1, f"only the launched run may be yielded: {out}"
+    assert isinstance(out[0], RunRequest), f"a launching tick yields no SkipReason: {out}"
+
+
 def test_a_reupload_is_not_lost_behind_twenty_one_loads_of_other_tables() -> None:
     """BLD-14 review R1: a chain waits up to six hours. Twenty-one loads of
     other tables after the re-upload must not push it out of the sensor's

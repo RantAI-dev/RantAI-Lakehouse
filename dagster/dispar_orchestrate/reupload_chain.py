@@ -29,6 +29,11 @@ tagged run, so downstream pipelines never wait on a re-upload that was
 silently dropped. The other option offered (counting a later untagged
 first run as the newer load) was not taken.
 
+BLD-14 G9 (real gate run 44771928694): Dagster's daemon rejects a tick that
+yields both a `RunRequest` and a `SkipReason`. A tick that launches anything
+therefore yields only its `RunRequest`s; the reasons why other roots waited
+go to the log. A tick that launches nothing yields exactly one `SkipReason`.
+
 This module imports from `authored_factory`, never the reverse: the graph
 and the wire helpers live there, and this file only turns them into
 Dagster sensors. With `PIPELINE_RUN_TOKEN` unset it builds no sensors and
@@ -400,7 +405,14 @@ def build_reupload_chain_sensor(
         context.update_cursor(
             json.dumps({"floor": floor, "settled": settled[-SETTLED_LIMIT:]})
         )
-        if not roots:
+        # BLD-14 G9: Dagster accepts either RunRequests or exactly one
+        # SkipReason per evaluation, never both -- the daemon raised
+        # CheckError when a launch tick also yielded a skip explanation.
+        if launched:
+            # The tick already yielded RunRequests; explanations for the
+            # roots that waited belong in the log, not in a SkipReason.
+            _LOGGER.info("BLD-14: tick for %s: %s", pipeline_id, "; ".join(waits))
+        elif not roots:
             yield SkipReason("BLD-14: no re-upload in the window for this pipeline")
         elif waits:
             yield SkipReason("; ".join(waits))
