@@ -87,3 +87,24 @@ background. In `@media print`, `html` now also has
 `color-scheme: light !important` (white backgrounds kept) and the comment says
 why. Screen styles are unchanged. Not re-rendered by me; the CSS is not
 compiled or tested on this VM.
+
+## Handoff 3
+
+PR #641 review SHOULD-FIX 2: `src/components/app-shell/console-theme-provider.tsx`
+wraps the design system's `ThemeProvider` and passes `forcedTheme="light"` when
+`usePathname()` is `/render` or under `/render/`; elsewhere nothing is forced.
+`src/app/layout.tsx` uses it in place of the bare provider. `design-system/` and
+the print CSS are unchanged.
+
+Checks (bun via flock + systemd-run, temporary node_modules symlink removed):
+`bun test src/components/app-shell/console-theme-provider.test.tsx` 3 pass;
+`bun x tsc --noEmit -p .` no output; `bun x eslint` on the three changed files
+no output. Test: light forced on `/render/report/x`, not on `/dashboards`, and
+the path matcher.
+
+Race check: the render views (`render-view.tsx`) mark ready (`markReady`) only
+after their data has loaded and every tile drew or failed; nothing in them reads
+or waits on the theme (they draw light by their own `dashboardLook`). next-themes
+gets `forcedTheme` on first render (the pathname is known on the server), so the
+class and `color-scheme` are set at mount, before the data fetch completes. Not
+confirmed by a real render.
