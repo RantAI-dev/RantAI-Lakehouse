@@ -172,7 +172,8 @@ describe("ReportingSettingsForm", () => {
     expect(await screen.findByRole("img", { name: "#112233" })).toBeDefined()
     expect(screen.queryByRole("button", { name: "Add colour" })).toBeNull()
     expect(screen.queryByRole("button", { name: "Remove #112233" })).toBeNull()
-    expect(screen.getByRole("heading", { name: "Numbers" })).toBeDefined()
+    expect(screen.getByLabelText("Number format")).toBeDefined()
+    expect(screen.queryByRole("heading", { name: "Numbers" })).toBeNull()
     expect(screen.getByRole("heading", { name: "Fonts" })).toBeDefined()
   })
 
@@ -227,12 +228,12 @@ describe("ReportingSettingsForm", () => {
     mockSettings(DEFAULTS)
     render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
 
-    const paragraph = (await screen.findByText(/A checked role cannot use the console/)) as HTMLElement
-    expect(paragraph.textContent).toContain("a Query Studio result download")
-    expect(paragraph.textContent).toContain('"Copy as TSV"')
-    expect(paragraph.textContent).toContain(
-      "It does not stop a person from selecting and copying what is on the screen."
-    )
+    // UX-7: the line says the rule, the help tip holds what it covers.
+    expect(await screen.findByText("Checked roles cannot export or download.")).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "More about Block downloads for these roles" }))
+    const tip = (await screen.findByText(/Query Studio result downloads/)) as HTMLElement
+    expect(tip.textContent).toContain("Copy as TSV")
+    expect(tip.textContent).toContain("It cannot stop copying from the screen.")
   })
 
   it("shows no downloads section to a caller who may not read the list (PR #204 review SHOULD-FIX 3)", async () => {
@@ -267,7 +268,7 @@ describe("ReportingSettingsForm", () => {
     mockSettings(READER_DEFAULTS)
     render(<ReportingSettingsForm canWrite={false} zoneList={zoneList} />)
     await screen.findByLabelText("Report time zone")
-    expect(screen.queryByRole("heading", { name: "Reports: outside email domains" })).toBeNull()
+    expect(screen.queryByRole("heading", { name: "Outside email domains" })).toBeNull()
     expect(screen.queryByLabelText("Report domain")).toBeNull()
   })
 
@@ -294,5 +295,15 @@ describe("ReportingSettingsForm", () => {
     fireEvent.change(colour, { target: { value: "#112233" } })
     fireEvent.click(screen.getByRole("button", { name: "Add colour" }))
     expect(screen.getAllByText("Unsaved changes").length).toBe(2)
+  })
+})
+
+describe("help text on Settings > Reporting (UX-7)", () => {
+  it("keeps the detail in a help tip that opens on a click, and the line under the heading short", async () => {
+    mockSettings(DEFAULTS)
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+    fireEvent.click(await screen.findByRole("button", { name: "More about Public links" }))
+    expect(await screen.findByText(/Nothing is deleted: turning it on again/)).toBeDefined()
+    expect(screen.getByText("Off stops every public link at once.")).toBeDefined()
   })
 })
