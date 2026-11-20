@@ -423,7 +423,10 @@ export function DashboardListPage() {
   // leaves the dashboards usable.
   // Until the session is known the templates read is a stand-in (`canFile` is
   // still false), so the list also waits for it.
-  const loading = auth.status === "loading" || state.status === "loading" || reportsState.status === "loading" || !templatesReady || outlinesState.status === "loading"
+  // PR #530 review SHOULD-FIX: outlines (`GET /api/dashboard/specs`) stay out
+  // of `loading` so the table does not block on every chart spec; thumbnails
+  // fall back to glyphs until outlines arrive or when they fail.
+  const loading = auth.status === "loading" || state.status === "loading" || reportsState.status === "loading" || !templatesReady
   const tabs = tabValues.map((v) => ({ value: v, label: TAB_LABEL[v] }))
   const setTab = (next: TabValue) => {
     setTabRaw(next)

@@ -593,4 +593,20 @@ describe("the page while it loads", () => {
     release()
     await screen.findByText("QA BI")
   })
+
+  // PR #530 review SHOULD-FIX: the list renders as soon as boards/reports/templates
+  // land, without waiting on GET /api/dashboard/specs.
+  it("renders the list rows while /api/dashboard/specs is still pending", async () => {
+    let releaseSpecs = () => {}
+    const pendingSpecs = new Promise<void>((resolve) => { releaseSpecs = resolve })
+    serve(["dashboard:read", "dashboard:write"], {
+      "GET /api/dashboard/specs": (() => pendingSpecs.then(() => json({ charts: [{ id: "u1", board: "b1", kind: "bar" }] }))) as unknown as () => Response,
+    })
+    renderPage()
+    await screen.findByText("QA BI")
+    expect(screen.queryByRole("status", { name: "Loading dashboards" })).toBeNull()
+    expect(document.querySelectorAll('svg[role="presentation"]')).toHaveLength(0)
+    releaseSpecs()
+    await waitFor(() => expect(document.querySelectorAll('svg[role="presentation"]').length).toBeGreaterThan(0))
+  })
 })
