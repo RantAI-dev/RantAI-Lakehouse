@@ -169,7 +169,53 @@ changes on purpose.
 
 ## Handoff
 
-(developer appends here)
+### Handoff: SRC-48, one PR slice
+
+Developer: Sonnet. Branch `fix/src-48-replace-drops-left-out-columns` (not pushed).
+
+Commits, in order:
+
+1. `8393eb0f6` SRC-48 test: measure that a replace leaving a column out keeps it with nulls
+2. `6f0cecbfd` SRC-48 fix(sink): a replaced table drops the columns left out of it
+3. `0ba07b0a4` SRC-48 test: prove the replace drops the columns left out and keeps the rest
+4. `69f080f59` SRC-48 fix(ingest): the SQL paths pass a table's excluded columns to the sink
+5. this commit: feature-page line and this Handoff
+
+Task 1 measurement (dlt 1.30.0, local filesystem Iceberg): after a second replace
+whose rows carry `a, b` only, BOTH stores kept `c`: the Iceberg table (column
+present, nulls in the new rows) and the stored `dlt` schema (`default_schema.tables["t"]["columns"]`).
+D5 did not trigger: with both removed before the run (task 2), `dlt` did not write
+`c` back, in `replace` and in `replace_dedup`.
+
+Commands run locally (python from `~/.cache/rantai-dagster-venv`):
+
+- `cd dagster && python -m pytest dispar_orchestrate/test_typed_load.py -q`: 26 passed (after task 3; task 1 alone: 1 passed with `-k src_48`)
+- `cd dagster && python -m pytest dispar_orchestrate/test_ingest_run_reports.py dispar_orchestrate/test_dlt_pipeline.py dispar_orchestrate/test_ingest_single_table.py dispar_orchestrate/test_ingest_factory.py -q`: 157 passed (task 4)
+
+Not verified locally, runs in CI: `python3 ops/lint/check_intra_package_imports.py`,
+`python3 ops/lint/check_bare_iceberg_count.py`, `(cd dagster && python -m pytest dispar_orchestrate -q)`
+(full suite, including the other test files that stub `load_via_sink`).
+
+Deviations from the plan, for the reviewer:
+
+- **Task 4 anchor.** `ingest_factory.py:940` is the Oracle path. The PostgreSQL path
+  (the QA case, alfamei POS) loads through `dlt_pipeline.run_bronze_ingest`, which calls
+  `load_via_sink` itself, and the generic `sql` adapter (MySQL, MariaDB, SQL Server) through
+  `_load`. All three now pass `drop_columns`, only when the object has excluded columns
+  (so existing stubs of `load_via_sink` keep working), and only for `adapter_name == "sql"`.
+  `run_bronze_ingest` gained a `drop_columns` keyword. Without it the QA case would not
+  have been fixed.
+- **Naming helper.** None existed; `sink.bronze_column_names` uses `dlt.Schema("bronze").naming`
+  (the precedent is `file_ingest.py:1161`).
+- **Author on the schema commit (D3).** A `pyiceberg` schema commit makes no snapshot, so it
+  carries no `rantai.author`; the replace that follows records it. Stated in the docstring.
+- **Commit 2 alone** leaves the task 1 measurement test failing (it asserts the bug); commit 3
+  replaces it. Commits 3 and 4 are green.
+- `test_ingest_factory.py::_wire_mysql`'s `fake_load` now accepts `**kwargs`.
+- Incremental "keeps the column" test calls `_drop_left_out_columns` with an incremental plan
+  and then appends without the column; a full `incremental` load needs a `sql_database` source,
+  which the local harness has not.
+
 
 ## Review
 
