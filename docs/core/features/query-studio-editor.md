@@ -76,9 +76,10 @@ and the last result) keeps working, and follows the active query tab.
 | 10 | The Natural language and SQL tabs stay. Query tabs live inside the SQL tab | none | Owner, 2026-10-23 |
 | 11 | No on/off switch. This is the editor itself, and every part degrades on its own: without column data the editor still runs SQL | none | Owner, 2026-10-23 |
 | 12 | Explain, Fix with AI, Estimate, Save query and Save as SQL source work on one statement: the selection when there is one, else the whole tab when it holds one statement. With several statements and no selection they are disabled, and the button's title says to select one statement. A saved query or SQL source with several statements would fail where it is run later (the server runs one statement per request) | none | Planner's choice, 2026-10-23 |
-| 13 | Fix with AI is offered on a failed statement's result tab and proposes a fix for that statement; Accept replaces that statement's text in the editor and nothing else | none | Planner's choice, 2026-10-23 |
+| 13 | Fix with AI is offered on a failed statement's result tab and proposes a fix for that statement; Accept replaces that statement's text in the editor and nothing else. Since `QS-11` it is offered only when the failure is a statement error (`invalid_request`, the server's 400/422): a permission refusal, a hidden table, an outage or a rate limit get no button, because changing the SQL cannot help | none | Planner's choice, 2026-10-23; changed: Planner's choice, 2026-11-20 (QS-11) |
 | 14 | On a Trino tab, Estimate sends no request. The panel says "No pre-run estimate for Trino queries." in place of every other state, because the estimate route explains ClickHouse statements only. A Trino `EXPLAIN` route is not built | none | Planner's choice, 2026-11-12 |
 | 15 | An engine failure in Query Studio, on a run or on the cost estimate, shows a fixed sentence for its cause followed by ` Reference: <id>`, never the engine's own text. The raw text goes to the log under the same reference. Outages, timeouts and Stop keep their own fixed sentences. The sentences for each cause are the ones the query history keeps (`query-history.md`, decision 3) | none | Owner, 2026-11-12, LH-QS-2-08 |
+| 16 | `QS-11` editor limits and hints are said where the person is: a new tab's document is empty and "Write SQL here, or generate it from a question" is a grey placeholder, never text a run could send (a stored tab holding exactly the old starter text reads back as empty). At 20 query tabs "+" is disabled with a sentence beside it; a batch over 20 statements is refused with an alert under Run that stays until the SQL changes or another tab opens — no toasts *(planner default, owner may change: the placement)*. The schema browser has a "Search tables" field that filters the listed tables by a case-insensitive contains-match on the table's label and SQL reference; a layer with no match is not drawn, and no match at all says so. The search is not stored. The QA report that completion ranked tables above keywords and that a click on `select` inserted a table was reproduced first on 2026-11-20: the keyword was already first and applying it inserted the keyword, so no ranking change was made | none | Planner's choice, 2026-11-20 (QS-11), *(proposed, not yet signed)* |
 
 ## Limits to tell a customer
 
@@ -95,7 +96,11 @@ and the last result) keeps working, and follows the active query tab.
   the table, or writing its `namespace.name` in the statement, reads it too.
   A name only Trino serves is offered on a Trino tab only.
 - On a Trino tab, Estimate makes no estimate. Only ClickHouse statements get one.
-- Run all takes at most 20 statements, and a browser keeps at most 20 tabs.
+- Run all takes at most 20 statements, and a browser keeps at most 20 tabs. Both
+  limits are said on the page when they are reached.
+- The schema browser's search matches a table's label and its SQL reference
+  only. It does not search inside a table's columns, and it is not kept between
+  visits.
 
 ## Acceptance checklist
 
