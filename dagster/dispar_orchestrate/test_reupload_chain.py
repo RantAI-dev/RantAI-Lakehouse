@@ -9,7 +9,7 @@ after the record was accepted" rule (D8, P4, P5, P10).
 
 from __future__ import annotations
 
-from dispar_orchestrate.authored_factory import FILE_INGEST_JOB, reupload_chain_graph
+from dispar_orchestrate.authored_factory import FILE_INGEST_JOB, ChainEntry, reupload_chain_graph
 
 
 def pipeline(
@@ -163,3 +163,259 @@ def test_a_first_pipeline_that_also_reads_another_first_pipeline_has_parents() -
 
     assert graph["pl-second"]["orders"].parents == ("pl-first",)
     assert graph["pl-second"]["orders"].ancestors == ("pl-first",)
+
+
+# ── BLD-14 T7: the polling sensor ──────────────────────────────────────────
+
+import json
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import patch
+
+from dagster import DagsterRunStatus, SkipReason, job
+
+from dispar_orchestrate.authored_factory import AuthoredPipelineConfig
+from dispar_orchestrate.reupload_chain import (
+    CHAIN_WAIT_LIMIT_SECONDS,
+    REUPLOAD_ROOT_TAG,
+    REUPLOAD_TABLE_TAG,
+    Lookups,
+    Root,
+    RunInfo,
+    build_reupload_chain_sensor,
+    build_reupload_chain_sensors,
+    chain_sensor_name,
+    decide,
+)
+
+
+def lookups(
+    pipeline_id: str,
+    runs: dict[tuple[str, str], RunInfo] | None = None,
+    *,
+    newer: bool = False,
+    in_flight: bool = False,
+) -> Lookups:
+    runs = runs or {}
+    return Lookups(
+        pipeline_id=pipeline_id,
+        run_for_tag=lambda pid, root: runs.get((pid, root)),
+        newer_root=lambda table, root: newer,
+        in_flight=lambda pid: in_flight,
+    )
+
+
+ROOT = Root(run_id="root-1", table="orders", end_time=1_000.0)
+NOW = 1_000.0 + 60.0
+
+
+def test_a_pipeline_starts_when_every_parent_succeeded_for_this_reupload() -> None:
+    entry = ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",))
+    runs = {("pl-silver", "root-1"): RunInfo("silver-run", "SUCCESS")}
+
+    decision = decide(ROOT, entry, lookups("pl-gold", runs), NOW)
+
+    assert decision.action == "run"
+    assert decision.run_key == "reupload-chain:root-1:pl-gold"
+    assert decision.tags == {REUPLOAD_ROOT_TAG: "root-1", REUPLOAD_TABLE_TAG: "orders"}
+
+
+def test_a_pipeline_waits_while_one_branch_of_a_diamond_is_running() -> None:
+    entry = ChainEntry(
+        parents=("pl-left", "pl-right"), ancestors=("pl-first", "pl-left", "pl-right")
+    )
+    runs = {
+        ("pl-left", "root-1"): RunInfo("left-run", "SUCCESS"),
+        ("pl-right", "root-1"): RunInfo("right-run", "STARTED", in_flight=True),
+    }
+
+    decision = decide(ROOT, entry, lookups("pl-join", runs), NOW)
+
+    assert decision.action == "wait"
+    assert decision.run_key is None
+
+
+def test_a_failed_parent_stops_the_chain_and_records_the_cause() -> None:
+    entry = ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",))
+    runs = {("pl-silver", "root-1"): RunInfo("silver-run", "FAILURE")}
+
+    decision = decide(ROOT, entry, lookups("pl-gold", runs), NOW)
+
+    assert decision.action == "record"
+    assert (decision.outcome, decision.reason, decision.cause) == (
+        "not_run",
+        "upstream_failed",
+        "pl-silver",
+    )
+
+
+def test_a_failure_two_steps_up_is_named_as_the_cause() -> None:
+    entry = ChainEntry(
+        parents=("pl-silver",), ancestors=("pl-first", "pl-silver")
+    )
+    runs = {
+        ("pl-first", "root-1"): RunInfo("first-run", "FAILURE"),
+        ("pl-silver", "root-1"): RunInfo("silver-run", "SUCCESS"),
+    }
+
+    decision = decide(ROOT, entry, lookups("pl-gold", runs), NOW)
+
+    assert (decision.reason, decision.cause) == ("upstream_failed", "pl-first")
+
+
+def test_a_cancelled_parent_records_upstream_cancelled() -> None:
+    entry = ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",))
+    runs = {("pl-silver", "root-1"): RunInfo("silver-run", "CANCELED")}
+
+    decision = decide(ROOT, entry, lookups("pl-gold", runs), NOW)
+
+    assert (decision.outcome, decision.reason, decision.cause) == (
+        "not_run",
+        "upstream_cancelled",
+        "pl-silver",
+    )
+
+
+def test_the_run_key_is_the_same_for_the_same_reupload_so_it_runs_once() -> None:
+    entry = ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",))
+    runs = {("pl-silver", "root-1"): RunInfo("silver-run", "SUCCESS")}
+    answer = lookups("pl-gold", runs)
+
+    first = decide(ROOT, entry, answer, NOW)
+    second = decide(ROOT, entry, answer, NOW + 1)
+
+    assert first.run_key == second.run_key == "reupload-chain:root-1:pl-gold"
+
+
+def test_a_newer_reupload_supersedes_an_older_one_that_has_not_launched() -> None:
+    entry = ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",))
+
+    decision = decide(ROOT, entry, lookups("pl-gold", newer=True), NOW)
+
+    assert decision.action == "record"
+    assert decision.outcome == "superseded"
+
+
+def test_a_pipeline_with_a_run_in_flight_is_not_launched_again() -> None:
+    entry = ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",))
+    runs = {("pl-silver", "root-1"): RunInfo("silver-run", "SUCCESS")}
+
+    decision = decide(ROOT, entry, lookups("pl-gold", runs, in_flight=True), NOW)
+
+    assert decision.action == "wait"
+
+
+def test_waiting_past_six_hours_records_wait_expired() -> None:
+    entry = ChainEntry(parents=("pl-silver", "pl-other"), ancestors=("pl-silver", "pl-other"))
+
+    decision = decide(
+        ROOT,
+        entry,
+        lookups("pl-gold"),
+        ROOT.end_time + CHAIN_WAIT_LIMIT_SECONDS + 1,
+    )
+
+    assert (decision.outcome, decision.reason, decision.cause) == (
+        "not_run",
+        "wait_expired",
+        "pl-silver",
+    )
+
+
+def _root_record(run_id: str, table: str, end_time: float) -> SimpleNamespace:
+    run = SimpleNamespace(
+        run_id=run_id,
+        status=DagsterRunStatus.SUCCESS,
+        tags={},
+        run_config={
+            "ops": {"ingest_uploaded_file": {"config": {"bronze_table_name": table}}}
+        },
+    )
+    return SimpleNamespace(dagster_run=run, end_time=end_time, start_time=end_time - 10)
+
+
+class _StubInstance:
+    def __init__(self, roots: list, tagged: list | None = None) -> None:
+        self.roots = roots
+        self.tagged = tagged or []
+
+    def get_run_records(self, filters, limit=None):
+        if filters.job_name == "file_ingest_job":
+            return self.roots[:limit] if limit else self.roots
+        if filters.tags and filters.tags.get(REUPLOAD_ROOT_TAG):
+            return [record for record in self.tagged if record.dagster_run.job_name == filters.job_name]
+        return []
+
+
+class _StubContext:
+    def __init__(self, cursor: str | None, instance: _StubInstance) -> None:
+        self.cursor = cursor
+        self.instance = instance
+        self.updated: list[str] = []
+
+    def update_cursor(self, value: str) -> None:
+        self.updated.append(value)
+        self.cursor = value
+
+
+def _sensor(entries: dict[str, ChainEntry]) -> Any:
+    @job(name="authored__pl_gold")
+    def _placeholder_job() -> None:
+        return None
+
+    return build_reupload_chain_sensor(
+        {"id": "pl-gold", "definition": {}, "status": "ready"},
+        _placeholder_job,
+        entries,
+        AuthoredPipelineConfig(api_url="http://api.invalid", run_token="token"),
+    )
+
+
+def test_the_first_tick_sets_the_floor_and_launches_nothing() -> None:
+    instance = _StubInstance([_root_record("root-1", "orders", NOW)])
+    context = _StubContext(None, instance)
+    body = _sensor({"orders": ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",))})._raw_fn
+    out = list(body(context))
+
+    assert len(out) == 1
+    assert isinstance(out[0], SkipReason)
+    assert "floor" in out[0].skip_message
+    cursor = json.loads(context.updated[-1])
+    assert cursor["settled"] == []
+    assert cursor["floor"] > 0
+
+
+def test_a_root_is_settled_only_after_its_record_was_accepted() -> None:
+    tagged_run = SimpleNamespace(
+        run_id="gold-run",
+        job_name="authored__pl_gold",
+        status=DagsterRunStatus.SUCCESS,
+        tags={REUPLOAD_ROOT_TAG: "root-1", REUPLOAD_TABLE_TAG: "orders"},
+    )
+    tagged = [SimpleNamespace(dagster_run=tagged_run, end_time=NOW)]
+    instance = _StubInstance([_root_record("root-1", "orders", NOW)], tagged)
+    context = _StubContext('{"floor": 0, "settled": []}', instance)
+    body = _sensor({"orders": ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",))})._raw_fn
+
+    with patch(
+        "dispar_orchestrate.reupload_chain._post_chain_step", return_value=False
+    ):
+        list(body(context))
+    cursor = json.loads(context.updated[-1])
+    assert cursor["settled"] == [], "a refused post must be retried next tick"
+
+    context2 = _StubContext('{"floor": 0, "settled": []}', instance)
+    with patch("dispar_orchestrate.reupload_chain._post_chain_step", return_value=True) as post:
+        list(body(context2))
+    assert post.call_count == 1
+    cursor2 = json.loads(context2.updated[-1])
+    assert cursor2["settled"] == ["root-1"]
+
+
+def test_the_sensor_name_matches_the_api_chain_sensor_name() -> None:
+    assert chain_sensor_name("pl-x") == "authored__pl_x_chain"
+
+
+def test_no_token_builds_no_chain_sensors() -> None:
+    cfg = AuthoredPipelineConfig(api_url="http://api.invalid", run_token="")
+    assert build_reupload_chain_sensors([], cfg) == []
