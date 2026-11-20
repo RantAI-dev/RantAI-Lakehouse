@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { missingSection, NOT_SET, sectionSummaries, type SummaryInput } from "./section-summary"
+import { missingPlace, missingSection, NOT_SET, sectionSummaries, type SummaryInput } from "./section-summary"
 
 const base: SummaryInput = {
   kind: "bar", rowsMode: false, source: "mart_visits", joins: 0, dimension: "", grain: "", breakdown: "",
@@ -72,9 +72,22 @@ describe("missingSection", () => {
     expect(missingSection("Join 2 columns")).toBe(1)
   })
   it("puts the chart's own picks in section 2", () => {
-    for (const label of ["Dimension (X)", "Measure (Y)", "Group by", "Latitude", "Columns", "Rows", "Values", "Dimension bin width"]) expect(missingSection(label)).toBe(2)
+    for (const label of ["X axis", "Value", "Group by", "Latitude", "Columns", "Rows", "Values", "Dimension bin width"]) expect(missingSection(label)).toBe(2)
   })
   it("puts steps, questions and a KPI's comparison in section 4", () => {
     for (const label of ["Step 1 value", "Question 2 measure", "Date column", "Goal"]) expect(missingSection(label)).toBe(4)
+  })
+})
+
+describe("missingPlace (BI-58 T4)", () => {
+  it("sends the source and the joins to the data panel", () => {
+    expect(missingPlace("Data source")).toBe("source")
+    expect(missingPlace("Join 2 columns")).toBe("source")
+  })
+  it("sends a step to Sort & filter", () => {
+    expect(missingPlace("Step 1 value")).toBe("sort")
+  })
+  it("sends the chart's picks, questions, a KPI's comparison and a goal to the Data tab", () => {
+    for (const label of ["X axis", "Value", "Group by", "Latitude", "Columns", "Question 2 measure", "Date column", "Goal"]) expect(missingPlace(label)).toBe("data")
   })
 })

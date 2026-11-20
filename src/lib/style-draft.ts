@@ -227,11 +227,6 @@ export function effectivePalette(
   return style.colors?.palette ?? paletteOfChoice(companyPalette, isEdit)
 }
 
-/** Whether the chart being edited uses anything in the Format section, so the section opens by itself. */
-export function formatUsed(style: StyleFields, referenceLines: number): boolean {
-  return referenceLines > 0 || Object.keys(style).length > 0
-}
-
 /**
  * The definition of a chart with one more note pinned (`Add note` of the click menu): the stored
  * definition as it is, plus the note. The caller sends it to the chart's write route. `point` is
