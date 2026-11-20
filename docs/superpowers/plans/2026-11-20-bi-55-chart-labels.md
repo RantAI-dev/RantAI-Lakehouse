@@ -290,4 +290,58 @@ commands it ran and writes *not verified* for the rest (rule 7). Use the shared
 
 ## Handoff
 
+Developer: `Hy4 flash` (OpenCode), branch `bi-55-chart-labels` off `a7cce7609` (the
+plan commit on `c7cd01a76`). All anchors were re-read by their quoted text at that
+head; every one matched. No mismatch with the plan.
+
+### Commits (each pushed)
+
+1. `0a2f2730b` — T1, `fix(export): an Excel text cell holds its text without the apostrophe (BI-55, LH-BI-1-08)`.
+   `csv_export::plain_text` is the single match; `cell_text` is byte-identical to the old
+   output; the four Excel sites use `plain_text` (header, header bytes, cell bytes, text
+   cell); CSV/TSV untouched.
+2. `948bc5738` — T2, `docs(features): an Excel text cell holds its text as it is (BI-55, LH-BI-1-08)`.
+   Only the three documents named in T2 changed; `BACKLOG.md` and `PRODUCT.md` untouched.
+
+### New and changed assertions fail on the old code
+
+Run with the new tests added but the source unchanged, at `a7cce7609`:
+
+- `export::tests::a_text_that_starts_like_a_formula_is_a_string_cell_in_the_workbook_with_no_apostrophe_and_no_formula`
+  → `'=1+1 in <?xml … <t>'=1+1</t> …` (assertion at `export.rs:1025`).
+- `export::tests::xlsx_keeps_numbers_as_numbers_with_the_charts_number_format`
+  → assertion at `export.rs:953` failed with the sheet showing `<t>'=HYPERLINK("http://x")</t>`.
+- `export::tests::a_formula_looking_text_costs_its_own_bytes_in_the_workbook_cap`
+  → `assertion left == right failed: left: 2, right: 3` at `export.rs:1045` (old rows 2, new 3).
+- `query_download::a_cell_that_starts_a_formula_is_guarded_in_every_text_format`
+  → `the workbook cell holds the text, not a guarded formula: … <t>'=1+1</t> …` at
+  `tests/query_download.rs:527`.
+
+### Verification on the final commit (foreground, counts as run)
+
+`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-6` (shared, outside the checkout);
+no `cargo clean`. TypeScript, Python and compose were not touched and were not run.
+No `cargo test --workspace`/workspace clippy — CI's job, per the developer brief.
+
+- `cd rust && cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-api --all-targets --all-features -- -D warnings` — clean, finished in 50.82 s.
+- `cargo test -p lakehouse-api --lib export::` — 62 passed, 0 failed, 3,699 filtered out.
+- `cargo test -p lakehouse-api --lib csv_export::` — 6 passed, 0 failed, 3,755 filtered out.
+- `cargo test -p lakehouse-api --test it query_download::` — 23 passed, 0 failed, 1,751 filtered out.
+- `cargo test -p lakehouse-api --test it sec11_guard::` — 4 passed, 0 failed, 1,770 filtered out.
+- `cargo test -p lakehouse-api` (plan §4) — first attempt with default threads: 3,716 passed,
+  27 failed, 18 ignored; every failure was `start the ClickHouse testcontainer:
+  Client(CreateContainer(RequestTimeoutError))` in `registry_clash`/engine tests. Retry with
+  `-- --test-threads=4`: the lib binary passed (re-run alone: 3,743 passed, 0 failed,
+  18 ignored in 740.45 s); the `it` binary reached 1,768 passed, 1 failed, 5 ignored —
+  the one failure `sql_lex_corpus::the_guard_agrees_with_a_real_clickhouse_on_every_corpus_row`
+  again `CreateContainer(RequestTimeoutError)`. Docker is up but container creation times
+  out under parallel agent load; none of the failures is in an export test. Those two
+  container-start cases are **not verified** here; CI runs them.
+- `git status` before each commit: only the intended files modified; no generated files
+  staged. After the final commit the tree is clean.
+- Disk pressure during the build: the shared target's regenerable `debug/incremental/`
+  scratch (4.2 GiB) was removed to let the link finish; no `cargo clean`, no compiled
+  dependency cache wiped.
+
 ## Review
