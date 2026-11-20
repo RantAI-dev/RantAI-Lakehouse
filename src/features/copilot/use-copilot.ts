@@ -677,8 +677,12 @@ function useCopilotState() {
               // A failed lookup leaves the step as it was stored.
               if (r.status !== "fulfilled") return;
               const a = approvals[i];
+              // AI-28 review R1: `failed` covers both "never ran" and "ran
+              // and failed", so pass the last step's label to tell them apart.
+              const steps = r.value.steps ?? [];
+              const lastStepLabel = steps[steps.length - 1]?.label;
               const updated = replaceToolStep(next, a.messageIndex, a.stepIndex, (msg, step) => ({
-                step: { ...step, approvalState: approvalStateOf(r.value.status) },
+                step: { ...step, approvalState: approvalStateOf(r.value.status, lastStepLabel) },
                 chartCreated: Boolean(msg.chartCreated),
               }));
               if (updated) next = updated;

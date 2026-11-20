@@ -20,6 +20,15 @@ describe("decisionOutcomeText", () => {
     )
   })
 
+  it("says the action ran and failed when the tool returned an error (AI-28 review R1)", () => {
+    expect(
+      decisionOutcomeText(
+        { executed: true, result: { error: "the board could not be changed" } },
+        "approved"
+      )
+    ).toBe("Approved; the action ran and failed.")
+  })
+
   it("says a reject ran nothing", () => {
     expect(decisionOutcomeText({ executed: false }, "rejected")).toBe(
       "Rejected. Nothing ran."

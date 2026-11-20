@@ -240,6 +240,16 @@ describe("a reopened approval step shows what the run did (AI-28, LH-AI-18-09)",
     )
   })
 
+  it("reads 'the action ran and failed' for an executed failure (AI-28 review R1)", () => {
+    const { container } = render(
+      <ToolStepCard step={{ ...step, approvalState: "failed" }} />
+    )
+    expect(container.textContent).toContain("approved, action failed")
+    fireEvent.click(container.querySelector("button")!)
+    expect(container.textContent).toContain("Approved; the action ran and failed.")
+    expect(container.textContent).not.toContain("Approved, but it did not run.")
+  })
+
   it("keeps the pending wording for a step that is still waiting", () => {
     const { container } = render(<ToolStepCard step={{ ...step, approvalState: "pending" }} />)
     // A pending step starts open, so the line is already on screen.

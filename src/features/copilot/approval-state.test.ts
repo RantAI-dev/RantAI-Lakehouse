@@ -17,6 +17,16 @@ describe("approvalStateOf", () => {
     expect(approvalStateOf("budget_exhausted")).toBe("not_run")
   })
 
+  it("tells an executed-and-failed run from one that never ran (AI-28 review R1)", () => {
+    // The decide route records `failed` both before and after execution;
+    // only the last step's label tells the two apart.
+    expect(approvalStateOf("failed", "Executed after approval")).toBe("failed")
+    expect(approvalStateOf("failed", "Not executed")).toBe("not_run")
+    expect(APPROVAL_STATE_TEXT.failed.line).toBe(
+      "Approved; the action ran and failed."
+    )
+  })
+
   it("treats a rejected run as rejected", () => {
     expect(approvalStateOf("rejected")).toBe("rejected")
   })
@@ -26,7 +36,7 @@ describe("approvalStateOf", () => {
   })
 
   it("gives every state a badge and a line", () => {
-    for (const state of ["pending", "ran", "not_run", "rejected"] as const) {
+    for (const state of ["pending", "ran", "not_run", "rejected", "failed"] as const) {
       expect(APPROVAL_STATE_TEXT[state].badge.length).toBeGreaterThan(0)
       expect(APPROVAL_STATE_TEXT[state].line.length).toBeGreaterThan(0)
     }

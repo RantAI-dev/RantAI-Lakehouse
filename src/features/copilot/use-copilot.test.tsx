@@ -813,4 +813,53 @@ describe("a reopened conversation shows what happened to its approvals (AI-28, L
     };
     expect(saved.messages[0].tools?.[0]?.approvalState).toBeUndefined();
   });
+
+  it("uses the run's last step so an executed failure is not shown as not run (AI-28 review R1)", async () => {
+    sessionOpens = {
+      appr2: {
+        status: 200,
+        json: {
+          session: {
+            id: "appr2",
+            title: "Delete a chart",
+            mode: "build",
+            messages: [
+              {
+                id: "m1",
+                role: "assistant",
+                content: "The action needs approval.",
+                tools: [
+                  {
+                    tool: "delete_chart",
+                    args: { id: "c1" },
+                    ok: true,
+                    result: {
+                      needs_approval: true,
+                      approval_id: "appr-2",
+                      run_id: "r2",
+                      summary: "Moves chart c1 from its dashboard to the trash.",
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    };
+    runOpens = {
+      r2: {
+        status: "failed",
+        steps: [{ label: "Executed after approval", status: "failed", detail: "x" }],
+      },
+    };
+    renderCopilot();
+
+    await act(async () => {
+      await copilot!.loadSession("appr2");
+    });
+    await waitFor(() => {
+      expect(copilot!.messages[0]?.tools?.[0]?.approvalState).toBe("failed");
+    });
+  });
 });
