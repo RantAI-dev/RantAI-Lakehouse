@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import {
@@ -29,7 +29,7 @@ import { formatDateTime, formatRelativeTime } from "@/lib/format"
 import { notifyError, notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
-import type { ConnectorDetail, ConnectorTestResult } from "@/services/contracts/connectors"
+import type { ConnectorDetail, ConnectorRun, ConnectorTestResult } from "@/services/contracts/connectors"
 import { ConnectorChangeCapturePanel } from "./connector-change-capture-panel"
 import { ConnectorDeleteDialog } from "./connector-delete-dialog"
 import { ReplicationSlotHealth } from "@/features/governance/replication-slot-health"
@@ -204,6 +204,10 @@ function SourcesLink() {
   )
 }
 
+/** `SRC-46`: how often the detail is read again after a run ended, and for how long, while the run is not yet counted. */
+const COUNT_POLL_MS = 10_000
+const COUNT_WAIT_MAX_MS = 180_000
+
 /**
  * One connector, at `/connectors/<id>`: what the Sources list used to open in
  * a side sheet, now an address of its own (plan
@@ -227,6 +231,38 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   const state = useService((s) => connectorService.getConnector(id, s), [id], {
     keepDataOnReload: true,
   })
+  // `SRC-46` (`QA LH-SRC-6-43`): the connector's health follows a run only when the orchestrator's sensor
+  // reports it to the API, about a minute after the run ends, and nothing else re-reads the detail. So when
+  // the Ingest panel says a run ended, read the detail now, then every 10 s until the run is counted (the
+  // outcome's timestamp differs from what it was when the run ended), for at most 3 minutes. A run that is
+  // never counted (paused, or a missed sensor tick) just stops being asked about; a page load reads the truth.
+  const [countWait, setCountWait] = useState<{ field: "lastRunSuccessAt" | "lastRunFailureAt"; from: string | null } | null>(null)
+  const detailRef = useRef<ConnectorDetail | null>(null)
+  detailRef.current = state.data
+  const { reload: reloadDetail } = state
+  const onRunEnded = useCallback(
+    (run: ConnectorRun) => {
+      reloadDetail()
+      const field = run.status === "failed" ? "lastRunFailureAt" : run.status === "succeeded" ? "lastRunSuccessAt" : null
+      // Any other status (paused, a run with no end reported) reads once and does not wait for a count.
+      // A new run ending replaces the older wait: the effect below restarts on the new object.
+      setCountWait(field === null ? null : { field, from: detailRef.current?.[field] ?? null })
+    },
+    [reloadDetail]
+  )
+  useEffect(() => {
+    if (!countWait) return
+    const poll = window.setInterval(reloadDetail, COUNT_POLL_MS)
+    const giveUp = window.setTimeout(() => setCountWait(null), COUNT_WAIT_MAX_MS)
+    return () => {
+      window.clearInterval(poll)
+      window.clearTimeout(giveUp)
+    }
+  }, [countWait, reloadDetail])
+  const countedAt = countWait && state.data ? (state.data[countWait.field] ?? null) : null
+  useEffect(() => {
+    if (countWait && countedAt !== countWait.from) setCountWait(null)
+  }, [countWait, countedAt])
   const [deleteOpen, setDeleteOpen] = useState(false)
   const urlTab = parseTab(searchParams.get("tab"))
   const [tab, setTab] = useState<ConnectorTab>(urlTab)
@@ -462,6 +498,7 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
               pausedReason={c.pausedReason}
               waitingTables={waiting.tables}
               onResumed={state.reload}
+              onRunEnded={onRunEnded}
             />
           </TabsContent>
           {capturesChanges ? (
