@@ -97,6 +97,7 @@ describe("ReportingSettingsForm", () => {
     expect(screen.getByText(/Only an administrator/i)).toBeDefined()
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull()
     expect((screen.getByLabelText("Report time zone") as HTMLInputElement).disabled).toBe(true)
+    expect(document.querySelector("datalist")).toBeNull()
   })
 
   it("sends the chosen zone and first day on Save", async () => {
@@ -105,7 +106,10 @@ describe("ReportingSettingsForm", () => {
     const input = (await screen.findByLabelText("Report time zone")) as HTMLInputElement
     // The form fills the saved values after the load; edit only once it has.
     await waitFor(() => expect(input.value).toBe("Asia/Jakarta"))
-    fireEvent.change(input, { target: { value: "Europe/Berlin" } })
+    // The console's own combobox (`UX-7`): typing filters, the arrow key opens it, an option is chosen.
+    fireEvent.change(input, { target: { value: "Berlin" } })
+    fireEvent.keyDown(input, { key: "ArrowDown" })
+    fireEvent.click(await screen.findByRole("option", { name: /Europe\/Berlin/ }))
     const save = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement
     await waitFor(() => expect(save.disabled).toBe(false))
     fireEvent.click(save)
@@ -168,7 +172,8 @@ describe("ReportingSettingsForm", () => {
     expect(await screen.findByRole("img", { name: "#112233" })).toBeDefined()
     expect(screen.queryByRole("button", { name: "Add colour" })).toBeNull()
     expect(screen.queryByRole("button", { name: "Remove #112233" })).toBeNull()
-    expect(screen.getByRole("heading", { name: "Numbers" })).toBeDefined()
+    expect(screen.getByLabelText("Number format")).toBeDefined()
+    expect(screen.queryByRole("heading", { name: "Numbers" })).toBeNull()
     expect(screen.getByRole("heading", { name: "Fonts" })).toBeDefined()
   })
 
@@ -223,12 +228,12 @@ describe("ReportingSettingsForm", () => {
     mockSettings(DEFAULTS)
     render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
 
-    const paragraph = (await screen.findByText(/A checked role cannot use the console/)) as HTMLElement
-    expect(paragraph.textContent).toContain("a Query Studio result download")
-    expect(paragraph.textContent).toContain('"Copy as TSV"')
-    expect(paragraph.textContent).toContain(
-      "It does not stop a person from selecting and copying what is on the screen."
-    )
+    // UX-7: the line says the rule, the help tip holds what it covers.
+    expect(await screen.findByText("Checked roles cannot export or download.")).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: /Query Studio result downloads/ }))
+    const tip = (await screen.findAllByText(/Query Studio result downloads/))[0] as HTMLElement
+    expect(tip.textContent).toContain("Copy as TSV")
+    expect(tip.textContent).toContain("It cannot stop copying from the screen.")
   })
 
   it("shows no downloads section to a caller who may not read the list (PR #204 review SHOULD-FIX 3)", async () => {
@@ -263,7 +268,7 @@ describe("ReportingSettingsForm", () => {
     mockSettings(READER_DEFAULTS)
     render(<ReportingSettingsForm canWrite={false} zoneList={zoneList} />)
     await screen.findByLabelText("Report time zone")
-    expect(screen.queryByRole("heading", { name: "Reports: outside email domains" })).toBeNull()
+    expect(screen.queryByRole("heading", { name: "Outside email domains" })).toBeNull()
     expect(screen.queryByLabelText("Report domain")).toBeNull()
   })
 
@@ -290,5 +295,17 @@ describe("ReportingSettingsForm", () => {
     fireEvent.change(colour, { target: { value: "#112233" } })
     fireEvent.click(screen.getByRole("button", { name: "Add colour" }))
     expect(screen.getAllByText("Unsaved changes").length).toBe(2)
+  })
+})
+
+describe("help text on Settings > Reporting (UX-7)", () => {
+  it("keeps the detail in a help tip that opens on a click, and the line under the heading short", async () => {
+    mockSettings(DEFAULTS)
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+    // `HelpHint`: the button's name is the detail itself, and a press opens it.
+    const hint = await screen.findByRole("button", { name: /Nothing is deleted: turning it on again/ })
+    fireEvent.click(hint)
+    expect((await screen.findAllByText(/Nothing is deleted: turning it on again/)).length).toBeGreaterThan(0)
+    expect(screen.getByText("Off stops every public link at once.")).toBeDefined()
   })
 })
