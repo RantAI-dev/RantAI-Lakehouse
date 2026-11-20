@@ -200,7 +200,7 @@ estimate (S, M, L), which the base has no field for.
 | `QS-13` | Feature | Trino as a second query engine: Query Studio runs on it and masking applies on it | Query Studio | P2 | In Acceptance |  | Feature-row audit against the product, 2026-11-13 |
 | `BLD-15` | Feature | Pipelines: create, schedule, run history, versions and Bronze inputs (`BLD-1` and `BLD-2` cover steps and target lag only) | Build | P2 | In Acceptance |  | Feature-row audit against the product, 2026-11-13; gate `g7` |
 | `BLD-16` | Task | `BLD-1` part 2: join two inputs or steps, group by with count, count distinct, sum, avg, min, max and a filter on an aggregate, filters of several conditions joined by all or any, all as form steps; any form step shown as SQL and switchable to a SQL step (one way); the assistant's `create_pipeline` covers the same. Owner 2026-11-20: build, GLM 5.3 develops both slices | Build | P1 | Building | | `features/pipeline-joins-and-sql.md` capabilities 10-13; `superpowers/plans/2026-11-20-bld-16-joins-and-aggregations.md` |
-| `BLD-17` | Task | `BLD-1` part 3: publish a step as its own table so other pipelines can read it; choose what a run does when the output's columns change; run quality rules before the output is published. **Blocked by `BLD-16`** | Build | P1 | Todo | | `features/pipeline-joins-and-sql.md` capabilities 14-15 |
+| `BLD-17` | Task | `BLD-1` part 3: publish a step as its own table so other pipelines can read it; choose what a run does when the output's columns change; run quality rules before the output is published. **Blocked by `BLD-16`** (merged, #619). Planner defaults P1 to P15 wait for the owner's signature before the build starts | Build | P1 | In Progress | | `features/pipeline-joins-and-sql.md` capabilities 14-15; `superpowers/plans/2026-11-20-bld-17-publish-step.md` |
 | `BI-56` | Feature | Dashboards: create, browse, about two dozen chart types, threshold alerts (the other `BI-` rows cover only additions) | Dashboards | P2 | In Acceptance |  | Feature-row audit against the product, 2026-11-13 |
 | `GOV-13` | Feature | Approvals of risky assistant actions (Governance → Approvals; `DEC-8`). **Follow-up, 2026-11-17:** the agent run's approval card stores the tool's own risk sentence instead of a generic "cannot be undone once executed" text (#575) | Governance | P2 | In Acceptance |  | Feature-row audit against the product, 2026-11-13 |
 | `GOV-14` | Feature | Plain-language questions run inside the user's masks and row filters. Built as `SEC-9` | Governance | P2 | In Acceptance | #78, #105 | Feature-row audit against the product, 2026-11-13; `features/natural-language-queries-respect-permissions.md` |
@@ -561,6 +561,7 @@ set by the product owner and are left empty until they are.
 
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
+| `BLD-17` | 2026-11-20 | | |
 | `SRC-44` | 2026-11-18 | 2026-11-19 (#593) | |
 | `SRC-45` | 2026-11-19 | 2026-11-19 (#597) | |
 | `SRC-46` | 2026-11-19 | 2026-11-20 (#607) | |
