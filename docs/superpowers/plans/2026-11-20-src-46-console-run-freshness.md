@@ -215,3 +215,29 @@ accepted.
     interval: 10 s per `act`, about 19 steps. The assertion stays the
     same: no fetch after the 3 minute cap.
   - Do not raise the test's timeout.
+
+### Round 3 (planner, 2026-11-20, head `dd1a394c8`)
+
+- **BLOCKER 3.** CI `Unit tests` (run 44669329801) fail 3 of the 4 new
+  detail-page wait tests. Each fails with "timed out after 5000ms", then
+  "Fake timers are not active" from `tick` after the timeout. Test 1
+  passes in 50 ms, so this is a hang, not slowness.
+  - Locally the whole suite passes under the CI's Bun 1.3.12 (4619 pass),
+    and the file passes on one core. The hang appears only on the CI
+    runner, which points at the fake-timer and stubbed-fetch interplay.
+  - No other test in `src/` uses fake timers with fetch. The repo's
+    pattern is real timers, with `waitFor` and longer per-test timeouts
+    (see the panel's own `onRunEnded` tests).
+
+  Fix:
+  - Move the wait of D2 into a small hook, for example
+    `useRunCountWait` in `src/features/connectors/`. Its poll interval
+    and cap are parameters, defaulting to D2's 10 s and 3 min; the page
+    uses the defaults. The hook's own tests use real timers and tiny
+    values (tens of ms) for cases (a) to (d), with no fetch: `reload` is
+    a mock, and the detail is a prop changed by `rerender`.
+  - Keep one page integration test with real timers, following the
+    panel tests' pattern. When a run ends, the detail is read again, and
+    a detail that reports the count shows "Degraded".
+  - Remove the fake-timer tests.
+  - D2's behaviour does not change.
