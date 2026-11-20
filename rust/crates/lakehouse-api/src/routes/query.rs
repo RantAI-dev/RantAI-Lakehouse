@@ -3206,6 +3206,9 @@ pub async fn list_saved(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryQueryRaw {
+    /// One run's id (`QS-12`, `LH-QS-4-07`): a link to `/query-studio?run=`
+    /// asks the server for that row by id, never by its SQL text.
+    id: Option<String>,
     status: Option<String>,
     engine: Option<String>,
     min_duration_ms: Option<String>,
@@ -3251,6 +3254,17 @@ const HISTORY_ENGINES: [&str; 2] = ["clickhouse", "trino"];
 /// getting a 400 it cannot read.
 fn parse_history_query(raw: &HistoryQueryRaw) -> Result<HistoryFilter<'_>, ApiError> {
     let mut filter = HistoryFilter::default();
+    // QS-12 (LH-QS-4-07): the id from `?run=` is the run's own, validated by
+    // the same shape guard the download header uses. A non-empty value that
+    // is not an id is a 400, never a filter that silently finds nothing.
+    if let Some(id) = raw.id.as_deref().filter(|s| !s.is_empty()) {
+        if !is_valid_history_id(id) {
+            return Err(ApiError::BadRequest(
+                "id must be a query history id".to_owned(),
+            ));
+        }
+        filter.id = Some(id);
+    }
     if let Some(status) = raw.status.as_deref().filter(|s| !s.is_empty()) {
         if !HISTORY_STATUSES.contains(&status) {
             return Err(ApiError::BadRequest(
@@ -3317,7 +3331,8 @@ fn history_time(field: &str, raw: Option<&str>) -> Result<Option<OffsetDateTime>
 /// # Errors
 ///
 /// 401 when nobody is signed in — history belongs to a person, so there is
-/// no sensible answer for "everyone's". 400 for a bad filter value or a
+/// no sensible answer for "everyone's". 400 for a bad filter value — including
+/// an `id` that is not a query history id (`QS-12`, `LH-QS-4-07`) — or a
 /// `page` that is not a whole number from 1, with a fixed message naming
 /// the field, and for a query string the route cannot
 /// read (a parameter sent twice), with the fixed sentence of
@@ -8082,6 +8097,7 @@ mod history_query_tests {
         page: Option<&str>,
     ) -> HistoryQueryRaw {
         HistoryQueryRaw {
+            id: None,
             status: status.map(str::to_owned),
             engine: engine.map(str::to_owned),
             min_duration_ms: min_duration_ms.map(str::to_owned),

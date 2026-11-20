@@ -193,6 +193,61 @@ mod filters {
         );
     }
 
+    /// QS-12 (LH-QS-4-07): `?id=` answers that one run, with the true total —
+    /// the console opens a run by its id, not by its SQL text.
+    #[tokio::test]
+    async fn the_id_filter_answers_that_run_alone() {
+        let app = common::spin_up().await;
+        let user = create_principal_with_permissions(&app.pool, "query:read").await;
+        let cookie = session_cookie_for_user(&app.pool, user).await;
+        for (id, sql) in [("q-100", "SELECT 11"), ("q-200", "SELECT 22")] {
+            record_history(
+                &app.pool,
+                &RecordHistoryInput {
+                    id,
+                    sql,
+                    user: &user.to_string(),
+                    owner_id: Some(user),
+                    status: "completed",
+                    duration_ms: 10,
+                    scanned_bytes: 1,
+                    cost_units: 0.1,
+                    workload_class: "hot-analytics",
+                    engine: "clickhouse",
+                    cache_assisted: false,
+                    tables_read: &[],
+                    message: None,
+                    tenant_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let (status, body) = get_history(&app, &cookie, "id=q-100").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], json!(1), "{body}");
+        let runs = body["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), 1, "{body}");
+        assert_eq!(runs[0]["id"], json!("q-100"));
+        assert_eq!(runs[0]["sql"], json!("SELECT 11"));
+    }
+
+    /// QS-12 (LH-QS-4-07): a non-empty `id` that is not a history id is a 400
+    /// with the route's fixed sentence, not a silent empty page.
+    #[tokio::test]
+    async fn a_bad_history_id_is_a_400_with_the_fixed_message() {
+        let app = common::spin_up().await;
+        let user = create_principal_with_permissions(&app.pool, "query:read").await;
+        let cookie = session_cookie_for_user(&app.pool, user).await;
+
+        let (status, body) = get_history(&app, &cookie, "id=x'1").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "id must be a query history id", "{body}");
+    }
+
     /// The parsed filters reach the rows: the endpoint answers the page's
     /// one-axis questions, and each row carries `tablesRead` — with `message`
     /// only where there is something to say.
