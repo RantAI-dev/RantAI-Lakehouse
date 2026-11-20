@@ -78,9 +78,9 @@ export function builderRules(s: BuilderState): BuilderRules {
   const layersApply = takesLayers(s.kind) && !s.rowsMode
   const otherBlocked = !s.other && (s.steps > 0 || s.layers > 0)
   const hint = otherBlocked
-    ? s.steps > 0 ? "Not available with steps." : "Not available with more questions."
+    ? s.steps > 0 ? "Not available with steps." : "Not available with a second source."
     : s.other && (stepsApply || layersApply)
-      ? "While this is on, steps and more questions are not available."
+      ? "While this is on, steps and a second source are not available."
       : undefined
   return {
     sections: { data: !text, show: !text, sortAndFilter: !text, moreOptions: !text },
@@ -94,27 +94,9 @@ export function builderRules(s: BuilderState): BuilderRules {
     referenceLines: LINE_KINDS.includes(s.kind),
     parameters: !text,
     click: !text && kindHasClickValue(s.kind as ChartKind),
-    breakdownLocked: s.layers > 0 ? "Not available with more questions." : undefined,
+    breakdownLocked: s.layers > 0 ? "Not available with a second source." : undefined,
     bins: takesBin(s.kind, s.rowsMode) && s.layers === 0,
   }
-}
-
-/** What a chart being edited uses that sits inside "More options", so the fold opens by itself. */
-export type MoreOptionsUse = {
-  steps: number
-  layers: number
-  /** A click that replaces the drill menu. */
-  click: boolean
-  /** Column formats of a grouped table. */
-  columnSettings: number
-  /** A KPI compared with an earlier period or a goal. */
-  compare: boolean
-  /** A freshness rule of the chart's own (`BI-4` part B). */
-  freshness?: boolean
-}
-
-export function moreOptionsUsed(u: MoreOptionsUse): boolean {
-  return u.steps > 0 || u.layers > 0 || u.click || u.columnSettings > 0 || u.compare || u.freshness === true
 }
 
 /**
@@ -162,4 +144,25 @@ export function carryOverOnKindSwitch(s: KindSwitch): KindSwitchPatch {
     }
   }
   return {}
+}
+
+/**
+ * Kinds a dashboard parameter cannot stand in for a column or the limit of
+ * (`lakehouse_bi::params::takes_param_slots`, which `check_chart_shape`
+ * refuses with "a parameter can stand for a column or the limit of a chart
+ * that lists groups along one dimension").
+ */
+const NO_PARAM_SLOT_KINDS: readonly string[] = [
+  "pivot", "table", "pointmap", "geoheat", "boxplot", "text", "heading", "divider", "section",
+  "image", "web", "progress", "histogram", "gantt", "bullet",
+]
+
+/**
+ * `BI-58` T6 (QA 2026-11-14): whether a number parameter may be the limit of
+ * this chart, as the server decides it: not for the kinds above, and not for
+ * a chart whose steps are sent. The builder hides the choice otherwise and
+ * says why, instead of a preview that disappears with the server's sentence.
+ */
+export function limitTakesParam(kind: string, s: { steps: boolean; rowsMode: boolean }): boolean {
+  return !NO_PARAM_SLOT_KINDS.includes(kind) && !s.steps && !s.rowsMode
 }
