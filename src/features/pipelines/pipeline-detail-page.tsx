@@ -32,6 +32,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { useAuth } from "@/features/auth/auth-provider"
 import { formatDateTime, formatDuration, formatRelativeTime } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
+import { readableErrorMessage } from "@/lib/notify-message"
 import type { EntityStatus } from "@/lib/status"
 import { cn } from "@/lib/utils"
 import { identityService, pipelineService } from "@/services"
@@ -58,6 +59,10 @@ const LIVE_POLL_MS = 4000
 const IDLE_POLL_MS = 30_000
 /** How long after a launch to keep polling fast: the new run may take a few seconds to be listed. */
 const LAUNCH_WINDOW_MS = 20_000
+/** BLD-11 D10: bounded detail poll while a just-marked-ready job is loading. */
+const JOB_LOAD_POLL_MS = 4000
+/** 30 looks x 4 s = the 2-minute bound on that poll. */
+const JOB_LOAD_MAX_TICKS = 30
 
 type TabId = "runs" | "definition" | "settings"
 
@@ -182,6 +187,38 @@ export function PipelineDetailPage() {
   const runs = React.useMemo(() => (runsState.status === "success" ? runsState.data : []), [runsState])
   const summary = React.useMemo(() => summarizeRuns(runs), [runs])
   const anyLive = runs.some(isLiveRun)
+
+  // BLD-11 F6/D10: a just-marked-ready authored pipeline has no job yet, and
+  // the reload is now a background write. Poll its detail briefly so the
+  // page notices when the orchestrator loads the job, then stop.
+  const [jobLoadActive, setJobLoadActive] = React.useState(false)
+  const jobLoadTicks = React.useRef(0)
+  const detailNeedsJob =
+    state.status === "success" &&
+    state.data.engine === "authored" &&
+    state.data.status === "ready" &&
+    !state.data.orchestratorJob
+  React.useEffect(() => {
+    if (detailNeedsJob) {
+      setJobLoadActive(true)
+    } else {
+      setJobLoadActive(false)
+      jobLoadTicks.current = 0
+    }
+  }, [detailNeedsJob])
+  React.useEffect(() => {
+    if (!jobLoadActive || !detailNeedsJob) return
+    const t = setInterval(() => {
+      if (jobLoadTicks.current >= JOB_LOAD_MAX_TICKS) {
+        setJobLoadActive(false)
+        clearInterval(t)
+        return
+      }
+      jobLoadTicks.current += 1
+      state.reload()
+    }, JOB_LOAD_POLL_MS)
+    return () => clearInterval(t)
+  }, [jobLoadActive, detailNeedsJob, state.reload])
 
   // BLD-1 / D2: who this pipeline reads as. The NAME rides along with the
   // detail read, so everyone sees it; the user LIST is only needed by the
@@ -381,7 +418,13 @@ export function PipelineDetailPage() {
         size="sm"
         disabled={activate.status === "pending"}
         onClick={async () => {
-          if (await activate.run(pipelineId)) state.reload()
+          if (await activate.run(pipelineId)) {
+            // BLD-11 D10: start a fresh bounded window — the job is built on
+            // the background reload this page no longer waits for.
+            jobLoadTicks.current = 0
+            setJobLoadActive(true)
+            state.reload()
+          }
         }}
       >
         <PlayIcon data-icon="inline-start" />
@@ -435,6 +478,18 @@ export function PipelineDetailPage() {
         readsAs={readsAsState}
       />
 
+      {/* BLD-11 D10: a refused Run now is shown where the button is, not only
+          in a toast that disappears. `useServiceAction.run` clears this on
+          the next launch. */}
+      {runNow.status === "error" && runNow.error ? (
+        <p
+          role="alert"
+          className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+        >
+          {readableErrorMessage(runNow.error.message)}
+        </p>
+      ) : null}
+
       {/* BLD-1 / D2: the one control that can change who a pipeline reads
           as. Platform Admin only (`identity:write`), the same grant the
           route requires — and the page hides it rather than offering a
@@ -485,9 +540,15 @@ export function PipelineDetailPage() {
 
       {authored && !isDraft && !p.orchestratorJob ? (
         <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-          The orchestrator has not loaded this pipeline&apos;s job yet. Run now asks it to reload first; if it still has
-          no job, check that <code className="font-mono">PIPELINE_RUN_TOKEN</code> is set for both the API and the Dagster
-          code location.
+          {jobLoadActive ? (
+            "The orchestrator is loading this pipeline's job."
+          ) : (
+            <>
+              The orchestrator has not loaded this pipeline&apos;s job yet. Run now asks it to reload first; if it still
+              has no job, check that <code className="font-mono">PIPELINE_RUN_TOKEN</code> is set for both the API and
+              the Dagster code location.
+            </>
+          )}
         </p>
       ) : null}
 

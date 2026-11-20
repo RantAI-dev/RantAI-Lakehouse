@@ -28,8 +28,8 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { afterEach, describe, expect, it, jest, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import type { PipelineDetail, PipelineRun } from "@/services/contracts/pipelines"
 import { PipelineDetailPage } from "./pipeline-detail-page"
@@ -120,15 +120,39 @@ type Stub = {
   logLines?: { ts: number; level: string; stepKey: string | null; message: string }[]
   /** The pipeline the detail read answers; the test swaps its definition. */
   pipeline?: PipelineDetail
+  /** Successive detail reads (the last repeats) — the job-load poll test. */
+  details?: PipelineDetail[]
+  /** A refused Run now: the 409 error text the trigger POST answers. */
+  triggerError?: string
+  /** The detail read after a status POST (Mark ready). */
+  readyPipeline?: PipelineDetail
 }
 
 function stubApi(stub: Stub) {
-  return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+  let detailIndex = 0
+  let current = stub.pipeline ?? PIPELINE
+  return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
+    const method = init?.method ?? "GET"
     if (path.includes("/api/auth/me")) {
       return json({ id: "u1", name: "Operator", email: null, roles: [], permissions: ["pipeline:read"], tenants: [] })
     }
-    if (path.endsWith("/api/pipelines/pl-connector-1")) return json(stub.pipeline ?? PIPELINE)
+    if (path.endsWith("/api/pipelines/pl-connector-1/status") && method === "POST") {
+      current = stub.readyPipeline ?? { ...current, status: "ready" }
+      return json(current)
+    }
+    if (path.endsWith("/api/pipelines/pl-connector-1")) {
+      if (stub.details?.length) {
+        const next = stub.details[Math.min(detailIndex, stub.details.length - 1)]
+        detailIndex += 1
+        return json(next)
+      }
+      return json(current)
+    }
+    if (path.endsWith("/api/pipelines/pl-connector-1/trigger") && method === "POST") {
+      if (stub.triggerError) return json({ error: stub.triggerError }, 409)
+      return json(run("running"))
+    }
     if (path.endsWith("/api/pipelines/pl-connector-1/runs")) return json({ runs: [run(stub.status())], unavailable: null })
     if (path.includes("/runs/run-0001/logs")) {
       return json({ lines: stub.logLines ?? [], cursor: "0", truncated: false })
@@ -251,6 +275,63 @@ describe("the pipeline page's trigger (BLD-11)", () => {
 
     expect(await screen.findByText("Within 2 h of its inputs")).toBeTruthy()
     expect(screen.queryByRole("button", { name: /pause schedule/i })).toBeNull()
+  })
+
+  it("a refused Run now shows the API's reason under the masthead", async () => {
+    stubApi({
+      status: () => "completed",
+      triggerError: "the orchestrator has not loaded this pipeline's job yet; try again in a minute.",
+    })
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: /run now/i }))
+    const alert = await screen.findByRole("alert", undefined, { timeout: 8000 })
+    expect(alert.textContent).toContain("try again in a minute")
+  })
+
+  it("a ready pipeline whose job is loading reloads its detail until the job is there", async () => {
+    // The poll is on a 4 s timer: drive it with fake timers so the second
+    // detail read is deterministic, then let React flush inside act().
+    jest.useFakeTimers()
+    try {
+      const loading: PipelineDetail = { ...PIPELINE, orchestratorJob: null }
+      const loaded: PipelineDetail = { ...PIPELINE, orchestratorJob: "authored__pl_connector_1" }
+      // The harness double-mounts (StrictMode), so the first two reads are
+      // still loading; only the bounded poll's read sees the job loaded.
+      stubApi({ status: () => "completed", details: [loading, loading, loaded] })
+      renderPage()
+
+      await act(async () => {})
+      expect(screen.getByText("The orchestrator is loading this pipeline's job.")).toBeTruthy()
+      // Two separate act() flushes: one poll look per 4 s tick.
+      await act(async () => {
+        jest.advanceTimersByTime(4500)
+      })
+      await act(async () => {
+        jest.advanceTimersByTime(4500)
+      })
+      // The detail poll saw the job load; no manual reload was needed.
+      expect(screen.queryByText("The orchestrator is loading this pipeline's job.")).toBeNull()
+    } finally {
+      jest.useRealTimers()
+    }
+  }, 20_000)
+
+  it("after Mark ready the page shows the pipeline as ready without a reload", async () => {
+    const draft: PipelineDetail = { ...PIPELINE, status: "draft", orchestratorJob: null }
+    const ready: PipelineDetail = { ...draft, status: "ready" }
+    stubApi({ status: () => "completed", pipeline: draft, readyPipeline: ready })
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: /mark ready/i }))
+    // The button's label flips to "Marking ready…" while pending, so wait for
+    // the post-reload banner rather than for the label to disappear.
+    expect(
+      await screen.findByText("The orchestrator is loading this pipeline's job.", undefined, {
+        timeout: 8000,
+      })
+    ).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /mark ready/i })).toBeNull()
   })
 })
 
