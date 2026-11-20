@@ -632,7 +632,7 @@ async fn pausing_a_report_with_an_outside_list_is_a_confirm() {
         pending["result"]["summary"]
             .as_str()
             .unwrap()
-            .contains("tanpa penerima baru"),
+            .contains("no new recipients"),
         "{pending}"
     );
     let done = tool(
