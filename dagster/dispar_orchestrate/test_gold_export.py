@@ -951,5 +951,57 @@ class GoldTrimOpTests(unittest.TestCase):
         self.assertEqual(kwargs["reason"], "invalid GOLD_ORPHAN_MIN_AGE_SECONDS")
 
 
+class GoldTrimSharedCleanupTests(unittest.TestCase):
+    """DATA-6 T3: the trim's two cleanup steps, extracted into shared
+    helpers the latest-copy op reuses (D11). One test per helper, with
+    fakes: what ids the expiry covers, and that the orphan-file age the
+    caller computed is the age the verb receives (DATA-2 review BLOCKER 1
+    — the trim's own test above already proves the whole path)."""
+
+    def test_expire_all_but_current_snapshot_expires_every_id_but_the_current_one(self) -> None:
+        from unittest.mock import MagicMock
+
+        table = MagicMock()
+        snapshots = [MagicMock(snapshot_id=i) for i in (101, 102, 103)]
+        table.snapshots.return_value = snapshots
+        table.current_snapshot.return_value = snapshots[2]
+
+        expired = gold_export.expire_all_but_current_snapshot(table)
+
+        self.assertEqual(expired, 2)
+        table.maintenance.expire_snapshots.return_value.by_ids.assert_called_once_with([101, 102])
+
+    def test_expire_all_but_current_snapshot_skips_the_commit_when_current_is_the_only_one(self) -> None:
+        from unittest.mock import MagicMock
+
+        table = MagicMock()
+        snapshots = [MagicMock(snapshot_id=7)]
+        table.snapshots.return_value = snapshots
+        table.current_snapshot.return_value = snapshots[0]
+
+        expired = gold_export.expire_all_but_current_snapshot(table)
+
+        self.assertEqual(expired, 0)
+        table.maintenance.expire_snapshots.assert_not_called()
+
+    def test_remove_gold_orphan_files_passes_the_age_through_and_counts_data_files(self) -> None:
+        from unittest.mock import patch
+
+        cfg = _cfg()
+        with patch("dispar_orchestrate.maintenance.ensure_catalog_database") as mock_ensure_db, \
+             patch(
+                 "dispar_orchestrate.maintenance.run_remove_orphan_files",
+                 return_value={"deleted_data_files_count": 3},
+             ) as mock_orphan:
+            removed = gold_export.remove_gold_orphan_files(cfg, "gold.sales_mart", 0)
+
+        self.assertEqual(removed, 3)
+        mock_ensure_db.assert_called_once_with(cfg, db_name="icecat_gold_export")
+        mock_orphan.assert_called_once_with(
+            cfg, "gold.sales_mart", dry_run=False, catalog_db="icecat_gold_export",
+            older_than_seconds=0,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
