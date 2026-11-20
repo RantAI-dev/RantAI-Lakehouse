@@ -10,6 +10,8 @@ const eslintConfig = defineConfig([
   // class string, so a new one is refused at lint time instead of in review.
   // An exception belongs at the site, with a comment saying why
   // (`AGENTS.md`, choke points).
+  // `UX-7`: the same for `<datalist>`: the browser draws it as a long unstyled
+  // list (owner QA 2026-11-20, the report time zone). Use `Combobox`.
   {
     files: ["src/**/*.{ts,tsx}"],
     rules: {
@@ -19,6 +21,11 @@ const eslintConfig = defineConfig([
           selector: "JSXOpeningElement[name.name='select']",
           message:
             "Use SelectField (`@/components/patterns/select-field`); a native select is unreadable in the dark theme (`WEB-9`)",
+        },
+        {
+          selector: "JSXOpeningElement[name.name='datalist']",
+          message:
+            "Use Combobox (`@/components/ui/combobox`); a native datalist is drawn by the browser, not the console (`UX-7`)",
         },
       ],
     },
