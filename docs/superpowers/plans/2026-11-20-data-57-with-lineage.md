@@ -735,3 +735,42 @@ Not verified:
   touched to force fresh builds before each reported run.
 
 ## Review
+
+### Round 1 — planner review, 2026-11-20, at `052bd6971`
+
+Holds: the merge `828e4c788` reverts nothing from #619; CTE names match
+exactly; only a one-part name can be a CTE; definitions are computed once,
+in order, so there is no cycle; `count()` gives no edge; `__left`/`__right`
+resolve by alias; anything unreadable becomes a partial row, never an edge.
+
+**R1 BLOCKER: a nested `WITH` loses the "not defined yet" check and gives
+wrong edges.** `sql_lineage.rs:454-457`, `:505`, `:559-569`: a CTE whose
+own query has a `WITH` starts a fresh `pending` list, and `cte_lookup`
+searches `defined` before `pending`. Two inputs that must give
+`MSG_CTE_FORWARD` (partial), not an edge:
+`WITH a AS (WITH x AS (SELECT 1 AS k) SELECT id FROM b), b AS (SELECT Amount AS id FROM silver.orders) SELECT id FROM a`
+(today: `id ← b.id`), and
+`WITH b AS (SELECT name AS id FROM silver.users), s AS (WITH a AS (SELECT id FROM b), b AS (SELECT id FROM silver.orders) SELECT id FROM a) SELECT id FROM s`
+(today: `id ← silver.users.name`; which `b` the engine binds is unclear, so
+the only safe answer is partial). Fix: carry the enclosing pending names
+into the child environment and check every pending name (at any level)
+before `defined`. Both inputs become tests.
+
+**R2 SHOULD-FIX: three unsupported shapes have no test.** `MSG_CTE_HINT`,
+`MSG_CTE_DUPLICATE`, `MSG_CTE_UNREADABLE`: add `WITH c AS MATERIALIZED (…)`,
+`WITH c AS (…), c AS (…)`, `WITH c AS (VALUES (1)) SELECT * FROM c`.
+
+**R3 SHOULD-FIX: a `FROM` alias with a column list is ignored.**
+`sql_lineage.rs:599`: `… FROM c AS x(name, id)` maps by the CTE's names,
+not the alias list. Treat an alias with a non-empty column list as opaque
+(partial, fixed reason), as `MSG_CTE_COLUMNS` does. Test.
+
+**R4 SHOULD-FIX: the bound is claimed, not enforced.** `sql_lineage.rs:146`
+says "at most 25 CTEs", which holds only for pipelines; SQL sources and the
+query-log pass have no cap, and self-joined CTE chains double the output
+count per level (the duplicate check at `:822` is then quadratic). Cap the
+total output count (e.g. 2,000 columns per statement), answer partial with
+a fixed reason past it, fix the comment. Test with a doubling chain.
+
+**R5 SHOULD-FIX: stale comment.** `authored_pipelines.rs:2112` "(after
+#619)": #619 is merged.
