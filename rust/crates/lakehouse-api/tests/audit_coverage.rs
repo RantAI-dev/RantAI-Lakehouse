@@ -675,6 +675,85 @@ async fn the_query_limits_update_names_the_settings_that_changed_and_holds_no_va
     assert_eq!(row["args"], json!({"fields": []}), "nothing changed: {row}");
 }
 
+/// Plan D3b: the limits save answers with the numbers it stored and names
+/// the settings that changed, both from the save's own transaction. The row
+/// holds the paths and no value, and the answer carries the numbers the
+/// save wrote: the install's, the roles' and the caller's effective ones.
+#[tokio::test]
+async fn the_limits_save_answers_with_the_numbers_it_stored_and_names_what_changed() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let role_name = "Limits Stored Role";
+    let role: Uuid =
+        sqlx::query_scalar("INSERT INTO role (name, permissions) VALUES ($1, '') RETURNING id")
+            .bind(role_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    // The caller holds that role, so the effective limits it is told are the
+    // ones the role's own limit gives it.
+    sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
+        .bind(admin)
+        .bind(role)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let body = |chart_rows: i32| {
+        json!({
+            "install": {"timeoutSeconds": 30, "chartRows": chart_rows, "mapPoints": 1000, "studioRows": 4000},
+            "roles": [{"roleId": role, "timeoutSeconds": 300}]
+        })
+    };
+
+    // The first save sets every limit; the second moves one of them.
+    let (status, first) = call(
+        &router,
+        "PUT",
+        "/api/settings/limits",
+        &cookie,
+        Some(body(500)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, second) = call(
+        &router,
+        "PUT",
+        "/api/settings/limits",
+        &cookie,
+        Some(body(501)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+
+    // The row names the setting that changed and holds no value.
+    let row = the_newest_row(&pool, "settings.limits.update").await;
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(row["args"], json!({"fields": ["install.chartRows"]}));
+    assert_eq!(row["detail"].as_str(), Some("install.chartRows"));
+    assert!(
+        !row["args"].to_string().contains("501")
+            && !row["detail"].as_str().unwrap_or_default().contains("501"),
+        "only paths are kept, never the value that changed: {row}"
+    );
+
+    // The answer carries the numbers the save stored.
+    assert_eq!(second["install"], body(501)["install"]);
+    assert_eq!(
+        second["roles"],
+        json!([{"roleId": role.to_string(), "timeoutSeconds": 300}]),
+        "the answer carries the role limit the save stored: {second}"
+    );
+    assert_eq!(
+        second["effective"],
+        json!({
+            "timeoutSeconds": 300, "chartRows": 501, "mapPoints": 1000, "studioRows": 4000,
+            "source": {"kind": "role", "name": role_name}
+        }),
+        "the caller's effective limits come from the stored values: {second}"
+    );
+}
+
 /// Plan D3: the reporting save names the settings that changed the same way,
 /// from the row the save replaced, and never a value.
 #[tokio::test]

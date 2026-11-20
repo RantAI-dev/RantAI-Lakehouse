@@ -245,7 +245,7 @@ async fn save_limits(
             "Settings need a database, and none is configured.".to_owned(),
         ));
     };
-    let replaced = match lakehouse_store::query_limits::save(
+    let (replaced, stored) = match lakehouse_store::query_limits::save(
         pool,
         &install,
         &roles,
@@ -253,7 +253,7 @@ async fn save_limits(
     )
     .await
     {
-        Ok(replaced) => replaced,
+        Ok(saved) => saved,
         Err(StoreError::ForeignKeyViolation) => {
             return Err(ApiError::BadRequest(
                 "The role limits must name roles that exist.".to_owned(),
@@ -263,17 +263,20 @@ async fn save_limits(
             return Err(upstream_error::internal_error(&upstream_error::STORE, &err));
         }
     };
-    // Cleared after the write so the read below, and the next tile of this
-    // process, see the new numbers (plan D2).
+    // Cleared after the write so the next tile of this process sees the new
+    // numbers (plan D2).
     state.query_limits.clear();
-    let snap = snapshot(state).await?;
     // Plan D3: the row names the settings that changed — the dotted paths
-    // between the values this save replaced (plan D3b) and the saved ones,
-    // with the roles' names, never a value. The store seeds the install row,
-    // so no replaced row reads as the defaults every reader falls back to.
+    // between the values this save replaced (plan D3b) and the values it
+    // stored, with the roles' names, never a value. Both sides come out of
+    // the save's own transaction, so no read sits between the write and the
+    // row: a read after the commit could fail, which would leave a committed
+    // save with no record of it, or name another save's values as this one's.
+    // The store seeds the install row, so no replaced row reads as the
+    // defaults every reader falls back to.
     let paths = changed_setting_paths(
         &limits_snapshot_json(&replaced.install.unwrap_or_default(), &replaced.roles),
-        &limits_snapshot_json(&snap.install, &snap.roles),
+        &limits_snapshot_json(&stored.install, &stored.roles),
     );
     let detail = (!paths.is_empty()).then(|| paths.join(", "));
     audit_settings_event(
@@ -285,6 +288,12 @@ async fn save_limits(
         detail.as_deref(),
     )
     .await;
+    // The answer carries the values the save stored, so the caller sees what
+    // was written and not what another save wrote in between.
+    let snap = Snapshot {
+        install: stored.install,
+        roles: stored.roles,
+    };
     Ok(ApiJson(body_json(&snap, principal, true)))
 }
 
@@ -375,5 +384,35 @@ mod tests {
     fn an_unknown_field_is_not_part_of_the_body() {
         let text = OK.replace("\"roles\":[]", "\"roles\":[],\"extra\":1");
         assert!(serde_json::from_str::<LimitsBody>(&text).is_err());
+    }
+
+    /// The save's answer and its audit row come from the values the store
+    /// returned (plan D3b), so the route reads the limits nowhere between the
+    /// write and the row. A read after the commit could fail, which would
+    /// leave a committed save with no record of it, or name another save's
+    /// values as this one's — the race the store's own transaction closed.
+    ///
+    /// The property is about the shape of the code, so it is pinned by
+    /// reading it: the save holds no read of the limits at all.
+    #[test]
+    fn the_save_reads_the_limits_nowhere_after_the_write() {
+        let source = include_str!("query_limits.rs");
+        let start = source
+            .find("async fn save_limits(")
+            .expect("the save is in this file");
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").expect("the save ends with a brace");
+        let body = &rest[..end];
+        for read in [
+            "snapshot(",
+            "query_limits::get(",
+            "query_limits::role_limits(",
+        ] {
+            assert!(
+                !body.contains(read),
+                "the save must answer from the values the store returned, so it reads the \
+                 limits nowhere after the write; it reads them with `{read}`: {body}"
+            );
+        }
     }
 }

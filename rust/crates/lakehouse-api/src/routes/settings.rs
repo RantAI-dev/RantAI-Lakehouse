@@ -3091,6 +3091,9 @@ pub async fn put_general(
             .map_err(|err| workspace_store_failed(&err))?;
     // The save is visible to the next reader on this process at once (decision 6).
     state.settings_caches.workspace.clear().await;
+    // The direct comparison stays on purpose: plan D3b forbids touching
+    // this route, whose save race `adm-120` owns, so the second way to count
+    // the fields that changed is deliberate until that plan lands.
     let fields: &[&str] = if changed { &["workspaceName"] } else { &[] };
     audit_settings_update(
         &state,
