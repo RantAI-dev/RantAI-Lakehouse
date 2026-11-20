@@ -307,9 +307,16 @@ export function QueryHistoryPage() {
                     className="cursor-pointer align-top hover:bg-muted/20"
                     // QS-12 (LH-QS-4-07), D16: the whole row opens the run by
                     // its id. A click that ended a text selection is not a
-                    // navigation; the SQL link stays the keyboard path.
-                    onClick={() => {
+                    // navigation. QS round review R2: a click on the SQL link
+                    // is the browser's own navigation (often "open in a new
+                    // tab"), so the row must not push as well — nor a click
+                    // someone else already handled or made with a modifier.
+                    onClick={(event) => {
                       if (window.getSelection()?.toString()) return
+                      if (event.defaultPrevented) return
+                      if (event.button !== 0) return
+                      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+                      if ((event.target as HTMLElement).closest("a")) return
                       router.push(studioHref(run))
                     }}
                   >

@@ -321,6 +321,41 @@ describe("QueryHistoryPage", () => {
     expect(pushed).toEqual(["/query-studio?run=q-42"])
   })
 
+  // QS round review R2: a modified click on the SQL link is the browser's
+  // "open in a new tab" and must not also navigate this tab; a plain click on
+  // the row still pushes exactly once.
+  it("does not navigate this tab on a modified click of the SQL link", async () => {
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(
+      pageOf([row({ id: "q-42" })], 1),
+    )
+    render(<QueryHistoryPage />)
+    const link = await screen.findByRole("link", { name: "SELECT 1" })
+
+    for (const init of [
+      { metaKey: true },
+      { ctrlKey: true },
+      { shiftKey: true },
+      { altKey: true },
+      { button: 1 },
+    ]) {
+      fireEvent.click(link, init)
+    }
+
+    expect(pushed).toEqual([])
+  })
+
+  it("does not navigate this tab when the click came from the SQL link", async () => {
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(
+      pageOf([row({ id: "q-42" })], 1),
+    )
+    render(<QueryHistoryPage />)
+    const link = await screen.findByRole("link", { name: "SELECT 1" })
+
+    fireEvent.click(link)
+
+    expect(pushed).toEqual([])
+  })
+
   it("does not navigate when the click ended a text selection", async () => {
     spyOn(queryService, "listHistoryPage").mockResolvedValue(
       pageOf([row({ id: "q-42" })], 1),
