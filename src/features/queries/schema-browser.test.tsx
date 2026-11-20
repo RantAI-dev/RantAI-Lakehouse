@@ -349,7 +349,14 @@ describe("SchemaBrowser", () => {
 
   it("keeps the table's name unknown on a Trino tab until its detail loads", async () => {
     visitTrinoTab()
-    stubServices()
+    const { getAsset } = stubServices()
+    // The row's SQL name comes from that detail (the studio also reads it for
+    // a table it must prove), and `stubServices` answers at once. Holding it
+    // pending keeps the row in the state this test is about -- "until its
+    // detail loads" -- instead of racing the stub's answer: when the fetch
+    // landed first, the same click inserted the name built from an empty
+    // detail (`undefined.undefined`) and the test failed (UX-6, 2026-11-20).
+    getAsset.mockImplementation((() => new Promise(() => {})) as never)
     const { container } = render(<Harness />)
     const view = editorView(container)
     setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
