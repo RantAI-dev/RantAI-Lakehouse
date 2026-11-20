@@ -18,6 +18,10 @@
 //!   columns, so it refuses to guess and makes the caller list them.
 //!   `__left` and `__right` are fixed aliases; D2 refuses a name
 //!   starting with `__`, so no input or step can collide with them.
+//!   Whether the analyzer lets an output alias capture a qualified `ON`
+//!   column — an alias equal to the OTHER side's join key — is
+//!   unverified: the `g7` case proves `id AS id` only (BLD-16 review R3's
+//!   note, kept here because a variant is more than a few lines there).
 //! - A measure's `name` may not be a column the step names (F2): in
 //!   `ClickHouse` an alias is visible in the whole query, so
 //!   `sum(amount) AS amount, avg(amount) AS a` makes the second read
@@ -1487,9 +1491,8 @@ mod tests {
     }
 
     /// F2's guard rail, from the other side: a measure's name that is NOT a
-    /// column the step reads is accepted, and so is an aggregate whose
-    /// measure reads the column another measure is named after — only the
-    /// NAME is refused, not the coincidence.
+    /// column the step reads is accepted. (A name that another measure reads
+    /// as its column is refused — see the case below.)
     #[test]
     fn a_measure_name_that_is_no_column_is_accepted() {
         use lakehouse_core::ident::Ident;
@@ -1510,5 +1513,26 @@ mod tests {
             Some(MeasureFunction::CountDistinct)
         ));
         assert!(matches!(form.having[0].value, ConditionValue::Number(_)));
+    }
+
+    /// F2's guard rail across measures: `read_keys` holds every measure's
+    /// column, so a measure named `revenue` while another measure reads a
+    /// column called `revenue` is refused — the alias would be read back as
+    /// that column, the same collision as the single-measure case. The doc on
+    /// the test above used to claim this was accepted (BLD-16 review R3).
+    #[test]
+    fn a_measure_name_that_another_measure_reads_is_refused() {
+        let err = parse_aggregate(
+            0,
+            &["country".to_owned()],
+            &[
+                measure("sum", "amount", "revenue"),
+                measure("sum", "revenue", "amount_total"),
+            ],
+            "",
+            &[],
+        )
+        .unwrap_err();
+        refused(&err, "steps[0].measures[0]", MEASURE_NAME_IS_COLUMN);
     }
 }
