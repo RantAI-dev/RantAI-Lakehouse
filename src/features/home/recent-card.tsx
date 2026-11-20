@@ -28,6 +28,7 @@ export function RecentList({
   failed: string[]
   items: RecentItem[]
 }) {
+  const latestChat = items.find((it) => it.kind === "conversation")
   return (
     <section className="flex min-w-0 flex-col gap-3">
       <SectionTitle>Recent</SectionTitle>
@@ -80,9 +81,13 @@ export function RecentList({
           <Link href="/dashboards/browse" className="underline-offset-4 hover:text-foreground hover:underline">
             Dashboards
           </Link>
-          <Link href="/copilot/history" className="underline-offset-4 hover:text-foreground hover:underline">
-            History
-          </Link>
+          {/* WEB-18: the chats are listed in the sidebar of a conversation, so this opens the
+              newest one listed here; with none, there is nothing to list. */}
+          {latestChat ? (
+            <Link href={latestChat.href} className="underline-offset-4 hover:text-foreground hover:underline">
+              Chats
+            </Link>
+          ) : null}
           <Link href="/query-studio/saved" className="underline-offset-4 hover:text-foreground hover:underline">
             Saved queries
           </Link>
