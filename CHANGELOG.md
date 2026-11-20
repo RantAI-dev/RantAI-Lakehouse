@@ -40,6 +40,7 @@ once a first release is tagged.
 
 ### Security
 
+- Next.js and `eslint-config-next` are updated from 16.4.3 to 16.4.6 (`SEC-81`). 16.4.5 fixes seven moderate advisories, among them GHSA-pc58-hwjq-p385 (self-hosted response forwarding) and GHSA-7qx7-33qx-rqx2 (SVG rejection bypass in image optimization); the other five concern `use cache`, Cache Components and the Edge runtime, which the console does not use.
 - The audit row written when a sign-in gets locked no longer holds part of a hash of what was typed as the identifier; older rows keep it.
 - Dagster's instance database has its own role, `lakehouse_dagster`, which is not a superuser and owns nothing outside its database. The code location, the webserver and the daemon no longer hold the owner's password (`SEC-78`, second change). New required setting: `LAKEHOUSE_DB_DAGSTER_PASSWORD`.
 - The console connects to Postgres as a role that owns no table and is not a superuser (`SEC-78`), so it cannot switch off the audit trail's append-only rule; the migrations and the role's setup run in a separate one-shot `lakehouse-db-migrate` service with the owner's credentials, and `lakehouse-api` refuses to start as a superuser or a table owner. New required setting: `LAKEHOUSE_DB_APP_PASSWORD` (`ops/init-env.sh` generates it); `CONNECTOR_PG_PASSWORD` now falls back to it, the seeded `conn-pg-lakehouse` connector dials as `lakehouse_app` (migration `0149`), and the API container holds no `POSTGRES_PASSWORD`.
