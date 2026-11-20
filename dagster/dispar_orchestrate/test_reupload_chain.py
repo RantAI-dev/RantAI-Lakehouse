@@ -328,6 +328,41 @@ def test_waiting_past_six_hours_records_wait_expired() -> None:
     )
 
 
+def test_a_settled_newer_reupload_supersedes_an_older_open_one() -> None:
+    """BLD-14 review R4: R2 was settled on an earlier tick and is no longer
+    in the open set, but it is still a newer re-upload of the same table.
+    R1 must be superseded, not launched."""
+    base = time.time() - 400
+    roots = [
+        _root_record("R2", "orders", base + 200),
+        _root_record("R1", "orders", base),
+    ]
+    parent = SimpleNamespace(
+        run_id="silver-r1",
+        job_name="authored__pl_silver",
+        status=DagsterRunStatus.SUCCESS,
+        tags={REUPLOAD_ROOT_TAG: "R1", REUPLOAD_TABLE_TAG: "orders"},
+    )
+    instance = _StubInstance(roots, [SimpleNamespace(dagster_run=parent, end_time=base)])
+    context = _StubContext(
+        json.dumps({"floor": 0, "settled": ["R2"]}), instance
+    )
+    body = _sensor(
+        {"orders": ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",))}
+    )._raw_fn
+
+    with patch("dispar_orchestrate.reupload_chain._post_chain_step", return_value=True) as post:
+        out = list(body(context))
+
+    assert not [item for item in out if isinstance(item, RunRequest)], (
+        f"an older open re-upload must not launch: {out}"
+    )
+    bodies = [call.args[2] for call in post.call_args_list]
+    assert any(
+        b.get("rootRunId") == "R1" and b.get("outcome") == "superseded" for b in bodies
+    ), f"the older root must be superseded: {bodies}"
+
+
 def test_a_second_reupload_waits_for_the_next_tick_after_one_launch() -> None:
     """BLD-14 review R3: the instance does not yet hold a request yielded
     earlier in this tick, so `in_flight` cannot stop a second launch for

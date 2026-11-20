@@ -279,6 +279,26 @@ def build_reupload_chain_sensor(
                 ),
             ),
         )
+        # BLD-14 review R4: supersession compares against EVERY re-upload
+        # of the table, finished/settled ones included -- not just the
+        # open, windowed roots. A newer load settled on a previous tick
+        # must still supersede an older one left open.
+        all_root_records = context.instance.get_run_records(
+            filters=RunsFilter(
+                job_name=FILE_INGEST_JOB,
+                statuses=[DagsterRunStatus.SUCCESS],
+            ),
+        )
+        all_roots = [
+            Root(
+                run_id=record.dagster_run.run_id,
+                table=str(_run_config_value(record.dagster_run, FILE_INGEST_OP_CONFIG)),
+                end_time=record.end_time or 0.0,
+            )
+            for record in all_root_records
+            if _run_config_value(record.dagster_run, FILE_INGEST_OP_CONFIG) in entries
+        ]
+
         roots: list[Root] = []
         for record in root_records:
             table = _run_config_value(record.dagster_run, FILE_INGEST_OP_CONFIG)
@@ -339,7 +359,7 @@ def build_reupload_chain_sensor(
                 pipeline_id=pipeline_id,
                 run_for_tag=run_for_tag,
                 newer_root=lambda table, root_id, r=root: any(
-                    other.table == table and other.end_time > r.end_time for other in roots
+                    other.table == table and other.end_time > r.end_time for other in all_roots
                 ),
                 in_flight=in_flight,
             )
