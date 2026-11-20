@@ -410,6 +410,28 @@ export function routeMatches(pattern: string, pathname: string): boolean {
   })
 }
 
+/** The access-map entry for a pathname: an exact entry first, then a parameterized one. */
+function routeAccessFor(pathname: string): RouteAccessEntry | undefined {
+  const normPath = pathname.split("?")[0].replace(/\/+$/, "") || "/"
+  return (
+    ROUTE_ACCESS.find((entry) => entry.pattern === normPath) ??
+    ROUTE_ACCESS.find((entry) => routeMatches(entry.pattern, normPath))
+  )
+}
+
+/**
+ * Whether the access map names this address at all (`adm-121`, decision 6).
+ *
+ * `nav-config.test.ts` keeps every page of `src/app` in the map, so an
+ * address the map does not name is one no page answers. The route guard uses
+ * this to say "not found" for it, and "no access" only for a page that
+ * exists. `canOpen` stays fail closed on its own: an unlisted path is still
+ * not openable.
+ */
+export function isKnownRoute(pathname: string): boolean {
+  return routeAccessFor(pathname) !== undefined
+}
+
 /**
  * ADM-13 (D7): Fail-closed access check for pathnames against ROUTE_ACCESS.
  * Unlisted paths return false.
@@ -420,11 +442,7 @@ export function canOpen(
   pathname: string,
   hasPermission: (perm: string) => boolean
 ): boolean {
-  const normPath = pathname.split("?")[0].replace(/\/+$/, "") || "/"
-  // Exact match wins over parameterized match
-  const match =
-    ROUTE_ACCESS.find((entry) => entry.pattern === normPath) ??
-    ROUTE_ACCESS.find((entry) => routeMatches(entry.pattern, normPath))
+  const match = routeAccessFor(pathname)
 
   if (!match) {
     return false // Fail closed: unlisted routes return false

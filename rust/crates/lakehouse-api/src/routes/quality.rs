@@ -856,8 +856,10 @@ struct RunRecord {
 ///
 /// # Errors
 ///
-/// `404` when no rule has that id; `503` when the store or the run table
-/// cannot be read (the cause is logged, not returned).
+/// `404` when no rule has that id, and for a rule on a table the caller may
+/// not read (the same answer, so the refusal says nothing about what the
+/// deployment holds); `503` when the store or the run table cannot be read
+/// (the cause is logged, not returned).
 pub async fn rule_runs(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -875,6 +877,17 @@ pub async fn rule_runs(
         .iter()
         .find(|r| r.id == id)
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
+    // `SEC-20` (plan ai-118): a rule names the table it checks, so a rule on
+    // a table outside the caller's reach is not there for this caller: the
+    // same 404 an unknown rule id gets, so the answer says nothing about the
+    // other tenants' rules.
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+    let readable =
+        crate::routes::query::reachable_names(&state, reach, std::slice::from_ref(&rule.asset))
+            .await?;
+    if !readable.contains(&rule.asset) {
+        return Err(ApiError::NotFound("Quality rule not found".to_owned()).into());
+    }
     let ch = &state.clickhouse;
     ensure_table(ch).await.map_err(|err| {
         tracing::warn!(?err, rule = %rule.name, "quality: the run table is unavailable");
@@ -997,8 +1010,115 @@ pub(crate) async fn quality_table_access(
     crate::routes::catalog::table_access_for(state, principal).await
 }
 
+/// What a writer answers for a table outside the caller's reach (`SEC-80`).
+///
+/// Both answers are ones the writer already gives, so the refusal says
+/// nothing about which tables exist and whose they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutOfReach {
+    /// [`unreadable_table`]: the answer for a table the role does not read.
+    /// Create, and an edit that moves a rule onto another table, give it.
+    UnreadableTable,
+    /// `404` "Quality rule not found": the answer for an unknown rule.
+    /// `run_rule` looks the rule up first, so a known rule out of reach
+    /// must read as an unknown one.
+    UnknownRule,
+}
+
+/// `SEC-80`: whether the caller's reach covers the quality state of `key`,
+/// a `zone.table` key as rules and schedules store it.
+///
+/// The question the readers ask (`crate::routes::query::resolve_reach`, then
+/// `reachable_names`), asked for one key. A tenant reads its own upload
+/// tables and the shared ones only as the catalog's tenant, so a table another
+/// tenant claimed is out of reach for every writer. No principal is a system
+/// call (the scheduled and on-load passes), and it is not narrowed.
+///
+/// # Errors
+///
+/// The errors of [`crate::routes::query::resolve_reach`] (`404` for an
+/// `X-Tenant` the caller does not belong to) and of
+/// [`crate::routes::query::reachable_names`] (`503` when the claims cannot be
+/// read).
+pub(crate) async fn quality_key_in_reach(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &HeaderMap,
+    key: &str,
+) -> Result<bool, ApiError> {
+    let Some(principal) = principal else {
+        return Ok(true);
+    };
+    let reach = crate::routes::query::resolve_reach(state, principal, headers).await?;
+    if reach == crate::routes::query::TenantReach::All {
+        return Ok(true);
+    }
+    // The claim is stored under the lowercase name an upload lands with, and
+    // the zone is matched without case by `resolve`. A key that differs only
+    // in case must not get past the claim check.
+    let key = canonical_table_key(key);
+    let readable =
+        crate::routes::query::reachable_names(state, reach, std::slice::from_ref(&key)).await?;
+    Ok(readable.contains(&key))
+}
+
+/// `zone.table` with the zone and the table lowercased, trimmed around the
+/// whole key. A key without a dot is returned as it is.
+fn canonical_table_key(key: &str) -> String {
+    let key = key.trim();
+    match key.split_once('.') {
+        Some((zone, table)) => format!("{}.{}", zone.to_lowercase(), table.to_lowercase()),
+        None => key.to_owned(),
+    }
+}
+
+/// `SEC-80`: whether the table `asset` names is there, a `silver.` or
+/// `serving.` table in `ClickHouse` or a `bronze.` Iceberg table.
+///
+/// The one presence check the rule writers and the schedule writers share.
+/// The writers ask it for every name, before they check the reach, so an
+/// outage answers a name another tenant claimed the same way as an unknown
+/// one. A deployment with no Iceberg query database has no bronze table to
+/// find, so a bronze name is absent there.
+///
+/// # Errors
+///
+/// [`ApiError::Unavailable`] (`503`) when the table cannot be checked because
+/// the engine or the catalog did not answer: a check that cannot be made is
+/// not a refusal.
+pub(crate) async fn quality_table_present(state: &AppState, asset: &str) -> Result<bool, ApiError> {
+    let Some((zone, table)) = asset.trim().split_once('.') else {
+        return Ok(false);
+    };
+    let zone = zone.to_lowercase();
+    let unanswered =
+        || ApiError::Unavailable("The table could not be checked. Try again.".to_owned());
+    match zone.as_str() {
+        "silver" | "serving" => {
+            match catalog_source::clickhouse_source(&state.clickhouse, &zone, table).await {
+                Ok(found) => Ok(found.is_some()),
+                Err(err) => {
+                    tracing::warn!(%err, "could not check that a quality table exists");
+                    Err(unanswered())
+                }
+            }
+        }
+        "bronze" => match catalog_source::iceberg_table_presence(state, table).await {
+            Ok(present) => Ok(present),
+            // `NoQueryDatabase` means nothing in this deployment can read a
+            // bronze table, so it is absent, as a rule on it could never run.
+            Err(catalog_source::PresenceUnknown::NoQueryDatabase) => Ok(false),
+            Err(catalog_source::PresenceUnknown::Unanswered) => Err(unanswered()),
+        },
+        _ => Ok(false),
+    }
+}
+
 /// Refuses a quality rule written for a table that is not there, or that the
 /// author's roles do not let them read (QA `LH-DATA-14-01` F2, `DATA-54`).
+///
+/// A table another tenant claimed as its upload is refused the same way
+/// (`SEC-80`): the caller's reach over upload claims is checked after the role.
 ///
 /// The form offers only tables the person may read; what the form hides the
 /// server refuses. "Not there" and "not yours" are one sentence on purpose:
@@ -1028,6 +1148,36 @@ pub(crate) async fn ensure_rule_table(
     headers: &HeaderMap,
     asset: &str,
 ) -> Result<(), ApiError> {
+    ensure_rule_table_with(
+        state,
+        principal,
+        headers,
+        asset,
+        OutOfReach::UnreadableTable,
+    )
+    .await
+}
+
+/// [`ensure_rule_table`], with the answer for a table out of the caller's
+/// reach given by `out_of_reach` (`SEC-80`).
+///
+/// # Errors
+///
+/// [`ApiError::PermissionDenied`] (`403`) when the caller is outside the
+/// tenant that owns the shared catalog, for every table. [`ApiError::BadRequest`]
+/// (`400`) with the [`unreadable_table`] sentence when `asset` is not a plain
+/// `silver.`, `serving.` or `bronze.` name, when the caller's table access
+/// hides it, when the table does not exist, or when it is outside the caller's
+/// reach (`SEC-80`). With [`OutOfReach::UnknownRule`], the reach refusal is
+/// `404` "Quality rule not found" instead. [`ApiError::Unavailable`] (`503`)
+/// when the table cannot be checked.
+pub(crate) async fn ensure_rule_table_with(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &HeaderMap,
+    asset: &str,
+    out_of_reach: OutOfReach,
+) -> Result<(), ApiError> {
     let asset = asset.trim();
     let refused = || unreadable_table(asset);
     let Some((zone, table)) = asset.split_once('.') else {
@@ -1054,29 +1204,30 @@ pub(crate) async fn ensure_rule_table(
     if !access.allows(&zone, table) {
         return Err(refused());
     }
-    match zone.as_str() {
-        "silver" | "serving" => {
-            match catalog_source::clickhouse_source(&state.clickhouse, &zone, table).await {
-                Ok(Some(_)) => Ok(()),
-                Ok(None) => Err(refused()),
-                Err(err) => {
-                    tracing::warn!(%err, "could not check that a quality rule's table exists");
-                    Err(ApiError::Unavailable(
-                        "The table could not be checked. Try again.".to_owned(),
-                    ))
-                }
+    match out_of_reach {
+        // SEC-80: the caller names the table, so presence is asked for every
+        // name first: an outage (`503`) answers a name another tenant claimed
+        // and a name no table has alike. Then the reach, and both refusals are
+        // the `400`.
+        OutOfReach::UnreadableTable => {
+            let present = quality_table_present(state, asset).await?;
+            if !quality_key_in_reach(state, principal, headers, asset).await? || !present {
+                return Err(refused());
             }
         }
-        _ => match catalog_source::iceberg_table_presence(state, table).await {
-            // `NoQueryDatabase` means such a rule could never run in this
-            // deployment, so it is refused like a missing table.
-            Ok(true) => Ok(()),
-            Ok(false) | Err(catalog_source::PresenceUnknown::NoQueryDatabase) => Err(refused()),
-            Err(catalog_source::PresenceUnknown::Unanswered) => Err(ApiError::Unavailable(
-                "The table could not be checked. Try again.".to_owned(),
-            )),
-        },
+        // SEC-80: the rule is stored, so its reach is answered first. A table
+        // out of reach is the same `404` an unknown rule id gets, and no table
+        // is looked up for it. An in-reach table that is absent is the `400`.
+        OutOfReach::UnknownRule => {
+            if !quality_key_in_reach(state, principal, headers, asset).await? {
+                return Err(ApiError::NotFound("Quality rule not found".to_owned()));
+            }
+            if !quality_table_present(state, asset).await? {
+                return Err(refused());
+            }
+        }
     }
+    Ok(())
 }
 
 /// Why a rule could not be run.
@@ -1156,7 +1307,8 @@ async fn evaluate(state: &AppState, rule: &QualityRule, run_by: &str) -> Result<
 /// # Errors
 ///
 /// - `403` without `governance:write` (`GOV-10`, `DEC-17`; the policy gate).
-/// - `404` when no rule has that id.
+/// - `404` when no rule has that id, and for a rule on a table another tenant
+///   claimed (`SEC-80`): the same answer, so a run cannot say which rules exist.
 /// - `403` when the caller is outside the tenant that owns the shared
 ///   catalog ([`crate::routes::catalog::catalog_tenant_refusal`]) — the same
 ///   answer whatever the table, for every rule whose asset is a table key; an
@@ -1186,7 +1338,17 @@ pub async fn run_rule(
     // is measured or written. The scheduled and on-load passes call `evaluate`
     // directly and are the system's, so they keep working whatever a role may
     // read.
-    ensure_rule_table(&state, Some(&principal), &headers, &rule.asset).await?;
+    // SEC-80: a rule on another tenant's table is an unknown rule to this
+    // caller, the same 404 as an id that does not exist, so nothing is
+    // measured and the answer says nothing about the other tenant's tables.
+    ensure_rule_table_with(
+        &state,
+        Some(&principal),
+        &headers,
+        &rule.asset,
+        OutOfReach::UnknownRule,
+    )
+    .await?;
     let verdict = evaluate(&state, rule, &principal.display_name)
         .await
         .map_err(|err| match err {
@@ -1256,8 +1418,8 @@ pub struct UpdateRuleBody {
 /// outside the tenant that owns the shared catalog — for every edit, not only
 /// one that changes the table; `404` when no rule has that id, and for a rule
 /// on a table the caller's role does not read (it answers as an unknown rule,
-/// `GOV-15`); `503` when the table cannot be checked; `500` on a store
-/// failure.
+/// `GOV-15`) and for a table outside the caller's reach (`SEC-80`); `503` when
+/// the table cannot be checked; `500` on a store failure.
 pub async fn update_rule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1294,6 +1456,11 @@ pub async fn update_rule(
     // GOV-15 (GOV-12 plan, section 4): a rule on a table the role does not
     // read is not on the caller's list, so it answers as an unknown rule (D5).
     if !access.allows_key(before.asset.trim()) {
+        return Err(ApiError::NotFound("Quality rule not found".to_owned()).into());
+    }
+    // SEC-80: a rule on a table another tenant claimed is not on this
+    // caller's list either, so it answers as an unknown rule.
+    if !quality_key_in_reach(&state, Some(&principal), &headers, before.asset.trim()).await? {
         return Err(ApiError::NotFound("Quality rule not found".to_owned()).into());
     }
     // A rewrite that keeps the table is not checked, so a rule whose table
@@ -1357,8 +1524,8 @@ pub async fn update_rule(
 ///
 /// `403` when the caller is outside the tenant that owns the shared catalog;
 /// `404` when no rule has that id, and for a rule on a table the caller's role
-/// does not read (it answers as an unknown rule, `GOV-15`); `503`/`500` on a
-/// store failure.
+/// does not read (it answers as an unknown rule, `GOV-15`) and for a table
+/// outside the caller's reach (`SEC-80`); `503`/`500` on a store failure.
 pub async fn delete_rule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1378,6 +1545,11 @@ pub async fn delete_rule(
     // GOV-15 (GOV-12 plan, section 4): a rule on a table the role does not
     // read is not on the caller's list, so it answers as an unknown rule (D5).
     if !access.allows_key(before.asset.trim()) {
+        return Err(ApiError::NotFound("Quality rule not found".to_owned()).into());
+    }
+    // SEC-80: as in `update_rule`, a rule on another tenant's table is an
+    // unknown rule to this caller.
+    if !quality_key_in_reach(&state, Some(&principal), &headers, before.asset.trim()).await? {
         return Err(ApiError::NotFound("Quality rule not found".to_owned()).into());
     }
     let rule = lakehouse_store::governance::delete_quality_rule(pool, &id)

@@ -161,7 +161,7 @@ hands-on testing.
 | Catalog and search | **Partial.** Search finds a table by its name, columns, tags, description or owner, forgives a typo and ranks (`DATA-11`, accepted 2026-10-23; speed on 10,000 tables not measured, and a typo that matches only a table's name carries no "approximate match" label, `DATA-24`, `DATA-32`). Certified and deprecated marks, governed tags, and the marks in the chart builder and Query Studio are built and accepted (`DATA-12`, 2026-10-23); per-user table visibility is not built | Yes: columns, tags, certification | `DATA-12`, `DATA-20`, `DATA-24` |
 | Lineage | **Partial** | Yes, including outside systems | Depth |
 | Data quality checks | **Partial.** Hand-written rules; freshness against a set target | Yes: ready check libraries, anomaly detection | `DATA-14` |
-| Audit trail | **Partial.** About 87 of the 218 routes that change something record an audit row (identity, policies, governance, connectors, pipelines, sharing, the assistant's actions); dashboards, saved queries, alerts and some settings do not. `GOV-1` closes it. | Yes | Full coverage |
+| Audit trail | **Partial.** 182 of the 224 routes that change something record an audit row (identity, policies, governance, connectors, pipelines, sharing, the assistant's actions, and now dashboards, saved queries, alerts, report subscriptions and the settings); the other 42 are excluded, each with a listed reason. `GOV-1` closes it. | Yes | Full coverage |
 | Single sign-on | **Partial.** The sign-in start, callback and provider-list routes exist in the API; not tested against a real identity provider. | Yes | Test it |
 
 #### Business intelligence
@@ -175,7 +175,7 @@ hands-on testing.
 | Share by link and embed in other sites | **Partial.** Public links never expire; embed tokens can lack an expiry | Yes; often a paid extra | `BI-19`, `BI-26`, `SEC-12` |
 | Alerts on a threshold | **Partial.** Email and webhook; one aggregate per table, re-fires every check | Yes | `BI-19` |
 | Scheduled reports with PDF or spreadsheet attached | **Built, in acceptance** (#204, 2026-10-26). Email on a schedule with the dashboard as PDF and charts as Excel or CSV; needs SMTP and the PDF settings below. The assistant can set one up (`AI-10`) | Yes, all three BI tools | `RPT-1`, `BI-35` |
-| Export to PDF or spreadsheet | **Released** (#204, 2026-10-26; accepted by the product owner 2026-11-16). A server-made PDF of every tab (Gotenberg), chart data as Excel or CSV up to 1,000,000 rows, a chart as PNG (`BI-37`); the assistant gives the same links (`AI-10`). Off until `CONSOLE_INTERNAL_URL` is set (`docs/OPERATIONS.md`, `REL-18`); image and web cards and uploaded maps do not print yet | Yes | `BI-1`, `BI-36`, `BI-42`, `REL-18` |
+| Export to PDF or spreadsheet | **Released** (#204, 2026-10-26; accepted by the product owner 2026-11-16). A server-made PDF of every tab (Gotenberg), chart data as Excel or CSV up to 1,000,000 rows, a chart as PNG (`BI-37`); the assistant gives the same links (`AI-10`). Off until `CONSOLE_INTERNAL_URL` is set (`docs/OPERATIONS.md`, `REL-18`); image cards print from the content sites; web cards do not (`BI-42`) | Yes | `BI-1`, `BI-36`, `BI-42`, `REL-18` |
 | Shared business definitions (a governed metrics layer) | **Partial.** Built-in dashboard cards are defined once in code; users cannot define and reuse their own metrics | Yes, all three BI tools | User-defined metrics |
 | Mobile app | **Missing** | Tableau and Power BI | Decide if wanted |
 | Import dashboards from another BI tool | **Missing** | Databricks imports Tableau and Power BI | Helps switching |
@@ -201,7 +201,7 @@ hands-on testing.
 | Self-hosted | **Have** | Mostly no | A strength |
 | High availability | **Missing** | Yes | Yes |
 | Backup and restore | **Partial.** Procedures exist; no tested restore time | Yes, managed | Test it |
-| Usage and cost view | **Missing.** No usage page or API route | Yes | Yes |
+| Usage and cost view | **Have.** Usage page and API route | Yes | — |
 | API for everything | **Have** | Yes | — |
 | Several organisations in one install | **Partial.** One organisation's data per install | Yes | Later |
 
@@ -270,7 +270,7 @@ in `docs/KNOWN-LIMITATIONS.md` (moved from the README, 2026-11-05).
   saved query is limited to 2,000 rows and 30 seconds.
 - PDF export is released and scheduled reports are built but in acceptance; both are off on a
   fresh install until `CONSOLE_INTERNAL_URL` is set (`REL-18`). A PDF has no
-  image or web cards (`BI-42`) and may miss an uploaded map (`BI-36`).
+  web cards (`BI-42`).
 
 **AI**
 - Needs a model endpoint. Works over tables, not documents.
@@ -285,7 +285,7 @@ in `docs/KNOWN-LIMITATIONS.md` (moved from the README, 2026-11-05).
   (`SEC-15`, `SEC-10`); raw database errors reach the screen on dashboard
   tiles and embeds (`SEC-11`). The full list is `SEC-10` to `SEC-21` in
   `BACKLOG.md`.
-- The audit trail does not cover every console change.
+- The audit trail does not cover every console change: 42 of the 224 routes that change something are excluded, each with a listed reason (the audit trail's Decision 1).
 - The backend was ported and reviewed by AI agents, with no full human
   security review. A previously internal key is in the public git history
   (`SECURITY.md`).
@@ -353,7 +353,7 @@ customer would hit first, not matching every feature.
 
 | Item | Why |
 | --- | --- |
-| Accept the merged features: Gold publishing (`DATA-1`), login protection (`SEC-2`, `SEC-5`), file upload (`DATA-9`) | Blocker 1; merged is not accepted |
+| Accept the merged features: login protection (`SEC-2`, `SEC-5`), file upload (`DATA-9`). Gold publishing (`DATA-1`), result caching (`BI-4`), upload formats (`DATA-17`) and upload folders (`DATA-35`) were accepted on 2026-11-20 | Blocker 1; merged is not accepted |
 | Fix the security findings under Now: `SEC-10`, `SEC-11`, `SEC-13`, `SEC-14`, `SEC-15` | Blocker 6; they come before feature work |
 | Clear blockers 2 and 4 | Small, and they are embarrassing if found |
 

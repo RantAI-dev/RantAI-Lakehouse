@@ -10,7 +10,7 @@ import {
   datePickToFilter, filterToDatePick, filterToNumberPick, isActiveFilter, numberPickToFilter, opOf,
   type DatePick, type NumberPick,
 } from "@/lib/dashboard-filter-state";
-import type { FilterDef, FilterKind, RelativeUnit } from "@/services/clients/bi-store";
+import type { FilterDef, FilterKind, RelativeUnit } from "@/services";
 import { ValueList } from "./value-list";
 import type { OwnSource } from "./use-filter-values";
 

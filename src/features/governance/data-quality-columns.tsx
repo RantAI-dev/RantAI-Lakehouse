@@ -24,6 +24,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatRelativeTime } from "@/lib/format"
 import {
   CHECK_STATUS_LABEL,
@@ -222,7 +223,7 @@ export function getDataQualityColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(rule.name)
+                    void copyTextWithToast(rule.name)
                   }}
                 >
                   <Copy className="size-4" />
@@ -231,7 +232,7 @@ export function getDataQualityColumns({
                 <DropdownMenuItem
                   onClick={(e) => {
                     e.stopPropagation()
-                    void navigator.clipboard.writeText(rule.asset)
+                    void copyTextWithToast(rule.asset)
                   }}
                 >
                   <Database className="size-4" />

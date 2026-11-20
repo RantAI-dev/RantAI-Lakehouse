@@ -470,13 +470,28 @@ pub struct EmployeeQuery {
 
 /// `GET /api/agents/runs?employeeId=` — mirrors `AgentService::listRuns`.
 ///
+/// `SEC-20` (plan ai-118): a run belongs to the deployment, not to a tenant
+/// — `agent_employee` has no tenant column and its `owner` is free text — so
+/// the shared catalog's own rule decides who reads the run history: the
+/// tenant that owns the shared catalog, or an unrestricted caller. A caller
+/// the rule refuses gets the empty list, so the answer says nothing about
+/// what the deployment ran.
+///
 /// # Errors
 ///
 /// 503 if no pool is configured; 500 on a database failure.
 pub async fn list_runs(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Query(query): Query<EmployeeQuery>,
 ) -> ApiResult<ApiJson<Vec<AgentRun>>> {
+    if crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
+        .await?
+        .is_some()
+    {
+        return Ok(ApiJson(Vec::new()));
+    }
     Ok(ApiJson(
         agents::list_runs(pool(&state)?, query.employee_id.as_deref()).await?,
     ))
@@ -484,13 +499,27 @@ pub async fn list_runs(
 
 /// `GET /api/agents/runs/{id}`.
 ///
+/// `SEC-20` (plan ai-118): the run history is the deployment's, so the
+/// shared catalog's own rule decides who reads it (see [`list_runs`]). A
+/// caller the rule refuses gets the unknown 404, so the answer says nothing
+/// about whether the run exists.
+///
 /// # Errors
 ///
-/// 404 if `id` is unknown; 503/500 as above.
+/// 404 if `id` is unknown, and for a caller the shared catalog's rule
+/// refuses; 503/500 as above.
 pub async fn get_run(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<AgentRun>> {
+    if crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
+        .await?
+        .is_some()
+    {
+        return Err(ApiError::NotFound(format!("Run {id} not found")).into());
+    }
     let run = agents::get_run(pool(&state)?, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Run {id} not found")))?;
@@ -536,10 +565,13 @@ pub struct DecideApprovalBody {
 /// type both routes already share — so there is ONE check, not two
 /// (AGENTS.md rule 4: duplicated guards are a finding).
 ///
-/// The refusal is `403 permission_denied`, and NOTHING is written when it
-/// fires: both routes call this BEFORE their store call, so a refused
-/// decision leaves the approval `pending`, writes no audit row and grants
-/// nothing.
+/// The refusal is `403 permission_denied` and NOTHING is decided or run
+/// when it fires: both routes call this BEFORE their store call, so the
+/// approval stays `pending`, the run stays `waiting_approval`, and no
+/// grant or execution follows. `AI-28` / `LH-AI-18-10` adds ONE `refused`
+/// audit row on the tool-call decide route (the approval's own action,
+/// `resource_kind: "approval"`, the approval id, detail naming the
+/// refusal); the catalog access route is out of scope for that row.
 ///
 /// The message is one sentence for BOTH kinds — the access route's own
 /// wording minus the word "akses", which would not fit a tool call
@@ -593,7 +625,10 @@ pub(crate) fn refuse_own_request(
 ///    checked — `agent:approve` (this route's own policy) does NOT imply
 ///    the approver may perform the underlying action. A missing
 ///    permission means the tool is NEVER executed: the run is recorded
-///    `failed`/"not executed", audited, and this returns 403.
+///    `failed`/"not executed", audited, and this returns 200 with
+///    `executed: false` and a `notExecuted.reason` of `"permission"`
+///    (`AI-28`, `LH-AI-18-07`: the decision was recorded, so the answer
+///    must say so rather than fail).
 /// 2. The linked run's stored tool call (`lakehouse_store::agents::
 ///    pending_tool_call`, recorded verbatim by `gate::create_write_high_approval`
 ///    at request time) is replayed through the SAME tool dispatch
@@ -614,9 +649,11 @@ pub(crate) fn refuse_own_request(
 /// 400: see `lakehouse_store::agents::decide_approval`'s doc comment);
 /// 403 if the approver IS the human who requested this approval
 /// (`SEC-57`: the requester may not decide their own request — refused
-/// BEFORE any write, so the approval stays `pending` and nothing runs);
-/// 403 if the approval was approved but the approver lacks the underlying
-/// tool's own permission (the tool is never executed in that case);
+/// before the decision's own writes, so the approval stays `pending` and
+/// nothing runs; `AI-28`/`LH-AI-18-10` writes one `refused` audit row);
+/// 200 with `executed: false` if the approval was approved but the
+/// approver lacks the underlying tool's own permission (the tool is never
+/// executed, but the decision was recorded — `AI-28`, `LH-AI-18-07`);
 /// 503/500 as above.
 /// The `NewAuditEvent` [`decide_approval`]'s approval-decision audit write
 /// builds — extracted as a pure, unit-tested function (WS5 item D2),
@@ -644,6 +681,7 @@ fn decide_approval_audit_event(
     comment: Option<&str>,
     outcome: &str,
     run_id: Option<&str>,
+    detail: Option<&str>,
 ) -> NewAuditEvent {
     ai_audit::build_event(
         principal.kind_for_audit(),
@@ -654,7 +692,7 @@ fn decide_approval_audit_event(
         Some(approval_id),
         &json!({ "comment": comment }),
         outcome,
-        None,
+        detail,
         run_id,
         Some(approval_id),
     )
@@ -704,18 +742,42 @@ pub async fn decide_approval(
     //
     // SEC-57: the requester of a tool call may not decide their own
     // request. The check runs HERE — after the kind check, before the store
-    // call — so a refused decision writes nothing at all: the approval
-    // stays `pending`, the run stays `waiting_approval`, the tool never
-    // runs.
-    match agents::get_approval(pg, &id).await {
-        Ok(Some(existing)) if existing.kind != "tool_call" => {
-            return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
-        }
+    // call — so a refused decision decides nothing and runs nothing: the
+    // approval stays `pending`, the run stays `waiting_approval`, the tool
+    // never runs. AI-28 / LH-AI-18-10: the ONE row the route writes on that
+    // refusal is an audit row with outcome `refused` (the approval's own
+    // action, resource_kind "approval", the approval id).
+    //
+    // Keep `existing` for the Conflict path below too: a second decision
+    // writes the same `refused` row with detail "already decided" (AI-28).
+    let existing = match agents::get_approval(pg, &id).await {
         Ok(Some(existing)) => {
-            refuse_own_request(&existing, &principal)?;
+            if existing.kind != "tool_call" {
+                return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
+            }
+            Some(existing)
         }
-        Ok(_) => {}
+        Ok(_) => None,
         Err(err) => return Err(ApiError::from(err).into()),
+    };
+
+    if let Some(existing) = existing.as_ref()
+        && let Err(err) = refuse_own_request(existing, &principal)
+    {
+        audit_coverage::record_best_effort(
+            &state,
+            decide_approval_audit_event(
+                &principal,
+                &existing.action,
+                &id,
+                body.comment.as_deref(),
+                "refused",
+                existing.run_id.as_deref(),
+                Some("the requester may not decide their own request"),
+            ),
+        )
+        .await;
+        return Err(err.into());
     }
 
     let approval = match agents::decide_approval(pg, &id, decision, body.comment.as_deref()).await {
@@ -724,6 +786,24 @@ pub async fn decide_approval(
             return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
         }
         Err(lakehouse_store::StoreError::Conflict) => {
+            // AI-28 / LH-AI-18-10: the 409 is unchanged, but a decision that
+            // lost the pending→decided race writes one `refused` audit row
+            // naming why, instead of silently returning.
+            if let Some(existing) = existing.as_ref() {
+                audit_coverage::record_best_effort(
+                    &state,
+                    decide_approval_audit_event(
+                        &principal,
+                        &existing.action,
+                        &id,
+                        body.comment.as_deref(),
+                        "refused",
+                        existing.run_id.as_deref(),
+                        Some("already decided"),
+                    ),
+                )
+                .await;
+            }
             return Err(
                 ApiError::Conflict(format!("Approval {id} has already been decided")).into(),
             );
@@ -747,6 +827,7 @@ pub async fn decide_approval(
         body.comment.as_deref(),
         decide_outcome,
         approval.run_id.as_deref(),
+        None,
     );
     audit_coverage::record_best_effort(&state, decide_audit_event).await;
 
@@ -838,7 +919,16 @@ pub async fn decide_approval(
             Some(&id),
         )
         .await;
-        return Err(ApiError::PermissionDenied(detail).into());
+        // AI-28 / LH-AI-18-07 (feature decision 5, ADR 0012 decision 3):
+        // the decision IS recorded — the approval is `approved`, the run is
+        // `failed`, both audit rows are written exactly as before — so the
+        // answer reports that, not a failure. A 403 here made the console
+        // show "Failed to record decision" for a decision it had recorded.
+        return Ok(ApiJson(json!({
+            "approval": approval,
+            "executed": false,
+            "notExecuted": { "reason": "permission", "required": spec.permission },
+        })));
     }
     let result = ai_tools::run_tool(&state, Some(&principal), &pending.tool, &args).await;
     // LH-QS-2-08 (owner 2026-11-12): this run's outcome is read by a browser,
@@ -2140,6 +2230,7 @@ mod tests {
             Some("looks fine"),
             "approved",
             Some("run-1"),
+            None,
         );
         assert_eq!(event.principal_kind.as_deref(), Some("user"));
         assert_eq!(
@@ -2166,6 +2257,7 @@ mod tests {
             "appr-2",
             None,
             "rejected",
+            None,
             None,
         );
         assert_eq!(event.principal_kind.as_deref(), Some("service"));

@@ -7,7 +7,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { downloadCsv, toCsv } from "@/lib/csv";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { RowsTable } from "@/components/patterns/rows-table";
-import type { FilterSkip } from "@/services/clients/bi-store";
+import type { FilterSkip } from "@/services";
 import type { GrainNotApplied } from "@/lib/grain-switch";
 import type { TileLimit } from "@/services/contracts/settings";
 import { visibleColumns } from "@/lib/chart-shape";

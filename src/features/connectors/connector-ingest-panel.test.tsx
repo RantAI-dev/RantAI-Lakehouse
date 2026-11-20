@@ -1258,6 +1258,101 @@ describe("ConnectorIngestPanel run log", () => {
   })
 })
 
+describe("ConnectorIngestPanel run log follows its run (SRC-46, QA LH-SRC-6-43)", () => {
+  const ID = "run-live-00001"
+  const attempt = (n: number, result: string) => ({
+    table: "orders",
+    attempt: n,
+    startedAt: "2026-11-19T08:00:01.000Z",
+    endedAt: "2026-11-19T08:00:02.000Z",
+    rowsLoaded: 0,
+    result,
+    errorClass: result === "succeeded" ? null : "timeout",
+    waitSeconds: null,
+  })
+  const running = () =>
+    record({ runId: ID, status: "running", attempts: 3, startedAt: new Date().toISOString(), endedAt: null, durationSeconds: null, endReason: null })
+  const panel = () =>
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+  const logCalls = (calls: Call[]) => calls.filter((c) => c.url.endsWith(`/runs/${ID}/log`)).length
+  const runListCalls = (calls: Call[]) => calls.filter((c) => c.url.endsWith("/runs")).length
+
+  it("reads an open log again when the run's next poll says it failed with a fourth attempt", async () => {
+    const history: { runs: unknown[]; logs: Record<string, unknown> } = {
+      runs: [running()],
+      logs: { [ID]: { run: running(), attempts: [1, 2, 3].map((n) => attempt(n, "failed")), lines: [] } },
+    }
+    const calls = stubFetch(SPEC, history)
+    panel()
+    fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+    await waitFor(() => expect(screen.getAllByText(/attempt \d/)).toHaveLength(3))
+    expect(logCalls(calls)).toBe(1)
+
+    const failed = record({ runId: ID, status: "failed", attempts: 4, endedAt: new Date().toISOString(), durationSeconds: 90, endReason: "table_failed" })
+    history.runs = [failed]
+    history.logs = {
+      [ID]: {
+        run: failed,
+        attempts: [1, 2, 3, 4].map((n) => attempt(n, "failed")),
+        lines: [{ at: "2026-11-19T08:27:33.000Z", event: "run_ended", table: null, attempt: null, text: "Run ended: a table failed" }],
+      },
+    }
+    await waitFor(() => expect(screen.getAllByText(/attempt \d/)).toHaveLength(4), { timeout: 6000 })
+    expect(screen.getByText("Run ended")).toBeDefined()
+    expect(logCalls(calls)).toBe(2)
+  }, 15000)
+
+  it("does not read the log again across polls while the run does not change", async () => {
+    const history = {
+      runs: [running()],
+      logs: { [ID]: { run: running(), attempts: [1, 2, 3].map((n) => attempt(n, "failed")), lines: [] } },
+    }
+    const calls = stubFetch(SPEC, history)
+    panel()
+    fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+    await waitFor(() => expect(screen.getAllByText(/attempt \d/)).toHaveLength(3))
+    const listed = runListCalls(calls)
+    // Two polls of the run list pass; the run is the same, so the log is not asked for again.
+    await waitFor(() => expect(runListCalls(calls)).toBeGreaterThanOrEqual(listed + 2), { timeout: 8000 })
+    expect(logCalls(calls)).toBe(1)
+  }, 15000)
+})
+
+describe("ConnectorIngestPanel onRunEnded (SRC-46, QA LH-SRC-6-43)", () => {
+  const ID = "run-live-00001"
+  const running = () =>
+    record({ runId: ID, status: "running", attempts: 3, startedAt: new Date().toISOString(), endedAt: null, durationSeconds: null, endReason: null })
+  const failed = () => record({ runId: ID, status: "failed", attempts: 4, endedAt: new Date().toISOString(), durationSeconds: 90, endReason: "table_failed" })
+
+  it("tells the page once, with the run as the list returned it, when a run it watched has failed", async () => {
+    const history: { runs: unknown[] } = { runs: [running()] }
+    stubFetch(SPEC, history)
+    const onRunEnded = mock((_run: { runId: string; status: string }) => {})
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" onRunEnded={onRunEnded} />)
+    await screen.findByText(/Run run-live is running/)
+    expect(onRunEnded).not.toHaveBeenCalled()
+
+    history.runs = [failed()]
+    await waitFor(() => expect(onRunEnded).toHaveBeenCalledTimes(1), { timeout: 6000 })
+    expect(onRunEnded.mock.calls[0]![0].runId).toBe(ID)
+    expect(onRunEnded.mock.calls[0]![0].status).toBe("failed")
+    // A later poll or render does not call it again.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 200))
+    })
+    expect(onRunEnded).toHaveBeenCalledTimes(1)
+  }, 15000)
+
+  it("does not throw when the panel has no handler and a run ends", async () => {
+    const history: { runs: unknown[] } = { runs: [running()] }
+    stubFetch(SPEC, history)
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText(/Run run-live is running/)
+    history.runs = [failed()]
+    await waitFor(() => expect(screen.getByText("Failed")).toBeDefined(), { timeout: 6000 })
+  }, 15000)
+})
+
 describe("ConnectorIngestPanel resume", () => {
   const AUTO = "Paused after 30 failed runs in a row"
   const panel = (props: Partial<React.ComponentProps<typeof ConnectorIngestPanel>> = {}) =>

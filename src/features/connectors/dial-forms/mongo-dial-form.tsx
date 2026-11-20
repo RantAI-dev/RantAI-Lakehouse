@@ -3,8 +3,6 @@
 import * as React from "react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { RequiredMarker } from "@/components/ui/required"
-import { RequiredLegend } from "@/components/patterns/required-legend"
 import type { MongoDial } from "@/services/contracts/connectors"
 
 /**
@@ -19,12 +17,9 @@ import type { MongoDial } from "@/services/contracts/connectors"
 export function MongoDialForm({
   value,
   onChange,
-  showLegend = true,
 }: {
   value: MongoDial | null
   onChange: (next: MongoDial) => void
-  /** UX-1-R7: a parent step can opt out of its own legend. */
-  showLegend?: boolean
 }) {
   const dial: MongoDial = value ?? {
     hosts: [""],
@@ -53,14 +48,14 @@ export function MongoDialForm({
 
   return (
     <div className="grid gap-3">
-      {/* UX-1-R7: opt out when a parent step already explains the marker. */}
-      {showLegend ? <RequiredLegend /> : null}
+      {/* UX-4: every input on this form is required (hosts, database,
+          username), so no star and no legend; `aria-required` stays. */}
       <p className="text-xs text-muted-foreground">
         Direct connection to explicit seed hosts only — this build refuses `mongodb+srv` and
         replica-set discovery; there is no toggle for either.
       </p>
       <div className="space-y-2">
-        <p className="flex items-center gap-1.5 text-sm font-medium">Seed hosts (host:port) <RequiredMarker /></p>
+        <p className="text-sm font-medium">Seed hosts (host:port)</p>
         {/* UX-1-R5: `Dial::parse` runs `check_hostname` over EVERY entry, so
             every rendered row is required — not just the first. Each row
             gets a visible associated label; Remove drops an unused row. */}
@@ -69,7 +64,7 @@ export function MongoDialForm({
         </p>
         {dial.hosts.map((host, index) => (
           <div key={index} className="flex items-center gap-2">
-            <Label htmlFor={`mongo-dial-host-${index}`} required className="shrink-0 text-xs">
+            <Label htmlFor={`mongo-dial-host-${index}`} className="shrink-0 text-xs">
               Seed host {index + 1}
             </Label>
             <Input
@@ -98,7 +93,7 @@ export function MongoDialForm({
       </div>
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="space-y-1.5">
-          <Label htmlFor="mongo-dial-database" required>Database</Label>
+          <Label htmlFor="mongo-dial-database">Database</Label>
           <Input
             id="mongo-dial-database"
             aria-required
@@ -110,7 +105,7 @@ export function MongoDialForm({
         <div className="space-y-1.5">
           {/* A literal username, never a secretRef picker -- same
               reasoning as SqlDialForm's User field. */}
-          <Label htmlFor="mongo-dial-username" required>Username</Label>
+          <Label htmlFor="mongo-dial-username">Username</Label>
           <Input
             id="mongo-dial-username"
             aria-required

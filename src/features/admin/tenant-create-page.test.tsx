@@ -103,14 +103,15 @@ describe("TenantCreatePage (WEB-7 D2)", () => {
     await waitFor(() => expect(pushed).toEqual(["/admin/tenants"]))
   })
 
-  // UX-1-R10: every field carried a required star but none had semantics.
-  it("marks all four fields required with matching semantics", async () => {
+  // UX-1-R10 gave every field required semantics; UX-4 removes the stars
+  // because nothing on this form is optional. The semantics stay.
+  it("keeps all four fields required without stars (UX-4)", async () => {
     stubApi()
     renderPage()
     for (const label of ["Name", "Slug", "Plan", "Residency"]) {
       const input = await screen.findByLabelText(label)
       expect(input.getAttribute("aria-required")).toBe("true")
-      expect(input.closest("div")?.querySelector("label")?.getAttribute("data-required")).toBe("")
+      expect(input.closest("div")?.querySelector("label")?.hasAttribute("data-required")).toBe(false)
     }
   })
 

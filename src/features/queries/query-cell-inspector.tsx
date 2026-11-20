@@ -11,8 +11,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { copyText } from "@/lib/copy-text"
-import { notifyFailure, notifySuccess } from "@/lib/notify"
+import { copyTextWithToast } from "@/lib/copy-text"
 import type { QueryCell } from "@/services/contracts/queries"
 import { cellText } from "./query-grid-tools"
 
@@ -40,16 +39,9 @@ export function QueryCellInspector({
 
   async function copy() {
     // The raw value, not the pretty-printed one: the clipboard is for the
-    // value the engine sent.
-    const copied = await copyText(text)
-    if (copied) {
-      notifySuccess("Value copied", "The cell's value is on the clipboard.")
-    } else {
-      notifyFailure(
-        "Could not copy the value",
-        "The browser refused the copy."
-      )
-    }
+    // value the engine sent. One toast pair for every copy site (`UX-6`
+    // review R1).
+    await copyTextWithToast(text, "Value copied")
   }
 
   return (

@@ -18,8 +18,10 @@ import {
 } from "lucide-react";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { RequiredLegend } from "@/components/patterns/required-legend";
 import { Textarea } from "@/components/ui/textarea";
+// The clipboard API is missing over plain http, so the copy goes through
+// the helper that falls back to a textarea (`UX-6`).
+import { copyTextWithToast } from "@/lib/copy-text";
 import { formatRelativeTime } from "@/lib/format";
 import { settleStreamingMarkdown } from "@/lib/stream-markdown";
 import { cn } from "@/lib/utils";
@@ -193,7 +195,13 @@ function MessageFooter({
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-200 group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100">
         <ActionButton
           label={copied ? "Copied" : "Copy message"}
-          onClick={() => void navigator.clipboard.writeText(msg.content).then(() => setCopied(true), () => {})}
+          onClick={() =>
+            // The check mark means "on the clipboard", so it flips only when
+            // the helper reports the copy worked (`UX-6` D2).
+            void copyTextWithToast(msg.content).then((copied) => {
+              if (copied) setCopied(true);
+            })
+          }
         >
           {copied ? <Check className="size-3 text-emerald-500" /> : <Copy className="size-3" />}
         </ActionButton>
@@ -302,8 +310,9 @@ export function ChatMessages({
 
                 {isEditing ? (
                   <div className="space-y-2">
-                    <RequiredLegend />
-                    <Label htmlFor="edit-message" required>Edit message</Label>
+                    {/* UX-4: the textarea is this box's one required input, so
+                        no star and no legend; it keeps `aria-required`. */}
+                    <Label htmlFor="edit-message">Edit message</Label>
                     <Textarea
                       id="edit-message"
                       aria-required

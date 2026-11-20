@@ -9,6 +9,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::HashMap;
+
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode};
 use serde_json::{Value, json};
@@ -17,9 +19,13 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::common::{
-    TestApp, audit_rows, create_principal_with_permissions, leave_no_seeded_tenants,
-    session_cookie_for_user, spin_up,
+    CATALOG_TENANT, TestApp, audit_rows, create_principal_with_permissions,
+    leave_no_seeded_tenants, session_cookie_for_user, spin_up, spin_up_with_env,
 };
+
+/// The tenant of Meridian Retail: not the catalog's owner. The seeded
+/// deployment holds four tenants, so the reach is a real one.
+const OTHER_TENANT: &str = "11111111-1111-4111-8111-000000000002";
 
 /// One `audit_event` row to seed.
 struct Seed<'a> {
@@ -158,7 +164,13 @@ fn parse_csv(text: &str) -> Vec<Vec<String>> {
     rows
 }
 
-const COLUMNS: [&str; 9] = [
+/// The final column of the file: the event id first — the same id the
+/// `?event=` deep link takes (`GOV-1` acceptance follow-up, D5) — then the
+/// row, the actor, the action, the resource, the four-word outcome the page
+/// shows with the stored value beside it (`D4`), the stored detail as
+/// `reason` (`D4b`), and the arguments.
+const COLUMNS: [&str; 11] = [
+    "id",
     "at",
     "actor",
     "principal_kind",
@@ -166,7 +178,8 @@ const COLUMNS: [&str; 9] = [
     "resource_kind",
     "resource_id",
     "outcome",
-    "detail",
+    "outcome_detail",
+    "reason",
     "args",
 ];
 
@@ -177,6 +190,10 @@ const COLUMNS: [&str; 9] = [
 /// `get_audit_history` tool and `ops/g3a`, so its keys and values are pinned
 /// here; the search and the single-event routes answer the same object.
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one shape asserted across three routes: the old list, the page and the single event must agree row for row, and splitting it would let them drift"
+)]
 async fn the_old_list_and_the_new_routes_show_one_event_as_the_same_object() {
     let TestApp { router, pool } = spin_up().await;
     // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
@@ -212,33 +229,67 @@ async fn the_old_list_and_the_new_routes_show_one_event_as_the_same_object() {
     plain.resource_kind = Some("dashboard");
     plain.outcome = "needs_approval";
     plain.insert(&pool).await;
+    let mut sign_in = Seed::new(
+        "audit-shape-signin",
+        "2026-02-03T04:00:00.000Z",
+        "auth.login_refused",
+    );
+    sign_in.actor_label = Some("Sign-in form");
+    sign_in.outcome = "refused";
+    sign_in.detail = Some("Unknown identifier.");
+    sign_in.insert(&pool).await;
 
     let expected_grant = json!({
         "id": "audit-shape-grant",
         "at": "2026-02-03T04:05:06.789Z",
+        "actorId": "p-1",
         "actor": "Rina Wijaya",
         "actorKind": "user",
         "action": "catalog.grant",
         "resource": "catalog:t1",
         "outcome": "success",
+        "outcomeDetail": "executed",
         "policyDecision": "allow",
         "obligations": [],
         "approvalId": null,
         "source": "console",
         "detail": "Granted query:read to A <a@example.test> until 2026-12-06",
+        "reason": null,
     });
     let expected_plain = json!({
         "id": "audit-shape-plain",
         "at": "2026-02-03T04:05:00.000Z",
+        "actorId": "p-2",
         "actor": "p-2",
         "actorKind": "agent",
         "action": "dashboard.update",
         "resource": "dashboard",
         "outcome": "pending",
+        "outcomeDetail": "needs_approval",
         "policyDecision": "pending",
         "obligations": [],
         "approvalId": null,
         "source": "copilot",
+        "reason": null,
+    });
+    // The refused sign-in: nobody signed in caused it, so it carries no
+    // `actorId`, its kind reads as a service and its source as the system,
+    // and the stored detail is its `reason`.
+    let expected_sign_in = json!({
+        "id": "audit-shape-signin",
+        "at": "2026-02-03T04:00:00.000Z",
+        "actorId": null,
+        "actor": "Sign-in form",
+        "actorKind": "service",
+        "action": "auth.login_refused",
+        "resource": "auth.login_refused",
+        "outcome": "denied",
+        "outcomeDetail": "refused",
+        "policyDecision": "deny",
+        "obligations": [],
+        "approvalId": null,
+        "source": "system",
+        "reason": "Unknown identifier.",
     });
 
     let (status, old) = get_json(&router, "/api/governance/audit", &cookie).await;
@@ -252,10 +303,31 @@ async fn the_old_list_and_the_new_routes_show_one_event_as_the_same_object() {
         Some(&expected_plain),
         "the old row of a plain event"
     );
+    // D2: the id sits beside the name, so the person filter can send it; an
+    // event nobody signed in caused carries no id.
+    let old_sign_in = old_rows.iter().find(|r| r["id"] == "audit-shape-signin");
+    assert_eq!(old_sign_in.and_then(|r| r["actorId"].as_str()), None);
+    assert_eq!(
+        old_sign_in.and_then(|r| r["actor"].as_str()),
+        Some("Sign-in form")
+    );
+    assert_eq!(
+        old_sign_in.and_then(|r| r["reason"].as_str()),
+        Some("Unknown identifier.")
+    );
 
     let (status, page) = get_json(&router, "/api/governance/audit/events", &cookie).await;
     assert_eq!(status, StatusCode::OK, "{page}");
-    assert_eq!(page["events"], json!([expected_grant, expected_plain]));
+    assert_eq!(
+        page["events"],
+        json!([expected_grant, expected_plain, expected_sign_in])
+    );
+    let listed = page["events"].as_array().expect("an events array");
+    let listed_sign_in = listed.iter().find(|r| r["id"] == "audit-shape-signin");
+    assert_eq!(
+        listed_sign_in.map(|r| r["actorId"].clone()),
+        Some(Value::Null)
+    );
 
     let (status, one) = get_json(
         &router,
@@ -265,6 +337,190 @@ async fn the_old_list_and_the_new_routes_show_one_event_as_the_same_object() {
     .await;
     assert_eq!(status, StatusCode::OK, "{one}");
     assert_eq!(one, json!({ "event": expected_grant }));
+
+    let (status, one) = get_json(
+        &router,
+        "/api/governance/audit/events/audit-shape-signin",
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["event"]["actorId"], Value::Null);
+    assert_eq!(one["event"]["outcome"], "denied");
+    assert_eq!(one["event"]["outcomeDetail"], "refused");
+    assert_eq!(one["event"]["policyDecision"], "deny");
+}
+
+// ── One outcome vocabulary, and the stored reason (`D4`, `D4b`) ──────────
+
+/// The trail stores eight outcome values and the page shows four. Every shape
+/// carries both — the four-word `outcome` and the stored value as
+/// `outcomeDetail` — and `failed` is an execution's failure, not a policy
+/// refusal: the policy let it through the gate (`GOV-1` acceptance
+/// follow-up, D4).
+#[tokio::test]
+async fn every_outcome_reports_one_vocabulary_and_failed_is_not_a_policy_refusal() {
+    let TestApp { router, pool } = spin_up().await;
+    leave_no_seeded_tenants(&pool).await;
+    let (_, cookie) = auditor(&pool).await;
+    let cases = [
+        (
+            "v-executed",
+            "2026-07-01T00:00:00Z",
+            "executed",
+            "success",
+            "allow",
+        ),
+        (
+            "v-failed",
+            "2026-07-02T00:00:00Z",
+            "failed",
+            "error",
+            "allow",
+        ),
+        (
+            "v-refused",
+            "2026-07-03T00:00:00Z",
+            "refused",
+            "denied",
+            "deny",
+        ),
+        (
+            "v-rejected",
+            "2026-07-04T00:00:00Z",
+            "rejected",
+            "denied",
+            "deny",
+        ),
+        (
+            "v-needs-approval",
+            "2026-07-05T00:00:00Z",
+            "needs_approval",
+            "pending",
+            "pending",
+        ),
+    ];
+    for (id, at, outcome, _, _) in cases {
+        let mut seed = Seed::new(id, at, "vocab.event");
+        seed.principal_id = Some("p-1");
+        seed.principal_kind = Some("user");
+        seed.actor_label = Some("Rina");
+        seed.outcome = outcome;
+        seed.insert(&pool).await;
+    }
+
+    let (status, page) = get_json(
+        &router,
+        "/api/governance/audit/events?action=vocab.event",
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let listed = page["events"].as_array().expect("an events array");
+    assert_eq!(listed.len(), 5, "{page}");
+    for event in listed {
+        let id = event["id"].as_str().expect("an event id");
+        let (_, _, stored, want_outcome, want_decision) = cases
+            .iter()
+            .find(|case| case.0 == id)
+            .unwrap_or_else(|| panic!("{id} is one of the seeded cases"));
+        assert_eq!(event["outcome"], *want_outcome, "{id}");
+        assert_eq!(event["outcomeDetail"], *stored, "{id}");
+        assert_eq!(event["policyDecision"], *want_decision, "{id}");
+    }
+
+    // The single-event shape says the same: the gate allowed the call and the
+    // execution failed afterwards.
+    let (status, one) = get_json(&router, "/api/governance/audit/events/v-failed", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["event"]["outcome"], "error");
+    assert_eq!(one["event"]["outcomeDetail"], "failed");
+    assert_eq!(one["event"]["policyDecision"], "allow");
+
+    // The file says the same, in its own cells.
+    let (status, _, body) = get(
+        &router,
+        "/api/governance/audit/export.csv?action=vocab.event",
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = parse_csv(&String::from_utf8(body).unwrap());
+    assert_eq!(rows[0], COLUMNS);
+    let seeded = &rows[1..];
+    assert_eq!(seeded.len(), 5, "{rows:?}");
+    let failed = seeded
+        .iter()
+        .find(|r| r[0] == "v-failed")
+        .expect("the failed row");
+    assert_eq!(failed[7], "error");
+    assert_eq!(failed[8], "failed");
+    let refused = seeded
+        .iter()
+        .find(|r| r[0] == "v-refused")
+        .expect("the refused row");
+    assert_eq!(refused[7], "denied");
+    assert_eq!(refused[8], "refused");
+}
+
+/// `D4b`: the stored `detail` column — a refusal reason, a status code —
+/// reaches the page as `reason`, beside the derived grant summary that stays
+/// `detail`. It is `null` when nothing was stored.
+#[tokio::test]
+async fn a_stored_detail_reaches_the_page_as_reason() {
+    let TestApp { router, pool } = spin_up().await;
+    leave_no_seeded_tenants(&pool).await;
+    let (_, cookie) = auditor(&pool).await;
+    let mut grant = Seed::new("reason-grant", "2026-08-01T00:00:00Z", "catalog.grant");
+    grant.principal_id = Some("p-1");
+    grant.principal_kind = Some("user");
+    grant.args = json!({
+        "permission": "query:read",
+        "grantee": "B <b@example.test>",
+        "expiresAt": "2027-01-01T00:00:00Z",
+    });
+    grant.detail = Some("approved in the access request");
+    grant.insert(&pool).await;
+    let plain = Seed::new("reason-plain", "2026-08-02T00:00:00Z", "dashboard.update");
+    plain.insert(&pool).await;
+
+    let (status, page) = get_json(
+        &router,
+        "/api/governance/audit/events?action=catalog.grant",
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        page["events"][0]["detail"], "Granted query:read to B <b@example.test> until 2027-01-01",
+        "the derived summary is still `detail`"
+    );
+    assert_eq!(
+        page["events"][0]["reason"], "approved in the access request",
+        "the stored column is `reason`"
+    );
+
+    let (status, one) = get_json(
+        &router,
+        "/api/governance/audit/events/reason-plain",
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["event"]["reason"], Value::Null, "nothing stored, null");
+
+    let (_, _, body) = get(
+        &router,
+        "/api/governance/audit/export.csv?action=catalog.grant",
+        &cookie,
+    )
+    .await;
+    let rows = parse_csv(&String::from_utf8(body).unwrap());
+    assert_eq!(rows[1][0], "reason-grant");
+    assert_eq!(
+        rows[1][9], "approved in the access request",
+        "the `reason` cell"
+    );
 }
 
 // ── Search ────────────────────────────────────────────────────────────────
@@ -539,10 +795,17 @@ async fn one_event_is_found_by_id_and_an_unknown_id_is_a_fixed_not_found() {
 
 // ── Export ────────────────────────────────────────────────────────────────
 
-/// The file's start and shape: a byte-order mark, the nine columns in order,
-/// the headers a download carries, and one row per event, newest first.
+/// The file's start and shape: a byte-order mark, the eleven columns in order
+/// with the event id first — the id the `?event=` deep link takes — the
+/// headers a download carries, and one row per event, newest first. The
+/// outcome column is the same four words the page shows, with the stored
+/// value beside it.
 #[tokio::test]
-async fn the_export_is_a_csv_with_the_nine_columns_newest_first() {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one file asserted cell by cell, with the id, both outcome columns and the deep link checked on the same rows; splitting it would re-read the trail for each cell"
+)]
+async fn the_export_is_a_csv_with_the_eleven_columns_newest_first() {
     let TestApp { router, pool } = spin_up().await;
     // `SEC-20` (plan 100): the trail is read per tenant, and the seeded
     // deployment holds four tenants, so this test makes it a one-tenant one.
@@ -612,20 +875,27 @@ async fn the_export_is_a_csv_with_the_nine_columns_newest_first() {
     // the `to` bound leaves them out; `x-2` is `failed`.
     let seeded = &rows[1..];
     assert_eq!(seeded.len(), 1, "{rows:?}");
-    assert_eq!(seeded[0][0], "2026-06-01T08:00:00.500Z");
-    assert_eq!(seeded[0][1], "Rina Wijaya");
-    assert_eq!(seeded[0][2], "user");
-    assert_eq!(seeded[0][3], "dashboard.update");
-    assert_eq!(seeded[0][4], "dashboard");
-    assert_eq!(seeded[0][5], "b-1");
-    assert_eq!(seeded[0][6], "executed");
-    assert_eq!(seeded[0][7], "200");
+    assert_eq!(seeded[0][0], "x-1", "the first column is the event id");
+    assert_eq!(seeded[0][1], "2026-06-01T08:00:00.500Z");
+    assert_eq!(seeded[0][2], "Rina Wijaya");
+    assert_eq!(seeded[0][3], "user");
+    assert_eq!(seeded[0][4], "dashboard.update");
+    assert_eq!(seeded[0][5], "dashboard");
+    assert_eq!(seeded[0][6], "b-1");
+    assert_eq!(seeded[0][7], "success", "the outcome word the page shows");
+    assert_eq!(seeded[0][8], "executed", "the stored value beside it");
+    assert_eq!(seeded[0][9], "200", "the stored detail, as `reason`");
     assert_eq!(
-        serde_json::from_str::<Value>(&seeded[0][8]).unwrap(),
+        serde_json::from_str::<Value>(&seeded[0][10]).unwrap(),
         json!({ "fields": ["name"] })
     );
+    // D5: the id in the file is the id the deep link reads one event by.
+    let (status, one) = get_json(&router, "/api/governance/audit/events/x-1", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["event"]["id"], seeded[0][0]);
 
-    // Newest first, and the actor falls back to the principal id.
+    // Newest first, the actor falls back to the principal id, and a `failed`
+    // row carries the page's word `error` with the stored value beside it.
     let (_, _, body) = get(
         &router,
         "/api/governance/audit/export.csv?action=alert.create",
@@ -634,9 +904,13 @@ async fn the_export_is_a_csv_with_the_nine_columns_newest_first() {
     .await;
     let rows = parse_csv(&String::from_utf8(body).unwrap());
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[1][0], "2026-06-02T08:00:00.000Z");
-    assert_eq!(rows[1][1], "p-2", "no label: the principal id");
-    assert_eq!(rows[1][2], "service");
+    assert_eq!(rows[1][0], "x-2");
+    assert_eq!(rows[1][1], "2026-06-02T08:00:00.000Z");
+    assert_eq!(rows[1][2], "p-2", "no label: the principal id");
+    assert_eq!(rows[1][3], "service");
+    assert_eq!(rows[1][7], "error");
+    assert_eq!(rows[1][8], "failed");
+    assert_eq!(rows[1][9], "", "no stored detail, an empty cell");
 
     let (_, _, body) = get(
         &router,
@@ -645,7 +919,7 @@ async fn the_export_is_a_csv_with_the_nine_columns_newest_first() {
     )
     .await;
     let rows = parse_csv(&String::from_utf8(body).unwrap());
-    let order: Vec<&str> = rows[1..].iter().map(|r| r[3].as_str()).collect();
+    let order: Vec<&str> = rows[1..].iter().map(|r| r[4].as_str()).collect();
     assert_eq!(order, ["alert.create", "dashboard.update"], "newest first");
 }
 
@@ -685,7 +959,7 @@ async fn a_cell_that_starts_like_a_formula_is_neutralised_in_the_export() {
     assert_eq!(rows.len(), 7);
     let cells: Vec<(&str, &str)> = rows[1..]
         .iter()
-        .map(|r| (r[1].as_str(), r[7].as_str()))
+        .map(|r| (r[2].as_str(), r[9].as_str()))
         .collect();
     assert_eq!(
         cells,
@@ -722,7 +996,7 @@ async fn a_field_with_a_comma_a_quote_or_a_line_break_is_quoted() {
         "the detail is quoted with doubled quotes: {text:?}"
     );
     let rows = parse_csv(&text);
-    assert_eq!(rows[1][7], "a,b \"c\"\nsecond line");
+    assert_eq!(rows[1][9], "a,b \"c\"\nsecond line");
 }
 
 /// More than 100,000 events match: the file holds the newest 100,000, and two
@@ -757,10 +1031,10 @@ async fn an_export_of_more_than_one_hundred_thousand_events_keeps_the_newest_and
     assert_eq!(headers["x-audit-export-total"], "100001");
     let rows = parse_csv(&String::from_utf8(body).unwrap());
     assert_eq!(rows.len(), 100_001, "the header and exactly 100,000 events");
-    assert_eq!(rows[1][7], "row-000001", "the newest event is kept");
-    assert_eq!(rows[100_000][7], "row-100000");
+    assert_eq!(rows[1][9], "row-000001", "the newest event is kept");
+    assert_eq!(rows[100_000][9], "row-100000");
     assert!(
-        rows.iter().all(|r| r[7] != "row-100001"),
+        rows.iter().all(|r| r[9] != "row-100001"),
         "the oldest event is the one left out"
     );
 
@@ -882,4 +1156,193 @@ async fn the_three_audit_routes_need_audit_read_both_ways() {
         let (status, _, _) = get(&router, path, &auditor_cookie).await;
         assert_eq!(status, StatusCode::OK, "{path}: audit:read");
     }
+}
+
+// ── The person filter's actors (`GOV-1` acceptance follow-up, D2) ─────────
+
+/// A principal that holds exactly `permissions` and belongs to exactly
+/// `tenant`: its id and its session cookie.
+async fn principal_in_tenant(pool: &PgPool, permissions: &str, tenant: &str) -> (Uuid, String) {
+    let user = create_principal_with_permissions(pool, permissions).await;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(user)
+        .bind(tenant.parse::<Uuid>().expect("a seeded tenant id"))
+        .execute(pool)
+        .await
+        .expect("add the membership");
+    let cookie = session_cookie_for_user(pool, user).await;
+    (user, cookie)
+}
+
+/// One actor of the trail, seen at `at` under `label`.
+async fn seed_actor(
+    pool: &PgPool,
+    at: &str,
+    principal: Option<&str>,
+    kind: Option<&str>,
+    label: Option<&str>,
+    action: &str,
+) {
+    sqlx::query(
+        "INSERT INTO audit_event (id, at, principal_id, principal_kind, actor_label, action, \
+         outcome) VALUES ($1, $2::timestamptz, $3, $4, $5, $6, 'executed')",
+    )
+    .bind(format!("actor-{}", action.replace('.', "-")))
+    .bind(at)
+    .bind(principal)
+    .bind(kind)
+    .bind(label)
+    .bind(action)
+    .execute(pool)
+    .await
+    .expect("seed an audit_event row");
+}
+
+/// The picker's list: one entry per principal with the newest label it acted
+/// under, newest seen first, and nobody without an id — the filter sends an
+/// id back, so an actor with none cannot be picked.
+#[tokio::test]
+async fn the_person_filter_lists_each_actor_once_with_the_newest_label() {
+    let TestApp { router, pool } = spin_up().await;
+    leave_no_seeded_tenants(&pool).await;
+    let (_, cookie) = auditor(&pool).await;
+    // One principal under two labels: an older and a newer name.
+    seed_actor(
+        &pool,
+        "2026-06-01T00:00:00Z",
+        Some("p-1"),
+        Some("user"),
+        Some("Old Name"),
+        "a.older",
+    )
+    .await;
+    seed_actor(
+        &pool,
+        "2026-06-02T00:00:00Z",
+        Some("p-1"),
+        Some("user"),
+        Some("New Name"),
+        "a.newer",
+    )
+    .await;
+    seed_actor(
+        &pool,
+        "2026-06-01T12:00:00Z",
+        Some("p-2"),
+        Some("copilot"),
+        None,
+        "a.copilot",
+    )
+    .await;
+    // A row nobody signed in caused: never in the list.
+    seed_actor(
+        &pool,
+        "2026-06-03T00:00:00Z",
+        None,
+        None,
+        Some("Sign-in form"),
+        "auth.login_refused",
+    )
+    .await;
+
+    let (status, body) = get_json(&router, "/api/governance/audit/actors", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "actors": [
+                { "actorId": "p-1", "actor": "New Name", "actorKind": "user" },
+                { "actorId": "p-2", "actor": "p-2", "actorKind": "agent" },
+            ]
+        }),
+        "newest seen first, the newer label kept, the id-less row left out"
+    );
+}
+
+/// The list follows the trail's own reach (`SEC-20`): an auditor of the
+/// tenant that owns the shared catalog and an auditor of another organisation
+/// each list only their own people, and a forged `X-Tenant` is the same 404
+/// every other audit route answers.
+#[tokio::test]
+async fn the_person_filter_follows_the_tenant_reach() {
+    let mut env = HashMap::new();
+    env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let (group, group_cookie) = principal_in_tenant(&pool, "audit:read", CATALOG_TENANT).await;
+    let (retail, retail_cookie) = principal_in_tenant(&pool, "audit:read", OTHER_TENANT).await;
+    seed_actor(
+        &pool,
+        "2026-06-01T00:00:00Z",
+        Some(&group.to_string()),
+        Some("user"),
+        Some("Ayu of Meridian Group"),
+        "dashboard.update",
+    )
+    .await;
+    seed_actor(
+        &pool,
+        "2026-06-02T00:00:00Z",
+        Some(&retail.to_string()),
+        Some("user"),
+        Some("Rafi of Meridian Retail"),
+        "query.run",
+    )
+    .await;
+    seed_actor(
+        &pool,
+        "2026-06-03T00:00:00Z",
+        None,
+        Some("schedule"),
+        Some("Dagster"),
+        "pipeline.build",
+    )
+    .await;
+
+    let (status, body) = get_json(&router, "/api/governance/audit/actors", &group_cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["actors"]
+        .as_array()
+        .expect("an actors array")
+        .iter()
+        .map(|a| a["actorId"].as_str().expect("an actor id"))
+        .collect();
+    assert_eq!(
+        ids,
+        [group.to_string().as_str()],
+        "the owner lists its own people only"
+    );
+
+    let (status, body) = get_json(&router, "/api/governance/audit/actors", &retail_cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["actors"]
+        .as_array()
+        .expect("an actors array")
+        .iter()
+        .map(|a| a["actorId"].as_str().expect("an actor id"))
+        .collect();
+    assert_eq!(
+        ids,
+        [retail.to_string().as_str()],
+        "the other organisation never crosses"
+    );
+
+    // A forged `X-Tenant` naming a tenant the caller is not in: 404.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/governance/audit/actors")
+                .header("cookie", &group_cookie)
+                .header("x-tenant", OTHER_TENANT)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a forged tenant is a 404"
+    );
 }

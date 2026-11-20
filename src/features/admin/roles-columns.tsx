@@ -13,6 +13,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatNumber } from "@/lib/format"
 import type { Role } from "@/services/contracts/identity"
 
@@ -134,7 +135,7 @@ export function getRoleColumns({
                 <DropdownMenuLabel>Role</DropdownMenuLabel>
                 <DropdownMenuItem
                   onClick={() => {
-                    navigator.clipboard?.writeText(item.name)
+                    void copyTextWithToast(item.name)
                   }}
                 >
                   Copy role name

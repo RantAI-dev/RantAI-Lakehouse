@@ -5,8 +5,10 @@
 // requests go through the real `assetService` and `apiFetch`; only `fetch` is
 // stubbed.
 const pushed: string[] = []
+// The route the palette thinks it is on; `afterEach` puts it back to "/".
+let currentPath = "/"
 mock.module("next/navigation", () => ({
-  usePathname: () => "/",
+  usePathname: () => currentPath,
   useSearchParams: () => new URLSearchParams(""),
   useRouter: () => ({
     push: (to: string) => {
@@ -34,6 +36,7 @@ afterEach(() => {
   requested.length = 0
   pushed.length = 0
   authPermissions = ["*:*"]
+  currentPath = "/"
   cleanup()
 })
 
@@ -55,12 +58,20 @@ function authResponse() {
   )
 }
 
+/** The public branding answer of a workspace that set nothing. */
+const NO_BRANDING = { workspaceName: null, logo: null, logoDark: null, icon: null }
+
 /** Answer every catalog request with `body` (or a status), and note its URL. */
 function stubCatalog(body: unknown, status = 200) {
   global.fetch = mock(async (input: RequestInfo | URL) => {
     const url = String(input)
     if (url.includes("/api/auth/me")) {
       return authResponse()
+    }
+    // The palette reads the workspace's name (`ADM-2`) on its own; it is not
+    // a catalog request, so it stays out of `requested`.
+    if (url.includes("/api/branding")) {
+      return new Response(JSON.stringify(NO_BRANDING), { status: 200 })
     }
     requested.push(url)
     return new Response(JSON.stringify(body), {
@@ -473,5 +484,33 @@ describe("CommandPalette catalog order", () => {
       "Zzz",
       "Revenue",
     ])
+  })
+})
+
+describe("CommandPalette Recent pages (ADM-2)", () => {
+  it("records the workspace's name, not the product's, for a page no menu item names", async () => {
+    currentPath = "/no/menu/item/names/this"
+    localStorage.removeItem("rantai-recent-pages")
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/api/auth/me")) return authResponse()
+      if (url.includes("/api/branding")) {
+        return new Response(
+          JSON.stringify({ ...NO_BRANDING, workspaceName: "Acme Data" }),
+          { status: 200 }
+        )
+      }
+      return new Response(JSON.stringify({}), { status: 200 })
+    }) as unknown as typeof fetch
+    render(
+      <AuthProvider>
+        <CommandPalette />
+      </AuthProvider>
+    )
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("rantai-recent-pages") ?? "[]")).toEqual([
+        { href: "/no/menu/item/names/this", title: "Acme Data" },
+      ])
+    )
   })
 })

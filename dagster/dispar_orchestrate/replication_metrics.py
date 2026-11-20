@@ -67,7 +67,7 @@ import requests
 from dagster import DefaultScheduleStatus, Definitions, ScheduleDefinition, job, op
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget
-from dispar_orchestrate.ingest_factory import run_limit_tags
+from dispar_orchestrate.ingest_factory import job_tags
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 # How long one run of this job may run, in seconds. The schedule fires
@@ -454,7 +454,7 @@ def run_replication_slot_check(context) -> list[dict[str, Any]]:
 # whose process died is cancelled and failed by the daemon, so it does not
 # hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
 # is a tag and not `run_monitoring.max_runtime_seconds`.
-@job(tags=run_limit_tags(RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
+@job(tags=job_tags("replication_slot_check_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def replication_slot_check_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `replication_slot_check_job`."""
     run_replication_slot_check()

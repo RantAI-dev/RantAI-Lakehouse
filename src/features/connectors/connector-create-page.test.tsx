@@ -89,6 +89,18 @@ describe("ConnectorCreatePage", () => {
     expect(link.compareDocumentPosition(card)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
   })
 
+  // UX-5: no step explains the star with a "* Required" line; the star itself
+  // stays on the mixed first step's required Name field.
+  it("renders no '* Required' line while the mixed first step still stars Name", async () => {
+    stubFetch()
+    renderPage()
+    await screen.findByRole("radio", { name: /PostgreSQL/ })
+    expect(screen.queryByText("Required")).toBeNull()
+    const label = document.querySelector('label[for="connector-name"]')
+    expect(label?.getAttribute("data-required")).toBe("")
+    expect(label?.querySelector('span[aria-hidden="true"][class*="before:content-"]')).not.toBeNull()
+  })
+
   it("renders connector types from listTypes as cards, disabling unsupported ones", async () => {
     stubFetch()
     renderPage()
@@ -657,7 +669,12 @@ describe("the created screen waits for the save (LH-SRC-6-39)", () => {
     held.release()
     await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
     // Only now is the panel mounted, and it reads the settings it was saved with.
-    expect(calls.some((c) => c.url.includes("/ingest-spec") && c.method === "GET")).toBe(true)
+    // The read happens in the panel's mount effect, so it lands one tick after
+    // the success sentence; a synchronous assertion here failed intermittently
+    // on a loaded full-suite run (BLD-16), not because the read was missing.
+    await waitFor(() =>
+      expect(calls.some((c) => c.url.includes("/ingest-spec") && c.method === "GET")).toBe(true)
+    )
     expect(page.queryByText(/has no connection settings saved yet/)).toBeNull()
   })
 })
@@ -783,5 +800,73 @@ describe("the New Connector page when the types cannot be read (LH-SRC-3-08)", (
     expect(await screen.findByRole("button", { name: "Retry" })).toBeDefined()
     expect(screen.queryByRole("button", { name: "Next" })).toBeNull()
     expect(screen.queryByLabelText("Name")).toBeNull()
+  })
+})
+
+// QA LH-SRC-6-41 (SRC-44): the loader runs a Kafka connector only as a stream,
+// so the wizard must not save it as a batch.
+describe("ConnectorCreatePage, Kafka", () => {
+  it("saves a Kafka connector's connection settings with ingestMode stream", async () => {
+    const calls = stubFetch(
+      (url, method) => {
+        if (url.endsWith("/api/connectors") && method === "POST") {
+          return json(
+            {
+              id: "conn-events-k3x9",
+              name: "events",
+              type: "Kafka",
+              direction: "source",
+              health: "unknown",
+              environment: "production",
+              tenant: "Acme Co",
+              lastTestAt: null,
+              lastActivityAt: null,
+              lastRunSuccessAt: null,
+              lastRunFailureAt: null,
+              failureStreak: 0,
+              schemaChangePolicy: "apply_non_breaking",
+              pausedReason: null,
+              pausedAt: null,
+              capabilities: [],
+              owner: "Current user",
+              credential: { primary: null, secondary: null },
+              credentialStored: false,
+            },
+            201
+          )
+        }
+        if (url.includes("/ingest-spec")) {
+          return json({ adapter: "kafka", ingestMode: "stream", dial: {}, sourceObjects: [], scheduleCron: null })
+        }
+        if (url.endsWith("/test")) {
+          return json({ ok: true, supported: true, latencyMs: 12, message: "ok", testedAt: "2026-01-01T00:00:00.000Z" })
+        }
+        if (url.endsWith("/runs")) return json({ runs: [] })
+        return null
+      },
+      [{ name: "Kafka", adapter: "kafka", supported: true, docsUrl: null, unsupportedReason: null }]
+    )
+    const page = renderPage()
+    await waitFor(() =>
+      expect(page.getByRole("radio", { name: /Kafka/ }).getAttribute("aria-checked")).toBe("true")
+    )
+    fireEvent.change(page.getByLabelText("Name"), { target: { value: "events" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    await waitFor(() => page.getByLabelText("Bootstrap server 1"))
+    fireEvent.change(page.getByLabelText("Bootstrap server 1"), { target: { value: "kafka-0.internal:9092" } })
+    fireEvent.change(page.getByLabelText("Topic"), { target: { value: "events" } })
+    fireEvent.change(page.getByLabelText("Consumer group id"), { target: { value: "lakehouse-events" } })
+    fireEvent.change(page.getByLabelText("SASL username"), { target: { value: "lakehouse" } })
+    fireEvent.change(page.getByLabelText("Password"), { target: { value: "s3cret-pass" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    await waitFor(() => page.getByLabelText("Residency"))
+    fireEvent.change(page.getByLabelText("Residency"), { target: { value: "in-region" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    fireEvent.click(page.getByRole("button", { name: "Create connector" }))
+    await waitFor(() => expect(calls.some((c) => c.url.includes("/ingest-spec") && c.method === "PUT")).toBe(true))
+
+    const spec = calls.find((c) => c.url.includes("/ingest-spec") && c.method === "PUT")
+    expect((spec?.body as { adapter: string; ingestMode: string }).adapter).toBe("kafka")
+    expect((spec?.body as { ingestMode: string }).ingestMode).toBe("stream")
   })
 })

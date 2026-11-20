@@ -88,7 +88,7 @@ enum Kind {
 }
 
 impl Kind {
-    /// `SEC-20` (plan 95, plan 96): the list a kind answers with table names,
+    /// `SEC-20` (plan 95, plan 96, plan ai-118): the list a kind answers with table names,
     /// and the field of each row that holds the table, for the kinds a
     /// caller's reach narrows ([`retain_rows_in_reach`]). The match has no
     /// wildcard, so a kind added later must decide whether its rows name tables.
@@ -96,9 +96,12 @@ impl Kind {
         match self {
             Self::Classification => Some(("classifications", "asset")),
             Self::Maintenance => Some(("maintenance", "tableName")),
-            Self::Quality | Self::Audit | Self::Residency | Self::Replication | Self::Unknown => {
-                None
-            }
+            // A quality rule names the table it checks, and the rules of
+            // every tenant's upload are in the list, so the quality list is
+            // narrowed by the caller's reach like the maintenance history
+            // and the classification list (`SEC-20`, plan ai-118).
+            Self::Quality => Some(("quality", "asset")),
+            Self::Audit | Self::Residency | Self::Replication | Self::Unknown => None,
         }
     }
 
@@ -159,13 +162,15 @@ const AUDIT_READ_DENIED: &str = "reading the audit trail needs the audit:read pe
 /// history names upload tables of every tenant: see
 /// [`retain_rows_in_reach`]. The classification list is narrowed the same way
 /// (`SEC-20`, plan 96), by each row's `asset`: it names the tables of the
-/// shared catalog and the upload tables of every tenant. The audit trail is
-/// narrowed per tenant (`SEC-20`, plan 100): the reader's scope is resolved
-/// with [`crate::routes::audit_scope::scope_for_principal`] and the rows are
-/// read through [`audit_trail`], so a reader sees its own organisation's rows
-/// plus the deployment's rows when that organisation owns the shared catalog.
-/// The other kinds are not narrowed. No principal is a system call: the
-/// quality list leaves one as it was, which
+/// shared catalog and the upload tables of every tenant. The quality list is
+/// narrowed the same way (`SEC-20`, plan ai-118): every rule names the table
+/// it checks. The audit trail is narrowed per tenant (`SEC-20`, plan 100):
+/// the reader's scope is resolved with
+/// [`crate::routes::audit_scope::scope_for_principal`] and the rows are read
+/// through [`audit_trail`], so a reader sees its own organisation's rows plus
+/// the deployment's rows when that organisation owns the shared catalog. The
+/// residency list and the replication list are not narrowed. No principal is
+/// a system call: the quality list leaves one as it was, which
 /// [`crate::routes::quality::quality_table_access`] documents, while the
 /// audit list gives a headless call (no principal behind it) no row of the
 /// trail, through [`crate::routes::audit_scope::scope_without_principal`].
@@ -265,6 +270,14 @@ pub(crate) async fn read_kind(
                 {
                     return ApiRejection(err).into_response();
                 }
+                // The observed rows are numbered after every filter has run,
+                // so an id says nothing about the rows a filter dropped
+                // (`GOV-15`, review round 1 (R1)). The other kinds carry ids
+                // of their own — a classification row's slug, an audit run's
+                // id, a maintenance row none — and are left as they are.
+                if parsed == Kind::Quality {
+                    renumber_observed_quality_rows(&mut body);
+                }
                 (StatusCode::OK, ApiJson(body)).into_response()
             }
             // Every branch shares one outer `catch (e)` returning
@@ -280,15 +293,18 @@ pub(crate) async fn read_kind(
 
 /// Drops every quality row whose `asset` the caller's table access hides, in
 /// place — the rule [`crate::routes::catalog::retain_visible`] applies to the
-/// catalog's own rows (`GOV-15` D6) — and gives the kept observed rows
-/// positional ids from the kept order, so an id says nothing about hidden rows
-/// (`GOV-15`, review round 1 (R1)).
+/// catalog's own rows (`GOV-15` D6).
 ///
 /// `retain_visible` itself cannot be called: it reads a row's `tableKey` or
 /// dotted `id`, while a quality row's key is its `asset` (an authored rule's
 /// `id` is a UUID, an observed row's `q-<n>`). A row with no `asset` string is
 /// hidden from a narrowed caller, as is an `asset` with no schema: nothing
 /// proves the grant covers it (fail closed).
+///
+/// The ids of the rows that are left are not renumbered here: this filter is
+/// one of the two that hide rows, and a row the other one drops would leave a
+/// gap in them. [`renumber_observed_quality_rows`] numbers them once both
+/// have run.
 fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut Value) {
     if access.is_all() {
         return;
@@ -302,10 +318,24 @@ fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut V
             .map(str::trim)
             .is_some_and(|asset| access.allows_key(asset))
     });
-    // The kept observed rows take their positional ids from the kept order
-    // (`q-0`, `q-1`, …): an id from the list before the filter would tell the
-    // caller how many hidden rows sorted before a visible one (`GOV-15`,
-    // review round 1 (R1)). An authored rule's id is a UUID and is left alone.
+}
+
+/// Numbers the observed rows of the quality list from the order they are left
+/// in, in place.
+///
+/// An observed row's id is `q-<n>`, and that number counts the observations of
+/// every tenant's tables, so an id taken before the filters ran would tell
+/// the caller how many rows of another organisation's tables sorted before a
+/// visible one (`GOV-15`, review round 1 (R1)). The numbers are therefore
+/// taken once every filter has run, so an id says nothing about what a filter
+/// dropped.
+///
+/// Only an observed row is renumbered: its id starts with `q-`, while an
+/// authored rule's id is a UUID and stays as it is.
+fn renumber_observed_quality_rows(body: &mut Value) {
+    let Some(rows) = body.get_mut("quality").and_then(Value::as_array_mut) else {
+        return;
+    };
     for (index, row) in rows
         .iter_mut()
         .filter(|row| {
@@ -548,8 +578,10 @@ pub(crate) async fn observed_quality(
 /// no recorded principal is one nobody signed in caused — a refused sign-in,
 /// a locked public link, a refused single sign-on link — and the platform
 /// recorded it. The actor's own name comes from `actor_label`
-/// ([`actor_of`]).
-fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
+/// ([`actor_of`]). The audit page's person filter lists the same kinds
+/// (`GOV-1` acceptance follow-up, D2), so the list narrows them the same
+/// way.
+pub(super) fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
     match principal_kind {
         Some("user") => "user",
         // "copilot" and "schedule" are both non-human actors from the
@@ -620,7 +652,13 @@ fn detail_of(action: &str, args: &Value) -> Option<String> {
 /// `"denied"` — the policy refused nothing — and not to `"success"`,
 /// because a viewer scanning for problems must not read a still-pending
 /// gate as clean (`GOV-5`).
-fn outcome_of(outcome: &str) -> &'static str {
+///
+/// The one mapping for every shape that names an outcome: the events JSON,
+/// the single-event JSON (`audit_event_row`) and the CSV export
+/// (`routes::audit_events`) all call it, so the page and the file agree
+/// (`GOV-1` acceptance follow-up, D4). The stored value travels beside it
+/// as `outcomeDetail` / `outcome_detail`.
+pub(super) fn outcome_of(outcome: &str) -> &'static str {
     match outcome {
         "allowed" | "executed" | "approved" => "success",
         "failed" => "error",
@@ -634,12 +672,22 @@ fn outcome_of(outcome: &str) -> &'static str {
 /// The policy decision a row reports beside its outcome. A row whose
 /// decision is still open reports `"pending"` too: the policy allowed
 /// nothing and denied nothing, so neither `"allow"` nor `"deny"` would be
-/// true (`GOV-5`). A success row stays `"allow"`, everything else stays
-/// `"deny"`.
+/// true (`GOV-5`).
+///
+/// `failed` reports `"allow"` (`GOV-1` acceptance follow-up, D4): the policy
+/// let the call through the gate and the execution failed afterwards — the
+/// outcome says so with its own word, `error` — so a failed row must not
+/// read as a policy refusal. Only the gate's own refusals, `refused` and
+/// `rejected`, report `"deny"`; a success row stays `"allow"`.
 fn policy_decision_of(outcome: &str) -> &'static str {
     match outcome_of(outcome) {
-        "success" => "allow",
+        // `error` is in the same arm: it is the one word the four-word
+        // vocabulary derives only from `failed`, and `failed` is an
+        // execution's failure, not a policy refusal — the gate allowed
+        // the call (`GOV-1` acceptance follow-up, D4).
+        "success" | "error" => "allow",
         "pending" => "pending",
+        // "refused" | "rejected": the gate itself said no.
         _ => "deny",
     }
 }
@@ -649,6 +697,13 @@ fn policy_decision_of(outcome: &str) -> &'static str {
 /// the search and single-event routes (`routes::audit_events`) has too, so a
 /// console or a tool reads one object for one event whichever route it came
 /// from.
+///
+/// Every event also carries, beside the keys the shape has always had: the
+/// actor's id as `actorId` (`GOV-1` acceptance follow-up, D2 — null when
+/// nobody signed in caused the event), the stored outcome value as
+/// `outcomeDetail` beside the four words of `outcome` (D4), and the stored
+/// `detail` column as `reason` (D4b — null when nothing was stored; the
+/// derived grant summary below stays `detail`).
 pub(super) fn audit_event_row(e: &lakehouse_store::audit::AuditEvent) -> Value {
     let resource = match (&e.resource_kind, &e.resource_id) {
         (Some(kind), Some(id)) => format!("{kind}:{id}"),
@@ -659,6 +714,10 @@ pub(super) fn audit_event_row(e: &lakehouse_store::audit::AuditEvent) -> Value {
     let mut row = json!({
         "id": e.id,
         "at": e.at,
+        // `GOV-1` acceptance follow-up (D2): the id sits beside the
+        // name, so the person filter can send it back; an event nobody
+        // signed in caused carries null.
+        "actorId": e.principal_id,
         // AI-23 (product owner 2026-11-02): one name for the
         // assistant — "AI Copilot", for an event whose kind is
         // `copilot`; SEC-70 D4: an event nobody signed in caused
@@ -672,12 +731,20 @@ pub(super) fn audit_event_row(e: &lakehouse_store::audit::AuditEvent) -> Value {
         "action": e.action,
         "resource": resource,
         "outcome": outcome_of(&e.outcome),
+        // `GOV-1` acceptance follow-up (D4): the stored value, beside
+        // the four words above — the detail view shows both.
+        "outcomeDetail": e.outcome,
         "policyDecision": policy_decision_of(&e.outcome),
         "obligations": [],
         "approvalId": e.approval_id,
         // QA LH-DATA-15-03 F3 (plan D9): every row used to say
         // "copilot", whoever acted.
         "source": source_of(e.principal_kind.as_deref()),
+        // `GOV-1` acceptance follow-up (D4b): the stored `detail`
+        // column — a refusal reason, a status code — as `reason`, null
+        // when nothing was stored. The derived grant summary below
+        // stays `detail`.
+        "reason": e.detail.as_deref().filter(|detail| !detail.is_empty()),
     });
     // QA LH-DATA-15-03 F1 (plan D9): the row names who got which
     // permission, from the stored fields only.
@@ -3478,7 +3545,9 @@ mod tests {
 
     /// `GOV-5`: a row whose decision is still open reports `"pending"` as
     /// its policy decision as well — it allowed nothing and denied
-    /// nothing.
+    /// nothing. `failed` reports `"allow"` (`GOV-1` acceptance follow-up,
+    /// D4): the policy let the call through the gate and the execution
+    /// failed afterwards, so it must not read as a policy refusal.
     #[test]
     fn policy_decision_of_reports_pending_for_a_gate_still_waiting() {
         assert_eq!(policy_decision_of("allowed"), "allow");
@@ -3488,7 +3557,7 @@ mod tests {
         assert_eq!(policy_decision_of("needs_approval"), "pending");
         assert_eq!(policy_decision_of("refused"), "deny");
         assert_eq!(policy_decision_of("rejected"), "deny");
-        assert_eq!(policy_decision_of("failed"), "deny");
+        assert_eq!(policy_decision_of("failed"), "allow");
     }
 
     /// The merge sort in [`audit`] compares `at` strings lexicographically;

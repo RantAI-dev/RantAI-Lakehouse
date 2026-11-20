@@ -63,6 +63,18 @@ pub async fn list_schedules(
         return Err(ApiError::PermissionDenied(reason.to_owned()).into());
     }
     let schedules = quality::list_schedules(pool(&state)?).await?;
+    // `SEC-20` (plan ai-118): a schedule names the table it belongs to, and
+    // the schedules of every tenant's upload are in the list, so the ones
+    // outside the caller's reach are left out — the reach Query Studio keeps
+    // (`crate::routes::query::resolve_reach` and
+    // `crate::routes::query::reachable_names`).
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+    let assets: Vec<String> = schedules.iter().map(|s| s.asset.clone()).collect();
+    let readable = crate::routes::query::reachable_names(&state, reach, &assets).await?;
+    let schedules: Vec<_> = schedules
+        .into_iter()
+        .filter(|s| readable.contains(&s.asset))
+        .collect();
     Ok(ApiJson(json!({
         "schedules": schedules,
         "defaultIntervalMinutes": DEFAULT_INTERVAL_MINUTES,
@@ -88,10 +100,14 @@ pub struct ScheduleBody {
 /// `403` when the caller is outside the tenant that owns the shared catalog
 /// (that answer is the same for every table); `400` when the table is not
 /// `bronze.`/`silver.`/`serving.` plus a plain name, when the caller's table
-/// access hides it (the sentence a rule on that table gets, `GOV-15`), when the
+/// access hides it (the sentence a rule on that table gets, `GOV-15`), or when
+/// the table is outside the caller's reach (`SEC-80`, the same sentence), when the
 /// mode is not `on_load` or `interval`, the interval is missing for `interval`
-/// or outside 60 to 1440, or the body is malformed; `503`/`500` on a store
-/// failure. The table's existence is not checked, as before.
+/// or outside 60 to 1440, or the body is malformed; `400` with the same
+/// sentence when no table has that name (`SEC-80`); `503` with the text
+/// "The table could not be checked. Try again." when the presence check cannot
+/// run (`SEC-80`), for a claimed name and an unknown one alike; `503`/`500` on a
+/// store failure.
 pub async fn put_schedule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -115,8 +131,19 @@ pub async fn put_schedule(
     })?;
     // GOV-15 (GOV-12 plan, section 4): a schedule names a table, not a rule, so
     // a table the role does not read is refused with the sentence a rule on it
-    // gets (D5). Existence is not checked, so the two refusals read alike.
+    // gets (D5).
     if !access.allows_key(&key) {
+        return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
+    }
+    // SEC-80: presence and reach are asked for every name before anything is
+    // answered, presence first. An outage then answers a name another tenant
+    // claimed and a name no table has alike, and a refusal of either is the
+    // same 400.
+    let present = crate::routes::quality::quality_table_present(&state, &key).await?;
+    let in_reach =
+        crate::routes::quality::quality_key_in_reach(&state, Some(&principal), &headers, &key)
+            .await?;
+    if !present || !in_reach {
         return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
     }
     let mode = ScheduleMode::parse(&body.mode)
@@ -155,8 +182,13 @@ pub async fn put_schedule(
 /// `403` when the caller is outside the tenant that owns the shared catalog;
 /// `400` when the table is not `bronze.`/`silver.`/`serving.` plus a plain
 /// name, or when the caller's table access hides it (the sentence a rule on
-/// that table gets, `GOV-15`); `503`/`500` on a store failure. The table's
-/// existence is not checked, as before.
+/// that table gets, `GOV-15`), or when the table is outside the caller's reach
+/// (`SEC-80`), or when no table has that name and the schedule it would reset
+/// does not exist (`SEC-80`: a reset of a dropped table still works); an existing
+/// schedule row in the caller's reach gives 204 even when the table is gone;
+/// `503` with the text "The table could not be checked. Try again." when the
+/// presence check cannot run (`SEC-80`), for a claimed name and an unknown one
+/// alike; `503`/`500` on a store failure.
 pub async fn delete_schedule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -175,6 +207,22 @@ pub async fn delete_schedule(
     // GOV-15 (GOV-12 plan, section 4): refusing first, so a reset changes
     // nothing for a table the role does not read (D8).
     if !access.allows_key(&key) {
+        return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
+    }
+    // SEC-80: presence and reach are asked for every name before anything is
+    // answered, presence first, so an outage answers a claimed name and an
+    // unknown name alike.
+    let present = crate::routes::quality::quality_table_present(&state, &key).await?;
+    let in_reach =
+        crate::routes::quality::quality_key_in_reach(&state, Some(&principal), &headers, &key)
+            .await?;
+    // A reset of an existing in-reach schedule answers 204 when its table was dropped.
+    // An outage that stops the presence check answers 503 for it too (SEC-80).
+    let scheduled = quality::list_schedules(pool(&state)?)
+        .await?
+        .iter()
+        .any(|schedule| schedule.asset == key);
+    if !in_reach || !(present || scheduled) {
         return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
     }
     quality::delete_schedule(pool(&state)?, &key).await?;

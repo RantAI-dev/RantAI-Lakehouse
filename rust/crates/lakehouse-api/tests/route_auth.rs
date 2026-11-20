@@ -1911,6 +1911,44 @@ async fn the_audit_list_needs_audit_read_and_a_governance_reader_without_it_is_r
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// The audit trail's actor list — the person filter's source (`GOV-1`
+/// acceptance follow-up, D2) — is its own route with `audit:read` and nothing
+/// else, asserted both ways: no session is 401, a `governance:read` holder
+/// without `audit:read` is 403 with the permission named, and a holder gets
+/// in.
+#[tokio::test]
+async fn the_audit_actors_route_needs_audit_read_and_a_governance_reader_without_it_is_refused() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/governance/audit/actors";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == uri)
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("audit:read")),
+    );
+
+    let none = request_with_cookie(&router, "GET", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+
+    let analyst = create_principal_with_permissions(&pool, "query:read,governance:read").await;
+    let analyst_cookie = session_cookie_for_user(&pool, analyst).await;
+    let refused = request_with_cookie(&router, "GET", uri, &analyst_cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(
+        body.contains("audit:read"),
+        "the refusal names the permission: {body}"
+    );
+
+    let auditor = create_principal_with_permissions(&pool, "governance:read,audit:read").await;
+    let cookie = session_cookie_for_user(&pool, auditor).await;
+    let allowed = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+}
+
 /// `WEB-8` S2 T8 (D8): `GET /api/governance/row-filter-grammar` needs
 /// `policy:read` and nothing less, asserted both ways: no session is 401, a
 /// principal with another permission is 403, and a `policy:read` holder gets
@@ -2762,6 +2800,38 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
     let mut env = std::collections::HashMap::new();
     let catalog_tenant = "11111111-1111-4111-8111-000000000001";
     env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    // A schedule's table must be there (`SEC-80`): ClickHouse has `silver.orders`
+    // and no other table, so the reset of it reaches the handler's answer.
+    let ch = wiremock::MockServer::start().await;
+    // Every other lookup answers no columns; the table-specific answer below is
+    // mounted at a higher priority and wins for `silver.orders`.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_string_contains("system.columns"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+                "data": [],
+                "rows": 0,
+            })),
+        )
+        .mount(&ch)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_string_contains(
+            "database = 'silver'",
+        ))
+        .and(wiremock::matchers::body_string_contains("table = 'orders'"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "name", "type": "String"}, {"name": "type", "type": "String"}],
+                "data": [{"name": "id", "type": "String"}],
+                "rows": 1,
+            })),
+        )
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    env.insert("CH_URL".to_owned(), ch.uri());
     let TestApp { router, pool } = common::spin_up_with_env(&env).await;
 
     let reader = create_principal_with_permissions(&pool, "catalog:read").await;
@@ -4027,6 +4097,10 @@ async fn the_public_map_boundary_routes_are_not_refused_by_the_auth_gate() {
             "/api/public/dashboard/tok/maps/m_0123456789ab/geojson",
         ),
         ("POST", "/api/embed/maps/m_0123456789ab/geojson"),
+        // BI-36: the print view's own route, behind the render token.
+        ("POST", "/api/render/maps/m_0123456789ab/geojson"),
+        // BI-42: the print view's image route, behind the render token.
+        ("GET", "/api/render/image"),
     ] {
         let resp = router
             .clone()
@@ -4317,6 +4391,42 @@ async fn the_scheduler_run_door_stays_shut_to_a_person_when_the_test_door_is_ope
         "POST /api/alerts/test is a person's door, got {}",
         tested.status()
     );
+}
+
+/// `BI-43` D1, both directions: `GET /api/alerts/mine` is signed in at the
+/// router (no session is 401), and a Dashboard Viewer, who holds neither
+/// `alert:read` nor `alert:write`, is not refused: the person's own alerts are
+/// theirs to list. The same person is still refused `GET /api/alerts`.
+#[tokio::test]
+async fn listing_ones_own_chart_alerts_is_signed_in_at_the_router_and_needs_no_alert_permission() {
+    let TestApp { router, pool } = alert_test_app().await;
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/alerts/mine")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresAuth)
+    );
+
+    let no_session = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/alerts/mine?chart=c_kpi")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_session.status(), StatusCode::UNAUTHORIZED);
+
+    let viewer = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, viewer).await;
+    let own = request_with_cookie(&router, "GET", "/api/alerts/mine?chart=c_kpi", &cookie).await;
+    assert_eq!(own.status(), StatusCode::OK);
+    let list = request_with_cookie(&router, "GET", "/api/alerts", &cookie).await;
+    assert_eq!(list.status(), StatusCode::FORBIDDEN);
 }
 
 /// ADM-4 T1/T2: the four new identity write routes are in `POLICY_TABLE`
@@ -4699,6 +4809,41 @@ async fn the_pipeline_preview_route_authorization_is_asserted_both_ways() {
         POLICY_TABLE
             .iter()
             .find(|(m, p, _)| *m == "POST" && *p == "/api/pipelines/preview")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("pipeline:write")),
+    );
+
+    let reader = create_principal_with_permissions(&pool, "query:read").await;
+    let refused = session_cookie_for_user(&pool, reader).await;
+    let writer = create_principal_with_permissions(&pool, "pipeline:write").await;
+    let allowed = session_cookie_for_user(&pool, writer).await;
+
+    let none = request_with_cookie(&router, "POST", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+    let denied = request_with_cookie(&router, "POST", uri, &refused).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let through = request_with_cookie(&router, "POST", uri, &allowed).await;
+    assert!(
+        through.status() != StatusCode::UNAUTHORIZED && through.status() != StatusCode::FORBIDDEN,
+        "a pipeline:write holder must get past the gate, got {}",
+        through.status()
+    );
+}
+
+/// BLD-16 / J6: the step-SQL route is in `POLICY_TABLE` as `pipeline:write`,
+/// and the gate answers both ways: no session is 401, `query:read` alone is
+/// 403, and a `pipeline:write` holder gets past authentication (the handler
+/// then refuses the empty body it was sent with a 400, which is not an
+/// authorization answer).
+#[tokio::test]
+async fn the_pipeline_step_sql_route_authorization_is_asserted_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/pipelines/step-sql";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/pipelines/step-sql")
             .map(|(_, _, policy)| *policy),
         Some(Policy::RequiresPermission("pipeline:write")),
     );

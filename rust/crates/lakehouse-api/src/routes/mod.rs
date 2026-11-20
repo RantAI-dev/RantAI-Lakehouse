@@ -431,17 +431,24 @@ fn pipeline_compile_router() -> Router<AppState> {
 
 /// `POST /api/pipelines/preview` (BLD-1 part 1 / D16): the first rows of one
 /// input or step of a definition that is not saved yet.
+/// `POST /api/pipelines/step-sql` (BLD-16 / J6): the SQL of one form step of
+/// such a definition, over names, answered as text.
 ///
-/// Its own function for the same reason [`pipeline_compile_router`] is: so the
-/// route can be added without pushing [`pipelines_router`] over
+/// Their own function for the same reason [`pipeline_compile_router`] is: so the
+/// routes can be added without pushing [`pipelines_router`] over
 /// `clippy::too_many_lines`. It merges straight back in and carries no
 /// middleware or state of its own. Static, like `generate`, so axum never
 /// reads it as `/api/pipelines/{id}`.
 fn pipeline_preview_router() -> Router<AppState> {
-    Router::new().route(
-        "/api/pipelines/preview",
-        axum::routing::post(pipeline_preview::preview),
-    )
+    Router::new()
+        .route(
+            "/api/pipelines/preview",
+            axum::routing::post(pipeline_preview::preview),
+        )
+        .route(
+            "/api/pipelines/step-sql",
+            axum::routing::post(pipeline_preview::step_sql),
+        )
 }
 
 /// The authored-pipeline (orchestrator-only) routes: the definitions the
@@ -688,6 +695,10 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/audit/export.csv",
             get(audit_events::export),
         )
+        // `GOV-1` acceptance follow-up (D2): the person filter's list of
+        // the trail's actors, static ahead of the `{kind}` capture like
+        // the routes above.
+        .route("/api/governance/audit/actors", get(audit_events::actors))
         // DATA-13: column-level lineage. A static path ahead of the
         // `{kind}` capture like `lineage` above (and four segments deep).
         .route(
@@ -1425,6 +1436,9 @@ pub fn router(state: AppState) -> Router {
                 .delete(alerts::delete),
         )
         .route("/api/alerts/status", get(alerts::status))
+        // `BI-43` D1: a person's own alerts on one chart, for the chart's alert
+        // dialog; `GET /api/alerts` itself still needs `alert:read`.
+        .route("/api/alerts/mine", get(alerts::mine))
         // `BI-40` D1: a person's door for one rule, next to the scheduler's
         // (`/api/alerts/run`, unchanged, still behind `check_run_token`).
         .route("/api/alerts/test", post(alerts::test_one))
@@ -1652,6 +1666,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
         .route("/api/render/data", axum::routing::post(render::data))
+        // BI-42: one image card's picture for the print view, behind the render token.
+        .route("/api/render/image", get(render::image))
+        // BI-36: the print view's uploaded maps, behind the same render token
+        // as the data.
+        .route(
+            "/api/render/maps/{id}/geojson",
+            axum::routing::post(render::map_geojson),
+        )
         // RPT-1 (D7): scheduled reports. Authorisation beyond `dashboard:read`
         // (owner or administrator, download right) is in the handlers.
         .route(

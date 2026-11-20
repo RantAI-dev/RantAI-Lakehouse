@@ -839,3 +839,47 @@ describe("a connector that authenticates with none (LH-SRC-6-39)", () => {
     expect(facts.queryByText("Stored by lakehouse, encrypted")).toBeNull()
   })
 })
+
+// SRC-46 (QA LH-SRC-6-43): the health follows a run only when the orchestrator's sensor reports it to the API,
+// about a minute after the run ends, so the page reads the detail again until the run is counted. The wait's
+// own cases (counted, cap, paused, unmount) are in `use-run-count-wait.test.tsx`, with real timers and tiny values.
+// SRC-46 review round 3, BLOCKER 3: real timers here too; fake timers with stubbed fetch hung on CI.
+describe("ConnectorDetailPage after a run ends", () => {
+  it("reads the detail again when the run ends, and shows Degraded once the detail reports the failure", async () => {
+    const world = { ended: false, counted: false }
+    const run = () => ({
+      runId: "run-live-00001",
+      trigger: "schedule",
+      table: null,
+      status: world.ended ? "failed" : "running",
+      startedAt: new Date().toISOString(),
+      endedAt: world.ended ? new Date().toISOString() : null,
+      durationSeconds: world.ended ? 90 : null,
+      rowsLoaded: 0,
+      attempts: 4,
+      endReason: world.ended ? "table_failed" : null,
+    })
+    const stub = stubFetch({
+      "GET /api/connectors/conn-a/runs": () => json({ runs: [run()] }),
+      "GET /api/connectors/conn-a": () =>
+        json(
+          world.counted
+            ? { ...DETAIL, health: "degraded", lastRunFailureAt: "2026-11-19T08:28:40.000Z", failureStreak: 1 }
+            : DETAIL
+        ),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByText(/Run run-live is running/)
+    expect(screen.queryByText("Degraded")).toBeNull()
+    const before = stub.count("GET /api/connectors/conn-a")
+
+    // The panel's own 3 s poll sees the run end, then the page reads the detail at once: still healthy.
+    world.ended = true
+    await waitFor(() => expect(stub.count("GET /api/connectors/conn-a")).toBeGreaterThan(before), { timeout: 6000 })
+    expect(screen.queryByText("Degraded")).toBeNull()
+
+    // The sensor counts the run; the page's own wait (every 10 s) picks it up.
+    world.counted = true
+    await waitFor(() => expect(screen.getAllByText("Degraded").length).toBeGreaterThan(0), { timeout: 14000 })
+  }, 25000)
+})

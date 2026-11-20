@@ -1,6 +1,8 @@
 # SEC-18 -- no default credentials. These variables have NO fallback and
 # compose refuses to start without them (`${X:?}`): POSTGRES_PASSWORD,
-# RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY, LAKEKEEPER_ENCRYPTION_KEY.
+# RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY, LAKEKEEPER_ENCRYPTION_KEY,
+# LAKEHOUSE_DB_APP_PASSWORD (SEC-78: the console's runtime role's own
+# password; it is NOT the owner's).
 # `CONNECTOR_PG_PASSWORD` / `CONNECTOR_S3_*` fall back to those, never to a
 # literal. `ops/init-env.sh` writes a local `.env` with generated values;
 # docs/OPERATIONS.md has the upgrade note. Compose interpolates the whole
@@ -149,6 +151,67 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  # SEC-78 — the schema is applied HERE, not by the API container.
+  #
+  # The console connects as `lakehouse_app`: a role that owns no table and
+  # is not a superuser. Owning a table is enough to switch off the audit
+  # trail's append-only triggers (`ALTER TABLE audit_event DISABLE
+  # TRIGGER`, `SET session_replication_role = replica`), so the role that
+  # owns the tables must not be the role the console runs as. The
+  # migrations therefore run in this one-shot service, which holds the
+  # OWNER's credentials (`POSTGRES_USER`, the Postgres image's superuser)
+  # and is gone before the API starts.
+  lakehouse-db-migrate:
+    # The SAME image as `lakehouse-api` below: one build, one published
+    # image, one entrypoint. The release publishes it once and names it
+    # for both services (`ops/release/release-images.json`).
+    image: ${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}
+    build:
+      context: ./rust
+      dockerfile: Dockerfile
+      # WS4 item C2 — the source tree `GET /api/pipelines/{id}/source`
+      # serves from, baked into the image via a SECOND, independent build
+      # context rather than widening `context` above to the repository
+      # root (judge review V8: the repository root's `.dockerignore`
+      # excludes `rust`/`docs`/`*.md`, so a `context: .` change would
+      # break every `COPY rust/...` this file needs; that ignore file is
+      # read only by a build whose context IS the root, so it does not
+      # apply to this one — but it would apply to that change). Neither
+      # `context` nor `dockerfile` above changes at all.
+      additional_contexts:
+        pipeline_src: ./dagster/dispar_orchestrate
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+        # Must name the SAME Python package as `pipeline_src` above: the
+        # API keys op source files by the baked directory's own name,
+        # because that is what a `source_ref` is relative to. Stated here
+        # rather than left to `rust/Dockerfile`'s default so the two halves
+        # are visibly one decision (see that file's ARG comment).
+        PIPELINE_PACKAGE: dispar_orchestrate
+    # The API binary's own `migrate` subcommand: it applies the
+    # migrations, then creates the runtime role and its grants.
+    command: ["migrate"]
+    # It applies the schema once and exits; there is nothing to restart.
+    restart: "no"
+    # `postgres` is healthy when `pg_isready` answers, and the Postgres
+    # image restarts once after that first success (its temporary
+    # init-phase server is replaced by the real one), so "healthy" is not
+    # "accepts a connection from a new one". No shell retry loop is needed
+    # here: the Rust side retries the connection for about a minute.
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # The OWNER's URL, with NO override: the migrations need DDL, and
+      # only the owner has it. An ambient `DATABASE_URL` — the one the
+      # API may be pointed at — would make the migrations run as a role
+      # that cannot run them. This is the only place the owner's password
+      # reaches the console's own database.
+      DATABASE_URL: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${POSTGRES_DB:-lakehouse}
+      # The runtime role's password. Set on every run, so a rotation
+      # applies on the next deploy. MUST SET, never a default (SEC-18).
+      LAKEHOUSE_DB_APP_PASSWORD: ${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+
   lakehouse-api:
     # CI-SPEED-PLAN §4.2: a name for the image, so the `images` job in
     # .github/workflows/ci.yml can build it ONCE per run, hand it to the
@@ -187,6 +250,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # SEC-78: the schema and the console's runtime role are applied by
+      # `lakehouse-db-migrate` above, with the OWNER's credentials. The API
+      # starts only once that one-shot service succeeded: its boot check
+      # refuses a pending migration, and a superuser or a table owner, and
+      # it fails closed — starting earlier would only turn a clear message
+      # into a crash loop.
+      lakehouse-db-migrate:
+        condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
       # A single-file `subpath` volume mount (the `gold-export.jwt`/
@@ -226,6 +297,26 @@ services:
     environment:
       PORT: "8080"
       APP_ENV: ${APP_ENV:-local}
+      # The commit this deployment runs.
+      #
+      # `check_commit` (`rust/crates/lakehouse-api/src/pipeline_source.rs`)
+      # compares it with the commit the Dagster code location stamped on
+      # the op, and the console's pipeline page serves the op's source
+      # text only when the two agree. "unknown" on EITHER side means "no
+      # real commit was ever recorded here", so the route refuses instead
+      # of serving source it cannot verify.
+      #
+      # It is set HERE, at RUN time, and not only as the image's build
+      # arg: the API image is built in CI WITHOUT `GIT_SHA` (a per-commit
+      # build arg sits near the top of `rust/Dockerfile`, so it would
+      # invalidate every layer below it and the layer cache would never
+      # hit), which means the image itself carries `GIT_SHA=unknown`. A
+      # container's `environment:` overrides the image's `ENV`, so the
+      # value the API reads is the one the deploy exports --
+      # `scripts/compose.sh` exports `GIT_SHA=$(git rev-parse HEAD)`, the
+      # SAME value the code location's image is built with, and the two
+      # agree.
+      GIT_SHA: ${GIT_SHA:-unknown}
       # ── ClickHouse: points at the compose service by default ──
       CH_URL: ${CH_URL:-http://clickhouse:8123}
       CH_USER: ${CH_USER:-default}
@@ -485,7 +576,11 @@ services:
       #    deliberately no default credential — see docs/OPERATIONS.md. ──
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
-      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${POSTGRES_DB:-lakehouse}}
+      # SEC-78: the console's RUNTIME role, not the owner. `lakehouse_app`
+      # owns no table and is not a superuser, so it cannot switch off the
+      # audit trail's append-only triggers. The migrations run in
+      # `lakehouse-db-migrate` above, with the owner's credentials.
+      DATABASE_URL: ${DATABASE_URL:-postgres://lakehouse_app:${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${POSTGRES_DB:-lakehouse}}
       # ── secretRef-resolvable credentials for `connector_probe`'s real
       #    PostgreSQL/S3 connectivity tests (P6, ADR 0002). The seeded
       #    `conn-pg-lakehouse`/`conn-s3-warehouse` connectors reference
@@ -498,14 +593,19 @@ services:
       # secrets. Only these three names are on
       # `CONNECTOR_ALLOWED_SECRET_REFS`, which is what stops a
       # `connector:manage` principal creating a connector that names
-      # `env:POSTGRES_PASSWORD` (the console's own database password) with a
+      # `env:POSTGRES_PASSWORD` (the database OWNER's password) with a
       # caller-chosen external host and having the API authenticate to it.
       # They fall back to the must-set values above (SEC-18: never to a
       # literal) so the local stack still works —
       # separate NAMES, not necessarily separate values. Point them at
       # least-privilege credentials in any deployment that accepts connector
       # definitions from callers you do not fully trust.
-      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      # SEC-78: the console's own runtime role's password, not the OWNER's.
+      # The seeded `conn-pg-lakehouse` connector dials the console database
+      # as `lakehouse_app` from now on (a migration moves the seeded row's
+      # user), so a connector can never authenticate with the owner's
+      # credentials.
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       # SEC-14 part B (D5/D7): CA certificate for connector dials. Mounted
@@ -2214,6 +2314,20 @@ services:
   # `lakekeeper-db-init` exactly — separate database, not a schema mixed
   # into the `lakehouse` app database). See
   # docs/adr/0005-dagster-code-location-ownership-and-packaging.md.
+  # SEC-78 (second change): Dagster's instance database has its OWN role,
+  # `lakehouse_dagster`. It is not a superuser and owns nothing outside its
+  # database, so the code location and the daemon, which run product code and
+  # authored pipelines, cannot switch off the console's append-only triggers
+  # with the owner's password (they never see it). This one-shot service runs
+  # as the owner (`POSTGRES_USER`) on EVERY start, so the role's password
+  # follows the variable, and a `dagster` database the superuser owns (a volume
+  # from before this change) moves to the role. Objects are re-owned one by
+  # one: `REASSIGN OWNED` would also move objects of the console database and
+  # the shared catalog, which stay with the owner.
+  #
+  # The role's password is set in a transaction with statement logging off,
+  # the same guard `lakehouse-api migrate` uses (SEC-78): the plain password is
+  # a literal in that statement.
   dagster-db-init:
     profiles: ["dagster"]
     image: postgres:16.15@sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c
@@ -2227,13 +2341,91 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      # The role's password. Set on every start, so a rotation applies on the
+      # next deploy. MUST SET, never a default (SEC-18).
+      DAGSTER_ROLE_PASSWORD: ${LAKEHOUSE_DB_DAGSTER_PASSWORD:?LAKEHOUSE_DB_DAGSTER_PASSWORD is required (Dagster's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - >
-        psql -v ON_ERROR_STOP=1 -tc
-        "SELECT 1 FROM pg_database WHERE datname = '$${DAGSTER_PG_DB}'" |
-        grep -q 1 ||
-        psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$${DAGSTER_PG_DB}\""
+      - |
+        set -eu
+        # Postgres restarts once after pg_isready first succeeds, so wait for a
+        # connection that really works (the same reason as openfga-db-init).
+        ready=0
+        for attempt in $$(seq 1 30); do
+          if psql -v ON_ERROR_STOP=1 -tAc 'SELECT 1' >/dev/null 2>&1; then ready=1; break; fi
+          sleep 2
+        done
+        if [ "$$ready" != 1 ]; then
+          echo "dagster-db-init: postgres never accepted a connection" >&2; exit 1
+        fi
+        # The password is read from the environment inside psql (`\getenv`), not
+        # passed with `-v`: a command-line argument shows up in `ps` in the container.
+        psql -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+        \getenv pw DAGSTER_ROLE_PASSWORD
+        BEGIN;
+        SET LOCAL log_statement = 'none';
+        SET LOCAL log_min_error_statement = 'panic';
+        DO $$body$$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'lakehouse_dagster') THEN
+            CREATE ROLE lakehouse_dagster LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+              NOREPLICATION NOBYPASSRLS;
+          END IF;
+        END $$body$$;
+        ALTER ROLE lakehouse_dagster LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+          NOREPLICATION NOBYPASSRLS PASSWORD :'pw';
+        COMMIT;
+        SQL
+        if ! psql -v ON_ERROR_STOP=1 -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '$$DAGSTER_PG_DB'" | grep -q 1; then
+          psql -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE \"$$DAGSTER_PG_DB\" OWNER lakehouse_dagster"
+        fi
+        psql -v ON_ERROR_STOP=1 -d postgres -c "ALTER DATABASE \"$$DAGSTER_PG_DB\" OWNER TO lakehouse_dagster"
+        psql -v ON_ERROR_STOP=1 -d "$$DAGSTER_PG_DB" <<'SQL'
+        DO $$body$$
+        DECLARE r record;
+        BEGIN
+          FOR r IN
+            SELECT n.nspname AS schema, c.relname AS name, c.relkind AS kind
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND n.nspname NOT LIKE 'pg_toast%'
+              AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+              AND pg_get_userbyid(c.relowner) <> 'lakehouse_dagster'
+              AND NOT (c.relkind = 'S' AND EXISTS (
+                SELECT 1 FROM pg_depend d
+                WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                  AND d.refclassid = 'pg_class'::regclass AND d.refobjsubid > 0
+                  AND d.deptype IN ('a', 'i')))
+          LOOP
+            EXECUTE format(
+              CASE r.kind
+                WHEN 'S' THEN 'ALTER SEQUENCE %I.%I OWNER TO lakehouse_dagster'
+                WHEN 'v' THEN 'ALTER VIEW %I.%I OWNER TO lakehouse_dagster'
+                WHEN 'm' THEN 'ALTER MATERIALIZED VIEW %I.%I OWNER TO lakehouse_dagster'
+                ELSE 'ALTER TABLE %I.%I OWNER TO lakehouse_dagster'
+              END, r.schema, r.name);
+          END LOOP;
+          FOR r IN
+            SELECT n.nspname AS schema, p.proname AS name,
+                   pg_get_function_identity_arguments(p.oid) AS args, p.prokind AS kind
+            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND p.prokind IN ('f', 'p')
+              AND pg_get_userbyid(p.proowner) <> 'lakehouse_dagster'
+          LOOP
+            EXECUTE format('ALTER %s %I.%I(%s) OWNER TO lakehouse_dagster',
+              CASE r.kind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END,
+              r.schema, r.name, r.args);
+          END LOOP;
+          FOR r IN
+            SELECT nspname FROM pg_namespace
+            WHERE nspname NOT IN ('pg_catalog', 'information_schema')
+              AND nspname NOT LIKE 'pg_toast%' AND nspname NOT LIKE 'pg_temp%'
+              AND pg_get_userbyid(nspowner) <> 'lakehouse_dagster'
+          LOOP
+            EXECUTE format('ALTER SCHEMA %I OWNER TO lakehouse_dagster', r.nspname);
+          END LOOP;
+        END $$body$$;
+        SQL
     restart: "no"
 
   # P3 (G3a) — the code location: a gRPC server serving
@@ -2301,6 +2493,32 @@ services:
           subpath: gold-export.jwt
         read_only: true
     environment:
+      # How many steps the multiprocess executor of THIS code location may
+      # run at the same time.
+      #
+      # Dagster's own default is the CPU count of the machine the code
+      # location runs on (`multiprocessing.cpu_count()`, see
+      # `dagster/_core/executor/multiprocess.py`), so on the staging VM
+      # (8 vCPU) EIGHT steps ran at once. Every step of this code location
+      # is a spawned Python process of its own (~235 MB RSS), which is why
+      # the container was measured at 1012 MiB and 268% CPU while
+      # `bronze_maintenance_job` fanned out over its 513 bronze tables --
+      # and why the `docker compose up --build` of a deploy, running on the
+      # SAME 8 cores, starved and stalled next to it.
+      #
+      # Two keeps the pipeline working and bounds the footprint: the
+      # fan-out is untouched (the job still steps over every table, it just
+      # does fewer of them at the same time). The host cannot grow its RAM
+      # -- the Proxmox host `pve` is at 96% of its 62 GiB, and the staging
+      # VM's 8 GiB is already half in swap -- so the bound has to come from
+      # here, not from more memory.
+      #
+      # A code location with no `max_concurrent` in its executor config
+      # reads this variable, and only then falls back to the CPU count
+      # (`if not max_concurrent: env_var_default = os.getenv(...)`).
+      # An operator may raise or lower it in `.env`; the default below is
+      # the number this deployment runs with. Not a credential.
+      DAGSTER_MULTIPROCESS_EXECUTOR_MAX_CONCURRENT: ${DAGSTER_MULTIPROCESS_EXECUTOR_MAX_CONCURRENT:-2}
       # `dlt_pipeline.py::run_bronze_ingest`: the `dlt`
       # SSRF guard fail-closed refuses to dial an RFC1918/private
       # address unless this is set; `BRONZE_SOURCE_DB_HOST` below is
@@ -2416,10 +2634,16 @@ services:
       AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
       AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
       AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
+      # SEC-78: the OWNER's password still reaches this container for
+      # Dagster's OWN instance database (`DAGSTER_PG_*` below). That database
+      # gets its own role in the second change of SEC-78. Until it lands, this
+      # container holds the owner's password; the gap is written down here
+      # instead of hidden
+      # (principle 2: state the gap where the reader looks).
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
-      DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
-      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      DAGSTER_PG_USER: lakehouse_dagster
+      DAGSTER_PG_PASSWORD: ${LAKEHOUSE_DB_DAGSTER_PASSWORD:?LAKEHOUSE_DB_DAGSTER_PASSWORD is required (Dagster's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
       # REL-2 S4 decision D16: the pause. `true` stops the jobs that
       # DELETE files — the snapshot expiry and the orphan-file removal —
@@ -2452,8 +2676,16 @@ services:
       # recognize the `postgres://` scheme alias.
       BRONZE_SOURCE_DB_HOST: postgres
       BRONZE_SOURCE_DB_PORT: "5432"
-      BRONZE_SOURCE_DB_USER: ${POSTGRES_USER:-lakehouse}
-      BRONZE_SOURCE_DB_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      # SEC-78: the demo pipeline reads the console
+      # database as a SOURCE, so it connects as the console's RUNTIME
+      # role, not the owner: the owner's password must not reach this
+      # container for that. The default below is that role
+      # (`lakehouse_app`), overridable for a source role that needs
+      # more than the runtime role has — a CDC source needs
+      # `REPLICATION`, which the runtime role deliberately lacks (see
+      # docs/OPERATIONS.md, "Database roles").
+      BRONZE_SOURCE_DB_USER: ${BRONZE_SOURCE_DB_USER:-lakehouse_app}
+      BRONZE_SOURCE_DB_PASSWORD: ${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       # Verification correction: `BRONZE_SOURCE_DB_PASSWORD` above
       # only ever fed the g3a demo pipeline's OWN hardcoded credential
       # assembly (`dlt_pipeline.py`). The SEEDED `conn-pg-lakehouse`
@@ -2468,7 +2700,16 @@ services:
       # deployment of this compose file, not just the gate. Exported here
       # under its own name, same value as above, so both readers resolve
       # it.
-      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      # SEC-78: the seeded connector's row now dials the
+      # console database as the role `lakehouse_app` (the seeded row's
+      # user moves to that role in the same PR), so the secret its
+      # `secretRef` resolves to must be the ROLE's password: the default
+      # below is the role's password, not the owner's. It is the same
+      # value `BRONZE_SOURCE_DB_PASSWORD` above carries — the two readers
+      # still resolve one value — unless the operator sets
+      # `CONNECTOR_PG_PASSWORD` in the environment, which overrides this
+      # default and must then hold the role's password too.
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${LAKEHOUSE_DB_APP_PASSWORD:?LAKEHOUSE_DB_APP_PASSWORD is required (the console's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       BRONZE_SOURCE_DB_NAME: ${POSTGRES_DB:-lakehouse}
       BRONZE_SOURCE_SCHEMA: ${BRONZE_SOURCE_SCHEMA:-ingest_demo}
       BRONZE_SOURCE_TABLE: ${BRONZE_SOURCE_TABLE:-orders}
@@ -2610,7 +2851,42 @@ services:
     # authored-pipeline change (`routes::authored_pipelines`), since
     # authored jobs are built at import time; `api grpc` kept serving the
     # definitions it started with.
-    command: ["dagster", "code-server", "start", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
+    #
+    # OPS-37: the code server runs UNDER a supervisor, because on staging
+    # (2026-11-18 22:15 UTC to 2026-11-19 02:58 UTC) the INNER code server
+    # died -- "No heartbeat received in 30 seconds, shutting down" -- and
+    # the `code-server start` proxy never respawned it: it starts the inner
+    # server once (`dagster/_grpc/proxy_server.py`) and the registry never
+    # restarts a dead one. The container stayed "Up" while the daemon failed
+    # 1550 times, and no schedule or sensor ran until a manual restart 4.5
+    # hours later. Dagster 1.13.20 has no option that makes the proxy exit
+    # when the inner server dies, and Docker does NOT restart an unhealthy
+    # container by itself: `restart: unless-stopped` restarts a container
+    # whose PROCESS exited. So the container's main process is now
+    # `dispar_orchestrate.code_server_guard`, which starts the very same
+    # code server as a child, pings it every 30 s (the proxy FORWARDS `Ping`
+    # to the inner server, so a missing answer means the inner server is
+    # gone) and EXITS NON-ZERO when it is: that is what makes Docker
+    # restart the container. The guard also forwards SIGTERM to the child,
+    # so `docker compose stop` still stops the container cleanly.
+    command: ["python3", "-m", "dispar_orchestrate.code_server_guard", "--host", "0.0.0.0", "--port", "4000", "--module", "dispar_orchestrate.definitions"]
+    # OPS-37: the healthcheck runs the guard's ONE probe, so the container's
+    # health state shows a dead inner server instead of staying "Up" and
+    # healthy. The proxy's own gRPC HEALTH service is hardcoded SERVING
+    # (`dagster/_grpc/server.py`), which is why `dagster api
+    # grpc-health-check` cannot see the outage; a `Ping` can.
+    # `interval: 30s` is the guard's own probe interval, so the two agree
+    # on how fast a dead server is noticed. `timeout: 15s` leaves room for
+    # the probe's own 10 s gRPC timeout. `retries: 3` needs three failed
+    # probes (~90 s) before the container is called unhealthy, so one slow
+    # probe does not flap the state. `start_period: 300s` covers the code
+    # location importing its definitions at start, which is not a failure.
+    healthcheck:
+      test: ["CMD", "python3", "-m", "dispar_orchestrate.code_server_guard", "--healthcheck", "--port", "4000"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 300s
     restart: unless-stopped
 
   # WS5 item G2 — one-shot: `pg_dump` every compose-created Postgres
@@ -2701,13 +2977,15 @@ services:
       args:
         GIT_SHA: ${GIT_SHA:-unknown}
     depends_on:
+      dagster-db-init:
+        condition: service_completed_successfully
       dagster-code-location:
         condition: service_started
     environment:
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
-      DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
-      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      DAGSTER_PG_USER: lakehouse_dagster
+      DAGSTER_PG_PASSWORD: ${LAKEHOUSE_DB_DAGSTER_PASSWORD:?LAKEHOUSE_DB_DAGSTER_PASSWORD is required (Dagster's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
       # REL-2 S4 decision D16: the pause. `true` stops the jobs that
       # DELETE files — the snapshot expiry and the orphan-file removal —
@@ -2760,13 +3038,15 @@ services:
       args:
         GIT_SHA: ${GIT_SHA:-unknown}
     depends_on:
+      dagster-db-init:
+        condition: service_completed_successfully
       dagster-code-location:
         condition: service_started
     environment:
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
-      DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
-      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      DAGSTER_PG_USER: lakehouse_dagster
+      DAGSTER_PG_PASSWORD: ${LAKEHOUSE_DB_DAGSTER_PASSWORD:?LAKEHOUSE_DB_DAGSTER_PASSWORD is required (Dagster's database role password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
       # REL-2 S4 decision D16: the pause. `true` stops the jobs that
       # DELETE files — the snapshot expiry and the orphan-file removal —
@@ -2805,6 +3085,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # SEC-78: the role this fixture grants to must EXIST
+      # before it can be granted to. `lakehouse-db-migrate` creates it (and
+      # the grants on the product schemas) with the owner's credentials,
+      # and it has no profile, so every stack that starts this fixture
+      # starts it too.
+      lakehouse-db-migrate:
+        condition: service_completed_successfully
     environment:
       PGHOST: postgres
       PGPORT: "5432"
@@ -2819,6 +3106,14 @@ services:
     # load it (0034's seed is applied, never edited) and the only code path
     # that loads it is that gate's own ingest-spec PUT, against this stack's
     # own instance.
+    # SEC-78: the grants for the console's runtime role
+    # (`lakehouse_app`) on this fixture's schema. `ingest_demo` is a FIXTURE
+    # schema, not a product one: the product schemas are `public` and
+    # `bronze_meta`, and the role setup in `lakehouse-db-migrate` grants
+    # those to the role. This fixture OWNS `ingest_demo` (it creates it, as
+    # the owner), so it grants the role on it here — the demo pipeline and
+    # the seeded `conn-pg-lakehouse` connector both read these tables as
+    # `lakehouse_app` (SEC-78), not as the owner.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
@@ -2844,6 +3139,8 @@ services:
         SELECT 'customer_' || g, 'customer_' || g || '@example.invalid'
         FROM generate_series(1, 20) AS g
         WHERE NOT EXISTS (SELECT 1 FROM ingest_demo.customers);
+        GRANT USAGE ON SCHEMA ingest_demo TO lakehouse_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ingest_demo TO lakehouse_app;
         "
     restart: "no"
 
