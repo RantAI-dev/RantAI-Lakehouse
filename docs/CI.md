@@ -32,6 +32,12 @@ This repo's CI is split into workflows under `.github/workflows/`:
   (`self-hosted`, `staging`), like the deploy, and has its own concurrency group
   so that a scheduled run can never cancel a deploy that is still queued. See
   "Staging disk (cache prune)" below.
+- **`deploy-staging.yml`** — the staging deployment, on a push to `main` or on
+  manual dispatch. Two jobs: `build-api-image` builds `lakehouse-api`'s image
+  (the `cargo build --release`) on a GitHub-hosted runner, and `deploy` runs on
+  the staging VM, loads that image and starts the stack with it. The Rust
+  compile therefore does NOT happen on the VM, next to the running stack. See
+  "The staging deploy" below.
 
 ## Change Scopes and the Single Gate (`ci-required`)
 
@@ -562,6 +568,62 @@ against the full stack.
 The build that used to live here — `docker.yml`, which built `rust/Dockerfile` on a tag
 push and never published anything — is now the release pipeline below. It builds the same
 image, with the same build arguments, and then does the rest.
+
+## The staging deploy
+
+`deploy-staging.yml` runs on a push to `main` and on manual dispatch, with
+`concurrency: {group: staging, cancel-in-progress: false}` — a deploy is never
+cancelled half-way, and a second push waits for the first.
+
+It has two jobs.
+
+### `build-api-image` (GitHub-hosted runner)
+
+`lakehouse-api`'s image comes from `rust/Dockerfile`, which runs
+`cargo build --release --locked -p lakehouse-api`. That compile used to run ON
+the staging VM, in the middle of `docker compose up --build`, next to the whole
+running stack — the API, Postgres, Trino, ClickHouse, Kafka, the Dagster code
+location, webserver and daemon — on 8 vCPU and 8 GiB.
+
+That is what the deploy's build used to starve on. The bake stopped right
+after its last `exporting attestation manifest` line and sat in `futex_wait`
+until the run was cancelled (runs `44596923569` and `44666444411`, 17 and 28
+minutes of a 120-minute budget). The same bake returns 0 in a second on an idle
+box, so buildkit was never broken — the box was simply full of other work.
+
+The build now runs on `ubuntu-latest` and arrives as an artifact. It is the
+same build `ci.yml`'s `images` job makes, with the same arguments and the same
+GHA layer cache, so it is a cache hit:
+
+- `GIT_SHA` is deliberately **not** passed. `ARG GIT_SHA` sits near the top of
+  `rust/Dockerfile`, so a per-commit value would invalidate every layer below
+  it. The image carries `GIT_SHA=unknown`; the deploy sets the real commit at
+  RUN time (compose's `environment:` overrides the image's `ENV`, and
+  `check_commit` reads the run-time value), so the API and the code location
+  still agree and the console's op-source view still matches.
+- `CARGO_TARGET_DIR` and the `pipeline_src` build context are the same as in
+  `ci.yml` and in `docker-compose.yml`.
+- The cache is read and never written: the repository's Actions cache is capped
+  at 10 GB and `ci.yml`'s `images` job is what keeps it.
+
+### `deploy` (the staging VM)
+
+The deploy job downloads the artifact, `docker load`s it, and starts the stack
+with `up -d --no-build`. The images that are still built on the VM are the
+light ones (`dagster`, `console`, `g7-test-runner`, `oidc-mock`); the list is
+read out of compose's own resolved configuration, one service per image, so it
+cannot go stale.
+
+**The fallback.** If the artifact is missing, cannot be decompressed, or does
+not carry the expected image, the deploy builds the API image on the VM, as it
+did before. A staging deploy must not be blocked by an artifact service — and
+it must not come up with a stale image either, so the fallback builds rather
+than skips.
+
+The build step's budget is 45 minutes (it was 120). The longest build that
+succeeded took 22 minutes (a cold `cargo build --release`); 45 leaves room for
+a cold build and stops a hung one from holding the self-hosted runner for two
+hours, which it cannot afford — the runner serves one job at a time.
 
 ## Staging disk (cache prune)
 

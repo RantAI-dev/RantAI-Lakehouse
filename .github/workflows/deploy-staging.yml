@@ -11,8 +11,85 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ── The Rust release build happens HERE, in CI ────────────────────────────
+  #
+  # Why this job exists: `lakehouse-api`'s image is built by
+  # `rust/Dockerfile`, which runs `cargo build --release --locked -p
+  # lakehouse-api`. Until now that compile ran ON the staging VM, in the
+  # middle of `docker compose up --build`, NEXT TO the whole running
+  # stack -- the API, Postgres, Trino, ClickHouse, Kafka, the Dagster code
+  # location and the Dagster webserver and daemon, on 8 vCPU and 8 GiB.
+  # That is what the deploy's build used to starve on: the bake stopped
+  # right after its last "exporting attestation manifest" line and sat in
+  # `futex_wait` until the run was cancelled (runs 44596923569 and
+  # 44666444411, 17 and 28 minutes of a 120-minute budget).
+  #
+  # The same build, on a GitHub-hosted runner, takes the same CPU away
+  # from the VM. The image arrives as an artifact, is loaded into the
+  # VM's docker, and the deploy starts it WITHOUT building it again.
+  build-api-image:
+    name: Build the API image (in CI, not on the VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # The same build `ci.yml`'s `images` job makes, with the same
+      # arguments and the same layer cache, so it is a cache hit and takes
+      # a couple of minutes instead of a quarter of an hour:
+      #
+      #   * `GIT_SHA` is deliberately NOT passed (the same reason as in
+      #     `ci.yml`): `ARG GIT_SHA` sits near the top of `rust/Dockerfile`,
+      #     so a per-commit value would invalidate every layer below it and
+      #     the cache would never hit. The image therefore carries
+      #     `GIT_SHA=unknown`, and the deploy sets the real commit at RUN
+      #     time -- compose's `environment:` overrides the image's `ENV`,
+      #     and `check_commit` reads the run-time value, not the baked one.
+      #     The API and the code location therefore still agree, and the
+      #     console's op-source view still matches.
+      #   * `CARGO_TARGET_DIR` and the `pipeline_src` build context are the
+      #     same as in `ci.yml` and in `docker-compose.yml`, so the GHA
+      #     cache hits. The cache is READ here and never written: the
+      #     repository's Actions cache is capped at 10 GB and `ci.yml`'s
+      #     `images` job is the one that keeps it.
+      - name: Build the lakehouse-api image
+        uses: docker/build-push-action@v7
+        with:
+          context: rust
+          file: rust/Dockerfile
+          build-contexts: |
+            pipeline_src=dagster/dispar_orchestrate
+          build-args: |
+            CARGO_TARGET_DIR=/build/target-layer
+          tags: rantai-lakehouse-api:ci
+          outputs: type=docker,dest=${{ runner.temp }}/lakehouse-api.tar
+          cache-from: type=gha,scope=api-image
+
+      # `zstd` and `compression-level: 0`: the artifact service would
+      # otherwise deflate an already-compressed file a second time for
+      # nothing.
+      - name: Compress the image archive
+        run: |
+          cd "$RUNNER_TEMP"
+          zstd -T0 -3 --rm lakehouse-api.tar lakehouse-api.tar.zst
+          ls -l lakehouse-api.tar.zst
+
+      - name: Upload the API image
+        uses: actions/upload-artifact@v7
+        with:
+          name: staging-api-image
+          path: ${{ runner.temp }}/lakehouse-api.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
   deploy:
     name: Deploy to staging VM
+    needs: build-api-image
     # Runs on the VM via self-hosted runner registered with label "staging"
     runs-on: [self-hosted, staging]
     environment:
@@ -314,8 +391,59 @@ jobs:
           docker image prune --force --filter until=168h
           df -h / | tail -1
 
+      # The API image comes from the `build-api-image` job above: the
+      # `cargo build --release` that used to run ON this VM, next to the
+      # whole stack, now runs on a GitHub-hosted runner and arrives here
+      # as an artifact.
+      #
+      # `continue-on-error` on the download, and the check afterwards, are
+      # the FALLBACK: if the artifact is not there (the upload failed, the
+      # artifact expired, the network broke), the deploy builds the image
+      # here as it did before. A staging deploy must not be blocked by an
+      # artifact service, and it must not come up with a stale API image
+      # either -- so the fallback builds, it does not skip.
+      - name: Download the API image CI built
+        id: download_api_image
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: staging-api-image
+          path: ${{ runner.temp }}/staging-api-image
+
+      - name: Load the API image (no Rust compile on this VM)
+        id: api_image
+        shell: bash
+        run: |
+          set -uo pipefail
+          tarball="$RUNNER_TEMP/staging-api-image/lakehouse-api.tar.zst"
+          if [ ! -f "$tarball" ]; then
+            echo "::warning::the CI-built API image is not available; this deploy builds it here, as it did before"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          zstd -d -f "$tarball" -o "$RUNNER_TEMP/lakehouse-api.tar" || {
+            echo "::warning::the downloaded archive could not be decompressed; this deploy builds the image here"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          docker load -i "$RUNNER_TEMP/lakehouse-api.tar"
+          if ! docker image inspect rantai-lakehouse-api:ci >/dev/null 2>&1; then
+            echo "::warning::the downloaded archive did not carry rantai-lakehouse-api:ci; this deploy builds the image here"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          docker image inspect rantai-lakehouse-api:ci --format 'loaded {{.Id}} ({{.Size}} bytes)'
+
       - name: Build & start backend stack (core + seaweedfs + dagster + trino + sso)
         working-directory: ${{ github.workspace }}
+        env:
+          # The tag the CI-built image carries. When the artifact was not
+          # available this stays EMPTY, and the compose default
+          # (`${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}`) takes
+          # over -- so the fallback path builds and runs the image the
+          # deploy has always built.
+          LAKEHOUSE_API_IMAGE: ${{ steps.api_image.outputs.available == 'true' && 'rantai-lakehouse-api:ci' || '' }}
         # Retry: transient registry/PyPI flakes fail the whole compose build;
         # each retry reuses BuildKit layer cache, so a re-attempt is cheap.
         #
@@ -335,17 +463,59 @@ jobs:
         # hours -- the runner this deployment runs on cannot serve a
         # second job while it is stuck.
         run: |
-          for attempt in 1 2 3; do
-            echo "=== compose up attempt ${attempt}/3 ==="
-            if scripts/compose.sh \
+          compose() {
+            scripts/compose.sh \
               -f docker-compose.yml \
               -f ops/sso/docker-compose.staging-keycloak.override.yml \
               --profile sso \
               --profile seaweedfs \
               --profile dagster \
               --profile trino \
-              up -d --build --remove-orphans; then
-              exit 0
+              "$@"
+          }
+
+          # Which images this deploy has to build HERE. Everything whose
+          # image is NOT the API image CI built. One service per image:
+          # `dagster-code-location`, `dagster-daemon` and `dagster-webserver`
+          # share ONE image (and one build block), so building all three
+          # would build the same image three times.
+          #
+          # The list is read out of compose's own resolved configuration
+          # rather than written out here, so a service added to the compose
+          # file is picked up automatically. If it is not built, `up
+          # --no-build` fails loudly with "image not found" -- the deploy
+          # cannot come up with a stale image by accident.
+          build_list="$(compose config --format json | python3 -c "
+          import json, os, sys
+          cfg = json.load(sys.stdin)
+          api = os.environ.get('LAKEHOUSE_API_IMAGE') or ''
+          project = cfg.get('name', '')
+          one_per_image = {}
+          for name, svc in cfg['services'].items():
+              if not svc.get('build'):
+                  continue
+              if api and svc.get('image') == api:
+                  continue
+              image = svc.get('image') or (project + '-' + name)
+              one_per_image.setdefault(image, name)
+          print(' '.join(sorted(one_per_image.values())))
+          ")"
+          echo "images built on this VM: ${build_list}"
+
+          for attempt in 1 2 3; do
+            echo "=== compose attempt ${attempt}/3 ==="
+            if [ -n "${LAKEHOUSE_API_IMAGE:-}" ]; then
+              # The API image is already here (loaded above): build the
+              # REST here and start everything WITHOUT building again.
+              # `--no-build` is what makes the API image CI built the one
+              # that runs, instead of a second local build of the same
+              # code.
+              compose build ${build_list} \
+                && compose up -d --no-build --remove-orphans && exit 0
+            else
+              # The fallback: no image from CI, so build everything here,
+              # exactly as the deploy did before this change.
+              compose up -d --build --remove-orphans && exit 0
             fi
             [ "$attempt" = 3 ] && exit 1
             sleep 10
