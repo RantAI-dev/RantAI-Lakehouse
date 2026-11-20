@@ -902,6 +902,15 @@ checks pass at that head, including `Rust · fmt`, `Rust · clippy`,
 
 ### Not verified
 
+- D11's cleanup is not proved on the stack (`DATA-6 review R5`). The
+  `gold-export` gate sets `GOLD_ORPHAN_MIN_AGE_SECONDS=0`, but it only
+  counts Iceberg rows; it never asserts that the old copy's Parquet
+  files are gone from the object store. Proving that needs an object-store
+  file listing around a short-age update — more than a few lines of gate
+  change — so the R5 fix takes the finding's "Not verified" option and
+  records it here and in the feature page's Limits. The op's expiry and
+  orphan-removal calls are covered by unit tests, but the end-to-end
+  file removal is *not verified*.
 - T0's numeric readings, and the numeric evidence for its stop gate — no
   result file or committed measurement exists (above).
 - The §11 foreground verification block (`cargo fmt --check`, workspace

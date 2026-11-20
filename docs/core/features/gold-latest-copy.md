@@ -50,6 +50,10 @@ No; publishing is not one of the assistant's dashboard tools.
 ## Limits to tell a customer
 
 - The latest-only table changes only when a publish succeeds.
+- The old copy's storage is expired and its orphan files removed after a
+  replace (D11), but this is **not verified** end to end: the acceptance
+  gate counts rows and never asserts that the old Parquet files are gone
+  from object storage (`DATA-6 review R5`).
 
 ## Acceptance checklist
 
