@@ -5,8 +5,19 @@
 // state, and the empty state says what the window is. The service is spied; nothing leaves the
 // test. `next/navigation` is stubbed before any import resolves
 // (`mock.module` is hoisted), for the tabs' pathname.
+let pushed: string[] = []
 mock.module("next/navigation", () => ({
   usePathname: () => "/query-studio/history",
+  useRouter: () => ({
+    push: (href: string) => {
+      pushed.push(href)
+    },
+    replace: () => {},
+    refresh: () => {},
+    back: () => {},
+    forward: () => {},
+    prefetch: () => {},
+  }),
 }))
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
@@ -19,7 +30,15 @@ import { QueryHistoryPage } from "./query-history-page"
 afterEach(() => {
   cleanup()
   mock.restore()
+  pushed = []
+  visit("/query-studio/history")
 })
+
+/** Points the browser at a history address, the way a link does. */
+function visit(path: string) {
+  const url = new URL(path, "http://localhost:3000").href
+  ;(window as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM.setURL(url)
+}
 
 function row(over: Partial<QueryHistoryItem> = {}): QueryHistoryItem {
   return {
@@ -108,9 +127,9 @@ describe("QueryHistoryPage", () => {
     expect(within(refusedRow!).queryByText("Blocked")).toBeNull()
 
     const link = screen.getByRole("link", { name: "SELECT * FROM bronze.orders" })
-    expect(link.getAttribute("href")).toBe(
-      `/query-studio?sql=${encodeURIComponent("SELECT * FROM bronze.orders")}&engine=clickhouse`,
-    )
+    // QS-12 (LH-QS-4-07), D15: the id travels, not the person's SQL.
+    expect(link.getAttribute("href")).toBe("/query-studio?run=q-no")
+    expect(link.getAttribute("href")).not.toContain("sql=")
   })
 
   it("shows Stopped on a stopped run's row", async () => {
@@ -285,5 +304,81 @@ describe("QueryHistoryPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "2" }))
 
     expect(await screen.findByText("You don't have access")).toBeDefined()
+  })
+
+  // QS-12 (LH-QS-4-07), D16: the whole row opens the run by id, not just its
+  // SQL text, and a click that ended a selection does not navigate.
+  it("opens the run by its id when the row's time cell is clicked", async () => {
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(
+      pageOf([row({ id: "q-42" })], 1),
+    )
+    render(<QueryHistoryPage />)
+    const link = await screen.findByRole("link", { name: "SELECT 1" })
+    const timeCell = link.closest("tr")!.querySelector("td")!
+
+    fireEvent.click(timeCell)
+
+    expect(pushed).toEqual(["/query-studio?run=q-42"])
+  })
+
+  it("does not navigate when the click ended a text selection", async () => {
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(
+      pageOf([row({ id: "q-42" })], 1),
+    )
+    render(<QueryHistoryPage />)
+    const link = await screen.findByRole("link", { name: "SELECT 1" })
+    const timeCell = link.closest("tr")!.querySelector("td")!
+    const selection = spyOn(window, "getSelection").mockReturnValue({
+      toString: () => "selected",
+    } as never)
+
+    fireEvent.click(timeCell)
+
+    expect(pushed).toEqual([])
+    selection.mockRestore()
+  })
+
+  // QS-12 (LH-QS-4-06), D17: the address holds the filters on entry and is
+  // rewritten with replaceState on change, never one history entry per key.
+  it("opens with the filters in the address and sends them to the server", async () => {
+    visit("/query-studio/history?engine=trino&table=orders")
+    const spy = spyOn(queryService, "listHistoryPage").mockResolvedValue(pageOf([], 0))
+    render(<QueryHistoryPage />)
+
+    expect(await screen.findByText("No runs match these filters")).toBeTruthy()
+    expect(spy.mock.calls[0]?.[0]).toMatchObject({ engine: "trino", table: "orders" })
+    expect(
+      (screen.getByRole("button", { name: "Trino" }) as HTMLButtonElement).getAttribute(
+        "aria-pressed",
+      ),
+    ).toBe("true")
+    expect((screen.getByLabelText("Table contains") as HTMLInputElement).value).toBe("orders")
+  })
+
+  it("writes a filter change back to the address with replaceState", async () => {
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(pageOf([], 0))
+    const replace = spyOn(window.history, "replaceState")
+    render(<QueryHistoryPage />)
+    await screen.findByText("No runs in the last 14 days")
+
+    fireEvent.click(screen.getByRole("button", { name: "Failed" }))
+
+    await waitFor(() => {
+      const href = replace.mock.calls.at(-1)?.[2] as string
+      expect(href).toContain("status=failed")
+    })
+  })
+
+  // QS-12 (LH-QS-4-06), D18: a filter that emptied the list is the thing to
+  // blame, with an action that clears it.
+  it("blames the filters, not the window, when a filter emptied the list", async () => {
+    spyOn(queryService, "listHistoryPage").mockResolvedValue(pageOf([], 0))
+    render(<QueryHistoryPage />)
+    await screen.findByText("No runs in the last 14 days")
+
+    fireEvent.click(screen.getByRole("button", { name: "Failed" }))
+
+    expect(await screen.findByText("No runs match these filters")).toBeTruthy()
+    expect(screen.getByText("Clear a filter and try again.")).toBeTruthy()
   })
 })

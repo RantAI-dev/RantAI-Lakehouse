@@ -309,6 +309,11 @@ export type QueryHistoryItem = {
  * last 14 days whatever the caller sends (decision 2).
  */
 export type QueryHistoryFilter = {
+  /**
+   * QS-12 (LH-QS-4-07): one run's id, for the `/query-studio?run=` handoff.
+   * The server still scopes it to the caller and the last 14 days.
+   */
+  id?: string
   status?: QueryHistoryItem["status"]
   engine?: string
   minDurationMs?: number
