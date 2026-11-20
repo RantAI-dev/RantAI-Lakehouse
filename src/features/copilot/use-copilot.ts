@@ -208,6 +208,41 @@ function savedMessages(msgs: Msg[]): Msg[] {
   }));
 }
 
+/**
+ * AI-28 review R2: tag a reopened approval step by the ids stored in the
+ * conversation — the run id, or an approval id the run carries — never by the
+ * position the step had when the chat was loaded. A message can be sent or
+ * removed while the lookups are in flight, so an index would point at the
+ * wrong step. The caller applies this inside a `setMessages` updater so it
+ * runs against the latest state, not a snapshot taken at load time.
+ */
+function tagApprovalStep(
+  messages: Msg[],
+  run: { id: string; status: string; approvals?: { id: string }[]; steps?: { label: string }[] },
+): Msg[] {
+  const approvalIds = new Set(run.approvals?.map((a) => a.id) ?? []);
+  const steps = run.steps ?? [];
+  const state = approvalStateOf(run.status, steps[steps.length - 1]?.label);
+  let changed = false;
+  const next = messages.map((msg) => {
+    if (!msg.tools) return msg;
+    let touched = false;
+    const tools = msg.tools.map((step) => {
+      const result = step.result as { approval_id?: unknown; run_id?: unknown } | null | undefined;
+      const matches =
+        (typeof result?.run_id === "string" && result.run_id === run.id) ||
+        (typeof result?.approval_id === "string" && approvalIds.has(result.approval_id));
+      if (!matches || step.approvalState === state) return step;
+      touched = true;
+      return { ...step, approvalState: state };
+    });
+    if (!touched) return msg;
+    changed = true;
+    return { ...msg, tools };
+  });
+  return changed ? next : messages;
+}
+
 /** A copy of `messages` with one tool step swapped out; `null` if it no longer exists. */
 function replaceToolStep(
   messages: Msg[],
@@ -651,9 +686,9 @@ function useCopilotState() {
       // AI-28 / LH-AI-18-09: a saved step holds the approval request, not
       // its outcome. Read each run again on open (at most 20) and show
       // what happened; the state is never persisted back into the chat.
-      const approvals: { messageIndex: number; stepIndex: number; runId: string }[] = [];
-      loaded.forEach((m, messageIndex) => {
-        m.tools?.forEach((step, stepIndex) => {
+      const approvalRunIds: string[] = [];
+      loaded.forEach((m) => {
+        m.tools?.forEach((step) => {
           const result = step.result as
             | { needs_approval?: unknown; run_id?: unknown }
             | null
@@ -661,33 +696,29 @@ function useCopilotState() {
           if (
             result?.needs_approval === true &&
             typeof result.run_id === "string" &&
-            approvals.length < 20
+            approvalRunIds.length < 20
           ) {
-            approvals.push({ messageIndex, stepIndex, runId: result.run_id });
+            approvalRunIds.push(result.run_id);
           }
         });
       });
-      if (approvals.length > 0) {
-        void Promise.allSettled(approvals.map((a) => agentService.getRun(a.runId))).then(
+      if (approvalRunIds.length > 0) {
+        void Promise.allSettled(approvalRunIds.map((runId) => agentService.getRun(runId))).then(
           (results) => {
             // Another conversation (or a new chat) was opened meanwhile.
             if (sessionIdRef.current !== session.id) return;
-            let next = messagesRef.current;
-            results.forEach((r, i) => {
-              // A failed lookup leaves the step as it was stored.
-              if (r.status !== "fulfilled") return;
-              const a = approvals[i];
-              // AI-28 review R1: `failed` covers both "never ran" and "ran
-              // and failed", so pass the last step's label to tell them apart.
-              const steps = r.value.steps ?? [];
-              const lastStepLabel = steps[steps.length - 1]?.label;
-              const updated = replaceToolStep(next, a.messageIndex, a.stepIndex, (msg, step) => ({
-                step: { ...step, approvalState: approvalStateOf(r.value.status, lastStepLabel) },
-                chartCreated: Boolean(msg.chartCreated),
-              }));
-              if (updated) next = updated;
+            // AI-28 review R2: resolve against the latest state. A concrete
+            // `setMessages` built from a ref captured at load time would
+            // overwrite a message sent or removed while the lookups ran.
+            setMessages((prev) => {
+              let next = prev;
+              results.forEach((r) => {
+                // A failed lookup leaves the step as it was stored.
+                if (r.status !== "fulfilled") return;
+                next = tagApprovalStep(next, r.value);
+              });
+              return next;
             });
-            if (next !== messagesRef.current) setMessages(next);
           }
         );
       }
