@@ -151,7 +151,7 @@ import json
 import logging
 import os
 import warnings
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -868,6 +868,58 @@ def _retype_in(transaction: Any, table: Any, changed: list[str], column_types: M
                 update.move_after(name, order[position - 1])
 
 
+def _drop_left_out_columns(
+    pipeline: Any, bronze_table_name: str, plan: LoadPlan, drop_columns: Collection[str]
+) -> list[str]:
+    """`SRC-48`, `QA TC-1706`, decision 10 of `connector-operations.md`: a table replaced on
+    every load loses the columns the person left out. The load no longer reads them, but a
+    `replace` keeps the table's schema, so without this the column stayed and every row
+    carried a null in it (measured with `dlt` 1.30.0: both the stored `dlt` schema and the
+    Iceberg table keep it).
+
+    What is dropped: the names in `drop_columns` (Bronze names) that the table has, minus
+    the system columns, the plan's key and the plan's cursor (fail closed: the picker locks
+    the key and the cursor already, and a name of those in the list is skipped and logged by
+    name, to the log only). Only for a plan that replaces on every load (`replace`,
+    `replace_dedup`): the other modes keep their rows and so keep the column. Removed from
+    the stored `dlt` schema of the table (so `dlt` does not write the column as nulls
+    again) and from the Iceberg table with one `pyiceberg` schema commit. The table is
+    never dropped or purged (`DATA-18`). A schema commit makes no snapshot, so it carries
+    no author; the replace that follows records it on its own snapshot.
+
+    Not one commit with the rows: a load that fails after the schema commit leaves the old
+    rows without the column until the next run. That is accepted (the person asked for the
+    column to be left out, and the next successful run replaces the rows). Ticking the
+    column again needs nothing here: the next replace reads it and `dlt` adds it back.
+
+    Returns the names dropped, empty when nothing was (then no commit is made).
+
+    # Errors
+
+    Raises whatever the catalog raises; the load then fails before anything is written and
+    the table keeps its column."""
+    if plan.mode not in ("replace", "replace_dedup") or not drop_columns:
+        return []
+    table = history.open_table(pipeline, bronze_table_name, sync=False)
+    if table is None:
+        return []
+    held = {field.name for field in table.schema().fields}
+    protected = {*SYSTEM_COLUMNS, *plan.key, *([plan.cursor] if plan.cursor else [])}
+    refused = sorted(name for name in drop_columns if name in protected and name in held)
+    if refused:
+        logger.warning("SRC-48: a key, cursor or system column is not dropped: %s", ", ".join(refused))
+    dropped = sorted(name for name in drop_columns if name in held and name not in protected)
+    if not dropped:
+        return []
+    stored = pipeline.default_schema.tables.get(bronze_table_name, {}).get("columns", {})
+    for name in dropped:
+        stored.pop(name, None)
+    with table.update_schema() as update:
+        for name in dropped:
+            update.delete_column(name)
+    return dropped
+
+
 def _items_of(source: Any) -> Iterable[Any]:
     """What a `dlt` source or resource yields when it is run without a pipeline (its
     maps, among them the `_ingested_at` stamp, are applied), or the items of a plain iterable."""
@@ -1088,6 +1140,7 @@ def load_via_sink(
     config: SinkConfig,
     plan: LoadPlan = LoadPlan(),
     column_types: Mapping[str, str] | None = None,
+    drop_columns: Collection[str] = (),
 ) -> SinkResult:
     """Write `source` (an already-configured `dlt` source, e.g. `sql_database(...)`
     with hints/maps already applied by the calling adapter) to Bronze
@@ -1109,6 +1162,11 @@ def load_via_sink(
     `column_types` (name to Iceberg type name, `DATA-18`): when given, a `replace` that
     changes a column's type is written as one `pyiceberg` transaction instead of through
     `dlt` (`_replace_changing_types`); it never drops the table.
+
+    `drop_columns` (Bronze names, `SRC-48`): the columns the person left out. A plan that
+    replaces on every load (`replace`, `replace_dedup`) removes those the table has from it,
+    before the run (`_drop_left_out_columns`: what is kept, and the failure window of
+    two commits); any other mode keeps them. An error of that step fails the load.
     """
     _install_catalog_env(config)
     # PR #186 review BLOCKER 6: dlt's Iceberg job reads the whole load into memory; see
@@ -1243,6 +1301,9 @@ def load_via_sink(
         # re-reads and re-merges the last row.
         write_disposition = "replace"
     try:
+        # SRC-48 (decision 10): before the run, so the replace below finds neither the stored
+        # column nor the Iceberg one; a failure here fails the load, with the column kept.
+        _drop_left_out_columns(pipeline, bronze_table_name, plan, drop_columns)
         changed: list[str] = []
         retype_table = None
         if column_types is not None and write_disposition == "replace":
