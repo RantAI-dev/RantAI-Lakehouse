@@ -277,6 +277,22 @@ describe("the pipeline page's trigger (BLD-11)", () => {
     expect(screen.queryByRole("button", { name: /pause schedule/i })).toBeNull()
   })
 
+  // BLD-11 review R1: D3 must hide Pause for a target-lag pipeline, but a
+  // pipeline already paused still needs its Resume to get running again.
+  it("a paused target-lag pipeline still offers Resume", async () => {
+    const pipeline: PipelineDetail = {
+      ...PIPELINE,
+      schedule: "cron: 0 * * * * (PAUSED)",
+      status: "paused",
+      targetLag: { kind: "lag", minutes: 10 },
+    }
+    stubApi({ status: () => "completed", pipeline })
+    renderPage()
+
+    expect(await screen.findByRole("button", { name: /resume schedule/i })).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /pause schedule/i })).toBeNull()
+  })
+
   it("a refused Run now shows the API's reason under the masthead", async () => {
     stubApi({
       status: () => "completed",

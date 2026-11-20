@@ -434,25 +434,27 @@ export function PipelineDetailPage() {
   ) : (
     <>
       {authoredMenu}
-      {schedule.kind === "cron" && !p.targetLag ? (
-        schedulePaused ? (
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={resume.status === "pending"}
-            onClick={async () => {
-              if (await resume.run(pipelineId)) state.reload()
-            }}
-          >
-            <PlayIcon data-icon="inline-start" />
-            {resume.status === "pending" ? "Resuming…" : "Resume schedule"}
-          </Button>
-        ) : (
-          <Button variant="outline" size="sm" disabled={pause.status === "pending"} onClick={() => setPauseOpen(true)}>
-            <PauseIcon data-icon="inline-start" />
-            Pause schedule
-          </Button>
-        )
+      {/* BLD-11 review R1: D3 hides Pause for a target-lag pipeline (its
+          lag sensor is only skipped at the next orchestrator reload, F10),
+          but a pipeline that is ALREADY paused must keep Resume so an
+          operator can get it running again. */}
+      {schedulePaused ? (
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={resume.status === "pending"}
+          onClick={async () => {
+            if (await resume.run(pipelineId)) state.reload()
+          }}
+        >
+          <PlayIcon data-icon="inline-start" />
+          {resume.status === "pending" ? "Resuming…" : "Resume schedule"}
+        </Button>
+      ) : schedule.kind === "cron" && !p.targetLag ? (
+        <Button variant="outline" size="sm" disabled={pause.status === "pending"} onClick={() => setPauseOpen(true)}>
+          <PauseIcon data-icon="inline-start" />
+          Pause schedule
+        </Button>
       ) : null}
       <Button
         size="sm"
