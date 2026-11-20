@@ -3,9 +3,14 @@
 // keeps the assertion on the card, where a reader of the asset page looks.
 import type { ReactNode } from "react"
 
+// A faithful stand-in: forward every prop, not just href and children. A
+// stripped mock leaks into other test files that share the module registry and
+// breaks their assertions on `title`/`className` (QS round: PR #637 CI).
 mock.module("next/link", () => ({
-  default: ({ href, children }: { href: string; children: ReactNode }) => (
-    <a href={href}>{children}</a>
+  default: ({ href, children, ...rest }: { href: string; children: ReactNode } & Record<string, unknown>) => (
+    <a href={href} {...rest}>
+      {children}
+    </a>
   ),
 }))
 mock.module("next/navigation", () => ({
@@ -21,12 +26,9 @@ mock.module("next/navigation", () => ({
     prefetch: () => {},
   }),
 }))
-mock.module("@/features/auth/auth-provider", () => ({
-  useAuth: () => ({ hasPermission: () => true, hasRole: () => false }),
-}))
-
 import { cleanup, render, screen } from "@testing-library/react"
-import { afterEach, expect, it, mock } from "bun:test"
+import { afterEach, expect, it, mock, spyOn } from "bun:test"
+import { AuthProvider } from "@/features/auth/auth-provider"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AssetOverview } from "./asset-overview"
 
@@ -70,14 +72,35 @@ const ASSET = {
 } as unknown as AssetDetail
 
 it("says a classification alone does not mask a column", () => {
+  // A real provider with a stubbed session: no global auth mock that could
+  // leak into another test file's permission assertions.
+  spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+    if (String(input).includes("/api/auth/me")) {
+      return new Response(
+        JSON.stringify({
+          id: "u1",
+          name: "Reader",
+          email: null,
+          roles: [],
+          permissions: [],
+          tenants: [],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    }
+    return new Response(JSON.stringify({}), { status: 404 })
+  }) as unknown as typeof fetch)
+
   render(
-    <AssetOverview
-      asset={ASSET}
-      iceberg={{ status: "loading", data: null, error: null, reload: () => {} }}
-      lineage={{ status: "loading", data: null, error: null, reload: () => {} }}
-      onNavigate={() => {}}
-      onAssetChanged={() => {}}
-    />
+    <AuthProvider>
+      <AssetOverview
+        asset={ASSET}
+        iceberg={{ status: "loading", data: null, error: null, reload: () => {} }}
+        lineage={{ status: "loading", data: null, error: null, reload: () => {} }}
+        onNavigate={() => {}}
+        onAssetChanged={() => {}}
+      />
+    </AuthProvider>
   )
 
   expect(
