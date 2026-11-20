@@ -831,3 +831,28 @@ a fixed reason past it, fix the comment. Test with a doubling chain.
 
 **R5 SHOULD-FIX: stale comment.** `authored_pipelines.rs:2112` "(after
 #619)": #619 is merged.
+
+### Round 2 — planner review, 2026-11-20, at `b7681df27`
+
+**R6 SHOULD-FIX: a nested `WITH` shadowing a later outer name is called a
+duplicate.** `sql_lineage.rs:476`: the R1 fix merged the enclosing pending
+names into `pending`, but the duplicate-name check was then built over that
+merged list. A nested `WITH b` therefore looks like a second declaration of
+an outer `WITH b` defined later, and the mapping is replaced by
+`MSG_CTE_DUPLICATE`. The input
+
+```sql
+WITH a AS (WITH b AS (SELECT name AS id FROM silver.users) SELECT id FROM b),
+b AS (SELECT 1 AS id) SELECT id FROM a
+```
+
+must map `id ← silver.users.name` with no partial row; the nested `b` is a
+legitimate shadow, not a duplicate. Fix: compute `duplicated` from this
+`WITH`'s own `cte_tables` names only. The input is added as a test and fails
+on the code before the fix (no mapping).
+
+**CI failure, not this branch.** The CI run reported
+`upload_routes::two_tenants_asking_for_one_new_name_at_the_same_moment_one_launches`
+failing. This is the known `REL-27` flake in the upload route, not a DATA-57
+regression; the branch touches no upload code. It is recorded in
+`docs/core/BACKLOG.md` under `REL-27`.

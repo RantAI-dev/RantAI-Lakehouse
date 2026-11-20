@@ -466,16 +466,20 @@ fn outputs_of_query(
     // yet" scope. Carry the enclosing pending names into this one, or a
     // reference to a later name of an enclosing `WITH` would be looked up in
     // `defined` and become a wrong edge instead of a partial row.
-    let mut pending: Vec<String> = env.pending.clone();
-    pending.extend(
-        with.cte_tables
-            .iter()
-            .map(|cte| cte.alias.name.value.clone()),
-    );
-    // A name declared twice is opaque on both definitions (D7).
-    let duplicated: Vec<String> = pending
+    let own_names: Vec<String> = with
+        .cte_tables
         .iter()
-        .filter(|name| pending.iter().filter(|n| *n == *name).count() > 1)
+        .map(|cte| cte.alias.name.value.clone())
+        .collect();
+    let mut pending: Vec<String> = env.pending.clone();
+    pending.extend(own_names.iter().cloned());
+    // DATA-57 review R6: "declared twice" means twice in THIS WITH. The
+    // merged `pending` also holds enclosing names, and a nested WITH may
+    // legitimately shadow one of those; counting them would mark a valid
+    // shadow as a duplicate and turn a proven mapping into a partial row.
+    let duplicated: Vec<String> = own_names
+        .iter()
+        .filter(|name| own_names.iter().filter(|n| *n == *name).count() > 1)
         .cloned()
         .collect();
 
@@ -1441,6 +1445,17 @@ mod tests {
             reasons(&l),
             vec![("id".to_owned(), MSG_CTE_FORWARD.to_owned())]
         );
+    }
+
+    // DATA-57 review R6: a nested WITH may shadow a later enclosing name.
+    #[test]
+    fn a_nested_with_shadowing_a_later_outer_name_is_not_a_duplicate() {
+        let l = run(
+            "WITH a AS (WITH b AS (SELECT name AS id FROM silver.users) SELECT id FROM b), \
+             b AS (SELECT 1 AS id) SELECT id FROM a",
+        );
+        assert_eq!(triples(&l), vec![t("id", "silver.users.name", "copy")]);
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
     }
 
     #[test]
