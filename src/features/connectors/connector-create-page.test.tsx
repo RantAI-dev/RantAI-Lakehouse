@@ -669,12 +669,7 @@ describe("the created screen waits for the save (LH-SRC-6-39)", () => {
     held.release()
     await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
     // Only now is the panel mounted, and it reads the settings it was saved with.
-    // The read happens in the panel's mount effect, so it lands one tick after
-    // the success sentence; a synchronous assertion here failed intermittently
-    // on a loaded full-suite run (BLD-16), not because the read was missing.
-    await waitFor(() =>
-      expect(calls.some((c) => c.url.includes("/ingest-spec") && c.method === "GET")).toBe(true)
-    )
+    expect(calls.some((c) => c.url.includes("/ingest-spec") && c.method === "GET")).toBe(true)
     expect(page.queryByText(/has no connection settings saved yet/)).toBeNull()
   })
 })
