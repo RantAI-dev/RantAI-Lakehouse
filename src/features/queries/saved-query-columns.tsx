@@ -16,7 +16,6 @@ import {
   Share2Icon,
   Trash2Icon,
 } from "lucide-react"
-import { toast } from "sonner"
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
@@ -27,6 +26,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { levelAtLeast } from "@/lib/access-level"
 import { formatRelativeTime } from "@/lib/format"
 import type { SavedQuery } from "@/services/contracts/queries"
@@ -172,8 +172,7 @@ export function getSavedQueryColumns(
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    navigator.clipboard.writeText(query.sql)
-                    toast.success("SQL copied to clipboard")
+                    void copyTextWithToast(query.sql, "SQL copied to clipboard")
                   }}
                 >
                   <CodeIcon className="size-3.5" data-icon="inline-start" />
@@ -181,8 +180,7 @@ export function getSavedQueryColumns(
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    navigator.clipboard.writeText(query.id)
-                    toast.success("Query ID copied to clipboard")
+                    void copyTextWithToast(query.id, "Query ID copied to clipboard")
                   }}
                 >
                   <CopyIcon className="size-3.5" data-icon="inline-start" />
