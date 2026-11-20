@@ -108,3 +108,20 @@ or waits on the theme (they draw light by their own `dashboardLook`). next-theme
 gets `forcedTheme` on first render (the pathname is known on the server), so the
 class and `color-scheme` are set at mount, before the data fetch completes. Not
 confirmed by a real render.
+
+## Review (planner, 2026-11-21)
+
+Checked on the QA stack (integration with this branch, Gotenberg 8.37, a
+mail catcher), by reading the PDF's first page fill and rendering the page
+with LibreOffice:
+
+- The sign-off reads "RantAI Lakehouse, scheduled report". Done.
+- `a686d1a5` alone (`html, body` white) left the full-page `#121212` fill:
+  the margin takes the colour scheme's canvas colour.
+- `8ba7da03` (`color-scheme: light` on `html` in print) **fixes it**: the
+  page's first fill is white and the render is white to the edge.
+- `f04d331a` (light theme forced on `/render/*`) was asked for on a misread
+  check (the planner's script kept re-reading the first, pre-fix email). It
+  is not what fixed the band; it stays because the print views are paper and
+  light is right for them whatever the console's default theme, and it is
+  covered by its test. No open finding.
