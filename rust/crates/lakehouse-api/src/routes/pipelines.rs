@@ -3789,6 +3789,23 @@ async fn authored_status(
         {
             tracing::info!(%err, pipeline_id = id, "authored sensor not switched");
         }
+        // BLD-14 D6/D7: the re-upload chain sensor is a second polling
+        // sensor for the same pipeline. Its stored state also outlives a
+        // reload, so a paused pipeline would otherwise keep starting the
+        // downstream chain. A pipeline with no chain sensor is tolerated
+        // the same way as a missing `_after` sensor above.
+        let chain_sensor = authored_pipelines::chain_sensor_name(id);
+        let chain_switched = if paused {
+            state.dagster.set_sensor_running(&chain_sensor, false).await
+        } else {
+            state.dagster.set_sensor_running(&chain_sensor, true).await
+        };
+        if let Ok(SensorOutcome {
+            error: Some(err), ..
+        }) = &chain_switched
+        {
+            tracing::info!(%err, pipeline_id = id, "authored chain sensor not switched");
+        }
         authored_pipelines::reload_orchestrator(state).await;
     }
     Ok(updated)

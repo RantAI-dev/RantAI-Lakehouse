@@ -12,8 +12,11 @@ use lakehouse_auth::Secret;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+use std::collections::HashMap;
+
 use common::{
-    CATALOG_TENANT, TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up,
+    CATALOG_TENANT, TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
+    session_cookie_for_user, spin_up, spin_up_with_env,
 };
 use lakehouse_store::pipelines::{self, CreatePipelineInput};
 
@@ -396,6 +399,101 @@ async fn another_tenants_pipeline_answers_the_same_404_as_an_unknown_one() {
     assert_eq!(
         unknown_body["error"].as_str(),
         Some("Pipeline pl-never-existed not found")
+    );
+}
+
+/// Pausing stops the chain sensor as well as the `_after` sensor and the
+/// cron schedule; resuming starts it. BLD-14 D6's sensor ships RUNNING, so
+/// an untouched stored state would keep starting the chain after a pause.
+#[tokio::test]
+async fn pausing_a_pipeline_stops_its_chain_sensor_and_resuming_starts_it() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/graphql"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "startSchedule": { "__typename": "ScheduleStateResult" },
+                "stopRunningSchedule": { "__typename": "ScheduleStateResult" },
+                "sensorOrError": {
+                    "__typename": "Sensor",
+                    "sensorState": { "id": "state-id", "status": "RUNNING" }
+                },
+                "stopSensor": {
+                    "__typename": "StopSensorMutationResult",
+                    "instigationState": { "id": "state-id", "status": "STOPPED" }
+                },
+                "startSensor": { "__typename": "Sensor", "sensorState": { "status": "RUNNING" } },
+                "reloadLocation": {
+                    "__typename": "WorkspaceLocationEntry",
+                    "name": "dispar_orchestrate.definitions"
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    let mut env = HashMap::new();
+    env.insert(
+        "DAGSTER_URL".to_owned(),
+        format!("{}/graphql", server.uri()),
+    );
+    let app = spin_up_with_env(&env).await;
+    let tenant: uuid::Uuid = CATALOG_TENANT.parse().expect("the seeded catalog tenant");
+    let id = seed_pipeline(&app.pool, "chain-pause", Some(tenant)).await;
+    lakehouse_store::pipelines::set_status(&app.pool, &id, "ready")
+        .await
+        .expect("mark it ready");
+    let cookie = session_cookie_for_seeded_user(&app.pool, "fajar@meridian.example").await;
+
+    for action in ["pause", "resume"] {
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/pipelines/{id}/{action}"))
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("the router answers");
+        assert!(
+            response.status().is_success(),
+            "{action}: {}",
+            response.status()
+        );
+    }
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the received requests");
+    let bodies: Vec<String> = requests
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    // `authored__<safe_id>_chain`: safe_id replaces `-` with `_`, the same
+    // `_dagster_safe_name` rule the factory and the Rust helper use.
+    let chain = format!("authored__{}_chain", id.replace('-', "_"));
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains(&chain) && b.contains("sensorOrError")),
+        "pausing looked up the chain sensor's stored state: {bodies:?}"
+    );
+    // `stopSensor` carries only the instigation-state id, not the name:
+    // two stops (after and chain) are the proof the chain was switched.
+    assert_eq!(
+        bodies.iter().filter(|b| b.contains("stopSensor")).count(),
+        2,
+        "pausing stopped both sensors: {bodies:?}"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains(&chain) && b.contains("startSensor")),
+        "resuming started the chain sensor: {bodies:?}"
     );
 }
 
