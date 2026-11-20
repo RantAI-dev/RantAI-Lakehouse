@@ -6,7 +6,7 @@ import { dashboardLook } from "@/lib/dashboard-look";
 import { issuedLine, paperContentWidth } from "@/lib/render-summary";
 import type { ReportingContext } from "@/lib/time-grain";
 import type { Report, ReportChartEntry } from "@/services/contracts/dashboard-reports";
-import { READY_SAFETY_MS, markReady, renderFailure } from "./render-view";
+import { READY_SAFETY_MS, markReady, renderFailure, renderMapLoader } from "./render-view";
 import { RenderModeProvider, type RenderMode } from "./render-mode";
 import { ReportBlocks } from "./report-blocks";
 import { ReportingProvider } from "./reporting-context";
@@ -40,6 +40,9 @@ export function ReportRenderView({ token }: { token: string }) {
     chartMounted: () => { live.current.mounted += 1; setCounts({ ...live.current }); },
     chartFinished: () => { live.current.finished += 1; setCounts({ ...live.current }); },
   }), []);
+  // PR #528 review BLOCKER: an uploaded map's boundary is read through the
+  // render token, not the signed-in loader (which redirects to `/login`).
+  const loadMap = React.useMemo(() => renderMapLoader(token), [token]);
 
   React.useEffect(() => {
     let alive = true;
@@ -108,7 +111,7 @@ export function ReportRenderView({ token }: { token: string }) {
           {data.report.blocks.length === 0 ? (
             <p className="text-sm text-muted-foreground">This report is empty.</p>
           ) : (
-            <ReportBlocks blocks={data.report.blocks} charts={data.charts} dark={false} print />
+            <ReportBlocks blocks={data.report.blocks} charts={data.charts} dark={false} print loadMap={loadMap} />
           )}
         </div>
       </RenderModeProvider>

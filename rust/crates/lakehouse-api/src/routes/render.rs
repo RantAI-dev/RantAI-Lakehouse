@@ -249,23 +249,23 @@ fn token_of(body: &Bytes) -> Option<String> {
 }
 
 /// `POST /api/render/maps/{id}/geojson { token }` — the boundary file of an
-/// uploaded map one of the board's charts draws on, for the print view
-/// (`BI-36`).
+/// uploaded map one of the board's (or report's) charts draws on, for the print
+/// view (`BI-36`, `PR #528 review BLOCKER`).
 ///
 /// The print view has no session, so the signed-in loader (`GET
 /// /api/maps/{id}/geojson`) answered it with a redirect to the login page and
-/// the map tile did not draw. The public link and the embed got their own token
-/// routes in `PR #246`; this is the print view's, with the same rule: the token
-/// opens its board's maps and nothing else, and a map no chart on that board
-/// draws on is the same 404 as a map that does not exist. The token is checked
-/// as [`data`] checks it (the person's rights are read now), and the charts are
-/// read as that person.
+/// the map tile did not draw. The token opens only its board's maps — or, for
+/// a report token (`BI-18` part D, `pdf_export.rs` leaves `board` empty), only
+/// the maps drawn by charts placed in that report that the token's viewer may
+/// see. A map no allowed chart draws on is the same 404 as a map that does not
+/// exist. The token is checked as [`data`] checks it (the person's rights are
+/// read now), and the charts are read as that person.
 ///
 /// # Errors
 ///
 /// 400 for a body that is not `{ "token": string }`; 503 when PDF export is not
-/// set up; 401 (one sentence) for a token that is refused; 404 for a map the
-/// board does not use.
+/// set up; 401 (one sentence) for a token that is refused (or a report the
+/// person cannot read); 404 for a map the board or report does not use.
 pub async fn map_geojson(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -287,7 +287,64 @@ pub async fn map_geojson(
         Ok(viewer) => viewer,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
+    // PR #528 review BLOCKER: report render tokens carry `board: ""` and
+    // `report: Some(...)`; widen no token beyond the report's own readable
+    // chart blocks.
+    if let Some(report) = claims.report.as_deref() {
+        return map_for_report(&state, report, &id, &headers, &viewer).await;
+    }
     crate::routes::embed::map_for_board(&state, &claims.board, &id, &headers, &viewer).await
+}
+
+/// Fail-closed map boundary lookup for a report render token (`PR #528 review
+/// BLOCKER`): the report must be readable by `viewer`, and `map_id` must be
+/// named by at least one visible, non-static chart placed on that report.
+async fn map_for_report(
+    state: &AppState,
+    report: &str,
+    map_id: &str,
+    headers: &HeaderMap,
+    viewer: &lakehouse_bi::access::Viewer,
+) -> Response {
+    use crate::routes::dashboard_reports as reports;
+    let Ok(report_id) = reports::report_id(report) else {
+        return refused();
+    };
+    let found = match reports::readable_report(state, viewer, report_id).await {
+        Ok(found) => found,
+        Err(lakehouse_core::ApiError::NotFound(_)) => return refused(),
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    let blocks: Vec<lakehouse_bi::reports::Block> =
+        serde_json::from_value(found.blocks).unwrap_or_default();
+    let wanted: std::collections::HashSet<String> = lakehouse_bi::reports::chart_ids(&blocks)
+        .into_iter()
+        .collect();
+    if wanted.is_empty() || map_id.is_empty() {
+        return crate::routes::public_links::not_found();
+    }
+    let stored = match lakehouse_bi::store::list_stored_charts(&state.clickhouse, viewer).await {
+        Ok(stored) => stored,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+            )
+                .into_response();
+        }
+    };
+    let allowed = stored.iter().any(|c| {
+        !c.spec.kind.is_static()
+            && wanted.contains(&c.spec.id)
+            && c.def.map.as_deref() == Some(map_id)
+    });
+    if !allowed {
+        return crate::routes::public_links::not_found();
+    }
+    match super::maps::map_file(state, map_id, headers).await {
+        Ok(response) => response,
+        Err(rejection) => rejection.into_response(),
+    }
 }
 
 /// The most bytes of an image card's picture the print view takes (`BI-42`).
