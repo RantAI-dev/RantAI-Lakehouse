@@ -11,7 +11,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
-import { notifyError, notifySuccess } from "@/lib/notify"
+import { copyTextWithToast } from "@/lib/copy-text"
 import type { Asset } from "@/services/contracts/assets"
 
 /**
@@ -37,16 +37,6 @@ export interface AssetAction {
   separatorBefore?: boolean
 }
 
-async function copyToClipboard(value: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(value)
-    notifySuccess(`${label} copied`)
-  } catch (err) {
-    // Usually a denied clipboard permission or a non-secure origin.
-    notifyError(`Failed to copy ${label.toLowerCase()}`, err)
-  }
-}
-
 export function getAssetActions(
   asset: Asset,
   { onOpen }: { onOpen: (asset: Asset) => void }
@@ -63,13 +53,13 @@ export function getAssetActions(
       label: "Copy asset ID",
       icon: Copy,
       separatorBefore: true,
-      onSelect: () => void copyToClipboard(asset.id, "Asset ID"),
+      onSelect: () => void copyTextWithToast(asset.id, "Asset ID copied"),
     },
     {
       id: "copy-namespace",
       label: "Copy namespace",
       icon: Boxes,
-      onSelect: () => void copyToClipboard(asset.namespace, "Namespace"),
+      onSelect: () => void copyTextWithToast(asset.namespace, "Namespace copied"),
     },
   ]
 }

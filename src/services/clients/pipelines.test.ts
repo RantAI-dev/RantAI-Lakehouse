@@ -236,3 +236,61 @@ describe("dagsterPipelineService re-upload chain read", () => {
     expect(await dagsterPipelineService.getReuploadChain("pl-1")).toEqual({ last: null })
   })
 })
+
+// BLD-16 / J6: the SQL of one form step of an unsaved definition. The body
+// and the answer are the plan's contract; a 400 keeps the API's sentence so
+// the editor can select the step and the row it names (D7).
+describe("dagsterPipelineService.stepSql", () => {
+  const body = {
+    inputs: [
+      { name: "orders", zone: "silver", table: "orders" },
+      { name: "customers", zone: "silver", table: "customers" },
+    ],
+    steps: [
+      {
+        name: "joined",
+        kind: "join" as const,
+        left: "orders",
+        right: "customers",
+        joinType: "left",
+        on: [{ left: "customer_id", right: "id" }],
+        columns: [{ side: "left", column: "order_id" }],
+      },
+    ],
+    step: "joined",
+  }
+  const sql =
+    "SELECT `__left`.`order_id` AS `order_id` FROM `orders` AS `__left` " +
+    "LEFT JOIN `customers` AS `__right` ON `__left`.`customer_id` = `__right`.`id`"
+
+  it("posts the definition and step to /api/pipelines/step-sql and returns the sql", async () => {
+    const calls = stubFetch(() => json({ sql }))
+
+    const res = await dagsterPipelineService.stepSql(body)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe("/api/pipelines/step-sql")
+    expect(calls[0].init.method).toBe("POST")
+    expect(JSON.parse(calls[0].init.body as string)).toEqual(body)
+    expect(res).toEqual({ sql })
+  })
+
+  it("keeps the API's sentence on a 400, as the preview does (D7)", async () => {
+    stubFetch(() =>
+      json(
+        {
+          error:
+            "steps[0].on[0]: a column must be a plain name (letters, digits and underscores, not starting with a digit)",
+        },
+        400
+      )
+    )
+
+    const err = await rejection(dagsterPipelineService.stepSql(body))
+
+    expect(err.code).toBe("invalid_request")
+    expect(err.message).toBe(
+      "steps[0].on[0]: a column must be a plain name (letters, digits and underscores, not starting with a digit)"
+    )
+  })
+})

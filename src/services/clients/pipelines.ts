@@ -7,6 +7,7 @@ import type {
   PipelinePreview,
   PipelinePreviewInput,
   PipelineSource,
+  PipelineStepSqlInput,
   PipelineRunStep,
   PipelineRunLogsPage,
   CreatePipelineInput,
@@ -177,6 +178,12 @@ export const dagsterPipelineService: PipelineService = {
   // step at fault (D7).
   previewPipelineStep(input: PipelinePreviewInput, signal) {
     return postJson<PipelinePreview>("/api/pipelines/preview", input, signal);
+  },
+  // BLD-16 / J6. Through `postJson` for the same reason as the preview
+  // above: a 400's sentence (`steps[0].on[0]: ...`) is what the editor
+  // reads to select the step and the row at fault (D7).
+  stepSql(input: PipelineStepSqlInput, signal) {
+    return postJson<{ sql: string }>("/api/pipelines/step-sql", input, signal);
   },
   setTargetLag(id, targetLag, signal) {
     return sendJson<Pipeline>(
