@@ -980,10 +980,11 @@ def step_a_reader_during_a_publish_never_sees_a_mix() -> None:
 
     # DATA-6 review R1: T0 recorded no numbers, so the one-commit claim
     # (D3) is measured here on the real stack, not asserted from a spike.
-    # Read the catalog's own metadata BEFORE the publish: the log length
-    # and the snapshot ids give us a baseline for the replace below.
+    # Read the catalog's own metadata BEFORE the publish through the gate's
+    # existing helper: the metadata-log entries are the baseline for the
+    # replace below (DATA-6 review R7).
     meta_before = _load_lakekeeper_metadata(f"{MART_NAME}_latest")
-    log_before = len(meta_before.get("metadata-log") or [])
+    log_before = list(meta_before.get("metadata-log") or [])
     snapshot_ids_before = {
         snapshot.get("snapshot-id")
         for snapshot in (meta_before.get("snapshots") or [])
@@ -1034,17 +1035,59 @@ def step_a_reader_during_a_publish_never_sees_a_mix() -> None:
         _wait_for("the latest-copy run to report success", run_succeeded, 120, interval_s=1.0)
 
         # DATA-6 review R1: prove the replace was ONE catalog commit (D3).
-        # The metadata log grows by exactly one for it; a delete-then-append
-        # split into two commits would grow it twice and could leave the
-        # reader sampling an empty table. The new snapshots' operation is
-        # read back too, so the log entry is tied to the replace, not to an
-        # unrelated metadata update.
+        # DATA-6 review R7: D11's snapshot expiry is itself a catalog commit
+        # whenever an older snapshot exists, so the whole log can grow by 2
+        # on a correct run. Attribute the growth to the replace instead:
+        # find the metadata-log entry that introduced the new current
+        # snapshot and assert the entry before it is the baseline's last
+        # entry. A delete-then-append split would put an extra commit
+        # between them and fail, whatever the cleanup did afterwards.
+        # Every read here comes from `_load_lakekeeper_metadata` — no new
+        # metadata-file reader is introduced by this gate.
         meta_after = _load_lakekeeper_metadata(f"{MART_NAME}_latest")
-        log_after = len(meta_after.get("metadata-log") or [])
-        if log_after - log_before != 1:
+        log_after = list(meta_after.get("metadata-log") or [])
+        if len(log_after) <= len(log_before):
             raise GoldExportFailure(
-                f"DATA-6 D3: the one-commit replace of gold.{MART_NAME}_latest "
-                f"grew the metadata log by {log_after - log_before}, expected 1"
+                f"DATA-6 D3: the metadata log did not grow across the replace: "
+                f"{len(log_before)} -> {len(log_after)}"
+            )
+        current_id = meta_after.get("current-snapshot-id")
+        current_snapshot = next(
+            (
+                snapshot
+                for snapshot in (meta_after.get("snapshots") or [])
+                if snapshot.get("snapshot-id") == current_id
+            ),
+            None,
+        )
+        if current_snapshot is None:
+            raise GoldExportFailure(
+                f"DATA-6 D3: gold.{MART_NAME}_latest has no current snapshot {current_id}"
+            )
+        snapshot_ms = current_snapshot.get("timestamp-ms")
+        if not isinstance(snapshot_ms, int):
+            raise GoldExportFailure(
+                f"DATA-6 D3: the current snapshot has no timestamp-ms: {current_snapshot}"
+            )
+        new_entries = log_after[len(log_before):]
+        introducing = next(
+            (
+                i
+                for i, entry in enumerate(new_entries)
+                if isinstance(entry.get("timestamp-ms"), int)
+                and entry["timestamp-ms"] >= snapshot_ms
+            ),
+            None,
+        )
+        if introducing != 0:
+            raise GoldExportFailure(
+                f"DATA-6 D3: the new current snapshot was introduced by "
+                f"metadata-log entry {introducing} after the baseline, "
+                "expected 0 (one commit for the replace)"
+            )
+        if log_before and log_after[len(log_before) - 1] != log_before[-1]:
+            raise GoldExportFailure(
+                "DATA-6 D3: the entry before the replace is not the baseline entry"
             )
         new_snapshots = [
             snapshot
@@ -1060,8 +1103,9 @@ def step_a_reader_during_a_publish_never_sees_a_mix() -> None:
                 f"DATA-6 D3: unexpected replace snapshot operations {operations}"
             )
         print(
-            f"[gold-export] DATA-6 D3: metadata log {log_before} -> {log_after} "
-            f"for one replace; new snapshot operations {operations}"
+            f"[gold-export] DATA-6 D3: metadata log {len(log_before)} -> "
+            f"{len(log_after)}; the replace introduced the current snapshot "
+            f"at entry 0 (cleanup may add entries after it); operations {operations}"
         )
 
         delay = time.time() - published_at
