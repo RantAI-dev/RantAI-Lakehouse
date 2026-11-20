@@ -1262,6 +1262,8 @@ pub fn iceberg_config(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::HashSet;
+
     use arrow_array::Array as _;
 
     use super::*;
@@ -1292,6 +1294,38 @@ mod tests {
     fn copy_exported_at_micros_keeps_sub_second_precision() {
         let now = time::macros::datetime!(2026-11-20 10:00:00.123456 UTC);
         assert_eq!(copy_exported_at_micros(now), 1_795_168_800_123_456);
+    }
+
+    // DATA-6 review R4: the DATA-62 fix had no test that failed on the old
+    // code. The old loop recomputed the stamp for every batch at SECOND
+    // precision, so a mart over `batch_size` rows carried several distinct
+    // `_exported_at` values and DATA-2's trim kept 7 batches, not 7 copies.
+    // The stamp is now computed once, before the loop, and handed to every
+    // batch; this pins that invariant across three simulated batches.
+    #[test]
+    fn one_publish_stamps_every_batch_with_the_same_micros() {
+        let publish_stamp =
+            copy_exported_at_micros(time::macros::datetime!(2026-11-20 10:00:00.123456 UTC));
+        assert_ne!(
+            publish_stamp % 1_000_000,
+            0,
+            "the stamp keeps sub-second precision"
+        );
+        let batch_rows = [2usize, 1, 3];
+        let batches: Vec<ArrayRef> = batch_rows
+            .iter()
+            .map(|&rows| exported_at_column(publish_stamp, rows))
+            .collect();
+        let mut distinct: HashSet<i64> = HashSet::new();
+        for (batch, &rows) in batches.iter().zip(batch_rows.iter()) {
+            let stamps = batch
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("a timestamp-microsecond column");
+            assert_eq!(stamps.len(), rows);
+            distinct.extend(stamps.values().iter().copied());
+        }
+        assert_eq!(distinct, HashSet::from([publish_stamp]));
     }
 
     fn row_with(name: &str, value: Value) -> Map<String, Value> {
