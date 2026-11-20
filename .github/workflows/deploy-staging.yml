@@ -513,16 +513,39 @@ jobs:
               # `--no-build` is what makes the API image CI built the one
               # that runs, instead of a second local build of the same
               # code.
-              compose build ${build_list} \
-                && compose up -d --no-build --remove-orphans && exit 0
+              #
+              # The whole chain is the CONDITION of the `if`, never a
+              # standalone statement: with the runner's default
+              # `bash -e`, a standalone `a && b` that fails aborts the
+              # step on the spot, and the retry below would never run.
+              if compose build ${build_list} \
+                 && compose up -d --no-build --remove-orphans; then
+                exit 0
+              fi
             else
               # The fallback: no image from CI, so build everything here,
               # exactly as the deploy did before this change.
-              compose up -d --build --remove-orphans && exit 0
+              if compose up -d --build --remove-orphans; then
+                exit 0
+              fi
             fi
-            [ "$attempt" = 3 ] && exit 1
+            if [ "$attempt" = 3 ]; then
+              break
+            fi
             sleep 10
           done
+
+          # Three attempts with the CI-built image failed. Fall back to
+          # what this deploy did before this change: build the API image
+          # HERE as well. Unsetting the variable is what makes compose
+          # go back to its default image name, so the API is rebuilt
+          # rather than left pointing at an image that is there but
+          # broken.
+          if [ -n "${LAKEHOUSE_API_IMAGE:-}" ]; then
+            echo "::warning::the CI-built API image path failed three times; building the API image on this VM instead"
+            unset LAKEHOUSE_API_IMAGE
+            compose up -d --build --remove-orphans
+          fi
         timeout-minutes: 45
 
       # The cache this build just wrote is what makes the NEXT deploy fast,
