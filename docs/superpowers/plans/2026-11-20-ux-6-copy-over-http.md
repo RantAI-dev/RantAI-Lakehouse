@@ -187,6 +187,41 @@ the state its name describes; no assertion changed and it still fails if the
 click ever inserts something. The reviewer should look at that commit on its
 own, as it is outside the plan's task list.
 
+### Fix round 1 (`UX-6` review R1)
+
+Commit `461d7c3bc`, pushed. `copyTextWithToast(text, success?)` lives in
+`src/lib/copy-text.ts`; every copy site uses it (35 calls in 22 files: the
+34 sites this plan lists, plus `query-cell-inspector.tsx` and
+`query-results-section.tsx`, which had their own failure sentence).
+`copy-button.tsx` and `chat-messages.tsx` pass no `success` and flip the
+check on `true`.
+
+Three tests added to the existing `src/lib/copy-text.test.ts` (its five
+`copyText` cases are untouched): success toast on `true`, silence when no
+`success` is given, the failure toast and no success toast on `false`.
+
+Commands on `461d7c3bc`, in the foreground:
+
+```bash
+bun run typecheck                          # exit 0, no output
+bun run lint                               # exit 0, 12 warnings, 0 errors
+bun run test                               # exit 0: 4630 pass, 1 skip, 0 fail,
+                                           #   14668 expect() calls,
+                                           #   4631 tests across 429 files
+grep -rc 'refused the copy' src | grep -v ':0'
+# src/features/copilot/copy-button.test.tsx:1
+# src/components/copyable.test.tsx:1
+# src/lib/copy-text.ts:1
+# src/lib/copy-text.test.ts:1
+```
+
+The failure sentence now exists once outside tests, as R1 asks. Two success
+descriptions are gone with the local pairs they belonged to
+(`query-cell-inspector`'s "The cell's value is on the clipboard." and
+`query-results-section`'s "N rows copied to the clipboard."), because the
+helper R1 specifies takes a message only; the messages themselves are
+unchanged. Nothing was run outside the frontend block.
+
 ## Review
 
 Planner review, 2026-11-20, at `c01af29eb`. No BLOCKER.
