@@ -924,6 +924,57 @@ checks pass at that head, including `Rust · fmt`, `Rust · clippy`,
   (the fixture's epoch constant and the ClickHouse test-container fallback);
   both are reproduced above. No other stop-and-report mismatch was recorded.
 
+### Fix round 1 (developer, 2026-11-20)
+
+Findings R1 (BLOCKER) and R2–R6 (SHOULD-FIX) from §13 "Round 1" fixed, one
+commit each in order, each pushed to `data-6-latest-copy`. No PR was opened
+or merged by this worker.
+
+| SHA | Finding | Commit subject |
+| --- | --- | --- |
+| `104c5bb20` | R1 | DATA-6 review R1: prove the one-commit claim in the gate, not T0 |
+| `586dec35b` | R2 | DATA-6 review R2: a committed replace is never recorded as failed |
+| `2bbf5b9c7` | R3 | DATA-6 review R3: record a row when an Iceberg scan throws |
+| `e103481d4` | R4 | DATA-6 review R4: test one copy stamp across every batch of a publish |
+| `06bbadb12` | R5 | DATA-6 review R5: record D11 cleanup as not verified |
+| `d9fc7a2c1` | R6 | DATA-6 review R6: require the latest-copy contract fields |
+
+Commands run (scoped, on the shared `CARGO_TARGET_DIR=/home/rismana/cargo-target-1`;
+`bun install` run once at the start — 678 packages):
+
+- R1: `python3 -m py_compile ops/gold_export/gold_export_test.py` — OK.
+  `cd rust && cargo fmt --check && cargo clippy -p lakehouse-api --all-targets -- -D warnings && cargo test -p lakehouse-api --lib gold_latest_copy` —
+  fmt clean, clippy clean, **5 passed / 0 failed / 3753 filtered out**.
+- R2 and R3: `python3 -m py_compile` on the touched Python files — OK.
+  The new tests were not executed (pytest missing); fail-on-old-code was
+  checked by reading the pre-fix branches at `HEAD` — the `==` case returned
+  `superseded`, the reload error returned `failed`/`catalog_unavailable`,
+  and both scans sat outside any `try`, so no record row was written.
+- R4: `cd rust && cargo fmt --check && cargo clippy -p lakehouse-api --all-targets -- -D warnings && cargo test -p lakehouse-api --lib one_publish_stamps_every_batch_with_the_same_micros` —
+  fmt clean, clippy clean, **1 passed / 0 failed / 3758 filtered out**.
+  `git show 8d7b7c2b5^:rust/crates/lakehouse-api/src/gold_export.rs` has
+  neither helper and recomputes the stamp per batch at second precision.
+- R5: documentation only; no language check applies.
+- R6: `bun run typecheck` — pass. `bun test src/lib/gold-freshness.test.ts src/features/catalog/open-format-card.test.tsx` —
+  **37 pass / 0 fail / 94 expect() calls**. Temporarily reverting the three
+  fields to optional made typecheck fail with three `TS2322` (plus three
+  `TS2769`) errors in the new type guard; it passes on this commit.
+- Final, on the head commit: `bun run typecheck` — pass; `bun run lint` —
+  **0 errors, 11 warnings**, none in touched files;
+  `python3 ops/lint/check_intra_package_imports.py` — OK;
+  `python3 ops/lint/check_bare_iceberg_count.py` — OK.
+
+Not verified:
+
+- The R1 gate change was not run (no compose stack here):
+  `python3 -m py_compile` passed, and the gate itself runs in CI on PR #612.
+- No Dagster unit test was executed in this environment (pytest is not
+  installed), including the R2 and R3 tests; see the static checks above.
+- D11's end-to-end file removal (R5), as recorded in "Not verified" above.
+- The §11 full workspace verification block: this brief asked for scoped
+  checks only, so no `cargo test --workspace`, no `bun run test`, no full
+  `docker compose up`.
+
 ## 13. Review
 
 (empty — the planner writes findings here, tagged `BLOCKER` or `SHOULD-FIX`)
