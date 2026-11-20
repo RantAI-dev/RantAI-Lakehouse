@@ -11,8 +11,105 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ── The Rust release build happens HERE, in CI ────────────────────────────
+  #
+  # Why this job exists: `lakehouse-api`'s image is built by
+  # `rust/Dockerfile`, which runs `cargo build --release --locked -p
+  # lakehouse-api`. Until now that compile ran ON the staging VM, in the
+  # middle of `docker compose up --build`, NEXT TO the whole running
+  # stack -- the API, Postgres, Trino, ClickHouse, Kafka, the Dagster code
+  # location and the Dagster webserver and daemon, on 8 vCPU and 8 GiB.
+  # That is what the deploy's build used to starve on: the bake stopped
+  # right after its last "exporting attestation manifest" line and sat in
+  # `futex_wait` until the run was cancelled (runs 44596923569 and
+  # 44666444411, 17 and 28 minutes of a 120-minute budget).
+  #
+  # The same build, on a GitHub-hosted runner, takes the same CPU away
+  # from the VM. The image arrives as an artifact, is loaded into the
+  # VM's docker, and the deploy starts it WITHOUT building it again.
+  build-api-image:
+    name: Build the API image (in CI, not on the VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # The same build `ci.yml`'s `images` job makes, with the same
+      # arguments and the same layer cache, so it is a cache hit and takes
+      # a couple of minutes instead of a quarter of an hour:
+      #
+      #   * `GIT_SHA` is deliberately NOT passed (the same reason as in
+      #     `ci.yml`): `ARG GIT_SHA` sits near the top of `rust/Dockerfile`,
+      #     so a per-commit value would invalidate every layer below it and
+      #     the cache would never hit. The image therefore carries
+      #     `GIT_SHA=unknown`, and the deploy sets the real commit at RUN
+      #     time: `docker-compose.yml`'s `lakehouse-api` service carries
+      #     `GIT_SHA` in its `environment:` block, which overrides the
+      #     image's `ENV`, and `check_commit` reads the run-time value, not
+      #     the baked one. `scripts/compose.sh` exports
+      #     `GIT_SHA=$(git rev-parse HEAD)` -- the SAME value the code
+      #     location's image is built with -- so the API and the code
+      #     location agree, and the console's op-source view still matches.
+      #     The "Verify the API and the code location run the same commit"
+      #     step below proves that on the VM instead of assuming it.
+      #   * `CARGO_TARGET_DIR` and the `pipeline_src` build context are the
+      #     same as in `ci.yml` and in `docker-compose.yml`, so the GHA
+      #     cache hits. The cache is READ here and never written: the
+      #     repository's Actions cache is capped at 10 GB and `ci.yml`'s
+      #     `images` job is the one that keeps it.
+      - name: Build the lakehouse-api image
+        uses: docker/build-push-action@v7
+        with:
+          context: rust
+          file: rust/Dockerfile
+          build-contexts: |
+            pipeline_src=dagster/dispar_orchestrate
+          build-args: |
+            CARGO_TARGET_DIR=/build/target-layer
+          tags: rantai-lakehouse-api:ci
+          outputs: type=docker,dest=${{ runner.temp }}/lakehouse-api.tar
+          cache-from: type=gha,scope=api-image
+
+      # `zstd` and `compression-level: 0`: the artifact service would
+      # otherwise deflate an already-compressed file a second time for
+      # nothing.
+      #
+      # `-o` names the output EXPLICITLY. It is not decoration: zstd's
+      # positional arguments are all INPUT files, and the output name is
+      # derived from the input. Writing `zstd --rm a.tar a.tar.zst` asks
+      # zstd to compress TWO inputs -- `a.tar` and `a.tar.zst` -- and the
+      # second one is the output of the first, so it gets compressed a
+      # second time into `a.tar.zst.zst` and `--rm` then deletes the
+      # `a.tar.zst` the artifact step needs. That is exactly what the
+      # first run of this workflow did (run 44686403380): the archive
+      # compressed fine, the file it produced was gone, and the deploy
+      # job never started.
+      - name: Compress the image archive
+        run: |
+          cd "$RUNNER_TEMP"
+          zstd -T0 -3 --rm -o lakehouse-api.tar.zst lakehouse-api.tar
+          ls -l lakehouse-api.tar.zst
+          # The archive has to survive the round trip: the VM pipes it
+          # straight into `docker load`, and a truncated archive there
+          # looks like a corrupt image rather than a broken upload.
+          zstd -dc lakehouse-api.tar.zst | wc -c
+
+      - name: Upload the API image
+        uses: actions/upload-artifact@v7
+        with:
+          name: staging-api-image
+          path: ${{ runner.temp }}/lakehouse-api.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
   deploy:
     name: Deploy to staging VM
+    needs: build-api-image
     # Runs on the VM via self-hosted runner registered with label "staging"
     runs-on: [self-hosted, staging]
     environment:
@@ -292,31 +389,209 @@ jobs:
           SSO_CONSOLE_URL: ${{ vars.SSO_CONSOLE_URL }}
           SSO_REALM: ${{ vars.SSO_REALM }}
 
+      # The build below writes a new BuildKit cache and a new image layer
+      # set on every deploy. On a 146 GB disk that adds up, and a disk
+      # that fills mid-build is a build that dies halfway with an error
+      # that looks like a network problem.
+      #
+      # This step reclaims the room WITHOUT touching the build cache: only
+      # DANGLING images older than a week go, and those are the layers of
+      # the deployments before the last one. An image a container uses --
+      # running or stopped -- is never removed by `docker image prune`, and
+      # the image the stack runs is tagged, so it is not dangling at all.
+      # The base images the builds need (`rust:1.99.1-slim`,
+      # `python:3.12-slim`, `oven/bun:1-alpine`, `node:22-alpine`) are
+      # tagged too, so this never makes a build re-download its base.
+      #
+      # NOT `docker system prune`: that removes stopped containers, and
+      # with them their logs. NOT `docker volume prune`: that removes
+      # volumes, and with them the data.
+      - name: Reclaim disk from images the previous deploys left behind
+        run: |
+          docker image prune --force --filter until=168h
+          df -h / | tail -1
+
+      # The API image comes from the `build-api-image` job above: the
+      # `cargo build --release` that used to run ON this VM, next to the
+      # whole stack, now runs on a GitHub-hosted runner and arrives here
+      # as an artifact.
+      #
+      # `continue-on-error` on the download, and the check afterwards, are
+      # the FALLBACK: if the artifact is not there (the upload failed, the
+      # artifact expired, the network broke), the deploy builds the image
+      # here as it did before. A staging deploy must not be blocked by an
+      # artifact service, and it must not come up with a stale API image
+      # either -- so the fallback builds, it does not skip.
+      - name: Download the API image CI built
+        id: download_api_image
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: staging-api-image
+          path: ${{ runner.temp }}/staging-api-image
+
+      - name: Load the API image (no Rust compile on this VM)
+        id: api_image
+        shell: bash
+        run: |
+          set -uo pipefail
+          tarball="$RUNNER_TEMP/staging-api-image/lakehouse-api.tar.zst"
+          if [ ! -f "$tarball" ]; then
+            echo "::warning::the CI-built API image is not available; this deploy builds it here, as it did before"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # `zstd -dc | docker load` -- streamed, the same shape `ci.yml`'s
+          # acceptance jobs use. The archive is never written to disk as a
+          # plain tar first: the VM's disk is the tightest resource on it
+          # and the extra copy buys nothing.
+          if ! zstd -dc "$tarball" | docker load; then
+            echo "::warning::the downloaded archive could not be loaded; this deploy builds the image here"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! docker image inspect rantai-lakehouse-api:ci >/dev/null 2>&1; then
+            echo "::warning::the downloaded archive did not carry rantai-lakehouse-api:ci; this deploy builds the image here"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          docker image inspect rantai-lakehouse-api:ci --format 'loaded {{.Id}} ({{.Size}} bytes)'
+
       - name: Build & start backend stack (core + seaweedfs + dagster + trino + sso)
         working-directory: ${{ github.workspace }}
+        env:
+          # The tag the CI-built image carries. When the artifact was not
+          # available this stays EMPTY, and the compose default
+          # (`${LAKEHOUSE_API_IMAGE:-rantai-lakehouse-api:local}`) takes
+          # over -- so the fallback path builds and runs the image the
+          # deploy has always built.
+          LAKEHOUSE_API_IMAGE: ${{ steps.api_image.outputs.available == 'true' && 'rantai-lakehouse-api:ci' || '' }}
         # Retry: transient registry/PyPI flakes fail the whole compose build;
         # each retry reuses BuildKit layer cache, so a re-attempt is cheap.
         #
         # `-f docker-compose.yml` is named explicitly because `-f` REPLACES
         # the default file list; the second `-f` is the Keycloak the staging
         # deployment signs in through (its own services, its own profile).
+        #
+        # `timeout-minutes: 45`, down from 120. The build used to hang: it
+        # stopped right after its last "exporting attestation manifest"
+        # line and sat in `futex_wait` until someone cancelled the run
+        # (runs 44596923569 and 44666444411, 17 and 28 minutes of a
+        # 120-minute budget). The stall is contention, not a broken
+        # buildkit: the same bake returns 0 in a second on an idle box.
+        # The longest build that DID succeed took 22 minutes (a cold
+        # `cargo build --release`), so 45 leaves room for a cold build and
+        # stops a hung one from holding the self-hosted runner for two
+        # hours -- the runner this deployment runs on cannot serve a
+        # second job while it is stuck.
         run: |
-          for attempt in 1 2 3; do
-            echo "=== compose up attempt ${attempt}/3 ==="
-            if scripts/compose.sh \
+          compose() {
+            scripts/compose.sh \
               -f docker-compose.yml \
               -f ops/sso/docker-compose.staging-keycloak.override.yml \
               --profile sso \
               --profile seaweedfs \
               --profile dagster \
               --profile trino \
-              up -d --build --remove-orphans; then
-              exit 0
+              "$@"
+          }
+
+          # Which images this deploy has to build HERE. Everything whose
+          # image is NOT the API image CI built. One service per image:
+          # `dagster-code-location`, `dagster-daemon` and `dagster-webserver`
+          # share ONE image (and one build block), so building all three
+          # would build the same image three times.
+          #
+          # The list is read out of compose's own resolved configuration
+          # rather than written out here, so a service added to the compose
+          # file is picked up automatically. If it is not built, `up
+          # --no-build` fails loudly with "image not found" -- the deploy
+          # cannot come up with a stale image by accident.
+          build_list="$(compose config --format json | python3 -c "
+          import json, os, sys
+          cfg = json.load(sys.stdin)
+          api = os.environ.get('LAKEHOUSE_API_IMAGE') or ''
+          project = cfg.get('name', '')
+          one_per_image = {}
+          for name, svc in cfg['services'].items():
+              if not svc.get('build'):
+                  continue
+              if api and svc.get('image') == api:
+                  continue
+              image = svc.get('image') or (project + '-' + name)
+              one_per_image.setdefault(image, name)
+          print(' '.join(sorted(one_per_image.values())))
+          ")"
+          echo "images built on this VM: ${build_list}"
+
+          for attempt in 1 2 3; do
+            echo "=== compose attempt ${attempt}/3 ==="
+            if [ -n "${LAKEHOUSE_API_IMAGE:-}" ]; then
+              # The API image is already here (loaded above): build the
+              # REST here and start everything WITHOUT building again.
+              # `--no-build` is what makes the API image CI built the one
+              # that runs, instead of a second local build of the same
+              # code.
+              #
+              # The whole chain is the CONDITION of the `if`, never a
+              # standalone statement: with the runner's default
+              # `bash -e`, a standalone `a && b` that fails aborts the
+              # step on the spot, and the retry below would never run.
+              if compose build ${build_list} \
+                 && compose up -d --no-build --remove-orphans; then
+                exit 0
+              fi
+            else
+              # The fallback: no image from CI, so build everything here,
+              # exactly as the deploy did before this change.
+              if compose up -d --build --remove-orphans; then
+                exit 0
+              fi
             fi
-            [ "$attempt" = 3 ] && exit 1
+            if [ "$attempt" = 3 ]; then
+              break
+            fi
             sleep 10
           done
-        timeout-minutes: 120
+
+          # Three attempts with the CI-built image failed. Fall back to
+          # what this deploy did before this change: build the API image
+          # HERE as well. Unsetting the variable is what makes compose
+          # go back to its default image name, so the API is rebuilt
+          # rather than left pointing at an image that is there but
+          # broken.
+          if [ -n "${LAKEHOUSE_API_IMAGE:-}" ]; then
+            echo "::warning::the CI-built API image path failed three times; building the API image on this VM instead"
+            unset LAKEHOUSE_API_IMAGE
+            compose up -d --build --remove-orphans
+          fi
+        timeout-minutes: 45
+
+      # The cache this build just wrote is what makes the NEXT deploy fast,
+      # so it is kept; what grows without bound is the cache of the builds
+      # BEFORE it. On a 146 GB disk the build cache reached 50 GB and
+      # the box was at 94% before it was pruned by hand.
+      #
+      # `--max-used-space 8GB` is the bound: the LEAST recently used cache
+      # goes first, so the cache of the build that just ran -- the one the
+      # next deploy needs -- is the last to be touched. `--reserved-space
+      # 4GB` says that at least 4 GB of cache always stays, so a burst of
+      # deploys can never prune the cache away and turn the next build
+      # into a cold 20-minute `cargo build --release` again. Measured on
+      # the staging VM: this freed 4.37 GB and left 11.27 GB (the shared
+      # and in-use records cannot be pruned, so the effective ceiling is
+      # a little above the number).
+      #
+      # `docker builder prune` removes BuildKit build cache and NOTHING
+      # else: not containers, not their logs, not images, not volumes. That
+      # is exactly why it is used here and `docker system prune` is not --
+      # the latter removes stopped containers and with them the logs of the
+      # containers QA still has to read.
+      - name: Prune the build cache back to its budget
+        run: |
+          docker builder prune --all --max-used-space 8GB --reserved-space 4GB --force
+          docker system df
 
       - name: Health-check lakehouse-api
         run: |
@@ -330,6 +605,60 @@ jobs:
           done
           echo "::error::lakehouse-api did not become healthy"
           exit 1
+
+      # The API and the code location have to carry the SAME commit: the
+      # console's pipeline page serves an op's source text only when the
+      # commit the code location stamped on the op equals the API's own
+      # `GIT_SHA` (`rust/crates/lakehouse-api/src/pipeline_source.rs`'s
+      # `check_commit`; "unknown" on either side means "no real commit was
+      # ever recorded here", and the route refuses).
+      #
+      # The API's image is built in CI WITHOUT a `GIT_SHA`, so the commit
+      # reaches the API through compose's `environment:` block, while the
+      # code location carries it in its own image. Two different paths for
+      # one value -- and they drift apart silently: the symptom is a
+      # console that says "source unavailable" on every pipeline, which
+      # reads as a missing feature rather than as a broken deployment.
+      # (It already happened once: the first CI-built deploy left the API
+      # with `GIT_SHA=unknown` while the code location ran the real
+      # commit, because nothing put the commit into the API's container.)
+      #
+      # This compares the two values on the RUNNING containers and fails
+      # the deploy when they differ or when neither carries a real one.
+      - name: Verify the API and the code location run the same commit
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          compose() {
+            scripts/compose.sh \
+              -f docker-compose.yml \
+              -f ops/sso/docker-compose.staging-keycloak.override.yml \
+              --profile sso \
+              --profile seaweedfs \
+              --profile dagster \
+              --profile trino \
+              "$@"
+          }
+          api_container="$(compose ps -q lakehouse-api | head -1)"
+          code_container="$(compose ps -q dagster-code-location | head -1)"
+          if [ -z "$api_container" ] || [ -z "$code_container" ]; then
+            echo "::error::the API or the code location is not running; cannot compare the commits they run"
+            exit 1
+          fi
+          api_sha="$(docker exec "$api_container" printenv GIT_SHA || true)"
+          code_sha="$(docker exec "$code_container" printenv GIT_SHA || true)"
+          echo "checkout                $(git rev-parse HEAD)"
+          echo "lakehouse-api           ${api_sha}"
+          echo "dagster-code-location   ${code_sha}"
+          if [ "$api_sha" != "$code_sha" ]; then
+            echo "::error::the API (${api_sha}) and the code location (${code_sha}) do not run the same commit; the console's op-source view will refuse to serve source"
+            exit 1
+          fi
+          if [ -z "$api_sha" ] || [ "$api_sha" = "unknown" ]; then
+            echo "::error::neither image carries a real commit (GIT_SHA='${api_sha}'); the console's op-source view will refuse to serve source"
+            exit 1
+          fi
+          echo "the API and the code location both run ${api_sha}"
 
       # The provider answers a browser, not the API: the API fetches the key
       # set lazily on the first sign-in, so it is up before Keycloak is. This

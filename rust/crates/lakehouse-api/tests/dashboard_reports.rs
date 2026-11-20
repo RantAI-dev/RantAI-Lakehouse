@@ -39,20 +39,27 @@ struct FakeCh {
     /// SHOULD-FIX 1): left out of every live read, and `is_deleted = 2` in the
     /// by-id row state.
     trashed: Arc<Mutex<Vec<String>>>,
+    /// Map-backed charts `(id, board, map_id)` registered per test (`PR #528
+    /// review BLOCKER`).
+    map_charts: Arc<Mutex<Vec<(String, String, String)>>>,
 }
 
-fn chart_row(id: &str, board: &str, kind: &str) -> Value {
-    let spec = json!({
+fn chart_row(id: &str, board: &str, kind: &str, map: Option<&str>) -> Value {
+    let mut spec = json!({
         "id": id, "title": format!("Tile {id}"), "kind": kind, "mart": "mart_x",
         "sql": if kind == "text" { String::new() } else {
             format!("SELECT email, region FROM serving.mart_x WHERE '{id}' != ''")
         },
         "x": "region", "y": "email"
     });
-    let def = json!({
+    let mut def = json!({
         "title": format!("Tile {id}"), "mart": "mart_x", "kind": kind,
         "dimension": "region", "measures": ["email"]
     });
+    if let Some(map_id) = map {
+        spec["map"] = json!(map_id);
+        def["map"] = json!(map_id);
+    }
     json!({
         "id": id, "board": board, "created_by": "ui", "created_at": "2026-01-01 00:00:00",
         "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
@@ -143,13 +150,24 @@ impl Respond for FakeCh {
             ("b_locked", "f_locked", ""),
             ("b_mine", "p_owner", OWNER),
         ];
-        let charts = [
+        let mut charts: Vec<(String, String, String, Option<String>)> = [
             ("c_one", "b_one", "bar"),
             ("c_two", "b_two", "bar"),
             ("c_text", "b_one", "text"),
             ("c_locked", "b_locked", "bar"),
             ("c_mine", "b_mine", "bar"),
-        ];
+        ]
+        .into_iter()
+        .map(|(id, board, kind)| (id.to_owned(), board.to_owned(), kind.to_owned(), None))
+        .collect();
+        for (id, board, map) in self.map_charts.lock().unwrap().iter() {
+            charts.push((
+                id.clone(),
+                board.clone(),
+                "geomap".to_owned(),
+                Some(map.clone()),
+            ));
+        }
         let trashed = self.trashed.lock().unwrap().clone();
         // `store::chart_row_state` and `store::board_row_state`: one row by
         // id, read as the server (no viewer fragment).
@@ -161,8 +179,8 @@ impl Respond for FakeCh {
             return rows(
                 charts
                     .iter()
-                    .filter(|(chart, _, _)| *chart == id)
-                    .map(|(chart, board, _)| {
+                    .filter(|(chart, _, _, _)| chart.as_str() == id)
+                    .map(|(chart, board, _, _)| {
                         let gone = trashed.iter().any(|t| t == chart);
                         json!({ "is_deleted": if gone { 2 } else { 0 }, "board": board })
                     })
@@ -186,9 +204,12 @@ impl Respond for FakeCh {
             return rows(
                 charts
                     .iter()
-                    .filter(|(id, _, _)| !trashed.iter().any(|t| t == id))
-                    .filter(|(_, board, _)| {
-                        let owner = boards.iter().find(|b| b.0 == *board).map_or("", |b| b.2);
+                    .filter(|(id, _, _, _)| !trashed.iter().any(|t| t == id))
+                    .filter(|(_, board, _, _)| {
+                        let owner = boards
+                            .iter()
+                            .find(|b| b.0 == board.as_str())
+                            .map_or("", |b| b.2);
                         // The chart clause hides another owner's board by a
                         // sub-select, and the permission list by board id.
                         let private = !owner.is_empty()
@@ -196,7 +217,7 @@ impl Respond for FakeCh {
                             && !sql.contains(&format!("owner_id != '{owner}'"));
                         !private && passes(&sql, "board", board, "")
                     })
-                    .map(|(id, board, kind)| chart_row(id, board, kind))
+                    .map(|(id, board, kind, map)| chart_row(id, board, kind, map.as_deref()))
                     .collect(),
             );
         }
@@ -280,6 +301,7 @@ async fn fixture_with(extra: &[(&str, &str)]) -> Fixture {
     let fake = FakeCh {
         log: Arc::new(Mutex::new(Vec::new())),
         trashed: Arc::new(Mutex::new(Vec::new())),
+        map_charts: Arc::new(Mutex::new(Vec::new())),
     };
     let ch = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1180,4 +1202,134 @@ async fn the_report_pdf_opens_the_report_print_view_and_is_audited() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(said["error"], "report not found.");
     assert_eq!(gotenberg.received_requests().await.unwrap().len(), 1);
+}
+
+const TEST_GEOJSON: &str = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"NAME":"North"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}}]}"#;
+
+async fn upload_test_map(app: &TestApp, cookie: &str, name: &str) -> String {
+    let mut body = Vec::new();
+    for (field, value) in [("name", name), ("nameProperty", "NAME")] {
+        body.extend_from_slice(
+            format!(
+                "--BOUNDARY\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"file\"; filename=\"map.geojson\"\r\nContent-Type: application/geo+json\r\n\r\n",
+    );
+    body.extend_from_slice(TEST_GEOJSON.as_bytes());
+    body.extend_from_slice(b"\r\n--BOUNDARY--\r\n");
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/maps")
+                .header("cookie", cookie)
+                .header("content-type", "multipart/form-data; boundary=BOUNDARY")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    json["id"].as_str().unwrap().to_owned()
+}
+
+/// `PR #528 review BLOCKER`: a report render token has `board: ""` and
+/// opens uploaded maps through `POST /api/render/maps/{id}/geojson`, strictly
+/// scoped to maps drawn by visible charts in that report.
+#[tokio::test]
+async fn a_report_token_opens_only_the_maps_used_by_the_reports_visible_charts() {
+    let f = fixture_with(&[("RENDER_TOKEN_SECRET", RENDER_SECRET)]).await;
+    let admin_id = common::create_principal_with_permissions(&f.app.pool, "settings:write").await;
+    let admin_cookie = session_cookie_for_user(&f.app.pool, admin_id).await;
+    let m_used = upload_test_map(&f.app, &admin_cookie, "Report Map").await;
+    let m_sibling = upload_test_map(&f.app, &admin_cookie, "Sibling Map").await;
+    let m_hidden = upload_test_map(&f.app, &admin_cookie, "Private Map").await;
+
+    f.fake.map_charts.lock().unwrap().extend([
+        ("c_map".to_owned(), "b_one".to_owned(), m_used.clone()),
+        (
+            "c_sibling_map".to_owned(),
+            "b_one".to_owned(),
+            m_sibling.clone(),
+        ),
+        (
+            "c_mine_map".to_owned(),
+            "b_mine".to_owned(),
+            m_hidden.clone(),
+        ),
+    ]);
+
+    // Owner places both a visible chart (`c_map`) and their personal-board
+    // chart (`c_mine_map`) in a shared report in `f_open`. `c_sibling_map` is
+    // on the same board `b_one` as `c_map`, but is NOT in the report.
+    let (status, made) = create(
+        &f,
+        &f.owner,
+        json!({
+            "title": "Regional summary",
+            "folderId": "f_open",
+            "blocks": [chart("c_map"), chart("c_mine_map")],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    let report_id = made["report"]["id"].as_str().unwrap().to_owned();
+    let reader_tok = report_token(f.reader_id, &report_id);
+
+    // Allowed: map used by `c_map` in the report.
+    let (status, body) = call(
+        &f.app,
+        "POST",
+        &format!("/api/render/maps/{m_used}/geojson"),
+        "",
+        Some(json!({ "token": reader_tok })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["type"], "FeatureCollection");
+
+    // Refused (404): map on the same board not in the report, map of a hidden
+    // chart in the report, and an unknown map id.
+    for refused_map in [m_sibling.as_str(), m_hidden.as_str(), "m_000000000000"] {
+        let (status, body) = call(
+            &f.app,
+            "POST",
+            &format!("/api/render/maps/{refused_map}/geojson"),
+            "",
+            Some(json!({ "token": reader_tok })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{refused_map}: {body}");
+    }
+
+    // Fail-closed: an unreadable report's token is refused with 401.
+    let (status, private_report) = create(
+        &f,
+        &f.owner,
+        json!({ "title": "Private", "folderId": "p_owner", "blocks": [chart("c_map")] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{private_report}");
+    let private_id = private_report["report"]["id"].as_str().unwrap().to_owned();
+    let bad_tok = report_token(f.reader_id, &private_id);
+    let (status, body) = call(
+        &f.app,
+        "POST",
+        &format!("/api/render/maps/{m_used}/geojson"),
+        "",
+        Some(json!({ "token": bad_tok })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "render token is invalid or expired");
 }

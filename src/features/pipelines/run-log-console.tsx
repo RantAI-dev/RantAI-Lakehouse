@@ -2,8 +2,8 @@
 
 import * as React from "react"
 import { CopyIcon, DownloadIcon, SearchIcon, XIcon } from "lucide-react"
-import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { cn } from "@/lib/utils"
 import { pipelineService } from "@/services"
 import {
@@ -171,12 +171,9 @@ export function RunLogConsole({
   }, [shown.length, live, follow])
 
   const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(logsToText(shown))
-      toast.success(`Copied ${shown.length} log lines`)
-    } catch {
-      toast.error("The browser refused clipboard access")
-    }
+    // Over plain http there is no clipboard API (`UX-6`); the success toast
+    // waits for the textarea fallback's answer.
+    await copyTextWithToast(logsToText(shown), `Copied ${shown.length} log lines`)
   }
   const download = () => {
     const blob = new Blob([logsToText(logs.lines)], { type: "text/plain" })

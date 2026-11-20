@@ -1,9 +1,10 @@
-//! `GET /api/governance/audit/events`, `.../events/{id}` and
-//! `.../export.csv`: search the audit trail at any age, read one event, and
-//! take a copy of it out as a CSV file (`GOV-1` part B, feature page
+//! `GET /api/governance/audit/events`, `.../events/{id}`, `.../actors` and
+//! `.../export.csv`: search the audit trail at any age, read one event, list
+//! the actors the person filter offers (`GOV-1` acceptance follow-up, D2),
+//! and take a copy of it out as a CSV file (`GOV-1` part B, feature page
 //! Decisions 5 and 9).
 //!
-//! # Why three routes beside the old list
+//! # Why these routes beside the old list
 //!
 //! `GET /api/governance/audit` (`routes::governance`) answers the newest 200
 //! events with the last 50 pipeline runs merged in, and it stays as it is: the
@@ -11,11 +12,13 @@
 //! read `audit_event` only, filter on the server, page with a keyset cursor
 //! over `(at, id)` and have no age or row cut except the export's cap. Each
 //! event is the same JSON object the old list shows
-//! ([`governance::audit_event_row`]).
+//! ([`governance::audit_event_row`]). The actors route reads the same table
+//! with the same reach and no age cut either: it is the person filter's
+//! list, and it needs no `identity:read` (D2).
 //!
 //! # Permission
 //!
-//! All three need `audit:read` in `POLICY_TABLE` and nothing else. Every role
+//! All four need `audit:read` in `POLICY_TABLE` and nothing else. Every role
 //! holds `governance:read`, which must not open the trail (Decision 9). They
 //! are reads, so they are not in `AUDIT_TABLE`; the export is the one read
 //! that records itself, see [`export`].
@@ -30,6 +33,7 @@
 //! principle 4). An empty value is no value, like the other filter routes, so
 //! a link built from empty inputs filters nothing instead of failing.
 
+use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 
@@ -51,7 +55,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::QUERY_STRING_UNREADABLE;
-use super::governance::{actor_of, audit_event_row};
+use super::governance::{actor_kind_of, actor_of, audit_event_row, outcome_of};
 use crate::audit_coverage;
 use crate::csv_export;
 use crate::error::ApiResult;
@@ -268,6 +272,56 @@ pub async fn one(
     Ok(ApiJson(json!({ "event": audit_event_row(&event) })))
 }
 
+/// `GET /api/governance/audit/actors`: the actors of the trail, as the audit
+/// page's person filter lists them (`GOV-1` acceptance follow-up, D2). One
+/// entry per principal, newest seen first, at most
+/// [`audit::ACTORS_MAX`] of them:
+/// the console's filter is a picker over this list that narrows by typing,
+/// and it sends an id back. The store lists one row per
+/// `(principal_id, actor_label, principal_kind)` group, so a principal that
+/// acted under two names is two rows; this keeps the newest label, which the
+/// store's order puts first. Nobody without a principal id is listed — an
+/// event nobody signed in caused is not a person the filter can pick.
+///
+/// No `identity:read` is needed: the list is a read of the trail, gated by
+/// `audit:read` like every other one (Decision 9).
+///
+/// `SEC-20` (plan 100): the list follows the reader's reach, resolved by
+/// [`super::audit_scope::scope_for_principal`] — a person filter never
+/// offers another organisation's people.
+///
+/// # Errors
+///
+/// 404 for a forged `X-Tenant` header. 503 when no database is configured;
+/// 500 (the fixed `database error`) when the read fails.
+pub async fn actors(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Value>> {
+    let scope = super::audit_scope::scope_for_principal(&state, &principal, &headers).await?;
+    let listed = audit::actors(pool(&state)?, &scope).await?;
+    let mut seen = HashSet::new();
+    let mut actors = Vec::new();
+    for actor in listed {
+        // The list is newest seen first, so the first row of a principal
+        // is the newest label it acted under.
+        if !seen.insert(actor.principal_id.clone()) {
+            continue;
+        }
+        actors.push(json!({
+            "actorId": actor.principal_id,
+            "actor": actor_of(
+                actor.actor_label.as_deref(),
+                Some(&actor.principal_id),
+                actor.principal_kind.as_deref(),
+            ),
+            "actorKind": actor_kind_of(actor.principal_kind.as_deref()),
+        }));
+    }
+    Ok(ApiJson(json!({ "actors": actors })))
+}
+
 /// The filters a request used, as the plain text its own `audit.export` row
 /// records. Only the filters that were set, and never the cursor or the limit
 /// (the export has neither). The values are cut to
@@ -313,8 +367,13 @@ fn recorded_filters(filter: &AuditFilter) -> Value {
     Value::Object(args)
 }
 
-/// The header row of the file, in the order of [`export_row`].
-const EXPORT_COLUMNS: [&str; 9] = [
+/// The header row of the file, in the order of [`export_row`]. The event id
+/// comes first — the same id the `?event=` deep link takes (`GOV-1`
+/// acceptance follow-up, D5) — `outcome` is the same four words the page
+/// shows with the stored value beside it as `outcome_detail` (D4), and the
+/// stored `detail` column is `reason` (D4b).
+const EXPORT_COLUMNS: [&str; 11] = [
+    "id",
     "at",
     "actor",
     "principal_kind",
@@ -322,16 +381,20 @@ const EXPORT_COLUMNS: [&str; 9] = [
     "resource_kind",
     "resource_id",
     "outcome",
-    "detail",
+    "outcome_detail",
+    "reason",
     "args",
 ];
 
-/// One event as the nine cells of the file. Every cell is text from the trail,
+/// One event as the eleven cells of the file. Every cell is text from the trail,
 /// which can hold a name or a detail a person typed, so every one goes through
 /// the one CSV rule, [`csv_export::neutralise`].
 fn export_row(event: &AuditEvent) -> Vec<String> {
     let cell = |text: Option<&str>| csv_export::neutralise(text.unwrap_or_default());
     vec![
+        // `GOV-1` acceptance follow-up (D5): the event id first, the same
+        // id the `?event=` deep link reads one event by.
+        cell(Some(event.id.as_str())),
         cell(Some(event.at.as_str())),
         // The name the audit page shows for the actor, so the file and the
         // page agree: the stored label, then the principal id.
@@ -344,7 +407,12 @@ fn export_row(event: &AuditEvent) -> Vec<String> {
         cell(Some(event.action.as_str())),
         cell(event.resource_kind.as_deref()),
         cell(event.resource_id.as_deref()),
+        // `GOV-1` acceptance follow-up (D4): the four words the page
+        // shows, with the stored value beside it.
+        cell(Some(outcome_of(&event.outcome))),
         cell(Some(event.outcome.as_str())),
+        // `GOV-1` acceptance follow-up (D4b): the stored detail, as the
+        // page's `reason`.
         cell(event.detail.as_deref()),
         cell(Some(event.args.to_string().as_str())),
     ]
@@ -426,8 +494,9 @@ fn download_header(text: &str) -> Result<HeaderValue, ApiError> {
 
 /// `GET /api/governance/audit/export.csv`: the events the search filters pick,
 /// newest first, as a CSV file of at most [`MAX_EXPORT_ROWS`] rows with the
-/// columns `at`, `actor`, `principal_kind`, `action`, `resource_kind`,
-/// `resource_id`, `outcome`, `detail` and `args`. It takes the search's
+/// columns `id`, `at`, `actor`, `principal_kind`, `action`, `resource_kind`,
+/// `resource_id`, `outcome`, `outcome_detail`, `reason` and `args`
+/// (`GOV-1` acceptance follow-up, D4, D4b and D5). It takes the search's
 /// filters and ignores `limit` and `cursor`.
 ///
 /// When more events match than the file holds, it holds the newest ones and

@@ -14,7 +14,6 @@ import {
   RotateCcwIcon,
   SquareIcon,
 } from "lucide-react"
-import { toast } from "sonner"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { StatusBadge } from "@/components/patterns/status-badge"
@@ -26,6 +25,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatDateTime, formatDuration, formatNumber, parseTimestamp } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
 import { pipelineService } from "@/services"
@@ -242,12 +242,9 @@ export function RunInspector({
               title="Copy the full run id"
               aria-label="Copy the full run id"
               onClick={async () => {
-                try {
-                  await navigator.clipboard.writeText(run.id)
-                  toast.success("Run id copied")
-                } catch {
-                  toast.error("The browser refused clipboard access")
-                }
+                // Over plain http there is no clipboard API (`UX-6`); the
+                // success toast waits for the fallback's answer.
+                await copyTextWithToast(run.id, "Run id copied")
               }}
             >
               <CopyIcon className="size-3.5" />

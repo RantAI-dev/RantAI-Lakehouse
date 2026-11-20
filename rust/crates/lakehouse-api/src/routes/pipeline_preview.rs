@@ -2,6 +2,12 @@
 //! 17): the first rows of ONE input or step of a pipeline definition that may
 //! not be saved yet.
 //!
+//! `POST /api/pipelines/step-sql` (BLD-16 / J6): the SQL of one form step
+//! of a definition that is not saved yet — the body the compiler would put
+//! inside that step's `WITH` entry, over names. It is part of authoring,
+//! not a read of a stored pipeline, so it sits beside the preview under
+//! `pipeline:write`.
+//!
 //! # Why the API and not the console
 //!
 //! The preview runs the same three steps the save path (D9) and the run route
@@ -133,6 +139,56 @@ pub async fn preview(
         .await
         .map_err(|err| preview_failure(&err))?;
     Ok(ApiJson(answer(&columns, &result.data)))
+}
+
+/// `POST /api/pipelines/step-sql` body (BLD-16 / J6).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StepSqlBody {
+    /// D1's inputs, exactly as a save would carry them.
+    #[serde(default)]
+    inputs: Vec<PipelineInput>,
+    /// D1's steps, exactly as a save would carry them.
+    #[serde(default)]
+    steps: Vec<PipelineStep>,
+    /// The step whose SQL is asked for, by name.
+    #[serde(default)]
+    step: String,
+}
+
+/// `POST /api/pipelines/step-sql` (BLD-16 / J6): the SQL of one form step,
+/// over the inputs and the earlier steps by their names — the same body
+/// [`preview`] would run as part of a compiled statement, but answered as
+/// text for a person to read ("Show as SQL") or to take over ("Switch to
+/// SQL step"), before the access rewrite (the rewritten text would show
+/// another person's masking expressions).
+///
+/// No `ClickHouse`, no Postgres, no tenant: the answer is
+/// [`crate::pipeline_compile::step_sql`]'s own text and nothing is read or
+/// stored. It still needs `pipeline:write`, because it is part of
+/// authoring — the same floor as the preview — and it shows a pipeline's
+/// names, which a person who may not author one has no business asking
+/// about.
+///
+/// # Errors
+///
+/// 400 for a body that does not parse, a missing `step`, or a definition
+/// refusal naming `inputs[i]`/`steps[i]`/`step` — the message built by
+/// [`definition_message`], exactly as the preview answers its refusals.
+pub async fn step_sql(
+    State(_state): State<AppState>,
+    Extension(_principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let body: StepSqlBody = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
+    let step = body.step.trim();
+    if step.is_empty() {
+        return Err(ApiError::BadRequest("step is required.".to_owned()).into());
+    }
+    let sql = crate::pipeline_compile::step_sql(&body.inputs, &body.steps, step)
+        .map_err(|err| ApiError::BadRequest(definition_message(&err)))?;
+    Ok(ApiJson(json!({ "sql": sql })))
 }
 
 /// A `ClickHouse` failure, reported the way Query Studio reports one for the

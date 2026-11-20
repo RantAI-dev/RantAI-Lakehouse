@@ -198,10 +198,12 @@ function ReportEditor({ view }: { view: ReportView | null }) {
 
       <div className="grid gap-3 sm:grid-cols-[1fr_16rem]">
         <div className="flex flex-col gap-1.5">
-          <Label htmlFor="report-title">Title</Label>
+          {/* PR #528 review SHOULD-FIX (UX-1/UX-4): Title is required next to optional Folder. */}
+          <Label htmlFor="report-title" required>Title</Label>
           <Input
             id="report-title"
             autoFocus={!view}
+            required
             value={title}
             maxLength={200}
             onChange={(e) => setTitle(e.target.value)}
