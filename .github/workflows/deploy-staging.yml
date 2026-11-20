@@ -421,12 +421,15 @@ jobs:
             echo "available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          zstd -d -f "$tarball" -o "$RUNNER_TEMP/lakehouse-api.tar" || {
-            echo "::warning::the downloaded archive could not be decompressed; this deploy builds the image here"
+          # `zstd -dc | docker load` -- streamed, the same shape `ci.yml`'s
+          # acceptance jobs use. The archive is never written to disk as a
+          # plain tar first: the VM's disk is the tightest resource on it
+          # and the extra copy buys nothing.
+          if ! zstd -dc "$tarball" | docker load; then
+            echo "::warning::the downloaded archive could not be loaded; this deploy builds the image here"
             echo "available=false" >> "$GITHUB_OUTPUT"
             exit 0
-          }
-          docker load -i "$RUNNER_TEMP/lakehouse-api.tar"
+          fi
           if ! docker image inspect rantai-lakehouse-api:ci >/dev/null 2>&1; then
             echo "::warning::the downloaded archive did not carry rantai-lakehouse-api:ci; this deploy builds the image here"
             echo "available=false" >> "$GITHUB_OUTPUT"
