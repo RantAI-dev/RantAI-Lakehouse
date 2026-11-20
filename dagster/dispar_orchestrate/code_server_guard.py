@@ -30,7 +30,9 @@ process has to notice and EXIT. This module is that process.
   not come back means the inner server is gone -- which is exactly what the
   hardcoded health service cannot report;
 - reads the code server's output and forwards it, unchanged, so the container
-  log keeps showing what the code server says;
+  log keeps showing what the code server says. A byte the encoding cannot
+  show is rendered escaped, and the reader never stops while the code server
+  lives: a pipe nobody reads fills up and blocks every run;
 - when the inner server says it is shutting down because it missed its
   heartbeat, it asks the proxy to RELOAD the code location: a new inner
   server takes the new runs, and the old one finishes the runs it still
@@ -59,6 +61,7 @@ service's `command:` in `docker-compose.yml`).
 from __future__ import annotations
 
 import argparse
+import errno
 import logging
 import os
 import queue
@@ -71,6 +74,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import FrameType
+from typing import Any
 
 from dispar_orchestrate import orphan_runs
 
@@ -141,6 +145,38 @@ LOOPBACK_HOST = "127.0.0.1"
 # operator who set it for the code server keeps it. `None` means "unset":
 # the child then runs with Dagster's own default.
 CONTAINER_GRPC_TIMEOUT_SECONDS = os.environ.get("DAGSTER_GRPC_TIMEOUT_SECONDS")
+
+# How the child's pipes are opened, and the ONE place that says so: the
+# guard's child and the test's child both use it, so a test reads a child's
+# output exactly the way the guard does.
+#
+# `errors="backslashreplace"` is the fix for PR #636 review 1. With the
+# default `errors="strict"` the FIRST byte the encoding cannot show raises
+# `UnicodeDecodeError` in the reader thread -- and `UnicodeDecodeError` IS
+# a `ValueError`, so the reader caught it and stopped for good. Nobody read
+# the pipe after that, it filled up (64 KiB), and every process that writes
+# to it blocked: the proxy, the inner server and every run the location
+# starts (a run's process inherits these streams). That is the hang OPS-37
+# exists to remove. `backslashreplace` turns every byte sequence into a
+# line and shows the undecodable byte escaped (`\xff`), so the reader keeps
+# going.
+CHILD_PIPE_OPTIONS: dict[str, Any] = {
+    "text": True,
+    "errors": "backslashreplace",
+    "bufsize": 1,
+}
+
+# How many times the reader tries the text layer again after a failure
+# before it copies the raw bytes instead, and how long it waits between two
+# tries. The wait keeps a stream that fails on every line from spinning the
+# reader thread (PR #636 review 1).
+READ_FAILURES_BEFORE_RAW_COPY = 3
+READ_RETRY_BACKOFF_SECONDS = 0.05
+READ_RETRY_BACKOFF_MAX_SECONDS = 1.0
+
+# How many raw bytes the reader copies at a time when the text layer cannot
+# read the stream at all.
+RAW_COPY_CHUNK_BYTES = 8192
 
 
 def _env(name: str, default: str) -> str:
@@ -360,7 +396,9 @@ def spawn_child(
     Its output goes to PIPES, and the guard reads them: a pipe nobody reads
     fills up and blocks the code server. The reader threads forward every
     line to the guard's own output, so the container log keeps showing what
-    the code server says.
+    the code server says. The pipes are opened with
+    `CHILD_PIPE_OPTIONS`, whose decoder never raises: one undecodable byte
+    must not stop the reader (PR #636 review 1).
     """
     return subprocess.Popen(
         child_command(
@@ -373,8 +411,7 @@ def spawn_child(
         start_new_session=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+        **CHILD_PIPE_OPTIONS,
     )
 
 
@@ -410,40 +447,223 @@ class ShutdownWatcher:
                 return found
 
 
+class _Forwarder:
+    """Writes the code server's lines on to the guard's own output.
+
+    A write that fails does NOT end the reader: the pipe the code server
+    writes to must keep being drained, or the code server blocks on a full
+    pipe (PR #636 review 1). The lines are noticed by the watcher either
+    way, so a missed-heartbeat line is seen even when the guard's own
+    output is gone.
+    """
+
+    def __init__(self, target, watcher: ShutdownWatcher) -> None:
+        self._target = target
+        self._watcher = watcher
+        self._writing = True
+
+    def forward(self, line: str) -> None:
+        """Notices the line, then writes it on, unchanged.
+
+        The line is noticed BEFORE it is forwarded: a test that has seen
+        the line knows the watcher has it, and the guard's next round acts
+        on it.
+        """
+        self._watcher.notice(line)
+        if not self._writing:
+            return
+        try:
+            self._target.write(line)
+            self._target.flush()
+        except (OSError, ValueError):
+            self._writing = False
+            logger.warning(
+                "the guard's own output could not be written to: the code server's "
+                "output keeps being read, but it is not forwarded any more"
+            )
+
+
+def _the_pipe_is_closed(error: BaseException) -> bool:
+    """True when the pipe itself is closed: there is nothing left to read.
+
+    `UnicodeDecodeError` is a `ValueError`, so the type alone does not tell
+    "the pipe closed" from "the bytes could not be decoded": the message
+    does.
+    """
+    if isinstance(error, UnicodeDecodeError):
+        return False
+    if isinstance(error, ValueError):
+        return "closed file" in str(error)
+    if isinstance(error, OSError):
+        return error.errno in (errno.EBADF, errno.EPIPE)
+    return False
+
+
+def _copy_raw_bytes(stream, *, forwarder: _Forwarder) -> bool:
+    """Copies the raw bytes of a stream the text layer cannot read.
+
+    The bytes are decoded with `backslashreplace`, so an undecodable byte
+    is shown escaped instead of raising again, and the lines are noticed
+    by the watcher as they come.
+
+    False when the stream has no raw side (a test double), so the caller
+    goes on with the text layer. True when the copy is DONE: the raw side
+    reached its end, or the pipe closed.
+
+    A failure that is NOT the pipe closing does NOT end the copy (PR #636
+    review 1): the reader has to keep draining the pipe while the code
+    server lives, or the pipe fills up (64 KiB) and blocks every process
+    that writes to it -- the proxy, the inner server and every run. The
+    read is tried again after a short wait, so a raw side that fails on
+    every read does not spin the reader thread.
+    """
+    raw = getattr(stream, "buffer", None)
+    if raw is None:
+        return False
+    # `read1` gives back what is there without waiting for a full buffer:
+    # the reader must forward a line the moment it arrives. It is looked up
+    # WITHOUT naming `read` as the default, because a raw side that offers
+    # only `read1` must not raise while the fallback is set up.
+    read = getattr(raw, "read1", None) or raw.read
+    pending = b""
+    failures = 0
+    reported = False
+    while True:
+        try:
+            chunk = read(RAW_COPY_CHUNK_BYTES)
+        except Exception as error:
+            if _the_pipe_is_closed(error):
+                # The pipe closed while the raw bytes were copied: there is
+                # nothing left to read, so the reader is done with it.
+                return True
+            failures += 1
+            if not reported:
+                reported = True
+                logger.warning(
+                    "the code server's raw output could not be read (%s): the reader "
+                    "keeps draining it, so the code server does not block on a full "
+                    "pipe",
+                    type(error).__name__,
+                )
+            # The raw side failed again right away: wait a little, so it
+            # does not spin this thread.
+            time.sleep(
+                min(
+                    READ_RETRY_BACKOFF_SECONDS * failures,
+                    READ_RETRY_BACKOFF_MAX_SECONDS,
+                )
+            )
+            continue
+        if not chunk:
+            # The raw side reached its end: the child closed its side.
+            break
+        failures = 0
+        pending += chunk
+        *lines, pending = pending.split(b"\n")
+        for raw_line in lines:
+            forwarder.forward(raw_line.decode("utf-8", errors="backslashreplace") + "\n")
+    if pending:
+        forwarder.forward(pending.decode("utf-8", errors="backslashreplace"))
+    return True
+
+
 def _forward_lines(stream, *, is_stderr: bool, watcher: ShutdownWatcher) -> None:
-    """One line at a time: notice it, then write it on, unchanged."""
-    target = sys.stderr if is_stderr else sys.stdout
-    try:
-        for line in stream:
-            # The line is noticed BEFORE it is forwarded: a test that has
-            # seen the line knows the watcher has it, and the guard's next
-            # round acts on it.
-            watcher.notice(line)
-            target.write(line)
-            target.flush()
-    except (OSError, ValueError):
-        # The pipe closed while the guard was reading it: the code server is
-        # gone, and the main loop notices that on its own.
-        pass
+    """One line at a time: notice it, then write it on, unchanged.
+
+    The reader must NOT stop while the child lives (PR #636 review 1): a
+    pipe nobody reads fills up (64 KiB) and then blocks every process that
+    writes to it -- the proxy, the inner server and every run the location
+    starts. One undecodable byte used to end this thread for good: the
+    reader caught `ValueError` (which `UnicodeDecodeError` is) and
+    returned, and the hang that followed is the one OPS-37 exists to
+    remove.
+
+    So the pipes are opened with `errors="backslashreplace"`
+    (`CHILD_PIPE_OPTIONS`), which turns every byte sequence into a line,
+    and a failure that is not the pipe closing is logged ONCE and the
+    reader keeps draining. When the text layer cannot read the stream at
+    all, the raw bytes are copied through instead. The thread ends only
+    when the stream ends.
+    """
+    forwarder = _Forwarder(sys.stderr if is_stderr else sys.stdout, watcher)
+    reported = False
+    raw_copy_reported = False
+    failures = 0
+    while True:
+        try:
+            for line in stream:
+                failures = 0
+                forwarder.forward(line)
+            # The stream ended: the child closed its side.
+            return
+        except Exception as error:
+            if _the_pipe_is_closed(error):
+                return
+            if not reported:
+                reported = True
+                logger.warning(
+                    "the code server's output could not be read (%s): the reader keeps "
+                    "draining it, so the code server does not block on a full pipe",
+                    type(error).__name__,
+                )
+            failures += 1
+            # Decoding is impossible for this stream: the raw bytes are
+            # copied through instead, so the pipe keeps being drained.
+            if (
+                isinstance(error, UnicodeDecodeError)
+                or failures >= READ_FAILURES_BEFORE_RAW_COPY
+            ):
+                try:
+                    copied = _copy_raw_bytes(stream, forwarder=forwarder)
+                except Exception as raw_error:
+                    # PR #636 review 1: the failure is recorded; a silent
+                    # retry every second would leave nothing in the log.
+                    if not raw_copy_reported:
+                        raw_copy_reported = True
+                        logger.warning(
+                            "the code server's raw output could not be copied (%s): "
+                            "the reader goes on with the text layer",
+                            type(raw_error).__name__,
+                        )
+                    copied = False
+                if copied:
+                    # The raw side reached its end, or the pipe closed:
+                    # there is nothing left to read.
+                    return
+            # The text layer failed again right away: wait a little, so a
+            # stream that fails on every line does not spin this thread.
+            time.sleep(
+                min(
+                    READ_RETRY_BACKOFF_SECONDS * failures,
+                    READ_RETRY_BACKOFF_MAX_SECONDS,
+                )
+            )
 
 
-def start_output_readers(child: subprocess.Popen, watcher: ShutdownWatcher) -> None:
+def start_output_readers(
+    child: subprocess.Popen, watcher: ShutdownWatcher
+) -> list[threading.Thread]:
     """Reads the code server's output and forwards it, line by line.
 
     The threads are daemons: the guard exits without waiting for them.
+    They are returned so that a test can wait for the output to be read.
     """
+    threads: list[threading.Thread] = []
     for stream, is_stderr in ((child.stdout, False), (child.stderr, True)):
         if stream is None:
             # A child built without pipes (a test builds one by hand):
             # there is nothing to read.
             continue
-        threading.Thread(
+        thread = threading.Thread(
             target=_forward_lines,
             args=(stream,),
             kwargs={"is_stderr": is_stderr, "watcher": watcher},
             name="code-server-output",
             daemon=True,
-        ).start()
+        )
+        thread.start()
+        threads.append(thread)
+    return threads
 
 
 @dataclass(frozen=True)

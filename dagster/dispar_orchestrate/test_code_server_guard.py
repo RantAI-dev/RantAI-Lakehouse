@@ -29,6 +29,7 @@ Run with:
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import signal
@@ -103,14 +104,16 @@ def _child_printing(script: str, *lines: str) -> subprocess.Popen:
     """A code server that writes `lines` to its output, then waits.
 
     Its stdout and stderr are pipes, so the guard reads them and forwards
-    what it reads.
+    what it reads. The pipes are opened with the SAME options the guard's
+    own child gets (`code_server_guard.CHILD_PIPE_OPTIONS`), so the test
+    reads a child's output exactly the way the guard does.
     """
     return subprocess.Popen(
         [sys.executable, "-c", script, *lines],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        **code_server_guard.CHILD_PIPE_OPTIONS,
     )
 
 
@@ -165,6 +168,24 @@ class _Forwarded:
         captured = self.capsys.readouterr()
         self.out += captured.out
         self.err += captured.err
+
+
+def _wait_until_forwarded(
+    forwarded: _Forwarded, text: str, *, timeout: float = 30.0
+) -> bool:
+    """Waits until `text` shows up in the captured output.
+
+    The reader is a thread: a line reaches the capture a moment after the
+    child wrote it, so a test that looks once can miss it.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        forwarded.collect()
+        if text in forwarded.out or text in forwarded.err:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
 
 
 def _probe_waiting_for(
@@ -801,4 +822,316 @@ def test_the_installed_dagster_source_still_has_the_line_the_matcher_expects() -
     assert (
         "No heartbeat received in {heartbeat_timeout} seconds, shutting down" in text
     ), "the installed Dagster writes another line for the missed heartbeat"
+
+
+# --- the output reader: one undecodable byte must not stop it (PR #636 review 1)
+
+# A child that writes a line the text layer cannot decode, then the
+# missed-heartbeat line, then more output. The bytes are written RAW, so
+# the reader's decoder is the one that has to cope with them: a run's
+# connector output reaches this pipe (the run's process inherits the code
+# server's streams).
+_CHILD_BAD_BYTE_THEN_HEARTBEAT = r"""
+import sys, time
+out = sys.stdout.buffer
+out.write(b"bad \xff line\n")
+out.write(sys.argv[1].encode("utf-8") + b"\n")
+out.write(b"after the bad byte\n")
+out.flush()
+time.sleep(2)
+"""
+
+# A child that writes more than a pipe's buffer (64 KiB) after the bad
+# byte: a reader that stopped at the bad byte leaves the child blocked on
+# a full pipe, forever.
+_CHILD_MANY_BYTES_AFTER_A_BAD_BYTE = r"""
+import sys
+out = sys.stdout.buffer
+out.write(b"bad \xff line\n")
+out.write((b"x" * 1023 + b"\n") * 128)
+out.flush()
+"""
+
+# The undecodable byte, as the reader forwards it: escaped, not dropped.
+ESCAPED_BAD_LINE = "bad \\xff line\n"
+
+
+class _Stream_that_fails_to_decode_once:
+    """A stream whose text layer fails once, then gives its lines.
+
+    A pipe opened with `errors="backslashreplace"` cannot fail this way,
+    but the reader has to survive a stream that does: the pipe it reads
+    is the code server's only way out, and a pipe nobody reads blocks the
+    code server and every run (PR #636 review 1).
+    """
+
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = list(lines)
+        self._failed = False
+
+    def __iter__(self) -> "_Stream_that_fails_to_decode_once":
+        return self
+
+    def __next__(self) -> str:
+        if not self._failed:
+            self._failed = True
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        if not self._lines:
+            raise StopIteration
+        return self._lines.pop(0)
+
+
+def test_the_child_pipes_are_opened_with_a_decoder_that_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The child's pipes are opened with `errors="backslashreplace"`.
+
+    With the default `errors="strict"` ONE byte the encoding cannot show
+    raises `UnicodeDecodeError` in the reader thread, and
+    `UnicodeDecodeError` IS a `ValueError`: the reader caught it and
+    stopped for good (PR #636 review 1).
+    """
+    captured: dict[str, object] = {}
+
+    def fake_popen(*args, **kwargs) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    code_server_guard.spawn_child(
+        host="0.0.0.0",
+        port=4000,
+        module="dispar_orchestrate.definitions",
+        heartbeat_ttl_seconds=300,
+    )
+    assert captured["errors"] == "backslashreplace"
+    assert captured["text"] is True
+
+
+def test_a_child_output_with_an_undecodable_byte_is_read_without_a_warning(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture
+) -> None:
+    """The byte the encoding cannot show is forwarded ESCAPED, and the
+    reader has nothing to report: it did not fail (PR #636 review 1)."""
+    child = _child_printing(_CHILD_BAD_BYTE_THEN_HEARTBEAT, HEARTBEAT_LINE)
+    try:
+        with caplog.at_level(logging.WARNING):
+            threads = code_server_guard.start_output_readers(
+                child, code_server_guard.ShutdownWatcher()
+            )
+            for thread in threads:
+                thread.join(timeout=30)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
+    captured = capsys.readouterr()
+    assert ESCAPED_BAD_LINE in captured.out
+    assert HEARTBEAT_LINE + "\n" in captured.out
+    assert not [
+        record
+        for record in caplog.records
+        if "the code server's output could not be read" in record.message
+    ], [record.message for record in caplog.records]
+
+
+def test_a_non_utf8_line_does_not_stop_the_reader_and_the_heartbeat_line_still_reloads(
+    capsys: pytest.CaptureFixture, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A byte the encoding cannot show does not end the reader.
+
+    The missed-heartbeat line that comes after it is still noticed, every
+    line is forwarded, and the code server ends by itself instead of
+    blocking on a full pipe (PR #636 review 1).
+    """
+    forwarded = _Forwarded(capsys)
+    reloads: list[dict] = []
+    child = _child_printing(_CHILD_BAD_BYTE_THEN_HEARTBEAT, HEARTBEAT_LINE)
+    try:
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(_StopGuard):
+                code_server_guard.run_guard(
+                    _guard_args(_closed_port()),
+                    spawn=lambda **_kwargs: child,
+                    probe_fn=_probe_waiting_for(
+                        forwarded,
+                        HEARTBEAT_LINE,
+                        reloads=reloads,
+                        stop_when_reloads=1,
+                    ),
+                    reload_fn=lambda **kwargs: reloads.append(kwargs),
+                    interval_seconds=0.01,
+                )
+            # The code server must not be blocked on a full pipe: it ends
+            # by itself.
+            try:
+                child.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pytest.fail("the code server was blocked on a full pipe")
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
+    assert child.returncode == 0
+    assert len(reloads) == 1
+    assert _wait_until_forwarded(forwarded, ESCAPED_BAD_LINE)
+    assert _wait_until_forwarded(forwarded, HEARTBEAT_LINE)
+    assert _wait_until_forwarded(forwarded, "after the bad byte\n")
+    assert not [
+        record
+        for record in caplog.records
+        if "the code server's output could not be read" in record.message
+    ], [record.message for record in caplog.records]
+
+
+def test_a_child_that_writes_more_than_a_pipe_buffer_after_a_bad_byte_does_not_block() -> None:
+    """A pipe nobody reads fills up at 64 KiB and blocks the writer.
+
+    The reader keeps draining, so the code server ends by itself
+    (PR #636 review 1).
+    """
+    child = _child_printing(_CHILD_MANY_BYTES_AFTER_A_BAD_BYTE)
+    try:
+        threads = code_server_guard.start_output_readers(
+            child, code_server_guard.ShutdownWatcher()
+        )
+        try:
+            child.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            pytest.fail("the code server was blocked on a full pipe")
+        for thread in threads:
+            thread.join(timeout=30)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
+    assert child.returncode == 0
+
+
+def test_the_reader_keeps_draining_after_the_output_could_not_be_read(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture
+) -> None:
+    """A failure that is not the pipe closing must not end the reader.
+
+    It is logged ONCE, and the lines that come after it still reach the
+    output: the reader is the only thing that keeps the code server's pipe
+    from filling up (PR #636 review 1).
+    """
+    watcher = code_server_guard.ShutdownWatcher()
+    stream = _Stream_that_fails_to_decode_once(["a line after the failure\n"])
+    with caplog.at_level(logging.WARNING):
+        code_server_guard._forward_lines(stream, is_stderr=False, watcher=watcher)
+    captured = capsys.readouterr()
+    assert "a line after the failure\n" in captured.out
+    failures = [
+        record
+        for record in caplog.records
+        if "the code server's output could not be read" in record.message
+    ]
+    assert len(failures) == 1, [record.message for record in caplog.records]
+
+
+def test_the_reader_keeps_draining_when_the_guards_own_output_cannot_be_written(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The guard's own output can go away (a closed stdout): the code
+    server's pipe must still be drained, or the code server blocks on a
+    full pipe (PR #636 review 1)."""
+    watcher = code_server_guard.ShutdownWatcher()
+
+    class ClosedOutput:
+        """The guard's own output, closed under the reader."""
+
+        def write(self, line: str) -> None:
+            raise ValueError("I/O operation on closed file")
+
+        def flush(self) -> None:
+            raise ValueError("I/O operation on closed file")
+
+    forwarder = code_server_guard._Forwarder(ClosedOutput(), watcher)
+    with caplog.at_level(logging.WARNING):
+        forwarder.forward(HEARTBEAT_LINE + "\n")
+        forwarder.forward("another line\n")
+    # The lines are noticed even when they cannot be written: a
+    # missed-heartbeat line still reaches the watcher.
+    assert [line for _, line in watcher.drain()] == [HEARTBEAT_LINE + "\n"]
+    # The failure is reported once, not once per line.
+    warnings = [
+        record
+        for record in caplog.records
+        if "could not be written to" in record.message
+    ]
+    assert len(warnings) == 1, [record.message for record in caplog.records]
+
+
+class _Stream_with_a_raw_side_that_fails_once:
+    """A stream whose text layer fails to decode and whose raw side fails
+    once with an error that is NOT "the pipe closed".
+
+    The reader must not end on that failure: the pipe it reads is the code
+    server's only way out, and a pipe nobody reads blocks the code server
+    and every run (PR #636 review 1).
+    """
+
+    def __init__(self, raw: bytes) -> None:
+        self._raw = raw
+        self._text_failed = False
+        self._raw_failed = False
+
+    def __iter__(self) -> "_Stream_with_a_raw_side_that_fails_once":
+        return self
+
+    def __next__(self) -> str:
+        if not self._text_failed:
+            self._text_failed = True
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        raise StopIteration
+
+    @property
+    def buffer(self) -> "_Stream_with_a_raw_side_that_fails_once":
+        """The raw side of the stream: what the reader falls back to."""
+        return self
+
+    def read1(self, size: int) -> bytes:
+        """The raw bytes, one chunk at a time.
+
+        The first read fails with an error that is NOT "the pipe closed":
+        the reader has to go on and drain the pipe.
+        """
+        if not self._raw_failed:
+            self._raw_failed = True
+            raise OSError(errno.EIO, "Input/output error")
+        chunk, self._raw = self._raw[:size], self._raw[size:]
+        return chunk
+
+
+def test_the_reader_keeps_draining_when_the_raw_copy_fails(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture
+) -> None:
+    """A raw side that fails with something that is NOT "the pipe closed"
+    must not end the reader.
+
+    The failure is reported once and the reader goes on: the line behind
+    the failure still reaches the output and the watcher still notices it
+    (PR #636 review 1).
+    """
+    watcher = code_server_guard.ShutdownWatcher()
+    stream = _Stream_with_a_raw_side_that_fails_once(
+        HEARTBEAT_LINE.encode("utf-8") + b"\n"
+    )
+    with caplog.at_level(logging.WARNING):
+        code_server_guard._forward_lines(stream, is_stderr=False, watcher=watcher)
+    captured = capsys.readouterr()
+    # The reader went on: the line behind the failure reached the output.
+    assert HEARTBEAT_LINE + "\n" in captured.out
+    # ... and the watcher noticed it.
+    assert [line for _, line in watcher.drain()] == [HEARTBEAT_LINE + "\n"]
+    # The failure is reported once, not once per attempt.
+    warnings = [
+        record
+        for record in caplog.records
+        if "raw output could not be read" in record.message
+    ]
+    assert len(warnings) == 1, [record.message for record in caplog.records]
+
 
