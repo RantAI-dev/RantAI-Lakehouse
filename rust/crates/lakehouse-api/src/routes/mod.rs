@@ -688,6 +688,10 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/audit/export.csv",
             get(audit_events::export),
         )
+        // `GOV-1` acceptance follow-up (D2): the person filter's list of
+        // the trail's actors, static ahead of the `{kind}` capture like
+        // the routes above.
+        .route("/api/governance/audit/actors", get(audit_events::actors))
         // DATA-13: column-level lineage. A static path ahead of the
         // `{kind}` capture like `lineage` above (and four segments deep).
         .route(
