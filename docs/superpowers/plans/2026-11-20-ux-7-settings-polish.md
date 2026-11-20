@@ -149,3 +149,23 @@ Notes and deviations:
 - Existing tests that read the old long paragraphs or the `datalist` were updated (download-switch paragraph, "Numbers" heading, schema and pipeline-table suggestions). Added: HelpTip test, a Reporting help-tip test, series-name test, lineage-page test.
 - Not verified: no browser or phone check of the popover and the combobox (happy-dom only); one-line fit of the copy at 384 px was not measured. `bun run lint` and the full `bun run test` were not run (VM memory); CI runs them.
 - `node_modules` symlink used as is; no `bun install`.
+
+## Review (planner, 2026-11-20, at `7b956e9f1`)
+
+No BLOCKER. Lint selector, `TimeZoneSelect` move, `SuggestInput` (free text
+kept, the console's `Combobox`), and the copy are as planned.
+
+- **SHOULD-FIX 1 (rule 4, duplicated helper; the planner's miss in decision
+  4).** `patterns/help-tip.tsx` repeats `patterns/help-hint.tsx` (same
+  popover, hover + press, same surface); only the accessible name and the
+  hover fill differ. `HelpHint` is the pattern the owner already passed in QA
+  (alert and subscriptions dialogs, 2026-11-16): the ⓘ sits at the **end of
+  the one-line helper**, and its accessible name is the detail itself. Use
+  it here too, one look across the app: delete `help-tip.tsx` and its test;
+  in Reporting and query limits put `<HelpHint>` at the end of each help
+  line that has a tip (`<p …>Line. <HelpHint>{detail}</HelpHint></p>`, the
+  way `chart-alert-dialog.tsx` does), with the detail as one string (build
+  it with a template literal where it holds a constant); headings go back to
+  a plain `h2`, and "Number format" back to a plain `Label` with the hint on
+  its help line. Decision 4 is replaced by this. Keep one test that a
+  Reporting hint opens and shows its detail.
