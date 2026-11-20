@@ -129,6 +129,7 @@ mod overview_feed;
 mod pdf_export;
 mod pdf_real_gotenberg;
 mod permission_catalog;
+mod picture_drain;
 mod pipeline_compile_route;
 mod pipeline_definition_save;
 mod pipeline_lag_check;

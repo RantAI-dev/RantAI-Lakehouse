@@ -2900,7 +2900,10 @@ fn sniff_picture_type(bytes: &[u8]) -> Option<&'static str> {
 
 /// The picture kind a path names, from the fixed list. A `match`, never
 /// text put into a path or a column name.
-fn picture_kind(kind: &str) -> Result<ImageKind, ApiError> {
+///
+/// `pub(crate)`, not private: `routes::picture_drain` reads the same list,
+/// so a kind it refuses to drain is a kind the route does not serve.
+pub(crate) fn picture_kind(kind: &str) -> Result<ImageKind, ApiError> {
     match kind {
         "logo" => Ok(ImageKind::Logo),
         "logo-dark" => Ok(ImageKind::LogoDark),
@@ -2919,7 +2922,11 @@ fn picture_label(kind: ImageKind) -> &'static str {
 }
 
 /// The sentence for a picture that breaks the size rule of its kind.
-fn picture_size_sentence(kind: ImageKind) -> &'static str {
+///
+/// `pub(crate)`, not private: `routes::picture_drain` answers a body over
+/// its cap with the same sentence, so the rule the person is told about is
+/// the rule the server keeps.
+pub(crate) fn picture_size_sentence(kind: ImageKind) -> &'static str {
     match kind {
         ImageKind::Icon => ICON_REFUSED,
         ImageKind::Logo | ImageKind::LogoDark => LOGO_SIZE_REFUSED,
