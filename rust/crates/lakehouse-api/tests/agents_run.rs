@@ -571,9 +571,7 @@ async fn write_high_tool_call_ends_waiting_approval_with_a_linked_approval() {
     // restorable, so the generic "cannot be undone" sentence would be false
     // on this very card (`AI-1`, `GOV-13`).
     assert_eq!(
-        risk,
-        "Tindakan berisiko tinggi (WriteHigh): chart masuk tempat sampah dan bisa dipulihkan \
-         selama 30 hari.",
+        risk, "High-risk action: the chart goes to the trash and can be restored for 30 days.",
         "the headless approval stores the same risk sentence as the chat's"
     );
 }

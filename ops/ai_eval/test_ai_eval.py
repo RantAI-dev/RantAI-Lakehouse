@@ -790,6 +790,31 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(names, {"b": "b-123"})
         self.assertEqual(created, [{"kind": "board", "id": "b-123"}])
 
+    def test_the_run_id_makes_an_invite_unique_per_run_without_becoming_a_saved_name(self) -> None:
+        # AI-29..31 review R2: no API deletes an invited user, so the case's
+        # username AND email must be unique per run or the second setup fails.
+        cfg = make_cfg()
+        session = FakeSession({
+            ("POST", "/api/identity/users"): {"id": "u-1", "name": "Eval Colleague"},
+        })
+        setup = [{
+            "name": "colleague_name", "method": "POST", "path": "/api/identity/users",
+            "body": {"name": "Eval Colleague", "username": "eval_colleague_{run_id}",
+                     "email": "eval.colleague.{run_id}@example.com"},
+            "id_at": "name",
+        }]
+        names, created = m.run_setup(cfg, session, setup)
+        self.assertEqual(names, {"colleague_name": "Eval Colleague"})
+        self.assertEqual(created, [], "no API deletes a user")
+        first = session.calls[0][2]
+        self.assertTrue(first["username"].startswith("eval_colleague_"))
+        self.assertNotIn("{run_id}", first["username"])
+        self.assertIn(first["username"][len("eval_colleague_"):], first["email"])
+        m.run_setup(cfg, session, setup)
+        second = session.calls[1][2]
+        self.assertNotEqual(first["username"], second["username"])
+        self.assertNotEqual(first["email"], second["email"])
+
     def test_the_kind_of_a_setup_object_comes_from_its_route(self) -> None:
         self.assertEqual(m.kind_of_path("/api/dashboard/specs"), "chart")
         self.assertEqual(m.kind_of_path("/api/dashboard/boards"), "board")

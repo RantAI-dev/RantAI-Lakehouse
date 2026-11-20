@@ -120,27 +120,28 @@ pub fn is_write_high_pending(value: &Value) -> bool {
     value.get("__write_high_pending__").and_then(Value::as_bool) == Some(true)
 }
 
-/// A short, deterministic Indonesian reason sentence for a [`Risk::WriteHigh`]
+/// A short, deterministic English reason sentence for a [`Risk::WriteHigh`]
 /// approval request — the same "never ask the LLM" discipline as
 /// [`summary_for`], with its own match arms since a `WriteHigh` tool's
-/// phrasing ("menghapus", "tidak dapat dibatalkan") reads differently from
-/// a `WriteLow` confirmation.
+/// phrasing reads differently from a `WriteLow` confirmation. The console is
+/// English; a sentence a person reads on an approval card must be too
+/// (`AI-31`, D11).
 fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
         // BI-18 part C, part 2: a deleted chart goes to the trash, not away.
         "delete_chart" => format!(
-            "Memindahkan chart {} dari dashboard ke tempat sampah; bisa dipulihkan selama 30 hari.",
+            "Moves chart {} from its dashboard to the trash; it can be restored for 30 days.",
             s("id")
         ),
-        "delete_calculated_field" => format!("Menghapus kolom hitung {} secara permanen.", s("id")),
+        "delete_calculated_field" => format!("Deletes calculated field {} permanently.", s("id")),
         // BI-18 part C, part 2: a deleted board and its charts go to the
         // trash, not away.
         "delete_board" => format!(
-            "Memindahkan board {} berikut seluruh chart di dalamnya ke tempat sampah; bisa dipulihkan selama 30 hari.",
+            "Moves dashboard {} and every chart on it to the trash; they can be restored for 30 days.",
             s("id")
         ),
-        "delete_metric" => format!("Menghapus metrik {} secara permanen.", s("id")),
+        "delete_metric" => format!("Deletes metric {} permanently.", s("id")),
         "create_report_subscription" | "update_report_subscription" => {
             let others = args
                 .get("recipients")
@@ -153,50 +154,50 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
                 .flatten()
                 .filter_map(|r| r.get("email").and_then(Value::as_str))
                 .collect();
-            let verb = if spec.name == "create_report_subscription" {
-                "Mengirim laporan terjadwal dashboard"
+            let board_or_id = if s("board").is_empty() {
+                s("id")
             } else {
-                "Mengubah laporan terjadwal"
+                s("board")
             };
-            format!(
-                "{verb} {} ke {others} penerima selain peminta (alamat luar: {}). Penerima melihat data sesuai hak akses peminta, bukan hak Anda.",
-                if s("board").is_empty() {
-                    s("id")
-                } else {
-                    s("board")
-                },
-                if outside.is_empty() {
-                    "tidak ada".to_owned()
-                } else {
-                    outside.join(", ")
-                }
-            )
+            let outside_list = if outside.is_empty() {
+                "none".to_owned()
+            } else {
+                outside.join(", ")
+            };
+            if spec.name == "create_report_subscription" {
+                format!(
+                    "Sends dashboard {board_or_id} as a scheduled report to {others} recipient(s) besides the requester (outside addresses: {outside_list}). Recipients see the data as the requester may see it, not as you may."
+                )
+            } else {
+                format!(
+                    "Changes scheduled report {board_or_id} so it goes to {others} recipient(s) besides the requester (outside addresses: {outside_list}). Recipients see the data as the requester may see it, not as you may."
+                )
+            }
         }
         "delete_report_subscription" => {
-            format!("Menghapus laporan terjadwal {} secara permanen.", s("id"))
+            format!("Deletes scheduled report {} permanently.", s("id"))
         }
         // BI-18 part D (T4): a deleted report goes to the trash, a template away.
         "delete_report" => format!(
-            "Memindahkan laporan {} ke tempat sampah; bisa dipulihkan selama 30 hari.",
+            "Moves report {} to the trash; it can be restored for 30 days.",
             s("id")
         ),
         "delete_template" => format!(
-            "Menghapus template dashboard {} secara permanen; dashboard yang sudah dibuat darinya tetap ada.",
+            "Deletes dashboard template {} permanently; dashboards created from it remain.",
             s("id")
         ),
         "delete_tab" => format!(
-            "Menghapus tab {} dari dashboard {}; chart di dalamnya pindah ke tab pertama.",
+            "Deletes tab {} from dashboard {}; its charts move to the first tab.",
             s("tab"),
             s("board")
         ),
         // BI-26 slice 2 D9: the two WriteHigh embed tools. The first says who
         // can reach the dashboard after it, the second what a viewer may change.
         "enable_embed" | "set_embed_filter_modes" => embed_write_high_reason(spec.name, args),
-        "run_bronze_maintenance" => "Menjalankan maintenance Bronze: menghapus file data/manifest \
-            Iceberg yatim secara permanen (bukan dry run)."
+        "run_bronze_maintenance" => "Runs Bronze maintenance: permanently deletes orphaned Iceberg data and manifest files (not a dry run)."
             .to_owned(),
         "kill_query" => format!(
-            "Menghentikan paksa query ClickHouse {} (KILL QUERY sungguhan).",
+            "Stops ClickHouse query {} by force (a real KILL QUERY).",
             s("id")
         ),
         _ => format!(
@@ -210,6 +211,7 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
 /// `enable_embed` adds and who can then reach the dashboard, and each column
 /// `set_embed_filter_modes` sets with what an embed's viewer may change. Split
 /// out of [`reason_for_write_high`] to keep its match within the line limit.
+/// English, the console's language (`AI-31`, D11).
 fn embed_write_high_reason(name: &str, args: &Map<String, Value>) -> String {
     let board = args
         .get("board")
@@ -224,9 +226,9 @@ fn embed_write_high_reason(name: &str, args: &Map<String, Value>) -> String {
             .filter_map(Value::as_str)
             .collect();
         return format!(
-            "Menjadikan dashboard {board} bisa disematkan di situs {}. Siapa pun yang servernya menandatangani token untuk situs itu dapat menampilkan dashboard ini sebagai peran penonton tetap.",
+            "Makes dashboard {board} embeddable on {}. Anyone whose server signs a token for that site can show this dashboard as a fixed viewer role.",
             if sites.is_empty() {
-                "(belum ada situs)".to_owned()
+                "(no site yet)".to_owned()
             } else {
                 sites.join(", ")
             }
@@ -243,17 +245,18 @@ fn embed_write_high_reason(name: &str, args: &Map<String, Value>) -> String {
         })
         .unwrap_or_default();
     format!(
-        "Mengatur mode filter embed dashboard {board}: {}. Filter editable dapat diubah oleh penonton embed.",
+        "Sets the embed filter modes of dashboard {board}: {}. An embed viewer can change an editable filter.",
         if modes.is_empty() {
-            "(belum ada filter)".to_owned()
+            "(no filter yet)".to_owned()
         } else {
             modes.join(", ")
         }
     )
 }
 
-/// The generic Indonesian risk statement stored on a `WriteHigh` approval: it
-/// tells the reader the action cannot be undone once executed.
+/// The generic risk statement stored on a `WriteHigh` approval: it tells the
+/// reader the action cannot be undone once executed. English, the console's
+/// language (`AI-31`, D11).
 ///
 /// Today it is the sentence [`risk_for_write_high`] gives every `WriteHigh`
 /// tool except `delete_chart`, `delete_board`, `delete_report`,
@@ -264,8 +267,7 @@ fn embed_write_high_reason(name: &str, args: &Map<String, Value>) -> String {
 /// [`WRITE_HIGH_RISK_TRASHED_REPORT`], [`WRITE_HIGH_RISK_PAUSED_PIPELINE`] and
 /// [`WRITE_HIGH_RISK_EMBED_FILTER_MODES`] instead;
 /// [`risk_for_write_high`] picks between the sentences (`AI-1`, `BI-18` part D).
-const WRITE_HIGH_RISK: &str =
-    "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan.";
+const WRITE_HIGH_RISK: &str = "High-risk action: it cannot be undone once it runs.";
 
 /// The risk statement for `delete_chart`: the chart is not gone, it is in the
 /// trash and can be restored, so the generic sentence would contradict the
@@ -276,7 +278,8 @@ const WRITE_HIGH_RISK: &str =
 /// `&'static str` and a `u32` cannot be interpolated into one; the approval
 /// stores the sentence as it stands (`NewApprovalRequest.risk` is a `&str`).
 /// The constant is named here so the two are changed together.
-const WRITE_HIGH_RISK_TRASHED_CHART: &str = "Tindakan berisiko tinggi (WriteHigh): chart masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
+const WRITE_HIGH_RISK_TRASHED_CHART: &str =
+    "High-risk action: the chart goes to the trash and can be restored for 30 days.";
 
 /// The risk statement for `delete_board`: the board and its charts are not
 /// gone, they are in the trash and can be restored, so the generic sentence
@@ -287,7 +290,7 @@ const WRITE_HIGH_RISK_TRASHED_CHART: &str = "Tindakan berisiko tinggi (WriteHigh
 /// `&'static str` and a `u32` cannot be interpolated into one; the approval
 /// stores the sentence as it stands (`NewApprovalRequest.risk` is a `&str`).
 /// The constant is named here so the two are changed together.
-const WRITE_HIGH_RISK_TRASHED_BOARD: &str = "Tindakan berisiko tinggi (WriteHigh): board dan chart-nya masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
+const WRITE_HIGH_RISK_TRASHED_BOARD: &str = "High-risk action: the dashboard and its charts go to the trash and can be restored for 30 days.";
 
 /// The risk statement for `delete_report` (`BI-18` part D): the report is not
 /// gone, it is in the trash and can be restored, so the generic sentence would
@@ -296,7 +299,8 @@ const WRITE_HIGH_RISK_TRASHED_BOARD: &str = "Tindakan berisiko tinggi (WriteHigh
 /// The `30` is the trash's retention, `lakehouse_bi::trash::RETENTION_DAYS`
 /// (30 days), a literal for the reason given at
 /// [`WRITE_HIGH_RISK_TRASHED_CHART`].
-const WRITE_HIGH_RISK_TRASHED_REPORT: &str = "Tindakan berisiko tinggi (WriteHigh): laporan masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
+const WRITE_HIGH_RISK_TRASHED_REPORT: &str =
+    "High-risk action: the report goes to the trash and can be restored for 30 days.";
 
 /// The risk statement for `pause_pipeline`: the pipeline only stops running
 /// until `resume_pipeline` starts it again, so the generic sentence would be
@@ -307,7 +311,8 @@ const WRITE_HIGH_RISK_TRASHED_REPORT: &str = "Tindakan berisiko tinggi (WriteHig
 /// pipeline's status, its Dagster schedule, the chained-pipeline sensor and
 /// the orchestrator reload. The constant is named here so it is changed
 /// together with [`risk_for_write_high`].
-const WRITE_HIGH_RISK_PAUSED_PIPELINE: &str = "Tindakan berisiko tinggi (WriteHigh): pipeline berhenti berjalan sampai dilanjutkan lagi dengan resume.";
+const WRITE_HIGH_RISK_PAUSED_PIPELINE: &str =
+    "High-risk action: the pipeline stops running until it is resumed.";
 
 /// The risk statement for `set_embed_filter_modes`: the modes are an event in
 /// `console.bi_board_embed_event` where the newest event wins, so they can be
@@ -316,17 +321,17 @@ const WRITE_HIGH_RISK_PAUSED_PIPELINE: &str = "Tindakan berisiko tinggi (WriteHi
 ///
 /// The constant is named here so it is changed together with
 /// [`risk_for_write_high`].
-const WRITE_HIGH_RISK_EMBED_FILTER_MODES: &str = "Tindakan berisiko tinggi (WriteHigh): mengubah filter yang dikunci untuk embed; bisa diatur ulang kapan saja.";
+const WRITE_HIGH_RISK_EMBED_FILTER_MODES: &str =
+    "High-risk action: changes the filters locked for embeds; they can be set again at any time.";
 
 /// The risk sentence stored on a `WriteHigh` approval, chosen per tool.
 ///
 /// One sentence for every tool hid the mismatch: `delete_chart`,
 /// `delete_board` and `delete_report` go to the trash and stay restorable,
 /// `pause_pipeline` runs again after a `resume_pipeline`, and
-/// `set_embed_filter_modes` can be set again, so the generic "tidak dapat
-/// dibatalkan" sentence contradicted the reason line on the same card
-/// (`AI-1`). Every other `WriteHigh` tool keeps [`WRITE_HIGH_RISK`] word for
-/// word.
+/// `set_embed_filter_modes` can be set again, so the generic "cannot be
+/// undone" sentence contradicted the reason line on the same card (`AI-1`).
+/// Every other `WriteHigh` tool keeps [`WRITE_HIGH_RISK`] word for word.
 ///
 /// `pub(in crate::routes)`: the headless agent run (`routes::agents`) stores
 /// the same sentence on the approval it creates, so there is one source for
@@ -428,7 +433,7 @@ pub async fn create_write_high_approval(
 /// non-default config is what elevates the tool's risk to `WriteHigh` — see
 /// [`effective_risk`]).
 ///
-/// The format follows the same Indonesian one-liner shape every other
+/// The format follows the same English one-liner shape every other
 /// `WriteLow` arm produces, with the pipeline id and the top-level keys of
 /// `runConfig` when one was supplied. Listing the KEYS (not the values)
 /// matches [`crate::routes::pipelines::record_pipeline_audit`]'s own
@@ -442,18 +447,19 @@ fn pipeline_summary(args: &Map<String, Value>) -> String {
             let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
             keys.sort_unstable();
             let keys_part = if keys.is_empty() {
-                "tanpa kunci konfigurasi".to_owned()
+                "with a runConfig that has no keys".to_owned()
             } else {
-                format!("dengan runConfig ({})", keys.join(", "))
+                format!("with runConfig ({})", keys.join(", "))
             };
-            format!("Menjalankan pipeline {pipeline_id} {keys_part}.")
+            format!("Runs pipeline {pipeline_id} {keys_part}.")
         }
-        _ => format!("Menjalankan pipeline {pipeline_id} dengan konfigurasi bawaan."),
+        _ => format!("Runs pipeline {pipeline_id} with its default configuration."),
     }
 }
 
-/// A short, deterministic Indonesian sentence describing exactly what a
-/// [`Risk::WriteLow`] tool call is about to do, generated from the tool
+/// A short, deterministic English sentence — English is the console's
+/// language (`AI-31`, D11) — describing exactly what a [`Risk::WriteLow`]
+/// tool call is about to do, generated from the tool
 /// name and its (not yet stripped of `confirmed`) arguments — NEVER from
 /// asking the LLM, so the summary can't drift from what will actually
 /// execute. One arm per `WriteLow` tool; an unlisted tool (there is none
@@ -471,29 +477,29 @@ fn look_summary(name: &str, args: &Map<String, Value>) -> String {
     let get = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     let or_same = |key: &str| {
         let v = get(key);
-        if v.is_empty() { "tetap" } else { v }
+        if v.is_empty() { "unchanged" } else { v }
     };
     if name == "format_chart" {
         return format!(
-            "Mengubah tampilan chart {} (format, warna, sumbu, garis acuan).",
+            "Changes how chart {} looks (formats, colours, axes, reference lines).",
             get("chart")
         );
     }
     if name == "set_cache_rule" {
         let rule = match (get("rule"), args.get("minutes").and_then(Value::as_i64)) {
-            ("minutes", Some(n)) => format!("diingat {n} menit"),
-            ("fresh", _) => "selalu segar".to_owned(),
-            _ => "ikut aturan di atasnya".to_owned(),
+            ("minutes", Some(n)) => format!("remembered for {n} minutes"),
+            ("fresh", _) => "always fresh".to_owned(),
+            _ => "following the rule above it".to_owned(),
         };
         let (kind, id) = if get("chart").is_empty() {
             ("dashboard", get("board"))
         } else {
             ("chart", get("chart"))
         };
-        return format!("Mengatur seberapa lama hasil {kind} {id} diingat ({rule}).");
+        return format!("Sets how long the results of {kind} {id} are remembered ({rule}).");
     }
     format!(
-        "Mengatur tema dan font dashboard {} (tema: {}, font: {}).",
+        "Sets the theme and font of dashboard {} (theme: {}, font: {}).",
         get("board"),
         or_same("theme"),
         or_same("font")
@@ -512,14 +518,14 @@ fn board_layout_summary(name: &str, args: &Map<String, Value>) -> String {
             .and_then(Value::as_object)
             .map_or(0, Map::len);
         return format!(
-            "Menata ulang {n} tile pada board {board} (grid 12 kolom, hanya tile yang disebut berubah)."
+            "Rearranges {n} tiles on dashboard {board} (12-column grid; only the tiles named change)."
         );
     }
     let n = args
         .get("filters")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
-    format!("Menyimpan {n} filter sebagai default board {board} untuk semua pengguna.")
+    format!("Saves {n} filters as the default of dashboard {board} for everyone.")
 }
 
 /// The confirmation sentence of the report tools (`RPT-1`): what is scheduled
@@ -530,15 +536,15 @@ fn report_summary(name: &str, args: &Map<String, Value>) -> String {
         .get("schedule")
         .and_then(|v| v.get("kind"))
         .and_then(Value::as_str)
-        .unwrap_or("jadwal yang sama");
+        .unwrap_or("the same schedule");
     if name == "create_report_subscription" {
         format!(
-            "Menjadwalkan laporan dashboard {} ({when}) lewat email ke Anda sendiri.",
+            "Schedules dashboard {} as a report ({when}) by email to you alone.",
             s("board")
         )
     } else {
         format!(
-            "Mengubah laporan terjadwal {} (tanpa penerima baru; penerima yang ada tetap atau berkurang).",
+            "Changes scheduled report {} (no new recipients; the current ones stay or become fewer).",
             s("id")
         )
     }
@@ -557,24 +563,24 @@ fn alert_summary(name: &str, args: &Map<String, Value>) -> String {
             .map_or_else(|| "-".to_owned(), |t| t.to_string())
     };
     let verb = if name == "create_alert_rule" {
-        "Membuat"
+        "Creates"
     } else {
-        "Mengubah"
+        "Changes"
     };
     let watched = if !s("chart").is_empty() {
         let series = if s("series").is_empty() {
             String::new()
         } else {
-            format!(" seri \"{}\"", s("series"))
+            format!(", series \"{}\"", s("series"))
         };
         let rule = match s("condition") {
-            "any_rows" => "bila chart menampilkan baris".to_owned(),
-            "below" => format!("bila nilainya di bawah {}", number()),
-            _ => format!("bila nilainya di atas {}", number()),
+            "any_rows" => "when it shows rows".to_owned(),
+            "below" => format!("when its value is below {}", number()),
+            _ => format!("when its value is above {}", number()),
         };
         format!("chart {}{series}, {rule}", s("chart"))
     } else if !s("metric").is_empty() {
-        format!("metrik {} ({} {})", s("metric"), s("op"), number())
+        format!("metric {} ({} {})", s("metric"), s("op"), number())
     } else if !s("mart").is_empty() {
         format!("{} {} {} ({})", s("mart"), s("measure"), s("agg"), s("op"))
     } else {
@@ -586,12 +592,12 @@ fn alert_summary(name: &str, args: &Map<String, Value>) -> String {
         "webhook"
     };
     let target = if s("target").is_empty() {
-        "alamat Anda".to_owned()
+        "your address".to_owned()
     } else {
         s("target").to_owned()
     };
     format!(
-        "{verb} aturan alert \"{}\" pada {watched}, lewat {channel} ke {target}.",
+        "{verb} alert rule \"{}\" on {watched}, by {channel} to {target}.",
         s("name")
     )
 }
@@ -607,7 +613,7 @@ fn written_summary(name: &str, args: &Map<String, Value>) -> String {
     };
     match name {
         "create_report" => format!(
-            "Membuat laporan \"{}\" dengan {} chart langsung dari dashboard.",
+            "Creates report \"{}\" with {} chart(s) directly from the dashboard.",
             s("title"),
             charts("blocks")
         ),
@@ -615,84 +621,112 @@ fn written_summary(name: &str, args: &Map<String, Value>) -> String {
             let added = charts("append") + usize::from(!s("chart").trim().is_empty());
             if args.contains_key("blocks") {
                 format!(
-                    "Mengganti seluruh isi laporan {} ({} chart).",
+                    "Replaces all contents of report {} ({} chart(s)).",
                     s("id"),
                     charts("blocks")
                 )
             } else if added > 0 || args.contains_key("append") {
                 format!(
-                    "Menambah isi di akhir laporan {} ({added} chart baru).",
+                    "Appends content to report {} ({added} new chart(s)).",
                     s("id")
                 )
             } else {
-                format!("Mengubah laporan {}.", s("id"))
+                format!("Updates report {}.", s("id"))
             }
         }
         _ => format!(
-            "Membuat dashboard baru \"{}\" dari template {}; salinan ini tidak mengubah templatenya.",
+            "Creates a new dashboard \"{}\" from template {}; this copy does not change the template.",
             s("name"),
             s("template")
         ),
     }
 }
 
+/// The `AI-31` (D14) tail of the `create_chart` card: when a chart has layers,
+/// name every extra question's source so the person confirms all of them, not
+/// just the chart's own mart. Empty for a single-question chart, so the card
+/// keeps its one-line shape. Split out of [`summary_for`] to keep its match
+/// within clippy's line limit.
+fn create_chart_layers_part(args: &Map<String, Value>) -> String {
+    let layers: Vec<String> = args
+        .get("layers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|layer| {
+            let l = |key: &str| layer.get(key).and_then(Value::as_str).unwrap_or("");
+            if l("sqlSource").is_empty() {
+                format!("mart {}", l("mart"))
+            } else {
+                format!("SQL source {}", l("sqlSource"))
+            }
+        })
+        .collect();
+    if layers.is_empty() {
+        return String::new();
+    }
+    let noun = if layers.len() == 1 {
+        "question"
+    } else {
+        "questions"
+    };
+    format!(
+        ", with {} more {} from {}",
+        layers.len(),
+        noun,
+        layers.join(", ")
+    )
+}
+
 fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
-        "trigger_lakehouse_build" => {
-            "Menjalankan build ulang lakehouse (Bronze → Silver → Gold).".to_owned()
-        }
+        "trigger_lakehouse_build" => "Rebuilds the lakehouse (Bronze → Silver → Gold).".to_owned(),
         "trigger_pipeline" => pipeline_summary(args),
         "create_chart" => {
             // A chart reads either a mart or a dashboard SQL source; name
-            // whichever one the call actually uses.
+            // whichever one the call actually uses. The layers tail names
+            // every extra question the card makes (`AI-31`, D14).
             let from = if s("sqlSource").is_empty() {
                 format!("mart {}", s("mart"))
             } else {
                 format!("SQL source {}", s("sqlSource"))
             };
             format!(
-                "Membuat chart baru \"{}\" ({}) dari {from}.",
+                "Creates a new chart \"{}\" ({}) from {from}{}.",
                 s("title"),
-                s("kind")
+                s("kind"),
+                create_chart_layers_part(args)
             )
         }
         "update_chart" => format!(
-            "Mengubah chart {} menjadi \"{}\" ({}).",
+            "Changes chart {} to \"{}\" ({}).",
             s("id"),
             s("title"),
             s("kind")
         ),
         "format_chart" | "set_dashboard_theme" | "set_cache_rule" => look_summary(spec.name, args),
-        "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
-        "create_tab" => format!(
-            "Menambah tab \"{}\" pada dashboard {}.",
-            s("title"),
-            s("board")
-        ),
+        "create_board" => format!("Creates a new dashboard named \"{}\".", s("name")),
+        "create_tab" => format!("Adds tab \"{}\" to dashboard {}.", s("title"), s("board")),
         "rename_tab" => format!(
-            "Mengganti nama tab {} pada dashboard {} menjadi \"{}\".",
+            "Renames tab {} on dashboard {} to \"{}\".",
             s("tab"),
             s("board"),
             s("title")
         ),
         "move_charts_to_tab" => format!(
-            "Memindahkan chart ke tab {} pada dashboard {}.",
+            "Moves charts to tab {} on dashboard {}.",
             s("tab"),
             s("board")
         ),
-        "move_tab" => format!("Mengubah urutan tab pada dashboard {}.", s("board")),
-        "rename_board" => format!(
-            "Mengganti nama board {} menjadi \"{}\".",
-            s("id"),
-            s("name")
-        ),
+        "move_tab" => format!("Changes the order of the tabs on dashboard {}.", s("board")),
+        "rename_board" => format!("Renames dashboard {} to \"{}\".", s("id"), s("name")),
         "arrange_board" | "save_board_filters" => board_layout_summary(spec.name, args),
-        "move_chart" => format!("Memindahkan chart {} ke board {}.", s("id"), s("board")),
+        "move_chart" => format!("Moves chart {} to dashboard {}.", s("id"), s("board")),
         // BI-26 slice 2 D9: the Confirm card's text for the one embed write
         // that only narrows access.
         "withdraw_embed_tokens" => format!(
-            "Menarik semua token embed dashboard {}; token yang ditandatangani sebelum sekarang tidak berlaku lagi.",
+            "Withdraws every embed token of dashboard {}; tokens signed before now stop working.",
             s("board")
         ),
         "create_report_subscription" | "update_report_subscription" => {
@@ -704,7 +738,7 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             written_summary(spec.name, args)
         }
         "create_calculated_field" => format!(
-            "Membuat kolom hitung \"{}\" = {} (pada {}).",
+            "Creates calculated field \"{}\" = {} (on {}).",
             s("name"),
             s("formula"),
             if s("sqlSource").is_empty() {
@@ -714,12 +748,12 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             }
         ),
         "update_calculated_field" => format!(
-            "Mengubah rumus kolom hitung {} menjadi {}.",
+            "Changes the formula of calculated field {} to {}.",
             s("id"),
             s("formula")
         ),
         "create_metric" => format!(
-            "Membuat metrik \"{}\" = {} (pada {}).",
+            "Creates metric \"{}\" = {} (on {}).",
             s("name"),
             s("formula"),
             if s("sqlSource").is_empty() {
@@ -729,7 +763,7 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             }
         ),
         "update_metric" => format!(
-            "Mengubah metrik {} menjadi {}; semua chart yang memakainya ikut berubah.",
+            "Changes metric {} to {}; every chart that uses it changes too.",
             s("id"),
             s("formula")
         ),
@@ -1107,13 +1141,13 @@ mod tests {
         args.insert("sqlSource".to_owned(), Value::from("s_1234abcd"));
         assert_eq!(
             summary_for(spec("create_chart"), &args),
-            "Membuat chart baru \"T\" (bar) dari SQL source s_1234abcd."
+            "Creates a new chart \"T\" (bar) from SQL source s_1234abcd."
         );
         args.remove("sqlSource");
         args.insert("mart".to_owned(), Value::from("mart_x"));
         assert_eq!(
             summary_for(spec("create_chart"), &args),
-            "Membuat chart baru \"T\" (bar) dari mart mart_x."
+            "Creates a new chart \"T\" (bar) from mart mart_x."
         );
     }
 
@@ -1245,7 +1279,7 @@ mod tests {
             decide(true, Some(&perms), spec("create_chart"), &args).expect("must not execute");
         assert_eq!(
             result["summary"],
-            json!("Membuat chart baru \"Kunjungan Harian\" (bar) dari mart mart_wisman.")
+            json!("Creates a new chart \"Kunjungan Harian\" (bar) from mart mart_wisman.")
         );
         args.remove("mart");
         args.insert("sqlSource".to_owned(), json!("s_1"));
@@ -1253,7 +1287,7 @@ mod tests {
             decide(true, Some(&perms), spec("create_chart"), &args).expect("must not execute");
         assert_eq!(
             result["summary"],
-            json!("Membuat chart baru \"Kunjungan Harian\" (bar) dari SQL source s_1.")
+            json!("Creates a new chart \"Kunjungan Harian\" (bar) from SQL source s_1.")
         );
     }
 
@@ -1262,7 +1296,7 @@ mod tests {
     /// gate summary names the id AND the top-level keys of `runConfig`
     /// when one is supplied — a model that did not see the id or the
     /// config keys in its confirmation was confirming in the dark. The
-    /// arm follows the existing Indonesian one-liner shape
+    /// arm follows the existing English one-liner shape
     /// ([`summary_for`]'s other `WriteLow` arms) so a UI rendering one
     /// arm renders the other the same way.
     ///
@@ -1425,13 +1459,13 @@ mod tests {
         let risk = risk_for_write_high(spec("delete_chart"));
         assert_eq!(
             risk,
-            "Tindakan berisiko tinggi (WriteHigh): chart masuk tempat sampah dan bisa dipulihkan selama 30 hari."
+            "High-risk action: the chart goes to the trash and can be restored for 30 days."
         );
         assert!(
-            !risk.contains("tidak dapat dibatalkan"),
+            !risk.contains("cannot be undone"),
             "the card must not say the action cannot be undone: {risk}"
         );
-        assert!(risk.contains("30 hari"), "{risk}");
+        assert!(risk.contains("30 days"), "{risk}");
     }
 
     /// `BI-18` part D (OPS-32 merge, aligned with #525): a deleted report is in
@@ -1442,9 +1476,13 @@ mod tests {
         let risk = risk_for_write_high(spec("delete_report"));
         assert_eq!(
             risk,
-            "Tindakan berisiko tinggi (WriteHigh): laporan masuk tempat sampah dan bisa dipulihkan selama 30 hari."
+            "High-risk action: the report goes to the trash and can be restored for 30 days."
         );
-        assert!(!risk.contains("tidak dapat dibatalkan"), "{risk}");
+        assert!(
+            !risk.contains("cannot be undone"),
+            "the card must not say the action cannot be undone: {risk}"
+        );
+        assert!(risk.contains("30 days"), "{risk}");
     }
 
     /// The card a person reads before approving a board deletion must not
@@ -1458,21 +1496,21 @@ mod tests {
         let risk = risk_for_write_high(spec("delete_board"));
         assert_eq!(
             risk,
-            "Tindakan berisiko tinggi (WriteHigh): board dan chart-nya masuk tempat sampah dan bisa dipulihkan selama 30 hari."
+            "High-risk action: the dashboard and its charts go to the trash and can be restored for 30 days."
         );
         let reason = reason_for_write_high(spec("delete_board"), &args);
         assert!(
             reason.contains("b1"),
             "the reason must name the board: {reason}"
         );
-        assert!(reason.contains("30 hari"), "{reason}");
+        assert!(reason.contains("30 days"), "{reason}");
         for sentence in [risk, reason.as_str()] {
             assert!(
-                !sentence.contains("permanen"),
+                !sentence.contains("permanently"),
                 "the card must not say the board is permanent: {sentence}"
             );
             assert!(
-                !sentence.contains("tidak dapat dibatalkan"),
+                !sentence.contains("cannot be undone"),
                 "the card must not say the action cannot be undone: {sentence}"
             );
         }
@@ -1493,7 +1531,7 @@ mod tests {
         ] {
             assert_eq!(
                 risk_for_write_high(spec(name)),
-                "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan.",
+                "High-risk action: it cannot be undone once it runs.",
                 "{name}"
             );
         }
@@ -1513,10 +1551,10 @@ mod tests {
         let risk = risk_for_write_high(spec("pause_pipeline"));
         assert_eq!(
             risk,
-            "Tindakan berisiko tinggi (WriteHigh): pipeline berhenti berjalan sampai dilanjutkan lagi dengan resume."
+            "High-risk action: the pipeline stops running until it is resumed."
         );
         assert!(
-            !risk.contains("tidak dapat dibatalkan"),
+            !risk.contains("cannot be undone"),
             "the card must not say the action cannot be undone: {risk}"
         );
     }
@@ -1530,10 +1568,10 @@ mod tests {
         let risk = risk_for_write_high(spec("set_embed_filter_modes"));
         assert_eq!(
             risk,
-            "Tindakan berisiko tinggi (WriteHigh): mengubah filter yang dikunci untuk embed; bisa diatur ulang kapan saja."
+            "High-risk action: changes the filters locked for embeds; they can be set again at any time."
         );
         assert!(
-            !risk.contains("tidak dapat dibatalkan"),
+            !risk.contains("cannot be undone"),
             "the card must not say the action cannot be undone: {risk}"
         );
     }
@@ -1547,7 +1585,7 @@ mod tests {
     fn enabling_an_embed_keeps_the_generic_risk_sentence() {
         assert_eq!(
             risk_for_write_high(spec("enable_embed")),
-            "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan."
+            "High-risk action: it cannot be undone once it runs."
         );
     }
 
@@ -1914,5 +1952,66 @@ mod tests {
             None,
             "query:read is enough for run_sql, as before"
         );
+    }
+
+    /// `AI-31` (D14): a layered chart asks more than one question, and the
+    /// card the person confirms must name every one of them — not just the
+    /// chart's own mart. The summary lists each extra question's source in
+    /// the order the layers were given.
+    #[test]
+    fn a_chart_with_layers_names_each_question_on_its_card() {
+        let mut args = Map::new();
+        args.insert("title".to_owned(), json!("T"));
+        args.insert("kind".to_owned(), json!("bar"));
+        args.insert("mart".to_owned(), json!("mart_x"));
+        args.insert(
+            "layers".to_owned(),
+            json!([
+                { "mart": "mart_y", "measure": "y", "draw": "bar", "axis": "left" },
+                { "sqlSource": "s_1", "measure": "s", "draw": "line", "axis": "right" },
+            ]),
+        );
+        assert_eq!(
+            summary_for(spec("create_chart"), &args),
+            "Creates a new chart \"T\" (bar) from mart mart_x, with 2 more questions from mart mart_y, SQL source s_1."
+        );
+    }
+
+    /// `AI-31` (D11): the console is English, so every sentence a confirmation
+    /// or approval card shows must be English. Build every `WriteLow` summary
+    /// and every `WriteHigh` reason/risk over the registry with empty args;
+    /// none may contain an Indonesian word from the old cards.
+    #[test]
+    fn no_card_sentence_contains_an_indonesian_word() {
+        let banned = [
+            "Membuat",
+            "Mengubah",
+            "Menghapus",
+            "Memindahkan",
+            "Menjalankan",
+            "Tindakan",
+            "dengan",
+            "tidak",
+        ];
+        let empty = Map::new();
+        for tool in registry::TOOLS {
+            let sentences: Vec<String> = match tool.risk {
+                Risk::WriteLow => vec![summary_for(tool, &empty)],
+                Risk::WriteHigh => vec![
+                    reason_for_write_high(tool, &empty),
+                    risk_for_write_high(tool).to_owned(),
+                ],
+                Risk::Read => Vec::new(),
+            };
+            for sentence in sentences {
+                for word in banned {
+                    assert!(
+                        !sentence.contains(word),
+                        "{} card sentence contains {word:?}: {sentence}",
+                        tool.name
+                    );
+                }
+            }
+        }
     }
 }

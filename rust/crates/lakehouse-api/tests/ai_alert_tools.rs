@@ -448,8 +448,10 @@ async fn ask_mode_refuses_and_an_unconfirmed_call_names_the_chart_and_condition(
         summary.contains(CHART),
         "the card names the chart: {summary}"
     );
+    // AI-31 D11: the confirmation card is English, the console's language.
+    // The old assertion pinned the Indonesian "di bawah" and failed CI.
     assert!(
-        summary.contains("di bawah") && summary.contains("1000"),
+        summary.contains("when its value is below 1000"),
         "the card names the condition and the threshold: {summary}"
     );
     assert!(saved(&f).is_empty(), "nothing was saved before the Confirm");

@@ -126,6 +126,49 @@ fn view_pairs(args: &Map<String, Value>) -> Result<Vec<(&'static str, String)>, 
     Ok(out)
 }
 
+/// `AI-30` (D9): fill a PDF export of the dashboard on screen with that screen's
+/// filters, when the call names the same board and sends no view of its own.
+/// Pure, so the rule is testable without an app; the gate and the export tool
+/// still check the filters afterwards. Parameters and grain stay the model's
+/// to supply — only filters come from the screen.
+pub(in crate::routes::ai) fn with_screen_filters(
+    name: &str,
+    args: &Map<String, Value>,
+    view: Option<(&str, &[Value])>,
+) -> Map<String, Value> {
+    let Some((board, filters)) = view else {
+        return args.clone();
+    };
+    let format = args.get("format").and_then(Value::as_str).unwrap_or("");
+    let same_board = args
+        .get("board")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        == board;
+    if name != "export_dashboard"
+        || (!format.is_empty() && format != "pdf")
+        || !same_board
+        || args.contains_key("filters")
+        || args.contains_key("params")
+        || args.contains_key("grain")
+        || filters.is_empty()
+    {
+        return args.clone();
+    }
+    let mut filled = args.clone();
+    filled.insert("filters".to_owned(), Value::Array(filters.to_vec()));
+    filled
+}
+
+/// The number of filters a PDF link carries (`AI-30`), zero when the call sent
+/// none. Split out of [`export_dashboard`] to keep it under clippy's line limit.
+fn applied_filter_count(args: &Map<String, Value>) -> usize {
+    args.get("filters")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+}
+
 /// Refuse a parameter name or a filter column the dashboard does not have, with
 /// a sentence the model can fix (BI-1 QA fix A1: `ukuren_demo` for `ukuran_demo`
 /// was passed into the link and failed only when the person opened it).
@@ -323,6 +366,9 @@ async fn export_dashboard(
         "url": link("/api/dashboard/export/pdf", &pairs),
         "fileName": format!("{}-{date}.pdf", file_slug(name, "dashboard")),
         "format": "pdf",
+        // `AI-30`: how many filters made it into the link, so the caller can
+        // say the file matches the screen only when that is true.
+        "appliedFilters": applied_filter_count(args),
         "note": "Give the person this link; the PDF is made when they open it, with their own permissions.",
     })
 }
@@ -431,6 +477,80 @@ mod tests {
         assert_eq!(
             link("/api/x", &[("board", "a b&c=d"), ("paper", "a4")]),
             "/api/x?board=a+b%26c%3Dd&paper=a4"
+        );
+    }
+
+    fn call_args(v: &Value) -> Map<String, Value> {
+        v.as_object().expect("an object").clone()
+    }
+
+    /// `AI-30` (D9): the screen's filters fill a PDF of its own dashboard,
+    /// leaving every other argument alone.
+    #[test]
+    fn the_screens_filters_fill_a_pdf_export_of_the_same_board() {
+        let filters = vec![json!({ "column": "region", "values": ["West"] })];
+        let args = call_args(&json!({ "board": "b1", "paper": "a4" }));
+        let filled = with_screen_filters("export_dashboard", &args, Some(("b1", &filters)));
+        assert_eq!(filled["filters"], Value::Array(filters));
+        assert_eq!(filled["paper"], json!("a4"));
+        assert_eq!(args.get("filters"), None, "the caller's map is not changed");
+    }
+
+    /// `AI-30`: a filter list is never borrowed from another dashboard.
+    #[test]
+    fn another_boards_filters_are_not_used() {
+        let filters = vec![json!({ "column": "region", "values": ["West"] })];
+        let args = call_args(&json!({ "board": "b2" }));
+        assert_eq!(
+            with_screen_filters("export_dashboard", &args, Some(("b1", &filters))),
+            args
+        );
+    }
+
+    /// `AI-30`: the model's own view wins over the screen's.
+    #[test]
+    fn a_call_sending_its_own_filters_params_or_grain_is_not_filled() {
+        let filters = vec![json!({ "column": "region", "values": ["West"] })];
+        for own in [
+            json!({ "filters": [] }),
+            json!({ "params": { "target": 20000 } }),
+            json!({ "grain": "month" }),
+        ] {
+            let mut base = call_args(&json!({ "board": "b1" }));
+            base.extend(own.as_object().expect("an object").clone());
+            assert_eq!(
+                with_screen_filters("export_dashboard", &base, Some(("b1", &filters))),
+                base,
+                "{own}"
+            );
+        }
+    }
+
+    /// `AI-30`: only a PDF of the dashboard on screen is filled.
+    #[test]
+    fn a_file_export_and_a_chart_export_are_not_filled() {
+        let filters = vec![json!({ "column": "region", "values": ["West"] })];
+        let file = call_args(&json!({ "board": "b1", "format": "file" }));
+        assert_eq!(
+            with_screen_filters("export_dashboard", &file, Some(("b1", &filters))),
+            file
+        );
+        let chart = call_args(&json!({ "chart": "c1", "board": "b1" }));
+        assert_eq!(
+            with_screen_filters("export_chart", &chart, Some(("b1", &filters))),
+            chart
+        );
+    }
+
+    /// `AI-30`: no view, or a screen with no active filters, changes nothing.
+    #[test]
+    fn no_screen_or_no_filters_changes_nothing() {
+        let none: Vec<Value> = Vec::new();
+        let args = call_args(&json!({ "board": "b1" }));
+        assert_eq!(with_screen_filters("export_dashboard", &args, None), args);
+        assert_eq!(
+            with_screen_filters("export_dashboard", &args, Some(("b1", &none))),
+            args
         );
     }
 
