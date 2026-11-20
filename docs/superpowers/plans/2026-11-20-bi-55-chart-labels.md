@@ -345,3 +345,12 @@ No `cargo test --workspace`/workspace clippy — CI's job, per the developer bri
   dependency cache wiped.
 
 ## Review
+
+### Round 1 — planner review, 2026-11-20, at `647fe2e92`
+
+**No finding.** The four Excel sites write the text as it is
+(`csv_export::plain_text`), through `write_string*`, which always makes a
+typed string cell; CSV and TSV keep `neutralise`. The new test asserts the
+formula-looking texts are in the sheet with no apostrophe and no formula
+element; the changed assertions fail on the old code. The handoff's one
+`it` Docker timeout and two container cases are left to CI.
