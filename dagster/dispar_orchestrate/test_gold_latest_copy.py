@@ -160,6 +160,21 @@ class _MainTable:
         return MagicMock(to_arrow=MagicMock(return_value=self.copy_frame))
 
 
+class _HeldScanFailingTable(_LatestTable):
+    """DATA-6 review R3: reading the held copy's stamp throws (an
+    object-store error), before any write was attempted."""
+
+    def scan(self, selected_fields=None, limit=None, row_filter=None) -> object:
+        raise RuntimeError("object store refused the held-copy scan")
+
+
+class _MainScanFailingTable(_MainTable):
+    """DATA-6 review R3: reading this publish's rows throws."""
+
+    def scan(self, row_filter=None) -> object:
+        raise RuntimeError("object store refused the publish scan")
+
+
 class _Catalog:
     def __init__(self, main: _MainTable, latest: _LatestTable | None) -> None:
         self.main = main
@@ -430,6 +445,49 @@ class LatestCopyRefreshTests(unittest.TestCase):
         self.assertEqual(row["rows"], 5)
         self.assertIsNone(row["snapshot_id"])
         self.assertEqual(row["cleanup"], gold_latest_copy.CLEANUP_RELOAD_FAILED)
+
+    def test_a_failed_held_copy_read_records_catalog_unavailable_and_one_row(self) -> None:
+        """DATA-6 review R3: the held-copy scan sits outside the write's
+        try/except. A read error must still produce exactly one run row
+        with a fixed reason, never exception text."""
+        latest = _HeldScanFailingTable(
+            properties={gold_latest_copy.LATEST_COPY_OF_PROPERTY: TABLE},
+            schema_=_MAIN_SCHEMA,
+            held_micros=COPY_MICROS - 2_000_000,
+        )
+        main = _MainTable(_MAIN_SCHEMA, copy_frame=_arrow_frame(COPY_MICROS, 5))
+        catalog = _Catalog(main, latest)
+        recorded: list[dict] = []
+
+        result = self._refresh(_cfg(), _req(), catalog, recorded)
+
+        self.assertEqual(result, {"status": "failed", "reason": "catalog_unavailable"})
+        self.assertIsNone(latest.tx, "nothing was written")
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0]["status"], "failed")
+        self.assertEqual(recorded[0]["reason"], "catalog_unavailable")
+        self.assertNotIn("object store", str(recorded))
+
+    def test_a_failed_publish_read_records_catalog_unavailable_and_one_row(self) -> None:
+        """DATA-6 review R3: the publish's own row scan has the same fixed-
+        reason obligation (D12) as the held-copy read above."""
+        latest = _LatestTable(
+            properties={gold_latest_copy.LATEST_COPY_OF_PROPERTY: TABLE},
+            schema_=_MAIN_SCHEMA,
+            held_micros=COPY_MICROS - 2_000_000,
+        )
+        main = _MainScanFailingTable(_MAIN_SCHEMA, copy_frame=_arrow_frame(COPY_MICROS, 5))
+        catalog = _Catalog(main, latest)
+        recorded: list[dict] = []
+
+        result = self._refresh(_cfg(), _req(), catalog, recorded)
+
+        self.assertEqual(result, {"status": "failed", "reason": "catalog_unavailable"})
+        self.assertIsNone(latest.tx, "nothing was written")
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0]["status"], "failed")
+        self.assertEqual(recorded[0]["reason"], "catalog_unavailable")
+        self.assertNotIn("object store", str(recorded))
 
     def test_a_row_count_that_differs_from_the_publish_records_copy_incomplete(self) -> None:
         for rows in (0, 4):

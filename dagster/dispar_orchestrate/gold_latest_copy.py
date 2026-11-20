@@ -362,7 +362,16 @@ def refresh_latest_copy(
             return {"status": "failed", "reason": REASON_SCHEMA_INCOMPATIBLE}
         # Never backwards (D9): the latest table holds one whole copy by
         # construction, so any row's stamp is the held copy's stamp.
-        held = latest.scan(selected_fields=("_exported_at",), limit=1).to_arrow()
+        # DATA-6 review R3: the scan is a catalog/object-store read and can
+        # throw; with no record row D12 would be broken. Wrap it in the
+        # fixed-reason pattern, detail to the log only.
+        try:
+            held = latest.scan(selected_fields=("_exported_at",), limit=1).to_arrow()
+        except Exception as exc:  # noqa: BLE001
+            if log:
+                log.error(f"the held copy of gold.{req.latest_table} could not be read: {exc}")
+            record("failed", REASON_CATALOG_UNAVAILABLE)
+            return {"status": "failed", "reason": REASON_CATALOG_UNAVAILABLE}
         if held.num_rows:
             held_micros = _exported_at_as_micros(held.column("_exported_at").to_pylist()[0])
             if held_micros > req.copy_exported_at_micros:
@@ -387,9 +396,18 @@ def refresh_latest_copy(
     # ClickHouse.
     from pyiceberg.expressions import EqualTo
 
-    df = main.scan(
-        row_filter=EqualTo("_exported_at", req.copy_exported_at_micros)
-    ).to_arrow()
+    # DATA-6 review R3: this second scan is also outside the write's
+    # try/except. An object-store error here must still record exactly one
+    # row (D12), with a fixed reason and the exception detail in the log.
+    try:
+        df = main.scan(
+            row_filter=EqualTo("_exported_at", req.copy_exported_at_micros)
+        ).to_arrow()
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log.error(f"the copy of gold.{req.table} could not be read: {exc}")
+        record("failed", REASON_CATALOG_UNAVAILABLE)
+        return {"status": "failed", "reason": REASON_CATALOG_UNAVAILABLE}
     if df.num_rows != req.rows:
         if log:
             log.error(
