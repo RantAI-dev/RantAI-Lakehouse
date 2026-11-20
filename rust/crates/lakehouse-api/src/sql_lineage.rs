@@ -161,6 +161,11 @@ struct Entry {
 struct Scope<'a> {
     entries: Vec<Entry>,
     known: &'a HashMap<String, Vec<String>>,
+    /// Aliases of other projection items, with the index that defines each
+    /// (`DATA-57` D6). An unqualified name that is one of them is read by
+    /// `ClickHouse` as the alias, not as a column of `FROM`.
+    aliases: Vec<(String, usize)>,
+    current_item: usize,
 }
 
 /// One output slot, before it is split into mappings and partials.
@@ -254,6 +259,8 @@ const MSG_CTE_UNREADABLE: &str =
     "read through a WITH name whose query cannot be read, which is not traced";
 const MSG_CTE_CASE: &str =
     "the name differs from a WITH name only in letter case, which is not traced";
+const MSG_ALIAS_CAPTURE: &str =
+    "the name is also an alias in this SELECT, and ClickHouse reads the alias; rename one";
 
 /// What one statement writes (`INSERT` and `CREATE TABLE ... AS`), an
 /// `INSERT`'s explicit column list, and the query that fills it.
@@ -412,6 +419,26 @@ fn table_key(name: &ObjectName) -> String {
     canonicalize(&parts)
 }
 
+/// Aliases of the projection items of one `SELECT`, with their index. `id AS
+/// id` names the column itself and is not a capture (`DATA-57` D6); every
+/// other alias hides that spelling for an unqualified read in another item.
+fn projection_aliases(projection: &[SelectItem]) -> Vec<(String, usize)> {
+    projection
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            SelectItem::ExprWithAlias { expr, alias } => {
+                if matches!(unwrap_nested(expr), Expr::Identifier(id) if id.value == alias.value) {
+                    None
+                } else {
+                    Some((alias.value.clone(), index))
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The outputs of a query: read its own `WITH` in order, then its body. The
 /// CTEs of a `WITH` are visible to the ones after them and to the body, and a
 /// nested `WITH` shadows an outer name of the same spelling (`DATA-57` D1, D2).
@@ -490,12 +517,15 @@ fn outputs_of_body(
 ) -> Result<Vec<Out>, Unmappable> {
     match body {
         SetExpr::Select(select) => {
-            let scope = Scope {
+            let mut scope = Scope {
                 entries: select_entries(&select.from, env),
                 known,
+                aliases: projection_aliases(&select.projection),
+                current_item: 0,
             };
             let mut outs = Vec::new();
-            for item in &select.projection {
+            for (index, item) in select.projection.iter().enumerate() {
+                scope.current_item = index;
                 outs.extend(outputs_of_item(item, &scope));
             }
             Ok(outs)
@@ -1017,6 +1047,14 @@ fn resolve_qualified(column: &str, qualifier: &[Ident], scope: &Scope<'_>) -> Re
 }
 
 fn resolve_unqualified(column: &str, scope: &Scope<'_>) -> Result<Read, String> {
+    // `ClickHouse` reads an unqualified name that is another item's alias as
+    // that alias, so mapping it to a `FROM` column would be a wrong edge
+    // (`DATA-57` D6). A qualified name and the item's own alias are not.
+    if let Some((_, owner)) = scope.aliases.iter().find(|(name, _)| name == column)
+        && *owner != scope.current_item
+    {
+        return Err(MSG_ALIAS_CAPTURE.to_owned());
+    }
     // A source whose columns are not traced might hold this name too, so no
     // table can be named for it.
     let opaque = scope.entries.iter().find_map(|e| match &e.source {
@@ -1557,6 +1595,60 @@ mod tests {
             ]
         );
         assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    // DATA-57 T3: an alias of another item captures an unqualified name (D6).
+
+    #[test]
+    fn an_alias_of_another_item_captures_an_unqualified_name() {
+        let l = run("SELECT Amount AS id, id AS original FROM silver.orders");
+        assert_eq!(triples(&l), vec![t("id", "silver.orders.Amount", "copy")]);
+        assert_eq!(
+            reasons(&l),
+            vec![("original".to_owned(), MSG_ALIAS_CAPTURE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_same_capture_inside_a_cte_is_carried_through() {
+        let l = run(
+            "WITH c AS (SELECT Amount AS id, id AS original FROM silver.orders) \
+             SELECT original FROM c",
+        );
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("original".to_owned(), MSG_ALIAS_CAPTURE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_items_own_alias_and_a_qualified_name_are_not_captured() {
+        let l = run(
+            "SELECT CAST(Amount AS Float64) AS Amount, o.id AS region_id, o.region AS id \
+             FROM silver.orders AS o",
+        );
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("Amount", "silver.orders.Amount", "cast"),
+                t("region_id", "silver.orders.id", "copy"),
+                t("id", "silver.orders.region", "copy"),
+            ]
+        );
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn id_as_id_does_not_capture() {
+        let l = run("SELECT id AS id, id + 1 AS next FROM silver.orders");
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("id", "silver.orders.id", "copy"),
+                t("next", "silver.orders.id", "expression"),
+            ]
+        );
     }
 
     #[test]
