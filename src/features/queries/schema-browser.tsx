@@ -5,6 +5,7 @@ import { ChevronDown, ChevronRight, Lock, RotateCcw, X } from "lucide-react"
 
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { quoteIdent, NO_READABLE_TABLE } from "@/lib/asset-query"
 import type { CompletionTable } from "@/lib/sql-completion"
 import { DATA_LAYER_LABEL, type DataLayer } from "@/lib/status"
@@ -53,6 +54,18 @@ export function SchemaBrowser({
 }) {
   const { assetsState, tables, columns, engine, loadColumns, insertAtCursor, proofs } = studio
   const [expanded, setExpanded] = React.useState<ReadonlySet<string>>(new Set())
+  // QS-11 (LH-QS-1-07), D10: a local, contains-match filter over the labels
+  // and SQL references the browser already holds. It is not stored: a search
+  // is a moment's narrowing, not a preference.
+  const [search, setSearch] = React.useState("")
+  const needle = search.trim().toLowerCase()
+  const matched = needle
+    ? tables.filter(
+        (table) =>
+          table.label.toLowerCase().includes(needle) ||
+          table.reference.toLowerCase().includes(needle)
+      )
+    : tables
 
   const toggle = (id: string) => {
     const opening = !expanded.has(id)
@@ -81,6 +94,16 @@ export function SchemaBrowser({
           <X className="size-4" aria-hidden />
         </Button>
       </div>
+      {assetsState.status === "success" && tables.length > 0 ? (
+        <div className="border-b border-border px-3 py-2">
+          <Input
+            aria-label="Search tables"
+            placeholder="Search tables"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+        </div>
+      ) : null}
       <div className="min-h-0 flex-1 overflow-y-auto p-2 text-sm">
         {assetsState.status === "loading" ? (
           <LoadingSkeleton rows={4} />
@@ -101,9 +124,13 @@ export function SchemaBrowser({
           )
         ) : tables.length === 0 ? (
           <p className="px-2 py-4 text-muted-foreground">The catalog shows no tables.</p>
+        ) : matched.length === 0 ? (
+          // QS-11 (LH-QS-1-07), D10: say the search found nothing rather than
+          // drawing an empty browser that looks like a broken catalog.
+          <p className="px-2 py-4 text-muted-foreground">No table matches "{search}".</p>
         ) : (
           LAYERS.map((layer) => {
-            const inLayer = tables.filter((table) => table.layer === layer)
+            const inLayer = matched.filter((table) => table.layer === layer)
             if (inLayer.length === 0) return null
             return (
               <section key={layer} className="mb-3">
