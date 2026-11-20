@@ -520,6 +520,66 @@ pages were opened in a browser and in which theme, or *not verified*.
 
 *(the developer appends one entry per round)*
 
+### Round 1 — all ten tasks (Hy4 flash, 2026-11-20)
+
+Branch `bld-11-pipeline-page`, base `eafff51e3`; one commit per task, pushed
+after each. No PR opened (developer never opens/merges). No migration, no
+Python, no compose, no assistant change.
+
+| Task | Commit | Scoped checks actually run (counts) |
+| --- | --- | --- |
+| T1 F1/D1/D2 | `a4f11c81e` | `cargo test -p lakehouse-store --test it pipeline_last_run::` → 3 passed; `cargo test -p lakehouse-api --lib run_event_writes_the_runs_start_as_last_run_at` → 2 passed; clippy both crates clean |
+| T2 F7/D11 | `3ae339282` | `cargo test -p lakehouse-api --lib pipeline_compile::tests::` → 43 passed; clippy clean |
+| T3 F4/D5 | `20121edde` | `cargo test -p lakehouse-api --lib pipeline_lag::tests::` → 49 passed; clippy clean |
+| T4 F6/D8/D9 | `8e3f5c2d6` | `cargo test -p lakehouse-api --lib status_route::` → 9 passed; clippy clean |
+| T5 F2/D3 | `985dc040f` | `bun test` on `pipeline-schedule`, `pipeline-columns`, `pipeline-detail-page` → 27 passed; typecheck clean |
+| T6 F3/D4/D6 | `87f877942` | `bun test pipeline-freshness-panel.test.tsx` → 18 passed; typecheck clean |
+| T7 F5/D7 | `8658589ec` | `bun test pipeline-reads-as.test.ts pipeline-detail-page.test.tsx` → 26 passed (re-run reads-as alone → 14); typecheck clean |
+| T8 F6/D10 | `b774c7d7e` | `bun test pipeline-detail-page.test.tsx` → 15 passed; typecheck clean |
+| T9 F8/F9/D12 | `e570ded66` | `bun test pipeline-columns.test.tsx` → 14 passed; typecheck clean |
+| T10 docs | `b221ae837` | docs only |
+
+Each commit ran `cargo fmt --check` (Rust) / `bun run typecheck` (TS) and the
+scoped clippy/test above, in the foreground, from the shared `rust/target`
+(no `cargo clean`). Every new behaviour test was mutation-checked by reverting
+its fix line, running, and restoring: T1 5 fail, T2 3 fail, T3 4 fail, T4 3
+fail (blocking reload, single-look poll, old 409 text), T5 9 fail, T6 6 fail,
+T7 3 fail (the no-author case correctly passes on both), T8 inline-alert and
+poll-disabled fail, T9 3 fail. The tests that pin today's behaviour on purpose
+(`a_filter_or_dedupe_alone_still_selects_star`, no-time/future-commit lag,
+no-author reads-as, no-target-lag labels, draft Trigger-run) pass on both.
+
+**Final verification (final commit `b221ae837`, foreground):**
+
+- `bun run typecheck` — pass.
+- `bun run lint` — pass.
+- `bun run test` — first run 4658 pass / 1 skip / 1 fail
+  (`schema-browser.test.tsx:360` "keeps the table's name unknown on a Trino
+  tab until its detail loads", expected `SELECT * FROM ` got
+  `SELECT * FROM undefined.undefined`); that test passes in isolation and the
+  immediate re-run of the whole suite was **4659 pass / 1 skip / 0 fail**, so
+  it was a shared-process flake in an unrelated area, not caused by this
+  branch. No test here was weakened to get green.
+- `cd rust && cargo fmt --check && cargo clippy -p lakehouse-store -p
+  lakehouse-api --all-targets -- -D warnings` — pass.
+
+**Extras:**
+
+- T2 live SQL check: on a real `ClickHouse` 26.8 (testcontainer), created
+  `default.bld11_src (id Int32, amount Decimal(12,2))`, inserted one row, then
+  `CREATE TABLE default.bld11_out ENGINE = MergeTree ORDER BY tuple() AS
+  SELECT * REPLACE (CAST(amount AS Float64) AS amount) FROM default.bld11_src`;
+  `SELECT toTypeName(amount) FROM default.bld11_out` returned **Float64** (the
+  source type was Decimal). The `EXCEPT`-with-rename statements also executed.
+  Both tables were dropped after. This was a testcontainer ClickHouse, not a
+  `docker compose up` of the project stack.
+- The time the first Run now took after Mark ready on the compose stack:
+  **not verified** (no compose stack was started; the Rust route tests use
+  wiremock mocks).
+- Browser pages/themes opened: **not verified** (no browser session).
+- No full Rust workspace run locally (CI runs it on the PR, per the owner's
+  2026-10-30 decision). Scoped per-crate clippy/test above are the local proof.
+
 ## Review
 
 *(the reviewer appends one entry per round)*
