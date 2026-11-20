@@ -24,7 +24,7 @@ import { Copy, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { sortKeyColumns, valueShares } from "@/lib/column-profile"
 import { cellKind } from "@/lib/sample-grid"
-import { notifyError, notifySuccess } from "@/lib/notify"
+import { copyTextWithToast } from "@/lib/copy-text"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { schemaRows, useProfile } from "./asset-column-data"
 import { ColumnDetail, EMPTY_VALUE, ProfileNote, type SchemaRow } from "./asset-columns"
@@ -32,16 +32,6 @@ import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { NULL_LABEL, type Picked } from "./sample-grid"
 
 const NOT_IN_SCHEMA = "Not in the schema"
-
-async function copyValue(value: string) {
-  try {
-    await navigator.clipboard.writeText(value)
-    notifySuccess("Copied value")
-  } catch (err) {
-    // Usually a denied clipboard permission or a non-secure origin.
-    notifyError("Failed to copy", err)
-  }
-}
 
 /** The picked cell's value, in words where it is not a value. */
 function CellValue({ value }: { value: string | null | undefined }) {
@@ -137,7 +127,7 @@ export function SampleInspector({
           <CellValue value={value} />
           {cellKind(value) !== "value" ? null : (
             <div>
-              <Button type="button" size="sm" variant="outline" onClick={() => void copyValue(value ?? "")}>
+              <Button type="button" size="sm" variant="outline" onClick={() => void copyTextWithToast(value ?? "", "Copied value")}>
                 <Copy aria-hidden />
                 Copy value
               </Button>

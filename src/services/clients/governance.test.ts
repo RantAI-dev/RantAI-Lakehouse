@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, mock } from "bun:test"
-import type { AuditEvent } from "../contracts/governance"
+import type { AuditEvent, AuditActorsPage } from "../contracts/governance"
 import { clickhouseGovernanceService as service } from "./governance"
 
 const originalFetch = global.fetch
@@ -134,12 +134,15 @@ describe("governanceService: audit search, one event and export (GOV-1)", () => 
     id: "audit-1",
     at: "2026-11-06T08:00:00.000Z",
     actor: "Platform Admin",
+    actorId: "usr_admin",
     actorKind: "user",
     action: "dashboard.share",
     resource: "dashboard:d1",
     outcome: "success",
+    outcomeDetail: "executed",
     policyDecision: "allow",
     obligations: [],
+    reason: null,
   }
 
   it("sends every filter the person set, and no key for an empty one", async () => {
@@ -174,6 +177,27 @@ describe("governanceService: audit search, one event and export (GOV-1)", () => 
     const bare = stubFetch(() => json({ events: [], nextCursor: null }))
     await service.searchAudit({ actor: "", outcome: undefined })
     expect(bare[0].url).toBe("/api/governance/audit/events")
+  })
+
+  it("reads the trail's principals from the actors route, with no params, and refuses like its neighbours", async () => {
+    const actors: AuditActorsPage = {
+      actors: [
+        { actorId: "usr_admin", actor: "Platform Admin", actorKind: "user" },
+        { actorId: "agt_qa", actor: "QA Runner", actorKind: "agent" },
+      ],
+    }
+    const calls = stubFetch(() => json(actors))
+    expect(await service.listAuditActors()).toEqual(actors)
+    expect(sent(calls[0].url)).toEqual({ path: "/api/governance/audit/actors", params: {} })
+
+    stubFetch(() => json({ error: "permission_denied: audit:read" }, 403))
+    await expect(service.listAuditActors()).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the audit:read permission.",
+    })
+    stubFetch(() => json({ error: "The audit trail could not be read." }, 500))
+    await expect(service.listAuditActors()).rejects.toMatchObject({ code: "unavailable" })
   })
 
   it("maps a refusal and a bad filter onto the sentence the API gave", async () => {

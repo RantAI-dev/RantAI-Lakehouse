@@ -5,6 +5,7 @@ import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
 import { AlertCircleIcon, BoxIcon, CodeIcon, DatabaseIcon, ListChecksIcon, PlayIcon, PlusIcon, TableIcon } from "lucide-react"
 import { FormPage } from "@/components/patterns/form-page"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SelectField } from "@/components/patterns/select-field"
 import { SqlColumnChips, SqlRowsTable } from "@/components/patterns/sql-rows-table"
@@ -41,6 +42,7 @@ import {
   previewAsRecords,
   previewRequest,
   previewKey,
+  readColumns,
   readableItems,
   readableNames,
   sqlStepHint,
@@ -49,25 +51,40 @@ import {
   removeItem,
   renameItem,
   setInputTable,
+  switchToSql,
   updateInput,
   updateStep,
   type Column,
   type EditorSelection,
   type EditorState,
+  type EditorStep,
   type SaveBlocker,
 } from "@/lib/pipeline-editor"
 import { cn } from "@/lib/utils"
 import { connectorService, lakehouseService, pipelineService } from "@/services"
-import type { Pipeline, PipelineDetail, PipelinePreview, PipelinePreviewInput } from "@/services/contracts/pipelines"
+import type {
+  Pipeline,
+  PipelineDetail,
+  PipelinePreview,
+  PipelinePreviewInput,
+  PipelineStep,
+  PipelineStepSqlInput,
+} from "@/services/contracts/pipelines"
 import { connectorLoadTriggerOn, withConnectorLoadTrigger } from "./pipeline-connector-trigger"
 import {
+  AggregateStepPane,
+  FilterStepPane,
+  StepSqlSection,
   InputPane,
+  JoinStepPane,
   OutputPane,
+  PANE_REFUSAL_ID,
   PaneProblem,
   SqlStepPane,
   TransformStepPane,
   UnknownStepPane,
   type ConnectorSource,
+  type FailedRow,
   type Invalid,
 } from "./pipeline-editor-panes"
 import { isSchedulable, PipelineScheduleField } from "./pipeline-schedule-field"
@@ -219,6 +236,24 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     setRan({ item: itemKey, key: currentKey, inputIds: request.inputIds, stepIds: request.stepIds })
     await preview.run(request.body)
   }
+  /**
+   * BLD-16 / J9: runs the preview of ONE read item, without selecting it, so
+   * a form step's pane can load the columns of what it reads (D16) while the
+   * person keeps editing the step.
+   */
+  async function previewReadItem(itemId: string) {
+    const isInput = editor.inputs.some((input) => input.id === itemId)
+    const target: EditorSelection = isInput ? { kind: "input", id: itemId } : { kind: "step", id: itemId }
+    const itemRequest = previewRequest(inputs, editor.steps, target)
+    if (!("body" in itemRequest)) return
+    setRan({
+      item: selectionKey(target),
+      key: previewKey(itemRequest.body),
+      inputIds: itemRequest.inputIds,
+      stepIds: itemRequest.stepIds,
+    })
+    await preview.run(itemRequest.body)
+  }
   // BLD-1 part 1 S3 review R1-S5: the item a preview's refusal names, read
   // through the body that was sent (a preview sends a part of the
   // definition, so `inputs[0]` there may be the editor's third input).
@@ -231,6 +266,67 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     for (const step of editor.steps) out[step.id] = results[step.id]?.data.columns ?? null
     return out
   }, [editor.steps, results])
+
+  // ── a form step as SQL (BLD-16 / J6) ─────────────────────────────────
+  const stepSql = useServiceAction((signal, body: PipelineStepSqlInput) => pipelineService.stepSql(body, signal))
+  /** The step whose SQL was shown, the body it was shown for, and the route's own text. */
+  const [shownSql, setShownSql] = React.useState<{ step: string; key: string; data: string } | null>(null)
+  /** The step a Switch was asked for; the confirm dialog is open while this is set. */
+  const [switching, setSwitching] = React.useState<string | null>(null)
+  /** The step the last route call was for, so a refusal is shown on it (D7). */
+  const [ranSql, setRanSql] = React.useState<string | null>(null)
+  /** The body a "Show as SQL" of `stepId` sends now: the definition and the step's name. */
+  function stepSqlBody(stepId: string): PipelineStepSqlInput | null {
+    const index = editor.steps.findIndex((step) => step.id === stepId)
+    if (index < 0) return null
+    return { ...definitionBody(inputs, editor.steps), step: editor.steps[index].name.trim() }
+  }
+  async function showStepSql(stepId: string) {
+    const body = stepSqlBody(stepId)
+    if (body === null) return
+    setRanSql(stepId)
+    const data = await stepSql.run(body)
+    if (data === null) return
+    setShownSql({ step: stepId, key: JSON.stringify(body), data: data.sql })
+  }
+  /**
+   * J6, the one-way switch: asked for through a confirm (the page's dialog),
+   * then the step is REPLACED with the route's own text, unformatted — same
+   * id, same name, same place — and nothing is saved until Save. The route's
+   * refusal is shown in the pane, so a person never switches into SQL the
+   * API would not accept.
+   */
+  async function switchStepToSql(stepId: string) {
+    const body = stepSqlBody(stepId)
+    if (body === null) {
+      setSwitching(null)
+      return
+    }
+    setRanSql(stepId)
+    const data = await stepSql.run(body)
+    if (data === null) return
+    setEditor((prev) => switchToSql(prev, stepId, data.sql))
+    setShownSql(null)
+    setSwitching(null)
+  }
+  /** The section every form pane carries (J6); `null` for the kinds it is not for. */
+  function sqlSectionFor(step: EditorStep): React.ReactNode {
+    if (step.kind !== "transform" && step.kind !== "join" && step.kind !== "aggregate" && step.kind !== "filter")
+      return null
+    const key = stepSqlBody(step.id)
+    const currentKey = key === null ? null : JSON.stringify(key)
+    const shown = shownSql !== null && shownSql.step === step.id ? shownSql : null
+    return (
+      <StepSqlSection
+        text={shown ? shown.data : null}
+        stale={shown !== null && currentKey !== shown.key}
+        error={ranSql === step.id && stepSql.status === "error" ? stepSql.error.message : null}
+        pending={ranSql === step.id && stepSql.status === "pending"}
+        onShow={() => void showStepSql(step.id)}
+        onSwitch={() => setSwitching(step.id)}
+      />
+    )
+  }
 
   // ── checks and the save ────────────────────────────────────────────
   const problems = editorProblems(shownState, { targetZone, targetTable, plainCopy, hasConnector })
@@ -304,12 +400,19 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     stepIds: string[]
     /** Each form step's operations as sent, so a refused one is marked only while they are unchanged (R1-S7). */
     transforms: Record<string, string[]>
+    /** BLD-16: each form step's body as sent, so a refused `<field>[j]` row is marked only while the step is unchanged (R1-S7's rule, kept for the form kinds). */
+    forms: Record<string, PipelineStep>
   } | null>(null)
   async function handleSubmit() {
+    // The bodies a save sends, once: the step a refusal names is found in
+    // them by id, and the row it marks stays marked only while the step's
+    // body is still this one.
+    const bodies = definitionBody(inputs, editor.steps)
     setSent({
       inputIds: inputs.map((input) => input.id),
       stepIds: editor.steps.map((step) => step.id),
       transforms: Object.fromEntries(editor.steps.flatMap((step) => (step.kind === "transform" ? [[step.id, step.transforms]] : []))),
+      forms: Object.fromEntries(editor.steps.map((step, index) => [step.id, bodies.steps[index]])),
     })
     const result = await save.run(saveBody())
     // Straight to the pipeline's own page, where it can be marked ready and
@@ -355,7 +458,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
       select({ kind: "input", id: added.id })
     }
   }
-  function onAddStep(kind: "transform" | "sql") {
+  function onAddStep(kind: "transform" | "sql" | "join" | "aggregate" | "filter") {
     const added = addStep(editor, kind)
     if (!added.id) return
     setEditor(added.state)
@@ -376,7 +479,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   }
 
   // ── the pane of the selected item ──────────────────────────────────
-  const errorMessageId = "pipeline-editor-item-error"
+  const errorMessageId = PANE_REFUSAL_ID
   function problemFor(id: string): React.ReactNode {
     if (errorItem === id && saveError) return <PaneProblem id={errorMessageId} message={saveError} tone="error" />
     const problem = problems.items[id]
@@ -396,6 +499,22 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     if (errorItem === id && saveError) return saveError
     if (previewErrorItem === id && previewError) return previewError
     return problems.items[id]?.message
+  }
+  /**
+   * BLD-16 / J9: what a save refusal named on a form step, and the message
+   * it said, marked only while the step's body is still the one that was
+   * sent (R1-S7's rule for a refused transform row, kept for a refused
+   * `<field>[j]` row).
+   */
+  function failedFor(stepId: string): FailedRow {
+    const base = { field: null as string | null, row: null as number | null, message: errorItem === stepId ? saveError : null }
+    if (sent === null || saveTarget === null || saveTarget.kind !== "step") return base
+    if (sent.stepIds[saveTarget.index] !== stepId) return base
+    const index = editor.steps.findIndex((step) => step.id === stepId)
+    const body = definitionBody(inputs, editor.steps).steps[index]
+    const unchanged = JSON.stringify(sent.forms[stepId]) === JSON.stringify(body)
+    if (!unchanged) return base
+    return { field: saveTarget.field, row: saveTarget.row, message: errorItem === stepId ? saveError : null }
   }
 
   let pane: React.ReactNode = null
@@ -442,29 +561,32 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
       }
       pane =
         step.kind === "transform" ? (
-          <TransformStepPane
-            key={step.id}
-            {...common}
-            step={step}
-            readable={readableItems(shownState, index)}
-            readsName={readsName(shownState, step.reads)}
-            columns={columnsRead(step, inputColumns, stepColumns)}
-            readsStep={editor.steps.some((other) => "id" in step.reads && other.id === step.reads.id)}
-            // BLD-1 part 1 S3 review R1-S7: `steps[i].transforms[j]` names a
-            // row of what was sent. Once the operations change, row j may be
-            // another one, so the row is marked only while they are the ones
-            // sent; the message stays on the step.
-            failedTransform={
-              errorItem === step.id &&
-              saveTarget?.kind === "step" &&
-              sameList(sent?.transforms[step.id], step.transforms)
-                ? saveTarget.transform
-                : null
-            }
-            failedMessage={errorItem === step.id ? saveError : null}
-            failedMessageId={errorMessageId}
-            onChange={(patch) => setEditor((prev) => updateStep(prev, step.id, patch))}
-          />
+          <React.Fragment key={step.id}>
+            <TransformStepPane
+              key={step.id}
+              {...common}
+              step={step}
+              readable={readableItems(shownState, index)}
+              readsName={readsName(shownState, step.reads)}
+              columns={columnsRead(step, inputColumns, stepColumns)}
+              readsStep={editor.steps.some((other) => "id" in step.reads && other.id === step.reads.id)}
+              // BLD-1 part 1 S3 review R1-S7: `steps[i].transforms[j]` names a
+              // row of what was sent. Once the operations change, row j may be
+              // another one, so the row is marked only while they are the ones
+              // sent; the message stays on the step.
+              failedTransform={
+                errorItem === step.id &&
+                saveTarget?.kind === "step" &&
+                sameList(sent?.transforms[step.id], step.transforms)
+                  ? saveTarget.transform
+                  : null
+              }
+              failedMessage={errorItem === step.id ? saveError : null}
+              failedMessageId={errorMessageId}
+              onChange={(patch) => setEditor((prev) => updateStep(prev, step.id, patch))}
+            />
+            {sqlSectionFor(step)}
+          </React.Fragment>
         ) : step.kind === "sql" ? (
           <SqlStepPane
             key={step.id}
@@ -475,6 +597,53 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
             hint={sqlStepHint(step.sql, readableNames(shownState, index))}
             onSql={(sql) => setEditor((prev) => updateStep(prev, step.id, { sql }))}
           />
+        ) : step.kind === "join" ? (
+          <React.Fragment key={step.id}>
+          <JoinStepPane
+            key={step.id}
+            {...common}
+            step={step}
+            readable={readableItems(shownState, index)}
+            leftName={readsName(shownState, step.left)}
+            rightName={readsName(shownState, step.right)}
+            inputColumns={inputColumns}
+            stepColumns={stepColumns}
+            failed={failedFor(step.id)}
+            onChange={(patch) => setEditor((prev) => updateStep(prev, step.id, patch))}
+            onPreviewItem={(itemId) => void previewReadItem(itemId)}
+          />
+          {sqlSectionFor(step)}
+          </React.Fragment>
+        ) : step.kind === "aggregate" ? (
+          <React.Fragment key={step.id}>
+          <AggregateStepPane
+            key={step.id}
+            {...common}
+            step={step}
+            readable={readableItems(shownState, index)}
+            readsName={readsName(shownState, step.reads)}
+            columns={readColumns(step.reads, inputColumns, stepColumns)}
+            failed={failedFor(step.id)}
+            onChange={(patch) => setEditor((prev) => updateStep(prev, step.id, patch))}
+            onPreviewItem={(itemId) => void previewReadItem(itemId)}
+          />
+          {sqlSectionFor(step)}
+          </React.Fragment>
+        ) : step.kind === "filter" ? (
+          <React.Fragment key={step.id}>
+          <FilterStepPane
+            key={step.id}
+            {...common}
+            step={step}
+            readable={readableItems(shownState, index)}
+            readsName={readsName(shownState, step.reads)}
+            columns={readColumns(step.reads, inputColumns, stepColumns)}
+            failed={failedFor(step.id)}
+            onChange={(patch) => setEditor((prev) => updateStep(prev, step.id, patch))}
+            onPreviewItem={(itemId) => void previewReadItem(itemId)}
+          />
+          {sqlSectionFor(step)}
+          </React.Fragment>
         ) : (
           <UnknownStepPane key={step.id} {...common} step={step} />
         )
@@ -680,9 +849,15 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                       step.kind === "sql"
                         ? "SQL"
                         : step.kind === "transform"
-                          ? `Form · reads ${readsName(shownState, step.reads) || "…"}`
-                          : // R1-S2: a kind this console does not know.
-                            `${step.stored.kind} · not editable here`
+                          ? `Operations · reads ${readsName(shownState, step.reads) || "…"}`
+                          : step.kind === "join"
+                            ? `Join · ${readsName(shownState, step.left) || "…"} + ${readsName(shownState, step.right) || "…"}`
+                            : step.kind === "aggregate"
+                              ? `Aggregate · reads ${readsName(shownState, step.reads) || "…"}`
+                              : step.kind === "filter"
+                                ? `Filter · reads ${readsName(shownState, step.reads) || "…"}`
+                                : // R1-S2: a kind this console does not know.
+                                  `${step.stored.kind} · not editable here`
                     }
                     selected={selection.kind === "step" && selection.id === step.id}
                     description={railDescription(step.id)}
@@ -691,13 +866,28 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 ))}
                 {canAddStep(editor) ? (
                   <div className="flex flex-wrap gap-1">
+                    {/* BLD-16 / J9: with four kinds of form the word "Form"
+                        names none of them, so the buttons (and the pane
+                        headers) say what each one is. */}
                     <Button type="button" variant="ghost" size="sm" onClick={() => onAddStep("sql")}>
                       <PlusIcon aria-hidden />
-                      SQL step
+                      SQL
+                    </Button>
+                    <Button type="button" variant="ghost" size="sm" onClick={() => onAddStep("join")}>
+                      <PlusIcon aria-hidden />
+                      Join
+                    </Button>
+                    <Button type="button" variant="ghost" size="sm" onClick={() => onAddStep("aggregate")}>
+                      <PlusIcon aria-hidden />
+                      Aggregate
+                    </Button>
+                    <Button type="button" variant="ghost" size="sm" onClick={() => onAddStep("filter")}>
+                      <PlusIcon aria-hidden />
+                      Filter
                     </Button>
                     <Button type="button" variant="ghost" size="sm" onClick={() => onAddStep("transform")}>
                       <PlusIcon aria-hidden />
-                      Form step
+                      Operations
                     </Button>
                   </div>
                 ) : null}
@@ -823,6 +1013,21 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
         <p role="status" className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">
           {READS_AS_YOU_NOTICE}
         </p>
+      ) : null}
+      {switching !== null ? (
+        // BLD-16 / J6: the one-way switch, asked for before anything changes.
+        // Spec: it cannot be turned back into a form — the sentence is the
+        // dialog's own, and cancelling leaves the step exactly as it was.
+        <ConfirmActionDialog
+          open
+          onOpenChange={(open) => (open ? undefined : setSwitching(null))}
+          title="Switch to SQL step"
+          description="This step becomes a SQL step. It cannot be turned back into a form."
+          impact="You can still edit its SQL; the form's fields are gone."
+          confirmLabel="Switch"
+          confirming={ranSql === switching && stepSql.status === "pending"}
+          onConfirm={() => void switchStepToSql(switching)}
+        />
       ) : null}
     </FormPage>
   )
