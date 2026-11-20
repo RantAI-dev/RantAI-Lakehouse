@@ -49,6 +49,30 @@ const eslintConfig = defineConfig([
       ],
     },
   },
+  // `UX-6` D3: `navigator.clipboard` exists only in a secure context (https
+  // or localhost). A console opened by IP over plain http has none, so a
+  // direct read throws there or fails silently behind `?.` / `() => {}` --
+  // QA found it on the staging console and on the one-time password and
+  // secret reveal screens, where the value is shown once. `copyText` falls
+  // back to a textarea and `execCommand("copy")` and answers whether it
+  // worked; the failure needs a toast, so the direct call is refused here.
+  // Not in the `WEB-9` block above: a second `no-restricted-syntax` array
+  // would replace that select rule (flat config replaces, it does not merge).
+  {
+    files: ["src/**/*.{ts,tsx}"],
+    ignores: ["src/lib/copy-text.ts", "src/**/*.test.{ts,tsx}"],
+    rules: {
+      "no-restricted-properties": [
+        "error",
+        {
+          object: "navigator",
+          property: "clipboard",
+          message:
+            "Use `copyText` (`@/lib/copy-text`); `navigator.clipboard` does not exist over plain http (`UX-6`)",
+        },
+      ],
+    },
+  },
   // Override default ignores of eslint-config-next.
   globalIgnores([
     // Default ignores of eslint-config-next:

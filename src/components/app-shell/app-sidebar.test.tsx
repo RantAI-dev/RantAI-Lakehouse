@@ -185,8 +185,8 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
     // is empty, so the product's name is not drawn twice by a slow answer.
     expect(await screen.findByText(PRODUCT_NAME)).toBeTruthy()
     expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
-      "/logo-light.png",
-      "/logo-dark.png",
+      "/logo-light.svg",
+      "/logo-dark.svg",
     ])
   })
 
@@ -204,7 +204,7 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
     fireEvent.error(shown[0])
     // A broken picture must never be left on the page: the product's own
     // file stands in for it.
-    expect(shown[0].getAttribute("src")).toBe("/logo-light.png")
+    expect(shown[0].getAttribute("src")).toBe("/logo-light.svg")
   })
 
   it("shows no logo at all while the branding answer is on its way", async () => {
