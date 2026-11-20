@@ -2108,10 +2108,11 @@ pub async fn compile_pipeline(
     // which would make every column partial); the mapping is written when the
     // run is reported successful.
     //
-    // DATA-57 D9: every compiled statement is noted. The mapper now reads a
-    // `WITH`, so SQL steps, several inputs, several steps and (after #619)
-    // join, aggregate and filter steps all yield mappings; anything it cannot
-    // prove is stored as a partial row with its reason, never a guessed edge.
+    // DATA-57 review R5: #619 is merged, so its form steps are present now.
+    // DATA-57 D9: every compiled statement is noted. The mapper reads a
+    // `WITH`, so SQL steps, several inputs, several steps and join, aggregate
+    // and filter steps all yield mappings; anything it cannot prove is stored
+    // as a partial row with its reason, never a guessed edge.
     super::lineage::columns::note_pipeline_sql(pool, &id, &compiled).await;
     Ok(ApiJson(json!({
         "sql": rewritten,
