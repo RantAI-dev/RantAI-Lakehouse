@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { chartDefFromArgs, draftMeasureLabel } from "./chart-draft-card"
+import { chartDefFromArgs, draftLayerLines, draftMeasureLabel } from "./chart-draft-card"
 
 test("a create_chart call on a SQL source keeps its sqlSource for the preview and the builder", () => {
   const def = chartDefFromArgs({
@@ -36,6 +36,20 @@ test("a create_chart call with layers keeps them, and how its own series is draw
   expect([def.draw, def.axis]).toEqual(["bar", "left"])
   const plain = chartDefFromArgs({ title: "T", kind: "bar", mart: "mart_x", dimension: "d", measures: ["m"], draw: "dots", axis: "up" })
   expect([plain.layers, plain.draw, plain.axis]).toEqual([undefined, undefined, undefined])
+})
+
+// AI-31 (D14): a layered chart asks more than one question, and the card must
+// name each one — not just the chart's own mart.
+test("a draft with layers shows one line per extra question on its card", () => {
+  const def = chartDefFromArgs({
+    title: "T", kind: "bar", mart: "mart_x", dimension: "month", measures: ["visitors"],
+    layers: [{ mart: "mart_rooms", dimension: "month", measures: ["rooms"], draw: "line", axis: "right" }],
+  })
+  const lines = draftLayerLines(def, undefined)
+  expect(lines.length).toBe(1)
+  expect(lines[0]).toContain("+ mart_rooms")
+  expect(lines[0]).toContain("(line, right axis)")
+  expect(draftLayerLines(chartDefFromArgs({ title: "T", mart: "mart_x" }), undefined)).toEqual([])
 })
 
 test("a create_chart call keeps every field Confirm sends, so the preview and the builder show the chart that is saved", () => {

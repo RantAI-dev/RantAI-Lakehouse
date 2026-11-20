@@ -39,6 +39,7 @@ mod connectors;
 mod dashboards;
 mod embed;
 mod export;
+pub(super) use export::with_screen_filters;
 mod maps;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
 // SIBLING module of `routes::ai`, not a descendant — can reuse
@@ -51,6 +52,7 @@ mod ingest;
 mod lakehouse;
 mod limits;
 mod look;
+pub(super) use look::ADD_REFERENCE_LINES;
 #[cfg(test)]
 pub(super) use look::FORMAT_FIELDS;
 mod metrics;

@@ -451,6 +451,7 @@ function useCopilotState() {
           stream: true,
           tools: toolsFromCaps(enabledCaps, mode),
           context: pageContextRef.current?.system,
+          view: pageContextRef.current?.view,
           messages: chatHistory(next),
         }),
       });
