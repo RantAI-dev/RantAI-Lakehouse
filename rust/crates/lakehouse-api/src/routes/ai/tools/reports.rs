@@ -1,6 +1,7 @@
 //! Scheduled-report tools (`AI-10`, schedule half; `RPT-1` plan D10):
 //! `create_report_subscription`, `list_report_subscriptions`,
-//! `update_report_subscription` and `delete_report_subscription`.
+//! `update_report_subscription` and `delete_report_subscription`, plus the
+//! read-only `find_report_recipients` people picker (`AI-30`).
 //!
 //! They call the same rules as the console's routes
 //! ([`crate::routes::reports::validate_input`]): the download right, a
@@ -30,14 +31,16 @@
 //! call's arguments ([`crate::routes::ai::gate::strip_confirmed`]) and only
 //! ever written here, server side, into an approval's stored arguments.
 
+use axum::Extension;
+use axum::extract::{Query, State};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_store::report_subscriptions::{self as subscriptions, Subscription};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use super::arg_str;
-use crate::routes::reports::{self, SubscriptionInput, schedule_json, validate_input};
+use super::{api_result_to_value, arg_str};
+use crate::routes::reports::{self, PickerQuery, SubscriptionInput, schedule_json, validate_input};
 use crate::state::AppState;
 
 const SIGN_IN: &str = "Sign in to manage scheduled reports.";
@@ -46,12 +49,14 @@ const NO_SUCH: &str = "That subscription does not exist.";
 const OWNER_GONE: &str = "The person who asked for this report is no longer active.";
 const FAILED: &str = "The request could not be completed.";
 
-/// The four tools.
+/// The five tools: the four subscription tools plus the read-only people
+/// picker (`AI-30`).
 pub(super) fn handles(name: &str) -> bool {
     matches!(
         name,
         "create_report_subscription"
             | "list_report_subscriptions"
+            | "find_report_recipients"
             | "update_report_subscription"
             | "delete_report_subscription"
     )
@@ -75,7 +80,7 @@ fn refusal(err: &ApiError) -> Value {
     json!({ "error": sentence(err) })
 }
 
-/// Dispatch one of the four tools.
+/// Dispatch one of the five tools.
 pub(super) async fn run(
     state: &AppState,
     principal: Option<&Principal>,
@@ -85,6 +90,31 @@ pub(super) async fn run(
     let Some(caller) = principal else {
         return json!({ "error": SIGN_IN });
     };
+    // `AI-30`: a read over the console's own picker. Go through its handler so
+    // the rights and the tenant scope cannot drift; it names no report, so
+    // there is no owner to resolve and nothing to approve.
+    if name == "find_report_recipients" {
+        let q = arg_str(args, "q");
+        if q.trim().is_empty() {
+            return json!({ "error": "q is required: part of a name or an email address." });
+        }
+        let reply = api_result_to_value(
+            reports::recipients(
+                State(state.clone()),
+                Extension(caller.clone()),
+                Query(PickerQuery {
+                    q: Some(q),
+                    roles: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+        return match reply.get("items") {
+            Some(items) => json!({ "items": items }),
+            None => reply,
+        };
+    }
     let owner = match acting_owner(state, caller, args).await {
         Ok(owner) => owner,
         Err(error) => return error,
