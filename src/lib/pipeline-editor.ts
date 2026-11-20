@@ -311,10 +311,15 @@ function taken(names: readonly string[], candidate: string): boolean {
 }
 
 /** `base`, or `base_2`, `base_3`, … : the first that no other item has. */
-function firstFree(base: string, names: readonly string[]): string {
-  if (!taken(names, base)) return base
+function firstFree(base: string, names: readonly string[], maxChars = Number.POSITIVE_INFINITY): string {
+  // BLD-16 review R5: a caller whose name must fit D2's 48 characters
+  // passes `maxChars`; the cut then also covers the uniqueness suffix, so
+  // `_2` is inside the limit rather than appended past it.
+  const first = base.slice(0, maxChars)
+  if (!taken(names, first)) return first
   for (let n = 2; ; n += 1) {
-    const candidate = `${base}_${n}`
+    const suffix = `_${n}`
+    const candidate = `${first.slice(0, Math.max(0, maxChars - suffix.length))}${suffix}`
     if (!taken(names, candidate)) return candidate
   }
 }
@@ -925,7 +930,10 @@ export function joinOutputColumns(
  */
 export function measureName(fn: string, column: string, takenNames: readonly string[]): string {
   const base = column.trim() === "" && fn === "count" ? "count" : `${fn}_${column.trim()}`
-  return firstFree(base, takenNames)
+  // BLD-16 review R5: the name becomes an output column, so it lives by
+  // D2's 48 characters — `countDistinct_` plus a 48-character column is
+  // 63, which the API would refuse on a name nobody typed.
+  return firstFree(base, takenNames, MAX_NAME_CHARS)
 }
 
 /**

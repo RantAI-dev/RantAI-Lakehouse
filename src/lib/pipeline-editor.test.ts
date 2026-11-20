@@ -23,6 +23,7 @@ import {
   formColumns,
   hasProblems,
   isUsableName,
+  MAX_NAME_CHARS,
   joinOutputColumns,
   knownStep,
   measureName,
@@ -769,6 +770,21 @@ describe("the form kinds' fill and naming rules (J9)", () => {
     expect(measureName("count", "", [])).toBe("count")
     expect(measureName("count", "", ["count"])).toBe("count_2")
     expect(measureName("sum", "amount", ["sum_amount"])).toBe("sum_amount_2")
+  })
+
+  // BLD-16 review R5: a name is at most 48 characters (D2), and
+  // `countDistinct_` plus a 40-character column is 54.
+  it("caps an automatic measure name at the 48 characters a name may have", () => {
+    const column = "c".repeat(40)
+    const fresh = measureName("countDistinct", column, [])
+    expect(fresh.length).toBe(MAX_NAME_CHARS)
+    expect(fresh.startsWith("countDistinct_")).toBe(true)
+    expect(isUsableName(fresh)).toBe(true)
+    // The uniqueness suffix is part of the 48, not added past it.
+    const numbered = measureName("countDistinct", column, [fresh])
+    expect(numbered.length).toBeLessThanOrEqual(MAX_NAME_CHARS)
+    expect(numbered.endsWith("_2")).toBe(true)
+    expect(isUsableName(numbered)).toBe(true)
   })
 
   it("formColumns drops the names the API would refuse, and says it dropped one", () => {
