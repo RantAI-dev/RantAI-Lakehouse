@@ -177,4 +177,5 @@ mod upload_folder_routes;
 mod upload_routes;
 mod upstream_errors;
 mod usage_routes;
+mod workspace_settings_audit;
 mod workspace_settings_route;
