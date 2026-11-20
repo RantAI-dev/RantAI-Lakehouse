@@ -50,6 +50,39 @@ function stubApi(answer?: (call: Call) => Response | null) {
   return calls
 }
 
+/**
+ * The first bytes of a PNG (the API's `sniff_picture_type`,
+ * `rust/crates/lakehouse-api/src/routes/settings.rs:2888`). The API reads
+ * these bytes, not the file's name and not the browser's claim, so a test
+ * writes them.
+ */
+const PNG_HEAD = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
+/** The first bytes of a JPEG (`settings.rs:2889`). */
+const JPEG_HEAD = new Uint8Array([0xff, 0xd8, 0xff])
+
+/**
+ * The first twelve bytes of a WebP file: `RIFF`, four bytes of the file's
+ * own length, then `WEBP` (`settings.rs:2894`).
+ */
+const WEBP_HEAD = new Uint8Array([
+  0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
+])
+
+/** The text of an SVG: the first bytes of no picture the API takes. */
+const SVG_TEXT = '<svg xmlns="http://www.w3.org/2000/svg"></svg>'
+
+/**
+ * A file with a real head of `head` and a size of `size` bytes. The head is
+ * what the rules read (`file.slice(0, 12)`); the size is faked, so a 20 MB
+ * picture costs nothing.
+ */
+function fileWithHead(name: string, type: string, head: BlobPart, size: number): File {
+  const file = new File([head], name, { type })
+  Object.defineProperty(file, "size", { value: size })
+  return file
+}
+
 describe("GeneralSettings", () => {
   it("shows the workspace's name as it is stored", async () => {
     stubApi()
@@ -68,7 +101,7 @@ describe("GeneralSettings", () => {
     render(<GeneralSettings />)
     const file = await screen.findByLabelText("Logo")
     fireEvent.change(file, {
-      target: { files: [new File(["bytes"], "logo.png", { type: "image/png" })] },
+      target: { files: [fileWithHead("logo.png", "image/png", PNG_HEAD, 1024)] },
     })
     expect(await screen.findByText("The logo must be at most 512 KB.")).toBeTruthy()
   })
@@ -144,7 +177,7 @@ describe("GeneralSettings", () => {
     // Storing a picture reads the settings again; the unsaved name is not
     // the server's to overwrite.
     fireEvent.change(screen.getByLabelText("Logo"), {
-      target: { files: [new File(["bytes"], "logo.png", { type: "image/png" })] },
+      target: { files: [fileWithHead("logo.png", "image/png", PNG_HEAD, 1024)] },
     })
     // The form is drawn again from the second answer.
     await waitFor(() =>
@@ -174,13 +207,6 @@ describe("GeneralSettings", () => {
 
   // ── The picture is checked in the browser before it is sent (adm-120) ────
 
-  /** A picture file of `size` bytes, without allocating them. */
-  function pictureFile(name: string, type: string, size: number): File {
-    const file = new File(["bytes"], name, { type })
-    Object.defineProperty(file, "size", { value: size })
-    return file
-  }
-
   /** Whether a picture of this kind was sent to the API. */
   function sentPicture(calls: Call[], kind: string): boolean {
     return calls.some(
@@ -193,7 +219,7 @@ describe("GeneralSettings", () => {
     render(<GeneralSettings />)
     const picker = await screen.findByLabelText("Logo")
     fireEvent.change(picker, {
-      target: { files: [pictureFile("logo.png", "image/png", 20 * 1024 * 1024)] },
+      target: { files: [fileWithHead("logo.png", "image/png", PNG_HEAD, 20 * 1024 * 1024)] },
     })
     // The server's own sentence, the one it would answer with.
     expect(await screen.findByText("The logo must be at most 512 KB.")).toBeTruthy()
@@ -205,7 +231,7 @@ describe("GeneralSettings", () => {
     render(<GeneralSettings />)
     const picker = await screen.findByLabelText("Logo")
     fireEvent.change(picker, {
-      target: { files: [pictureFile("logo.png", "image/png", 400 * 1024)] },
+      target: { files: [fileWithHead("logo.png", "image/png", PNG_HEAD, 400 * 1024)] },
     })
     await waitFor(() => expect(sentPicture(calls, "logo")).toBe(true))
     // The picture itself goes with the request.
@@ -214,23 +240,56 @@ describe("GeneralSettings", () => {
     expect((put?.body as FormData).get("file")).toBeTruthy()
   })
 
-  it("refuses a logo of the wrong format, with the server's sentence, and sends nothing", async () => {
+  it("sends a JPEG logo", async () => {
     const calls = stubApi()
     render(<GeneralSettings />)
     const picker = await screen.findByLabelText("Logo")
     fireEvent.change(picker, {
-      target: { files: [pictureFile("logo.svg", "image/svg+xml", 1024)] },
+      target: { files: [fileWithHead("logo.jpg", "image/jpeg", JPEG_HEAD, 400 * 1024)] },
     })
+    await waitFor(() => expect(sentPicture(calls, "logo")).toBe(true))
+  })
+
+  it("sends a WebP logo", async () => {
+    const calls = stubApi()
+    render(<GeneralSettings />)
+    const picker = await screen.findByLabelText("Logo")
+    fireEvent.change(picker, {
+      target: { files: [fileWithHead("logo.webp", "image/webp", WEBP_HEAD, 400 * 1024)] },
+    })
+    await waitFor(() => expect(sentPicture(calls, "logo")).toBe(true))
+  })
+
+  it("sends a picture whose browser type is wrong, because its bytes are a PNG", async () => {
+    const calls = stubApi()
+    render(<GeneralSettings />)
+    const picker = await screen.findByLabelText("Logo")
+    // The browser says text; the first bytes say PNG. The API reads the
+    // first bytes, so it would accept this picture.
+    fireEvent.change(picker, {
+      target: { files: [fileWithHead("logo.txt", "text/plain", PNG_HEAD, 400 * 1024)] },
+    })
+    await waitFor(() => expect(sentPicture(calls, "logo")).toBe(true))
+  })
+
+  it("refuses a file that is no picture, even when the browser says it is a PNG", async () => {
+    const calls = stubApi()
+    render(<GeneralSettings />)
+    const picker = await screen.findByLabelText("Logo")
+    fireEvent.change(picker, {
+      target: { files: [fileWithHead("logo.png", "image/png", SVG_TEXT, 1024)] },
+    })
+    // The bytes decide, not the name and not the browser's claim.
     expect(await screen.findByText("The logo must be a PNG, JPEG or WebP image.")).toBeTruthy()
     expect(sentPicture(calls, "logo")).toBe(false)
   })
 
-  it("refuses a logo of the wrong type that is also too big with the type sentence", async () => {
+  it("refuses a logo that is no picture and is too big with the type sentence", async () => {
     const calls = stubApi()
     render(<GeneralSettings />)
     const picker = await screen.findByLabelText("Logo")
     fireEvent.change(picker, {
-      target: { files: [pictureFile("logo.svg", "image/svg+xml", 20 * 1024 * 1024)] },
+      target: { files: [fileWithHead("logo.png", "image/png", SVG_TEXT, 20 * 1024 * 1024)] },
     })
     // The type is judged first, as the API judges it.
     expect(await screen.findByText("The logo must be a PNG, JPEG or WebP image.")).toBeTruthy()
@@ -242,7 +301,7 @@ describe("GeneralSettings", () => {
     render(<GeneralSettings />)
     const picker = await screen.findByLabelText("Browser-tab icon")
     fireEvent.change(picker, {
-      target: { files: [pictureFile("icon.png", "image/png", 65_537)] },
+      target: { files: [fileWithHead("icon.png", "image/png", PNG_HEAD, 65_537)] },
     })
     expect(await screen.findByText("The icon must be a PNG image of at most 64 KB.")).toBeTruthy()
     expect(sentPicture(calls, "icon")).toBe(false)
@@ -253,9 +312,21 @@ describe("GeneralSettings", () => {
     render(<GeneralSettings />)
     const picker = await screen.findByLabelText("Browser-tab icon")
     fireEvent.change(picker, {
-      target: { files: [pictureFile("icon.png", "image/png", 4096)] },
+      target: { files: [fileWithHead("icon.png", "image/png", PNG_HEAD, 4096)] },
     })
     await waitFor(() => expect(sentPicture(calls, "icon")).toBe(true))
+  })
+
+  it("refuses an icon that is not a PNG, with the server's sentence, and sends nothing", async () => {
+    const calls = stubApi()
+    render(<GeneralSettings />)
+    const picker = await screen.findByLabelText("Browser-tab icon")
+    fireEvent.change(picker, {
+      target: { files: [fileWithHead("icon.jpg", "image/jpeg", JPEG_HEAD, 4096)] },
+    })
+    // The icon takes a PNG only, and the API has one sentence for it.
+    expect(await screen.findByText("The icon must be a PNG image of at most 64 KB.")).toBeTruthy()
+    expect(sentPicture(calls, "icon")).toBe(false)
   })
 
   it("refuses an oversized dark-mode logo with the logo's sentence, and sends nothing", async () => {
@@ -263,22 +334,10 @@ describe("GeneralSettings", () => {
     render(<GeneralSettings />)
     const picker = await screen.findByLabelText("Dark-mode logo")
     fireEvent.change(picker, {
-      target: { files: [pictureFile("logo-dark.png", "image/png", 20 * 1024 * 1024)] },
+      target: { files: [fileWithHead("logo-dark.png", "image/png", PNG_HEAD, 20 * 1024 * 1024)] },
     })
     // The dark-mode logo follows the logo's rules and the logo's sentences.
     expect(await screen.findByText("The logo must be at most 512 KB.")).toBeTruthy()
     expect(sentPicture(calls, "logo-dark")).toBe(false)
-  })
-
-  it("sends a file whose type the browser does not know, so the server sniffs it", async () => {
-    const calls = stubApi()
-    render(<GeneralSettings />)
-    const picker = await screen.findByLabelText("Logo")
-    fireEvent.change(picker, {
-      target: { files: [pictureFile("logo.bin", "application/octet-stream", 400 * 1024)] },
-    })
-    // The browser knows no type, so the console refuses nothing: the API
-    // reads the first bytes and stays the authority.
-    await waitFor(() => expect(sentPicture(calls, "logo")).toBe(true))
   })
 })

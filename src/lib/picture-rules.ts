@@ -3,11 +3,15 @@
  * so the screen can say no BEFORE a request, in the API's own words, and
  * never say yes to something the API will refuse.
  *
- * Every rule here repeats one the API enforces (`rust/crates/lakehouse-api/
- * src/routes/settings.rs`: `LOGO_MAX_BYTES`, `ICON_MAX_BYTES`,
- * `sniff_picture_type` and `check_picture`). The API is the authority: it
- * reads the type from the file's first bytes and refuses what it refuses.
- * These rules only save the person a request the API would refuse.
+ * The rule here is the API's rule: the console sniffs the same first bytes
+ * the API sniffs (`sniff_picture_type` in
+ * `rust/crates/lakehouse-api/src/routes/settings.rs`), so it refuses exactly
+ * what the API refuses and accepts exactly what the API accepts. The file's
+ * name and the browser's claim of its type are never read: the API does not
+ * read them either, so a PNG named `logo.txt` is a PNG for both.
+ *
+ * The API stays the authority for what is stored. These rules only save the
+ * person a request the API would refuse.
  */
 
 import type { BrandingImageKind } from "@/services/contracts/branding"
@@ -43,11 +47,29 @@ export const LOGO_SIZE_REFUSED = "The logo must be at most 512 KB."
  */
 export const ICON_REFUSED = "The icon must be a PNG image of at most 64 KB."
 
-/** The types the API sniffs for the logo and the dark-mode logo. */
-const LOGO_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/webp"]
+/** The media type the API names a PNG. */
+const PNG_TYPE = "image/png"
 
-/** The type the API sniffs for the icon: a PNG, and nothing else. */
-const ICON_TYPES: readonly string[] = ["image/png"]
+/** The media type the API names a JPEG. */
+const JPEG_TYPE = "image/jpeg"
+
+/** The media type the API names a WebP. */
+const WEBP_TYPE = "image/webp"
+
+/** The first bytes of a PNG (the API's `sniff_picture_type`, `settings.rs:2888`). */
+const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+
+/** The first bytes of a JPEG (`settings.rs:2889`). */
+const JPEG_MAGIC = [0xff, 0xd8, 0xff]
+
+/** The first four bytes of a WebP file: `RIFF` (`settings.rs:2894`). */
+const RIFF_MAGIC = [0x52, 0x49, 0x46, 0x46]
+
+/** The bytes 8 to 12 of a WebP file: `WEBP` (`settings.rs:2894`). */
+const WEBP_TAG = [0x57, 0x45, 0x42, 0x50]
+
+/** How many bytes the sniffer reads: the WebP tag ends at byte 12. */
+const HEAD_BYTES = 12
 
 /**
  * The types each picture takes, for the picker's `accept`. The logo and the
@@ -55,33 +77,54 @@ const ICON_TYPES: readonly string[] = ["image/png"]
  * for the whole console, so the picker cannot offer a type the rules refuse.
  */
 export const PICTURE_TYPES: Record<BrandingImageKind, readonly string[]> = {
-  logo: LOGO_TYPES,
-  "logo-dark": LOGO_TYPES,
-  icon: ICON_TYPES,
+  logo: [PNG_TYPE, JPEG_TYPE, WEBP_TYPE],
+  "logo-dark": [PNG_TYPE, JPEG_TYPE, WEBP_TYPE],
+  icon: [PNG_TYPE],
+}
+
+/** Whether the bytes of the head at `at` are these bytes. */
+function bytesAt(head: Uint8Array, at: number, bytes: readonly number[]): boolean {
+  if (head.length < at + bytes.length) return false
+  return bytes.every((byte, index) => head[at + index] === byte)
+}
+
+/**
+ * The media type the first bytes of a file say it is, exactly as the API
+ * sniffs it (`sniff_picture_type`, `settings.rs:2887-2899`): PNG, JPEG and
+ * WebP, and nothing else. The file's name and the browser's claim are never
+ * read; an SVG or a text file named `logo.png` has none of these bytes.
+ */
+function sniffPictureType(head: Uint8Array): string | null {
+  if (bytesAt(head, 0, PNG_MAGIC)) return PNG_TYPE
+  if (bytesAt(head, 0, JPEG_MAGIC)) return JPEG_TYPE
+  if (bytesAt(head, 0, RIFF_MAGIC) && bytesAt(head, 8, WEBP_TAG)) return WEBP_TYPE
+  return null
 }
 
 /**
  * What the API would answer for a file that breaks the rule of its kind, in
  * the API's own words, or `null` when the file may be sent.
  *
- * The order of the checks is the API's (`check_picture`, `settings.rs:2944`):
- * the type first, then the size. A logo of the wrong type that is also too
- * big is refused with the type sentence, as the API refuses it. The
- * dark-mode logo follows the logo's rules and the logo's sentences.
+ * The type comes from the file's first bytes, as it does in the API, and the
+ * order of the checks is the API's (`check_picture`, `settings.rs:2944`): the
+ * type first, then the size. A file that is no picture is refused with the
+ * type sentence even when it is small; a picture that is too big is refused
+ * with the size sentence. The dark-mode logo follows the logo's rules and the
+ * logo's sentences.
  */
-export function pictureRefusal(kind: BrandingImageKind, file: File): string | null {
-  const type = file.type.trim().toLowerCase()
-  // The browser does not always know the type of a file: an empty type or
-  // `application/octet-stream` says nothing about the bytes. The API sniffs
-  // the first bytes and stays the authority, so nothing is refused on the
-  // type here; only the size, which the browser does know, is judged.
-  const known = type !== "" && type !== "application/octet-stream"
+export async function pictureRefusal(
+  kind: BrandingImageKind,
+  file: File
+): Promise<string | null> {
+  const head = new Uint8Array(await file.slice(0, HEAD_BYTES).arrayBuffer())
+  const type = sniffPictureType(head)
   if (kind === "icon") {
-    if (known && !ICON_TYPES.includes(type)) return ICON_REFUSED
-    if (file.size > ICON_MAX_BYTES) return ICON_REFUSED
+    // The API has one sentence for the icon, for its type and for its size.
+    if (type !== PNG_TYPE || file.size > ICON_MAX_BYTES) return ICON_REFUSED
     return null
   }
-  if (known && !LOGO_TYPES.includes(type)) return LOGO_TYPE_REFUSED
+  // The sniffer answers with the three types the logo takes, or with none.
+  if (type === null) return LOGO_TYPE_REFUSED
   if (file.size > LOGO_MAX_BYTES) return LOGO_SIZE_REFUSED
   return null
 }

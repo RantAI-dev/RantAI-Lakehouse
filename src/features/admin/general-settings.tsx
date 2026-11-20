@@ -135,9 +135,10 @@ export function GeneralSettings() {
   }
 
   async function uploadPicture(kind: BrandingImageKind, file: File) {
-    // The API is the authority; the console only refuses a file the API would
-    // refuse, in the API's own sentence, and sends nothing for it (adm-120).
-    const refused = pictureRefusal(kind, file)
+    // The API is the authority; the console sniffs the same first bytes the
+    // API sniffs, so it refuses exactly what the API would refuse, in the
+    // API's own sentence, and sends nothing for it (adm-120).
+    const refused = await pictureRefusal(kind, file)
     setRefusal(refused)
     if (refused !== null) return
     const result = await upload.run(kind, file)
