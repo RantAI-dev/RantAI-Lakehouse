@@ -202,11 +202,13 @@ impl CteEnv {
     }
 }
 
-/// One resolved read: the sources and reasons a column carries. A real table
-/// gives one source; a `WITH` column gives its own sources and reasons.
+/// One resolved read: the sources and reasons a column carries, and how it
+/// was computed. A real table gives one source and `Copy`; a `WITH` column
+/// gives its own sources, reasons and transform (`DATA-57` D5).
 struct Read {
     sources: Vec<(String, String)>,
     reasons: Vec<String>,
+    transform: Transform,
 }
 
 impl Read {
@@ -214,7 +216,21 @@ impl Read {
         Self {
             sources: vec![pair],
             reasons: Vec::new(),
+            transform: Transform::Copy,
         }
+    }
+}
+
+/// Compose an outer transform with the transform of a column read through a
+/// `WITH` (`DATA-57` D5). `expression` absorbs anything; a `cast` of a `cast`
+/// is `expression` because the stored word means one `CAST` of one column
+/// (planner default).
+fn compose_transforms(outer: Transform, inner: Transform) -> Transform {
+    use Transform::{Cast, Copy, Expression};
+    match (outer, inner) {
+        (Copy, inner) => inner,
+        (Cast, Copy) => Cast,
+        _ => Expression,
     }
 }
 
@@ -855,6 +871,8 @@ fn analyse(name: &str, expr: &Expr, scope: &Scope<'_>) -> Out {
         out.reasons.push(MSG_SUBQUERY_EXPR.to_owned());
         return out;
     }
+    let outer = out.transform;
+    let mut composed = None;
     for parts in &reads.identifiers {
         match resolve(parts, scope) {
             Ok(read) => {
@@ -868,6 +886,7 @@ fn analyse(name: &str, expr: &Expr, scope: &Scope<'_>) -> Out {
                         out.reasons.push(reason);
                     }
                 }
+                composed = Some(compose_transforms(outer, read.transform));
             }
             Err(reason) => {
                 if !out.reasons.contains(&reason) {
@@ -875,6 +894,13 @@ fn analyse(name: &str, expr: &Expr, scope: &Scope<'_>) -> Out {
                 }
             }
         }
+    }
+    // Only a bare column or a cast of one has a single read to compose with
+    // (`transform_of` is `Copy` or `Cast`); an expression stays an expression.
+    if matches!(outer, Transform::Copy | Transform::Cast)
+        && let Some(transform) = composed
+    {
+        out.transform = transform;
     }
     out
 }
@@ -931,6 +957,7 @@ fn read_from_cte(name: &str, columns: &[Out], column: &str) -> Result<Read, Stri
         [one] => Ok(Read {
             sources: one.sources.clone(),
             reasons: one.reasons.clone(),
+            transform: one.transform,
         }),
         [] => Err(format!(
             "the column {} is not a column of the CTE {}",
@@ -1453,6 +1480,83 @@ mod tests {
                 t("b", "silver.users.name", "copy"),
             ]
         );
+    }
+
+    // DATA-57 T2: transforms compose through a WITH (D5).
+
+    #[test]
+    fn a_cast_of_a_cte_copy_is_a_cast_and_a_copy_of_a_cte_cast_is_a_cast() {
+        let l = run(
+            "WITH c AS (SELECT id, CAST(Amount AS Float64) AS f FROM silver.orders) \
+             SELECT CAST(id AS String) AS s, f FROM c",
+        );
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("s", "silver.orders.id", "cast"),
+                t("f", "silver.orders.Amount", "cast"),
+            ]
+        );
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn a_cast_of_a_cte_cast_is_an_expression() {
+        let l = run(
+            "WITH c AS (SELECT CAST(Amount AS Float64) AS f FROM silver.orders) \
+             SELECT CAST(f AS String) AS g FROM c",
+        );
+        assert_eq!(
+            triples(&l),
+            vec![t("g", "silver.orders.Amount", "expression")]
+        );
+    }
+
+    #[test]
+    fn a_copy_of_a_cte_constant_is_a_constant() {
+        let l = run(
+            "WITH c AS (SELECT 1 AS one, count() AS n FROM silver.orders) SELECT one, n FROM c",
+        );
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+        assert_eq!(l.constants, vec!["one".to_owned(), "n".to_owned()]);
+    }
+
+    #[test]
+    fn the_compiled_shape_of_a_multi_step_pipeline_is_traced() {
+        let l = run("WITH \
+             `orders` AS (SELECT * FROM silver.`orders`), \
+             `paid` AS (SELECT * FROM `orders` WHERE region = 'EU'), \
+             `shaped` AS (SELECT id, CAST(Amount AS Float64) AS amount_f, upper(region) AS r FROM paid) \
+             SELECT * FROM `shaped`");
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("id", "silver.orders.id", "copy"),
+                t("amount_f", "silver.orders.Amount", "cast"),
+                t("r", "silver.orders.region", "expression"),
+            ]
+        );
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn two_inputs_joined_in_a_sql_step_map_each_column_to_its_own_table() {
+        let l = run("WITH \
+             `orders` AS (SELECT * FROM silver.`orders`), \
+             `users` AS (SELECT * FROM silver.`users`), \
+             `joined` AS (SELECT o.id AS order_id, u.name, o.Amount * 2 AS doubled \
+             FROM orders AS o JOIN users AS u ON o.id = u.id) \
+             SELECT * FROM `joined`");
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("order_id", "silver.orders.id", "copy"),
+                t("name", "silver.users.name", "copy"),
+                t("doubled", "silver.orders.Amount", "expression"),
+            ]
+        );
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
     }
 
     #[test]
