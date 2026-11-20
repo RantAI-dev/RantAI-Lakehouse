@@ -689,3 +689,55 @@ matches `dagster/pyproject.toml`.
 - The two unrelated Dagster failures above are reported, not papered over.
 
 ## Review
+
+### Round 1 — planner review, 2026-11-20, at `23e9f9ede`
+
+Holds: the graph is derived only through `_pipeline_target`/`_pipeline_sources`,
+same tenant; cycles removed (Tarjan) before reach (P2); paused and
+target-lag pipelines excluded (P1); fan-in waits for every parent; each
+parent is looked up by its run tagged with this re-upload; fixed `run_key`
+per re-upload and pipeline; P6 and P10 as planned; routes gated and asserted
+both ways; migration `0153` with a why-header; Python rules kept. The two
+Dagster failures in the handoff do not touch this change.
+
+**R1 BLOCKER: a re-upload can leave the sensor's view and is lost without
+a record.** `reupload_chain.py:254-269` scans only the newest 20 successful
+`file_ingest_job` runs across every table and tenant, while a chain waits
+up to 6 hours. Twenty loads of other tables later, Gold's tick no longer
+sees the re-upload: Gold never runs, nothing is recorded, P5's expiry never
+fires. Fix: find the open re-uploads by their own key, not a recency window
+— e.g. `get_run_records` filtered by job, status SUCCESS, the uploaded
+table's tag and `updated_after` = now − 6 h (P5), or a record the chain
+writes when it first sees a re-upload, read back until it is finished. A
+test with 21+ loads of other tables between the re-upload and Gold's turn.
+
+**R2 BLOCKER: P4 assumes the newer re-upload starts its own first
+pipeline, and the existing `_after` sensor does not guarantee it.**
+`reupload_chain.py:131-132` with `authored_factory.py:1212-1217`: if R2
+ends while R1's first pipeline run is still queued, `_after` skips R2 once
+and never retries, so no run is tagged R2; Gold records R1 `superseded`,
+then waits on R2 and records `wait_expired` with a false sentence while
+Silver did load R2's data. Fix: the chain sensor owns the first pipeline's
+launch too (same `run_key` per re-upload and pipeline), and `_after` steps
+aside for a file load whose table starts a chain; or a later successful
+first-pipeline run (started after R2's load ended) counts as R2's. Pick
+one, say which in the module doc. Test: two re-uploads with R2 ending while
+R1's first run is queued — Gold runs once, for R2, and no false sentence.
+
+**R3 SHOULD-FIX: two runs of one pipeline in one tick.**
+`reupload_chain.py:299-318`: `in_flight` reads the instance, which does not
+yet hold requests yielded earlier in the same tick. Launch at most one run
+per pipeline per tick; the other root waits for the next tick. Test.
+
+**R4 SHOULD-FIX: an older re-upload can come back.** `reupload_chain.py:
+302-304` compares only against unfinished re-uploads; compare against every
+re-upload of the same table, finished ones included. Test.
+
+**R5 SHOULD-FIX: placement and validation.** Move `GET /api/pipelines/{id}/
+reupload-chain` out of `authored_pipelines_router` (whose doc says
+orchestrator-only) next to `runs` in `routes/pipelines.rs`, as T3 said; and
+validate `runId`'s shape and length on the POST route (section 3).
+
+Not confirmed, check while fixing: whether Dagster keeps a sensor cursor
+across stop and start, so a resumed pipeline acts on re-uploads from while
+it was paused (P10's floor would not apply).
