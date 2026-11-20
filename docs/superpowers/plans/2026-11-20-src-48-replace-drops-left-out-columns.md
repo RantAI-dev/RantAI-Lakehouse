@@ -220,3 +220,28 @@ Deviations from the plan, for the reviewer:
 ## Review
 
 (planner appends here)
+
+### Round 1 (planner, 2026-11-20, head `10de824a9`)
+
+No BLOCKER.
+
+**The deviation is accepted, and it corrects the plan.** The plan's task-4
+anchor `ingest_factory.py:940` is the Oracle path. The QA case (PostgreSQL)
+loads through `dlt_pipeline.run_bronze_ingest`. Passing `drop_columns` on
+all three SQL paths is what the backlog item needs. The planner's anchor was
+wrong.
+
+**Also accepted:**
+- `bronze_column_names`, which uses `dlt`'s naming;
+- the author note on the schema commit;
+- the stub change in `_wire_mysql`.
+
+**Not provable in the local harness (staging retest of `TC-1706` decides):**
+- the harness reuses one pipeline object between loads;
+- on staging, a run may start from the bucket's stored `dlt` schema
+  (`sync_destination`), which still lists the column the first time;
+- the drop runs after the sink's own sync (`refuse_history_rows`), so the
+  in-memory removal should be what `run` saves, but a `dlt` restore inside
+  `run` has not been measured;
+- if the retest shows the column back after a second replace, that is a
+  new finding against this item.
