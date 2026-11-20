@@ -198,3 +198,18 @@ ref that keeps the ended run's id, and 1 s fake-timer steps.
   the behaviour and the tests the same. Run CI run 44667901397, job
   `Lint`.
 
+
+### Round 2 (planner, 2026-11-20, head `490f02c5e`)
+
+BLOCKER 1 is closed: CI Lint is green, and the derived `countWaiting` is
+accepted.
+
+- **BLOCKER 2.** CI `Unit tests`: 4618 pass, 1 fail.
+  - Failing test: `ConnectorDetailPage after a run ends > stops asking
+    after 3 minutes when the run is never counted`, which timed out after
+    5000 ms. It moves 180 one-second steps, each in its own `act`, and
+    that is too slow on the CI runner (CI run 44668481444).
+  - Fix the test, not the limit (rule 2). Move time in steps of the poll
+    interval: 10 s per `act`, about 19 steps. The assertion stays the
+    same: no fetch after the 3 minute cap.
+  - Do not raise the test's timeout.
