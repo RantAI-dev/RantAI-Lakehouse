@@ -30,6 +30,9 @@ use uuid::Uuid;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::query_limits::{Snapshot, snapshot};
+use crate::routes::settings::{
+    audit_settings_event, audit_settings_refusal, changed_setting_paths, handler_refusal_status,
+};
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -172,7 +175,10 @@ pub async fn get_limits(
     )))
 }
 
-/// `PUT /api/settings/limits` — save `{ install, roles }`.
+/// `PUT /api/settings/limits` — save `{ install, roles }`. The route's audit
+/// rows are the handler's (plan D3): the save writes one naming the settings
+/// that changed, and a save this handler refuses writes its own `refused`
+/// row.
 ///
 /// # Errors
 ///
@@ -185,6 +191,51 @@ pub async fn put_limits(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    let reply = save_limits(&state, &principal, body).await;
+    match reply {
+        Ok(reply) => Ok(reply),
+        Err(err) => {
+            // Plan D3: the route's refusal row is now the handler's to write;
+            // the gate's 403 row is separate and already written there.
+            if let Some(status) = handler_refusal_status(&err) {
+                audit_settings_refusal(
+                    &state,
+                    &principal,
+                    "settings.limits.update",
+                    "limits",
+                    status,
+                )
+                .await;
+            }
+            Err(err.into())
+        }
+    }
+}
+
+/// The limits as the console names them, for the snapshot a save's row diffs
+/// against (plan D3): `install.*` and one entry per role keyed by the role's
+/// NAME, so the paths read `roles.Analyst.timeoutSeconds` the way the console
+/// names a role limit.
+fn limits_snapshot_json(install: &QueryLimits, roles: &[RoleLimit]) -> Value {
+    let roles: serde_json::Map<String, Value> = roles
+        .iter()
+        .map(|role| {
+            (
+                role.role_name.clone(),
+                json!({ "timeoutSeconds": role.timeout_seconds }),
+            )
+        })
+        .collect();
+    json!({ "install": install_json(install), "roles": roles })
+}
+
+/// The save behind [`put_limits`], whose errors the wrapper turns into the
+/// refusal row.
+async fn save_limits(
+    state: &AppState,
+    principal: &Principal,
+    body: Bytes,
+) -> Result<ApiJson<Value>, ApiError> {
     // Parsed by hand so a malformed body gets this module's message.
     let parsed: LimitsBody =
         serde_json::from_slice(&body).map_err(|_| ApiError::BadRequest(BODY_SHAPE.to_owned()))?;
@@ -192,10 +243,9 @@ pub async fn put_limits(
     let Some(pool) = state.pg.as_deref() else {
         return Err(ApiError::Unavailable(
             "Settings need a database, and none is configured.".to_owned(),
-        )
-        .into());
+        ));
     };
-    match lakehouse_store::query_limits::save(
+    let (replaced, stored) = match lakehouse_store::query_limits::save(
         pool,
         &install,
         &roles,
@@ -203,22 +253,48 @@ pub async fn put_limits(
     )
     .await
     {
-        Ok(()) => {}
+        Ok(saved) => saved,
         Err(StoreError::ForeignKeyViolation) => {
             return Err(ApiError::BadRequest(
                 "The role limits must name roles that exist.".to_owned(),
-            )
-            .into());
+            ));
         }
         Err(err) => {
-            return Err(upstream_error::internal_error(&upstream_error::STORE, &err).into());
+            return Err(upstream_error::internal_error(&upstream_error::STORE, &err));
         }
-    }
-    // Cleared after the write so the read below, and the next tile of this
-    // process, see the new numbers (plan D2).
+    };
+    // Cleared after the write so the next tile of this process sees the new
+    // numbers (plan D2).
     state.query_limits.clear();
-    let snap = snapshot(&state).await?;
-    Ok(ApiJson(body_json(&snap, &principal, true)))
+    // Plan D3: the row names the settings that changed — the dotted paths
+    // between the values this save replaced (plan D3b) and the values it
+    // stored, with the roles' names, never a value. Both sides come out of
+    // the save's own transaction, so no read sits between the write and the
+    // row: a read after the commit could fail, which would leave a committed
+    // save with no record of it, or name another save's values as this one's.
+    // The store seeds the install row, so no replaced row reads as the
+    // defaults every reader falls back to.
+    let paths = changed_setting_paths(
+        &limits_snapshot_json(&replaced.install.unwrap_or_default(), &replaced.roles),
+        &limits_snapshot_json(&stored.install, &stored.roles),
+    );
+    let detail = (!paths.is_empty()).then(|| paths.join(", "));
+    audit_settings_event(
+        state,
+        principal,
+        "settings.limits.update",
+        "limits",
+        json!({ "fields": paths }),
+        detail.as_deref(),
+    )
+    .await;
+    // The answer carries the values the save stored, so the caller sees what
+    // was written and not what another save wrote in between.
+    let snap = Snapshot {
+        install: stored.install,
+        roles: stored.roles,
+    };
+    Ok(ApiJson(body_json(&snap, principal, true)))
 }
 
 #[cfg(test)]
@@ -308,5 +384,35 @@ mod tests {
     fn an_unknown_field_is_not_part_of_the_body() {
         let text = OK.replace("\"roles\":[]", "\"roles\":[],\"extra\":1");
         assert!(serde_json::from_str::<LimitsBody>(&text).is_err());
+    }
+
+    /// The save's answer and its audit row come from the values the store
+    /// returned (plan D3b), so the route reads the limits nowhere between the
+    /// write and the row. A read after the commit could fail, which would
+    /// leave a committed save with no record of it, or name another save's
+    /// values as this one's — the race the store's own transaction closed.
+    ///
+    /// The property is about the shape of the code, so it is pinned by
+    /// reading it: the save holds no read of the limits at all.
+    #[test]
+    fn the_save_reads_the_limits_nowhere_after_the_write() {
+        let source = include_str!("query_limits.rs");
+        let start = source
+            .find("async fn save_limits(")
+            .expect("the save is in this file");
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").expect("the save ends with a brace");
+        let body = &rest[..end];
+        for read in [
+            "snapshot(",
+            "query_limits::get(",
+            "query_limits::role_limits(",
+        ] {
+            assert!(
+                !body.contains(read),
+                "the save must answer from the values the store returned, so it reads the \
+                 limits nowhere after the write; it reads them with `{read}`: {body}"
+            );
+        }
     }
 }

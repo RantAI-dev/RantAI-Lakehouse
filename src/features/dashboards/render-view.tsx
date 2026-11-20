@@ -110,6 +110,20 @@ export function markReady() {
 }
 
 /**
+ * Loads an uploaded map's GeoJSON boundary through the print view's render
+ * token (`BI-36`, `PR #528 review BLOCKER`), because the headless print view
+ * has no session cookie and `apiFetch` would redirect to `/login`.
+ */
+export function renderMapLoader(token: string): MapLoader {
+  return (id) => fetch(`/api/render/maps/${encodeURIComponent(id)}/geojson`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+    cache: "no-store",
+  });
+}
+
+/**
  * The PDF's print view (`BI-1`, plan D4), opened by Gotenberg at
  * `/render/dashboard/<token>`. It has no session: the token in the address is
  * posted to `POST /api/render/data`, which answers the dashboard as the person
@@ -189,17 +203,9 @@ export function RenderView({ token, chart = false }: { token: string; chart?: bo
     return () => { cancelAnimationFrame(first); cancelAnimationFrame(second); };
   }, [state, counts]);
 
-  // BI-36: an uploaded map's boundary is read through the render token, like the
-  // data. The signed-in loader (`apiFetch`, the default) answers this view, which
-  // has no session, with a 401 and a redirect to the login page, so a map tile
-  // of a PDF did not draw. The route opens the token's own board's maps only.
-  const loadMap = React.useCallback<MapLoader>(
-    (id) => fetch(`/api/render/maps/${encodeURIComponent(id)}/geojson`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token }), cache: "no-store",
-    }),
-    [token],
-  );
+  // BI-36 / PR #528 review BLOCKER: an uploaded map's boundary is read through
+  // the render token, like the data (no session -> /login redirect otherwise).
+  const loadMap = React.useMemo(() => renderMapLoader(token), [token]);
 
   if (state === "error") {
     return <div role="alert" className="grid h-screen place-content-center px-4 text-center text-sm">{message}</div>;

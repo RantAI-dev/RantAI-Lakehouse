@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils"
 import { safeReportUrl } from "@/lib/report-blocks"
 import { parseInline, type InlineRun } from "@/lib/report-inline"
 import type { ReportBlock, ReportChartEntry } from "@/services/contracts/dashboard-reports"
+import type { MapLoader } from "./echarts-maps"
 import { TileBody } from "./tile-body"
 import "./report-document.css"
 
@@ -38,6 +39,7 @@ export function ReportBlocks({
   print = false,
   title,
   className,
+  loadMap,
 }: {
   readonly blocks: readonly ReportBlock[]
   readonly charts: Readonly<Record<string, ReportChartEntry>>
@@ -47,12 +49,14 @@ export function ReportBlocks({
   /** The report's title as the document's first line (the reader page, Preview). */
   readonly title?: string
   readonly className?: string
+  /** Map boundary loader for headless print views with no session (`PR #528 review BLOCKER`). */
+  readonly loadMap?: MapLoader
 }) {
   return (
     <div className={cn("rd-doc", print && "rd-print", className)} data-report-blocks>
       {title !== undefined ? <h1 className="rd-title">{title || "Untitled report"}</h1> : null}
       {blocks.map((block, i) => (
-        <ReportBlockView key={i} block={block} charts={charts} dark={dark} print={print} />
+        <ReportBlockView key={i} block={block} charts={charts} dark={dark} print={print} loadMap={loadMap} />
       ))}
     </div>
   )
@@ -103,11 +107,13 @@ function ReportBlockView({
   charts,
   dark,
   print,
+  loadMap,
 }: {
   readonly block: ReportBlock
   readonly charts: Readonly<Record<string, ReportChartEntry>>
   readonly dark: boolean
   readonly print: boolean
+  readonly loadMap?: MapLoader
 }) {
   switch (block.type) {
     case "heading": {
@@ -164,7 +170,7 @@ function ReportBlockView({
     case "chart":
       return (
         <ReportChartBlock wide={block.width === "wide"}>
-          <ReportChart entry={charts[block.chart]} dark={dark} print={print} wide={block.width === "wide"} />
+          <ReportChart entry={charts[block.chart]} dark={dark} print={print} wide={block.width === "wide"} loadMap={loadMap} />
         </ReportChartBlock>
       )
     default:
@@ -209,6 +215,7 @@ export function ReportChart({
   wide = false,
   selected = false,
   toolbar,
+  loadMap,
 }: {
   readonly entry: ReportChartEntry | undefined
   readonly dark: boolean
@@ -216,6 +223,7 @@ export function ReportChart({
   readonly wide?: boolean
   readonly selected?: boolean
   readonly toolbar?: React.ReactNode
+  readonly loadMap?: MapLoader
 }) {
   const card = cn(
     "group/chart relative m-0 rounded-2xl bg-muted/50 px-4 pt-3.5 pb-3 break-inside-avoid transition-[box-shadow,background-color] duration-200 ease-[cubic-bezier(0.2,0,0,1)] dark:bg-card",
@@ -253,7 +261,7 @@ export function ReportChart({
       </figcaption>
       {spec.subtitle ? <p className="mt-0.5 text-xs leading-4 text-muted-foreground">{spec.subtitle}</p> : null}
       <div className={cn("relative mt-2 min-h-0", reportChartHeight(spec.kind, wide))}>
-        <TileBody spec={spec} cell={cell ?? undefined} dark={dark} loading={false} />
+        <TileBody spec={spec} cell={cell ?? undefined} dark={dark} loading={false} loadMap={loadMap} />
       </div>
       {toolbar}
     </figure>

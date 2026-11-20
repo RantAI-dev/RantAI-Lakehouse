@@ -297,6 +297,26 @@ services:
     environment:
       PORT: "8080"
       APP_ENV: ${APP_ENV:-local}
+      # The commit this deployment runs.
+      #
+      # `check_commit` (`rust/crates/lakehouse-api/src/pipeline_source.rs`)
+      # compares it with the commit the Dagster code location stamped on
+      # the op, and the console's pipeline page serves the op's source
+      # text only when the two agree. "unknown" on EITHER side means "no
+      # real commit was ever recorded here", so the route refuses instead
+      # of serving source it cannot verify.
+      #
+      # It is set HERE, at RUN time, and not only as the image's build
+      # arg: the API image is built in CI WITHOUT `GIT_SHA` (a per-commit
+      # build arg sits near the top of `rust/Dockerfile`, so it would
+      # invalidate every layer below it and the layer cache would never
+      # hit), which means the image itself carries `GIT_SHA=unknown`. A
+      # container's `environment:` overrides the image's `ENV`, so the
+      # value the API reads is the one the deploy exports --
+      # `scripts/compose.sh` exports `GIT_SHA=$(git rev-parse HEAD)`, the
+      # SAME value the code location's image is built with, and the two
+      # agree.
+      GIT_SHA: ${GIT_SHA:-unknown}
       # ── ClickHouse: points at the compose service by default ──
       CH_URL: ${CH_URL:-http://clickhouse:8123}
       CH_USER: ${CH_USER:-default}
@@ -2473,6 +2493,32 @@ services:
           subpath: gold-export.jwt
         read_only: true
     environment:
+      # How many steps the multiprocess executor of THIS code location may
+      # run at the same time.
+      #
+      # Dagster's own default is the CPU count of the machine the code
+      # location runs on (`multiprocessing.cpu_count()`, see
+      # `dagster/_core/executor/multiprocess.py`), so on the staging VM
+      # (8 vCPU) EIGHT steps ran at once. Every step of this code location
+      # is a spawned Python process of its own (~235 MB RSS), which is why
+      # the container was measured at 1012 MiB and 268% CPU while
+      # `bronze_maintenance_job` fanned out over its 513 bronze tables --
+      # and why the `docker compose up --build` of a deploy, running on the
+      # SAME 8 cores, starved and stalled next to it.
+      #
+      # Two keeps the pipeline working and bounds the footprint: the
+      # fan-out is untouched (the job still steps over every table, it just
+      # does fewer of them at the same time). The host cannot grow its RAM
+      # -- the Proxmox host `pve` is at 96% of its 62 GiB, and the staging
+      # VM's 8 GiB is already half in swap -- so the bound has to come from
+      # here, not from more memory.
+      #
+      # A code location with no `max_concurrent` in its executor config
+      # reads this variable, and only then falls back to the CPU count
+      # (`if not max_concurrent: env_var_default = os.getenv(...)`).
+      # An operator may raise or lower it in `.env`; the default below is
+      # the number this deployment runs with. Not a credential.
+      DAGSTER_MULTIPROCESS_EXECUTOR_MAX_CONCURRENT: ${DAGSTER_MULTIPROCESS_EXECUTOR_MAX_CONCURRENT:-2}
       # `dlt_pipeline.py::run_bronze_ingest`: the `dlt`
       # SSRF guard fail-closed refuses to dial an RFC1918/private
       # address unless this is set; `BRONZE_SOURCE_DB_HOST` below is

@@ -1715,8 +1715,13 @@ fn rotate_connector_credential_schema() -> Value {
 }
 
 fn create_pipeline_schema() -> Value {
+    // The `steps` parameter is a pre-built value rather than a literal: the
+    // three form kinds of BLD-16 made the one `json!` literal deeper than
+    // the macro's expansion budget, and a named function a reader can jump
+    // to beats a raised `recursion_limit` the whole crate would carry.
+    let steps = create_pipeline_steps_parameter();
     json!({ "type": "function", "function": { "name": "create_pipeline",
-        "description": "Author a new pipeline that reads tables and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold -- a pipeline never writes bronze, which is written by ingestion. A pipeline is 1-5 named inputs and 0-20 named steps. Give the shape one of two ways: (a) inputs and steps, which is the fuller one -- a step is { name, kind: 'sql', sql } with ONE read-only SELECT over the inputs and earlier steps by their names (joins, aggregations, CASE, subqueries and window functions are allowed; a table that is not an input is refused, so list every table you read under inputs), or { name, kind: 'transform', reads, transforms } with the five operations below; or (b) today's sourceZone, sourceTable and transforms, which is one input and one transform step. Send one form, never both. Use a SQL step whenever the person asks for a join, a group-by, an aggregate, a calculated column or anything the five operations cannot say. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
+        "description": "Author a new pipeline that reads tables and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold -- a pipeline never writes bronze, which is written by ingestion. A pipeline is 1-5 named inputs and 0-20 named steps. Give the shape one of two ways: (a) inputs and steps, which is the fuller one -- a step is one of: { name, kind: 'sql', sql } with ONE read-only SELECT over the inputs and earlier steps by their names (joins, aggregations, CASE, subqueries and window functions are allowed; a table that is not an input is refused, so list every table you read under inputs), { name, kind: 'transform', reads, transforms } with the five operations below, or a form step: { name, kind: 'join', left, right, joinType, on, columns }, { name, kind: 'aggregate', reads, groupBy, measures, havingMatch, having }, { name, kind: 'filter', reads, match, conditions }; or (b) today's sourceZone, sourceTable and transforms, which is one input and one transform step. Send one form, never both. Prefer a form step (join, aggregate, filter, transform) when it can say what the person asked, because they can then change it in the form; use a SQL step for anything else (a CASE, a calculated column, a window function, a join that is not on equal columns, all and any mixed). A join matches on equal columns only, 1-10 pairs; look its sides' columns up first with describe_mart, describe_dataset or run_sql and list every output column. A measure's name cannot be a column the step reads; a having names a group-by column or a measure; values are text, except a count, sum or average is compared with a number. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "description": { "type": "string" },
@@ -1727,15 +1732,7 @@ fn create_pipeline_schema() -> Value {
                     "zone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
                     "table": { "type": "string" } },
                     "required": ["name", "zone", "table"] } },
-            "steps": { "type": "array", "maxItems": 20,
-                "description": "the pipeline's steps in order; the last one's result is the output",
-                "items": { "type": "object", "properties": {
-                    "name": { "type": "string" },
-                    "kind": { "type": "string", "enum": ["sql", "transform"] },
-                    "sql": { "type": "string", "description": "kind=sql: one read-only SELECT over the inputs and earlier steps" },
-                    "reads": { "type": "string", "description": "kind=transform: the input or earlier step it reads" },
-                    "transforms": { "type": "array", "items": { "type": "string" }, "description": "kind=transform: the operations, one per entry" } },
-                    "required": ["name", "kind"] } },
+            "steps": steps,
             "sourceZone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
             "sourceTable": { "type": "string" },
             "targetZone": { "type": "string", "enum": ["silver", "gold"] },
@@ -1744,6 +1741,61 @@ fn create_pipeline_schema() -> Value {
             "incrementalColumn": { "type": "string", "description": "optional column for incremental loads" },
             "schedule": { "type": "string", "description": "\"manual\" or a cron expression" } },
             "required": ["name", "targetZone", "targetTable"] } } })
+}
+
+/// `create_pipeline`'s `steps` parameter (BLD-16 / J1, J2): a step is SQL,
+/// the five operations, or one of the three form kinds, each property
+/// naming the kind it belongs to so the model sends the right shape.
+fn create_pipeline_steps_parameter() -> Value {
+    json!({ "type": "array", "maxItems": 20,
+        "description": "the pipeline's steps in order; the last one's result is the output",
+        "items": { "type": "object", "properties": {
+            "name": { "type": "string" },
+            "kind": { "type": "string", "enum": ["sql", "transform", "join", "aggregate", "filter"] },
+            "sql": { "type": "string", "description": "kind=sql: one read-only SELECT over the inputs and earlier steps" },
+            "reads": { "type": "string", "description": "kind=transform/aggregate/filter: the input or earlier step it reads" },
+            "transforms": { "type": "array", "items": { "type": "string" }, "description": "kind=transform: the operations, one per entry" },
+            "left": { "type": "string", "description": "kind=join: the input or earlier step on the left side" },
+            "right": { "type": "string", "description": "kind=join: the input or earlier step on the right side" },
+            "joinType": { "type": "string", "enum": ["inner", "left", "right", "full"], "description": "kind=join: the join type" },
+            "on": { "type": "array", "minItems": 1, "maxItems": 10,
+                "description": "kind=join: the column pairs matched on, equal columns only",
+                "items": { "type": "object", "properties": {
+                    "left": { "type": "string", "description": "the left side's column" },
+                    "right": { "type": "string", "description": "the right side's column" } },
+                    "required": ["left", "right"] } },
+            "columns": { "type": "array", "minItems": 1, "maxItems": 300,
+                "description": "kind=join: the output columns, listed after looking them up",
+                "items": { "type": "object", "properties": {
+                    "side": { "type": "string", "enum": ["left", "right"], "description": "which side the column comes from" },
+                    "column": { "type": "string", "description": "the side's column" },
+                    "name": { "type": "string", "description": "the output name; leave out to keep the column's own" } },
+                    "required": ["side", "column"] } },
+            "groupBy": { "type": "array", "maxItems": 20, "items": { "type": "string" }, "description": "kind=aggregate: the columns to group by; empty means one row" },
+            "measures": { "type": "array", "maxItems": 50,
+                "description": "kind=aggregate: the measures; a name may not be a column the step reads",
+                "items": { "type": "object", "properties": {
+                    "function": { "type": "string", "enum": ["count", "countDistinct", "sum", "avg", "min", "max"] },
+                    "column": { "type": "string", "description": "the column; only count may leave it out" },
+                    "name": { "type": "string", "description": "the output name" } },
+                    "required": ["function", "name"] } },
+            "havingMatch": { "type": "string", "enum": ["all", "any"], "description": "kind=aggregate: how the having conditions combine; default all" },
+            "match": { "type": "string", "enum": ["all", "any"], "description": "kind=filter: how the conditions combine; default all" },
+            "having": { "type": "array", "maxItems": 20,
+                "description": "kind=aggregate: conditions on the group-by columns and measures",
+                "items": { "type": "object", "properties": {
+                    "column": { "type": "string", "description": "a group-by column or a measure's name" },
+                    "operator": { "type": "string", "enum": ["=", "!=", "<", ">", "<=", ">="] },
+                    "value": { "type": "string", "description": "text, except a count, sum or average is compared with a number" } },
+                    "required": ["column", "operator", "value"] } },
+            "conditions": { "type": "array", "minItems": 1, "maxItems": 20,
+                "description": "kind=filter: the rows to keep",
+                "items": { "type": "object", "properties": {
+                    "column": { "type": "string" },
+                    "operator": { "type": "string", "enum": ["=", "!=", "<", ">", "<=", ">="] },
+                    "value": { "type": "string" } },
+                    "required": ["column", "operator", "value"] } } },
+            "required": ["name", "kind"] } })
 }
 
 fn get_pipeline_schema() -> Value {

@@ -359,6 +359,7 @@ export function ConnectorIngestPanel({
   pausedReason = null,
   waitingTables,
   onResumed,
+  onRunEnded,
 }: {
   connectorId: string
   connectorName: string
@@ -366,6 +367,8 @@ export function ConnectorIngestPanel({
   onTableCount?: (count: number) => void
   /** Called after Resume lifted a pause (`SRC-11`), so the page reloads the connector and the pause goes. */
   onResumed?: () => void
+  /** Called once when a run the panel was watching is over (`SRC-46`), with the run as the list returned it. */
+  onRunEnded?: (run: ConnectorRun) => void
   /** Why the connector is paused (`SRC-8`); the API refuses a run meanwhile. */
   pausedReason?: string | null
   /** Source tables that wait for a schema decision (`SRC-8`), from the Schema changes tab's one list. */
@@ -408,6 +411,7 @@ export function ConnectorIngestPanel({
       pausedReason={pausedReason}
       waitingTables={waitingTables}
       onResumed={onResumed}
+      onRunEnded={onRunEnded}
     />
   )
 }
@@ -421,6 +425,7 @@ function IngestEditor({
   pausedReason,
   waitingTables,
   onResumed,
+  onRunEnded,
 }: {
   connectorId: string
   connectorName: string
@@ -430,6 +435,7 @@ function IngestEditor({
   pausedReason: string | null
   waitingTables?: ReadonlySet<string>
   onResumed?: () => void
+  onRunEnded?: (run: ConnectorRun) => void
 }) {
   const adapter = spec.adapter ?? ""
   const isCdc = adapter === "cdc"
@@ -458,7 +464,7 @@ function IngestEditor({
   const previews = useColumnPreviews(connectorId)
   const columnChoice = !isCdc && supportsColumnChoice(adapter, spec.dial)
   // Owned here, not by the Runs card: the per-table actions are disabled while a run is going.
-  const runState = useIngestRunState(connectorId)
+  const runState = useIngestRunState(connectorId, onRunEnded)
 
   const saved = React.useMemo(() => fromSpec(spec), [spec])
   const [selection, setSelection] = React.useState<Selection>(saved)
@@ -1419,7 +1425,7 @@ const EVENT_LABEL: Record<string, string> = {
  * every few seconds while a run is going. Used by the editor (the per-table
  * actions are disabled meanwhile) and handed to the Runs card.
  */
-function useIngestRunState(connectorId: string) {
+function useIngestRunState(connectorId: string, onRunEnded?: (run: ConnectorRun) => void) {
   const list = useRefreshable((s) => connectorService.listConnectorRuns(connectorId, s), connectorId)
   // A run just launched, until the record lists it.
   const [launchedRunId, setLaunchedRunId] = React.useState<string | null>(null)
@@ -1446,10 +1452,41 @@ function useIngestRunState(connectorId: string) {
     return () => window.clearTimeout(timer)
   }, [launchedRunId])
 
+  // `SRC-46` (`QA LH-SRC-6-43`): tell the page when the run it watched is over, so it can read the connector
+  // again (its health follows the run by about a minute). The run handed over is the one the last read
+  // after the edge returns, by `runId`, not the stale row that was going. The handler sits in a ref so a
+  // new function on each render neither re-runs the effects nor loses the call.
+  const onRunEndedRef = React.useRef(onRunEnded)
+  React.useEffect(() => {
+    onRunEndedRef.current = onRunEnded
+  })
+  const lastActiveRunId = React.useRef<string | null>(null)
+  const endedRunId = React.useRef<string | null>(null)
+  // `SRC-46 review round 1, BLOCKER 1`: written in an effect, not during render (`react-hooks/refs`). When the run
+  // ends `activeRun` is null, so the id of the run that was going stays for the edge effect below.
+  const activeRunId = activeRun?.runId ?? null
+  React.useEffect(() => {
+    if (activeRunId !== null) lastActiveRunId.current = activeRunId
+  }, [activeRunId])
+  // Declared before the edge effect below: the list that ends the watch is not the "last read", so the
+  // edge must not find its own run id waiting in the same commit.
+  React.useEffect(() => {
+    const id = endedRunId.current
+    if (id === null) return
+    const run = list.data?.runs.find((r) => r.runId === id)
+    if (!run) return
+    endedRunId.current = null
+    onRunEndedRef.current?.(run)
+  }, [list.data])
+
   // A run that just finished: one last read, so its final numbers show.
   const wasWatching = React.useRef(false)
   React.useEffect(() => {
-    if (wasWatching.current && !watching) refreshRuns()
+    if (wasWatching.current && !watching) {
+      endedRunId.current = lastActiveRunId.current
+      lastActiveRunId.current = null
+      refreshRuns()
+    }
     wasWatching.current = watching
   }, [watching, refreshRuns])
 
@@ -1745,7 +1782,11 @@ function RunCard({
                 : null}
         </p>
         {logOpen ? (
-          <RunLog connectorId={connectorId} runId={run.runId} />
+          <RunLog
+            connectorId={connectorId}
+            runId={run.runId}
+            followKey={`${run.status}|${run.attempts}|${run.endedAt ?? ""}`}
+          />
         ) : (
           <Button type="button" size="xs" variant="outline" onClick={() => setLogOpen(true)}>
             Show log
@@ -1767,8 +1808,21 @@ function waitLabel(seconds: number): string {
  * writes the lines from a closed list and never carries the source's or the
  * driver's error text; this view only words the closed event and error class.
  */
-function RunLog({ connectorId, runId }: { connectorId: string; runId: string }) {
-  const log = useService((s) => connectorService.getConnectorRunLog(connectorId, runId, s), [connectorId, runId])
+function RunLog({ connectorId, runId, followKey }: { connectorId: string; runId: string; followKey: string }) {
+  // `SRC-46` (`QA LH-SRC-6-43`): a log opened while the run was going stayed at
+  // the attempts it first read. `keepDataOnReload` holds the lines on screen
+  // only for a reload with the same deps, so `followKey` (the run's status,
+  // attempts and end) is not a dep: an effect calls `reload()` when it changes.
+  const log = useService((s) => connectorService.getConnectorRunLog(connectorId, runId, s), [connectorId, runId], {
+    keepDataOnReload: true,
+  })
+  const { reload } = log
+  const seenKey = React.useRef(followKey)
+  React.useEffect(() => {
+    if (seenKey.current === followKey) return
+    seenKey.current = followKey
+    reload()
+  }, [followKey, reload])
   const download = useServiceAction(async (signal) => {
     const text = await connectorService.downloadConnectorRunLog(connectorId, runId, signal)
     if (signal.aborted) return text

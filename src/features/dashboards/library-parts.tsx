@@ -307,11 +307,14 @@ export function Avatar({ owner, builtin, className }: { readonly owner: string; 
   )
 }
 
-/** The owner's name as the list says it: "You" for the person reading, "Built-in" for the built-in board, "—" when unknown. */
-export function ownerLabel(item: Pick<LibraryItem, "owner" | "builtin">, myName: string | undefined): string {
+/**
+ * The owner's name as the list says it: "Built-in" for the built-in board, "—" when unknown.
+ * PR #530 review SHOULD-FIX: dropped the "You" display-name check because the list contracts
+ * (`Board`, `ReportSummary`, `DashboardTemplate`) carry no creator user ID and display names can collide.
+ */
+export function ownerLabel(item: Pick<LibraryItem, "owner" | "builtin">): string {
   if (item.builtin) return "Built-in"
-  if (!item.owner) return "—"
-  return myName && item.owner === myName ? "You" : item.owner
+  return item.owner || "—"
 }
 
 /**

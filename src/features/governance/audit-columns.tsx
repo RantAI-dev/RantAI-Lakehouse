@@ -23,8 +23,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { formatCost, formatDateTime, formatRelativeTime } from "@/lib/format"
-import { notifySuccess } from "@/lib/notify"
 import {
   ACTOR_KIND_LABEL,
   AUDIT_OUTCOME_LABEL,
@@ -43,8 +43,13 @@ export const OUTCOME_OPTIONS = (Object.keys(AUDIT_OUTCOME_LABEL) as AuditOutcome
 
 export function getAuditColumns({
   onSelect,
+  onPickActor,
 }: {
   readonly onSelect: (event: AuditEvent) => void
+  /** plan D2: filters the trail to a principal by id; absent when the page
+   * does not offer the person filter, and ignored for a row whose event
+   * names no principal (`actorId: null`). */
+  readonly onPickActor?: (actorId: string) => void
 }): ColumnDef<AuditEvent>[] {
   return [
     {
@@ -114,15 +119,34 @@ export function getAuditColumns({
       ),
       cell: ({ row }) => {
         const item = row.original
-        return (
+        const actorId = item.actorId
+        const name = (
+          <span className="text-sm font-medium text-foreground">
+            {item.actor}
+          </span>
+        )
+        const kind = (
+          <span className="text-xs text-muted-foreground">
+            {ACTOR_KIND_LABEL[item.actorKind]}
+            {item.delegatedActor ? ` · on behalf of ${item.delegatedActor}` : ""}
+          </span>
+        )
+        // plan D2: the actor is a filter like the Action is a link — clicking
+        // it narrows the trail to that principal. A row with no principal (a
+        // sign-in-form row) is plain text, not a dead button.
+        return actorId !== null && onPickActor !== undefined ? (
+          <button
+            type="button"
+            className="flex flex-col gap-0.5 text-left hover:underline focus:outline-none"
+            onClick={() => onPickActor(actorId)}
+          >
+            {name}
+            {kind}
+          </button>
+        ) : (
           <div className="flex flex-col gap-0.5">
-            <span className="text-sm font-medium text-foreground">
-              {item.actor}
-            </span>
-            <span className="text-xs text-muted-foreground">
-              {ACTOR_KIND_LABEL[item.actorKind]}
-              {item.delegatedActor ? ` · on behalf of ${item.delegatedActor}` : ""}
-            </span>
+            {name}
+            {kind}
           </div>
         )
       },
@@ -263,8 +287,7 @@ export function getAuditColumns({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(item.id)
-                    notifySuccess("Audit event ID copied")
+                    void copyTextWithToast(item.id, "Audit event ID copied")
                   }}
                 >
                   <Copy className="size-4" />
@@ -272,8 +295,7 @@ export function getAuditColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(item.action)
-                    notifySuccess("Action copied")
+                    void copyTextWithToast(item.action, "Action copied")
                   }}
                 >
                   <Activity className="size-4" />
@@ -281,8 +303,7 @@ export function getAuditColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(item.resource)
-                    notifySuccess("Resource copied")
+                    void copyTextWithToast(item.resource, "Resource copied")
                   }}
                 >
                   <FileText className="size-4" />
@@ -290,8 +311,7 @@ export function getAuditColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    void navigator.clipboard.writeText(item.actor)
-                    notifySuccess("Actor copied")
+                    void copyTextWithToast(item.actor, "Actor copied")
                   }}
                 >
                   <UserIcon className="size-4" />
