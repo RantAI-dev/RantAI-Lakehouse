@@ -24,17 +24,16 @@ export type GoldExportResult = {
   /**
    * The ONE `_exported_at` stamp this publish wrote on every row
    * (`DATA-6` M2), RFC 3339 with microseconds, or `null` on a zero-row
-   * publish (no copy exists to identify). Optional: an older API predates
-   * the field.
+   * publish (no copy exists to identify).
    */
-  copyExportedAt?: string | null
+  copyExportedAt: string | null
   /**
    * What happened to the follow-up run that replaces
    * `gold.<table>_latest` with this copy (`DATA-6` D6/D13): `queued`, or
    * `not_started` when the orchestrator refused or could not be reached.
-   * `null` on a zero-row publish and on an older API.
+   * `null` on a zero-row publish.
    */
-  latestCopy?: { table: string; status: "queued" | "not_started" | string } | null
+  latestCopy: { table: string; status: "queued" | "not_started" | string } | null
 }
 
 /**
@@ -167,8 +166,8 @@ export type GoldLatestCopyRun = {
  * Iceberg table, `gold.<table>_latest`, that always holds only the newest
  * copy, for tools that do not filter on export time. `holds`/`lastRun`
  * are `null` before the first update; the table's name is always there,
- * so a tool can be pointed at it ahead of time. `null`/absent entirely on
- * an older API that predates the table.
+ * so a tool can be pointed at it ahead of time. The whole block is
+ * `null` when this publish wrote no copy.
  */
 export type GoldLatestCopy = {
   table: string
@@ -201,7 +200,7 @@ export type GoldPublication = {
   canEdit: boolean
   trim?: GoldTrimSummary | null
   /** The latest-copy table's name, what it holds, its newest run (DATA-6). */
-  latestCopy?: GoldLatestCopy | null
+  latestCopy: GoldLatestCopy | null
 }
 
 export interface GoldService {

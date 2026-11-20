@@ -853,7 +853,11 @@ describe("OpenFormatCard", () => {
     )
   })
 
-  it("renders without the latest-copy block on an older API", async () => {
+  it("renders without the latest-copy block when the publish wrote no copy", async () => {
+    // DATA-6 review R6: `latestCopy: null` is a required field with a
+    // real meaning (a zero-row publish), not the absence of the field on
+    // an older API. The card hides the block for null and shows it for
+    // every API build this console ships with.
     mockWithPublication(null)
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
