@@ -23,12 +23,22 @@ process has to notice and EXIT. This module is that process.
 # What it does
 
 - starts the code server as a CHILD process, with the very arguments the
-  compose file passed before (`code-server start -h ... -p ... -m ...`), so
-  nothing about the code location changes;
+  compose file passed before (`code-server start -h ... -p ... -m ...`), plus
+  the heartbeat TTL, so nothing about the code location changes;
 - every 30 s sends ONE `Ping` THROUGH the proxy. The proxy FORWARDS `Ping`
   to the inner server (`dagster/_grpc/proxy_server.py`), so a Ping that does
   not come back means the inner server is gone -- which is exactly what the
   hardcoded health service cannot report;
+- reads the code server's output and forwards it, unchanged, so the container
+  log keeps showing what the code server says;
+- when the inner server says it is shutting down because it missed its
+  heartbeat, it asks the proxy to RELOAD the code location: a new inner
+  server takes the new runs, and the old one finishes the runs it still
+  has. The guard does not exit for that, so the in-flight runs survive;
+- ends the runs the PREVIOUS code location left behind, once, when the code
+  location answers for the first time: a run that was STARTED when the
+  guard started ran in a process tree that died with the previous container
+  (`orphan_runs.py`);
 - exits NON-ZERO when the inner server is gone, so `restart: unless-stopped`
   restarts the container. Exiting is the only restart path Docker has;
 - forwards SIGTERM and SIGINT to the child and exits 0, so `docker compose
@@ -51,6 +61,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import queue
+import re
 import signal
 import subprocess
 import sys
@@ -59,6 +71,8 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import FrameType
+
+from dispar_orchestrate import orphan_runs
 
 logger = logging.getLogger("code_server_guard")
 
@@ -77,6 +91,44 @@ FAILURES_BEFORE_FIRST_SUCCESS = 10
 # How long the guard waits for the code server to stop before killing it.
 SHUTDOWN_TIMEOUT_SECONDS = 30
 
+# How long the inner server waits for the proxy's heartbeat before it shuts
+# itself down, in seconds. Dagster's own default is 30 s
+# (`dagster/_cli/code_server.py`), and a busy container misses that easily:
+# that is how the inner server died on 2026-11-18, and every run dequeued in
+# the shutdown window failed at once. Five minutes is long enough for a
+# loaded container, and short enough that an orphaned inner server (one whose
+# proxy is gone) ends by itself.
+DEFAULT_HEARTBEAT_TTL_SECONDS = 300
+
+# This repository's own setting for that TTL, and Dagster's own variable
+# for the same thing (`dagster/_cli/code_server.py`). Ours wins; an operator
+# who already sets Dagster's keeps it.
+HEARTBEAT_TTL_ENV = "DAGSTER_CODE_SERVER_HEARTBEAT_TTL_SECONDS"
+DAGSTER_HEARTBEAT_TTL_ENV = "DAGSTER_GRPC_PROXY_HEARTBEAT_TTL_SECONDS"
+
+# The line the INNER server writes when it misses its heartbeat
+# (`dagster/_grpc/server.py`). The PROXY writes the IDENTICAL line when it
+# is started with `--heartbeat` (`dagster/_grpc/proxy_server.py`), so the
+# child's command must never carry `--heartbeat` -- it does not, and
+# `test_the_child_command_does_not_carry_the_heartbeat_flag` keeps it that
+# way: with the flag, every reload would be triggered by the proxy's own
+# heartbeat instead of the inner server's.
+SHUTDOWN_LINE_PATTERN = re.compile(
+    r"No heartbeat received in \d+ seconds, shutting down"
+)
+
+# How long the guard waits for the code server to RELOAD, in seconds. The
+# proxy starts a new inner server and waits for it, and the new server
+# imports the whole code location, which takes tens of seconds: the guard's
+# own probe timeout (10 s) is far too short for that.
+RELOAD_TIMEOUT_SECONDS = 120
+
+# How long a reload protects the code location from a second shutdown. A
+# second missed-heartbeat line within this window means the reload did not
+# help, and the guard gives up: exiting non-zero hands the container to
+# `restart: unless-stopped`, which is the fallback #605 already proved.
+SECOND_SHUTDOWN_WINDOW_SECONDS = 600
+
 # The address the healthcheck and the guard's own ping use. The code server
 # runs in the SAME container, so the loopback address reaches it; `--host` is
 # the address the server BINDS to, not the one to connect to.
@@ -89,6 +141,50 @@ LOOPBACK_HOST = "127.0.0.1"
 # operator who set it for the code server keeps it. `None` means "unset":
 # the child then runs with Dagster's own default.
 CONTAINER_GRPC_TIMEOUT_SECONDS = os.environ.get("DAGSTER_GRPC_TIMEOUT_SECONDS")
+
+
+def _env(name: str, default: str) -> str:
+    """An environment variable, stripped; an empty one counts as unset."""
+    value = os.environ.get(name, "").strip()
+    return value if value else default
+
+
+@dataclass(frozen=True)
+class HeartbeatTtlSettings:
+    """How long the inner server waits for the proxy's heartbeat.
+
+    `from_env` reads this repository's own setting first and Dagster's own
+    variable second, so an operator who already sets Dagster's keeps it.
+    A malformed value is not used: the default is, and the warning names the
+    setting, never its value (`ingest_factory.py::RunLimitSettings.from_env`
+    reads a setting the same way).
+    """
+
+    ttl_seconds: int = DEFAULT_HEARTBEAT_TTL_SECONDS
+
+    @classmethod
+    def from_env(cls) -> "HeartbeatTtlSettings":
+        for env_name in (HEARTBEAT_TTL_ENV, DAGSTER_HEARTBEAT_TTL_ENV):
+            raw = _env(env_name, "")
+            if not raw:
+                continue
+            # ASCII digits only, and at least one second: `int()` alone
+            # would take "30.5" and "1_000", which the code server's own
+            # option refuses.
+            seconds = int(raw) if raw.isascii() and raw.isdigit() else 0
+            if seconds < 1:
+                # The value is the operator's own setting, but a malformed
+                # one is not worth echoing into a log line the whole team
+                # reads.
+                logger.warning(
+                    "%s cannot be used (expected a whole number of seconds, 1 or more); "
+                    "using the default %d",
+                    env_name,
+                    DEFAULT_HEARTBEAT_TTL_SECONDS,
+                )
+                return cls(ttl_seconds=DEFAULT_HEARTBEAT_TTL_SECONDS)
+            return cls(ttl_seconds=seconds)
+        return cls(ttl_seconds=DEFAULT_HEARTBEAT_TTL_SECONDS)
 
 
 @dataclass(frozen=True)
@@ -200,12 +296,21 @@ def probe(*, host: str, port: int) -> bool:
     return True
 
 
-def child_command(*, host: str, port: int, module: str) -> list[str]:
+def child_command(
+    *, host: str, port: int, module: str, heartbeat_ttl_seconds: int
+) -> list[str]:
     """The code server, with the arguments the compose file passed before.
 
     `sys.executable -m dagster` instead of the `dagster` entry point: the
     guard and the code server then run on the SAME interpreter, whichever
     one the container was started with.
+
+    `--heartbeat-ttl` is how long the INNER server waits for the proxy's
+    heartbeat before it shuts itself down
+    (`dagster/_core/remote_representation/grpc_server_registry.py`). The
+    command must NOT carry `--heartbeat`: that flag makes the PROXY write
+    the same missed-heartbeat line the guard matches on, and every reload
+    would then be triggered by the proxy's own heartbeat.
     """
     return [
         sys.executable,
@@ -219,6 +324,8 @@ def child_command(*, host: str, port: int, module: str) -> list[str]:
         str(port),
         "-m",
         module,
+        "--heartbeat-ttl",
+        str(heartbeat_ttl_seconds),
     ]
 
 
@@ -241,17 +348,199 @@ def child_environment(environ: Mapping[str, str]) -> dict[str, str]:
     return env
 
 
-def spawn_child(*, host: str, port: int, module: str) -> subprocess.Popen:
+def spawn_child(
+    *, host: str, port: int, module: str, heartbeat_ttl_seconds: int
+) -> subprocess.Popen:
     """Starts the code server as a CHILD of the guard.
 
     The child gets its own session, so the guard's process group signals
     never reach it behind the guard's back: the guard forwards the signals
     itself, and knows when the child is gone.
+
+    Its output goes to PIPES, and the guard reads them: a pipe nobody reads
+    fills up and blocks the code server. The reader threads forward every
+    line to the guard's own output, so the container log keeps showing what
+    the code server says.
     """
     return subprocess.Popen(
-        child_command(host=host, port=port, module=module),
+        child_command(
+            host=host,
+            port=port,
+            module=module,
+            heartbeat_ttl_seconds=heartbeat_ttl_seconds,
+        ),
         env=child_environment(os.environ),
         start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+
+class ShutdownWatcher:
+    """Notices the line the inner server writes when it misses its heartbeat.
+
+    The line comes from the INNER server (`dagster/_grpc/server.py`), whose
+    output the PROXY inherits, so it reaches the guard's child.
+
+    The reader thread only QUEUES the line: the reload runs on the guard's
+    main loop, because a gRPC call that blocks on that thread would stall
+    the child's output pipe.
+    """
+
+    def __init__(self) -> None:
+        self.lines: queue.Queue[tuple[float, str]] = queue.Queue()
+        self.wake = threading.Event()
+
+    def notice(self, line: str) -> None:
+        """Queues a line that matches the missed-heartbeat line."""
+        if SHUTDOWN_LINE_PATTERN.search(line):
+            self.lines.put((time.monotonic(), line))
+            self.wake.set()
+
+    def drain(self) -> list[tuple[float, str]]:
+        """The missed-heartbeat lines seen since the last drain, oldest
+        first, each with the moment it was read."""
+        found: list[tuple[float, str]] = []
+        while True:
+            try:
+                found.append(self.lines.get_nowait())
+            except queue.Empty:
+                return found
+
+
+def _forward_lines(stream, *, is_stderr: bool, watcher: ShutdownWatcher) -> None:
+    """One line at a time: notice it, then write it on, unchanged."""
+    target = sys.stderr if is_stderr else sys.stdout
+    try:
+        for line in stream:
+            # The line is noticed BEFORE it is forwarded: a test that has
+            # seen the line knows the watcher has it, and the guard's next
+            # round acts on it.
+            watcher.notice(line)
+            target.write(line)
+            target.flush()
+    except (OSError, ValueError):
+        # The pipe closed while the guard was reading it: the code server is
+        # gone, and the main loop notices that on its own.
+        pass
+
+
+def start_output_readers(child: subprocess.Popen, watcher: ShutdownWatcher) -> None:
+    """Reads the code server's output and forwards it, line by line.
+
+    The threads are daemons: the guard exits without waiting for them.
+    """
+    for stream, is_stderr in ((child.stdout, False), (child.stderr, True)):
+        if stream is None:
+            # A child built without pipes (a test builds one by hand):
+            # there is nothing to read.
+            continue
+        threading.Thread(
+            target=_forward_lines,
+            args=(stream,),
+            kwargs={"is_stderr": is_stderr, "watcher": watcher},
+            name="code-server-output",
+            daemon=True,
+        ).start()
+
+
+@dataclass(frozen=True)
+class ReloadState:
+    """What the guard knows about the reloads it asked for."""
+
+    reloads: int = 0
+    last_reload_at: float | None = None
+
+    def after_reload(self, at: float) -> "ReloadState":
+        """The state after one more reload, started at `at`."""
+        return ReloadState(reloads=self.reloads + 1, last_reload_at=at)
+
+
+def should_give_up_after_shutdown(state: ReloadState, *, observed_at: float) -> bool:
+    """True when a second missed-heartbeat line arrived within the window.
+
+    The first reload starts a new inner server. A second shutdown line right
+    after it means the reload did not help, and the guard stops trying:
+    exiting non-zero hands the container to `restart: unless-stopped`, which
+    is the fallback #605 already proved.
+    """
+    if state.last_reload_at is None:
+        return False
+    return observed_at - state.last_reload_at <= SECOND_SHUTDOWN_WINDOW_SECONDS
+
+
+def reload_code(*, host: str, port: int) -> None:
+    """Asks the proxy to RELOAD the code location.
+
+    `ReloadCode` on the proxy (`dagster/_grpc/proxy_server.py`) starts a new
+    inner server and tells the old one to shut down; the old one keeps
+    running its in-flight runs to the end, and the new runs go to the new
+    server. That is the whole point: the shutdown window is left, and the
+    runs that were in flight are not killed.
+    """
+    from dagster._grpc.client import DagsterGrpcClient
+
+    client = DagsterGrpcClient(host=host, port=port)
+    client.reload_code(timeout=RELOAD_TIMEOUT_SECONDS)
+
+
+def dagster_instance():
+    """The Dagster instance of this container.
+
+    `DAGSTER_HOME` points at the instance's config (`dagster/Dockerfile`),
+    and that config points the storage at the same Postgres the daemon uses
+    (`dagster/dagster.yaml`), so this is the SAME instance the daemon sees.
+    """
+    from dagster import DagsterInstance
+
+    return DagsterInstance.get()
+
+
+def fail_orphaned_runs_at_start(
+    args: argparse.Namespace,
+    *,
+    instance,
+    guard_started_at: float,
+) -> None:
+    """Ends the runs the previous code location left behind, ONCE.
+
+    Every run that was STARTED when the guard started ran in a process tree
+    that died with the previous container, so it is failed here instead of
+    waiting for the daemon's run monitoring to reach `dagster/max_runtime`
+    (three hours for `bronze_maintenance_job`).
+
+    The instance is built when this runs, not before: the guard's own start
+    must not depend on the database. An instance that cannot be reached, or
+    opened, is logged and the guard goes on.
+    """
+    try:
+        the_instance = instance if instance is not None else dagster_instance()
+    except Exception as error:
+        logger.warning(
+            "the Dagster instance could not be opened (%s): the runs of the previous code "
+            "location are not ended now (the run monitoring ends them when their run limit "
+            "runs out)",
+            type(error).__name__,
+        )
+        return
+    # The code location's name is `dispar_orchestrate.definitions`
+    # (`dagster/workspace.yaml`, `location_name:`), and the guard is
+    # started with the SAME string as the code location's module
+    # (`docker-compose.yml`, `--module`). A run names its location with the
+    # name the workspace gives it, so the module name is what a run of THIS
+    # location carries. If an operator renames one of the two, the runs of
+    # this location are no longer recognized: the step finds nothing and
+    # the zombies stay.
+    failed = orphan_runs.fail_orphaned_runs(
+        the_instance,
+        location_name=args.module,
+        guard_started_at=guard_started_at,
+        now=time.time(),
+    )
+    logger.info(
+        "failed %d run(s) that the previous code location left behind", failed
     )
 
 
@@ -290,9 +579,14 @@ class CodeServerSupervisor:
         self.stop.set()
         forward_signal(self.child, signum)
 
-    def wait_interval(self, seconds: float) -> bool:
+    def wait_interval(self, seconds: float, *, wake: threading.Event | None = None) -> bool:
         """Waits `seconds`, in small steps, so a signal or a dead child is
-        noticed at once. False when the wait was cut short."""
+        noticed at once. False when the wait was cut short.
+
+        `wake` ends the wait early: the reader thread sets it when the code
+        server's output carries a missed-heartbeat line, and the reload that
+        follows must not wait for the whole probe interval.
+        """
         deadline = time.monotonic() + seconds
         while not self.stop.is_set():
             if self.child.poll() is not None:
@@ -300,7 +594,13 @@ class CodeServerSupervisor:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return True
-            self.stop.wait(min(remaining, 1.0))
+            step = min(remaining, 1.0)
+            if wake is not None:
+                if wake.wait(step):
+                    wake.clear()
+                    return True
+            else:
+                self.stop.wait(step)
         return False
 
     def wait_for_exit(self) -> None:
@@ -325,20 +625,44 @@ def run_guard(
     args: argparse.Namespace,
     *,
     spawn: Callable[..., subprocess.Popen] = spawn_child,
+    instance=None,
+    probe_fn: Callable[..., bool] = probe,
+    reload_fn: Callable[..., None] = reload_code,
+    interval_seconds: float = PROBE_INTERVAL_SECONDS,
 ) -> int:
     """Runs the code server under the guard. The exit code is the container's.
 
     0: a signal asked the guard to stop (a stopped container is not a
     failure). 1: the code server is gone, so `restart: unless-stopped`
-    restarts the container.
+    restarts the container, or the inner server shut down twice in a row
+    (the reload did not help).
+
+    `instance`, `probe_fn`, `reload_fn` and `interval_seconds` are the
+    seams a test drives: the real instance is built when the step runs, the
+    real probe and reload talk to the code server, and the real interval is
+    the probe interval.
     """
-    child = spawn(host=args.host, port=args.port, module=args.module)
+    guard_started_at = time.time()
+    ttl = HeartbeatTtlSettings.from_env()
+    logger.info(
+        "the code server's inner heartbeat TTL is %d s", ttl.ttl_seconds
+    )
+    child = spawn(
+        host=args.host,
+        port=args.port,
+        module=args.module,
+        heartbeat_ttl_seconds=ttl.ttl_seconds,
+    )
     supervisor = CodeServerSupervisor(child)
+    watcher = ShutdownWatcher()
+    start_output_readers(child, watcher)
     previous_handlers = {
         signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)
     }
     target = probe_host(args.host)
     state = ProbeState()
+    reload_state = ReloadState()
+    orphan_checked = False
     try:
         supervisor.install_signal_handlers()
         while True:
@@ -352,7 +676,28 @@ def run_guard(
                     child.returncode,
                 )
                 return 1
-            answered = probe(host=target, port=args.port)
+            for observed_at, line in watcher.drain():
+                if should_give_up_after_shutdown(reload_state, observed_at=observed_at):
+                    logger.error(
+                        "the inner code server shut down again within %d s of the last reload: "
+                        "giving up so the container restarts",
+                        SECOND_SHUTDOWN_WINDOW_SECONDS,
+                    )
+                    supervisor.stop_child()
+                    return 1
+                reload_state = reload_state.after_reload(time.monotonic())
+                logger.warning(
+                    "the inner code server missed its heartbeat and is shutting down: "
+                    "reloading the code location"
+                )
+                try:
+                    reload_fn(host=target, port=args.port)
+                except Exception as error:
+                    logger.warning(
+                        "the reload of the code location failed (%s): the guard keeps running",
+                        type(error).__name__,
+                    )
+            answered = probe_fn(host=target, port=args.port)
             state = state.after_probe(answered)
             if not answered:
                 logger.warning(
@@ -363,11 +708,18 @@ def run_guard(
                 )
             else:
                 logger.info("the code server answered a ping on %s:%d", target, args.port)
+                if not orphan_checked:
+                    # The code location is up: now, and only now, the runs
+                    # the PREVIOUS code location left behind are ended.
+                    orphan_checked = True
+                    fail_orphaned_runs_at_start(
+                        args, instance=instance, guard_started_at=guard_started_at
+                    )
             if should_give_up(state, child_exited=child.poll() is not None):
                 logger.error("%s", give_up_reason(state))
                 supervisor.stop_child()
                 return 1
-            if not supervisor.wait_interval(PROBE_INTERVAL_SECONDS):
+            if not supervisor.wait_interval(interval_seconds, wake=watcher.wake):
                 if supervisor.stop.is_set():
                     supervisor.wait_for_exit()
                     return 0
