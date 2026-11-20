@@ -313,4 +313,33 @@ describe("authoredFlow: the form kinds (BLD-16)", () => {
       "step:1>target",
     ])
   })
+
+  // BLD-16 review R2: the sublabel said only what the step groups by, so an
+  // aggregate with a having read as "every group kept" while groups are
+  // dropped. It says the having is there.
+  test("an aggregate's having is in its sublabel", () => {
+    const { nodes } = authoredFlow(
+      {
+        ...base,
+        inputs: [{ name: "orders", zone: "bronze", table: "orders_raw" }],
+        steps: [
+          {
+            name: "big_spenders",
+            kind: "aggregate",
+            reads: "orders",
+            groupBy: ["country"],
+            measures: [{ function: "sum", column: "amount", name: "revenue" }],
+            havingMatch: "all",
+            having: [{ column: "revenue", operator: ">", value: "1000" }],
+          },
+        ],
+      },
+      describeTransform
+    )
+    expect(nodes[1]).toMatchObject({
+      id: "step:0",
+      stepKind: "aggregate",
+      sublabel: "group by country · keep groups where 1 condition",
+    })
+  })
 })

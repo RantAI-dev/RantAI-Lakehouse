@@ -422,6 +422,8 @@ describe("the pipeline page's form steps in words (BLD-16)", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Group by country"))
     expect(document.body.textContent).toContain("revenue = sum of amount")
     expect(document.body.textContent).toContain("order_count = count")
+    // BLD-16 review R2: a having drops groups, so the words say it does.
+    expect(document.body.textContent).toContain("Keep groups where revenue > 1000")
 
     within(chart).getByText("big_or_local").closest("button")?.click()
     expect(await screen.findByText("Step 3 of 3 · Filter")).toBeTruthy()

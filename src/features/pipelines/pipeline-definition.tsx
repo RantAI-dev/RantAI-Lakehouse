@@ -375,6 +375,18 @@ export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
                       ))}
                     </ol>
                   ) : null}
+                  {(step.having ?? []).length > 0 ? (
+                    // BLD-16 review R2: a having drops groups, and the words
+                    // said only what the step groups by.
+                    <p className="text-muted-foreground">
+                      Keep groups where{" "}
+                      <span className="font-mono text-foreground">
+                        {(step.having ?? [])
+                          .map((condition) => `${condition.column} ${condition.operator} ${condition.value}`)
+                          .join(step.havingMatch === "any" ? " or " : " and ")}
+                      </span>
+                    </p>
+                  ) : null}
                 </>
               ) : step.kind === "filter" ? (
                 <>

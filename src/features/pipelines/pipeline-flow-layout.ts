@@ -231,9 +231,15 @@ export function authoredFlow(
               : step.kind === "join"
                 ? `${joinWord(step.joinType)} join`
                 : step.kind === "aggregate"
-                  ? step.groupBy.length > 0
-                    ? `group by ${step.groupBy.join(", ")}`
-                    : "aggregate"
+                  ? // BLD-16 review R2: a having drops groups, so the
+                    // sublabel says it is there rather than reading as
+                    // "every group kept".
+                    `${
+                      step.groupBy.length > 0 ? `group by ${step.groupBy.join(", ")}` : "aggregate"
+                    }${(step.having ?? []).length > 0
+                        ? ` · keep groups where ${(step.having ?? []).length} condition${(step.having ?? []).length === 1 ? "" : "s"}`
+                        : ""
+                    }`
                   : step.kind === "filter"
                     ? `${step.match === "any" ? "any" : "all"} of ${step.conditions.length} condition${step.conditions.length === 1 ? "" : "s"}`
                     : `${stored.kind}, not shown here`,
