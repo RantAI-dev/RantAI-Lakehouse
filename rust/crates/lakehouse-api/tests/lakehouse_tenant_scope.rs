@@ -2677,18 +2677,17 @@ fn unreadable_sentence(asset: &str) -> String {
 
 /// How many requests the mock `ClickHouse` has answered that measure or record
 /// something: a refused run must add none. A table lookup (`DESCRIBE`,
-/// `system.columns`) reads the table's shape and is not counted, since every
-/// writer asks it before the reach (`SEC-80`).
+/// `system.columns`) reads the table's shape and is not counted (`SEC-80`).
 async fn clickhouse_requests(ch: &MockServer) -> usize {
-    ch.received_requests().await.map_or(0, |requests| {
-        requests
-            .iter()
-            .filter(|request| {
-                let body = String::from_utf8_lossy(&request.body);
-                !body.contains("DESCRIBE TABLE") && !body.contains("system.columns")
-            })
-            .count()
-    })
+    let requests = ch.received_requests().await.unwrap_or_default();
+    let mut measured = 0;
+    for request in &requests {
+        let body = String::from_utf8_lossy(&request.body);
+        if !body.contains("DESCRIBE TABLE") && !body.contains("system.columns") {
+            measured += 1;
+        }
+    }
+    measured
 }
 
 fn rule_body(name: &str, table: &str, threshold: &str) -> Value {
@@ -3298,33 +3297,99 @@ async fn an_outage_answers_a_claimed_rule_table_and_an_unknown_one_alike() {
         "a refused create stores nothing"
     );
 
-    // Run: a rule on the claimed table and a rule on an unknown table answer
-    // the same 503, and nothing is measured.
-    let claimed_rule = add_a_rule(&pool, RETAIL_TABLE).await;
+    // Run: a rule on a table in the owner's reach is checked, so the outage
+    // answers 503. A rule on a claimed table is covered by the test below.
     let unknown_rule = add_a_rule(&pool, "no_such_table").await;
-    let mut runs = Vec::new();
-    for rule in [claimed_rule, unknown_rule] {
-        runs.push(
+    let (status, body) = send(
+        &router,
+        "POST",
+        &format!("/api/governance/quality/{unknown_rule}/run"),
+        &owner,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+}
+
+/// `SEC-80`: a rule the caller cannot reach answers as an unknown rule id
+/// does, and during an outage it asks no table at all: a run, an edit and a
+/// delete of such a rule give the same `404` as an id that does not exist.
+#[tokio::test]
+async fn an_outage_answers_a_rule_out_of_reach_like_an_unknown_rule_id() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("ClickHouse is down"))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let TestApp { router, pool } = spin_up_with_env(&quality_writers_env(&catalog, &ch)).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_WRITER, CATALOG_TENANT).await;
+    let claimed_rule = add_a_rule(&pool, RETAIL_TABLE).await;
+    let unknown_id = Uuid::new_v4();
+    let rule_uri = |id: Uuid| format!("/api/governance/quality/{id}");
+
+    let run = |id: Uuid| {
+        let (router, owner) = (router.clone(), owner.clone());
+        async move {
             send(
                 &router,
                 "POST",
-                &format!("/api/governance/quality/{rule}/run"),
+                &format!("{}/run", rule_uri(id)),
                 &owner,
                 None,
                 None,
             )
-            .await,
-        );
-    }
+            .await
+        }
+    };
+    let (status, unknown) = run(unknown_id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+    assert_eq!(unknown["error"], json!(RULE_NOT_FOUND), "{unknown}");
+    assert_eq!(run(claimed_rule).await, (status, unknown.clone()), "run");
+
+    let update = |id: Uuid| {
+        let (router, owner) = (router.clone(), owner.clone());
+        async move {
+            send(
+                &router,
+                "PUT",
+                &rule_uri(id),
+                &owner,
+                None,
+                Some(update_rule_body(RETAIL_TABLE, "rows >= 5")),
+            )
+            .await
+        }
+    };
     assert_eq!(
-        runs[0].0,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "{:?}",
-        runs[0].1
+        update(claimed_rule).await,
+        (status, unknown.clone()),
+        "update"
     );
     assert_eq!(
-        runs[0], runs[1],
-        "run: a claimed and an unknown table answer alike"
+        update(unknown_id).await,
+        (status, unknown.clone()),
+        "update"
+    );
+
+    let delete = |id: Uuid| {
+        let (router, owner) = (router.clone(), owner.clone());
+        async move { send(&router, "DELETE", &rule_uri(id), &owner, None, None).await }
+    };
+    assert_eq!(
+        delete(claimed_rule).await,
+        (status, unknown.clone()),
+        "delete"
+    );
+    assert_eq!(delete(unknown_id).await, (status, unknown), "delete");
+    assert_eq!(
+        rules_on(&pool, RETAIL_TABLE).await,
+        1,
+        "a refused delete keeps the rule"
     );
 }
 

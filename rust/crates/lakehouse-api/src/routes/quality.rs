@@ -1204,19 +1204,30 @@ pub(crate) async fn ensure_rule_table_with(
     if !access.allows(&zone, table) {
         return Err(refused());
     }
-    // SEC-80: presence is asked for every name first, so an outage (`503`)
-    // answers a name another tenant claimed and a name no table has alike.
-    // Then the reach: a table out of reach is refused as `out_of_reach` says,
-    // whether or not it is there, so an absent table never turns a not-found
-    // answer into a `400`. An absent table in reach is the `400`.
-    let present = quality_table_present(state, asset).await?;
-    if !quality_key_in_reach(state, principal, headers, asset).await? {
-        return Err(match out_of_reach {
-            OutOfReach::UnreadableTable => refused(),
-            OutOfReach::UnknownRule => ApiError::NotFound("Quality rule not found".to_owned()),
-        });
+    match out_of_reach {
+        // SEC-80: the caller names the table, so presence is asked for every
+        // name first: an outage (`503`) answers a name another tenant claimed
+        // and a name no table has alike. Then the reach, and both refusals are
+        // the `400`.
+        OutOfReach::UnreadableTable => {
+            let present = quality_table_present(state, asset).await?;
+            if !quality_key_in_reach(state, principal, headers, asset).await? || !present {
+                return Err(refused());
+            }
+        }
+        // SEC-80: the rule is stored, so its reach is answered first. A table
+        // out of reach is the same `404` an unknown rule id gets, and no table
+        // is looked up for it. An in-reach table that is absent is the `400`.
+        OutOfReach::UnknownRule => {
+            if !quality_key_in_reach(state, principal, headers, asset).await? {
+                return Err(ApiError::NotFound("Quality rule not found".to_owned()));
+            }
+            if !quality_table_present(state, asset).await? {
+                return Err(refused());
+            }
+        }
     }
-    if present { Ok(()) } else { Err(refused()) }
+    Ok(())
 }
 
 /// Why a rule could not be run.
