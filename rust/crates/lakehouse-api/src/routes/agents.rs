@@ -565,10 +565,13 @@ pub struct DecideApprovalBody {
 /// type both routes already share — so there is ONE check, not two
 /// (AGENTS.md rule 4: duplicated guards are a finding).
 ///
-/// The refusal is `403 permission_denied`, and NOTHING is written when it
-/// fires: both routes call this BEFORE their store call, so a refused
-/// decision leaves the approval `pending`, writes no audit row and grants
-/// nothing.
+/// The refusal is `403 permission_denied` and NOTHING is decided or run
+/// when it fires: both routes call this BEFORE their store call, so the
+/// approval stays `pending`, the run stays `waiting_approval`, and no
+/// grant or execution follows. `AI-28` / `LH-AI-18-10` adds ONE `refused`
+/// audit row on the tool-call decide route (the approval's own action,
+/// `resource_kind: "approval"`, the approval id, detail naming the
+/// refusal); the catalog access route is out of scope for that row.
 ///
 /// The message is one sentence for BOTH kinds — the access route's own
 /// wording minus the word "akses", which would not fit a tool call
@@ -646,7 +649,8 @@ pub(crate) fn refuse_own_request(
 /// 400: see `lakehouse_store::agents::decide_approval`'s doc comment);
 /// 403 if the approver IS the human who requested this approval
 /// (`SEC-57`: the requester may not decide their own request — refused
-/// BEFORE any write, so the approval stays `pending` and nothing runs);
+/// before the decision's own writes, so the approval stays `pending` and
+/// nothing runs; `AI-28`/`LH-AI-18-10` writes one `refused` audit row);
 /// 200 with `executed: false` if the approval was approved but the
 /// approver lacks the underlying tool's own permission (the tool is never
 /// executed, but the decision was recorded — `AI-28`, `LH-AI-18-07`);
@@ -677,6 +681,7 @@ fn decide_approval_audit_event(
     comment: Option<&str>,
     outcome: &str,
     run_id: Option<&str>,
+    detail: Option<&str>,
 ) -> NewAuditEvent {
     ai_audit::build_event(
         principal.kind_for_audit(),
@@ -687,7 +692,7 @@ fn decide_approval_audit_event(
         Some(approval_id),
         &json!({ "comment": comment }),
         outcome,
-        None,
+        detail,
         run_id,
         Some(approval_id),
     )
@@ -737,18 +742,42 @@ pub async fn decide_approval(
     //
     // SEC-57: the requester of a tool call may not decide their own
     // request. The check runs HERE — after the kind check, before the store
-    // call — so a refused decision writes nothing at all: the approval
-    // stays `pending`, the run stays `waiting_approval`, the tool never
-    // runs.
-    match agents::get_approval(pg, &id).await {
-        Ok(Some(existing)) if existing.kind != "tool_call" => {
-            return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
-        }
+    // call — so a refused decision decides nothing and runs nothing: the
+    // approval stays `pending`, the run stays `waiting_approval`, the tool
+    // never runs. AI-28 / LH-AI-18-10: the ONE row the route writes on that
+    // refusal is an audit row with outcome `refused` (the approval's own
+    // action, resource_kind "approval", the approval id).
+    //
+    // Keep `existing` for the Conflict path below too: a second decision
+    // writes the same `refused` row with detail "already decided" (AI-28).
+    let existing = match agents::get_approval(pg, &id).await {
         Ok(Some(existing)) => {
-            refuse_own_request(&existing, &principal)?;
+            if existing.kind != "tool_call" {
+                return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
+            }
+            Some(existing)
         }
-        Ok(_) => {}
+        Ok(_) => None,
         Err(err) => return Err(ApiError::from(err).into()),
+    };
+
+    if let Some(existing) = existing.as_ref()
+        && let Err(err) = refuse_own_request(existing, &principal)
+    {
+        audit_coverage::record_best_effort(
+            &state,
+            decide_approval_audit_event(
+                &principal,
+                &existing.action,
+                &id,
+                body.comment.as_deref(),
+                "refused",
+                existing.run_id.as_deref(),
+                Some("the requester may not decide their own request"),
+            ),
+        )
+        .await;
+        return Err(err.into());
     }
 
     let approval = match agents::decide_approval(pg, &id, decision, body.comment.as_deref()).await {
@@ -757,6 +786,24 @@ pub async fn decide_approval(
             return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
         }
         Err(lakehouse_store::StoreError::Conflict) => {
+            // AI-28 / LH-AI-18-10: the 409 is unchanged, but a decision that
+            // lost the pending→decided race writes one `refused` audit row
+            // naming why, instead of silently returning.
+            if let Some(existing) = existing.as_ref() {
+                audit_coverage::record_best_effort(
+                    &state,
+                    decide_approval_audit_event(
+                        &principal,
+                        &existing.action,
+                        &id,
+                        body.comment.as_deref(),
+                        "refused",
+                        existing.run_id.as_deref(),
+                        Some("already decided"),
+                    ),
+                )
+                .await;
+            }
             return Err(
                 ApiError::Conflict(format!("Approval {id} has already been decided")).into(),
             );
@@ -780,6 +827,7 @@ pub async fn decide_approval(
         body.comment.as_deref(),
         decide_outcome,
         approval.run_id.as_deref(),
+        None,
     );
     audit_coverage::record_best_effort(&state, decide_audit_event).await;
 
@@ -2182,6 +2230,7 @@ mod tests {
             Some("looks fine"),
             "approved",
             Some("run-1"),
+            None,
         );
         assert_eq!(event.principal_kind.as_deref(), Some("user"));
         assert_eq!(
@@ -2208,6 +2257,7 @@ mod tests {
             "appr-2",
             None,
             "rejected",
+            None,
             None,
         );
         assert_eq!(event.principal_kind.as_deref(), Some("service"));
