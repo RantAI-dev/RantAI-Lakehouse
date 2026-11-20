@@ -1365,6 +1365,28 @@ mod recording {
             "nothing to record: no statement, no run"
         );
     }
+
+    /// QS-11 (LH-QS-4-02), D6: a statement the parser cannot read is a syntax
+    /// error from the first word to the last — never a policy or access-rule
+    /// problem. Same sentence the engine's own syntax error keeps in History.
+    #[tokio::test]
+    async fn a_statement_that_does_not_parse_is_refused_as_a_syntax_error() {
+        let ch = MockServer::start().await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+        let (status, body) = post_sql(&router, &cookie, "SELECT FROM WHERE").await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let error = body["error"].as_str().expect("the fixed syntax sentence");
+        assert_eq!(
+            error,
+            lakehouse_api::upstream_error::SYNTAX_SENTENCE,
+            "{body}"
+        );
+        assert!(!error.contains("policy"), "{error}");
+        assert!(!error.contains("access rules"), "{error}");
+    }
 }
 
 /// What the migration does to the rows already stored (`QS-2` and `QS-4` QA

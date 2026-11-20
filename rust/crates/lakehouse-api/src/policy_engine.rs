@@ -163,10 +163,9 @@ pub enum PolicyEngineError {
 #[must_use]
 pub fn engine_error_message(err: &PolicyEngineError) -> &'static str {
     match err {
-        PolicyEngineError::Unparseable => {
-            "The query could not be read, so access rules could not be checked. Check the SQL \
-             syntax."
-        }
+        // QS-11 (LH-QS-4-02), D6: a statement that does not parse is a syntax
+        // problem; no policy was in question, so no access-rule wording.
+        PolicyEngineError::Unparseable => crate::upstream_error::SYNTAX_SENTENCE,
         PolicyEngineError::Store(_) => {
             "Access rules could not be checked because of a database error."
         }
@@ -184,9 +183,9 @@ pub fn engine_error_message(err: &PolicyEngineError) -> &'static str {
 #[must_use]
 pub fn refusal_message(err: &sql_rewrite::RewriteError) -> &'static str {
     match err {
-        sql_rewrite::RewriteError::Unparseable => {
-            "The query could not be read by the policy engine. Check the SQL syntax."
-        }
+        // QS-11 (LH-QS-4-02), D6: same reason as `PolicyEngineError::Unparseable`
+        // — the statement's syntax, not the policy engine, is the problem.
+        sql_rewrite::RewriteError::Unparseable => crate::upstream_error::SYNTAX_SENTENCE,
         sql_rewrite::RewriteError::UnprovableSubstitution { .. } => {
             "The query reads a policy-governed table through a construct the policy engine does \
              not support, such as a table function or ARRAY JOIN."
@@ -1035,10 +1034,7 @@ mod tests {
                 policy_name: "p".to_owned(),
             });
 
-        assert_eq!(
-            unparseable,
-            "The query could not be read, so access rules could not be checked. Check the SQL syntax."
-        );
+        assert_eq!(unparseable, crate::upstream_error::SYNTAX_SENTENCE);
         assert_eq!(
             store,
             "Access rules could not be checked because of a database error."
@@ -1060,8 +1056,9 @@ mod tests {
 
     /// QS-14: every rewrite refusal reaches the person in English, one
     /// distinct sentence per variant, with no em dash or other non-ASCII
-    /// character. The expected texts are the plan's, typed here as
-    /// literals, so the test cannot agree with a wrong edit by construction.
+    /// character. Most expected texts are the plan's, typed here as literals;
+    /// the syntax one is the shared `SYNTAX_SENTENCE` (QS-11, D6), so the two
+    /// parse-failure paths cannot drift apart.
     #[test]
     fn refusal_messages_are_distinct_ascii_english_sentences() {
         use sql_rewrite::RewriteError;
@@ -1069,7 +1066,7 @@ mod tests {
         let cases: [(RewriteError, &str); 8] = [
             (
                 RewriteError::Unparseable,
-                "The query could not be read by the policy engine. Check the SQL syntax.",
+                crate::upstream_error::SYNTAX_SENTENCE,
             ),
             (
                 RewriteError::UnprovableSubstitution {
