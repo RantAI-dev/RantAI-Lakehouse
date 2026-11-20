@@ -6,14 +6,14 @@
 | Backlog | `GOV-1` |
 | Kind | Feature |
 | Spec | `docs/core/specs/gov-1.md` |
-| Status | In Acceptance |
+| Status | Released |
 | Priority | P1 |
 | Owner | In the base |
 | Acceptor | In the base |
 | Plan | Engineering plan kept by the planner |
 | Started | 2026-11-14 |
 | Shipped | 2026-11-15 |
-| Evidence | PR #546 (part A: coverage, central writer, append-only trail, audit:read), PR #549 (part B: server-side search, paging, CSV export) |
+| Evidence | PR #546 (part A: coverage, central writer, append-only trail, audit:read), PR #549 (part B: server-side search, paging, CSV export), PR #608 (part C: the acceptance follow-ups) |
 
 ## Problem
 
@@ -96,9 +96,9 @@ Exceptions, each with an owner and a date:
 
 ## After acceptance
 
-- [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
+- [x] `PRODUCT.md` section 2 and 3 updated
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
 - [ ] The base row updated to match the repo; the Acceptor is recorded in the base
-- [ ] `CHANGELOG.md` entry a customer can read
+- [x] `CHANGELOG.md` entry a customer can read
 
