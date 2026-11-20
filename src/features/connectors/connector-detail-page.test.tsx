@@ -21,7 +21,7 @@ mock.module("next/navigation", () => ({
 }))
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
-import { afterEach, beforeEach, describe, expect, it, jest, mock, spyOn } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { toast } from "sonner"
 import { ConnectorDetailPage } from "./connector-detail-page"
 
@@ -32,7 +32,6 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  jest.useRealTimers()
   global.fetch = originalFetch
   url.search = ""
   pushed.length = 0
@@ -842,28 +841,26 @@ describe("a connector that authenticates with none (LH-SRC-6-39)", () => {
 })
 
 // SRC-46 (QA LH-SRC-6-43): the health follows a run only when the orchestrator's sensor reports it to the API,
-// about a minute after the run ends, so the page reads the detail again until the run is counted.
+// about a minute after the run ends, so the page reads the detail again until the run is counted. The wait's
+// own cases (counted, cap, paused, unmount) are in `use-run-count-wait.test.tsx`, with real timers and tiny values.
+// SRC-46 review round 3, BLOCKER 3: real timers here too; fake timers with stubbed fetch hung on CI.
 describe("ConnectorDetailPage after a run ends", () => {
-  const RUN_ID = "run-live-00001"
-  const runRecord = (status: string) => ({
-    runId: RUN_ID,
-    trigger: "schedule",
-    table: null,
-    status,
-    startedAt: new Date().toISOString(),
-    endedAt: status === "running" ? null : new Date().toISOString(),
-    durationSeconds: status === "running" ? null : 90,
-    rowsLoaded: 0,
-    attempts: 4,
-    endReason: status === "running" ? null : "table_failed",
-  })
-
-  /** A page with a run going; `end(status)` ends it, `count()` makes the detail say the run was counted. */
-  async function openWithRunGoing() {
-    jest.useFakeTimers()
-    const world = { runStatus: "running", counted: false }
+  it("reads the detail again when the run ends, and shows Degraded once the detail reports the failure", async () => {
+    const world = { ended: false, counted: false }
+    const run = () => ({
+      runId: "run-live-00001",
+      trigger: "schedule",
+      table: null,
+      status: world.ended ? "failed" : "running",
+      startedAt: new Date().toISOString(),
+      endedAt: world.ended ? new Date().toISOString() : null,
+      durationSeconds: world.ended ? 90 : null,
+      rowsLoaded: 0,
+      attempts: 4,
+      endReason: world.ended ? "table_failed" : null,
+    })
     const stub = stubFetch({
-      "GET /api/connectors/conn-a/runs": () => json({ runs: [runRecord(world.runStatus)] }),
+      "GET /api/connectors/conn-a/runs": () => json({ runs: [run()] }),
       "GET /api/connectors/conn-a": () =>
         json(
           world.counted
@@ -871,86 +868,18 @@ describe("ConnectorDetailPage after a run ends", () => {
             : DETAIL
         ),
     })
-    const view = render(<ConnectorDetailPage connectorId="conn-a" />)
-    await tick(0)
-    const detailReads = () => stub.count("GET /api/connectors/conn-a")
-    return {
-      view,
-      detailReads,
-      end: async (status: string) => {
-        world.runStatus = status
-        // The panel's own 3 s poll sees the run end, then reads the list once more and reports it.
-        await tick(3000)
-        await tick(0)
-      },
-      count: () => {
-        world.counted = true
-      },
-    }
-  }
-
-  /** Moves fake time on, letting the reads it starts finish inside `act`. */
-  // Bun's fake timers have no async advance, so time moves in steps, each in its own `act` so the render and the
-  // effects of one step (the next reload) have run before the next step. A step is the 10 s poll interval at most:
-  // finer steps (180 of 1 s for the 3-minute cap) made the test outrun its 5 s limit on CI (`SRC-46 review round 2, BLOCKER 2`).
-  const tick = async (ms: number) => {
-    const step = 10_000
-    for (let left = ms; ; left -= step) {
-      await act(async () => {
-        jest.advanceTimersByTime(Math.min(left, step))
-        for (let i = 0; i < 30; i++) await Promise.resolve()
-      })
-      if (left <= step) break
-    }
-  }
-
-  it("reads the detail at once, then every 10 s, until the failure is counted, then stops", async () => {
-    const page = await openWithRunGoing()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByText(/Run run-live is running/)
     expect(screen.queryByText("Degraded")).toBeNull()
-    const before = page.detailReads()
+    const before = stub.count("GET /api/connectors/conn-a")
 
-    await page.end("failed")
-    // The first reload still says healthy: the sensor has not counted the run yet.
-    expect(page.detailReads()).toBe(before + 1)
+    // The panel's own 3 s poll sees the run end, then the page reads the detail at once: still healthy.
+    world.ended = true
+    await waitFor(() => expect(stub.count("GET /api/connectors/conn-a")).toBeGreaterThan(before), { timeout: 6000 })
     expect(screen.queryByText("Degraded")).toBeNull()
-    await tick(10_000)
-    expect(page.detailReads()).toBe(before + 2)
 
-    page.count()
-    await tick(10_000)
-    expect(page.detailReads()).toBe(before + 3)
-    expect(screen.getAllByText("Degraded").length).toBeGreaterThan(0)
-    // Counted: no further read.
-    await tick(60_000)
-    expect(page.detailReads()).toBe(before + 3)
-  })
-
-  it("stops asking after 3 minutes when the run is never counted", async () => {
-    const page = await openWithRunGoing()
-    const before = page.detailReads()
-    await page.end("failed")
-    await tick(180_000)
-    const atCap = page.detailReads()
-    expect(atCap).toBeGreaterThan(before + 10)
-    await tick(60_000)
-    expect(page.detailReads()).toBe(atCap)
-  })
-
-  it("reads once, and does not poll, for a run that is paused", async () => {
-    const page = await openWithRunGoing()
-    const before = page.detailReads()
-    await page.end("paused")
-    await tick(60_000)
-    expect(page.detailReads()).toBe(before + 1)
-  })
-
-  it("reads nothing after the page is left during the wait", async () => {
-    const page = await openWithRunGoing()
-    await page.end("failed")
-    await tick(10_000)
-    const atLeave = page.detailReads()
-    page.view.unmount()
-    await tick(60_000)
-    expect(page.detailReads()).toBe(atLeave)
-  })
+    // The sensor counts the run; the page's own wait (every 10 s) picks it up.
+    world.counted = true
+    await waitFor(() => expect(screen.getAllByText("Degraded").length).toBeGreaterThan(0), { timeout: 14000 })
+  }, 25000)
 })

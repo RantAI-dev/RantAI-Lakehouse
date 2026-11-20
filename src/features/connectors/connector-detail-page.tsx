@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useRef, useState } from "react"
 import Link from "next/link"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import {
@@ -29,7 +29,7 @@ import { formatDateTime, formatRelativeTime } from "@/lib/format"
 import { notifyError, notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
-import type { ConnectorDetail, ConnectorRun, ConnectorTestResult } from "@/services/contracts/connectors"
+import type { ConnectorDetail, ConnectorTestResult } from "@/services/contracts/connectors"
 import { ConnectorChangeCapturePanel } from "./connector-change-capture-panel"
 import { ConnectorDeleteDialog } from "./connector-delete-dialog"
 import { ReplicationSlotHealth } from "@/features/governance/replication-slot-health"
@@ -39,6 +39,7 @@ import { ConnectorOverview } from "./connector-overview"
 import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
 import { ConnectorSchemaChangesPanel } from "./connector-schema-changes-panel"
 import { ConnectorSetupChecks } from "./connector-setup-checks"
+import { useRunCountWait } from "./use-run-count-wait"
 import { DIRECTION_LABEL } from "./connectors-columns"
 import { usesNoCredential } from "./connector-form-parts"
 
@@ -204,10 +205,6 @@ function SourcesLink() {
   )
 }
 
-/** `SRC-46`: how often the detail is read again after a run ended, and for how long, while the run is not yet counted. */
-const COUNT_POLL_MS = 10_000
-const COUNT_WAIT_MAX_MS = 180_000
-
 /**
  * One connector, at `/connectors/<id>`: what the Sources list used to open in
  * a side sheet, now an address of its own (plan
@@ -231,43 +228,8 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   const state = useService((s) => connectorService.getConnector(id, s), [id], {
     keepDataOnReload: true,
   })
-  // `SRC-46` (`QA LH-SRC-6-43`): the connector's health follows a run only when the orchestrator's sensor
-  // reports it to the API, about a minute after the run ends, and nothing else re-reads the detail. So when
-  // the Ingest panel says a run ended, read the detail now, then every 10 s until the run is counted (the
-  // outcome's timestamp differs from what it was when the run ended), for at most 3 minutes. A run that is
-  // never counted (paused, or a missed sensor tick) just stops being asked about; a page load reads the truth.
-  const [countWait, setCountWait] = useState<{ field: "lastRunSuccessAt" | "lastRunFailureAt"; from: string | null } | null>(null)
-  const detailRef = useRef<ConnectorDetail | null>(null)
-  // `SRC-46 review round 1, BLOCKER 1`: synced in an effect, not during render (`react-hooks/refs`). The handler
-  // runs from a later poll, after the commit, so it reads the detail as of the last render.
-  useEffect(() => {
-    detailRef.current = state.data
-  }, [state.data])
-  const { reload: reloadDetail } = state
-  const onRunEnded = useCallback(
-    (run: ConnectorRun) => {
-      reloadDetail()
-      const field = run.status === "failed" ? "lastRunFailureAt" : run.status === "succeeded" ? "lastRunSuccessAt" : null
-      // Any other status (paused, a run with no end reported) reads once and does not wait for a count.
-      // A new run ending replaces the older wait: the effect below restarts on the new object.
-      setCountWait(field === null ? null : { field, from: detailRef.current?.[field] ?? null })
-    },
-    [reloadDetail]
-  )
-  // Counted when the outcome's timestamp differs from its value at the run's end. Derived, not set from an effect
-  // (`react-hooks/set-state-in-effect`, `SRC-46 review round 1, BLOCKER 1`): a counted wait stays in state, inactive,
-  // until a newer run replaces it.
-  const countedAt = countWait && state.data ? (state.data[countWait.field] ?? null) : null
-  const countWaiting = countWait !== null && countedAt === countWait.from ? countWait : null
-  useEffect(() => {
-    if (!countWaiting) return
-    const poll = window.setInterval(reloadDetail, COUNT_POLL_MS)
-    const giveUp = window.setTimeout(() => setCountWait(null), COUNT_WAIT_MAX_MS)
-    return () => {
-      window.clearInterval(poll)
-      window.clearTimeout(giveUp)
-    }
-  }, [countWaiting, reloadDetail])
+  // `SRC-46` D2: read the detail again after a run ends, until the run is counted (see the hook).
+  const onRunEnded = useRunCountWait(state.data, state.reload)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const urlTab = parseTab(searchParams.get("tab"))
   const [tab, setTab] = useState<ConnectorTab>(urlTab)

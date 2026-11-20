@@ -179,6 +179,8 @@ Notes for the reviewer:
 
 **Fix round 2.** `BLOCKER 2` (CI Unit tests, one timeout): the detail page tests' `tick` moved fake time in 1 s steps, so the 3-minute cap test ran 180 acts and outran the 5 s limit on CI. `tick` now steps by the 10 s poll interval at most (about 19 acts); the assertions and the 5 s limit are unchanged. `bun test src/features/connectors/connector-detail-page.test.tsx`: 46 pass, 0 fail. The four new tests take 0.41 s, 0.46 s, 0.08 s and 0.11 s (junit reporter, local). Full typecheck and suite: not verified locally, runs in CI.
 
+**Fix round 3.** `BLOCKER 3` (CI, 3 of 4 wait tests hung): the wait of D2 moved into `useRunCountWait` (`src/features/connectors/use-run-count-wait.ts`, `pollMs`/`maxMs` default 10 s / 3 min, the page uses the defaults, behaviour unchanged). Its tests (`use-run-count-wait.test.tsx`, five cases: counted, succeeded counted by its own field, cap, paused, unmount) use real timers with a 20 ms poll and a 200 ms cap, `reload` as a mock and the detail changed by `rerender`, no fetch. The four fake-timer page tests are replaced by one real-timer integration test (run ends, detail re-read, "Degraded" shows once the detail reports the count). No `useFakeTimers` is left in the connectors tests. `bun test` on the two files, local Bun 1.4.0 and CI's Bun 1.3.12: 48 pass, 0 fail each. Hook tests take 0.12 s to 0.37 s each. The page integration test takes about 13 s (the panel's 3 s poll plus the page's 10 s wait, both real); its timeout is 25000 ms, so it is the slow one. eslint on the four files: exit 0. Full typecheck and suite: not verified locally, runs in CI.
+
 ## Review
 
 ### Round 1 (planner, 2026-11-20, head `98c978be1`)
