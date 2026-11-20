@@ -12,6 +12,7 @@ import type {
   CreatePipelineInput,
   GeneratePipelineInput,
   ScheduleTicks,
+  ReuploadChainStep,
   UpdatePipelineInput,
 } from "../contracts/pipelines";
 import { apiFetch } from "../http";
@@ -183,6 +184,14 @@ export const dagsterPipelineService: PipelineService = {
       `/api/pipelines/${encodeURIComponent(id)}/target-lag`,
       { targetLag },
       signal
+    );
+  },
+  // BLD-14 D8: the page's one-sentence reason. Through `apiFetch` like every
+  // other read; the route's `in_scope` gate answers another tenant's id as 404.
+  async getReuploadChain(id, signal) {
+    return getJson<{ last: ReuploadChainStep | null }>(
+      `/api/pipelines/${encodeURIComponent(id)}/reupload-chain`,
+      { signal }
     );
   },
 };
