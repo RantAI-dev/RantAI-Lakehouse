@@ -32,6 +32,12 @@ describe("route loading fallback", () => {
     expect(screen.queryByRole("status", { name: "Loading dashboard" })).toBeNull()
   })
 
+  it("draws Home's placeholder on /", () => {
+    at("/")
+    expect(screen.getByRole("status", { name: "Loading Home" })).toBeTruthy()
+    expect(screen.queryByRole("status", { name: "Loading" })).toBeNull()
+  })
+
   it("draws nothing on /login", () => {
     const { container } = at("/login")
     expect(container.innerHTML).toBe("")
