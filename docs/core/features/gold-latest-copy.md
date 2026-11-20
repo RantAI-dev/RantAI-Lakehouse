@@ -10,7 +10,7 @@
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | Not written yet. Nothing open blocks it (`DATA-2` shipped in #164). |
+| Plan | `docs/superpowers/plans/2026-11-20-data-6-latest-copy.md` |
 | Started | |
 | Shipped | |
 | Evidence | |
@@ -39,8 +39,13 @@ No; publishing is not one of the assistant's dashboard tools.
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
 | 1 | Built, with "keep N copies" | Yes | Product owner, 2026-10-14 |
-| 2 | Name *(proposed)* | `gold.<table>_latest` | Product owner, 2026-10-14 |
-| 3 | Form | A plain Iceberg table, replaced in one commit | Planner |
+| 2 | Name | `gold.<table>_latest` | Product owner, 2026-10-14; confirmed 2026-11-20 |
+| 3 | Form | A plain Iceberg table, not an Iceberg view | Product owner, 2026-11-20 |
+| 4 | Consistency | Replaced in one Iceberg commit on each successful publish: a reader sees the old copy or the new one, never a mix | Product owner, 2026-11-20 |
+| 5 | Shown | The table's name on the publish card, with a copy button | Product owner, 2026-11-20 |
+| 6 | Switch off | Switching publishing off stops updates to both tables; both stay | Product owner, 2026-11-20 |
+| 7 | Who writes it | The orchestrator, in its own run started right after each successful publish (the Rust Iceberg library cannot replace a table's contents). So the latest copy follows a publish by that run's delay, which the plan measures | Planner |
+| 8 | A failed update | Recorded with a fixed reason and shown; the table keeps its previous copy; the publish's own result is unchanged | Planner |
 
 ## Limits to tell a customer
 
