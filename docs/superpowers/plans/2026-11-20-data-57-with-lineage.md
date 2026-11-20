@@ -609,4 +609,72 @@ code or compose changes, so those lines do not run. The handoff says
 
 ## Handoff
 
+### T1–T5, before #619
+
+Developer: `Hy4 flash` (OpenCode). Branch `data-57-with-lineage`, base
+`9fb8804d7`, pushed after every commit. T6 to T8 are not started (blocked by
+PR #619); this branch is not rebased or merged with `main` yet.
+
+Commits, in plan order:
+
+| Task | Commit |
+| --- | --- |
+| T1 | `b954bb13650b2d34272fd58cd07e884efc5c0d56` |
+| T2 | `4cd3c8987bf5a06ae5937440b1a7e86c35571eeb` |
+| T3 | `839e1252be230ef9fabd806e79d307c0129f1df8` |
+| T4 | `b51c1b9afe91d9a224c7442bba38e918a4916d6d` |
+| T5 | `3df21867f684d96e96da0c87b2169d1918c71c75` |
+
+Commands run, in the foreground, on the final commit (counts quoted):
+
+- `cd rust && cargo fmt --check` — clean (whole workspace).
+- `cd rust && cargo clippy -p lakehouse-api --all-targets -j 2 -- -D warnings`
+  — finished, no warning.
+- `cd rust && cargo test -p lakehouse-api --lib -j 2 -- sql_lineage` —
+  **49 passed**, 0 failed, 3736 filtered out.
+- `cd rust && cargo test -p lakehouse-api --test it -j 2 column_lineage_pipeline::`
+  — **9 passed**, 0 failed, 1767 filtered out.
+
+Each commit ran the same scoped commands (fmt --check, clippy, and its
+filtered unit or integration test) before it was pushed; the counts grew
+37 → 42 → 46 → 49 unit tests at T1 to T4, and the integration module went
+6 → 9 tests at T5.
+
+New tests were checked against the code they must fail on (rule 2 / "a
+wrong lineage edge is worse than none"), by temporarily adding only the new
+tests, and only the new fixed reason strings where the tests would not
+otherwise compile, to the earlier implementation:
+
+- T1: all 14 new tests fail on the base implementation; the 23 existing
+  tests pass.
+- T2: the two direct-read composition tests fail on the T1 implementation;
+  the compiled-shape and constant tests also pass on T1 because `*` over a
+  CTE clones its output unchanged and constants carry no transform.
+- T3: the two positive capture tests fail on the T2 implementation; the two
+  negative tests pass on both (they guard against over-capture).
+- T4: all three rendered-form-step tests fail on the pre-DATA-57 base.
+- T5: all three new route tests fail with the gated route restored; the five
+  existing tests of the file pass on both.
+
+Parser fallbacks: none needed. `ClickHouseDialect` parses `WITH RECURSIVE`, a
+CTE column list, `INSERT ... WITH`, the aggregate `count(DISTINCT ...)`, and
+`HAVING`; each acceptance test asserts the behaviour directly rather than the
+"statement does not parse" fallback.
+
+Not verified:
+
+- The full `cargo test --workspace` / `cargo nextest` partitions, the `g7`
+  gate, TypeScript, Dagster and compose checks — CI's job for this slice
+  (`AGENTS.md`, "Keep build time down"; plan section 7 is for T6 to T8).
+- `column_lineage_route::`, `column_lineage_sql_source::`,
+  `pipeline_compile_route::` and `sec11_guard::`: not run here; T5 touches no
+  file with tests in those modules at this base (verified by grep). #619's
+  `a_form_step_pipeline_is_not_noted_for_column_lineage` does not exist here.
+- T6 to T8: not built, blocked by PR #619. #619's test will fail once T5 is
+  on `main`; the planner owns the merge order (section 6).
+- `cargo-locked` is not on this machine; `cargo` with `-j 2` was used per the
+  plan's fallback. A shared `CARGO_TARGET_DIR` with other worktrees served a
+  stale lib test binary once; the crate sources were touched to force a
+  fresh rebuild before the final run.
+
 ## Review
