@@ -1180,6 +1180,68 @@ Notes for the reviewer:
 - T9's commit body names the tests whose label expectation moved from
   "Form step" / "· Form" to "Operations", as the plan requires.
 
+### Fix round 1 — planner review R1–R5
+
+One commit per finding, in order, each with the test the finding asks for
+and each pushed on its own:
+
+- `ff8837277` — R1: the join's output fill now gets `formColumns(...)`'s
+  filtered lists, not the raw ones. Test: the join's output over a side
+  with `order date` saves exactly the accepted columns.
+- `3aa6473f7` — R2: the read view says "Keep groups where …" and the flow
+  sublabel says "· keep groups where N condition(s)". Tests in
+  `pipeline-detail-page.test.tsx` and `pipeline-flow-layout.test.ts`.
+- `5ba76348f` — R3: the `read_keys` doc now says what the code does, with
+  `a_measure_name_that_another_measure_reads_is_refused`. The reviewer's
+  `g7` note is a line in the same J3 module doc (a variant there is more
+  than a few lines: a second create-run-compare through the stack).
+- `199add779` — R4: the Join type select ties to `joinType` (and to a
+  `joinType` refusal's sentence, via the new `PANE_REFUSAL_ID`), not to
+  `name`. Two page tests: a name problem leaves it unmarked; a
+  `steps[0].joinType` refusal marks and describes it.
+- `280069620` — R5: `firstFree` takes an optional limit and `measureName`
+  passes `MAX_NAME_CHARS`, so the uniqueness suffix stays inside 48. Test
+  with `countDistinct` over a 40-character column.
+
+How "fails before the fix" was checked, per finding:
+
+- R1: the page test was added first and failed on the `order date` output
+  row (its saved body carried the column).
+- R2: both tests were added first and failed — no "Keep groups where"
+  text, and the old `group by country` sublabel.
+- R3: the fix is a comment, so the new test passes on the pre-fix code —
+  that pass *is* the evidence the comment was wrong. To show the test
+  bites, the guard was temporarily disabled (`if false && read_keys…`):
+  it then panicked on `unwrap_err()` of an `Ok`, and passed again once
+  the guard was restored.
+- R4: with the sources stashed and the tests kept, the name-problem test
+  failed with the select's `aria-invalid` at `"true"` (wrongly tied to
+  the name) and the refusal test with it at `null`.
+- R5: the unit test failed on the 54-character name.
+
+Commands run on the final commit (`280069620`), foreground:
+
+- `bun run typecheck` — clean.
+- `bun run lint` — **0 errors, 11 warnings**, the same pre-existing ones
+  in files this slice does not touch.
+- `bun run test` — **4646 pass, 1 skip, 0 fail**, 14422 `expect()` calls,
+  4647 tests in 426 files (90 s).
+- For R3 only, as instructed, no workspace run:
+  `cd rust && cargo fmt --check` (clean) and
+  `cargo test -p lakehouse-api --lib -- pipeline_forms` — **40 passed,
+  0 failed**.
+
+Not verified, and why:
+
+- **The panes in a browser.** Still not verified: no API was running, so
+  the filtered join fill, the read view's having line and the Join type
+  marking were exercised only through the page tests.
+- **Rust beyond `pipeline_forms`** — CI's workspace run on the PR stands
+  in, as section 8 says.
+- **The unverified `ClickHouse` alias question** (an output alias equal
+  to the other side's join key) — recorded in the J3 module doc, not
+  proven; no gate case was added.
+
 ## 12. Review
 
 *(the reviewer appends findings per slice and round, tagged `BLOCKER` or
