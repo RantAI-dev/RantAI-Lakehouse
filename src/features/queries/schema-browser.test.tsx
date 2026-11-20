@@ -350,12 +350,16 @@ describe("SchemaBrowser", () => {
   it("keeps the table's name unknown on a Trino tab until its detail loads", async () => {
     visitTrinoTab()
     const { getAsset } = stubServices()
-    // The test is about the row before its detail has answered, so it holds
-    // that read open instead of racing it. The stub's default detail carries
-    // no name, so once it resolved the studio recorded a target from it, the
-    // row stopped being "Trino only" and the click inserted the placeholder
-    // `undefined.undefined`; on a loaded full-suite run that happened before
-    // the assertions (REL-26; it also failed on this slice's base commit).
+    // The test is about the row BEFORE its detail has answered, so hold that
+    // read open instead of racing the stub: `stubServices` answers at once,
+    // and the studio reads the detail for the row's SQL name (also for a
+    // table it must prove). When the fetch landed first, the studio recorded
+    // a target from the stub's name-less detail, the row stopped being
+    // "Trino only" and the same click inserted the placeholder
+    // `undefined.undefined` — a flake seen on a loaded full-suite run
+    // (REL-26, also on this slice's base commit) and again on 2026-11-20
+    // (UX-6). The held read is released at the end so nothing stays pending
+    // behind the test.
     let releaseDetail: (detail: { schema: never[] }) => void = () => {}
     getAsset.mockImplementation(
       (() =>
