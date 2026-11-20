@@ -85,8 +85,8 @@ describe("the public link page shows the workspace's own branding (ADM-2)", () =
 
     expect(await screen.findByText("RantAI Lakehouse")).toBeTruthy()
     expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
-      "/logo-light.png",
-      "/logo-dark.png",
+      "/logo-light.svg",
+      "/logo-dark.svg",
     ])
   })
 
