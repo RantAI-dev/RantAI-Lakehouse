@@ -211,3 +211,106 @@ describe("layoutFlow", () => {
     expect(edgePath(from, to)).toMatch(/^M [\d.]+ [\d.]+ L /)
   })
 })
+
+// ── BLD-16 (BLD-1 part 2) / J9: the form kinds' edges and sublabels ──────
+
+describe("authoredFlow: the form kinds (BLD-16)", () => {
+  const base = {
+    sourceZone: "bronze",
+    sourceTable: "orders_raw",
+    incrementalColumn: null,
+    transforms: [],
+    fbicEnabled: false,
+    targetZone: "silver",
+    targetTable: "sales_by_country",
+    connectorId: null,
+  }
+
+  test("a join draws two edges in, one per side, and a self-join one", () => {
+    const { nodes, edges } = authoredFlow(
+      {
+        ...base,
+        inputs: [
+          { name: "orders", zone: "bronze", table: "orders_raw" },
+          { name: "customers", zone: "bronze", table: "customers" },
+        ],
+        steps: [
+          {
+            name: "joined",
+            kind: "join",
+            left: "orders",
+            right: "customers",
+            joinType: "left",
+            on: [{ left: "customer_id", right: "id" }],
+            columns: [{ side: "left", column: "id" }],
+          },
+        ],
+      },
+      describeTransform
+    )
+    expect(nodes[2]).toMatchObject({ id: "step:0", label: "joined", stepKind: "join", sublabel: "left join" })
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual([
+      "input:0>step:0",
+      "input:1>step:0",
+      "step:0>target",
+    ])
+
+    // A self-join reads one item under two sides: one edge, not two
+    // identical ones.
+    const self = authoredFlow(
+      {
+        ...base,
+        inputs: [{ name: "orders", zone: "bronze", table: "orders_raw" }],
+        steps: [
+          {
+            name: "joined",
+            kind: "join",
+            left: "orders",
+            right: "orders",
+            joinType: "inner",
+            on: [{ left: "id", right: "parent_id" }],
+            columns: [{ side: "left", column: "id" }],
+          },
+        ],
+      },
+      describeTransform
+    )
+    expect(self.edges.map((e) => `${e.from}>${e.to}`)).toEqual(["input:0>step:0", "step:0>target"])
+  })
+
+  test("an aggregate and a filter each draw one edge in, with their own sublabels", () => {
+    const { nodes, edges } = authoredFlow(
+      {
+        ...base,
+        inputs: [{ name: "orders", zone: "bronze", table: "orders_raw" }],
+        steps: [
+          {
+            name: "by_country",
+            kind: "aggregate",
+            reads: "orders",
+            groupBy: ["country"],
+            measures: [{ function: "sum", column: "amount", name: "revenue" }],
+          },
+          {
+            name: "big_or_local",
+            kind: "filter",
+            reads: "by_country",
+            match: "any",
+            conditions: [
+              { column: "revenue", operator: ">=", value: "5000" },
+              { column: "country", operator: "=", value: "ID" },
+            ],
+          },
+        ],
+      },
+      describeTransform
+    )
+    expect(nodes[1]).toMatchObject({ id: "step:0", stepKind: "aggregate", sublabel: "group by country" })
+    expect(nodes[2]).toMatchObject({ id: "step:1", stepKind: "filter", sublabel: "any of 2 conditions" })
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual([
+      "input:0>step:0",
+      "step:0>step:1",
+      "step:1>target",
+    ])
+  })
+})
