@@ -349,7 +349,20 @@ describe("SchemaBrowser", () => {
 
   it("keeps the table's name unknown on a Trino tab until its detail loads", async () => {
     visitTrinoTab()
-    stubServices()
+    const { getAsset } = stubServices()
+    // The test is about the row before its detail has answered, so it holds
+    // that read open instead of racing it. The stub's default detail carries
+    // no name, so once it resolved the studio recorded a target from it, the
+    // row stopped being "Trino only" and the click inserted the placeholder
+    // `undefined.undefined`; on a loaded full-suite run that happened before
+    // the assertions (REL-26; it also failed on this slice's base commit).
+    let releaseDetail: (detail: { schema: never[] }) => void = () => {}
+    getAsset.mockImplementation(
+      (() =>
+        new Promise((resolve) => {
+          releaseDetail = resolve
+        })) as never
+    )
     const { container } = render(<Harness />)
     const view = editorView(container)
     setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
@@ -359,6 +372,11 @@ describe("SchemaBrowser", () => {
 
     expect(view.state.doc.toString()).toBe("SELECT * FROM ")
     expect(row.getAttribute("title") ?? "").toContain("SQL name")
+
+    // Let the held read answer, so nothing is left pending behind the test.
+    await act(async () => {
+      releaseDetail({ schema: [] })
+    })
   })
 
   // LH-QS-4-08: a Bronze row is proven when the list
