@@ -24,4 +24,21 @@ describe("BrandPicture (ADM-2)", () => {
       "size-8 object-contain",
     )
   })
+
+  it("hides the empty box from assistive technology", () => {
+    const { container } = render(
+      <BrandPicture
+        src=""
+        alt=""
+        fallbackSrc="/logo-light.png"
+        className="size-8 object-contain"
+      />,
+    )
+
+    // The empty box is decoration: it holds no picture and no word, so a
+    // screen reader must not read it out (`adm-120`).
+    const box = container.firstElementChild
+    expect(box?.tagName).toBe("SPAN")
+    expect(box?.getAttribute("aria-hidden")).toBe("true")
+  })
 })
