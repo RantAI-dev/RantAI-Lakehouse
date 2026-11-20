@@ -108,4 +108,83 @@ The download block (`LH-QS-2-06` F1) is already fixed. `LH-DATA-11-08` F3
 
 ## Handoff
 
+Developer: DeepSeek V4.1 Flash, 2026-11-20. Base `main` at `d85b0eeac`,
+branch `ux-6-copy-over-http`. Five commits, each pushed after it was made.
+
+| Task | Commit | What |
+| --- | --- | --- |
+| T1 | `5dab2956b` | lint block in `eslint.config.mjs` (red on purpose) |
+| T2 | `7ca0a2b4c` | `copyable.tsx`, `copy-button.tsx`, `chat-messages.tsx` + 2 test files |
+| T3 | `2a9320635` | `users-page.tsx`, `service-identities-page.tsx` + 2 page tests |
+| T4 | `f916644d8` | the remaining 17 files (21 calls) |
+| T5 | `0ccd011c5` | pin the detail a racy `schema-browser` test waits on (see below) |
+
+T1 was committed alone with lint red (32 errors, exactly the 22 files this
+plan lists), because nothing in the repo blocks a red pre-commit hook. T4
+removes all 32; the 12 warnings on `main` are untouched.
+
+`grep -rn 'navigator.clipboard' src | grep -v '\.test\.'` prints only
+`src/lib/copy-text.ts` (4 lines: the helper's own doc comment and body).
+The comments added in T2–T4 say "clipboard API" so they do not match.
+
+### Commands run, on the final commit (`0ccd011c5`)
+
+```bash
+bun run typecheck                          # exit 0, no output
+bun run lint                               # exit 0, 12 warnings, 0 errors
+bun run test                               # exit 0: 4627 pass, 1 skip, 0 fail,
+                                           #   14658 expect() calls,
+                                           #   4628 tests across 429 files
+git status                                 # clean
+```
+
+Frontend only: no cargo, Python or Docker command was run, and nothing
+outside `src/` and `eslint.config.mjs` changed.
+
+### Tests added, and how they were checked against the old code
+
+- `src/components/copyable.test.tsx`, `src/features/copilot/copy-button.test.tsx`:
+  `navigator.clipboard` removed for the whole file (the staging situation),
+  `document.execCommand` stubbed `true`/`false`. Checked by stashing the two
+  components and re-running: **4 fail, 0 pass** there
+  (`TypeError: undefined is not an object (evaluating 'navigator.clipboard.writeText')`
+  for `CopyButton`; no "Could not copy" toast for `Copyable`), 4 pass on the
+  commit.
+- One page test each in `users-page.test.tsx` and
+  `service-identities-page.test.tsx`: click Copy with no clipboard API and
+  assert the textarea `execCommand` sees holds the revealed value **and sits
+  inside the dialog**. Checked the same way (both pages stashed): **2 fail**
+  on the old code, 2 pass on the commit.
+
+### Not verified
+
+- **The reveal screens on a running console over plain http** (`UX-6` T3
+  asked for this). This session had no stack to open the console against, so
+  the dialog-level check is the two page tests above, which run in happy-dom
+  with `document.execCommand` stubbed — not a real browser over http. The
+  textarea is appended to the active element's `[role=dialog]` ancestor;
+  the tests focus the Copy button first, because `fireEvent.click` does not
+  move focus in happy-dom while a real click does (Chrome, Firefox).
+- A click in a browser that does not focus a button on click (Safari on
+  macOS) leaves `document.activeElement` on the dialog itself or on body;
+  then the fallback is not inside the dialog and the copy can be refused —
+  the user gets the failure toast and is told to copy by hand. That is the
+  accepted behaviour in decision 2, and it is not measured.
+
+### The one test this branch had to touch outside `UX-6`
+
+`schema-browser.test.tsx` (`QS-4`) has one test that asserts a *loading*
+state ("keeps the table's name unknown … until its detail loads") while
+`stubServices` resolves `getAsset` at once. Adding a second `UsersPage`
+render in `users-page.test.tsx` was enough to lose that race: the row was
+already insertable and the click inserted `SELECT * FROM undefined.undefined`
+(the name built from the empty detail). It reproduces on the base commit
+with a test that only renders `UsersPage` once more, so it is the test's race,
+not this change: `git worktree` at `0061cd790` + one extra page-rendering
+test in `users-page.test.tsx` → same failure; the same worktree without it →
+0 fail, twice. `0ccd011c5` holds the detail pending in that test, which is
+the state its name describes; no assertion changed and it still fails if the
+click ever inserts something. The reviewer should look at that commit on its
+own, as it is outside the plan's task list.
+
 ## Review
