@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import { HelpTip } from "@/components/patterns/help-tip"
+import { HelpHint } from "@/components/patterns/help-hint"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -201,9 +201,9 @@ export function QueryLimitsForm({ canWrite }: { canWrite: boolean }) {
               </div>
             ) : null}
           </div>
-          <p className="flex items-center gap-1 text-xs text-muted-foreground">
-            A dashboard may wait this long to answer.
-            <HelpTip heading="the time limit">With 30 minutes, a dashboard may take 30 minutes to answer. Exports keep their own limits.</HelpTip>
+          {/* PR UX-7 review SHOULD-FIX 1: the one help popover, `HelpHint`, ends the one-line help. */}
+          <p className="text-xs text-muted-foreground">
+            A dashboard may wait this long to answer. <HelpHint>With 30 minutes, a dashboard may take 30 minutes to answer. Exports keep their own limits.</HelpHint>
           </p>
           {canWrite ? (
             <div className="flex items-center gap-3">

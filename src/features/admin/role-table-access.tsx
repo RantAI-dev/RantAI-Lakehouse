@@ -3,7 +3,7 @@
 import * as React from "react"
 import { ChevronDownIcon, ChevronRightIcon } from "lucide-react"
 
-import { HelpTip } from "@/components/patterns/help-tip"
+import { HelpHint } from "@/components/patterns/help-hint"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
@@ -259,15 +259,14 @@ export function RoleTableAccessSection({
   return (
     <section className="space-y-3" aria-labelledby={`${idPrefix}-table-access-title`}>
       <div className="space-y-1">
-        <div className="flex items-center gap-1">
-          <h2 id={`${idPrefix}-table-access-title`} className="text-sm font-semibold">
-            Tables this role can read
-          </h2>
-          <HelpTip heading="Tables this role can read">
-            A table a role may not read is hidden everywhere, and a query naming it answers &quot;not found&quot;, as for a missing table.
-          </HelpTip>
-        </div>
-        <p className="text-xs text-muted-foreground">People read every table any of their roles allows.</p>
+        <h2 id={`${idPrefix}-table-access-title`} className="text-sm font-semibold">
+          Tables this role can read
+        </h2>
+        {/* PR UX-7 review SHOULD-FIX 1: the one help popover, `HelpHint`, ends the one-line help. */}
+        <p className="text-xs text-muted-foreground">
+          People read every table any of their roles allows.{" "}
+          <HelpHint>A table a role may not read is hidden everywhere, and a query naming it answers &quot;not found&quot;, as for a missing table.</HelpHint>
+        </p>
       </div>
 
       {accessError ? (

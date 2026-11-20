@@ -230,8 +230,8 @@ describe("ReportingSettingsForm", () => {
 
     // UX-7: the line says the rule, the help tip holds what it covers.
     expect(await screen.findByText("Checked roles cannot export or download.")).toBeDefined()
-    fireEvent.click(screen.getByRole("button", { name: "More about Block downloads for these roles" }))
-    const tip = (await screen.findByText(/Query Studio result downloads/)) as HTMLElement
+    fireEvent.click(screen.getByRole("button", { name: /Query Studio result downloads/ }))
+    const tip = (await screen.findAllByText(/Query Studio result downloads/))[0] as HTMLElement
     expect(tip.textContent).toContain("Copy as TSV")
     expect(tip.textContent).toContain("It cannot stop copying from the screen.")
   })
@@ -302,8 +302,10 @@ describe("help text on Settings > Reporting (UX-7)", () => {
   it("keeps the detail in a help tip that opens on a click, and the line under the heading short", async () => {
     mockSettings(DEFAULTS)
     render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
-    fireEvent.click(await screen.findByRole("button", { name: "More about Public links" }))
-    expect(await screen.findByText(/Nothing is deleted: turning it on again/)).toBeDefined()
+    // `HelpHint`: the button's name is the detail itself, and a press opens it.
+    const hint = await screen.findByRole("button", { name: /Nothing is deleted: turning it on again/ })
+    fireEvent.click(hint)
+    expect((await screen.findAllByText(/Nothing is deleted: turning it on again/)).length).toBeGreaterThan(0)
     expect(screen.getByText("Off stops every public link at once.")).toBeDefined()
   })
 })

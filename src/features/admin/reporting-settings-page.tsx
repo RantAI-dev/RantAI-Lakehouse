@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { HelpTip } from "@/components/patterns/help-tip"
+import { HelpHint } from "@/components/patterns/help-hint"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -228,10 +228,7 @@ export function ReportingSettingsForm({
             </Select>
           </div>
           <div className="flex flex-col gap-1.5">
-            <div className="flex items-center gap-1">
-              <Label htmlFor="number-locale">Number format</Label>
-              <HelpTip heading="Number format">A chart that set its own separators keeps them.</HelpTip>
-            </div>
+            <Label htmlFor="number-locale">Number format</Label>
             <Select
               value={locale}
               items={NUMBER_LOCALES}
@@ -249,7 +246,10 @@ export function ReportingSettingsForm({
                 ))}
               </SelectContent>
             </Select>
-            <p className="text-xs text-muted-foreground">Separators in every chart.</p>
+            {/* PR UX-7 review SHOULD-FIX 1: the one help popover, `HelpHint`, ends the one-line help. */}
+            <p className="text-xs text-muted-foreground">
+              Separators in every chart. <HelpHint>A chart that set its own separators keeps them.</HelpHint>
+            </p>
           </div>
           <section className="flex flex-col gap-1.5" aria-labelledby="settings-palette">
             <h2 id="settings-palette" className="text-sm font-medium">
@@ -321,14 +321,13 @@ export function ReportingSettingsForm({
             ))}
           </section>
           <section className="flex flex-col gap-1.5" aria-labelledby="settings-content-sites">
-            <div className="flex items-center gap-1">
-              <h2 id="settings-content-sites" className="text-sm font-medium">
-                Allowed content sites
-              </h2>
-              <HelpTip heading="Allowed content sites">Written https://host or https://host:port, no wildcards. At most {MAX_CONTENT_SITES}. With none listed, no image or web-page card can be saved.</HelpTip>
-            </div>
+            <h2 id="settings-content-sites" className="text-sm font-medium">
+              Allowed content sites
+            </h2>
             {unsaved.sites ? <UnsavedNote /> : null}
-            <p className="text-xs text-muted-foreground">Sites image and web-page cards may show.</p>
+            <p className="text-xs text-muted-foreground">
+              Sites image and web-page cards may show. <HelpHint>{`Written https://host or https://host:port, no wildcards. At most ${MAX_CONTENT_SITES}. With none listed, no image or web-page card can be saved.`}</HelpHint>
+            </p>
             <ul className="flex flex-col gap-1" aria-label="Allowed content sites">
               {sites.map((s) => (
                 <li key={s} className="flex items-center gap-2 text-sm">
@@ -367,14 +366,13 @@ export function ReportingSettingsForm({
           </section>
           {canReadDomains ? (
             <section className="flex flex-col gap-1.5" aria-labelledby="settings-report-domains">
-              <div className="flex items-center gap-1">
-                <h2 id="settings-report-domains" className="text-sm font-medium">
-                  Outside email domains
-                </h2>
-                <HelpTip heading="Outside email domains">Written example.com, no wildcards. At most {MAX_REPORT_DOMAINS}. With none listed, no report leaves the company.</HelpTip>
-              </div>
+              <h2 id="settings-report-domains" className="text-sm font-medium">
+                Outside email domains
+              </h2>
               {unsaved.domains ? <UnsavedNote /> : null}
-              <p className="text-xs text-muted-foreground">Outside domains a scheduled report may reach.</p>
+              <p className="text-xs text-muted-foreground">
+              Outside domains a scheduled report may reach. <HelpHint>{`Written example.com, no wildcards. At most ${MAX_REPORT_DOMAINS}. With none listed, no report leaves the company.`}</HelpHint>
+            </p>
               <ul className="flex flex-col gap-1" aria-label="Report domains">
                 {domains.map((d) => (
                   <li key={d} className="flex items-center gap-2 text-sm">
@@ -414,13 +412,12 @@ export function ReportingSettingsForm({
           ) : null}
           {canReadDeniedRoles ? (
             <section className="flex flex-col gap-1.5" aria-labelledby="settings-downloads">
-              <div className="flex items-center gap-1">
-                <h2 id="settings-downloads" className="text-sm font-medium">
-                  Block downloads for these roles
-                </h2>
-                <HelpTip heading="Block downloads for these roles">Covers PDF, Excel, CSV, image and dashboard-file downloads, Query Studio result downloads and Copy as TSV. It cannot stop copying from the screen. A person who also holds an unchecked role still can, and Platform Admin is never blocked.</HelpTip>
-              </div>
-              <p className="text-xs text-muted-foreground">Checked roles cannot export or download.</p>
+              <h2 id="settings-downloads" className="text-sm font-medium">
+                Block downloads for these roles
+              </h2>
+              <p className="text-xs text-muted-foreground">
+              Checked roles cannot export or download. <HelpHint>Covers PDF, Excel, CSV, image and dashboard-file downloads, Query Studio result downloads and Copy as TSV. It cannot stop copying from the screen. A person who also holds an unchecked role still can, and Platform Admin is never blocked.</HelpHint>
+            </p>
               {roleNames.map((name) => (
                 <div key={name} className="flex items-center gap-2">
                   <Checkbox
@@ -435,13 +432,12 @@ export function ReportingSettingsForm({
             </section>
           ) : null}
           <section className="flex flex-col gap-1.5" aria-labelledby="settings-public-links">
-            <div className="flex items-center gap-1">
-              <h2 id="settings-public-links" className="text-sm font-medium">
-                Public links
-              </h2>
-              <HelpTip heading="Public links">Nothing is deleted: turning it on again brings back the links that have not expired.</HelpTip>
-            </div>
-            <p className="text-xs text-muted-foreground">Off stops every public link at once.</p>
+            <h2 id="settings-public-links" className="text-sm font-medium">
+              Public links
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              Off stops every public link at once. <HelpHint>Nothing is deleted: turning it on again brings back the links that have not expired.</HelpHint>
+            </p>
             <div className="flex items-center gap-2">
               <Checkbox
                 id="public-links-enabled"
