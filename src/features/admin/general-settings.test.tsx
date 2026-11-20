@@ -29,7 +29,7 @@ const BRANDING = {
   icon: null,
 }
 
-type Call = { method: string; url: string }
+type Call = { method: string; url: string; body?: BodyInit | null }
 
 /**
  * Answers the two reads, and lets a test take over one call of its own.
@@ -40,7 +40,7 @@ function stubApi(answer?: (call: Call) => Response | null) {
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     const method = (init?.method ?? "GET").toUpperCase()
-    calls.push({ method, url })
+    calls.push({ method, url, body: init?.body ?? null })
     const own = answer?.({ method, url })
     if (own) return own
     if (url.includes("/api/settings/general")) return json(SAVED)
@@ -170,5 +170,115 @@ describe("GeneralSettings", () => {
       const field = (await screen.findByLabelText("Workspace name")) as HTMLInputElement
       expect(field.value).toBe("")
     })
+  })
+
+  // ── The picture is checked in the browser before it is sent (adm-120) ────
+
+  /** A picture file of `size` bytes, without allocating them. */
+  function pictureFile(name: string, type: string, size: number): File {
+    const file = new File(["bytes"], name, { type })
+    Object.defineProperty(file, "size", { value: size })
+    return file
+  }
+
+  /** Whether a picture of this kind was sent to the API. */
+  function sentPicture(calls: Call[], kind: string): boolean {
+    return calls.some(
+      (call) => call.method === "PUT" && call.url.includes(`/api/settings/general/images/${kind}`)
+    )
+  }
+
+  it("refuses an oversized logo in the browser, with the server's sentence, and sends nothing", async () => {
+    const calls = stubApi()
+    render(<GeneralSettings />)
+    const picker = await screen.findByLabelText("Logo")
+    fireEvent.change(picker, {
+      target: { files: [pictureFile("logo.png", "image/png", 20 * 1024 * 1024)] },
+    })
+    // The server's own sentence, the one it would answer with.
+    expect(await screen.findByText("The logo must be at most 512 KB.")).toBeTruthy()
+    expect(sentPicture(calls, "logo")).toBe(false)
+  })
+
+  it("sends a logo the API accepts, with the file", async () => {
+    const calls = stubApi()
+    render(<GeneralSettings />)
+    const picker = await screen.findByLabelText("Logo")
+    fireEvent.change(picker, {
+      target: { files: [pictureFile("logo.png", "image/png", 400 * 1024)] },
+    })
+    await waitFor(() => expect(sentPicture(calls, "logo")).toBe(true))
+    // The picture itself goes with the request.
+    const put = calls.find((call) => call.method === "PUT")
+    expect(put?.body).toBeInstanceOf(FormData)
+    expect((put?.body as FormData).get("file")).toBeTruthy()
+  })
+
+  it("refuses a logo of the wrong format, with the server's sentence, and sends nothing", async () => {
+    const calls = stubApi()
+    render(<GeneralSettings />)
+    const picker = await screen.findByLabelText("Logo")
+    fireEvent.change(picker, {
+      target: { files: [pictureFile("logo.svg", "image/svg+xml", 1024)] },
+    })
+    expect(await screen.findByText("The logo must be a PNG, JPEG or WebP image.")).toBeTruthy()
+    expect(sentPicture(calls, "logo")).toBe(false)
+  })
+
+  it("refuses a logo of the wrong type that is also too big with the type sentence", async () => {
+    const calls = stubApi()
+    render(<GeneralSettings />)
+    const picker = await screen.findByLabelText("Logo")
+    fireEvent.change(picker, {
+      target: { files: [pictureFile("logo.svg", "image/svg+xml", 20 * 1024 * 1024)] },
+    })
+    // The type is judged first, as the API judges it.
+    expect(await screen.findByText("The logo must be a PNG, JPEG or WebP image.")).toBeTruthy()
+    expect(sentPicture(calls, "logo")).toBe(false)
+  })
+
+  it("refuses an icon over 64 KB, with the server's sentence, and sends nothing", async () => {
+    const calls = stubApi()
+    render(<GeneralSettings />)
+    const picker = await screen.findByLabelText("Browser-tab icon")
+    fireEvent.change(picker, {
+      target: { files: [pictureFile("icon.png", "image/png", 65_537)] },
+    })
+    expect(await screen.findByText("The icon must be a PNG image of at most 64 KB.")).toBeTruthy()
+    expect(sentPicture(calls, "icon")).toBe(false)
+  })
+
+  it("sends an icon the API accepts", async () => {
+    const calls = stubApi()
+    render(<GeneralSettings />)
+    const picker = await screen.findByLabelText("Browser-tab icon")
+    fireEvent.change(picker, {
+      target: { files: [pictureFile("icon.png", "image/png", 4096)] },
+    })
+    await waitFor(() => expect(sentPicture(calls, "icon")).toBe(true))
+  })
+
+  it("refuses an oversized dark-mode logo with the logo's sentence, and sends nothing", async () => {
+    const calls = stubApi()
+    render(<GeneralSettings />)
+    const picker = await screen.findByLabelText("Dark-mode logo")
+    fireEvent.change(picker, {
+      target: { files: [pictureFile("logo-dark.png", "image/png", 20 * 1024 * 1024)] },
+    })
+    // The dark-mode logo follows the logo's rules and the logo's sentences.
+    expect(await screen.findByText("The logo must be at most 512 KB.")).toBeTruthy()
+    expect(sentPicture(calls, "logo-dark")).toBe(false)
+  })
+
+  it("sends a file whose type the browser does not know, so the server sniffs it", async () => {
+    const calls = stubApi()
+    render(<GeneralSettings />)
+    const picker = await screen.findByLabelText("Logo")
+    fireEvent.change(picker, {
+      target: { files: [pictureFile("logo.bin", "application/octet-stream", 400 * 1024)] },
+    })
+    // The browser knows no type, so the console refuses nothing: the API
+    // reads the first bytes and stays the authority.
+    await waitFor(() => expect(sentPicture(calls, "logo")).toBe(true))
   })
 })
