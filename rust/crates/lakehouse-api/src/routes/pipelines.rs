@@ -2957,16 +2957,6 @@ pub async fn run_finished_event(
     Ok(ApiJson(json!({ "matched": matched })))
 }
 
-/// The job to launch for authored pipeline `id`, or the response that
-/// explains why there is none. A draft is refused (409) before the
-/// orchestrator is asked. A ready pipeline whose job the orchestrator has
-/// not loaded (marked ready while it was down, say) gets one reload; if
-/// the job is still missing, 409 says so rather than a launch error that
-/// reads like a bad job name.
-// `result_large_err` now reports `async fn`s too (clippy 1.98,
-// rust-clippy#17130). The `Err` here is a ready `Response` the route returns
-// verbatim, so boxing it would change this helper's contract and every call
-// site for an allocation only on the error path (REL-9, decision D2).
 /// BLD-11 D9 (F6): a bound on how long `Run now` waits for the orchestrator
 /// to finish loading a just-marked-ready job. Ten two-second looks (20 s)
 /// bound a request a person is waiting on — this is NOT a measured reload
@@ -2978,6 +2968,9 @@ const LAUNCH_JOB_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// Look for a loaded job up to `attempts` times, `interval` apart (BLD-11
 /// D9). A job that appears on a later look is found; exhausting the looks
 /// returns `false` so the caller can refuse with the try-again 409.
+// BLD-11 review R2: this helper and its constants sit above
+// `authored_launch_target`'s doc block so that doc stays attached to the
+// function it describes, not to the first item that followed it.
 async fn wait_for_job(
     state: &AppState,
     id: &str,
@@ -2995,6 +2988,16 @@ async fn wait_for_job(
     false
 }
 
+/// The job to launch for authored pipeline `id`, or the response that
+/// explains why there is none. A draft is refused (409) before the
+/// orchestrator is asked. A ready pipeline whose job the orchestrator has
+/// not loaded (marked ready while it was down, say) gets one reload; if
+/// the job is still missing, 409 says so rather than a launch error that
+/// reads like a bad job name.
+// `result_large_err` now reports `async fn`s too (clippy 1.98,
+// rust-clippy#17130). The `Err` here is a ready `Response` the route returns
+// verbatim, so boxing it would change this helper's contract and every call
+// site for an allocation only on the error path (REL-9, decision D2).
 #[allow(
     clippy::result_large_err,
     reason = "the Err is a ready Response the route returns verbatim; boxing it would change every call site for no gain on the success path"
