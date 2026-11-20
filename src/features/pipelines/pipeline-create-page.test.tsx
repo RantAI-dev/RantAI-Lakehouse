@@ -1291,6 +1291,43 @@ describe("the form kinds in the pipeline editor (BLD-16)", () => {
     ])
   })
 
+  it("marks the Join type select when a refusal names it, and not for a name problem (BLD-16 review R4)", async () => {
+    renderEditor()
+    await twoKnownInputs()
+    fireEvent.click(screen.getByRole("button", { name: /^Join$/ }))
+    await screen.findByText("Step 1 · Join")
+    // A step named after an input is a "name" problem; the Join type select
+    // is not what it is about.
+    const name = screen.getByLabelText("Name in this pipeline")
+    fireEvent.change(name, { target: { value: "orders_raw" } })
+    await waitFor(() => expect(name.getAttribute("aria-invalid")).toBe("true"))
+    expect(screen.getByRole("combobox", { name: "Join type" }).getAttribute("aria-invalid")).toBeNull()
+  })
+
+  it("marks the Join type select for a `steps[0].joinType` refusal (BLD-16 review R4)", async () => {
+    const message = "steps[0].joinType: joinType is one of inner, left, right or full"
+    saveAnswer = { status: 400, body: { error: message } }
+    renderEditor()
+    await twoKnownInputs()
+    fireEvent.click(screen.getByRole("button", { name: /^Join$/ }))
+    await screen.findByText("Step 1 · Join")
+    chooseOption(screen.getByRole("combobox", { name: "Right" }), "orders_raw")
+    await screen.findByDisplayValue("orders_raw_id")
+    fireEvent.click(screen.getByRole("button", { name: /add a pair/i }))
+    chooseLastOption(screen.getByRole("combobox", { name: /stock_raw's column/ }), "id")
+    chooseLastOption(screen.getByRole("combobox", { name: /orders_raw's column/ }), "id")
+    selectOutput()
+    fireEvent.change(screen.getByPlaceholderText("orders_hourly"), { target: { value: "form_400_type_out" } })
+
+    await saveAndRead("POST")
+
+    const alerts = await screen.findAllByRole("alert")
+    expect(alerts.map((alert) => alert.textContent)).toContain(message)
+    const select = screen.getByRole("combobox", { name: "Join type" })
+    expect(select.getAttribute("aria-invalid")).toBe("true")
+    expect(select.getAttribute("aria-describedby")).toBe("pipeline-editor-item-error")
+  })
+
   it("selects the join a 400 names, and marks the pair it names (D7)", async () => {
     const message =
       "steps[0].on[0]: a column must be a plain name (letters, digits and underscores, not starting with a digit)"

@@ -52,6 +52,14 @@ import { TransformRows } from "./pipeline-transform-rows"
  */
 export type Invalid = { field: ProblemField; describedBy: string } | null
 
+/**
+ * The id of a save refusal's sentence in the open pane (the editor renders
+ * it). A control whose own field the refusal names points at it, so a
+ * `steps[i].joinType` refusal describes the select it is about (BLD-16
+ * review R4).
+ */
+export const PANE_REFUSAL_ID = "pipeline-editor-item-error"
+
 /** The ARIA a control gets when the pane's problem is about it. */
 function tie(invalid: Invalid | undefined, field: ProblemField): { "aria-invalid"?: true; "aria-describedby"?: string } {
   return invalid && invalid.field === field ? { "aria-invalid": true, "aria-describedby": invalid.describedBy } : {}
@@ -776,6 +784,7 @@ export function JoinStepPane({
   const right = formColumns(rightColumns ?? [])
   const droppedColumns = left.dropped || right.dropped
   const joinType = JOIN_TYPES.find((t) => t.value === step.joinType) ?? JOIN_TYPES[0]
+  const joinTypeRefused = failed.field === "joinType" && failed.message !== null
   const outer = joinType.value !== "inner"
   const itemName = (read: StepRead): string =>
     "id" in read ? (readable.find((item) => item.id === read.id)?.name ?? "") : ""
@@ -835,7 +844,11 @@ export function JoinStepPane({
             value={step.joinType}
             options={JOIN_TYPES.map((t) => ({ value: t.value, label: t.label }))}
             onValueChange={(joinType) => onChange({ joinType })}
-            aria-invalid={tie(invalid, "name")["aria-invalid"]}
+            // BLD-16 review R4: a `steps[i].joinType` refusal marks this
+            // select (and points at its sentence); a "name" problem, which
+            // this field never is about, used to mark it instead.
+            aria-invalid={joinTypeRefused ? true : tie(invalid, "joinType")["aria-invalid"]}
+            aria-describedby={joinTypeRefused ? PANE_REFUSAL_ID : tie(invalid, "joinType")["aria-describedby"]}
           />
           {/* J3: one line per type, so the four are told apart without SQL. */}
           <p className="text-xs text-muted-foreground">{joinType.note}</p>

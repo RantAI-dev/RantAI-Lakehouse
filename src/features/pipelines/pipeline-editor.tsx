@@ -78,6 +78,7 @@ import {
   InputPane,
   JoinStepPane,
   OutputPane,
+  PANE_REFUSAL_ID,
   PaneProblem,
   SqlStepPane,
   TransformStepPane,
@@ -478,7 +479,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   }
 
   // ── the pane of the selected item ──────────────────────────────────
-  const errorMessageId = "pipeline-editor-item-error"
+  const errorMessageId = PANE_REFUSAL_ID
   function problemFor(id: string): React.ReactNode {
     if (errorItem === id && saveError) return <PaneProblem id={errorMessageId} message={saveError} tone="error" />
     const problem = problems.items[id]

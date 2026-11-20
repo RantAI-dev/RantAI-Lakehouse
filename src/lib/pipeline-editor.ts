@@ -585,6 +585,9 @@ export type ProblemField =
   | "left"
   | "right"
   | "on"
+  // BLD-16 review R4: a join's type has no page-side rule, but the API's
+  // refusal names it (`steps[i].joinType`), so a control can be tied to it.
+  | "joinType"
   | "columns"
   | "groupBy"
   | "measures"
