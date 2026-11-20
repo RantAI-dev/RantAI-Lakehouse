@@ -101,6 +101,12 @@ impl From<GoldExportError> for ApiError {
             // not a 500: the fix is retrying with a smaller mart or a
             // deliberately raised cap, not anything server-side.
             | GoldExportError::RowCapExceeded { .. }
+            // DATA-6 D7: the target table is another mart's latest-copy
+            // table. It joins the same 422 group for the same reason: its
+            // `Display` is this repo's own fixed sentence (naming the
+            // mart, no upstream words), so the fix is renaming the mart,
+            // not anything server-side.
+            | GoldExportError::TargetIsLatestCopy { .. }
             // WS7 item D2: `err.to_string()` is safe here — the inner
             // string is already `policy_engine::enforcement_error_message`'s
             // own fixed, non-leaking text (`export_batch_sql` never wraps
@@ -1855,8 +1861,35 @@ mod tests {
                 rows_exported: 1,
                 snapshot_id: Some(1),
                 exported_at_ms: Some(1_700_000_000_000),
+                copy_exported_at_micros: Some(1_700_000_000_123_456),
             }))
             .is_none()
+        );
+    }
+
+    /// `DATA-6` D7: a mart whose Iceberg table is another mart's
+    /// latest-copy table is refused with the fixed sentence, as a 422 —
+    /// the text names the mart and carries no upstream words (no catalog
+    /// address, no HTTP detail), so it is safe to answer as-is.
+    #[test]
+    fn a_latest_copy_target_answers_the_fixed_sentence_as_a_422() {
+        let err = ApiError::from(GoldExportError::TargetIsLatestCopy {
+            mart: "x_latest".to_owned(),
+        });
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let text = err.to_string();
+        assert!(
+            text.contains("x_latest"),
+            "the sentence names the mart: {text}"
+        );
+        assert!(text.contains("latest-copy table"), "{text}");
+        assert!(
+            !text.to_lowercase().contains("iceberg catalog"),
+            "no catalog address travels: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("http"),
+            "no HTTP detail travels: {text}"
         );
     }
 
