@@ -128,7 +128,7 @@ fn passes(sql: &str, column: &str, id: &str, owner: &str) -> bool {
 }
 
 impl FakeCh {
-    fn json_rows(data: Vec<Value>) -> ResponseTemplate {
+    fn json_rows(data: &[Value]) -> ResponseTemplate {
         let n = data.len();
         ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
     }
@@ -162,12 +162,12 @@ impl Respond for FakeCh {
         self.log.lock().unwrap().push(sql.clone());
         if sql.contains("FROM console.bi_folder") {
             let all = [("f_open", ""), ("f_locked", ""), ("p_owner", OWNER)];
-            return Self::json_rows(
-                all.iter()
-                    .filter(|(id, owner)| passes(&sql, "id", id, owner))
-                    .map(|(id, owner)| folder_row(id, owner))
-                    .collect(),
-            );
+            let rows: Vec<Value> = all
+                .iter()
+                .filter(|(id, owner)| passes(&sql, "id", id, owner))
+                .map(|(id, owner)| folder_row(id, owner))
+                .collect();
+            return Self::json_rows(&rows);
         }
         let boards = [
             ("b_one", "f_open", ""),
@@ -184,72 +184,67 @@ impl Respond for FakeCh {
             .nth(1)
             .and_then(|rest| rest.split('\'').next())
         {
-            return Self::json_rows(
-                charts
-                    .iter()
-                    .filter(|(chart, _, _, _)| chart.as_str() == id)
-                    .map(|(chart, board, _, _)| {
-                        let gone = trashed.iter().any(|t| t == chart);
-                        json!({ "is_deleted": if gone { 2 } else { 0 }, "board": board })
-                    })
-                    .collect(),
-            );
+            let rows: Vec<Value> = charts
+                .iter()
+                .filter(|(chart, _, _, _)| chart.as_str() == id)
+                .map(|(chart, board, _, _)| {
+                    let gone = trashed.iter().any(|t| t == chart);
+                    json!({ "is_deleted": if gone { 2 } else { 0 }, "board": board })
+                })
+                .collect();
+            return Self::json_rows(&rows);
         }
         if let Some(id) = sql
             .split("SELECT is_deleted, owner_id FROM console.bi_board FINAL WHERE id = '")
             .nth(1)
             .and_then(|rest| rest.split('\'').next())
         {
-            return Self::json_rows(
-                boards
-                    .iter()
-                    .filter(|(board, _, _)| *board == id)
-                    .map(|(_, _, owner)| json!({ "is_deleted": 0, "owner_id": owner }))
-                    .collect(),
-            );
+            let rows: Vec<Value> = boards
+                .iter()
+                .filter(|(board, _, _)| *board == id)
+                .map(|(_, _, owner)| json!({ "is_deleted": 0, "owner_id": owner }))
+                .collect();
+            return Self::json_rows(&rows);
         }
         if sql.contains("FROM console.bi_chart") {
-            return Self::json_rows(
-                charts
-                    .iter()
-                    .filter(|(id, _, _, _)| !trashed.iter().any(|t| t == id))
-                    .filter(|(_, board, _, _)| {
-                        let owner = boards
-                            .iter()
-                            .find(|b| b.0 == board.as_str())
-                            .map_or("", |b| b.2);
-                        // The chart clause hides another owner's board by a
-                        // sub-select, and the permission list by board id.
-                        let private = !owner.is_empty()
-                            && sql.contains("owner_id != ''")
-                            && !sql.contains(&format!("owner_id != '{owner}'"));
-                        !private && passes(&sql, "board", board, "")
-                    })
-                    .map(|(id, board, kind, map)| chart_row(id, board, kind, map.as_deref()))
-                    .collect(),
-            );
+            let rows: Vec<Value> = charts
+                .iter()
+                .filter(|(id, _, _, _)| !trashed.iter().any(|t| t == id))
+                .filter(|(_, board, _, _)| {
+                    let owner = boards
+                        .iter()
+                        .find(|b| b.0 == board.as_str())
+                        .map_or("", |b| b.2);
+                    // The chart clause hides another owner's board by a
+                    // sub-select, and the permission list by board id.
+                    let private = !owner.is_empty()
+                        && sql.contains("owner_id != ''")
+                        && !sql.contains(&format!("owner_id != '{owner}'"));
+                    !private && passes(&sql, "board", board, "")
+                })
+                .map(|(id, board, kind, map)| chart_row(id, board, kind, map.as_deref()))
+                .collect();
+            return Self::json_rows(&rows);
         }
         if sql.contains("FROM console.bi_board") {
             let wanted =
                 |id: &str| sql.contains(&format!("id='{id}'")) || !sql.contains("AND id='");
-            return Self::json_rows(
-                boards
-                    .iter()
-                    .filter(|(id, _, owner)| wanted(id) && passes(&sql, "id", id, owner))
-                    .map(|(id, folder, owner)| board_row(id, folder, owner))
-                    .collect(),
-            );
+            let rows: Vec<Value> = boards
+                .iter()
+                .filter(|(id, _, owner)| wanted(id) && passes(&sql, "id", id, owner))
+                .map(|(id, folder, owner)| board_row(id, folder, owner))
+                .collect();
+            return Self::json_rows(&rows);
         }
         if sql.contains("system.columns") {
-            return Self::json_rows(
-                ["email", "region"]
-                    .iter()
-                    .map(|n| json!({"table": "mart_x", "name": n, "type": "String"}))
-                    .collect(),
-            );
+            let rows: Vec<Value> = ["email", "region"]
+                .iter()
+                .map(|n| json!({"table": "mart_x", "name": n, "type": "String"}))
+                .collect();
+            return Self::json_rows(&rows);
         }
         if sql.contains("FROM serving.mart_x") || sql.contains("replaceRegexpOne") {
-            return Self::json_rows(vec![json!({"email": "a@x", "region": "north"})]);
+            return Self::json_rows(&[json!({"email": "a@x", "region": "north"})]);
         }
         ResponseTemplate::new(200).set_body_string("Ok.\n")
     }
