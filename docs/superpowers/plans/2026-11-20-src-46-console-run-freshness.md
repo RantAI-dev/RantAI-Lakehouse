@@ -153,7 +153,27 @@ Do not commit `.env.staging` or the `AGENTS.md` block in the working tree
 
 ## Handoff
 
-(developer appends here)
+**Slice 1 (the only slice), branch `fix/src-46-console-freshness`.**
+
+Commits:
+
+- `f1293db4c` SRC-46 fix(connectors): an open run log follows its run (task 1)
+- `0a2702b40` SRC-46 feat(connectors): the ingest panel reports a run that ended (task 2)
+- `f81a6a87c` SRC-46 fix(connectors): the connector page waits for a run to be counted (task 3)
+
+Commands run, in the foreground, with counts:
+
+- `bun test src/features/connectors/connector-ingest-panel.test.tsx` after task 1: 97 pass, 0 fail.
+- Same file after task 2: 99 pass, 0 fail (two new tests for `onRunEnded`).
+- `bun test src/features/connectors/connector-detail-page.test.tsx` after task 3: 46 pass, 0 fail (four new tests: (a) to (d)).
+- Note: `bun run test <file>` runs `bun test src <file>`, which is the whole `src` tree, so the touched files were run with `bun test <file>` directly.
+
+Not verified locally: `bun run typecheck && bun run lint && bun run test` (the full block), and any build. Not verified locally, runs in CI (owner's instruction 2026-11-20). `bun run typecheck` was started once and passed the 120 s limit, then was stopped on that instruction.
+
+Notes for the reviewer:
+
+- Task 2: `useIngestRunState` keeps the id of the last active run in a ref; on the watching to not-watching edge it asks for one more read and calls `onRunEnded` with the run found by `runId` in the list that read returns. The effect that resolves it is declared before the edge effect, so the list that ended the watch is not taken as the "last read".
+- Task 3: Bun's fake timers have no async advance, so the tests move time in 1 s steps, each in its own `act`.
 
 ## Review
 
