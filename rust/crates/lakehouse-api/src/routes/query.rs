@@ -2766,6 +2766,12 @@ fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> f64 {
 /// reads nothing". A `Trino` statement is not estimated at all: it answers
 /// 200 with `supported: false` and nothing sent to any engine (`QS-6`,
 /// `LH-QS-4-08`, decision 7).
+///
+/// Catalog facts are gated by `catalog:read` (`QS-10`, `LH-QS-1-11`, D2): a
+/// caller without it gets the numbers but no `sources`, no `sourceMarks` and
+/// no `freshnessLagSeconds`, with `catalogHidden: true` explaining why. The
+/// route itself stays at `query:read`. A plan that names no table lists no
+/// source (D3) — no source is invented.
 pub async fn estimate(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -2827,30 +2833,44 @@ pub async fn estimate(
     // SEC-21: the same settings rule as the run, on the statement the engine
     // is sent.
     refuse_unlisted_settings(&rewritten)?;
+    // QS-10 (LH-QS-1-11), D2: this route needs `query:read` only — QS-1-AC11
+    // keeps the editor running SQL without catalog access. Sources, their
+    // marks and their freshness are facts from the catalog, so a caller who
+    // does not hold `catalog:read` gets none of them: no `system.parts` read,
+    // no marks lookup, and `catalogHidden` tells the console why.
+    let reads_catalog = principal.has("catalog:read");
     let estimated = estimate_body(&state.clickhouse, &rewritten).await;
     let (estimated_bytes, sources, estimate_error) = match estimated {
         Ok((bytes, sources)) => (Some(bytes), sources, None),
         Err(message) => (None, Vec::new(), Some(message)),
     };
-    let freshness_lag_seconds = freshness_lag(&state.clickhouse, &sources).await;
+    // D3: a plan that names no table names no source. The old fabricated
+    // `clickhouse@lakehouse` default is gone (QS-10, LH-QS-1-11).
+    let sources_out: Vec<String> = sources;
+    let freshness_lag_seconds = if reads_catalog {
+        freshness_lag(&state.clickhouse, &sources_out).await
+    } else {
+        None
+    };
 
     // No floor: an estimate of nothing costs nothing. `max(1, …)` used to
     // make an empty editor read "1.00 cu–1.00 cu".
     let cost_min = estimated_bytes.map(|b| bytes_to_cost_bucket(b, 2_000_000.0));
     let cost_max = estimated_bytes.map(|b| bytes_to_cost_bucket(b, 1_000_000.0));
-    let sources_out: Vec<String> = if sources.is_empty() {
-        vec!["clickhouse@lakehouse".to_owned()]
+    let sources_json = if reads_catalog {
+        json!(sources_out)
     } else {
-        sources
+        json!([])
     };
 
     let mut result = estimate_result_json(
         estimated_bytes,
         cost_min,
         cost_max,
-        &json!(sources_out),
+        &sources_json,
         freshness_lag_seconds,
         estimate_error.as_deref(),
+        !reads_catalog,
     );
     // DATA-12 part 3: the marks of the tables this ClickHouse query reads,
     // beside `sources` (which stays a list of names). One batch read; only a
@@ -2858,9 +2878,11 @@ pub async fn estimate(
     // This route estimates ClickHouse queries only; a Trino query is not
     // estimated here and has no sources to mark.
     // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2:
-    // Only decorate with sourceMarks if catalog_tenant_refusal allows it:
-    if let Ok(None) =
-        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await
+    // Only decorate with sourceMarks if catalog_tenant_refusal allows it and
+    // the caller holds `catalog:read` (QS-10, LH-QS-1-11, D2).
+    if reads_catalog
+        && let Ok(None) =
+            crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await
     {
         let names = std::collections::HashMap::new();
         let marks = crate::routes::catalog::certification_marks(&state, &sources_out, &names).await;
@@ -2898,6 +2920,7 @@ fn trino_estimate_json() -> Value {
         "cacheEligible": Value::Null,
         "freshnessLagSeconds": Value::Null,
         "policyObligations": Value::Null,
+        "catalogHidden": false,
         "sources": [],
         "plan": Value::Null,
     })
@@ -2921,6 +2944,7 @@ fn estimate_result_json(
     sources_out: &Value,
     freshness_lag_seconds: Option<i64>,
     error: Option<&str>,
+    catalog_hidden: bool,
 ) -> Value {
     json!({
         // `QS-6` (decision 7): a ClickHouse estimate is supported by
@@ -2946,6 +2970,9 @@ fn estimate_result_json(
         "cacheEligible": Value::Null,
         "freshnessLagSeconds": freshness_lag_seconds,
         "policyObligations": Value::Null,
+        // QS-10 (LH-QS-1-11), D2: true when the caller lacks `catalog:read`,
+        // so the console explains the withheld sources and freshness.
+        "catalogHidden": catalog_hidden,
         "sources": sources_out,
         // WS1 task 1.6: the old `plan` marked stages that had *not run* as
         // status "completed" with `estimatedBytes: 0` — a fabricated
@@ -4890,7 +4917,15 @@ mod tests {
 
     #[test]
     fn a_clickhouse_estimate_says_it_is_supported_and_names_its_engine() {
-        let v = estimate_result_json(Some(100), Some(1.0), Some(2.0), &json!([]), None, None);
+        let v = estimate_result_json(
+            Some(100),
+            Some(1.0),
+            Some(2.0),
+            &json!([]),
+            None,
+            None,
+            false,
+        );
 
         // QA LH-QS-4-08 (QS-6), decision 7: the console reads one shape for
         // both engines, and a ClickHouse estimate is supported by definition.
@@ -4902,7 +4937,15 @@ mod tests {
 
     #[test]
     fn estimate_result_emits_null_for_unmeasured_fields() {
-        let v = estimate_result_json(Some(100), Some(1.0), Some(2.0), &json!([]), None, None);
+        let v = estimate_result_json(
+            Some(100),
+            Some(1.0),
+            Some(2.0),
+            &json!([]),
+            None,
+            None,
+            false,
+        );
 
         for key in [
             "cacheEligible",
@@ -4965,8 +5008,27 @@ mod tests {
             server
         }
 
+        /// A logged-in human with `catalog:read` as well as `query:read`.
+        /// `PermissionSet::parse` splits on commas (verified against
+        /// `lakehouse_auth::permissions::PermissionSet::parse`).
+        fn catalog_reader_principal() -> Principal {
+            Principal {
+                id: PrincipalId::User(Uuid::from_u128(3)),
+                tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
+                display_name: "Rina Wijaya".to_owned(),
+                permissions: PermissionSet::parse("query:read, catalog:read"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            }
+        }
+
+        // These DATA-12 tests assert catalog facts (sources and marks). The
+        // fixture is corrected to hold `catalog:read` because QS-10 (D2) now
+        // gates those facts on it — the assertions and their strength are
+        // unchanged, not weakened.
         async fn estimate_of(state: AppState) -> Value {
-            estimate_of_caller(state, fixture_user_principal(), HeaderMap::new()).await
+            estimate_of_caller(state, catalog_reader_principal(), HeaderMap::new()).await
         }
 
         async fn estimate_of_caller(
@@ -4994,6 +5056,115 @@ mod tests {
                 panic!("an estimate never errors back to the caller");
             };
             body
+        }
+
+        /// A `ClickHouse` whose `EXPLAIN ESTIMATE` names no table.
+        async fn clickhouse_reading_no_tables() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [],
+                    "data": [],
+                    "rows": 0,
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        // QS-10 (LH-QS-1-11), D2: a caller without `catalog:read` gets the
+        // estimate numbers but no catalog facts, and the engine is never
+        // asked for freshness.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn an_estimate_without_catalog_read_carries_no_sources_marks_or_freshness(
+            pool: lakehouse_store::PgPool,
+        ) {
+            lakehouse_store::annotation::set_certification(
+                &pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: "silver.orders".to_owned(),
+                    status: "deprecated".to_owned(),
+                    note: Some("Use silver.orders_v2".to_owned()),
+                    replacement_asset_id: Some("silver.orders_v2".to_owned()),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+            let ch = clickhouse_reading("silver", "orders").await;
+
+            let body = estimate_of_caller(
+                state_for(&pool, &ch.uri()),
+                fixture_user_principal(),
+                HeaderMap::new(),
+            )
+            .await;
+
+            assert_eq!(body["sources"], json!([]));
+            assert!(body.get("sourceMarks").is_none());
+            assert!(body["freshnessLagSeconds"].is_null());
+            assert_eq!(body["catalogHidden"], json!(true));
+            assert!(body["estimatedBytes"].is_number());
+            assert!(
+                ch.received_requests()
+                    .await
+                    .expect("the mock records requests")
+                    .iter()
+                    .all(|r| !String::from_utf8_lossy(&r.body).contains("system.parts")),
+                "freshness_lag must not read system.parts without catalog:read"
+            );
+        }
+
+        // QS-10 (LH-QS-1-11), D2: the catalog reader keeps today's answer.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn an_estimate_with_catalog_read_keeps_its_sources_and_marks(
+            pool: lakehouse_store::PgPool,
+        ) {
+            lakehouse_store::annotation::set_certification(
+                &pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: "silver.orders".to_owned(),
+                    status: "deprecated".to_owned(),
+                    note: Some("Use silver.orders_v2".to_owned()),
+                    replacement_asset_id: Some("silver.orders_v2".to_owned()),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+            let ch = clickhouse_reading("silver", "orders").await;
+
+            let body = estimate_of_caller(
+                state_for(&pool, &ch.uri()),
+                catalog_reader_principal(),
+                HeaderMap::new(),
+            )
+            .await;
+
+            assert_eq!(body["sources"], json!(["silver.orders"]));
+            assert_eq!(
+                body["sourceMarks"]["silver.orders"]["certification"],
+                json!("deprecated")
+            );
+            assert_eq!(body["catalogHidden"], json!(false));
+        }
+
+        // QS-10 (LH-QS-1-11), D3: no invented source for a plan that names
+        // no table.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn an_estimate_that_names_no_table_lists_no_source(pool: lakehouse_store::PgPool) {
+            let ch = clickhouse_reading_no_tables().await;
+
+            let body = estimate_of_caller_sql(
+                state_for(&pool, &ch.uri()),
+                catalog_reader_principal(),
+                HeaderMap::new(),
+                "SELECT 1",
+            )
+            .await;
+
+            assert_eq!(body["sources"], json!([]));
+            assert_eq!(body["catalogHidden"], json!(false));
         }
 
         #[sqlx::test(migrations = "../../migrations")]
@@ -5110,12 +5281,15 @@ mod tests {
             let ch = clickhouse_reading("bronze", "retail_orders").await;
             let state = state_for(&pool, &ch.uri());
 
-            // A caller who belongs to retail (not meridian-group catalog tenant):
+            // A caller who belongs to retail (not meridian-group catalog
+            // tenant). It holds `catalog:read` so that its sources are still
+            // reported and this test keeps checking the tenant gate on marks
+            // (QS-10, LH-QS-1-11, D2) rather than the catalog-read gate.
             let outside_caller = Principal {
                 id: PrincipalId::User(Uuid::new_v4()),
                 tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000002")],
                 display_name: "Outsider".to_owned(),
-                permissions: PermissionSet::parse("query:read"),
+                permissions: PermissionSet::parse("query:read, catalog:read"),
                 provider: "session".to_owned(),
                 must_change_password: false,
                 role_names: Vec::new(),
