@@ -677,4 +677,61 @@ Not verified:
   stale lib test binary once; the crate sources were touched to force a
   fresh rebuild before the final run.
 
+### T6–T8, after #619
+
+Developer: `Hy4 flash` (OpenCode). PR #619 merged to `main` as `fd325da69`.
+`origin/main` was brought in with `git merge --no-edit origin/main` (merge
+commit `828e4c78836ca26a4bfb1e705823bf7d3370436c`), resolved cleanly, then
+the merge was pushed normally. No rebase and no force-push were used. After
+the merge, the T1 to T5 scoped checks were re-run: `sql_lineage` 49 passed,
+`column_lineage_pipeline::` 9 passed, fmt and clippy clean.
+
+Commits, in plan order:
+
+| Task | Commit |
+| --- | --- |
+| merge of `origin/main` (#619) | `828e4c78836ca26a4bfb1e705823bf7d3370436c` |
+| T6 | `98855db6dcf0fcf538c200023a4607298dbf2617` |
+| T7 | `52c1be30294a411533d6edc6ad9c541cb72cc122` |
+| T8 | `972689e9dcf325389fdbfaf76426f1d332861009` |
+
+Commands run, in the foreground, on the final commit (counts quoted):
+
+- `cd rust && cargo fmt --check` — clean (whole workspace).
+- `cd rust && cargo clippy -p lakehouse-api --all-targets -j 2 -- -D warnings`
+  — finished, no warning.
+- `cd rust && cargo test -p lakehouse-api --lib -j 2 -- sql_lineage` —
+  **49 passed**, 0 failed, 3790 filtered out.
+- `cd rust && cargo test -p lakehouse-api --lib -j 2 -- pipeline_compile` —
+  **50 passed**, 0 failed, 3789 filtered out.
+- `cd rust && cargo test -p lakehouse-api --test it -j 2 column_lineage_pipeline::`
+  — **10 passed**, 0 failed, 1780 filtered out.
+- `cd rust && cargo test -p lakehouse-api --test it -j 2 pipeline_compile_route::`
+  — **26 passed**, 0 failed, 1764 filtered out.
+- `python3 -m py_compile ops/g7/g7_pipeline_test.py` — OK.
+- `python3 ops/lint/check_intra_package_imports.py` — OK.
+- `python3 ops/lint/check_bare_iceberg_count.py` — OK, no bare Bronze count.
+
+Per-commit scoped checks: T6 ran fmt --check, clippy, `--lib pipeline_compile`
+(38 passed), `--test it pipeline_compile_route::` (26 passed) and
+`--test it column_lineage_pipeline::` (10 passed); T7 ran the two Python
+checks above; T8 is docs-only and ran no language checks.
+
+Old-code checks for T6: both the flipped #619 gate test and the new form-step
+route test fail when the D4b gate is temporarily restored (the first on
+`noted` 0 vs 1, the second on a missing pending row). The step helper exists
+so clippy's `too_many_lines` is met without suppressing the lint.
+
+Not verified:
+
+- The `g7` gate itself runs only in CI job `g3a-dagster`; only its Python
+  syntax and intra-package import check ran here.
+- The full `cargo test --workspace` / nextest partitions, TypeScript, Dagster
+  tests and compose checks — CI's job (`AGENTS.md`, "Keep build time down").
+- `column_lineage_route::`, `column_lineage_sql_source::` and `sec11_guard::`
+  integration modules were not run for this slice (unchanged by T6 to T8).
+- The shared `CARGO_TARGET_DIR` twice served a stale artifact (a lib test
+  binary, then a pre-BLD-16 `lakehouse-store` rlib); crate sources were
+  touched to force fresh builds before each reported run.
+
 ## Review
