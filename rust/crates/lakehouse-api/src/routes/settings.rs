@@ -2903,6 +2903,12 @@ fn sniff_picture_type(bytes: &[u8]) -> Option<&'static str> {
 ///
 /// `pub(crate)`, not private: `routes::picture_drain` reads the same list,
 /// so a kind it refuses to drain is a kind the route does not serve.
+///
+/// # Errors
+///
+/// 404 through `ApiError::NotFound` when the kind is not one of the three
+/// the route serves (`logo`, `logo-dark`, `icon`): a picture that does not
+/// exist.
 pub(crate) fn picture_kind(kind: &str) -> Result<ImageKind, ApiError> {
     match kind {
         "logo" => Ok(ImageKind::Logo),
