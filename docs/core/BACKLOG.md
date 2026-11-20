@@ -599,6 +599,7 @@ set by the product owner and are left empty until they are.
 | `ADM-2` | 2026-11-15 | 2026-11-17 (#562, #570, #572), #590 2026-11-19 | |
 | `SEC-76` | | | |
 | `SEC-80` | 2026-11-19 | 2026-11-19 (#601) | |
+| `SEC-81` | Task | Next.js 16.4.3 → 16.4.6 (with `eslint-config-next`): 16.4.3 is inside seven moderate advisories fixed in 16.4.5 (GHSA-mfr8-8qww-v76h, GHSA-vc7v-qv4w-wrv8, GHSA-7qx7-33qx-rqx2, GHSA-f3mh-rxg3-f5g2, GHSA-pc58-hwjq-p385, GHSA-rhh4-g77r-r9qj, GHSA-vvgp-ww4w-46vf); the console uses the self-hosted `/api` proxy and `next/image`, so two may apply | Platform | P2 | Building | | owner 2026-11-21; `superpowers/plans/2026-11-21-sec-81-next-16-4-6.md` |
 | `SEC-77` | | | |
 | `SEC-78` | 2026-11-16 | | |
 | `QS-14` | 2026-11-14 | 2026-11-14 (#532) | |
