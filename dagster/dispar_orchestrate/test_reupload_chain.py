@@ -328,6 +328,40 @@ def test_waiting_past_six_hours_records_wait_expired() -> None:
     )
 
 
+def test_a_second_reupload_waits_for_the_next_tick_after_one_launch() -> None:
+    """BLD-14 review R3: the instance does not yet hold a request yielded
+    earlier in this tick, so `in_flight` cannot stop a second launch for
+    another root. At most one run per pipeline per tick; the older root
+    waits (and is superseded on a later tick)."""
+    base = time.time() - 400
+    # Equal end times: neither root supersedes the other (R4 is a separate
+    # finding), so both would launch unless R3 limits the tick.
+    roots = [
+        _root_record("R2", "orders", base + 200),
+        _root_record("R1", "orders", base + 200),
+    ]
+
+    def parent(root_id: str):
+        run = SimpleNamespace(
+            run_id=f"silver-{root_id}",
+            job_name="authored__pl_silver",
+            status=DagsterRunStatus.SUCCESS,
+            tags={REUPLOAD_ROOT_TAG: root_id, REUPLOAD_TABLE_TAG: "orders"},
+        )
+        return SimpleNamespace(dagster_run=run, end_time=base + 200)
+
+    instance = _StubInstance(roots, [parent("R1"), parent("R2")])
+    context = _StubContext('{"floor": 0, "settled": []}', instance)
+    body = _sensor(
+        {"orders": ChainEntry(parents=("pl-silver",), ancestors=("pl-silver",))}
+    )._raw_fn
+
+    out = list(body(context))
+    requests = [item for item in out if isinstance(item, RunRequest)]
+    assert len(requests) == 1, f"one run per pipeline per tick: {out}"
+    assert requests[0].run_key == "reupload-chain:R2:pl-gold"
+
+
 def test_two_reuploads_with_the_newer_load_queued_start_gold_once_for_r2() -> None:
     """BLD-14 review R2: R2 ends while R1's first-pipeline run is still
     queued. Option A in the review: the chain sensor owns the first

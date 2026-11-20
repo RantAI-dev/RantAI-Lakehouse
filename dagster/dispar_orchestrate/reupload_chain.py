@@ -325,6 +325,13 @@ def build_reupload_chain_sensor(
             )
             return bool(runs)
 
+        # BLD-14 review R3: a yielded RunRequest is not yet in the
+        # instance, so `in_flight` alone cannot stop a second launch for
+        # another root in this tick. Newest root first (P4), at most one
+        # launch per pipeline per tick; the other root waits for the next
+        # tick and is then superseded or launched.
+        roots.sort(key=lambda root: root.end_time, reverse=True)
+        launched: set[str] = set()
         waits: list[str] = []
         for root in roots:
             entry = entries[root.table]
@@ -337,7 +344,10 @@ def build_reupload_chain_sensor(
                 in_flight=in_flight,
             )
             decision = decide(root, entry, lookups, now)
-            if decision.action == "run":
+            if decision.action == "run" and pipeline_id in launched:
+                waits.append(f"{root.run_id}: waiting for the next tick after this tick's launch")
+            elif decision.action == "run":
+                launched.add(pipeline_id)
                 yield RunRequest(run_key=decision.run_key, tags=decision.tags)
                 waits.append(f"{root.run_id}: launched; recording on the next tick")
             elif decision.action == "record":
