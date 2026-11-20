@@ -132,6 +132,10 @@ const INVALID_TABLE: &str =
 const READS_NOT_INPUT: &str = "this step reads a table that is not an input; add it under Inputs";
 const READS_LATER_STEP: &str = "this step reads a step that comes after it; reorder the steps";
 const TRANSFORM_REFUSED: &str = "this transform is not in the supported grammar";
+/// BLD-11 review R5: a rename that would leave two output columns with one
+/// name is refused when the pipeline is saved, not left to fail on its next
+/// run with a duplicate-column error from the engine.
+const DUPLICATE_OUTPUT_COLUMN: &str = "two columns would have the same name after this step; give the renamed column a different name";
 const OUTPUT_IS_INPUT: &str =
     "the output table is one of the inputs; the output cannot be one of the inputs";
 const BRONZE_NEEDS_CATALOG: &str =
@@ -213,6 +217,43 @@ fn parse_transforms(
             })
         })
         .collect()
+}
+
+/// BLD-11 review R5: refuse a transform step whose own transforms would emit
+/// two columns with one name. With an explicit `select` the emitted names are
+/// the selected columns after renaming; without one, the renamed columns are
+/// appended to `*` and only collisions between rename targets are knowable —
+/// the source table's columns are not part of a saved definition.
+fn check_output_names(parsed: &[Transform], index: usize) -> Result<(), DefinitionError> {
+    let renames: Vec<(&Ident, &Ident)> = parsed
+        .iter()
+        .filter_map(|transform| match transform {
+            Transform::Rename { from, to } => Some((from, to)),
+            _ => None,
+        })
+        .collect();
+    let emitted: Vec<String> = match parsed.iter().find_map(|transform| match transform {
+        Transform::Select { columns } => Some(columns),
+        _ => None,
+    }) {
+        Some(selected) => selected
+            .iter()
+            .map(|column| {
+                renames
+                    .iter()
+                    .find(|(from, _)| *from == column)
+                    .map_or_else(|| column.to_string(), |(_, to)| to.to_string())
+            })
+            .collect(),
+        None => renames.iter().map(|(_, to)| to.to_string()).collect(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    for name in emitted {
+        if !seen.insert(name) {
+            return Err(DefinitionError::step(index, DUPLICATE_OUTPUT_COLUMN));
+        }
+    }
+    Ok(())
 }
 
 /// D4a: whether this definition is today's shape — one input and either no
@@ -341,14 +382,21 @@ fn validate(
             PipelineStep::Transform {
                 reads, transforms, ..
             } => {
-                for (position, text) in transforms.iter().enumerate() {
-                    parse_transform(text).map_err(|_| {
-                        DefinitionError::at(
-                            format!("steps[{index}].transforms[{position}]"),
-                            TRANSFORM_REFUSED,
-                        )
-                    })?;
-                }
+                let parsed = transforms
+                    .iter()
+                    .enumerate()
+                    .map(|(position, text)| {
+                        parse_transform(text).map_err(|_| {
+                            DefinitionError::at(
+                                format!("steps[{index}].transforms[{position}]"),
+                                TRANSFORM_REFUSED,
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                // BLD-11 review R5: a duplicate output name is refused here,
+                // at save, instead of failing on the pipeline's next run.
+                check_output_names(&parsed, index)?;
                 // R1-B6 / D6a: a step names what it reads EXACTLY, case
                 // included — `ClickHouse` matches a `WITH` name by exact case,
                 // so a reference that differs only in case would be looked up
@@ -1075,6 +1123,38 @@ mod tests {
         )];
         let err = refusal(&one_input(), &steps);
         assert_eq!(err.path(), "steps[0].transforms[1]");
+    }
+
+    // BLD-11 review R5: a rename that lands on a name this step also emits
+    // would fail the next run on a duplicate column; refuse it at save.
+    #[test]
+    fn a_second_rename_to_the_same_name_is_refused_at_save() {
+        let steps = vec![transform_step(
+            "dup",
+            "orders",
+            &["rename(a,b)", "rename(c,b)"],
+        )];
+        let err = refusal(&one_input(), &steps);
+        assert_eq!(err.path(), "steps[0]");
+        assert_eq!(err.message(), super::DUPLICATE_OUTPUT_COLUMN);
+    }
+
+    #[test]
+    fn a_rename_onto_another_selected_column_is_refused_at_save() {
+        let steps = vec![transform_step(
+            "dup",
+            "orders",
+            &["select(a,b)", "rename(a,b)"],
+        )];
+        let err = refusal(&one_input(), &steps);
+        assert_eq!(err.path(), "steps[0]");
+        assert_eq!(err.message(), super::DUPLICATE_OUTPUT_COLUMN);
+    }
+
+    #[test]
+    fn a_single_rename_still_compiles() {
+        let steps = vec![transform_step("ok", "orders", &["rename(a,b)"])];
+        assert!(compile(&one_input(), &steps, None, Some("icecat_api")).is_ok());
     }
 
     #[test]
