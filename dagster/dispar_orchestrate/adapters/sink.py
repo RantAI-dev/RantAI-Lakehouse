@@ -868,6 +868,15 @@ def _retype_in(transaction: Any, table: Any, changed: list[str], column_types: M
                 update.move_after(name, order[position - 1])
 
 
+def bronze_column_names(names: Iterable[str]) -> list[str]:
+    """The Bronze spelling of source column names (`SRC-48`): `dlt`'s own naming convention
+    applied the way the pipeline's schema applies it when it writes a column, so a name the
+    person ticked off (`Shift`) meets the column the table holds (`shift`). A name is not
+    checked against the table here; `_drop_left_out_columns` keeps only those it has."""
+    naming = dlt.Schema("bronze").naming
+    return [naming.normalize_identifier(name) for name in names]
+
+
 def _drop_left_out_columns(
     pipeline: Any, bronze_table_name: str, plan: LoadPlan, drop_columns: Collection[str]
 ) -> list[str]:

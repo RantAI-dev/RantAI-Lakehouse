@@ -397,3 +397,25 @@ def test_without_a_gate_the_source_is_built_once_and_without_a_callback(monkeypa
     builds, loads = _gate_env(monkeypatch)
     run_bronze_ingest(_base_config())
     assert len(builds) == 1 and loads == ["orders"]
+
+
+def test_run_bronze_ingest_hands_the_columns_left_out_to_the_sink_only_when_there_are_some(monkeypatch) -> None:
+    """`SRC-48` (`QA TC-1706`): the PostgreSQL connector's load passes the object's left-out
+    columns (Bronze names) on, so a table replaced on every load loses them; a load with none
+    calls the sink as it always did."""
+    calls = []
+
+    monkeypatch.setattr("dispar_orchestrate.dlt_pipeline.sql_database", lambda **kwargs: _FakeSource("orders"))
+    monkeypatch.setattr(
+        "dispar_orchestrate.dlt_pipeline.ssrf_guard.resolve_checked",
+        lambda host, port: ssrf_guard.ResolvedAddress(ip="10.0.0.9", port=port, family=2),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.dlt_pipeline.load_via_sink",
+        lambda source, table_name, sink_config, plan, **kwargs: calls.append(kwargs) or _FakeLoadResult(),
+    )
+
+    run_bronze_ingest(_base_config(), drop_columns=["shift"])
+    run_bronze_ingest(_base_config())
+
+    assert calls == [{"drop_columns": ["shift"]}, {}]
