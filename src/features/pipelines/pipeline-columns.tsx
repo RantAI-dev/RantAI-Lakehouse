@@ -460,10 +460,11 @@ export function getPipelineColumns({
                   </DropdownMenuItem>
                 ) : null}
                 {onTrigger && pipelineOrigin(pipeline) === "authored" ? (
-                  // BLD-11 F9/D12: an authored row CAN be triggered once it
-                  // is ready — the same handler a Dagster row uses. A draft
-                  // is offered but disabled with the actual next step.
-                  pipeline.status === "ready" ? (
+                  // BLD-11 F9/D12 / review R4: an authored row CAN be
+                  // triggered whenever it is not a draft — the trigger route
+                  // launches ready AND paused pipelines; only drafts are
+                  // refused. A draft is offered disabled with that next step.
+                  pipeline.status !== "draft" ? (
                     <DropdownMenuItem onClick={() => onTrigger(pipeline)}>
                       <Play className="size-4" />
                       <span>Trigger run</span>

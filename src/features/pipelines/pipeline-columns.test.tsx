@@ -157,6 +157,16 @@ describe("pipeline-columns honest list cells (BLD-11 F8/F9/D12)", () => {
     expect(triggered[0].id).toBe("pl-auth")
   })
 
+  // BLD-11 review R4: the trigger route launches a paused authored pipeline
+  // as well; only drafts are refused with "mark it ready first".
+  it("an authored paused row offers an enabled Trigger run", () => {
+    render(<>{cellFor("actions", makePipeline({ id: "pl-paused", status: "paused" }), () => {})}</>)
+    fireEvent.click(screen.getByRole("button", { name: "Pipeline actions" }))
+    const item = screen.getByRole("menuitem", { name: "Trigger run" })
+    expect(item.getAttribute("aria-disabled")).not.toBe("true")
+    expect(screen.queryByText(/mark it ready first/i)).toBeNull()
+  })
+
   it("an authored draft row's Trigger run is disabled and says to mark it ready", () => {
     render(<>{cellFor("actions", makePipeline({ id: "pl-draft", status: "draft" }), () => {})}</>)
     fireEvent.click(screen.getByRole("button", { name: "Pipeline actions" }))
