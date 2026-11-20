@@ -28,6 +28,7 @@ export function EChart({
   onDataClick,
   keepView,
   onChart,
+  live,
   optionDeps,
 }: {
   option: echarts.EChartsOption;
@@ -48,6 +49,14 @@ export function EChart({
   keepView?: boolean;
   /** Receives the ECharts instance once created (and `null` on dispose), for zoom controls. */
   onChart?: (chart: echarts.ECharts | null) => void;
+  /**
+   * A chart that stays on screen while its data changes (the sign-in page's
+   * sample dashboard): after the first draw, a changed `option` is merged
+   * into the chart instead of replacing it, so bars and points morph from
+   * their current values in 500 ms (`cubicOut`) and nothing regrows from
+   * zero. Absent, every change is a clean replace, as for the rest of the console.
+   */
+  live?: boolean;
   /**
    * BI-32 review: what the option's formatter functions close over (number
    * format, locale, decimals, theme…). Functions are compared by source, so
@@ -122,16 +131,18 @@ export function EChart({
     // identity. `setOption(…, true)` replays the entrance animation (a
     // reference line redrawn from the left), so an option that says the same
     // as the one on screen is not applied again.
-    const key = `${keepView ? "v" : ""}${renderMode ? "r" : ""}${optionKey(optionDeps)}|${optionKey(option)}`;
+    const key = `${keepView ? "v" : ""}${renderMode ? "r" : ""}${live ? "l" : ""}${optionKey(optionDeps)}|${optionKey(option)}`;
     if (appliedKey.current === key) return;
     appliedKey.current = key;
     // The first option has no view to keep (getOption would be empty).
     const base = keepView && hasOption.current ? withView(option, readView(chart.getOption())) : option;
-    const next = renderMode ? { ...base, animation: false } : base;
-    // notMerge=true so theme/option changes are clean (no stacking of old series).
-    chart.setOption(next, true);
+    const timed = live ? { ...base, animationDurationUpdate: 500, animationEasingUpdate: "cubicOut" as const } : base;
+    const next = renderMode ? { ...timed, animation: false } : timed;
+    // notMerge=true so theme/option changes are clean (no stacking of old series);
+    // a `live` chart merges after its first draw so its data morphs in place.
+    chart.setOption(next, !(live && hasOption.current));
     hasOption.current = true;
-  }, [option, optionDeps, keepView, renderMode]);
+  }, [option, optionDeps, keepView, renderMode, live]);
 
   return <div ref={elRef} style={{ width: "100%", height, cursor: onDataClick ? "pointer" : "default" }} />;
 }

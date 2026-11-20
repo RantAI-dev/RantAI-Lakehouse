@@ -15,11 +15,16 @@
  */
 export const PRODUCT_NAME = "RantAI Lakehouse"
 
-/** The console's own logo, for a light background. */
-export const PRODUCT_LOGO_LIGHT = "/logo-light.png"
+/**
+ * The console's own logo, for a light background: the official mark
+ * (`WEB-15`, at its own 196 x 167 ratio; PR #536 review SHOULD-FIX 1 moved
+ * the files here, where the fallback lives, instead of hard-coding them in
+ * each surface).
+ */
+export const PRODUCT_LOGO_LIGHT = "/logo-light.svg"
 
-/** The console's own logo, for a dark background. */
-export const PRODUCT_LOGO_DARK = "/logo-dark.png"
+/** The console's own logo, for a dark background (the official mark's dark variant). */
+export const PRODUCT_LOGO_DARK = "/logo-dark.svg"
 
 /**
  * The line under the sign-in form that says who built the console

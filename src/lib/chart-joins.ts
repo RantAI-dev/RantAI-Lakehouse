@@ -102,6 +102,11 @@ export function displayColumn(name: string): string {
   return splitJoined(name)?.column ?? name
 }
 
+/** The alias of the joined table a flat column comes from (`mart_demo_province_capacity`), or null for the base table's own. */
+export function joinedAlias(name: string): string | null {
+  return splitJoined(name)?.alias ?? null
+}
+
 /** The short tag of the table a joined column comes from ("capacity", "capacity2" for a second join of it), or null. */
 export function columnSource(name: string): string | null {
   const alias = splitJoined(name)?.alias
