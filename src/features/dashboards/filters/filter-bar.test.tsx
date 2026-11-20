@@ -15,7 +15,7 @@ const filters: FilterDef[] = [
   { column: "price", op: "between", values: [], min: "100" },
 ]
 
-function bar(over: { dirty?: boolean; canSaveDefault?: boolean; filters?: FilterDef[]; savedFilters?: FilterDef[] }) {
+function bar(over: { dirty?: boolean; canSaveDefault?: boolean; filters?: FilterDef[]; savedFilters?: FilterDef[]; canAdd?: boolean }) {
   render(
     <FilterBar
       board="b1"
@@ -28,9 +28,34 @@ function bar(over: { dirty?: boolean; canSaveDefault?: boolean; filters?: Filter
       saving={false}
       onSaveDefault={() => {}}
       onReset={() => {}}
+      canAdd={over.canAdd}
     />,
   )
 }
+
+// BI-61 T3: borderless chips, tinted when they differ from the saved default; "+ Filter" where the page offers it.
+describe("dashboard filter chips (BI-61 T3)", () => {
+  const chip = (text: string) => screen.getByText(text).closest("[data-slot='filter-chip']") as HTMLElement
+
+  it("tints a chip that differs from the saved default, and only that one", () => {
+    bar({ savedFilters: [{ column: "province", values: ["Bali", "Aceh"] }] })
+    expect(chip("province is Bali, Aceh").className).not.toContain("bg-primary/12")
+    expect(chip("price ≥ 100").className).toContain("bg-primary/12")
+  })
+
+  it("draws no border on a chip", () => {
+    bar({})
+    expect(chip("province is Bali, Aceh").className).not.toMatch(/(^|\s)border(\s|$)/)
+  })
+
+  it("offers + Filter only where the page allows it", () => {
+    bar({ canAdd: false })
+    expect(screen.queryByRole("button", { name: "Add filter" })).toBeNull()
+    cleanup()
+    bar({ canAdd: true })
+    expect(screen.getByRole("button", { name: "Add filter" })).toBeDefined()
+  })
+})
 
 describe("dashboard filter bar", () => {
   it("shows one chip per active filter, read in words", () => {
@@ -71,7 +96,7 @@ describe("dashboard filter bar", () => {
     bar({ filters: [{ column: "province", values: [] }, { column: "price", values: [] }] })
     expect(screen.queryByLabelText("Remove province filter")).toBeNull()
     expect(screen.queryByLabelText("Remove price filter")).toBeNull()
-    fireEvent.click(screen.getByText("Add filter"))
+    fireEvent.click(screen.getByRole("button", { name: "Add filter" }))
     expect(screen.getByText("province")).toBeDefined()
     expect(screen.getByText("price")).toBeDefined()
   })
@@ -97,7 +122,7 @@ describe("the Required switch while adding a filter", () => {
     )
   }
   const openPrice = () => {
-    fireEvent.click(screen.getByText("Add filter"))
+    fireEvent.click(screen.getByRole("button", { name: "Add filter" }))
     fireEvent.click(screen.getByText("price"))
   }
 

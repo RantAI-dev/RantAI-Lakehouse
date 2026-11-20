@@ -90,6 +90,9 @@ type ChatResult = {
   nextStep?: string;
 };
 
+/** What an answer with no text and no tool steps is shown as. */
+export const NO_ANSWER_TEXT = "AI Copilot didn't return an answer.";
+
 /** How many recent sessions the header history menus list. */
 const RECENT_SESSIONS = 20;
 
@@ -412,8 +415,12 @@ function useCopilotState() {
   /**
    * Sends `text` after `history` (default: the current conversation) and
    * streams Copilot's progress until the answer arrives.
+   *
+   * `options.mode` asks in that mode for this one message and leaves the
+   * conversation's own mode as it is (`BI-62` D8: the report editor's
+   * drafts are always Ask, whatever the panel is set to).
    */
-  const send = React.useCallback(async (text: string, history?: Msg[], options?: { continuation?: boolean }) => {
+  const send = React.useCallback(async (text: string, history?: Msg[], options?: { continuation?: boolean; mode?: Mode }) => {
     const q = text.trim();
     if (!q || busy) return;
     // A typed message starts a new chain; a continuation belongs to the
@@ -439,9 +446,9 @@ function useCopilotState() {
         method: "POST", headers: { "Content-Type": "application/json" },
         signal: controller.signal,
         body: JSON.stringify({
-          mode,
+          mode: options?.mode ?? mode,
           stream: true,
-          tools: toolsFromCaps(enabledCaps, mode),
+          tools: toolsFromCaps(enabledCaps, options?.mode ?? mode),
           context: pageContextRef.current?.system,
           messages: chatHistory(next),
         }),
@@ -498,7 +505,7 @@ function useCopilotState() {
         {
           id: assistantId,
           role: "assistant",
-          content: result.answer || (tools.length ? "" : "AI Copilot didn't return an answer."),
+          content: result.answer || (tools.length ? "" : NO_ANSWER_TEXT),
           tools,
           buildRunId: result.buildRunId,
           chartCreated,

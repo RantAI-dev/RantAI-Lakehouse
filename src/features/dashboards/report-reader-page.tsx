@@ -8,7 +8,6 @@ import { ArrowLeft, Download, FileText, Pencil, Trash2 } from "lucide-react"
 
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import { PageHeader } from "@/components/patterns/page-header"
 import { Button } from "@/components/ui/button"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useAuth } from "@/features/auth/auth-provider"
@@ -18,6 +17,7 @@ import { formatRelativeTime } from "@/lib/format"
 import { notifyError, notifySuccess, withNotify } from "@/lib/notify"
 import { buildReportPageContext, chartCount } from "@/lib/report-blocks"
 import { dashboardReportService, dashboardService } from "@/services"
+import { forgetRow, rememberRow } from "./dashboards-row"
 import { downloadReportPdf } from "./chart-download"
 import { ReportBlocks } from "./report-blocks"
 import { ReportingProvider } from "./reporting-context"
@@ -53,6 +53,10 @@ export function ReportReaderPage({ id }: { id: string }) {
   // screen, as the dashboard page names its board, so it can change this one.
   const { setPageContext } = useCopilot()
   const shown = state.status === "success" ? state.data.report : null
+  // BI-61 T11: the sidebar's Dashboards row names the last dashboard or report opened.
+  React.useEffect(() => {
+    if (shown) rememberRow("report", shown.id, shown.title)
+  }, [shown])
   React.useEffect(() => {
     if (!shown) return
     setPageContext({
@@ -108,60 +112,71 @@ export function ReportReaderPage({ id }: { id: string }) {
     }
   }
 
+  const meta = [where || "No folder", report.updatedBy ? `Updated by ${report.updatedBy} ${formatRelativeTime(report.updatedAt)}` : ""]
+    .filter(Boolean)
+    .join(" · ")
+
+  // BI-62 (D7, spec T1): the report reads as the document it was written as, in
+  // the editor's column and typography; the actions sit in one short row above
+  // it, the primary one (Download PDF, else Edit) at the far right.
   return (
-    <div className="mx-auto flex w-full max-w-4xl flex-col gap-5">
-      <Link
-        href={REPORTS_TAB_HREF}
-        className="inline-flex w-fit items-center gap-1 rounded-sm text-xs text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-      >
-        <ArrowLeft className="size-3" aria-hidden />
-        Reports
-      </Link>
-      <PageHeader
-        title={report.title}
-        description={[where || "No folder", report.updatedBy ? `Updated by ${report.updatedBy} ${formatRelativeTime(report.updatedAt)}` : ""]
-          .filter(Boolean)
-          .join(" · ")}
-        actions={
-          <div className="flex flex-wrap items-center gap-2">
-            {pdf ? (
-              <Button variant="outline" size="sm" disabled={pdfBusy} onClick={() => void download()}>
-                <Download data-icon="inline-start" />
-                {pdfBusy ? "Making the PDF…" : "Download PDF"}
-              </Button>
-            ) : null}
-            {canDelete ? (
-              <Button variant="outline" size="sm" onClick={() => setDeleting(true)}>
-                <Trash2 data-icon="inline-start" />
-                Delete
-              </Button>
-            ) : null}
-            {canEdit ? (
-              <Button size="sm" render={<Link href={`/dashboards/reports/${encodeURIComponent(report.id)}/edit`} />}>
-                <Pencil data-icon="inline-start" />
-                Edit
-              </Button>
-            ) : null}
-          </div>
-        }
-      />
+    <div className="rd-scroll flex w-full flex-col gap-2">
+      <div className="flex min-h-8 flex-wrap items-center gap-2">
+        <Link
+          href={REPORTS_TAB_HREF}
+          className="inline-flex shrink-0 items-center gap-1 rounded-sm text-sm text-muted-foreground transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          <ArrowLeft className="size-4" aria-hidden />
+          Reports
+        </Link>
+        <span className="hidden min-w-0 truncate text-xs text-muted-foreground sm:inline" title={meta}>
+          · {meta}
+        </span>
+        <div className="ml-auto flex items-center gap-2">
+          {canDelete ? (
+            <Button variant="outline" size="sm" onClick={() => setDeleting(true)}>
+              <Trash2 data-icon="inline-start" />
+              Delete
+            </Button>
+          ) : null}
+          {canEdit ? (
+            <Button
+              variant={pdf ? "outline" : "default"}
+              size="sm"
+              render={<Link href={`/dashboards/reports/${encodeURIComponent(report.id)}/edit`} />}
+            >
+              <Pencil data-icon="inline-start" />
+              Edit
+            </Button>
+          ) : null}
+          {pdf ? (
+            <Button size="sm" disabled={pdfBusy} onClick={() => void download()}>
+              <Download data-icon="inline-start" />
+              {pdfBusy ? "Making the PDF…" : "Download PDF"}
+            </Button>
+          ) : null}
+        </div>
+      </div>
       {report.blocks.length === 0 ? (
-        <EmptyState
-          title="This report is empty"
-          description={canEdit ? "Add headings, text and charts from your dashboards." : "Nothing has been written here yet."}
-          action={
-            canEdit ? (
-              <Button size="sm" render={<Link href={`/dashboards/reports/${encodeURIComponent(report.id)}/edit`} />}>
-                <FileText data-icon="inline-start" />
-                Start writing
-              </Button>
-            ) : null
-          }
-        />
+        <>
+          <h1 className="sr-only">{report.title}</h1>
+          <EmptyState
+            title="This report is empty"
+            description={canEdit ? "Add headings, text and charts from your dashboards." : "Nothing has been written here yet."}
+            action={
+              canEdit ? (
+                <Button size="sm" render={<Link href={`/dashboards/reports/${encodeURIComponent(report.id)}/edit`} />}>
+                  <FileText data-icon="inline-start" />
+                  Start writing
+                </Button>
+              ) : null
+            }
+          />
+        </>
       ) : (
         <ReportingProvider reporting={view.reporting ?? undefined}>
-          <article aria-label={report.title}>
-            <ReportBlocks blocks={report.blocks} charts={view.charts} dark={resolvedTheme === "dark"} />
+          <article aria-label={report.title} className="mx-auto w-full max-w-[720px] px-0 pt-4 pb-16 sm:px-2 sm:pt-8">
+            <ReportBlocks title={report.title} blocks={report.blocks} charts={view.charts} dark={resolvedTheme === "dark"} />
           </article>
         </ReportingProvider>
       )}
@@ -176,6 +191,7 @@ export function ReportReaderPage({ id }: { id: string }) {
         onConfirm={() => {
           void (async () => {
             const done = await deleteAction.run()
+            if (done !== null) forgetRow({ kind: "report", id })
             setDeleting(false)
             if (done !== null) router.push(REPORTS_TAB_HREF)
           })()

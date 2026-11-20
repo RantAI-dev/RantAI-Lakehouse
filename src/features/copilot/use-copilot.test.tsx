@@ -1,5 +1,6 @@
 import { act, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import * as realNavigation from "next/navigation";
 import * as React from "react";
 import type { Msg } from "./use-copilot";
 
@@ -8,9 +9,19 @@ import type { Msg } from "./use-copilot";
  * context. The happy-dom environment does not provide it, so the module is
  * stubbed before the hook is imported.
  */
+// BI-62 PR B review SHOULD-FIX 1: `mock.module` outlives this file when CI runs
+// every test in one bun process, so the override keeps the real exports (a
+// later file importing `useRouter` must still find it) and `afterAll` puts the
+// real module back.
+const realNavigationModule = { ...realNavigation };
 mock.module("next/navigation", () => ({
+  ...realNavigationModule,
   usePathname: () => "/dashboards/main-board",
 }));
+
+afterAll(() => {
+  mock.module("next/navigation", () => realNavigationModule);
+});
 
 const {
   CopilotProvider,
@@ -776,6 +787,27 @@ describe("streaming does not re-render the whole Copilot (AI-24 D6)", () => {
       stream.end();
       await sending;
     });
+  });
+});
+
+describe("one message in another mode (BI-62 D8)", () => {
+  it("asks in Ask mode for that message and leaves the conversation in Build", async () => {
+    renderCopilot();
+    await act(async () => {
+      await copilot!.send("Write for this report: a short summary", undefined, { mode: "ask" });
+    });
+    const sent = JSON.parse(chatRequests[0].body) as { mode: string; tools: string[] };
+    expect(sent.mode).toBe("ask");
+    // Ask mode's tools, not Build's.
+    const { ALL_CAP_KEYS, toolsFromCaps } = await import("./capabilities");
+    expect(sent.tools).toEqual(toolsFromCaps(new Set(ALL_CAP_KEYS), "ask"));
+    expect(sent.tools).not.toEqual(toolsFromCaps(new Set(ALL_CAP_KEYS), "build"));
+    expect(copilot!.mode).toBe("build");
+    // The next message without a mode is Build again.
+    await act(async () => {
+      await copilot!.send("Build me a dashboard about events.");
+    });
+    expect((JSON.parse(chatRequests[1].body) as { mode: string }).mode).toBe("build");
   });
 });
 
