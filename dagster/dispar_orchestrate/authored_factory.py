@@ -797,9 +797,18 @@ def build_authored_dependency_sensors(
     docstring for the F1.1 BLOCKER this avoids). `run_jobs` does the
     HTTP fetch itself, so this function takes a plain list and is
     unit-testable without monkeypatching `requests`."""
+    # BLD-14 D7: one chain per re-upload owns a pipeline's run when the
+    # graph gives it chain parents, so the `_after` sensor must not also
+    # launch it. Both sensors are built from the SAME payload list, so
+    # they derive the same D3 order rather than two copies of the rule.
+    chain_graph = reupload_chain_graph([p for p, _ in pipeline_jobs])
     sensors: list[Any] = []
     for pipeline, authored_job in pipeline_jobs:
-        sensor = build_authored_dependency_sensor(pipeline, authored_job)
+        sensor = build_authored_dependency_sensor(
+            pipeline,
+            authored_job,
+            chain=chain_graph.get(str(pipeline.get("id")), {}),
+        )
         if sensor is not None:
             sensors.append(sensor)
     return sensors
@@ -1041,7 +1050,7 @@ def _latest_record_for_ingest_table(instance: Any, table: str) -> Any | None:
 
 
 def build_authored_dependency_sensor(
-    pipeline: dict[str, Any], authored_job: Any
+    pipeline: dict[str, Any], authored_job: Any, chain: dict[str, ChainEntry] | None = None
 ) -> Any | None:
     """One `run_status_sensor` for `pipeline`, or `None` when it has no
     `dependsOn`. Reads `dependsOn` (camelCase), matching the wire
@@ -1085,6 +1094,14 @@ def build_authored_dependency_sensor(
     connector per run and reads it from the materialization that run logged
     (`_latest_record_for_ingest_table`). Everything else keeps the
     unfiltered rule above, byte for byte.
+
+    BLD-14 D5/D7: `chain` is this pipeline's D3 entry map (`table` ->
+    [`ChainEntry`]). When a file load of a table it belongs to is the fresh
+    upstream, the chain sensor owns that launch and this sensor skips; a
+    run of a chain parent tagged with the same re-upload root skips too.
+    Otherwise a file load's `RunRequest` carries the two re-upload tags so
+    the downstream chain can tell which load it came from. A manual or
+    scheduled upstream still triggers this sensor exactly as before.
     """
     # BLD-2 D3: A target lag (either kind) replaces the dependency (_after) sensor while it is set.
     # The dependsOn list stays stored, so clearing the target lag restores the chain sensor (AC8).
@@ -1131,6 +1148,14 @@ def build_authored_dependency_sensor(
         if source_zone and source_table
         else "a source that names no bronze table"
     )
+    chain = chain or {}
+
+    def _chain_skip(table: str | None) -> str | None:
+        entry = chain.get(table or "")
+        if entry is None:
+            return None
+        parents = ", ".join(entry.parents)
+        return f"BLD-14: the re-upload chain starts this pipeline after {parents}"
 
     @run_status_sensor(
         run_status=DagsterRunStatus.SUCCESS,
@@ -1145,6 +1170,10 @@ def build_authored_dependency_sensor(
         ),
     )
     def _dependency_sensor(context: Any) -> Any:
+        # D5: a fresh file load gives the RunRequest its two tags; a manual
+        # or scheduled upstream leaves them unset. Both are per-tick state.
+        reupload_root: str | None = None
+        reupload_table: str | None = None
         # `context.dagster_run` is the upstream run that triggered THIS
         # tick -- it is always SUCCESS here (`run_status=SUCCESS` on the
         # decorator).
@@ -1254,6 +1283,35 @@ def build_authored_dependency_sensor(
                     f"this upstream run ({upstream_run.run_id}) is not enough"
                 )
                 return
+            # BLD-14 D5/D7: a fresh file load of a table this pipeline is
+            # in the chain for belongs to the chain sensor, not to this
+            # one. Remember the root so an untagged chain (P10's floor)
+            # still passes the re-upload tags to its RunRequest.
+            if upstream_id == FILE_INGEST_JOB and latest is not None and latest.end_time is not None:
+                if (reason := _chain_skip(bronze_table)) is not None:
+                    yield SkipReason(reason)
+                    return
+                reupload_root = latest.dagster_run.run_id
+                reupload_table = bronze_table or ""
+            elif (
+                upstream_id.startswith("pl-")
+                and latest is not None
+                and latest.end_time is not None
+            ):
+                # An upstream pipeline's run tagged by the chain sensor is
+                # also owned by that chain: this sensor must not launch a
+                # second run for the same re-upload (D7).
+                upstream_tags = getattr(latest.dagster_run, "tags", None) or {}
+                tagged_table = upstream_tags.get(REUPLOAD_TABLE_TAG)
+                if (
+                    upstream_tags.get(REUPLOAD_ROOT_TAG)
+                    and tagged_table in chain
+                    and upstream_id in chain[tagged_table].parents
+                ):
+                    yield SkipReason(
+                        _chain_skip(tagged_table) or "BLD-14: the re-upload chain owns this run"
+                    )
+                    return
             if latest.end_time <= (downstream_start or 0.0):
                 if upstream_id in _PER_TABLE_UPSTREAMS and bronze_table:
                     # BLD-4 review R1 SHOULD-FIX 1: name the table in the stale anchor reason
@@ -1277,7 +1335,15 @@ def build_authored_dependency_sensor(
         # see the same set of upstreams ask for the same downstream
         # launch exactly once.
         joined = ",".join(sorted(latest_success_ids))
-        yield RunRequest(run_key=f"authored-deps:{joined}")
+        tags = (
+            {REUPLOAD_ROOT_TAG: reupload_root, REUPLOAD_TABLE_TAG: reupload_table}
+            if reupload_root is not None and reupload_table is not None
+            else None
+        )
+        # The run_key stays exactly as before: D5 adds tags, not a new
+        # dedup key. A manual or scheduled upstream has no root and keeps
+        # an untagged request.
+        yield RunRequest(run_key=f"authored-deps:{joined}", tags=tags)
 
     return _dependency_sensor
 

@@ -44,6 +44,7 @@ from dagster import (
     RetryPolicy,
     RunRequest,
     RunsFilter,
+    SkipReason,
     build_op_context,
     job,
     op,
@@ -53,6 +54,9 @@ from dispar_orchestrate import authored_factory
 from dispar_orchestrate.authored_factory import (
     DAGSTER_LOCATION,
     DAGSTER_REPO,
+    REUPLOAD_ROOT_TAG,
+    REUPLOAD_TABLE_TAG,
+    ChainEntry,
     _upstream_job_selector,
     build_authored_dependency_sensor,
 )
@@ -804,6 +808,7 @@ class _FakeDagsterRun:
         start_time: float | None,
         end_time: float | None,
         run_config: Any = None,
+        tags: dict[str, str] | None = None,
     ) -> None:
         self.job_name = job_name
         self.run_id = run_id
@@ -811,6 +816,9 @@ class _FakeDagsterRun:
         self.start_time = start_time
         self.end_time = end_time
         self.run_config = run_config
+        # BLD-14 D5: a chain-launched run carries the re-upload root and
+        # table, which is how `_after` recognises a parent the chain owns.
+        self.tags = tags or {}
 
 
 class _FakeRunRecord:
@@ -2893,3 +2901,144 @@ class CodeLocationLoadMutationTest(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("Duplicate", message)
         self.assertIn("authored__pl_down_1", message)
+
+
+class TestDependencySensorTagsAReupload:
+    """BLD-14 D5/D7: `_after` tags a file-load run and steps aside when the
+    re-upload chain owns the pipeline. Plain pytest class, same fakes as
+    `TestDependencySensor`; no Dagster instance and no network.
+    """
+
+    @staticmethod
+    def _pipeline(pid: str, depends_on: list[str]) -> dict[str, Any]:
+        return {
+            "id": pid,
+            "tenantId": "t1",
+            "status": "ready",
+            "dependsOn": depends_on,
+            "definition": {
+                "sourceZone": "bronze",
+                "sourceTable": "orders",
+                "targetZone": "silver",
+                "targetTable": "orders_clean",
+                "inputs": [{"zone": "bronze", "table": "orders"}],
+            },
+        }
+
+    @staticmethod
+    def _load_run() -> _FakeDagsterRun:
+        return _FakeDagsterRun(
+            job_name="file_ingest_job",
+            run_id="root-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=10.0,
+            end_time=20.0,
+            run_config={
+                "ops": {"ingest_uploaded_file": {"config": {"bronze_table_name": "orders"}}}
+            },
+        )
+
+    @staticmethod
+    def _sensor(pid: str, depends_on: list[str], chain: dict[str, ChainEntry]):
+        @job(name=f"authored__{pid.replace('-', '_')}")
+        def _placeholder_job() -> None:
+            return None
+
+        sensor = build_authored_dependency_sensor(
+            TestDependencySensorTagsAReupload._pipeline(pid, depends_on),
+            _placeholder_job,
+            chain=chain,
+        )
+        assert sensor is not None
+        return sensor
+
+    def test_a_file_load_run_request_carries_the_reupload_tags(self) -> None:
+        load = self._load_run()
+        instance = _StubInstance({"file_ingest_job": [load], "authored__pl_down_1": []})
+        body = self._sensor("pl-down-1", ["file_ingest_job"], {})._run_status_sensor_fn
+        out = list(body(_StubContext(load, instance)))
+
+        assert len(out) == 1
+        request = out[0]
+        assert isinstance(request, RunRequest)
+        assert request.run_key == "authored-deps:root-1"
+        assert request.tags == {
+            REUPLOAD_ROOT_TAG: "root-1",
+            REUPLOAD_TABLE_TAG: "orders",
+        }
+
+    def test_a_run_after_another_pipeline_carries_no_reupload_tags(self) -> None:
+        upstream = _FakeDagsterRun(
+            job_name="authored__pl_up_a",
+            run_id="manual-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=10.0,
+            end_time=20.0,
+        )
+        instance = _StubInstance({"authored__pl_up_a": [upstream], "authored__pl_down_1": []})
+        body = self._sensor("pl-down-1", ["pl-up-a"], {})._run_status_sensor_fn
+        out = list(body(_StubContext(upstream, instance)))
+
+        assert len(out) == 1
+        assert isinstance(out[0], RunRequest)
+        assert not out[0].tags
+
+    def test_a_pipeline_the_chain_owns_skips_the_file_load(self) -> None:
+        load = self._load_run()
+        instance = _StubInstance({"file_ingest_job": [load], "authored__pl_down_1": []})
+        chain = {
+            "orders": ChainEntry(
+                parents=("pl-silver",), ancestors=("pl-silver",)
+            )
+        }
+        body = self._sensor("pl-down-1", ["file_ingest_job"], chain)._run_status_sensor_fn
+        out = list(body(_StubContext(load, instance)))
+
+        assert len(out) == 1
+        assert isinstance(out[0], SkipReason)
+        assert "BLD-14" in out[0].skip_message
+        assert "pl-silver" in out[0].skip_message
+
+    def test_a_tagged_run_of_a_chain_parent_is_skipped_with_bld_14_named(self) -> None:
+        parent = _FakeDagsterRun(
+            job_name="authored__pl_silver",
+            run_id="parent-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=10.0,
+            end_time=20.0,
+            tags={REUPLOAD_ROOT_TAG: "root-1", REUPLOAD_TABLE_TAG: "orders"},
+        )
+        instance = _StubInstance({"authored__pl_silver": [parent], "authored__pl_down_1": []})
+        chain = {
+            "orders": ChainEntry(
+                parents=("pl-silver",), ancestors=("pl-silver",)
+            )
+        }
+        body = self._sensor("pl-down-1", ["pl-silver"], chain)._run_status_sensor_fn
+        out = list(body(_StubContext(parent, instance)))
+
+        assert len(out) == 1
+        assert isinstance(out[0], SkipReason)
+        assert "BLD-14" in out[0].skip_message
+        assert "pl-silver" in out[0].skip_message
+
+    def test_an_untagged_manual_run_of_the_same_parent_still_triggers(self) -> None:
+        parent = _FakeDagsterRun(
+            job_name="authored__pl_silver",
+            run_id="manual-2",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=10.0,
+            end_time=20.0,
+        )
+        instance = _StubInstance({"authored__pl_silver": [parent], "authored__pl_down_1": []})
+        chain = {
+            "orders": ChainEntry(
+                parents=("pl-silver",), ancestors=("pl-silver",)
+            )
+        }
+        body = self._sensor("pl-down-1", ["pl-silver"], chain)._run_status_sensor_fn
+        out = list(body(_StubContext(parent, instance)))
+
+        assert len(out) == 1
+        assert isinstance(out[0], RunRequest)
+        assert not out[0].tags
