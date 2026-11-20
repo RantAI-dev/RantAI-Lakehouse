@@ -333,14 +333,42 @@ fn hidden_read<D: Dialect>(
 /// names sources that cannot be resolved to tables; and
 /// [`EnforcementError::Rewrite`] if `sql` fails classification or
 /// substitution once obligations are known.
-pub async fn rewrite_sql_for_roles<D: Dialect + Sync>(
+/// QS-10 (LH-QS-2-05), D4: the obligations a rewrite can report, in the
+/// order the console lists them. No table or column name is included — the
+/// result already shows the masked values, and `BI-51` does not name masked
+/// columns.
+pub const OBLIGATION_COLUMN_MASKS: &str = "Column masks";
+/// QS-10 (LH-QS-2-05), D4: the second reportable obligation, listed after
+/// [`OBLIGATION_COLUMN_MASKS`].
+pub const OBLIGATION_ROW_FILTERS: &str = "Row filters";
+
+/// A rewrite's output alongside the obligations it applied (QS-10, D4).
+pub struct RoleRewrite {
+    /// The statement the engine runs, rewritten for the caller's roles.
+    pub sql: String,
+    /// The obligations the rewrite applied, in report order, each at most
+    /// once.
+    pub obligations: Vec<&'static str>,
+}
+
+/// The shared rewrite, also reporting which obligations it applied.
+///
+/// # Errors
+/// [`EnforcementError::Engine`] if obligations or the principal's table
+/// access cannot be resolved; [`EnforcementError::TableNotReadable`] if the
+/// statement reads a table the principal's roles do not include;
+/// [`EnforcementError::Unresolvable`] if a narrowed principal's statement
+/// names sources that cannot be resolved to tables; and
+/// [`EnforcementError::Rewrite`] if `sql` fails classification or
+/// substitution once obligations are known.
+pub async fn rewrite_sql_for_roles_reporting<D: Dialect + Sync>(
     sql: &str,
     dialect: &D,
     engine: sql_rewrite::Engine,
     roles: &[String],
     placeholders: &sql_rewrite::PlaceholderValues,
     obligations_source: &PolicyEngineObligations<'_>,
-) -> Result<String, EnforcementError> {
+) -> Result<RoleRewrite, EnforcementError> {
     let tables =
         sql_rewrite::referenced_tables(sql, dialect).ok_or(PolicyEngineError::Unparseable)?;
     // GOV-7 D5: what the principal may read at all is settled BEFORE any
@@ -359,7 +387,11 @@ pub async fn rewrite_sql_for_roles<D: Dialect + Sync>(
     let (obligations, views) = obligations_source
         .prefetch_for_tables(&tables, roles)
         .await?;
-    Ok(sql_rewrite::enforce(
+    // QS-10 (LH-QS-2-05), D4: read what the rewrite is about to apply before
+    // handing the obligations to `enforce` — it borrows them, so nothing is
+    // consumed and the report stays truthful.
+    let applied = obligations.applied();
+    let sql = sql_rewrite::enforce(
         sql,
         dialect,
         engine,
@@ -367,7 +399,35 @@ pub async fn rewrite_sql_for_roles<D: Dialect + Sync>(
         placeholders,
         &obligations,
         &views,
-    )?)
+    )?;
+    Ok(RoleRewrite {
+        sql,
+        obligations: applied,
+    })
+}
+
+/// The shared rewrite's SQL, for callers that do not report obligations.
+///
+/// # Errors
+/// Every [`EnforcementError`] [`rewrite_sql_for_roles_reporting`] can return.
+pub async fn rewrite_sql_for_roles<D: Dialect + Sync>(
+    sql: &str,
+    dialect: &D,
+    engine: sql_rewrite::Engine,
+    roles: &[String],
+    placeholders: &sql_rewrite::PlaceholderValues,
+    obligations_source: &PolicyEngineObligations<'_>,
+) -> Result<String, EnforcementError> {
+    Ok(rewrite_sql_for_roles_reporting(
+        sql,
+        dialect,
+        engine,
+        roles,
+        placeholders,
+        obligations_source,
+    )
+    .await?
+    .sql)
 }
 
 /// Loads every `status = 'ready'` policy's `conditions`, applying Hard
@@ -872,6 +932,24 @@ pub struct PrefetchedObligations {
     has_any: bool,
 }
 
+impl PrefetchedObligations {
+    /// The obligations this rewrite applied, in report order (QS-10, D4):
+    /// column masks first, then row filters, each at most once. No table or
+    /// column names — the result already shows the masked values, and
+    /// `BI-51` does not name masked columns.
+    #[must_use]
+    pub fn applied(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.map.values().any(|obl| !obl.mask.is_empty()) {
+            out.push(OBLIGATION_COLUMN_MASKS);
+        }
+        if self.map.values().any(|obl| obl.row_filter.is_some()) {
+            out.push(OBLIGATION_ROW_FILTERS);
+        }
+        out
+    }
+}
+
 impl ObligationsSource for PrefetchedObligations {
     fn obligations_for(
         &self,
@@ -901,6 +979,47 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    // QS-10 (LH-QS-2-05), D4: the report lists each obligation once, in
+    // order, and names no table or column.
+    #[test]
+    fn applied_lists_masks_then_filters_once_each() {
+        let obligation = |mask: Vec<String>, row_filter: Option<String>| TableObligations {
+            mask,
+            row_filter,
+            real_columns: None,
+        };
+        let both = PrefetchedObligations {
+            map: std::collections::HashMap::from([
+                (
+                    "silver.a".to_owned(),
+                    obligation(vec!["email".to_owned()], None),
+                ),
+                (
+                    "silver.b".to_owned(),
+                    obligation(vec!["phone".to_owned()], None),
+                ),
+                (
+                    "silver.c".to_owned(),
+                    obligation(Vec::new(), Some("region != 'zz'".to_owned())),
+                ),
+            ]),
+            has_any: true,
+        };
+        assert_eq!(
+            both.applied(),
+            vec![OBLIGATION_COLUMN_MASKS, OBLIGATION_ROW_FILTERS]
+        );
+
+        let none = PrefetchedObligations {
+            map: std::collections::HashMap::from([(
+                "silver.plain".to_owned(),
+                obligation(Vec::new(), None),
+            )]),
+            has_any: true,
+        };
+        assert_eq!(none.applied(), Vec::<&str>::new());
+    }
 
     #[test]
     fn engine_error_messages_are_distinct_english_sentences() {

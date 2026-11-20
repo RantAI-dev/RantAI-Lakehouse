@@ -276,6 +276,25 @@ pub(crate) async fn rewrite_sql_for_principal_with_headers(
     principal: &Principal,
     headers: &HeaderMap,
 ) -> Result<String, ApiError> {
+    rewrite_and_report_for_principal(state, sql, engine, principal, headers)
+        .await
+        .map(|r| r.sql)
+}
+
+/// The shared rewrite with the obligations it applied, recording the same
+/// policy-decision latency as [`rewrite_sql_for_principal_with_headers`]
+/// (QS-10, D4). Callers that report obligations use this; the older wrapper
+/// keeps its six callers unchanged.
+///
+/// # Errors
+/// The same as [`rewrite_sql_for_principal`].
+pub(crate) async fn rewrite_and_report_for_principal(
+    state: &AppState,
+    sql: &str,
+    engine: &str,
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> Result<crate::policy_engine::RoleRewrite, ApiError> {
     let started_rewrite = Instant::now();
     let result = rewrite_sql_for_principal_inner(state, sql, engine, principal, headers).await;
     state
@@ -303,7 +322,7 @@ async fn rewrite_sql_for_principal_inner(
     engine: &str,
     principal: &Principal,
     headers: &HeaderMap,
-) -> Result<String, ApiError> {
+) -> Result<crate::policy_engine::RoleRewrite, ApiError> {
     let engine_kind = crate::sql_rewrite::Engine::from_name(engine);
     // DATA-21 D2: `Trino`'s own past-version clause (`FOR VERSION AS OF
     // <id>`) is not a form `sqlparser` parses — it reads `VERSION AS OF
@@ -361,8 +380,8 @@ async fn rewrite_sql_for_principal_inner(
     // copy of this logic. Only the per-engine dialect *selection*
     // (`ClickHouseDialect` vs. `TrinoDialect`) stays here, since the
     // two are different concrete types.
-    if engine_kind == crate::sql_rewrite::Engine::Trino {
-        crate::policy_engine::rewrite_sql_for_roles(
+    let rewrite = if engine_kind == crate::sql_rewrite::Engine::Trino {
+        crate::policy_engine::rewrite_sql_for_roles_reporting(
             &sql,
             &crate::sql_rewrite::TrinoDialect::default(),
             crate::sql_rewrite::Engine::Trino,
@@ -372,7 +391,7 @@ async fn rewrite_sql_for_principal_inner(
         )
         .await
     } else {
-        crate::policy_engine::rewrite_sql_for_roles(
+        crate::policy_engine::rewrite_sql_for_roles_reporting(
             &sql,
             &sqlparser::dialect::ClickHouseDialect {},
             crate::sql_rewrite::Engine::ClickHouse,
@@ -405,14 +424,19 @@ async fn rewrite_sql_for_principal_inner(
         // shared with every other governed read path, so a hidden table gets
         // the tenant gate's own 404 and sentence.
         crate::routes::support::enforcement_refusal(&sql, &err)
-    })
+    })?;
     // DATA-21 D2: the statement the engine reads is `Trino`'s own form
-    // again — the reverse of the pass that made it parseable.
-    .map(|rewritten| match engine_kind {
-        crate::sql_rewrite::Engine::ClickHouse => rewritten,
+    // again — the reverse of the pass that made it parseable. The
+    // obligations the rewrite applied travel with it (QS-10, D4).
+    let sql = match engine_kind {
+        crate::sql_rewrite::Engine::ClickHouse => rewrite.sql,
         crate::sql_rewrite::Engine::Trino => {
-            crate::sql_rewrite::denormalize_past_version_clause(&rewritten)
+            crate::sql_rewrite::denormalize_past_version_clause(&rewrite.sql)
         }
+    };
+    Ok(crate::policy_engine::RoleRewrite {
+        sql,
+        obligations: rewrite.obligations,
     })
 }
 
@@ -2133,33 +2157,36 @@ async fn run_statement_with(
     // included, so `download` re-rewrites it for the caller's roles at that
     // time and needs no values. `rewritten` is what the engine runs and the
     // audit event records (`SEC-21`, `SEC-33`).
-    let rewritten =
-        match rewrite_sql_for_principal_with_headers(state, statement, engine, p, headers).await {
-            Ok(rewritten) => rewritten,
-            Err(err) => {
-                // A 4xx from the rewrite is the gate refusing (the policy, the
-                // tenant's tables, the caller's own tenant header); a 5xx is
-                // the service failing while asking. The history row says
-                // which.
-                let status: &'static str = if err.status() < 500 {
-                    "blocked"
-                } else {
-                    "failed"
-                };
-                record_uncompleted_run(
-                    state,
-                    (p, headers),
-                    statement,
-                    engine,
-                    status,
-                    &err.to_string(),
-                    &tables_read,
-                    0,
-                )
-                .await;
-                return Err(AssistantFailure::fixed(err));
-            }
-        };
+    // QS-10 (LH-QS-2-05), D4: keep what the rewrite applied so the result
+    // reports it; `rewritten` is still the SQL the engine runs.
+    let rewrite = match rewrite_and_report_for_principal(state, statement, engine, p, headers).await
+    {
+        Ok(rewrite) => rewrite,
+        Err(err) => {
+            // A 4xx from the rewrite is the gate refusing (the policy, the
+            // tenant's tables, the caller's own tenant header); a 5xx is
+            // the service failing while asking. The history row says
+            // which.
+            let status: &'static str = if err.status() < 500 {
+                "blocked"
+            } else {
+                "failed"
+            };
+            record_uncompleted_run(
+                state,
+                (p, headers),
+                statement,
+                engine,
+                status,
+                &err.to_string(),
+                &tables_read,
+                0,
+            )
+            .await;
+            return Err(AssistantFailure::fixed(err));
+        }
+    };
+    let rewritten = rewrite.sql;
     // SEC-21: a statement's own `SETTINGS` would override the cap the run
     // sends with the request. Trino has no such settings in its client.
     if !is_trino_engine(engine)
@@ -2316,6 +2343,12 @@ async fn run_statement_with(
         });
     if let Some(map) = body.as_object_mut() {
         map.insert("canDownload".to_owned(), Value::Bool(can_download));
+        // QS-10 (LH-QS-2-05), D4: overwrite the `null` the builder writes with
+        // what the rewrite actually applied. `metrics` is the field the
+        // console reads; no table or column name is reported.
+        if let Some(metrics) = map.get_mut("metrics").and_then(Value::as_object_mut) {
+            metrics.insert("policyObligations".to_owned(), json!(rewrite.obligations));
+        }
     }
     Ok(ApiJson(body))
 }
@@ -2645,10 +2678,11 @@ fn run_result_json(
             "engine": if is_trino_engine(engine) { Value::Null } else { json!("hot-store") },
             "workloadClass": if is_trino_engine(engine) { Value::Null } else { json!("hot-analytics") },
             // WS1 task 1.6: `ClickHouse`'s response carries no cache-hit flag
-            // and no pushdown list, and there is no policy engine to produce
-            // obligations (`WS7` builds one). Null says "not measured"; the
-            // old constants (`false`, `[]`, `[]`) claimed a measurement that
-            // was never taken.
+            // and no pushdown list. Null says "not measured"; the old
+            // constants (`false`, `[]`, `[]`) claimed a measurement that was
+            // never taken. QS-10 (LH-QS-2-05), D4: the caller overwrites
+            // `policyObligations` with what the rewrite applied; this builder
+            // keeps `null` for its own unit tests and an older reader.
             "cacheHit": Value::Null,
             "pushdowns": Value::Null,
             "policyObligations": Value::Null,
@@ -2827,9 +2861,11 @@ pub async fn estimate(
     // status and fixed message and is never sent to the engine. The planner
     // reports the tables the statement reads, which the rewrite does not
     // change, so the sources shown are what the run would show.
-    let rewritten =
-        rewrite_sql_for_principal_with_headers(&state, &sql, "clickhouse", &principal, &headers)
-            .await?;
+    // QS-10 (LH-QS-2-05), D4: the estimate reports the obligations the
+    // rewrite applied, just as the run does.
+    let rewrite =
+        rewrite_and_report_for_principal(&state, &sql, "clickhouse", &principal, &headers).await?;
+    let rewritten = rewrite.sql;
     // SEC-21: the same settings rule as the run, on the statement the engine
     // is sent.
     refuse_unlisted_settings(&rewritten)?;
@@ -2872,6 +2908,11 @@ pub async fn estimate(
         estimate_error.as_deref(),
         !reads_catalog,
     );
+    // QS-10 (LH-QS-2-05), D4: overwrite the `null` the builder writes with
+    // what the rewrite actually applied, before the marks are added below.
+    if let Some(o) = result.as_object_mut() {
+        o.insert("policyObligations".to_owned(), json!(rewrite.obligations));
+    }
     // DATA-12 part 3: the marks of the tables this ClickHouse query reads,
     // beside `sources` (which stays a list of names). One batch read; only a
     // marked source gets an entry, and `sourceMarks` is absent when none is.
@@ -2961,10 +3002,11 @@ fn estimate_result_json(
         // estimate only, which runs through the hot analytical store.
         "workloadClass": "hot-analytics",
         "engine": "hot-store",
-        // Nothing in this deployment configures ClickHouse's query cache,
-        // and no policy engine is consulted before a run (`WS7` builds
-        // one) — `cacheEligible`/`policyObligations` stay `null`, not a
-        // fabricated "Eligible"/`[]`. `freshnessLagSeconds` IS a real
+        // Nothing in this deployment configures ClickHouse's query cache, so
+        // `cacheEligible` stays `null`, not a fabricated "Eligible". QS-10
+        // (LH-QS-2-05), D4: the caller overwrites `policyObligations` with
+        // what the rewrite applied; the builder keeps `null` for its own unit
+        // tests and an older reader. `freshnessLagSeconds` IS a real
         // measurement (`freshness_lag`, ClickHouse `system.parts`), unlike
         // the `0` it used to hardcode.
         "cacheEligible": Value::Null,
