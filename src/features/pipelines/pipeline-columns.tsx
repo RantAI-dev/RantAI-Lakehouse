@@ -36,7 +36,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { ENTITY_STATUS_LABEL, type EntityStatus } from "@/lib/status"
 import type { Pipeline, PipelineKind } from "@/services/contracts/pipelines"
 import { knownStatus } from "./pipeline-detail-header"
-import { describeCron, isScheduleRunning, parseSchedule } from "./pipeline-schedule"
+import { describeCron, isLagTrigger, isScheduleRunning, parseSchedule, triggerSummary } from "./pipeline-schedule"
 
 // `PipelineKind` widens to `string` on `Pipeline.kind` (rows authored
 // before WS1 may still carry `"document"`/`"vector"`, which the database
@@ -268,6 +268,12 @@ export function getPipelineColumns({
       ),
       cell: ({ row }) => {
         const parsed = parseSchedule(row.original.schedule)
+        // BLD-11 F2/D3: a target-lag row is not "On demand" and its stored
+        // cron never fires — name the lag, which is the real trigger.
+        const trigger = triggerSummary(parsed, row.original.targetLag)
+        if (isLagTrigger(trigger)) {
+          return <span className="text-xs text-foreground">{trigger.label}</span>
+        }
         if (parsed.kind === "manual") return <span className="text-xs text-muted-foreground">On demand</span>
         if (parsed.kind === "other") {
           return <span className="font-mono text-xs text-muted-foreground">{parsed.raw}</span>

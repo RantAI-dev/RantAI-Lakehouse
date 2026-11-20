@@ -93,3 +93,32 @@ describe("pipeline-columns lag column", () => {
     expect(screen.getByText("Not measured")).toBeTruthy()
   })
 })
+
+describe("pipeline-columns schedule column (BLD-11 F2/D3)", () => {
+  const columns = getPipelineColumns()
+  const scheduleColumn = columns.find((c) => c.id === "schedule") as AccessorFnColumnDef<Pipeline>
+  const scheduleCell = (pipeline: Pipeline): React.ReactNode =>
+    (scheduleColumn.cell as (ctx: { row: { original: Pipeline } }) => React.ReactNode)({
+      row: { original: pipeline },
+    })
+
+  it("names the target lag, not 'On demand', for an authored lag-driven row", () => {
+    const p = makePipeline({
+      schedule: "manual",
+      targetLag: { kind: "lag", minutes: 10 },
+    })
+    render(<>{scheduleCell(p)}</>)
+    expect(screen.getByText("Within 10 min of its inputs")).toBeTruthy()
+    expect(screen.queryByText("On demand")).toBeNull()
+  })
+
+  it("a stored cron with a target lag does not show the cron", () => {
+    const p = makePipeline({
+      schedule: "cron: 0 * * * * (RUNNING)",
+      targetLag: { kind: "lag", minutes: 10 },
+    })
+    render(<>{scheduleCell(p)}</>)
+    expect(screen.getByText("Within 10 min of its inputs")).toBeTruthy()
+    expect(screen.queryByText("Hourly")).toBeNull()
+  })
+})

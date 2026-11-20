@@ -39,7 +39,14 @@ import type { PipelineDetail, PipelineRun } from "@/services/contracts/pipelines
 import { AuthoredFlow, DagsterDefinition } from "./pipeline-definition"
 import { PipelineMasthead, PipelineVitals } from "./pipeline-detail-header"
 import { isLiveRun, runDurationMs, summarizeRuns } from "./pipeline-run-stats"
-import { describeCron, isScheduleRunning, localizeScheduleTime, parseSchedule } from "./pipeline-schedule"
+import {
+  describeCron,
+  isLagTrigger,
+  isScheduleRunning,
+  localizeScheduleTime,
+  parseSchedule,
+  triggerSummary,
+} from "./pipeline-schedule"
 import { RunHistoryStrip, runFill, statusLabel } from "./run-history-strip"
 import { authorChoices, readsAs } from "./pipeline-reads-as"
 import { RunInspector } from "./run-inspector"
@@ -319,8 +326,13 @@ export function PipelineDetailPage() {
     ? p.status === "paused"
     : schedule.kind === "cron" && schedule.state !== null && !isScheduleRunning(schedule.state)
   const isDraft = p.status === "draft"
-  const scheduleText =
-    schedule.kind === "manual"
+  // BLD-11 F2/D3: the trigger is the target lag when one is set, whatever
+  // cron text is stored; a cron the orchestrator never builds must not be
+  // named as if it fired.
+  const trigger = triggerSummary(schedule, p.targetLag)
+  const scheduleText = isLagTrigger(trigger)
+    ? trigger.label
+    : schedule.kind === "manual"
       ? "Manual only"
       : schedule.kind === "cron"
         ? `${localizeScheduleTime(describeCron(schedule.cron) ?? "Cron", p.nextRunAt)} (cron ${schedule.cron})${schedule.state ? `, ${schedule.state.toLowerCase()}` : ""}`
@@ -372,7 +384,7 @@ export function PipelineDetailPage() {
   ) : (
     <>
       {authoredMenu}
-      {schedule.kind === "cron" ? (
+      {schedule.kind === "cron" && !p.targetLag ? (
         schedulePaused ? (
           <Button
             variant="outline"
@@ -479,6 +491,7 @@ export function PipelineDetailPage() {
           nextRunAt={p.nextRunAt}
           schedule={schedule}
           schedulePaused={schedulePaused}
+          targetLag={p.targetLag}
           now={now}
         />
       ) : null}

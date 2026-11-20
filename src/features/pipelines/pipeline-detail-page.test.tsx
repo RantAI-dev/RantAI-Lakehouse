@@ -222,6 +222,38 @@ describe("the pipeline page's run state (BLD-8)", () => {
   }, 20_000)
 })
 
+// BLD-11 F2/D3: the target lag is the trigger when one is set, whatever the
+// stored `schedule` says. A stored cron with a target lag never fires, and
+// the page must say neither "Manual only" nor offer a Pause for it.
+describe("the pipeline page's trigger (BLD-11)", () => {
+  it("a pipeline with a target lag and no schedule never says 'Manual only'", async () => {
+    const pipeline: PipelineDetail = {
+      ...PIPELINE,
+      schedule: "manual",
+      targetLag: { kind: "lag", minutes: 10 },
+    }
+    stubApi({ status: () => "completed", pipeline })
+    renderPage()
+
+    expect(await screen.findByText("Within 10 min of its inputs")).toBeTruthy()
+    expect(screen.queryByText("Manual only")).toBeNull()
+    expect(screen.getByText("Runs when an input changes")).toBeTruthy()
+  })
+
+  it("a pipeline with a target lag and a stored cron offers no Pause schedule button", async () => {
+    const pipeline: PipelineDetail = {
+      ...PIPELINE,
+      schedule: "cron: 0 * * * * (RUNNING)",
+      targetLag: { kind: "lag", minutes: 120 },
+    }
+    stubApi({ status: () => "completed", pipeline })
+    renderPage()
+
+    expect(await screen.findByText("Within 2 h of its inputs")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /pause schedule/i })).toBeNull()
+  })
+})
+
 // BLD-10 D3: the definition page says the same as the form -- FBIC is not
 // available, and a pipeline with no transform copies its source as is.
 describe("the pipeline page's Definition tab (BLD-10)", () => {
