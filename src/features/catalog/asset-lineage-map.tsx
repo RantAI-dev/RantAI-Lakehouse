@@ -2,9 +2,12 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { BarChart3, ChartColumn, ChevronRight } from "lucide-react"
+import { BarChart3, ChartColumn, ChevronRight, Minus, Plus, Scan } from "lucide-react"
+import { Button } from "@/components/ui/button"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { KIND_LABEL, focusIds, nodeHref, nodeKind } from "@/features/governance/lineage-graph"
 import { useService } from "@/hooks/use-service"
+import { boxHeight, clampView, fitScale, fitView, zoomAt, ZOOM_MAX, ZOOM_STEP, type Size, type View } from "@/lib/pan-zoom"
 import { cn } from "@/lib/utils"
 import { dashboardService } from "@/services"
 import type { Board, ChartOutline } from "@/services/contracts/dashboards"
@@ -407,7 +410,8 @@ function curve(from: Placed, to: Placed) {
  * a list, left to right, for a reader who cannot see the lines.
  *
  * With a `placement`, the charts are grouped by dashboard ([`groupCharts`]);
- * a group opens and closes in place, one at a time.
+ * a group opens and closes in place, one at a time. The map pans and zooms
+ * inside its box ([`PanZoomBox`]) and opens fitted to it.
  */
 export function LineageMindmap({
   model: full,
@@ -418,87 +422,15 @@ export function LineageMindmap({
 }) {
   const [open, setOpen] = React.useState<string | null>(null)
   const model = React.useMemo(() => groupCharts(full, placement, open), [full, placement, open])
-  const toggle = (key: string) => setOpen((now) => (now === key ? null : key))
-  const { nodes, width, height } = mindmapLayout(model)
-  const at = new Map(nodes.map((n) => [n.id, n]))
-  const centre = nodes.find((n) => n.centre)
+  const toggle = React.useCallback((key: string) => setOpen((now) => (now === key ? null : key)), [])
+  const layout = React.useMemo(() => mindmapLayout(model), [model])
   const dashed = model.edges.some((e) => !e.recorded)
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="overflow-x-auto rounded-lg border border-border bg-muted/20 p-6">
-        <div className="relative mx-auto" style={{ width, height }}>
-          <svg
-            className="pointer-events-none absolute inset-0 overflow-visible"
-            width={width}
-            height={height}
-            aria-hidden
-          >
-            {model.edges.map((e) => {
-              const from = at.get(e.from)
-              const to = at.get(e.to)
-              if (!from || !to) return null
-              const touchesCentre = from.id === centre?.id || to.id === centre?.id
-              return (
-                <path
-                  key={e.id}
-                  d={curve(from, to).d}
-                  fill="none"
-                  strokeWidth={e.recorded ? 2 : 1.5}
-                  strokeDasharray={e.recorded ? undefined : "5 5"}
-                  strokeLinecap="round"
-                  className={touchesCentre && e.recorded ? "stroke-primary/60" : "stroke-muted-foreground/40"}
-                />
-              )
-            })}
-          </svg>
-          {model.edges.map((e) => {
-            const from = at.get(e.from)
-            const to = at.get(e.to)
-            if (!from || !to) return null
-            if (e.label === "") return null
-            const { mid } = curve(from, to)
-            return (
-              <span
-                key={e.id}
-                title={e.title}
-                className="absolute max-w-[112px] -translate-x-1/2 -translate-y-1/2 truncate rounded-full border border-border bg-card px-1.5 py-px text-[10px] leading-4 text-muted-foreground"
-                style={{ left: mid.x, top: mid.y }}
-              >
-                {e.label}
-              </span>
-            )
-          })}
-          <div role="list" aria-label="Lineage graph">
-            {nodes.map((n) => (
-              <div
-                key={n.id}
-                role="listitem"
-                className={cn(
-                  "absolute flex flex-col justify-center gap-0.5 rounded-xl border bg-card px-3 shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]",
-                  n.centre
-                    ? "border-primary bg-primary/10 ring-2 ring-primary/30"
-                    : n.recorded
-                      ? "border-border"
-                      : "border-dashed border-border"
-                )}
-                style={{ left: n.x, top: n.y, width: NODE_W, height: NODE_H }}
-              >
-                {n.group ? (
-                  <GroupToggle node={n} group={n.group} onToggle={toggle} />
-                ) : (
-                  <>
-                    <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                      {n.caption}
-                    </span>
-                    <NodeName node={n} />
-                  </>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
+      <PanZoomBox content={{ width: layout.width, height: layout.height }}>
+        <MindmapDrawing edges={model.edges} layout={layout} onToggle={toggle} />
+      </PanZoomBox>
       <p className="text-xs text-muted-foreground">
         This asset is in the middle: what it is built from is to its left, what is built from it to
         its right.
@@ -508,11 +440,382 @@ export function LineageMindmap({
   )
 }
 
+/**
+ * The drawing at zoom 1. Memoised: a pan or zoom moves the box's one
+ * transform and must not redraw a hundred nodes on every pointer move.
+ */
+const MindmapDrawing = React.memo(function MindmapDrawing({
+  edges,
+  layout,
+  onToggle,
+}: {
+  edges: MapEdge[]
+  layout: ReturnType<typeof mindmapLayout>
+  onToggle: (key: string) => void
+}) {
+  const { nodes, width, height } = layout
+  const at = new Map(nodes.map((n) => [n.id, n]))
+  const centre = nodes.find((n) => n.centre)
+  return (
+    <div className="relative" style={{ width, height }}>
+      <svg
+        className="pointer-events-none absolute inset-0 overflow-visible"
+        width={width}
+        height={height}
+        aria-hidden
+      >
+        {edges.map((e) => {
+          const from = at.get(e.from)
+          const to = at.get(e.to)
+          if (!from || !to) return null
+          const touchesCentre = from.id === centre?.id || to.id === centre?.id
+          return (
+            <path
+              key={e.id}
+              d={curve(from, to).d}
+              fill="none"
+              strokeWidth={e.recorded ? 2 : 1.5}
+              strokeDasharray={e.recorded ? undefined : "5 5"}
+              strokeLinecap="round"
+              className={touchesCentre && e.recorded ? "stroke-primary/60" : "stroke-muted-foreground/40"}
+            />
+          )
+        })}
+      </svg>
+      {edges.map((e) => {
+        const from = at.get(e.from)
+        const to = at.get(e.to)
+        if (!from || !to) return null
+        if (e.label === "") return null
+        const { mid } = curve(from, to)
+        return (
+          <span
+            key={e.id}
+            title={e.title}
+            className="absolute max-w-[112px] -translate-x-1/2 -translate-y-1/2 truncate rounded-full border border-border bg-card px-1.5 py-px text-[10px] leading-4 text-muted-foreground"
+            style={{ left: mid.x, top: mid.y }}
+          >
+            {e.label}
+          </span>
+        )
+      })}
+      <div role="list" aria-label="Lineage graph">
+        {nodes.map((n) => (
+          <div
+            key={n.id}
+            role="listitem"
+            className={cn(
+              "absolute flex flex-col justify-center gap-0.5 rounded-xl border bg-card px-3 shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]",
+              n.centre
+                ? "border-primary bg-primary/10 ring-2 ring-primary/30"
+                : n.recorded
+                  ? "border-border"
+                  : "border-dashed border-border"
+            )}
+            style={{ left: n.x, top: n.y, width: NODE_W, height: NODE_H }}
+          >
+            {n.group ? (
+              <GroupToggle node={n} group={n.group} onToggle={onToggle} />
+            ) : (
+              <>
+                <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  {n.caption}
+                </span>
+                <NodeName node={n} />
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+})
+
+/** Room between the box's edge and the drawing, at any zoom. */
+const BOX_PAD = 24
+/** The tallest the box grows; a taller drawing opens fitted inside it. */
+const BOX_CAP = 560
+/** How far a pointer moves before a press becomes a drag (and stops being a click). */
+const DRAG_SLOP = 4
+
+/**
+ * A box the drawing pans and zooms in (`BI-71` decision 3): drag (mouse or
+ * one finger) moves it; Ctrl/⌘ + wheel, a trackpad pinch and a two-finger
+ * pinch zoom around the pointer; `+`, `−` and Fit sit in the corner, and
+ * `+`/`-`/`0` do the same while the box has focus. A plain wheel is left
+ * to the page, so the box never traps its scroll.
+ *
+ * The view is `null` while the drawing is fitted, so it stays fitted as the
+ * box resizes and is fitted again when the drawing changes size (a group
+ * opened or closed). A button, a key or a fit eases over 200 ms; a drag,
+ * pinch or wheel follows the hand with no easing.
+ */
+function PanZoomBox({ content, children }: { content: Size; children: React.ReactNode }) {
+  const boxRef = React.useRef<HTMLDivElement>(null)
+  const [width, setWidth] = React.useState(0)
+  const [chosen, setChosen] = React.useState<View | null>(null)
+  const [eased, setEased] = React.useState(false)
+  const [dragging, setDragging] = React.useState(false)
+
+  React.useLayoutEffect(() => {
+    if (boxRef.current) setWidth(boxRef.current.getBoundingClientRect().width)
+  }, [])
+  React.useEffect(() => {
+    const el = boxRef.current
+    if (!el) return
+    const ro = new ResizeObserver((e) => setWidth(e[0].contentRect.width))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  // A drawing of a new size (a group opened or closed) is fitted again.
+  const sizeKey = `${content.width}x${content.height}`
+  const [fittedFor, setFittedFor] = React.useState(sizeKey)
+  if (fittedFor !== sizeKey) {
+    setFittedFor(sizeKey)
+    setChosen(null)
+    setEased(true)
+  }
+
+  const box = { width, height: boxHeight(content, width, BOX_PAD, BOX_CAP) }
+  const measured = width > 0
+  const min = fitScale(content, box, BOX_PAD)
+  const view: View = !measured
+    ? { scale: 1, x: BOX_PAD, y: BOX_PAD }
+    : chosen
+      ? clampView(chosen, content, box, BOX_PAD)
+      : fitView(content, box, BOX_PAD)
+
+  // The handlers below run outside render; they read the latest of these,
+  // written after each render commits.
+  const live = React.useRef({ view, content, box })
+  React.useLayoutEffect(() => {
+    live.current = { view, content, box }
+  })
+
+  const move = React.useCallback((next: View, ease: boolean) => {
+    // Several wheel or pinch events can arrive before a render commits; each
+    // builds on the last one, not on the view last drawn.
+    live.current = { ...live.current, view: next }
+    setEased(ease)
+    setChosen(next)
+  }, [])
+  const zoomBy = React.useCallback(
+    (factor: number, point?: { x: number; y: number }, ease = false) => {
+      const { view: v, content: c, box: b } = live.current
+      move(zoomAt(v, factor, point ?? { x: b.width / 2, y: b.height / 2 }, c, b, BOX_PAD), ease)
+    },
+    [move]
+  )
+  const fit = () => {
+    setEased(true)
+    setChosen(null)
+  }
+
+  // Ctrl/⌘ + wheel (a trackpad pinch arrives as one too) and Safari's
+  // gesture events. Not React handlers: both must be non-passive to stop
+  // the page zooming instead.
+  React.useEffect(() => {
+    const el = boxRef.current
+    if (!el) return
+    const local = (e: { clientX: number; clientY: number }) => {
+      const r = el.getBoundingClientRect()
+      return { x: e.clientX - r.left, y: e.clientY - r.top }
+    }
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return
+      e.preventDefault()
+      const lines = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1
+      zoomBy(Math.exp(-e.deltaY * lines * 0.01), local(e))
+    }
+    type Gesture = Event & { scale: number; clientX: number; clientY: number }
+    let start: View | null = null
+    const onGestureStart = (e: Event) => {
+      e.preventDefault()
+      start = live.current.view
+    }
+    const onGestureChange = (e: Event) => {
+      e.preventDefault()
+      const g = e as Gesture
+      if (!start) return
+      const { content: c, box: b } = live.current
+      move(zoomAt(start, g.scale, local(g), c, b, BOX_PAD), false)
+    }
+    el.addEventListener("wheel", onWheel, { passive: false })
+    el.addEventListener("gesturestart", onGestureStart)
+    el.addEventListener("gesturechange", onGestureChange)
+    return () => {
+      el.removeEventListener("wheel", onWheel)
+      el.removeEventListener("gesturestart", onGestureStart)
+      el.removeEventListener("gesturechange", onGestureChange)
+    }
+  }, [move, zoomBy])
+
+  // Pointers: one drags, two pinch. A press becomes a drag only after
+  // DRAG_SLOP pixels, so a click on a node still opens it; a drag that
+  // ends over a node does not.
+  const pointers = React.useRef(new Map<number, { x: number; y: number }>())
+  const gesture = React.useRef<
+    | { kind: "drag"; from: { x: number; y: number }; view: View; moved: boolean }
+    | { kind: "pinch"; distance: number; mid: { x: number; y: number }; view: View }
+    | null
+  >(null)
+  const swallowClick = React.useRef(false)
+
+  const at = (e: React.PointerEvent) => {
+    const r = e.currentTarget.getBoundingClientRect()
+    return { x: e.clientX - r.left, y: e.clientY - r.top }
+  }
+  const pair = () => {
+    const [a, b] = [...pointers.current.values()]
+    return { distance: Math.hypot(a.x - b.x, a.y - b.y) || 1, mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } }
+  }
+  const startDrag = (from: { x: number; y: number }, moved: boolean) => {
+    gesture.current = { kind: "drag", from, view: live.current.view, moved }
+  }
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return
+    swallowClick.current = false
+    pointers.current.set(e.pointerId, at(e))
+    if (pointers.current.size === 1) startDrag(at(e), false)
+    else if (pointers.current.size === 2) {
+      gesture.current = { kind: "pinch", ...pair(), view: live.current.view }
+      swallowClick.current = true
+    }
+  }
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!pointers.current.has(e.pointerId)) return
+    pointers.current.set(e.pointerId, at(e))
+    const g = gesture.current
+    if (!g) return
+    const { content: c, box: b } = live.current
+    if (g.kind === "pinch" && pointers.current.size >= 2) {
+      const { distance, mid } = pair()
+      const zoomed = zoomAt(g.view, distance / g.distance, g.mid, c, b, BOX_PAD)
+      move(clampView({ ...zoomed, x: zoomed.x + mid.x - g.mid.x, y: zoomed.y + mid.y - g.mid.y }, c, b, BOX_PAD), false)
+      return
+    }
+    if (g.kind !== "drag") return
+    const p = at(e)
+    const dx = p.x - g.from.x
+    const dy = p.y - g.from.y
+    if (!g.moved) {
+      if (Math.hypot(dx, dy) < DRAG_SLOP) return
+      g.moved = true
+      swallowClick.current = true
+      setDragging(true)
+      e.currentTarget.setPointerCapture?.(e.pointerId)
+    }
+    move(clampView({ ...g.view, x: g.view.x + dx, y: g.view.y + dy }, c, b, BOX_PAD), false)
+  }
+  const onPointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!pointers.current.delete(e.pointerId)) return
+    const [left] = [...pointers.current.values()]
+    // One finger lifted from a pinch: the other carries on as a drag.
+    if (left) startDrag(left, true)
+    else {
+      gesture.current = null
+      setDragging(false)
+    }
+  }
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return
+    if (e.key === "+" || e.key === "=") zoomBy(ZOOM_STEP, undefined, true)
+    else if (e.key === "-" || e.key === "_") zoomBy(1 / ZOOM_STEP, undefined, true)
+    else if (e.key === "0") fit()
+    else return
+    e.preventDefault()
+  }
+
+  const fitted = chosen === null
+  return (
+    <div
+      ref={boxRef}
+      role="region"
+      aria-label="Lineage map"
+      aria-keyshortcuts="+ - 0"
+      tabIndex={0}
+      data-zoom={view.scale.toFixed(3)}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerEnd}
+      onPointerCancel={onPointerEnd}
+      onClickCapture={(e) => {
+        if (!swallowClick.current) return
+        swallowClick.current = false
+        e.preventDefault()
+        e.stopPropagation()
+      }}
+      onKeyDown={onKeyDown}
+      className={cn(
+        "relative touch-none overflow-hidden rounded-lg border border-border bg-muted/20 outline-none select-none focus-visible:ring-2 focus-visible:ring-ring",
+        dragging ? "cursor-grabbing" : "cursor-grab"
+      )}
+      style={{ height: box.height }}
+    >
+      <div
+        data-slot="map-drawing"
+        className={cn("absolute top-0 left-0 origin-top-left", eased && "transition-transform duration-200 ease-ui")}
+        style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}
+      >
+        {children}
+      </div>
+      <div
+        className="absolute top-2 right-2 flex items-center rounded-lg bg-background p-0.5 shadow-[0_1px_2px_rgb(0_0_0/0.06)] ring-1 ring-border"
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        <MapButton label="Zoom in" keys="+" disabled={!measured || view.scale >= ZOOM_MAX} onClick={() => zoomBy(ZOOM_STEP, undefined, true)}>
+          <Plus />
+        </MapButton>
+        <MapButton label="Zoom out" keys="−" disabled={!measured || view.scale <= min + 1e-6} onClick={() => zoomBy(1 / ZOOM_STEP, undefined, true)}>
+          <Minus />
+        </MapButton>
+        <MapButton label="Fit" keys="0" disabled={!measured || fitted} onClick={fit}>
+          <Scan />
+        </MapButton>
+      </div>
+    </div>
+  )
+}
+
+/** One of the map's corner buttons: an icon, its name and shortcut in the tooltip. */
+function MapButton({
+  label,
+  keys,
+  disabled,
+  onClick,
+  children,
+}: {
+  label: string
+  keys: string
+  disabled: boolean
+  onClick: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button variant="ghost" size="icon" aria-label={label} disabled={disabled} onClick={onClick}>
+            {children}
+          </Button>
+        }
+      />
+      <TooltipContent>
+        {label} <span className="text-background/60">{keys}</span>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 /** A node's name: a link to its page when it has one. The full name is in the tooltip. */
 function NodeName({ node: n }: { node: MapNode }) {
   return n.href ? (
     <Link
       href={n.href}
+      draggable={false}
       className="truncate text-sm font-medium leading-5 text-foreground hover:text-primary"
       title={n.label}
     >
