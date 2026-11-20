@@ -19,7 +19,11 @@ import {
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+// `navigator.clipboard` is missing over plain http, so the copy goes through
+// the helper that falls back to a textarea (`UX-6`).
+import { copyText } from "@/lib/copy-text";
 import { formatRelativeTime } from "@/lib/format";
+import { notifyFailure } from "@/lib/notify";
 import { settleStreamingMarkdown } from "@/lib/stream-markdown";
 import { cn } from "@/lib/utils";
 import type { AskAnswer } from "./answer-ask";
@@ -192,7 +196,20 @@ function MessageFooter({
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-200 group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100">
         <ActionButton
           label={copied ? "Copied" : "Copy message"}
-          onClick={() => void navigator.clipboard.writeText(msg.content).then(() => setCopied(true), () => {})}
+          onClick={() =>
+            // The check mark means "on the clipboard", so it flips only when
+            // the helper reports the copy worked (`UX-6` D2).
+            void copyText(msg.content).then((copied) => {
+              if (copied) {
+                setCopied(true);
+                return;
+              }
+              notifyFailure(
+                "Could not copy",
+                "The browser refused the copy. Select the text and copy it by hand."
+              );
+            })
+          }
         >
           {copied ? <Check className="size-3 text-emerald-500" /> : <Copy className="size-3" />}
         </ActionButton>
