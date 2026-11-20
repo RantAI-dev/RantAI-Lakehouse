@@ -580,6 +580,30 @@ no-author reads-as, no-target-lag labels, draft Trigger-run) pass on both.
 - No full Rust workspace run locally (CI runs it on the PR, per the owner's
   2026-10-30 decision). Scoped per-crate clippy/test above are the local proof.
 
+### Fix round 1 — planner review R1–R5 (Hy4 flash, 2026-11-20)
+
+One commit per finding, in order, pushed after each. Every fix site cites
+`BLD-11 review R<n>`. No force push, no PR.
+
+| Finding | Commit | Fix + scoped check (counts) |
+| --- | --- | --- |
+| R1 | `b7d78b767` | Keep Resume for a paused target-lag pipeline (hide Pause only); reword feature-page decision 6. `bun test pipeline-detail-page.test.tsx` → 16 passed. Mutation: old hide-both condition → new test fails (no Resume) |
+| R2 | `ee74930ce` | Move the D9 constants and `wait_for_job` above `authored_launch_target`'s doc block. Structural (no test asked): `cargo fmt --check`, `cargo clippy -p lakehouse-api --all-targets -- -D warnings`, existing Run-now 409 test → 1 passed |
+| R3 | `d5e530f24` | Wrap the bounded looks in `tokio::time::timeout(20 s)`; same 409 on expiry; fix the "first attempt is that look" comment. `cargo test -p lakehouse-api --lib status_route::` → 10 passed. Mutation: remove the timeout → the stalled-probe test ran 269 s and failed |
+| R4 | `4fd9dbde5` | Enable Trigger run for any non-draft authored row (paused included); correct the list page's comment. `bun test pipeline-columns.test.tsx` → 15 passed. Mutation: ready-only condition → new paused-row test fails |
+| R5 | `15d8ec773` | Limits line in `pipeline-joins-and-sql.md` + changelog entry about D11's changed output; refuse duplicate output names at save with a fixed sentence. `cargo test -p lakehouse-api --lib pipeline_compile::tests::` → 46 passed. Mutation: remove the check → old code compiled the duplicate-column SQL and both refusal tests failed |
+
+**Final verification (final commit `15d8ec773`, foreground):**
+
+- `bun run typecheck` — pass.
+- `bun run lint` — 0 errors, 13 pre-existing warnings (none from this branch).
+- `bun run test` — first run 4660 pass / 1 skip / 1 fail in an unrelated
+  shared-process test (`schema-browser.test.tsx` Trino-tab case, which passes
+  in isolation); the immediate re-run was **4661 pass / 1 skip / 0 fail**.
+  No test was weakened to get green.
+- Per-commit scoped Rust checks: `cargo fmt --check`, `cargo clippy -p
+  lakehouse-api --all-targets -- -D warnings`, and the filters above; all pass.
+
 ## Review
 
 *(the reviewer appends one entry per round)*
