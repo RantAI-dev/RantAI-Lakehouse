@@ -107,6 +107,8 @@ export const TOOL_LABEL: Record<string, string> = {
   // RPT-1 / AI-10: scheduled reports by email.
   create_report_subscription: "Schedule report",
   list_report_subscriptions: "List scheduled reports",
+  // AI-30: the read-only people lookup for a report's recipients.
+  find_report_recipients: "Find recipients",
   update_report_subscription: "Change scheduled report",
   delete_report_subscription: "Delete scheduled report",
   // BI-26 slice 2: signed embedding. The labels say what waits for a human
