@@ -2904,6 +2904,18 @@ table = catalog.load_table(("gold", "gold_export_smoke"))
 print(table.scan().to_arrow().num_rows)
 ```
 
+Reading `gold.<table>` WITHOUT a filter counts every kept copy — the
+table holds one full copy per publish and `DATA-2`'s trim keeps the
+newest 7 — so a tool that just counts rows sees seven times the truth.
+`DATA-6` added the latest-copy table for exactly that reader:
+`gold.<table>_latest` always holds only the newest copy, so it needs no
+filter:
+
+```python
+table = catalog.load_table(("gold", "gold_export_smoke_latest"))
+print(table.scan().to_arrow().num_rows)  # one copy, no filter needed
+```
+
 **DuckDB.** The `iceberg` extension attaches the REST catalog as a
 database:
 
