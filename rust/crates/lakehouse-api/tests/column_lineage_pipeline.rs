@@ -608,3 +608,125 @@ async fn a_pipeline_whose_step_is_a_union_records_no_edge() {
         Some("built with UNION, INTERSECT or EXCEPT; the branches are not traced")
     );
 }
+
+// DATA-57 T6: the form steps of #619, built exactly as #619's own tests do,
+// recorded through the routes now that D9 notes every compiled statement.
+
+/// A join, an aggregate and a filter, built exactly as #619's own tests do.
+fn form_steps() -> Vec<pipelines::PipelineStep> {
+    vec![
+        pipelines::PipelineStep::Join {
+            name: "joined".to_owned(),
+            left: "orders".to_owned(),
+            right: "customers".to_owned(),
+            join_type: "inner".to_owned(),
+            on: vec![pipelines::JoinPair {
+                left: "id".to_owned(),
+                right: "id".to_owned(),
+            }],
+            columns: vec![
+                pipelines::JoinColumn {
+                    side: "left".to_owned(),
+                    column: "id".to_owned(),
+                    name: String::new(),
+                },
+                pipelines::JoinColumn {
+                    side: "left".to_owned(),
+                    column: "amount".to_owned(),
+                    name: String::new(),
+                },
+                pipelines::JoinColumn {
+                    side: "right".to_owned(),
+                    column: "price".to_owned(),
+                    name: "unit_price".to_owned(),
+                },
+            ],
+        },
+        pipelines::PipelineStep::Aggregate {
+            name: "by_id".to_owned(),
+            reads: "joined".to_owned(),
+            group_by: vec!["id".to_owned()],
+            measures: vec![
+                pipelines::Measure {
+                    function: "sum".to_owned(),
+                    column: "amount".to_owned(),
+                    name: "total".to_owned(),
+                },
+                pipelines::Measure {
+                    function: "count".to_owned(),
+                    column: String::new(),
+                    name: "n".to_owned(),
+                },
+            ],
+            having_match: String::new(),
+            having: Vec::new(),
+        },
+        pipelines::PipelineStep::Filter {
+            name: "big".to_owned(),
+            reads: "by_id".to_owned(),
+            match_mode: "all".to_owned(),
+            conditions: vec![pipelines::StepCondition {
+                column: "total".to_owned(),
+                operator: ">".to_owned(),
+                value: "0".to_owned(),
+            }],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_pipeline_of_form_steps_records_its_columns() {
+    let (router, pool, cookie, _servers) = app("SUCCESS").await;
+    let author = seeded_user_id(&pool, "yoga@meridian.example").await;
+    let id = seed_pipeline_with(
+        &pool,
+        author,
+        vec![
+            pipelines::PipelineInput {
+                name: "orders".to_owned(),
+                zone: "bronze".to_owned(),
+                table: "orders".to_owned(),
+            },
+            pipelines::PipelineInput {
+                name: "customers".to_owned(),
+                zone: "bronze".to_owned(),
+                table: "customers".to_owned(),
+            },
+        ],
+        form_steps(),
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        pending(&pool, &id).await.is_some(),
+        "the form steps were noted"
+    );
+
+    let (status, body) = run_finished(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = rows_for_pipeline(&pool, &id).await;
+    assert_eq!(
+        rows,
+        vec![
+            (
+                Some("bronze.orders".to_owned()),
+                Some("amount".to_owned()),
+                "total".to_owned(),
+                "expression".to_owned(),
+                false,
+                None,
+            ),
+            (
+                Some("bronze.orders".to_owned()),
+                Some("id".to_owned()),
+                "id".to_owned(),
+                "copy".to_owned(),
+                false,
+                None,
+            ),
+        ],
+        "`n` is a constant and `unit_price` is dropped by the aggregate"
+    );
+}
