@@ -2967,6 +2967,34 @@ pub async fn run_finished_event(
 // rust-clippy#17130). The `Err` here is a ready `Response` the route returns
 // verbatim, so boxing it would change this helper's contract and every call
 // site for an allocation only on the error path (REL-9, decision D2).
+/// BLD-11 D9 (F6): a bound on how long `Run now` waits for the orchestrator
+/// to finish loading a just-marked-ready job. Ten two-second looks (20 s)
+/// bound a request a person is waiting on — this is NOT a measured reload
+/// time; the handoff reports the real first-Run-now time on the compose
+/// stack. One fresh look after the reload is followed by these attempts.
+const LAUNCH_JOB_WAIT_ATTEMPTS: u32 = 10;
+const LAUNCH_JOB_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Look for a loaded job up to `attempts` times, `interval` apart (BLD-11
+/// D9). A job that appears on a later look is found; exhausting the looks
+/// returns `false` so the caller can refuse with the try-again 409.
+async fn wait_for_job(
+    state: &AppState,
+    id: &str,
+    attempts: u32,
+    interval: std::time::Duration,
+) -> bool {
+    for attempt in 0..attempts {
+        if authored_pipelines::job_is_loaded(state, id).await {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(interval).await;
+        }
+    }
+    false
+}
+
 #[allow(
     clippy::result_large_err,
     reason = "the Err is a ready Response the route returns verbatim; boxing it would change every call site for no gain on the success path"
@@ -2987,10 +3015,21 @@ async fn authored_launch_target(state: &AppState, id: &str) -> Result<String, Re
     }
     if !authored_pipelines::job_is_loaded(state, id).await {
         authored_pipelines::reload_orchestrator(state).await;
-        if !authored_pipelines::job_is_loaded(state, id).await {
+        // BLD-11 D9 (F6): a job the reload has not loaded yet is often there
+        // a moment later. Give it bounded looks before answering 409, so the
+        // first Run now after Mark ready is not refused by a race.
+        if !wait_for_job(
+            state,
+            id,
+            LAUNCH_JOB_WAIT_ATTEMPTS,
+            LAUNCH_JOB_WAIT_INTERVAL,
+        )
+        .await
+        {
             return Err(ApiRejection(ApiError::Conflict(
-                "the orchestrator has not loaded this pipeline's job; check that \
-                 PIPELINE_RUN_TOKEN is set for both the API and the Dagster code location"
+                "the orchestrator has not loaded this pipeline's job yet; try again in a minute. \
+                 If it never loads, check that PIPELINE_RUN_TOKEN is set for both the API and the \
+                 Dagster code location"
                     .to_owned(),
             ))
             .into_response());
@@ -3688,10 +3727,15 @@ pub async fn set_status_route(
     let updated = pipelines::set_status(pool(&state)?, &id, &body.status)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
-    // A pipeline that just became ready needs a job: the orchestrator
-    // builds it on reload. Best effort; `trigger` reloads again if the job
-    // is still missing when someone runs it.
-    authored_pipelines::reload_orchestrator(&state).await;
+    // A pipeline that just became ready needs a job: the orchestrator builds
+    // it on reload. BLD-11 D8 (F6): the status write has already committed,
+    // so answer now and let the best-effort reload finish in the background.
+    // Waiting here made "Mark ready" hang for the whole reload; `Run now`
+    // waits briefly for the job instead (see `authored_launch_target`).
+    let bg = state.clone();
+    tokio::spawn(async move {
+        let _ = authored_pipelines::reload_orchestrator(&bg).await;
+    });
     Ok(ApiJson(updated))
 }
 
@@ -8092,6 +8136,31 @@ mod tests {
             AppState::new(config)
         }
 
+        /// The same state with `DAGSTER_URL` pointed at a wiremock, for the
+        /// BLD-11 D8/D9 tests that exercise the reload and job-load probes.
+        fn state_with_dagster(pool: &sqlx::PgPool, dagster_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
+            env.insert("DAGSTER_URL".to_owned(), format!("{dagster_uri}/graphql"));
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        /// A Dagster GraphQL job list, with or without the authored job.
+        fn job_list_response(with_job: bool) -> serde_json::Value {
+            let jobs = if with_job {
+                vec![json!({ "name": "authored__pl_wait" })]
+            } else {
+                Vec::new()
+            };
+            json!({
+                "data": { "repositoriesOrError": {
+                    "__typename": "RepositoryConnection",
+                    "nodes": [{ "jobs": jobs }]
+                } }
+            })
+        }
+
         /// R1-B9: a service identity can create a pipeline, and it has no
         /// author — a service has no `app_user` row to read as, and "the
         /// service account reads everything" is what `run_as` exists to stop
@@ -8184,6 +8253,157 @@ mod tests {
             .await
             .expect("draft -> ready should succeed");
             assert_eq!(updated.status, "ready");
+        }
+
+        /// BLD-11 D8 (F6): Mark ready answers as soon as the status is
+        /// written, not after the orchestrator's (here 5-second) reload.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn marking_ready_answers_before_the_orchestrator_reload_finishes(pool: sqlx::PgPool) {
+            use wiremock::matchers::{body_string_contains, method};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let dagster = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("reloadRepositoryLocation"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_secs(5))
+                        .set_body_json(json!({
+                            "data": { "reloadRepositoryLocation": {
+                                "__typename": "WorkspaceLocationEntry",
+                                "locationOrLoadError": { "__typename": "Loaded" }
+                            } }
+                        })),
+                )
+                .mount(&dagster)
+                .await;
+            let state = state_with_dagster(&pool, &dagster.uri());
+            let pipeline = create_draft(&state).await;
+
+            let ApiJson(updated) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                set_status_route(
+                    State(state),
+                    Some(Extension(fixture_unrestricted_principal())),
+                    HeaderMap::new(),
+                    Path(pipeline.id.clone()),
+                    status_body("ready"),
+                ),
+            )
+            .await
+            .expect("the route answers before the 5 s reload finishes")
+            .expect("draft -> ready succeeds");
+            assert_eq!(updated.status, "ready");
+            let stored = pipelines::get_pipeline(&pool, &pipeline.id)
+                .await
+                .expect("read the pipeline")
+                .expect("the row exists");
+            assert_eq!(stored.status, "ready");
+            // Let the best-effort background reload settle before the mock drops.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+
+        /// BLD-11 D9 (F6): a job that is not loaded on the first look but is
+        /// on the second is found before the attempts run out.
+        #[tokio::test]
+        async fn wait_for_job_finds_a_job_that_appears_on_the_second_look() {
+            use wiremock::matchers::{body_string_contains, method};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("repositoriesOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(job_list_response(false)))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("repositoriesOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(job_list_response(true)))
+                .with_priority(2)
+                .mount(&server)
+                .await;
+            let state = AppState::new(
+                Config::from_map(&HashMap::from([(
+                    "DAGSTER_URL".to_owned(),
+                    format!("{}/graphql", server.uri()),
+                )]))
+                .expect("a valid test Config"),
+            );
+
+            assert!(wait_for_job(&state, "pl-wait", 3, std::time::Duration::from_millis(50)).await);
+        }
+
+        /// BLD-11 D9: when the job never appears, `wait_for_job` gives up
+        /// after its attempts instead of waiting forever.
+        #[tokio::test]
+        async fn wait_for_job_gives_up_after_its_attempts() {
+            use wiremock::matchers::{body_string_contains, method};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("repositoriesOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(job_list_response(false)))
+                .mount(&server)
+                .await;
+            let state = AppState::new(
+                Config::from_map(&HashMap::from([(
+                    "DAGSTER_URL".to_owned(),
+                    format!("{}/graphql", server.uri()),
+                )]))
+                .expect("a valid test Config"),
+            );
+
+            assert!(
+                !wait_for_job(&state, "pl-wait", 3, std::time::Duration::from_millis(50)).await
+            );
+        }
+
+        /// BLD-11 D9 (F6): a Run now on a job that never loads answers 409
+        /// with the try-again text, not the old bare token-check sentence.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn run_now_on_a_job_that_never_loads_says_to_try_again(pool: sqlx::PgPool) {
+            use wiremock::matchers::{body_string_contains, method};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let dagster = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("repositoriesOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(job_list_response(false)))
+                .mount(&dagster)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("reloadRepositoryLocation"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "reloadRepositoryLocation": {
+                        "__typename": "WorkspaceLocationEntry",
+                        "locationOrLoadError": { "__typename": "Loaded" }
+                    } }
+                })))
+                .mount(&dagster)
+                .await;
+            let state = state_with_dagster(&pool, &dagster.uri());
+            let pipeline = create_draft(&state).await;
+            sqlx::query("UPDATE pipeline_definition SET status = 'ready' WHERE id = $1")
+                .bind(&pipeline.id)
+                .execute(&pool)
+                .await
+                .expect("mark the pipeline ready");
+
+            let response = authored_launch_target(&state, &pipeline.id)
+                .await
+                .expect_err("a job that never loads is refused");
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read the response body");
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains("try again in a minute"),
+                "the 409 says to try again: {text}"
+            );
         }
 
         #[sqlx::test(migrations = "../../migrations")]
