@@ -10,10 +10,13 @@
 //!   drain sits outside the auth gate, so the gate's own early answer is
 //!   drained too;
 //! * a body over the drain's cap is refused with the size sentence, and the
-//!   API reads no more than the cap;
+//!   API reads no more than the cap plus one frame;
 //! * the drain touches that one route and nothing else: another route's
 //!   body is not read at all, another method on the same path is not read
-//!   either, and a kind outside the list keeps its own 404.
+//!   either;
+//! * a kind outside the list is drained all the same and keeps its own 404:
+//!   it has no size sentence, so a body of its own over the cap keeps the
+//!   404 too, never a 413.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -43,6 +46,10 @@ const ICON_RULE: &str = "The icon must be a PNG image of at most 64 KB.";
 /// The cap the drain reads up to, 16 MiB. Written out here rather than read
 /// from the server's constant, so a change to the cap fails this test.
 const DRAIN_CAP: u64 = 16 * 1024 * 1024;
+
+/// A frame size that does not divide the cap, so the frame the cap does not
+/// cover shows up in the count of what the API read.
+const ODD_FRAME: usize = 100 * 1024;
 
 /// A PNG-headed buffer of `total` bytes.
 fn png_bytes(total: usize) -> Vec<u8> {
@@ -308,7 +315,8 @@ async fn an_oversized_icon_put_answers_the_icon_sentence_over_a_real_socket() {
 /// This one runs in process: over a socket the peer may see the connection
 /// go away before it reads the answer, because the server stopped reading
 /// the body on purpose. What is deterministic — and what the cap exists for
-/// — is how much the API read: exactly the cap, not one byte more.
+/// — is how much the API read: with frames that divide the cap, exactly the
+/// cap, not one byte more.
 #[tokio::test]
 async fn a_body_over_the_cap_is_refused_with_the_size_sentence_and_the_api_reads_no_more_than_the_cap()
  {
@@ -332,6 +340,39 @@ async fn a_body_over_the_cap_is_refused_with_the_size_sentence_and_the_api_reads
         taken.load(Ordering::Relaxed),
         DRAIN_CAP,
         "the API must stop reading at the cap"
+    );
+}
+
+/// The bound the cap really is: the drain reads a frame and only then looks
+/// at the counter, so the API reads at most the cap plus one frame. A frame
+/// size that does not divide the cap shows the frame the cap does not
+/// cover: the API reads past the cap, but never past the cap plus a frame.
+#[tokio::test]
+async fn a_body_over_the_cap_is_read_up_to_the_cap_plus_one_frame() {
+    let app = common::spin_up().await;
+    let taken = Arc::new(AtomicU64::new(0));
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/api/settings/general/images/logo")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(counted_body(20 * 1024 * 1024, ODD_FRAME, taken.clone()))
+        .unwrap();
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let text = String::from_utf8_lossy(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+        .to_string();
+    assert!(text.contains(LOGO_SIZE), "{text}");
+    let read = taken.load(Ordering::Relaxed);
+    assert!(
+        read > DRAIN_CAP,
+        "the API read {read} bytes, not past the cap"
+    );
+    assert!(
+        read <= DRAIN_CAP + ODD_FRAME as u64,
+        "the API read {read} bytes, past the cap plus one frame"
     );
 }
 
@@ -414,10 +455,11 @@ async fn the_general_settings_put_is_not_drained_by_the_picture_drain() {
     );
 }
 
-/// A kind outside the list has no size sentence, so the drain does not act
-/// on it: the route's own 404 stands and its body is not read.
+/// A kind outside the list has no size sentence, so the drain cannot refuse
+/// it with one: the route's own 404 stands, and the body is read all the
+/// same — a client that is still sending it must be able to finish.
 #[tokio::test]
-async fn a_kind_outside_the_list_is_not_drained_and_keeps_its_own_404() {
+async fn a_kind_outside_the_list_is_drained_and_keeps_its_own_404() {
     let app = common::spin_up().await;
     let cookie = admin_cookie(&app.pool).await;
     let taken = Arc::new(AtomicU64::new(0));
@@ -435,7 +477,34 @@ async fn a_kind_outside_the_list_is_not_drained_and_keeps_its_own_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         taken.load(Ordering::Relaxed),
-        0,
-        "a kind outside the list must not be drained"
+        1024 * 1024,
+        "the drain must read the body of a kind outside the list too"
+    );
+}
+
+/// A body over the cap for a kind outside the list: the cap stops the
+/// reading, but there is no size sentence to refuse the body with, so the
+/// route's own 404 stands — never a 413.
+#[tokio::test]
+async fn a_kind_outside_the_list_over_the_cap_keeps_its_own_404() {
+    let app = common::spin_up().await;
+    let cookie = admin_cookie(&app.pool).await;
+    let taken = Arc::new(AtomicU64::new(0));
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/api/settings/general/images/banner")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header("cookie", cookie)
+        .body(counted_body(20 * 1024 * 1024, 64 * 1024, taken.clone()))
+        .unwrap();
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        taken.load(Ordering::Relaxed),
+        DRAIN_CAP,
+        "the API must stop reading at the cap"
     );
 }

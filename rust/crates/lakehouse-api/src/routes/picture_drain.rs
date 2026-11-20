@@ -16,12 +16,14 @@
 //!
 //! # What this layer does
 //!
-//! On that one route, and only for a `PUT` with a known kind, the layer
-//! reads what is left of the request body after the inner service answered
-//! and throws it away — never buffered, only counted — so the client
-//! finishes its upload and reads the answer on a connection that is still
-//! good. The answer itself does not change: the `422` with the size
-//! sentence, the `401`, the `404`, all as they were.
+//! On that one route, and only for a `PUT`, the layer reads what is left of
+//! the request body after the inner service answered and throws it away —
+//! never buffered, only counted — so the client finishes its upload and
+//! reads the answer on a connection that is still good. The kind of the
+//! picture does not decide whether the layer acts: a kind outside the list
+//! is drained all the same, and its own `404` stands. The answer itself
+//! does not change: the `422` with the size sentence, the `401`, the `404`,
+//! all as they were.
 //!
 //! The layer sits OUTSIDE the auth gate on purpose: the gate's `401` is one
 //! of the early answers, and an unauthenticated caller must get it the same
@@ -33,13 +35,25 @@
 //!
 //! Draining a body is work the API does for a caller it may have just
 //! refused, so the drain stops at [`PICTURE_DRAIN_MAX_BYTES`] (16 MiB) and
-//! answers `413` with the size sentence of the kind. The cap is far above
-//! the 512 KB logo rule and the 64 KB icon rule — every picture the feature
-//! accepts is well inside it — and far below a size that could pin memory.
-//! The amplification it allows is therefore small and bounded, and it is
+//! answers `413` with the size sentence of the kind. A kind outside the
+//! list has no size sentence, so a body of its own over the cap keeps the
+//! inner answer — the `404`, never a `413`. The cap is far above the 512 KB
+//! logo rule and the 64 KB icon rule — every picture the feature accepts is
+//! well inside it — and far below a size that could pin memory. The
+//! amplification it allows is therefore small and bounded, and it is
 //! accepted on purpose: an unauthenticated caller can make the API read up
 //! to 16 MiB per request. The alternative — refusing without reading — is
 //! what produced the reset the proxy turned into a server error.
+//!
+//! # What the cap does not promise
+//!
+//! The drain reads a frame and only then looks at the counter, so the API
+//! reads at most the cap plus one frame: the bytes of the frame that
+//! crossed the cap are already in memory when the cap is noticed. A frame
+//! is the transport's unit, not ours — hyper decides how large a frame is —
+//! so its size is not ours to fix. What the cap does promise is a bound
+//! that holds: the drain never reads an unbounded body and never buffers
+//! one.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -64,7 +78,11 @@ use crate::routes::settings::{picture_kind, picture_size_sentence};
 /// read it, so the two cannot drift apart.
 pub(crate) const PICTURE_ROUTE_PATTERN: &str = "/api/settings/general/images/{kind}";
 
-/// The most the drain reads from one request body, 16 MiB.
+/// The cap the drain reads up to, 16 MiB. The API reads at most the cap
+/// plus one frame: it reads a frame and only then looks at the counter, so
+/// the bytes of the frame that crossed the cap are already in memory when
+/// the cap is noticed. A frame is the transport's unit, not ours, so its
+/// size is not ours to fix.
 ///
 /// Why it exists: the drain reads a body the API has already answered, so
 /// without a bound an unauthenticated caller could make the API read an
@@ -72,8 +90,8 @@ pub(crate) const PICTURE_ROUTE_PATTERN: &str = "/api/settings/general/images/{ki
 /// icon rule (every picture the feature accepts is well inside it) and far
 /// below a size that could pin memory. The cap is hard for every caller,
 /// signed in or not (the Auditor's ruling, 2026-11-19); the amplification it
-/// allows — up to 16 MiB read per request — is small and bounded and is the
-/// accepted cost of answering instead of resetting.
+/// allows — up to 16 MiB plus one frame read per request — is small and
+/// bounded and is the accepted cost of answering instead of resetting.
 pub(crate) const PICTURE_DRAIN_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// The request body, shared between the inner service and the drain.
@@ -82,7 +100,8 @@ pub(crate) const PICTURE_DRAIN_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// a stream that pulls from the slot; when it drops its stream, the body is
 /// still in the slot, so hyper's connection stays open for the drain. The
 /// counter counts every byte handed out, so the cap bounds what the API read
-/// in total — the handler's reads included, the drain's included.
+/// in total, up to one frame — the handler's reads included, the drain's
+/// included.
 #[derive(Clone)]
 struct SharedBody {
     slot: Arc<Mutex<Option<Body>>>,
@@ -172,29 +191,40 @@ fn over_cap(kind: ImageKind) -> Response {
         .into_response()
 }
 
-/// The kind of the picture this request is about, when the request is one
-/// the drain acts on: a `PUT` on the picture route, for a kind in the list.
-/// Every other request is left alone.
-fn picture_kind_of(req: &Request) -> Option<ImageKind> {
+/// Whether this request is one the drain acts on: a `PUT` on the picture
+/// route, whatever kind of picture it names. Every other request is left
+/// alone.
+fn is_picture_put(req: &Request) -> bool {
     if req.method() != Method::PUT {
-        return None;
+        return false;
     }
-    let matched = req.extensions().get::<MatchedPath>()?.as_str();
-    if matched != PICTURE_ROUTE_PATTERN {
-        return None;
-    }
+    req.extensions()
+        .get::<MatchedPath>()
+        .is_some_and(|matched| matched.as_str() == PICTURE_ROUTE_PATTERN)
+}
+
+/// The kind of the picture this request is about, when the path names one in
+/// the list: `logo`, `logo-dark` or `icon`.
+///
+/// `None` for a kind outside the list: the route answers its own `404` for
+/// such a kind, and there is no size sentence to give.
+fn picture_kind_of(req: &Request) -> Option<ImageKind> {
     let kind = req.uri().path().rsplit('/').next()?;
     picture_kind(kind).ok()
 }
 
 /// The drain: reads what is left of the request body after the inner
-/// service answered, up to [`PICTURE_DRAIN_MAX_BYTES`], and answers `413`
-/// when the body turns out to be bigger than that. See the module doc
-/// comment for what broke and why the layer sits where it sits.
+/// service answered, up to [`PICTURE_DRAIN_MAX_BYTES`] plus one frame, and
+/// answers `413` when the body turns out to be bigger than that. A kind
+/// outside the list has no size sentence, so its own answer stands. See the
+/// module doc comment for what broke and why the layer sits where it sits.
 pub(crate) async fn drain(req: Request, next: Next) -> Response {
-    let Some(kind) = picture_kind_of(&req) else {
+    if !is_picture_put(&req) {
         return next.run(req).await;
-    };
+    }
+    // The kind is resolved apart from the scope check: a kind outside the
+    // list is drained all the same, and its own `404` stands.
+    let kind = picture_kind_of(&req);
 
     let (parts, body) = req.into_parts();
     let shared = SharedBody::shared(body);
@@ -220,7 +250,9 @@ pub(crate) async fn drain(req: Request, next: Next) -> Response {
             return if body_ended(&body) {
                 answer
             } else {
-                over_cap(kind)
+                // A kind outside the list has no size sentence, so the
+                // inner answer stands: the `404`, never a `413`.
+                kind.map_or_else(|| answer, over_cap)
             };
         }
         match next_data(Pin::new(&mut body)).await {
