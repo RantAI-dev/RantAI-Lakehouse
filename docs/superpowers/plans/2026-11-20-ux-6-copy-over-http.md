@@ -188,3 +188,34 @@ click ever inserts something. The reviewer should look at that commit on its
 own, as it is outside the plan's task list.
 
 ## Review
+
+Planner review, 2026-11-20, at `c01af29eb`. No BLOCKER.
+
+- Checked: no `navigator.clipboard` left in `src/` outside
+  `src/lib/copy-text.ts`; the lint block is its own block and leaves the
+  `WEB-9` select rule alone; success shows only on `true` at the sites read
+  (`copyable.tsx`, `copy-button.tsx`, `chat-messages.tsx`, `users-page.tsx`,
+  `audit-columns.tsx`); the new tests were shown to fail on the old code.
+- `0ccd011c5` (the `schema-browser` race) is outside the plan but justified
+  in its commit: no assertion changed, the test now holds the state its
+  name describes. Accepted.
+
+**R1 SHOULD-FIX: one failure toast, written 34 times.** The sentence
+"Could not copy" / "The browser refused the copy. Select the text and copy
+it by hand." is repeated in 24 files, most inside the same
+`copyText(x).then((copied) => { if (copied) notifySuccess(...) else
+notifyFailure(...) })` block. Rule 4 (`AGENTS.md`): one helper. Add to
+`src/lib/copy-text.ts`:
+
+```ts
+/** Copies `text` and tells the user: `success` (if given) on success, the
+ *  fixed failure toast otherwise. Resolves to whether it worked. */
+export async function copyTextWithToast(text: string, success?: string): Promise<boolean>
+```
+
+and use it at every site that only toasts. Sites that flip an icon
+(`copy-button.tsx`, `chat-messages.tsx`) call it without `success` and set
+the icon on `true`. Add one unit test for the helper (success toast on
+`true`, failure toast on `false`, no success toast on `false`). The
+failure text then exists once in `src/` (check: `grep -rc 'refused the
+copy' src | grep -v ':0'` lists only `copy-text.ts` and tests).
