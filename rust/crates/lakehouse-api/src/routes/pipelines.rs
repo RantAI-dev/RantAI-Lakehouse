@@ -2961,9 +2961,14 @@ pub async fn run_finished_event(
 /// to finish loading a just-marked-ready job. Ten two-second looks (20 s)
 /// bound a request a person is waiting on — this is NOT a measured reload
 /// time; the handoff reports the real first-Run-now time on the compose
-/// stack. One fresh look after the reload is followed by these attempts.
+/// stack. The first attempt IS that fresh look after the reload, not an
+/// extra one before the ten attempts (BLD-11 review R3).
 const LAUNCH_JOB_WAIT_ATTEMPTS: u32 = 10;
 const LAUNCH_JOB_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// BLD-11 review R3: a hard wall-clock bound on the whole wait. Sleeps alone
+/// are not a bound — an untimed `list_jobs` that stalls can run the request
+/// into the route deadline and answer a 408 instead of the try-again 409.
+const LAUNCH_JOB_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Look for a loaded job up to `attempts` times, `interval` apart (BLD-11
 /// D9). A job that appears on a later look is found; exhausting the looks
@@ -2986,6 +2991,21 @@ async fn wait_for_job(
         }
     }
     false
+}
+
+/// BLD-11 review R3: put a wall-clock deadline around the bounded looks so
+/// that a stalled `job_is_loaded` call cannot turn the try-again 409 into the
+/// route's generic 408. A timed-out wait is the same "job not loaded" answer.
+async fn wait_for_job_within(
+    state: &AppState,
+    id: &str,
+    attempts: u32,
+    interval: std::time::Duration,
+    budget: std::time::Duration,
+) -> bool {
+    tokio::time::timeout(budget, wait_for_job(state, id, attempts, interval))
+        .await
+        .unwrap_or(false)
 }
 
 /// The job to launch for authored pipeline `id`, or the response that
@@ -3018,14 +3038,17 @@ async fn authored_launch_target(state: &AppState, id: &str) -> Result<String, Re
     }
     if !authored_pipelines::job_is_loaded(state, id).await {
         authored_pipelines::reload_orchestrator(state).await;
-        // BLD-11 D9 (F6): a job the reload has not loaded yet is often there
-        // a moment later. Give it bounded looks before answering 409, so the
-        // first Run now after Mark ready is not refused by a race.
-        if !wait_for_job(
+        // BLD-11 D9 (F6) / review R3: a job the reload has not loaded yet is
+        // often there a moment later. Give it bounded looks under a 20 s
+        // wall-clock deadline before answering 409, so the first Run now
+        // after Mark ready is not refused by a race and a stalled Dagster
+        // cannot turn the 409 into the route deadline's 408.
+        if !wait_for_job_within(
             state,
             id,
             LAUNCH_JOB_WAIT_ATTEMPTS,
             LAUNCH_JOB_WAIT_INTERVAL,
+            LAUNCH_JOB_WAIT_TIMEOUT,
         )
         .await
         {
@@ -8406,6 +8429,55 @@ mod tests {
             assert!(
                 text.contains("try again in a minute"),
                 "the 409 says to try again: {text}"
+            );
+        }
+
+        /// BLD-11 review R3: the wait is bounded by wall-clock time, not by
+        /// sleeps plus however long `list_jobs` takes. A probe that stalls for
+        /// 25 s cannot outlive a 100 ms budget; before the fix there was no
+        /// bounded helper, and the same mock hung the whole request past the
+        /// route deadline instead of answering the try-again 409.
+        #[tokio::test]
+        async fn a_stalled_job_probe_stops_at_the_wall_clock_budget() {
+            use wiremock::matchers::{body_string_contains, method};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            assert_eq!(
+                super::super::LAUNCH_JOB_WAIT_TIMEOUT,
+                std::time::Duration::from_secs(20),
+                "the route's hard bound is 20 s"
+            );
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("repositoriesOrError"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_secs(25))
+                        .set_body_json(job_list_response(false)),
+                )
+                .mount(&server)
+                .await;
+            let state = AppState::new(
+                Config::from_map(&HashMap::from([(
+                    "DAGSTER_URL".to_owned(),
+                    format!("{}/graphql", server.uri()),
+                )]))
+                .expect("a valid test Config"),
+            );
+            let started = std::time::Instant::now();
+            let loaded = wait_for_job_within(
+                &state,
+                "pl-wait",
+                10,
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+            assert!(!loaded, "a stalled probe is a job that did not load");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "the stall was cut off at the budget, not left to run: {:?}",
+                started.elapsed()
             );
         }
 
