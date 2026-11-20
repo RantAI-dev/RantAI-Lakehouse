@@ -527,6 +527,38 @@ class CleanupPlanTests(unittest.TestCase):
             ],
         )
 
+    def test_a_report_and_a_template_are_deleted_by_the_id_in_the_path(self) -> None:
+        # BI-18 part D: their routes take the id in the path, not in `?id=`, and
+        # a report goes before the charts it places, a template after the boards.
+        cfg = make_cfg()
+        session = FakeSession()
+        created = [
+            {"kind": "template", "id": "t1"},
+            {"kind": "board", "id": "b1"},
+            {"kind": "chart", "id": "c1"},
+            {"kind": "report", "id": "r1"},
+        ]
+        self.assertEqual(m.run_cleanup(cfg, session, created), [])
+        self.assertEqual(
+            [url for _, url, _ in session.calls],
+            [
+                "http://api.test/api/dashboard/reports/r1",
+                "http://api.test/api/dashboard/specs?id=c1",
+                "http://api.test/api/dashboard/boards?id=b1",
+                "http://api.test/api/dashboard/templates/t1",
+            ],
+        )
+
+    def test_the_report_and_the_board_a_template_made_are_collected_for_the_cleanup(self) -> None:
+        traces = [[
+            {"tool": "create_report", "result": {"ok": True, "report": {"id": "r1", "title": "X"}}},
+            {"tool": "create_dashboard_from_template", "result": {"ok": True, "board": {"id": "b9"}}},
+            # A refused or pending call made nothing.
+            {"tool": "create_report", "result": {"status": "needs_confirmation"}},
+        ]]
+        found = m.collect_created([], traces, [])
+        self.assertEqual(found, [{"kind": "report", "id": "r1"}, {"kind": "board", "id": "b9"}])
+
     def test_a_failed_delete_is_a_problem_not_a_crash(self) -> None:
         cfg = make_cfg()
         session = FakeSession({("DELETE", "/api/dashboard/specs"): FakeResponse(409, {"error": "in use"})})

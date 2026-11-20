@@ -81,6 +81,8 @@ export function revertNote(done: { chartsRemoved: number; chartsRestored: string
  */
 export function restoreNote(item: Pick<TrashItem, "kind" | "boardState" | "boardName">): string {
   if (item.kind === "board") return "With its charts"
+  // BI-18 part D: a report comes back into its folder (the root when that folder is gone).
+  if (item.kind === "report") return "A report, back in its folder"
   switch (item.boardState) {
     case "live":
       return item.boardName ? `Back on ${item.boardName}` : "Back on its dashboard"
