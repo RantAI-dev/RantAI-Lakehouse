@@ -1913,6 +1913,16 @@ fn list_report_subscriptions_schema() -> Value {
             "board": { "type": "string", "description": "only this dashboard's, optional" } } } } })
 }
 
+/// `AI-30`: the installation's own people picker, so the model can learn a
+/// colleague's id to pass as `recipients[].userId` instead of inventing one.
+fn find_report_recipients_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "find_report_recipients",
+        "description": "Find people of this installation to send a scheduled report to, by part of their name or email address (at most 20). Gives each person's id, name and email; pass the id as recipients[].userId on create_report_subscription or update_report_subscription.",
+        "parameters": { "type": "object", "properties": {
+            "q": { "type": "string", "description": "part of a name or an email address" } },
+            "required": ["q"] } } })
+}
+
 fn update_report_subscription_schema() -> Value {
     json!({ "type": "function", "function": { "name": "update_report_subscription",
         "description": "Change a scheduled report the person set up: the schedule, time zone, attachments, filters or recipients, or pause or resume it. Give only what changes; everything left out stays. Naming recipients in `recipients` needs a human's approval.",
@@ -2735,6 +2745,14 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "list_report_subscriptions",
         schema: list_report_subscriptions_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    // `AI-30`: a read over the console's own recipient picker; no dashboard is
+    // named, so this stays off `DASHBOARD_SCOPED`.
+    ToolSpec {
+        name: "find_report_recipients",
+        schema: find_report_recipients_schema,
         risk: Risk::Read,
         permission: "dashboard:read",
     },

@@ -983,14 +983,16 @@ pub async fn deliveries(
 /// Query of `GET /api/reports/recipients`.
 #[derive(Debug, Deserialize)]
 pub struct PickerQuery {
+    // `AI-30` (`find_report_recipients`): the assistant calls this same
+    // handler with a `q`; keep the fields constructible from that tool.
     #[serde(default)]
-    q: Option<String>,
+    pub(crate) q: Option<String>,
     /// `1`: the permissions picker (`BI-19` part B): also list roles whose
     /// name matches. Roles are shown only to somebody who manages a dashboard
     /// (`dashboard:write` or a `manage` rule); the report picker stays as
     /// narrow as it was.
     #[serde(default)]
-    roles: Option<String>,
+    pub(crate) roles: Option<String>,
 }
 
 /// `GET /api/reports/recipients?q=` — active users' names and addresses for the
