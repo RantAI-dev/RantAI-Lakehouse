@@ -4206,7 +4206,12 @@ mod alert_test_fixture {
 }
 
 /// A test app whose `ClickHouse` serves [`alert_test_fixture::TwoRules`].
-async fn alert_test_app() -> TestApp {
+///
+/// The mock server is returned with the app: wiremock hands a dropped server
+/// back to a shared pool and resets it, so a server dropped here could be
+/// taken by another test while this app still dials its `CH_URL`. Bind it
+/// to a named variable for the whole test.
+async fn alert_test_app() -> (TestApp, wiremock::MockServer) {
     use std::collections::HashMap;
 
     use wiremock::matchers::method;
@@ -4224,7 +4229,7 @@ async fn alert_test_app() -> TestApp {
         .mount(&ch)
         .await;
     let env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
-    spin_up_with_env(&env).await
+    (spin_up_with_env(&env).await, ch)
 }
 
 /// `BI-40` D2, both directions with real principals: no session is 401; the
@@ -4235,7 +4240,7 @@ async fn alert_test_app() -> TestApp {
 async fn testing_an_alert_is_signed_in_at_the_router_and_asks_for_alert_write() {
     use serde_json::json;
 
-    let TestApp { router, pool } = alert_test_app().await;
+    let (TestApp { router, pool }, _ch) = alert_test_app().await;
 
     assert_eq!(
         POLICY_TABLE
@@ -4298,7 +4303,7 @@ async fn testing_an_alert_is_signed_in_at_the_router_and_asks_for_alert_write() 
 /// door stays shut to one.
 #[tokio::test]
 async fn the_scheduler_run_door_stays_shut_to_a_person_when_the_test_door_is_open() {
-    let TestApp { router, pool } = alert_test_app().await;
+    let (TestApp { router, pool }, _ch) = alert_test_app().await;
     let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
 
     let scheduler = request_with_cookie(&router, "POST", "/api/alerts/run", &analyst).await;
@@ -4329,7 +4334,7 @@ async fn the_scheduler_run_door_stays_shut_to_a_person_when_the_test_door_is_ope
 /// theirs to list. The same person is still refused `GET /api/alerts`.
 #[tokio::test]
 async fn listing_ones_own_chart_alerts_is_signed_in_at_the_router_and_needs_no_alert_permission() {
-    let TestApp { router, pool } = alert_test_app().await;
+    let (TestApp { router, pool }, _ch) = alert_test_app().await;
 
     assert_eq!(
         POLICY_TABLE

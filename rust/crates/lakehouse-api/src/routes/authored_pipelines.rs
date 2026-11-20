@@ -3412,7 +3412,13 @@ mod tests {
         /// share state across the `DAGSTER_URL` boundary, and a sync
         /// helper cannot start a wiremock without blocking the
         /// runtime.
-        async fn state_with_dagster(pool: &sqlx::PgPool) -> AppState {
+        ///
+        /// The mock server is returned with the state: wiremock hands a
+        /// dropped server back to a shared pool and resets it, so a server
+        /// dropped here could be taken by another test while this state
+        /// still dials its `DAGSTER_URL`. Bind it to a named variable for the
+        /// whole test.
+        async fn state_with_dagster(pool: &sqlx::PgPool) -> (AppState, wiremock::MockServer) {
             let server = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .and(wiremock::matchers::body_string_contains(
@@ -3436,7 +3442,9 @@ mod tests {
                 "DAGSTER_URL".to_owned(),
                 format!("{}/graphql", server.uri()),
             );
-            AppState::new(Config::from_map(&env_with_dagster).expect("a valid test Config"))
+            let state =
+                AppState::new(Config::from_map(&env_with_dagster).expect("a valid test Config"));
+            (state, server)
         }
 
         fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
@@ -3514,8 +3522,9 @@ mod tests {
             //    reference; with the validator it returns the same
             //    400 `update` returns for a fresh edit against the
             //    same graph, naming `pl-b` verbatim.
+            let (state, _dagster) = state_with_dagster(&pool).await;
             let err = restore_version(
-                State(state_with_dagster(&pool).await),
+                State(state),
                 Extension(unrestricted_principal()),
                 HeaderMap::new(),
                 Path((pl_a.id.clone(), 1)),
@@ -3624,8 +3633,9 @@ mod tests {
             //    transform and returns the same 400 body `update`
             //    produces — the canonical
             //    `"invalid transform at transforms[0]: ..."` shape.
+            let (state, _dagster) = state_with_dagster(&pool).await;
             let err = restore_version(
-                State(state_with_dagster(&pool).await),
+                State(state),
                 Extension(unrestricted_principal()),
                 HeaderMap::new(),
                 Path((pl.id.clone(), 2)),

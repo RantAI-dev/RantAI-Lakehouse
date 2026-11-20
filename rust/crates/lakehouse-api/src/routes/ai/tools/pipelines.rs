@@ -1141,7 +1141,12 @@ mod t1_3_tests {
     /// `Config::DATABASE_URL` builds it in production (so the test does
     /// not reach past the config choke point), plus a Dagster mock that
     /// answers a workspace reload.
-    async fn state_with_pg(pool: &sqlx::PgPool) -> AppState {
+    ///
+    /// The mock server is returned with the state: wiremock hands a dropped
+    /// server back to a shared pool and resets it, so a server dropped here
+    /// could be taken by another test while this state still dials its
+    /// `DAGSTER_URL`. Bind it to a named variable for the whole test.
+    async fn state_with_pg(pool: &sqlx::PgPool) -> (AppState, MockServer) {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("reloadWorkspace"))
@@ -1168,7 +1173,8 @@ mod t1_3_tests {
         );
         // BLD-1 part 1 / D4: a Bronze input is compiled through it.
         env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
-        AppState::new(Config::from_map(&env).expect("valid test Config"))
+        let state = AppState::new(Config::from_map(&env).expect("valid test Config"));
+        (state, server)
     }
 
     /// BLD-1 part 1 / D15: the assistant's `create_pipeline` takes `inputs`
@@ -1177,7 +1183,7 @@ mod t1_3_tests {
     /// whole save-time check (D2–D6, D9) applies to it with no second copy.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_pipeline_accepts_inputs_and_a_sql_step(pool: PgPool) {
-        let state = state_with_pg(&pool).await;
+        let (state, _dagster) = state_with_pg(&pool).await;
         // A seeded Platform Admin: a real `app_user` (the `run_as` key) whose
         // role is the `*:*` the save-time gate needs.
         let user: Uuid =
@@ -1239,7 +1245,7 @@ mod t1_3_tests {
         // the test pool alone; the Dagster mock is here because a
         // successful write would reload the orchestrator, and this test
         // asserts nothing was written.
-        let state = state_with_pg(&pool).await;
+        let (state, _dagster) = state_with_pg(&pool).await;
         // `pipeline_definition.tenant_id` references `tenant (id)`, so both
         // sides of the attempt are real rows rather than bare UUIDs.
         let tenant_a = seed_tenant(&pool).await;
