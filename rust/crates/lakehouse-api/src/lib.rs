@@ -33,6 +33,7 @@ pub mod error;
 pub mod export;
 pub mod gold_export;
 pub mod gold_export_history;
+pub mod gold_latest_copy;
 pub mod gold_lock;
 pub mod health;
 pub mod internal_hosts;
