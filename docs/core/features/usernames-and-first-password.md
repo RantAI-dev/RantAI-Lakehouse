@@ -66,7 +66,7 @@ No.
 | `ADM-11-AC8` | Rename `ana` to `ana.s` | `ana.s` signs in; `ana` no longer does | Not run |
 | `ADM-11-AC9` | Change password to 7 characters as a signed-in user (operator, curl, bypassing the form) | 400 with the rule | Not run |
 | `ADM-11-AC10` | Subscribe `ana` (no email) to a report and send now | Not sent; the run says the user has no email address | Not run |
-| `ADM-11-AC11` | Wrong password for `ana` | "Invalid username/email or password"; the lockout from `ADM-8` still applies | Not run |
+| `ADM-11-AC11` | Wrong password for `ana` | "Wrong username or password." (`WEB-15`, 2026-11-14; was "Invalid username/email or password"); the lockout from `ADM-8` still applies | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 
