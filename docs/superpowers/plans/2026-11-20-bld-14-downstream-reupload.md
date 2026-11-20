@@ -688,6 +688,85 @@ matches `dagster/pyproject.toml`.
   developer brief and the plan's note.
 - The two unrelated Dagster failures above are reported, not papered over.
 
+### Fix round 1 (PR #633 review, findings R1-R5)
+
+Developer: `Hy4 flash`. Base for the fixes: `2cf45dc0e` (the review commit).
+One commit per finding, in order, each pushed with a normal push; `git
+status` was clean before every commit. Every new test was run against the
+code BEFORE its fix and failed with the message quoted below. Each fix site
+carries `BLD-14 review R<n>`; every commit body cites the same tag.
+
+1. `2ba595109` — **R1 BLOCKER**, `fix(orchestrator): find open reuploads by the six-hour window`.
+   Root discovery now filters `file_ingest_job` SUCCESS runs by
+   `updated_after = now - CHAIN_WAIT_LIMIT_SECONDS` with no row cap, instead
+   of the newest 20 across all tables. Test
+   `test_a_reupload_is_not_lost_behind_twenty_one_loads_of_other_tables`
+   failed before the fix with `the re-upload must still start Gold:
+   [SkipReason(skip_message='BLD-14: no re-upload in the window for this pipeline')]`.
+2. `1c73abbd5` — **R2 BLOCKER**, `fix(orchestrator): chain owns the first pipeline's launch`.
+   Chosen option, named in `reupload_chain.py`'s module doc: **option A —
+   the chain sensor owns the first pipeline's launch too, with the same
+   `run_key` per re-upload and pipeline, and `_after` steps aside for a file
+   load whose table starts a chain**. `reupload_first_pipeline_entries`
+   shares the P1/P2/D3 node-edge helpers with the downstream graph. Test
+   `test_two_reuploads_with_the_newer_load_queued_start_gold_once_for_r2`
+   failed before the fix with `_after` yielding
+   `RunRequest(run_key='authored-deps:R2', tags={root: R2, table: orders})`
+   instead of a `BLD-14` `SkipReason`.
+3. `4d7b8effa` — **R3 SHOULD-FIX**, `fix(orchestrator): launch at most one run per pipeline per tick`.
+   Roots are processed newest first with a per-tick `launched` set. Test
+   `test_a_second_reupload_waits_for_the_next_tick_after_one_launch` failed
+   before the fix with two `RunRequest`s (`reupload-chain:R2:pl-gold` and
+   `reupload-chain:R1:pl-gold`).
+4. `d16b1af37` — **R4 SHOULD-FIX**, `fix(orchestrator): supersede against every reupload, settled included`.
+   `newer_root` now compares against all SUCCESS `file_ingest_job` runs of
+   the table, not just open/windowed roots. Test
+   `test_a_settled_newer_reupload_supersedes_an_older_open_one` failed before
+   the fix with `RunRequest(run_key='reupload-chain:R1:pl-gold')`.
+5. `62e2fcc94` — **R5 SHOULD-FIX**, `fix(api): place the chain read with runs and validate runId`.
+   The GET handler moved to `routes/pipelines.rs`, its registration into
+   `chain_read_routes()` merged beside `runs`; the POST route validates
+   `runId`'s shape and length with a fixed 422 sentence. The source-layout
+   test failed before the fix with `the chain read must be registered beside
+   runs in pipelines.rs`; the validation test got 200 instead of 422 for
+   `runId = "not a run!"`.
+
+#### The "not confirmed" sensor-cursor question — answered
+
+Dagster **keeps the cursor across stop and start** in the pinned 1.13.20,
+so a resumed chain sensor does act on re-uploads from while it was paused;
+P10's floor is set only on the sensor's first-ever tick, not on resume.
+Evidence in the installed source: the cursor lives in
+`SensorInstigatorData.cursor` (`dagster/_core/scheduler/instigation.py:101`);
+`start_sensor` keeps the stored row and only replaces the status and the
+start timestamp (`dagster/_core/instance/methods/scheduling_methods.py:148-154`),
+and `stop_sensor` likewise uses `with_status` without clearing the data
+(`:198` onward); the daemon reads `instigator_data.cursor` into each
+evaluation (`dagster/_daemon/sensor.py:852`) and writes the tick's cursor
+back into that same state (`:248-276`). It also passes
+`last_sensor_start_timestamp` into the evaluation, which this sensor does
+not use. Consequence for `BLD-14`: after a pause/resume, roots from the
+paused interval are still inside the six-hour window (R1's fix) and may be
+picked up on resume; this is the documented behaviour, not a bug to fix in
+this round.
+
+#### Verification after the five fixes (foreground, counts as run)
+
+- `cd dagster && python -m pytest dispar_orchestrate -q -k "reupload or authored"`
+  (venv with `dagster==1.13.20`, the system `python` has no pytest) —
+  140 passed, 2,559 deselected, in 60.16 s.
+- `cd rust && cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D warnings` — clean.
+- `cargo test -p lakehouse-api --test it -- route_auth:: pipeline_chain` —
+  102 passed, 0 failed, 1,687 filtered out. The two-filter form needs the
+  `--` separator that `cargo test` requires; the bare form printed
+  `unexpected argument 'pipeline_chain'`.
+- `cargo test -p lakehouse-api --test it pipeline_reupload_chain::` —
+  13 passed, 0 failed, 1,776 filtered out.
+- `bun run typecheck` — clean.
+- `git status` — clean. No gate run (no compose stack), unchanged from the
+  first handoff.
+
 ## Review
 
 ### Round 1 — planner review, 2026-11-20, at `23e9f9ede`
