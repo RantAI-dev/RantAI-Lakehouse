@@ -2072,6 +2072,39 @@ pub async fn set_status(
     Ok(row.map(Pipeline::from))
 }
 
+/// Record the start time of a pipeline's newest *finished* run (BLD-11 F1,
+/// D1). Only `run_finished_event`/`run_failed_event` call this, after they
+/// have confirmed the run's state with `Dagster`; a run still in progress is
+/// shown by the detail page's run list, not by this field, and a cancelled
+/// run is reported by neither event. We store the *start*, matching the
+/// Dagster-backed rows the list already shows (`routes::pipelines::last_run_for`).
+///
+/// The write is monotonic (D2): events can arrive out of order on a sensor
+/// retry, so the `WHERE` never lets an older run move `last_run_at` back.
+/// `started_at` is bound, never formatted into the SQL.
+///
+/// Returns `true` only when a row's `last_run_at` changed — `false` for an
+/// unknown `id` or when a newer run has already set the field.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn record_last_run(
+    pool: &PgPool,
+    id: &str,
+    started_at: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let result = sqlx::query(
+        "UPDATE pipeline_definition SET last_run_at = $2 \
+           WHERE id = $1 AND (last_run_at IS NULL OR last_run_at < $2)",
+    )
+    .bind(id)
+    .bind(started_at)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// List every version row for `pipeline_id`, newest first (largest
 /// `version` first; the migration's gap-free allocator means the most
 /// recent event is the one with the highest number). The list shape has

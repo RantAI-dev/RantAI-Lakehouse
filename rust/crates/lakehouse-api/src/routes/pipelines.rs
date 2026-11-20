@@ -1703,6 +1703,34 @@ fn duration_seconds(start: Option<f64>, end: Option<f64>) -> Option<i64> {
     }
 }
 
+/// `Dagster`'s `startTime` (unix seconds) as an `OffsetDateTime` (BLD-11 F1,
+/// D1). A missing or out-of-range time writes no `last_run_at` — never a
+/// fabricated `now`. The fractional second is dropped, the same conversion
+/// `pipeline_lag::settle_request` applies to this field when it records a
+/// consumed run's start.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "Dagster run start times are unix seconds; the fractional part is dropped on purpose, matching pipeline_lag::settle_request"
+)]
+fn run_started_at(start: Option<f64>) -> Option<OffsetDateTime> {
+    start.and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds as i64).ok())
+}
+
+/// Record a confirmed run's start as the pipeline's `last_run_at` (BLD-11 F1,
+/// D1, D2). A store failure is reported through `upstream_error` and
+/// deliberately does not fail the run event: alerts are the event's job, the
+/// timestamp is a by-product. A missing `start_time` writes nothing.
+async fn note_last_run(pool: &PgPool, pipeline_id: &str, start: Option<f64>) {
+    let Some(started_at) = run_started_at(start) else {
+        return;
+    };
+    if let Err(err) = pipelines::record_last_run(pool, pipeline_id, started_at).await {
+        // BLD-11 F1: a timestamp by-product must never fail a run event that
+        // has already confirmed the run with Dagster; log it with a reference.
+        let _ = crate::upstream_error::store(&crate::upstream_error::STORE, &err);
+    }
+}
+
 /// Pipeline SLA "late" decision (plan 1f). Re-exported from
 /// `lakehouse_alerts::late` so the runs/detail routes and the alerts
 /// crate's `evaluate_pipeline_late` share one implementation. The
@@ -2648,6 +2676,10 @@ pub async fn run_failed_event(
         ))
         .into());
     }
+    // BLD-11 F1 (D1, D2): the failure is confirmed, so record its start as
+    // the pipeline's last run. Before the dedupe return on purpose — a sensor
+    // retry still carries the same start, and the monotonic write is a no-op.
+    note_last_run(pool, &pipeline_id, info.start_time).await;
     let failed_step_keys: Vec<String> = info
         .steps
         .iter()
@@ -2838,6 +2870,10 @@ pub async fn run_finished_event(
         ))
         .into());
     }
+    // BLD-11 F1 (D1, D2): the success is confirmed, so record its start as
+    // the pipeline's last run. The write is monotonic and never fails this
+    // event — see `note_last_run`.
+    note_last_run(pool, &pipeline_id, info.start_time).await;
     // DATA-13 (F2): the run is confirmed SUCCESS, so the SQL it ran becomes
     // the pipeline's column lineage. A failed run was refused above and
     // writes nothing.
@@ -9827,6 +9863,118 @@ mod tests {
                 .await
                 .expect("mark the fixture runnable");
             pipeline.id
+        }
+
+        /// BLD-11 F1 (D1, D2): a confirmed SUCCESS writes the run's start as
+        /// the pipeline's `last_run_at`. Before the fix nothing wrote the
+        /// column, so the list/masthead always said "Never". A store failure
+        /// here is a by-product and never fails the event.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_successful_run_event_writes_the_runs_start_as_last_run_at(pool: sqlx::PgPool) {
+            let dagster = MockServer::start().await;
+            let ch = MockServer::start().await;
+            let state = state_for(&pool, &dagster.uri(), &ch.uri());
+            let pipeline_id = seed_runnable_pipeline(&state, "Last Run Success Flow").await;
+            let job = super::super::authored_pipelines::job_name(&pipeline_id);
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("pipelineRunOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run", "status": "SUCCESS",
+                        "startTime": 1_700_000_000.0, "endTime": null, "stepStats": []
+                    } }
+                })))
+                .mount(&dagster)
+                .await;
+            // No alert rules — the event still succeeds and the timestamp is written.
+            Mock::given(method("POST"))
+                .and(body_string_contains("FROM console.alert_rule"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [], "rows": 0, "data": []
+                })))
+                .mount(&ch)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&ch)
+                .await;
+
+            let before = pipelines::get_pipeline(&pool, &pipeline_id)
+                .await
+                .expect("read the pipeline")
+                .expect("the pipeline exists");
+            assert_eq!(before.last_run_at, None, "a fresh pipeline never ran");
+
+            run_finished_event(
+                State(state),
+                Extension(fixture_service_principal()),
+                body_for("run-last-run-success", &job),
+            )
+            .await
+            .expect("the success event is accepted");
+
+            let after = pipelines::get_pipeline(&pool, &pipeline_id)
+                .await
+                .expect("read the pipeline")
+                .expect("the pipeline exists");
+            assert_eq!(
+                after.last_run_at,
+                Some(iso_from_unix_seconds(1_700_000_000.0)),
+                "the run's start is recorded as the last run"
+            );
+        }
+
+        /// BLD-11 F1 (D1, D2): a confirmed FAILURE also writes the run's
+        /// start. The write sits before the dedupe return so a retried event
+        /// still records it (the monotonic `WHERE` makes retries no-ops).
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_failed_run_event_writes_the_runs_start_as_last_run_at(pool: sqlx::PgPool) {
+            let dagster = MockServer::start().await;
+            let ch = MockServer::start().await;
+            let state = state_for(&pool, &dagster.uri(), &ch.uri());
+            let pipeline_id = seed_runnable_pipeline(&state, "Last Run Failure Flow").await;
+            let job = super::super::authored_pipelines::job_name(&pipeline_id);
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("pipelineRunOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run", "status": "FAILURE",
+                        "startTime": 1_700_000_000.0, "endTime": null, "stepStats": []
+                    } }
+                })))
+                .mount(&dagster)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("FROM console.alert_rule"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [], "rows": 0, "data": []
+                })))
+                .mount(&ch)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&ch)
+                .await;
+
+            run_failed_event(
+                State(state),
+                Extension(fixture_service_principal()),
+                body_for("run-last-run-failure", &job),
+            )
+            .await
+            .expect("the failure event is accepted");
+
+            let after = pipelines::get_pipeline(&pool, &pipeline_id)
+                .await
+                .expect("read the pipeline")
+                .expect("the pipeline exists");
+            assert_eq!(
+                after.last_run_at,
+                Some(iso_from_unix_seconds(1_700_000_000.0)),
+                "the failed run's start is recorded as the last run"
+            );
         }
 
         /// A sensor retry must not re-deliver: the first
