@@ -25,6 +25,13 @@ This repo's CI is split into workflows under `.github/workflows/`:
   dispatch scan of all git branches using `gitleaks` (`--log-opts="--all"`).
   Deliberately separate from pull-request checks so findings on one branch do
   not block unrelated PRs (SEC-36, D2).
+- **`staging-cache-prune.yml`** — daily scheduled (`cron: '23 6 * * *'`) and manual
+  dispatch cleanup of the staging VM's disk. It prunes the BuildKit build cache
+  (cache only: no container, no log, no volume) and the dangling images the
+  earlier deploys left behind, and nothing else. It runs on the staging runner
+  (`self-hosted`, `staging`), like the deploy, and has its own concurrency group
+  so that a scheduled run can never cancel a deploy that is still queued. See
+  "Staging disk (cache prune)" below.
 
 ## Change Scopes and the Single Gate (`ci-required`)
 
@@ -555,6 +562,48 @@ against the full stack.
 The build that used to live here — `docker.yml`, which built `rust/Dockerfile` on a tag
 push and never published anything — is now the release pipeline below. It builds the same
 image, with the same build arguments, and then does the rest.
+
+## Staging disk (cache prune)
+
+Every staging deploy writes a new BuildKit build cache and a new image layer set.
+The cache reached 50 GB on the 146 GB disk of the staging VM, the disk was at
+94%, and the first manual prune had to free 50.31 GB to bring the box back.
+Nothing else reclaims that space: the build cache is only touched by a build.
+
+`staging-cache-prune.yml` bounds it. It runs on the staging runner
+(`self-hosted`, `staging`), daily at 06:23 UTC — an hour and a half after the
+bronze maintenance schedule (03:00), whose fan-out over 513 bronze tables is
+over by then — and on manual dispatch.
+
+| Command | What it removes | What it never removes |
+|---|---|---|
+| `docker builder prune --all --max-used-space 8GB --reserved-space 4GB --force` | BuildKit build cache beyond its budget, least recently used first | Containers, their logs, images, volumes |
+| `docker image prune --force --filter until=168h` | Dangling images (untagged leftovers of earlier deploys) older than a week | A tagged image; an image any container (running or stopped) uses |
+
+The two commands are deliberately **not** `docker system prune` and **not**
+`docker container prune`: both remove stopped containers, and with them the logs
+QA still has to read. `docker volume prune` is never run: it removes volumes,
+and with them the data.
+
+Two details are measured, not guessed:
+
+- **The size bound works; the age filter does not combine with it.** With
+  `--filter until=...` in place the space bounds stop biting (a filter plus
+  `--min-free-space 60GB` freed 0 B while the disk was 15 GB short of the
+  target), so the budget is the only bound that is used. `--reserved-space
+  4GB` keeps at least 4 GB of cache, so a burst of deploys can never prune the
+  cache away and turn the next deploy into a cold 20-minute `cargo build
+  --release`. Measured on the staging VM: the prune freed 4.37 GB and left
+  11.27 GB (the shared and the in-use records cannot be pruned, so the
+  effective ceiling sits a little above 8 GB).
+- **The prune cannot cancel a deploy.** Its concurrency group is
+  `staging-cache-prune`, not the deploy's `staging`: a new run replaces a
+  pending one in the same group, so a scheduled run sharing the deploy's group
+  could cancel a deploy that was still queued. No overlap with a build is
+  possible anyway — the staging runner runs one job at a time.
+
+The deploy workflow applies the same cache bound right after its build, so the
+cache never grows between the daily runs either.
 
 ## Release pipeline
 

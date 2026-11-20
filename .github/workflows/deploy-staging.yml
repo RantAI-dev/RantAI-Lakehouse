@@ -292,6 +292,28 @@ jobs:
           SSO_CONSOLE_URL: ${{ vars.SSO_CONSOLE_URL }}
           SSO_REALM: ${{ vars.SSO_REALM }}
 
+      # The build below writes a new BuildKit cache and a new image layer
+      # set on every deploy. On a 146 GB disk that adds up, and a disk
+      # that fills mid-build is a build that dies halfway with an error
+      # that looks like a network problem.
+      #
+      # This step reclaims the room WITHOUT touching the build cache: only
+      # DANGLING images older than a week go, and those are the layers of
+      # the deployments before the last one. An image a container uses --
+      # running or stopped -- is never removed by `docker image prune`, and
+      # the image the stack runs is tagged, so it is not dangling at all.
+      # The base images the builds need (`rust:1.99.1-slim`,
+      # `python:3.12-slim`, `oven/bun:1-alpine`, `node:22-alpine`) are
+      # tagged too, so this never makes a build re-download its base.
+      #
+      # NOT `docker system prune`: that removes stopped containers, and
+      # with them their logs. NOT `docker volume prune`: that removes
+      # volumes, and with them the data.
+      - name: Reclaim disk from images the previous deploys left behind
+        run: |
+          docker image prune --force --filter until=168h
+          df -h / | tail -1
+
       - name: Build & start backend stack (core + seaweedfs + dagster + trino + sso)
         working-directory: ${{ github.workspace }}
         # Retry: transient registry/PyPI flakes fail the whole compose build;
@@ -300,6 +322,18 @@ jobs:
         # `-f docker-compose.yml` is named explicitly because `-f` REPLACES
         # the default file list; the second `-f` is the Keycloak the staging
         # deployment signs in through (its own services, its own profile).
+        #
+        # `timeout-minutes: 45`, down from 120. The build used to hang: it
+        # stopped right after its last "exporting attestation manifest"
+        # line and sat in `futex_wait` until someone cancelled the run
+        # (runs 44596923569 and 44666444411, 17 and 28 minutes of a
+        # 120-minute budget). The stall is contention, not a broken
+        # buildkit: the same bake returns 0 in a second on an idle box.
+        # The longest build that DID succeed took 22 minutes (a cold
+        # `cargo build --release`), so 45 leaves room for a cold build and
+        # stops a hung one from holding the self-hosted runner for two
+        # hours -- the runner this deployment runs on cannot serve a
+        # second job while it is stuck.
         run: |
           for attempt in 1 2 3; do
             echo "=== compose up attempt ${attempt}/3 ==="
@@ -316,7 +350,32 @@ jobs:
             [ "$attempt" = 3 ] && exit 1
             sleep 10
           done
-        timeout-minutes: 120
+        timeout-minutes: 45
+
+      # The cache this build just wrote is what makes the NEXT deploy fast,
+      # so it is kept; what grows without bound is the cache of the builds
+      # BEFORE it. On a 146 GB disk the build cache reached 50 GB and
+      # the box was at 94% before it was pruned by hand.
+      #
+      # `--max-used-space 8GB` is the bound: the LEAST recently used cache
+      # goes first, so the cache of the build that just ran -- the one the
+      # next deploy needs -- is the last to be touched. `--reserved-space
+      # 4GB` says that at least 4 GB of cache always stays, so a burst of
+      # deploys can never prune the cache away and turn the next build
+      # into a cold 20-minute `cargo build --release` again. Measured on
+      # the staging VM: this freed 4.37 GB and left 11.27 GB (the shared
+      # and in-use records cannot be pruned, so the effective ceiling is
+      # a little above the number).
+      #
+      # `docker builder prune` removes BuildKit build cache and NOTHING
+      # else: not containers, not their logs, not images, not volumes. That
+      # is exactly why it is used here and `docker system prune` is not --
+      # the latter removes stopped containers and with them the logs of the
+      # containers QA still has to read.
+      - name: Prune the build cache back to its budget
+        run: |
+          docker builder prune --all --max-used-space 8GB --reserved-space 4GB --force
+          docker system df
 
       - name: Health-check lakehouse-api
         run: |
