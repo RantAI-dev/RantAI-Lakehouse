@@ -59,8 +59,12 @@ import {
 } from "./sql-completion-source"
 import { useQueryDownload } from "./use-query-download"
 
-/** What the editor holds before anyone types. */
-export const STARTER_SQL = "-- Write SQL here, or generate it from a question"
+/**
+ * QS-11 (LH-QS-1-01), D7: a new tab holds the empty string; this is a grey
+ * CodeMirror placeholder, never text in the document. The old starter text
+ * was real SQL that a run would send as a comment-only statement.
+ */
+export const SQL_PLACEHOLDER = "Write SQL here, or generate it from a question"
 
 /** How long to wait after the last keystroke before asking for an estimate. */
 const ESTIMATE_DEBOUNCE_MS = 500
@@ -270,7 +274,7 @@ export function useQueryStudio(draftKey: string | null) {
     {
       id: FIRST_TAB_ID,
       name: "Query 1",
-      sql: STARTER_SQL,
+      sql: "",
       engine: "clickhouse",
       parameters: [],
       values: {},
@@ -1004,7 +1008,7 @@ export function useQueryStudio(draftKey: string | null) {
       const opened: QueryTab = {
         id: newTabId(),
         name: nextTabName(tabs),
-        sql: options?.sql ?? STARTER_SQL,
+        sql: options?.sql ?? "",
         engine: options?.engine ?? "clickhouse",
         parameters: [],
         values: {},

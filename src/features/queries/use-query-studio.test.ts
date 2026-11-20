@@ -78,6 +78,25 @@ function mountWith(sql: string) {
   return hook
 }
 
+// QS-11 (LH-QS-1-01), D7: a new tab's document is empty; the hint is a
+// placeholder in the editor, never starter text someone could run by mistake.
+describe("useQueryStudio starter text", () => {
+  it("starts the first tab and every new tab with an empty document", () => {
+    window.localStorage.clear()
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+    visit("/query-studio")
+
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+    expect(hook.result.current.tabs[0]?.sql).toBe("")
+    act(() => {
+      hook.result.current.addTab()
+    })
+    expect(hook.result.current.tabs[1]?.sql).toBe("")
+  })
+})
+
 describe("useQueryStudio saved-query link", () => {
   it("opens the saved query the link names, with its id and the caller's level", async () => {
     window.localStorage.clear()
