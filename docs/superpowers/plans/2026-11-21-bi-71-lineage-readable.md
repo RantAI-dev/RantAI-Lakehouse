@@ -184,3 +184,25 @@ Developer: Opus developer agent (console design work), 2026-11-20. Branch
   (`GraphCard`, from `useChartPlacement`'s resolved no-op read) among its
   many existing ones; it does not fail.
 - No cargo (no Rust touched).
+
+## Owner QA round 1 (2026-11-21)
+
+1. **Source and dataset steps have no icon and a raw label.** The API sends
+   step kinds `source` (a publisher, e.g. "Badan Pusat Statistik") and
+   `dataset` (a catalog dataset); neither is in `STEP_KIND_LABEL`
+   (`src/lib/lineage-words.ts`) nor in the panel's `KIND_ICON`, so they show
+   a dot and "source"/"dataset" in lower case. Add both to both maps, using
+   the mockup A icons (`Landmark` for a source, `Database` for a dataset;
+   check `mockup-a.tsx` on `design/chart-builder-mockups`) and the labels
+   "Source" and "Dataset". Grep the API (`rust/crates/lakehouse-api/src/routes/lineage*`)
+   for every step kind it can send and cover any other missing one the same
+   way; a test asserts every kind the API sends has a label and an icon.
+2. **The map gets a full-screen view** ("biar lebih lebar luas lagi
+   liatnya"). A fourth ghost icon button beside `+`, `−`, Fit (`Maximize2`,
+   becoming `Minimize2`; tooltip "Full screen" / "Exit full screen", with
+   `F`) opens the same map in an in-app overlay over the whole window
+   (`fixed inset-0`, the app's background, the controls in the same
+   corner), fitted on open and on close. Esc, the button, or `F` closes it;
+   focus returns to the button. Not the browser Fullscreen API (iPhone
+   Safari does not support it for elements). Opening and closing ease over
+   200 ms, none under reduced motion. Page scroll is locked while it is open.
