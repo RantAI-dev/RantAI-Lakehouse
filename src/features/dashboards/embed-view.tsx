@@ -192,7 +192,13 @@ export function EmbedView({
     return <PasswordGate token={token ?? ""} onOpen={() => { setState("loading"); setAttempt((n) => n + 1); }} />;
   }
   if (state === "notfound" || state === "error") {
-    return <div className="grid h-screen place-content-center px-4 text-center text-sm text-muted-foreground">{refusal}</div>;
+    // PR #648 review 2: with `embed-transparent` the page behind is the host's,
+    // so the refusal keeps a surface of its own instead of floating on it.
+    return (
+      <div className="grid h-screen place-content-center px-4">
+        <div className="max-w-sm rounded-xl border border-border bg-card px-6 py-5 text-center text-sm text-card-foreground">{refusal}</div>
+      </div>
+    );
   }
 
   const charts = data?.charts ?? [];

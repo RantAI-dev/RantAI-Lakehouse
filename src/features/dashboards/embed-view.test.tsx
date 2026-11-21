@@ -58,7 +58,13 @@ function payload(extra: Record<string, unknown> = {}, board: Record<string, unkn
 type Call = { url: string; body: Record<string, unknown> }
 
 /** Serves the embed's three routes and records what was asked. */
-function serve(opts: { data?: unknown; origins?: string[]; values?: string[]; branding?: unknown } = {}): Call[] {
+function serve(opts: {
+  data?: unknown; origins?: string[]; values?: string[]; branding?: unknown;
+  /** What a public link answers (`BI-19`): a password gate, a gone link or an error. */
+  publicAnswer?: () => Response;
+  /** What the signed token's data route answers (a refusal or a failure). */
+  embedAnswer?: () => Response;
+} = {}): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
@@ -66,6 +72,8 @@ function serve(opts: { data?: unknown; origins?: string[]; values?: string[]; br
     calls.push({ url, body })
     if (url === "/api/embed/frame") return json({ origins: opts.origins ?? [] })
     if (url === "/api/embed/values") return json({ column: body.column, values: opts.values ?? [], truncated: false })
+    if (opts.publicAnswer && url.startsWith("/api/public/dashboard/")) return opts.publicAnswer()
+    if (opts.embedAnswer && url === "/api/embed/data") return opts.embedAnswer()
     // The workspace's own branding (`ADM-2`). Nothing set unless a test
     // says otherwise, so the product's own name is what shows.
     if (url.includes("/api/branding")) {
@@ -167,6 +175,22 @@ describe("the look in the embed address (BI-26 D6)", () => {
     render(<EmbedView jwt="j" />)
     await screen.findByTestId("tile")
     expect(document.documentElement.classList.contains("embed-transparent")).toBe(false)
+  })
+
+  it("a password gate keeps a card of its own on a transparent frame (PR #648 review 2)", async () => {
+    serve({ publicAnswer: () => json({ error: "password_required" }, 401) })
+    render(<EmbedView token="p_pw" look={{ ...DEFAULT_EMBED_LOOK, transparent: true }} />)
+    const heading = await screen.findByText("This dashboard needs a password")
+    // The form is the gate's surface: without it, dark-theme text sits on the
+    // host page's own background and can be unreadable.
+    expect(heading.closest(".bg-card")).not.toBeNull()
+  })
+
+  it("a refusal keeps a card of its own on a transparent frame (PR #648 review 2)", async () => {
+    serve({ embedAnswer: () => json({ error: "not_found" }, 404) })
+    render(<EmbedView jwt="j" look={{ ...DEFAULT_EMBED_LOOK, transparent: true }} />)
+    const refusal = await screen.findByText("Dashboard not available.")
+    expect(refusal.closest(".bg-card")).not.toBeNull()
   })
 
   it("a chart token's payload is drawn as one chart filling the frame", async () => {
