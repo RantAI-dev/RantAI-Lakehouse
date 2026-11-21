@@ -20,6 +20,15 @@
 //! the row and never in a caller's request path. The console puts it in the
 //! picture's address (`?v=`) to bypass a cached older picture, and the API
 //! uses it as the `ETag`.
+//!
+//! # The name a save replaced
+//!
+//! [`upsert_name`] reads the name its write replaces under the row's lock,
+//! in the same transaction as the write, and returns it beside the row it
+//! wrote ([`SavedWorkspaceName`]). A caller that wants to know whether the
+//! name changed cannot read the row first and compare afterwards: two saves
+//! that race would compare against each other's value, and the answer would
+//! be about a name that was never replaced (`ADM-2`, plan adm-120 step 3b).
 
 use std::sync::Arc;
 
@@ -66,6 +75,22 @@ pub struct WorkspaceSettings {
     pub icon: Option<StoredImage>,
     /// When the row was last saved.
     pub updated_at: OffsetDateTime,
+}
+
+/// What a name save wrote, and the name it replaced.
+///
+/// `previous_name` is the name the row held when the write landed. The store
+/// reads it under the row's lock, in the same transaction as the write, so a
+/// caller that says whether the name changed never has to compare against a
+/// value it read separately: such a read can be the value another save wrote
+/// in between, and the answer would then be about a name that was never
+/// replaced (`ADM-2`, plan adm-120 step 3b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedWorkspaceName {
+    /// The row as stored after the write.
+    pub settings: WorkspaceSettings,
+    /// The name the write replaced, or `None` when there was none.
+    pub previous_name: Option<String>,
 }
 
 /// The columns every read and every `RETURNING` selects, written once so a
@@ -143,7 +168,14 @@ pub async fn get(pool: &PgPool) -> Result<Option<WorkspaceSettings>, StoreError>
 }
 
 /// Save the name (or clear it with `None`), leaving the pictures as they are,
-/// and return what is stored. `updated_by` is the saving principal's id.
+/// and return what is stored together with the name the write replaced.
+/// `updated_by` is the saving principal's id.
+///
+/// The name the write replaced is read in the SAME transaction as the write,
+/// under the row's lock, so it is the value the write really replaced even
+/// when another save lands at the same time. A caller that reads the row
+/// first and compares afterwards cannot say that: its read is the value
+/// before the other save committed, not the value its own write replaced.
 ///
 /// # Errors
 ///
@@ -153,20 +185,48 @@ pub async fn upsert_name(
     pool: &PgPool,
     name: Option<&str>,
     updated_by: &str,
-) -> Result<WorkspaceSettings, StoreError> {
+) -> Result<SavedWorkspaceName, StoreError> {
+    let mut tx = pool.begin().await?;
+    // The row may not exist yet (nothing was ever saved), so it is created
+    // first. `DO NOTHING` never overwrites a row a concurrent save created,
+    // and this statement waits for that creator to commit, so the read
+    // below finds the row the other save wrote. Every save takes the same
+    // three steps in the same order, so two saves of a row that does not
+    // exist yet cannot deadlock: the second one's insert waits for the
+    // first one to commit, and it takes the row's lock only after that.
+    sqlx::query(
+        "INSERT INTO workspace_settings (singleton) VALUES (TRUE) \
+         ON CONFLICT (singleton) DO NOTHING",
+    )
+    .execute(&mut *tx)
+    .await?;
+    // The row's lock, taken before the write. Under READ COMMITTED this
+    // read re-reads the row after it waits for a concurrent writer, so the
+    // value it returns IS the value the write below replaces. A plain
+    // `SELECT` would not: it reads the snapshot taken before the wait and
+    // would report the value that was there before the other save
+    // committed.
+    let previous_name: Option<String> = sqlx::query_scalar(
+        "SELECT workspace_name FROM workspace_settings WHERE singleton = TRUE FOR UPDATE",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    // The write itself, in the same transaction and under the lock the read
+    // above took, so no other save can write between the two.
     let row: Row = sqlx::query_as(concat!(
-        "INSERT INTO workspace_settings (singleton, workspace_name, updated_at, updated_by) \
-         VALUES (TRUE, $1, now(), $2) \
-         ON CONFLICT (singleton) DO UPDATE SET workspace_name = EXCLUDED.workspace_name, \
-              updated_at = now(), updated_by = EXCLUDED.updated_by \
-         RETURNING ",
+        "UPDATE workspace_settings SET workspace_name = $1, updated_at = now(), updated_by = $2 \
+         WHERE singleton = TRUE RETURNING ",
         columns!()
     ))
     .bind(name)
     .bind(updated_by)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
-    Ok(row.into())
+    tx.commit().await?;
+    Ok(SavedWorkspaceName {
+        settings: row.into(),
+        previous_name,
+    })
 }
 
 /// The statement that stores one picture, written out per kind so each column
@@ -349,7 +409,7 @@ mod tests {
         let sixty = "é".repeat(60);
         let saved = upsert_name(&pool, Some(&sixty), "u").await.unwrap();
         assert_eq!(
-            saved.workspace_name.as_deref(),
+            saved.settings.workspace_name.as_deref(),
             Some(sixty.as_str()),
             "60 characters, counted as characters and not bytes"
         );
@@ -446,8 +506,8 @@ mod tests {
             .await
             .unwrap();
         let after = upsert_name(&pool, None, "u").await.unwrap();
-        assert!(after.workspace_name.is_none());
-        assert_eq!(&*after.logo.unwrap().bytes, b"a");
+        assert!(after.settings.workspace_name.is_none());
+        assert_eq!(&*after.settings.logo.unwrap().bytes, b"a");
         Ok(())
     }
 
@@ -460,6 +520,35 @@ mod tests {
         reset(&pool).await.unwrap();
         assert!(get(&pool).await.unwrap().is_none());
         reset(&pool).await.unwrap();
+        Ok(())
+    }
+
+    /// The name a save replaced is the name the row held, not the name the
+    /// save wrote: a caller that says whether the name changed needs the
+    /// value its own write replaced, and only the store can say it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_name_save_reports_the_name_it_replaced(pool: PgPool) -> sqlx::Result<()> {
+        let first = upsert_name(&pool, Some("Meridian"), "u").await.unwrap();
+        assert_eq!(
+            first.previous_name, None,
+            "nothing was saved before, so there was no name to replace"
+        );
+        assert_eq!(first.settings.workspace_name.as_deref(), Some("Meridian"));
+
+        let same = upsert_name(&pool, Some("Meridian"), "u").await.unwrap();
+        assert_eq!(
+            same.previous_name.as_deref(),
+            Some("Meridian"),
+            "the second save replaced the name the first one wrote"
+        );
+
+        let other = upsert_name(&pool, Some("Atlas"), "u").await.unwrap();
+        assert_eq!(other.previous_name.as_deref(), Some("Meridian"));
+        assert_eq!(other.settings.workspace_name.as_deref(), Some("Atlas"));
+
+        let cleared = upsert_name(&pool, None, "u").await.unwrap();
+        assert_eq!(cleared.previous_name.as_deref(), Some("Atlas"));
+        assert!(cleared.settings.workspace_name.is_none());
         Ok(())
     }
 }

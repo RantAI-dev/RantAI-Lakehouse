@@ -20,6 +20,8 @@ export type PageContext = {
   hint: string; // empty-state helper text
   suggest: PageSuggest;
   system: string; // injected into the AI system prompt
+  /** The dashboard on screen; only the dashboard page sets it (AI-30). */
+  view?: { board: string; filters: unknown[] };
 };
 
 const GENERIC: PageContext = {

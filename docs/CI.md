@@ -138,6 +138,23 @@ manual run it is ignored, and `ci-required` gates exactly as it does without it.
 nightly run of D3 and `CI_PUSH_FULL=true` are the backstops that still run every
 gate.
 
+### Draft PRs (`OPS-38`)
+
+On a `pull_request` event whose PR is a draft, only the fast checks run so
+in-progress and stacked PRs do not fill the hosted runner queue: `changes`,
+`repo-lints`, `verify` (when in scope), `Rust · fmt` (when in scope),
+`ci-required`, and the separate `security.yml` workflow. Every heavy job (`clippy`,
+`build`, `msrv`, `test`, Dagster unit/loader tests, `images`, `image-smoke`, and
+all 25 acceptance gates) and the two `REL-20` nextest steps in `ci-required` are
+skipped. `scripts/ci/detect_change_scope.sh` compares
+`github.event.pull_request.draft` to **exactly `true`, lower case** and fails
+closed on any other or missing value (non-draft / full run); `changes` exports
+`draft` and `heavy` (`draft != 'true'`), and `ci-required` accepts the skipped
+heavy jobs on a draft while still failing if any job failed or was cancelled and
+printing the draft state in its log. `ci.yml` subscribes to `pull_request` types
+`opened`, `synchronize`, `reopened`, and `ready_for_review`, so marking a draft
+ready starts a full run automatically.
+
 ### Gates by path (`OPS-25`)
 
 A pull request runs only the acceptance gates its changed files can affect. The 25 gate
@@ -195,6 +212,16 @@ tests, `ops/lint`, `ops/release`, `ops/ai_eval`, `ops/bench`, `ops/geo`, `ops/de
 `Dockerfile.frontend`; `images` builds the API and Dagster only). Two console paths are
 the exception: `src/lib/dashboard-specs.ts` and `public/geo/*` are compiled into
 `lakehouse-bi`, so they select `governance,alerts`.
+
+**Adding a `path` line requires evidence (`OPS-38` D2).** Add a `path` rule to
+`scripts/ci/gate_paths.txt` for a module under `rust/crates/lakehouse-api/src/`
+or `rust/crates/lakehouse-store/src/` only where its gate reach is proven: grep
+the gate scripts (`ops/g*`, `ops/gold_export*`, `dagster/`) and the gate jobs
+in `.github/workflows/ci.yml` for every route path defined in the file, trace
+every Rust caller and importer across the workspace, and record that evidence in
+a `#` comment line immediately above the new `path` rule. Map a file to `none`
+only when no gate calls any of its routes and no gate-exercised module imports
+it; any file whose reach is unclear keeps the `all` default.
 
 **The label `ci:all-gates`.** Adding that label to a pull request selects every group
 and sets `stack=true`, so `images` runs too. Only a boolean crosses into the script

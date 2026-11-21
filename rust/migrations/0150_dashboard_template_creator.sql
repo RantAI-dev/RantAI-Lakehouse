@@ -1,0 +1,23 @@
+-- Who saved a dashboard template, by account (`BI-18` part D; PR #528 review
+-- SHOULD-FIX 2; owner decision D-A of 2026-11-18, decision T6 on the feature
+-- page `docs/core/features/reports-and-templates.md`). Read by
+-- `lakehouse_store::dashboard_templates` and checked by `lakehouse-api`'s
+-- `routes::dashboard_templates::delete_template`.
+--
+-- WHY: deleting a template is for good (there is no trash for templates), and
+-- the owner decided that only the person who saved it, or an administrator,
+-- may delete it. `created_by` (`0146`) is a display name: two people can share
+-- one and a name can change, so it cannot decide who may delete. This column
+-- holds the saver's `app_user.id`.
+--
+-- WHY A NEW MIGRATION and not a change to `0146`: `0146` has already been
+-- applied to databases that ran this branch, and an applied migration is never
+-- edited (AGENTS.md). `0149` is taken by another open branch, so this is
+-- `0150`; sqlx applies a missing lower version later, so the order in which
+-- the two merge does not matter.
+--
+-- NULL for a template saved before this column existed: nobody is its creator
+-- by account, so only an administrator may delete it (fail closed). No foreign
+-- key: the account may be removed later and the template stays, as it does
+-- for `source_board`.
+ALTER TABLE dashboard_template ADD COLUMN IF NOT EXISTS created_by_id UUID;

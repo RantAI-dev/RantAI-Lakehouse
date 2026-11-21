@@ -107,6 +107,8 @@ export const TOOL_LABEL: Record<string, string> = {
   // RPT-1 / AI-10: scheduled reports by email.
   create_report_subscription: "Schedule report",
   list_report_subscriptions: "List scheduled reports",
+  // AI-30: the read-only people lookup for a report's recipients.
+  find_report_recipients: "Find recipients",
   update_report_subscription: "Change scheduled report",
   delete_report_subscription: "Delete scheduled report",
   // BI-26 slice 2: signed embedding. The labels say what waits for a human
@@ -116,6 +118,14 @@ export const TOOL_LABEL: Record<string, string> = {
   set_embed_filter_modes: "Set embed filter modes",
   withdraw_embed_tokens: "Withdraw embed tokens",
   get_embed_snippet: "Describe embedding",
+  // BI-18 part D: written reports and dashboard templates.
+  list_reports: "List reports",
+  create_report: "Write report",
+  update_report: "Change report",
+  delete_report: "Delete report",
+  list_templates: "List templates",
+  create_dashboard_from_template: "Start dashboard from template",
+  delete_template: "Delete template",
 };
 
 /**
