@@ -698,18 +698,24 @@ export function forecastNote(lines: readonly ReferenceLine[] | undefined, ctx: L
   return forecastOf(lines, ctx, horizontal)?.plan.note;
 }
 
-/** Digits only: "Goal 1,000", "1.000" and "1 000" all read "1000". */
-const digitsOnly = (t: string) => t.replace(/[\s,.\u00a0\u202f']/g, "");
+/** One number as the person wrote it: digits with grouping separators ("1,000", "1 000", "1'000") and a decimal point. */
+const NUMBER = /\d[\d' \u00a0\u202f,.]*/g;
+
+/** A number as digits and its decimal point, grouping separators dropped; trailing periods are a sentence's, not the number's. */
+const plainNumber = (t: string) => t.replace(/[' \u00a0\u202f,]/g, "").replace(/\.+$/, "");
 
 /**
- * Whether a person's own label already holds the line's number, compared
- * without grouping separators or spaces against both the formatted value and
- * the plain number (BI-72).
+ * Whether a person's own label already holds the line's number as a whole
+ * number, compared against both the formatted value (the chart's locale and
+ * format) and the plain number, grouping separators ignored. "Goal 1,000" for
+ * a 1,000 line carries it; "Goal 21000" does not (its 1,000 sits inside
+ * another number), so the second still shows the line's number once
+ * (`BI-72`; whole-number tokens, `PR #651 review 2`).
  */
 function carriesNumber(label: string, formatted: string, value: number): boolean {
-  const text = digitsOnly(label);
-  const wanted = [digitsOnly(formatted), digitsOnly(String(value))].filter((w) => w !== "");
-  return wanted.some((w) => text.includes(w));
+  const wanted = [plainNumber(formatted), plainNumber(String(value))].filter((w) => w !== "");
+  const numbers = label.match(NUMBER) ?? [];
+  return numbers.some((n) => wanted.includes(plainNumber(n)));
 }
 
 /** The next 1, 2, 2.5 or 5 x 10^n step above `top`, with steps sized for about five intervals from `min` (BI-72). */

@@ -271,6 +271,15 @@ test("BI-72: a goal label carries its number once", () => {
   assert.equal(labelOf(undefined, 1000), "1,000")
 })
 
+test("BI-72, PR #651 review 2: a label holding another number still shows the line's number", () => {
+  // "Goal 21000" does not carry 1,000: the value sits inside another number,
+  // so the line's own number is still written once beside it.
+  assert.equal(labelOf("Goal 21000", 1000), "Goal 21000 1,000")
+  // A period after the number ends a sentence, not the number: the label
+  // still carries it and is not given a second copy.
+  assert.equal(labelOf("Q4 target 1,000. Due.", 1000), "Q4 target 1,000. Due.")
+})
+
 test("BI-72: a widened axis ends on a round tick and every value axis hides overlapping labels", () => {
   const base = buildOption({ kind: "bar", x: "k", y: "v", source: "ui" } as never, [{ k: "a", v: 12000 }], false)
   const option = withReferenceLines(base, [{ value: 15700, label: "Goal" }], false, false) as unknown as {
