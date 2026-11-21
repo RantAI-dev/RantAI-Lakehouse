@@ -2,7 +2,7 @@
 // read the asset come grouped by dashboard, a group opens in place, and a
 // failed read of the viewer's charts or dashboards leaves the map as it was;
 // the map opens fitted to its box and pans and zooms inside it.
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
 
 import { boxHeight, fitScale } from "@/lib/pan-zoom"
@@ -90,8 +90,10 @@ describe("LineageMindmap groups (BI-71)", () => {
   it("keeps every chart as its own node when the charts cannot be read", async () => {
     serve(new ServiceError("unavailable", "The charts could not be loaded"))
     render(<Tab />)
-    await waitFor(() => expect(screen.queryByText("Loading")).toBeNull())
-    expect(screen.getByText("Visitors by port")).toBeTruthy()
+    // `findBy` rides a MutationObserver like the first test's does, and needs no
+    // timer: a `waitFor` poll waits on one, which a shared process can leave stopped.
+    expect(await screen.findByText("Visitors by port")).toBeTruthy()
+    expect(screen.queryByText("Loading")).toBeNull()
     expect(screen.getByText("Arrivals share")).toBeTruthy()
     expect(screen.queryByRole("button", { name: /charts?$/ })).toBeNull()
     // And says nothing about it: grouping is a reading aid.
