@@ -304,9 +304,18 @@ async fn sixty_failed_signins_from_one_source_write_one_refused_row_and_one_summ
         summary["actor_label"],
         lakehouse_store::audit::ACTOR_SIGN_IN_FORM
     );
-    assert!(summary["principal_id"].is_null(), "nobody signed in: {summary}");
-    assert_eq!(summary["args"]["source"], SOURCE, "the summary names the source");
-    assert_eq!(summary["args"]["count"], 59, "the count of the later failures");
+    assert!(
+        summary["principal_id"].is_null(),
+        "nobody signed in: {summary}"
+    );
+    assert_eq!(
+        summary["args"]["source"], SOURCE,
+        "the summary names the source"
+    );
+    assert_eq!(
+        summary["args"]["count"], 59,
+        "the count of the later failures"
+    );
     assert!(
         summary["args"]["windowStartedAt"].is_string(),
         "the summary names the window: {summary}"
@@ -315,7 +324,7 @@ async fn sixty_failed_signins_from_one_source_write_one_refused_row_and_one_summ
         summary["args"]["windowEndedAt"].is_string(),
         "the summary names the window: {summary}"
     );
-    assert_nothing_the_visitor_typed(&summary, "spray", FAILURES);
+    assert_nothing_the_visitor_typed(summary, "spray", FAILURES);
 }
 
 /// Two sources get a refused row of their own.
@@ -434,7 +443,11 @@ async fn two_principals_and_two_routes_get_a_refused_row_of_their_own() {
         .map(|row| row["principal_id"].as_str().unwrap_or(""))
         .collect();
     principals.sort_unstable();
-    assert_eq!(principals, vec![first.to_string(), second.to_string()]);
+    // The two principals are uuids, so their order is the coin toss of the
+    // run: the expectation is sorted too, or the test fails half the time.
+    let mut expected = vec![first.to_string(), second.to_string()];
+    expected.sort_unstable();
+    assert_eq!(principals, expected);
 
     let updates = audit_rows(&pool, "identity.role.update").await;
     assert_eq!(updates.len(), 1, "another route, another row: {updates:#?}");
@@ -516,15 +529,27 @@ async fn a_closed_window_gets_one_summary_row_with_the_count() {
 
     let rows = audit_rows(&pool, "auth.login").await;
     assert_eq!(rows.len(), 2, "one refused row and one summary: {rows:#?}");
-    let summary = summary_of(&rows, "2 more failed sign-ins from this source in 15 minutes.");
+    let summary = summary_of(
+        &rows,
+        "2 more failed sign-ins from this source in 15 minutes.",
+    );
     assert_eq!(summary["outcome"], "refused");
     assert_eq!(
         summary["actor_label"],
         lakehouse_store::audit::ACTOR_SIGN_IN_FORM
     );
-    assert!(summary["principal_id"].is_null(), "nobody signed in: {summary}");
-    assert_eq!(summary["args"]["source"], SOURCE, "the summary names the source");
-    assert_eq!(summary["args"]["count"], 2, "the count of the later failures");
+    assert!(
+        summary["principal_id"].is_null(),
+        "nobody signed in: {summary}"
+    );
+    assert_eq!(
+        summary["args"]["source"], SOURCE,
+        "the summary names the source"
+    );
+    assert_eq!(
+        summary["args"]["count"], 2,
+        "the count of the later failures"
+    );
     assert!(
         summary["args"]["windowStartedAt"].is_string(),
         "the summary names the window: {summary}"
@@ -612,10 +637,9 @@ async fn a_closed_window_of_gate_refusals_gets_one_summary_row() {
     assert_eq!(summary["args"]["method"], "POST");
     assert_eq!(summary["args"]["count"], 2);
 
-    let counter_rows: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM gate_refusal_throttle")
-            .fetch_one(&pool)
-            .await
-            .expect("count the counter rows");
+    let counter_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM gate_refusal_throttle")
+        .fetch_one(&pool)
+        .await
+        .expect("count the counter rows");
     assert_eq!(counter_rows, 0, "the summarised counter row is deleted");
 }

@@ -72,7 +72,7 @@ const RECORD_REFUSAL_SQL: &str = "INSERT INTO gate_refusal_throttle \
              to_timestamp(floor(extract(epoch from now()) / 900) * 900), 1, FALSE) \
      ON CONFLICT (principal_id, method, route_pattern, window_started_at) DO UPDATE \
        SET refusals = gate_refusal_throttle.refusals + 1 \
-     RETURNING refusals";
+     RETURNING refusals, window_started_at";
 
 /// The statement that says the first refused row of a window was written.
 const MARK_FIRST_ROW_SQL: &str = "UPDATE gate_refusal_throttle SET first_row_written = TRUE \
@@ -337,7 +337,11 @@ fn refusal_summary_event(window: &RefusalWindow, count: u32) -> NewAuditEvent {
             "windowStartedAt": iso(window.window_started_at),
             "windowEndedAt": iso(window.window_started_at + WINDOW),
         })),
-        detail: Some(refusal_summary_detail(count, &window.method, &window.route_pattern)),
+        detail: Some(refusal_summary_detail(
+            count,
+            &window.method,
+            &window.route_pattern,
+        )),
         ..Default::default()
     }
 }
@@ -349,7 +353,8 @@ fn refusal_summary_detail(count: u32, method: &str, route: &str) -> String {
 
 /// A timestamp in ISO 8601, `None` when it cannot be written.
 fn iso(at: OffsetDateTime) -> Option<String> {
-    at.format(&time::format_description::well_known::Rfc3339).ok()
+    at.format(&time::format_description::well_known::Rfc3339)
+        .ok()
 }
 
 #[cfg(test)]
