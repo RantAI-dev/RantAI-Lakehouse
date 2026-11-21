@@ -469,3 +469,133 @@ def test_the_sink_writes_a_type_changing_replace_through_the_transaction_and_oth
     )
     assert again.rows == 3
     assert "replaced in one commit" not in again.load_info_str
+
+
+def _left_out_load(monkeypatch, directory: str, mode: str = "replace", key: tuple[str, ...] = ()):
+    """`SRC-48`: a table of `a`, `b`, `c` loaded through the sink, and a function that runs
+    another load of the same table through the sink with the given columns and
+    `drop_columns`. The commits the schema takes are recorded in `commits`."""
+    dedup = mode == "replace_dedup"
+    # A deduplicating load reads records, so `dlt` adds its own `_dlt_*` columns, which the
+    # Arrow table of `_text_table` has not: that table is first loaded the same way as the rest.
+    pipeline = _local_pipeline(directory) if dedup else _text_table(directory)[0]
+    monkeypatch.setattr(sink_module, "_install_catalog_env", lambda config: None)
+    monkeypatch.setattr(sink_module, "_bronze_pipeline", lambda name, config: pipeline)
+    monkeypatch.setattr(sink_module, "_abort_pending", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sink_module.history, "refuse_history_rows", lambda *args, **kwargs: False)
+    config = sink_module.SinkConfig("u", "w", "e", "a", "s", "b", "", author="a run")
+    commits: list[list[str]] = []
+    original = sink_module._drop_left_out_columns
+
+    def recording(*args, **kwargs):
+        dropped = original(*args, **kwargs)
+        commits.append(dropped)
+        return dropped
+
+    monkeypatch.setattr(sink_module, "_drop_left_out_columns", recording)
+
+    def load(names: str, rows: list[list[str]], drop=(), plan_mode: str = mode):
+        hints = [{"name": n, "data_type": "text"} for n in names]
+        plan = sink_module.LoadPlan(mode=plan_mode, key=key)
+        if plan_mode == "replace_dedup":
+            # A deduplicating load reads records (column to value), not Arrow batches.
+            records = [dict(zip(names, values)) for values in zip(*rows)]
+            resource = dlt.resource(records, name="t")
+            resource.apply_hints(columns=hints)
+            source = resource
+        else:
+            batch = pa.table({name: pa.array(values, pa.string()) for name, values in zip(names, rows)})
+            source = _source(batch, hints)
+        return sink_module.load_via_sink(source, "t", config, plan, drop_columns=drop)
+
+    if dedup:
+        load("abc", [["1", "2"], ["x", "y"], ["1.5", "2.5"]])
+        commits.clear()
+    return pipeline, load, commits
+
+
+def _held(pipeline) -> tuple[list[str], dict[str, list]]:
+    table = sink_module.history.open_table(pipeline, "t", sync=False)
+    table.refresh()
+    rows = table.scan().to_arrow()
+    return [f.name for f in table.schema().fields], {n: rows.column(n).to_pylist() for n in rows.schema.names}
+
+
+@loader
+def test_src_48_a_replace_with_a_column_left_out_leaves_no_such_column_in_the_table(local_catalog, tmp_path, monkeypatch):
+    """`SRC-48` (`QA TC-1706`, decision 10): the column is gone from the Iceberg schema and
+    from the stored `dlt` schema, and the rows carry the right values in the others."""
+    pipeline, load, commits = _left_out_load(monkeypatch, str(tmp_path))
+    result = load("ab", [["3", "4"], ["z", "w"]], drop=["c"])
+    assert (result.rows, result.has_failed_jobs) == (2, False)
+    names, rows = _held(pipeline)
+    assert "c" not in names
+    assert sorted(rows["a"]) == ["3", "4"] and sorted(rows["b"]) == ["w", "z"]
+    assert "c" not in pipeline.default_schema.tables["t"]["columns"]
+    assert commits == [["c"]]
+
+
+@loader
+def test_src_48_a_replace_dedup_with_a_column_left_out_leaves_no_such_column_in_the_table(local_catalog, tmp_path, monkeypatch):
+    pipeline, load, commits = _left_out_load(monkeypatch, str(tmp_path), mode="replace_dedup", key=("a",))
+    load("ab", [["3", "3", "4"], ["z", "y", "w"]], drop=["c"])
+    names, rows = _held(pipeline)
+    assert "c" not in names
+    assert sorted(rows["a"]) == ["3", "4"], "one row per key, as the mode keeps"
+    assert commits == [["c"]]
+
+
+@loader
+def test_src_48_an_incremental_table_keeps_the_column_left_out_with_nulls_in_the_new_rows(local_catalog, tmp_path, monkeypatch):
+    """Decision 10: a table that keeps its rows keeps the column. The sink refuses to drop
+    for a plan that is not a replace on every load, so it is asked here with the plan an
+    incremental run has and nothing is removed."""
+    pipeline, _, _ = _left_out_load(monkeypatch, str(tmp_path))
+    plan = sink_module.LoadPlan(mode="incremental", cursor="a")
+    assert sink_module._drop_left_out_columns(pipeline, "t", plan, ["c"]) == []
+    assert "c" in _held(pipeline)[0]
+    # An `append` that does not carry the column writes nulls in it, as `dlt` does.
+    batch = pa.table({"a": pa.array(["3"], pa.string()), "b": pa.array(["z"], pa.string())})
+    pipeline.run(
+        _source(batch, [{"name": n, "data_type": "text"} for n in "ab"]),
+        table_name="t", write_disposition="append", loader_file_format="parquet", table_format="iceberg",
+    )
+    names, rows = _held(pipeline)
+    assert "c" in names
+    assert sorted(rows["c"], key=lambda value: (value is None, value or "")) == ["1.5", "2.5", None]
+
+
+@loader
+def test_src_48_a_key_column_or_a_system_column_in_the_list_is_not_dropped(local_catalog, tmp_path, monkeypatch):
+    pipeline, load, commits = _left_out_load(monkeypatch, str(tmp_path), mode="replace_dedup", key=("a",))
+    load("ab", [["3"], ["z"]], drop=["a", "_ingested_at", "_dlt_id", "c"])
+    names, _ = _held(pipeline)
+    assert "a" in names and "_dlt_id" in names and "_ingested_at" in names
+    assert "c" not in names
+    assert commits == [["c"]]
+    # The cursor is protected the same way.
+    plan = sink_module.LoadPlan(mode="replace_dedup", key=("a",), cursor="b")
+    assert sink_module._drop_left_out_columns(pipeline, "t", plan, ["b"]) == []
+    assert "b" in _held(pipeline)[0]
+
+
+@loader
+def test_src_48_ticking_the_column_again_brings_it_back_filled_from_that_load(local_catalog, tmp_path, monkeypatch):
+    pipeline, load, _ = _left_out_load(monkeypatch, str(tmp_path))
+    load("ab", [["3"], ["z"]], drop=["c"])
+    assert "c" not in _held(pipeline)[0]
+    load("abc", [["5", "6"], ["p", "q"], ["7.5", "8.5"]])
+    names, rows = _held(pipeline)
+    assert "c" in names
+    assert sorted(rows["c"]) == ["7.5", "8.5"]
+
+
+@loader
+def test_src_48_a_name_the_table_does_not_have_changes_nothing_and_makes_no_schema_commit(local_catalog, tmp_path, monkeypatch):
+    pipeline, _, _ = _left_out_load(monkeypatch, str(tmp_path))
+    table = sink_module.history.open_table(pipeline, "t", sync=False)
+    before = (table.metadata.current_schema_id, len(table.metadata.schemas), len(table.metadata.snapshots))
+    plan = sink_module.LoadPlan(mode="replace")
+    assert sink_module._drop_left_out_columns(pipeline, "t", plan, ["nope"]) == []
+    table.refresh()
+    assert (table.metadata.current_schema_id, len(table.metadata.schemas), len(table.metadata.snapshots)) == before

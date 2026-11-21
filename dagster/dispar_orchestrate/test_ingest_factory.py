@@ -1589,7 +1589,7 @@ def _wire_mysql(monkeypatch, *, loads: list, builds: list, table=None):
 
     monkeypatch.setitem(f._ADAPTERS, "sql", _Adapter())
 
-    def fake_load(source, target, sink_config, plan):
+    def fake_load(source, target, sink_config, plan, **kwargs):
         loads.append(target)
         return f.sink_adapter.SinkResult(rows=5, has_failed_jobs=False, load_info_str="")
 

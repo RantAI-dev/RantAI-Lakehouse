@@ -364,3 +364,38 @@ def test_the_note_is_cleared_between_steps(monkeypatch, reports, observations) -
     _step(_step_context(), _mysql_connector(), {"name": "b", "target": "b"})
     assert [r[0] for r in reports] == ["attempt"]
     assert f._NOTES.get() is None
+
+
+def _drop_columns_seen(monkeypatch, obj: dict) -> list:
+    """The `drop_columns` argument each `load_via_sink` call of one load of `obj` got (a
+    missing argument is recorded as `None`)."""
+    seen: list = []
+    _wire_mysql(monkeypatch, loads=[], builds=[])
+
+    def capture(source, target, sink_config, plan, **kwargs):
+        seen.append(kwargs.get("drop_columns"))
+        return f.sink_adapter.SinkResult(rows=5, has_failed_jobs=False, load_info_str="")
+
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", capture)
+    f._run_one_object(_mysql_connector(), obj)
+    return seen
+
+
+def test_src_48_a_replaced_object_with_excluded_columns_passes_their_bronze_names_to_the_sink(
+    monkeypatch, observations
+) -> None:
+    """`SRC-48` decision 10 (`QA TC-1706`): the console's spelling (`Note`) reaches the sink
+    in the Bronze spelling the table holds (`note`)."""
+    obj = {"name": "shop.orders", "target": "orders", "loadMode": "replace", "excludedColumns": ["note"]}
+    assert _drop_columns_seen(monkeypatch, obj) == [["note"]]
+
+
+def test_src_48_an_object_without_excluded_columns_passes_no_columns_to_the_sink(
+    monkeypatch, observations
+) -> None:
+    obj = {"name": "shop.orders", "target": "orders", "loadMode": "replace"}
+    assert _drop_columns_seen(monkeypatch, obj) == [None]
+
+
+def test_src_48_the_bronze_name_of_a_ticked_off_column_follows_the_naming_convention() -> None:
+    assert f.sink_adapter.bronze_column_names(["Shift", "OrderDate", "note"]) == ["shift", "order_date", "note"]
