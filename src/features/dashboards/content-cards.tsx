@@ -3,6 +3,7 @@
 import * as React from "react";
 import { Button } from "@/components/ui/button";
 import { useService } from "@/hooks/use-service";
+import { isPublicPath } from "@/features/auth/auth-provider";
 import { SITE_NO_LONGER_ALLOWED, siteAllowed, type TypeDefFields } from "@/lib/type-b";
 import { dashboardService } from "@/services";
 import { useReporting } from "./reporting-context";
@@ -51,10 +52,19 @@ export function WebCard({ def, title }: { readonly def: TypeDefFields | undefine
   // Asked once per address. A site that refuses framing is invisible to the
   // browser (a refused frame fires no event the page can read), so the server
   // reads the site's headers; no answer (`null`) keeps the frame as it was.
-  const frame = useService<boolean | null>(
-    (signal) => (allowed ? dashboardService.frameCheck(url as string, signal) : Promise.resolve(null)),
-    [url, allowed],
-  );
+  //
+  // PR #651 review 1 (BLOCKER): the route needs a session, so a page without
+  // one must not ask — the 401 would go through `apiFetch`'s redirect to
+  // `/login` (`src/services/http.ts`) and carry an anonymous visitor off the
+  // public link or embed they are reading. The address is read at ask time,
+  // inside the effect (client only, never a server render): `isPublicPath`
+  // is the auth provider's own list of session-less prefixes (`/public`,
+  // `/embed`, `/login`, `/landing`, `/render`), kept in sync with the
+  // backend's public route table, so no page has to remember to opt out.
+  const frame = useService<boolean | null>((signal) => {
+    if (!allowed || isPublicPath(window.location.pathname)) return Promise.resolve(null);
+    return dashboardService.frameCheck(url as string, signal);
+  }, [url, allowed]);
   if (!url || !allowed) return <Blocked message={SITE_NO_LONGER_ALLOWED} />;
   if (frame.status === "loading") return <div className="h-full animate-pulse rounded bg-muted/40" />;
   const openLink = (
