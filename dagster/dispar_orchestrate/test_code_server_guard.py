@@ -640,7 +640,8 @@ def test_the_guard_goes_on_when_the_dagster_instance_cannot_be_opened(
 
 # The line the INNER server writes when it misses its heartbeat
 # (`dagster/_grpc/server.py`).
-HEARTBEAT_LINE = "No heartbeat received in 30 seconds, shutting down"
+HEARTBEAT_MESSAGE = "No heartbeat received in 30 seconds, shutting down"
+HEARTBEAT_LINE = f"2026-11-20 03:00:00 +0000 - dagster.code_server - WARNING - {HEARTBEAT_MESSAGE}"
 
 
 def test_the_missed_heartbeat_line_triggers_one_reload(
@@ -677,6 +678,13 @@ def test_the_missed_heartbeat_line_triggers_one_reload(
         ),
         pytest.param(
             "Failed to shut down server", id="a-shutdown-that-failed"
+        ),
+        pytest.param(
+            f"connector diagnostic: {HEARTBEAT_MESSAGE}", id="a-run-quoting-the-heartbeat"
+        ),
+        pytest.param(
+            HEARTBEAT_LINE.replace("dagster.code_server", "dagster.run"),
+            id="another-logger-quoting-the-heartbeat",
         ),
     ],
 )
@@ -808,7 +816,17 @@ def test_the_code_servers_output_is_forwarded_to_the_guards_own_output(
 
 def test_the_matcher_finds_the_rendered_heartbeat_line() -> None:
     """The line the inner server writes, as it appears in the log."""
-    assert code_server_guard.SHUTDOWN_LINE_PATTERN.search(HEARTBEAT_LINE)
+    from dagster._utils.log import define_default_formatter
+
+    record = logging.LogRecord(
+        "dagster.code_server", logging.WARNING, "", 0, HEARTBEAT_MESSAGE, (), None
+    )
+    line = define_default_formatter().format(record)
+    colored_line = line.replace("WARNING", "\x1b[34mWARNING\x1b[0m")
+    watcher = code_server_guard.ShutdownWatcher()
+    watcher.notice(line + "\n")
+    watcher.notice(colored_line + "\n")
+    assert [message for _, message in watcher.drain()] == [line + "\n", colored_line + "\n"]
 
 
 def test_the_installed_dagster_source_still_has_the_line_the_matcher_expects() -> None:

@@ -117,8 +117,15 @@ DAGSTER_HEARTBEAT_TTL_ENV = "DAGSTER_GRPC_PROXY_HEARTBEAT_TTL_SECONDS"
 # `test_the_child_command_does_not_carry_the_heartbeat_flag` keeps it that
 # way: with the flag, every reload would be triggered by the proxy's own
 # heartbeat instead of the inner server's.
+# PR #636 review 1: the run workers share these streams. Match the entire
+# record written by the CLI's dagster.code_server logger, using Dagster's
+# default timestamp, name and level format (_utils/log.py). Strip the SGR
+# sequences its colored formatter adds before matching.
+LOG_COLOR_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 SHUTDOWN_LINE_PATTERN = re.compile(
-    r"No heartbeat received in \d+ seconds, shutting down"
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} [+-][0-9]{4}"
+    r" - dagster\.code_server - WARNING - "
+    r"No heartbeat received in [0-9]+ seconds, shutting down"
 )
 
 # How long the guard waits for the code server to RELOAD, in seconds. The
@@ -432,7 +439,7 @@ class ShutdownWatcher:
 
     def notice(self, line: str) -> None:
         """Queues a line that matches the missed-heartbeat line."""
-        if SHUTDOWN_LINE_PATTERN.search(line):
+        if SHUTDOWN_LINE_PATTERN.fullmatch(LOG_COLOR_PATTERN.sub("", line.rstrip("\r\n"))):
             self.lines.put((time.monotonic(), line))
             self.wake.set()
 
