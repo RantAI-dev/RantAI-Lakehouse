@@ -291,11 +291,10 @@ def give_up_reason(state: ProbeState) -> str:
     """One line, no secrets: why the guard is giving up."""
     if state.succeeded_once:
         return (
-            f"the code server did not answer {state.consecutive_failures} pings in a row: "
-            "its inner server is dead"
+            f"the code location failed {state.consecutive_failures} probes in a row"
         )
     return (
-        f"the code server answered none of {state.consecutive_failures} pings: it never came up"
+        f"the code location passed none of {state.consecutive_failures} startup probes"
     )
 
 
@@ -711,6 +710,17 @@ def reload_code(*, host: str, port: int) -> None:
 
     client = DagsterGrpcClient(host=host, port=port)
     client.reload_code(timeout=RELOAD_TIMEOUT_SECONDS)
+    verify_code_location(host=host, port=port)
+
+
+def verify_code_location(*, host: str, port: int) -> None:
+    """Raise if the proxy cannot load its current repository definitions."""
+    from dagster._api.list_repositories import sync_list_repositories_grpc
+    from dagster._grpc.client import DagsterGrpcClient
+
+    # PR #636 review 3: ReloadCode can return successfully even when the
+    # proxy stored a replacement load error and the old server still pings.
+    sync_list_repositories_grpc(DagsterGrpcClient(host=host, port=port))
 
 
 def dagster_instance():
@@ -855,6 +865,7 @@ def run_guard(
     spawn: Callable[..., subprocess.Popen] = spawn_child,
     probe_fn: Callable[..., bool] = probe,
     reload_fn: Callable[..., None] = reload_code,
+    verify_loaded_fn: Callable[..., None] = verify_code_location,
     interval_seconds: float = PROBE_INTERVAL_SECONDS,
 ) -> int:
     """Runs the code server under the guard. The exit code is the container's.
@@ -889,6 +900,7 @@ def run_guard(
     state = ProbeState()
     reload_state = ReloadState()
     orphan_checked = False
+    verify_after_failed_reload = False
     try:
         supervisor.install_signal_handlers()
         while True:
@@ -902,7 +914,8 @@ def run_guard(
                     child.returncode,
                 )
                 return 1
-            for observed_at, line in watcher.drain():
+            reload_failed = False
+            for observed_at, _line in watcher.drain():
                 if should_give_up_after_shutdown(reload_state, observed_at=observed_at):
                     logger.error(
                         "the inner code server shut down again within %d s of the last reload: "
@@ -918,16 +931,29 @@ def run_guard(
                 )
                 try:
                     reload_fn(host=target, port=args.port)
+                    verify_after_failed_reload = False
                 except Exception as error:
+                    reload_failed = verify_after_failed_reload = True
                     logger.warning(
-                        "the reload of the code location failed (%s): the guard keeps running",
+                        "the reload of the code location failed (%s): counting a failed probe",
                         type(error).__name__,
                     )
-            answered = probe_fn(host=target, port=args.port)
+            answered = not reload_failed and probe_fn(host=target, port=args.port)
+            if answered and verify_after_failed_reload:
+                try:
+                    verify_loaded_fn(host=target, port=args.port)
+                except Exception as error:
+                    logger.warning(
+                        "the code location still cannot load its repositories (%s)",
+                        type(error).__name__,
+                    )
+                    answered = False
+                else:
+                    verify_after_failed_reload = False
             state = state.after_probe(answered)
             if not answered:
                 logger.warning(
-                    "the code server did not answer a ping on %s:%d (attempt %d)",
+                    "the code location failed its probe on %s:%d (attempt %d)",
                     target,
                     args.port,
                     state.consecutive_failures,

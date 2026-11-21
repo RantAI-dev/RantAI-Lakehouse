@@ -680,6 +680,59 @@ def test_the_missed_heartbeat_line_triggers_one_reload(
     assert len(reloads) == 1
 
 
+def test_a_reload_reply_with_a_repository_load_error_fails_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dagster._core.errors import DagsterUserCodeProcessError
+    from dagster._grpc.client import DagsterGrpcClient
+    from dagster._serdes import serialize_value
+    from dagster._utils.error import SerializableErrorInfo
+
+    monkeypatch.setattr(DagsterGrpcClient, "reload_code", lambda self, timeout: None)
+    error = SerializableErrorInfo(message="replacement could not load", stack=[], cls_name=None)
+    monkeypatch.setattr(DagsterGrpcClient, "list_repositories", lambda self: serialize_value(error))
+
+    with pytest.raises(DagsterUserCodeProcessError):
+        code_server_guard.reload_code(host="localhost", port=1)
+
+
+def test_pings_from_the_old_server_do_not_clear_a_replacement_load_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(**_kwargs) -> None:
+        raise RuntimeError("replacement could not load")
+
+    monkeypatch.setattr(
+        code_server_guard, "start_output_readers",
+        lambda _child, watcher: watcher.notice(HEARTBEAT_LINE),
+    )
+    probes = []
+    child = _sleeping_child()
+
+    def ping(**_kwargs) -> bool:
+        probes.append(True)
+        if len(probes) >= code_server_guard.FAILURES_BEFORE_FIRST_SUCCESS:
+            pytest.fail("successful pings cleared the failed reload")
+        return True
+
+    try:
+        exit_code = code_server_guard.run_guard(
+            _guard_args(_closed_port()),
+            spawn=lambda **_kwargs: child,
+            instance_factory=lambda: _RecordingInstance([]),
+            probe_fn=ping,
+            reload_fn=unavailable,
+            verify_loaded_fn=unavailable,
+            interval_seconds=0.001,
+        )
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+    assert exit_code == 1
+    assert len(probes) == code_server_guard.FAILURES_BEFORE_FIRST_SUCCESS - 1
+
+
 @pytest.mark.parametrize(
     "line",
     [
