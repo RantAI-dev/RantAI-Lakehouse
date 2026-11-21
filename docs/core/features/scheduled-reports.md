@@ -79,19 +79,24 @@ PDF."). The AI team reviews this part. `list_report_subscriptions` answers a
 
 Run by the product owner on a running console. A step not performed is never a pass.
 
-- `RPT-1-AC1` A weekly Monday 08:00 PDF arrives with the dashboard's charts.
-- `RPT-1-AC2` A subscription filtered to Bali shows only Bali.
-- `RPT-1-AC3` With "skip when empty", no email is sent for an empty result, and the skip is recorded.
-- `RPT-1-AC4` A user who may not download is refused; an outside address on a domain not listed is refused; a failure shows a plain sentence and tells the owner.
-- `RPT-1-AC5` "Send now" delivers a test email and records it.
+- `RPT-1-AC1` A weekly Monday 08:00 PDF arrives with the dashboard's charts. Run 2026-11-21: pass.
+- `RPT-1-AC2` A subscription filtered to Bali shows only Bali. Run 2026-11-21: pass.
+- `RPT-1-AC3` With "skip when empty", no email is sent for an empty result, and the skip is recorded. Run 2026-11-21: pass.
+- `RPT-1-AC4` A user who may not download is refused; an outside address on a domain not listed is refused; a failure shows a plain sentence and tells the owner. Run 2026-11-21: the outside-domain clause passed; the other two clauses were not run (see Exceptions).
+- `RPT-1-AC5` "Send now" delivers a test email and records it. Run 2026-11-21: pass.
 - `RPT-1-AC6` With e-mail not set up on the installation, "Send now" and a scheduled
   run each record a failed send with the reason "Email is not set up on this
   deployment."; the failures are not counted and the subscription is not paused
   (`DEC-18`). The subscriptions list shows on that subscription "Not sent: e-mail is
   not set up on this installation." with the time of the last attempt. Row added
   2026-11-12 (`RPT-2`) for QA `LH-RPT-1-06`; the words on screen are *(proposed, not
-  yet signed)*.
+  yet signed)*. Not run on 2026-11-21 (see Exceptions).
 - `AI-10-AC1` "Send this dashboard to me every Monday as a PDF." creates a Monday PDF subscription for the person. Accepted by the AI owner, 2026-11-13 (staging `80fb2f68`). The PDF itself not rendered: staging has no Gotenberg.
 
 **Accepted by:** the product owner **Date:** 2026-11-21 **Build:** the QA stack, against a local mail catcher with TLS.  
 Released by the product owner on 2026-11-21 on the planner's run (the owner does not check e-mail in the dev setup).
+
+Exceptions, each with an owner and a date:
+
+- `RPT-1-AC6` (an installation with no e-mail settings) was not run. Owner: product owner; to run by 2026-11-28.
+- `RPT-1-AC4` was run for its outside-domain clause only: "a user who may not download is refused" and "a failure shows a plain sentence and tells the owner" were not run. Owner: product owner; to run by 2026-11-28.
