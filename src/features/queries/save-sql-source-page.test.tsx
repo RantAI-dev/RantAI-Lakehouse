@@ -26,6 +26,7 @@ import { dashboardService, settingsService } from "@/services"
 import { ServiceError } from "@/services/errors"
 import { SaveSqlSourcePage } from "./save-sql-source-page"
 import { readSaveSourceDraft, writeSaveSourceDraft } from "./save-draft"
+import { takeChartDraft } from "@/features/dashboards/chart-page"
 
 afterEach(() => {
   cleanup()
@@ -94,5 +95,34 @@ describe("SaveSqlSourcePage", () => {
     expect(screen.getByText("Open Query Studio").closest("a")?.getAttribute("href")).toBe(
       "/query-studio"
     )
+  })
+})
+
+// UX-9 Make a chart: a result's ⋯ leaves the statement here with
+// `next: "chart"`; once the source is saved, the chart builder opens on it
+// through the builder's own draft, on the built-in dashboard.
+describe("SaveSqlSourcePage for Make a chart", () => {
+  it("saves the source, then opens the chart builder on it", async () => {
+    spyOn(settingsService, "getLimits").mockRejectedValue(
+      new ServiceError("unavailable", "no limits")
+    )
+    writeSaveSourceDraft({ sql: "SELECT region, sum(n) FROM serving.orders GROUP BY region", next: "chart" })
+    spyOn(dashboardService, "createSqlSource").mockResolvedValue({
+      id: "s9",
+      title: "Orders by region",
+      sql: "SELECT region, sum(n) FROM serving.orders GROUP BY region",
+      columns: [],
+      folderId: "",
+      createdBy: "u1",
+      updatedAt: "2026-11-21T10:00:00.000Z",
+    })
+    render(<SaveSqlSourcePage />)
+
+    expect(await screen.findByText("Make a chart")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Save and build the chart" }))
+
+    await waitFor(() => expect(pushed).toEqual(["/dashboards/default/charts/new"]))
+    expect(takeChartDraft("default")).toEqual({ board: "default", def: { sqlSource: "s9" } })
+    expect(readSaveSourceDraft()).toBeNull()
   })
 })
