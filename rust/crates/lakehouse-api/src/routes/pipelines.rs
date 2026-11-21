@@ -424,6 +424,29 @@ pub async fn runs(
     (StatusCode::OK, ApiJson(body)).into_response()
 }
 
+/// `GET /api/pipelines/{id}/reupload-chain` — the newest chain outcome the
+/// page shows as one sentence (BLD-14 D8). It is a page read like [`runs`],
+/// so it lives here rather than in the orchestrator-only authored router.
+///
+/// BLD-14 review R5: the per-tenant gate runs first, exactly as [`runs`]
+/// does; an id in another tenant and an unknown id are the same 404.
+///
+/// # Errors
+///
+/// 404 for an unknown id or one outside the caller's tenant; 503 with no
+/// database; 500 on a store failure.
+pub async fn reupload_chain(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    authored_pipelines::in_scope(state.pg.as_deref(), &principal, &headers, &id).await?;
+    let pool = pool(&state)?;
+    let last = lakehouse_store::pipeline_chain::latest_chain_step(pool, &id).await?;
+    Ok(ApiJson(json!({ "last": last })))
+}
+
 async fn runs_body(state: &AppState, id: &str) -> Value {
     // An authored pipeline's runs belong to its `authored__<id>` job; the
     // `pl-` id itself names no job, so asking for it always found none.
@@ -3788,6 +3811,23 @@ async fn authored_status(
         }) = &sensor_switched
         {
             tracing::info!(%err, pipeline_id = id, "authored sensor not switched");
+        }
+        // BLD-14 D6/D7: the re-upload chain sensor is a second polling
+        // sensor for the same pipeline. Its stored state also outlives a
+        // reload, so a paused pipeline would otherwise keep starting the
+        // downstream chain. A pipeline with no chain sensor is tolerated
+        // the same way as a missing `_after` sensor above.
+        let chain_sensor = authored_pipelines::chain_sensor_name(id);
+        let chain_switched = if paused {
+            state.dagster.set_sensor_running(&chain_sensor, false).await
+        } else {
+            state.dagster.set_sensor_running(&chain_sensor, true).await
+        };
+        if let Ok(SensorOutcome {
+            error: Some(err), ..
+        }) = &chain_switched
+        {
+            tracing::info!(%err, pipeline_id = id, "authored chain sensor not switched");
         }
         authored_pipelines::reload_orchestrator(state).await;
     }

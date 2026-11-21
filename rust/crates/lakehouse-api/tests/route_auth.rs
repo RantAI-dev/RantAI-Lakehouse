@@ -3809,6 +3809,70 @@ async fn the_report_routes_need_dashboard_read_both_ways() {
     }
 }
 
+/// BLD-14 D8: the page's chain read is asserted both ways.
+#[tokio::test]
+async fn reupload_chain_route_authorization_asserted_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/pipelines/pl-test/reupload-chain";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/pipelines/{id}/reupload-chain")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("pipeline:read")),
+    );
+
+    let allowed = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let refused_user = common::create_principal_with_permissions(&pool, "query:read").await;
+    let refused = common::session_cookie_for_user(&pool, refused_user).await;
+
+    let resp = request_with_cookie(&router, "GET", uri, &refused).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = request_with_cookie(&router, "GET", uri, "").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = request_with_cookie(&router, "GET", uri, &allowed).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "allowed principal must get past the auth gate, got {}",
+        resp.status()
+    );
+}
+
+/// BLD-14 D8: the chain-step write is asserted both ways, as `lag-check` is.
+#[tokio::test]
+async fn chain_step_route_authorization_asserted_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/pipelines/runnable/pl-test/chain-step";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/pipelines/runnable/{id}/chain-step")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("pipeline:read")),
+    );
+
+    let allowed = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let refused_user = common::create_principal_with_permissions(&pool, "query:read").await;
+    let refused = common::session_cookie_for_user(&pool, refused_user).await;
+
+    let resp = request_with_cookie(&router, "POST", uri, &refused).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = request_with_cookie(&router, "POST", uri, "").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = request_with_cookie(&router, "POST", uri, &allowed).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "allowed principal must get past the auth gate, got {}",
+        resp.status()
+    );
+}
+
 /// BLD-2 review R1 BLOCKER 7: lag-check route authorization asserted both ways.
 #[tokio::test]
 async fn lag_check_route_authorization_asserted_both_ways() {
