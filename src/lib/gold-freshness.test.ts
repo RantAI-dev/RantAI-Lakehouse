@@ -1,6 +1,12 @@
 import { describe, expect, it } from "bun:test"
 import { freshnessLine, publicationLabel } from "./gold-freshness"
-import type { GoldPublication } from "@/services/contracts/gold"
+import type { GoldExportResult, GoldPublication } from "@/services/contracts/gold"
+
+// DATA-6 review R6: these three fields ship with the console. An optional
+// property adds `undefined` to the indexed type, so the assertions below
+// flip to `false` and typecheck fails if any of them becomes optional
+// again. This is the regression guard the old contract had no test for.
+type RequiredKey<T, K extends keyof T> = undefined extends T[K] ? false : true
 
 const basePublication: GoldPublication = {
   mart: "sales_rollup",
@@ -12,6 +18,7 @@ const basePublication: GoldPublication = {
   lastFailure: null,
   canEdit: true,
   trim: null,
+  latestCopy: null,
 }
 
 describe("gold-freshness", () => {
@@ -88,5 +95,16 @@ describe("gold-freshness", () => {
       changedSinceExport: false,
     }
     expect(publicationLabel(pub)).toBe("Off")
+  })
+})
+
+describe("the DATA-6 contract fields are required", () => {
+  it("does not allow an older API to omit the latest-copy fields", () => {
+    const publicationLatestCopy: RequiredKey<GoldPublication, "latestCopy"> = true
+    const resultStamp: RequiredKey<GoldExportResult, "copyExportedAt"> = true
+    const resultLatestCopy: RequiredKey<GoldExportResult, "latestCopy"> = true
+    expect(publicationLatestCopy).toBe(true)
+    expect(resultStamp).toBe(true)
+    expect(resultLatestCopy).toBe(true)
   })
 })

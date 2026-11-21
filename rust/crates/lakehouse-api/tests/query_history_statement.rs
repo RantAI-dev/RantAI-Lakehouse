@@ -285,12 +285,22 @@ async fn post_run(
     cookie: &str,
     request: &Value,
 ) -> axum::http::Response<Body> {
+    post_json(router, cookie, "/api/query/run", request).await
+}
+
+/// Posts a JSON body to a query route as the cookie's user.
+async fn post_json(
+    router: &axum::Router,
+    cookie: &str,
+    uri: &str,
+    request: &Value,
+) -> axum::http::Response<Body> {
     router
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/query/run")
+                .uri(uri)
                 .header("cookie", cookie)
                 .header("content-type", "application/json")
                 .body(Body::from(request.to_string()))
@@ -396,4 +406,66 @@ async fn a_run_refused_while_filling_is_recorded_as_blocked_with_the_text_the_us
     );
     assert_eq!(sql, PARAMETERISED);
     assert_eq!(sent_statements(&ch).await, Vec::<String>::new());
+}
+
+/// QS-10 (LH-QS-2-05), D4: the run's `metrics` carry what the rewrite
+/// applied — both obligations, once each, with no table or column names.
+#[tokio::test]
+async fn a_masked_run_reports_its_column_masks_and_row_filters() {
+    let ch = MockServer::start().await;
+    mount_columns_csv_and_json(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    seed_mask_and_row_filter_policy(&pool).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let resp = post_run(&router, &cookie, &json!({ "sql": USER_STATEMENT })).await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(resp).await["metrics"]["policyObligations"],
+        json!(["Column masks", "Row filters"])
+    );
+}
+
+/// QS-10 (LH-QS-2-05), D4: the estimate reports the same obligations as the
+/// run, from the same rewrite.
+#[tokio::test]
+async fn the_estimate_of_a_masked_statement_reports_the_same_obligations() {
+    let ch = MockServer::start().await;
+    mount_columns_csv_and_json(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    seed_mask_and_row_filter_policy(&pool).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let resp = post_json(
+        &router,
+        &cookie,
+        "/api/query/estimate",
+        &json!({ "sql": USER_STATEMENT }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(resp).await["policyObligations"],
+        json!(["Column masks", "Row filters"])
+    );
+}
+
+/// QS-10 (LH-QS-2-05), D4: no policy seeded means no obligations applied —
+/// an empty list, never a fabricated name.
+#[tokio::test]
+async fn a_run_with_no_policy_reports_no_obligations() {
+    let ch = MockServer::start().await;
+    mount_columns_csv_and_json(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let resp = post_run(&router, &cookie, &json!({ "sql": USER_STATEMENT })).await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(resp).await["metrics"]["policyObligations"],
+        json!([])
+    );
 }

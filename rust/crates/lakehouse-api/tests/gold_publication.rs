@@ -48,10 +48,16 @@ use common::{
 /// `console.gold_export_run` read then hits a server without the table
 /// and 500s). Tests stay isolated the other way: each has its own
 /// Postgres database, and every test uses its own mart names.
+///
+/// `pub(crate)`: `gold_latest_copy`'s tests share this same container for
+/// the same reason — its `LATEST_COPY_TABLE_ENSURED` `OnceCell` is just as
+/// process-wide, so a second container would let whichever module ran
+/// first pin the other's DDL to the wrong server.
 static CLICKHOUSE: tokio::sync::OnceCell<(String, testcontainers::ContainerAsync<ClickHouse>)> =
     tokio::sync::OnceCell::const_new();
 
-async fn shared_clickhouse() -> &'static (String, testcontainers::ContainerAsync<ClickHouse>) {
+pub(crate) async fn shared_clickhouse()
+-> &'static (String, testcontainers::ContainerAsync<ClickHouse>) {
     CLICKHOUSE
         .get_or_init(|| async {
             // Exactly the compose service's env trio (CH_USER defaults to
@@ -768,6 +774,179 @@ async fn publication_detail_reports_trim_failed() {
     assert!(body["trim"]["oldestKeptExportedAt"].is_null());
     assert!(body["trim"]["finishedAt"].is_string());
     assert_eq!(body["trim"]["reason"], "delete_failed");
+}
+
+// ── DATA-6 T2: the latest-copy block of the publication detail ──────────
+
+use lakehouse_api::gold_latest_copy;
+
+/// Seeds one `console.gold_latest_copy_run` row, mirroring
+/// `seed_trim_run` above. `started_ms` orders the rows, so a test can
+/// make one run newer than another.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one flat seed row whose columns are each independently optional; \
+              grouping them into a struct would only move the same facts one \
+              level of indirection from the two call sites"
+)]
+async fn seed_latest_copy_run(
+    ch: &ChClient,
+    mart: &str,
+    status: &str,
+    reason: Option<&str>,
+    copy_micros: Option<i64>,
+    rows: Option<u64>,
+    cleanup: Option<&str>,
+    started_ms: i64,
+    finished_ms: i64,
+) {
+    gold_latest_copy::ensure_gold_latest_copy_run_table(ch)
+        .await
+        .expect("ensure latest-copy run table");
+    let reason_sql = reason.map_or_else(
+        || "NULL".to_owned(),
+        |r| format!("'{}'", r.replace('\\', "\\\\").replace('\'', "''")),
+    );
+    let cleanup_sql = cleanup.map_or_else(
+        || "NULL".to_owned(),
+        |c| format!("'{}'", c.replace('\\', "\\\\").replace('\'', "''")),
+    );
+    let copy_sql = copy_micros.map_or_else(
+        || "NULL".to_owned(),
+        |us| format!("fromUnixTimestamp64Micro({us})"),
+    );
+    let rows_sql = rows.map_or_else(|| "NULL".to_owned(), |n| n.to_string());
+    ch.exec(
+        &format!(
+            "INSERT INTO console.gold_latest_copy_run \
+             (id, mart, latest_table, status, reason, copy_exported_at, rows, \
+              snapshot_id, cleanup, started_at, finished_at) VALUES \
+             ('{id}', '{mart}', '{mart}_latest', '{status}', {reason_sql}, {copy_sql}, \
+              {rows_sql}, NULL, {cleanup_sql}, fromUnixTimestamp64Milli({started_ms}), \
+              fromUnixTimestamp64Milli({finished_ms}))",
+            id = uuid::Uuid::new_v4(),
+        ),
+        None,
+    )
+    .await
+    .expect("seed latest-copy run row");
+}
+
+#[tokio::test]
+async fn publication_detail_names_the_latest_table_before_any_update() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "fresh_latest_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/fresh_latest_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The name is a fact of the design (D1), not of any run: it shows
+    // before the first copy exists, so a tool can be pointed at the table
+    // ahead of time. Nothing is held and nothing has run.
+    assert_eq!(body["latestCopy"]["table"], "gold.fresh_latest_mart_latest");
+    assert!(body["latestCopy"]["holds"].is_null(), "{body}");
+    assert!(body["latestCopy"]["lastRun"].is_null(), "{body}");
+}
+
+#[tokio::test]
+async fn publication_detail_reports_what_the_latest_table_holds() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "holding_latest_mart").await;
+    seed_latest_copy_run(
+        &ch,
+        "holding_latest_mart",
+        "success",
+        None,
+        Some(1_795_168_800_123_456),
+        Some(17),
+        None,
+        1_700_000_000_000,
+        1_700_000_001_000,
+    )
+    .await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/holding_latest_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["latestCopy"]["holds"]["rows"], 17);
+    // Microseconds are kept: two publishes can fall in one second, and
+    // the copy stamp is what tells them apart.
+    assert_eq!(
+        body["latestCopy"]["holds"]["copyExportedAt"],
+        "2026-11-20T10:00:00.123456Z"
+    );
+    assert!(body["latestCopy"]["holds"]["replacedAt"].is_string());
+    assert_eq!(body["latestCopy"]["lastRun"]["status"], "success");
+    assert!(body["latestCopy"]["lastRun"]["reason"].is_null());
+    assert!(body["latestCopy"]["lastRun"]["cleanup"].is_null());
+}
+
+#[tokio::test]
+async fn a_failed_update_after_a_success_keeps_holds_and_reports_the_reason() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "stale_latest_mart").await;
+    seed_latest_copy_run(
+        &ch,
+        "stale_latest_mart",
+        "success",
+        None,
+        Some(1_795_168_800_123_456),
+        Some(17),
+        None,
+        1_700_000_000_000,
+        1_700_000_001_000,
+    )
+    .await;
+    // The failed run is NEWER, so `lastRun` reports it while `holds`
+    // still reads the newest SUCCESS row — the card can say both facts
+    // at once (the same split the publish's own failure card uses).
+    seed_latest_copy_run(
+        &ch,
+        "stale_latest_mart",
+        "failed",
+        Some("copy_incomplete"),
+        Some(1_795_169_000_000_000),
+        None,
+        None,
+        1_700_000_010_000,
+        1_700_000_011_000,
+    )
+    .await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/stale_latest_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["latestCopy"]["holds"]["rows"], 17);
+    assert_eq!(
+        body["latestCopy"]["holds"]["copyExportedAt"],
+        "2026-11-20T10:00:00.123456Z"
+    );
+    assert_eq!(body["latestCopy"]["lastRun"]["status"], "failed");
+    assert_eq!(body["latestCopy"]["lastRun"]["reason"], "copy_incomplete");
 }
 
 /// QA `LH-DATA-1-01` (`DATA-49`): a failed publish stores the sentence the

@@ -752,4 +752,119 @@ describe("OpenFormatCard", () => {
     expect(refusal.textContent).toBe("Not measured")
   })
 
+  // ── DATA-6 D4: the latest-copy block of the publication card ──────────
+
+  function mockWithPublication(latestCopy: Record<string, unknown> | null) {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({ ...publicationBody, latestCopy })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+  }
+
+  it("shows the latest table's name with a copy button", async () => {
+    mockWithPublication({
+      table: "gold.mart_a_latest",
+      holds: {
+        copyExportedAt: "2026-11-20T10:00:00.123456Z",
+        rows: 17,
+        replacedAt: "2026-11-20T10:00:05Z",
+      },
+      lastRun: {
+        status: "success",
+        reason: null,
+        cleanup: null,
+        finishedAt: "2026-11-20T10:00:05Z",
+      },
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("gold.mart_a_latest")).toBeDefined())
+    // One copy button for the table's name, reusing the shared Copyable.
+    expect(screen.getByRole("button", { name: "Copy" })).toBeDefined()
+    // The held copy is the one the newest publish wrote.
+    expect(
+      screen.getByText(/^The copy published .+ \(17 rows\)$/).textContent,
+    ).toMatch(/\(17 rows\)$/)
+  })
+
+  it("says Not written yet when no copy has been written", async () => {
+    mockWithPublication({
+      table: "gold.mart_a_latest",
+      holds: null,
+      lastRun: null,
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("Not written yet")).toBeDefined())
+    // The name shows even before the first update: it is a fact of the
+    // design, so a tool can be pointed at the table ahead of time.
+    expect(screen.getByText("gold.mart_a_latest")).toBeDefined()
+  })
+
+  it("shows a failed run's fixed sentence and keeps the copy it still holds", async () => {
+    mockWithPublication({
+      table: "gold.mart_a_latest",
+      holds: {
+        copyExportedAt: "2026-11-20T10:00:00.123456Z",
+        rows: 17,
+        replacedAt: "2026-11-20T10:00:05Z",
+      },
+      lastRun: {
+        status: "failed",
+        reason: "copy_incomplete",
+        cleanup: null,
+        finishedAt: "2026-11-20T11:00:05Z",
+      },
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByTestId("latest-copy-failure")).toBeDefined())
+    expect(screen.getByTestId("latest-copy-failure").textContent).toBe(
+      "The latest copy was not updated: the published copy was incomplete or already removed.",
+    )
+    // The failure never erases the copy that is still there.
+    expect(screen.getByText(/^The copy published .+ \(17 rows\)$/)).toBeDefined()
+  })
+
+  it("shows the generic sentence with an unknown reason's code", async () => {
+    mockWithPublication({
+      table: "gold.mart_a_latest",
+      holds: null,
+      lastRun: {
+        status: "failed",
+        reason: "a_code_this_console_does_not_know",
+        cleanup: null,
+        finishedAt: "2026-11-20T11:00:05Z",
+      },
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByTestId("latest-copy-failure")).toBeDefined())
+    expect(screen.getByTestId("latest-copy-failure").textContent).toBe(
+      "The latest copy was not updated. (a_code_this_console_does_not_know)",
+    )
+  })
+
+  it("renders without the latest-copy block when the publish wrote no copy", async () => {
+    // DATA-6 review R6: `latestCopy: null` is a required field with a
+    // real meaning (a zero-row publish), not the absence of the field on
+    // an older API. The card hides the block for null and shows it for
+    // every API build this console ships with.
+    mockWithPublication(null)
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByTestId("publication-status")).toBeDefined())
+    expect(screen.queryByText("Latest copy only")).toBeNull()
+    expect(screen.queryByText("Not written yet")).toBeNull()
+    expect(screen.queryByTestId("latest-copy-failure")).toBeNull()
+  })
+
 })

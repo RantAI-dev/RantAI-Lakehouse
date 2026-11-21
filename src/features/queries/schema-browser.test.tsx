@@ -498,3 +498,46 @@ describe("SchemaBrowser", () => {
     })
   })
 })
+
+// QS-11 (LH-QS-1-07), D10: the browser's search narrows by label or reference
+// and says when nothing matches. The filter is local, never stored.
+describe("SchemaBrowser search", () => {
+  it("keeps the tables that match and hides the ones that do not", async () => {
+    stubServices()
+    render(<Harness />)
+    await screen.findByText("Silver")
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search tables" }), {
+      target: { value: "ord" },
+    })
+
+    expect(screen.getByRole("button", { name: "Columns of Orders" })).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Columns of Mart Wisman" })).toBeNull()
+  })
+
+  it("says when no table matches the text", async () => {
+    stubServices()
+    render(<Harness />)
+    await screen.findByText("Silver")
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search tables" }), {
+      target: { value: "zzzz" },
+    })
+
+    expect(screen.getByText('No table matches "zzzz".')).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Columns of Orders" })).toBeNull()
+  })
+
+  it("shows every table again when the search is cleared", async () => {
+    stubServices()
+    render(<Harness />)
+    await screen.findByText("Silver")
+    const search = screen.getByRole("textbox", { name: "Search tables" })
+
+    fireEvent.change(search, { target: { value: "ord" } })
+    fireEvent.change(search, { target: { value: "" } })
+
+    expect(screen.getByRole("button", { name: "Columns of Orders" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Columns of Mart Wisman" })).toBeTruthy()
+  })
+})

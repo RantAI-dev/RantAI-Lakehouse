@@ -11,7 +11,6 @@ import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { levelAtLeast } from "@/lib/access-level"
 import { catalogRefusal } from "@/lib/catalog-refusal"
-import { notifyInfo } from "@/lib/notify"
 import { readableErrorMessage } from "@/lib/notify-message"
 import { newRunId } from "@/lib/run-id"
 import {
@@ -49,6 +48,7 @@ import type {
   QueryParamDef,
   QueryParamInputs,
   QueryParamValue,
+  QueryHistoryItem,
   QueryResult,
   SavedQuery,
   SqlFixOutcome,
@@ -59,8 +59,12 @@ import {
 } from "./sql-completion-source"
 import { useQueryDownload } from "./use-query-download"
 
-/** What the editor holds before anyone types. */
-export const STARTER_SQL = "-- Write SQL here, or generate it from a question"
+/**
+ * QS-11 (LH-QS-1-01), D7: a new tab holds the empty string; this is a grey
+ * CodeMirror placeholder, never text in the document. The old starter text
+ * was real SQL that a run would send as a comment-only statement.
+ */
+export const SQL_PLACEHOLDER = "Write SQL here, or generate it from a question"
 
 /** How long to wait after the last keystroke before asking for an estimate. */
 const ESTIMATE_DEBOUNCE_MS = 500
@@ -91,6 +95,13 @@ const FIRST_TAB_ID = "tab-1"
  * following it learns that the query is not there for them (`QS-3` C5).
  */
 export const SAVED_QUERY_UNAVAILABLE = "This query is not available to you."
+
+/**
+ * QS-12 (LH-QS-4-07), D15: a `/query-studio?run=<id>` link whose run is not in
+ * the caller's own last-14-day history. One sentence for "not there" and for
+ * "not yours", so the link never reveals which it was.
+ */
+export const RUN_LINK_UNAVAILABLE = "This run is not in your history of the last 14 days."
 
 /**
  * The shape of a catalog id that is a SQL table name: `silver.orders`.
@@ -270,7 +281,7 @@ export function useQueryStudio(draftKey: string | null) {
     {
       id: FIRST_TAB_ID,
       name: "Query 1",
-      sql: STARTER_SQL,
+      sql: "",
       engine: "clickhouse",
       parameters: [],
       values: {},
@@ -353,6 +364,10 @@ export function useQueryStudio(draftKey: string | null) {
   const [explainResult, setExplainResult] = React.useState<string | null>(null)
   const [explainBusy, setExplainBusy] = React.useState(false)
   const [explainError, setExplainError] = React.useState<ServiceError | null>(null)
+  // QS-11 (LH-QS-1-12), D9: a refused batch is said on the page until the
+  // person changes the SQL or opens another tab — a toast would be gone by
+  // the time they look for the reason nothing ran.
+  const [batchRefusal, setBatchRefusal] = React.useState<string | null>(null)
   const setSql = React.useCallback(
     (next: string) => {
       setTabs((previous) =>
@@ -368,6 +383,7 @@ export function useQueryStudio(draftKey: string | null) {
       )
       setFixResult(null)
       setFixStatement(null)
+      setBatchRefusal(null)
     },
     [activeTabId]
   )
@@ -1004,7 +1020,7 @@ export function useQueryStudio(draftKey: string | null) {
       const opened: QueryTab = {
         id: newTabId(),
         name: nextTabName(tabs),
-        sql: options?.sql ?? STARTER_SQL,
+        sql: options?.sql ?? "",
         engine: options?.engine ?? "clickhouse",
         parameters: [],
         values: {},
@@ -1072,6 +1088,7 @@ export function useQueryStudio(draftKey: string | null) {
   const setActiveTab = React.useCallback((id: string) => {
     setActiveTabId(id)
     setFixResult(null)
+    setBatchRefusal(null)
   }, [])
 
   const generate = React.useCallback(async () => {
@@ -1232,12 +1249,13 @@ export function useQueryStudio(draftKey: string | null) {
   const runQuery = React.useCallback(async () => {
     if (statements.length === 0) return
     if (statements.length > MAX_STATEMENTS_PER_RUN) {
-      notifyInfo(
-        `At most ${MAX_STATEMENTS_PER_RUN} statements are run at once`,
-        "Split the buffer into smaller queries and run them one after another."
+      // QS-11 (LH-QS-1-12), D9: the refusal stays on the page, beside Run.
+      setBatchRefusal(
+        `At most ${MAX_STATEMENTS_PER_RUN} statements are run at once. Split the buffer into smaller queries and run them one after another.`
       )
       return
     }
+    setBatchRefusal(null)
     await runBatch(activeTabId, statements, engine, runInputs)
   }, [statements, activeTabId, engine, runBatch, runInputs])
 
@@ -1475,6 +1493,62 @@ export function useQueryStudio(draftKey: string | null) {
     setTab("sql")
   }, [hydrated, linkedSaved])
 
+  // Handoff from History: /query-studio?run=<id> asks the server for that one
+  // run (the caller's own, last 14 days — the same scope as the list) and
+  // opens its SQL on the engine it ran on. Mirrors the `?saved=` handoff,
+  // including its StrictMode read-once guard and its wait for hydration.
+  const [linkedRun, setLinkedRun] = React.useState<QueryHistoryItem | null>(null)
+  const [runLinkError, setRunLinkError] = React.useState<string | null>(null)
+  const appliedRunRef = React.useRef(false)
+  React.useEffect(() => {
+    if (appliedRunRef.current) return
+    const id = new URLSearchParams(window.location.search).get("run")
+    if (!id) return
+    appliedRunRef.current = true
+    void queryService.listHistoryPage({ id, page: 1 }).then(
+      (answer) => {
+        if (!mountedRef.current) return
+        // An id outside the caller's scope or window is answered with an
+        // empty page, not a 404 — the list and this lookup share that rule.
+        const run = answer.runs[0]
+        if (run) setLinkedRun(run)
+        else setRunLinkError(RUN_LINK_UNAVAILABLE)
+      },
+      (error: unknown) => {
+        if (!mountedRef.current) return
+        const failure = toServiceError(error)
+        setRunLinkError(
+          failure.code === "not_found" || failure.code === "invalid_request"
+            ? RUN_LINK_UNAVAILABLE
+            : readableErrorMessage(failure.message)
+        )
+      }
+    )
+  }, [])
+
+  React.useEffect(() => {
+    if (!hydrated || !linkedRun) return
+    const openedId = newTabId()
+    const takesPlaceholder = placeholderRef.current
+    placeholderRef.current = false
+    setTabs((previous) => {
+      const opened: QueryTab = {
+        id: openedId,
+        name: nextTabName(previous),
+        sql: linkedRun.sql,
+        engine: linkedRun.engine === "trino" ? "trino" : "clickhouse",
+        parameters: [],
+        values: {},
+      }
+      if (takesPlaceholder && previous.length === 1 && previous[0].id === FIRST_TAB_ID) {
+        return [opened]
+      }
+      return [...previous, opened]
+    })
+    setActiveTabId(openedId)
+    setTab("sql")
+  }, [hydrated, linkedRun])
+
   // The rows on screen for each tab: the result of the statement that is
   // open on it. The per-statement state behind it is `runs`.
   const results = React.useMemo<Record<string, QueryResult | null>>(() => {
@@ -1531,6 +1605,8 @@ export function useQueryStudio(draftKey: string | null) {
     saveParameters,
     tabs,
     activeTabId,
+    /** Why a batch of too many statements was refused, until the SQL changes. */
+    batchRefusal,
     addTab,
     renameTab,
     closeTab,
@@ -1621,5 +1697,10 @@ export function useQueryStudio(draftKey: string | null) {
      * the query is not there for the caller, or `null` when it opened.
      */
     savedLinkError,
+    /**
+     * What a `?run=` link answered: the sentence the studio shows when the
+     * run is not in the caller's last 14 days, or `null` when it opened.
+     */
+    runLinkError,
   }
 }
