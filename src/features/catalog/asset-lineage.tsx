@@ -196,7 +196,7 @@ function RelatedList({ items }: { items: Related[] }) {
 }
 
 /** The recorded graph around the asset, or why there is none to draw. */
-function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
+export function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
   // BI-71 decision 4: the charts that read the asset are grouped by
   // dashboard, which needs the viewer's charts and dashboards. Asked only
   // when the graph has charts; while they load the map keeps its one
