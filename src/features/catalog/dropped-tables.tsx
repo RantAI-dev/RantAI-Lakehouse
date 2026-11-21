@@ -77,7 +77,7 @@ export function DroppedTablesList({ state, now }: { state: DroppedTablesState; n
   }
 
   return (
-    <ul className="-mx-2 flex flex-col text-sm">
+    <ul className="flex flex-col text-sm">
       {state.data.map((entry) => {
         const days = daysLeft(entry.expiresAt, nowMs)
         const left = days <= 0 ? "less than a day left" : `${days} ${days === 1 ? "day" : "days"} left`
@@ -123,7 +123,9 @@ export function DroppedTablesDialog({
           <DialogTitle>Dropped tables</DialogTitle>
           <DialogDescription>Open a table to restore it before its time runs out.</DialogDescription>
         </DialogHeader>
-        <div className="max-h-[60vh] overflow-y-auto">
+        {/* Bleeds 8 px each side so a row's hover fill lines up with the
+            title, without a sideways scroll in the dialog. */}
+        <div className="-mx-2 max-h-[60vh] overflow-x-hidden overflow-y-auto">
           <DroppedTablesList state={state} />
         </div>
       </DialogContent>
