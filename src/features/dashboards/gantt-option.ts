@@ -201,8 +201,9 @@ export function ganttOption(i: GanttInput): GanttDrawn {
       markLine: {
         silent: true, symbol: "none", animation: false,
         lineStyle: { color: t.today, type: "dashed", width: 1.5 },
-        // BI-73 (d): at the top end of the line (grid.top leaves room), not over the date labels at the bottom.
-        label: { formatter: "Today", color: t.today, fontSize: 11, position: "end" },
+        // BI-73 (d, review): the task axis is inverted (first task on top), so the line runs from the
+        // top of the plot (its start) to the date labels (its end); "start" puts the label at the top, clear of them.
+        label: { formatter: "Today", color: t.today, fontSize: 11, position: "start" },
         data: [{ xAxis: today }],
       },
     });
