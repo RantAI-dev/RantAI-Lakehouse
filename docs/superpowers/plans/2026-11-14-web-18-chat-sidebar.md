@@ -123,3 +123,27 @@ Owner: "halaman menu history itu dihapus aja, dan cukup ditampilkan dari menu Ho
 **Commands:** `bun run typecheck`: no errors. `bun test src/components/app-shell`: 72 pass, 0 fail, 10 files. `bun x eslint nav-config.ts app-sidebar.tsx sidebar-chats.test.tsx`: 0 problems. Each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`.
 
 **Not verified:** in a browser (no dev server run), the tooltip and lit state visually, the phone sheet, dark mode, `src/features/copilot`/`home` tests (not run), and the Home label's "not lit" check is weak (`data-active` is not asserted positively elsewhere).
+
+### Owner QA, 2026-11-15 (recorded by the reviewer)
+
+Three commits on `feat/web-18-chat-sidebar` had no handoff entry of their
+own; this one records what changed and the checks the reviewer ran over
+their final state (`0ecf3fd11`), per AGENTS.md rule 7 (a handoff quotes the
+commands and counts it actually ran).
+
+| Commit | What |
+| --- | --- |
+| `a789f610b` | Owner QA 2026-11-15: the navbar showed "Conversation" next to the sidebar toggle, which the owner did not want; `SECONDARY_ROUTES` gained `hideNavbarTitle` and the navbar drew nothing for `/copilot` |
+| `6bb08f341` | Reverted `a789f610b`: the owner clarified the same day that the navbar title stays and the thread title goes instead, so `hideNavbarTitle` and the null-title navbar branch are gone from the final code |
+| `39dd7e054` | The conversation page drops its visible thread title: the `<h1>` stays as `sr-only` (the page keeps a heading for screen readers), and the 36 px bar it sat in is gone, so the chat starts at the top. `copilot-page.test.tsx` gains a test that the heading is visually hidden |
+
+**Commands** (run by the reviewer on the final head `0ecf3fd11`, which
+contains all three commits): `bun run typecheck`: exit 0. `bunx eslint` on
+the 20 touched `.ts/.tsx` files (including `copilot-page.tsx` and
+`copilot-page.test.tsx`): 0 problems. `bun test src/components/app-shell
+src/features/copilot src/features/home`: 290 pass, 0 fail, 31 files.
+
+**Not verified:** the visible layout in a browser (the change was read and
+its unit test run, not looked at on a screen); `bun run lint` and the full
+`bun run test` (out of scope for a review of these commits' code, per this
+plan's machine rules).
