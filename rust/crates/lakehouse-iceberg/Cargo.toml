@@ -7,13 +7,17 @@ license.workspace = true
 
 [dependencies]
 lakehouse-core = { path = "../lakehouse-core" }
-# Pinned to the 0.10.x line (R6 in the plan's risk register: iceberg-rust is
+# Pinned to the 0.11.0 line (R6 in the plan's risk register: iceberg-rust is
 # pre-1.0, API churn expected — confined to this crate so an upgrade touches
-# one place). `=0.10.1` (exact), not `0.10`, because 0.10.x has already shown
-# breaking changes between patch-adjacent tags on the `StorageFactory` seam
-# this crate depends on directly.
-iceberg = "=0.10.1"
-iceberg-catalog-rest = "=0.10.1"
+# one place; 0.11.0's one hit here was `FileWrite::close`, see `storage.rs`).
+# `=0.11.0` (exact), not `0.11`, because patch-adjacent tags have already
+# broken the `StorageFactory` seam this crate depends on directly.
+# `iceberg-catalog-rest` moves in lockstep: 0.11.0 requires `iceberg ^0.11`,
+# so bumping one without the other puts two `iceberg` crates in the graph and
+# the catalog's types stop matching (the two dependabot PRs #430/#431 could
+# each only land together, as one change).
+iceberg = "=0.11.0"
+iceberg-catalog-rest = "=0.11.0"
 # S3 backend for the `StorageFactory` this crate implements itself — see
 # `storage.rs`. Never a vendor SDK (`aws-sdk-s3`), never RustFS/MinIO admin
 # APIs: only the plain S3 API surface `object_store::aws` speaks.

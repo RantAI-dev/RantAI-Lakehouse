@@ -93,10 +93,12 @@ lakehouse-trino = { path = "../lakehouse-trino" }
 # which used to say nothing in the workspace depended on it.
 lakehouse-iceberg = { path = "../lakehouse-iceberg" }
 # Same exact pin `lakehouse-iceberg` uses (see that crate's Cargo.toml
-# comment on why `=0.10.1`, not `0.10`) — needed directly here for
+# comment on why `=0.11.0`, not `0.11`) — needed directly here for
 # `iceberg::spec` types and `iceberg::arrow::schema_to_arrow_schema`,
-# which `lakehouse-iceberg` does not re-export.
-iceberg = "=0.10.1"
+# which `lakehouse-iceberg` does not re-export. It must equal that crate's
+# pin exactly: two `iceberg` versions in the graph make one crate's types
+# fail to match the other's at every call across the seam.
+iceberg = "=0.11.0"
 rand = { workspace = true }
 aes-gcm = { workspace = true }
 axum = { workspace = true }

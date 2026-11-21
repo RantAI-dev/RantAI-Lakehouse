@@ -2305,9 +2305,9 @@ dependencies = [
 
 [[package]]
 name = "iceberg"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e50fb53c7480f414911ab76b6e14c0042d54ad5c30f6ac2bf2f52a487a25716"
+checksum = "25dd5d1aa2fa92d2c9bc426f72bc16717a27eb73255805beb8845afcca31e58d"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2328,12 +2328,15 @@ dependencies = [
  "bimap",
  "bytes",
  "chrono",
+ "crc32fast",
  "derive_builder",
  "expect-test",
  "fastnum",
  "flate2",
  "fnv",
+ "form_urlencoded",
  "futures",
+ "iceberg-property-macro",
  "itertools 0.13.0",
  "moka",
  "murmur3",
@@ -2362,9 +2365,9 @@ dependencies = [
 
 [[package]]
 name = "iceberg-catalog-rest"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1500a26a9b18f286a319e914ce7290dddb7e2eef810edf535afc4ce0c8a6f45"
+checksum = "6adef6989310849467f1d8fdccf4bdb78c736db7c06d302a3b1663a32236373b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2376,8 +2379,20 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "tokio",
+ "tracing",
  "typed-builder",
  "uuid",
+]
+
+[[package]]
+name = "iceberg-property-macro"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6de7eea6577fed2290867f7604483e3649297514b873cdac108e0cc7f783c9e1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
