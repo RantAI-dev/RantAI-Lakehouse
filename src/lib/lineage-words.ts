@@ -16,7 +16,19 @@ export const STEP_KIND_LABEL: Record<string, string> = {
   connector: "Connector",
   upload: "Upload",
   pipeline: "Pipeline",
+  source: "Source",
+  dataset: "Dataset",
+  iceberg: "Iceberg",
 }
+
+/**
+ * Every step kind the lineage API can send (`lakehouse-api` routes/lineage.rs
+ * and routes/lineage/charts.rs). Each needs a label and an icon; a test holds
+ * both maps to this list, so a new kind cannot ship as a dot and a raw word.
+ */
+export const LINEAGE_STEP_KINDS = [
+  "chart", "sql_source", "metric", "gold", "silver", "bronze", "connector", "upload", "pipeline", "source", "dataset", "iceberg",
+] as const
 
 /**
  * When a step was last refreshed, in the report zone, or "Not recorded" when

@@ -3,7 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import {
-  ArrowUpRight, ChartColumn, Circle, Clock, FileCode, Plug, SquareSigma, Table2, Upload, Workflow, type LucideIcon,
+  ArrowUpRight, ChartColumn, Circle, Clock, Database, FileCode, Landmark, Plug, SquareSigma, Table2, Upload, Workflow, type LucideIcon,
 } from "lucide-react"
 import { HelpHint } from "@/components/patterns/help-hint"
 import { ErrorState } from "@/components/patterns/page-states"
@@ -87,7 +87,7 @@ export function ChartLineagePanel({
 }
 
 /** A step's kind as an icon; a kind this console does not know yet gets a plain dot, not a guess. */
-const KIND_ICON: Record<string, LucideIcon> = {
+export const KIND_ICON: Record<string, LucideIcon> = {
   chart: ChartColumn,
   sql_source: FileCode,
   metric: SquareSigma,
@@ -97,6 +97,9 @@ const KIND_ICON: Record<string, LucideIcon> = {
   connector: Plug,
   upload: Upload,
   pipeline: Workflow,
+  source: Landmark,
+  dataset: Database,
+  iceberg: Table2,
 }
 
 /** The delay between two steps' entrances, so the route draws from the source down. */
