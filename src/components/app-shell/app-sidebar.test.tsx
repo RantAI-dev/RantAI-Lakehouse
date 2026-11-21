@@ -1,38 +1,198 @@
-import * as React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock } from "bun:test"
-import { PRODUCT_NAME } from "@/lib/product-branding"
-
-// `AppSidebar` reads the route through `next/navigation`, which needs a
-// Next.js AppRouter context that a bare happy-dom environment does not
-// have, so the module is stubbed at the boundary (the same pattern as
-// `per-role-navigation.test.tsx`).
 mock.module("next/navigation", () => ({
-  usePathname: () => "/dashboards",
+  usePathname: () => "/catalog",
   useSearchParams: () => new URLSearchParams(""),
-  useRouter: () => ({
-    push: () => {},
-    replace: () => {},
-    refresh: () => {},
-    back: () => {},
-    forward: () => {},
-    prefetch: () => {},
-  }),
+  useRouter: () => ({ push: () => {}, replace: () => {}, refresh: () => {}, back: () => {}, forward: () => {}, prefetch: () => {} }),
 }))
+mock.module("next/image", () => ({ default: () => null }))
 
-import { AppSidebar } from "@/components/app-shell/app-sidebar"
+import type { ReactNode } from "react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { AuthProvider, useAuth } from "@/features/auth/auth-provider"
 import { SidebarProvider } from "@/components/ui/sidebar"
 import { TooltipProvider } from "@/components/ui/tooltip"
-import { AuthProvider } from "@/features/auth/auth-provider"
+import { forgetRow, readRow, rememberRow, setRowOwner } from "@/features/dashboards/dashboards-row"
+import { readLastBoard, rememberLastBoard } from "@/features/dashboards/last-board"
+import { PRODUCT_NAME } from "@/lib/product-branding"
+import { AppSidebar } from "./app-sidebar"
 
 const json = (body: unknown, status = 200) =>
-  new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  })
+  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
 
 const originalFetch = global.fetch
 
+// PR #541 review SHOULD-FIX 1: the remembered row is the signed-in person's, and the session
+// below is "u1"; a test that remembers a row before the session answers names "u1" as `AuthProvider` will.
+beforeEach(() => setRowOwner("u1"))
+
+afterEach(() => {
+  cleanup()
+  window.localStorage.clear()
+  mock.restore()
+  global.fetch = originalFetch
+  setRowOwner(null)
+})
+
+function renderSidebar(open: boolean, extra?: ReactNode, userId = "u1") {
+  spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+    if (String(input).includes("/api/auth/me")) {
+      return json({ id: userId, name: "Ana", email: "ana@example.invalid", roles: ["R"], permissions: ["catalog:read", "query:read", "dashboard:read"], tenants: [] })
+    }
+    return json({})
+  }) as unknown as typeof fetch)
+  return render(
+    <AuthProvider>
+      <SidebarProvider open={open} onOpenChange={() => {}}>
+        <AppSidebar />
+        {extra}
+      </SidebarProvider>
+    </AuthProvider>,
+  )
+}
+
+// Owner 2026-11-14 ("aku kurang suka animasi saat collapse sidebar"): a section is one row in both
+// states, so nothing is swapped as the sidebar moves; its pages fold away instead of disappearing.
+describe("AppSidebar, one row per section in both states", () => {
+  it("expanded: the section's header opens its pages in place, and they are reachable", async () => {
+    renderSidebar(true)
+    const data = await screen.findByRole("button", { name: "Data" })
+    expect(data.getAttribute("aria-expanded")).toBe("true")
+    const catalog = screen.getByRole("link", { name: "Catalog" })
+    expect(catalog.closest("[inert]")).toBeNull()
+  })
+
+  it("collapsed: the same row opens a flyout, and the folded pages take no focus", async () => {
+    renderSidebar(false)
+    const data = await screen.findByTitle("Data")
+    expect(data.tagName).toBe("BUTTON")
+    expect(data.getAttribute("aria-expanded")).toBe("false")
+    const folded = document.querySelector("[data-slot='sidebar-menu-sub']")?.closest("[inert]")
+    expect(folded).not.toBeNull()
+    fireEvent.click(data)
+    expect(data.getAttribute("aria-expanded")).toBe("true")
+    expect(screen.getAllByRole("link", { name: "Catalog" }).some((a) => a.closest("[inert]") === null)).toBe(true)
+  })
+})
+
+// Owner 2026-11-14: the Dashboards row is a split button group; the right part is the whole
+// touch target for Browse, its own link and tab stop, with the label for assistive tech.
+describe("AppSidebar, the Dashboards split row", () => {
+  it("has the label link and a separate full-height Browse link, joined by a separator", async () => {
+    renderSidebar(true)
+    const dashboards = await screen.findByRole("link", { name: "Dashboards" })
+    const browse = screen.getByRole("link", { name: "Browse all dashboards" })
+    expect(browse.getAttribute("href")).toBe("/dashboards/browse")
+    expect(dashboards).not.toBe(browse)
+    expect(browse.className).toContain("size-8")
+    expect(dashboards.closest("li")).toBe(browse.closest("li"))
+    expect(browse.previousElementSibling?.className).toContain("w-px")
+  })
+})
+
+// BI-61 T10/T11 (owner QA 2026-11-15): the row is named after the last dashboard or report
+// opened, in its own memory that Browse clears and the last board does not share.
+describe("AppSidebar, the Dashboards row names what it opens", () => {
+  const row = () => document.querySelector("a[href^='/dashboards']:not([aria-label='Browse all dashboards'])") as HTMLAnchorElement
+
+  it("says Dashboards and goes to Browse when nothing is remembered", async () => {
+    renderSidebar(true)
+    await screen.findByRole("link", { name: "Dashboards" })
+    expect(row().getAttribute("href")).toBe("/dashboards/browse")
+  })
+
+  it("is named after the remembered dashboard and goes to it", async () => {
+    rememberRow("dashboard", "b1", "Revenue")
+    renderSidebar(true)
+    const link = await screen.findByRole("link", { name: "Dashboard: Revenue" })
+    expect(link.textContent).toBe("Revenue")
+    expect(link.getAttribute("href")).toBe("/dashboards/b1")
+  })
+
+  it("a report sets the name, the report href and the report icon; a dashboard then replaces it", async () => {
+    rememberRow("report", "r1", "Q3 review")
+    renderSidebar(true)
+    const link = await screen.findByRole("link", { name: "Report: Q3 review" })
+    expect(link.getAttribute("href")).toBe("/dashboards/reports/r1")
+    const reportIcon = link.querySelector("svg")?.getAttribute("class")
+    expect(reportIcon).toContain("lucide-file-text")
+    act(() => rememberRow("dashboard", "b2", "Ops"))
+    const dash = await screen.findByRole("link", { name: "Dashboard: Ops" })
+    expect(dash.getAttribute("href")).toBe("/dashboards/b2")
+    // BI-61 T11 review: the dashboard keeps the row's chart icon, not the grid the Browse part uses.
+    expect(dash.querySelector("svg")?.getAttribute("class")).not.toContain("lucide-layout-grid")
+    expect(dash.querySelector("svg")?.getAttribute("class")).toContain("lucide-chart-column")
+  })
+
+  it("Browse clears the row but not the last board", async () => {
+    rememberLastBoard("b1")
+    rememberRow("dashboard", "b1", "Revenue")
+    renderSidebar(true)
+    await screen.findByRole("link", { name: "Dashboard: Revenue" })
+    act(() => forgetRow())
+    expect((await screen.findByRole("link", { name: "Dashboards" })).getAttribute("href")).toBe("/dashboards/browse")
+    expect(readLastBoard()).toBe("b1")
+  })
+
+  it("deleting the remembered item clears the row; deleting another does not", async () => {
+    rememberRow("report", "r1", "Q3 review")
+    renderSidebar(true)
+    await screen.findByRole("link", { name: "Report: Q3 review" })
+    act(() => forgetRow({ kind: "dashboard", id: "r1" }))
+    act(() => forgetRow({ kind: "report", id: "other" }))
+    await screen.findByRole("link", { name: "Report: Q3 review" })
+    act(() => forgetRow({ kind: "report", id: "r1" }))
+    await screen.findByRole("link", { name: "Dashboards" })
+  })
+
+  it("a rename updates the label at once", async () => {
+    rememberRow("dashboard", "b2", "Ops")
+    renderSidebar(true)
+    await screen.findByRole("link", { name: "Dashboard: Ops" })
+    act(() => rememberRow("dashboard", "b2", "Operations"))
+    await screen.findByRole("link", { name: "Dashboard: Operations" })
+  })
+
+  // PR #541 review SHOULD-FIX 1 (security): the row holds a title, so it never reaches the next
+  // person on the browser.
+  it("is emptied when the person signs out", async () => {
+    rememberRow("dashboard", "b1", "Q4 restructuring plan")
+    function SignOut() {
+      const { status, logout } = useAuth()
+      return status === "authenticated" ? <button type="button" onClick={() => void logout()}>Sign out now</button> : null
+    }
+    renderSidebar(true, <SignOut />)
+    await screen.findByRole("link", { name: "Dashboard: Q4 restructuring plan" })
+    fireEvent.click(screen.getByRole("button", { name: "Sign out now" }))
+    await waitFor(() => expect(window.localStorage.getItem("dashboards:menu-row")).toBeNull())
+    expect(readRow()).toBeNull()
+  })
+
+  it("is not shown to another person who signs in on the same browser, and is removed", async () => {
+    setRowOwner("u0")
+    rememberRow("dashboard", "b1", "Q4 restructuring plan")
+    // A new page load: no session has answered yet.
+    setRowOwner(null)
+    renderSidebar(true, null, "u2")
+    await waitFor(() => expect(window.localStorage.getItem("dashboards:menu-row")).toBeNull())
+    expect((await screen.findByRole("link", { name: "Dashboards" })).getAttribute("href")).toBe("/dashboards/browse")
+    expect(screen.queryByText("Q4 restructuring plan")).toBeNull()
+  })
+
+  it("does not show an entry that names no person (stored before rows had an owner)", async () => {
+    window.localStorage.setItem("dashboards:menu-row", JSON.stringify({ kind: "dashboard", id: "b1", name: "Q4 restructuring plan" }))
+    renderSidebar(true)
+    expect((await screen.findByRole("link", { name: "Dashboards" })).getAttribute("href")).toBe("/dashboards/browse")
+    expect(screen.queryByText("Q4 restructuring plan")).toBeNull()
+  })
+
+  it("ignores a malformed stored value", async () => {
+    window.localStorage.setItem("dashboards:menu-row", "{nope")
+    renderSidebar(true)
+    expect((await screen.findByRole("link", { name: "Dashboards" })).getAttribute("href")).toBe("/dashboards/browse")
+  })
+})
+
+// ADM-2 (from main): the header shows the workspace's own name and logo.
 /**
  * Serves the session check and the public branding route. The branding is
  * what the header shows; the session check only keeps the console chrome
@@ -59,7 +219,7 @@ function stubApi(branding: unknown): string[] {
   return requested
 }
 
-function renderSidebar() {
+function renderBranded() {
   return render(
     <TooltipProvider>
       <SidebarProvider>
@@ -79,11 +239,6 @@ function pictures(container: HTMLElement): HTMLImageElement[] {
   return Array.from(container.querySelectorAll("img"))
 }
 
-afterEach(() => {
-  cleanup()
-  global.fetch = originalFetch
-})
-
 describe("the sidebar header shows the workspace's own branding (ADM-2)", () => {
   it("shows the workspace name and logo from settings, not a fixed product name", async () => {
     stubApi({
@@ -92,7 +247,7 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
       logoDark: { type: "image/png", version: "v2" },
       icon: null,
     })
-    const { container } = renderSidebar()
+    const { container } = renderBranded()
 
     expect(await screen.findByText("Acme Data")).toBeTruthy()
     // The product's own name is nowhere in the header: a workspace that set
@@ -109,7 +264,7 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
 
   it("shows no fixed subtitle under the name, whether or not the workspace set one", async () => {
     stubApi({ workspaceName: "Acme Data", logo: null, logoDark: null, icon: null })
-    const named = renderSidebar()
+    const named = renderBranded()
     expect(await screen.findByText("Acme Data")).toBeTruthy()
     // `ADM-2`: the line "Enterprise Lakehouse Console" described the
     // product, not the workspace, so it goes from the header either way.
@@ -117,7 +272,7 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
     cleanup()
 
     stubApi({ workspaceName: null, logo: null, logoDark: null, icon: null })
-    const unnamed = renderSidebar()
+    const unnamed = renderBranded()
     expect(await screen.findByText(PRODUCT_NAME)).toBeTruthy()
     expect(unnamed.container.textContent).not.toContain("Enterprise Lakehouse Console")
   })
@@ -129,7 +284,7 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
       logoDark: null,
       icon: null,
     })
-    const { container } = renderSidebar()
+    const { container } = renderBranded()
 
     expect(await screen.findByText("Acme Data")).toBeTruthy()
     const shown = pictures(container)
@@ -145,7 +300,7 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
       logoDark: null,
       icon: null,
     })
-    const { container } = renderSidebar()
+    const { container } = renderBranded()
 
     await waitFor(() =>
       expect(requested.some((url) => url.includes("/api/branding"))).toBe(true),
@@ -166,7 +321,7 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
       logoDark: null,
       icon: null,
     })
-    const { container } = renderSidebar()
+    const { container } = renderBranded()
 
     expect(await screen.findByText("Acme Data")).toBeTruthy()
     const shown = pictures(container)

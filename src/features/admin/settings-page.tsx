@@ -9,8 +9,8 @@ import {
   MailIcon,
   MapIcon,
   RocketIcon,
+  BotIcon,
   SettingsIcon,
-  SparklesIcon,
   TagsIcon,
 } from "lucide-react"
 import { LineTabsList, type LineTab } from "@/components/patterns/line-tabs"
@@ -66,7 +66,7 @@ const ADMIN_TABS: LineTab[] = [
   { value: "general", label: "General", icon: SettingsIcon },
   { value: "deployment", label: "Deployment", icon: RocketIcon },
   { value: "email", label: "Email", icon: MailIcon },
-  { value: "assistant", label: "Assistant", icon: SparklesIcon },
+  { value: "assistant", label: "Assistant", icon: BotIcon },
 ]
 
 /**
