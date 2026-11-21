@@ -21,6 +21,7 @@ import type { AlertRule, AlertRunResult } from "@/services/contracts/alerts"
 // The rule form is its own page (`WEB-7` D2/D7); the list still writes a rule
 // back when it is switched on or off, with the same body builder.
 import { alertRuleSaveInput } from "./alert-rule-page"
+import { formatRunResult } from "./run-result"
 
 const RULE_QUERY_KEYS: Partial<QueryKeys> = {
   search: "rule_search",
@@ -30,29 +31,11 @@ const RULE_QUERY_KEYS: Partial<QueryKeys> = {
   filters: "rule_filter",
 }
 
-function formatRunResult(r: AlertRunResult): string {
-  if (r.skipped) {
-    return `skipped: ${r.skipped}`
-  }
-  if (r.type === "alert") {
-    const formattedVal = Math.round(r.value ?? 0).toLocaleString()
-    if (r.fired) {
-      if (r.delivered?.ok) {
-        return `fired (value ${formattedVal}) · sent`
-      }
-      const err = r.delivered?.error ?? "unknown error"
-      return `fired (value ${formattedVal}) · send failed: ${err}`
-    }
-    return `ok (value ${formattedVal}, not breached)`
-  }
-  if (r.delivered?.ok) {
-    return "digest sent"
-  }
-  const err = r.delivered?.error ?? "unknown error"
-  return `send failed: ${err}`
-}
-
 function RunResultIcon({ r }: { readonly r: AlertRunResult }) {
+  // `BI-67`: a rule that could not be evaluated is destructive, a deliberate skip stays amber.
+  if (r.failed) {
+    return <CircleX className="size-4 text-destructive" />
+  }
   if (r.skipped) {
     return <CircleX className="size-4 text-amber-500" />
   }
@@ -226,7 +209,7 @@ export function AlertsPage() {
               <li key={r.id} className="flex items-center gap-2">
                 <RunResultIcon r={r} />
                 <span className="font-medium">{r.name}</span>
-                <span className="text-muted-foreground">{formatRunResult(r)}</span>
+                <span className={r.failed ? "text-destructive" : "text-muted-foreground"}>{formatRunResult(r)}</span>
               </li>
             ))}
             {runResults.length === 0 ? <li className="text-muted-foreground">No enabled rules.</li> : null}

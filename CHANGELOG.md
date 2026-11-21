@@ -45,6 +45,7 @@ once a first release is tagged.
 
 ### Fixed
 
+- An alert that could not be evaluated now reports **failed**, not skipped (backlog `BI-67`). A rule whose metric's source is gone, or whose read the governance gate refused or the engine failed, used to come back from a run as `skipped` while its state recorded the failure. The run result gains a `failed` field (the reason; never set together with `skipped`), and the alerts page shows "Failed: <reason>" in the destructive tone. Every deliberate skip (no state, owner disabled, handled by another runner, event-driven kinds) stays `skipped`.
 - A combined chart whose categories are numbers (years, numeric buckets) now sorts them numerically, so a point only a layer has (a 2019 beside bars for 2020 to 2025) sits at its place on the axis instead of after the last bar (backlog `BI-67`). Text categories keep the base order.
 
 - Query Studio's Execution transparency panel no longer shows the catalog's sources, their certification marks or freshness to a person without `catalog:read`: it says catalog access is needed instead, and runs SQL all the same. An estimate whose plan names no table no longer invents a source. Runs and estimates now report which masking and row-filter obligations actually applied to the statement ("Column masks", "Row filters"), instead of saying they were not evaluated, and the asset page's Sensitive columns card no longer implies that a classification by itself masks a column (backlog `QS-10`).
