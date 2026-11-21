@@ -37,7 +37,7 @@ mock.module("@/features/auth/auth-provider", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
-import { alertRuleService, assetService, connectorService, dashboardService, metricService } from "@/services"
+import { alertRuleService, assetService, connectorService, dashboardService, metricService, settingsService } from "@/services"
 import { ServiceError } from "@/services/errors"
 import type { AlertRule } from "@/services/contracts/alerts"
 import { AlertRulePage } from "./alert-rule-page"
@@ -80,6 +80,8 @@ function stubReads(rules: AlertRule[] = []) {
   spyOn(dashboardService, "listMartMeasures").mockResolvedValue(["jumlah", "nights"])
   spyOn(connectorService, "listConnectors").mockResolvedValue([])
   spyOn(metricService, "list").mockResolvedValue([])
+  // BI-65: a digest's schedule opens in the report time zone.
+  spyOn(settingsService, "getReporting").mockResolvedValue({ timeZone: "Asia/Jakarta" } as never)
   // WEB-8 D8: the table pickers read the catalog.
   // Shaped like the API's list rows (`DATA-54`): a Silver row's `id` is its
   // table key; a Bronze row's `id` is a registry slug and its table is named
@@ -114,10 +116,9 @@ describe("the alert rule page (WEB-7 T7)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create" }))
 
     await waitFor(() => expect(create).toHaveBeenCalledTimes(1))
-    // A threshold rule goes out as the form holds it (`alertRuleSaveInput`
-    // returns the older kinds unchanged; only the load rules are trimmed).
+    // A threshold rule goes out as the form holds it, but only the fields the
+    // API takes (BI-65: it refuses the rest).
     expect(create.mock.calls[0]?.[0]).toEqual({
-      id: "",
       name: "  Visitors in Bali ",
       type: "alert",
       agg: "sum",
@@ -420,6 +421,30 @@ describe("required-field indicators on the alert rule page (UX-1-R9)", () => {
     expectRequiredField("Dashboard")
     await chooseRuleType("Connector run failed")
     expectRequiredField("Connector")
+  })
+
+  it("saves a digest with its schedule: weekly on Monday at 08:00 in the report time zone to start", async () => {
+    stubReads()
+    spyOn(dashboardService, "listBoards").mockResolvedValue([{ id: "b_sales", name: "Sales" }])
+    const create = spyOn(alertRuleService, "createRule").mockResolvedValue(RULE)
+    render(<AlertRulePage />)
+    fireEvent.change(await screen.findByPlaceholderText("e.g. Foreign visitors dropped"), { target: { value: "Monday digest" } })
+    await chooseRuleType("Dashboard digest")
+    // The same fields the Subscriptions dialog has.
+    expect(screen.getByText("Repeat")).toBeTruthy()
+    expect(screen.getByText("Time zone")).toBeTruthy()
+    expect((screen.getByLabelText("Time") as HTMLInputElement).value).toBe("08:00")
+    fireEvent.click(screen.getByRole("combobox", { name: /dashboard/i }))
+    pickOption(await screen.findByRole("option", { name: "Sales" }))
+    fireEvent.change(screen.getByPlaceholderText("https://hooks.slack.com/services/…"), { target: { value: "https://hooks.example.com/x" } })
+    fireEvent.click(screen.getByRole("button", { name: "Create" }))
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1))
+    expect(create.mock.calls[0]?.[0]).toMatchObject({
+      type: "digest",
+      board: "b_sales",
+      schedule: { kind: "weekly", weekday: 1, hour: 8, minute: 0 },
+      timeZone: "Asia/Jakarta",
+    })
   })
 
   it("stars the table picker on a freshness and a quality rule without a false button attribute", async () => {
