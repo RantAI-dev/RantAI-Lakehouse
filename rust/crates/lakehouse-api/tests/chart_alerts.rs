@@ -476,7 +476,9 @@ async fn a_restricted_dashboards_alert_goes_only_to_its_owners_own_address() {
     .await
     .unwrap();
     let r = run(&f).await;
-    assert!(r["skipped"].as_str().unwrap().contains("restricted"), "{r}");
+    // `BI-67`: the rule could not be evaluated for this target, so it is `failed`.
+    assert!(r["failed"].as_str().unwrap().contains("restricted"), "{r}");
+    assert_eq!(r["skipped"], Value::Null, "{r}");
     assert!(
         !f.fake
             .log
@@ -652,9 +654,14 @@ async fn a_chart_alert_of_another_tenant_fails_and_sends_nothing() {
     let f = fixture_in("owner@test.invalid", OTHER_TENANT).await;
     let r = run(&f).await;
     assert_eq!(
-        r["skipped"],
+        r["failed"],
         json!("The chart could not be read."),
         "the tile is refused, so the alert cannot be read: {r}"
+    );
+    assert_eq!(
+        r["skipped"],
+        Value::Null,
+        "a read failure is not a skip: {r}"
     );
     assert_eq!(r["fired"], json!(false), "{r}");
     assert!(

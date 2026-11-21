@@ -373,7 +373,9 @@ mod tests {
             "a chart rule is read now, not skipped as before: {text}"
         );
         assert_eq!(result["ran"], json!(1), "{text}");
-        assert!(result["results"][0]["skipped"].is_string(), "{text}");
+        // `BI-67`: a chart that could not be read is `failed`, not `skipped`.
+        assert!(result["results"][0]["failed"].is_string(), "{text}");
+        assert!(result["results"][0].get("skipped").is_none(), "{text}");
     }
 
     #[tokio::test]
@@ -562,7 +564,7 @@ mod tests {
 
         let result = run_alert_rule(&state, Some(&person), &args).await;
 
-        assert_eq!(result["results"][0]["skipped"], REFUSAL, "{result}");
+        assert_eq!(result["results"][0]["failed"], REFUSAL, "{result}");
         assert_eq!(result["results"][0]["fired"], false, "{result}");
         let asked = server
             .received_requests()

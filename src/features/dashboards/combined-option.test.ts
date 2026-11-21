@@ -27,6 +27,18 @@ test("text categories keep the base's order and append the new ones", () => {
   assert.deepEqual(categoryKeys(rows, "p", [layer]), ["b", "a", "c"])
 })
 
+test("numeric categories sort numerically so a layer-only year lands first (BI-67)", () => {
+  const rows = [{ y: "2020", v: 1 }, { y: "2025", v: 2 }, { y: "10", v: 3 }]
+  const layer: LayerCell = { ...rooms, dimension: "y", columns: ["y", "w"], rows: [{ y: "2019", w: 1 }, { y: "2020", w: 2 }] }
+  assert.deepEqual(categoryKeys(rows, "y", [layer]), ["10", "2019", "2020", "2025"])
+})
+
+test("categories mixing numbers and text keep the base's order (BI-67)", () => {
+  const rows = [{ y: "2020", v: 1 }, { y: "n/a", v: 2 }]
+  const layer: LayerCell = { ...rooms, dimension: "y", columns: ["y", "w"], rows: [{ y: "2019", w: 1 }] }
+  assert.deepEqual(categoryKeys(rows, "y", [layer]), ["2020", "n/a", "2019"])
+})
+
 test("a value a question lacks is a gap, never a zero", () => {
   const { option, keys } = buildCombinedOption(input, false)
   const [own, layer] = option.series as Series[]

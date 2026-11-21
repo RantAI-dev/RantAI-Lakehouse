@@ -485,11 +485,12 @@ async fn running_a_chart_rule_surfaces_the_runners_own_reason() {
     .await;
     assert_eq!(body["outcome"], "executed", "{body}");
     let item = &body["result"]["results"][0];
-    let skipped = item["skipped"].as_str().unwrap_or_default();
+    // `BI-67`: the reading failed, so the result says `failed`.
+    let failed = item["failed"].as_str().unwrap_or_default();
     // Equal, not `starts_with`: the whole sentence is the runner's, and the
     // tool appends nothing to it (D4).
     assert_eq!(
-        skipped, SERIES_NOT_IN_CHART,
+        failed, SERIES_NOT_IN_CHART,
         "the runner's own reason: {body}"
     );
     // No sentence of the assistant's own: the answer is the runner's `ran`
@@ -518,7 +519,7 @@ async fn running_a_chart_rule_surfaces_the_runners_own_reason() {
     fields.sort();
     assert_eq!(
         fields,
-        ["fired", "id", "name", "skipped", "type"],
+        ["failed", "fired", "id", "name", "type"],
         "the result is the runner's, with no extra field: {body}"
     );
     assert!(
