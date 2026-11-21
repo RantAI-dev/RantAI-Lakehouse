@@ -391,17 +391,19 @@ impl FileWrite for ObjectStoreFileWrite {
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
+    // `iceberg` 0.11.0's `FileWrite::close` returns the stored size; this writer buffered every byte, so it knows the length without a storage stat.
+    async fn close(&mut self) -> Result<FileMetadata> {
         if self.closed {
             return Err(Error::new(ErrorKind::Unexpected, "file already closed"));
         }
         self.closed = true;
+        let stored = self.buffer.len() as u64;
         let payload = PutPayload::from_bytes(Bytes::from(std::mem::take(&mut self.buffer)));
         self.client
             .put(&self.path, payload)
             .await
             .map_err(|err| map_object_store_err(err, "closing (final put)"))?;
-        Ok(())
+        Ok(FileMetadata { size: stored })
     }
 }
 
@@ -432,6 +434,59 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// `close` must report the bytes it stored, not `0` and not the size of
+    /// the last `write()` chunk: `iceberg` 0.11.0 records that number as the
+    /// data file's length.
+    #[tokio::test]
+    async fn close_reports_the_buffered_byte_count() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A real S3 answers a PUT with the object's ETag; `object_store` reads
+        // it to build the `PutResult`, so the stub must return one.
+        Mock::given(method("PUT"))
+            .and(path("/bucket/dir/file.parquet"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"d41d8cd98f00b204e9800998ecf8427e\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Arc::new(
+            AmazonS3Builder::new()
+                .with_bucket_name("bucket")
+                .with_region("us-east-1")
+                .with_access_key_id("ak")
+                .with_secret_access_key("sk")
+                .with_endpoint(server.uri())
+                .with_allow_http(true)
+                .with_virtual_hosted_style_request(false)
+                .build()
+                .unwrap(),
+        );
+        let mut write = ObjectStoreFileWrite {
+            client,
+            path: ObjectPath::from("dir/file.parquet"),
+            buffer: Vec::new(),
+            closed: false,
+        };
+        write
+            .write(Bytes::from_static(b"0123456789"))
+            .await
+            .unwrap();
+        write.write(Bytes::from_static(b"abcde")).await.unwrap();
+
+        let metadata = write.close().await.unwrap();
+
+        assert_eq!(
+            metadata.size, 15,
+            "close must report every buffered byte (10 + 5), not 0 and not one chunk"
+        );
+        server.verify().await;
+    }
 
     #[test]
     fn split_s3_path_extracts_bucket_and_key() {
