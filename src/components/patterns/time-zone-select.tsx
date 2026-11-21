@@ -35,23 +35,28 @@ function matches(zone: string, query: string): boolean {
 
 /**
  * The time zone of a subscription as a searchable list (owner QA 2026-11-16:
- * the free-text field with a `datalist` read as a typing exercise). The names
+ * the free-text field with a `datalist` read as a typing exercise); Settings >
+ * Reporting uses it too (`UX-7`), so it lives in `patterns`. The names
  * are `listTimeZones` (WEB-8 D8: the browser's IANA list, plus `UTC` and the
  * zone already held, so a saved value is never missing). The browser's own
  * zone is first, marked, so the likely answer is one press away; each name
  * shows its offset now. The server still checks the name.
  */
-export function TimeZoneSelect({ id, value, onValueChange }: {
+export function TimeZoneSelect({ id, value, onValueChange, disabled, zones: zoneSource = listTimeZones }: {
   readonly id: string;
   readonly value: string;
   readonly onValueChange: (zone: string) => void;
+  /** A read-only form (a non-admin on Settings) shows the zone but cannot change it. */
+  readonly disabled?: boolean;
+  /** Where the names come from; tests pass a short list (`UX-7`), the app the browser's. */
+  readonly zones?: (held: string) => string[];
 }) {
   const own = React.useMemo(() => browserTimeZone(), []);
   const zones = React.useMemo(() => {
-    const all = listTimeZones(value);
+    const all = zoneSource(value);
     if (own && !all.includes(own)) all.push(own);
     return own ? [own, ...all.filter((z) => z !== own)] : all;
-  }, [value, own]);
+  }, [value, own, zoneSource]);
   const offsets = React.useMemo(() => {
     const now = new Date();
     return new Map(zones.map((z) => [z, utcOffset(z, now)]));
@@ -66,7 +71,7 @@ export function TimeZoneSelect({ id, value, onValueChange }: {
       autoHighlight
     >
       {/* Focus selects the name, so typing searches instead of adding to it. */}
-      <ComboboxInput id={id} className="w-full" placeholder="Search a time zone" autoComplete="off"
+      <ComboboxInput id={id} className="w-full" placeholder="Search a time zone" autoComplete="off" disabled={disabled}
         onFocus={(e) => e.currentTarget.select()} />
       <ComboboxContent>
         <ComboboxEmpty>No time zone matches.</ComboboxEmpty>
