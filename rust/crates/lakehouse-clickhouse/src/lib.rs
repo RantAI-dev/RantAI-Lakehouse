@@ -166,6 +166,12 @@ pub struct QueryOptions {
     /// byte stream do not send it, so a tile and a download receive what they did before
     /// (`D20`). Default `false`.
     pub quote_decimals: bool,
+    /// `max_memory_usage`: the engine stops the query that would use more than
+    /// this many bytes, with its own error, instead of the host's memory killer
+    /// choosing a victim (`BI-34`). Sent by the row stream and the byte stream,
+    /// the two paths a download reads through; the buffered
+    /// [`ChClient::query_with_options`] leaves the engine's own default.
+    pub max_memory_usage: Option<u64>,
 }
 
 /// Most progress headers one limited request may receive; hyper's client
@@ -590,6 +596,9 @@ impl ChClient {
         if let Some(id) = &options.query_id {
             settings.push(("query_id", id.clone()));
         }
+        if let Some(bytes) = options.max_memory_usage {
+            settings.push(("max_memory_usage", bytes.to_string()));
+        }
         settings.push((
             "cancel_http_readonly_queries_on_client_close",
             "1".to_owned(),
@@ -672,6 +681,9 @@ impl ChClient {
         }
         if let Some(id) = &options.query_id {
             settings.push(("query_id", id.clone()));
+        }
+        if let Some(bytes) = options.max_memory_usage {
+            settings.push(("max_memory_usage", bytes.to_string()));
         }
         settings.push((
             "cancel_http_readonly_queries_on_client_close",
@@ -1419,6 +1431,7 @@ mod tests {
             max_result_rows: Some(2001),
             query_id: Some("u:r:1".to_owned()),
             quote_decimals: false,
+            max_memory_usage: None,
         };
         let result = client(&server.uri())
             .query_with_options("SELECT n FROM t", &options, None)
@@ -1660,6 +1673,36 @@ mod tests {
             !settings.iter().any(|(key, _)| key == "wait_end_of_query"),
             "the row stream answers while the query runs: {settings:?}"
         );
+    }
+
+    /// `BI-34`: both download paths send the memory setting; the buffered
+    /// query does not.
+    #[tokio::test]
+    async fn the_row_stream_and_the_byte_stream_carry_max_memory_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[\"a\"]\n[\"Int64\"]\n"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let options = QueryOptions {
+            max_memory_usage: Some(2_147_483_648),
+            ..QueryOptions::default()
+        };
+        let ch = client(&server.uri());
+        ch.query_stream_with_options("SELECT 1", std::time::Duration::from_secs(5), &options)
+            .await
+            .unwrap();
+        ch.byte_stream("SELECT 1 FORMAT Parquet", &options)
+            .await
+            .unwrap();
+        for request in server.received_requests().await.unwrap() {
+            let settings = url_settings(&request);
+            assert!(
+                settings.contains(&("max_memory_usage".to_owned(), "2147483648".to_owned())),
+                "{settings:?}"
+            );
+        }
     }
 
     #[tokio::test]
