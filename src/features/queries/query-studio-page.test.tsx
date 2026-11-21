@@ -781,7 +781,7 @@ describe("QueryStudioPage UX-9 layout", () => {
     expect(screen.getByText("No pre-run estimate for Trino")).toBeTruthy()
   })
 
-  it("opens the command menu with Ctrl+Shift+P, lists the ⋯ actions, and runs the one picked", async () => {
+  it("opens the command menu with Ctrl+Shift+P and runs the item picked", async () => {
     stubNetwork()
     seedDraft("SELECT 1")
     renderPage()
@@ -794,6 +794,35 @@ describe("QueryStudioPage UX-9 layout", () => {
     fireEvent.click(screen.getByRole("option", { name: "Keyboard shortcuts" }))
 
     expect(await screen.findByRole("dialog", { name: "Keyboard shortcuts" })).toBeTruthy()
+  })
+
+  // PR #658 review 3: the plan puts every editor action in ⋯ and repeats it in
+  // the command menu, "an extra way in, never the only one". This reads the ⋯
+  // menu the page actually draws and the command menu it builds from the same
+  // list, so a dropped action fails here — the earlier unit test checked a
+  // hard-coded id list and could not see either menu.
+  it("offers every ⋯ menu action in the command menu too", async () => {
+    stubNetwork()
+    // A pinned version, so ⋯'s "Read the current version" is among the items.
+    seedDraft("SELECT * FROM bronze.orders\nSETTINGS iceberg_snapshot_id = 42")
+    renderPage()
+    await screen.findByRole("button", { name: "Run" })
+
+    fireEvent.click(await screen.findByRole("button", { name: "More query actions" }))
+    const menu = (await screen.findAllByRole("menuitem")).map((item) => item.textContent)
+    expect(menu).toEqual([
+      "Format",
+      "Format settings…",
+      "Explain with AI",
+      "Time travel…",
+      "Read the current version",
+      "Keyboard shortcuts",
+    ])
+    fireEvent.keyDown(document.activeElement ?? window, { key: "Escape" })
+
+    fireEvent.keyDown(window, { key: "P", ctrlKey: true, shiftKey: true })
+    const commands = (await screen.findAllByRole("option")).map((item) => item.textContent)
+    for (const label of menu) expect(commands).toContain(label)
   })
 
   it("shows a version pin as a chip and reads the current version again from its ×", async () => {

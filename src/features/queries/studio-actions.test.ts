@@ -70,7 +70,11 @@ describe("studioActions", () => {
     }
   })
 
-  it("lists every action the ⋯ menu shows, so the command menu is never the only way in", () => {
+  // PR #658 review 3: the guarantee that every ⋯ action is also in the
+  // command menu is the page test's ("offers every ⋯ menu action in the
+  // command menu too"), which reads both menus as the page draws them. Here
+  // the list only has to hold the ids the page picks, in that order.
+  it("holds every id the page's ⋯ menu picks, in the order it picks them", () => {
     const actions = studioActions(context({ onUnpin: () => {} }))
     const menu = ["format", "format-settings", "explain", "time-travel", "unpin", "shortcuts"] as const
     expect(pickActions(actions, menu).map((action) => action.id)).toEqual([...menu])
