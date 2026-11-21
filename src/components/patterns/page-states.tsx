@@ -47,15 +47,18 @@ export function EmptyState({
   description,
   action,
   className,
+  icon: Icon = Inbox,
 }: {
   title: string
   description?: string
   action?: React.ReactNode
   className?: string
+  /** The mark in the circle; an inbox unless the empty thing has its own (a search with no match). */
+  icon?: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>
 }) {
   return (
     <StateShell
-      icon={<Inbox className="size-5" aria-hidden />}
+      icon={<Icon className="size-5" aria-hidden />}
       title={title}
       description={description}
       action={action}

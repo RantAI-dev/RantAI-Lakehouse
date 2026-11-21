@@ -14,22 +14,19 @@ import {
 } from "@/components/ui/input-group";
 
 /**
- * Free-text search over whatever the endpoint declared `searchable` — the
- * backend's `search` param, which is ANDed with whatever the filter list does.
+ * The table's free-text search as a value and a setter: the backend's
+ * `search` param, kept in the URL like the rest of the table state, held
+ * locally only so typing stays responsive (the URL write is debounced).
  *
- * Keeps its value in the URL like the rest of the table state, so the input is
- * controlled locally only to stay responsive while typing.
+ * Split from `DataTableSearch` (`UX-8`) so a page can draw the same search
+ * in its own control, the icon-only search of the page frame (`DESIGN.md`
+ * §3), without a second copy of this state. Must sit under the toolbar's
+ * `DataTableQueryKeysProvider`, which names the table's params.
  */
-export function DataTableSearch({
-  placeholder = "Search...",
-  label = "Search",
-  /** Match canonical table fetch (`useSearchParams`) — prefer false. */
-  shallow = false,
-}: {
-  placeholder?: string;
-  label?: string;
-  shallow?: boolean;
-}) {
+export function useDataTableSearchValue(shallow = false): {
+  value: string;
+  update: (next: string) => void;
+} {
   // Named by the toolbar's table, so two tables on one route do not type into
   // each other's search box.
   const { keys, paginationMode } = useDataTableQueryKeys();
@@ -79,6 +76,25 @@ export function DataTableSearch({
     pushed.current = next;
     push(next);
   };
+
+  return { value, update };
+}
+
+/**
+ * Free-text search over whatever the endpoint declared `searchable` — the
+ * backend's `search` param, which is ANDed with whatever the filter list does.
+ */
+export function DataTableSearch({
+  placeholder = "Search...",
+  label = "Search",
+  /** Match canonical table fetch (`useSearchParams`) — prefer false. */
+  shallow = false,
+}: {
+  placeholder?: string;
+  label?: string;
+  shallow?: boolean;
+}) {
+  const { value, update } = useDataTableSearchValue(shallow);
 
   return (
     <InputGroup className="w-56">
