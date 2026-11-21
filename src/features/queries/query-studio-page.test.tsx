@@ -86,6 +86,15 @@ function renderPage() {
   )
 }
 
+/**
+ * `UX-9`: the editor's less frequent actions are in ⋯ ("More query
+ * actions"); this opens it and finds one of its items.
+ */
+async function moreItem(name: string): Promise<HTMLElement> {
+  fireEvent.click(await screen.findByRole("button", { name: "More query actions" }))
+  return screen.findByRole("menuitem", { name })
+}
+
 /** One row of a result, as the API sends it. */
 const RESULT = {
   id: "r1",
@@ -137,7 +146,7 @@ describe("QueryStudioPage Fix with AI", () => {
     renderPage()
 
     // Before any run: the button is absent.
-    const runButton = await screen.findByRole("button", { name: "Run query" })
+    const runButton = await screen.findByRole("button", { name: "Run" })
     await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
     expect(screen.queryByRole("button", { name: /Fix with AI/ })).toBeNull()
 
@@ -163,7 +172,7 @@ describe("QueryStudioPage Fix with AI", () => {
     seedDraft("SELECT amont FROM t")
     renderPage()
 
-    const runButton = await screen.findByRole("button", { name: "Run query" })
+    const runButton = await screen.findByRole("button", { name: "Run" })
     await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(runButton)
 
@@ -182,7 +191,7 @@ describe("QueryStudioPage format settings", () => {
     seedDraft("select a from t")
     renderPage()
 
-    fireEvent.click(await screen.findByRole("button", { name: "Format settings" }))
+    fireEvent.click(await moreItem("Format settings…"))
     await waitFor(() =>
       expect(screen.getByRole("combobox", { name: "Keyword case" }).textContent).toContain(
         "Lower case"
@@ -200,9 +209,11 @@ describe("QueryStudioPage format settings", () => {
     seedDraft("select a from t")
     const { container } = renderPage()
 
-    const formatButton = await screen.findByRole("button", { name: "Format" })
-    await waitFor(() => expect((formatButton as HTMLButtonElement).disabled).toBe(false))
-    fireEvent.click(formatButton)
+    // The draft is read once the session has answered: wait for its text.
+    await waitFor(() => expect(container.querySelector(".cm-line")?.textContent).toBe("select a from t"))
+    const formatItem = await moreItem("Format")
+    expect(formatItem.getAttribute("aria-disabled")).not.toBe("true")
+    fireEvent.click(formatItem)
 
     await waitFor(() => {
       const lines = Array.from(container.querySelectorAll(".cm-line")).map(
@@ -262,11 +273,16 @@ describe("QueryStudioPage estimate panel", () => {
     const estimateSpy = queryService.estimate as unknown as { mock: { calls: unknown[] } }
     renderPage()
 
+    // UX-9: the status bar says it in one line, and the Plan tab in full.
+    expect(await screen.findByText("No pre-run estimate for Trino")).toBeTruthy()
+    fireEvent.click(screen.getByRole("tab", { name: "Plan" }))
     expect(await screen.findByText("No pre-run estimate for Trino queries.")).toBeTruthy()
     expect(screen.queryByText("This query cannot be planned")).toBeNull()
     expect(screen.queryByText("Type SQL for a pre-run estimate.")).toBeNull()
-    const estimate = screen.getByRole("button", { name: "Estimate" })
-    expect((estimate as HTMLButtonElement).disabled).toBe(true)
+    // The command menu's "Estimate again" has nothing to do either.
+    fireEvent.keyDown(window, { key: "p", ctrlKey: true, shiftKey: true })
+    const estimate = await screen.findByRole("option", { name: "Estimate again" })
+    expect(estimate.getAttribute("aria-disabled")).toBe("true")
     expect(estimate.getAttribute("title")).toBe("No pre-run estimate for Trino queries.")
     await new Promise((resolve) => setTimeout(resolve, 700))
     expect(estimateSpy.mock.calls.length).toBe(0)
@@ -277,6 +293,8 @@ describe("QueryStudioPage estimate panel", () => {
     seedDraft("SELECT {{region}}")
     renderPage()
 
+    expect(await screen.findByText("Fill in {{region}} for an estimate")).toBeTruthy()
+    fireEvent.click(screen.getByRole("tab", { name: "Plan" }))
     expect(await screen.findByText("Fill in {{region}} for a pre-run estimate.")).toBeTruthy()
     expect(screen.queryByText("Type SQL for a pre-run estimate.")).toBeNull()
   })
@@ -288,17 +306,21 @@ describe("QueryStudioPage statements", () => {
     seedDraft("SELECT 1; SELECT 2")
     renderPage()
 
-    const explain = await screen.findByRole("button", { name: "Explain" })
-    await waitFor(() => expect((explain as HTMLButtonElement).disabled).toBe(true))
-    expect(explain.getAttribute("title")).toBe("Select one statement")
-
-    const estimate = screen.getByRole("button", { name: "Estimate" })
-    expect((estimate as HTMLButtonElement).disabled).toBe(true)
-    expect(estimate.getAttribute("title")).toBe("Select one statement")
-
-    const save = screen.getByRole("button", { name: "Save as new" })
+    // The draft is read once the session has answered: Run all says it is in.
+    await screen.findByRole("button", { name: "Run all" })
+    const save = screen.getByRole("button", { name: "Save" })
     expect((save as HTMLButtonElement).disabled).toBe(true)
     expect(save.getAttribute("title")).toBe("Select one statement")
+
+    const explain = await moreItem("Explain with AI")
+    expect(explain.getAttribute("aria-disabled")).toBe("true")
+    expect(explain.getAttribute("title")).toBe("Select one statement")
+    fireEvent.keyDown(document.activeElement ?? window, { key: "Escape" })
+
+    fireEvent.keyDown(window, { key: "p", ctrlKey: true, shiftKey: true })
+    const estimate = await screen.findByRole("option", { name: "Estimate again" })
+    expect(estimate.getAttribute("aria-disabled")).toBe("true")
+    expect(estimate.getAttribute("title")).toBe("Select one statement")
   })
 
   it("proposes a fix for the statement that failed, not for the whole buffer", async () => {
@@ -367,31 +389,33 @@ describe("QueryStudioPage schema browser", () => {
     seedDraft("SELECT 1")
     const { container } = renderPage()
 
-    fireEvent.click(await screen.findByRole("button", { name: "Schema" }))
+    // UX-9: the side panel is open on a laptop, on its Schema tab.
     expect(await screen.findByText(/needs catalog access/i)).toBeTruthy()
 
     // The refusal sits beside the editor, not in place of it.
+    const runButton = await screen.findByRole("button", { name: "Run" })
     expect(container.querySelector(".cm-content")).not.toBeNull()
-    const runButton = await screen.findByRole("button", { name: "Run query" })
     await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(runButton)
     await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
     await screen.findByText(/stopped here/)
   })
 
-  it("closes the browser from its own button and from the toolbar toggle", async () => {
+  it("hides and shows the Schema and plan panel from the toolbar toggle", async () => {
     stubNetwork()
     seedDraft("SELECT 1")
     renderPage()
 
-    const toggle = await screen.findByRole("button", { name: "Schema" })
-    expect(toggle.getAttribute("aria-pressed")).toBe("false")
-    fireEvent.click(toggle)
+    const toggle = await screen.findByRole("button", { name: "Hide schema and plan" })
     expect(toggle.getAttribute("aria-pressed")).toBe("true")
-    fireEvent.click(await screen.findByRole("button", { name: "Close schema browser" }))
+    expect(screen.getByRole("complementary", { name: "Schema and plan" })).toBeTruthy()
+    fireEvent.click(toggle)
 
-    expect(screen.queryByRole("complementary", { name: "Schema browser" })).toBeNull()
-    expect(toggle.getAttribute("aria-pressed")).toBe("false")
+    expect(screen.queryByRole("complementary", { name: "Schema and plan" })).toBeNull()
+    const shown = screen.getByRole("button", { name: "Show schema and plan" })
+    expect(shown.getAttribute("aria-pressed")).toBe("false")
+    fireEvent.click(shown)
+    expect(screen.getByRole("complementary", { name: "Schema and plan" })).toBeTruthy()
   })
 })
 
@@ -400,19 +424,21 @@ describe("QueryStudioPage parameters", () => {
     stubNetwork()
     seedDraft("SELECT 1")
     renderPage()
-    await screen.findByRole("button", { name: "Run query" })
+    await screen.findByRole("button", { name: "Run" })
     expect(screen.queryByRole("group", { name: "Query parameters" })).toBeNull()
   })
 
-  it("shows a field for each placeholder, above the toolbar, and a field for a name typed later", async () => {
+  it("shows a field for each placeholder, between the editor and the status bar, and a field for a name typed later", async () => {
     stubNetwork()
     seedDraft("SELECT {{region}}")
-    renderPage()
+    const { container } = renderPage()
     const fields = await screen.findByRole("group", { name: "Query parameters" })
-    const runButton = screen.getByRole("button", { name: "Run query" })
+    const engine = screen.getByRole("button", { name: "Engine: ClickHouse" })
     expect(within(fields).getByLabelText("region")).toBeTruthy()
-    // The row sits between the editor and the toolbar.
-    expect(fields.compareDocumentPosition(runButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // UX-9: the row sits between the editor and the status bar.
+    const editor = container.querySelector(".cm-content") as HTMLElement
+    expect(editor.compareDocumentPosition(fields) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(fields.compareDocumentPosition(engine) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 
   it("restores the fields of a reload at the values the tab held", async () => {
@@ -448,7 +474,7 @@ describe("QueryStudioPage parameters", () => {
     seedDraft("SELECT {{region}}, {{city}}")
     renderPage()
     const fields = await screen.findByRole("group", { name: "Query parameters" })
-    const runButton = screen.getByRole("button", { name: "Run query" })
+    const runButton = screen.getByRole("button", { name: "Run" })
     await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
 
     fireEvent.click(runButton)
@@ -471,7 +497,7 @@ describe("QueryStudioPage parameters", () => {
     const fields = await screen.findByRole("group", { name: "Query parameters" })
     fireEvent.change(within(fields).getByLabelText("region"), { target: { value: "EU" } })
 
-    fireEvent.click(screen.getByRole("button", { name: "Run query" }))
+    fireEvent.click(screen.getByRole("button", { name: "Run" }))
 
     await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
     expect(run.mock.calls[0]?.[1]).toMatchObject({
@@ -518,7 +544,7 @@ describe("QueryStudioPage parameters", () => {
     fireEvent.focus(none)
     fireEvent.click(none)
 
-    fireEvent.click(screen.getByRole("button", { name: "Run query" }))
+    fireEvent.click(screen.getByRole("button", { name: "Run" }))
 
     await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
     // The run holds no value for the parameter: the name is not sent at all.
@@ -535,7 +561,10 @@ describe("QueryStudioPage save handoff ('WEB-7' D5)", () => {
     seedDraft("SELECT 1")
     renderPage()
 
-    fireEvent.click(await screen.findByRole("button", { name: "Save as new" }))
+    // UX-9: a tab that did not come from a saved query has one save, "Save".
+    const save = await screen.findByRole("button", { name: "Save" })
+    await waitFor(() => expect((save as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(save)
 
     await waitFor(() => expect(pushed).toEqual(["/query-studio/save"]))
     expect(readSaveQueryDraft()).toEqual({
@@ -554,19 +583,26 @@ describe("QueryStudioPage save handoff ('WEB-7' D5)", () => {
     seedDraft("SELECT * FROM serving.orders")
     renderPage()
 
-    fireEvent.click(await screen.findByRole("button", { name: "Save as SQL source" }))
+    // UX-9: Save as SQL source is in Save's own menu.
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(false)
+    )
+    fireEvent.click(screen.getByRole("button", { name: "More ways to save" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Save as SQL source" }))
 
     await waitFor(() => expect(pushed).toEqual(["/query-studio/save-source"]))
     expect(readSaveSourceDraft()).toEqual({ sql: "SELECT * FROM serving.orders" })
   })
 
-  it("shows no Save as SQL source button to a caller without dashboard:sql", async () => {
+  it("shows no Save as SQL source to a caller without dashboard:sql", async () => {
     stubNetwork()
     seedDraft("SELECT * FROM serving.orders")
     renderPage()
 
-    await screen.findByRole("button", { name: "Save as new" })
-    expect(screen.queryByRole("button", { name: "Save as SQL source" })).toBeNull()
+    await screen.findByRole("button", { name: "Save" })
+    // A new tab with no SQL source to save has nothing else in Save's menu,
+    // so the menu is not drawn at all.
+    expect(screen.queryByRole("button", { name: "More ways to save" })).toBeNull()
   })
 })
 
@@ -681,5 +717,152 @@ describe("QueryStudioPage batch refusal", () => {
       "At most 20 statements are run at once. Split the buffer into smaller queries and run them one after another."
     )
     expect(run).not.toHaveBeenCalled()
+  })
+})
+
+// UX-9 (layout A with mockup B's status bar): the frame, the status bar, the
+// command menu, the version chip and Make a chart.
+describe("QueryStudioPage UX-9 layout", () => {
+  /** A ready ClickHouse estimate, as the API sends it. */
+  const ESTIMATE = {
+    supported: true,
+    queryEngine: "clickhouse",
+    estimatedBytes: 1024,
+    estimatedCostMin: 0.01,
+    estimatedCostMax: 0.02,
+    error: null,
+    workloadClass: "hot-analytics",
+    engine: "hot-store",
+    cacheEligible: null,
+    freshnessLagSeconds: 3 * 3600,
+    policyObligations: [],
+    sources: ["serving.orders"],
+    plan: null,
+  } as never
+
+  it("puts the sections on the title row as links, with no Saved or History card beside the editor", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderPage()
+
+    const sections = await screen.findByRole("navigation", { name: "Query Studio sections" })
+    const links = within(sections).getAllByRole("link")
+    expect(links.map((link) => link.getAttribute("href"))).toEqual([
+      "/query-studio",
+      "/query-studio/saved",
+      "/query-studio/history",
+    ])
+    expect(within(sections).getByRole("link", { name: "Studio" }).getAttribute("aria-current")).toBe("page")
+    await screen.findByRole("button", { name: "Run" })
+    expect(screen.queryByText("Your recent runs.")).toBeNull()
+  })
+
+  it("shows the engine and the estimate in the status bar, and the estimate opens the Plan tab", async () => {
+    stubNetwork()
+    spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    seedDraft("SELECT * FROM serving.orders")
+    renderPage()
+
+    expect(await screen.findByRole("button", { name: "Engine: ClickHouse" })).toBeTruthy()
+    const estimate = await screen.findByRole("button", { name: /^Estimate ≈ 1\.0 KB · / })
+    expect(estimate.textContent).toContain("data 3h 00m old")
+    fireEvent.click(estimate)
+
+    const plan = screen.getByRole("tab", { name: "Plan" })
+    await waitFor(() => expect(plan.getAttribute("aria-selected")).toBe("true"))
+    expect(await screen.findByText("Hot analytics")).toBeTruthy()
+  })
+
+  it("switches the engine from the status bar's menu", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Engine: ClickHouse" }))
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^Trino/ }))
+
+    expect(await screen.findByRole("button", { name: "Engine: Trino" })).toBeTruthy()
+    expect(screen.getByText("No pre-run estimate for Trino")).toBeTruthy()
+  })
+
+  it("opens the command menu with Ctrl+Shift+P, lists the ⋯ actions, and runs the one picked", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderPage()
+    await screen.findByRole("button", { name: "Run" })
+
+    fireEvent.keyDown(window, { key: "P", ctrlKey: true, shiftKey: true })
+    for (const name of ["Format", "Format settings…", "Explain with AI", "Time travel…", "Keyboard shortcuts"]) {
+      expect(await screen.findByRole("option", { name })).toBeTruthy()
+    }
+    fireEvent.click(screen.getByRole("option", { name: "Keyboard shortcuts" }))
+
+    expect(await screen.findByRole("dialog", { name: "Keyboard shortcuts" })).toBeTruthy()
+  })
+
+  it("shows a version pin as a chip and reads the current version again from its ×", async () => {
+    stubNetwork()
+    seedDraft("SELECT * FROM bronze.orders\nSETTINGS iceberg_snapshot_id = 42")
+    const { container } = renderPage()
+
+    expect(await screen.findByText("Version 42")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Read the current version" }))
+
+    await waitFor(() => {
+      const lines = Array.from(container.querySelectorAll(".cm-line")).map((line) => line.textContent ?? "")
+      expect(lines.join("\n")).toBe("SELECT * FROM bronze.orders")
+    })
+    expect(screen.queryByText("Version 42")).toBeNull()
+  })
+
+  it("opens Time travel from the ⋯ menu", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderPage()
+    await screen.findByRole("button", { name: "Run" })
+
+    fireEvent.click(await moreItem("Time travel…"))
+
+    expect(await screen.findByRole("dialog", { name: "Time travel" })).toBeTruthy()
+    expect(screen.getByText("Query this version")).toBeTruthy()
+  })
+
+  it("makes a chart from a result through the Save as SQL source page, with the statement that ran", async () => {
+    stubNetwork(["dashboard:sql", "dashboard:write"])
+    spyOn(queryService, "run").mockResolvedValue(RESULT)
+    seedDraft("SELECT n FROM serving.orders")
+    renderPage()
+
+    const runButton = await screen.findByRole("button", { name: "Run" })
+    await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(runButton)
+    fireEvent.click(await screen.findByRole("button", { name: "More result actions" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Make a chart" }))
+
+    await waitFor(() => expect(pushed).toEqual(["/query-studio/save-source"]))
+    expect(readSaveSourceDraft()).toEqual({ sql: "SELECT n FROM serving.orders", next: "chart" })
+  })
+
+  it("offers no Make a chart to a caller who may not build a chart", async () => {
+    stubNetwork(["dashboard:sql"])
+    spyOn(queryService, "run").mockResolvedValue(RESULT)
+    seedDraft("SELECT n FROM serving.orders")
+    renderPage()
+
+    const runButton = await screen.findByRole("button", { name: "Run" })
+    await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(runButton)
+    fireEvent.click(await screen.findByRole("button", { name: "More result actions" }))
+
+    await screen.findByRole("menuitem", { name: "Column statistics" })
+    expect(screen.queryAllByRole("menuitem", { name: "Make a chart" })).toHaveLength(0)
+  })
+
+  it("says where results show before anything ran", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderPage()
+
+    expect(await screen.findByText("Results show here")).toBeTruthy()
   })
 })

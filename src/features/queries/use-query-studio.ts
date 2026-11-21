@@ -1390,7 +1390,7 @@ export function useQueryStudio(draftKey: string | null) {
     [sql, engine, readSelection]
   )
   // Accept puts the proposal in the editor. It does not run it: the person
-  // presses "Run query" to see its rows, as with any statement they typed.
+  // presses Run to see its rows, as with any statement they typed.
   //
   // Only the statement the proposal was made for is replaced. The rest of
   // the buffer is not the assistant's business.

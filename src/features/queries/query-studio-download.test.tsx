@@ -115,7 +115,7 @@ const FILE = {
 
 /** Runs the statement of the draft and waits for the result to be on screen. */
 async function runAndWait() {
-  const runButton = await screen.findByRole("button", { name: "Run query" })
+  const runButton = await screen.findByRole("button", { name: "Run" })
   await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
   fireEvent.click(runButton)
   return screen.findByRole("button", { name: "Download" })
@@ -278,7 +278,7 @@ describe("the elapsed time of a run", () => {
     seedDraft("SELECT 1")
     renderPage()
 
-    const runButton = await screen.findByRole("button", { name: "Run query" })
+    const runButton = await screen.findByRole("button", { name: "Run" })
     await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
     expect(screen.queryAllByRole("timer", { name: "Elapsed time" })).toHaveLength(0)
 
@@ -296,7 +296,7 @@ describe("the elapsed time of a run", () => {
     seedDraft("SELECT 1")
     renderPage()
 
-    const runButton = await screen.findByRole("button", { name: "Run query" })
+    const runButton = await screen.findByRole("button", { name: "Run" })
     await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
 
     fireEvent.click(runButton)
