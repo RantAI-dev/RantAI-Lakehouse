@@ -1,0 +1,23 @@
+[
+  { "text": "=1+1", "neutralised": "'=1+1" },
+  { "text": "@SUM(A1)", "neutralised": "'@SUM(A1)" },
+  { "text": "\tx", "neutralised": "'\tx" },
+  { "text": "\rx", "neutralised": "'\rx" },
+  { "text": "-1+1", "neutralised": "'-1+1" },
+  { "text": "+1+1", "neutralised": "'+1+1" },
+  { "text": "-x", "neutralised": "'-x" },
+  { "text": "-", "neutralised": "'-" },
+  { "text": "=", "neutralised": "'=" },
+  { "text": "-5", "neutralised": "-5" },
+  { "text": "+1", "neutralised": "+1" },
+  { "text": "-1", "neutralised": "-1" },
+  { "text": "+3.2e4", "neutralised": "+3.2e4" },
+  { "text": "-5.5E-3", "neutralised": "-5.5E-3" },
+  { "text": "-.5", "neutralised": "-.5" },
+  { "text": "-9223372036854775807", "neutralised": "-9223372036854775807" },
+  { "text": "", "neutralised": "" },
+  { "text": "abc", "neutralised": "abc" },
+  { "text": " =1", "neutralised": " =1" },
+  { "text": ".5", "neutralised": ".5" },
+  { "text": "1+1", "neutralised": "1+1" }
+]

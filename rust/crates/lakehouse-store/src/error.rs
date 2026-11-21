@@ -14,6 +14,7 @@
 //! | [`StoreError`]            | [`ApiError`]         | status | why                                                          |
 //! |----------------------------|-----------------------|--------|---------------------------------------------------------------|
 //! | [`StoreError::Conflict`]   | `Conflict`            | 409    | caller-supplied data collides with a unique constraint         |
+//! | [`StoreError::Contended`]  | `Conflict`            | 409    | a bounded retry lost to a concurrent writer (`PR #638 review 1`) |
 //! | [`StoreError::ForeignKeyViolation`] | `BadRequest`  | 400    | caller referenced a row that doesn't exist                     |
 //! | [`StoreError::NotFound`]   | `NotFound`            | 404    | caller asked for a row that doesn't exist                      |
 //! | [`StoreError::NotAllowed`] | `PermissionDenied`    | 403    | the store's own rule refuses the action on a row that does exist (`QS-3` review of #382: a move needs manage) |
@@ -48,6 +49,19 @@ pub enum StoreError {
     /// A unique-constraint violation (e.g. a duplicate email or slug).
     #[error("a record with that value already exists")]
     Conflict,
+    /// A bounded retry gave up: another writer kept changing the row
+    /// between this write's own steps, so the write is refused instead of
+    /// spinning on a row that keeps disappearing. The one rule that raises
+    /// it today is the workspace name save (`workspace_settings::upsert_name`,
+    /// `PR #638 review 1`): a concurrent save or reset deleted the
+    /// settings row between the save's insert and its lock three tries in
+    /// a row. The message is this crate's own fixed sentence — never an
+    /// upstream error's text — and the status is 409: the write lost to
+    /// the row's state, and a retry once the other writer stops succeeds.
+    #[error(
+        "the workspace settings were changed by another save or reset at the same time; try again"
+    )]
+    Contended,
     /// A field the caller tried to set is already taken by ANOTHER user's
     /// username or email, compared case-insensitively (ADM-11 D5: one
     /// sign-in box must never match two people). Unlike [`Self::Conflict`],
@@ -176,7 +190,13 @@ impl From<StoreError> for ApiError {
             // the field that must change. Same refusal shape as
             // `Conflict`, with the field-specific sentence instead of the
             // generic one — hence one arm for both variants.
-            StoreError::Conflict | StoreError::FieldConflict(_) => Self::Conflict(message),
+            // `Contended` joins the same arm (PR #638 review 1): a write
+            // that lost a bounded race to a concurrent writer conflicts
+            // with the row's state, its sentence is this crate's own —
+            // safe to surface — and the caller can simply try again.
+            StoreError::Conflict | StoreError::Contended | StoreError::FieldConflict(_) => {
+                Self::Conflict(message)
+            }
             // `ForeignKeyViolation` and `Validation` both map to `BadRequest`
             // for different reasons (see the module doc comment's mapping
             // table): the former because the caller referenced a row that
@@ -215,6 +235,20 @@ mod tests {
     fn conflict_maps_to_409() {
         let api: ApiError = StoreError::Conflict.into();
         assert_eq!(api.status(), 409);
+    }
+
+    /// PR #638 review 1: a save that lost a bounded race against a
+    /// concurrent save or reset is a 409 that carries the store's own
+    /// fixed sentence, so the caller knows to save again rather than
+    /// that "something failed".
+    #[test]
+    fn contended_maps_to_409_and_carries_the_fixed_sentence() {
+        let api: ApiError = StoreError::Contended.into();
+        assert_eq!(api.status(), 409);
+        assert_eq!(
+            api.to_string(),
+            "the workspace settings were changed by another save or reset at the same time; try again"
+        );
     }
 
     /// ADM-11 D5: a field-specific username/email clash maps to 409 and
