@@ -33,6 +33,27 @@ test("parseDraft memakai tab natural language bila nilainya tidak dikenal", () =
   assert.equal(draft?.tab, "nl")
 })
 
+// QS-11 (LH-QS-1-01), D7: the old starter text was real SQL in the document.
+// Only that exact value is read back as empty; a person's own comment stays.
+test("a stored tab with the old starter text reads back as empty", () => {
+  const tabs = parseTabs(
+    JSON.stringify({
+      tabs: [
+        {
+          id: "a",
+          name: "Legacy",
+          sql: "-- Write SQL here, or generate it from a question",
+          engine: "clickhouse",
+        },
+        { id: "b", name: "Mine", sql: "-- mine", engine: "clickhouse" },
+      ],
+      activeId: "a",
+    })
+  )
+  assert.equal(tabs?.tabs[0]?.sql, "")
+  assert.equal(tabs?.tabs[1]?.sql, "-- mine")
+})
+
 test("parseTabs memulihkan tab yang tersimpan dalam bentuk baru", () => {
   const tabs = parseTabs(
     JSON.stringify({

@@ -61,6 +61,28 @@ path rust/crates/lakehouse-api/src/routes/knowledge.rs none
 path rust/crates/lakehouse-store/src/chat_term.rs none
 path rust/crates/lakehouse-store/src/assistant_settings.rs none
 path rust/crates/lakehouse-store/src/knowledge.rs none
+# OPS-38 D2: `/api/governance/audit/events`, `/events/{id}`, `/actors`, `/export.csv`
+# grepped across `ops/`, `dagster/`, `.github/workflows/ci.yml` -> 0 hits (`g3a` reads
+# `/api/governance/audit` via `routes/governance.rs`); only `routes/mod.rs` imports it.
+path rust/crates/lakehouse-api/src/routes/audit_events.rs none
+# OPS-38 D2: `POST /api/query/cancel` grepped across `ops/`, `dagster/`,
+# `.github/workflows/ci.yml` -> 0 hits; only `routes/mod.rs` and `routes/ai/tools/limits.rs` (`none`) import it.
+path rust/crates/lakehouse-api/src/routes/query_cancel.rs none
+# OPS-38 D2: `/api/settings/limits` grepped across `ops/`, `dagster/`,
+# `.github/workflows/ci.yml` -> 0 hits; only `routes/mod.rs` imports `routes::query_limits`
+# (`src/query_limits.rs` middleware stays shared).
+path rust/crates/lakehouse-api/src/routes/query_limits.rs none
+# OPS-38 D2: `GET /api/governance/lineage/used-by` grepped across `ops/`, `dagster/`,
+# `.github/workflows/ci.yml` -> 0 hits; only `routes/mod.rs` imports `used_by`.
+path rust/crates/lakehouse-api/src/routes/lineage/used_by.rs none
+# OPS-38 D2: `GET /api/dashboard/charts/{id}/lineage` grepped across `ops/`, `dagster/`,
+# `.github/workflows/ci.yml` -> 0 hits; only `routes/mod.rs` and `routes/lineage/used_by.rs` (`none`) import it.
+path rust/crates/lakehouse-api/src/routes/lineage/charts.rs none
+# OPS-38 D2: `/api/storage`, `/api/storage/policies`, `/operations`, `/restore`
+# grepped across `ops/`, `dagster/`, `.github/workflows/ci.yml` -> 0 hits; only `routes/mod.rs` imports it.
+path rust/crates/lakehouse-api/src/routes/storage.rs none
+# OPS-38 D2: `lakehouse_store::storage` is imported only by `routes/storage.rs` (`none`).
+path rust/crates/lakehouse-store/src/storage.rs none
 path dagster/dispar_orchestrate/test_* none
 path dagster/dispar_orchestrate/conftest.py none
 path ops/lint/* none
@@ -171,6 +193,8 @@ path ops/g3a/* pipelines
 path ops/g7/* pipelines
 path ops/gold_export/* pipelines
 path rust/crates/lakehouse-api/src/pipeline_compile.rs pipelines
+# OPS-38 D2: no routes; imported only by `pipeline_compile.rs` (`pipelines`).
+path rust/crates/lakehouse-api/src/pipeline_forms.rs pipelines
 path rust/crates/lakehouse-api/src/transform_grammar.rs pipelines
 path rust/crates/lakehouse-api/src/routes/authored_pipelines.rs pipelines
 path rust/crates/lakehouse-api/src/routes/pipeline_preview.rs pipelines
@@ -182,6 +206,13 @@ path dagster/dispar_orchestrate/authored_* pipelines
 # `routes/catalog_query.rs` are not listed: they stay shared.
 path rust/crates/lakehouse-api/src/gold_* pipelines,governance
 path rust/crates/lakehouse-api/src/routes/gold.rs pipelines,governance
+# OPS-38 D2: `/api/iceberg` (`v1/*`) grepped across `ops/`, `dagster/`, `.github/workflows/ci.yml`
+# -> only `ops/gold_export/gold_export_test.py` (`pipelines`); imported only by
+# `gold_export.rs`, `routes/gold.rs` (`pipelines,governance`), and `routes/mod.rs`.
+path rust/crates/lakehouse-api/src/routes/iceberg_door.rs pipelines,governance
+# OPS-38 D2: `lakehouse_store::outside_reads` is imported only by
+# `routes/gold.rs` and `routes/iceberg_door.rs` (`pipelines,governance`).
+path rust/crates/lakehouse-store/src/outside_reads.rs pipelines,governance
 path rust/crates/lakehouse-store/src/gold_publication.rs pipelines,governance
 path dagster/dispar_orchestrate/gold_export.py pipelines,governance
 path rust/crates/lakehouse-api/src/routes/catalog.rs pipelines,governance
@@ -190,8 +221,19 @@ path rust/crates/lakehouse-api/src/routes/catalog_profile.rs pipelines,governanc
 path rust/crates/lakehouse-api/src/routes/catalog_grants.rs pipelines,governance
 path rust/crates/lakehouse-api/src/routes/catalog_restore.rs pipelines,governance
 path rust/crates/lakehouse-api/src/routes/catalog_source.rs pipelines,governance
+# OPS-38 D2: `GET`/`POST /api/catalog/{id}/drop` and `GET /api/catalog/dropped/tables`
+# grepped across `ops/`, `dagster/`, `.github/workflows/ci.yml` -> only `ops/g9/upload_test.py` (`upload`);
+# imported only by `routes/uploads.rs` (`upload,ingest`), `routes/catalog_restore.rs`
+# (`pipelines,governance`), and `routes/mod.rs`.
+path rust/crates/lakehouse-api/src/routes/catalog_drop.rs upload,ingest,pipelines,governance
 path rust/crates/lakehouse-api/src/bronze_stats_cache.rs pipelines,governance
 path rust/crates/lakehouse-api/src/catalog_search_cache.rs pipelines,governance
+# OPS-38 D2: no routes; imported only by `routes/lineage/columns.rs`, where
+# `sql_lineage::{map_select,statement_target}` is called by `record_sql_source`
+# (`routes/dashboard_sources.rs`: `governance,alerts`), `record_pipeline_run`
+# (`put_pending` written only by `routes/authored_pipelines.rs`: `pipelines`),
+# and `run_builds_pass` (`routes/alerts.rs`: `alerts,cdc,ingest,pipelines`).
+path rust/crates/lakehouse-api/src/sql_lineage.rs pipelines,governance,alerts,cdc,ingest
 
 # ── governance: masking, time travel, and the BI side both gates read ─────
 path ops/g8/* governance
@@ -201,6 +243,9 @@ path rust/crates/lakehouse-trino/* governance
 path rust/crates/lakehouse-bi/* governance,alerts
 path rust/crates/lakehouse-embed/* governance,alerts
 path rust/crates/lakehouse-api/src/routes/dashboard* governance,alerts
+# OPS-38 D2: private module (`mod dashboard_visibility;`), imported only by
+# `routes/dashboard_access.rs` and `routes/embed.rs` (`governance,alerts`).
+path rust/crates/lakehouse-api/src/dashboard_visibility.rs governance,alerts
 path rust/crates/lakehouse-api/src/routes/embed.rs governance,alerts
 path rust/crates/lakehouse-api/src/routes/layout_tabs.rs governance,alerts
 path rust/crates/lakehouse-api/src/routes/metrics.rs governance,alerts

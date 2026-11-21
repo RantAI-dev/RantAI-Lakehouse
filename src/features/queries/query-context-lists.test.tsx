@@ -38,6 +38,26 @@ describe("SavedQuickList", () => {
 })
 
 describe("HistoryQuickList", () => {
+  // QS-11 (LH-QS-4-02), D13: the side panel calls a blocked run what History
+  // calls it, so the two lists never disagree about a refusal.
+  it("reads a blocked run as Refused, not Blocked", () => {
+    const onLoadSql = mock<(sql: string) => void>(() => {})
+    const item = {
+      id: "h2",
+      sql: "SELECT 1",
+      status: "blocked",
+      at: "2026-11-04T10:00:00.000Z",
+      durationMs: 5,
+    } as unknown as QueryHistoryItem
+    const state = { status: "success", data: [item], error: null, reload: () => {} } as ServiceState<
+      QueryHistoryItem[]
+    > & { reload: () => void }
+    render(<HistoryQuickList state={state} onLoadSql={onLoadSql} />)
+
+    expect(screen.getByText("Refused")).toBeTruthy()
+    expect(screen.queryByText("Blocked")).toBeNull()
+  })
+
   it("loads only the statement that ran", () => {
     const onLoadSql = mock<(sql: string, definitions?: SavedQuery["parameters"]) => void>(() => {})
     const item = {
