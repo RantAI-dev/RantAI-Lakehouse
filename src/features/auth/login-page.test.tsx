@@ -428,9 +428,14 @@ describe("LoginPage form (WEB-15 T1)", () => {
     // WEB-15 spec: "the password is selected for retyping".
     const password = screen.getByLabelText("Password") as HTMLInputElement
     expect(password.getAttribute("aria-describedby")).toBe("login-error")
-    expect(document.activeElement).toBe(password)
-    expect(password.selectionStart).toBe(0)
-    expect(password.selectionEnd).toBe("wrong-password".length)
+    // Focus and selection run in a passive `useEffect` after `error` commits,
+    // whereas `findByRole("alert")` resolves on the commit's MutationObserver
+    // microtask before passive effects flush.
+    await waitFor(() => {
+      expect(document.activeElement).toBe(password)
+      expect(password.selectionStart).toBe(0)
+      expect(password.selectionEnd).toBe("wrong-password".length)
+    })
 
     // The 240 ms shake is a class on the form (the motion itself is CSS, and
     // sits inside `prefers-reduced-motion: no-preference`).
