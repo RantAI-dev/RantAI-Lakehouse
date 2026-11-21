@@ -1295,6 +1295,27 @@ fn alert_agg_enum() -> Value {
     json!(["sum", "avg", "max", "min", "count"])
 }
 
+/// `BI-65`: when a digest is sent, shared by [`create_alert_rule_schema`] and
+/// [`update_alert_rule_schema`] so the two cannot drift. It is the shape a
+/// report subscription's schedule has (`routes::reports::ScheduleInput`), and
+/// the alerts route refuses anything else with a 400 that says so.
+fn digest_schedule_schema() -> Value {
+    json!({ "type": "object",
+        "description": "for type=digest: when it is sent. Required when creating a digest. kind is hourly, daily, weekly or monthly; hour is 0 to 23 (not for hourly); minute is 0 to 59; weekday is 1 (Monday) to 7 (Sunday), for weekly; monthDay is 1 to 28 or \"last\", for monthly. A digest is sent within 15 minutes of its time.",
+        "properties": {
+            "kind": { "type": "string", "enum": ["hourly", "daily", "weekly", "monthly"] },
+            "hour": { "type": "integer" },
+            "minute": { "type": "integer" },
+            "weekday": { "type": "integer" },
+            "monthDay": { "type": ["integer", "string"] } },
+        "required": ["kind"] })
+}
+
+fn digest_time_zone_schema() -> Value {
+    json!({ "type": "string",
+        "description": "for type=digest: the IANA time zone the schedule is read in, for example Asia/Jakarta; the report time zone when left out" })
+}
+
 fn list_alert_rules_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_alert_rules",
         "description": "List every alert rule (threshold alerts) and digest (scheduled summaries), with whether each is enabled.",
@@ -1303,7 +1324,7 @@ fn list_alert_rules_schema() -> Value {
 
 fn create_alert_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_alert_rule",
-        "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold; it watches that aggregate. Or give metric (a name from list_metrics) with op and threshold, and the alert watches that metric instead (it is read as the person who saves it: their masking and row filters apply, and if they lose access or the alert permission the rule stops and says why). Chart alert (BI-37, also type=alert): give chart (a chart id from list_charts or the page context), the condition above, below or any_rows, and the threshold; with `series` when the chart shows more than one number. With no target a chart alert is sent to your own email address. Without the alert permission only a chart alert to your own email address is allowed. Digest (type=digest): board, the dashboard to summarise. Delivered by webhook (target=URL) or email (target=address).",
+        "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold; it watches that aggregate. Or give metric (a name from list_metrics) with op and threshold, and the alert watches that metric instead (it is read as the person who saves it: their masking and row filters apply, and if they lose access or the alert permission the rule stops and says why). Chart alert (BI-37, also type=alert): give chart (a chart id from list_charts or the page context), the condition above, below or any_rows, and the threshold; with `series` when the chart shows more than one number. With no target a chart alert is sent to your own email address. Without the alert permission only a chart alert to your own email address is allowed. Digest (type=digest): board, the dashboard to summarise, and schedule, when it is sent (and timeZone). Delivered by webhook (target=URL) or email (target=address).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "type": { "type": "string", "enum": ["alert", "digest"] },
@@ -1318,6 +1339,8 @@ fn create_alert_rule_schema() -> Value {
             "condition": { "type": "string", "enum": ["above", "below", "any_rows"], "description": "for a chart alert: over the threshold, under it, or 'returns any rows'" },
             "filters": { "type": "array", "items": { "type": "object" }, "description": "for a chart alert: the filters in force on the page, copied from the page context's raw JSON, so the number is the one on screen; leave out when there are none" },
             "board": { "type": "string", "description": "dashboard board id, for type=digest" },
+            "schedule": digest_schedule_schema(),
+            "timeZone": digest_time_zone_schema(),
             "channel": { "type": "string", "enum": ["webhook", "email"] },
             "target": { "type": "string", "description": "webhook URL or email address to deliver to; leave out for a chart alert to your own email" },
             "enabled": { "type": "boolean" } },
@@ -1342,6 +1365,8 @@ fn update_alert_rule_schema() -> Value {
             "condition": { "type": "string", "enum": ["above", "below", "any_rows"] },
             "filters": { "type": "array", "items": { "type": "object" } },
             "board": { "type": "string" },
+            "schedule": digest_schedule_schema(),
+            "timeZone": digest_time_zone_schema(),
             "channel": { "type": "string", "enum": ["webhook", "email"] },
             "target": { "type": "string" },
             "enabled": { "type": "boolean" } },

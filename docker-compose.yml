@@ -2528,6 +2528,11 @@ services:
       # An operator may raise or lower it in `.env`; the default below is
       # the number this deployment runs with. Not a credential.
       DAGSTER_MULTIPROCESS_EXECUTOR_MAX_CONCURRENT: ${DAGSTER_MULTIPROCESS_EXECUTOR_MAX_CONCURRENT:-2}
+      # OPS-37: how long the inner code server waits for the proxy's
+      # heartbeat before it shuts itself down, in seconds. Unset or empty
+      # keeps the guard's own default, 300 (`code_server_guard.py`'s
+      # `HeartbeatTtlSettings.from_env`). Not a credential.
+      DAGSTER_CODE_SERVER_HEARTBEAT_TTL_SECONDS: ${DAGSTER_CODE_SERVER_HEARTBEAT_TTL_SECONDS:-}
       # `dlt_pipeline.py::run_bronze_ingest`: the `dlt`
       # SSRF guard fail-closed refuses to dial an RFC1918/private
       # address unless this is set; `BRONZE_SOURCE_DB_HOST` below is

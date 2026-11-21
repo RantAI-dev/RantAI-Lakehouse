@@ -4,6 +4,7 @@ import { formatDateTime } from "@/lib/format"
 import {
   clock,
   describeAttachments,
+  describeDigestSchedule,
   describeNotSent,
   describeSchedule,
   describeStatus,
@@ -64,5 +65,21 @@ describe("describeNotSent", () => {
     expect(describeNotSent(base)).toBeNull()
     expect(describeNotSent({ ...base, notSent: null })).toBeNull()
     expect(describeNotSent({ ...base, notSent: { cause: "something_new", lastAttemptAt } })).toBeNull()
+  })
+})
+
+describe("describeDigestSchedule", () => {
+  it("is one short line with the time and the zone", () => {
+    expect(describeDigestSchedule({ kind: "weekly", weekday: 1, hour: 8, minute: 0 }, "UTC")).toBe("Mondays · 08:00 UTC")
+    expect(describeDigestSchedule({ kind: "daily", hour: 18, minute: 30 }, "UTC")).toBe("Daily · 18:30 UTC")
+    expect(describeDigestSchedule({ kind: "monthly", monthDay: 1, hour: 9, minute: 0 }, "UTC")).toBe("Monthly on the 1st · 09:00 UTC")
+    expect(describeDigestSchedule({ kind: "monthly", monthDay: "last", hour: 9, minute: 0 }, "UTC")).toBe("Last day of the month · 09:00 UTC")
+    expect(describeDigestSchedule({ kind: "hourly", minute: 5 }, "UTC")).toBe("Hourly · :05")
+  })
+  it("says what a digest saved before schedules does", () => {
+    expect(describeDigestSchedule(undefined, undefined)).toBe("Daily · 08:00 (report time zone)")
+  })
+  it("names the Jakarta zone WIB or by its offset, never blank", () => {
+    expect(describeDigestSchedule({ kind: "weekly", weekday: 1, hour: 8, minute: 0 }, "Asia/Jakarta")).toMatch(/^Mondays · 08:00 (WIB|UTC\+7)$/)
   })
 })
