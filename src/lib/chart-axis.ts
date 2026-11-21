@@ -65,3 +65,25 @@ export function formatCompactNumber(v: number, decimals = 0, locale = "en-US"): 
   if (a >= 1_000) return `${fmt(v / 1_000)}K`
   return formatNumber(v, decimals, locale)
 }
+
+const ORDERED_PARTS = [
+  String.raw`-?\d+(?:\.\d+)?`, // 7, 2026, 12.5
+  String.raw`\d{4}-\d{2}(?:-\d{2})?(?:[ T].*)?`, // 2026-03, 2026-03-05, 2026-03-05 10:00
+  String.raw`Q[1-4](?: \d{4})?`, // Q2, Q2 2026
+  String.raw`W\d{1,2}`, // W14
+  String.raw`\d{2}:\d{2}`, // 09:00
+  "Mon|Tue|Wed|Thu|Fri|Sat|Sun", // day of week
+  String.raw`(?:\d{1,2} )?(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?: \d{4}| \d{2}:\d{2})?`, // Mar, Mar 2026, 5 Mar, 5 Mar 10:00
+]
+const ORDERED_LABEL = new RegExp(`^(?:${ORDERED_PARTS.map((p) => `(?:${p})`).join("|")})$`)
+
+/**
+ * BI-73 (c): whether a category axis has an order a line can follow: dates,
+ * months, years, quarters, weekdays, hours or plain numbers. A line over
+ * unordered text categories (regions, products) is drawn with straight
+ * segments, because a smooth curve would dip between points that have no
+ * order. An empty axis is not ordered.
+ */
+export function isOrderedAxis(categories: readonly string[]): boolean {
+  return categories.length > 0 && categories.every((c) => ORDERED_LABEL.test(c.trim()))
+}
