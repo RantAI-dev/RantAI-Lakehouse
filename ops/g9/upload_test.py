@@ -257,6 +257,10 @@ PIPELINE_RUN_TIMEOUT_S = 420
 # going.
 RUN_COMPLETED = "completed"
 RUN_FAILED = "failed"
+# BLD-14 G9: `queued` / `running` / `unknown` are NOT results. A new run
+# can appear QUEUED and finish seconds later; only these two states end the
+# wait. `cancelled` is not a result either -- it is not a successful run.
+RUN_TERMINAL_STATUSES = frozenset({RUN_COMPLETED, RUN_FAILED})
 
 # How long the gate watches a pipeline that must NOT run. Longer than a
 # sensor evaluation: Dagster's daemon evaluates a run-status sensor on its
@@ -1619,6 +1623,31 @@ def _new_runs(api, pipeline_id: str, before_ids: set[str]) -> list[dict]:
     return [r for r in _pipeline_runs(api, pipeline_id) if r.get("id") not in before_ids]
 
 
+def wait_for_terminal_chain_run(
+    api, pipeline_id: str, before_ids: set[str], what: str, timeout_s: int
+) -> dict:
+    """Wait for a NEW run to reach a terminal status, and return it.
+
+    BLD-14 G9: run 44812988896 saw a new Silver run and read it while it was
+    still `queued` (`startedAt: ''`, `endedAt: None`), then reported 'did not
+    succeed' 0.15 s later. A run's existence is not its result: keep polling
+    until `completed` or `failed`, or report that it did not FINISH within
+    the gate's own timeout. Success is still exactly `completed` -- the
+    caller checks the status this function returns.
+    """
+
+    def finished() -> dict | None:
+        return next(
+            (r for r in _new_runs(api, pipeline_id, before_ids) if r.get("status") in RUN_TERMINAL_STATUSES),
+            None,
+        )
+
+    try:
+        return _wait_for(f"{what} to finish", finished, timeout_s)
+    except G9Failure as exc:
+        raise G9Failure(f"{what} did not finish within {timeout_s} s: {exc}") from exc
+
+
 def step_reupload_runs_the_chain(
     api,
     requests,
@@ -1639,25 +1668,22 @@ def step_reupload_runs_the_chain(
     upload_id = upload_changed_copy(api, expected, state)
     step_load(api, upload_id, table, "replace", using, len(expected["rows"]), table_rows=len(expected["rows"]))
 
-    _wait_for(
-        "Silver ran again after the re-upload",
-        lambda: bool(_new_runs(api, silver_pipeline_id, before_silver)),
-        PIPELINE_RUN_TIMEOUT_S,
+    # BLD-14 G9: wait for a RESULT, not merely for the run to appear. The
+    # new run is QUEUED on its first read and can take seconds to start.
+    silver_run = wait_for_terminal_chain_run(
+        api, silver_pipeline_id, before_silver, "the Silver chain run", PIPELINE_RUN_TIMEOUT_S
     )
-    silver_runs = _new_runs(api, silver_pipeline_id, before_silver)
-    silver_run = silver_runs[0]
     if silver_run.get("status") != RUN_COMPLETED:
-        raise G9Failure(f"the Silver chain run did not succeed: {silver_run}")
+        raise G9Failure(f"the Silver chain run ended as {silver_run.get('status')}: {silver_run}")
 
-    _wait_for(
-        "Gold ran once after the Silver run",
-        lambda: bool(_new_runs(api, gold_pipeline_id, before_gold)),
-        PIPELINE_RUN_TIMEOUT_S,
+    run = wait_for_terminal_chain_run(
+        api, gold_pipeline_id, before_gold, "the Gold chain run", PIPELINE_RUN_TIMEOUT_S
     )
+    if run.get("status") != RUN_COMPLETED:
+        raise G9Failure(f"the Gold chain run ended as {run.get('status')}: {run}")
     gold_runs = _new_runs(api, gold_pipeline_id, before_gold)
     if len(gold_runs) != 1:
         raise G9Failure(f"the chain should start exactly one Gold run, got {gold_runs}")
-    run = gold_runs[0]
     queued, ended = run.get("queuedAt"), silver_run.get("endedAt")
     if not queued or not ended:
         raise G9Failure(f"the runs must carry their times to prove the order: {silver_run} {run}")
