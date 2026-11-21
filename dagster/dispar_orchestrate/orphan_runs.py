@@ -198,15 +198,23 @@ def fail_orphaned_runs(
         # must not lead to new writes. An in-progress call cannot be interrupted.
         if should_stop():
             break
-        run = record.dagster_run
+        run_id = record.dagster_run.run_id
         try:
+            # PR #636 review 5: the daemon or an operator may have changed
+            # the status since the scan. Dagster writes a failure event
+            # unconditionally, even for a run that has since finished.
+            run = instance.get_run_by_id(run_id)
+            if run is None or run.status != DagsterRunStatus.STARTED:
+                continue
+            if should_stop():
+                break
             instance.report_run_failed(
                 run, message=orphan_failure_message(guard_started_at)
             )
         except Exception as error:
             logger.warning(
                 "the orphaned run %s could not be failed (%s)",
-                run.run_id,
+                run_id,
                 type(error).__name__,
             )
             continue

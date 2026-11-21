@@ -8,7 +8,8 @@ guard starts, through the Dagster instance API.
 
 These tests use a FAKE instance: no database, no network, no Dagster
 instance. The fake exposes the two calls the module makes --
-`get_run_records(filters=...)` and `report_run_failed(run, message=...)` --
+`get_run_records(filters=...)`, `get_run_by_id(run_id)` and
+`report_run_failed(run, message=...)` --
 and the runs it hands back are stand-ins for `DagsterRun` and `RunRecord`
 (`dagster/_core/storage/dagster_run.py`).
 
@@ -89,6 +90,7 @@ class FakeInstance:
 
     def __init__(self, records: list[FakeRecord]) -> None:
         self.records = records
+        self.current_runs = {record.dagster_run.run_id: record.dagster_run for record in records}
         self.failed: list[tuple[str, str | None]] = []
         self.list_calls = 0
         self.list_error: Exception | None = None
@@ -99,6 +101,9 @@ class FakeInstance:
         if self.list_error is not None:
             raise self.list_error
         return list(self.records)
+
+    def get_run_by_id(self, run_id: str) -> FakeRun | None:
+        return self.current_runs.get(run_id)
 
     def report_run_failed(self, run, message=None) -> None:
         if self.fail_error_for == run.run_id:
@@ -194,6 +199,25 @@ def test_a_successful_run_is_not_touched() -> None:
     )
     assert _fail(instance) == 0
     assert instance.failed == []
+
+
+def test_a_run_canceled_after_the_scan_is_skipped_and_the_sweep_continues() -> None:
+    instance = FakeInstance([
+        FakeRecord(_run("canceled-after-scan"), start_time=GUARD_STARTED_AT - 60),
+        FakeRecord(_run("still-started"), start_time=GUARD_STARTED_AT - 30),
+    ])
+    get_records = instance.get_run_records
+
+    def get_records_then_cancel(**kwargs):
+        snapshot = get_records(**kwargs)
+        instance.current_runs["canceled-after-scan"] = _run(
+            "canceled-after-scan", status=DagsterRunStatus.CANCELED
+        )
+        return snapshot
+
+    instance.get_run_records = get_records_then_cancel
+    assert _fail(instance) == 1
+    assert instance.failed == [("still-started", EXPECTED_MESSAGE)]
 
 
 def test_a_run_without_a_code_location_is_not_touched() -> None:
