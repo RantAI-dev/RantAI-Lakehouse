@@ -112,3 +112,6 @@ Not verified: all Rust compilation, clippy and Rust tests (CI only; new Rust tes
 CI fix (PR #654, clippy): `chart_alerts::number_locale` is an `if let Ok(..) else` (was `single_match_else`); no other new single-arm `match` was added on this branch.
 In `routes/alerts.rs` the handler `run` now holds `Box::pin(number_locale(state))`, `Box::pin(lakehouse_alerts::run_rules(..))` and `Box::pin(chart_alerts::evaluate(..))`, for `large_futures`; the test call sites are not boxed. Other callers of `run_rules` or `evaluate`: none in the workspace.
 Not verified: clippy and the future size (CI only); if the handler future is still over 16,384 bytes, box the test calls too.
+
+Review fix (finding d): the Gantt task axis is inverted, so a vertical mark line starts at the top and ends at the date labels; the label is now `position: "start"` (was `"end"`, which landed on the axis). The +8 px top room stays for the label.
+Test asserts `yAxis.inverse === true` and `label.position === "start"`; `bun test gantt-option.test.tsx` and eslint clean. Not verified: the browser look (planner checks).
