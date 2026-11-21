@@ -1,14 +1,14 @@
 "use client"
 
 import * as React from "react"
-import { ChevronDown, ChevronRight, Lock, RotateCcw, X } from "lucide-react"
+import { ChevronRight, Lock, RotateCcw, Search, Table2 } from "lucide-react"
 
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { quoteIdent, NO_READABLE_TABLE } from "@/lib/asset-query"
 import type { CompletionTable } from "@/lib/sql-completion"
 import { DATA_LAYER_LABEL, type DataLayer } from "@/lib/status"
+import { cn } from "@/lib/utils"
 import type { useQueryStudio } from "./use-query-studio"
 
 /** Why a table with no SQL name cannot be inserted. */
@@ -42,15 +42,14 @@ function quotedReference(reference: string): string {
  * table's columns once it is expanded. A click puts the name in the editor
  * at the cursor.
  *
- * It is a panel next to the editor, never in place of it: whatever the
- * catalog answers, the editor stays usable.
+ * It is the Schema tab of the studio's side panel (`UX-9`), never in place
+ * of the editor: whatever the catalog answers, the editor stays usable. The
+ * panel's toggle shows and hides it, so it has no close button of its own.
  */
 export function SchemaBrowser({
   studio,
-  onClose,
 }: {
   readonly studio: ReturnType<typeof useQueryStudio>
-  readonly onClose: () => void
 }) {
   const { assetsState, tables, columns, engine, loadColumns, insertAtCursor, proofs } = studio
   const [expanded, setExpanded] = React.useState<ReadonlySet<string>>(new Set())
@@ -79,32 +78,24 @@ export function SchemaBrowser({
   }
 
   return (
-    <aside
-      aria-label="Schema browser"
-      className="flex max-h-[32rem] min-w-0 flex-col rounded-md border border-border bg-background"
-    >
-      <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
-        <h2 className="text-sm font-semibold">Schema</h2>
-        <Button
-          size="icon-sm"
-          variant="ghost"
-          onClick={onClose}
-          aria-label="Close schema browser"
-        >
-          <X className="size-4" aria-hidden />
-        </Button>
-      </div>
+    <div className="flex min-w-0 flex-col">
       {assetsState.status === "success" && tables.length > 0 ? (
-        <div className="border-b border-border px-3 py-2">
-          <Input
+        <div className="relative px-2 pt-2">
+          <Search
+            className="pointer-events-none absolute top-1/2 left-4.5 mt-1 size-3.5 -translate-y-1/2 text-muted-foreground"
+            aria-hidden
+          />
+          <input
+            type="search"
             aria-label="Search tables"
             placeholder="Search tables"
             value={search}
             onChange={(event) => setSearch(event.target.value)}
+            className="h-8 w-full rounded-md bg-muted/70 pr-2 pl-8 text-[13px] outline-none placeholder:text-muted-foreground focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
           />
         </div>
       ) : null}
-      <div className="min-h-0 flex-1 overflow-y-auto p-2 text-sm">
+      <div className="p-2 text-[13px]">
         {assetsState.status === "loading" ? (
           <LoadingSkeleton rows={4} />
         ) : assetsState.status === "error" ? (
@@ -135,8 +126,8 @@ export function SchemaBrowser({
             const inLayer = matched.filter((table) => table.layer === layer)
             if (inLayer.length === 0) return null
             return (
-              <section key={layer} className="mb-3">
-                <h3 className="px-2 py-1 text-xs font-medium text-muted-foreground">
+              <section key={layer} className="mb-2">
+                <h3 className="px-2 py-1 text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
                   {DATA_LAYER_LABEL[layer]}
                 </h3>
                 <ul>
@@ -159,7 +150,7 @@ export function SchemaBrowser({
           })
         )}
       </div>
-    </aside>
+    </div>
   )
 }
 
@@ -205,25 +196,27 @@ function TableRow({
   const noTable = columnsFollowRow && proof?.status === "missing"
   return (
     <li>
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-0.5 rounded-md hover:bg-muted/60">
         <Button
-          size="icon-sm"
+          size="icon-xs"
           variant="ghost"
           onClick={onToggle}
           aria-expanded={open}
           aria-label={`Columns of ${table.label}`}
         >
-          {open ? (
-            <ChevronDown className="size-4" aria-hidden />
-          ) : (
-            <ChevronRight className="size-4" aria-hidden />
-          )}
+          <ChevronRight
+            className={cn(
+              "size-3.5 text-muted-foreground transition-transform duration-150 ease-ui",
+              open && "rotate-90"
+            )}
+            aria-hidden
+          />
         </Button>
         {/* A registry slug is not a table name: inserting it would write a
             query that fails, so the row is shown but does nothing. */}
         <button
           type="button"
-          className="min-w-0 flex-1 truncate rounded px-1 py-1 text-left hover:bg-muted aria-disabled:cursor-not-allowed aria-disabled:opacity-60 aria-disabled:hover:bg-transparent"
+          className="flex h-7 min-w-0 flex-1 items-center gap-1.5 rounded px-1 text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/50 aria-disabled:cursor-not-allowed aria-disabled:opacity-60"
           aria-disabled={!insertable}
           title={insertable ? `Insert ${table.reference}` : missingReason}
           aria-label={insertable ? `Insert ${table.reference}` : table.label}
@@ -235,16 +228,17 @@ function TableRow({
               : undefined
           }
         >
-          <span>{table.label}</span>
+          <Table2 className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+          <span className="truncate font-medium">{table.label}</span>
           {insertable ? (
-            <span className="ml-2 font-mono text-xs text-muted-foreground">
+            <span className="ml-auto truncate pl-1 font-mono text-[11px] text-muted-foreground">
               {table.reference}
             </span>
           ) : null}
         </button>
       </div>
       {open ? (
-        <div className="ml-8 border-l border-border pl-2">
+        <div className="mb-1 ml-[18px] border-l border-border/70 pl-2">
           {noTable ? (
             <p className="py-1 text-xs text-muted-foreground">{NO_READABLE_TABLE}</p>
           ) : !state || state.status === "loading" ? (
@@ -270,14 +264,14 @@ function TableRow({
                 <li key={column.name}>
                   <button
                     type="button"
-                    className="flex w-full items-baseline justify-between gap-2 rounded px-1 py-0.5 text-left hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent"
+                    className="flex h-6 w-full items-center justify-between gap-2 rounded px-1.5 text-left outline-none transition-colors duration-150 ease-ui hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent"
                     aria-label={`Insert column ${quoteIdent(column.name)}`}
                     disabled={columnsLocked}
                     title={columnsLocked ? missingReason : undefined}
                     onClick={() => onInsert(quoteIdent(column.name))}
                   >
                     <span className="truncate font-mono text-xs">{column.name}</span>
-                    <span className="shrink-0 text-xs text-muted-foreground">
+                    <span className="truncate text-[11px] text-muted-foreground">
                       {column.dataType}
                     </span>
                   </button>

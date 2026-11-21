@@ -10,6 +10,7 @@ import { EmptyState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { chartNewHref, writeChartDraft } from "@/features/dashboards/chart-page"
 import { useEffectiveLimits } from "@/hooks/use-effective-limits"
 import { useServiceAction } from "@/hooks/use-service"
 import { sqlSummary } from "@/lib/sql-text"
@@ -65,23 +66,41 @@ function SaveSourceForm({ draft }: { draft: SaveSourceDraft }) {
     dashboardService.createSqlSource(input, signal)
   )
 
+  const forChart = draft.next === "chart"
+
   async function handleSave() {
     const saved = await createSource.run({ title: title.trim(), sql: draft.sql })
     if (!saved) return
+    clearSaveSourceDraft()
+    if (forChart) {
+      // UX-9 Make a chart: the builder opens on the source just saved, on
+      // the built-in dashboard; its own "Add to dashboard" picker moves the
+      // chart to another one. The draft is the builder's existing handoff
+      // (`chart-page.ts`), so no new route or API is involved.
+      toast.success(`SQL source “${saved.title}” saved`, {
+        description: "Build the chart on it, then pick the dashboard it goes on.",
+      })
+      writeChartDraft({ board: "default", def: { sqlSource: saved.id } })
+      router.push(chartNewHref("default"))
+      return
+    }
     toast.success(`SQL source “${saved.title}” saved`, {
       description: "Pick it under Data source → SQL sources when building a chart.",
     })
-    clearSaveSourceDraft()
     router.push(backHref)
   }
 
   return (
     <FormPage
-      title="Save as SQL source"
-      description="A SQL source can be picked as the data source of a dashboard chart, next to the Gold marts."
+      title={forChart ? "Make a chart" : "Save as SQL source"}
+      description={
+        forChart
+          ? "The query is saved as a SQL source first; the chart builder then opens on it."
+          : "A SQL source can be picked as the data source of a dashboard chart, next to the Gold marts."
+      }
       backHref={backHref}
       backLabel="Back to Query Studio"
-      submitLabel="Save source"
+      submitLabel={forChart ? "Save and build the chart" : "Save source"}
       submittingLabel="Saving…"
       canSubmit={title.trim().length > 0 && draft.sql.trim().length > 0}
       submitting={createSource.status === "pending"}

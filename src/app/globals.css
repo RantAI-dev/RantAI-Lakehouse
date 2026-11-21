@@ -51,6 +51,16 @@
     from { opacity: 0; transform: translateY(4px); }
     to { opacity: 1; transform: translateY(0); }
   }
+  /*
+   * UX-9: Query Studio's running bar, a short segment crossing the top of
+   * the result area while a statement runs, so a wait reads as work going
+   * on. Transform only; the reduced-motion rule below stops it.
+   */
+  --animate-studio-running: studio-running 1.2s var(--ease-move) infinite;
+  @keyframes studio-running {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(400%); }
+  }
 }
 
 /*

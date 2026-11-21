@@ -13,6 +13,7 @@ import { ServiceError } from "@/services/errors"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
 import { SchemaBrowser } from "./schema-browser"
 import { SqlPanel } from "./sql-panel"
+import { RunButton } from "./studio-toolbar"
 import { queryDraftKey } from "@/lib/query-draft"
 import { useQueryStudio } from "./use-query-studio"
 
@@ -82,13 +83,14 @@ const ICEBERG_TABLE = {
   },
 } as unknown as LakehouseTableDetail
 
-/** The page's two halves that matter here: the editor with its toolbar, and the browser. */
+/** The page's two halves that matter here: the editor with its Run button, and the browser. */
 function Harness() {
   const studio = useQueryStudio(queryDraftKey("u1", null))
   return (
     <>
-      <SqlPanel studio={studio} onSave={() => {}} />
-      <SchemaBrowser studio={studio} onClose={() => {}} />
+      <RunButton studio={studio} />
+      <SqlPanel studio={studio} />
+      <SchemaBrowser studio={studio} />
     </>
   )
 }
@@ -493,7 +495,7 @@ describe("SchemaBrowser", () => {
     setBuffer(view, "SELECT 1", "SELECT 1".length)
     expect(view.state.doc.toString()).toBe("SELECT 1")
     await waitFor(() => {
-      const run = screen.getByRole("button", { name: "Run query" }) as HTMLButtonElement
+      const run = screen.getByRole("button", { name: "Run" }) as HTMLButtonElement
       expect(run.disabled).toBe(false)
     })
   })
@@ -507,7 +509,7 @@ describe("SchemaBrowser search", () => {
     render(<Harness />)
     await screen.findByText("Silver")
 
-    fireEvent.change(screen.getByRole("textbox", { name: "Search tables" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search tables" }), {
       target: { value: "ord" },
     })
 
@@ -520,7 +522,7 @@ describe("SchemaBrowser search", () => {
     render(<Harness />)
     await screen.findByText("Silver")
 
-    fireEvent.change(screen.getByRole("textbox", { name: "Search tables" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search tables" }), {
       target: { value: "zzzz" },
     })
 
@@ -532,7 +534,7 @@ describe("SchemaBrowser search", () => {
     stubServices()
     render(<Harness />)
     await screen.findByText("Silver")
-    const search = screen.getByRole("textbox", { name: "Search tables" })
+    const search = screen.getByRole("searchbox", { name: "Search tables" })
 
     fireEvent.change(search, { target: { value: "ord" } })
     fireEvent.change(search, { target: { value: "" } })

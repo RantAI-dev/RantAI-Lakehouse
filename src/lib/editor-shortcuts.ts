@@ -101,3 +101,22 @@ export const EDITOR_SHORTCUTS: readonly EditorShortcut[] = [
     label: "Shift+⌘/Ctrl+\\",
   },
 ]
+
+/**
+ * `UX-9` review: whether the browser runs on an Apple platform, where the
+ * modifier is ⌘ rather than Ctrl. The list above writes both ("⌘/Ctrl+…")
+ * because it is read once, in a dialog; a hint that is always on screen (the
+ * studio's status bar) names only the keys this person presses. Reads
+ * `navigator`, so call it after mount, never during server rendering.
+ */
+export function isApplePlatform(
+  nav: { userAgentData?: { platform?: string }; platform?: string } = navigator as never
+): boolean {
+  const platform = nav.userAgentData?.platform || nav.platform || ""
+  return /mac|iphone|ipad|ipod/i.test(platform)
+}
+
+/** The keys of Query Studio's two page shortcuts, as this platform writes them. */
+export function studioKeys(apple: boolean): { run: string; commands: string } {
+  return apple ? { run: "⌘↵", commands: "⌘⇧P" } : { run: "Ctrl+↵", commands: "Ctrl+Shift+P" }
+}

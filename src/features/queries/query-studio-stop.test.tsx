@@ -87,7 +87,7 @@ describe("QueryStudioPage Stop (BI-5)", () => {
     seedDraft("SELECT sleep(100)")
     renderPage()
 
-    const runButton = await screen.findByRole("button", { name: "Run query" })
+    const runButton = await screen.findByRole("button", { name: "Run" })
     await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(runButton)
     const stop = await screen.findByRole("button", { name: "Stop" })
@@ -116,7 +116,7 @@ describe("QueryStudioPage Stop (BI-5)", () => {
     spyOn(queryService, "cancel").mockRejectedValue(new ServiceError("not_found", "Not found"))
     seedDraft("SELECT 1")
     renderPage()
-    const runButton = await screen.findByRole("button", { name: "Run query" })
+    const runButton = await screen.findByRole("button", { name: "Run" })
     await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(runButton)
     fireEvent.click(await screen.findByRole("button", { name: "Stop" }))
