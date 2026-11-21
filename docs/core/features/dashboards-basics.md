@@ -13,7 +13,7 @@
 | Plan | This page; the run is an acceptance run, not a build |
 | Started | 2026-11-21 |
 | Shipped | Before 2026-11-13 (the base of the module) |
-| Evidence | Acceptance run of 2026-11-21 on the QA stack (agent, API and headless Chrome; gallery board of 33 tiles, one per chart kind); the owner looked at the gallery and found it tidy |
+| Evidence | Acceptance run of 2026-11-21 on the QA stack, built from the QA integration branch `qa/integration-2026-11-21` (tip `3fd675ee9`), by an agent (API and headless Chrome; gallery board of 33 tiles, one per chart kind); the owner looked at the gallery and found it tidy. The run's report and screenshots are held outside this repository |
 
 ## What the user can do
 
@@ -46,7 +46,7 @@
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
 | D1 | The acceptance run is done by an agent on the QA stack (API and headless Chrome, screenshots in the report); the owner looks at one gallery dashboard with every chart type and at the report | Planner | Owner, 2026-11-21 ("okeay" to the checklist) |
-| D2 | "Every chart type" means every kind the chart builder offers on the run's commit, listed in the report with its result; a kind that cannot draw is a finding, not a skip | Planner | Owner, 2026-11-21 |
+| D2 | "Every chart type" means every kind the chart builder offers on the run's commit (the QA integration branch in Evidence), listed in the report with its result; a kind that cannot draw is a finding, not a skip | Planner | Owner, 2026-11-21 |
 | D3 | `BI-4-AC3` timing (`BI-66`): a real dashboard of 12 tiles, opened 5 times cold (no remembered result) and 5 times with remembered results, median and range written to `docs/plans/BI-4-RESULT.md` with the method | Planner | Owner, 2026-11-21 |
 
 ## Acceptance checklist
@@ -70,6 +70,9 @@
   the page does not scroll sideways.
 - [x] `BI-66` (`BI-4-AC3`): the 12-tile cold and remembered timing (`BI-56` D3) is in section 5
   of `docs/plans/BI-4-RESULT.md`.
+
+**Acceptor** (not the Owner): the product owner (recorded in the base) **Date:** 2026-11-21
+**Build:** QA integration branch `qa/integration-2026-11-21`, tip `3fd675ee9`
 
 ## Result (2026-11-21)
 
