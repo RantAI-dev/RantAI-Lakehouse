@@ -2000,12 +2000,23 @@ the API at start: a dropped entry would quietly stop trusting a proxy the
 operator named, and every caller would then look like one source.
 
 **The limit of the current deployment.** The console proxies `/api` to the
-API. When the console is published directly, the API sees the console's own
-address (Docker's bridge gateway) as the source of every request, so several
-callers share one source bucket. A per-caller limit therefore needs a
-reverse proxy in front of the console that sets `X-Forwarded-For`; without
-one, the 50-failure limit applies to the whole group of callers behind that
-address.
+API and is in `TRUSTED_PROXIES` by default, so the source of a request is
+the address the console saw: the console sends the caller's address in
+`X-Forwarded-For`, and the API takes the right-most entry of that header
+that is not itself trusted. Without the console in the trusted list every
+request through it has the console's own address as its source, so all
+callers behind it share one source bucket and the 50-failure limit
+applies to the whole group.
+
+**Behind an outer reverse proxy or load balancer**, list that proxy too
+and make sure it APPENDS the address it saw to `X-Forwarded-For` rather
+than replacing the header. The console's own `/api` proxy keeps a
+client-supplied `X-Forwarded-For` unchanged (Next.js sets it with `??=`),
+so a proxy that replaces the header the same way lets a caller name its
+own source: the limit can be evaded by rotating the address, and every
+forged address gets its own first row in the audit trail. That gap is
+reported in the `SEC-75` pull request and is not fixed by this change; the
+API ignores a header whose peer is not trusted.
 
 ## Proposal: `GET /api/auth/providers` (not built)
 
