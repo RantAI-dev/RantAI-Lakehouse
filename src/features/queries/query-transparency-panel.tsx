@@ -254,14 +254,21 @@ export function QueryTransparencyPanel({
             )}
           </Row>
           <Row label="Freshness">
-            <FreshnessIndicator lagSeconds={state.data.freshnessLagSeconds} />
+            {/* QS-10 (LH-QS-1-11), D2: without catalog:read the server sends no
+                freshness at all — say why instead of showing a stale 0. */}
+            {state.data.catalogHidden ? (
+              <span className="text-muted-foreground">Needs catalog access</span>
+            ) : (
+              <FreshnessIndicator lagSeconds={state.data.freshnessLagSeconds} />
+            )}
           </Row>
           <div>
             <dt className="text-muted-foreground">Policy obligations</dt>
             <dd className="mt-1 flex flex-wrap gap-1">
               {state.data.policyObligations == null ? (
-                // No policy engine runs before a query here. "None" would
-                // read as "checked, nothing applies".
+                // QS-10 (LH-QS-2-05), D4: null now only comes from an older
+                // server or a Trino estimate, which is not rewritten. "None"
+                // would read as "checked, nothing applies".
                 <span className="text-xs text-muted-foreground">
                   Not evaluated
                 </span>
@@ -279,7 +286,15 @@ export function QueryTransparencyPanel({
           <div>
             <dt className="text-muted-foreground">Sources</dt>
             <dd className="mt-1">
-              <SourcesList sources={state.data.sources} marks={state.data.sourceMarks} />
+              {/* QS-10 (LH-QS-1-11), D2/D3: withhold the catalog's answer, or
+                  say the plan named no table — never invent a source. */}
+              {state.data.catalogHidden ? (
+                <span className="text-muted-foreground">Needs catalog access</span>
+              ) : state.data.sources.length === 0 ? (
+                <span className="text-muted-foreground">No table found in the plan</span>
+              ) : (
+                <SourcesList sources={state.data.sources} marks={state.data.sourceMarks} />
+              )}
             </dd>
           </div>
           <QueryPlanPanel plan={state.data.plan} />
