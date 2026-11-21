@@ -151,12 +151,19 @@ row records one value per state, not a median and range.
 | 12 tiles, console to all tiles drawn | 1.69 s (1.45–2.42) | 1.51 s (1.34–1.62) |
 | Heavy board, console to all tiles drawn | 1.30 s (1.13–1.40) | 1.25 s (1.20–1.30) |
 
-A trivial route costs about 0.08–0.12 s of the tunnel numbers.
+The tunnel adds about 0.09–0.10 s at the 12-tile size (the difference between the two
+12-tile rows: 0.321 − 0.229 and 0.318 − 0.220, derived rather than timed on a trivial
+route); the heavy board has no on-machine row.
 
-**Reading.** The 3-second target holds with and without remembered results. At this data
-size a remembered result gives no gain that stands out of the spread (about 0.02–0.03 s on
-the API): ClickHouse answers these tiles well under a second either way. The cache's gain
-shows only on slower queries than these, which this stack does not have.
+**Reading.** The 3-second target holds with and without remembered results. **This
+supersedes the earlier acceptance-run figures recorded in `BI-66` (547 ms cold; 347 / 268 /
+201 ms remembered on 2026-11-16):** with the method above the medians are 0.321 s cold and
+0.318 s remembered on the 12-tile board, and the earlier remembered step-down did not
+reproduce; that run's board, method and raw reads are not recorded in the repo. At this data
+size the difference between the medians is 0.003 s on the 12-tile board and 0.033 s on the
+heavy board, both inside the ranges: ClickHouse answers these tiles well under a second
+either way. The cache's gain shows only on slower queries than these, which this stack does
+not have.
 
 **Not measured:** the pre-cache build's 12-tile timing (`feat/bi-phase-4`); `BI-56` D3
 (owner, 2026-11-21) defines "before and after" for `BI-4-AC3` as cold vs remembered, so
