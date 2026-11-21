@@ -1564,9 +1564,12 @@ pub(crate) async fn run_one(
         &email,
         only,
         freshness_source.as_ref().map(|s| s as &dyn FreshnessSource),
-        silence_source.as_ref().map(|s| s as &dyn SilenceSource),
-        state_source.as_ref().map(|s| s as &dyn StateSource),
+        (
+            silence_source.as_ref().map(|s| s as &dyn SilenceSource),
+            state_source.as_ref().map(|s| s as &dyn StateSource),
+        ),
         &gate,
+        &crate::routes::chart_alerts::number_locale(state).await,
     )
     .await
     .map_err(|err| {
