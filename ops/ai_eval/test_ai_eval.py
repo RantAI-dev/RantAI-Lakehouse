@@ -527,6 +527,38 @@ class CleanupPlanTests(unittest.TestCase):
             ],
         )
 
+    def test_a_report_and_a_template_are_deleted_by_the_id_in_the_path(self) -> None:
+        # BI-18 part D: their routes take the id in the path, not in `?id=`, and
+        # a report goes before the charts it places, a template after the boards.
+        cfg = make_cfg()
+        session = FakeSession()
+        created = [
+            {"kind": "template", "id": "t1"},
+            {"kind": "board", "id": "b1"},
+            {"kind": "chart", "id": "c1"},
+            {"kind": "report", "id": "r1"},
+        ]
+        self.assertEqual(m.run_cleanup(cfg, session, created), [])
+        self.assertEqual(
+            [url for _, url, _ in session.calls],
+            [
+                "http://api.test/api/dashboard/reports/r1",
+                "http://api.test/api/dashboard/specs?id=c1",
+                "http://api.test/api/dashboard/boards?id=b1",
+                "http://api.test/api/dashboard/templates/t1",
+            ],
+        )
+
+    def test_the_report_and_the_board_a_template_made_are_collected_for_the_cleanup(self) -> None:
+        traces = [[
+            {"tool": "create_report", "result": {"ok": True, "report": {"id": "r1", "title": "X"}}},
+            {"tool": "create_dashboard_from_template", "result": {"ok": True, "board": {"id": "b9"}}},
+            # A refused or pending call made nothing.
+            {"tool": "create_report", "result": {"status": "needs_confirmation"}},
+        ]]
+        found = m.collect_created([], traces, [])
+        self.assertEqual(found, [{"kind": "report", "id": "r1"}, {"kind": "board", "id": "b9"}])
+
     def test_a_failed_delete_is_a_problem_not_a_crash(self) -> None:
         cfg = make_cfg()
         session = FakeSession({("DELETE", "/api/dashboard/specs"): FakeResponse(409, {"error": "in use"})})
@@ -757,6 +789,31 @@ class SetupTests(unittest.TestCase):
         names, created = m.run_setup(cfg, session, setup)
         self.assertEqual(names, {"b": "b-123"})
         self.assertEqual(created, [{"kind": "board", "id": "b-123"}])
+
+    def test_the_run_id_makes_an_invite_unique_per_run_without_becoming_a_saved_name(self) -> None:
+        # AI-29..31 review R2: no API deletes an invited user, so the case's
+        # username AND email must be unique per run or the second setup fails.
+        cfg = make_cfg()
+        session = FakeSession({
+            ("POST", "/api/identity/users"): {"id": "u-1", "name": "Eval Colleague"},
+        })
+        setup = [{
+            "name": "colleague_name", "method": "POST", "path": "/api/identity/users",
+            "body": {"name": "Eval Colleague", "username": "eval_colleague_{run_id}",
+                     "email": "eval.colleague.{run_id}@example.com"},
+            "id_at": "name",
+        }]
+        names, created = m.run_setup(cfg, session, setup)
+        self.assertEqual(names, {"colleague_name": "Eval Colleague"})
+        self.assertEqual(created, [], "no API deletes a user")
+        first = session.calls[0][2]
+        self.assertTrue(first["username"].startswith("eval_colleague_"))
+        self.assertNotIn("{run_id}", first["username"])
+        self.assertIn(first["username"][len("eval_colleague_"):], first["email"])
+        m.run_setup(cfg, session, setup)
+        second = session.calls[1][2]
+        self.assertNotEqual(first["username"], second["username"])
+        self.assertNotEqual(first["email"], second["email"])
 
     def test_the_kind_of_a_setup_object_comes_from_its_route(self) -> None:
         self.assertEqual(m.kind_of_path("/api/dashboard/specs"), "chart")

@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { BarChart3, LayoutGrid, Trash2 } from "lucide-react";
+import { BarChart3, FileText, LayoutGrid, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -60,7 +60,9 @@ export function TrashDialog({
               <div className="flex items-center gap-2 text-sm">
                 {item.kind === "board"
                   ? <LayoutGrid className="size-4 shrink-0 text-muted-foreground" aria-label="Dashboard" />
-                  : <BarChart3 className="size-4 shrink-0 text-muted-foreground" aria-label="Chart" />}
+                  : item.kind === "report"
+                    ? <FileText className="size-4 shrink-0 text-muted-foreground" aria-label="Report" />
+                    : <BarChart3 className="size-4 shrink-0 text-muted-foreground" aria-label="Chart" />}
                 <span className="min-w-0 flex-1 truncate font-medium">{item.name}</span>
                 {canWrite ? (
                   <Button size="xs" variant="outline" disabled={restore.status === "pending" || restoreBlocked(item)}
