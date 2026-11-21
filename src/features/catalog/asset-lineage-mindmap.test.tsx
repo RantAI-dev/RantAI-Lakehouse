@@ -209,4 +209,45 @@ describe("LineageMindmap pan and zoom (BI-71)", () => {
     link.dispatchEvent(again)
     expect(again.defaultPrevented).toBe(false)
   })
+
+  // Owner QA round 1: a full-screen view of the same map.
+  describe("full screen", () => {
+    beforeEach(() => {
+      undo.push(stubRectWidth(() => 1200, 800))
+    })
+    // The overlay fades for 200 ms before it unmounts; wait that out inside act.
+    const settle = () => act(async () => { await new Promise((r) => setTimeout(r, 260)) })
+    const dialog = () => screen.queryByRole("dialog", { name: "Lineage map, full screen" })
+
+    it("opens in an overlay over the window, fitted, and closes by the button, Esc or F, returning focus", async () => {
+      render(<LineageMindmap model={WIDE} />)
+      fireEvent.click(button("Full screen"))
+      expect(dialog()).not.toBeNull()
+      expect(document.body.style.overflow).toBe("hidden")
+      expect(button("Exit full screen")).toBeDefined()
+      // Fitted inside the 1200 x 800 window, not the 560 px inline cap.
+      const c = content()
+      expect(Number(screen.getByRole("region", { name: "Lineage map" }).getAttribute("data-zoom"))).toBeCloseTo(
+        fitScale(c, { width: 1200, height: 800 }, 24),
+        3
+      )
+
+      fireEvent.click(button("Exit full screen"))
+      await settle()
+      expect(dialog()).toBeNull()
+      expect(document.body.style.overflow).not.toBe("hidden")
+      expect(document.activeElement).toBe(button("Full screen"))
+
+      fireEvent.click(button("Full screen"))
+      fireEvent.keyDown(document, { key: "Escape" })
+      await settle()
+      expect(dialog()).toBeNull()
+
+      fireEvent.keyDown(map(), { key: "f" })
+      expect(dialog()).not.toBeNull()
+      fireEvent.keyDown(document, { key: "F" })
+      await settle()
+      expect(dialog()).toBeNull()
+    })
+  })
 })

@@ -2,7 +2,8 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { BarChart3, ChartColumn, ChevronRight, Minus, Plus, Scan } from "lucide-react"
+import { createPortal } from "react-dom"
+import { BarChart3, ChartColumn, ChevronRight, Maximize2, Minimize2, Minus, Plus, Scan } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { KIND_LABEL, focusIds, nodeHref, nodeKind } from "@/features/governance/lineage-graph"
@@ -551,19 +552,134 @@ const DRAG_SLOP = 4
  * pinch or wheel follows the hand with no easing.
  */
 function PanZoomBox({ content, children }: { content: Size; children: React.ReactNode }) {
+  // `full`: the overlay is mounted; `shown`: it is faded in. Closing fades
+  // out first, then unmounts. The map inside is a fresh one each way, so it
+  // opens fitted on open and on close.
+  const [full, setFull] = React.useState(false)
+  const [shown, setShown] = React.useState(false)
+  const [held, setHeld] = React.useState(0)
+  const slotRef = React.useRef<HTMLDivElement>(null)
+  const buttonRef = React.useRef<HTMLButtonElement>(null)
+  const [toggled, setToggled] = React.useState(false)
+  const timer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  React.useEffect(() => () => {
+    if (timer.current) clearTimeout(timer.current)
+  }, [])
+
+  const reduced = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false
+  const open = () => {
+    setToggled(true)
+    setHeld(slotRef.current?.offsetHeight ?? 0)
+    setFull(true)
+  }
+  const close = React.useCallback(() => {
+    setToggled(true)
+    setShown(false)
+    if (reduced()) setFull(false)
+    else timer.current = setTimeout(() => setFull(false), OVERLAY_MS)
+  }, [])
+  // Fade in on the frame after it mounts.
+  React.useEffect(() => {
+    if (!full) return
+    const id = requestAnimationFrame(() => setShown(true))
+    return () => cancelAnimationFrame(id)
+  }, [full])
+  // Page scroll is locked while the overlay is open; Esc or F closes it.
+  React.useEffect(() => {
+    if (!full) return
+    const before = document.body.style.overflow
+    document.body.style.overflow = "hidden"
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return
+      if (e.key === "Escape" || e.key === "f" || e.key === "F") {
+        e.preventDefault()
+        close()
+      }
+    }
+    document.addEventListener("keydown", onKey)
+    return () => {
+      document.body.style.overflow = before
+      document.removeEventListener("keydown", onKey)
+    }
+  }, [full, close])
+
+  const box = (
+    <PanZoomInner
+      key={full ? "full" : "inline"}
+      content={content}
+      full={full}
+      onToggleFull={full ? close : open}
+      buttonRef={buttonRef}
+      focusButton={toggled}
+    >
+      {children}
+    </PanZoomInner>
+  )
+  return (
+    <>
+      <div ref={slotRef} style={full ? { height: held } : undefined}>
+        {!full && box}
+      </div>
+      {full &&
+        createPortal(
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Lineage map, full screen"
+            className={cn(
+              "fixed inset-0 z-50 bg-background transition-opacity duration-200 ease-ui motion-reduce:transition-none",
+              shown ? "opacity-100" : "opacity-0"
+            )}
+          >
+            {box}
+          </div>,
+          document.body
+        )}
+    </>
+  )
+}
+
+/** How long the full-screen overlay eases in and out. */
+const OVERLAY_MS = 200
+
+function PanZoomInner({
+  content,
+  children,
+  full,
+  onToggleFull,
+  buttonRef,
+  focusButton,
+}: {
+  content: Size
+  children: React.ReactNode
+  full: boolean
+  onToggleFull: () => void
+  buttonRef: React.RefObject<HTMLButtonElement | null>
+  focusButton: boolean
+}) {
   const boxRef = React.useRef<HTMLDivElement>(null)
   const [width, setWidth] = React.useState(0)
+  const [fullHeight, setFullHeight] = React.useState(0)
+  React.useEffect(() => {
+    if (focusButton) buttonRef.current?.focus()
+  }, [focusButton, buttonRef])
   const [chosen, setChosen] = React.useState<View | null>(null)
   const [eased, setEased] = React.useState(false)
   const [dragging, setDragging] = React.useState(false)
 
   React.useLayoutEffect(() => {
-    if (boxRef.current) setWidth(boxRef.current.getBoundingClientRect().width)
+    if (!boxRef.current) return
+    const r = boxRef.current.getBoundingClientRect()
+    setWidth(r.width)
+    setFullHeight(r.height)
   }, [])
   React.useEffect(() => {
     const el = boxRef.current
     if (!el) return
-    const ro = new ResizeObserver((e) => setWidth(e[0].contentRect.width))
+    const ro = new ResizeObserver((e) => {
+      setWidth(e[0].contentRect.width)
+      setFullHeight(e[0].contentRect.height)
+    })
     ro.observe(el)
     return () => ro.disconnect()
   }, [])
@@ -577,8 +693,8 @@ function PanZoomBox({ content, children }: { content: Size; children: React.Reac
     setEased(true)
   }
 
-  const box = { width, height: boxHeight(content, width, BOX_PAD, BOX_CAP) }
-  const measured = width > 0
+  const box = { width, height: full ? fullHeight : boxHeight(content, width, BOX_PAD, BOX_CAP) }
+  const measured = width > 0 && box.height > 0
   const min = fitScale(content, box, BOX_PAD)
   const view: View = !measured
     ? { scale: 1, x: BOX_PAD, y: BOX_PAD }
@@ -725,6 +841,7 @@ function PanZoomBox({ content, children }: { content: Size; children: React.Reac
     if (e.key === "+" || e.key === "=") zoomBy(ZOOM_STEP, undefined, true)
     else if (e.key === "-" || e.key === "_") zoomBy(1 / ZOOM_STEP, undefined, true)
     else if (e.key === "0") fit()
+    else if ((e.key === "f" || e.key === "F") && !full) onToggleFull()
     else return
     e.preventDefault()
   }
@@ -735,7 +852,7 @@ function PanZoomBox({ content, children }: { content: Size; children: React.Reac
       ref={boxRef}
       role="region"
       aria-label="Lineage map"
-      aria-keyshortcuts="+ - 0"
+      aria-keyshortcuts="+ - 0 F"
       tabIndex={0}
       data-zoom={view.scale.toFixed(3)}
       onPointerDown={onPointerDown}
@@ -750,10 +867,11 @@ function PanZoomBox({ content, children }: { content: Size; children: React.Reac
       }}
       onKeyDown={onKeyDown}
       className={cn(
-        "relative touch-none overflow-hidden rounded-lg border border-border bg-muted/20 outline-none select-none focus-visible:ring-2 focus-visible:ring-ring",
+        "relative touch-none overflow-hidden bg-muted/20 outline-none select-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+        full ? "bg-background" : "rounded-lg border border-border",
         dragging ? "cursor-grabbing" : "cursor-grab"
       )}
-      style={{ height: box.height }}
+      style={{ height: full ? "100%" : box.height }}
     >
       <div
         data-slot="map-drawing"
@@ -763,7 +881,10 @@ function PanZoomBox({ content, children }: { content: Size; children: React.Reac
         {children}
       </div>
       <div
-        className="absolute top-2 right-2 flex items-center rounded-lg bg-background p-0.5 shadow-[0_1px_2px_rgb(0_0_0/0.06)] ring-1 ring-border"
+        className={cn(
+          "absolute right-2 flex items-center rounded-lg bg-background p-0.5 shadow-[0_1px_2px_rgb(0_0_0/0.06)] ring-1 ring-border",
+          full ? "top-[max(0.5rem,env(safe-area-inset-top))] right-[max(0.5rem,env(safe-area-inset-right))]" : "top-2"
+        )}
         onPointerDown={(e) => e.stopPropagation()}
       >
         <MapButton label="Zoom in" keys="+" disabled={!measured || view.scale >= ZOOM_MAX} onClick={() => zoomBy(ZOOM_STEP, undefined, true)}>
@@ -774,6 +895,9 @@ function PanZoomBox({ content, children }: { content: Size; children: React.Reac
         </MapButton>
         <MapButton label="Fit" keys="0" disabled={!measured || fitted} onClick={fit}>
           <Scan />
+        </MapButton>
+        <MapButton buttonRef={buttonRef} label={full ? "Exit full screen" : "Full screen"} keys="F" disabled={false} onClick={onToggleFull}>
+          {full ? <Minimize2 /> : <Maximize2 />}
         </MapButton>
       </div>
     </div>
@@ -786,19 +910,21 @@ function MapButton({
   keys,
   disabled,
   onClick,
+  buttonRef,
   children,
 }: {
   label: string
   keys: string
   disabled: boolean
   onClick: () => void
+  buttonRef?: React.Ref<HTMLButtonElement>
   children: React.ReactNode
 }) {
   return (
     <Tooltip>
       <TooltipTrigger
         render={
-          <Button variant="ghost" size="icon" aria-label={label} disabled={disabled} onClick={onClick}>
+          <Button ref={buttonRef} variant="ghost" size="icon" aria-label={label} disabled={disabled} onClick={onClick}>
             {children}
           </Button>
         }
