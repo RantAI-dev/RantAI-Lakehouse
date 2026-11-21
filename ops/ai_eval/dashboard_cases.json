@@ -1058,6 +1058,21 @@
     ]
   },
   {
+    "id": "report_with_marks_a_quote_and_a_wide_chart",
+    "mode": "build",
+    "confirm": true,
+    "note": "BI-62 (D9, assistant parity): the assistant writes what the editor shows: a bold sentence (inline **marks** in a paragraph), a quote block and a wide chart. args_contains reads the blocks' JSON text, so it checks the wide width and the quote kind; the bold mark is read from the saved report by hand.",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Wide Report Source Board"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Wide Report Events", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "turns": ["Write a report titled \"Eval Wide Report\" with a paragraph that has one bold sentence, then a quote, then the chart {chart} drawn wide."],
+    "expect_tool": {"name": "create_report", "args_contains": {"title": "Eval Wide Report", "blocks": "wide"}},
+    "expect_state": [
+      {"path": "/api/dashboard/reports", "list": "reports", "where": {"title": "Eval Wide Report", "chartCount": 1}, "count": 1}
+    ]
+  },
+  {
     "id": "dashboard_from_template",
     "mode": "build",
     "confirm": true,
