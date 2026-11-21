@@ -3,9 +3,10 @@
 Plan: `docs/superpowers/plans/2026-10-24-bi-4-caching-parallel-tiles.md`
 (tasks T1, T2). Feature page: `docs/core/features/result-caching-and-parallel-tiles.md`
 (decisions 3 and 9). Written by the developer; the planner reads and signs.
-This file states what was measured, how, and what was not. It states no
-verdict on the 3-second target: that target is for a warm cache (part B), and
-no real-engine number exists yet.
+This file states what was measured, how, and what was not. Sections 1 to 4 cover the
+mock-engine scheduling check, what was not measured then, and the cache-fingerprint
+checks; section 5 (2026-11-21) is the real-engine timing of a 12-tile dashboard and
+states the verdict on the 3-second target, measured cold and remembered (`BI-56` D3).
 
 ## 1. What was measured: a mock engine, in-process
 
@@ -96,14 +97,16 @@ empty.
 
 ### 4.2 What was NOT measured (not verified)
 
-- The warm-cache open time of a 12-tile dashboard and the **3-second target**: the API binary
-  was not built or run on this machine (disk and memory; AGENTS.md), no console, no data of
-  the size a customer has. The target is **neither met nor failed**. The in-process facts that
-  stand behind it are the unit tests in `result_cache::tests` and
+- The warm-cache open time of a 12-tile dashboard and the **3-second target** were not
+  measured in part B: the API binary was not built or run on this machine (disk and memory;
+  AGENTS.md), no console, no data of the size a customer has. **Section 5 (2026-11-21)
+  measures them on the QA stack: the target is met (1.51 s remembered and 1.69 s cold,
+  console to all tiles drawn, medians of 5).** The in-process facts that stood behind the
+  question are the unit tests in `result_cache::tests` and
   `routes::dashboard::time_grain::a_second_open_is_remembered_and_fresh_computes_again`
   (a second open is served without a tile query; only the one fingerprint read goes to the
-  engine). Take the number with `ops/bench/dashboard_open_bench.py` (section 3) twice on the
-  same board, first open then second open, and paste the raw output here.
+  engine). For a repeat, take the number with `ops/bench/dashboard_open_bench.py` (section 3)
+  twice on the same board, first open then second open, and paste the raw output here.
 - That `referenced_tables` on the rewritten statement names the physical tables when masking
   wraps them: the cache reads them from the same rewritten statement the engine runs, and a
   table it cannot find in `system.parts` is treated as unwatchable (10 minutes), so a wrapping
