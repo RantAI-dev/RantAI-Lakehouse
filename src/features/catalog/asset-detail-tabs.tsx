@@ -29,22 +29,31 @@ import {
   useAssetLineage,
   type AssetLineageState,
 } from "./asset-lineage"
+import { LineageStrip } from "./asset-lineage-strip"
 import { AssetOverview, type AssetTab } from "./asset-overview"
 import { AssetQuality } from "./asset-quality"
 import { AssetSample } from "./asset-sample"
 import { AssetSchema } from "./asset-schema"
 import { useIcebergTable, type IcebergTableState } from "./asset-storage"
 
-/** The seven tabs, in order. `?tab=` names any but the first. */
-const TABS: { value: AssetTab; label: string; icon: LucideIcon }[] = [
+/**
+ * The seven tabs, in order. `?tab=` names any but the first.
+ *
+ * `UX-8` (mockup A): "Schema" reads "Columns", which is what the tab lists,
+ * and Lineage follows Sample, so the tabs go from what the data is to how it
+ * is kept. The `?tab=schema` value stays: links in the console and in
+ * people's bookmarks name it.
+ */
+export const ASSET_TABS: { value: AssetTab; label: string; icon: LucideIcon }[] = [
   { value: "overview", label: "Overview", icon: LayoutGrid },
-  { value: "schema", label: "Schema", icon: Columns3 },
+  { value: "schema", label: "Columns", icon: Columns3 },
   { value: "sample", label: "Sample", icon: Rows3 },
+  { value: "lineage", label: "Lineage", icon: GitFork },
   { value: "quality", label: "Quality", icon: BadgeCheck },
   { value: "access", label: "Access", icon: ShieldCheck },
-  { value: "lineage", label: "Lineage", icon: GitFork },
   { value: "activity", label: "Activity", icon: Activity },
 ]
+const TABS = ASSET_TABS
 
 function parseTab(raw: string | null): AssetTab {
   return TABS.find((t) => t.value === raw)?.value ?? "overview"
@@ -167,7 +176,11 @@ export function AssetDetailTabsView({
         </TabsContent>
 
         <TabsContent value="lineage">
-          <AssetLineage asset={a} state={lineage} iceberg={iceberg} />
+          {/* UX-8: mockup C's source-to-chart strip, above today's map. */}
+          <div className="flex flex-col gap-2">
+            <LineageStrip asset={a} state={lineage} />
+            <AssetLineage asset={a} state={lineage} iceberg={iceberg} />
+          </div>
         </TabsContent>
 
         <TabsContent value="activity">

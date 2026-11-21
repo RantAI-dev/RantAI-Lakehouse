@@ -15,7 +15,7 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import type { AssetDetail } from "@/services/contracts/assets"
@@ -59,6 +59,12 @@ const ASSET: AssetDetail = {
   upstream: [],
   downstream: [],
 } as unknown as AssetDetail
+
+/** UX-8: Certification moved from a header button into the header's ⋯. */
+async function openCertification() {
+  fireEvent.pointerDown(await screen.findByRole("button", { name: "More actions for this asset" }))
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Certification…" }))
+}
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
@@ -211,13 +217,16 @@ describe("AssetDetailPage certification control", () => {
     renderPage()
     expect(await screen.findByText("Orders Silver")).toBeTruthy()
     // The permission list arrives after the asset; wait for it to settle.
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Certification" })).toBeNull())
+    fireEvent.pointerDown(await screen.findByRole("button", { name: "More actions for this asset" }))
+    const menu = await screen.findByRole("menu")
+    expect(within(menu).getByRole("menuitem", { name: "Copy asset ID" })).toBeTruthy()
+    await waitFor(() => expect(within(menu).queryByRole("menuitem", { name: "Certification…" })).toBeNull())
   })
 
   it("sends the note and the replacement when the mark is deprecated, then reloads the asset", async () => {
     const fetchSpy = stubApi({}, GOVERNOR)
     renderPage()
-    fireEvent.click(await screen.findByRole("button", { name: "Certification" }))
+    await openCertification()
     fireEvent.click(screen.getByLabelText("Deprecated"))
     fireEvent.change(screen.getByLabelText("Note"), { target: { value: " Superseded " } })
     fireEvent.change(screen.getByLabelText("Replacement table id (optional)"), {
@@ -240,7 +249,7 @@ describe("AssetDetailPage certification control", () => {
   it("sends status null when the choice is no mark", async () => {
     const fetchSpy = stubApi({ certification: "certified" }, GOVERNOR)
     renderPage()
-    fireEvent.click(await screen.findByRole("button", { name: "Certification" }))
+    await openCertification()
     // The dialog opens on the saved mark.
     expect((screen.getByLabelText("Certified") as HTMLInputElement).checked).toBe(true)
     fireEvent.click(screen.getByLabelText("No mark"))
@@ -252,7 +261,7 @@ describe("AssetDetailPage certification control", () => {
   it("shows the API's sentence and keeps the dialog open on a refusal", async () => {
     stubApi({}, GOVERNOR, () => json({ error: "the replacement is itself deprecated" }, 400))
     renderPage()
-    fireEvent.click(await screen.findByRole("button", { name: "Certification" }))
+    await openCertification()
     fireEvent.click(screen.getByLabelText("Deprecated"))
     fireEvent.change(screen.getByLabelText("Replacement table id (optional)"), { target: { value: "serving.old" } })
     fireEvent.click(screen.getByRole("button", { name: "Save" }))

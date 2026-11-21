@@ -5,6 +5,12 @@
 // Iceberg table's snapshots with a query for each, Schema is one table in
 // the table's own order, and Quality never invents a verdict for a rule
 // nothing has run.
+//
+// UX-8 (mockup A): "Schema" reads "Columns" and Lineage follows Sample; the
+// Overview reads like a readme (the columns, "Start a query", Details and a
+// short lineage list), storage moved to Activity, and Edit details,
+// Certification and Drop table moved to the page header's ⋯ — the tests for
+// those render the header with the tabs (`renderPage`).
 const url = { search: "" }
 mock.module("next/navigation", () => ({
   usePathname: () => "/data/assets/demo-orders",
@@ -28,7 +34,9 @@ import { NO_READABLE_TABLE } from "@/lib/asset-query"
 import { formatDate, formatDateTime } from "@/lib/format"
 import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
-import { AssetDetailTabs } from "./asset-detail-tabs"
+import { AssetDetailTabs, AssetDetailTabsView } from "./asset-detail-tabs"
+import { AssetHeader } from "./asset-header"
+import { useIcebergTable } from "./asset-storage"
 import type { MeaningState } from "./asset-meaning"
 import type { SemanticEntry } from "@/services/contracts/semantic"
 import { relatedTables } from "./asset-lineage"
@@ -379,6 +387,53 @@ function renderTabs(asset: AssetDetail = BRONZE, onAssetChanged: () => void = ()
   )
 }
 
+/** The page's header (with its ⋯) above the tabs, sharing one Iceberg read, as the page draws them. */
+function HeaderAndTabs({ asset, onAssetChanged }: { asset: AssetDetail; onAssetChanged: () => void }) {
+  const iceberg = useIcebergTable(asset)
+  return (
+    <>
+      <AssetHeader
+        asset={asset}
+        iceberg={iceberg}
+        meanings={{ kind: "none" }}
+        missingPermissions={[]}
+        onRequestAccess={() => {}}
+        onChanged={onAssetChanged}
+      />
+      <AssetDetailTabsView asset={asset} iceberg={iceberg} onAssetChanged={onAssetChanged} />
+    </>
+  )
+}
+
+function renderPage(asset: AssetDetail = BRONZE, onAssetChanged: () => void = () => {}) {
+  return render(
+    <AuthProvider>
+      <HeaderAndTabs asset={asset} onAssetChanged={onAssetChanged} />
+    </AuthProvider>
+  )
+}
+
+/** Opens the header's ⋯ and returns its menu. */
+async function openAssetMenu() {
+  fireEvent.pointerDown(await screen.findByRole("button", { name: "More actions for this asset" }))
+  return screen.findByRole("menu")
+}
+
+/** Opens Edit details from the header's ⋯ (it was the About card's Edit). */
+async function openEditDetails() {
+  const menu = await openAssetMenu()
+  fireEvent.click(await within(menu).findByRole("menuitem", { name: "Edit details…" }))
+}
+
+/** The Schema tab's Columns card (the tab is called Columns too). */
+async function columnsCard() {
+  const found = (await screen.findAllByText("Columns"))
+    .map((el) => el.closest("[data-slot=card]"))
+    .find((el): el is HTMLElement => el instanceof HTMLElement)
+  if (!found) throw new Error("no Columns card")
+  return found
+}
+
 /** The `[method, path, body]` of every write the page sent. */
 function writes(fetchSpy: ReturnType<typeof stubApi>) {
   return fetchSpy.mock.calls
@@ -400,11 +455,11 @@ describe("AssetDetailTabs", () => {
     await waitFor(() =>
       expect(tabNames()).toEqual([
         "Overview",
-        "Schema2",
+        "Columns2",
         "Sample",
+        "Lineage3",
         "Quality0",
         "Access0",
-        "Lineage3",
         "Activity",
       ])
     )
@@ -558,8 +613,15 @@ describe("Activity tab", () => {
     renderTabs()
 
     await screen.findByText("append")
-    expect(screen.getByText(/1 version, from /)).toBeTruthy()
-    expect(screen.queryByText(/\bdays?\b/i)).toBeNull()
+    // UX-8: scoped to the Snapshots card, which says how far back versions
+    // go; the Storage card now sits on this tab too, with its own times.
+    const card = screen
+      .getAllByText("Snapshots")
+      .map((el) => el.closest("[data-slot=card]"))
+      .find((el): el is HTMLElement => el instanceof HTMLElement && /One per load/.test(el.textContent ?? ""))
+    if (!card) throw new Error("no Snapshots card")
+    expect(within(card).getByText(/1 version, from /)).toBeTruthy()
+    expect(within(card).queryByText(/\bdays?\b/i)).toBeNull()
   })
 
   it("says a ClickHouse table keeps no snapshots, rather than that it has none", () => {
@@ -586,7 +648,7 @@ describe("Schema tab", () => {
     renderTabs()
 
     await screen.findByText("System columns")
-    const columns = screen.getByText("Columns").closest("[data-slot=card]") as HTMLElement
+    const columns = await columnsCard()
     await waitFor(() => expect(within(columns).getByText("25.0%")).toBeTruthy())
     // One row per column after the header, each led by the button that names it.
     const names = within(columns)
@@ -1055,7 +1117,7 @@ describe("About card", () => {
   it("lets someone with catalog:write edit the details, and reloads the asset", async () => {
     const fetchSpy = stubApi()
     const reloaded = mock(() => {})
-    renderTabs(
+    renderPage(
       {
         ...BRONZE,
         owner: "Data Platform",
@@ -1068,7 +1130,7 @@ describe("About card", () => {
     )
 
     expect(screen.getByText("finance")).toBeTruthy()
-    fireEvent.click(await screen.findByText("Edit"))
+    await openEditDetails()
     // The form holds the annotation; the registry's words are the placeholder.
     expect((screen.getByLabelText("Owner") as HTMLInputElement).value).toBe("Data Platform")
     expect(screen.getByLabelText("Description").getAttribute("placeholder")).toBe("Orders ingested from Postgres.")
@@ -1096,7 +1158,7 @@ describe("About card", () => {
 
   it("shows governed tags beside the free tags as key: value", async () => {
     stubApi()
-    renderTabs({ ...BRONZE, tags: ["finance"], governedTags: { data_domain: "finance" } })
+    renderPage({ ...BRONZE, tags: ["finance"], governedTags: { data_domain: "finance" } })
     expect(await screen.findByText("data_domain: finance")).toBeTruthy()
     expect(screen.getByText("finance")).toBeTruthy()
   })
@@ -1104,12 +1166,12 @@ describe("About card", () => {
   it("offers one select per tag key with its allowed values and None, and saves the choice", async () => {
     const fetchSpy = stubApi({ tagKeys: [DOMAIN_KEY] })
     const reloaded = mock(() => {})
-    renderTabs(
+    renderPage(
       { ...BRONZE, annotation: { owner: null, steward: null, tags: [], description: null } },
       reloaded
     )
 
-    fireEvent.click(await screen.findByText("Edit"))
+    await openEditDetails()
     const select = await screen.findByRole("combobox", { name: "data_domain" })
     // WEB-9 D2: "None" is a real choice whose value is "".
     expect(select.querySelector('[data-slot="select-value"]')?.textContent).toBe("None")
@@ -1134,13 +1196,13 @@ describe("About card", () => {
 
   it("starts from the stored value and takes the key off the table when None is chosen", async () => {
     const fetchSpy = stubApi({ tagKeys: [DOMAIN_KEY] })
-    renderTabs({
+    renderPage({
       ...BRONZE,
       governedTags: { data_domain: "finance" },
       annotation: { owner: null, steward: null, tags: ["pii"], description: null, governedTags: { data_domain: "finance" } },
     })
 
-    fireEvent.click(await screen.findByText("Edit"))
+    await openEditDetails()
     const select = await screen.findByRole("combobox", { name: "data_domain" })
     expect(select.querySelector('[data-slot="select-value"]')?.textContent).toBe("finance")
     chooseOption(select, "None")
@@ -1156,9 +1218,9 @@ describe("About card", () => {
       annotationRefusal:
         'governedTags: "ops" is not an allowed value for "data_domain"; allowed values: finance',
     })
-    renderTabs({ ...BRONZE, annotation: { owner: null, steward: null, tags: [], description: null } })
+    renderPage({ ...BRONZE, annotation: { owner: null, steward: null, tags: [], description: null } })
 
-    fireEvent.click(await screen.findByText("Edit"))
+    await openEditDetails()
     chooseOption(await screen.findByRole("combobox", { name: "data_domain" }), "ops")
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
 
@@ -1176,13 +1238,13 @@ describe("About card", () => {
       }
       return json({ error: "not stubbed" }, 404)
     }) as unknown as typeof fetch)
-    renderTabs({
+    renderPage({
       ...BRONZE,
       governedTags: { data_domain: "finance" },
       annotation: { owner: null, steward: null, tags: [], description: null, governedTags: { data_domain: "finance" } },
     })
 
-    fireEvent.click(await screen.findByText("Edit"))
+    await openEditDetails()
     expect(await screen.findByText(/governed tag keys could not be loaded/)).toBeTruthy()
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
 
@@ -1192,9 +1254,9 @@ describe("About card", () => {
 
   it("refuses a tag the API would refuse, before sending anything", async () => {
     const fetchSpy = stubApi()
-    renderTabs()
+    renderPage()
 
-    fireEvent.click(await screen.findByText("Edit"))
+    await openEditDetails()
     fireEvent.change(screen.getByLabelText("Tags"), { target: { value: "Finance Team" } })
     expect(screen.getByText(/"Finance" is not a valid tag/)).toBeTruthy()
     expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true)
@@ -1203,9 +1265,12 @@ describe("About card", () => {
 
   it("offers no edit without catalog:write", async () => {
     stubApi({ permissions: ["catalog:read"] })
-    renderTabs()
-    await screen.findByText("About")
-    await waitFor(() => expect(screen.queryByText("Edit")).toBeNull())
+    renderPage()
+    await screen.findByRole("region", { name: "Details" })
+    const menu = await openAssetMenu()
+    // The copies are there for anyone; Edit details needs catalog:write.
+    expect(within(menu).getByRole("menuitem", { name: "Copy table name" })).toBeTruthy()
+    expect(within(menu).queryByRole("menuitem", { name: "Edit details…" })).toBeNull()
   })
 })
 
@@ -1337,8 +1402,10 @@ describe("About card: sensitivity of the whole table (WEB-3 S3-T5a)", () => {
       classificationSource: "rule",
       classificationRules: [{ id: "rule-asset", classification: "confidential" }],
     })
-    // Edit needs catalog:write, so its appearing proves the session loaded.
-    await screen.findByText("Edit")
+    // The session has loaded once the Columns tab counts its columns; the
+    // section's buttons would need governance:write, which it lacks.
+    await waitFor(() => expect(tableSection()).toBeTruthy())
+    await act(async () => {})
     const section = tableSection()
     expect(within(section).getByText("Confidential")).toBeTruthy()
     expect(within(section).queryByRole("button")).toBeNull()
@@ -1346,28 +1413,29 @@ describe("About card: sensitivity of the whole table (WEB-3 S3-T5a)", () => {
 })
 
 describe("Health and classification", () => {
+  // UX-8: the Overview's Health tile is gone; the header's health badge
+  // carries what the status rests on, as its title.
   it("says what the health rests on, signal by signal", async () => {
     stubApi()
-    renderTabs({
+    renderPage({
       ...BRONZE,
       health: "degraded",
       healthReasons: ["Late: written 8d 3h ago, expected within 36h 00m", "1 of 2 quality checks passed"],
     })
 
-    const tile = (await screen.findByText("Health")).closest("div") as HTMLElement
-    expect(within(tile).getByText("Degraded")).toBeTruthy()
-    expect(within(tile).getByText("Late: written 8d 3h ago, expected within 36h 00m")).toBeTruthy()
-    expect(within(tile).getByText("1 of 2 quality checks passed")).toBeTruthy()
+    const badge = (await screen.findByText("Degraded")).closest("[title]") as HTMLElement
+    expect(badge.getAttribute("title")).toBe(
+      "Late: written 8d 3h ago, expected within 36h 00m\n1 of 2 quality checks passed"
+    )
   })
 
   it("says nothing measures the asset, rather than leaving Unknown unexplained", async () => {
     stubApi()
-    renderTabs({ ...BRONZE, health: "unknown", healthReasons: [] })
+    renderPage({ ...BRONZE, health: "unknown", healthReasons: [] })
 
-    const tile = (await screen.findByText("Health")).closest("div") as HTMLElement
-    expect(within(tile).getByText(/Nothing measures this asset yet/)).toBeTruthy()
+    const badge = (await screen.findByText("Unknown")).closest("[title]") as HTMLElement
+    expect(badge.getAttribute("title")).toMatch(/Nothing measures this asset yet/)
   })
-
 })
 
 describe("Quality tab: deleting a rule", () => {
@@ -2110,27 +2178,38 @@ describe("Activity tab: a dropped table", () => {
   })
 })
 
-describe("Activity tab: dropping a table (DATA-55)", () => {
+describe("Dropping a table (DATA-55), from the header's ⋯ (UX-8)", () => {
   const DROPPABLE = { droppable: true, table: "bronze.demo_orders", keptDays: 7 }
 
-  it("offers Drop table on the Snapshots card for a table an upload made", async () => {
+  it("offers Drop table in the ⋯ for a table an upload made", async () => {
     stubApi({ drop: DROPPABLE })
-    url.search = "tab=activity"
-    renderTabs()
+    renderPage()
 
-    const card = (await screen.findByText("Snapshots")).closest("[data-slot=card]") as HTMLElement
-    expect(await within(card).findByRole("button", { name: "Drop table" })).toBeTruthy()
+    await waitFor(async () => {
+      cleanupMenus()
+      const menu = await openAssetMenu()
+      expect(within(menu).getByRole("menuitem", { name: "Drop table…" })).toBeTruthy()
+    })
+    fireEvent.click(screen.getByRole("menuitem", { name: "Drop table…" }))
+    expect(await screen.findByText("Drop bronze.demo_orders?")).toBeTruthy()
   })
 
   it("offers no Drop table, and asks the API nothing about it, without governance:write", async () => {
     const fetchSpy = stubApi({ permissions: ["catalog:read"], drop: DROPPABLE })
-    url.search = "tab=activity"
-    renderTabs()
+    renderPage()
 
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Drop table" })).toBeNull())
+    const menu = await openAssetMenu()
+    await act(async () => {})
+    expect(within(menu).queryByRole("menuitem", { name: "Drop table…" })).toBeNull()
     expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("/drop"))).toBe(false)
   })
 })
+
+/** Closes an open menu, so a retried look opens it fresh. */
+function cleanupMenus() {
+  const open = document.querySelector("[role=menu]")
+  if (open) fireEvent.keyDown(open, { key: "Escape" })
+}
 
 describe("Access tab: grants", () => {
   const GRANT = {
@@ -2538,8 +2617,7 @@ describe("Access tab: enforcing and deleting a policy", () => {
 })
 
 describe("Overview: the starter query", () => {
-  const useData = async () =>
-    (await screen.findByText("Use this data")).closest("[data-slot=card]") as HTMLElement
+  const useData = async () => screen.findByRole("region", { name: "Start a query" })
   /** The engine the card's link opens Query Studio on. */
   const engineOf = (card: HTMLElement) => {
     const href = within(card).getByText("Open in Query Studio").closest("a")?.getAttribute("href") ?? ""
@@ -2656,7 +2734,7 @@ describe("Sample and Lineage tabs: the Query Studio link", () => {
   })
 })
 
-describe("Overview: storage, and saying things once", () => {
+describe("Storage (Activity tab), and saying things once", () => {
   const GOLD: AssetDetail = {
     ...BRONZE,
     id: "serving.mart_orders",
@@ -2684,6 +2762,7 @@ describe("Overview: storage, and saying things once", () => {
 
   it("shows how ClickHouse holds a Gold table, which used to have no storage card", async () => {
     stubApi()
+    url.search = "tab=activity"
     renderTabs(GOLD)
 
     const card = (await screen.findByText("Storage")).closest("[data-slot=card]") as HTMLElement
@@ -2698,6 +2777,7 @@ describe("Overview: storage, and saying things once", () => {
 
   it("says a view stores nothing, rather than listing zeroes for it", async () => {
     stubApi()
+    url.search = "tab=activity"
     renderTabs({
       ...GOLD,
       type: "view",
@@ -2711,6 +2791,7 @@ describe("Overview: storage, and saying things once", () => {
 
   it("leaves a key it could not read unknown, instead of calling the table unsorted", async () => {
     stubApi()
+    url.search = "tab=activity"
     renderTabs({ ...GOLD, storage: { ...GOLD.storage!, engine: null, sortingKey: null, parts: null, bytesOnDisk: null } })
 
     const card = (await screen.findByText("Storage")).closest("[data-slot=card]") as HTMLElement
@@ -2722,7 +2803,7 @@ describe("Overview: storage, and saying things once", () => {
     stubApi()
     renderTabs()
 
-    const about = (await screen.findByText("About")).closest("[data-slot=card]") as HTMLElement
+    const about = await screen.findByRole("region", { name: "Details" })
     expect(within(about).queryByText("Orders ingested from Postgres.")).toBeNull()
     expect(within(about).queryByText(/No description yet/)).toBeNull()
   })
@@ -2731,7 +2812,7 @@ describe("Overview: storage, and saying things once", () => {
     stubApi()
     renderTabs({ ...BRONZE, description: "" })
 
-    const about = (await screen.findByText("About")).closest("[data-slot=card]") as HTMLElement
+    const about = await screen.findByRole("region", { name: "Details" })
     expect(within(about).getByText(/No description yet/)).toBeTruthy()
   })
 
@@ -2739,9 +2820,10 @@ describe("Overview: storage, and saying things once", () => {
     stubApi()
     renderTabs(GOLD)
 
-    const about = (await screen.findByText("About")).closest("[data-slot=card]") as HTMLElement
+    const about = await screen.findByRole("region", { name: "Details" })
     expect(within(about).queryByText("Schema")).toBeNull()
-    expect(within(about).getByText("Columns")).toBeTruthy()
+    // UX-8: the column count is the Columns tab's own; the list keeps the rows.
+    expect(within(about).getByText("Rows")).toBeTruthy()
   })
 })
 
@@ -2843,7 +2925,7 @@ describe("Schema tab: a wide table", () => {
     url.search = "tab=schema"
     renderTabs(WIDE)
 
-    const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
+    const card = await columnsCard()
     expect(columnRows(card)).toBe(25)
     expect(within(card).getByText("Showing the first 25 of 59 columns, in table order.")).toBeTruthy()
     const sizes = within(card).getByRole("group", { name: "Columns to show" })
@@ -2862,7 +2944,7 @@ describe("Schema tab: a wide table", () => {
     url.search = "tab=schema"
     renderTabs(WIDE)
 
-    const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
+    const card = await columnsCard()
     // col_41 is past the first 25, and is found by what it is described as.
     fireEvent.change(within(card).getByLabelText("Filter columns"), { target: { value: "weight" } })
     expect(columnRows(card)).toBe(1)
@@ -2878,7 +2960,7 @@ describe("Schema tab: a wide table", () => {
     url.search = "tab=schema"
     renderTabs()
 
-    const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
+    const card = await columnsCard()
     expect(within(card).queryByRole("group", { name: "Columns to show" })).toBeNull()
     expect(within(card).queryByLabelText("Filter columns")).toBeNull()
   })
@@ -2941,7 +3023,7 @@ describe("Schema tab: the column explorer", () => {
     url.search = "tab=schema"
     renderTabs(SILVER_ORDERS)
 
-    const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
+    const card = await columnsCard()
     const city = rowOf(card, "city")
     await waitFor(() => expect(within(city).getByText("Jakarta")).toBeTruthy())
     expect(within(city).getByText("60.0%")).toBeTruthy()
@@ -2965,7 +3047,7 @@ describe("Schema tab: the column explorer", () => {
     url.search = "tab=schema"
     renderTabs(SILVER_ORDERS)
 
-    const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
+    const card = await columnsCard()
     // A row renders its marks twice, beside the name and on the type's line (CSS shows one), so
     // one marked column is two "sort key" and an unmarked column none.
     expect(within(rowOf(card, "plnt")).getAllByText("sort key")).toHaveLength(2)
@@ -2978,7 +3060,7 @@ describe("Schema tab: the column explorer", () => {
     url.search = "tab=schema"
     renderTabs({ ...SILVER_ORDERS, storage: undefined })
 
-    await screen.findByText("Columns")
+    await columnsCard()
     expect(screen.queryByText("sort key")).toBeNull()
   })
 
@@ -2987,7 +3069,7 @@ describe("Schema tab: the column explorer", () => {
     url.search = "tab=schema"
     renderTabs(SILVER_ORDERS)
 
-    const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
+    const card = await columnsCard()
     expect(within(card).getByText(/they need the query:read permission/)).toBeTruthy()
     expect(within(card).queryByRole("columnheader", { name: "Nulls" })).toBeNull()
     expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("/profile"))).toBe(false)
@@ -3137,20 +3219,20 @@ describe("Schema versions of a Silver or Gold table", () => {
     ])
   })
 
-  it("shows the current version in the About card as recorded, not as the table's age", async () => {
+  it("shows the current version in Details as recorded, not as the table's age", async () => {
     stubApi()
     renderTabs(SILVER)
 
-    const about = (await screen.findByText("About")).closest("[data-slot=card]") as HTMLElement
+    const about = await screen.findByRole("region", { name: "Details" })
     expect(within(about).getByText("Schema")).toBeTruthy()
     expect(within(about).getByText(/^v2 · recorded /)).toBeTruthy()
   })
 
-  it("leaves the About card without a schema row until a version is recorded", async () => {
+  it("leaves Details without a schema row until a version is recorded", async () => {
     stubApi()
     renderTabs({ ...SILVER, schemaVersions: [] })
 
-    const about = (await screen.findByText("About")).closest("[data-slot=card]") as HTMLElement
+    const about = await screen.findByRole("region", { name: "Details" })
     expect(within(about).queryByText("Schema")).toBeNull()
   })
 
@@ -3198,7 +3280,7 @@ describe("Schema tab: the meaning the page passes in", () => {
       reload: () => {},
     }
     renderTabs(BRONZE, () => {}, meanings)
-    fireEvent.click(screen.getByRole("tab", { name: /Schema/ }))
+    fireEvent.click(screen.getByRole("tab", { name: /Columns/ }))
 
     expect(screen.getByText("Orders as confirmed by a person")).toBeTruthy()
     expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes("/api/semantic/"))).toBe(false)
@@ -3395,5 +3477,59 @@ describe("Schema tab: a column's sensitivity and masking (WEB-3 S3-D1)", () => {
     renderTabs({ ...BRONZE, schema: [{ name: "amount", dataType: "Decimal(12, 2)", masked: true }, { name: "id", dataType: "Int64" }] })
     const section = openColumn("amount")
     expect(await within(section).findByText("You. Who else it is masked for is shown with policy:read.")).toBeTruthy()
+  })
+})
+
+describe("UX-8: the header, the lineage at a glance and the Overview", () => {
+  it("opens Query Studio from the header's Query for a reader with query:read", async () => {
+    stubApi()
+    renderPage()
+    const query = await screen.findByRole("button", { name: "Query" })
+    await waitFor(() => expect(query.getAttribute("href")).toContain("engine=trino"))
+  })
+
+  it("offers no Query to a reader without query:read", async () => {
+    stubApi({ permissions: ["catalog:read"] })
+    renderPage()
+    await screen.findByRole("region", { name: "Details" })
+    await act(async () => {})
+    expect(screen.queryByRole("button", { name: "Query" })).toBeNull()
+  })
+
+  it("draws the strip from the source to what reads it, above the map", async () => {
+    stubApi()
+    url.search = "tab=lineage"
+    renderTabs()
+    const strip = await screen.findByRole("region", { name: "Lineage at a glance" })
+    expect(within(strip).getByText("Postgres")).toBeTruthy()
+    expect(within(strip).getByText("This table")).toBeTruthy()
+    expect(within(strip).getByText("silver.orders_clean")).toBeTruthy()
+  })
+
+  it("draws no strip when nothing is recorded either side", async () => {
+    stubApi({ lineage: NO_LINEAGE })
+    url.search = "tab=lineage"
+    renderTabs()
+    expect(await screen.findByText("Open lineage graph")).toBeTruthy()
+    expect(screen.queryByRole("region", { name: "Lineage at a glance" })).toBeNull()
+  })
+
+  it("lists where it comes from and what reads it on the Overview, with the way to the Lineage tab", async () => {
+    stubApi()
+    renderTabs()
+    const lineage = await screen.findByRole("region", { name: "Lineage" })
+    expect(await within(lineage).findByText("Postgres")).toBeTruthy()
+    expect(within(lineage).getByText("Comes from")).toBeTruthy()
+    expect(within(lineage).getByText("Read by")).toBeTruthy()
+    fireEvent.click(within(lineage).getByRole("button", { name: /Open Lineage/ }))
+    expect(screen.getByRole("tab", { name: /Lineage/ }).getAttribute("aria-selected")).toBe("true")
+  })
+
+  it("shows the Overview's columns with the way to all of them, and no Storage card there", async () => {
+    stubApi()
+    renderTabs()
+    const columns = await screen.findByRole("region", { name: "Columns" })
+    expect(within(columns).getByRole("table", { name: "Columns" })).toBeTruthy()
+    expect(screen.queryByText("Storage")).toBeNull()
   })
 })

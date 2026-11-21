@@ -7,19 +7,21 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatDate, formatNumber } from "@/lib/format"
 import { notifySuccess } from "@/lib/notify"
 import { assetService } from "@/services"
+import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import type { AssetDetail, AssetDropStatus } from "@/services/contracts/assets"
+import type { IcebergTableState } from "./asset-storage"
 
 /**
  * Drop table on the table's page (`DATA-55`, QA `LH-DATA-15-06`, `TC-1731`,
- * `DEC-21`): a table a file upload made can be dropped from the Activity
- * tab's Snapshots card, with the 7-day restore offered on the same card once
- * it is dropped.
+ * `DEC-21`): a table a file upload made can be dropped from the page's ⋯
+ * menu (`UX-8`; it was a button on the Activity tab's Snapshots card), with
+ * the 7-day restore offered on the Snapshots card once it is dropped.
  *
  * Nothing renders unless the server says the table may be dropped: a loading
  * read, an error, `supported: false` (outside the tenant that owns the shared
  * catalog) and `droppable: false` all render nothing, so no control is offered
  * for a table the drop route would refuse. The permission check that hides the
- * control is in `AssetActivity`.
+ * control is the page's (`canDropTable`).
  */
 
 /** Whether the server's answer is the one that offers the button. */
@@ -28,29 +30,69 @@ function droppableOrNull(status: AssetDropStatus | null): { table: string; keptD
   return { table: status.table, keptDays: status.keptDays }
 }
 
-export function DropTableAction({ asset, onDropped }: { asset: AssetDetail; onDropped: () => void }) {
-  const status = useService(
-    (s) => assetService.getDropStatus(asset.id, undefined, s),
-    [asset.id]
-  )
-  const [open, setOpen] = React.useState(false)
-  const ready = droppableOrNull(status.status === "success" ? status.data : null)
-  if (ready === null) return null
-
+/**
+ * `DATA-55` (QA `LH-DATA-15-06`, `TC-1731`): Drop table is offered only to
+ * `governance:write` — the permission that restores (D6, proposed) — and only
+ * for a Bronze table that exists and an upload made. The check hides the
+ * control AND the request: without the permission nothing is asked of
+ * `/drop`, which would answer 403 anyway.
+ */
+export function canDropTable(
+  a: AssetDetail,
+  iceberg: IcebergTableState,
+  hasPermission: (permission: string) => boolean
+): boolean {
   return (
-    <>
-      <Button size="sm" variant="outline" onClick={() => setOpen(true)}>
-        Drop table
-      </Button>
-      {open ? (
+    hasPermission("governance:write") &&
+    iceberg.status === "success" &&
+    iceberg.data !== null &&
+    isIcebergCandidate(a) &&
+    Boolean(a.tableName)
+  )
+}
+
+/**
+ * Whether the table may be dropped, and the dialog that does it. `UX-8`:
+ * the page offers it as "Drop table…" in its ⋯ menu, so the hook is apart
+ * from the button. `enabled: false` (no `governance:write`, no Iceberg
+ * table) asks nothing of `/drop`.
+ */
+export function useDropTable(
+  asset: AssetDetail,
+  { enabled, onDropped }: { enabled: boolean; onDropped: () => void }
+): { droppable: boolean; open: () => void; dialog: React.ReactNode } {
+  const status = useService(
+    (s) => (enabled ? assetService.getDropStatus(asset.id, undefined, s) : Promise.resolve(null)),
+    [asset.id, enabled]
+  )
+  const [opened, setOpened] = React.useState(false)
+  const ready = droppableOrNull(status.status === "success" ? status.data : null)
+  return {
+    droppable: ready !== null,
+    open: () => setOpened(true),
+    dialog:
+      ready !== null && opened ? (
         <DropTableDialog
           asset={asset}
           table={ready.table}
           keptDays={ready.keptDays}
-          onClose={() => setOpen(false)}
+          onClose={() => setOpened(false)}
           onDropped={onDropped}
         />
-      ) : null}
+      ) : null,
+  }
+}
+
+/** Drop table behind its own button (the hook above, drawn as a button). */
+export function DropTableAction({ asset, onDropped }: { asset: AssetDetail; onDropped: () => void }) {
+  const drop = useDropTable(asset, { enabled: true, onDropped })
+  if (!drop.droppable) return null
+  return (
+    <>
+      <Button size="sm" variant="outline" onClick={drop.open}>
+        Drop table
+      </Button>
+      {drop.dialog}
     </>
   )
 }
