@@ -1558,16 +1558,23 @@ pub(crate) async fn run_one(
     // the rule's statement is measured against.
     let gate = ApiSqlGate { state, actor };
 
-    let mut results = lakehouse_alerts::run_rules(
+    // Boxed so the handler's own future stays under clippy's `large_futures`
+    // limit (BI-73, PR #654 CI): the locale read and the rule run are the two
+    // large awaits it holds.
+    let locale = Box::pin(crate::routes::chart_alerts::number_locale(state)).await;
+    let mut results = Box::pin(lakehouse_alerts::run_rules(
         &state.clickhouse,
         &http,
         &email,
         only,
         freshness_source.as_ref().map(|s| s as &dyn FreshnessSource),
-        silence_source.as_ref().map(|s| s as &dyn SilenceSource),
-        state_source.as_ref().map(|s| s as &dyn StateSource),
+        (
+            silence_source.as_ref().map(|s| s as &dyn SilenceSource),
+            state_source.as_ref().map(|s| s as &dyn StateSource),
+        ),
         &gate,
-    )
+        &locale,
+    ))
     .await
     .map_err(|err| {
         upstream_error::ch_error_as(
@@ -1580,13 +1587,13 @@ pub(crate) async fn run_one(
     // BI-19 part C (D12): chart rules are read as their owners here; their
     // `run_rules` entries (skipped, with the reason) are replaced by the result.
     let state_ref = state_source.as_ref().map(|s| s as &dyn StateSource);
-    let chart_results = crate::routes::chart_alerts::evaluate(
+    let chart_results = Box::pin(crate::routes::chart_alerts::evaluate(
         state,
         (&http, &email),
         silence_source.as_ref().map(|s| s as &dyn SilenceSource),
         state_ref,
         only,
-    )
+    ))
     .await;
     results.retain(|r| !chart_results.iter().any(|c| c.id == r.id));
     results.extend(chart_results);
