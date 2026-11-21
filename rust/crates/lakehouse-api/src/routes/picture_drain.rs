@@ -35,7 +35,10 @@
 //!
 //! Draining a body is work the API does for a caller it may have just
 //! refused, so the drain stops at [`PICTURE_DRAIN_MAX_BYTES`] (16 MiB) and
-//! answers `413` with the size sentence of the kind. A kind outside the
+//! answers `413` with the size sentence of the kind — unless the inner
+//! answer already succeeded, which stands (`PR #638 review 2`): an upload
+//! the handler stored and audited is not turned into a refusal by the bytes
+//! that follow its form. A kind outside the
 //! list has no size sentence, so a body of its own over the cap keeps the
 //! inner answer — the `404`, never a `413`. The cap is far above the 512 KB
 //! logo rule and the 64 KB icon rule — every picture the feature accepts is
@@ -213,11 +216,37 @@ fn picture_kind_of(req: &Request) -> Option<ImageKind> {
     picture_kind(kind).ok()
 }
 
+/// The answer for a body the drain stopped reading at the cap.
+///
+/// A body that ended exactly on it — the size hint says so when the sender
+/// declared its length — is not over the cap, so the inner answer stands. A
+/// kind outside the list has no size sentence, so the inner answer stands for
+/// it too: the `404`, never a `413`.
+///
+/// PR #638 review 2: an answer that succeeded stands. The inner service may
+/// have stored the picture and audited the upload before the drain reached
+/// the cap — the form's own bytes can sit well inside the cap while what
+/// follows them does not — and answering `413` then would tell the caller a
+/// save failed that actually succeeded. The drain still stops reading at the
+/// cap: a client still sending may find the connection gone before it reads
+/// the answer, which is the cost of the cap and never a reason to read past
+/// it.
+fn answer_at_cap(answer: Response, kind: Option<ImageKind>, ended: bool) -> Response {
+    if ended || answer.status().is_success() {
+        answer
+    } else {
+        kind.map_or_else(|| answer, over_cap)
+    }
+}
+
 /// The drain: reads what is left of the request body after the inner
 /// service answered, up to [`PICTURE_DRAIN_MAX_BYTES`] plus one frame, and
 /// answers `413` when the body turns out to be bigger than that. A kind
-/// outside the list has no size sentence, so its own answer stands. See the
-/// module doc comment for what broke and why the layer sits where it sits.
+/// outside the list has no size sentence, so its own answer stands, and an
+/// answer that succeeded stands too (`PR #638 review 2`): the picture was
+/// stored and audited, so the cap stops the reading but never converts a
+/// success into a refusal. See the module doc comment for what broke and
+/// why the layer sits where it sits.
 pub(crate) async fn drain(req: Request, next: Next) -> Response {
     if !is_picture_put(&req) {
         return next.run(req).await;
@@ -244,16 +273,9 @@ pub(crate) async fn drain(req: Request, next: Next) -> Response {
     let mut seen = shared.seen.load(Ordering::Relaxed);
     loop {
         if seen >= PICTURE_DRAIN_MAX_BYTES as u64 {
-            // The cap is reached. The body may have ended exactly on it —
-            // the size hint says so when the sender declared its length —
-            // and that body is not over the cap.
-            return if body_ended(&body) {
-                answer
-            } else {
-                // A kind outside the list has no size sentence, so the
-                // inner answer stands: the `404`, never a `413`.
-                kind.map_or_else(|| answer, over_cap)
-            };
+            // The cap is reached; which answer stands is the decision
+            // `answer_at_cap` owns (`PR #638 review 2`).
+            return answer_at_cap(answer, kind, body_ended(&body));
         }
         match next_data(Pin::new(&mut body)).await {
             // A body that ended, and a body that cannot be read to its end,
@@ -262,5 +284,67 @@ pub(crate) async fn drain(req: Request, next: Next) -> Response {
             None | Some(Err(_)) => return answer,
             Some(Ok(bytes)) => seen += bytes.len() as u64,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    /// The sentences of the feature page, written out here and not read
+    /// from the server, so a change to the text fails the test.
+    const LOGO_SIZE: &str = "The logo must be at most 512 KB.";
+
+    async fn text_of(answer: Response) -> String {
+        String::from_utf8_lossy(&to_bytes(answer.into_body(), usize::MAX).await.unwrap())
+            .to_string()
+    }
+
+    /// PR #638 review 2: an answer that succeeded stands at the cap. The
+    /// picture may already have been stored and the upload audited when
+    /// the drain stops reading, so the cap must never convert a success
+    /// into a refusal the caller can act on ("it failed, send it again").
+    #[tokio::test]
+    async fn a_success_answer_keeps_itself_at_the_cap() {
+        let answer = (StatusCode::OK, "stored").into_response();
+        let answer = answer_at_cap(answer, Some(ImageKind::Logo), false);
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(text_of(answer).await, "stored");
+    }
+
+    /// The refusal the cap exists for: an inner answer that did not
+    /// succeed is replaced by the kind's size sentence, so a caller still
+    /// sending an oversized body learns the rule it broke.
+    #[tokio::test]
+    async fn a_refused_answer_gets_the_kind_sentence_at_the_cap() {
+        let answer = (StatusCode::UNPROCESSABLE_ENTITY, "refused").into_response();
+        let answer = answer_at_cap(answer, Some(ImageKind::Logo), false);
+        assert_eq!(answer.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let text = text_of(answer).await;
+        assert!(text.contains(LOGO_SIZE), "{text}");
+    }
+
+    /// A kind outside the list has no size sentence, so its own answer
+    /// stands at the cap: the `404`, never a `413`.
+    #[tokio::test]
+    async fn a_kind_outside_the_list_keeps_its_answer_at_the_cap() {
+        let answer = (StatusCode::NOT_FOUND, "no such picture").into_response();
+        let answer = answer_at_cap(answer, None, false);
+        assert_eq!(answer.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A body that ended exactly on the cap is not over it, so whatever
+    /// the inner answer was, it stands.
+    #[tokio::test]
+    async fn a_body_that_ended_on_the_cap_keeps_the_answer() {
+        let answer = (StatusCode::UNPROCESSABLE_ENTITY, "refused").into_response();
+        let answer = answer_at_cap(answer, Some(ImageKind::Logo), true);
+        assert_eq!(answer.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
