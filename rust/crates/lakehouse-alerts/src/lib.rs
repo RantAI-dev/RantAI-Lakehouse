@@ -6812,8 +6812,29 @@ mod tests {
             .map(|r| String::from_utf8_lossy(&r.body).into_owned())
             .collect();
         assert_eq!(bodies.len(), 2, "{bodies:?}");
-        assert!(bodies[0].contains("Alert:"), "{}", bodies[0]);
-        assert!(bodies[1].contains("Back to normal"), "{}", bodies[1]);
+        // PR #654 review 1: the subjects are pinned exactly, so a reintroduced
+        // "⚠️ Alert: …" / "✅ Back to normal: …" (BI-73, finding e) fails here.
+        // The webhook body carries the subject as its `title` field; a body
+        // that does not parse fails closed (an empty subject matches neither
+        // prefix).
+        let subject = |body: &str| {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| {
+                    v.get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default()
+        };
+        assert!(subject(&bodies[0]).starts_with("Alert: "), "{}", bodies[0]);
+        assert!(
+            subject(&bodies[1]).starts_with("Back to normal: "),
+            "{}",
+            bodies[1]
+        );
+        assert!(!bodies[0].contains('⚠'), "{}", bodies[0]);
+        assert!(!bodies[1].contains('✅'), "{}", bodies[1]);
         assert_eq!(state.states.lock().unwrap()["al_1"], AlertState::Ok);
     }
 
