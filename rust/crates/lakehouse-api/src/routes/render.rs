@@ -474,22 +474,23 @@ async fn fetch_image(state: &AppState, src: &str) -> Response {
         .into_response()
     };
     let internal_hosts = state.config.connector_internal_hosts();
-    let Some((host, port)) = crate::connector_probe::parse_endpoint_host_port(src)
-        .filter(|_| src.starts_with("https://"))
-    else {
-        return image_refusal(StatusCode::NOT_FOUND, IMAGE_NOT_AVAILABLE);
-    };
-    let Ok(checked) = crate::connector_probe::resolve_checked(host, port, &internal_hosts).await
-    else {
-        return failed(&"the image host was refused or did not resolve");
-    };
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(IMAGE_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(host, checked.all())
-        .build()
-    else {
-        return failed(&"the image client could not be built");
+    let client = match crate::connector_probe::pinned_https_client(
+        src,
+        &internal_hosts,
+        IMAGE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(crate::connector_probe::PinRefusal::NotHttps) => {
+            return image_refusal(StatusCode::NOT_FOUND, IMAGE_NOT_AVAILABLE);
+        }
+        Err(crate::connector_probe::PinRefusal::Refused) => {
+            return failed(&"the image host was refused or did not resolve");
+        }
+        Err(crate::connector_probe::PinRefusal::Build) => {
+            return failed(&"the image client could not be built");
+        }
     };
     let mut response = match client.get(src).send().await {
         Ok(response) if response.status().is_success() => response,

@@ -153,7 +153,7 @@ export function buildOption(
     type: "value" as const,
     name, nameTextStyle: { color: axis, fontSize: 10 }, nameGap: 8,
     position: (right ? "right" : "left") as "right" | "left",
-    axisLabel: { color: axis, fontSize: 11, formatter: (v: number) => fmtCompact(v) },
+    axisLabel: { color: axis, fontSize: 11, hideOverlap: true, formatter: (v: number) => fmtCompact(v) },
     splitLine: { show: !right, lineStyle: { color: split } },
     axisLine: { show: false }, axisTick: { show: false },
   });
@@ -400,7 +400,7 @@ export function buildOption(
   const horizontal = spec.kind === "hbar";
   const valueAxis = {
     type: "value" as const,
-    axisLabel: { color: axis, fontSize: 11, formatter: (v: number) => fmtCompact(v) },
+    axisLabel: { color: axis, fontSize: 11, hideOverlap: true, formatter: (v: number) => fmtCompact(v) },
     splitLine: { lineStyle: { color: split } },
     axisLine: { show: false },
     axisTick: { show: false },
@@ -698,6 +698,29 @@ export function forecastNote(lines: readonly ReferenceLine[] | undefined, ctx: L
   return forecastOf(lines, ctx, horizontal)?.plan.note;
 }
 
+/** Digits only: "Goal 1,000", "1.000" and "1 000" all read "1000". */
+const digitsOnly = (t: string) => t.replace(/[\s,.\u00a0\u202f']/g, "");
+
+/**
+ * Whether a person's own label already holds the line's number, compared
+ * without grouping separators or spaces against both the formatted value and
+ * the plain number (BI-72).
+ */
+function carriesNumber(label: string, formatted: string, value: number): boolean {
+  const text = digitsOnly(label);
+  const wanted = [digitsOnly(formatted), digitsOnly(String(value))].filter((w) => w !== "");
+  return wanted.some((w) => text.includes(w));
+}
+
+/** The next 1, 2, 2.5 or 5 x 10^n step above `top`, with steps sized for about five intervals from `min` (BI-72). */
+function niceCeil(top: number, min: number): number {
+  const raw = (top - Math.min(min, 0)) / 5;
+  if (!(raw > 0)) return top;
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * p).find((c) => c >= raw) ?? raw;
+  return Math.ceil(top / step) * step;
+}
+
 function withMarkLines(
   option: EChartsOption,
   lines: readonly ReferenceLine[] | undefined,
@@ -773,7 +796,9 @@ function withMarkLines(
       formatter: (p: { name?: string; value?: unknown }) => {
         // A trend line has two ends and no single value to write.
         const v = typeof p.value === "number" ? write(g.measure, p.value) : "";
-        return `${p.name ? `${p.name} ` : ""}${v}`.trim();
+        // BI-72: a label that already holds the number is not given it again ("Goal 1,000 1,000").
+        const written = typeof p.value === "number" && p.name && carriesNumber(p.name, v, p.value) ? "" : v;
+        return `${p.name ? `${p.name} ` : ""}${written}`.trim();
       },
     },
     data: g.lineData,
@@ -791,7 +816,8 @@ function withMarkLines(
   const widen = (axis: unknown, top: number) => {
     if (!axis || typeof axis !== "object" || (axis as { type?: string }).type !== "value") return axis;
     if (!Number.isFinite(top)) return axis;
-    return { ...(axis as object), max: (range: { max: number }) => Math.max(range.max, top) };
+    // BI-72: end on a round tick above the line, not on its raw value, so no second max label sits beside the last tick.
+    return { ...(axis as object), max: (range: { max: number; min?: number }) => (top <= range.max ? range.max : niceCeil(top, range.min ?? 0)) };
   };
   const valueAxes = horizontal ? option.xAxis : option.yAxis;
   const widened = Array.isArray(valueAxes)

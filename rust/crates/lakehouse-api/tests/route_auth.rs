@@ -3318,6 +3318,45 @@ async fn report_routes_need_dashboard_read_to_read_and_dashboard_write_to_write(
     }
 }
 
+/// `BI-72` (D3): `GET /api/dashboard/frame-check` needs `dashboard:read`, both
+/// ways. A reader gets past the gate (the handler's own 400 for an address
+/// off the content sites is not a refusal by the gate); a writer without
+/// `dashboard:read` and a principal with neither are refused with 403.
+#[tokio::test]
+async fn frame_check_needs_dashboard_read_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let reader = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let reader = common::session_cookie_for_user(&pool, reader).await;
+    let writer = common::create_principal_with_permissions(&pool, "dashboard:write").await;
+    let writer = common::session_cookie_for_user(&pool, writer).await;
+    let neither = common::create_principal_with_permissions(&pool, "query:read").await;
+    let neither = common::session_cookie_for_user(&pool, neither).await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/frame-check")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("dashboard:read"))
+    );
+    let uri = "/api/dashboard/frame-check?url=https://status.example/";
+    let resp = request_with_cookie(&router, "GET", uri, &reader).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a reader must get past the gate, got {}",
+        resp.status()
+    );
+    for (who, cookie) in [("writer", &writer), ("neither", &neither)] {
+        let resp = request_with_cookie(&router, "GET", uri, cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{who}");
+    }
+    let anonymous = router
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// `BI-18` part D (T3, feature T4 and `BI-18D-AC8`): every template route
 /// needs `dashboard:write`. Both ways: a writer gets past the gate, a reader
 /// with `dashboard:read` alone is refused with 403, and so is one with neither.

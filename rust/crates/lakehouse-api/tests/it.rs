@@ -114,6 +114,7 @@ mod deployment_settings_route;
 mod email_settings_route;
 mod embed_tokens;
 mod explain_rewrite;
+mod frame_check;
 mod gold_export_auth;
 mod gold_latest_copy;
 mod gold_publication;
