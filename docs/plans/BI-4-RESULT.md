@@ -136,6 +136,10 @@ This closes the gap section 4.2 names: the open time of a 12-tile dashboard and 
   to 12 drawn tiles with no skeleton, with the board's own freshness rule set to `fresh`
   (cold) or `default` (remembered). The workspace setting was not changed.
 
+**Not recorded here:** the exact command lines, the headless-Chrome timing script and the raw
+per-read output; the run's report is held outside this repository. The "API on the machine"
+row records one value per state, not a median and range.
+
 | Measure | Cold, median (range) | Remembered, median (range) |
 | --- | --- | --- |
 | 12 tiles, API through the tunnel | 0.321 s (0.296–0.496) | 0.318 s (0.282–0.344) |
