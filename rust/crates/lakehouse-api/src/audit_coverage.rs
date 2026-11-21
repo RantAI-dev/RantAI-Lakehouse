@@ -658,9 +658,7 @@ pub async fn record_gate_refusal(
         },
     )
     .await;
-    if written
-        && let Some(count) = count
-    {
+    if written && let Some(count) = count {
         crate::audit_compaction::mark_first_row_written(
             state,
             principal,

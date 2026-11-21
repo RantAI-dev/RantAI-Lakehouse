@@ -2718,7 +2718,7 @@ mod tests {
                 .await;
             let state = state_for(&server.uri());
 
-            let body = call_run(&state, Some("al-no-such-rule")).await;
+            let body = Box::pin(call_run(&state, Some("al-no-such-rule"))).await;
 
             assert_eq!(body["schemaPassStarted"], json!(false));
             assert_eq!(body["qualityPassStarted"], json!(false));
@@ -2741,7 +2741,7 @@ mod tests {
             // so ask again until a pass of ours starts.
             let mut started = false;
             for _ in 0..100 {
-                if call_run(&state, None).await["schemaPassStarted"] == json!(true) {
+                if Box::pin(call_run(&state, None)).await["schemaPassStarted"] == json!(true) {
                     started = true;
                     break;
                 }
