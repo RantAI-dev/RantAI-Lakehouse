@@ -2324,3 +2324,64 @@ administrator. Do not write the permission's technical name";
         );
     }
 }
+
+/// `AI-35`: the size of each fixed part of the system prompt, for the
+/// measurement report. Run with `--ignored --nocapture`.
+#[cfg(test)]
+mod prompt_size_report {
+    use super::*;
+
+    #[test]
+    #[ignore = "measurement report for AI-35; run with --ignored --nocapture"]
+    fn prompt_part_sizes() {
+        let viewer = lakehouse_auth::PermissionSet::parse("dashboard:read");
+        let admin = lakehouse_auth::PermissionSet::parse("*:*");
+        let parts: [(&str, usize); 9] = [
+            ("base (SYSTEM_BASE)", SYSTEM_BASE.chars().count()),
+            (
+                "ask suffix (SYSTEM_ASK_SUFFIX)",
+                SYSTEM_ASK_SUFFIX.chars().count(),
+            ),
+            (
+                "build suffix (SYSTEM_BUILD_SUFFIX)",
+                SYSTEM_BUILD_SUFFIX.chars().count(),
+            ),
+            (
+                "ask-back rules (ASK_BACK_RULES)",
+                ASK_BACK_RULES.chars().count(),
+            ),
+            (
+                "sql-help rules (SQL_HELP_RULES)",
+                SQL_HELP_RULES.chars().count(),
+            ),
+            (
+                "distinct-count rules (DISTINCT_COUNT_RULES)",
+                DISTINCT_COUNT_RULES.chars().count(),
+            ),
+            (
+                "closing (language line, example question)",
+                closing(
+                    "Show the share of foreign visitors by country as a pie.",
+                    None,
+                )
+                .chars()
+                .count(),
+            ),
+            ("mode note (build)", mode_note(true).chars().count()),
+            ("mode note (ask)", mode_note(false).chars().count()),
+        ];
+        println!();
+        println!("AI-35 fixed prompt parts (characters; tokens = characters / 4):");
+        for (name, chars) in parts {
+            println!("{name:<46} {chars:>6} ch ~{:>5} tok", chars / 4);
+        }
+        for (who, perms) in [("viewer", Some(&viewer)), ("admin", Some(&admin))] {
+            let note = dashboard_permission_note(perms).unwrap_or_default();
+            println!(
+                "permission note, {who:<6}                          {:>6} ch ~{:>5} tok",
+                note.chars().count(),
+                note.chars().count() / 4
+            );
+        }
+    }
+}
