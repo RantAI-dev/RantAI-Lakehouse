@@ -226,17 +226,21 @@ class _RecordingInstance:
 
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.read = threading.Event()
         self.failed: list[tuple[str, str | None]] = []
 
     def get_run_records(self, filters=None, **kwargs) -> list:
         self.events.append("instance")
+        self.read.set()
         return []
 
     def report_run_failed(self, run, message=None) -> None:
         self.failed.append((run.run_id, message))
 
 
-def _probe_recording(events: list[str], answers: list[bool]):
+def _probe_recording(
+    events: list[str], answers: list[bool], *, sweep_read: threading.Event
+):
     """A probe that answers as told, records every call, and ends the
     guard's loop when the answers run out."""
     calls = 0
@@ -245,6 +249,7 @@ def _probe_recording(events: list[str], answers: list[bool]):
         nonlocal calls
         calls += 1
         if calls > len(answers):
+            assert sweep_read.wait(2)
             raise _StopGuard()
         answered = answers[calls - 1]
         events.append("probe:yes" if answered else "probe:no")
@@ -553,7 +558,7 @@ def test_the_guard_fails_the_runs_of_the_previous_code_location_once_after_the_f
                 _guard_args(_closed_port()),
                 spawn=lambda **_kwargs: child,
                 instance_factory=lambda: instance,
-                probe_fn=_probe_recording(events, answers=[False, True]),
+                probe_fn=_probe_recording(events, answers=[False, True], sweep_read=instance.read),
                 interval_seconds=0.01,
             )
     finally:
@@ -576,7 +581,7 @@ def test_the_guard_fails_the_runs_of_the_previous_code_location_only_once_when_s
                 _guard_args(_closed_port()),
                 spawn=lambda **_kwargs: child,
                 instance_factory=lambda: instance,
-                probe_fn=_probe_recording(events, answers=[True, True]),
+                probe_fn=_probe_recording(events, answers=[True, True], sweep_read=instance.read),
                 interval_seconds=0.01,
             )
     finally:
@@ -599,20 +604,13 @@ def test_the_guard_goes_on_when_the_instance_cannot_be_read(
         def report_run_failed(self, run, message=None) -> None:
             raise AssertionError("no run may be failed")
 
-    child = _sleeping_child()
-    try:
-        with caplog.at_level(logging.WARNING):
-            with pytest.raises(_StopGuard):
-                code_server_guard.run_guard(
-                    _guard_args(_closed_port()),
-                    spawn=lambda **_kwargs: child,
-                    instance_factory=BrokenInstance,
-                    probe_fn=_probe_recording([], answers=[True, True]),
-                    interval_seconds=0.01,
-                )
-    finally:
-        child.kill()
-        child.wait(timeout=10)
+    with caplog.at_level(logging.WARNING):
+        code_server_guard.fail_orphaned_runs_at_start(
+            _guard_args(_closed_port()),
+            instance_factory=BrokenInstance,
+            guard_started_at=time.time(),
+            should_stop=lambda: False,
+        )
     assert any(
         "could not be read" in record.message for record in caplog.records
     ), [record.message for record in caplog.records]
@@ -627,23 +625,86 @@ def test_the_guard_goes_on_when_the_dagster_instance_cannot_be_opened(
     def broken() -> object:
         raise RuntimeError("DAGSTER_HOME is not set")
 
-    child = _sleeping_child()
-    try:
-        with caplog.at_level(logging.WARNING):
-            with pytest.raises(_StopGuard):
-                code_server_guard.run_guard(
-                    _guard_args(_closed_port()),
-                    spawn=lambda **_kwargs: child,
-                    instance_factory=broken,
-                    probe_fn=_probe_recording([], answers=[True, True]),
-                    interval_seconds=0.01,
-                )
-    finally:
-        child.kill()
-        child.wait(timeout=10)
+    with caplog.at_level(logging.WARNING):
+        code_server_guard.fail_orphaned_runs_at_start(
+            _guard_args(_closed_port()),
+            instance_factory=broken,
+            guard_started_at=time.time(),
+            should_stop=lambda: False,
+        )
     assert any(
         "could not be opened" in record.message for record in caplog.records
     ), [record.message for record in caplog.records]
+
+
+def test_a_blocked_instance_read_does_not_pause_probes_or_write_after_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    from dagster import DagsterRunStatus
+    from types import SimpleNamespace
+
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    finished = threading.Event()
+    writes = []
+    child = _sleeping_child()
+    real_sweep = code_server_guard.fail_orphaned_runs_at_start
+
+    class BlockedInstance:
+        def get_run_records(self, **_kwargs):
+            entered.set()
+            release.wait(2)
+            returned.set()
+            origin = SimpleNamespace(location_name="dispar_orchestrate.definitions")
+            remote_origin = SimpleNamespace(
+                repository_origin=SimpleNamespace(code_location_origin=origin)
+            )
+            run = SimpleNamespace(
+                status=DagsterRunStatus.STARTED, remote_job_origin=remote_origin, run_id="old"
+            )
+            return [SimpleNamespace(dagster_run=run, start_time=time.time() - 60)]
+
+        def report_run_failed(self, run, **_kwargs):
+            writes.append(run.run_id)
+
+    def sweep(*args, **kwargs):
+        try:
+            real_sweep(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(code_server_guard, "fail_orphaned_runs_at_start", sweep)
+    monkeypatch.setattr(code_server_guard, "ORPHAN_SWEEP_TIMEOUT_SECONDS", 0.05, raising=False)
+    probes = 0
+
+    def ping(**_kwargs):
+        nonlocal probes
+        probes += 1
+        if probes == 1:
+            return True
+        assert entered.wait(1)
+        assert not returned.is_set(), "the probe loop waited for the blocked read"
+        if "startup orphan sweep exceeded its deadline" in caplog.text:
+            release.set()
+            assert finished.wait(1)
+            raise _StopGuard()
+        return True
+
+    try:
+        with pytest.raises(_StopGuard):
+            code_server_guard.run_guard(
+                _guard_args(_closed_port()),
+                spawn=lambda **_kwargs: child,
+                instance_factory=BlockedInstance,
+                probe_fn=ping,
+                interval_seconds=0.01,
+            )
+    finally:
+        release.set()
+        child.kill()
+        child.wait(timeout=10)
+    assert writes == []
 
 
 # --- the shutdown window (decision 3) ---------------------------------------

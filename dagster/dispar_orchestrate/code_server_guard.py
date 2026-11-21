@@ -95,6 +95,10 @@ FAILURES_BEFORE_FIRST_SUCCESS = 10
 # How long the guard waits for the code server to stop before killing it.
 SHUTDOWN_TIMEOUT_SECONDS = 30
 
+# PR #636 review 4: a stuck database must never hold the watchdog. Give the
+# one-time sweep one probe interval to begin its writes.
+ORPHAN_SWEEP_TIMEOUT_SECONDS = PROBE_INTERVAL_SECONDS
+
 # How long the inner server waits for the proxy's heartbeat before it shuts
 # itself down, in seconds. Dagster's own default is 30 s
 # (`dagster/_cli/code_server.py`), and a busy container misses that easily:
@@ -740,6 +744,7 @@ def fail_orphaned_runs_at_start(
     *,
     instance_factory: Callable[[], Any],
     guard_started_at: float,
+    should_stop: Callable[[], bool],
 ) -> None:
     """Ends the runs the previous code location left behind, ONCE.
 
@@ -770,11 +775,14 @@ def fail_orphaned_runs_at_start(
     # location carries. If an operator renames one of the two, the runs of
     # this location are no longer recognized: the step finds nothing and
     # the zombies stay.
+    if should_stop():
+        return
     failed = orphan_runs.fail_orphaned_runs(
         the_instance,
         location_name=args.module,
         guard_started_at=guard_started_at,
         now=time.time(),
+        should_stop=should_stop,
     )
     logger.info(
         "failed %d run(s) that the previous code location left behind", failed
@@ -900,6 +908,8 @@ def run_guard(
     state = ProbeState()
     reload_state = ReloadState()
     orphan_checked = False
+    sweep: threading.Thread | None = None
+    sweep_deadline = 0.0
     verify_after_failed_reload = False
     try:
         supervisor.install_signal_handlers()
@@ -914,6 +924,10 @@ def run_guard(
                     child.returncode,
                 )
                 return 1
+            if sweep is not None and time.monotonic() >= sweep_deadline:
+                if sweep.is_alive():
+                    logger.warning("the startup orphan sweep exceeded its deadline")
+                sweep = None
             reload_failed = False
             for observed_at, _line in watcher.drain():
                 if should_give_up_after_shutdown(reload_state, observed_at=observed_at):
@@ -964,9 +978,25 @@ def run_guard(
                     # The code location is up: now, and only now, the runs
                     # the PREVIOUS code location left behind are ended.
                     orphan_checked = True
-                    fail_orphaned_runs_at_start(
-                        args, instance_factory=instance_factory, guard_started_at=guard_started_at
+                    sweep_deadline = time.monotonic() + ORPHAN_SWEEP_TIMEOUT_SECONDS
+
+                    def sweep_should_stop() -> bool:
+                        return supervisor.stop.is_set() or time.monotonic() >= sweep_deadline
+
+                    # PR #636 review 4: neither opening the instance nor
+                    # waiting on its storage may delay the next probe.
+                    sweep = threading.Thread(
+                        target=fail_orphaned_runs_at_start,
+                        args=(args,),
+                        kwargs={
+                            "instance_factory": instance_factory,
+                            "guard_started_at": guard_started_at,
+                            "should_stop": sweep_should_stop,
+                        },
+                        name="code-server-orphan-sweep",
+                        daemon=True,
                     )
+                    sweep.start()
             if should_give_up(state, child_exited=child.poll() is not None):
                 logger.error("%s", give_up_reason(state))
                 supervisor.stop_child()
@@ -982,6 +1012,7 @@ def run_guard(
                 )
                 return 1
     finally:
+        supervisor.stop.set()
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
 

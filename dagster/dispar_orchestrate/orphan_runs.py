@@ -49,6 +49,7 @@ exists. This module finds those runs and ends them, ONCE, at guard start.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from dagster import DagsterRunStatus, RunsFilter
@@ -168,6 +169,7 @@ def fail_orphaned_runs(
     location_name: str,
     guard_started_at: float,
     now: float,
+    should_stop: Callable[[], bool],
 ) -> int:
     """Ends every orphaned run; returns how many were ended.
 
@@ -192,6 +194,10 @@ def fail_orphaned_runs(
         return 0
     failed = 0
     for record in records:
+        # PR #636 review 4: a database read that returns after the deadline
+        # must not lead to new writes. An in-progress call cannot be interrupted.
+        if should_stop():
+            break
         run = record.dagster_run
         try:
             instance.report_run_failed(

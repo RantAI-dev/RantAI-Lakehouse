@@ -127,6 +127,7 @@ def _fail(
         location_name=location_name,
         guard_started_at=guard_started_at,
         now=now,
+        should_stop=lambda: False,
     )
 
 
