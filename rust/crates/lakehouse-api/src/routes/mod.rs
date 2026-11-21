@@ -59,6 +59,7 @@ mod dashboard_sources;
 pub(crate) mod dashboard_templates;
 pub(crate) mod drill;
 mod embed;
+mod frame_check;
 mod pdf_export;
 pub mod public_links;
 mod render;
@@ -1673,6 +1674,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/dashboard/table-export", get(dashboard::table_export))
         .route("/api/dashboard/chart-export", get(dashboard::chart_export))
+        // BI-72 (D3): whether a web-page card's site allows being framed.
+        .route("/api/dashboard/frame-check", get(frame_check::frame_check))
         // BI-14 (D1): where a chart comes from. `lineage:read` (owner decision Q6).
         .route(
             "/api/dashboard/charts/{id}/lineage",

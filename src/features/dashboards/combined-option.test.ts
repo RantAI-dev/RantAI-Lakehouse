@@ -120,3 +120,9 @@ test("a grain labels the buckets while the keys stay the stored values", () => {
   assert.deepEqual(built.keys.slice(0, 2), ["2026-01-01", "2026-02-01"])
   assert.deepEqual(built.labels.slice(0, 2), ["Jan 2026", "Feb 2026"])
 })
+
+test("BI-72: both value axes hide overlapping labels", () => {
+  const o = buildCombinedOption(input, false).option as unknown as { yAxis: { axisLabel: { hideOverlap?: boolean } }[] }
+  assert.ok(o.yAxis.length >= 2)
+  for (const a of o.yAxis) assert.equal(a.axisLabel.hideOverlap, true)
+})
