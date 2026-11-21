@@ -145,7 +145,7 @@ fn every_handler_action_is_a_string_literal_in_a_route_source() {
         .collect();
     let mut absent = Vec::new();
     for (method, pattern, coverage) in AUDIT_TABLE {
-        if let Coverage::Handler { action } = coverage {
+        if let Coverage::Handler { action, .. } = coverage {
             let literal = format!("\"{action}\"");
             if !sources.iter().any(|source| source.contains(&literal)) {
                 absent.push(format!("{method} {pattern}: {action}"));
@@ -156,6 +156,26 @@ fn every_handler_action_is_a_string_literal_in_a_route_source() {
         absent.is_empty(),
         "these Handler routes name an action that is not a string literal under src/routes/:\n{}",
         absent.join("\n")
+    );
+}
+
+/// Check 3b: a `Handler` entry names the kind of object its route
+/// changes (`SEC-75` decision 6), so the refusal row the gate writes names
+/// it too — a refused change says what it would have changed.
+#[test]
+fn every_handler_entry_names_a_resource_kind() {
+    let mut without = Vec::new();
+    for (method, pattern, coverage) in AUDIT_TABLE {
+        if let Coverage::Handler { resource_kind, .. } = coverage
+            && resource_kind.trim().is_empty()
+        {
+            without.push(format!("{method} {pattern}"));
+        }
+    }
+    assert!(
+        without.is_empty(),
+        "these Handler routes name no resource kind:\n{}",
+        without.join("\n")
     );
 }
 
@@ -174,7 +194,7 @@ fn central_actions_are_module_verb_unique_and_read_their_id_from_the_path_or_the
     let handler_actions: BTreeSet<&str> = AUDIT_TABLE
         .iter()
         .filter_map(|(_, _, coverage)| match coverage {
-            Coverage::Handler { action } => Some(*action),
+            Coverage::Handler { action, .. } => Some(*action),
             _ => None,
         })
         .collect();

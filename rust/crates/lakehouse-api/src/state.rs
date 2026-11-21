@@ -163,6 +163,14 @@ pub struct AppState {
     /// route reply 503 rather than panic — see
     /// `crate::auth::authenticators`.
     pub auth: Option<AuthState>,
+    /// The proxies whose `X-Forwarded-For` the API reads (`SEC-75`
+    /// decision 1) — see [`crate::client_source::TrustedProxies`].
+    ///
+    /// An `RwLock`, not a plain value: the compose service names in the
+    /// list are resolved again every few minutes, because a compose
+    /// network's addresses are not fixed and a container that is
+    /// recreated comes back with another one.
+    pub trusted_proxies: Arc<RwLock<crate::client_source::TrustedProxies>>,
     /// Per-mart single-flight guard for `POST /api/gold/export/{mart}` —
     /// see [`crate::gold_lock`]'s module doc comment for the duplicate-row
     /// defect this closes. Always populated (unlike [`Self::pg`]/
@@ -876,6 +884,13 @@ impl AppState {
             config.upload_max_conversions as usize,
             u64::from(config.upload_convert_memory_mb),
         );
+        // `SEC-75` decision 1: the proxies whose `X-Forwarded-For` the API
+        // reads. Built before the struct literal, because the literal
+        // moves `config` into its `Arc`.
+        let trusted_proxies = crate::client_source::TrustedProxies::new(
+            config.trusted_proxy_cidrs.clone(),
+            config.trusted_proxy_names.clone(),
+        );
         Self {
             config: Arc::new(config),
             clickhouse,
@@ -892,6 +907,7 @@ impl AppState {
             ),
             connector_secret_store,
             auth,
+            trusted_proxies: Arc::new(RwLock::new(trusted_proxies)),
             gold_export_locks: MartLocks::default(),
             iceberg: Arc::new(RwLock::new(None)),
             bronze_stats_cache: Arc::new(BronzeStatsCache::new()),

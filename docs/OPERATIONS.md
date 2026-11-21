@@ -1973,6 +1973,40 @@ only deletes — it does not rotate anything, and an ACTIVE (non-revoked)
 service token never expires or gets cleaned up no matter how old it is;
 rotation is a manual, operator-driven act.
 
+## Trusted proxies: whose `X-Forwarded-For` the API reads (`SEC-75`)
+
+`TRUSTED_PROXIES` names the proxies whose `X-Forwarded-For` the API may
+read. A request from a peer that is not on the list IS the source, whatever
+its header says; a request from a peer that is on the list takes the
+right-most `X-Forwarded-For` entry that is not itself trusted. An empty list
+trusts no header at all, so every request's source is the address of the
+peer that sent it.
+
+What to list:
+
+- The console's own address, which on the compose stack is its service
+  name (`console`): the console is the peer the API sees, and only a
+  trusted peer may name a source.
+- The outer reverse proxy's or load balancer's address or network, when one
+  sits in front of the console. The API then takes the right-most
+  `X-Forwarded-For` entry that is not itself trusted, which is the address
+  that proxy saw.
+- A compose service name, like the console's. The name is resolved again
+  every five minutes, because a compose network's addresses are not fixed
+  and a recreated container comes back with another one.
+
+An entry that is neither a network, nor an address, nor a service name stops
+the API at start: a dropped entry would quietly stop trusting a proxy the
+operator named, and every caller would then look like one source.
+
+**The limit of the current deployment.** The console proxies `/api` to the
+API. When the console is published directly, the API sees the console's own
+address (Docker's bridge gateway) as the source of every request, so several
+callers share one source bucket. A per-caller limit therefore needs a
+reverse proxy in front of the console that sets `X-Forwarded-For`; without
+one, the 50-failure limit applies to the whole group of callers behind that
+address.
+
 ## Proposal: `GET /api/auth/providers` (not built)
 
 **SSO is currently gated by a build-time flag, not a runtime one.** The

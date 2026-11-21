@@ -34,6 +34,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
+use lakehouse_auth::source_throttle;
 use lakehouse_auth::throttle;
 use lakehouse_auth::{
     AuthError, Authenticator, Credential, Principal, PrincipalId, Secret, password, session,
@@ -51,6 +52,7 @@ use uuid::Uuid;
 
 use crate::audit_coverage;
 use crate::auth::{AuthenticatedPrincipal, SESSION_COOKIE_NAME, session_cookie_from_headers};
+use crate::client_source::ClientSource;
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -143,12 +145,18 @@ fn sign_in_executed_event(user_id: Uuid, principal_kind: &str) -> NewAuditEvent 
 /// the hash of a password typed into the identifier box. An unknown email
 /// writes the identical row: the trail is not an account oracle. The lock row
 /// keeps no identifier material either (plan D5b).
-fn sign_in_refused_event() -> NewAuditEvent {
+///
+/// `SEC-75` decision 5: the row names the SOURCE the sign-in came from —
+/// the address the request came from (`crate::client_source`). It names
+/// nothing else the caller typed: not the identifier, not the password, and
+/// not a hash of either.
+fn sign_in_refused_event(source: &str) -> NewAuditEvent {
     NewAuditEvent {
         action: "auth.login".to_owned(),
         outcome: "refused".to_owned(),
         actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
         detail: Some(SIGN_IN_REFUSED_DETAIL.to_owned()),
+        args: Some(serde_json::json!({ "source": source })),
         ..Default::default()
     }
 }
@@ -220,6 +228,42 @@ fn locked_response(locked_until: Option<time::OffsetDateTime>) -> ApiError {
     }
 }
 
+/// The answer of a sign-in refused because its SOURCE is over the
+/// per-source limit (`SEC-75` decision 2).
+///
+/// The same fixed sentence for every source, and nothing about the
+/// account in it: the refusal says that the address is over its budget,
+/// never whether the account exists or whether the password was right.
+fn source_limited_response(retry_after_secs: u64) -> ApiError {
+    ApiError::TooManyRequests {
+        message: "Too many failed sign-in attempts from this address. Try again later.".to_owned(),
+        retry_after_secs,
+    }
+}
+
+/// Refuse a sign-in whose source is over its budget (`SEC-75` decision 2).
+///
+/// `Ok(())` when the source may try again. The check runs BEFORE the
+/// password is checked and BEFORE the account throttle is touched: a
+/// refused sign-in costs this one query and nothing else — no hash, no
+/// account walked toward its own lock, no audit row.
+///
+/// Decision 3: a sign-in refused here still counts against the source. The
+/// caller is still trying, and the count is what the summary row of the
+/// window reports. The refusal writes no row of its own: the first failure
+/// of the window wrote that.
+async fn check_source_budget(pool: &PgPool, source: &str) -> ApiResult<()> {
+    if let Some(window) = source_throttle::current(pool, source).await?
+        && window.failures >= source_throttle::MAX_FAILURES_PER_SOURCE
+    {
+        if let Err(err) = source_throttle::record_failure(pool, source).await {
+            tracing::warn!(%err, "failed to count a refused sign-in against its source");
+        }
+        return Err(source_limited_response(window.retry_after_secs()).into());
+    }
+    Ok(())
+}
+
 /// The longest `User-Agent` a session records, in characters. A browser's
 /// header is short; the cap keeps a caller from storing a kilobyte of text
 /// under the column the Sessions page renders.
@@ -260,13 +304,28 @@ fn session_user_agent(headers: &HeaderMap) -> Option<String> {
 /// (best-effort: a failed audit write is logged, not propagated). On a successful login,
 /// `clear` resets the count.
 ///
+/// # Per-source limit (SEC-75)
+///
+/// The account throttle cannot protect the installation: every attempt
+/// with a NEW identifier is a new key, so one caller can guess forever.
+/// The route therefore counts the failures per SOURCE (the address the
+/// request came from, `crate::client_source`) and answers `429` with a
+/// `Retry-After` once that source is over its budget — before the
+/// account throttle is touched and before the password is checked, so a
+/// refused sign-in costs no hash and never walks an account toward its
+/// own lock. A successful sign-in does NOT reset the count: the budget
+/// belongs to the address, not to the person who happened to type the
+/// right password once.
+///
 /// # Errors
 ///
 /// 400 on an unparseable body; 401 on bad credentials (same status for
 /// "no such email" and "wrong password" — see the module doc comment);
-/// 429 when the key is locked; 503 if no Postgres pool is configured.
+/// 429 when the key is locked or the source is over its limit; 503 if no
+/// Postgres pool is configured.
 pub async fn login(
     State(state): State<AppState>,
+    source: ClientSource,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Response> {
@@ -277,6 +336,14 @@ pub async fn login(
                 .to_owned(),
         )
     })?;
+
+    // `SEC-75` decision 2: the source's budget, checked BEFORE anything
+    // else the request would cost. An over-budget source gets `429` and
+    // a `Retry-After`; its account is not touched and its password is
+    // never checked, so a spray of guesses costs the API nothing but the
+    // one query this line runs.
+    check_source_budget(pool, source.as_str()).await?;
+
     let LoginBody {
         identifier,
         password,
@@ -328,9 +395,13 @@ pub async fn login(
                 pool,
                 user_id,
                 session::DEFAULT_SESSION_TTL,
-                // ADM-14 D10: no address — the API sits behind the console's
-                // own server and has no trusted source for the client's.
-                None,
+                // `SEC-75` decision 7: the session records the source of
+                // the sign-in, so the Sessions page shows an address.
+                // Before this the API had no trusted source for the
+                // client's (the `ADM-14` D10 comment), because it was
+                // served without connect information and read no
+                // `X-Forwarded-For`.
+                Some(source.as_str()),
                 session_user_agent(&headers).as_deref(),
                 &[],
             )
@@ -368,6 +439,23 @@ pub async fn login(
         // user toward a lockout over a database hiccup (review blocker 1,
         // 2026-10-03).
         Err(AuthError::InvalidCredentials) => {
+            // `SEC-75` decision 2: this failure counts against the
+            // source's budget. Best-effort: a storage failure here must
+            // not change the answer to a sign-in — the account throttle
+            // has already counted the attempt, and a database that is
+            // failing fails there first (with a 500, not with a 401).
+            //
+            // Decision 3: the count also says whether this failure is the
+            // FIRST of the source's window. Only the first one writes the
+            // refused row; the later ones are counted and summarised by
+            // the sweep when the window closes.
+            let window = match source_throttle::record_failure(pool, source.as_str()).await {
+                Ok(window) => Some(window),
+                Err(err) => {
+                    tracing::warn!(%err, "failed to count a failed sign-in against its source");
+                    None
+                }
+            };
             // SEC-49: the try was already counted before hashing; the try
             // that reached the limit is the one that set the lock.
             if attempt_lock.is_some() && attempt == policy.max_failures {
@@ -390,11 +478,37 @@ pub async fn login(
                 };
                 audit_coverage::record_best_effort(&state, event).await;
             }
-            // `GOV-1`: every refused sign-in is on the audit trail, with no
+            // `GOV-1`: a refused sign-in is on the audit trail, with no
             // principal (nobody proved who they were) and nothing the visitor
             // typed, not even a hash of it (`GOV-1 review`). An unknown email
             // writes the identical row: the trail is not an account oracle.
-            audit_coverage::record_best_effort(&state, sign_in_refused_event()).await;
+            //
+            // `SEC-75` decision 3: only the FIRST failure of the source's
+            // window writes that row; the later ones only count, and the
+            // sweep writes one summary row for the window.
+            if window.is_some_and(|window| window.failures == 1) {
+                let written = audit_coverage::record_best_effort_checked(
+                    &state,
+                    sign_in_refused_event(source.as_str()),
+                )
+                .await;
+                if written {
+                    if let Some(window) = window {
+                        if let Err(err) = source_throttle::mark_first_row_written(
+                            pool,
+                            source.as_str(),
+                            window.window_started_at,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                %err,
+                                "failed to mark the first refused row of a window as written"
+                            );
+                        }
+                    }
+                }
+            }
             tracing::warn!("login failed");
             Err(ApiError::Unauthorized("Invalid username/email or password.".to_owned()).into())
         }
@@ -654,11 +768,12 @@ fn sessions_decision_for(principal: &Principal) -> SessionsDecision {
 ///
 /// `user_agent` is the browser as it named itself at sign-in (`ADM-14`
 /// decision D9), and `null` for a session older than that change.
-/// `created_ip` is always `null`: the API sits behind the console's own
-/// server and has no trusted source for the client's address, so the page
-/// says "Not recorded" rather than showing a wrong address as a fact
-/// (decision D10) — see `lakehouse_store::sessions::SessionRow`'s own doc
-/// comment.
+/// `created_ip` is the SOURCE of the sign-in (`SEC-75` decision 7): the
+/// address a trusted proxy saw, or the peer's own address, and `unknown`
+/// when the API cannot see the peer's address at all — see
+/// `crate::client_source`. The `ADM-14` decision D10 leftover ("the API
+/// has no trusted source") is closed by that decision; see
+/// `lakehouse_store::sessions::SessionRow`'s own doc comment.
 ///
 /// # Errors
 ///
@@ -1242,6 +1357,7 @@ impl ExchangeFailure {
 )]
 pub async fn oidc_callback(
     State(state): State<AppState>,
+    source: ClientSource,
     Query(query): Query<OidcCallbackQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
@@ -1402,9 +1518,10 @@ pub async fn oidc_callback(
         pool,
         user_id,
         session::DEFAULT_SESSION_TTL,
-        // ADM-14 D10: no address — the API sits behind the console's own
-        // server and has no trusted source for the client's.
-        None,
+        // `SEC-75` decision 7: the session records the source of the
+        // sign-in, so the Sessions page shows an address — the same
+        // source the password sign-in records.
+        Some(source.as_str()),
         session_user_agent(&headers).as_deref(),
         &login.mapped_role_names,
     )
@@ -3281,6 +3398,7 @@ mod tests {
         );
         oidc_callback(
             axum::extract::State(state.clone()),
+            ClientSource::new(crate::client_source::UNKNOWN_SOURCE),
             axum::extract::Query(OidcCallbackQuery {
                 code: Some(code.to_owned()),
                 state: Some(flow.state.clone()),
@@ -3462,8 +3580,11 @@ mod tests {
             "expected the flow cookie to be cleared even on success: {set_cookies:?}"
         );
 
-        // QA LH-SEC-5-01 (ADM-14 D9/D10): the single sign-on callback records
-        // the browser it came from, and records no network address.
+        // QA LH-SEC-5-01 (ADM-14 D9/D10), as SEC-75 decision 7 changes it:
+        // the single sign-on callback records the browser it came from AND
+        // the source of the sign-in. This test calls the handler without
+        // connect information, so the source is the fixed `unknown` bucket
+        // (see `crate::client_source::UNKNOWN_SOURCE`).
         let (count, user_agent, created_ip): (i64, Option<String>, Option<String>) =
             sqlx::query_as("SELECT count(*), max(user_agent), max(created_ip) FROM session")
                 .fetch_one(&pool)
@@ -3471,8 +3592,9 @@ mod tests {
         assert_eq!(count, 1, "one callback, one session");
         assert_eq!(user_agent.as_deref(), Some("QA-Browser/1.0"));
         assert_eq!(
-            created_ip, None,
-            "the network address is not recorded (ADM-14 D10)"
+            created_ip.as_deref(),
+            Some("unknown"),
+            "the session records the source of the sign-in (SEC-75 decision 7)"
         );
         Ok(())
     }

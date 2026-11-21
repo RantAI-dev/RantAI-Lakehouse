@@ -106,10 +106,21 @@ the chat timeout); they were missing from the table above until 2026-10-15
 | `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS` | Lets connection tests dial internal addresses (the guard against using the console as a port scanner, `SEC-15`); `true` only for the exact string `"true"` | unset (refused) | Only to test connectors that point at internal hosts, such as the seeded ones | commented |
 | `CONNECTOR_PROBE_ALLOWED_CIDRS` | Private networks a connector may dial although internal addresses are refused: the narrow alternative to the setting above | empty | No | commented |
 | `WEBHOOK_ALLOWED_CIDRS` | Internal networks an alert webhook may call (`SEC-10`); never opens loopback, link-local or multicast | empty | No | commented |
+| `TRUSTED_PROXIES` | The addresses, networks or compose service names of the proxies whose `X-Forwarded-For` the API reads (`SEC-75`) | `console` in compose (the console service that proxies `/api`), empty elsewhere | No | commented |
 | `CONNECTOR_SECRETS_DIR` | Where the API itself reads and writes connector credential files; refs keep saying `file:/run/secrets/...`, the orchestrator's path | `/run/secrets` | Only when the API runs outside Docker | no |
 | `CONNECTOR_TLS_CA_FILE` | The CA certificate (PEM) connector dials verify the database server against (`SEC-14` part B); unset still requires TLS but trusts the server's certificate (`require`), set verifies the chain (and, for the PostgreSQL connection test, the host name too: `verify-full`); an unreadable path stops the API at start | unset | No | no |
 | `ICEBERG_QUERY_DB` | The `ClickHouse` `DataLakeCatalog` database the API reads Iceberg tables through (compose creates `icecat_api`) | unset in the API (compose sets `icecat_api`); unset means Iceberg tables stay unreadable for policy checks and the catalog | Only when running the API outside compose | no |
 | `GIT_SHA` | The commit the image was built from; lets the pipeline source view say whether the code shown is the code that ran | `unknown` | No | no |
+
+`TRUSTED_PROXIES` is a list, its entries separated by commas or spaces. An
+entry is a network (`192.168.18.0/24`), one address, or a compose service
+name (`console`). An entry that is none of the three stops the API at start
+(fail closed): a dropped entry would quietly stop trusting a proxy the
+operator named, and every caller would then look like one source. An empty
+list means the header is never read, so a request's source is the address of
+the peer that sent it. A compose service name is resolved again every five
+minutes, because a compose network's addresses are not fixed — see
+[`OPERATIONS.md`](OPERATIONS.md), "Trusted proxies".
 
 `WEBHOOK_TEST_ALLOW_ALL` exists in `config.rs` but is read only in test
 builds; no deployment setting can open loopback for webhooks.

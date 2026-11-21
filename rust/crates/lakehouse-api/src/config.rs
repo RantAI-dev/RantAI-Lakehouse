@@ -81,7 +81,7 @@ pub const OIDC_PROMPT_OFF: &str = "off";
 /// Only `PORT`, `CATALOG_TENANT_ID`, `AI_DEFAULT_REPLY_LANGUAGE`,
 /// `AI_SEMANTIC_LAYER`, `AI_ASK_BACK`, `AI_RELEVANT_TABLES`, `AI_SQL_HELP`,
 /// `CONNECTOR_TYPED_CREDENTIALS`, `EMBED_TOKEN_MAX_LIFETIME_SECONDS`,
-/// `CONNECTOR_TLS_CA_FILE` and `SMTP_CA_FILE` can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
+/// `CONNECTOR_TLS_CA_FILE`, `SMTP_CA_FILE` and `TRUSTED_PROXIES` can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
 /// backend runs under Next.js and never binds a port itself), so an
 /// unparseable value refusing to boot is the correct, Rust-specific failure
 /// mode. `SMTP_PORT` deliberately has no equivalent error variant —
@@ -123,6 +123,15 @@ pub enum ConfigError {
     /// quietly keep refusing the internal webhook target the operator listed.
     #[error("WEBHOOK_ALLOWED_CIDRS: {0}")]
     MalformedWebhookAllowedCidrs(String),
+    /// `TRUSTED_PROXIES` holds an entry that is neither a network, nor an
+    /// address, nor a compose service name (`SEC-75` decision 1).
+    ///
+    /// Fails config resolution for the same reason
+    /// [`ConfigError::MalformedWebhookAllowedCidrs`] does: a dropped
+    /// entry would quietly keep refusing to trust a proxy the operator
+    /// listed, and the API would then see one source for every caller.
+    #[error("TRUSTED_PROXIES: {0}")]
+    MalformedTrustedProxies(String),
     /// `SECRET_MANAGER` or the settings of the manager it names are unusable
     /// (`SRC-12` part B). Fails config resolution: an operator who named a
     /// manager must not get an installation that quietly has none.
@@ -303,6 +312,20 @@ pub struct Config {
     /// deliberately no "allow every internal address" switch for webhooks.
     /// Empty by default.
     pub webhook_allowed_cidrs: Vec<ipnet::IpNet>,
+    /// The addresses and networks of the proxies whose `X-Forwarded-For`
+    /// the API reads (`TRUSTED_PROXIES`, `SEC-75` decision 1).
+    ///
+    /// Empty by default: with nothing trusted, every request's source is
+    /// the peer address, and a header nobody vouched for is never read
+    /// (fail closed).
+    pub trusted_proxy_cidrs: Vec<ipnet::IpNet>,
+    /// The compose service names of the proxies whose `X-Forwarded-For`
+    /// the API reads (`TRUSTED_PROXIES`, `SEC-75` decision 1).
+    ///
+    /// A name, not an address, because a compose network's addresses are
+    /// not fixed: the name is resolved again every few minutes (see
+    /// [`crate::client_source::TrustedProxies::refresh`]).
+    pub trusted_proxy_names: Vec<String>,
     /// Test-only: lets webhook tests reach a `wiremock` listener on
     /// loopback, which no deployment setting can open. `WEBHOOK_TEST_ALLOW_ALL`
     /// is read only when compiled for tests (`cfg!(test)`), so in a service
@@ -1345,6 +1368,8 @@ impl std::fmt::Debug for Config {
                 &self.connector_probe_allowed_cidrs,
             )
             .field("webhook_allowed_cidrs", &self.webhook_allowed_cidrs)
+            .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
+            .field("trusted_proxy_names", &self.trusted_proxy_names)
             .field("webhook_test_allow_all", &self.webhook_test_allow_all)
             .field("connector_secrets_dir", &self.connector_secrets_dir)
             .field(
@@ -1877,6 +1902,16 @@ impl Config {
                 .map_err(|_| ConfigError::InvalidPort(raw.clone()))?,
             None => 8080,
         };
+        // `TRUSTED_PROXIES` (`SEC-75` decision 1): the networks, addresses
+        // and compose service names of the proxies whose
+        // `X-Forwarded-For` the API reads. Refused when an entry is none
+        // of those, for the same reason `CONNECTOR_PROBE_ALLOWED_CIDRS`
+        // is: a dropped entry would quietly stop trusting a proxy the
+        // operator meant to trust.
+        let trusted_proxies = crate::client_source::parse_trusted_proxies(
+            env.get("TRUSTED_PROXIES").map_or("", String::as_str),
+        )
+        .map_err(ConfigError::MalformedTrustedProxies)?;
 
         // LLM_KEY || MINIMAX_API_KEY || "" — the one `||` chain in this
         // config; an empty LLM_KEY falls through to MINIMAX_API_KEY.
@@ -1991,6 +2026,13 @@ impl Config {
                 env.get("WEBHOOK_ALLOWED_CIDRS").map_or("", String::as_str),
             )
             .map_err(ConfigError::MalformedWebhookAllowedCidrs)?,
+            // `SEC-75` decision 1: the proxies whose `X-Forwarded-For`
+            // the API reads. A list of networks, addresses and compose
+            // service names; an entry that is none of them refuses the
+            // configuration instead of being dropped (a dropped entry
+            // would quietly stop trusting a proxy the operator listed).
+            trusted_proxy_cidrs: trusted_proxies.0,
+            trusted_proxy_names: trusted_proxies.1,
             webhook_test_allow_all: cfg!(test)
                 && env
                     .get("WEBHOOK_TEST_ALLOW_ALL")

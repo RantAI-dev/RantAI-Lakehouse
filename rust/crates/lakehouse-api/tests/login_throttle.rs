@@ -321,9 +321,14 @@ async fn a_lock_is_listed_in_the_audit_log_as_the_sign_in_forms_and_not_the_assi
 }
 
 /// QA LH-SEC-5-01 (`ADM-14` decisions D9 and D14): a sign-in records the
-/// browser it came from, records no network address (the API has no trusted
-/// source for one), and creates exactly one session — the six rows QA saw for
-/// one administrator are six sign-ins, not one sign-in that repeats.
+/// browser it came from and creates exactly one session — the six rows QA
+/// saw for one administrator are six sign-ins, not one sign-in that
+/// repeats.
+///
+/// The network address is now recorded too (`SEC-75` decision 7, which
+/// closes the `ADM-14` D10 leftover): this test calls the route without
+/// connect information, so the source is the fixed `unknown` bucket — see
+/// `lakehouse_api::client_source::UNKNOWN_SOURCE`.
 #[tokio::test]
 async fn a_sign_in_records_the_browser_and_creates_exactly_one_session() {
     let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
@@ -349,8 +354,11 @@ async fn a_sign_in_records_the_browser_and_creates_exactly_one_session() {
     assert_eq!(count, 1, "one sign-in, one session");
     assert_eq!(user_agent.as_deref(), Some("QA-Browser/1.0"));
     assert_eq!(
-        created_ip, None,
-        "the network address is not recorded (ADM-14 D10)"
+        created_ip.as_deref(),
+        Some("unknown"),
+        "the session records the source of the sign-in (SEC-75 decision 7); \
+         this test calls the route without connect information, so the \
+         source is the fixed \"unknown\" bucket"
     );
 }
 
@@ -520,6 +528,14 @@ async fn a_successful_sign_in_writes_one_auth_login_row_without_the_email_or_the
 
 /// `GOV-1`: a refused sign-in is on the audit trail too, with no principal
 /// (nobody proved who they were) and nothing the visitor typed.
+///
+/// `SEC-75` decision 3: the trail records the FIRST failure of a source and
+/// a window, and counts the later ones. Both tries below come from the same
+/// source (a test request has no peer address, so it is the `unknown`
+/// bucket), so the second try would only count and write no row of its
+/// own. The counter row is deleted between the two tries, so that each one
+/// is the first of its window, and the test keeps comparing what an
+/// existing account and a missing one write.
 #[tokio::test]
 async fn a_wrong_password_writes_one_refused_auth_login_row_without_the_email_or_the_password() {
     let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
@@ -527,6 +543,10 @@ async fn a_wrong_password_writes_one_refused_auth_login_row_without_the_email_or
 
     let resp = login(&router, THROTTLED_EMAIL, WRONG_PASSWORD).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    sqlx::query("DELETE FROM login_source_throttle")
+        .execute(&pool)
+        .await
+        .expect("clear the per-source counter");
     // The same sentence for an account that does not exist: the trail must
     // not become the oracle the response is built not to be.
     let resp = login(&router, GHOST_EMAIL, WRONG_PASSWORD).await;
