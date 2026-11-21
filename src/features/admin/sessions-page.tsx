@@ -56,8 +56,10 @@ export function SessionsPanel() {
         </span>
       ),
     },
-    // QA LH-SEC-5-01 (ADM-14 D9/D10): the browser the session came from, and
-    // "Not recorded" for the address the API cannot know.
+    // SEC-75 decision 7 (QA LH-SEC-5-01, ADM-14 D9/D10): the SOURCE of the
+    // sign-in — the address a trusted proxy saw, or the peer's own address,
+    // `unknown` when the API cannot see the peer's address at all. "Not
+    // recorded" is now only a session that predates that change.
     { key: "ip", header: "IP", render: (r) => r.createdIp ?? "Not recorded" },
     {
       key: "ua",
