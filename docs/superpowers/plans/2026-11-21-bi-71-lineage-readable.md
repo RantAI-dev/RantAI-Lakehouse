@@ -206,3 +206,33 @@ Developer: Opus developer agent (console design work), 2026-11-20. Branch
    focus returns to the button. Not the browser Fullscreen API (iPhone
    Safari does not support it for elements). Opening and closing ease over
    200 ms, none under reduced motion. Page scroll is locked while it is open.
+
+## Handoff 2 (owner QA round 1)
+
+Commits:
+
+- `6ba2b96db` step icons and labels: `source` (Landmark, "Source"), `dataset`
+  (Database, "Dataset"), and `iceberg` (Table2, "Iceberg"), a third kind the
+  API sends (`routes/lineage.rs`, `g.node(.., "iceberg")`) that had neither.
+  `LINEAGE_STEP_KINDS` lists every kind the API sends; `src/lib/lineage-words.test.ts`
+  holds both maps to it. The list is kept by hand, so a new API kind must be
+  added there.
+- `27d443c70` full-screen map: a fourth ghost button (Maximize2 / Minimize2,
+  tooltip "Full screen" / "Exit full screen", `F`) opens the map in a portal
+  overlay (`fixed inset-0 z-50`, `role="dialog"`), fitted on open and on close
+  (the map inside is remounted each way). Esc, the button or `F` closes it;
+  focus returns to the inline button; `body` scroll is locked while open;
+  200 ms opacity fade, none under reduced motion. `stubRectWidth` in
+  `src/lib/test-layout.ts` takes an optional height.
+
+Commands (each wrapped in flock + systemd-run, 3G cap):
+
+- `bun x tsc --noEmit -p .`: clean.
+- `bun x eslint` on all changed files: clean (after replacing a ref read in render with state).
+- `bun test` on the panel test, `asset-lineage-mindmap.test.tsx`,
+  `asset-lineage-map.test.ts`, `pan-zoom.test.ts`, `lineage-words.test.ts`: 36 pass, 0 fail.
+
+Not verified: no browser check (overlay look, fade, iPhone Safari, safe-area
+insets); no focus trap inside the overlay (Tab can reach the page behind it);
+an overlay opened inside another modal was not tried; the full test run and
+CI were not run. Nothing pushed.
