@@ -17,7 +17,9 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { useDataTable } from "@/hooks/use-data-table"
+import { cellText as formatCellText } from "@/lib/cell-format"
 import { copyTextWithToast } from "@/lib/copy-text"
+import { DEFAULT_NUMBER_LOCALE } from "@/lib/formatting-settings"
 import { toTsv } from "@/lib/csv"
 import { formatBytes, formatCost, formatDuration, formatNumber } from "@/lib/format"
 import { queryEngineLabel, WORKLOAD_CLASS_LABEL } from "@/lib/status"
@@ -31,7 +33,14 @@ import { QueryColumnFilters } from "./query-column-filters"
 import { QueryColumnStatistics } from "./query-column-statistics"
 import { DOWNLOADS_OFF_REASON, QueryDownloadMenu } from "./query-download-menu"
 import { QueryResultBanner } from "./query-result-banner"
-import { cellText, filterRows, type QueryRow } from "./query-grid-tools"
+import {
+  cellText,
+  compareNumericCells,
+  filterRows,
+  formatDecimalText,
+  isNumericColumn,
+  type QueryRow,
+} from "./query-grid-tools"
 import { QueryPlanPanel } from "./query-transparency-panel"
 
 /**
@@ -53,12 +62,19 @@ function PillList({ values }: { values: string[] | null }) {
   )
 }
 
-/** How a cell reads. Numbers keep their type so they sort and align as numbers. */
-function renderCell(value: QueryCell): React.ReactNode {
+/**
+ * How a cell reads (`UX-9` browser review, SHOULD-FIX 2): a number with the
+ * deployment's number locale (Settings → Reporting), through the dashboards'
+ * own table formatter (`lib/cell-format.ts`), and numeric text — ClickHouse
+ * quotes 64-bit integers — with the same separators and every digit kept.
+ * The value itself is never changed: Copy as TSV, the inspector and the
+ * filters read the cell as the engine sent it.
+ */
+function renderCell(value: QueryCell, numeric: boolean, locale: string): React.ReactNode {
   if (value === null) return <span className="text-muted-foreground">NULL</span>
-  if (typeof value === "number") return formatNumber(value)
+  if (typeof value === "number") return formatCellText(value, undefined, locale)
   if (typeof value === "boolean") return String(value)
-  return value
+  return numeric ? formatDecimalText(value, locale) : value
 }
 
 /**
@@ -84,16 +100,18 @@ function toTsvText(columns: readonly string[], rows: readonly QueryRow[]): strin
 function buildQueryResultColumns(
   columnNames: readonly string[],
   rows: readonly Record<string, QueryCell>[],
-  onInspect: (column: string, value: QueryCell) => void
+  onInspect: (column: string, value: QueryCell) => void,
+  locale: string
 ): ColumnDef<Record<string, QueryCell>>[] {
   return columnNames.map((colName) => {
-    // Decided from the data, not from a guess about the column name: the
-    // server sends whatever type ClickHouse reported it as, so a numeric column
-    // is one whose values arrive as numbers. Numeric columns sort
-    // numerically and sit right-aligned, the way they do everywhere else
-    // in the console — before this every value was a string, so "10" came
-    // before "9".
-    const numeric = rows.some((row) => typeof row[colName] === "number")
+    // Decided from the data, not from a guess about the column name: a
+    // column is numeric when a value arrives as a number or every value
+    // reads as one (`isNumericColumn`, the statistics' own rule) — ClickHouse
+    // sends a 64-bit sum as text, and before this "3010348" sat left-aligned
+    // with no separators (UX-9 browser review). Numeric columns sort by
+    // value and sit right-aligned, the way they do everywhere else in the
+    // console.
+    const numeric = isNumericColumn(rows.map((row) => row[colName] ?? null))
     return {
       id: colName,
       accessorFn: (row) => row[colName] ?? null,
@@ -106,43 +124,41 @@ function buildQueryResultColumns(
       ),
       cell: ({ row, getValue }) => {
         const value = getValue() as QueryCell
-        return (
-          <span
-            className={
-              numeric
-                ? "flex w-full items-center justify-end gap-1"
-                : "flex items-center gap-1"
-            }
+        // The shared table has no cell click, so the inspector is opened
+        // from a button of its own. It shows on the row's hover or focus
+        // only (UX-9 browser review): at rest the value is the whole cell.
+        // Its name carries the row as well as the column: the grid holds
+        // thousands of rows, and "Inspect city" alone leaves a reader who
+        // cannot see the screen with hundreds of buttons that read the same.
+        const inspect = (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label={`Inspect ${colName}, row ${row.index + 1}`}
+            onClick={() => onInspect(colName, value)}
+            className="shrink-0 opacity-0 transition-opacity duration-150 ease-ui group-hover/row:opacity-100 group-focus-within/row:opacity-100 focus-visible:opacity-100"
           >
-            <span
-              className={
-                numeric
-                  ? "font-mono text-xs tabular-nums"
-                  : "font-mono text-xs"
-              }
-            >
-              {renderCell(value)}
-            </span>
-            {/* The shared table has no cell click, so the inspector is opened
-                from a button of its own. It stays quiet: the value is the
-                thing the reader came for. Its name carries the row as well
-                as the column: the grid holds thousands of rows, and "Inspect
-                city" alone leaves a reader who cannot see the screen with
-                hundreds of buttons that read the same. */}
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label={`Inspect ${colName}, row ${row.index + 1}`}
-              onClick={() => onInspect(colName, value)}
-            >
-              <Search className="size-3" aria-hidden />
-            </Button>
+            <Search className="size-3" aria-hidden />
+          </Button>
+        )
+        return numeric ? (
+          // The button sits before a number, so the digits stay flush right.
+          <span className="flex w-full items-center justify-end gap-1">
+            {inspect}
+            <span className="text-[13px] tabular-nums">{renderCell(value, true, locale)}</span>
+          </span>
+        ) : (
+          <span className="flex items-center gap-1">
+            <span className="min-w-0 truncate text-[13px]">{renderCell(value, false, locale)}</span>
+            {inspect}
           </span>
         )
       },
       enableSorting: true,
-      sortingFn: numeric ? "basic" : "alphanumeric",
+      sortingFn: numeric
+        ? (a, b, id) => compareNumericCells(a.getValue(id) as QueryCell, b.getValue(id) as QueryCell)
+        : "alphanumeric",
       meta: { label: colName },
     }
   })
@@ -162,6 +178,11 @@ interface QueryResultsSectionProps {
    * author SQL sources or build a chart.
    */
   readonly onMakeChart?: () => void
+  /**
+   * The deployment's number locale (Settings → Reporting), for the grid's
+   * numbers; `en-US`, the server's default, until it is known.
+   */
+  readonly numberLocale?: string
 }
 
 /** The run's own numbers in one line: what came back and what it cost. */
@@ -252,8 +273,14 @@ export function QueryResultsSection(props: QueryResultsSectionProps) {
   }, [])
 
   const columns = React.useMemo(
-    () => buildQueryResultColumns(result.columns, result.rows, onInspect),
-    [result.columns, result.rows, onInspect]
+    () =>
+      buildQueryResultColumns(
+        result.columns,
+        result.rows,
+        onInspect,
+        props.numberLocale ?? DEFAULT_NUMBER_LOCALE
+      ),
+    [result.columns, result.rows, onInspect, props.numberLocale]
   )
 
   const { table } = useDataTable({

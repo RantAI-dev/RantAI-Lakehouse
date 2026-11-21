@@ -272,6 +272,34 @@ platform's keys (no helper existed, so `isApplePlatform`/`studioKeys` were
 added to `src/lib/editor-shortcuts.ts`). This supersedes the two matching
 "Not verified" items above.
 
+**Browser review fixes (planner, QA stack, 2026-11-21)**, one commit:
+1. Schema rows: the cause was the console's base `li { font-size: 16px }`
+   (globals.css; the same rule sized bare `<p>`s in the Plan tab). Every row
+   now names its size (13 px, normal weight) and has one shape in every layer:
+   the name alone, truncated, with the full name and the address it inserts
+   (or why it cannot) in the row's tooltip.
+2. Result cells: scoped to Query Studio (`query-results-section.tsx` builds
+   its own columns over the shared `DataTable`; `sql-rows-table`/`rows-table`
+   are the dashboard and pipeline previews, not used here). A column is
+   numeric by the statistics' own rule (`isNumericColumn`), so ClickHouse's
+   quoted 64-bit sums count; numbers go through the dashboards' formatter
+   (`lib/cell-format.ts`) in the Settings → Reporting number locale
+   (`GET /api/settings/reporting`, any signed-in person), numeric text gets
+   the same separators with every digit kept (`formatDecimalText`, BigInt),
+   and numeric columns sort by value. Cells are sans 13 px, numbers
+   `tabular-nums` and right-aligned; the inspector button shows on row hover
+   or focus only. Copy as TSV, filters and the inspector still read the raw
+   value.
+3. Autocomplete: CodeMirror's emoji icons are off (`icons: false` in Query
+   Studio's completion extension) and each option ends with a small muted
+   word (column, table, parameter, keyword); the list's `li` reads at 13 px.
+   The dashboard SQL source and pipeline editors use the editor's basic setup
+   and keep the default icons: not changed here.
+4. Default mode: Ask (natural language), as before the revamp — the hook
+   starts on `"nl"` (`use-query-studio.ts`, unchanged) and a stored draft
+   restores the person's last choice; links that carry SQL (`?sql=`,
+   `?saved=`, `?run=`) open on SQL. Not changed.
+
 **Inventory map (section 3)** — "kept" means the same behaviour, labels and
 tests, restyled; files under `src/features/queries/` unless stated.
 

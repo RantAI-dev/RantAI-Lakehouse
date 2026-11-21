@@ -568,3 +568,57 @@ describe("the result's header row", () => {
     expect(screen.getAllByText("Not measured").length).toBeGreaterThan(0)
   })
 })
+
+// UX-9 browser review, SHOULD-FIX 2: numbers right-aligned in the console's
+// number format, sans with tabular figures, the inspector quiet at rest.
+describe("the grid's cells", () => {
+  const SUMS = result({
+    columns: ["kawasan", "jumlah"],
+    rows: [
+      { kawasan: "ASEAN", jumlah: "3010348" },
+      { kawasan: "Eropa", jumlah: "1037565" },
+    ],
+    rowCount: 2,
+  })
+
+  it("reads a column of numeric text as numbers, with separators, right-aligned", () => {
+    renderSection(SUMS)
+    const cell = grid().getByText("3,010,348")
+    expect(cell.className).toContain("tabular-nums")
+    expect(cell.className).not.toContain("font-mono")
+    expect(cell.parentElement?.className).toContain("justify-end")
+    // The text column stays text, in the sans face.
+    expect(grid().getByText("ASEAN").className).not.toContain("font-mono")
+  })
+
+  it("writes numbers in the deployment's number locale", () => {
+    render(
+      <TableProviders>
+        <QueryResultsSection
+          result={SUMS}
+          runId="7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f"
+          downloadBusy={null}
+          onDownload={() => {}}
+          numberLocale="id-ID"
+        />
+      </TableProviders>
+    )
+    expect(grid().getByText("3.010.348")).toBeTruthy()
+  })
+
+  it("copies the value as the engine sent it, not as the grid writes it", async () => {
+    renderSection(SUMS)
+    fireEvent.click(screen.getByRole("button", { name: "Copy as TSV" }))
+    await waitFor(() =>
+      expect(copied).toEqual(["kawasan\tjumlah\r\nASEAN\t3010348\r\nEropa\t1037565"])
+    )
+  })
+
+  it("keeps the cell inspector hidden until the row is hovered or focused", () => {
+    renderSection(SUMS)
+    const inspect = screen.getByRole("button", { name: "Inspect jumlah, row 1" })
+    expect(inspect.className).toContain("opacity-0")
+    expect(inspect.className).toContain("group-hover/row:opacity-100")
+    expect(inspect.className).toContain("focus-visible:opacity-100")
+  })
+})
