@@ -22,8 +22,8 @@ import {
   assetStudioTarget,
   NO_READABLE_TABLE,
 } from "@/lib/asset-query"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { isIcebergCandidate, snapshotRelativeTime } from "@/lib/lakehouse-view"
-import { notifyError, notifySuccess } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import type { AssetColumn, AssetDetail } from "@/services/contracts/assets"
 import { AssetAbout } from "./asset-about"
@@ -83,15 +83,6 @@ export function qualitySummary(checks: AssetDetail["qualityChecks"]) {
     null
   )
   return { passed, warning, failed, evaluated, unevaluated: checks.length - evaluated, lastRun }
-}
-
-async function copyText(value: string, what: string) {
-  try {
-    await navigator.clipboard.writeText(value)
-    notifySuccess(`Copied ${what}`)
-  } catch (err) {
-    notifyError("Failed to copy", err)
-  }
 }
 
 /**
@@ -242,7 +233,7 @@ export function AssetOverview({
         <SectionCard
           size="sm"
           title="Sensitive columns"
-          description="Masked by policy or classified confidential and above."
+          description="Columns a policy masks, and columns classified confidential or above. A classification alone does not mask a column."
         >
           {sensitive.length === 0 ? (
             <EmptyState title="No sensitive columns" className="py-4" />
@@ -289,7 +280,7 @@ export function AssetOverview({
         action={
           readable ? (
             <div className="flex gap-1.5">
-              <Button size="sm" variant="ghost" onClick={() => void copyText(sql, "SQL")}>
+              <Button size="sm" variant="ghost" onClick={() => void copyTextWithToast(sql, "Copied SQL")}>
                 <Copy />
                 Copy
               </Button>

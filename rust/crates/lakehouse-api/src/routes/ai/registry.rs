@@ -557,6 +557,16 @@ fn format_chart_schema() -> Value {
         properties.extend(style);
     }
     properties.insert("referenceLines".to_owned(), reference_lines_schema());
+    // `AI-29`: the append field uses the same item schema, but its own
+    // description — a model must not mistake it for the replacing list.
+    let mut add_lines = reference_lines_schema();
+    if let Value::Object(schema) = &mut add_lines
+        && let Some(Value::String(description)) = schema.get_mut("description")
+    {
+        "lines to add to the chart's own, which stay (at most 5 in all). Use this to add a line; referenceLines replaces every line the chart has."
+            .clone_into(description);
+    }
+    properties.insert(super::tools::ADD_REFERENCE_LINES.to_owned(), add_lines);
     json!({ "type": "function", "function": { "name": "format_chart",
         "description": "Change only how a saved chart looks: number and date formats (rupiah, percent, compact, decimals), colours (a palette, a colour per series, colour by value), axes, data labels, reference lines (a target at 1,000, an average, a trend, a band), notes, tooltip fields and, for a table or KPI, conditional colours. Send ONLY the fields that change: a field you give replaces that field, null removes it, and everything you leave out stays as it is (the data, the title, the filters and the other formatting). list_charts gives the ids. To change what the chart shows, use update_chart.",
         "parameters": { "type": "object", "properties": properties, "required": ["chart"] } } })
@@ -1715,8 +1725,13 @@ fn rotate_connector_credential_schema() -> Value {
 }
 
 fn create_pipeline_schema() -> Value {
+    // The `steps` parameter is a pre-built value rather than a literal: the
+    // three form kinds of BLD-16 made the one `json!` literal deeper than
+    // the macro's expansion budget, and a named function a reader can jump
+    // to beats a raised `recursion_limit` the whole crate would carry.
+    let steps = create_pipeline_steps_parameter();
     json!({ "type": "function", "function": { "name": "create_pipeline",
-        "description": "Author a new pipeline that reads tables and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold -- a pipeline never writes bronze, which is written by ingestion. A pipeline is 1-5 named inputs and 0-20 named steps. Give the shape one of two ways: (a) inputs and steps, which is the fuller one -- a step is { name, kind: 'sql', sql } with ONE read-only SELECT over the inputs and earlier steps by their names (joins, aggregations, CASE, subqueries and window functions are allowed; a table that is not an input is refused, so list every table you read under inputs), or { name, kind: 'transform', reads, transforms } with the five operations below; or (b) today's sourceZone, sourceTable and transforms, which is one input and one transform step. Send one form, never both. Use a SQL step whenever the person asks for a join, a group-by, an aggregate, a calculated column or anything the five operations cannot say. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
+        "description": "Author a new pipeline that reads tables and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold -- a pipeline never writes bronze, which is written by ingestion. A pipeline is 1-5 named inputs and 0-20 named steps. Give the shape one of two ways: (a) inputs and steps, which is the fuller one -- a step is one of: { name, kind: 'sql', sql } with ONE read-only SELECT over the inputs and earlier steps by their names (joins, aggregations, CASE, subqueries and window functions are allowed; a table that is not an input is refused, so list every table you read under inputs), { name, kind: 'transform', reads, transforms } with the five operations below, or a form step: { name, kind: 'join', left, right, joinType, on, columns }, { name, kind: 'aggregate', reads, groupBy, measures, havingMatch, having }, { name, kind: 'filter', reads, match, conditions }; or (b) today's sourceZone, sourceTable and transforms, which is one input and one transform step. Send one form, never both. Prefer a form step (join, aggregate, filter, transform) when it can say what the person asked, because they can then change it in the form; use a SQL step for anything else (a CASE, a calculated column, a window function, a join that is not on equal columns, all and any mixed). A join matches on equal columns only, 1-10 pairs; look its sides' columns up first with describe_mart, describe_dataset or run_sql and list every output column. A measure's name cannot be a column the step reads; a having names a group-by column or a measure; values are text, except a count, sum or average is compared with a number. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "description": { "type": "string" },
@@ -1727,15 +1742,7 @@ fn create_pipeline_schema() -> Value {
                     "zone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
                     "table": { "type": "string" } },
                     "required": ["name", "zone", "table"] } },
-            "steps": { "type": "array", "maxItems": 20,
-                "description": "the pipeline's steps in order; the last one's result is the output",
-                "items": { "type": "object", "properties": {
-                    "name": { "type": "string" },
-                    "kind": { "type": "string", "enum": ["sql", "transform"] },
-                    "sql": { "type": "string", "description": "kind=sql: one read-only SELECT over the inputs and earlier steps" },
-                    "reads": { "type": "string", "description": "kind=transform: the input or earlier step it reads" },
-                    "transforms": { "type": "array", "items": { "type": "string" }, "description": "kind=transform: the operations, one per entry" } },
-                    "required": ["name", "kind"] } },
+            "steps": steps,
             "sourceZone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
             "sourceTable": { "type": "string" },
             "targetZone": { "type": "string", "enum": ["silver", "gold"] },
@@ -1744,6 +1751,61 @@ fn create_pipeline_schema() -> Value {
             "incrementalColumn": { "type": "string", "description": "optional column for incremental loads" },
             "schedule": { "type": "string", "description": "\"manual\" or a cron expression" } },
             "required": ["name", "targetZone", "targetTable"] } } })
+}
+
+/// `create_pipeline`'s `steps` parameter (BLD-16 / J1, J2): a step is SQL,
+/// the five operations, or one of the three form kinds, each property
+/// naming the kind it belongs to so the model sends the right shape.
+fn create_pipeline_steps_parameter() -> Value {
+    json!({ "type": "array", "maxItems": 20,
+        "description": "the pipeline's steps in order; the last one's result is the output",
+        "items": { "type": "object", "properties": {
+            "name": { "type": "string" },
+            "kind": { "type": "string", "enum": ["sql", "transform", "join", "aggregate", "filter"] },
+            "sql": { "type": "string", "description": "kind=sql: one read-only SELECT over the inputs and earlier steps" },
+            "reads": { "type": "string", "description": "kind=transform/aggregate/filter: the input or earlier step it reads" },
+            "transforms": { "type": "array", "items": { "type": "string" }, "description": "kind=transform: the operations, one per entry" },
+            "left": { "type": "string", "description": "kind=join: the input or earlier step on the left side" },
+            "right": { "type": "string", "description": "kind=join: the input or earlier step on the right side" },
+            "joinType": { "type": "string", "enum": ["inner", "left", "right", "full"], "description": "kind=join: the join type" },
+            "on": { "type": "array", "minItems": 1, "maxItems": 10,
+                "description": "kind=join: the column pairs matched on, equal columns only",
+                "items": { "type": "object", "properties": {
+                    "left": { "type": "string", "description": "the left side's column" },
+                    "right": { "type": "string", "description": "the right side's column" } },
+                    "required": ["left", "right"] } },
+            "columns": { "type": "array", "minItems": 1, "maxItems": 300,
+                "description": "kind=join: the output columns, listed after looking them up",
+                "items": { "type": "object", "properties": {
+                    "side": { "type": "string", "enum": ["left", "right"], "description": "which side the column comes from" },
+                    "column": { "type": "string", "description": "the side's column" },
+                    "name": { "type": "string", "description": "the output name; leave out to keep the column's own" } },
+                    "required": ["side", "column"] } },
+            "groupBy": { "type": "array", "maxItems": 20, "items": { "type": "string" }, "description": "kind=aggregate: the columns to group by; empty means one row" },
+            "measures": { "type": "array", "maxItems": 50,
+                "description": "kind=aggregate: the measures; a name may not be a column the step reads",
+                "items": { "type": "object", "properties": {
+                    "function": { "type": "string", "enum": ["count", "countDistinct", "sum", "avg", "min", "max"] },
+                    "column": { "type": "string", "description": "the column; only count may leave it out" },
+                    "name": { "type": "string", "description": "the output name" } },
+                    "required": ["function", "name"] } },
+            "havingMatch": { "type": "string", "enum": ["all", "any"], "description": "kind=aggregate: how the having conditions combine; default all" },
+            "match": { "type": "string", "enum": ["all", "any"], "description": "kind=filter: how the conditions combine; default all" },
+            "having": { "type": "array", "maxItems": 20,
+                "description": "kind=aggregate: conditions on the group-by columns and measures",
+                "items": { "type": "object", "properties": {
+                    "column": { "type": "string", "description": "a group-by column or a measure's name" },
+                    "operator": { "type": "string", "enum": ["=", "!=", "<", ">", "<=", ">="] },
+                    "value": { "type": "string", "description": "text, except a count, sum or average is compared with a number" } },
+                    "required": ["column", "operator", "value"] } },
+            "conditions": { "type": "array", "minItems": 1, "maxItems": 20,
+                "description": "kind=filter: the rows to keep",
+                "items": { "type": "object", "properties": {
+                    "column": { "type": "string" },
+                    "operator": { "type": "string", "enum": ["=", "!=", "<", ">", "<=", ">="] },
+                    "value": { "type": "string" } },
+                    "required": ["column", "operator", "value"] } } },
+            "required": ["name", "kind"] } })
 }
 
 fn get_pipeline_schema() -> Value {
@@ -1903,6 +1965,16 @@ fn list_report_subscriptions_schema() -> Value {
             "board": { "type": "string", "description": "only this dashboard's, optional" } } } } })
 }
 
+/// `AI-30`: the installation's own people picker, so the model can learn a
+/// colleague's id to pass as `recipients[].userId` instead of inventing one.
+fn find_report_recipients_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "find_report_recipients",
+        "description": "Find people of this installation to send a scheduled report to, by part of their name or email address (at most 20). Gives each person's id, name and email; pass the id as recipients[].userId on create_report_subscription or update_report_subscription.",
+        "parameters": { "type": "object", "properties": {
+            "q": { "type": "string", "description": "part of a name or an email address" } },
+            "required": ["q"] } } })
+}
+
 fn update_report_subscription_schema() -> Value {
     json!({ "type": "function", "function": { "name": "update_report_subscription",
         "description": "Change a scheduled report the person set up: the schedule, time zone, attachments, filters or recipients, or pause or resume it. Give only what changes; everything left out stays. Naming recipients in `recipients` needs a human's approval.",
@@ -1983,6 +2055,92 @@ fn get_embed_snippet_schema() -> Value {
             "board": { "type": "string", "description": "the dashboard's id, from list_boards" },
             "chart": { "type": "string", "description": "one of the dashboard's chart ids, from list_charts, to embed one chart instead of the dashboard; leave out for the dashboard" } },
             "required": ["board"] } } })
+}
+
+/// The blocks of a report (`BI-18` part D, `lakehouse_bi::reports::Block`),
+/// shared by [`create_report_schema`] and [`update_report_schema`].
+fn report_blocks_schema(description: &str) -> Value {
+    json!({
+        "type": "array",
+        "description": description,
+        "items": { "type": "object", "properties": {
+            "type": { "type": "string", "enum": ["heading", "paragraph", "list", "link", "chart"] },
+            "text": { "type": "string", "description": "heading, paragraph or link words; plain text, never HTML or Markdown" },
+            "level": { "type": "integer", "enum": [1, 2, 3], "description": "heading size, 1 the largest; 2 when left out" },
+            "items": { "type": "array", "items": { "type": "string" }, "description": "a list's items" },
+            "ordered": { "type": "boolean", "description": "a numbered list when true" },
+            "url": { "type": "string", "description": "a link's address: https://, http://, mailto: or a console path such as /dashboards/<id>" },
+            "chart": { "type": "string", "description": "a chart block's chart id, from list_charts" } },
+            "required": ["type"] }
+    })
+}
+
+fn list_reports_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "list_reports",
+        "description": "List the written reports the person can read: id, title, folder, when it was last saved and how many charts it holds, newest first. Use the id with update_report.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn create_report_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "create_report",
+        "description": "Write a report: a page of headings, paragraphs, lists and links with live charts between them, picked from existing dashboards by chart id (list_charts). Each reader sees every chart with their own access, as on its dashboard. At most 30 charts. Needs a confirm in this chat.",
+        "parameters": { "type": "object", "properties": {
+            "title": { "type": "string", "description": "the report's title" },
+            "folderId": { "type": "string", "description": "a dashboard folder id to file it in; leave out for no folder" },
+            "blocks": report_blocks_schema("the blocks in reading order") },
+            "required": ["title"] } } })
+}
+
+fn update_report_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "update_report",
+        "description": "Change a report: its title, its folder, all its blocks (blocks), blocks added at the end (append), or one chart added at the end (chart, for \"add this chart to the report\"). Give only what changes. Needs a confirm in this chat.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "the report's id, from create_report or the page context" },
+            "title": { "type": "string", "description": "a new title" },
+            "folderId": { "type": "string", "description": "a dashboard folder to move it to; \"\" for no folder" },
+            "blocks": report_blocks_schema("every block, replacing the report's blocks in this order"),
+            "append": report_blocks_schema("blocks added after the last one"),
+            "chart": { "type": "string", "description": "one chart id, from list_charts, added as a chart block at the end" } },
+            "required": ["id"] } } })
+}
+
+fn delete_report_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "delete_report",
+        "description": "Delete a report: it goes to the trash and can be restored for 30 days. Needs human approval.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "the report's id" } },
+            "required": ["id"] } } })
+}
+
+fn list_templates_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "list_templates",
+        "description": "List the dashboard templates: saved dashboard layouts with their charts and filters (no data), with the id, name, the dashboard each was saved from, who saved it and when.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn create_dashboard_from_template_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "create_dashboard_from_template",
+        "description": "Start a new dashboard from a template (list_templates): an independent copy of its layout, charts and filters, under a name you give, in a folder or none. A chart over a table that is gone keeps its tile and says the source is not available. Needs a confirm in this chat.",
+        "parameters": { "type": "object", "properties": {
+            "template": { "type": "string", "description": "the template's id, from list_templates" },
+            "name": { "type": "string", "description": "the new dashboard's name" },
+            "folderId": { "type": "string", "description": "a dashboard folder id; leave out for no folder" } },
+            "required": ["template", "name"] } } })
+}
+
+fn delete_template_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "delete_template",
+        "description": "Delete a dashboard template for good. Dashboards already made from it stay. Needs human approval.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "the template's id, from list_templates" } },
+            "required": ["id"] } } })
 }
 
 /// The AI Copilot's full tool table, in the exact order the LLM sees them
@@ -2728,6 +2886,14 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "dashboard:read",
     },
+    // `AI-30`: a read over the console's own recipient picker; no dashboard is
+    // named, so this stays off `DASHBOARD_SCOPED`.
+    ToolSpec {
+        name: "find_report_recipients",
+        schema: find_report_recipients_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
     ToolSpec {
         name: "update_report_subscription",
         schema: update_report_subscription_schema,
@@ -2796,6 +2962,54 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "",
     },
+    // BI-18 part D (T4, decisions R5 and T5): reports and templates, behind the
+    // permission of their routes. Writing is a confirm in the chat; deleting a
+    // report or a template is an approval, as deleting a dashboard is. Listing
+    // the templates is a read, but the route it mirrors needs `dashboard:write`.
+    // Review round 1, SHOULD-FIX 2: the reports the person may read, so the
+    // assistant has an id for `update_report`. A read, as `list_boards` is.
+    ToolSpec {
+        name: "list_reports",
+        schema: list_reports_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "create_report",
+        schema: create_report_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "update_report",
+        schema: update_report_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_report",
+        schema: delete_report_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "list_templates",
+        schema: list_templates_schema,
+        risk: Risk::Read,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "create_dashboard_from_template",
+        schema: create_dashboard_from_template_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_template",
+        schema: delete_template_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
 ];
 
 /// The `OpenAI`-compatible `tools` schema array, matching
@@ -2844,6 +3058,9 @@ pub enum Reach {
 pub static DASHBOARD_SCOPED: &[(&str, Reach)] = &[
     // Reads: the handler reads through `viewer_for` / `viewer_for_write`.
     ("list_boards", Reach::Anywhere),
+    // BI-18 D review round 1, SHOULD-FIX 2: its handler lists through the
+    // caller's own viewer, as `list_boards` does.
+    ("list_reports", Reach::Anywhere),
     ("list_charts", Reach::Anywhere),
     ("list_sql_sources", Reach::Anywhere),
     ("suggest_join", Reach::Anywhere),
@@ -2991,8 +3208,11 @@ mod tests {
         // `update_report_subscription` and `delete_report_subscription`
         // (`AI-10`, with `RPT-1`) + `set_cache_rule` (`BI-4` part B)
         // + `list_maps` (`BI-16` part C2, `AI-5`) + `list_dashboard_comments`
-        // (`BI-37` D8) + the four signed-embed tools (`BI-26` slice 2).
-        assert_eq!(tool_schemas().len(), 115);
+        // (`BI-37` D8) + the four signed-embed tools (`BI-26` slice 2)
+        // + the six report and template tools (`BI-18` part D, T4)
+        // + `list_reports` (`BI-18` D review round 1, SHOULD-FIX 2)
+        // + `find_report_recipients` (`AI-30`).
+        assert_eq!(tool_schemas().len(), 123);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
@@ -3009,6 +3229,28 @@ mod tests {
             let spec = find(name).expect("registered tool");
             assert_eq!(spec.risk, risk, "{name}");
             assert_eq!(spec.permission, "dashboard:read", "{name}");
+        }
+    }
+
+    /// `BI-18` part D (T4): the report and template tools carry the permission
+    /// of their routes, writing is a confirmation and deleting an approval.
+    #[test]
+    fn the_report_and_template_tools_have_the_risk_and_permission_of_their_routes() {
+        // Review round 1, SHOULD-FIX 2: the listing is a read, as `list_boards`.
+        let list = find("list_reports").expect("registered tool");
+        assert_eq!(list.risk, Risk::Read);
+        assert_eq!(list.permission, "dashboard:read");
+        for (name, risk) in [
+            ("create_report", Risk::WriteLow),
+            ("update_report", Risk::WriteLow),
+            ("delete_report", Risk::WriteHigh),
+            ("list_templates", Risk::Read),
+            ("create_dashboard_from_template", Risk::WriteLow),
+            ("delete_template", Risk::WriteHigh),
+        ] {
+            let spec = find(name).expect("registered tool");
+            assert_eq!(spec.risk, risk, "{name}");
+            assert_eq!(spec.permission, "dashboard:write", "{name}");
         }
     }
 
@@ -3174,6 +3416,7 @@ mod tests {
             .collect();
         names.sort_unstable();
         let mut allowed = crate::routes::ai::tools::FORMAT_FIELDS.to_vec();
+        allowed.push(crate::routes::ai::tools::ADD_REFERENCE_LINES);
         allowed.sort_unstable();
         assert_eq!(names, allowed);
     }

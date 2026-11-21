@@ -254,9 +254,17 @@ impl PipelineInput {
 /// BLD-1 part 1 / D1: one named step. A step is a table, and a later step
 /// reads it by [`Self::name`].
 ///
-/// The wire shape is D1's internally tagged union (`kind` is `"transform"`
-/// or `"sql"`), so one type carries both the API body and the stored
-/// `steps` JSONB column and no second mapping can drift.
+/// The wire shape is D1's internally tagged union (`kind` is `"transform"`,
+/// `"sql"` — or, since BLD-16 / J1, `"join"`, `"aggregate"` or `"filter"`),
+/// so one type carries both the API body and the stored `steps` JSONB column
+/// and no second mapping can drift.
+///
+/// J2: the new kinds' fields are strings and lists of strings, exactly as
+/// `transforms` is, and every field has `#[serde(default)]` — the store holds
+/// what the route sent, and the **compiler** (`lakehouse-api`'s
+/// `pipeline_forms`) parses each field into a checked value and refuses it
+/// with a path (D7), so a missing or wrong field is a 400 naming
+/// `steps[i].<field>`, never serde's "body JSON is invalid".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PipelineStep {
@@ -277,6 +285,144 @@ pub enum PipelineStep {
         /// The SQL as written; the compiler checks it (D5).
         sql: String,
     },
+    /// BLD-16 / J1, J3: a join of two inputs or earlier steps on one or more
+    /// equality pairs, projecting the listed output columns.
+    Join {
+        /// The step's name; later steps read it by this.
+        name: String,
+        /// The input or earlier step on the left side.
+        #[serde(default)]
+        left: String,
+        /// The input or earlier step on the right side.
+        #[serde(default)]
+        right: String,
+        /// `inner`, `left`, `right` or `full`.
+        #[serde(rename = "joinType", default)]
+        join_type: String,
+        /// 1 to 10 equality pairs, checked by the API's compiler (J2).
+        #[serde(default)]
+        on: Vec<JoinPair>,
+        /// 1 to 300 output columns, checked by the API's compiler (J2).
+        #[serde(default)]
+        columns: Vec<JoinColumn>,
+    },
+    /// BLD-16 / J1, J4: group by columns and measures over one input or
+    /// earlier step, with optional `having` conditions on the result.
+    Aggregate {
+        /// The step's name; later steps read it by this.
+        name: String,
+        /// The input or earlier step this reads.
+        #[serde(default)]
+        reads: String,
+        /// 0 to 20 columns to group by.
+        #[serde(rename = "groupBy", default)]
+        group_by: Vec<String>,
+        /// 0 to 50 measures; at least one of `groupBy`/`measures` is needed.
+        #[serde(default)]
+        measures: Vec<Measure>,
+        /// `all` or `any`; empty means `all` (J2).
+        #[serde(
+            rename = "havingMatch",
+            default,
+            skip_serializing_if = "String::is_empty"
+        )]
+        having_match: String,
+        /// 0 to 20 conditions on the group columns and measures.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        having: Vec<StepCondition>,
+    },
+    /// BLD-16 / J1, J5: keep the rows of one input or earlier step that meet
+    /// all — or any — of the conditions.
+    Filter {
+        /// The step's name; later steps read it by this.
+        name: String,
+        /// The input or earlier step this reads.
+        #[serde(default)]
+        reads: String,
+        /// `all` or `any`; empty means `all` (J2).
+        #[serde(rename = "match", default)]
+        match_mode: String,
+        /// 1 to 20 conditions, checked by the API's compiler (J2).
+        #[serde(default)]
+        conditions: Vec<StepCondition>,
+    },
+}
+
+/// BLD-16 / J2: one equality pair a join matches on — `left` is a column of
+/// the join's left side, `right` of its right side.
+///
+/// The fields are strings on purpose: the store holds what the route sent,
+/// and the compiler (`lakehouse-api`'s `pipeline_forms`) parses each into a
+/// checked value and refuses it with a path (`steps[i].on[j]`), so a missing
+/// or wrong field is a 400 that names it, never serde's "body JSON is
+/// invalid" (D7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinPair {
+    /// The left side's column.
+    #[serde(default)]
+    pub left: String,
+    /// The right side's column.
+    #[serde(default)]
+    pub right: String,
+}
+
+/// BLD-16 / J2: one output column of a join — a column of one side, under an
+/// optional output name that defaults to `column`.
+///
+/// Strings for the same reason as [`JoinPair`]: the compiler checks and names
+/// the field at fault (`steps[i].columns[j]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinColumn {
+    /// `left` or `right`.
+    #[serde(default)]
+    pub side: String,
+    /// The side's column.
+    #[serde(default)]
+    pub column: String,
+    /// The output name; empty means `column`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+/// BLD-16 / J2: one condition of a filter or a `having`: a column, one of the
+/// six operators the transform grammar allows, and a value compared as
+/// `ClickHouse` compares a column with a string literal.
+///
+/// Strings for the same reason as [`JoinPair`]: the compiler checks and names
+/// the field at fault (`steps[i].conditions[j]`, `steps[i].having[j]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepCondition {
+    /// The column being compared.
+    #[serde(default)]
+    pub column: String,
+    /// One of `= != < > <= >=`.
+    #[serde(default)]
+    pub operator: String,
+    /// At most 1,000 characters, compared as text.
+    #[serde(default)]
+    pub value: String,
+}
+
+/// BLD-16 / J2: one measure of an aggregate: a function, its optional column
+/// (empty only for `count`), and the output name.
+///
+/// Strings for the same reason as [`JoinPair`]: the compiler checks and names
+/// the field at fault (`steps[i].measures[j]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Measure {
+    /// `count`, `countDistinct`, `sum`, `avg`, `min` or `max`.
+    #[serde(default)]
+    pub function: String,
+    /// The column; empty only for `count`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub column: String,
+    /// The output name, which may not be a column the step reads (F2).
+    #[serde(default)]
+    pub name: String,
 }
 
 impl PipelineStep {
@@ -284,7 +430,11 @@ impl PipelineStep {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::Transform { name, .. } | Self::Sql { name, .. } => name,
+            Self::Transform { name, .. }
+            | Self::Sql { name, .. }
+            | Self::Join { name, .. }
+            | Self::Aggregate { name, .. }
+            | Self::Filter { name, .. } => name,
         }
     }
 
@@ -2070,6 +2220,39 @@ pub async fn set_status(
         .fetch_optional(pool)
         .await?;
     Ok(row.map(Pipeline::from))
+}
+
+/// Record the start time of a pipeline's newest *finished* run (BLD-11 F1,
+/// D1). Only `run_finished_event`/`run_failed_event` call this, after they
+/// have confirmed the run's state with `Dagster`; a run still in progress is
+/// shown by the detail page's run list, not by this field, and a cancelled
+/// run is reported by neither event. We store the *start*, matching the
+/// Dagster-backed rows the list already shows (`routes::pipelines::last_run_for`).
+///
+/// The write is monotonic (D2): events can arrive out of order on a sensor
+/// retry, so the `WHERE` never lets an older run move `last_run_at` back.
+/// `started_at` is bound, never formatted into the SQL.
+///
+/// Returns `true` only when a row's `last_run_at` changed — `false` for an
+/// unknown `id` or when a newer run has already set the field.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn record_last_run(
+    pool: &PgPool,
+    id: &str,
+    started_at: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let result = sqlx::query(
+        "UPDATE pipeline_definition SET last_run_at = $2 \
+           WHERE id = $1 AND (last_run_at IS NULL OR last_run_at < $2)",
+    )
+    .bind(id)
+    .bind(started_at)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// List every version row for `pipeline_id`, newest first (largest

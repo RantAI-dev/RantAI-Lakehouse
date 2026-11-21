@@ -6,7 +6,6 @@
 // network.
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
-import * as notify from "@/lib/notify"
 import { LEGACY_QUERY_DRAFT_KEY, queryDraftKey } from "@/lib/query-draft"
 import { assetService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
@@ -180,9 +179,13 @@ describe("QueryTabBar", () => {
     expect(openTabName()).toBe("Orders")
   })
 
-  it("refuses a tab beyond the limit the browser keeps and says so", async () => {
+  // QS-11 (LH-QS-1-03), D9: the limit is said on the page, beside a disabled
+  // "+", not in a toast that vanishes. This replaces the toast-pinning test
+  // because the rule changed, not because the behaviour stopped being tested.
+  const LIMIT_SENTENCE = "At most 20 query tabs are kept. Close a tab to open another."
+
+  it("disables the add button and says why at 20 tabs", async () => {
     stubServices()
-    const notifyInfo = spyOn(notify, "notifyInfo")
     seedTabs(
       Array.from({ length: 20 }, (_, index) => ({
         id: `t${index}`,
@@ -195,11 +198,30 @@ describe("QueryTabBar", () => {
     render(<Harness />)
 
     await waitFor(() => expect(tabButtons().length).toBe(20))
-    fireEvent.click(screen.getByRole("button", { name: "Add query tab" }))
-
+    const add = screen.getByRole("button", { name: "Add query tab" }) as HTMLButtonElement
+    expect(add.disabled).toBe(true)
+    expect(screen.getByText(LIMIT_SENTENCE)).toBeTruthy()
+    fireEvent.click(add)
     expect(tabButtons().length).toBe(20)
-    expect(notifyInfo).toHaveBeenCalledTimes(1)
-    expect(String(notifyInfo.mock.calls[0]?.[0] ?? "")).toContain("20")
+  })
+
+  it("keeps the add button enabled with no limit sentence below 20 tabs", async () => {
+    stubServices()
+    seedTabs(
+      Array.from({ length: 19 }, (_, index) => ({
+        id: `t${index}`,
+        name: `Query ${index + 1}`,
+        sql: `SELECT ${index}`,
+        engine: "clickhouse",
+      })),
+      "t0"
+    )
+    render(<Harness />)
+
+    await waitFor(() => expect(tabButtons().length).toBe(19))
+    const add = screen.getByRole("button", { name: "Add query tab" }) as HTMLButtonElement
+    expect(add.disabled).toBe(false)
+    expect(screen.queryByText(LIMIT_SENTENCE)).toBeNull()
   })
 
   // QA LH-QS-1-04 (QS-8), decision 12: the entry every person on this

@@ -5,7 +5,6 @@ import { Pencil, Plus, X } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { notifyInfo } from "@/lib/notify"
 import { MAX_QUERY_TABS } from "@/lib/query-draft"
 import { cn } from "@/lib/utils"
 import type { useQueryStudio } from "./use-query-studio"
@@ -56,12 +55,13 @@ export function QueryTabBar({ studio }: { readonly studio: ReturnType<typeof use
     setRenamingId(null)
   }
 
+  // QS-11 (LH-QS-1-03), D9: at the limit the "+" is disabled and the reason
+  // is on the page, beside the button — a toast vanishes and leaves a dead
+  // control with no explanation.
+  const full = tabs.length >= MAX_QUERY_TABS
+
   function handleAdd() {
-    if (addTab()) return
-    notifyInfo(
-      `At most ${MAX_QUERY_TABS} query tabs are kept`,
-      "Close a tab before opening another one."
-    )
+    addTab()
   }
 
   return (
@@ -126,9 +126,21 @@ export function QueryTabBar({ studio }: { readonly studio: ReturnType<typeof use
           </div>
         )
       })}
-      <Button size="icon-xs" variant="outline" aria-label="Add query tab" onClick={handleAdd}>
+      <Button
+        size="icon-xs"
+        variant="outline"
+        aria-label="Add query tab"
+        aria-describedby={full ? "query-tab-limit" : undefined}
+        disabled={full}
+        onClick={handleAdd}
+      >
         <Plus className="size-3" aria-hidden />
       </Button>
+      {full ? (
+        <span id="query-tab-limit" className="text-xs text-muted-foreground">
+          At most {MAX_QUERY_TABS} query tabs are kept. Close a tab to open another.
+        </span>
+      ) : null}
     </div>
   )
 }

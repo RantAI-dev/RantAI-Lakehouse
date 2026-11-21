@@ -290,6 +290,16 @@ struct IncomingMessage {
     content: String,
 }
 
+/// The dashboard on screen, sent only by the dashboard page (`AI-30`). The
+/// server uses it to fill a PDF export's filters; it is never handed to the
+/// model as arguments it could change.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ScreenView {
+    board: String,
+    #[serde(default)]
+    filters: Vec<Value>,
+}
+
 /// `POST /api/ai/chat` request body.
 #[derive(Debug, Default, Deserialize)]
 struct ChatBody {
@@ -299,6 +309,9 @@ struct ChatBody {
     tools: Option<Vec<String>>,
     #[serde(default)]
     context: Option<String>,
+    /// The dashboard on screen; only the dashboard page sends it (`AI-30`).
+    #[serde(default)]
+    view: Option<ScreenView>,
     #[serde(default)]
     messages: Vec<IncomingMessage>,
     /// Answer as an NDJSON progress stream instead of one JSON body; see
@@ -343,6 +356,9 @@ pub async fn chat(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
+    // AI-34: the turn's clock starts with this handler, a little after the
+    // route's timeout has started (`timeout_middleware`).
+    let clock = TurnClock::new(std::time::Instant::now(), *super::AI_CHAT_TIMEOUT);
     let Ok(parsed) = serde_json::from_slice::<ChatBody>(&body) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -357,13 +373,13 @@ pub async fn chat(
         Err(response) => return response,
     };
     if stream {
-        return stream_chat(state, principal, run);
+        return stream_chat(state, principal, run, clock);
     }
     // GOV-17 review R9: table visibility adds state to nested tool futures.
     // The chat future carries the turn's whole state, and an unboxed future of
     // that size overflows the request task's stack (`clippy::large_futures`);
     // heap-pin the chat state machine at the HTTP boundary to bound its stack.
-    match Box::pin(run_chat(&state, principal.as_ref(), run, None)).await {
+    match Box::pin(run_chat(&state, principal.as_ref(), run, None, clock)).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => llm_unavailable(&err),
     }
@@ -385,6 +401,8 @@ struct PreparedChat {
     /// so what the loop pushes mid-turn cannot change which questions are
     /// checked.
     latest_user: String,
+    /// The dashboard on screen, when the caller was the dashboard page.
+    view: Option<ScreenView>,
 }
 
 /// Hard cap on the page context a client may add to the system prompt, in
@@ -906,6 +924,7 @@ async fn prepare_chat(
         // The same message `system_prompt` read for the closing line: the
         // latest user message of the request, before any loop message.
         latest_user: recent_user.last().copied().unwrap_or_default().to_owned(),
+        view: parsed.view,
     })
 }
 
@@ -1075,6 +1094,7 @@ async fn cjk_rewrite_round(
     messages: &mut Vec<LlmMessage>,
     progress: Progress<'_>,
     build_run_id: Option<&str>,
+    ends: Option<std::time::Instant>,
 ) -> Result<CjkRewrite, lakehouse_llm::LlmError> {
     if !report(progress, json!({ "type": "status", "phase": "thinking" })) {
         return Ok(CjkRewrite::ClientGone);
@@ -1087,7 +1107,18 @@ async fn cjk_rewrite_round(
         tool_call_id: None,
         name: None,
     });
-    let mut rewrite = model_round(state, messages, &[], progress).await?;
+    // AI-34: a rewrite that cannot finish by the turn's end is dropped, and
+    // the first answer stands, as it does when the rewrite is still not clean.
+    let Some(round) = before_turn_end(ends, model_round(state, messages, &[], progress)).await
+    else {
+        messages.truncate(before);
+        tracing::warn!(
+            "the rewrite of an answer to a Latin-script question ran past the turn's end; the first answer is kept (build run id: {})",
+            build_run_id.unwrap_or("none")
+        );
+        return Ok(CjkRewrite::Discarded);
+    };
+    let mut rewrite = round?;
     let cleaned = strip_repair_preamble(&strip_tool_xml(rewrite.content.as_deref().unwrap_or("")));
     let discard_reason = if cleaned.trim().is_empty() {
         Some("came back empty")
@@ -1109,10 +1140,53 @@ async fn cjk_rewrite_round(
     Ok(CjkRewrite::Clean(cleaned))
 }
 
+/// The note a turn carries when it stopped for time (`AI-34`).
+const TIME_NOTE: &str = "the turn ran out of time before it could answer";
+
+/// When a chat turn stops for time, as instants measured from the start of
+/// the turn (`AI-34`).
+#[derive(Clone, Copy)]
+struct TurnClock {
+    /// Past this instant the loop offers no more tools and asks for the
+    /// final answer.
+    budget_ends: std::time::Instant,
+    /// No model round may run past this instant. A round still running then
+    /// is dropped, and the turn answers with the fixed time reply. `None`:
+    /// no end, so a round always runs to its answer (the streamed path).
+    ends: Option<std::time::Instant>,
+}
+
+impl TurnClock {
+    /// The clock of a turn that started at `started` under `timeout`, the
+    /// route's `AI_CHAT_TIMEOUT`. The budget is three quarters of the
+    /// timeout, and the end nine tenths: the last tenth is for the reply,
+    /// since the route's timeout starts its clock a little before the
+    /// handler does. Both are shares of one value, so a deployment that
+    /// raises the timeout raises both.
+    fn new(started: std::time::Instant, timeout: std::time::Duration) -> Self {
+        Self {
+            budget_ends: started + timeout * 3 / 4,
+            ends: Some(started + timeout * 9 / 10),
+        }
+    }
+
+    /// The same clock with no end: the budget still stops the tool rounds,
+    /// but no round is cut. The streamed path uses it (`AI-34`): the
+    /// route's timeout never cut a streamed turn, so the end adds a limit
+    /// where none existed.
+    fn without_end(self) -> Self {
+        Self { ends: None, ..self }
+    }
+}
+
 /// The agentic loop: ask the model, run the tools it calls (through
 /// [`gate::decide_by_name`]), feed the results back, until it answers
 /// without a tool call or [`MAX_ITER`] rounds pass. Returns the response
 /// body `{ answer, toolTrace, buildRunId?, chartCreated, note? }`.
+///
+/// `clock` bounds the turn in time (`AI-34`): past its budget the loop asks
+/// for the final answer without tools, and a model round still running at
+/// its end is dropped for the time reply.
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line port of a single TS handler's iterative \
@@ -1124,6 +1198,7 @@ async fn run_chat(
     principal: Option<&Principal>,
     run: PreparedChat,
     progress: Progress<'_>,
+    clock: TurnClock,
 ) -> Result<Value, lakehouse_llm::LlmError> {
     let perms = principal.map(|p| &p.permissions);
     let PreparedChat {
@@ -1132,6 +1207,7 @@ async fn run_chat(
         is_build,
         allowlisted,
         latest_user,
+        view,
     } = run;
     let mut tool_trace: Vec<Value> = Vec::new();
     let mut build_run_id: Option<String> = None;
@@ -1167,6 +1243,12 @@ async fn run_chat(
     let conversation: Vec<&str> = conversation.iter().map(String::as_str).collect();
 
     'rounds: for _ in 0..MAX_ITER {
+        // AI-34: past the budget the loop offers no more tools, and the final
+        // round below answers from the results so far.
+        if std::time::Instant::now() >= clock.budget_ends {
+            stop_note = Some(TIME_NOTE);
+            break 'rounds;
+        }
         if !report(progress, json!({ "type": "status", "phase": "thinking" })) {
             return Ok(chat_response_body(
                 "",
@@ -1176,7 +1258,16 @@ async fn run_chat(
                 Some("stopped"),
             ));
         }
-        let msg = model_round(state, &messages, &tools, progress).await?;
+        let Some(round) =
+            before_turn_end(clock.ends, model_round(state, &messages, &tools, progress)).await
+        else {
+            return Ok(timed_out_body(
+                &tool_trace,
+                build_run_id.as_deref(),
+                chart_created,
+            ));
+        };
+        let msg = round?;
         messages.push(msg.clone());
 
         let mut calls: Vec<ToolCall> = msg.tool_calls.clone().unwrap_or_default();
@@ -1222,8 +1313,14 @@ async fn run_chat(
                 && prompt::contains_cjk(&answer)
             {
                 cjk_rewritten = true;
-                match cjk_rewrite_round(state, &mut messages, progress, build_run_id.as_deref())
-                    .await?
+                match cjk_rewrite_round(
+                    state,
+                    &mut messages,
+                    progress,
+                    build_run_id.as_deref(),
+                    clock.ends,
+                )
+                .await?
                 {
                     CjkRewrite::Clean(rewrite) => rewrite,
                     CjkRewrite::Discarded => answer,
@@ -1299,6 +1396,15 @@ async fn run_chat(
             let args = gate::strip_confirmed(
                 &serde_json::from_str::<Map<String, Value>>(&call.function.arguments)
                     .unwrap_or_default(),
+            );
+            // `AI-30`: a PDF of the dashboard on screen takes that screen's
+            // filters when the call sends no view of its own. Server-side and
+            // before the gate — the model cannot name the screen's filters.
+            let args = tools::with_screen_filters(
+                &call.function.name,
+                &args,
+                view.as_ref()
+                    .map(|v| (v.board.as_str(), v.filters.as_slice())),
             );
             // plan 14: an ask after any tool that ran in this turn is refused
             // before the gate, unless the step just before it was another
@@ -1522,7 +1628,18 @@ async fn run_chat(
         tool_call_id: None,
         name: None,
     });
-    let mut final_msg = model_round(state, &messages, &[], progress).await?;
+    // AI-34: the final round gets only the time before the turn's end. A round
+    // that cannot finish by then is dropped, and the reply says the time ran out.
+    let Some(round) =
+        before_turn_end(clock.ends, model_round(state, &messages, &[], progress)).await
+    else {
+        return Ok(timed_out_body(
+            &tool_trace,
+            build_run_id.as_deref(),
+            chart_created,
+        ));
+    };
+    let mut final_msg = round?;
     // `AI-17` review fix round 2 (BLOCKER): the final answer joins the
     // conversation, as the loop does for every round, so a rewrite request
     // follows the answer it asks about and not the "Give your final answer
@@ -1539,8 +1656,15 @@ async fn run_chat(
     // cite. `chat_response_body` still runs `take_next_step` on it, which
     // leaves it whole because the text has no `NEXT:` line of its own.
     if final_answer.trim().is_empty() {
+        // AI-34: a turn that stopped for time names its tools in the time
+        // reply; the refusal text of `unfinished_reply` is for the other stops.
+        let reply = if stop_note == TIME_NOTE {
+            timed_out_reply(&tool_trace)
+        } else {
+            unfinished_reply(&tool_trace, reason)
+        };
         return Ok(chat_response_body(
-            &unfinished_reply(&tool_trace, reason),
+            &reply,
             &tool_trace,
             build_run_id.as_deref(),
             chart_created,
@@ -1559,7 +1683,15 @@ async fn run_chat(
         && prompt::is_latin_script(&latest_user)
         && prompt::contains_cjk(&final_answer)
     {
-        match cjk_rewrite_round(state, &mut messages, progress, build_run_id.as_deref()).await? {
+        match cjk_rewrite_round(
+            state,
+            &mut messages,
+            progress,
+            build_run_id.as_deref(),
+            clock.ends,
+        )
+        .await?
+        {
             CjkRewrite::Clean(rewrite) => rewrite,
             CjkRewrite::Discarded => final_answer,
             CjkRewrite::ClientGone => {
@@ -1627,6 +1759,55 @@ fn unfinished_reply(tool_trace: &[Value], reason: &str) -> String {
     }
 }
 
+/// Runs one model round unless the turn's end comes first (`AI-34`). `None`
+/// means the round was dropped: no time was left, or it did not finish by
+/// `ends`. A dropped round is never waited for, so the reply goes out before
+/// the route's timeout cuts the turn. With no end (`None`) the round always
+/// runs, and the result is `Some`.
+async fn before_turn_end<T>(
+    ends: Option<std::time::Instant>,
+    round: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let Some(ends) = ends else {
+        return Some(round.await);
+    };
+    let remaining = ends.checked_duration_since(std::time::Instant::now())?;
+    tokio::time::timeout(remaining, round).await.ok()
+}
+
+/// The reply of a turn that stopped for time (`AI-34`): one sentence that
+/// says so, and names the tools that ran before the stop. Fixed text, and it
+/// claims nothing about what the results show.
+fn timed_out_reply(tool_trace: &[Value]) -> String {
+    let mut ran: Vec<&str> = Vec::new();
+    for step in tool_trace {
+        if let Some(tool) = step["tool"].as_str()
+            && !ran.contains(&tool)
+        {
+            ran.push(tool);
+        }
+    }
+    if ran.is_empty() {
+        return "The question took too long to answer in the time allowed, and no tool ran before the time ran out.".to_owned();
+    }
+    let names: Vec<String> = ran.iter().map(|tool| format!("`{tool}`")).collect();
+    format!(
+        "The question took too long to answer in the time allowed, so it stops after these tools ran: {}.",
+        names.join(", ")
+    )
+}
+
+/// The response body of a turn that stopped for time (`AI-34`).
+fn timed_out_body(tool_trace: &[Value], build_run_id: Option<&str>, chart_created: bool) -> Value {
+    chat_response_body(
+        &timed_out_reply(tool_trace),
+        tool_trace,
+        build_run_id,
+        chart_created,
+        Some(TIME_NOTE),
+    )
+}
+
 /// Drops a narrated preamble before a `Final answer:` line. After a repair
 /// round a model sometimes explains its own correction first ("Now I have
 /// everything from a tool result… Final answer:"), measured on the local
@@ -1687,8 +1868,17 @@ fn repair_request(numbers: &[String], table_omitted: bool) -> String {
 /// ([`model_round`]); the last line is `{"type":"done","body":…}` (the plain
 /// response body) or `{"type":"error","status":…,"body":…}`. When the
 /// client disconnects, the loop stops before its next round or tool.
-fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat) -> Response {
+fn stream_chat(
+    state: AppState,
+    principal: Option<Principal>,
+    run: PreparedChat,
+    clock: TurnClock,
+) -> Response {
     use tokio::io::AsyncWriteExt as _;
+
+    // AI-34: a streamed turn keeps the budget and loses the end. The route's
+    // timeout never cut a streamed turn, so no round of one is cut here either.
+    let clock = clock.without_end();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let (mut writer, reader) = tokio::io::duplex(16 * 1024);
@@ -1703,7 +1893,8 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
         // GOV-17 review R9: the streaming boundary needs the same bounded chat
         // state machine; boxed for the same reason as the unstreamed chat above
         // (`clippy::large_futures`).
-        let last = match Box::pin(run_chat(&state, principal.as_ref(), run, Some(&tx))).await {
+        let last = match Box::pin(run_chat(&state, principal.as_ref(), run, Some(&tx), clock)).await
+        {
             Ok(body) => json!({ "type": "done", "body": body }),
             Err(err) => json!({
                 "type": "error",
@@ -3273,6 +3464,26 @@ mod tests {
         }
     }
 
+    /// `AI-30`: the dashboard page's view is read into the chat body, and a
+    /// body without one (every other page, and older clients) still parses.
+    #[test]
+    fn a_chat_body_reads_the_dashboard_on_screen_and_one_without_it_still_parses() {
+        let with: ChatBody = serde_json::from_value(json!({
+            "messages": [{ "role": "user", "content": "Send this PDF" }],
+            "view": { "board": "b1", "filters": [{ "column": "region", "values": ["West"] }] }
+        }))
+        .expect("a body with a view");
+        let view = with.view.expect("a screen view");
+        assert_eq!(view.board, "b1");
+        assert_eq!(view.filters.len(), 1);
+
+        let without: ChatBody = serde_json::from_value(json!({
+            "messages": [{ "role": "user", "content": "Send this PDF" }]
+        }))
+        .expect("a body without a view");
+        assert!(without.view.is_none());
+    }
+
     async fn offered(state: &AppState, tools: Option<&[&str]>) -> Vec<String> {
         let who = analyst(1);
         let prepared = prepare_chat(
@@ -3413,24 +3624,26 @@ mod tests {
                 chat.messages[0].content.clone().unwrap_or_default()
             }
         };
+        // `AI-29..31` review R1: T9 (D13) reworded this note away from the
+        // technical permission and ids. All three checks must read the new
+        // sentence; the old `find` returned None and passed the order check
+        // vacuously (`None < Some`), which hid the drift from a filtered run.
+        let refusal = "tells the person, in the language of the person's message and in plain words, that their account may not change dashboards";
         let viewer = system(analyst(1)).await;
+        assert!(viewer.contains(refusal), "{viewer}");
+        let refusal_at = viewer
+            .find(refusal)
+            .expect("the refusal sentence is present for a viewer");
+        let closing_at = viewer
+            .find(&prompt::closing("Move the map charts to a new tab.", None))
+            .expect("the language line is present");
         assert!(
-            viewer.contains(
-                "tells the person, in the language of the person's message, that the account does not have the dashboard:write permission, so it cannot change dashboards, and asks for an editor or an administrator"
-            ),
-            "{viewer}"
-        );
-        assert!(
-            viewer.find(
-                "tells the person, in the language of the person's message, that the account does not have the dashboard:write permission, so it cannot change dashboards"
-            ) < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
+            refusal_at < closing_at,
             "the sentence comes before the language line"
         );
         let mut editor = analyst(2);
         editor.permissions = lakehouse_auth::PermissionSet::parse("dashboard:write, query:read");
-        assert!(!system(editor).await.contains(
-            "does not have the dashboard:write permission, so it cannot change dashboards"
-        ));
+        assert!(!system(editor).await.contains(refusal));
     }
 
     #[tokio::test]
@@ -3882,6 +4095,344 @@ mod tests {
         ];
         let reply = unfinished_reply(&trace, BUDGET_REASON);
         assert!(reply.contains("`create_chart`: no reason given"), "{reply}");
+    }
+
+    // AI-34: a turn that runs long on a slow model answers from what it
+    // found before its timeout, instead of ending in a 408. The clock is
+    // built by hand where a test needs a budget of a few hundred
+    // milliseconds, since the route's timeout has a floor of 30 seconds.
+
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const FINAL_ANSWER_REQUEST: &str =
+        "Give your final answer now, concisely, from the results above.";
+    const FINAL_ANSWER: &str = "The final answer, from what the tools found.";
+    const EARLY_ANSWER: &str = "An answer after one tool call.";
+    const TIMED_OUT_REPLY: &str = "The question took too long to answer in the time allowed, so it stops after these tools ran: `get_query_limits`.";
+
+    /// One model round as an OpenAI-compatible `/chat/completions` response.
+    fn mock_round(content: Option<&str>, calls: &[(&str, &str, &str)]) -> Value {
+        let tool_calls: Vec<Value> = calls
+            .iter()
+            .map(|(id, name, arguments)| {
+                json!({
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments },
+                })
+            })
+            .collect();
+        json!({ "choices": [{ "message": {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": if tool_calls.is_empty() { Value::Null } else { json!(tool_calls) },
+        } }] })
+    }
+
+    /// A streamed model round as server-sent events: one content delta per
+    /// piece, then `[DONE]`.
+    fn sse(pieces: &[&str]) -> String {
+        let mut body = String::new();
+        for piece in pieces {
+            let event = json!({ "choices": [ { "delta": { "content": piece } } ] });
+            let _ = std::fmt::Write::write_fmt(&mut body, format_args!("data: {event}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    /// The one tool these turns may call. It reads the query limits, which
+    /// needs no database, so every call succeeds.
+    fn limits_tool() -> Value {
+        json!({ "type": "function", "function": {
+            "name": "get_query_limits",
+            "description": "Reports the query limits that apply to the person.",
+            "parameters": { "type": "object", "properties": {} },
+        } })
+    }
+
+    /// A turn that asks the model one question, with the limits tool offered.
+    fn one_question(question: &str) -> PreparedChat {
+        PreparedChat {
+            messages: vec![LlmMessage {
+                role: LlmMessageRole::User,
+                content: Some(question.to_owned()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            tools: vec![limits_tool()],
+            is_build: false,
+            allowlisted: false,
+            latest_user: question.to_owned(),
+            // PR #639 review finding 2: `AI-29..31` on main added the
+            // dashboard-on-screen view to `PreparedChat`; a turn a test
+            // builds has no screen, so it carries none.
+            view: None,
+        }
+    }
+
+    /// A model that calls the limits tool in every round except the final
+    /// one. A tool round takes `round` to answer and the final round
+    /// `final_round`, so a test chooses how long the turn takes.
+    async fn slow_model(round: Duration, final_round: Duration) -> MockServer {
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                if String::from_utf8_lossy(&request.body).contains(FINAL_ANSWER_REQUEST) {
+                    ResponseTemplate::new(200)
+                        .set_body_json(mock_round(Some(FINAL_ANSWER), &[]))
+                        .set_delay(final_round)
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(mock_round(None, &[("call-1", "get_query_limits", "{}")]))
+                        .set_delay(round)
+                }
+            })
+            .mount(&llm)
+            .await;
+        llm
+    }
+
+    /// The state of a turn whose model is `llm`, with no database.
+    fn state_for(llm: &MockServer) -> AppState {
+        state_with_env(&[
+            ("LLM_URL", llm.uri().as_str()),
+            ("DATABASE_URL", "not a postgres url"),
+        ])
+    }
+
+    async fn run_turn(state: &AppState, clock: TurnClock, turn: PreparedChat) -> Value {
+        let who = analyst(1);
+        // Boxed as `chat` boxes it: the turn's future is too large to sit in
+        // a test's own future (`clippy::large_futures`).
+        Box::pin(run_chat(state, Some(&who), turn, None, clock))
+            .await
+            .expect("the mock model answers")
+    }
+
+    /// The bodies of the requests the model received, in the order sent.
+    async fn sent_bodies(llm: &MockServer) -> Vec<Value> {
+        llm.received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON request body"))
+            .collect()
+    }
+
+    /// A turn that keeps calling tools answers from the final round before
+    /// its timeout. The budget stops the tool rounds, and the final round
+    /// is tool-free.
+    #[tokio::test]
+    async fn a_turn_that_keeps_calling_tools_answers_before_its_timeout() {
+        let timeout = Duration::from_secs(6);
+        let llm = slow_model(Duration::from_millis(800), Duration::ZERO).await;
+        let state = state_for(&llm);
+        let clock = TurnClock::new(Instant::now(), timeout);
+        let body = tokio::time::timeout(
+            timeout,
+            run_turn(
+                &state,
+                clock,
+                one_question("How many query limits apply to me?"),
+            ),
+        )
+        .await
+        .expect("the turn answers before its timeout");
+        assert_eq!(body["answer"], FINAL_ANSWER, "{body}");
+        assert_eq!(body["note"], TIME_NOTE, "{body}");
+        let sent = sent_bodies(&llm).await;
+        let (last, tool_rounds) = sent.split_last().expect("the model was asked");
+        assert!(last.to_string().contains(FINAL_ANSWER_REQUEST), "{last}");
+        assert!(!tool_rounds.is_empty(), "{sent:?}");
+        assert!(tool_rounds.len() < MAX_ITER as usize, "{sent:?}");
+        assert!(
+            tool_rounds
+                .iter()
+                .all(|round| round["tools"].as_array().is_some_and(|t| !t.is_empty())),
+            "every round before the budget offers the tool: {sent:?}"
+        );
+    }
+
+    /// A turn that finishes before its budget is unchanged: the same answer,
+    /// no note, and no final-answer request.
+    #[tokio::test]
+    async fn a_turn_that_finishes_early_is_unchanged() {
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mock_round(None, &[("call-1", "get_query_limits", "{}")])),
+            )
+            .up_to_n_times(1)
+            .mount(&llm)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_round(Some(EARLY_ANSWER), &[])),
+            )
+            .mount(&llm)
+            .await;
+        let state = state_for(&llm);
+        let clock = TurnClock::new(Instant::now(), Duration::from_secs(6));
+        let body = run_turn(&state, clock, one_question("How many query limits apply?")).await;
+        assert_eq!(body["answer"], EARLY_ANSWER, "{body}");
+        assert!(body.get("note").is_none(), "{body}");
+        assert_eq!(
+            body["toolTrace"].as_array().map(Vec::len),
+            Some(1),
+            "{body}"
+        );
+        let sent = sent_bodies(&llm).await;
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(
+            sent.iter()
+                .all(|request| !request.to_string().contains(FINAL_ANSWER_REQUEST)),
+            "{sent:?}"
+        );
+    }
+
+    /// Past the budget, the final-answer round offers the model no tools.
+    #[tokio::test]
+    async fn the_final_answer_round_is_offered_no_tools() {
+        let llm = slow_model(Duration::ZERO, Duration::ZERO).await;
+        let state = state_for(&llm);
+        let now = Instant::now();
+        let clock = TurnClock {
+            budget_ends: now,
+            ends: Some(now + Duration::from_secs(10)),
+        };
+        let body = run_turn(&state, clock, one_question("How many query limits apply?")).await;
+        assert_eq!(body["answer"], FINAL_ANSWER, "{body}");
+        let sent = sent_bodies(&llm).await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "the budget is spent before the first round: {sent:?}"
+        );
+        assert!(
+            sent[0]["tools"].as_array().is_none_or(Vec::is_empty),
+            "{}",
+            sent[0]
+        );
+        assert!(
+            sent[0].to_string().contains(FINAL_ANSWER_REQUEST),
+            "{}",
+            sent[0]
+        );
+    }
+
+    /// A round still running at the turn's end is cut there. The turn then
+    /// answers with the fixed sentence and names the tools that ran.
+    #[tokio::test]
+    async fn a_turn_that_runs_out_of_time_says_so_and_names_the_tools_that_ran() {
+        // A tool round takes 300 ms, the final round 1 s. The budget ends at
+        // 100 ms and the turn at 500 ms, so the final round is cut.
+        let llm = slow_model(Duration::from_millis(300), Duration::from_secs(1)).await;
+        let state = state_for(&llm);
+        let start = Instant::now();
+        let clock = TurnClock {
+            budget_ends: start + Duration::from_millis(100),
+            ends: Some(start + Duration::from_millis(500)),
+        };
+        let body = tokio::time::timeout(
+            Duration::from_secs(6),
+            run_turn(&state, clock, one_question("How many query limits apply?")),
+        )
+        .await
+        .expect("the turn ends before its timeout");
+        assert_eq!(body["answer"], TIMED_OUT_REPLY, "{body}");
+        assert_eq!(body["note"], TIME_NOTE, "{body}");
+        assert_eq!(
+            body["toolTrace"].as_array().map(Vec::len),
+            Some(1),
+            "{body}"
+        );
+    }
+
+    /// The non-streamed path keeps the hard end: a round still running at
+    /// nine tenths of the timeout is cut, and the turn answers with the time
+    /// reply. It does not wait for a later round to answer (`AI-34`).
+    #[tokio::test]
+    async fn a_round_past_the_hard_end_gets_the_time_reply_not_a_later_answer() {
+        // A one-second timeout: the budget ends at 0.75 s and the hard end at
+        // 0.9 s. The first round is quick; the second round takes 1.2 s.
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mock_round(None, &[("call-1", "get_query_limits", "{}")])),
+            )
+            .up_to_n_times(1)
+            .mount(&llm)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mock_round(None, &[("call-2", "get_query_limits", "{}")]))
+                    .set_delay(Duration::from_millis(1200)),
+            )
+            .up_to_n_times(1)
+            .mount(&llm)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_round(Some(FINAL_ANSWER), &[])),
+            )
+            .mount(&llm)
+            .await;
+        let state = state_for(&llm);
+        let clock = TurnClock::new(Instant::now(), Duration::from_secs(1));
+        let body = run_turn(&state, clock, one_question("How many query limits apply?")).await;
+        assert_eq!(body["answer"], TIMED_OUT_REPLY, "{body}");
+        assert_eq!(body["note"], TIME_NOTE, "{body}");
+        let sent = sent_bodies(&llm).await;
+        assert_eq!(sent.len(), 2, "no request follows the cut round: {sent:?}");
+    }
+
+    /// The streamed path has no hard end (`AI-34`, option C): a round that
+    /// runs past nine tenths of the timeout is not cut, and the streamed turn
+    /// answers from it.
+    #[tokio::test]
+    async fn a_streamed_round_past_the_hard_end_is_not_cut() {
+        // A one-second timeout: the budget ends at 0.75 s and the hard end
+        // would be at 0.9 s. The one round answers at 1.2 s.
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse(&[EARLY_ANSWER]), "text/event-stream")
+                    .set_delay(Duration::from_millis(1200)),
+            )
+            .mount(&llm)
+            .await;
+        let state = state_for(&llm);
+        let clock = TurnClock::new(Instant::now(), Duration::from_secs(1));
+        let response = stream_chat(
+            state,
+            Some(analyst(1)),
+            one_question("How many query limits apply?"),
+            clock,
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the stream ends");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let last: Value =
+            serde_json::from_str(text.lines().last().expect("a done line")).expect("a JSON line");
+        assert_eq!(last["type"], "done", "{text}");
+        assert_eq!(last["body"]["answer"], EARLY_ANSWER, "{text}");
+        assert!(last["body"].get("note").is_none(), "{text}");
     }
 
     /// D4 regression: `buildRunId` must be omitted from the response body

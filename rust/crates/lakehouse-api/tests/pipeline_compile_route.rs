@@ -190,6 +190,9 @@ enum FixtureStep<'a> {
     SelectEmail,
     /// A SQL step, which is not today's shape (the compiled text is a `WITH`).
     Sql(&'a str),
+    /// The steps given whole (BLD-16: the new form kinds), over the
+    /// helper's single `source` input.
+    Steps(Vec<pipelines::PipelineStep>),
 }
 
 async fn seed_pipeline_reading(
@@ -210,6 +213,7 @@ async fn seed_pipeline_reading(
             name: "projected".to_owned(),
             sql: sql.to_owned(),
         }],
+        FixtureStep::Steps(steps) => steps,
     };
     let created = pipelines::create_pipeline(
         pool,
@@ -1105,5 +1109,207 @@ async fn a_stored_definition_that_does_not_compile_is_422() {
     assert!(
         !message.contains("silver.enforced_x"),
         "the refusal must not echo the statement: {message}"
+    );
+}
+
+// ── BLD-16 (BLD-1 part 2): the form kinds through the compile route ───
+
+/// Security rule 2 (plan section 3): a run reads as the AUTHOR. A masked
+/// column of an input, carried through a `join` form step, comes back
+/// masked from the compile route — the form step goes into the same one
+/// compiled statement, so the gate and the rewrite see the input's table
+/// exactly as they do for a SQL step.
+#[tokio::test]
+async fn a_masked_column_carried_through_a_join_step_comes_back_masked() {
+    let (router, pool, cookie, _engine) = app().await;
+    seed_mask(&pool, "Analyst").await;
+    let join = pipelines::PipelineStep::Join {
+        name: "joined".to_owned(),
+        left: "source".to_owned(),
+        right: "source".to_owned(),
+        join_type: "inner".to_owned(),
+        on: vec![pipelines::JoinPair {
+            left: "id".to_owned(),
+            right: "id".to_owned(),
+        }],
+        columns: vec![
+            pipelines::JoinColumn {
+                side: "left".to_owned(),
+                column: "id".to_owned(),
+                name: String::new(),
+            },
+            pipelines::JoinColumn {
+                side: "left".to_owned(),
+                column: "email".to_owned(),
+                name: String::new(),
+            },
+        ],
+    };
+    let id = seed_pipeline_reading(
+        &pool,
+        Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        Some(first_tenant_of(&pool, "rina@meridian.example").await),
+        READS,
+        FixtureStep::Steps(vec![join]),
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sql = body["sql"].as_str().expect("a sql string");
+    assert!(
+        sql.contains("INNER JOIN `source` AS `__right`"),
+        "the join step compiled into the statement: {sql}"
+    );
+    assert!(
+        sql.matches("replaceRegexpOne(toString(`email`)").count() >= 1,
+        "the author's mask must reach the read the join carries: {sql}"
+    );
+    assert!(
+        !sql.contains("SELECT `__left`.`email` AS `email` FROM `source` AS `__left`"),
+        "an unmasked email survived the rewrite: {sql}"
+    );
+}
+
+/// J7, the form twin of the join-of-two-governed-inputs case above: BOTH
+/// governed inputs come back rewritten, because the join form step is
+/// rendered into the one statement the rewrite walks.
+#[tokio::test]
+async fn a_join_of_two_governed_inputs_through_a_join_step_comes_back_with_both_rewritten() {
+    let (router, pool, cookie, _engine) = app().await;
+    for table in ["serving.enforced_x", "serving.enforced_y"] {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: format!("join-form-mask-{table}"),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: table.to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    json!({"roles": ["Analyst"], "table": table, "mask": ["email"]}).to_string(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let join = pipelines::PipelineStep::Join {
+        name: "joined".to_owned(),
+        left: "left_t".to_owned(),
+        right: "right_t".to_owned(),
+        join_type: "inner".to_owned(),
+        on: vec![pipelines::JoinPair {
+            left: "email".to_owned(),
+            right: "email".to_owned(),
+        }],
+        columns: vec![
+            pipelines::JoinColumn {
+                side: "left".to_owned(),
+                column: "email".to_owned(),
+                name: String::new(),
+            },
+            pipelines::JoinColumn {
+                side: "right".to_owned(),
+                column: "email".to_owned(),
+                name: "email_2".to_owned(),
+            },
+        ],
+    };
+    let created = pipelines::create_pipeline(
+        &pool,
+        &CreatePipelineInput {
+            inputs: vec![
+                pipelines::PipelineInput {
+                    name: "left_t".to_owned(),
+                    zone: "serving".to_owned(),
+                    table: "enforced_x".to_owned(),
+                },
+                pipelines::PipelineInput {
+                    name: "right_t".to_owned(),
+                    zone: "serving".to_owned(),
+                    table: "enforced_y".to_owned(),
+                },
+            ],
+            steps: vec![join],
+            name: "compile-join-form".to_owned(),
+            kind: "batch".to_owned(),
+            source_zone: "serving".to_owned(),
+            source_table: "enforced_x".to_owned(),
+            target_zone: "silver".to_owned(),
+            target_table: "compile_join_form_out".to_owned(),
+            schedule: "manual".to_owned(),
+            description: None,
+            incremental_column: None,
+            transforms: Vec::new(),
+            fbic_enabled: false,
+            max_retries: None,
+            owner: None,
+            tenant_id: Some(first_tenant_of(&pool, "rina@meridian.example").await),
+            depends_on: Vec::new(),
+            connector_id: None,
+            id: None,
+            target_lag: None,
+            run_as: Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = compile(&router, &cookie, &created.id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sql = body["sql"].as_str().expect("a sql string");
+    assert_eq!(
+        sql.matches("replaceRegexpOne(toString(`email`)").count(),
+        2,
+        "both governed inputs must be masked through the form join: {sql}"
+    );
+}
+
+/// J7 / `DATA-57` D9: a pipeline with a form step compiles to the `WITH`
+/// form, which the lineage mapper now reads, so its statement is noted like
+/// every other compiled statement. What the mapper cannot prove is stored
+/// as a partial row with its reason, never a guessed edge.
+#[tokio::test]
+async fn a_form_step_pipeline_is_noted_for_column_lineage() {
+    let (router, pool, cookie, _engine) = app().await;
+    let join = pipelines::PipelineStep::Join {
+        name: "joined".to_owned(),
+        left: "source".to_owned(),
+        right: "source".to_owned(),
+        join_type: "inner".to_owned(),
+        on: vec![pipelines::JoinPair {
+            left: "id".to_owned(),
+            right: "id".to_owned(),
+        }],
+        columns: vec![pipelines::JoinColumn {
+            side: "left".to_owned(),
+            column: "id".to_owned(),
+            name: String::new(),
+        }],
+    };
+    let id = seed_pipeline_reading(
+        &pool,
+        Some(seeded_user_id(&pool, "fajar@meridian.example").await),
+        Some(first_tenant_of(&pool, "fajar@meridian.example").await),
+        READS,
+        FixtureStep::Steps(vec![join]),
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let noted: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM column_lineage_pending WHERE pipeline_id = $1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        noted, 1,
+        "every compiled statement is noted for column lineage (DATA-57 D9)"
     );
 }

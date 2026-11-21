@@ -1141,7 +1141,12 @@ mod t1_3_tests {
     /// `Config::DATABASE_URL` builds it in production (so the test does
     /// not reach past the config choke point), plus a Dagster mock that
     /// answers a workspace reload.
-    async fn state_with_pg(pool: &sqlx::PgPool) -> AppState {
+    ///
+    /// The mock server is returned with the state: wiremock hands a dropped
+    /// server back to a shared pool and resets it, so a server dropped here
+    /// could be taken by another test while this state still dials its
+    /// `DAGSTER_URL`. Bind it to a named variable for the whole test.
+    async fn state_with_pg(pool: &sqlx::PgPool) -> (AppState, MockServer) {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("reloadWorkspace"))
@@ -1168,7 +1173,8 @@ mod t1_3_tests {
         );
         // BLD-1 part 1 / D4: a Bronze input is compiled through it.
         env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
-        AppState::new(Config::from_map(&env).expect("valid test Config"))
+        let state = AppState::new(Config::from_map(&env).expect("valid test Config"));
+        (state, server)
     }
 
     /// BLD-1 part 1 / D15: the assistant's `create_pipeline` takes `inputs`
@@ -1177,7 +1183,7 @@ mod t1_3_tests {
     /// whole save-time check (D2–D6, D9) applies to it with no second copy.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_pipeline_accepts_inputs_and_a_sql_step(pool: PgPool) {
-        let state = state_with_pg(&pool).await;
+        let (state, _dagster) = state_with_pg(&pool).await;
         // A seeded Platform Admin: a real `app_user` (the `run_as` key) whose
         // role is the `*:*` the save-time gate needs.
         let user: Uuid =
@@ -1231,6 +1237,145 @@ mod t1_3_tests {
         );
     }
 
+    /// BLD-16 / J8: the assistant's `create_pipeline` takes a `join` and an
+    /// `aggregate` form step, and the created definition keeps them — the
+    /// tool calls the CREATE route, so the whole save-time check (D2–D6,
+    /// D9, and the new kinds' own rules) applies with no second copy.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_pipeline_accepts_join_and_aggregate_form_steps(pool: PgPool) {
+        let (state, _dagster) = state_with_pg(&pool).await;
+        // A seeded Platform Admin: a real `app_user` (the `run_as` key) whose
+        // role is the `*:*` the save-time gate needs.
+        let user: Uuid =
+            sqlx::query_scalar("SELECT id FROM app_user WHERE email = 'fajar@meridian.example'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let tenant: Uuid =
+            sqlx::query_scalar("SELECT tenant_id FROM app_user_tenant WHERE user_id = $1 LIMIT 1")
+                .bind(user)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let principal = Principal {
+            id: PrincipalId::User(user),
+            tenant_ids: vec![tenant],
+            display_name: "Platform Admin".to_owned(),
+            permissions: PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+
+        let mut args = Map::new();
+        args.insert("name".to_owned(), json!("tool-form-steps"));
+        args.insert(
+            "inputs".to_owned(),
+            json!([
+                { "name": "orders", "zone": "silver", "table": "orders" },
+                { "name": "customers", "zone": "silver", "table": "customers" },
+            ]),
+        );
+        args.insert(
+            "steps".to_owned(),
+            json!([
+                { "name": "joined", "kind": "join",
+                  "left": "orders", "right": "customers", "joinType": "left",
+                  "on": [ { "left": "customer_id", "right": "id" } ],
+                  "columns": [
+                      { "side": "left", "column": "order_id" },
+                      { "side": "left", "column": "amount" },
+                      { "side": "right", "column": "country" } ] },
+                { "name": "by_country", "kind": "aggregate", "reads": "joined",
+                  "groupBy": ["country"],
+                  "measures": [ { "function": "sum", "column": "amount", "name": "revenue" } ],
+                  "havingMatch": "all",
+                  "having": [ { "column": "revenue", "operator": ">", "value": "1000" } ] },
+            ]),
+        );
+        args.insert("targetZone".to_owned(), json!("silver"));
+        args.insert("targetTable".to_owned(), json!("tool_form_out"));
+
+        let created = create_pipeline(&state, Some(&principal), &args).await;
+        assert_eq!(created["name"], "tool-form-steps", "{created}");
+        assert_eq!(created["status"], "draft", "{created}");
+        let id = created["id"].as_str().expect("the created pipeline's id");
+        let definition = lakehouse_store::pipelines::get_definition(&pool, id)
+            .await
+            .expect("get_definition")
+            .expect("the pipeline exists");
+        assert_eq!(
+            serde_json::to_value(&definition.steps).expect("serializes"),
+            json!([
+                { "kind": "join", "name": "joined",
+                  "left": "orders", "right": "customers", "joinType": "left",
+                  "on": [ { "left": "customer_id", "right": "id" } ],
+                  "columns": [
+                      { "side": "left", "column": "order_id" },
+                      { "side": "left", "column": "amount" },
+                      { "side": "right", "column": "country" } ] },
+                { "kind": "aggregate", "name": "by_country", "reads": "joined",
+                  "groupBy": ["country"],
+                  "measures": [ { "function": "sum", "column": "amount", "name": "revenue" } ],
+                  "havingMatch": "all",
+                  "having": [ { "column": "revenue", "operator": ">", "value": "1000" } ] },
+            ]),
+            "the form steps round-tripped through the create route"
+        );
+    }
+
+    /// BLD-16 / J8: a form step the compiler refuses comes back as an error
+    /// naming the FIELD at fault (D7), so the model can name it in its reply
+    /// instead of guessing.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_pipeline_refuses_a_form_step_with_the_field_named(pool: PgPool) {
+        let (state, _dagster) = state_with_pg(&pool).await;
+        let user: Uuid =
+            sqlx::query_scalar("SELECT id FROM app_user WHERE email = 'fajar@meridian.example'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let tenant: Uuid =
+            sqlx::query_scalar("SELECT tenant_id FROM app_user_tenant WHERE user_id = $1 LIMIT 1")
+                .bind(user)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let principal = Principal {
+            id: PrincipalId::User(user),
+            tenant_ids: vec![tenant],
+            display_name: "Platform Admin".to_owned(),
+            permissions: PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+
+        let mut args = Map::new();
+        args.insert("name".to_owned(), json!("tool-form-refused"));
+        args.insert(
+            "inputs".to_owned(),
+            json!([{ "name": "orders", "zone": "silver", "table": "orders" }]),
+        );
+        args.insert(
+            "steps".to_owned(),
+            json!([
+                { "name": "projected", "kind": "sql", "sql": "SELECT * FROM orders" },
+                { "name": "totaled", "kind": "aggregate", "reads": "projected",
+                  "measures": [ { "function": "median", "column": "amount", "name": "middle" } ] },
+            ]),
+        );
+        args.insert("targetZone".to_owned(), json!("silver"));
+        args.insert("targetTable".to_owned(), json!("tool_form_refused_out"));
+
+        let created = create_pipeline(&state, Some(&principal), &args).await;
+        let message = created["error"].as_str().expect("a refusal");
+        assert!(
+            message.starts_with("steps[1].measures[0]: "),
+            "the refusal must name the field at fault: {message}"
+        );
+    }
+
     /// BLD-2 review R1 BLOCKER 1: the assistant tool refuses cross-tenant pipelines
     /// by id and by name, returning 404 and leaving state untouched.
     #[sqlx::test(migrations = "../../migrations")]
@@ -1239,7 +1384,7 @@ mod t1_3_tests {
         // the test pool alone; the Dagster mock is here because a
         // successful write would reload the orchestrator, and this test
         // asserts nothing was written.
-        let state = state_with_pg(&pool).await;
+        let (state, _dagster) = state_with_pg(&pool).await;
         // `pipeline_definition.tenant_id` references `tenant (id)`, so both
         // sides of the attempt are real rows rather than bare UUIDs.
         let tenant_a = seed_tenant(&pool).await;

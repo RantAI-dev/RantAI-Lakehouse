@@ -332,12 +332,17 @@ SERIAL_TAG = "lakehouse/serial"
 # The list is here, next to the tag, so it is read with the code that uses
 # it. A job that waits for its own previous run stays QUEUED and is never
 # dropped.
+#
+# `gold_latest_copy_job` (DATA-6 D16): one run at a time per the whole
+# code location's serial rule; two updates of the same table never race,
+# and runs queue behind the one in flight instead of being dropped.
 SERIAL_JOB_NAMES = frozenset(
     {
         "bronze_maintenance_job",
         "capacity_snapshot_job",
         "discover_job",
         "gold_export_job",
+        "gold_latest_copy_job",
         "storage_snapshot_job",
     }
 )

@@ -174,3 +174,28 @@ describe("QueryTransparencyPanel without an estimate", () => {
     expect(screen.queryByText("Type SQL for a pre-run estimate.")).toBeNull()
   })
 })
+
+// QS-10 (LH-QS-1-11, LH-QS-2-05): the panel says what the estimate does and
+// does not hold — withheld catalog facts, reported obligations, an empty plan.
+describe("QueryTransparencyPanel withheld facts and obligations", () => {
+  it("says catalog access is needed for both freshness and sources, and names no source", () => {
+    panel({ ...BASE, catalogHidden: true })
+
+    expect(screen.getAllByText("Needs catalog access").length).toBe(2)
+    expect(screen.queryByText("silver.orders")).toBeNull()
+    expect(screen.queryByText("serving.stock")).toBeNull()
+  })
+
+  it("shows a reported obligation as a pill, not 'Not evaluated'", () => {
+    panel({ ...BASE, policyObligations: ["Column masks"] })
+
+    expect(screen.getByText("Column masks")).toBeTruthy()
+    expect(screen.queryByText("Not evaluated")).toBeNull()
+  })
+
+  it("says the plan named no table when sources are empty and nothing is hidden", () => {
+    panel({ ...BASE, sources: [] })
+
+    expect(screen.getByText("No table found in the plan")).toBeTruthy()
+  })
+})
