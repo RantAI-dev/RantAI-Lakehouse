@@ -221,6 +221,47 @@ Deviations from the plan, for the reviewer:
   and then appends without the column; a full `incremental` load needs a `sql_database` source,
   which the local harness has not.
 
+### Handoff: SRC-48, PR #621 review round 2
+
+Developer: GLM 5.3. Branch `fix/src-48-replace-drops-left-out-columns`, merged
+with `origin/main` (no rebase, no force). Two commits:
+
+1. `d7811b816` SRC-48 docs: the owner signs the two-commit window of D3
+   (review 1 BLOCKER, resolved by the owner decision; `sink.py` unchanged
+   except one comment sentence).
+2. this commit: `test_sink_drop_columns_modes.py` (review 1 SHOULD-FIX) and
+   this Handoff.
+
+The tests were proven to fail if `load_via_sink` dropped for those modes
+(both temporary breaks restored exactly; `git diff` on `sink.py` empty
+afterwards):
+
+- with the mode guard broken (`if not drop_columns:` only), the
+  `incremental` and `incremental_dedup` tests FAIL (2 failed, 1 passed);
+  the `history` test passes there because its branch returns before the
+  drop is ever called, so the plausible history regression was broken
+  too: with the drop routed temporarily into `_load_history`, the
+  `history` test FAILS.
+
+Commands run locally (python from `/home/rismana/rantai/venv-agents-4`, an
+editable dlt 1.30.0 / pyiceberg 0.12.0 environment, run from `dagster/`):
+
+- `python -m pytest dispar_orchestrate/test_sink_drop_columns_modes.py -q`:
+  3 passed.
+- `python -m pytest dispar_orchestrate/test_typed_load.py -q`: 26 passed
+  (the branch's SRC-48 tests after the merge of `origin/main`).
+- `python -m pytest dispar_orchestrate -q`: 2764 passed, 1 skipped,
+  36 subtests passed (25m33s). One earlier full run reported 3 failed and
+  12 errors, all schema-drift loader tests, straight after two partial
+  full runs had been killed; those 15 passed alone (`--lf`: 15 passed)
+  and the clean re-run above is fully green, so they were a one-off of
+  that interrupted environment, not of the branch.
+- `python3 ops/lint/check_intra_package_imports.py` and
+  `python3 ops/lint/check_bare_iceberg_count.py`: both OK.
+
+Not verified locally: nothing else in the verification block -- the slice
+touches `dagster/` tests and `docs/` only, so no cargo, bun or compose run.
+
 
 ## Review
 
