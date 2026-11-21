@@ -1,17 +1,19 @@
 "use client";
 
 import * as React from "react";
-import { Calendar, ChevronDown, CircleHelp, Hash, Plus, RotateCcw, Type, X } from "lucide-react";
+import { Calendar, CircleHelp, Hash, Plus, RotateCcw, Type, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
-import { filterLabel, isActiveFilter, isRequiredColumn } from "@/lib/dashboard-filter-state";
+import { filterLabel, filtersEqual, isActiveFilter, isRequiredColumn } from "@/lib/dashboard-filter-state";
 import { withTies } from "@/lib/dashboard-tabs";
 import type { BoardTab, FilterDef, FilterField } from "@/services";
 import { DateEditor, NumberEditor, TextEditor, blankFilter, type EditorProps } from "./filter-editors";
+import { ChipTrigger, chipShell } from "./chip";
+import { EASE, FOCUS } from "../dashboard-header";
 
 function KindIcon({ kind, className }: { kind: string; className?: string }) {
   const Icon = kind === "number" ? Hash : kind === "date" || kind === "datetime" ? Calendar : Type;
@@ -74,10 +76,16 @@ function Editor({ kind, ...props }: EditorProps & { kind: string }) {
  * menu over every column the board's tiles read, and Save as default / Reset
  * for the temporary state (BI-18). Changing a filter here only reports it
  * upward; the page decides what to do with it.
+ *
+ * `BI-61` T3: the chips are borderless and tinted when they differ from the
+ * saved default; "+ Filter" is offered where the page says (`canAdd`: in
+ * edit mode). The pieces are laid out by the row they sit in (`FilterRow`).
  */
 export function FilterBar({
-  board, fields, filters, savedFilters, onChange, dirty, canSaveDefault, saving, onSaveDefault, onReset, tabs,
+  board, fields, filters, savedFilters, onChange, dirty, canSaveDefault, saving, onSaveDefault, onReset, tabs, canAdd = true,
 }: {
+  /** Whether "+ Filter" is offered (`BI-61` T3). Absent: offered. */
+  canAdd?: boolean;
   board: string;
   /** The dashboard's tabs; with more than one, an editor can tie a filter to some of them. */
   tabs?: BoardTab[];
@@ -118,10 +126,16 @@ export function FilterBar({
     onChange(filters.map((f) => (f === old ? { ...f, required: required || undefined } : f)));
   const closeAdd = () => { setAddOpen(false); setPicked(null); setQuery(""); setNewRequired(false); setNewTies([]); };
 
+  const changedFrom = (f: FilterDef) => {
+    const saved = savedFilters.find((x) => x.column === f.column && isActiveFilter(x));
+    return !saved || !filtersEqual([f], [saved]);
+  };
+
   return (
-    <div className="flex flex-wrap items-center gap-2">
+    <>
       {active.map((f) => (
         <FilterChip
+          changed={changedFrom(f)}
           key={`${f.column}:${f.op ?? "in"}`}
           filter={f}
           kind={kindOf(f.column)}
@@ -136,13 +150,15 @@ export function FilterBar({
         />
       ))}
 
+      {canAdd ? (
       <Popover open={addOpen} onOpenChange={(o) => { if (o) setAddOpen(true); else closeAdd(); }}>
         <PopoverTrigger asChild>
-          <Button variant="outline" size="sm" disabled={fields.length === 0}>
-            <Plus className="size-3.5" /> Add filter
-          </Button>
+          <button type="button" aria-label="Add filter" disabled={fields.length === 0}
+            className={cn("inline-flex h-8 shrink-0 items-center gap-1 rounded-full px-3 text-sm font-medium text-primary hover:bg-primary/10 active:scale-[0.97] disabled:pointer-events-none disabled:opacity-50 dark:text-sky-300", EASE, FOCUS)}>
+            <Plus className="size-3.5" aria-hidden /> Filter
+          </button>
         </PopoverTrigger>
-        <PopoverContent align="start" className="w-72">
+        <PopoverContent align="start" collisionPadding={16} className="w-72">
           {picked ? (
             <>
               <p className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
@@ -185,27 +201,32 @@ export function FilterBar({
           )}
         </PopoverContent>
       </Popover>
+      ) : null}
 
+      {/* One Reset for the whole row, shown only when something differs from the saved default. */}
       {dirty ? (
-        <span className="ml-auto flex items-center gap-1.5">
-          <Button variant="ghost" size="sm" onClick={onReset}>
-            <RotateCcw className="size-3.5" /> Reset
-          </Button>
+        <span className="flex shrink-0 items-center gap-1">
+          <button type="button" onClick={onReset}
+            className={cn("inline-flex h-8 shrink-0 items-center gap-1 rounded-full px-2.5 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground active:scale-[0.97]", EASE, FOCUS)}>
+            <RotateCcw className="size-3" aria-hidden /> Reset
+          </button>
           {canSaveDefault ? (
-            <Button size="sm" disabled={saving} onClick={onSaveDefault}>
+            <Button variant="ghost" size="sm" className="h-8 rounded-full px-3 text-primary hover:text-primary dark:text-sky-300" disabled={saving} onClick={onSaveDefault}>
               {saving ? "Saving…" : "Save as default"}
             </Button>
           ) : null}
         </span>
       ) : null}
-    </div>
+    </>
   );
 }
 
 function FilterChip({
-  filter, kind, board, others, onApply, onRemove, onToggleRequired, tabs, onTies,
+  filter, kind, board, others, onApply, onRemove, onToggleRequired, tabs, onTies, changed,
 }: {
   filter: FilterDef;
+  /** The filter differs from the saved default's on its column: the chip is tinted. */
+  changed: boolean;
   kind: string;
   board: string;
   others: FilterDef[];
@@ -220,17 +241,14 @@ function FilterChip({
 }) {
   const [open, setOpen] = React.useState(false);
   const label = filterLabel(filter, kind);
+  const tone = changed ? "changed" : "default";
   return (
-    <div className="inline-flex h-7 items-center rounded-md border border-border bg-background text-foreground">
+    <div data-slot="filter-chip" className={chipShell(tone)}>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
-          <Button variant="ghost" size="sm" className={cn("h-7 max-w-64 gap-1 rounded-r-none border-0 px-2 font-normal shadow-none")} title={label}>
-            <KindIcon kind={kind} className="size-3.5 shrink-0 opacity-70" />
-            <span className="truncate">{label}</span>
-            <ChevronDown className="size-3.5 shrink-0 opacity-60" />
-          </Button>
+          <ChipTrigger value={label} tone={tone} title={label} className={cn("max-w-72", onRemove && "pr-1.5")} />
         </PopoverTrigger>
-        <PopoverContent align="start" className="w-72">
+        <PopoverContent align="start" collisionPadding={16} className="w-72">
           {open ? (
             <Editor
               kind={kind}
@@ -248,12 +266,11 @@ function FilterChip({
         </PopoverContent>
       </Popover>
       {onRemove ? (
-        <Button variant="ghost" size="icon-sm" className="size-7 rounded-l-none" aria-label={`Remove ${filter.column} filter`} onClick={onRemove}>
-          <X className="size-3.5" />
-        </Button>
-      ) : (
-        <span className="pr-1" />
-      )}
+        <button type="button" aria-label={`Remove ${filter.column} filter`} onClick={onRemove}
+          className={cn("mr-1 grid size-6 shrink-0 place-items-center rounded-full opacity-60 hover:bg-foreground/10 hover:opacity-100", EASE, FOCUS)}>
+          <X className="size-3.5" aria-hidden />
+        </button>
+      ) : null}
     </div>
   );
 }

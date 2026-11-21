@@ -54,6 +54,7 @@ import {
 import { cn } from "@/lib/utils"
 import { dashboardReportService, dashboardService } from "@/services"
 import type { ReportBlock, ReportChartEntry, ReportView } from "@/services"
+import { rememberRow } from "./dashboards-row"
 import { FolderOptions } from "./folder-options"
 import { ReportChart } from "./report-blocks"
 import { ReportChartPicker, type PickedChart } from "./report-chart-picker"
@@ -126,6 +127,13 @@ function ReportEditor({ view }: { view: ReportView | null }) {
   const [picked, setPicked] = React.useState<Picked>({})
   const [pickerAt, setPickerAt] = React.useState<number | null>(null)
   const [refusal, setRefusal] = React.useState<string | null>(null)
+
+  // BI-61 T11: editing an existing report also counts as opening it for the Dashboards row.
+  const openedId = view?.report.id
+  const openedTitle = view?.report.title
+  React.useEffect(() => {
+    if (openedId && openedTitle) rememberRow("report", openedId, openedTitle)
+  }, [openedId, openedTitle])
 
   const save = useServiceAction(
     withNotify({ success: "Report saved", error: "Could not save the report" }, (signal) => {

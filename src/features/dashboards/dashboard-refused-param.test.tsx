@@ -18,7 +18,7 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import { AuthProvider } from "@/features/auth/auth-provider"
@@ -63,7 +63,9 @@ describe("DashboardPage and a refused parameter value (QA LH-BI-11-05)", () => {
       </AuthProvider>,
     )
 
-    // The dashboard is drawn: its parameter control is there, with the value in force.
+    // The dashboard is drawn: its parameter chip is there (BI-61 T3), and its
+    // panel holds the control, with the value in force.
+    fireEvent.click(await screen.findByRole("button", { name: /^Target/ }))
     expect(await screen.findByLabelText("Target")).toBeTruthy()
     expect((screen.getByLabelText("Target") as HTMLInputElement).value).toBe("30")
     // The refusal is on the page, in the alert that belongs to that parameter.
