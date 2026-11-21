@@ -213,3 +213,12 @@ right.
   scheme then decides, and a normal scheme does not force the backdrop), and
   say why at the rule. The planner checks it in a real Chrome on the QA stack
   with a host page around the iframe.
+
+## Handoff 2, PR 2 (`BI-64`)
+
+Review SHOULD-FIX 1 fixed: `html.embed-transparent { color-scheme: normal; }`
+in `src/app/globals.css`, with the reason at the rule. The embed-view test
+already asserts the class on `<html>`, and a CSS rule is not testable in
+happy-dom, so no test change. Not verified in a browser (no login to the QA
+console was possible). Checks: `bun test embed-view.test.tsx` and
+`bun x tsc --noEmit -p .` run after the edit, results below in the report.

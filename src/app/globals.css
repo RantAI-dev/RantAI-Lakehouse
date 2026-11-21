@@ -35,7 +35,16 @@
  * page show through. The only opaque paint behind the tiles is `body`'s
  * `bg-background` from the design system's base layer; `EmbedView` sets this
  * class on `<html>` while the option is on.
+ *
+ * PR BI-64 review SHOULD-FIX 1: a transparent `body` is not enough. When the
+ * embedded document's used `color-scheme` differs from the host page's, the
+ * browser paints an opaque canvas behind the iframe (CSS Color Adjust, the
+ * iframe backdrop rule), and the console's dark theme sets `color-scheme:
+ * dark` on `<html>`. `normal` leaves the host page's scheme to decide.
  */
+html.embed-transparent {
+  color-scheme: normal;
+}
 html.embed-transparent,
 html.embed-transparent body {
   background: transparent;
