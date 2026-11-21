@@ -13,7 +13,7 @@
 | Plan | This page; the run is an acceptance run, not a build |
 | Started | 2026-11-21 |
 | Shipped | Before 2026-11-13 (the base of the module) |
-| Evidence | Acceptance run of 2026-11-21 on the QA stack, built from the QA integration branch `qa/integration-2026-11-21` (tip `3fd675ee9`), by an agent (API and headless Chrome; gallery board of 33 tiles, one per chart kind); the owner looked at the gallery and found it tidy. The run's report and screenshots are held outside this repository |
+| Evidence | Acceptance run of 2026-11-21 on the QA stack, built from the QA integration branch `qa/integration-2026-11-21` (tip `3fd675ee9`), by an agent (API and headless Chrome; gallery board with one tile per kind the builder offers — 33 kinds, `src/features/dashboards/chart-kinds.ts:21`); the owner looked at the gallery and found it tidy. The run's report and screenshots are held outside this repository |
 
 ## What the user can do
 
@@ -22,9 +22,10 @@
 2. **Find dashboards.** The Dashboards page lists them; search finds one by name; a
    favourite is marked and found again; the list switches between Table and Gallery
    (`BI-59` covers the page's own layout).
-3. **Draw every chart type with real data.** The builder offers about two dozen kinds. Each
-   one draws from a mart or a SQL source on the QA stack, its numbers match the same
-   question asked in Query Studio, and hovering it shows a tooltip with the value.
+3. **Draw every chart type with real data.** The builder offers 33 kinds, from bars and lines
+   to maps, tables and text tiles. Each one draws from a mart or a SQL source on the QA stack,
+   its numbers match the same question asked in Query Studio, and hovering it shows a tooltip
+   with the value.
 4. **Be told when a number crosses a line.** A threshold alert on a metric is created,
    tested from the Alerts page, fires when the value is over the threshold, does not fire
    when it is under, and its e-mail arrives.
@@ -56,12 +57,15 @@
 - [x] `BI-56-AC2`: search finds a dashboard by part of its name; a favourite is marked and
   listed; Table and Gallery both show it.
 - [x] `BI-56-AC3`: every chart kind the builder offers draws on one gallery dashboard with
-  real data, and the owner finds the gallery tidy.
+  real data (the builder offers 33 kinds on the run's build, `src/features/dashboards/chart-kinds.ts:21`;
+  the run's per-kind list is in the report, held outside the repo), and the owner finds the
+  gallery tidy.
 - [x] `BI-56-AC4`: for at least five kinds (bar, line, pie, table, KPI), the numbers equal
   the same question run in Query Studio.
-- [x] `BI-56-AC5`: hovering each drawn chart shows a tooltip with its value. 25 of 26 charts
-  did; the density map has none by design, and gets one in `BI-73` with the other findings
-  of the run (owner, 2026-11-21).
+- [x] `BI-56-AC5`: hovering each drawn chart shows a tooltip with its value. 25 of the 26
+  charts the run checked did (the 33 tiles include non-chart types); the density map has
+  none by design, and gets one in `BI-73` with the other findings of the run (owner,
+  2026-11-21).
 - [x] `BI-56-AC6`: a threshold alert fires over its threshold and not under it, from
   "Test run now", and its e-mail arrives in the QA mailbox.
 - [x] `BI-56-AC7`: a Dashboard Viewer reads a shared dashboard and sees no edit, move or
