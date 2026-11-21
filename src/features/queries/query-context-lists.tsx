@@ -123,7 +123,12 @@ export function HistoryQuickList({
                     title={h.sql}
                   >
                     <span className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <StatusBadge status={h.status} />
+                      {/* QS-11 (LH-QS-4-02), D13: the side panel uses the
+                          History page's word for a refused run. */}
+                      <StatusBadge
+                        status={h.status}
+                        label={h.status === "blocked" ? "Refused" : undefined}
+                      />
                       <span title={formatDateTime(h.at)}>
                         {formatRelativeTime(h.at)}
                       </span>

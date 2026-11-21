@@ -309,6 +309,11 @@ export type QueryHistoryItem = {
  * last 14 days whatever the caller sends (decision 2).
  */
 export type QueryHistoryFilter = {
+  /**
+   * QS-12 (LH-QS-4-07): one run's id, for the `/query-studio?run=` handoff.
+   * The server still scopes it to the caller and the last 14 days.
+   */
+  id?: string
   status?: QueryHistoryItem["status"]
   engine?: string
   minDurationMs?: number
@@ -375,8 +380,20 @@ export type QueryEstimate = {
   cacheEligible: boolean | null
   /** Lag of the stalest source table (`freshness_lag`, ClickHouse `system.parts`); null when no source is known. */
   freshnessLagSeconds: number | null
-  /** No policy engine exists yet — WS7 builds one. */
+  /**
+   * QS-10 (LH-QS-2-05): the obligations the rewrite applied to this statement
+   * — "Column masks" then "Row filters", each once — or an empty list when
+   * neither applies. "Column masks"/"Row filters" name kinds, never the
+   * masked columns. `null` comes only from an older server (which reported no
+   * policy engine) or from a Trino estimate, which is not rewritten.
+   */
   policyObligations: string[] | null
+  /**
+   * QS-10 (LH-QS-1-11), D2: true when the caller lacks `catalog:read`, so the
+   * server withheld `sources`, their marks and `freshnessLagSeconds`. Absent
+   * from an older server, which never withheld them — read as false.
+   */
+  catalogHidden?: boolean
   sources: string[]
   /**
    * `DATA-12` part 3: the certified or deprecated mark of each table a
@@ -437,7 +454,12 @@ export type QueryResult = {
     cacheHit: boolean | null
     /** No pushdown computation exists — not measured. */
     pushdowns: string[] | null
-    /** No policy engine exists yet — WS7 builds one. */
+    /**
+     * QS-10 (LH-QS-2-05), D4: the obligations the rewrite applied to this run
+     * — "Column masks" then "Row filters", each once — or an empty list when
+     * neither applied. `null` comes only from an older server that reported
+     * no policy engine.
+     */
     policyObligations: string[] | null
   }
   /**
