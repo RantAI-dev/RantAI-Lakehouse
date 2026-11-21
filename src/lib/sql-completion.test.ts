@@ -513,3 +513,34 @@ test("sqlCompletionOptions answers with the listed table when an alias name is d
   })
   assert.deepEqual(options.map((option) => option.label), ["amount", "status"])
 })
+
+// QS round review R1 (D8): the answer says which place it answered for, so the
+// source can boost names in a FROM/qualifier position but leave the general
+// list to CodeMirror's own match score against the keywords.
+test("sqlCompletionOptions marks the general branch as general", () => {
+  const sql = "s"
+  const answer = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "s"),
+    tables: TABLES,
+    columns: COLUMNS,
+  })
+  assert.equal(answer.place, "general")
+})
+
+test("sqlCompletionOptions marks the FROM, qualifier and placeholder branches as names", () => {
+  for (const [sql, marker] of [
+    ["SELECT * FROM ", "FROM "],
+    ["SELECT o. FROM silver.orders o", "o."],
+    ["SELECT {{", "{{"],
+  ] as const) {
+    const answer = sqlCompletionOptions({
+      sql,
+      cursor: after(sql, marker),
+      tables: TABLES,
+      columns: COLUMNS,
+      parameters: ["region"],
+    })
+    assert.equal(answer.place, "names", sql)
+  }
+})

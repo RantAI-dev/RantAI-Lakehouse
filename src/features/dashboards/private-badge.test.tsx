@@ -2,7 +2,8 @@ import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "bun:test"
 
 import { PRIVATE_HINT, PRIVATE_TIP, PrivateBadge } from "./private-badge"
-import { ShareBadges } from "./dashboard-list-columns"
+import { boardItem } from "./library-items"
+import { ItemBadges } from "./library-parts"
 
 afterEach(cleanup)
 
@@ -13,11 +14,11 @@ describe("PrivateBadge (BI-18 part C review fix R11)", () => {
     expect(PRIVATE_TIP).toBe("Only you and administrators can see it. Move it to a folder to share it.")
   })
 
-  it("is the badge the list card shows for a board with an owner, and only for one", () => {
-    render(<ShareBadges board={{ id: "b", name: "n", ownerId: "u" }} />)
+  it("is the badge the list shows for a board with an owner, and only for one", () => {
+    render(<ItemBadges item={boardItem({ id: "b", name: "n", ownerId: "u" })} />)
     expect(screen.getByText("Private")).toBeTruthy()
     cleanup()
-    render(<ShareBadges board={{ id: "b", name: "n" }} />)
+    render(<ItemBadges item={boardItem({ id: "b", name: "n" })} />)
     expect(screen.queryByText("Private")).toBeNull()
   })
 

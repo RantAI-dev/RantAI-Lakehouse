@@ -2900,7 +2900,16 @@ fn sniff_picture_type(bytes: &[u8]) -> Option<&'static str> {
 
 /// The picture kind a path names, from the fixed list. A `match`, never
 /// text put into a path or a column name.
-fn picture_kind(kind: &str) -> Result<ImageKind, ApiError> {
+///
+/// `pub(crate)`, not private: `routes::picture_drain` reads the same list,
+/// so a kind it refuses to drain is a kind the route does not serve.
+///
+/// # Errors
+///
+/// 404 through `ApiError::NotFound` when the kind is not one of the three
+/// the route serves (`logo`, `logo-dark`, `icon`): a picture that does not
+/// exist.
+pub(crate) fn picture_kind(kind: &str) -> Result<ImageKind, ApiError> {
     match kind {
         "logo" => Ok(ImageKind::Logo),
         "logo-dark" => Ok(ImageKind::LogoDark),
@@ -2919,7 +2928,11 @@ fn picture_label(kind: ImageKind) -> &'static str {
 }
 
 /// The sentence for a picture that breaks the size rule of its kind.
-fn picture_size_sentence(kind: ImageKind) -> &'static str {
+///
+/// `pub(crate)`, not private: `routes::picture_drain` answers a body over
+/// its cap with the same sentence, so the rule the person is told about is
+/// the rule the server keeps.
+pub(crate) fn picture_size_sentence(kind: ImageKind) -> &'static str {
     match kind {
         ImageKind::Icon => ICON_REFUSED,
         ImageKind::Logo | ImageKind::LogoDark => LOGO_SIZE_REFUSED,
@@ -3077,13 +3090,6 @@ pub async fn put_general(
     let Some(pool) = state.pg.as_deref() else {
         return Err(workspace_needs_a_database().into());
     };
-    let current = workspace_settings::get(pool)
-        .await
-        .map_err(|err| workspace_store_failed(&err))?;
-    let changed = current
-        .as_ref()
-        .and_then(|row| row.workspace_name.as_deref())
-        != name.as_deref();
 
     let saved =
         workspace_settings::upsert_name(pool, name.as_deref(), &principal.id.uuid().to_string())
@@ -3091,9 +3097,15 @@ pub async fn put_general(
             .map_err(|err| workspace_store_failed(&err))?;
     // The save is visible to the next reader on this process at once (decision 6).
     state.settings_caches.workspace.clear().await;
-    // The direct comparison stays on purpose: plan D3b forbids touching
-    // this route, whose save race `adm-120` owns, so the second way to count
-    // the fields that changed is deliberate until that plan lands.
+    // The changed list comes from the name the write replaced, which the
+    // store read under the row's lock in the write's own transaction. A
+    // read before the write cannot say that: when two saves race, it is the
+    // value the other save wrote, and the row would be logged as unchanged
+    // although the name did change (`ADM-2`, plan adm-120 step 3b).
+    //
+    // The direct comparison this route used is gone: the governance plan's
+    // D3b left the route to `adm-120`, which owns the race.
+    let changed = saved.previous_name.as_deref() != name.as_deref();
     let fields: &[&str] = if changed { &["workspaceName"] } else { &[] };
     audit_settings_update(
         &state,
@@ -3103,7 +3115,7 @@ pub async fn put_general(
         fields,
     )
     .await;
-    Ok(ApiJson(general_settings_json(Some(&saved))))
+    Ok(ApiJson(general_settings_json(Some(&saved.settings))))
 }
 
 /// `PUT /api/settings/general/images/{kind}` — store one picture from a form

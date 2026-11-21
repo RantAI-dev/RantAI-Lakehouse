@@ -1269,11 +1269,12 @@ async fn a_join_of_two_governed_inputs_through_a_join_step_comes_back_with_both_
     );
 }
 
-/// J7 / D4b (`DATA-57`): a pipeline with a form step is not today's shape,
-/// so it compiles to the `WITH` form and is NOT noted for column lineage —
-/// the mapper would record a target column with no provenance.
+/// J7 / `DATA-57` D9: a pipeline with a form step compiles to the `WITH`
+/// form, which the lineage mapper now reads, so its statement is noted like
+/// every other compiled statement. What the mapper cannot prove is stored
+/// as a partial row with its reason, never a guessed edge.
 #[tokio::test]
-async fn a_form_step_pipeline_is_not_noted_for_column_lineage() {
+async fn a_form_step_pipeline_is_noted_for_column_lineage() {
     let (router, pool, cookie, _engine) = app().await;
     let join = pipelines::PipelineStep::Join {
         name: "joined".to_owned(),
@@ -1308,7 +1309,7 @@ async fn a_form_step_pipeline_is_not_noted_for_column_lineage() {
             .await
             .unwrap();
     assert_eq!(
-        noted, 0,
-        "a WITH-shaped pipeline is not noted for column lineage (D4b, DATA-57)"
+        noted, 1,
+        "every compiled statement is noted for column lineage (DATA-57 D9)"
     );
 }

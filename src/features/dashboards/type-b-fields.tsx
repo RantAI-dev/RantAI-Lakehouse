@@ -40,7 +40,8 @@ export function GoalFields({
       <Label>
         {word} {kind === "bullet" ? <span className="font-normal text-muted-foreground">(optional)</span> : <RequiredMarker />}
       </Label>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      {/* BI-58 review round 1 (SHOULD-FIX 2): two columns only where the inspector is wide enough (@md), so its narrow column keeps every field full width. */}
+      <div className="grid grid-cols-1 gap-3 @md:grid-cols-2">
         <Select value={draft.goalMode} items={GOAL_MODES} onValueChange={(v) => onChange({ goalMode: v === "measure" ? "measure" : "number" })}>
           <SelectTrigger className="w-full" aria-label={`${word} is`}><SelectValue /></SelectTrigger>
           <SelectContent>
@@ -93,7 +94,7 @@ export function HistogramFields({ draft, onChange }: { readonly draft: TypeDraft
   return (
     <div className="grid gap-1.5">
       <Label>Ranges</Label>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div className="grid grid-cols-1 gap-3 @md:grid-cols-2">
         <Select value={draft.histMode} items={HIST_MODES} onValueChange={(v) => onChange({ histMode: v === "count" || v === "width" ? v : "auto" })}>
           <SelectTrigger className="w-full" aria-label="Ranges"><SelectValue /></SelectTrigger>
           <SelectContent>
@@ -149,7 +150,7 @@ export function GanttFields({
   );
   return (
     <div className="grid gap-3">
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div className="grid grid-cols-1 gap-3 @md:grid-cols-2">
         {pick("Start column", draft.ganttStart, (v) => onChange({ ganttStart: v }), true)}
         {pick("End column", draft.ganttEnd, (v) => onChange({ ganttEnd: v }), true)}
       </div>

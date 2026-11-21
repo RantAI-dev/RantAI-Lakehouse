@@ -632,7 +632,7 @@ async fn pausing_a_report_with_an_outside_list_is_a_confirm() {
         pending["result"]["summary"]
             .as_str()
             .unwrap()
-            .contains("tanpa penerima baru"),
+            .contains("no new recipients"),
         "{pending}"
     );
     let done = tool(
@@ -1039,5 +1039,73 @@ async fn an_approver_who_cannot_see_main_cannot_release_a_report_on_main() {
         subs::list_for_owner(&f.app.pool, me).await.unwrap().len(),
         1,
         "a fully granted approver releases the report"
+    );
+}
+
+/// `AI-30`: the assistant can learn a colleague's id from the console's own
+/// recipient picker, rather than guessing a `recipients[].userId`.
+#[tokio::test]
+async fn find_report_recipients_finds_an_active_colleague_by_name() {
+    let f = fixture().await;
+    let colleague: Uuid = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Colleague', 'colleague', 'colleague@company.example', 'active')")
+        .bind(colleague)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    let found = tool(&f, "find_report_recipients", json!({ "q": "Colleague" })).await;
+    assert_eq!(found["outcome"], "executed", "{found}");
+    let items = found["result"]["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{found}");
+    assert_eq!(items[0]["id"], json!(colleague.to_string()), "{found}");
+    assert_eq!(items[0]["name"], json!("Colleague"), "{found}");
+    assert_eq!(
+        items[0]["email"],
+        json!("colleague@company.example"),
+        "{found}"
+    );
+    assert!(
+        found["result"].get("roles").is_none(),
+        "the tool drops the roles list: {found}"
+    );
+}
+
+/// `AI-30`: the tool asks the console's handler, so the download right is
+/// enforced there; a refusal carries no people at all.
+#[tokio::test]
+async fn find_report_recipients_is_refused_without_the_download_right() {
+    let f = fixture().await;
+    let colleague: Uuid = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Colleague', 'colleague', 'colleague@company.example', 'active')")
+        .bind(colleague)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    let role: String = sqlx::query_scalar(
+        "SELECT r.name FROM role r JOIN app_user_role ur ON ur.role_id = r.id WHERE ur.user_id = $1",
+    )
+    .bind(f.me)
+    .fetch_one(&f.app.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO reporting_settings (singleton, time_zone, week_start, download_denied_roles, report_allowed_domains) \
+         VALUES (TRUE, 'UTC', 'monday', ARRAY[$1], ARRAY['company.example'])",
+    )
+    .bind(role)
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+    let refused = tool(&f, "find_report_recipients", json!({ "q": "Colleague" })).await;
+    assert_eq!(refused["outcome"], "failed", "{refused}");
+    assert!(
+        refused["result"]["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("Downloads are switched off")),
+        "{refused}"
+    );
+    assert!(
+        refused["result"].get("items").is_none(),
+        "a refusal carries no people: {refused}"
     );
 }
