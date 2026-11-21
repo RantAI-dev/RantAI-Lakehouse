@@ -474,6 +474,14 @@ export const clickhouseDashboardService: DashboardService = {
       "The permissions could not be loaded"
     )
   },
+  // BI-72: any refusal, including 401 on a public link or a signed embed, is
+  // "no claim" (`null`): the card then shows the frame as it always did.
+  async frameCheck(url, signal) {
+    const res = await apiFetch(`/api/dashboard/frame-check?url=${encodeURIComponent(url)}`, { cache: "no-store", signal })
+    if (!res.ok) return null
+    const json = (await res.json().catch(() => null)) as { framable?: unknown } | null
+    return typeof json?.framable === "boolean" ? json.framable : null
+  },
   async saveAccess(input, signal) {
     const res = await apiFetch("/api/dashboard/access", {
       method: "PUT",
