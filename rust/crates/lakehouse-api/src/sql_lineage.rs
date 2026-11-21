@@ -14,12 +14,25 @@
 //! that as a partial row rather than dropping it:
 //!
 //! * `*` or `t.*` over a table whose columns are not in `known_columns`;
-//! * a column read through a CTE, a subquery in `FROM` or a table function;
+//! * a column read through an unreadable `WITH` name (a recursive `WITH`, a
+//!   name with its own column list, a `MATERIALIZED`/`FROM` hint, a name read
+//!   before it is defined, a name defined twice, a name whose query cannot be
+//!   read, or one that differs only in letter case), a subquery in `FROM` or
+//!   a table function;
 //! * a `UNION` (every output of the left branch is partial);
 //! * an unqualified identifier that matches no table, or several, in `FROM`,
 //!   or that could belong to a source whose columns are not known;
 //! * an expression holding a subquery, or an unaliased expression (the engine
 //!   names it, so its column name is not known here).
+//!
+//! # Through a `WITH`
+//!
+//! A `WITH` name resolves to the outputs of its query, read with the same
+//! rules as a top-level `SELECT` (`DATA-57` D1). A nested `WITH` is read the
+//! same way and shadows an outer name of the same spelling (D2); names match
+//! exactly, case included (D3). A `*` over a name whose columns are all known
+//! expands to those columns (D4). A name we cannot read stays a partial row
+//! with a fixed reason, never a guessed edge (D7).
 //!
 //! A statement that cannot be read at all (not one statement, a kind other
 //! than the three above, or a `INSERT` whose target columns are not known)
@@ -129,6 +142,11 @@ fn short(name: &str) -> String {
 enum Source {
     /// A real table, by key.
     Table(String),
+    /// A `WITH` name and the outputs of its query (`DATA-57` D1). The outputs
+    /// are cloned so a nested query can read a shadowing name. The clone is
+    /// bounded by `MAX_OUTPUT_COLUMNS`, not by a pipeline's CTE count: SQL
+    /// sources and query-log statements have no such cap (DATA-57 review R4).
+    Cte { name: String, columns: Vec<Out> },
     /// Something whose columns are not traced; the sentence says what.
     Opaque(String),
 }
@@ -144,9 +162,15 @@ struct Entry {
 struct Scope<'a> {
     entries: Vec<Entry>,
     known: &'a HashMap<String, Vec<String>>,
+    /// Aliases of other projection items, with the index that defines each
+    /// (`DATA-57` D6). An unqualified name that is one of them is read by
+    /// `ClickHouse` as the alias, not as a column of `FROM`.
+    aliases: Vec<(String, usize)>,
+    current_item: usize,
 }
 
 /// One output slot, before it is split into mappings and partials.
+#[derive(Clone)]
 struct Out {
     name: String,
     sources: Vec<(String, String)>,
@@ -157,6 +181,65 @@ struct Out {
     unexpanded_star: bool,
 }
 
+/// What a `WITH` name stands for. An unreadable name is still in scope, as a
+/// partial row with its fixed reason, so a read through it is never guessed.
+#[derive(Clone)]
+enum CteDef {
+    Columns(Vec<Out>),
+    Opaque(String),
+}
+
+/// The `WITH` names visible in one query. `defined` is walked from the end
+/// (a nested name shadows an outer one of the same spelling, `DATA-57` D2);
+/// `pending` holds exact names of the current `WITH` not yet read, so a
+/// forward reference stays partial (D7). Both store the name as written,
+/// because `ClickHouse` matches `WITH` names with exact case (D3).
+struct CteEnv {
+    defined: Vec<(String, CteDef)>,
+    pending: Vec<String>,
+}
+
+impl CteEnv {
+    fn empty() -> Self {
+        Self {
+            defined: Vec::new(),
+            pending: Vec::new(),
+        }
+    }
+}
+
+/// One resolved read: the sources and reasons a column carries, and how it
+/// was computed. A real table gives one source and `Copy`; a `WITH` column
+/// gives its own sources, reasons and transform (`DATA-57` D5).
+struct Read {
+    sources: Vec<(String, String)>,
+    reasons: Vec<String>,
+    transform: Transform,
+}
+
+impl Read {
+    fn table(pair: (String, String)) -> Self {
+        Self {
+            sources: vec![pair],
+            reasons: Vec::new(),
+            transform: Transform::Copy,
+        }
+    }
+}
+
+/// Compose an outer transform with the transform of a column read through a
+/// `WITH` (`DATA-57` D5). `expression` absorbs anything; a `cast` of a `cast`
+/// is `expression` because the stored word means one `CAST` of one column
+/// (planner default).
+fn compose_transforms(outer: Transform, inner: Transform) -> Transform {
+    use Transform::{Cast, Copy, Expression};
+    match (outer, inner) {
+        (Copy, inner) => inner,
+        (Cast, Copy) => Cast,
+        _ => Expression,
+    }
+}
+
 const MSG_SUBQUERY_EXPR: &str = "the expression contains a subquery, which is not traced";
 const MSG_UNNAMED: &str =
     "the expression has no alias, so the engine chooses the column name; add an alias";
@@ -165,6 +248,29 @@ const MSG_SUBQUERY_FROM: &str = "read through a subquery in FROM, which is not t
 const MSG_TABLE_FUNCTION: &str = "read through a table function or another relation that is not a plain table, which is not traced";
 const MSG_WILDCARD_OPTIONS: &str =
     "the * has EXCEPT, REPLACE, RENAME or similar options, which are not traced";
+const MSG_CTE_RECURSIVE: &str = "read through a recursive WITH, which is not traced";
+const MSG_CTE_COLUMNS: &str =
+    "read through a WITH name with its own column list, which is not traced";
+const MSG_CTE_HINT: &str =
+    "read through a WITH name with a MATERIALIZED or FROM hint, which is not traced";
+const MSG_CTE_FORWARD: &str = "read through a WITH name before it is defined, which is not traced";
+const MSG_CTE_DUPLICATE: &str =
+    "read through a WITH name that is defined twice, which is not traced";
+const MSG_CTE_UNREADABLE: &str =
+    "read through a WITH name whose query cannot be read, which is not traced";
+const MSG_CTE_CASE: &str =
+    "the name differs from a WITH name only in letter case, which is not traced";
+const MSG_ALIAS_CAPTURE: &str =
+    "the name is also an alias in this SELECT, and ClickHouse reads the alias; rename one";
+// DATA-57 review R3: a FROM alias's column list renames the columns, so the
+// source's own names cannot be trusted for a read through it.
+const MSG_ALIAS_COLUMNS: &str = "read through a FROM alias with a column list, which is not traced";
+// DATA-57 review R4: only pipelines cap CTEs at 25; a SQL source or a
+// query-log statement has no such bound, and a self-joined CTE chain doubles
+// its outputs per level. Past this cap the statement is partial, not mapped.
+const MAX_OUTPUT_COLUMNS: usize = 2_000;
+const MSG_TOO_MANY_OUTPUTS: &str =
+    "the statement has more than 2,000 output columns, which is not traced";
 
 /// What one statement writes (`INSERT` and `CREATE TABLE ... AS`), an
 /// `INSERT`'s explicit column list, and the query that fills it.
@@ -237,13 +343,7 @@ pub(crate) fn map_select(
     known_columns: &HashMap<String, Vec<String>>,
 ) -> Result<Lineage, Unmappable> {
     let (target, insert_columns, query) = parse_statement(sql, dialect)?;
-    let ctes: Vec<String> = query
-        .with
-        .iter()
-        .flat_map(|with| with.cte_tables.iter())
-        .map(|cte| cte.alias.name.value.to_ascii_lowercase())
-        .collect();
-    let mut outs = outputs_of_body(&query.body, &ctes, known_columns)?;
+    let mut outs = outputs_of_query(&query, &CteEnv::empty(), known_columns)?;
 
     // An INSERT names its columns, or takes the target's in order; the
     // SELECT's own aliases do not matter to where a value lands.
@@ -329,38 +429,133 @@ fn table_key(name: &ObjectName) -> String {
     canonicalize(&parts)
 }
 
+/// Aliases of the projection items of one `SELECT`, with their index. `id AS
+/// id` names the column itself and is not a capture (`DATA-57` D6); every
+/// other alias hides that spelling for an unqualified read in another item.
+fn projection_aliases(projection: &[SelectItem]) -> Vec<(String, usize)> {
+    projection
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            SelectItem::ExprWithAlias { expr, alias } => {
+                if matches!(unwrap_nested(expr), Expr::Identifier(id) if id.value == alias.value) {
+                    None
+                } else {
+                    Some((alias.value.clone(), index))
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The outputs of a query: read its own `WITH` in order, then its body. The
+/// CTEs of a `WITH` are visible to the ones after them and to the body, and a
+/// nested `WITH` shadows an outer name of the same spelling (`DATA-57` D1, D2).
+fn outputs_of_query(
+    query: &Query,
+    env: &CteEnv,
+    known: &HashMap<String, Vec<String>>,
+) -> Result<Vec<Out>, Unmappable> {
+    let Some(with) = &query.with else {
+        return outputs_of_body(&query.body, env, known);
+    };
+
+    let mut defined = env.defined.clone();
+    // DATA-57 review R1: a nested `WITH` does not start a fresh "not defined
+    // yet" scope. Carry the enclosing pending names into this one, or a
+    // reference to a later name of an enclosing `WITH` would be looked up in
+    // `defined` and become a wrong edge instead of a partial row.
+    let own_names: Vec<String> = with
+        .cte_tables
+        .iter()
+        .map(|cte| cte.alias.name.value.clone())
+        .collect();
+    let mut pending: Vec<String> = env.pending.clone();
+    pending.extend(own_names.iter().cloned());
+    // DATA-57 review R6: "declared twice" means twice in THIS WITH. The
+    // merged `pending` also holds enclosing names, and a nested WITH may
+    // legitimately shadow one of those; counting them would mark a valid
+    // shadow as a duplicate and turn a proven mapping into a partial row.
+    let duplicated: Vec<String> = own_names
+        .iter()
+        .filter(|name| own_names.iter().filter(|n| *n == *name).count() > 1)
+        .cloned()
+        .collect();
+
+    for cte in &with.cte_tables {
+        let name = cte.alias.name.value.clone();
+        let def = if with.recursive {
+            CteDef::Opaque(MSG_CTE_RECURSIVE.to_owned())
+        } else if duplicated.contains(&name) {
+            CteDef::Opaque(MSG_CTE_DUPLICATE.to_owned())
+        } else if !cte.alias.columns.is_empty() {
+            CteDef::Opaque(MSG_CTE_COLUMNS.to_owned())
+        } else if cte.materialized.is_some() || cte.from.is_some() {
+            CteDef::Opaque(MSG_CTE_HINT.to_owned())
+        } else {
+            let child = CteEnv {
+                defined: defined.clone(),
+                pending: pending.clone(),
+            };
+            match outputs_of_query(&cte.query, &child, known) {
+                Err(_) => CteDef::Opaque(MSG_CTE_UNREADABLE.to_owned()),
+                Ok(outs) => match outs.iter().find(|o| o.unexpanded_star) {
+                    // An unreadable `*` inside the CTE makes the whole name
+                    // opaque with that `*`'s own reason (D4).
+                    Some(star) => CteDef::Opaque(
+                        star.reasons
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| MSG_CTE_UNREADABLE.to_owned()),
+                    ),
+                    None => CteDef::Columns(outs),
+                },
+            }
+        };
+        defined.push((name.clone(), def));
+        pending.retain(|n| n != &name);
+    }
+
+    // DATA-57 review R1: the body still sees enclosing names that have not
+    // been defined yet; only this `WITH`'s own names have been removed above.
+    outputs_of_body(&query.body, &CteEnv { defined, pending }, known)
+}
+
 /// The outputs of a query body: a `SELECT`, a parenthesized query, or a set
 /// operation (whose outputs are all partial).
 fn outputs_of_body(
     body: &SetExpr,
-    ctes: &[String],
+    env: &CteEnv,
     known: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<Out>, Unmappable> {
     match body {
         SetExpr::Select(select) => {
-            let scope = Scope {
-                entries: select_entries(&select.from, ctes),
+            let mut scope = Scope {
+                entries: select_entries(&select.from, env),
                 known,
+                aliases: projection_aliases(&select.projection),
+                current_item: 0,
             };
             let mut outs = Vec::new();
-            for item in &select.projection {
+            for (index, item) in select.projection.iter().enumerate() {
+                scope.current_item = index;
                 outs.extend(outputs_of_item(item, &scope));
+            }
+            if outs.len() > MAX_OUTPUT_COLUMNS {
+                // DATA-57 review R4: enforce the bound at every level, so a
+                // self-joined CTE chain cannot multiply outputs (and make the
+                // duplicate-name check quadratic) before the top level.
+                return Ok(vec![unexpanded(
+                    "*".to_owned(),
+                    MSG_TOO_MANY_OUTPUTS.to_owned(),
+                )]);
             }
             Ok(outs)
         }
-        SetExpr::Query(inner) => {
-            let mut inner_ctes = ctes.to_vec();
-            inner_ctes.extend(
-                inner
-                    .with
-                    .iter()
-                    .flat_map(|with| with.cte_tables.iter())
-                    .map(|cte| cte.alias.name.value.to_ascii_lowercase()),
-            );
-            outputs_of_body(&inner.body, &inner_ctes, known)
-        }
+        SetExpr::Query(inner) => outputs_of_query(inner, env, known),
         SetExpr::SetOperation { left, .. } => {
-            let mut outs = outputs_of_body(left, ctes, known)?;
+            let mut outs = outputs_of_body(left, env, known)?;
             if outs.iter().any(|o| o.unexpanded_star) {
                 return Err(unmappable(
                     "a UNION with * cannot be read: the columns of its branches are not known",
@@ -376,19 +571,52 @@ fn outputs_of_body(
     }
 }
 
+/// Whether a one-part name names a `WITH` of the current scope.
+enum CteLookup<'a> {
+    Defined(&'a CteDef),
+    Forward,
+    CaseOnly,
+    None,
+}
+
+fn cte_lookup<'a>(env: &'a CteEnv, name: &str) -> CteLookup<'a> {
+    // DATA-57 review R1: check "not defined yet" at ANY level before
+    // `defined`, even when an enclosing scope has already defined the same
+    // spelling. Which one an engine binds is then unclear, so the only safe
+    // answer is a partial row, never an edge.
+    if env.pending.iter().any(|n| n == name) {
+        return CteLookup::Forward;
+    }
+    // Walk back so a nested name shadows an outer one (D2).
+    for (defined_name, def) in env.defined.iter().rev() {
+        if defined_name == name {
+            return CteLookup::Defined(def);
+        }
+    }
+    let case_only = env
+        .defined
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case(name))
+        || env.pending.iter().any(|n| n.eq_ignore_ascii_case(name));
+    if case_only {
+        return CteLookup::CaseOnly;
+    }
+    CteLookup::None
+}
+
 /// Every relation of a `FROM` clause with the names it can be qualified by.
-fn select_entries(from: &[TableWithJoins], ctes: &[String]) -> Vec<Entry> {
+fn select_entries(from: &[TableWithJoins], env: &CteEnv) -> Vec<Entry> {
     let mut entries = Vec::new();
     for twj in from {
-        push_factor(&twj.relation, ctes, &mut entries);
+        push_factor(&twj.relation, env, &mut entries);
         for join in &twj.joins {
-            push_factor(&join.relation, ctes, &mut entries);
+            push_factor(&join.relation, env, &mut entries);
         }
     }
     entries
 }
 
-fn push_factor(factor: &TableFactor, ctes: &[String], entries: &mut Vec<Entry>) {
+fn push_factor(factor: &TableFactor, env: &CteEnv, entries: &mut Vec<Entry>) {
     match factor {
         TableFactor::Table {
             name, alias, args, ..
@@ -404,15 +632,56 @@ fn push_factor(factor: &TableFactor, ctes: &[String], entries: &mut Vec<Entry>) 
                 });
                 return;
             }
-            if name.0.len() == 1 && ctes.contains(&key) {
+            // DATA-57 review R3: `FROM t AS x(a, b)` renames the columns in
+            // the alias list. Mapping by the source's own names would give a
+            // wrong edge, so the entry is opaque with a fixed reason.
+            if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
                 entries.push(Entry {
                     names,
-                    source: Source::Opaque(format!(
-                        "read through the CTE {}, which is not traced",
-                        short(&key)
-                    )),
+                    source: Source::Opaque(MSG_ALIAS_COLUMNS.to_owned()),
                 });
                 return;
+            }
+            if name.0.len() == 1
+                && let Some(raw) = name.0.last().and_then(ObjectNamePart::as_ident)
+            {
+                // CTE names match exactly, case included (D3): an
+                // exact match resolves, a case-only match is opaque.
+                match cte_lookup(env, &raw.value) {
+                    CteLookup::Defined(CteDef::Columns(columns)) => {
+                        names.push(raw.value.to_ascii_lowercase());
+                        entries.push(Entry {
+                            names,
+                            source: Source::Cte {
+                                name: raw.value.clone(),
+                                columns: columns.clone(),
+                            },
+                        });
+                        return;
+                    }
+                    CteLookup::Defined(CteDef::Opaque(reason)) => {
+                        entries.push(Entry {
+                            names,
+                            source: Source::Opaque(reason.clone()),
+                        });
+                        return;
+                    }
+                    CteLookup::Forward => {
+                        entries.push(Entry {
+                            names,
+                            source: Source::Opaque(MSG_CTE_FORWARD.to_owned()),
+                        });
+                        return;
+                    }
+                    CteLookup::CaseOnly => {
+                        entries.push(Entry {
+                            names,
+                            source: Source::Opaque(MSG_CTE_CASE.to_owned()),
+                        });
+                        return;
+                    }
+                    CteLookup::None => {}
+                }
             }
             // A table with an alias is no longer reachable by its own name in
             // standard SQL, but ClickHouse still accepts it; accepting it
@@ -434,9 +703,9 @@ fn push_factor(factor: &TableFactor, ctes: &[String], entries: &mut Vec<Entry>) 
         TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
-            push_factor(&table_with_joins.relation, ctes, entries);
+            push_factor(&table_with_joins.relation, env, entries);
             for join in &table_with_joins.joins {
-                push_factor(&join.relation, ctes, entries);
+                push_factor(&join.relation, env, entries);
             }
         }
         _ => entries.push(Entry {
@@ -553,6 +822,11 @@ fn expand_star(
         let entry = &scope.entries[index];
         match &entry.source {
             Source::Opaque(reason) => outs.push(unexpanded("*".to_owned(), reason.clone())),
+            Source::Cte { columns, .. } => {
+                // A CTE's columns are all known here (D4): an unexpanded `*`
+                // would have made the name opaque when it was defined.
+                outs.extend(columns.iter().cloned());
+            }
             Source::Table(key) => match scope.known.get(key) {
                 Some(columns) if !columns.is_empty() => {
                     for column in columns {
@@ -572,9 +846,14 @@ fn expand_star(
             },
         }
     }
-    // Two tables with a column of the same name: the engine renames one, and
-    // which one is not decided here.
-    if entries.len() > 1 {
+    // Two relations with a column of the same name: the engine renames one,
+    // and which one is not decided here. A single CTE can also hold two
+    // outputs of one name (D7), so its `*` must run this rule too.
+    if entries.len() > 1
+        || entries
+            .iter()
+            .any(|&i| matches!(scope.entries[i].source, Source::Cte { .. }))
+    {
         let names: Vec<String> = outs.iter().map(|o| o.name.clone()).collect();
         for out in &mut outs {
             if !out.unexpanded_star && names.iter().filter(|n| **n == out.name).count() > 1 {
@@ -659,12 +938,22 @@ fn analyse(name: &str, expr: &Expr, scope: &Scope<'_>) -> Out {
         out.reasons.push(MSG_SUBQUERY_EXPR.to_owned());
         return out;
     }
+    let outer = out.transform;
+    let mut composed = None;
     for parts in &reads.identifiers {
         match resolve(parts, scope) {
-            Ok(pair) => {
-                if !out.sources.contains(&pair) {
-                    out.sources.push(pair);
+            Ok(read) => {
+                for source in read.sources {
+                    if !out.sources.contains(&source) {
+                        out.sources.push(source);
+                    }
                 }
+                for reason in read.reasons {
+                    if !out.reasons.contains(&reason) {
+                        out.reasons.push(reason);
+                    }
+                }
+                composed = Some(compose_transforms(outer, read.transform));
             }
             Err(reason) => {
                 if !out.reasons.contains(&reason) {
@@ -672,6 +961,13 @@ fn analyse(name: &str, expr: &Expr, scope: &Scope<'_>) -> Out {
                 }
             }
         }
+    }
+    // Only a bare column or a cast of one has a single read to compose with
+    // (`transform_of` is `Copy` or `Cast`); an expression stays an expression.
+    if matches!(outer, Transform::Copy | Transform::Cast)
+        && let Some(transform) = composed
+    {
+        out.transform = transform;
     }
     out
 }
@@ -718,8 +1014,33 @@ fn on_table(scope: &Scope<'_>, table: &str, column: &str) -> Result<(String, Str
     }
 }
 
-/// One identifier to `(table key, column)`, or the reason it cannot be.
-fn resolve(parts: &[Ident], scope: &Scope<'_>) -> Result<(String, String), String> {
+/// The read a column of a CTE carries: its own sources and reasons, or the
+/// fixed reason it is not one of the CTE's outputs (`DATA-57` D7).
+fn read_from_cte(name: &str, columns: &[Out], column: &str) -> Result<Read, String> {
+    // A CTE column matches exactly, case included (D3), unlike a table column
+    // whose known spelling keeps today's single case-folded match.
+    let matches: Vec<&Out> = columns.iter().filter(|o| o.name == column).collect();
+    match matches.as_slice() {
+        [one] => Ok(Read {
+            sources: one.sources.clone(),
+            reasons: one.reasons.clone(),
+            transform: one.transform,
+        }),
+        [] => Err(format!(
+            "the column {} is not a column of the CTE {}",
+            short(column),
+            short(name)
+        )),
+        _ => Err(format!(
+            "the CTE {} has more than one column named {}",
+            short(name),
+            short(column)
+        )),
+    }
+}
+
+/// One identifier to the read it resolves to, or the reason it cannot be.
+fn resolve(parts: &[Ident], scope: &Scope<'_>) -> Result<Read, String> {
     let Some((column, qualifier)) = parts.split_last() else {
         return Err("an empty identifier".to_owned());
     };
@@ -731,11 +1052,7 @@ fn resolve(parts: &[Ident], scope: &Scope<'_>) -> Result<(String, String), Strin
     }
 }
 
-fn resolve_qualified(
-    column: &str,
-    qualifier: &[Ident],
-    scope: &Scope<'_>,
-) -> Result<(String, String), String> {
+fn resolve_qualified(column: &str, qualifier: &[Ident], scope: &Scope<'_>) -> Result<Read, String> {
     let lowered: Vec<String> = qualifier
         .iter()
         .map(|i| i.value.to_ascii_lowercase())
@@ -761,65 +1078,93 @@ fn resolve_qualified(
     };
     match &entry.source {
         Source::Opaque(reason) => Err(reason.clone()),
-        Source::Table(key) => on_table(scope, key, column),
+        Source::Table(key) => on_table(scope, key, column).map(Read::table),
+        Source::Cte { name, columns } => read_from_cte(name, columns, column),
     }
 }
 
-fn resolve_unqualified(column: &str, scope: &Scope<'_>) -> Result<(String, String), String> {
+fn resolve_unqualified(column: &str, scope: &Scope<'_>) -> Result<Read, String> {
+    // `ClickHouse` reads an unqualified name that is another item's alias as
+    // that alias, so mapping it to a `FROM` column would be a wrong edge
+    // (`DATA-57` D6). A qualified name and the item's own alias are not.
+    if let Some((_, owner)) = scope.aliases.iter().find(|(name, _)| name == column)
+        && *owner != scope.current_item
+    {
+        return Err(MSG_ALIAS_CAPTURE.to_owned());
+    }
     // A source whose columns are not traced might hold this name too, so no
     // table can be named for it.
     let opaque = scope.entries.iter().find_map(|e| match &e.source {
         Source::Opaque(reason) => Some(reason),
-        Source::Table(_) => None,
+        Source::Table(_) | Source::Cte { .. } => None,
     });
     if let Some(reason) = opaque {
         return Err(reason.clone());
     }
-    let tables: Vec<&String> = scope
+    // Keep the lone-table behaviour: one real table is the only possible
+    // owner, checked by `on_table` rather than by a membership test. A lone
+    // CTE likewise owns every read through it, with its own exact-name rule.
+    let candidates: Vec<&Entry> = scope
         .entries
         .iter()
-        .filter_map(|e| match &e.source {
-            Source::Table(key) => Some(key),
-            Source::Opaque(_) => None,
-        })
+        .filter(|e| !matches!(e.source, Source::Opaque(_)))
         .collect();
-    match tables.as_slice() {
-        [] => Err(format!("the column {} has no table in FROM", short(column))),
-        [only] => on_table(scope, only, column),
-        several => {
-            // PR #106 review R1 BLOCKER 7: an unchecked table makes an unqualified column ambiguous
-            let mut holders: Vec<(&String, String)> = Vec::new();
-            let mut unchecked: Vec<&String> = Vec::new();
-            for key in several {
-                match lookup(scope, key, column) {
-                    Lookup::Found(real) => holders.push((*key, real)),
-                    Lookup::Unchecked => unchecked.push(*key),
-                    Lookup::Absent => {}
+    if let [entry] = candidates.as_slice() {
+        match &entry.source {
+            Source::Table(key) => return Ok(Read::table(on_table(scope, key, column)?)),
+            Source::Cte { name, columns } => return read_from_cte(name, columns, column),
+            Source::Opaque(_) => {}
+        }
+    }
+    let mut holders: Vec<(&Entry, String)> = Vec::new();
+    let mut unchecked: Vec<String> = Vec::new();
+    for entry in &candidates {
+        match &entry.source {
+            Source::Opaque(_) => {}
+            Source::Table(key) => match lookup(scope, key, column) {
+                Lookup::Found(real) => holders.push((entry, real)),
+                Lookup::Unchecked => unchecked.push(key.clone()),
+                Lookup::Absent => {}
+            },
+            Source::Cte { name, columns } => {
+                let matches: Vec<&Out> = columns.iter().filter(|o| o.name == column).collect();
+                match matches.as_slice() {
+                    [one] => holders.push((entry, one.name.clone())),
+                    [] => {}
+                    _ => {
+                        return Err(format!(
+                            "the CTE {} has more than one column named {}",
+                            short(name),
+                            short(column)
+                        ));
+                    }
                 }
             }
-            if !unchecked.is_empty() {
-                return Err(format!(
-                    "the column {} is ambiguous: the columns of {} are not known; qualify it",
-                    short(column),
-                    unchecked
-                        .iter()
-                        .map(|k| short(k))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            match holders.as_slice() {
-                [(key, real)] => Ok(((*key).clone(), real.clone())),
-                [] => Err(format!(
-                    "the column {} matches no table in FROM whose columns are known",
-                    short(column)
-                )),
-                _ => Err(format!(
-                    "the column {} matches more than one table in FROM; qualify it",
-                    short(column)
-                )),
-            }
         }
+    }
+    if !unchecked.is_empty() {
+        // PR #106 review R1 BLOCKER 7: an unchecked table makes an unqualified column ambiguous
+        return Err(format!(
+            "the column {} is ambiguous: the columns of {} are not known; qualify it",
+            short(column),
+            unchecked
+                .iter()
+                .map(|k| short(k))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    match holders.as_slice() {
+        [] => Err(format!("the column {} has no table in FROM", short(column))),
+        [(entry, real)] => match &entry.source {
+            Source::Table(key) => Ok(Read::table((key.clone(), real.clone()))),
+            Source::Cte { name, columns } => read_from_cte(name, columns, real),
+            Source::Opaque(reason) => Err(reason.clone()),
+        },
+        _ => Err(format!(
+            "the column {} matches more than one table in FROM; qualify it",
+            short(column)
+        )),
     }
 }
 
@@ -1026,22 +1371,502 @@ mod tests {
         assert_eq!(l.partial.len(), 2);
     }
 
+    // DATA-57: the CTE half moved to `a_column_read_through_a_cte_names_the_table_behind_it`;
+    // a subquery in `FROM` and a table function stay partial (D8).
     #[test]
-    fn a_cte_a_subquery_in_from_and_a_table_function_are_partial() {
-        let cte = run("WITH c AS (SELECT id FROM silver.orders) SELECT id FROM c");
-        assert_eq!(
-            reasons(&cte),
-            vec![(
-                "id".to_owned(),
-                "read through the CTE c, which is not traced".to_owned()
-            )]
-        );
+    fn a_subquery_in_from_and_a_table_function_are_partial() {
         let sub = run("SELECT id FROM (SELECT id FROM silver.orders) s");
         assert_eq!(sub.partial[0].reason, MSG_SUBQUERY_FROM);
         let func = run("SELECT x FROM numbers(10)");
         assert_eq!(func.partial[0].reason, MSG_TABLE_FUNCTION);
-        for l in [&cte, &sub, &func] {
+        for l in [&sub, &func] {
             assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        }
+    }
+
+    // DATA-57 T1: a `WITH` name resolves to the outputs of its query.
+
+    #[test]
+    fn a_column_read_through_a_cte_names_the_table_behind_it() {
+        let l =
+            run("WITH c AS (SELECT id, Amount AS amt FROM silver.orders) SELECT id, amt FROM c");
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("id", "silver.orders.id", "copy"),
+                t("amt", "silver.orders.Amount", "copy"),
+            ]
+        );
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn a_star_over_a_cte_expands_to_its_columns() {
+        let l = run("WITH c AS (SELECT * FROM silver.users) SELECT * FROM c");
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("id", "silver.users.id", "copy"),
+                t("name", "silver.users.name", "copy"),
+            ]
+        );
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn a_nested_with_is_read_and_shadows_the_outer_name() {
+        let l = run("WITH t AS (SELECT name FROM silver.users), \
+             s AS (WITH t AS (SELECT id FROM silver.orders) SELECT id FROM t) \
+             SELECT id FROM s");
+        assert_eq!(triples(&l), vec![t("id", "silver.orders.id", "copy")]);
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    // DATA-57 review R1: a nested WITH keeps the enclosing "not defined yet"
+    // names. Both statements below would otherwise produce a wrong edge.
+    #[test]
+    fn a_name_from_an_enclosing_with_that_is_defined_later_is_partial() {
+        let l = run("WITH a AS (WITH x AS (SELECT 1 AS k) SELECT id FROM b), \
+             b AS (SELECT Amount AS id FROM silver.orders) SELECT id FROM a");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_CTE_FORWARD.to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_nested_with_redefining_an_enclosing_name_is_partial() {
+        let l = run("WITH b AS (SELECT name AS id FROM silver.users), \
+             s AS (WITH a AS (SELECT id FROM b), \
+             b AS (SELECT id FROM silver.orders) SELECT id FROM a) SELECT id FROM s");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_CTE_FORWARD.to_owned())]
+        );
+    }
+
+    // DATA-57 review R6: a nested WITH may shadow a later enclosing name.
+    #[test]
+    fn a_nested_with_shadowing_a_later_outer_name_is_not_a_duplicate() {
+        let l = run(
+            "WITH a AS (WITH b AS (SELECT name AS id FROM silver.users) SELECT id FROM b), \
+             b AS (SELECT 1 AS id) SELECT id FROM a",
+        );
+        assert_eq!(triples(&l), vec![t("id", "silver.users.name", "copy")]);
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn a_cte_over_unknown_columns_leaves_the_star_partial() {
+        let l = run("WITH c AS (SELECT * FROM silver.unknown) SELECT * FROM c");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![(
+                "*".to_owned(),
+                "the columns of silver.unknown are not known".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_union_inside_a_cte_is_carried_through_as_partial() {
+        let l = run(
+            "WITH c AS (SELECT id FROM silver.orders UNION ALL SELECT id FROM silver.users) \
+             SELECT id FROM c",
+        );
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(reasons(&l), vec![("id".to_owned(), MSG_UNION.to_owned())]);
+    }
+
+    #[test]
+    fn a_subquery_in_from_inside_a_cte_is_carried_through_as_partial() {
+        let l = run("WITH c AS (SELECT id FROM (SELECT id FROM silver.orders) s) SELECT id FROM c");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_SUBQUERY_FROM.to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_recursive_with_is_partial() {
+        let l = run("WITH RECURSIVE c AS (SELECT id FROM silver.orders) SELECT id FROM c");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_CTE_RECURSIVE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_cte_with_a_column_list_is_partial() {
+        let l = run("WITH c(x) AS (SELECT id FROM silver.orders) SELECT x FROM c");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("x".to_owned(), MSG_CTE_COLUMNS.to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_name_read_before_its_cte_is_defined_is_partial() {
+        let l = run(
+            "WITH a AS (SELECT id FROM b), b AS (SELECT id FROM silver.orders) SELECT id FROM a",
+        );
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_CTE_FORWARD.to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_name_that_differs_from_a_cte_only_in_case_is_partial() {
+        let l = run("WITH c AS (SELECT id FROM silver.orders) SELECT id FROM C");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_CTE_CASE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_column_the_cte_does_not_output_is_partial() {
+        let l = run("WITH c AS (SELECT id FROM silver.orders) SELECT Amount FROM c");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![(
+                "Amount".to_owned(),
+                "the column Amount is not a column of the CTE c".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_cte_with_two_columns_of_one_name_is_partial_by_that_name() {
+        let l = run(
+            "WITH c AS (SELECT o.id, u.id FROM silver.orders AS o JOIN silver.users AS u \
+             ON o.id = u.id) SELECT id FROM c",
+        );
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![(
+                "id".to_owned(),
+                "the CTE c has more than one column named id".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_unqualified_column_in_two_joined_ctes_is_partial() {
+        let l = run("WITH a AS (SELECT id, name FROM silver.users), \
+             b AS (SELECT id FROM silver.orders) \
+             SELECT id FROM a JOIN b ON a.id = b.id");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![(
+                "id".to_owned(),
+                "the column id matches more than one table in FROM; qualify it".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_insert_through_a_with_maps_by_position() {
+        let l = run(
+            "INSERT INTO serving.target WITH c AS (SELECT id, name FROM silver.users) \
+             SELECT id, name FROM c",
+        );
+        assert_eq!(l.target.as_deref(), Some("serving.target"));
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("a", "silver.users.id", "copy"),
+                t("b", "silver.users.name", "copy"),
+            ]
+        );
+    }
+
+    // DATA-57 review R2: the three remaining D7 reasons get their own test.
+
+    #[test]
+    fn a_materialized_cte_hint_is_partial() {
+        use sqlparser::dialect::PostgreSqlDialect;
+        // DATA-57 review R2: `ClickHouseDialect` does not parse a
+        // MATERIALIZED hint, so exercise the branch with the dialect that
+        // produces that AST; the mapper itself takes any dialect.
+        let sql = "WITH c AS MATERIALIZED (SELECT id FROM silver.orders) SELECT id FROM c";
+        assert_eq!(
+            map_select(sql, &ClickHouseDialect {}, &known()).unwrap_err(),
+            Unmappable("the statement does not parse".to_owned())
+        );
+        let l = map_select(sql, &PostgreSqlDialect {}, &known()).unwrap();
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_CTE_HINT.to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_duplicate_cte_name_is_partial() {
+        let l = run(
+            "WITH c AS (SELECT id FROM silver.orders), c AS (SELECT id FROM silver.users) \
+             SELECT id FROM c",
+        );
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_CTE_DUPLICATE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_cte_body_is_partial() {
+        let l = run("WITH c AS (VALUES (1)) SELECT * FROM c");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("*".to_owned(), MSG_CTE_UNREADABLE.to_owned())]
+        );
+    }
+
+    // DATA-57 review R3: a FROM alias with a column list renames columns.
+    #[test]
+    fn a_from_alias_with_a_column_list_is_partial() {
+        let l = run("WITH c AS (SELECT id, name FROM silver.users) \
+             SELECT x.id FROM c AS x(name, id)");
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("id".to_owned(), MSG_ALIAS_COLUMNS.to_owned())]
+        );
+    }
+
+    // DATA-57 review R4: bound the output count for all producers.
+    #[test]
+    fn a_doubling_cte_chain_is_capped_instead_of_growing_without_bound() {
+        use std::fmt::Write;
+        let mut sql = String::from("WITH c0 AS (SELECT * FROM silver.users)");
+        for level in 1..=11 {
+            write!(
+                sql,
+                ", c{level} AS (SELECT * FROM c{} AS a JOIN c{} AS b ON a.id = b.id)",
+                level - 1,
+                level - 1
+            )
+            .unwrap();
+        }
+        sql.push_str(" SELECT * FROM c11");
+        let l = run(&sql);
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("*".to_owned(), MSG_TOO_MANY_OUTPUTS.to_owned())]
+        );
+    }
+
+    // DATA-57 T2: transforms compose through a WITH (D5).
+
+    #[test]
+    fn a_cast_of_a_cte_copy_is_a_cast_and_a_copy_of_a_cte_cast_is_a_cast() {
+        let l = run(
+            "WITH c AS (SELECT id, CAST(Amount AS Float64) AS f FROM silver.orders) \
+             SELECT CAST(id AS String) AS s, f FROM c",
+        );
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("s", "silver.orders.id", "cast"),
+                t("f", "silver.orders.Amount", "cast"),
+            ]
+        );
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn a_cast_of_a_cte_cast_is_an_expression() {
+        let l = run(
+            "WITH c AS (SELECT CAST(Amount AS Float64) AS f FROM silver.orders) \
+             SELECT CAST(f AS String) AS g FROM c",
+        );
+        assert_eq!(
+            triples(&l),
+            vec![t("g", "silver.orders.Amount", "expression")]
+        );
+    }
+
+    #[test]
+    fn a_copy_of_a_cte_constant_is_a_constant() {
+        let l = run(
+            "WITH c AS (SELECT 1 AS one, count() AS n FROM silver.orders) SELECT one, n FROM c",
+        );
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+        assert_eq!(l.constants, vec!["one".to_owned(), "n".to_owned()]);
+    }
+
+    #[test]
+    fn the_compiled_shape_of_a_multi_step_pipeline_is_traced() {
+        let l = run("WITH \
+             `orders` AS (SELECT * FROM silver.`orders`), \
+             `paid` AS (SELECT * FROM `orders` WHERE region = 'EU'), \
+             `shaped` AS (SELECT id, CAST(Amount AS Float64) AS amount_f, upper(region) AS r FROM paid) \
+             SELECT * FROM `shaped`");
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("id", "silver.orders.id", "copy"),
+                t("amount_f", "silver.orders.Amount", "cast"),
+                t("r", "silver.orders.region", "expression"),
+            ]
+        );
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn two_inputs_joined_in_a_sql_step_map_each_column_to_its_own_table() {
+        let l = run("WITH \
+             `orders` AS (SELECT * FROM silver.`orders`), \
+             `users` AS (SELECT * FROM silver.`users`), \
+             `joined` AS (SELECT o.id AS order_id, u.name, o.Amount * 2 AS doubled \
+             FROM orders AS o JOIN users AS u ON o.id = u.id) \
+             SELECT * FROM `joined`");
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("order_id", "silver.orders.id", "copy"),
+                t("name", "silver.users.name", "copy"),
+                t("doubled", "silver.orders.Amount", "expression"),
+            ]
+        );
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    // DATA-57 T3: an alias of another item captures an unqualified name (D6).
+
+    #[test]
+    fn an_alias_of_another_item_captures_an_unqualified_name() {
+        let l = run("SELECT Amount AS id, id AS original FROM silver.orders");
+        assert_eq!(triples(&l), vec![t("id", "silver.orders.Amount", "copy")]);
+        assert_eq!(
+            reasons(&l),
+            vec![("original".to_owned(), MSG_ALIAS_CAPTURE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_same_capture_inside_a_cte_is_carried_through() {
+        let l = run(
+            "WITH c AS (SELECT Amount AS id, id AS original FROM silver.orders) \
+             SELECT original FROM c",
+        );
+        assert_eq!(l.mappings, [] as [crate::sql_lineage::Mapping; 0]);
+        assert_eq!(
+            reasons(&l),
+            vec![("original".to_owned(), MSG_ALIAS_CAPTURE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_items_own_alias_and_a_qualified_name_are_not_captured() {
+        let l = run(
+            "SELECT CAST(Amount AS Float64) AS Amount, o.id AS region_id, o.region AS id \
+             FROM silver.orders AS o",
+        );
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("Amount", "silver.orders.Amount", "cast"),
+                t("region_id", "silver.orders.id", "copy"),
+                t("id", "silver.orders.region", "copy"),
+            ]
+        );
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn id_as_id_does_not_capture() {
+        let l = run("SELECT id AS id, id + 1 AS next FROM silver.orders");
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("id", "silver.orders.id", "copy"),
+                t("next", "silver.orders.id", "expression"),
+            ]
+        );
+    }
+
+    // DATA-57 T4: the form steps of #619, by their byte-for-byte rendered
+    // text. No #619 code is needed here; these pin the shapes T5 unblocks.
+
+    #[test]
+    fn a_join_an_aggregate_and_a_filter_as_compiled_are_traced() {
+        let l = run("WITH \
+             `orders` AS (SELECT * FROM silver.`orders`), \
+             `users` AS (SELECT * FROM silver.`users`), \
+             `joined` AS (SELECT `__left`.`id` AS `id`, `__left`.`Amount` AS `amount`, \
+             `__right`.`name` AS `name` FROM `orders` AS `__left` LEFT JOIN `users` AS `__right` \
+             ON `__left`.`id` = `__right`.`id`), \
+             `by_name` AS (SELECT `name`, sum(`amount`) AS `revenue`, count() AS `order_count`, \
+             count(DISTINCT `id`) AS `ids` FROM `joined` GROUP BY `name` HAVING sum(`amount`) > 1000), \
+             `big` AS (SELECT * FROM `by_name` WHERE `revenue` >= '5000' OR `name` = 'ID') \
+             SELECT * FROM `big`");
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("name", "silver.users.name", "copy"),
+                t("revenue", "silver.orders.Amount", "expression"),
+                t("ids", "silver.orders.id", "expression"),
+            ]
+        );
+        assert_eq!(l.constants, vec!["order_count".to_owned()]);
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn a_self_join_as_compiled_maps_both_sides_to_the_one_table() {
+        let l = run("WITH \
+             `orders` AS (SELECT * FROM silver.`orders`), \
+             `tree` AS (SELECT `__left`.`id` AS `id`, `__right`.`id` AS `parent` \
+             FROM `orders` AS `__left` INNER JOIN `orders` AS `__right` \
+             ON `__left`.`id` = `__right`.`region`) \
+             SELECT * FROM `tree`");
+        assert_eq!(
+            triples(&l),
+            vec![
+                t("id", "silver.orders.id", "copy"),
+                t("parent", "silver.orders.id", "copy"),
+            ]
+        );
+        assert_eq!(l.partial, [] as [crate::sql_lineage::PartialOutput; 0]);
+    }
+
+    #[test]
+    fn every_measure_function_as_rendered_reads_its_column() {
+        for expr in [
+            "count(`id`)",
+            "count(DISTINCT `id`)",
+            "sum(`id`)",
+            "avg(`id`)",
+            "min(`id`)",
+            "max(`id`)",
+        ] {
+            let sql = format!(
+                "WITH `o` AS (SELECT * FROM silver.`orders`), \
+                 `m` AS (SELECT {expr} AS `x` FROM `o`) SELECT * FROM `m`"
+            );
+            assert_eq!(
+                triples(&run(&sql)),
+                vec![t("x", "silver.orders.id", "expression")],
+                "{expr}"
+            );
         }
     }
 
