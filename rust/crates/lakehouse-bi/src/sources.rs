@@ -237,6 +237,6 @@ mod tests {
             metric("mart_named_like_it", SourceKind::Mart, "s_1"),
         ];
         assert_eq!(metrics_using_source(&all, "s_1"), ["visits"]);
-        assert!(metrics_using_source(&all, "s_3").is_empty());
+        assert_eq!(metrics_using_source(&all, "s_3"), Vec::<&str>::new());
     }
 }
