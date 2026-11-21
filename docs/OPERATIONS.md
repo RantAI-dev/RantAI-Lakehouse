@@ -1401,7 +1401,7 @@ Migration `0133_pages_per_role.sql` introduces four new read permissions (`assis
 1. **The added role: Assistant only**
    - **ID:** `22222222-2222-4222-8222-000000000008`
    - **Permissions:** `assistant:ask,dashboard:read`
-   - **Access:** Home (`/`), History (`/copilot/history`), Dashboards (`/dashboards`), and the Copilot dock.
+   - **Access:** Home (`/`), a conversation (`/copilot`, whose sidebar lists their chats), Dashboards (`/dashboards`), and the Copilot dock.
    - **Restrictions:** Operates in ask-only mode (`assistant:ask`). Can ask conversational questions and run read-only tools. Cannot perform write or mutate actions (`is_build = false`), cannot create charts or dashboards via tools, and cannot edit assets.
 
 2. **Existing roles upgrade (`role` table):**
@@ -1434,7 +1434,7 @@ role and uncheck both:
 
 **Effect on users with that role:**
 - The Copilot dock and composer toggle disappear entirely.
-- The Home (`/`) and History (`/copilot/history`) items are hidden in the sidebar.
+- The Home (`/`) item is hidden in the sidebar, and a conversation (`/copilot`) shows "You don't have access".
 - Visiting `/` automatically redirects to the first available page (e.g. `/dashboards`).
 - Any direct API requests to `/api/ai/*` return `403 Forbidden`.
 
