@@ -626,6 +626,21 @@ CASE_PR_DRAFT=TRUE assert_draft "draft=false on pull_request with PR_DRAFT=TRUE 
 CASE_PR_DRAFT=unknown assert_draft "draft=false on pull_request with unknown PR_DRAFT (fail closed)" "false"
 CASE_EVENT=push CASE_PR_DRAFT=true assert_draft "draft=false on push even with PR_DRAFT=true" "false"
 
+# ── OPS-38 D2: narrowed lakehouse-api / lakehouse-store gate_paths rules ───
+assert_groups "audit_events route handler selects no gate group" "none" "rust/crates/lakehouse-api/src/routes/audit_events.rs"
+assert_groups "query_cancel route handler selects no gate group" "none" "rust/crates/lakehouse-api/src/routes/query_cancel.rs"
+assert_groups "query_limits route handler selects no gate group" "none" "rust/crates/lakehouse-api/src/routes/query_limits.rs"
+assert_groups "lineage used_by handler selects no gate group" "none" "rust/crates/lakehouse-api/src/routes/lineage/used_by.rs"
+assert_groups "lineage charts handler selects no gate group" "none" "rust/crates/lakehouse-api/src/routes/lineage/charts.rs"
+assert_groups "storage route handler selects no gate group" "none" "rust/crates/lakehouse-api/src/routes/storage.rs"
+assert_groups "store storage module selects no gate group" "none" "rust/crates/lakehouse-store/src/storage.rs"
+assert_groups "pipeline_forms selects only pipelines" ",pipelines," "rust/crates/lakehouse-api/src/pipeline_forms.rs"
+assert_groups "dashboard_visibility selects alerts and governance" ",alerts,governance," "rust/crates/lakehouse-api/src/dashboard_visibility.rs"
+assert_groups "iceberg_door selects pipelines and governance" ",pipelines,governance," "rust/crates/lakehouse-api/src/routes/iceberg_door.rs"
+assert_groups "outside_reads selects pipelines and governance" ",pipelines,governance," "rust/crates/lakehouse-store/src/outside_reads.rs"
+assert_groups "catalog_drop selects pipelines, ingest, upload, and governance" ",pipelines,ingest,upload,governance," "rust/crates/lakehouse-api/src/routes/catalog_drop.rs"
+assert_groups "sql_lineage selects pipelines, cdc, ingest, alerts, and governance" ",pipelines,cdc,ingest,alerts,governance," "rust/crates/lakehouse-api/src/sql_lineage.rs"
+
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
   exit 1
