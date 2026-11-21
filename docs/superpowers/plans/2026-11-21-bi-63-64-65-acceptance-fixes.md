@@ -358,3 +358,40 @@ provider option was used and no other page is touched. CHANGELOG unchanged
 
 Checks: `bun test src/features/dashboards/embed-view.test.tsx` (counts in the
 report). Browser check: planner re-verifies on the QA stack.
+
+## Handoff 2, PR 3 (`BI-65`): owner QA fixes on the Alerts pages
+
+Three findings from the owner's QA of 2026-11-21, one commit on
+`feat/bi-65-digest-schedule`.
+
+- **The tab is in the address.** `alerts-view.tsx` reads `?tab=rules`
+  (anything else is Active Incidents) and a tab click does
+  `router.replace(..., { scroll: false })`. `app/(overview)/alerts/page.tsx`
+  wraps it in `Suspense`, as the lineage page does for `useSearchParams`. The
+  rule pages' `backHref` is `/alerts?tab=rules`, used after a save and by the
+  back arrow.
+- **Dashboard name.** Cause: base-ui's `Select` shows a label only for values
+  it was given in `items` on the root; `SelectValue` otherwise prints the raw
+  value (`b_813fc488`). The digest's select now passes `items` built from the
+  boards. A board missing from the list (deleted) still shows its id.
+- **One way back.** `FormPage` got an optional `onBack` (takes over the back
+  arrow's click) and `onCancel` is now optional (no Cancel button without it);
+  the other twelve form pages keep Cancel. The rule page passes no `onCancel`
+  and compares the form and schedule draft with what they held when filled;
+  when different, back opens the existing `ConfirmActionDialog` ("Discard your
+  changes?", as the Subscriptions dialog does). The page has no Esc handler, so
+  none was added.
+
+Commands (memory-wrapped, from the worktree):
+
+- `bun test src/features/alerts src/components/patterns/form-page.test.tsx`:
+  72 pass, 0 fail, 5 files (new `alerts-view.test.tsx`; new cases for no
+  Cancel, discard confirm, dashboard name, `onBack`).
+- `bun x tsc --noEmit -p .`: clean.
+- `bun x eslint` on the changed files and `src/features/alerts`: 0 errors, 1
+  existing warning in `alerts-page.tsx` (useMemo deps, not touched).
+
+Not verified: no browser check, no QA; the full `bun run test` and
+`bun run lint` were not run (VM memory). `alerts-view.test.tsx` restores the
+modules it mocks in `afterAll`, because bun's `mock.module` otherwise leaks into
+the other alerts test files.

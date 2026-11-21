@@ -31,6 +31,7 @@ import {
   type SaveAlertRuleInput,
 } from "@/services/contracts/alerts"
 import { isLoadAlertKind, isQualityAlertKind, ruleKindLabel } from "./rules-columns"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { readableErrorMessage } from "@/lib/notify-message"
 import { TablePicker, useTableCatalog } from "@/features/governance/table-picker"
 import type { Metric } from "@/services/contracts/metrics"
@@ -399,8 +400,10 @@ function DigestConditionFields({ f, setF, boards, boardsError, draft, onDraftCha
     <div className="grid gap-1.5">
       {/* UX-1-R9: the backend refuses a digest rule with no board. */}
       <Label htmlFor="alert-rule-dashboard" required>Dashboard</Label>
+      {/* BI-65 (owner QA): the select only knows a label for the values it is given in `items`; without them the closed trigger showed the board id. A board no longer in the list (deleted) falls back to its id. */}
       <Select
         value={f.board ?? ""}
+        items={boards.map((b) => ({ value: b.id, label: b.name }))}
         onValueChange={(v) => setF((prev) => ({ ...prev, board: v ?? "" }))}
       >
         <SelectTrigger id="alert-rule-dashboard" className="w-full" aria-required>
@@ -441,7 +444,7 @@ export function legacyOwnerNote(
 /** The stored rule these fields show, or `null` for a new one. */
 export function AlertRulePage({ ruleId }: { ruleId?: string }) {
   const router = useRouter()
-  const backHref = "/alerts"
+  const backHref = "/alerts?tab=rules"
   const { user } = useAuth()
   const canSeeAllTenants = seesEveryTenant(user?.permissions)
 
@@ -473,6 +476,13 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
   // ever given an owner, and a rename is not a save of what the form holds.
   const [stored, setStored] = React.useState<AlertRule | null>(null)
   const seeded = React.useRef(false)
+  // BI-65 (owner QA): what the form held when it was filled (a new rule: empty),
+  // to tell "unsaved changes" from none when the back arrow is pressed.
+  const [baseline, setBaseline] = React.useState(() =>
+    JSON.stringify({ f: EMPTY_FORM, draft: draftFromSchedule(DEFAULT_SCHEDULE, "") })
+  )
+  const [leaving, setLeaving] = React.useState(false)
+  const dirty = JSON.stringify({ f, draft }) !== baseline
 
   const saveAction = useServiceAction(
     (signal, input: SaveAlertRuleInput, id: string | null) =>
@@ -508,9 +518,12 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
     seeded.current = true
     setStored(rule)
     setF({ ...rule })
-    if (rule.type === "digest") {
-      setDraft(draftFromSchedule(rule.schedule ?? LEGACY_DIGEST_SCHEDULE, rule.timeZone ?? ""))
-    }
+    const seededDraft =
+      rule.type === "digest"
+        ? draftFromSchedule(rule.schedule ?? LEGACY_DIGEST_SCHEDULE, rule.timeZone ?? "")
+        : draftFromSchedule(DEFAULT_SCHEDULE, "")
+    if (rule.type === "digest") setDraft(seededDraft)
+    setBaseline(JSON.stringify({ f: { ...rule }, draft: seededDraft }))
     // The rows this rule watches are the mart's, so the measure picker is
     // given them before the form is used.
     if (rule.mart && alertRuleFormFields(rule.type, canSeeAllTenants).martMeasure) {
@@ -615,6 +628,7 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
   }
 
   return (
+    <>
     <FormPage
       title={ruleId ? "Edit rule" : "New rule"}
       description="Alerts fire when a Gold metric crosses a threshold. Digests summarise a dashboard on a schedule. Connector and upload rules tell you when a load fails or succeeds."
@@ -632,7 +646,8 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
         formErr ?? (saveAction.error ? readableErrorMessage(saveAction.error.message) : null)
       }
       onSubmit={() => void save()}
-      onCancel={() => router.push(backHref)}
+      // BI-65 (owner QA): one way out, the back arrow; unsaved changes ask first.
+      onBack={() => (dirty ? setLeaving(true) : router.push(backHref))}
       className="max-w-xl"
     >
         <div className="grid gap-3">
@@ -812,5 +827,15 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
           ) : null}
         </div>
     </FormPage>
+    <ConfirmActionDialog
+      open={leaving}
+      onOpenChange={setLeaving}
+      title="Discard your changes?"
+      description="The rule keeps what it had before; what you changed here is not saved."
+      confirmLabel="Discard changes"
+      destructive
+      onConfirm={() => router.push(backHref)}
+    />
+    </>
   )
 }

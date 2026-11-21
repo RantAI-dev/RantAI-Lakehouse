@@ -128,7 +128,7 @@ describe("the alert rule page (WEB-7 T7)", () => {
       target: " https://hooks.example.com/x ",
       enabled: true,
     })
-    await waitFor(() => expect(pushed).toEqual(["/alerts"]))
+    await waitFor(() => expect(pushed).toEqual(["/alerts?tab=rules"]))
   })
 
   it("loads a saved rule by id and writes the change back with its id", async () => {
@@ -152,7 +152,42 @@ describe("the alert rule page (WEB-7 T7)", () => {
       name: "Visitors in Jakarta",
       channel: "email",
     })
-    await waitFor(() => expect(pushed).toEqual(["/alerts"]))
+    await waitFor(() => expect(pushed).toEqual(["/alerts?tab=rules"]))
+  })
+
+  it("has no Cancel button: the back arrow is the one way out, and it leaves without asking when nothing changed", async () => {
+    stubReads([RULE])
+    render(<AlertRulePage ruleId="al_1234" />)
+    await screen.findByDisplayValue("Visitors in Bali")
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull()
+    fireEvent.click(screen.getByText("Back to Alerts"))
+    expect(pushed).toEqual(["/alerts?tab=rules"])
+    expect(screen.queryByText("Discard your changes?")).toBeNull()
+  })
+
+  it("asks before the back arrow throws away unsaved changes", async () => {
+    stubReads([RULE])
+    render(<AlertRulePage ruleId="al_1234" />)
+    fireEvent.change(await screen.findByDisplayValue("Visitors in Bali"), { target: { value: "Visitors in Jakarta" } })
+    fireEvent.click(screen.getByText("Back to Alerts"))
+    expect(pushed).toEqual([])
+    expect(await screen.findByText("Discard your changes?")).toBeTruthy()
+    fireEvent.click(await screen.findByText("Discard changes"))
+    expect(pushed).toEqual(["/alerts?tab=rules"])
+  })
+
+  it("shows the dashboard's name, not its id, on a saved digest", async () => {
+    const DIGEST: AlertRule = {
+      id: "al_digest", name: "Weekly", type: "digest", board: "b_813fc488", channel: "email",
+      target: "sari@meridian.example", enabled: true,
+      schedule: { kind: "daily", hour: 8, minute: 0 },
+    } as AlertRule
+    stubReads([DIGEST])
+    spyOn(dashboardService, "listBoards").mockResolvedValue([{ id: "b_813fc488", name: "qa-accept delivery" }])
+    render(<AlertRulePage ruleId="al_digest" />)
+    const trigger = await screen.findByRole("combobox", { name: /dashboard/i })
+    await waitFor(() => expect(trigger.textContent).toContain("qa-accept delivery"))
+    expect(trigger.textContent).not.toContain("b_813fc488")
   })
 
   it("shows the not-found state for an id nothing has", async () => {
@@ -160,7 +195,7 @@ describe("the alert rule page (WEB-7 T7)", () => {
     render(<AlertRulePage ruleId="gone" />)
 
     expect(await screen.findByText("Rule not found")).toBeDefined()
-    expect(screen.getByText("Back to Alerts").closest("a")?.getAttribute("href")).toBe("/alerts")
+    expect(screen.getByText("Back to Alerts").closest("a")?.getAttribute("href")).toBe("/alerts?tab=rules")
   })
 
   // DEC-16 (QA LH-SRC-7-04, SRC-42): the API sends a rule without its target to
@@ -177,7 +212,7 @@ describe("the alert rule page (WEB-7 T7)", () => {
       )
     ).toBeDefined()
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull()
-    expect(screen.getByText("Back to Alerts").closest("a")?.getAttribute("href")).toBe("/alerts")
+    expect(screen.getByText("Back to Alerts").closest("a")?.getAttribute("href")).toBe("/alerts?tab=rules")
   })
 
   it("still renders the form for a rule whose target is returned", async () => {
