@@ -16,13 +16,21 @@ import type { StudioAction } from "./studio-actions"
 
 const GROUPS: readonly StudioAction["group"][] = ["Query", "Edit", "Data", "View"]
 
-/** Whether a key press is ⌘⇧P (or Ctrl+Shift+P). */
+/**
+ * Whether a key press opens the command menu: ⌘⇧P (Ctrl+Shift+P), or F1.
+ * `UX-9` review: Firefox on Windows and Linux keeps Ctrl+Shift+P for a
+ * private window, so F1 (VS Code's other key for the same menu) is a way in
+ * that every browser hands to the page.
+ */
 export function isCommandMenuKey(event: KeyboardEvent): boolean {
+  if (event.key === "F1" && !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+    return true
+  }
   return (event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "p"
 }
 
 /**
- * The studio's command menu (`UX-9`, mockup B): ⌘⇧P lists every editor
+ * The studio's command menu (`UX-9`, mockup B): ⌘⇧P or F1 lists every editor
  * action, searchable, with its key. It is an extra way in: every action in
  * it is also on the toolbar, in its menus or in the side panel.
  *

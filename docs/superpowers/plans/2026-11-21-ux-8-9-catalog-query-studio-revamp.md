@@ -264,6 +264,14 @@ rendered by a test in `query-studio-page.test.tsx`,
   Explanation card in the Ask tab is only seen on going back. This was so
   before (inventory note 13); not changed.
 
+**Review follow-up (planner decisions, 2026-11-21)**: Schema | Plan and the
+AI Copilot panel share one slot (the shell's `useCopilot` docked-right +
+expanded state; opening either closes the other, tested both ways). F1 opens
+the command menu too and is in the shortcuts dialog; the status bar names the
+platform's keys (no helper existed, so `isApplePlatform`/`studioKeys` were
+added to `src/lib/editor-shortcuts.ts`). This supersedes the two matching
+"Not verified" items above.
+
 **Inventory map (section 3)** — "kept" means the same behaviour, labels and
 tests, restyled; files under `src/features/queries/` unless stated.
 

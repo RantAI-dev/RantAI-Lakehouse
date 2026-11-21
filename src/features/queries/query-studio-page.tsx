@@ -30,7 +30,14 @@ import { SqlPanel } from "./sql-panel"
 import { pickActions, studioActions, type PanelTab } from "./studio-actions"
 import { StudioCommandMenu } from "./studio-command-menu"
 import { StudioSidePanel } from "./studio-side-panel"
-import { MoreActionsMenu, ModeTabs, PanelToggle, RunButton, SaveButton } from "./studio-toolbar"
+import {
+  MoreActionsMenu,
+  ModeTabs,
+  PanelToggle,
+  RunButton,
+  SaveButton,
+  useStudioKeys,
+} from "./studio-toolbar"
 import { TimeTravelChip, TimeTravelDialog } from "./time-travel-dialog"
 import type { PinnedVersion } from "./time-travel-controls"
 import { useFormatSettings } from "./use-format-settings"
@@ -86,14 +93,38 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
 
   // The side panel is open on a laptop and closed on a narrow screen until
   // the person says otherwise; their choice then holds at every width.
+  //
+  // UX-9 review (DESIGN.md §3, one side panel at a time): Schema | Plan and
+  // the AI Copilot panel share the right-hand slot. The Copilot panel is the
+  // app shell's own state (`useCopilot`: docked right and expanded, which
+  // `CopilotSidebar` draws and remembers in this browser); opening ours
+  // collapses it, and opening it closes ours. Ours is not remembered across
+  // visits, as before; Copilot's is, by the shell.
+  const copilot = useCopilot()
+  const copilotPanelOpen = copilot.dockPosition === "right" && copilot.expanded
   const width = useWindowWidth()
   const [panelChoice, setPanelChoice] = React.useState<boolean | null>(null)
-  const panelOpen = panelChoice ?? (width === null || width >= PANEL_BESIDE_WIDTH)
+  const panelOpen =
+    panelChoice ?? (!copilotPanelOpen && (width === null || width >= PANEL_BESIDE_WIDTH))
   const [panelTab, setPanelTab] = React.useState<PanelTab>("schema")
-  const showPanel = React.useCallback((tab: PanelTab) => {
-    setPanelTab(tab)
+  function openPanel() {
     setPanelChoice(true)
-  }, [])
+    if (copilotPanelOpen) copilot.setExpanded(false)
+  }
+  function showPanel(tab: PanelTab) {
+    setPanelTab(tab)
+    openPanel()
+  }
+  // Copilot's panel opened (its navbar button, the dock, its history menu):
+  // ours makes room. A panel the person never chose closes by itself above.
+  const copilotWasOpen = React.useRef(copilotPanelOpen)
+  React.useEffect(() => {
+    if (copilotPanelOpen && !copilotWasOpen.current) {
+      setPanelChoice((choice) => (choice === true ? false : choice))
+    }
+    copilotWasOpen.current = copilotPanelOpen
+  }, [copilotPanelOpen])
+  const keys = useStudioKeys()
 
   const [dialog, setDialog] = React.useState<StudioDialog>(null)
   const [commandsOpen, setCommandsOpen] = React.useState(false)
@@ -153,6 +184,7 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
     panelOpen,
     onShowPanel: showPanel,
     onHidePanel: () => setPanelChoice(false),
+    runKey: keys?.run,
   })
   const [save] = pickActions(actions, ["save"])
   const [estimateAgain] = pickActions(actions, ["estimate"])
@@ -160,7 +192,7 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
   // Page-aware Copilot (plan §6): the SQL being written and the first rows
   // of its last result. Deferred so typing is not slowed by re-sending the
   // context on every keystroke.
-  const { setPageContext } = useCopilot()
+  const { setPageContext } = copilot
   const deferredSql = React.useDeferredValue(studio.sql)
   // The rows on screen are the open statement's own: a statement that
   // never ran shows nothing, and the assistant reads the same rows the
@@ -253,7 +285,7 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
             />
             <PanelToggle
               open={panelOpen}
-              onToggle={() => setPanelChoice(!panelOpen)}
+              onToggle={() => (panelOpen ? setPanelChoice(false) : openPanel())}
             />
             {sqlMode ? <RunButton studio={studio} /> : null}
           </div>
@@ -343,7 +375,7 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
               <ResultNote
                 icon={<Table2 className="size-5" aria-hidden />}
                 title="Results show here"
-                text="Run a query with ⌘↵, or open one you saved."
+                text={`Run a query${keys ? ` with ${keys.run}` : ""}, or open one you saved.`}
                 action={
                   <Button variant="outline" render={<Link href="/query-studio/saved" />}>
                     Open a saved query

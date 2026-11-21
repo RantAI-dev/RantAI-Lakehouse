@@ -16,6 +16,7 @@ import { formatBytes, formatCost, formatLagSeconds } from "@/lib/format"
 import { queryEngineLabel } from "@/lib/status"
 import { cn } from "@/lib/utils"
 import type { QueryEngine, QueryEstimate } from "@/services/contracts/queries"
+import { useStudioKeys } from "./studio-toolbar"
 import type { useQueryStudio } from "./use-query-studio"
 
 type Studio = ReturnType<typeof useQueryStudio>
@@ -161,6 +162,7 @@ export function StudioStatusBar({
   readonly studio: Studio
   readonly onOpenPlan: () => void
 }) {
+  const keys = useStudioKeys()
   return (
     <div className="flex h-8 items-center gap-1 overflow-x-auto border-t border-border/60 px-2 text-xs text-muted-foreground [scrollbar-width:none]">
       <EngineMenu studio={studio} />
@@ -168,7 +170,11 @@ export function StudioStatusBar({
         |
       </span>
       <EstimateSummary studio={studio} onOpenPlan={onOpenPlan} />
-      <span className="ml-auto hidden shrink-0 px-1.5 sm:inline">⌘↵ run · ⌘⇧P commands</span>
+      {keys ? (
+        <span className="ml-auto hidden shrink-0 px-1.5 sm:inline">
+          {keys.run} run · {keys.commands} commands
+        </span>
+      ) : null}
     </div>
   )
 }

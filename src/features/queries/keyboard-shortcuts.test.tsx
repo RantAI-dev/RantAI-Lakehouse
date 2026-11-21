@@ -84,5 +84,6 @@ describe("KeyboardShortcutsDialog", () => {
       expect(await screen.findByText(shortcut.action)).toBeTruthy()
     }
     expect(screen.getByText("Open the command menu")).toBeTruthy()
+    expect(screen.getByText("F1")).toBeTruthy()
   })
 })

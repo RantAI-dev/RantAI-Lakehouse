@@ -12,6 +12,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { isApplePlatform, studioKeys } from "@/lib/editor-shortcuts"
 import { formatDuration } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import type { StudioAction } from "./studio-actions"
@@ -51,6 +52,18 @@ export function Kbd({ className, ...props }: React.ComponentProps<"kbd">) {
   )
 }
 
+/**
+ * `UX-9` review: the studio's keys as this person's platform writes them
+ * (⌘ on Apple platforms, Ctrl elsewhere), or `null` before mount: the
+ * platform is read from `navigator`, which the server does not have, so a
+ * hint waits for it rather than flashing the other platform's keys.
+ */
+export function useStudioKeys(): ReturnType<typeof studioKeys> | null {
+  const [keys, setKeys] = React.useState<ReturnType<typeof studioKeys> | null>(null)
+  React.useEffect(() => setKeys(studioKeys(isApplePlatform())), [])
+  return keys
+}
+
 /** The elapsed time the way the Stop button reads it: "2.4 s", "184 ms". */
 function shortDuration(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`
@@ -64,6 +77,7 @@ function shortDuration(ms: number): string {
  */
 export function RunButton({ studio }: { readonly studio: Studio }) {
   const { running, download, engine, runnable, statements, elapsedMs } = studio
+  const keys = useStudioKeys()
   if (running || download.busy !== null) {
     const title = running
       ? engine === "trino"
@@ -95,9 +109,11 @@ export function RunButton({ studio }: { readonly studio: Studio }) {
     <Button onClick={() => void studio.runQuery()} disabled={!runnable} className="min-w-[92px]">
       <Play className="size-3.5 fill-current" aria-hidden />
       {statements.length > 1 ? "Run all" : "Run"}
-      <Kbd className="ml-0.5 hidden bg-white/15 text-white/85 sm:inline-flex" aria-hidden>
-        ⌘↵
-      </Kbd>
+      {keys ? (
+        <Kbd className="ml-0.5 hidden bg-white/15 text-white/85 sm:inline-flex" aria-hidden>
+          {keys.run}
+        </Kbd>
+      ) : null}
     </Button>
   )
 }

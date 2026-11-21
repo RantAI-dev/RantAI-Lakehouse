@@ -8,7 +8,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { MiniMarkdown } from "@/features/copilot/mini-markdown"
 import type { useQueryStudio } from "./use-query-studio"
 import { AgentResultCard } from "./agent-result-card"
-import { Kbd } from "./studio-toolbar"
+import { Kbd, useStudioKeys } from "./studio-toolbar"
 
 /**
  * Ask in words: the Ask tab of the studio (`UX-9`: Ask stays a tab beside
@@ -24,6 +24,7 @@ export function NaturalLanguagePanel({
   const asking = agent.busy
   const generating = generateAct.status === "pending"
   const canAsk = !asking && question.trim().length > 0
+  const keys = useStudioKeys()
 
   return (
     <div className="space-y-3">
@@ -52,9 +53,9 @@ export function NaturalLanguagePanel({
         <Button onClick={() => void agent.ask()} disabled={!canAsk}>
           <Play className="size-3.5 fill-current" aria-hidden />
           {asking ? "Agent working…" : "Ask"}
-          {asking ? null : (
+          {asking || !keys ? null : (
             <Kbd className="ml-0.5 hidden bg-white/15 text-white/85 sm:inline-flex" aria-hidden>
-              ⌘↵
+              {keys.run}
             </Kbd>
           )}
         </Button>

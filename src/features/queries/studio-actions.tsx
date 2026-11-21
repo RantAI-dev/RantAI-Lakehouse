@@ -85,6 +85,8 @@ export type StudioActionContext = {
   readonly panelOpen: boolean
   readonly onShowPanel: (tab: PanelTab) => void
   readonly onHidePanel: () => void
+  /** Run's key as this platform writes it (`useStudioKeys`), once it is known. */
+  readonly runKey?: string
 }
 
 const SELECT_ONE = "Select one statement"
@@ -109,7 +111,7 @@ export function studioActions(ctx: StudioActionContext): StudioAction[] {
           label: studio.statements.length > 1 ? "Run all" : "Run",
           icon: Play,
           group: "Query",
-          hint: "⌘↵",
+          hint: ctx.runKey,
           disabled: !studio.runnable,
           run: () => void studio.runSelectionOrAll(),
         },

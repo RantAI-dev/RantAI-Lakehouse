@@ -26,7 +26,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import { AuthProvider, useAuth } from "@/features/auth/auth-provider"
-import { CopilotProvider } from "@/features/copilot/use-copilot"
+import { CopilotProvider, useCopilot } from "@/features/copilot/use-copilot"
 import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
 import { queryDraftKey } from "@/lib/query-draft"
@@ -864,5 +864,108 @@ describe("QueryStudioPage UX-9 layout", () => {
     renderPage()
 
     expect(await screen.findByText("Results show here")).toBeTruthy()
+  })
+})
+
+// UX-9 review: one side panel at a time (DESIGN.md §3). Schema | Plan and the
+// AI Copilot panel share the right-hand slot; opening one closes the other.
+// The F1 key opens the command menu too (Firefox keeps Ctrl+Shift+P).
+describe("QueryStudioPage one side panel with AI Copilot", () => {
+  /** Stands in for the navbar's AI Copilot button: docks the assistant right and opens it. */
+  function CopilotPanelButton() {
+    const c = useCopilot()
+    const open = c.dockPosition === "right" && c.expanded
+    return (
+      <button
+        type="button"
+        aria-pressed={open}
+        onClick={() => {
+          c.setDockPosition("right")
+          c.setExpanded(true)
+        }}
+      >
+        AI Copilot panel
+      </button>
+    )
+  }
+
+  function renderWithCopilotButton() {
+    return render(
+      <AuthProvider>
+        <TableProviders>
+          <CopilotProvider>
+            <QueryStudioPage />
+            <CopilotPanelButton />
+          </CopilotProvider>
+        </TableProviders>
+      </AuthProvider>,
+    )
+  }
+
+  it("closes Schema and plan when the AI Copilot panel opens", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderWithCopilotButton()
+
+    expect(await screen.findByRole("complementary", { name: "Schema and plan" })).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "AI Copilot panel" }))
+
+    await waitFor(() =>
+      expect(screen.queryByRole("complementary", { name: "Schema and plan" })).toBeNull()
+    )
+    expect(screen.getByRole("button", { name: "AI Copilot panel" }).getAttribute("aria-pressed")).toBe("true")
+  })
+
+  it("closes the AI Copilot panel when Schema and plan opens, and starts closed while Copilot's is open", async () => {
+    stubNetwork()
+    // The shell remembers the assistant docked right and open.
+    window.localStorage.setItem("copilot-dock-pos", "right")
+    window.localStorage.setItem("copilot-dock-exp", "1")
+    seedDraft("SELECT 1")
+    renderWithCopilotButton()
+
+    const copilotButton = await screen.findByRole("button", { name: "AI Copilot panel" })
+    await waitFor(() => expect(copilotButton.getAttribute("aria-pressed")).toBe("true"))
+    expect(screen.queryByRole("complementary", { name: "Schema and plan" })).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "Show schema and plan" }))
+
+    expect(await screen.findByRole("complementary", { name: "Schema and plan" })).toBeTruthy()
+    await waitFor(() => expect(copilotButton.getAttribute("aria-pressed")).toBe("false"))
+
+    // And back: the panel the person opened makes room when Copilot's opens.
+    fireEvent.click(copilotButton)
+    await waitFor(() =>
+      expect(screen.queryByRole("complementary", { name: "Schema and plan" })).toBeNull()
+    )
+  })
+
+  it("closes the AI Copilot panel when a command opens the Plan tab", async () => {
+    stubNetwork()
+    window.localStorage.setItem("copilot-dock-pos", "right")
+    window.localStorage.setItem("copilot-dock-exp", "1")
+    seedDraft("SELECT 1")
+    renderWithCopilotButton()
+    const copilotButton = await screen.findByRole("button", { name: "AI Copilot panel" })
+    await waitFor(() => expect(copilotButton.getAttribute("aria-pressed")).toBe("true"))
+    await screen.findByRole("button", { name: "Run" })
+
+    fireEvent.keyDown(window, { key: "F1" })
+    fireEvent.click(await screen.findByRole("option", { name: "Show plan and estimate" }))
+
+    const plan = await screen.findByRole("tab", { name: "Plan" })
+    expect(plan.getAttribute("aria-selected")).toBe("true")
+    await waitFor(() => expect(copilotButton.getAttribute("aria-pressed")).toBe("false"))
+  })
+
+  it("opens the command menu with F1", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderPage()
+    await screen.findByRole("button", { name: "Run" })
+
+    fireEvent.keyDown(window, { key: "F1" })
+
+    expect(await screen.findByRole("option", { name: "Format settings…" })).toBeTruthy()
   })
 })

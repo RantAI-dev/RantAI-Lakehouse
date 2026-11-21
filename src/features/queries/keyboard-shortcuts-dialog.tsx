@@ -18,6 +18,8 @@ import { EDITOR_SHORTCUTS } from "@/lib/editor-shortcuts"
  */
 const PAGE_SHORTCUTS = [
   { action: "Open the command menu", label: "⌘/Ctrl+Shift+P" },
+  // UX-9 review: Firefox on Windows and Linux keeps Ctrl+Shift+P for itself.
+  { action: "Open the command menu (any browser)", label: "F1" },
 ] as const
 
 /**
