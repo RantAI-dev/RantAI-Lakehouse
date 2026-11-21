@@ -269,14 +269,17 @@ jobs:
           printf '\nCONSOLE_INTERNAL_URL=%s\n' 'http://lakehouse-frontend:3000' >> .env
           # SEC-75 D1: the proxies whose `X-Forwarded-For` the API reads. The
           # API is started by compose here, so it takes this value from the
-          # `.env` this step writes; the compose default (`console`) is the
-          # compose stack's own console service, and the staging frontend is
-          # NOT that service: it is the bare container `lakehouse-frontend`
-          # deployed below, on the same network. Without this line the API
-          # would trust the wrong name and every caller would look like one
-          # source (the proxy's address).
+          # `.env` this step writes. TWO proxies stand in front of it on
+          # staging, and BOTH are named because both write the caller's
+          # address into that header: the bare container `lakehouse-frontend`
+          # deployed below, and the compose stack's own `console` service,
+          # which proxies `/api` the same way (published on host port 3002,
+          # so it does not fight the bare container for 3000). A proxy left
+          # out is a peer the API does not trust: its header is ignored, and
+          # every caller behind it shares one source bucket, which makes
+          # the per-source limit one limit for all of them.
           sed -i '/^TRUSTED_PROXIES=/d' .env
-          printf '\nTRUSTED_PROXIES=%s\n' 'lakehouse-frontend' >> .env
+          printf '\nTRUSTED_PROXIES=%s\n' 'lakehouse-frontend,console' >> .env
           # ── Single sign-on (Keycloak) ─────────────────────────────────────
           # The staging deployment signs in through the Keycloak this workflow
           # starts (`ops/sso/docker-compose.staging-keycloak.override.yml`).
