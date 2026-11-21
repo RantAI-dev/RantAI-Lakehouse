@@ -1,0 +1,69 @@
+# Dashboards, the basics: create, browse, every chart type, threshold alerts
+
+| | |
+| --- | --- |
+| Module | Dashboards |
+| Backlog | `BI-56` (and `BI-66`, the timing that `BI-4-AC3` still needs) |
+| Kind | Feature |
+| Spec | none: the row came from the feature-row audit of 2026-11-13, which found the base of the module without an acceptance run. The other `BI-` rows cover only additions |
+| Status | In Acceptance |
+| Priority | P2 |
+| Owner | The module's owner, in the base. |
+| Acceptor | The product owner. |
+| Plan | This page; the run is an acceptance run, not a build |
+| Started | 2026-11-21 |
+| Shipped | Before 2026-11-13 (the base of the module) |
+| Evidence | |
+
+## What the user can do
+
+1. **Make and keep dashboards.** Create a dashboard, rename it, give it a description,
+   duplicate it, move it to a folder, and move it to the trash and back.
+2. **Find dashboards.** The Dashboards page lists them; search finds one by name; a
+   favourite is marked and found again; the list switches between Table and Gallery
+   (`BI-59` covers the page's own layout).
+3. **Draw every chart type with real data.** The builder offers about two dozen kinds. Each
+   one draws from a mart or a SQL source on the QA stack, its numbers match the same
+   question asked in Query Studio, and hovering it shows a tooltip with the value.
+4. **Be told when a number crosses a line.** A threshold alert on a metric is created,
+   tested from the Alerts page, fires when the value is over the threshold, does not fire
+   when it is under, and its e-mail arrives.
+5. **See without changing.** A Dashboard Viewer opens a shared dashboard and reads every
+   tile, and has no way to edit, move or delete it (no control shown; the API refuses).
+6. **Read it on a phone.** A dashboard at 390 px wide stacks its tiles, every tile is
+   readable, and the page never scrolls sideways.
+
+## Not included
+
+- Anything an addition row owns (filters `BI-18`, formatting `BI-17`, embedding `BI-26`,
+  reports `RPT-1`, digests `BI-19`, the Dashboards page layout `BI-59`). They have their own
+  checklists.
+- Import from other BI tools (`BI-3`) and the rest of the BI matrix (`BI-20`): the owner
+  deferred both on 2026-11-13.
+
+## Decisions
+
+| # | Decision | Default | Signed |
+| --- | --- | --- | --- |
+| D1 | The acceptance run is done by an agent on the QA stack (API and headless Chrome, screenshots in the report); the owner looks at one gallery dashboard with every chart type and at the report | Planner | Owner, 2026-11-21 ("okeay" to the checklist) |
+| D2 | "Every chart type" means every kind the chart builder offers on the run's commit, listed in the report with its result; a kind that cannot draw is a finding, not a skip | Planner | Owner, 2026-11-21 |
+| D3 | `BI-4-AC3` timing (`BI-66`): a real dashboard of 12 tiles, opened 5 times cold (no remembered result) and 5 times with remembered results, median and range written to `docs/plans/BI-4-RESULT.md` with the method | Planner | Owner, 2026-11-21 |
+
+## Acceptance checklist
+
+- [ ] `BI-56-AC1`: create, rename, describe, duplicate, move to a folder, move to the trash
+  and restore a dashboard; each step shows on the Dashboards page.
+- [ ] `BI-56-AC2`: search finds a dashboard by part of its name; a favourite is marked and
+  listed; Table and Gallery both show it.
+- [ ] `BI-56-AC3`: every chart kind the builder offers draws on one gallery dashboard with
+  real data, and the owner finds the gallery tidy.
+- [ ] `BI-56-AC4`: for at least five kinds (bar, line, pie, table, KPI), the numbers equal
+  the same question run in Query Studio.
+- [ ] `BI-56-AC5`: hovering each drawn chart shows a tooltip with its value.
+- [ ] `BI-56-AC6`: a threshold alert fires over its threshold and not under it, from
+  "Test run now", and its e-mail arrives in the QA mailbox.
+- [ ] `BI-56-AC7`: a Dashboard Viewer reads a shared dashboard and sees no edit, move or
+  delete control; the API refuses an edit from that account.
+- [ ] `BI-56-AC8`: at 390 px wide the gallery dashboard stacks, every tile is readable, and
+  the page does not scroll sideways.
+- [ ] `BI-66` (`BI-4-AC3`): the 12-tile timing is in `docs/plans/BI-4-RESULT.md`.
