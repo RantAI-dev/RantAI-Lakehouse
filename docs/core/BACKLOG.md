@@ -661,6 +661,7 @@ set by the product owner and are left empty until they are.
 | `BI-55` | 2026-11-13 | | |
 | `DATA-56` | 2026-11-12 | 2026-11-12 (#492) | |
 | `RPT-2` | 2026-11-12 | 2026-11-12 (#492) | |
+| `RPT-3` | Task | What a report's recipient sees: the scheduled-report email signs off as "Rantai Lake, scheduled report" (the old name; owner decision 2026-11-18 is "RantAI Lakehouse"), and every PDF prints a dark band around the white page (the page margins take the dark root background) | Dashboards | P2 | Building | | owner 2026-11-21 (RPT-1 check on the QA stack); `superpowers/plans/2026-11-21-rpt-3-report-email-polish.md` |
 | `REL-25` | 2026-11-12 | 2026-11-12 (#492) | |
 | `ADM-15` | 2026-11-12 | 2026-11-12 (#492) | |
 | `DATA-53` | 2026-11-12 | 2026-11-12 (#489) | |
