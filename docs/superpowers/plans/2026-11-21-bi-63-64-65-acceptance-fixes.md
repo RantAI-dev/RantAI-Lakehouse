@@ -197,3 +197,19 @@ removed before every commit):
 the structure (the measured root has `p-2`, the wrapper has none), not pixels.
 There is no `raw-table` test file; the year rule is tested on the formatters
 the table calls.
+
+## Review, PR 2 (planner, 2026-11-21)
+
+No BLOCKER. Year rule, padding move and the `embed-transparent` class read
+right.
+
+- **SHOULD-FIX 1:** a transparent `body` is not enough for a transparent
+  iframe. When the embedded document's used colour scheme differs from the
+  embedding page's, browsers paint an opaque canvas behind the iframe (CSS
+  Color Adjust, the `color-scheme` iframe rule). The console's default theme
+  puts `color-scheme: dark` on `<html>`, so on a light host page the frame
+  stays opaque. With `background=transparent`, also set
+  `color-scheme: normal` on `html.embed-transparent` (the host page's
+  scheme then decides, and a normal scheme does not force the backdrop), and
+  say why at the rule. The planner checks it in a real Chrome on the QA stack
+  with a host page around the iframe.
