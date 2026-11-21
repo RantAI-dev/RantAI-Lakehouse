@@ -1088,3 +1088,76 @@ sets, or sort the accepted lists too. Note that after the cleanup only the
 current snapshot survives, so the new-snapshot list is usually just the
 current one; assert on the current snapshot's `summary.operation`
 (`overwrite` or `append`) instead of on every new id.
+
+### T0 measurement record (developer, 2026-11-20 — post-merge addendum)
+
+This corrects §12's "T0 recorded **no numbers**": the numbers were
+measured on 2026-11-20 in the developer's session, but the session was cut
+before they were appended here, and no committed record existed when the
+handoff worker looked. They are quoted below first-hand. The spike script
+itself was not committed — §7 T0's own decision ("no commit, unless a
+gate script"), and the R1/R7/R8 fixes moved the one-commit proof into the
+gate, which now proves it on every CI run — so this record cannot be
+re-executed from the tree; it is the developer's measured log, not a
+runnable artifact.
+
+**Precondition and command.** A clean compose project `goldci`
+(`--profile dagster`, images built at the plan commit `5c84d3f73`,
+`.env` from `sh ops/init-env.sh` plus the CI job's own token values),
+with a published table of at least two copies produced by one full
+passing run of the gate on that stack
+(`docker compose -p goldci --profile dagster run --rm
+gold-export-test-runner` — `[gold-export] PASSED`, leaving
+`gold.gold_export_smoke` holding 7 copies). The spike then ran inside the
+code location container:
+
+```bash
+docker compose -p goldci --profile dagster exec -T dagster-code-location \
+  python - < <the T0 spike script>   # not committed; see above
+```
+
+**Readings (PyIceberg as pinned by `dagster/pyproject.toml`).**
+
+1. Filter form: an **`int` micros literal** —
+   `EqualTo("_exported_at", 1795147164000000)` — is accepted directly on
+   the `Timestamp` column and returns exactly that copy's rows (17). The
+   naive-UTC-`datetime` fallback §7 anticipated was never needed.
+2. `catalog.create_table_transaction("gold.gold_export_smoke_latest",
+   schema=main.schema(), properties={"rantai.latest-copy-of":
+   "gold_export_smoke", "format-version": "2"})` with `tx.append(df)`
+   inside: one commit — `len(table.metadata.metadata_log)` = 0 after,
+   snapshot count 1, the marker property stored, format version 2. The
+   table never existed empty.
+3. `with latest.transaction() as tx: tx.overwrite(df2)`: the metadata log
+   went **0 → 1 — grew by exactly 1, the stop gate** — in that one
+   commit, which carried two new snapshots, one `Operation.DELETE` and
+   one `Operation.APPEND`. (This is the shape the merged gate's R7/R8
+   check asserts on: the new current snapshot's operation is `append`,
+   and no metadata-log entry sits between the baseline's last entry and
+   the one that introduced it.)
+4. `SELECT count(), count(DISTINCT _exported_at) FROM
+   icecat_gold_export.\`gold.gold_export_smoke_latest\` WHERE 1` →
+   `16<TAB>1` — the new copy only, never a mix.
+5. Cleanup at age 0: expiring every snapshot but the current one (2
+   expired: the create+append snapshot and the overwrite's delete half),
+   then `run_remove_orphan_files(..., older_than_seconds=0)` →
+   `deleted_data_files_count = 1`; the Parquet files under the table's
+   location went 2 → 1 — the old copy's file left the object store.
+   (This was the spike's own end-to-end file check; the merged gate
+   still does not assert it — D11 stays *not verified* per R5, and this
+   addendum does not change that.)
+
+**Stop gate verdict: PASSED** — steps 3 and 4 as §7 defines them: the
+overwrite is one catalog commit, and a reader through `ClickHouse` sees
+the new copy only. T1–T7 were built on that measured basis.
+
+Also for the record, the developer's own §11 foreground block was cut
+short twice by the machine: `cargo fmt --check` and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`
+both passed on the final commit, but `cargo test --workspace` died on
+`No space left on device` mid-link (the disk hit 100% from the gate's
+Docker images and build cache), and the session ended before a clean
+full run; the per-commit scoped checks quoted in the commit messages and
+CI on #612 (all three Rust partitions green at the PR head) are the
+verification of record. Nothing in this addendum changes any decision:
+the feature is merged as #612.
