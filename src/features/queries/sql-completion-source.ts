@@ -45,14 +45,21 @@ type CompletionResult = NonNullable<
 /** One suggestion, as CodeMirror wants it. */
 type Completion = CompletionResult["options"][number]
 
-/** How far a column is lifted above the keywords the language extension offers. */
+/**
+ * How far a column is lifted above the keywords. Used only in a "names"
+ * place (QS round review R1, D8): in the general list names have no boost and
+ * a keyword that matches what was typed ranks by CodeMirror's own score.
+ */
 const COLUMN_BOOST = 100
 
-/** How far a table is lifted above the keywords, and below the columns. */
+/**
+ * How far a table is lifted above the keywords, and below the columns, after
+ * `FROM`/`JOIN` (D8). In the general list a table gets no boost at all.
+ */
 const TABLE_BOOST = 99
 
 /** One suggestion of ours, as CodeMirror wants it. */
-function toCompletion(option: CompletionOption): Completion {
+function toCompletion(option: CompletionOption, place: "names" | "general"): Completion {
   if (option.kind === "message") {
     // A message says something about the catalog; it is not part of the
     // query and inserts nothing. An empty text would be read as "no
@@ -70,7 +77,14 @@ function toCompletion(option: CompletionOption): Completion {
     type: option.kind === "column" ? "property" : option.kind === "parameter" ? "variable" : "class",
     detail: option.detail,
     apply: option.apply,
-    boost: option.kind === "table" ? TABLE_BOOST : COLUMN_BOOST,
+    // QS round review R1 (D8): only a "names" place boosts a table or column.
+    // The message branch above and the `{{` parameter list are unchanged.
+    boost:
+      place === "general"
+        ? 0
+        : option.kind === "table"
+          ? TABLE_BOOST
+          : COLUMN_BOOST,
   }
 }
 
@@ -103,7 +117,7 @@ export function createSqlCompletionSource({
     })
     return {
       from: answer.from,
-      options: answer.options.map(toCompletion),
+      options: answer.options.map((option) => toCompletion(option, answer.place)),
     }
   }
 }

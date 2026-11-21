@@ -123,6 +123,62 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
     Ok(())
 }
 
+/// QS-12 (LH-QS-4-07): `?id=` finds one run inside the owner's own history,
+/// and another owner's id finds nothing — an id is a lookup, not a way out of
+/// the owner scope.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_id_filter_finds_one_run_of_the_owner_only(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    for (id, who, sql) in [
+        ("q-100", owner, "SELECT first"),
+        ("q-200", owner, "SELECT second"),
+        ("q-300", other, "SELECT other"),
+    ] {
+        record_history(
+            &pool,
+            &RecordHistoryInput {
+                id,
+                sql,
+                user: "Bootstrap Admin",
+                owner_id: Some(who),
+                status: "completed",
+                duration_ms: 42,
+                scanned_bytes: 1024,
+                cost_units: 0.5,
+                workload_class: "hot-analytics",
+                engine: "hot-store",
+                cache_assisted: false,
+                tables_read: &[],
+                message: None,
+                tenant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let one = HistoryFilter {
+        id: Some("q-100"),
+        ..Default::default()
+    };
+    let found = list_history(&pool, owner, &one).await.unwrap();
+    assert_eq!(row_ids(&found), ["q-100"]);
+    assert_eq!(found[0].sql, "SELECT first");
+    assert_eq!(count_history(&pool, owner, &one).await.unwrap(), 1);
+
+    let stranger = HistoryFilter {
+        id: Some("q-300"),
+        ..Default::default()
+    };
+    assert_eq!(
+        list_history(&pool, owner, &stranger).await.unwrap(),
+        [] as [lakehouse_store::queries::QueryHistoryItem; 0]
+    );
+    assert_eq!(count_history(&pool, owner, &stranger).await.unwrap(), 0);
+    Ok(())
+}
+
 /// `OPS-8`: the tenant a run acted as is stored with it, so a usage view
 /// can sum per tenant. The tenant is one the seeded identity migration
 /// creates, because `query_history.tenant_id` references `tenant(id)`.
