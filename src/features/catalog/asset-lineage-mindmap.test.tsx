@@ -3,18 +3,21 @@
 // failed read of the viewer's charts or dashboards leaves the map as it was;
 // the map opens fitted to its box and pans and zooms inside it.
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
 
 import { boxHeight, fitScale } from "@/lib/pan-zoom"
 import { stubRectWidth, stubResizeObserver } from "@/lib/test-layout"
+import { ServiceError } from "@/services/errors"
+import { dashboardService } from "@/services"
 import { LineageMindmap, mindmapLayout, mindmapModel, useChartPlacement } from "./asset-lineage-map"
 
-const originalFetch = global.fetch
+// The two reads behind the map are stubbed on the service itself, in each test
+// and restored after it: a test must not depend on the network, or on what
+// another file left on `fetch` or on the HTTP layer in a shared bun process.
+const spies: { mockRestore: () => void }[] = []
 afterEach(() => {
-  global.fetch = originalFetch
+  while (spies.length) spies.pop()!.mockRestore()
 })
-const json = (body: unknown, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
 
 const TABLE = { id: "table:serving.mart_wisman", label: "serving.mart_wisman", kind: "focus" }
 const CHARTS = [
@@ -43,15 +46,17 @@ function Tab() {
   return <LineageMindmap model={MODEL} placement={placement} />
 }
 
-function serve(specs: () => Response) {
-  global.fetch = mock(async (input: RequestInfo | URL) => {
-    const path = String(input)
-    if (path.startsWith("/api/dashboard/specs")) return specs()
-    if (path.startsWith("/api/dashboard/boards")) {
-      return json({ boards: [{ id: "b_qa", name: "QA Auto" }, { id: "b_arr", name: "Arrivals" }] })
-    }
-    return json({ error: "not stubbed" }, 404)
-  }) as unknown as typeof fetch
+const BOARDS = [{ id: "b_qa", name: "QA Auto" }, { id: "b_arr", name: "Arrivals" }]
+
+/** Answers the boards read, and the charts read as the test says: a list, or a failure. */
+function serve(outlines: { id: string; board: string }[] | Error) {
+  spies.push(
+    spyOn(dashboardService, "listChartOutlines").mockImplementation((async () => {
+      if (outlines instanceof Error) throw outlines
+      return outlines.map((o) => ({ ...o, kind: "" }))
+    }) as unknown as typeof dashboardService.listChartOutlines),
+    spyOn(dashboardService, "listBoards").mockResolvedValue(BOARDS as never)
+  )
 }
 
 const groupNames = () =>
@@ -59,9 +64,7 @@ const groupNames = () =>
 
 describe("LineageMindmap groups (BI-71)", () => {
   it("draws one node per dashboard, and opens and closes a group in place", async () => {
-    serve(() =>
-      json({ charts: [{ id: "c1", board: "b_qa" }, { id: "c2", board: "b_qa" }, { id: "c3", board: "b_arr" }] })
-    )
+    serve([{ id: "c1", board: "b_qa" }, { id: "c2", board: "b_qa" }, { id: "c3", board: "b_arr" }])
     render(<Tab />)
     const qa = await screen.findByRole("button", { name: "QA Auto · 2 charts" })
     expect(groupNames()).toEqual(["QA Auto · 2 charts", "Arrivals · 1 chart"])
@@ -85,7 +88,7 @@ describe("LineageMindmap groups (BI-71)", () => {
   })
 
   it("keeps every chart as its own node when the charts cannot be read", async () => {
-    serve(() => json({ error: "The charts could not be loaded" }, 500))
+    serve(new ServiceError("unavailable", "The charts could not be loaded"))
     render(<Tab />)
     await waitFor(() => expect(screen.queryByText("Loading")).toBeNull())
     expect(screen.getByText("Visitors by port")).toBeTruthy()
