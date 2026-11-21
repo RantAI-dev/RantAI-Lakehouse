@@ -50,6 +50,17 @@
 | D2 | "Every chart type" means every kind the chart builder offers on the run's commit (the QA integration branch in Evidence), listed in the report with its result; a kind that cannot draw is a finding, not a skip | Planner | Owner, 2026-11-21 |
 | D3 | `BI-4-AC3` timing (`BI-66`): a real dashboard of 12 tiles, opened 5 times cold (no remembered result) and 5 times with remembered results, median and range written to `docs/plans/BI-4-RESULT.md` with the method | Planner | Owner, 2026-11-21 |
 
+## Limits to tell a customer
+
+- Filters are the dashboard's own year filter plus what `BI-18` delivers; relative dates,
+  number, text and linked filters are `BI-18`, not this page.
+- A Dashboard Viewer's settings menu still offers Version history, Subscriptions and Export;
+  it has no edit, move or delete item (owner, 2026-11-21).
+- On a phone, a long Sankey label is cut and a pivot scrolls inside its tile; maps fill half
+  their tile (accepted as they are, owner, 2026-11-21).
+- Phone width was checked at 390 px by emulation, not on a physical phone.
+- Importing dashboards from another BI tool is not included (`BI-3`, deferred).
+
 ## Acceptance checklist
 
 - [x] `BI-56-AC1`: create, rename, describe, duplicate, move to a folder, move to the trash
