@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 import { PageHeader } from "@/components/patterns/page-header"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { StatusBadge } from "@/components/patterns/status-badge"
@@ -9,7 +10,14 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useService } from "@/hooks/use-service"
 import { formatDateTime, formatDuration } from "@/lib/format"
-import { HISTORY_PAGE_LIMIT, historyQueryString } from "@/lib/history-query-params"
+import {
+  EMPTY_HISTORY_ADDRESS,
+  HISTORY_PAGE_LIMIT,
+  historyAddress,
+  historyQueryString,
+  readHistoryAddress,
+  type HistoryAddress,
+} from "@/lib/history-query-params"
 import { queryEngineLabel } from "@/lib/status"
 import { cn } from "@/lib/utils"
 import { queryService } from "@/services"
@@ -30,9 +38,19 @@ const STATUSES = [
 ] as const
 const ENGINES = ["clickhouse", "trino"] as const
 
-/** The studio link every row carries: the SQL and its engine (QS-4, D1). */
+/**
+ * QS-12 (LH-QS-4-07), D15: a row opens its run by id. The SQL stays in the
+ * browser, not in the address; the old `?sql=` handoff belongs to the
+ * catalog's starter-query links, which carry a query rather than a person's
+ * run.
+ */
 function studioHref(run: QueryHistoryItem): string {
-  return `/query-studio?sql=${encodeURIComponent(run.sql)}&engine=${encodeURIComponent(run.engine)}`
+  return `/query-studio?run=${encodeURIComponent(run.id)}`
+}
+
+/** Where the filters come from on first render (D17), guarded for SSR. */
+function initialAddress(): HistoryAddress {
+  return typeof window === "undefined" ? EMPTY_HISTORY_ADDRESS : readHistoryAddress(window.location.search)
 }
 
 /** A date input's `YYYY-MM-DD` as the day's first (or last) UTC instant —
@@ -91,12 +109,17 @@ function Pill({
  * A row's SQL opens a new Query Studio tab with the engine it ran on.
  */
 export function QueryHistoryPage() {
-  const [status, setStatus] = React.useState<QueryHistoryItem["status"] | "all">("all")
-  const [engine, setEngine] = React.useState<string>("all")
-  const [minDuration, setMinDuration] = React.useState("")
-  const [table, setTable] = React.useState("")
-  const [from, setFrom] = React.useState("")
-  const [to, setTo] = React.useState("")
+  const router = useRouter()
+  // QS-12 (LH-QS-4-06), D17: the address is the source of truth on entry.
+  const initial = React.useMemo(() => initialAddress(), [])
+  const [status, setStatus] = React.useState<QueryHistoryItem["status"] | "all">(
+    initial.status as QueryHistoryItem["status"] | "all"
+  )
+  const [engine, setEngine] = React.useState<string>(initial.engine)
+  const [minDuration, setMinDuration] = React.useState(initial.minDuration)
+  const [table, setTable] = React.useState(initial.table)
+  const [from, setFrom] = React.useState(initial.from)
+  const [to, setTo] = React.useState(initial.to)
 
   const filter = React.useMemo<QueryHistoryFilter>(
     () => ({
@@ -115,7 +138,7 @@ export function QueryHistoryPage() {
   // filter is a new question, so it starts on page 1: the stored page is
   // reset while rendering (React re-renders at once, with no frame that
   // asks for the old page under the new filter).
-  const [pageAt, setPageAt] = React.useState({ query, page: 1 })
+  const [pageAt, setPageAt] = React.useState({ query, page: initial.page })
   if (pageAt.query !== query) setPageAt({ query, page: 1 })
   const page = pageAt.query === query ? pageAt.page : 1
   const goToPage = (next: number) => setPageAt({ query, page: next })
@@ -137,6 +160,29 @@ export function QueryHistoryPage() {
   React.useEffect(() => {
     if (pastTheEnd) setPageAt({ query, page: lastPage })
   }, [pastTheEnd, query, lastPage])
+
+  // QS-12 (LH-QS-4-06), D17: every filter change is written back with
+  // replaceState, so the back button is not filled with one entry per
+  // keystroke. Read from window.location on entry, never useSearchParams, so
+  // the page needs no Suspense boundary.
+  React.useEffect(() => {
+    if (typeof window === "undefined") return
+    const address = historyAddress({ status, engine, minDuration, table, from, to, page })
+    window.history.replaceState(
+      null,
+      "",
+      `${window.location.pathname}${address ? `?${address}` : ""}`
+    )
+  }, [status, engine, minDuration, table, from, to, page])
+
+  const clearFilters = React.useCallback(() => {
+    setStatus("all")
+    setEngine("all")
+    setMinDuration("")
+    setTable("")
+    setFrom("")
+    setTo("")
+  }, [])
 
   const hasFilter = query !== ""
 
@@ -210,14 +256,7 @@ export function QueryHistoryPage() {
             variant="ghost"
             size="sm"
             className="h-7 text-xs"
-            onClick={() => {
-              setStatus("all")
-              setEngine("all")
-              setMinDuration("")
-              setTable("")
-              setFrom("")
-              setTo("")
-            }}
+            onClick={clearFilters}
           >
             Clear filters
           </Button>
@@ -227,17 +266,25 @@ export function QueryHistoryPage() {
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
       {state.status === "success" && !pastTheEnd ? (
         rows.length === 0 ? (
+          // QS-12 (LH-QS-4-06), D18: when a filter emptied the list, blame the
+          // filter, not the 14-day window, and offer to clear it.
           <EmptyState
-            title="No runs in the last 14 days"
+            title={hasFilter ? "No runs match these filters" : "No runs in the last 14 days"}
             description={
               hasFilter
-                ? "Nothing matches these filters. Clear one and try again."
+                ? "Clear a filter and try again."
                 : "Run a query in the Studio and it lands here."
             }
             action={
-              <Button size="sm" render={<Link href="/query-studio" />}>
-                Open the Studio
-              </Button>
+              hasFilter ? (
+                <Button size="sm" variant="outline" onClick={clearFilters}>
+                  Clear filters
+                </Button>
+              ) : (
+                <Button size="sm" render={<Link href="/query-studio" />}>
+                  Open the Studio
+                </Button>
+              )
             }
           />
         ) : (
@@ -255,7 +302,24 @@ export function QueryHistoryPage() {
               </thead>
               <tbody className="divide-y">
                 {rows.map((run) => (
-                  <tr key={run.id} className="align-top hover:bg-muted/20">
+                  <tr
+                    key={run.id}
+                    className="cursor-pointer align-top hover:bg-muted/20"
+                    // QS-12 (LH-QS-4-07), D16: the whole row opens the run by
+                    // its id. A click that ended a text selection is not a
+                    // navigation. QS round review R2: a click on the SQL link
+                    // is the browser's own navigation (often "open in a new
+                    // tab"), so the row must not push as well — nor a click
+                    // someone else already handled or made with a modifier.
+                    onClick={(event) => {
+                      if (window.getSelection()?.toString()) return
+                      if (event.defaultPrevented) return
+                      if (event.button !== 0) return
+                      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+                      if ((event.target as HTMLElement).closest("a")) return
+                      router.push(studioHref(run))
+                    }}
+                  >
                     <td className="px-3 py-2 text-xs whitespace-nowrap text-muted-foreground" title={formatDateTime(run.at)}>
                       {formatDateTime(run.at)}
                     </td>
@@ -280,7 +344,7 @@ export function QueryHistoryPage() {
                     <td className="max-w-96 px-3 py-2">
                       <Link
                         href={studioHref(run)}
-                        className="line-clamp-2 font-mono text-xs hover:underline"
+                        className="line-clamp-2 font-mono text-xs text-primary underline-offset-4 hover:underline"
                         title={run.sql}
                       >
                         {run.sql}

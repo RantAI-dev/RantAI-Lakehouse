@@ -54,7 +54,9 @@ pub mod dashboard_comments;
 mod dashboard_file;
 mod dashboard_folders;
 pub(crate) mod dashboard_organise;
+pub(crate) mod dashboard_reports;
 mod dashboard_sources;
+pub(crate) mod dashboard_templates;
 pub(crate) mod drill;
 mod embed;
 mod pdf_export;
@@ -85,6 +87,10 @@ mod notifications;
 mod ops;
 mod overview;
 pub(crate) mod params;
+// The picture route's drain (`ADM-2`, plan adm-120): reads the request body
+// an early answer left behind, so the client is not left writing into a
+// closed connection. See the module's own doc comment.
+mod picture_drain;
 mod pipeline_preview;
 mod pipelines;
 mod quality;
@@ -123,7 +129,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
-use axum::middleware::{Next, from_fn_with_state};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use lakehouse_core::ApiError;
@@ -258,12 +264,21 @@ fn route_timeout(path: &str) -> Duration {
         "/api/dashboard/chart-export" | "/api/dashboard/table-export" | "/api/dashboard/import" => {
             EXPORT_REQUEST_TIMEOUT
         }
+        // BI-18 part D (T3): starting from a template writes up to 200 charts,
+        // as an import does.
+        other if other.starts_with("/api/dashboard/templates/") && other.ends_with("/use") => {
+            EXPORT_REQUEST_TIMEOUT
+        }
         // QS-2: a download of a whole result writes a file that can be
         // gigabytes, so it gets the same outer bound as a board.
         other if other.starts_with("/api/query/run/") && other.ends_with("/download") => {
             crate::query_limits::BOARD_DEADLINE_CAP
         }
         "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
+        // BI-18 part D (T2): a report's PDF waits for the same slot and renderer.
+        other if other.starts_with("/api/dashboard/reports/") && other.ends_with("/pdf") => {
+            PDF_REQUEST_TIMEOUT
+        }
         // RPT-1: "Send now" makes the PDF and the chart files in the request,
         // so it gets the longest export deadline.
         other if other.starts_with("/api/reports/subscriptions/") && other.ends_with("/send") => {
@@ -310,6 +325,11 @@ fn limit_bearing(path: &str) -> bool {
 fn is_board_path(path: &str) -> bool {
     path == "/api/dashboard"
         || path == "/api/render/data"
+        // BI-18 part D (T1): reading a report reads up to 30 charts, each
+        // under the board deadline of its own dashboard read.
+        || path
+            .strip_prefix("/api/dashboard/reports/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
         || path == "/api/embed/data"
         || path
             .strip_prefix("/api/public/dashboard/")
@@ -1663,6 +1683,35 @@ pub fn router(state: AppState) -> Router {
             get(lineage::charts::chart_lineage),
         )
         .route("/api/dashboard/export/pdf", get(pdf_export::export_pdf))
+        // BI-18 part D (T1): reports, written pages with live charts.
+        .route(
+            "/api/dashboard/reports",
+            get(dashboard_reports::list).post(dashboard_reports::create),
+        )
+        .route(
+            "/api/dashboard/reports/{id}",
+            get(dashboard_reports::get)
+                .put(dashboard_reports::update)
+                .delete(dashboard_reports::delete),
+        )
+        // BI-18 part D (T2): a report as a server-made PDF.
+        .route(
+            "/api/dashboard/reports/{id}/pdf",
+            get(pdf_export::export_report_pdf),
+        )
+        // BI-18 part D (T3): dashboard templates.
+        .route(
+            "/api/dashboard/templates",
+            get(dashboard_templates::list).post(dashboard_templates::save),
+        )
+        .route(
+            "/api/dashboard/templates/{id}",
+            axum::routing::delete(dashboard_templates::delete),
+        )
+        .route(
+            "/api/dashboard/templates/{id}/use",
+            axum::routing::post(dashboard_templates::use_template),
+        )
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
         .route("/api/render/data", axum::routing::post(render::data))
@@ -1832,9 +1881,11 @@ pub fn router(state: AppState) -> Router {
         )
         // A picture arrives as a form, so this route alone takes a body of
         // 1 MiB (the 512 KB logo limit and the form's framing); the layer on
-        // the `PUT` keeps the raised limit off every other route.
+        // the `PUT` keeps the raised limit off every other route. The path
+        // is the one constant `routes::picture_drain` reads too, so the
+        // drain and the route cannot name different paths.
         .route(
-            "/api/settings/general/images/{kind}",
+            picture_drain::PICTURE_ROUTE_PATTERN,
             put(settings::put_general_image)
                 .layer(DefaultBodyLimit::max(settings::PICTURE_BODY_LIMIT_BYTES))
                 .delete(settings::delete_general_image),
@@ -1931,6 +1982,16 @@ pub fn router(state: AppState) -> Router {
 /// before it (the query scope) would run per query inside the handler's
 /// response instead. Like the gate, it is added before the two fallbacks, so
 /// a `404` or `405` writes nothing.
+///
+/// `ADM-2` (plan adm-120): the picture route's drain sits between the gate
+/// and the fallbacks, so it wraps the gate but not the fallbacks. It is
+/// outside `auth_gate` because the gate's `401` is one of the early answers
+/// the drain exists for — an unauthenticated caller must get the JSON error
+/// on a connection that is still usable, not a reset — and it is inside
+/// `timeout_middleware` because the time it spends draining a body counts
+/// against the request's deadline. `route_layer` (not `layer`) because it
+/// must not touch the fallbacks: a `404` or `405` writes nothing and reads
+/// nothing.
 fn gated(routes: Router<AppState>, state: AppState) -> Router {
     routes
         // Task 3.2: the one authorization gate every route (bar the four
@@ -1954,6 +2015,9 @@ fn gated(routes: Router<AppState>, state: AppState) -> Router {
             crate::audit_coverage::audit_gate,
         ))
         .layer(from_fn_with_state(state.clone(), auth_gate))
+        // `ADM-2` (plan adm-120): the picture route's drain, outside the
+        // gate and inside the timeout. See `routes::picture_drain`.
+        .route_layer(from_fn(picture_drain::drain))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(no_such_address)
         .layer(from_fn_with_state(state.clone(), timeout_middleware))
@@ -2084,9 +2148,13 @@ async fn ready(State(state): State<AppState>) -> Response {
 ///
 /// Two responses have no route of their own to render this through: the
 /// request timeout ([`timeout_middleware`]) and the 405 for a method no
-/// handler serves ([`method_not_allowed`]).
+/// handler serves ([`method_not_allowed`]). The picture route's drain
+/// (`routes::picture_drain`) renders its 413 through it as well.
+///
+/// `pub(crate)`, not private: the drain is a sibling module and needs the
+/// same envelope for its own answer.
 #[derive(Debug, Serialize)]
-struct FixedErrorBody {
+pub(crate) struct FixedErrorBody {
     error: String,
 }
 
@@ -2481,13 +2549,30 @@ mod route_policy_tests {
 
     /// The state [`test_router`] builds, for a test that assembles a router
     /// of its own through [`super::gated`].
+    ///
+    /// PR #528 CI: the pool gets a short acquire timeout. A limit-bearing path
+    /// (`limit_bearing`: the board routes, `/api/query/run`, the chart saves)
+    /// makes [`super::timeout_middleware`] read the query limits before the
+    /// auth gate answers 401, and that read dials this address. Nothing listens
+    /// there, and sqlx retries a refused connection until the pool's acquire
+    /// timeout, 30 seconds by default, so each such entry of the table cost
+    /// 30 seconds: on `main` the sweep took 554 of its 600 seconds under
+    /// nextest, and the three report entries of `BI-18` part D
+    /// (`GET`/`PUT`/`DELETE /api/dashboard/reports/{id}`) pushed it past the
+    /// limit. With 200 ms the same read fails just as it did, only at once;
+    /// what the test asserts (the route is mounted and gated) is unchanged.
     fn test_state() -> AppState {
-        let env = std::collections::HashMap::from([(
-            "DATABASE_URL".to_owned(),
-            "postgres://test:test@127.0.0.1:5432/test".to_owned(),
-        )]);
+        const URL: &str = "postgres://test:test@127.0.0.1:5432/test";
+        let env = std::collections::HashMap::from([("DATABASE_URL".to_owned(), URL.to_owned())]);
         let cfg = Config::from_map(&env).unwrap();
-        AppState::new(cfg)
+        let mut state = AppState::new(cfg);
+        state.pg = Some(std::sync::Arc::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(std::time::Duration::from_millis(200))
+                .connect_lazy(URL)
+                .unwrap(),
+        ));
+        state
     }
 
     /// `{id}`/`{token}`/`{kind}`/`{runId}` — any `{...}` capture segment —

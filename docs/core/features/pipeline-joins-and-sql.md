@@ -128,21 +128,24 @@ reviews that part.
 - A column a form step names that does not exist is found by the preview or
   the run, not by the save (`BLD-16`, F4): the save checks tables, not
   columns.
-- A pipeline with a join, aggregate or filter step has no column lineage yet
-  (`DATA-57`), exactly as a SQL step or several inputs do not. Table
-  lineage shows every input.
 - "Switch to SQL step" cannot be undone, except by restoring an earlier
   version of the pipeline (`BLD-16`, J6). The editor says so before it does
   it.
 - Every run rebuilds the output table and gives it the columns of the last
   step. A dashboard that reads a column the pipeline no longer returns
   breaks.
+- A `cast` or `rename` in a step with no `select` now applies to every column
+  (`BLD-11`, decision D11): a cast changes that column's type in place, and a
+  renamed column loses its old name and moves to the end of the table. A
+  pipeline already saved with such a step therefore produces a different
+  table on its next run — a chart or a downstream pipeline reading the old
+  name or type can break. A rename onto another name the same step already
+  emits is refused when the pipeline is saved.
 - A pipeline reads as its author: a column masked for the author is masked
   in the output table too.
 - A preview shows what the person looking may see. It can differ from what
   the pipeline writes when that person is not the author.
 - Changing the inputs or steps of someone else's pipeline makes it read as you from then on. An administrator who does this makes the output unmasked; the editor says so before saving.
-- A pipeline with a SQL step, several inputs or more than one step has no column lineage yet (`DATA-57`). Table lineage shows every input.
 - The editor has not been checked in a browser by anyone yet, nor against a running API; the acceptance checklist below is that check.
 - The text form of a pipeline (capability 8) is not built yet.
 - No Python.

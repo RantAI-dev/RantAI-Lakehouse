@@ -81,8 +81,24 @@ export type AuthorChoices = {
  * A pipeline with no tenant has no scope to check membership against, and
  * the API refuses the assignment until one is assigned, so the list is
  * empty with that stated rather than quietly showing everyone.
+ *
+ * BLD-11 F5/D7: an empty list is not always "nobody can read as this". When
+ * the author is already set, the masthead names them and runs; saying
+ * "no active user can read as it" here contradicts that. When the user list
+ * FAILED to load, the honest reason is the failure, not an absence of users.
  */
-export function authorChoices(users: readonly User[], tenantId: string | undefined): AuthorChoices {
+export function authorChoices(
+  users: readonly User[],
+  tenantId: string | undefined,
+  current: ReadsAs,
+  listFailed: boolean
+): AuthorChoices {
+  if (listFailed) {
+    return {
+      options: [],
+      blocked: "the user list could not be loaded, so no one can be offered here",
+    }
+  }
   if (!tenantId) {
     return {
       options: [],
@@ -92,10 +108,15 @@ export function authorChoices(users: readonly User[], tenantId: string | undefin
   const options = users
     .filter((user) => user.status === "active" && user.tenants.includes(tenantId))
     .sort((a, b) => a.name.localeCompare(b.name))
-  return {
-    options,
-    blocked: options.length === 0 ? "no active user in this pipeline's tenant can read as it" : null,
+  if (options.length > 0) return { options, blocked: null }
+  if (current.kind === "author") {
+    const name = current.name ?? "a user you cannot see"
+    return {
+      options,
+      blocked: `it reads as ${name}; no other active user in this pipeline's tenant can be chosen`,
+    }
   }
+  return { options, blocked: "no active user in this pipeline's tenant can read as it" }
 }
 
 /**

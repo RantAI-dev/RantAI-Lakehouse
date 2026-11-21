@@ -1,5 +1,6 @@
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+import { PRODUCT_LOGO_DARK, PRODUCT_LOGO_LIGHT } from "@/lib/product-branding"
 
 import { PublicDashboard } from "./public-dashboard"
 
@@ -27,14 +28,28 @@ const BOARD = {
  * route needs no session: the page reads the workspace's name and logo
  * through it, so an anonymous viewer sees the same branding as a signed-in
  * person.
+ *
+ * With `hold`, the branding answer waits for `release`, so a test can look
+ * at the page while the answer is still on its way.
  */
-function serve(branding: unknown): void {
+function serve(
+  branding: unknown,
+  options: { hold?: boolean } = {},
+): { release: () => void } {
+  let release: () => void = () => {}
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
   global.fetch = mock(async (input: RequestInfo | URL) => {
     const url = String(input)
-    if (url.includes("/api/branding")) return json(branding)
+    if (url.includes("/api/branding")) {
+      if (options.hold) await held
+      return json(branding)
+    }
     if (url.includes("/api/public/dashboard/")) return json(BOARD)
     return json({})
   }) as unknown as typeof fetch
+  return { release }
 }
 
 /** The header's two pictures, in the order they are drawn: light, then dark. */
@@ -85,8 +100,8 @@ describe("the public link page shows the workspace's own branding (ADM-2)", () =
 
     expect(await screen.findByText("RantAI Lakehouse")).toBeTruthy()
     expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
-      "/logo-light.png",
-      "/logo-dark.png",
+      "/logo-light.svg",
+      "/logo-dark.svg",
     ])
   })
 
@@ -107,5 +122,36 @@ describe("the public link page shows the workspace's own branding (ADM-2)", () =
     // The name is text, never HTML: a workspace that typed markup shows the
     // markup, it does not run it.
     expect(container.querySelector("b")).toBeNull()
+  })
+
+  it("shows no logo at all while the branding answer is on its way", async () => {
+    const { release } = serve(
+      {
+        workspaceName: "Acme Data",
+        logo: { type: "image/png", version: "v1" },
+        logoDark: { type: "image/png", version: "v2" },
+        icon: null,
+      },
+      { hold: true },
+    )
+    const { container } = render(<PublicDashboard token="tok" />)
+
+    // The page is drawn (the link's own route answered); the branding has
+    // not.
+    await screen.findByText("This dashboard has no charts yet.")
+
+    // No picture at all while the answer is on its way: the product's own
+    // logo must not stand on the page for a moment before the workspace's
+    // own logo lands (`adm-120`).
+    expect(container.querySelectorAll("img")).toHaveLength(0)
+    expect(container.innerHTML).not.toContain(PRODUCT_LOGO_LIGHT)
+    expect(container.innerHTML).not.toContain(PRODUCT_LOGO_DARK)
+
+    release()
+    await waitFor(() => expect(pictures(container)).toHaveLength(2))
+    expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
+      "/api/branding/images/logo?v=v1",
+      "/api/branding/images/logo-dark?v=v2",
+    ])
   })
 })

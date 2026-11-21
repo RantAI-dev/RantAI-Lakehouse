@@ -23,6 +23,14 @@
 //! `Extension<Principal>`: a session cookie sent along is never read. The body
 //! is `{ "token": ... }` and nothing else, so a caller cannot name another
 //! board; the board is in the signed token. Every refusal reads the same.
+//!
+//! # A report (`BI-18` part D, T2)
+//!
+//! A token with `report` set names one report and no dashboard. The answer is
+//! that report with every chart block read as the person, through the reader
+//! route's own function (`dashboard_reports::read_charts`), so the PDF shows
+//! what the report page shows; a report the person can no longer read is the
+//! same one-sentence refusal.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -82,6 +90,11 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     // PDF; durations only, never a token or a name.
     tracing::info!("render data requested");
     let read_started = std::time::Instant::now();
+    // BI-18 part D (T2): a report token is good for that report and nothing
+    // else, read as the person now, through the reader route's own function.
+    if let Some(report) = claims.report.as_deref() {
+        return report_data(&state, &principal, report, &claims).await;
+    }
     let query = DashboardQuery::for_render(
         &claims.board,
         claims.filters.as_deref(),
@@ -124,6 +137,51 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
             (StatusCode::OK, ApiJson(payload)).into_response()
         }
         Err(response) => response,
+    }
+}
+
+/// The report payload for a report token (`BI-18` part D, T2): the report and
+/// every chart block read as the person, through
+/// `dashboard_reports::read_charts` (the reader page's own function), with the
+/// `render` block for the first page. A report the person can no longer read
+/// is refused with the one sentence, as any refused token is.
+async fn report_data(
+    state: &AppState,
+    principal: &lakehouse_auth::Principal,
+    report: &str,
+    claims: &lakehouse_embed::RenderClaims,
+) -> Response {
+    use crate::routes::dashboard_reports as reports;
+    let started = std::time::Instant::now();
+    let Ok(viewer) = crate::routes::dashboard_access::viewer_for(state, principal).await else {
+        return refused();
+    };
+    let Ok(id) = reports::report_id(report) else {
+        return refused();
+    };
+    let found = match reports::readable_report(state, &viewer, id).await {
+        Ok(found) => found,
+        Err(lakehouse_core::ApiError::NotFound(_)) => return refused(),
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    let read = reports::read_charts(state, principal, &viewer, &found, &HeaderMap::new()).await;
+    tracing::info!(
+        payload_ms = crate::routes::pdf_export::millis(started),
+        ok = read.is_ok(),
+        "render data read"
+    );
+    match read {
+        Ok((charts, reporting)) => (
+            StatusCode::OK,
+            ApiJson(json!({
+                "report": reports::report_json(&found),
+                "charts": charts,
+                "reporting": reporting,
+                "render": render_block(&principal.display_name, claims),
+            })),
+        )
+            .into_response(),
+        Err(err) => crate::error::ApiRejection(err).into_response(),
     }
 }
 
@@ -191,23 +249,23 @@ fn token_of(body: &Bytes) -> Option<String> {
 }
 
 /// `POST /api/render/maps/{id}/geojson { token }` — the boundary file of an
-/// uploaded map one of the board's charts draws on, for the print view
-/// (`BI-36`).
+/// uploaded map one of the board's (or report's) charts draws on, for the print
+/// view (`BI-36`, `PR #528 review BLOCKER`).
 ///
 /// The print view has no session, so the signed-in loader (`GET
 /// /api/maps/{id}/geojson`) answered it with a redirect to the login page and
-/// the map tile did not draw. The public link and the embed got their own token
-/// routes in `PR #246`; this is the print view's, with the same rule: the token
-/// opens its board's maps and nothing else, and a map no chart on that board
-/// draws on is the same 404 as a map that does not exist. The token is checked
-/// as [`data`] checks it (the person's rights are read now), and the charts are
-/// read as that person.
+/// the map tile did not draw. The token opens only its board's maps — or, for
+/// a report token (`BI-18` part D, `pdf_export.rs` leaves `board` empty), only
+/// the maps drawn by charts placed in that report that the token's viewer may
+/// see. A map no allowed chart draws on is the same 404 as a map that does not
+/// exist. The token is checked as [`data`] checks it (the person's rights are
+/// read now), and the charts are read as that person.
 ///
 /// # Errors
 ///
 /// 400 for a body that is not `{ "token": string }`; 503 when PDF export is not
-/// set up; 401 (one sentence) for a token that is refused; 404 for a map the
-/// board does not use.
+/// set up; 401 (one sentence) for a token that is refused (or a report the
+/// person cannot read); 404 for a map the board or report does not use.
 pub async fn map_geojson(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -229,7 +287,64 @@ pub async fn map_geojson(
         Ok(viewer) => viewer,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
+    // PR #528 review BLOCKER: report render tokens carry `board: ""` and
+    // `report: Some(...)`; widen no token beyond the report's own readable
+    // chart blocks.
+    if let Some(report) = claims.report.as_deref() {
+        return map_for_report(&state, report, &id, &headers, &viewer).await;
+    }
     crate::routes::embed::map_for_board(&state, &claims.board, &id, &headers, &viewer).await
+}
+
+/// Fail-closed map boundary lookup for a report render token (`PR #528 review
+/// BLOCKER`): the report must be readable by `viewer`, and `map_id` must be
+/// named by at least one visible, non-static chart placed on that report.
+async fn map_for_report(
+    state: &AppState,
+    report: &str,
+    map_id: &str,
+    headers: &HeaderMap,
+    viewer: &lakehouse_bi::access::Viewer,
+) -> Response {
+    use crate::routes::dashboard_reports as reports;
+    let Ok(report_id) = reports::report_id(report) else {
+        return refused();
+    };
+    let found = match reports::readable_report(state, viewer, report_id).await {
+        Ok(found) => found,
+        Err(lakehouse_core::ApiError::NotFound(_)) => return refused(),
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    let blocks: Vec<lakehouse_bi::reports::Block> =
+        serde_json::from_value(found.blocks).unwrap_or_default();
+    let wanted: std::collections::HashSet<String> = lakehouse_bi::reports::chart_ids(&blocks)
+        .into_iter()
+        .collect();
+    if wanted.is_empty() || map_id.is_empty() {
+        return crate::routes::public_links::not_found();
+    }
+    let stored = match lakehouse_bi::store::list_stored_charts(&state.clickhouse, viewer).await {
+        Ok(stored) => stored,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+            )
+                .into_response();
+        }
+    };
+    let allowed = stored.iter().any(|c| {
+        !c.spec.kind.is_static()
+            && wanted.contains(&c.spec.id)
+            && c.def.map.as_deref() == Some(map_id)
+    });
+    if !allowed {
+        return crate::routes::public_links::not_found();
+    }
+    match super::maps::map_file(state, map_id, headers).await {
+        Ok(response) => response,
+        Err(rejection) => rejection.into_response(),
+    }
 }
 
 /// The most bytes of an image card's picture the print view takes (`BI-42`).
@@ -450,6 +565,7 @@ fn render_block(requested_by: &str, claims: &lakehouse_embed::RenderClaims) -> V
         "paper": claims.paper,
         "orientation": claims.orientation,
         "chart": claims.chart,
+        "report": claims.report,
     })
 }
 

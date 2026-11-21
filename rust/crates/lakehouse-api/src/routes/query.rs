@@ -276,6 +276,25 @@ pub(crate) async fn rewrite_sql_for_principal_with_headers(
     principal: &Principal,
     headers: &HeaderMap,
 ) -> Result<String, ApiError> {
+    rewrite_and_report_for_principal(state, sql, engine, principal, headers)
+        .await
+        .map(|r| r.sql)
+}
+
+/// The shared rewrite with the obligations it applied, recording the same
+/// policy-decision latency as [`rewrite_sql_for_principal_with_headers`]
+/// (QS-10, D4). Callers that report obligations use this; the older wrapper
+/// keeps its six callers unchanged.
+///
+/// # Errors
+/// The same as [`rewrite_sql_for_principal`].
+pub(crate) async fn rewrite_and_report_for_principal(
+    state: &AppState,
+    sql: &str,
+    engine: &str,
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> Result<crate::policy_engine::RoleRewrite, ApiError> {
     let started_rewrite = Instant::now();
     let result = rewrite_sql_for_principal_inner(state, sql, engine, principal, headers).await;
     state
@@ -303,7 +322,7 @@ async fn rewrite_sql_for_principal_inner(
     engine: &str,
     principal: &Principal,
     headers: &HeaderMap,
-) -> Result<String, ApiError> {
+) -> Result<crate::policy_engine::RoleRewrite, ApiError> {
     let engine_kind = crate::sql_rewrite::Engine::from_name(engine);
     // DATA-21 D2: `Trino`'s own past-version clause (`FOR VERSION AS OF
     // <id>`) is not a form `sqlparser` parses — it reads `VERSION AS OF
@@ -361,8 +380,8 @@ async fn rewrite_sql_for_principal_inner(
     // copy of this logic. Only the per-engine dialect *selection*
     // (`ClickHouseDialect` vs. `TrinoDialect`) stays here, since the
     // two are different concrete types.
-    if engine_kind == crate::sql_rewrite::Engine::Trino {
-        crate::policy_engine::rewrite_sql_for_roles(
+    let rewrite = if engine_kind == crate::sql_rewrite::Engine::Trino {
+        crate::policy_engine::rewrite_sql_for_roles_reporting(
             &sql,
             &crate::sql_rewrite::TrinoDialect::default(),
             crate::sql_rewrite::Engine::Trino,
@@ -372,7 +391,7 @@ async fn rewrite_sql_for_principal_inner(
         )
         .await
     } else {
-        crate::policy_engine::rewrite_sql_for_roles(
+        crate::policy_engine::rewrite_sql_for_roles_reporting(
             &sql,
             &sqlparser::dialect::ClickHouseDialect {},
             crate::sql_rewrite::Engine::ClickHouse,
@@ -405,14 +424,19 @@ async fn rewrite_sql_for_principal_inner(
         // shared with every other governed read path, so a hidden table gets
         // the tenant gate's own 404 and sentence.
         crate::routes::support::enforcement_refusal(&sql, &err)
-    })
+    })?;
     // DATA-21 D2: the statement the engine reads is `Trino`'s own form
-    // again — the reverse of the pass that made it parseable.
-    .map(|rewritten| match engine_kind {
-        crate::sql_rewrite::Engine::ClickHouse => rewritten,
+    // again — the reverse of the pass that made it parseable. The
+    // obligations the rewrite applied travel with it (QS-10, D4).
+    let sql = match engine_kind {
+        crate::sql_rewrite::Engine::ClickHouse => rewrite.sql,
         crate::sql_rewrite::Engine::Trino => {
-            crate::sql_rewrite::denormalize_past_version_clause(&rewritten)
+            crate::sql_rewrite::denormalize_past_version_clause(&rewrite.sql)
         }
+    };
+    Ok(crate::policy_engine::RoleRewrite {
+        sql,
+        obligations: rewrite.obligations,
     })
 }
 
@@ -2133,33 +2157,36 @@ async fn run_statement_with(
     // included, so `download` re-rewrites it for the caller's roles at that
     // time and needs no values. `rewritten` is what the engine runs and the
     // audit event records (`SEC-21`, `SEC-33`).
-    let rewritten =
-        match rewrite_sql_for_principal_with_headers(state, statement, engine, p, headers).await {
-            Ok(rewritten) => rewritten,
-            Err(err) => {
-                // A 4xx from the rewrite is the gate refusing (the policy, the
-                // tenant's tables, the caller's own tenant header); a 5xx is
-                // the service failing while asking. The history row says
-                // which.
-                let status: &'static str = if err.status() < 500 {
-                    "blocked"
-                } else {
-                    "failed"
-                };
-                record_uncompleted_run(
-                    state,
-                    (p, headers),
-                    statement,
-                    engine,
-                    status,
-                    &err.to_string(),
-                    &tables_read,
-                    0,
-                )
-                .await;
-                return Err(AssistantFailure::fixed(err));
-            }
-        };
+    // QS-10 (LH-QS-2-05), D4: keep what the rewrite applied so the result
+    // reports it; `rewritten` is still the SQL the engine runs.
+    let rewrite = match rewrite_and_report_for_principal(state, statement, engine, p, headers).await
+    {
+        Ok(rewrite) => rewrite,
+        Err(err) => {
+            // A 4xx from the rewrite is the gate refusing (the policy, the
+            // tenant's tables, the caller's own tenant header); a 5xx is
+            // the service failing while asking. The history row says
+            // which.
+            let status: &'static str = if err.status() < 500 {
+                "blocked"
+            } else {
+                "failed"
+            };
+            record_uncompleted_run(
+                state,
+                (p, headers),
+                statement,
+                engine,
+                status,
+                &err.to_string(),
+                &tables_read,
+                0,
+            )
+            .await;
+            return Err(AssistantFailure::fixed(err));
+        }
+    };
+    let rewritten = rewrite.sql;
     // SEC-21: a statement's own `SETTINGS` would override the cap the run
     // sends with the request. Trino has no such settings in its client.
     if !is_trino_engine(engine)
@@ -2316,6 +2343,12 @@ async fn run_statement_with(
         });
     if let Some(map) = body.as_object_mut() {
         map.insert("canDownload".to_owned(), Value::Bool(can_download));
+        // QS-10 (LH-QS-2-05), D4: overwrite the `null` the builder writes with
+        // what the rewrite actually applied. `metrics` is the field the
+        // console reads; no table or column name is reported.
+        if let Some(metrics) = map.get_mut("metrics").and_then(Value::as_object_mut) {
+            metrics.insert("policyObligations".to_owned(), json!(rewrite.obligations));
+        }
     }
     Ok(ApiJson(body))
 }
@@ -2645,10 +2678,11 @@ fn run_result_json(
             "engine": if is_trino_engine(engine) { Value::Null } else { json!("hot-store") },
             "workloadClass": if is_trino_engine(engine) { Value::Null } else { json!("hot-analytics") },
             // WS1 task 1.6: `ClickHouse`'s response carries no cache-hit flag
-            // and no pushdown list, and there is no policy engine to produce
-            // obligations (`WS7` builds one). Null says "not measured"; the
-            // old constants (`false`, `[]`, `[]`) claimed a measurement that
-            // was never taken.
+            // and no pushdown list. Null says "not measured"; the old
+            // constants (`false`, `[]`, `[]`) claimed a measurement that was
+            // never taken. QS-10 (LH-QS-2-05), D4: the caller overwrites
+            // `policyObligations` with what the rewrite applied; this builder
+            // keeps `null` for its own unit tests and an older reader.
             "cacheHit": Value::Null,
             "pushdowns": Value::Null,
             "policyObligations": Value::Null,
@@ -2766,6 +2800,12 @@ fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> f64 {
 /// reads nothing". A `Trino` statement is not estimated at all: it answers
 /// 200 with `supported: false` and nothing sent to any engine (`QS-6`,
 /// `LH-QS-4-08`, decision 7).
+///
+/// Catalog facts are gated by `catalog:read` (`QS-10`, `LH-QS-1-11`, D2): a
+/// caller without it gets the numbers but no `sources`, no `sourceMarks` and
+/// no `freshnessLagSeconds`, with `catalogHidden: true` explaining why. The
+/// route itself stays at `query:read`. A plan that names no table lists no
+/// source (D3) — no source is invented.
 pub async fn estimate(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -2821,46 +2861,69 @@ pub async fn estimate(
     // status and fixed message and is never sent to the engine. The planner
     // reports the tables the statement reads, which the rewrite does not
     // change, so the sources shown are what the run would show.
-    let rewritten =
-        rewrite_sql_for_principal_with_headers(&state, &sql, "clickhouse", &principal, &headers)
-            .await?;
+    // QS-10 (LH-QS-2-05), D4: the estimate reports the obligations the
+    // rewrite applied, just as the run does.
+    let rewrite =
+        rewrite_and_report_for_principal(&state, &sql, "clickhouse", &principal, &headers).await?;
+    let rewritten = rewrite.sql;
     // SEC-21: the same settings rule as the run, on the statement the engine
     // is sent.
     refuse_unlisted_settings(&rewritten)?;
+    // QS-10 (LH-QS-1-11), D2: this route needs `query:read` only — QS-1-AC11
+    // keeps the editor running SQL without catalog access. Sources, their
+    // marks and their freshness are facts from the catalog, so a caller who
+    // does not hold `catalog:read` gets none of them: no `system.parts` read,
+    // no marks lookup, and `catalogHidden` tells the console why.
+    let reads_catalog = principal.has("catalog:read");
     let estimated = estimate_body(&state.clickhouse, &rewritten).await;
     let (estimated_bytes, sources, estimate_error) = match estimated {
         Ok((bytes, sources)) => (Some(bytes), sources, None),
         Err(message) => (None, Vec::new(), Some(message)),
     };
-    let freshness_lag_seconds = freshness_lag(&state.clickhouse, &sources).await;
+    // D3: a plan that names no table names no source. The old fabricated
+    // `clickhouse@lakehouse` default is gone (QS-10, LH-QS-1-11).
+    let sources_out: Vec<String> = sources;
+    let freshness_lag_seconds = if reads_catalog {
+        freshness_lag(&state.clickhouse, &sources_out).await
+    } else {
+        None
+    };
 
     // No floor: an estimate of nothing costs nothing. `max(1, …)` used to
     // make an empty editor read "1.00 cu–1.00 cu".
     let cost_min = estimated_bytes.map(|b| bytes_to_cost_bucket(b, 2_000_000.0));
     let cost_max = estimated_bytes.map(|b| bytes_to_cost_bucket(b, 1_000_000.0));
-    let sources_out: Vec<String> = if sources.is_empty() {
-        vec!["clickhouse@lakehouse".to_owned()]
+    let sources_json = if reads_catalog {
+        json!(sources_out)
     } else {
-        sources
+        json!([])
     };
 
     let mut result = estimate_result_json(
         estimated_bytes,
         cost_min,
         cost_max,
-        &json!(sources_out),
+        &sources_json,
         freshness_lag_seconds,
         estimate_error.as_deref(),
+        !reads_catalog,
     );
+    // QS-10 (LH-QS-2-05), D4: overwrite the `null` the builder writes with
+    // what the rewrite actually applied, before the marks are added below.
+    if let Some(o) = result.as_object_mut() {
+        o.insert("policyObligations".to_owned(), json!(rewrite.obligations));
+    }
     // DATA-12 part 3: the marks of the tables this ClickHouse query reads,
     // beside `sources` (which stays a list of names). One batch read; only a
     // marked source gets an entry, and `sourceMarks` is absent when none is.
     // This route estimates ClickHouse queries only; a Trino query is not
     // estimated here and has no sources to mark.
     // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2:
-    // Only decorate with sourceMarks if catalog_tenant_refusal allows it:
-    if let Ok(None) =
-        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await
+    // Only decorate with sourceMarks if catalog_tenant_refusal allows it and
+    // the caller holds `catalog:read` (QS-10, LH-QS-1-11, D2).
+    if reads_catalog
+        && let Ok(None) =
+            crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await
     {
         let names = std::collections::HashMap::new();
         let marks = crate::routes::catalog::certification_marks(&state, &sources_out, &names).await;
@@ -2898,6 +2961,7 @@ fn trino_estimate_json() -> Value {
         "cacheEligible": Value::Null,
         "freshnessLagSeconds": Value::Null,
         "policyObligations": Value::Null,
+        "catalogHidden": false,
         "sources": [],
         "plan": Value::Null,
     })
@@ -2921,6 +2985,7 @@ fn estimate_result_json(
     sources_out: &Value,
     freshness_lag_seconds: Option<i64>,
     error: Option<&str>,
+    catalog_hidden: bool,
 ) -> Value {
     json!({
         // `QS-6` (decision 7): a ClickHouse estimate is supported by
@@ -2937,15 +3002,19 @@ fn estimate_result_json(
         // estimate only, which runs through the hot analytical store.
         "workloadClass": "hot-analytics",
         "engine": "hot-store",
-        // Nothing in this deployment configures ClickHouse's query cache,
-        // and no policy engine is consulted before a run (`WS7` builds
-        // one) — `cacheEligible`/`policyObligations` stay `null`, not a
-        // fabricated "Eligible"/`[]`. `freshnessLagSeconds` IS a real
+        // Nothing in this deployment configures ClickHouse's query cache, so
+        // `cacheEligible` stays `null`, not a fabricated "Eligible". QS-10
+        // (LH-QS-2-05), D4: the caller overwrites `policyObligations` with
+        // what the rewrite applied; the builder keeps `null` for its own unit
+        // tests and an older reader. `freshnessLagSeconds` IS a real
         // measurement (`freshness_lag`, ClickHouse `system.parts`), unlike
         // the `0` it used to hardcode.
         "cacheEligible": Value::Null,
         "freshnessLagSeconds": freshness_lag_seconds,
         "policyObligations": Value::Null,
+        // QS-10 (LH-QS-1-11), D2: true when the caller lacks `catalog:read`,
+        // so the console explains the withheld sources and freshness.
+        "catalogHidden": catalog_hidden,
         "sources": sources_out,
         // WS1 task 1.6: the old `plan` marked stages that had *not run* as
         // status "completed" with `estimatedBytes: 0` — a fabricated
@@ -3137,6 +3206,9 @@ pub async fn list_saved(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryQueryRaw {
+    /// One run's id (`QS-12`, `LH-QS-4-07`): a link to `/query-studio?run=`
+    /// asks the server for that row by id, never by its SQL text.
+    id: Option<String>,
     status: Option<String>,
     engine: Option<String>,
     min_duration_ms: Option<String>,
@@ -3182,6 +3254,17 @@ const HISTORY_ENGINES: [&str; 2] = ["clickhouse", "trino"];
 /// getting a 400 it cannot read.
 fn parse_history_query(raw: &HistoryQueryRaw) -> Result<HistoryFilter<'_>, ApiError> {
     let mut filter = HistoryFilter::default();
+    // QS-12 (LH-QS-4-07): the id from `?run=` is the run's own, validated by
+    // the same shape guard the download header uses. A non-empty value that
+    // is not an id is a 400, never a filter that silently finds nothing.
+    if let Some(id) = raw.id.as_deref().filter(|s| !s.is_empty()) {
+        if !is_valid_history_id(id) {
+            return Err(ApiError::BadRequest(
+                "id must be a query history id".to_owned(),
+            ));
+        }
+        filter.id = Some(id);
+    }
     if let Some(status) = raw.status.as_deref().filter(|s| !s.is_empty()) {
         if !HISTORY_STATUSES.contains(&status) {
             return Err(ApiError::BadRequest(
@@ -3248,7 +3331,8 @@ fn history_time(field: &str, raw: Option<&str>) -> Result<Option<OffsetDateTime>
 /// # Errors
 ///
 /// 401 when nobody is signed in — history belongs to a person, so there is
-/// no sensible answer for "everyone's". 400 for a bad filter value or a
+/// no sensible answer for "everyone's". 400 for a bad filter value — including
+/// an `id` that is not a query history id (`QS-12`, `LH-QS-4-07`) — or a
 /// `page` that is not a whole number from 1, with a fixed message naming
 /// the field, and for a query string the route cannot
 /// read (a parameter sent twice), with the fixed sentence of
@@ -3610,6 +3694,7 @@ async fn write_download_rows<S: crate::export::RowSource>(
         locale,
         labels: &labels,
         formats: &formats,
+        note: None,
     };
     crate::export::write_export_with_byte_cap(source, &options, Some(byte_cap)).await
 }
@@ -3860,6 +3945,9 @@ pub async fn download(
         query_id: Some(download_query_id(caller.id.uuid(), run_id)),
         // A download keeps the engine's own formatting (out of scope of `DATA-53`).
         quote_decimals: false,
+        // `BI-34` covers the dashboard's downloads; Query Studio's keeps the
+        // engine's default until it has its own decision.
+        max_memory_usage: None,
     };
     let statement = download_statement(&rewritten);
 
@@ -4890,7 +4978,15 @@ mod tests {
 
     #[test]
     fn a_clickhouse_estimate_says_it_is_supported_and_names_its_engine() {
-        let v = estimate_result_json(Some(100), Some(1.0), Some(2.0), &json!([]), None, None);
+        let v = estimate_result_json(
+            Some(100),
+            Some(1.0),
+            Some(2.0),
+            &json!([]),
+            None,
+            None,
+            false,
+        );
 
         // QA LH-QS-4-08 (QS-6), decision 7: the console reads one shape for
         // both engines, and a ClickHouse estimate is supported by definition.
@@ -4902,7 +4998,15 @@ mod tests {
 
     #[test]
     fn estimate_result_emits_null_for_unmeasured_fields() {
-        let v = estimate_result_json(Some(100), Some(1.0), Some(2.0), &json!([]), None, None);
+        let v = estimate_result_json(
+            Some(100),
+            Some(1.0),
+            Some(2.0),
+            &json!([]),
+            None,
+            None,
+            false,
+        );
 
         for key in [
             "cacheEligible",
@@ -4965,8 +5069,27 @@ mod tests {
             server
         }
 
+        /// A logged-in human with `catalog:read` as well as `query:read`.
+        /// `PermissionSet::parse` splits on commas (verified against
+        /// `lakehouse_auth::permissions::PermissionSet::parse`).
+        fn catalog_reader_principal() -> Principal {
+            Principal {
+                id: PrincipalId::User(Uuid::from_u128(3)),
+                tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
+                display_name: "Rina Wijaya".to_owned(),
+                permissions: PermissionSet::parse("query:read, catalog:read"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            }
+        }
+
+        // These DATA-12 tests assert catalog facts (sources and marks). The
+        // fixture is corrected to hold `catalog:read` because QS-10 (D2) now
+        // gates those facts on it — the assertions and their strength are
+        // unchanged, not weakened.
         async fn estimate_of(state: AppState) -> Value {
-            estimate_of_caller(state, fixture_user_principal(), HeaderMap::new()).await
+            estimate_of_caller(state, catalog_reader_principal(), HeaderMap::new()).await
         }
 
         async fn estimate_of_caller(
@@ -4994,6 +5117,115 @@ mod tests {
                 panic!("an estimate never errors back to the caller");
             };
             body
+        }
+
+        /// A `ClickHouse` whose `EXPLAIN ESTIMATE` names no table.
+        async fn clickhouse_reading_no_tables() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [],
+                    "data": [],
+                    "rows": 0,
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        // QS-10 (LH-QS-1-11), D2: a caller without `catalog:read` gets the
+        // estimate numbers but no catalog facts, and the engine is never
+        // asked for freshness.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn an_estimate_without_catalog_read_carries_no_sources_marks_or_freshness(
+            pool: lakehouse_store::PgPool,
+        ) {
+            lakehouse_store::annotation::set_certification(
+                &pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: "silver.orders".to_owned(),
+                    status: "deprecated".to_owned(),
+                    note: Some("Use silver.orders_v2".to_owned()),
+                    replacement_asset_id: Some("silver.orders_v2".to_owned()),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+            let ch = clickhouse_reading("silver", "orders").await;
+
+            let body = estimate_of_caller(
+                state_for(&pool, &ch.uri()),
+                fixture_user_principal(),
+                HeaderMap::new(),
+            )
+            .await;
+
+            assert_eq!(body["sources"], json!([]));
+            assert!(body.get("sourceMarks").is_none());
+            assert!(body["freshnessLagSeconds"].is_null());
+            assert_eq!(body["catalogHidden"], json!(true));
+            assert!(body["estimatedBytes"].is_number());
+            assert!(
+                ch.received_requests()
+                    .await
+                    .expect("the mock records requests")
+                    .iter()
+                    .all(|r| !String::from_utf8_lossy(&r.body).contains("system.parts")),
+                "freshness_lag must not read system.parts without catalog:read"
+            );
+        }
+
+        // QS-10 (LH-QS-1-11), D2: the catalog reader keeps today's answer.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn an_estimate_with_catalog_read_keeps_its_sources_and_marks(
+            pool: lakehouse_store::PgPool,
+        ) {
+            lakehouse_store::annotation::set_certification(
+                &pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: "silver.orders".to_owned(),
+                    status: "deprecated".to_owned(),
+                    note: Some("Use silver.orders_v2".to_owned()),
+                    replacement_asset_id: Some("silver.orders_v2".to_owned()),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+            let ch = clickhouse_reading("silver", "orders").await;
+
+            let body = estimate_of_caller(
+                state_for(&pool, &ch.uri()),
+                catalog_reader_principal(),
+                HeaderMap::new(),
+            )
+            .await;
+
+            assert_eq!(body["sources"], json!(["silver.orders"]));
+            assert_eq!(
+                body["sourceMarks"]["silver.orders"]["certification"],
+                json!("deprecated")
+            );
+            assert_eq!(body["catalogHidden"], json!(false));
+        }
+
+        // QS-10 (LH-QS-1-11), D3: no invented source for a plan that names
+        // no table.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn an_estimate_that_names_no_table_lists_no_source(pool: lakehouse_store::PgPool) {
+            let ch = clickhouse_reading_no_tables().await;
+
+            let body = estimate_of_caller_sql(
+                state_for(&pool, &ch.uri()),
+                catalog_reader_principal(),
+                HeaderMap::new(),
+                "SELECT 1",
+            )
+            .await;
+
+            assert_eq!(body["sources"], json!([]));
+            assert_eq!(body["catalogHidden"], json!(false));
         }
 
         #[sqlx::test(migrations = "../../migrations")]
@@ -5110,12 +5342,15 @@ mod tests {
             let ch = clickhouse_reading("bronze", "retail_orders").await;
             let state = state_for(&pool, &ch.uri());
 
-            // A caller who belongs to retail (not meridian-group catalog tenant):
+            // A caller who belongs to retail (not meridian-group catalog
+            // tenant). It holds `catalog:read` so that its sources are still
+            // reported and this test keeps checking the tenant gate on marks
+            // (QS-10, LH-QS-1-11, D2) rather than the catalog-read gate.
             let outside_caller = Principal {
                 id: PrincipalId::User(Uuid::new_v4()),
                 tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000002")],
                 display_name: "Outsider".to_owned(),
-                permissions: PermissionSet::parse("query:read"),
+                permissions: PermissionSet::parse("query:read, catalog:read"),
                 provider: "session".to_owned(),
                 must_change_password: false,
                 role_names: Vec::new(),
@@ -7866,6 +8101,7 @@ mod history_query_tests {
         page: Option<&str>,
     ) -> HistoryQueryRaw {
         HistoryQueryRaw {
+            id: None,
             status: status.map(str::to_owned),
             engine: engine.map(str::to_owned),
             min_duration_ms: min_duration_ms.map(str::to_owned),

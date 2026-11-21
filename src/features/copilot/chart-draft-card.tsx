@@ -152,6 +152,23 @@ export function draftMeasureLabel(def: ChartDef, metricLabels: Readonly<Record<s
 }
 
 /**
+ * `AI-31` (D14): one footer line per extra question of a layered chart. The
+ * card's own line names the chart's mart; a person confirming it must also see
+ * what each added layer asks, in the same order the model sent them.
+ */
+export function draftLayerLines(def: ChartDef, metricLabels: Readonly<Record<string, string>> | undefined): string[] {
+  if (!def.layers?.length) return [];
+  return def.layers.map((layer) => {
+    const name = layer.label || layer.mart || "SQL source";
+    const measures = draftMeasureLabel(
+      { measures: layer.measures, aggregate: layer.aggregate } as ChartDef,
+      metricLabels,
+    );
+    return `+ ${name}: ${measures} (${layer.draw}, ${layer.axis} axis)`;
+  });
+}
+
+/**
  * A `create_chart` waiting for confirmation, shown as the chart it would
  * create: rendered through the builder's preview endpoint, so what you see is
  * exactly what "Add to dashboard" saves. "Edit in builder" leaves the same
@@ -214,6 +231,7 @@ export function ChartDraftCard({
   const reporting = useService((signal) => settingsService.getReporting(signal), []).data ?? undefined;
   const metricLabels = preview && "metricLabels" in preview.result ? preview.result.metricLabels : undefined;
   const measureLabel = draftMeasureLabel(def, metricLabels);
+  const layerLines = draftLayerLines(def, metricLabels);
 
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-card text-xs shadow-xs">
@@ -261,6 +279,9 @@ export function ChartDraftCard({
         ) : null}
         {def.dimension ? <span>by {def.dimension}</span> : null}
         {measureLabel ? <span>· {measureLabel}</span> : null}
+        {layerLines.map((line) => (
+          <span key={line} className="w-full text-[10px]">{line}</span>
+        ))}
       </div>
 
       <div className="flex flex-wrap items-center gap-2 border-t border-border px-3 py-2">
