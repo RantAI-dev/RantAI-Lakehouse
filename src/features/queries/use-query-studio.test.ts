@@ -2,12 +2,12 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { EditorView } from "@codemirror/view"
 import * as React from "react"
-import * as notify from "@/lib/notify"
 import { LEGACY_QUERY_DRAFT_KEY, queryDraftKey, type QueryTabs } from "@/lib/query-draft"
 import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
-import { useQueryStudio } from "./use-query-studio"
+import type { QueryHistoryItem } from "@/services/contracts/queries"
+import { RUN_LINK_UNAVAILABLE, useQueryStudio } from "./use-query-studio"
 
 // The explain and fix actions of Query Studio: what Accept, Reject and the
 // editor do to each other, and that neither action runs the query. The
@@ -77,6 +77,93 @@ function mountWith(sql: string) {
   act(() => hook.result.current.setSql(sql))
   return hook
 }
+
+// QS-11 (LH-QS-1-01), D7: a new tab's document is empty; the hint is a
+// placeholder in the editor, never starter text someone could run by mistake.
+describe("useQueryStudio starter text", () => {
+  it("starts the first tab and every new tab with an empty document", () => {
+    window.localStorage.clear()
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+    visit("/query-studio")
+
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+    expect(hook.result.current.tabs[0]?.sql).toBe("")
+    act(() => {
+      hook.result.current.addTab()
+    })
+    expect(hook.result.current.tabs[1]?.sql).toBe("")
+  })
+})
+
+// QS-12 (LH-QS-4-07), D15: a `/query-studio?run=<id>` handoff asks for that
+// one run and opens its SQL on the engine it ran on; an id outside the
+// caller's last 14 days opens no tab and says why.
+describe("useQueryStudio run link", () => {
+  const RUN = {
+    id: "q-1",
+    sql: "SELECT * FROM iceberg.bronze.t",
+    engine: "trino",
+    user: "Rina Wijaya",
+    at: "2026-11-20T10:00:00.000Z",
+    status: "completed",
+    durationMs: 10,
+    scannedBytes: 1,
+    costUnits: 0.1,
+    workloadClass: "interactive",
+    cacheAssisted: false,
+    tablesRead: [],
+  } as unknown as QueryHistoryItem
+
+  function stubLists() {
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+  }
+
+  it("opens the run's SQL on its engine from ?run=", async () => {
+    window.localStorage.clear()
+    stubLists()
+    const list = spyOn(queryService, "listHistoryPage").mockResolvedValue({
+      runs: [RUN],
+      total: 1,
+      page: 1,
+      pageSize: 50,
+    } as never)
+    visit("/query-studio?run=q-1")
+
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(1))
+    expect(list.mock.calls[0]?.[0]).toMatchObject({ id: "q-1", page: 1 })
+    await waitFor(() =>
+      expect(hook.result.current.tabs.some((tab) => tab.sql === RUN.sql)).toBe(true)
+    )
+    const opened = hook.result.current.tabs.find((tab) => tab.sql === RUN.sql)
+    expect(opened?.engine).toBe("trino")
+    expect(hook.result.current.runLinkError).toBeNull()
+  })
+
+  it("says the run is unavailable and opens no tab when the answer is empty", async () => {
+    window.localStorage.clear()
+    stubLists()
+    spyOn(queryService, "listHistoryPage").mockResolvedValue({
+      runs: [],
+      total: 0,
+      page: 1,
+      pageSize: 50,
+    } as never)
+    visit("/query-studio?run=q-1")
+
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
+
+    await waitFor(() => expect(hook.result.current.runLinkError).toBe(RUN_LINK_UNAVAILABLE))
+    expect(hook.result.current.tabs.length).toBe(1)
+    expect(hook.result.current.tabs[0]?.sql).toBe("")
+  })
+})
 
 describe("useQueryStudio saved-query link", () => {
   it("opens the saved query the link names, with its id and the caller's level", async () => {
@@ -674,9 +761,11 @@ describe("useQueryStudio statements", () => {
     expect(runs[2]?.status === "error" && runs[2].error.code).toBe("permission_denied")
   })
 
-  it("refuses a batch of more than twenty statements before anything runs", async () => {
+  // QS-11 (LH-QS-1-12), D9: the refusal is state the page renders beside Run,
+  // cleared when the SQL changes — not a toast. This replaces the toast-pinning
+  // test because the rule changed, not because the behaviour is now untested.
+  it("refuses a batch of more than twenty statements and clears the notice when the SQL changes", async () => {
     const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
-    const notifyInfo = spyOn(notify, "notifyInfo")
     const many = Array.from({ length: 21 }, (_, index) => `SELECT ${index}`).join("; ")
     const { result } = mountWith(many)
 
@@ -685,8 +774,11 @@ describe("useQueryStudio statements", () => {
     })
 
     expect(run).not.toHaveBeenCalled()
-    expect(notifyInfo).toHaveBeenCalledTimes(1)
-    expect(String(notifyInfo.mock.calls[0]?.[0] ?? "")).toContain("20")
+    expect(result.current.batchRefusal).toBe(
+      "At most 20 statements are run at once. Split the buffer into smaller queries and run them one after another."
+    )
+    act(() => result.current.setSql("SELECT 1"))
+    expect(result.current.batchRefusal).toBeNull()
   })
 
   it("marks the statement in flight and the ones after it as not run when the batch is stopped", async () => {

@@ -16,15 +16,27 @@ export const STEP_KIND_LABEL: Record<string, string> = {
   connector: "Connector",
   upload: "Upload",
   pipeline: "Pipeline",
+  source: "Source",
+  dataset: "Dataset",
+  iceberg: "Iceberg",
 }
+
+/**
+ * Every step kind the lineage API can send (`lakehouse-api` routes/lineage.rs
+ * and routes/lineage/charts.rs). Each needs a label and an icon; a test holds
+ * both maps to this list, so a new kind cannot ship as a dot and a raw word.
+ */
+export const LINEAGE_STEP_KINDS = [
+  "chart", "sql_source", "metric", "gold", "silver", "bronze", "connector", "upload", "pipeline", "source", "dataset", "iceberg",
+] as const
 
 /**
  * When a step was last refreshed, in the report zone, or "Not recorded" when
  * there is no record (never a guess, feature decision 3).
  */
 export function refreshWords(step: { refreshedAt?: string; refreshSource?: string; notRecorded?: boolean }, timeZone: string): string {
-  const at = step.notRecorded || !step.refreshedAt ? null : new Date(step.refreshedAt)
-  if (!at || Number.isNaN(at.getTime())) return "Not recorded"
+  if (!hasRefreshTime(step)) return "Not recorded"
+  const at = new Date(step.refreshedAt ?? "")
   let when: string
   try {
     when = new Intl.DateTimeFormat("en-GB", { timeZone, dateStyle: "medium", timeStyle: "short" }).format(at)
@@ -32,6 +44,32 @@ export function refreshWords(step: { refreshedAt?: string; refreshSource?: strin
     when = at.toISOString()
   }
   return step.refreshSource ? `Refreshed ${when} (${step.refreshSource})` : `Refreshed ${when}`
+}
+
+/** True when a step has a refresh time on record that can be read as a date. */
+export function hasRefreshTime(step: { refreshedAt?: string; notRecorded?: boolean }): boolean {
+  return !step.notRecorded && !!step.refreshedAt && !Number.isNaN(new Date(step.refreshedAt).getTime())
+}
+
+/**
+ * The one quiet line under a chart's route (`BI-71` decision 1): what the
+ * route leaves out, said once instead of "Not recorded" on every step and
+ * "No column mapping recorded" under every field. The detail (the server's
+ * `coverage` sentences) goes in a help hint after it. `null` when nothing is
+ * missing and the server has nothing to add. The chart step is left out of
+ * the count: a chart has no refresh of its own to record.
+ */
+export function missingWords(lineage: {
+  steps: { kind: string; refreshedAt?: string; notRecorded?: boolean }[]
+  fields: { columns: unknown[] }[]
+  coverage: string[]
+}): string | null {
+  const sources = lineage.steps.filter((s) => s.kind !== "chart")
+  const timed = sources.filter(hasRefreshTime).length
+  const mapped = lineage.fields.filter((f) => f.columns.length > 0).length
+  if (timed === 0 && mapped === 0) return "No refresh times or column mappings recorded yet"
+  const missing = timed < sources.length || mapped < lineage.fields.length
+  return missing || lineage.coverage.length > 0 ? "Only recorded times and columns are shown" : null
 }
 
 /** "and 3 more you do not have access to"; empty when none are hidden. */

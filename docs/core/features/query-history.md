@@ -28,7 +28,8 @@ producer. The tables a run read are not recorded either, so nobody can find "the
 2. Filter by status (completed, failed, stopped, refused), engine, minimum duration, a table the run read, and a
    time range within the 14 days.
 3. See failed, stopped and refused runs as well as completed ones, each with a plain sentence that says why.
-4. Click a run to open its SQL in a new Query Studio tab.
+4. Click a run — anywhere on its row — to open its SQL in a new Query Studio tab by the run's id; the SQL does not
+   travel in the address. The filters you set are kept in the address, so a reload or a shared link keeps them.
 5. In the Query Studio editor, insert and complete Bronze tables too (`QS-1` review fix).
 
 ## Not included
@@ -57,6 +58,7 @@ recorded the same way; the chat's `run_sql` is not recorded, as today.
 | 6 | The side panel stays as it is (the last runs, now including failed ones) with a "View all" link to the page | none | Owner, 2026-10-24 |
 | 7 | The table filter matches a table name containing the text typed, case-insensitive | none | Owner, 2026-10-24 |
 | 8 | Bronze tables in the editor (`QS-1` review fix): a Bronze table has two names. The ClickHouse name the server sends (`queryTarget`) stays for the catalog page's policy and the stand-in. Its Trino name, `iceberg.bronze.<table>`, is built from the table's detail, read when the asset list loads, on expand, or when the statement names it. A Trino tab inserts the Trino name from the schema browser and offers it in the autocomplete only for a Bronze table whose Iceberg table a read has proven to exist — completion offers only proven Bronze tables (Owner, 2026-11-10) — and after `FROM iceberg.bronze.<table> b` the alias `b.` offers that table's columns. A ClickHouse tab inserts and offers no Bronze table; the table's row says "Bronze tables are read with Trino: switch this tab to Trino to insert it.", also before its detail has loaded. The catalog's "Open in Query Studio" and snapshot links for a Bronze table open a Trino tab for `iceberg.bronze.<table>` only when that Bronze table's Iceberg table exists, which the catalog page knows from the table's detail it loads, and the ClickHouse link otherwise; a Bronze table's starter SQL uses that name on Trino (#409). An asset with no readable table (no `Iceberg` table, no `queryTarget`, no stand-in) offers no `Query Studio` link, no starter SQL and no Copy button, and shows one sentence instead: "No readable table for this asset yet." The sentence appears only once the `Iceberg` load has finished, so it does not flash | none | Owner, 2026-10-24; changed: Owner, 2026-11-05; changed: Owner, 2026-11-06; changed: Owner, 2026-11-08; changed: Owner, 2026-11-09; changed: Owner, 2026-11-10; changed: Planner's choice, 2026-11-12 |
+| 9 | `QS-12`: a row opens `/query-studio?run=<id>`; Query Studio asks `GET /api/query/history?id=<id>` for that one run (the caller's own, last 14 days) and opens its SQL on its engine. A run it cannot find answers "This run is not in your history of the last 14 days." and opens no tab; the catalog's `?sql=` starter links stay. The whole row is clickable (pointer cursor), while the SQL text stays the keyboard-reachable link styled as a link; a click that ended a text selection does not navigate *(planner default, owner may change: the styling)*. The page reads `status`, `engine`, `minDurationMs`, `table`, `from`, `to` and `page` from the address on entry and writes them back with `replaceState` on every change; a value the page does not know is ignored. When a filter emptied the list the empty state says "No runs match these filters", "Clear a filter and try again.", with a Clear filters action | none | Planner's choice, 2026-11-20 (QS-12), *(proposed, not yet signed)* |
 
 ## Limits to tell a customer
 
@@ -87,7 +89,7 @@ Run on a running console by the product owner. A step not performed is never a p
 | `QS-4-AC4` | Sign in as a second user and open History | None of the first user's runs is listed | Pass (2026-11-04, f3cee927, LH-QS-4-04) |
 | `QS-4-AC5` | (operator) Have a run recorded 15 days ago | It is not listed | Pass (2026-11-04, f3cee927, LH-QS-4-05) |
 | `QS-4-AC6` | Filter on engine Trino and a minimum of 5 seconds | Only Trino runs of 5 seconds or more | Pass (2026-11-04, f3cee927, LH-QS-4-06) |
-| `QS-4-AC7` | Click a run | Its SQL opens in a new Query Studio tab with its engine | Pass (2026-11-04, f3cee927, LH-QS-4-07) |
+| `QS-4-AC7` | Click a run | Its SQL opens in a new Query Studio tab with its engine, and the address holds the run's id, not its SQL | Pass (2026-11-04, f3cee927, LH-QS-4-07) |
 | `QS-4-AC8` | In the editor, expand a Bronze table in the schema browser and click it; type its alias and a dot | The name is inserted and its columns are suggested | Pass (2026-11-13, 8b9c297c, LH-QS-4-08) |
 
 **Acceptor** (not the Owner): product owner (recorded in the base) **Date:** 2026-11-14 **Build:** 240d2e62

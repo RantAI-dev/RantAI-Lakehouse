@@ -8,7 +8,15 @@
  * common cron patterns in words. A pattern it does not recognise returns
  * `null` and the page shows the raw expression. A guessed sentence that is
  * wrong is worse than the expression itself.
+ *
+ * BLD-11 D3: a stored cron is NOT the whole truth about how a pipeline is
+ * triggered. With a target lag the orchestrator builds no schedule
+ * (`authored_factory.py`), so the cron never fires and "Manual only" is a
+ * lie. `triggerSummary` lets the target lag win everywhere the page names
+ * the trigger.
  */
+
+import type { TargetLag } from "@/services/contracts/pipelines"
 
 export type ParsedSchedule =
   | { kind: "manual" }
@@ -84,6 +92,51 @@ export function describeCron(cron: string): string | null {
 /** Whether an orchestrator schedule state means "will fire". */
 export function isScheduleRunning(state: string | null): boolean {
   return state === "RUNNING"
+}
+
+export type TriggerSummary = {
+  kind: "lag" | "downstream" | "unknown-lag" | "manual" | "cron" | "other"
+  label: string
+}
+
+/**
+ * How a pipeline is actually triggered (BLD-11 F2/D3). A target lag wins
+ * over `schedule`: with one set there is no firing cron to name, and
+ * "Manual only" would deny that the lag sensor runs the pipeline. The
+ * `unknown-lag` kind is for a `TargetLag` this build cannot describe — the
+ * contract widens with `| string` — so the page says so rather than
+ * inventing a meaning.
+ */
+export function triggerSummary(
+  schedule: ParsedSchedule,
+  targetLag: TargetLag | null | undefined
+): TriggerSummary {
+  if (targetLag) {
+    if (targetLag.kind === "lag" && typeof targetLag.minutes === "number") {
+      const minutes = targetLag.minutes
+      if (minutes > 59) {
+        const hours = Math.floor(minutes / 60)
+        const rest = minutes % 60
+        return {
+          kind: "lag",
+          label: `Within ${hours} h${rest ? ` ${rest} min` : ""} of its inputs`,
+        }
+      }
+      return { kind: "lag", label: `Within ${minutes} min of its inputs` }
+    }
+    if (targetLag.kind === "downstream") {
+      return { kind: "downstream", label: "When a downstream pipeline needs it" }
+    }
+    return { kind: "unknown-lag", label: "Target lag (unknown kind)" }
+  }
+  if (schedule.kind === "manual") return { kind: "manual", label: "Manual only" }
+  if (schedule.kind === "cron") return { kind: "cron", label: describeCron(schedule.cron) ?? "Cron" }
+  return { kind: "other", label: schedule.raw }
+}
+
+/** Whether a trigger summary names a target lag (BLD-11 D3). */
+export function isLagTrigger(summary: TriggerSummary): boolean {
+  return summary.kind === "lag" || summary.kind === "downstream" || summary.kind === "unknown-lag"
 }
 
 /**

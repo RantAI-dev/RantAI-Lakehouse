@@ -23,6 +23,11 @@
 #                         jobs and `image-smoke` on a `push` only; it never
 #                         excuses the Rust jobs, the Dagster jobs, `images` or
 #                         anything on another event (D6).
+#   PR_DRAFT              "true" when the event is `pull_request` and the PR is
+#                         a draft (OPS-38 D1). Only exact `true` on `pull_request`
+#                         excuses heavy checks (Rust clippy/build/test/msrv,
+#                         Dagster, images, acceptance gates); fast checks (`changes`,
+#                         `repo-lints`, `fmt`, `verify`) stay required when in scope.
 #   CHANGES_RESULT        result of `changes` job
 #   REPO_LINTS_RESULT     result of `repo-lints` job
 #   FRONTEND_RESULT       result of `verify` job
@@ -91,6 +96,13 @@ run_gate() {
   if [ "$event_name" = "push" ] && [ "${PUSH_PROVEN:-false}" = "true" ]; then
     push_proven="true"
   fi
+  # OPS-38 D1: a draft pull request runs only the fast checks. Any value of
+  # PR_DRAFT other than exact `true` on `pull_request` is treated as non-draft
+  # (fail closed: require full scope).
+  local pr_draft="false"
+  if [ "$event_name" = "pull_request" ] && [ "${PR_DRAFT:-false}" = "true" ]; then
+    pr_draft="true"
+  fi
 
   echo "=== Scope Evaluation ==="
   echo "EVENT_NAME:           $event_name"
@@ -101,6 +113,10 @@ run_gate() {
   echo "SCOPE_DOCS_ONLY:      $scope_docs_only"
   echo "SCOPE_ALL:            $scope_all"
   echo "PUSH_PROVEN:          $push_proven"
+  echo "PR_DRAFT:             $pr_draft"
+  if [ "$pr_draft" = "true" ]; then
+    echo "PR is a draft: running fast checks only (heavy Rust, Dagster, image, and gate checks skipped)."
+  fi
 
   # OPS-24 D3, R3: the nightly run and a manual run have no base commit, so
   # their scope is `all=true`. This makes "every job is required" explicit for
@@ -167,14 +183,27 @@ run_gate() {
     req_rust="true"
   fi
 
+  local req_rust_heavy="$req_rust"
+  if [ "$pr_draft" = "true" ]; then
+    req_rust_heavy="false"
+  fi
+
   local req_dagster="false"
   if [ "$req_all" = "true" ] || [ "$scope_dagster" = "true" ]; then
     req_dagster="true"
   fi
 
+  local req_dagster_heavy="$req_dagster"
+  if [ "$pr_draft" = "true" ]; then
+    req_dagster_heavy="false"
+  fi
+
   local req_acceptance="false"
   if [ "$req_all" = "true" ] || [ "$scope_rust" = "true" ] || [ "$scope_dagster" = "true" ] || [ "$scope_stack" = "true" ]; then
     req_acceptance="true"
+  fi
+  if [ "$pr_draft" = "true" ]; then
+    req_acceptance="false"
   fi
 
   # OPS-24 D5, D6: a push proven to repeat a passed pull request does not need
@@ -268,14 +297,14 @@ run_gate() {
 
   # Rust fast feedback & tests
   check_job "fmt" "${RUST_FMT_RESULT:-skipped}" "$req_rust"
-  check_job "clippy" "${RUST_CLIPPY_RESULT:-skipped}" "$req_rust"
-  check_job "build" "${RUST_BUILD_RESULT:-skipped}" "$req_rust"
-  check_job "test" "${RUST_TEST_RESULT:-skipped}" "$req_rust"
-  check_job "msrv" "${RUST_MSRV_RESULT:-skipped}" "$req_rust"
+  check_job "clippy" "${RUST_CLIPPY_RESULT:-skipped}" "$req_rust_heavy"
+  check_job "build" "${RUST_BUILD_RESULT:-skipped}" "$req_rust_heavy"
+  check_job "test" "${RUST_TEST_RESULT:-skipped}" "$req_rust_heavy"
+  check_job "msrv" "${RUST_MSRV_RESULT:-skipped}" "$req_rust_heavy"
 
   # Dagster
-  check_job "dagster-unit-tests" "${DAGSTER_TESTS_RESULT:-skipped}" "$req_dagster"
-  check_job "dagster-loader-tests" "${DAGSTER_LOADER_TESTS_RESULT:-skipped}" "$req_dagster"
+  check_job "dagster-unit-tests" "${DAGSTER_TESTS_RESULT:-skipped}" "$req_dagster_heavy"
+  check_job "dagster-loader-tests" "${DAGSTER_LOADER_TESTS_RESULT:-skipped}" "$req_dagster_heavy"
 
   # Acceptance
   check_job "g1-rustfs" "${G1_RUSTFS_RESULT:-skipped}" "$(req_gate_for g1-rustfs)"
@@ -321,7 +350,11 @@ run_gate() {
     return 1
   fi
 
-  echo "ci-required gate PASSED: all checks satisfied."
+  if [ "$pr_draft" = "true" ]; then
+    echo "ci-required gate PASSED (draft PR: fast checks satisfied, heavy checks skipped)."
+  else
+    echo "ci-required gate PASSED: all checks satisfied."
+  fi
   return 0
 }
 

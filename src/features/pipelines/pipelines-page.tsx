@@ -54,9 +54,9 @@ export function PipelinesPage() {
     () =>
       getPipelineColumns({
         onView: (p) => router.push(`/pipelines/${p.id}`),
-        // Only an orchestrator job can be launched; an authored pipeline
-        // has no engine behind it, and the menu says so rather than
-        // offering an action that always fails.
+        // BLD-11 review R4: the trigger route launches authored pipelines
+        // too (only drafts are refused), so this handler is shared with the
+        // Dagster rows; the menu says "mark it ready first" only for drafts.
         onTrigger: async (p) => {
           const run = await triggerAction.run(p.id)
           if (run) state.reload()

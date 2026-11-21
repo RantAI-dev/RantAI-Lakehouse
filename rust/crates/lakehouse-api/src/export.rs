@@ -21,10 +21,12 @@
 //! ends exactly at its cap is not cut.
 //!
 //! One rule per concern, shared with the older export: formula
-//! neutralising is `csv_export::neutralise` for a CSV cell, a tab-separated
-//! cell and an Excel text cell alike. Excel keeps numbers as numbers (feature
-//! decision 7): with "formatted", a column whose chart has a value format gets
-//! the Excel number format `lakehouse_bi::export_format::excel_number_format`
+//! neutralising is `csv_export::neutralise` for a CSV cell and a
+//! tab-separated cell. An Excel text cell is a string cell, never a formula,
+//! and holds its text as it is (`BI-55`, QA `LH-BI-1-08`). Excel keeps numbers
+//! as numbers (feature decision 7): with "formatted", a column whose chart has
+//! a value format gets the Excel number format
+//! `lakehouse_bi::export_format::excel_number_format`
 //! returns; with "raw" nothing is formatted. A CSV "formatted" file holds the
 //! text the chart shows (`format_text`).
 //!
@@ -53,6 +55,34 @@ pub(crate) const EXPORT_ROW_CAP: u32 = 1_000_000;
 /// The longest a download may take: the read timeout of the stream, 300
 /// seconds (D6).
 pub(crate) const EXPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The longest the engine may run a download's statement: 280 seconds, below
+/// [`EXPORT_TIMEOUT`] so the engine's own answer reaches the caller before the
+/// client gives up. A raw table over a SQL source already carried it in the
+/// statement; a table over a mart did not, and a grouped tile runs under its
+/// own limits, so this is sent as a setting of the request for every download
+/// (`BI-27`, plan D3).
+pub(crate) const EXPORT_ENGINE_TIME: std::time::Duration = std::time::Duration::from_secs(280);
+
+/// The most memory the engine may use for one download's statement: 2 GiB
+/// (`BI-34`, plan D3), sent as `max_memory_usage`. A scan streams, but a sort
+/// or a grouping behind a raw table or a grouped tile does not, and the
+/// engine's own default is far above what two downloads at once
+/// ([`crate::state::EXPORT_AT_ONCE`]) should take from a shared host. A
+/// statement that needs more fails with the engine's error, which the route
+/// turns into a fixed sentence.
+pub(crate) const EXPORT_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// What a download refused for lack of a slot is told (`BI-34`): fixed, so
+/// nothing of the process's state is in it.
+pub(crate) const EXPORT_BUSY: &str = "Two downloads are already running. Try again in a moment.";
+
+/// The most bytes a dashboard download holds: 1 GiB of text (`BI-27`, plan D3).
+/// The Query Studio download has 5 GB because it is one person's one result;
+/// this one is also what a scheduled report builds, in the temporary
+/// directory, so it is a fifth of that. A file over it is cut at the last whole row that fits and
+/// says so in its name, its headers and its audit row, as the row cap does.
+pub(crate) const EXPORT_BYTE_CAP: u64 = 1024 * 1024 * 1024;
 
 /// The file kinds a chart can be downloaded as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,7 +233,16 @@ pub(crate) struct ExportOptions<'a> {
     pub(crate) labels: &'a HashMap<String, String>,
     /// The value format of a column, by name (used with [`Values::Formatted`]).
     pub(crate) formats: &'a HashMap<String, ValueFormat>,
+    /// A sentence the file carries beside its data (`BI-28`): a `Note` sheet in
+    /// a workbook. A CSV or TSV body is never changed; the route says it in the
+    /// file's name and a header instead.
+    pub(crate) note: Option<&'a str>,
 }
+
+/// The sentence a download carries when an active dashboard filter did not
+/// apply to the tile's data and was left out of the file (`BI-28`).
+pub(crate) const FILTERS_NOT_APPLIED: &str =
+    "Some dashboard filters do not apply to this table, so they were not used for this file.";
 
 /// A finished file, open for reading from its start.
 pub(crate) struct Written {
@@ -211,6 +250,21 @@ pub(crate) struct Written {
     pub(crate) len: u64,
     pub(crate) rows: usize,
     pub(crate) cut: bool,
+}
+
+impl Written {
+    /// Which limit cut the file: `"rows"` when it holds the row cap, `"bytes"`
+    /// when the byte cap stopped it earlier, `None` when it was not cut
+    /// (`BI-27`: a cut file always says which limit it met).
+    pub(crate) fn cut_by(&self, row_cap: usize) -> Option<&'static str> {
+        // The dashboard's row cap (1,000,000) is under a sheet's (1,048,575),
+        // so a workbook cut by rows holds exactly `row_cap` rows too.
+        match (self.cut, self.rows >= row_cap) {
+            (false, _) => None,
+            (true, true) => Some("rows"),
+            (true, false) => Some("bytes"),
+        }
+    }
 }
 
 /// What reading the next row came to.
@@ -266,9 +320,29 @@ fn csv_cell(
     // BI-1 review fix (SHOULD-FIX) R5: a number the engine sent as text (a 64-bit
     // integer) is a number, not a formula: `"-5"` is written as `-5`, with no
     // apostrophe, as a JSON number is.
+    text_cell(value, numeric_column)
+}
+
+/// A text that is a plain decimal number: an optional minus sign, digits, and
+/// an optional fraction. No exponent, no sign other than a minus, no spaces.
+fn is_plain_number(s: &str) -> bool {
+    let body = s.strip_prefix('-').unwrap_or(s);
+    let (whole, fraction) = body
+        .split_once('.')
+        .map_or((body, None), |(w, f)| (w, Some(f)));
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    digits(whole) && fraction.is_none_or(digits)
+}
+
+/// The text of a cell that is not written as a number. `BI-28`: a number the
+/// engine sent as a quoted string (a 64-bit integer, 16 digits or more, which
+/// does not survive being a float) in a numeric column is written as it came,
+/// never prefixed with an apostrophe like a formula. Any other text is
+/// neutralised.
+fn text_cell(value: &Value, numeric_column: bool) -> String {
     if numeric_column
         && let Value::String(text) = value
-        && numeric_string(text).is_some()
+        && (numeric_string(text).is_some() || is_plain_number(text))
     {
         return text.clone();
     }
@@ -294,17 +368,16 @@ impl Drop for TempPath {
     }
 }
 
-/// Read `source` to its end (or the cap) and write it as `options` say.
-///
-/// This entry has no byte cap: the dashboard's download is bounded by its row
-/// cap alone, and its files are what they were before the byte cap existed.
-/// The Query Studio download, which has a cap of its own, calls
-/// [`write_export_with_byte_cap`].
+/// Read `source` to its end (or the cap) and write it as `options` say, with no
+/// byte cap. Every route sets a byte cap (`BI-27`: the dashboard's is
+/// [`EXPORT_BYTE_CAP`], Query Studio's its own), so this is the tests' short
+/// form of [`write_export_with_byte_cap`].
 ///
 /// # Errors
 ///
 /// [`ExportError`]: the source failed, the disk failed, or the workbook writer
 /// refused a cell.
+#[cfg(test)]
 pub(crate) async fn write_export<S: RowSource>(
     source: &mut S,
     options: &ExportOptions<'_>,
@@ -315,9 +388,9 @@ pub(crate) async fn write_export<S: RowSource>(
 /// Read `source` to its end (or the caps) and write it as `options` say.
 ///
 /// `byte_cap` is the most bytes the file may hold, `None` for no byte cap.
-/// The Query Studio download (`QS-2`) is the caller that has one: it stops a
-/// result that passes its cap at the last whole row, and tells the person
-/// which limit cut the file. The comma and tab files count the bytes they
+/// The Query Studio download (`QS-2`) and the dashboard's (`BI-27`) have one:
+/// each stops a result that passes its cap at the last whole row, and tells
+/// the person which limit cut the file. The comma and tab files count the bytes they
 /// write, the byte-order mark and the header among them; the workbook counts
 /// the text of its cells, the workbook being compressed, so the file on disk
 /// is never bigger than the counted text. A cap cuts at the last whole row
@@ -523,12 +596,94 @@ pub(crate) fn xlsx_row_cap(caller_cap: usize) -> usize {
 fn xlsx_cell_bytes(value: &Value, numeric_column: bool) -> u64 {
     match cell_number(value, numeric_column) {
         Some(n) => n.to_string().len() as u64,
-        None => csv_export::cell_text(Some(value)).len() as u64,
+        None => csv_export::plain_text(Some(value)).len() as u64,
     }
 }
 
 fn xlsx_err(e: &rust_xlsxwriter::XlsxError) -> ExportError {
     ExportError::Xlsx(e.to_string())
+}
+
+/// Rows handed to the workbook writer in one `spawn_blocking` call. The
+/// writer's work per cell is CPU, not I/O, so a million rows written on the
+/// async worker held it for seconds at a time (`BI-34`); a batch is the unit
+/// that moves to the blocking pool, big enough that the hand-over costs
+/// nothing and small enough that the rows held in memory stay a few hundred
+/// kilobytes.
+const XLSX_BATCH_ROWS: usize = 1_000;
+
+/// The workbook and what the row writes need of the columns. It is moved into
+/// `spawn_blocking` and back, one batch at a time, so the writes never run on
+/// the async worker (`BI-34`).
+struct XlsxSink {
+    workbook: rust_xlsxwriter::Workbook,
+    number_formats: Vec<Option<rust_xlsxwriter::Format>>,
+    numeric: Vec<bool>,
+}
+
+impl XlsxSink {
+    /// Write `rows` to the data sheet, the first at sheet row `first_row`.
+    /// Constant-memory mode needs the rows in order, which a batch keeps.
+    fn write_rows(&mut self, first_row: u32, rows: &[Vec<Value>]) -> Result<(), ExportError> {
+        let sheet = self
+            .workbook
+            .worksheet_from_index(0)
+            .map_err(|e| xlsx_err(&e))?;
+        for (offset, row) in rows.iter().enumerate() {
+            let r = u32::try_from(offset)
+                .ok()
+                .and_then(|o| first_row.checked_add(o))
+                .ok_or_else(|| ExportError::Xlsx("more rows than a sheet has".to_owned()))?;
+            for (i, value) in row.iter().enumerate() {
+                let col = u16::try_from(i)
+                    .map_err(|_| ExportError::Xlsx("more columns than a sheet has".to_owned()))?;
+                let numeric = self.numeric.get(i).copied().unwrap_or(false);
+                let written = match (value, cell_number(value, numeric)) {
+                    (Value::Null, _) => Ok(&mut *sheet),
+                    (_, Some(n)) => match self.number_formats.get(i).and_then(Option::as_ref) {
+                        Some(f) => sheet.write_number_with_format(r, col, n, f),
+                        None => sheet.write_number(r, col, n),
+                    },
+                    (Value::Bool(b), None) => sheet.write_boolean(r, col, *b),
+                    (other, None) => {
+                        // QA LH-BI-1-08 (BI-55, D3): an .xlsx text cell is a typed
+                        // string cell that a spreadsheet never evaluates, so it
+                        // holds the text as it is; the CSV keeps the apostrophe
+                        // (csv_export::neutralise).
+                        let text = csv_export::plain_text(Some(other));
+                        if text.chars().count() > XLSX_CELL_CHARS {
+                            return Err(ExportError::Xlsx(
+                                "a cell is longer than Excel allows".to_owned(),
+                            ));
+                        }
+                        sheet.write_string(r, col, text)
+                    }
+                };
+                written.map_err(|e| xlsx_err(&e))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Run `work` on the sink on the blocking pool and take the sink back. The
+/// sink is lost when the task panics or is cancelled, which is an error of
+/// the export, never a half-written file.
+async fn on_blocking_pool<T: Send + 'static>(
+    sink: &mut Option<XlsxSink>,
+    work: impl FnOnce(&mut XlsxSink) -> Result<T, ExportError> + Send + 'static,
+) -> Result<T, ExportError> {
+    let mut owned = sink
+        .take()
+        .ok_or_else(|| ExportError::Xlsx("the workbook was lost".to_owned()))?;
+    let (owned, result) = tokio::task::spawn_blocking(move || {
+        let result = work(&mut owned);
+        (owned, result)
+    })
+    .await
+    .map_err(|e| ExportError::Xlsx(e.to_string()))?;
+    *sink = Some(owned);
+    result
 }
 
 async fn write_xlsx_file<S: RowSource>(
@@ -565,18 +720,21 @@ async fn write_xlsx_file<S: RowSource>(
         let col = u16::try_from(i)
             .map_err(|_| ExportError::Xlsx("more columns than a sheet has".to_owned()))?;
         sheet
-            .write_string_with_format(0, col, csv_export::neutralise(label), &bold)
+            .write_string_with_format(0, col, label.as_str(), &bold)
             .map_err(|e| xlsx_err(&e))?;
     }
+    let mut sink = Some(XlsxSink {
+        workbook,
+        number_formats,
+        numeric: cols.numeric.clone(),
+    });
     let mut rows = 0_usize;
     let mut cut = false;
+    // The rows read and counted but not yet written: at most a batch.
+    let mut batch: Vec<Vec<Value>> = Vec::with_capacity(XLSX_BATCH_ROWS);
     // The byte cap counts the text of the cells the workbook holds, the
     // workbook being compressed: the file on disk is never bigger than this.
-    let mut bytes: u64 = cols
-        .labels
-        .iter()
-        .map(|label| csv_export::neutralise(label).len() as u64)
-        .sum();
+    let mut bytes: u64 = cols.labels.iter().map(|label| label.len() as u64).sum();
     let cap = xlsx_row_cap(options.cap);
     loop {
         match next_capped(source, rows, cap).await? {
@@ -600,42 +758,31 @@ async fn write_xlsx_file<S: RowSource>(
                     break;
                 }
                 bytes += row_bytes;
-                let r = u32::try_from(rows + 1)
-                    .map_err(|_| ExportError::Xlsx("more rows than a sheet has".to_owned()))?;
-                for (i, value) in row.iter().enumerate() {
-                    let col = u16::try_from(i).map_err(|_| {
-                        ExportError::Xlsx("more columns than a sheet has".to_owned())
-                    })?;
-                    let numeric = cols.numeric.get(i).copied().unwrap_or(false);
-                    let written = match (value, cell_number(value, numeric)) {
-                        (Value::Null, _) => Ok(&mut *sheet),
-                        (_, Some(n)) => match number_formats.get(i).and_then(Option::as_ref) {
-                            Some(f) => sheet.write_number_with_format(r, col, n, f),
-                            None => sheet.write_number(r, col, n),
-                        },
-                        (Value::Bool(b), None) => sheet.write_boolean(r, col, *b),
-                        (other, None) => {
-                            let text = csv_export::cell_text(Some(other));
-                            if text.chars().count() > XLSX_CELL_CHARS {
-                                return Err(ExportError::Xlsx(
-                                    "a cell is longer than Excel allows".to_owned(),
-                                ));
-                            }
-                            sheet.write_string(r, col, text)
-                        }
-                    };
-                    written.map_err(|e| xlsx_err(&e))?;
-                }
+                batch.push(row);
                 rows += 1;
+                if batch.len() >= XLSX_BATCH_ROWS {
+                    flush_batch(&mut sink, &mut batch, rows).await?;
+                }
             }
         }
     }
+    flush_batch(&mut sink, &mut batch, rows).await?;
     let path = TempPath::new("xlsx");
     let target = path.0.clone();
-    tokio::task::spawn_blocking(move || workbook.save(&target))
-        .await
-        .map_err(|e| ExportError::Xlsx(e.to_string()))?
-        .map_err(|e| xlsx_err(&e))?;
+    let note = options.note.map(str::to_owned);
+    on_blocking_pool(&mut sink, move |sink| {
+        if let Some(note) = &note {
+            // BI-28: a small second sheet after the data, so the data sheet's
+            // cells are exactly the tile's rows.
+            let sheet = sink.workbook.add_worksheet();
+            sheet.set_name("Note").map_err(|e| xlsx_err(&e))?;
+            sheet.write_string(0, 0, note).map_err(|e| xlsx_err(&e))?;
+            sheet.set_column_width(0, 90).map_err(|e| xlsx_err(&e))?;
+        }
+        // `Workbook::save` takes `&mut self`.
+        sink.workbook.save(&target).map_err(|e| xlsx_err(&e))
+    })
+    .await?;
     let mut file = tokio::fs::File::open(&path.0).await?;
     drop(tokio::fs::remove_file(&path.0).await);
     let len = file.seek(SeekFrom::End(0)).await?;
@@ -646,6 +793,23 @@ async fn write_xlsx_file<S: RowSource>(
         rows,
         cut,
     })
+}
+
+/// Write the pending batch (the last `batch.len()` of `rows_so_far` rows) on
+/// the blocking pool. Sheet row 0 is the header, so the batch starts at sheet
+/// row `rows_so_far - batch.len() + 1`.
+async fn flush_batch(
+    sink: &mut Option<XlsxSink>,
+    batch: &mut Vec<Vec<Value>>,
+    rows_so_far: usize,
+) -> Result<(), ExportError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let first = u32::try_from(rows_so_far - batch.len() + 1)
+        .map_err(|_| ExportError::Xlsx("more rows than a sheet has".to_owned()))?;
+    let pending = std::mem::replace(batch, Vec::with_capacity(XLSX_BATCH_ROWS));
+    on_blocking_pool(sink, move |sink| sink.write_rows(first, &pending)).await
 }
 
 #[cfg(test)]
@@ -713,6 +877,7 @@ mod tests {
             locale: "id-ID",
             labels,
             formats,
+            note: None,
         }
     }
 
@@ -814,6 +979,91 @@ mod tests {
         assert_eq!(w.rows, 2);
         let text = String::from_utf8(read_all(w).await).unwrap();
         assert_eq!(text, "\u{feff}name,amount\r\nxxxx,1\r\nxxxx,2\r\n");
+    }
+
+    /// BI-34: the workbook rows are written in batches on the blocking pool;
+    /// a result longer than a batch (and one cut inside a batch) keeps every
+    /// row it counts, in order.
+    #[tokio::test]
+    async fn a_workbook_longer_than_a_batch_holds_every_counted_row() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |i: usize| vec![json!("xxxx"), json!(i)];
+        let w = write_export(
+            &mut source(2_500, make),
+            &options(FileFormat::Xlsx, Values::Raw, 10_000, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        assert_eq!((w.rows, w.cut), (2_500, false));
+        let bytes = read_all(w).await;
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut sheet = String::new();
+        archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut sheet)
+            .unwrap();
+        // The header is row 1, the last data row is row 2,501.
+        assert!(sheet.contains("<row r=\"2501\""), "last row missing");
+        assert!(!sheet.contains("<row r=\"2502\""), "a row too many");
+        let cut = write_export_with_byte_cap(
+            &mut source(2_500, make),
+            &options(FileFormat::Xlsx, Values::Raw, 10_000, &labels, &formats),
+            Some(7_510),
+        )
+        .await
+        .unwrap();
+        // PR #527 CI: the count is derived from the byte accounting, not
+        // hard-coded. The cap counts the header's text first ("name" and
+        // "amount", 10 bytes), then each row: "xxxx" (4) and the digits of the
+        // number. Rows are numbered from 1; the cut is at the last whole row.
+        let mut used = 10_u64;
+        let mut expected = 0_usize;
+        for i in 1_usize..=2_500 {
+            let row = 4 + i.to_string().len() as u64;
+            if used + row > 7_510 {
+                break;
+            }
+            used += row;
+            expected += 1;
+        }
+        assert_eq!(expected, 1_075, "the header's 10 bytes are in the sum");
+        assert_eq!((cut.rows, cut.cut), (expected, true));
+    }
+
+    /// BI-27: a cut file says which limit cut it, and the row count a cut file
+    /// names is the one it holds.
+    #[tokio::test]
+    async fn a_cut_file_says_whether_rows_or_bytes_cut_it() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |i: usize| vec![json!("xxxx"), json!(i)];
+        for format in [FileFormat::Csv, FileFormat::Xlsx] {
+            let by_bytes = write_export_with_byte_cap(
+                &mut source(10, make),
+                &options(format, Values::Raw, 10, &labels, &formats),
+                Some(24),
+            )
+            .await
+            .unwrap();
+            assert!(by_bytes.cut, "{format:?}");
+            assert_eq!(by_bytes.cut_by(10), Some("bytes"), "{format:?}");
+            let by_rows = write_export_with_byte_cap(
+                &mut source(11, make),
+                &options(format, Values::Raw, 10, &labels, &formats),
+                Some(EXPORT_BYTE_CAP),
+            )
+            .await
+            .unwrap();
+            assert_eq!(by_rows.cut_by(10), Some("rows"), "{format:?}");
+            let whole = write_export_with_byte_cap(
+                &mut source(3, make),
+                &options(format, Values::Raw, 10, &labels, &formats),
+                Some(EXPORT_BYTE_CAP),
+            )
+            .await
+            .unwrap();
+            assert_eq!(whole.cut_by(10), None, "{format:?}");
+        }
     }
 
     #[tokio::test]
@@ -938,7 +1188,7 @@ mod tests {
             .unwrap();
         // The amount is a numeric cell, not a string.
         assert!(sheet.contains("<v>1234567</v>"), "{sheet}");
-        // The formula-looking text is a string cell with an apostrophe in front.
+        // The formula-looking text is a string cell holding the text as it is (QA `LH-BI-1-08`).
         assert!(!sheet.contains("<f>"), "{sheet}");
         let mut shared = String::new();
         zip.by_name("xl/sharedStrings.xml")
@@ -951,9 +1201,98 @@ mod tests {
             .unwrap();
         assert!(styles.contains("Rp"), "{styles}");
         assert!(
-            sheet.contains("'=HYPERLINK") || shared.contains("'=HYPERLINK"),
+            (sheet.contains("=HYPERLINK") || shared.contains("=HYPERLINK"))
+                && !sheet.contains("'=HYPERLINK")
+                && !shared.contains("'=HYPERLINK")
+                && !sheet.contains("&apos;=HYPERLINK")
+                && !shared.contains("&apos;=HYPERLINK"),
             "{sheet} {shared}"
         );
+    }
+
+    /// QA `LH-BI-1-08` (`BI-55`): every text that looks like a formula is a
+    /// typed string cell in the workbook, so it holds the text as it is — no
+    /// guarding apostrophe and no formula element anywhere in the sheet.
+    #[tokio::test]
+    async fn a_text_that_starts_like_a_formula_is_a_string_cell_in_the_workbook_with_no_apostrophe_and_no_formula()
+     {
+        const TEXTS: [&str; 5] = [
+            "=1+1",
+            "+SUM(1,2)",
+            "-2+3",
+            "@SUM(1)",
+            "=HYPERLINK(\"http://example.invalid\",\"x\")",
+        ];
+        let labels = HashMap::from([("name".to_owned(), "=Name".to_owned())]);
+        let formats = HashMap::new();
+        let make = |i: usize| vec![json!(TEXTS[i - 1]), json!(i)];
+        let w = write_export(
+            &mut source(5, make),
+            &options(FileFormat::Xlsx, Values::Raw, 10, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        assert_eq!(w.rows, 5);
+        let bytes = read_all(w).await;
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut sheet = String::new();
+        zip.by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut sheet)
+            .unwrap();
+        let mut shared = String::new();
+        zip.by_name("xl/sharedStrings.xml")
+            .map_or_else(|_| Ok(0), |mut f| f.read_to_string(&mut shared))
+            .unwrap();
+        let all = format!("{sheet}{shared}");
+        assert!(!sheet.contains("<f>") && !sheet.contains("<f "), "{sheet}");
+        assert!(
+            sheet.contains("t=\"inlineStr\"") || sheet.contains("t=\"s\""),
+            "{sheet}"
+        );
+        for text in [
+            "=1+1",
+            "+SUM(1,2)",
+            "-2+3",
+            "@SUM(1)",
+            "=HYPERLINK(",
+            "=Name",
+        ] {
+            assert!(all.contains(text), "{text} in {all}");
+        }
+        for guarded in [
+            "'=1+1",
+            "'+SUM",
+            "'-2+3",
+            "'@SUM",
+            "'=HYPERLINK",
+            "'=Name",
+            "&apos;=",
+            "&apos;+",
+            "&apos;-",
+            "&apos;@",
+        ] {
+            assert!(!all.contains(guarded), "{guarded} in {all}");
+        }
+    }
+
+    /// `BI-55` D5: a workbook's byte cap counts the text the cell holds, so a
+    /// formula-looking text costs its own bytes, not the guarded CSV ones.
+    #[tokio::test]
+    async fn a_formula_looking_text_costs_its_own_bytes_in_the_workbook_cap() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |i: usize| vec![json!("=x"), json!(i)];
+        // The header holds 10 bytes (`name` + `amount`); a row holds `=x` and
+        // one digit: 3 bytes. Three rows fit in 19, the fourth is cut.
+        let w = write_export_with_byte_cap(
+            &mut source(10, make),
+            &options(FileFormat::Xlsx, Values::Raw, 10, &labels, &formats),
+            Some(10 + 3 * 3),
+        )
+        .await
+        .unwrap();
+        assert!(w.cut);
+        assert_eq!(w.rows, 3);
     }
 
     #[test]
@@ -1031,7 +1370,7 @@ mod tests {
     #[tokio::test]
     async fn a_negative_quoted_integer_is_written_unchanged_and_text_is_still_neutralised() {
         let (labels, formats) = (HashMap::new(), HashMap::new());
-        let make = |_| vec![json!("-5"), json!("-5")];
+        let make = |_| vec![json!("-5x"), json!("-5")];
         let mut src = Generated {
             names: vec!["code".to_owned(), "amount".to_owned()],
             types: vec!["String".to_owned(), "Int64".to_owned()],
@@ -1046,7 +1385,95 @@ mod tests {
         .await
         .unwrap();
         let text = String::from_utf8(read_all(w).await).unwrap();
-        assert!(text.ends_with("code,amount\r\n'-5,-5\r\n"), "{text:?}");
+        assert!(text.ends_with("code,amount\r\n'-5x,-5\r\n"), "{text:?}");
+    }
+
+    /// BI-28: a negative 64-bit integer of 16 digits or more, sent as a quoted
+    /// string in a numeric column, is written as it came, in a CSV and in a
+    /// workbook; a text column's `-...` is still neutralised.
+    #[tokio::test]
+    async fn a_long_negative_integer_in_a_numeric_column_has_no_apostrophe() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let long = "-9223372036854775807";
+        assert!(is_plain_number(long) && is_plain_number("12.5") && !is_plain_number("-x"));
+        assert!(!is_plain_number("=1") && !is_plain_number("1e5") && !is_plain_number("-"));
+        let make = |_| vec![json!("-9223372036854775807"), json!("-9223372036854775807")];
+        let mk = || Generated {
+            names: vec!["code".to_owned(), "amount".to_owned()],
+            types: vec!["String".to_owned(), "Int64".to_owned()],
+            total: 1,
+            next: 0,
+            make,
+        };
+        let w = write_export(
+            &mut mk(),
+            &options(FileFormat::Csv, Values::Raw, 10, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(read_all(w).await).unwrap();
+        assert!(
+            text.ends_with(&format!("code,amount\r\n{long},{long}\r\n")),
+            "{text:?}"
+        );
+        assert!(!text.contains('\''), "{text:?}");
+        let w = write_export(
+            &mut mk(),
+            &options(FileFormat::Xlsx, Values::Raw, 10, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        let bytes = read_all(w).await;
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        // PR #527 CI: the data sheet is written in constant-memory mode, which
+        // keeps a string in the sheet itself (an inline string) and has no
+        // `sharedStrings.xml` when no other sheet has text.
+        let mut sheet = String::new();
+        zip.by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut sheet)
+            .unwrap();
+        assert!(sheet.contains(&format!(">{long}<")), "{sheet}");
+        assert!(!sheet.contains(&format!(">'{long}<")), "{sheet}");
+    }
+
+    /// BI-28: a note rides in a `Note` sheet of a workbook after the data; the
+    /// body of a CSV is the same with or without it.
+    #[tokio::test]
+    async fn a_note_is_a_second_sheet_and_never_changes_a_csv_body() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |_| vec![json!("a"), json!(1)];
+        let mut with = options(FileFormat::Xlsx, Values::Raw, 10, &labels, &formats);
+        with.note = Some(FILTERS_NOT_APPLIED);
+        let w = write_export(&mut source(1, make), &with).await.unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(read_all(w).await)).unwrap();
+        let mut workbook = String::new();
+        zip.by_name("xl/workbook.xml")
+            .unwrap()
+            .read_to_string(&mut workbook)
+            .unwrap();
+        assert!(workbook.contains("name=\"Data\"") && workbook.contains("name=\"Note\""));
+        let mut note = String::new();
+        zip.by_name("xl/sharedStrings.xml")
+            .unwrap()
+            .read_to_string(&mut note)
+            .unwrap();
+        assert!(note.contains(FILTERS_NOT_APPLIED), "{note}");
+        let plain = options(FileFormat::Xlsx, Values::Raw, 10, &labels, &formats);
+        let w = write_export(&mut source(1, make), &plain).await.unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(read_all(w).await)).unwrap();
+        assert!(zip.by_name("xl/worksheets/sheet2.xml").is_err());
+
+        let mut csv_with = options(FileFormat::Csv, Values::Raw, 10, &labels, &formats);
+        csv_with.note = Some(FILTERS_NOT_APPLIED);
+        let a = write_export(&mut source(1, make), &csv_with).await.unwrap();
+        let b = write_export(
+            &mut source(1, make),
+            &options(FileFormat::Csv, Values::Raw, 10, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_all(a).await, read_all(b).await);
     }
 
     #[test]

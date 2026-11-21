@@ -1,0 +1,199 @@
+/*
+ * Motion for the sign-in page (`WEB-15`). Names start with `login-` so
+ * nothing else in the console can collide with them. All movement is inside
+ * `prefers-reduced-motion: no-preference`: with reduced motion the form
+ * changes state without moving.
+ */
+
+@media (prefers-reduced-motion: no-preference) {
+  /* The form after a refused sign-in: one short, damped shake (240 ms, spec). */
+  .login-shake {
+    animation: login-shake 240ms cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+  }
+}
+
+@keyframes login-shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-6px); }
+  40% { transform: translateX(5px); }
+  60% { transform: translateX(-3px); }
+  80% { transform: translateX(2px); }
+}
+
+/*
+ * The lake depth lines behind the preview (`login-contours.tsx`, WEB-15 T1,
+ * T6). The drawings are 2000 x 1704 px at 1:1 with the card's top-left
+ * corner at (400, 320); the card sits at 8% / 11% of the panel, so the
+ * drawing is placed to put that point under the card's corner at every
+ * panel size, and is large enough that no edge of it shows in the panel.
+ * The lines are a mask over one solid colour, a faint lake blue, and each
+ * drawing's mask also fades them out toward the panel's edges, so they are
+ * densest around the card (DESIGN.md: no gradient fill, no glow). The fade
+ * sits in each drawing's own mask, measured in the panel's container units,
+ * rather than in a mask on the container: a mask over moving children is
+ * redrawn every frame, one on a moving layer is drawn once and only moved
+ * (T6: about 40 % less CPU in a software-composited Chrome).
+ */
+.login-contours {
+  /* A lighter lake blue, faint, on the navy panel (T7). */
+  --login-contour-ink: oklch(0.8 0.09 245 / 0.26);
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  container-type: size;
+}
+
+/* The dark page's deeper panel: the same blue, a touch fainter (T6: a lake blue, not the sky-cyan chart colour that read green). */
+.dark .login-contours {
+  --login-contour-ink: oklch(0.76 0.1 248 / 0.24);
+}
+
+.login-contour {
+  /*
+   * The panel's edges in the drawing's own coordinates: its left edge is at
+   * 400px - 8cqw, its top at 320px - 11cqh. Lines fade in over the panel's
+   * first 6 % from the left and 8 % from the top, and out over its last 10 %.
+   */
+  --login-fade:
+    linear-gradient(to right, transparent calc(400px - 8cqw), #000 calc(400px - 2cqw)),
+    linear-gradient(to bottom, transparent calc(320px - 11cqh), #000 calc(320px - 3cqh), #000 calc(320px + 79cqh), transparent calc(320px + 89cqh));
+  position: absolute;
+  left: calc(8cqw - 400px);
+  top: calc(11cqh - 320px);
+  width: 2000px;
+  height: 1704px;
+  background-color: var(--login-contour-ink);
+  mask-image: url("/login-contours-0.svg"), var(--login-fade);
+  mask-position: 0 0;
+  mask-size: 2000px 1704px, auto, auto;
+  mask-repeat: no-repeat;
+  mask-composite: intersect;
+  /* The lake's deepest point: the rings spread out from here. */
+  transform-origin: 830px 740px;
+}
+.login-contour[data-phase="1"] {
+  mask-image: url("/login-contours-1.svg"), var(--login-fade);
+  opacity: 0;
+}
+.login-contour[data-phase="2"] {
+  mask-image: url("/login-contours-2.svg"), var(--login-fade);
+  opacity: 0;
+}
+
+/*
+ * The water moving (T6, owner 2026-11-14: "aku pengen background wavenya
+ * gerak"). Each drawing lives 9 s: it fades in, spreads out from the deep
+ * point by 3.5 % (about 2 px a second at the card's edges) while drifting a
+ * few pixels its own way, and fades out. A new one is born every 3 s, each a
+ * third of a step deeper than the last (0, 1, 2, then 0 again a whole step
+ * on), so the rings keep rising out of the deep and rolling outward like
+ * ripples, with no jump: a drawing restarts only while it is invisible.
+ * Only `transform` and `opacity` change, on composited layers; the masks
+ * are never moved per frame. Paused until the page says the panel is on
+ * screen and the tab is in front (`data-playing`); without the page's script
+ * the paused first frame is the still picture. With reduced motion there is
+ * no animation at all and the first drawing stands alone.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  .login-contour {
+    --login-drift-x: 7px;
+    --login-drift-y: -5px;
+    will-change: transform, opacity;
+    animation:
+      login-contour-spread 9s linear infinite paused,
+      login-contour-life 9s linear infinite paused;
+  }
+  .login-contour[data-phase="1"] {
+    --login-drift-x: -6px;
+    --login-drift-y: 6px;
+    animation-delay: -6s;
+  }
+  .login-contour[data-phase="2"] {
+    --login-drift-x: 5px;
+    --login-drift-y: 7px;
+    animation-delay: -3s;
+  }
+  .login-contours[data-playing] .login-contour {
+    animation-play-state: running;
+  }
+}
+
+/* Constant motion is linear (emil-design-eng); the fades are eased. */
+@keyframes login-contour-spread {
+  from { transform: translate(0, 0) scale(1); }
+  to { transform: translate(var(--login-drift-x), var(--login-drift-y)) scale(1.035); }
+}
+
+@keyframes login-contour-life {
+  0% { opacity: 0; animation-timing-function: cubic-bezier(0.45, 0, 0.55, 1); }
+  35% { opacity: 1; }
+  65% { opacity: 1; animation-timing-function: cubic-bezier(0.45, 0, 0.55, 1); }
+  100% { opacity: 0; }
+}
+
+/*
+ * The KPI tile's trend line draws itself with each redraw of the sample
+ * dashboard (`login-showcase.tsx`, WEB-15 T2), as the line chart beside it
+ * does; `pathLength="1"` makes the dash the line's whole length. Still with
+ * reduced motion.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  .login-draw {
+    stroke-dasharray: 1;
+    animation: login-draw 1100ms cubic-bezier(0.23, 1, 0.32, 1) 150ms both;
+  }
+}
+
+@keyframes login-draw {
+  from { stroke-dashoffset: 1; }
+  to { stroke-dashoffset: 0; }
+}
+
+/*
+ * The first look (WEB-15 T9, owner 2026-11-14: "coba percantik animasi pas
+ * reveal dong, pas baru pertama kali dibuka"), one sequence under 900 ms:
+ *
+ * 1. 0 ms: the lake takes the drop. The contours open out from about the
+ *    card's centre, 92 % to full size, fading in, over 850 ms on a strong
+ *    ease-out, like rings from a stone landing in the water.
+ * 2. 60 to 300 ms: the form side arrives in a tight stagger, 50 ms apart
+ *    (brand row, title, username, password, button, footer), each rising
+ *    6 px and fading in over 240 ms.
+ * 3. The caption settles at 380 ms. The dashboard card rises onto the lake
+ *    as soon as it has loaded (`login-showcase.tsx`) and draws its charts.
+ *
+ * Only opacity and translate/scale, so nothing shifts the layout, and the
+ * username field holds focus and takes typing from the first frame. Plain
+ * CSS animations under `.login-first`, which the page carries for its first
+ * 900 ms only (`useFirstLook`): they run once, when an element first
+ * appears inside that window (the loading placeholder takes the fields'
+ * beat; fields that replace it in time arrive the same way), and never on a
+ * theme change, a refusal or a re-render. Without JavaScript the class stays
+ * and the reveal still ends visible. `backwards` fill hides an element only during its own
+ * delay and lets go afterwards, so it never holds a property the element's
+ * own states (press, focus) set. None of it runs with reduced motion.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  .login-first .login-contours {
+    transform-origin: 48% 50%;
+    animation: login-drop 850ms cubic-bezier(0.23, 1, 0.32, 1) backwards;
+  }
+  .login-first .login-reveal {
+    animation: login-arrive 240ms cubic-bezier(0.23, 1, 0.32, 1) backwards;
+  }
+  .login-first .login-reveal-0 { animation-delay: 60ms; }
+  .login-first .login-reveal-1 { animation-delay: 110ms; }
+  .login-first .login-reveal-2 { animation-delay: 160ms; }
+  .login-first .login-reveal-3 { animation-delay: 210ms; }
+  .login-first .login-reveal-4 { animation-delay: 260ms; }
+  .login-first .login-reveal-5 { animation-delay: 300ms; }
+  .login-first .login-reveal-caption { animation-delay: 380ms; }
+}
+
+@keyframes login-drop {
+  from { opacity: 0; scale: 0.92; }
+}
+
+@keyframes login-arrive {
+  from { opacity: 0; translate: 0 6px; }
+}
