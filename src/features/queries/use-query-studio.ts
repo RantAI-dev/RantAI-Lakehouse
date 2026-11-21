@@ -1230,7 +1230,11 @@ export function useQueryStudio(draftKey: string | null) {
             if (controller.signal.aborted || batch.stopped) {
               // The person stopped the batch: the statement that was in
               // flight did not finish, and neither did the ones after it.
-              markNotRun(index, "stopped")
+              // PR #649 review 1: Stop aborts only after the cancel's
+              // answer (up to `CANCEL_WAIT_MS`), so this catch can resume
+              // after a newer Run press already owns the tab; only the
+              // batch that still owns it may write its rows.
+              if (batchRef.current === batch) markNotRun(index, "stopped")
               break
             }
             const serviceError = toServiceError(error)
@@ -1263,14 +1267,21 @@ export function useQueryStudio(draftKey: string | null) {
         }
       } finally {
         batch.active = false
-        setRunning(false)
-        if (runControllerRef.current === controller) runControllerRef.current = null
-        // Every run is recorded, including the ones that failed, so the rail
-        // has to catch up — otherwise the query you just ran is missing from
-        // your own history until a reload. Once for the whole batch.
-        if (!batch.reloaded) {
-          batch.reloaded = true
-          historyState.reload()
+        // PR #649 review 1: the same deferred abort lets a stopped batch
+        // reach this finally after a newer Run press has taken the tab
+        // (`batchRef` points at the new batch). Only the owner clears the
+        // running state and reloads history; the old batch's rows and its
+        // reload were already handled when Stop was pressed.
+        if (batchRef.current === batch) {
+          setRunning(false)
+          if (runControllerRef.current === controller) runControllerRef.current = null
+          // Every run is recorded, including the ones that failed, so the rail
+          // has to catch up — otherwise the query you just ran is missing from
+          // your own history until a reload. Once for the whole batch.
+          if (!batch.reloaded) {
+            batch.reloaded = true
+            historyState.reload()
+          }
         }
       }
     },
