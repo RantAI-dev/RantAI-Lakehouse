@@ -152,6 +152,24 @@ describe("QueryStudioPage Fix with AI", () => {
     await waitFor(() => expect(run).toHaveBeenCalledTimes(2))
     expect(await screen.findByRole("button", { name: /Fix with AI/ })).toBeTruthy()
   })
+
+  // QS-11 (LH-QS-1-04 F2), D11: a permission refusal is not a broken
+  // statement; changing the SQL cannot help, so no Fix with AI is offered.
+  it("does not offer Fix with AI for a permission refusal", async () => {
+    stubNetwork()
+    spyOn(queryService, "run").mockRejectedValueOnce(
+      new ServiceError("permission_denied", "You may not read this table.")
+    )
+    seedDraft("SELECT amont FROM t")
+    renderPage()
+
+    const runButton = await screen.findByRole("button", { name: "Run query" })
+    await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(runButton)
+
+    expect(await screen.findByText("You don't have access")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /Fix with AI/ })).toBeNull()
+  })
 })
 
 describe("QueryStudioPage format settings", () => {
@@ -643,5 +661,25 @@ describe("QueryStudioPage draft owner", () => {
     // The first tenant's tabs are still theirs to find on the next switch.
     const firstKey = window.localStorage.getItem(queryDraftKey("u1", "t1"))
     expect(JSON.parse(firstKey ?? "{}").tabs?.[0]?.sql).toBe("SELECT {{first}}")
+  })
+})
+
+// QS-11 (LH-QS-1-12), D9: a batch over the limit is refused in the page,
+// beside Run, with no request sent — not in a toast that vanishes.
+describe("QueryStudioPage batch refusal", () => {
+  it("shows the statement-limit alert and sends nothing when Run all is pressed", async () => {
+    stubNetwork()
+    const run = spyOn(queryService, "run").mockResolvedValue(RESULT)
+    seedDraft(Array.from({ length: 21 }, (_, i) => `SELECT ${i}`).join("; "))
+    renderPage()
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /Run all/ })).toBeTruthy())
+    fireEvent.click(screen.getByRole("button", { name: /Run all/ }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe(
+      "At most 20 statements are run at once. Split the buffer into smaller queries and run them one after another."
+    )
+    expect(run).not.toHaveBeenCalled()
   })
 })

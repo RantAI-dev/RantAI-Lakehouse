@@ -31,6 +31,13 @@ import { parseDefinitions, parseValues } from "@/lib/query-params"
 export const LEGACY_QUERY_DRAFT_KEY = "rantai-lakehouse:query-studio-draft"
 
 /**
+ * QS-11 (LH-QS-1-01), D7: the old placeholder was stored as real SQL. A tab
+ * that still holds exactly this text is read back as empty; any other text,
+ * including a comment the person wrote, is kept as it is.
+ */
+const LEGACY_STARTER_SQL = "-- Write SQL here, or generate it from a question"
+
+/**
  * The key one person's draft lives under: the person and their active tenant
  * (`QS-8`, decision 12). `-` stands in for no active tenant, which is a real
  * state for a person who belongs to none; a person's key never collides with
@@ -128,7 +135,9 @@ function parseTab(value: unknown): QueryTab | null {
   const parsed: QueryTab = {
     id: tab.id,
     name: tab.name,
-    sql: tab.sql,
+    // QS-11 (LH-QS-1-01), D7: the old starter text was a comment in the
+    // document, not a grey hint. Read that one value back as empty.
+    sql: tab.sql === LEGACY_STARTER_SQL ? "" : tab.sql,
     engine: tab.engine,
     parameters,
     values: parseValues(tab.values, parameters),

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test"
-import { historyQueryString } from "./history-query-params"
+import {
+  EMPTY_HISTORY_ADDRESS,
+  historyAddress,
+  historyQueryString,
+  readHistoryAddress,
+} from "./history-query-params"
 
 describe("historyQueryString", () => {
   it("builds the query string in the contract's order from the fields the page set", () => {
@@ -38,5 +43,46 @@ describe("historyQueryString", () => {
   it("percent-encodes the table text, so a literal % survives the trip", () => {
     expect(historyQueryString({ table: "ord%" })).toBe("table=ord%25")
     expect(historyQueryString({ table: "bronze orders" })).toBe("table=bronze+orders")
+  })
+
+  it("writes the run id when one is asked for", () => {
+    expect(historyQueryString({ id: "q-1" })).toBe("id=q-1")
+  })
+})
+
+// QS-12 (LH-QS-4-06), D17: the page's own address, read on entry and written
+// back with replaceState. Unknown values are dropped, not sent to the server.
+describe("history address", () => {
+  const full = {
+    status: "failed",
+    engine: "trino",
+    minDuration: "1500",
+    table: "bronze.orders",
+    from: "2026-10-11",
+    to: "2026-10-20",
+    page: 3,
+  }
+
+  it("round trips every field", () => {
+    const search = historyAddress(full)
+    expect(search).toBe(
+      "status=failed&engine=trino&minDurationMs=1500&table=bronze.orders" +
+        "&from=2026-10-11&to=2026-10-20&page=3",
+    )
+    expect(readHistoryAddress(`?${search}`)).toEqual(full)
+  })
+
+  it("ignores a value the page does not know", () => {
+    expect(readHistoryAddress("?status=nope&from=2026-1-1&page=0")).toEqual(
+      EMPTY_HISTORY_ADDRESS,
+    )
+    expect(readHistoryAddress("?engine=presto&minDurationMs=soon&page=abc")).toEqual(
+      EMPTY_HISTORY_ADDRESS,
+    )
+  })
+
+  it("writes nothing for an untouched page and leaves the first page out", () => {
+    expect(historyAddress(EMPTY_HISTORY_ADDRESS)).toBe("")
+    expect(historyAddress({ ...full, page: 1 })).not.toContain("page=")
   })
 })
