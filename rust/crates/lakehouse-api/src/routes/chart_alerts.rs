@@ -106,12 +106,11 @@ async fn targets_only_the_owner(state: &AppState, owner: &str, rule: &AlertRule)
 /// setting cannot be read the message is written in the default locale and the
 /// gap is logged, so an unreadable setting never stops an alert from being sent.
 pub(crate) async fn number_locale(state: &AppState) -> String {
-    match crate::routes::settings::format_settings(state).await {
-        Ok(settings) => settings.number_locale,
-        Err(_) => {
-            tracing::warn!("alerts: the number locale could not be read, the default is used");
-            crate::routes::settings::FormatSettings::default().number_locale
-        }
+    if let Ok(settings) = crate::routes::settings::format_settings(state).await {
+        settings.number_locale
+    } else {
+        tracing::warn!("alerts: the number locale could not be read, the default is used");
+        crate::routes::settings::FormatSettings::default().number_locale
     }
 }
 
