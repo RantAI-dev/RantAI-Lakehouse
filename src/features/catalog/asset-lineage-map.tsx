@@ -305,18 +305,22 @@ export function groupCharts(
 export function useChartPlacement(needed: boolean): { loading: boolean; placement: ChartPlacement | null } {
   const state = useService(
     async (s) => {
-      if (!needed) return null
+      if (!needed) return { forNeeded: false as const, placement: null }
       const [outlines, boards] = await Promise.all([
         dashboardService.listChartOutlines(s),
         dashboardService.listBoards(s),
       ])
-      return chartPlacement(outlines, boards)
+      return { forNeeded: true as const, placement: chartPlacement(outlines, boards) }
     },
     [needed]
   )
+  const current = state.status === "success" && state.data.forNeeded === needed
   return {
-    loading: needed && state.status === "loading",
-    placement: state.status === "success" ? state.data : null,
+    // PR #642 review 1: when `needed` flips false -> true, `state` still holds
+    // the prior `forNeeded: false` result until `useService`'s effect resets it
+    // to `"loading"`, so treat a mismatched result as loading too.
+    loading: needed && (state.status === "loading" || (state.status === "success" && !current)),
+    placement: current ? state.data.placement : null,
   }
 }
 

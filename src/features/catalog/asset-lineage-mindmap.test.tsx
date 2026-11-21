@@ -2,13 +2,16 @@
 // read the asset come grouped by dashboard, a group opens in place, and a
 // failed read of the viewer's charts or dashboards leaves the map as it was;
 // the map opens fitted to its box and pans and zooms inside it.
+import { Profiler } from "react"
 import { act, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
 
 import { boxHeight, fitScale } from "@/lib/pan-zoom"
 import { stubRectWidth, stubResizeObserver } from "@/lib/test-layout"
-import { ServiceError } from "@/services/errors"
 import { dashboardService } from "@/services"
+import type { AssetDetail } from "@/services/contracts/assets"
+import { ServiceError } from "@/services/errors"
+import { GraphCard, type AssetLineageState } from "./asset-lineage"
 import { LineageMindmap, mindmapLayout, mindmapModel, useChartPlacement } from "./asset-lineage-map"
 
 // The two reads behind the map are stubbed on the service itself, in each test
@@ -25,19 +28,54 @@ const CHARTS = [
   { id: "chart:c2", label: "Visitors by month", kind: "chart" },
   { id: "chart:c3", label: "Arrivals share", kind: "chart" },
 ]
+const GRAPH_WITH_CHARTS = {
+  focus: "serving.mart_wisman",
+  nodes: [TABLE, ...CHARTS],
+  edges: CHARTS.map((c, i) => ({ id: `e${i}`, from: TABLE.id, to: c.id, kind: "chart" })),
+  columnMappings: [],
+  supported: true,
+}
 const MODEL = mindmapModel({
-  graph: {
-    focus: "serving.mart_wisman",
-    nodes: [TABLE, ...CHARTS],
-    edges: CHARTS.map((c, i) => ({ id: `e${i}`, from: TABLE.id, to: c.id, kind: "chart" })),
-    columnMappings: [],
-    supported: true,
-  },
+  graph: GRAPH_WITH_CHARTS,
   self: { label: "serving.mart_wisman", kind: "gold" },
   dependents: [],
   relatedUpstream: [],
   relatedDownstream: [],
 })
+const ASSET: AssetDetail = {
+  id: "mart-wisman",
+  name: "Mart Wisman",
+  namespace: "serving",
+  type: "table",
+  layer: "gold",
+  tier: "hot",
+  classification: "internal",
+  owner: "dagster",
+  domain: "tourism",
+  description: "",
+  format: "ClickHouse",
+  engine: "hot-store",
+  rows: 0,
+  sizeBytes: 0,
+  columnCount: 0,
+  freshnessLagSeconds: 0,
+  lastUpdated: "2026-10-20T00:00:00Z",
+  health: "unknown",
+  residency: "id-jakarta",
+  schema: [],
+  sample: [],
+  qualityChecks: [],
+  policySummary: [],
+  usage: null,
+  recentQueries: [],
+  dependents: [],
+  changeHistory: [],
+  snapshots: [],
+  schemaVersions: [],
+  upstream: [],
+  downstream: [],
+  tableKey: "serving.mart_wisman",
+}
 
 /** The map as the Lineage tab mounts it: the placement read first, then the map. */
 function Tab() {
@@ -97,6 +135,52 @@ describe("LineageMindmap groups (BI-71)", () => {
     expect(screen.getByText("Arrivals share")).toBeTruthy()
     expect(screen.queryByRole("button", { name: /charts?$/ })).toBeNull()
     // And says nothing about it: grouping is a reading aid.
+    expect(screen.queryByText(/could not be loaded/)).toBeNull()
+  })
+
+  // PR #642 review 1: assetLineage resolves after mount, flipping `charted` from
+  // false to true; GraphCard must keep its skeleton until placement loads.
+  it("never draws the ungrouped map when lineage arrives with charts after the first render", async () => {
+    serve([{ id: "c1", board: "b_qa" }, { id: "c2", board: "b_qa" }, { id: "c3", board: "b_arr" }])
+    const loading: AssetLineageState = { status: "loading", data: null, error: null, reload: () => {} }
+    const loaded: AssetLineageState = { status: "success", data: GRAPH_WITH_CHARTS, error: null, reload: () => {} }
+    let sawUngrouped = false
+    const onRender = () => {
+      if (document.body.querySelector('[aria-label="Lineage graph"]') && !document.body.querySelector('[aria-expanded]')) {
+        sawUngrouped = true
+      }
+    }
+    const { rerender } = render(
+      <Profiler id="graph-card" onRender={onRender}>
+        <GraphCard a={ASSET} state={loading} />
+      </Profiler>
+    )
+    // Let useChartPlacement(false) settle its initial no-op read before lineage resolves.
+    await act(async () => {
+      await Promise.resolve()
+    })
+    rerender(
+      <Profiler id="graph-card" onRender={onRender}>
+        <GraphCard a={ASSET} state={loaded} />
+      </Profiler>
+    )
+    expect(await screen.findByRole("button", { name: "QA Auto · 2 charts" })).toBeTruthy()
+    expect(sawUngrouped).toBe(false)
+    expect(screen.queryByText("Visitors by port")).toBeNull()
+  })
+
+  it("falls back to the ungrouped map when the placement read fails after lineage arrives", async () => {
+    serve(new ServiceError("unavailable", "The charts could not be loaded"))
+    const loading: AssetLineageState = { status: "loading", data: null, error: null, reload: () => {} }
+    const loaded: AssetLineageState = { status: "success", data: GRAPH_WITH_CHARTS, error: null, reload: () => {} }
+    const { rerender } = render(<GraphCard a={ASSET} state={loading} />)
+    await act(async () => {
+      await Promise.resolve()
+    })
+    rerender(<GraphCard a={ASSET} state={loaded} />)
+    expect(await screen.findByText("Visitors by port")).toBeTruthy()
+    expect(screen.getByText("Arrivals share")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /charts?$/ })).toBeNull()
     expect(screen.queryByText(/could not be loaded/)).toBeNull()
   })
 })
