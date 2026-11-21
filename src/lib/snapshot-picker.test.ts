@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test"
 import type { LakehouseSnapshot } from "@/services/contracts/lakehouse"
-import { pinSnapshot, snapshotRetentionText } from "./snapshot-picker"
+import { pinSnapshot, pinnedSnapshots, snapshotRetentionText, unpinSnapshots } from "./snapshot-picker"
 
 const T = "SELECT * FROM icecat_api.`bronze.orders`"
 
@@ -161,3 +161,42 @@ describe("snapshotRetentionText", () => {
   })
 })
 
+
+// UX-9: Query Studio reads the pin back from the SQL to show it as a chip,
+// and the chip's remove button takes it out again.
+describe("pinnedSnapshots and unpinSnapshots", () => {
+  it("finds the ClickHouse pin that pinSnapshot writes and removes the clause it made", () => {
+    const pinned = pinSnapshot("SELECT * FROM bronze.orders", "clickhouse", "9007199254740993")!
+    expect(pinnedSnapshots(pinned)).toEqual(["9007199254740993"])
+    expect(unpinSnapshots(pinned)).toBe("SELECT * FROM bronze.orders")
+  })
+
+  it("keeps the other settings of the clause, in their order, when the pin goes", () => {
+    const sql = "SELECT 1 SETTINGS max_threads = 2, iceberg_snapshot_id = 42, max_rows = 5"
+    expect(pinnedSnapshots(sql)).toEqual(["42"])
+    expect(unpinSnapshots(sql)).toBe("SELECT 1 SETTINGS max_threads = 2, max_rows = 5")
+  })
+
+  it("finds every Trino pin and removes each of them", () => {
+    let sql = "SELECT * FROM bronze.orders o JOIN bronze.items i ON o.id = i.order_id"
+    sql = pinSnapshot(sql, "trino", "7", "bronze.orders")!
+    sql = pinSnapshot(sql, "trino", "8", "bronze.items")!
+    expect(pinnedSnapshots(sql)).toEqual(["7", "8"])
+    expect(unpinSnapshots(sql)).toBe(
+      "SELECT * FROM bronze.orders o JOIN bronze.items i ON o.id = i.order_id"
+    )
+  })
+
+  it("ignores a pin written inside a comment or a string literal", () => {
+    const sql = "SELECT 'FOR VERSION AS OF 3' -- SETTINGS iceberg_snapshot_id = 4\nFROM t"
+    expect(pinnedSnapshots(sql)).toEqual([])
+    expect(unpinSnapshots(sql)).toBe(sql)
+  })
+
+  it("leaves a statement with no pin unchanged", () => {
+    expect(pinnedSnapshots("SELECT 1 SETTINGS max_threads = 2")).toEqual([])
+    expect(unpinSnapshots("SELECT 1 SETTINGS max_threads = 2")).toBe(
+      "SELECT 1 SETTINGS max_threads = 2"
+    )
+  })
+})
