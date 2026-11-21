@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { headers } from "next/headers";
 import { geist, geistMono } from "@rantai/design-system/fonts/fonts";
-import { ThemeProvider } from "@rantai/design-system/components/theme-provider";
+import { ConsoleThemeProvider } from "@/components/app-shell/console-theme-provider";
 import { Toaster } from "@rantai/design-system/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppFrame } from "@/components/app-shell/app-frame";
@@ -49,7 +49,7 @@ export async function generateMetadata(): Promise<Metadata> {
  * App-wide root layout.
  *
  * Wires up the global providers in this exact order (outer → inner):
- * `ThemeProvider` (light/dark via next-themes, from the Rantai Design System) →
+ * `ConsoleThemeProvider` (light/dark via next-themes, from the Rantai Design System) →
  * `TooltipProvider` (shadcn tooltips) → `AuthProvider` (session + route
  * guard) → `TableProviders` (nuqs URL state + React Query cache for the
  * Advanced Data Table) → `SidebarProvider` (collapsible sidebar
@@ -99,7 +99,7 @@ export default async function RootLayout({
           showed as a permanent "1 Issue". This only covers <body>'s own
           attributes, never a mismatch inside it. */}
       <body suppressHydrationWarning>
-        <ThemeProvider nonce={nonce}>
+        <ConsoleThemeProvider nonce={nonce}>
           {/* Micro-interaction audit 2026-11-14 (emil): the first tooltip waits a beat so a
               pointer passing over a toolbar does not flash labels; once one is open, the
               next opens at once (Base UI's `timeout`, 400 ms) with no animation. */}
@@ -117,7 +117,7 @@ export default async function RootLayout({
                 for a coding agent. Compiles away in production builds. */}
             <ReactGrabDev />
           </TooltipProvider>
-        </ThemeProvider>
+        </ConsoleThemeProvider>
       </body>
     </html>
   );

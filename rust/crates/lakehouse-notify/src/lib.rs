@@ -529,7 +529,7 @@ pub async fn deliver(
         "webhook" => http.send(target, title, text).await,
         "email" => {
             let html = format!(
-                "<div style=\"font-family:system-ui,sans-serif\"><h3 style=\"margin:0 0 8px\">{title}</h3><pre style=\"white-space:pre-wrap;font:inherit;margin:0\">{text}</pre><p style=\"color:#888;font-size:12px;margin-top:16px\">Rantai Lake — Enterprise Lakehouse Console</p></div>"
+                "<div style=\"font-family:system-ui,sans-serif\"><h3 style=\"margin:0 0 8px\">{title}</h3><pre style=\"white-space:pre-wrap;font:inherit;margin:0\">{text}</pre><p style=\"color:#888;font-size:12px;margin-top:16px\">RantAI Lakehouse</p></div>"
             );
             // `text ? html : html` in the TypeScript — both branches are
             // the literal same expression (apparently a leftover from an

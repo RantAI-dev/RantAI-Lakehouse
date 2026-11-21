@@ -821,6 +821,10 @@ const TEST_EMAIL_TOO_SOON: &str = "Wait a moment before asking for another test 
 const NO_INSTALLATION_KEY: &str =
     "The installation key is not configured, so a password cannot be saved.";
 
+/// The product's name as a person reads it in an email (`RPT-3`): the test
+/// email and the scheduled report's sign-off both use it, so it lives here.
+pub(crate) const PRODUCT_NAME: &str = "RantAI Lakehouse";
+
 /// The subject of the test email (plan D10).
 const TEST_EMAIL_SUBJECT: &str = "Test email from RantAI Lakehouse";
 
@@ -1436,7 +1440,7 @@ fn test_email_html(console_public_url: Option<&str>) -> String {
         None => "<p>Open the console to see your dashboards.</p>".to_owned(),
     };
     format!(
-        "<div style=\"font-family:system-ui,sans-serif\"><p>This is a test email from your RantAI Lakehouse console.</p>{link}</div>"
+        "<div style=\"font-family:system-ui,sans-serif\"><p>This is a test email from your {PRODUCT_NAME} console.</p>{link}</div>"
     )
 }
 
