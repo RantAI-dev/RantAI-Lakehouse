@@ -5,6 +5,7 @@ import Link from "next/link"
 import { Copy, Play } from "lucide-react"
 import { CodeBlock } from "@/components/patterns/code-block"
 import { Button } from "@/components/ui/button"
+import { useAuth } from "@/features/auth/auth-provider"
 import { formatRelativeTime } from "@/lib/format"
 import {
   assetHasReadableTable,
@@ -129,6 +130,7 @@ export function AssetOverview({
   onAssetChanged: () => void
 }) {
   const profile = useProfile(a.id)
+  const { hasPermission } = useAuth()
   // The Iceberg table, once loaded. It is what proves the table exists, so
   // the links below open Trino only when it is there (owner, 2026-11-08).
   const table = icebergTableOf(iceberg)
@@ -138,6 +140,7 @@ export function AssetOverview({
   // Iceberg read is still running the asset is given the benefit of the
   // doubt: the sentence waits for the answer.
   const readable = assetHasReadableTable(a, table, iceberg.status === "loading")
+  const canRun = hasPermission("query:read")
   // QA `LH-DATA-15-07` F2 (`DATA-54`): the count is the registry's, and a
   // table that is gone has no rows to count. Any other failure of the read
   // keeps the count: it does not prove the table is gone.
@@ -184,10 +187,14 @@ export function AssetOverview({
                   <Copy />
                   Copy
                 </Button>
-                <Button size="sm" variant="outline" render={<Link href={assetQueryStudioHref(a, table)} />}>
-                  <Play />
-                  Open in Query Studio
-                </Button>
+                {/* UX-8 review: the same check as the header's Query — running
+                    a query needs `query:read`; the SQL can still be copied. */}
+                {canRun ? (
+                  <Button size="sm" variant="outline" render={<Link href={assetQueryStudioHref(a, table)} />}>
+                    <Play />
+                    Open in Query Studio
+                  </Button>
+                ) : null}
               </div>
             ) : undefined
           }

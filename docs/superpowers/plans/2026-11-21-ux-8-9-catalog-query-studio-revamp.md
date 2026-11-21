@@ -228,7 +228,7 @@ Branch `feat/ux-8-catalog-revamp`, not pushed.
 | 35 | Freshness: "—" when not measured, one ⓘ on the header (`FRESHNESS_NOT_MEASURED`). |
 | 37, 38 | Unchanged (hidden by default). |
 | 39 | Row ⋯, unchanged. |
-| 40–43 | Row ⋯ and right-click: Open asset, **Copy table name** (new), Copy asset ID, Copy namespace. |
+| 40–43 | Row ⋯ and right-click: Open asset, **Copy table name** (new), Copy asset ID, Copy namespace. The plan's "query" row action was a mockup item, not a current capability; not added (planner, 2026-11-21): the asset page's Query primary covers it, and a list row cannot prove the table readable. |
 | 44–52 | Unchanged. |
 
 ### Handoff, PR 2 (`UX-8` part B, asset detail) — Opus design developer, 2026-11-21
@@ -247,7 +247,9 @@ Branch `feat/ux-8-catalog-revamp`, not pushed.
 
 **Screenshots** (`/home/hv/mtharreq/lakehouse-ux8/.ux8-shots/`, not committed; QA API as `qa-analyst`): `asset-a-{light,dark}-{1280,390}` (Gold `serving.mart_wisman`, 390 full page), `asset-sparse-{light,dark}-1280` and `asset-sparse-light-390` (Bronze `wisman-bulanan`, no readable table, unprofiled), `asset-lineage-{light,dark}-1280` (Silver, strip + map), `asset-columns-light-1280`, `asset-activity-light-1280` (full page, storage at the end), `asset-menu-{light,dark}-1280` (⋯ with `governance:write` and `catalog:write` added by interception), `asset-publish-light-1280`, `asset-noaccess-light-1280` (session faked to `catalog:read` only: Request access, no Query), `asset-loading-{light,dark}-1280`, `asset-notfound-{light,dark}-1280`, `asset-denied-{light,dark}-1280` (403 faked).
 
-**Not verified**: Drop table in the ⋯ in a browser (no upload-made table on the QA stack; covered by tests), Certification / Edit details saves in a browser (tests cover the calls), a real `gold:export` holder, an iPhone. The Overview's "Open in Query Studio" still shows without `query:read` (unchanged from before; the header's Query does check it) — flag for the owner whether to align them. The asset route's navbar breadcrumb shows the workspace name (pre-existing, untouched).
+**Not verified**: Drop table in the ⋯ in a browser (no upload-made table on the QA stack; covered by tests), Certification / Edit details saves in a browser (tests cover the calls), a real `gold:export` holder, an iPhone. The Overview's "Open in Query Studio" now needs `query:read`, like the header's Query (planner review, 2026-11-21; the SQL and Copy stay for everyone). The asset route's navbar breadcrumb shows the workspace name (pre-existing, untouched).
+
+**Review fix** (planner, 2026-11-21): `UX-8 fix(catalog): Open in Query Studio needs query:read, like the Query button (review)` — tested both ways in `asset-detail-tabs.test.tsx`; `bun test` on the three asset test files 194 pass, 0 fail; `tsc` and `eslint` (2 files) clean. The `node_modules` hard-link copy stays for now (planner removes it).
 
 **Machine notes**: the dev server ran on :28630 with Turbopack against a hard-linked copy of `lakehouse-preview/node_modules` (`cp -al`, no extra disk): Turbopack refuses a `node_modules` symlink that points outside the project root, and webpack dev was OOM-killed at the 3 GB cap. The copy is git-ignored (`/node_modules`) and nothing of it is staged. While locating the QA login I printed one QA user's line of `qa-users.env` (its password) into my own tool output; it is in no file, commit or message, but the planner may want to rotate that QA password.
 

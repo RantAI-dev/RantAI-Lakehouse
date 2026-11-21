@@ -3488,6 +3488,23 @@ describe("UX-8: the header, the lineage at a glance and the Overview", () => {
     await waitFor(() => expect(query.getAttribute("href")).toContain("engine=trino"))
   })
 
+  it("offers Open in Query Studio on the Overview only with query:read, like the header's Query (review)", async () => {
+    stubApi()
+    renderTabs()
+    const start = await screen.findByRole("region", { name: "Start a query" })
+    await waitFor(() => expect(within(start).getByText("Open in Query Studio")).toBeTruthy())
+    cleanup()
+
+    stubApi({ permissions: ["catalog:read"] })
+    renderTabs()
+    const noRun = await screen.findByRole("region", { name: "Start a query" })
+    await act(async () => {})
+    expect(within(noRun).queryByText("Open in Query Studio")).toBeNull()
+    // The SQL itself can still be read and copied.
+    expect(within(noRun).getByText("Copy")).toBeTruthy()
+    expect(within(noRun).getByText(/FROM /)).toBeTruthy()
+  })
+
   it("offers no Query to a reader without query:read", async () => {
     stubApi({ permissions: ["catalog:read"] })
     renderPage()
