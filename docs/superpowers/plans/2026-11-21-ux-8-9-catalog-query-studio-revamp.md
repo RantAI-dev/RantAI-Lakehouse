@@ -167,3 +167,180 @@ attach the screenshots' paths in the handoff. CHANGELOG lines. Do not push.
 ## Handoff
 
 (developer appends per PR, with the inventory map)
+
+### PR 3 (UX-9): Query Studio, layout A + B's status bar
+
+Developer: Opus design developer (console design exception), branch
+`feat/ux-9-query-studio-revamp` off `main` (`17bd04216`). Not pushed.
+
+**Commits**
+
+1. `56350614a` read and remove a version pin from the SQL (`pinnedSnapshots`,
+   `unpinSnapshots` in `src/lib/snapshot-picker.ts`; the SETTINGS item split
+   is one helper shared with `pinSnapshot`).
+2. `02901748f` sections on the title row (Studio · Saved · History, one 32 px
+   segmented control on all three pages), and a row menu on History (Open in
+   Studio, View in Audit).
+3. `7615f8f60` the result's header row (metrics line, Run details popover,
+   Filter rows, Copy as TSV, Download icon menu, ⋯ with Column statistics,
+   View in Audit, Make a chart).
+4. `7445d9677` Save as SQL source with `next: "chart"` goes on to the chart
+   builder (Make a chart).
+5. `f39e4a101` layout A with B's status bar and the ⌘⇧P command menu (the
+   page, toolbar, status bar, side panel, command menu, time-travel dialog
+   and chip, format settings dialog; the Saved/History rails removed).
+6. this commit: CHANGELOG (Unreleased → Changed) and this handoff.
+
+**Commands run (this VM, wrapped in the bun lock and the 3 GB scope)**
+
+- `bun x tsc --noEmit -p .` on the final commit: exit 0, no output.
+- `bun x eslint <the 37 .ts/.tsx files added or changed since 17bd04216>`:
+  exit 0, no output.
+- `bun test <the 12 changed test files> src/features/queries/` on the final
+  commit: **481 pass, 0 fail, 29 files** (all of `src/features/queries/` plus
+  `src/lib/snapshot-picker.test.ts`).
+- Commit 4 (`7445d9677`, before the layout commit) checked in a throw-away
+  worktree: `tsc` exit 0; `bun test src/features/queries/` 440 pass, 0 fail,
+  28 files. Commits 2 and 3 are subsets of it and were not checked on their
+  own.
+- Not run (VM rules): `bun run test`, `bun run lint`, `bun run build`, cargo
+  (no Rust touched), prettier.
+
+**Screenshots**: not taken (no dev server, planner checks on QA). The planner
+asked for this on 2026-11-21: the one dev server slot was the UX-8
+developer's. States to look at, 1280 and 390, light and dark: empty ("Results
+show here"), running (Stop · time, the moving bar), results, error (Retry,
+Fix with AI on an `invalid_request`), refused ("You don't have access"),
+stopped ("Run again"), Ask, time travel pinned (chip), command menu
+(⌘/Ctrl+Shift+P), side panel Schema and Plan. Each of these states is
+rendered by a test in `query-studio-page.test.tsx`,
+`query-studio-stop.test.tsx`, `query-results-section.test.tsx` or
+`query-transparency-panel.test.tsx`.
+
+**What differs from the plan (none of it changes a decision; say if one should)**
+
+- The query tab bar is its own row above the toolbar row, as in mockup A;
+  the plan's sentence lists it inside the toolbar row. With up to 20 tabs it
+  needs a row that scrolls.
+- The status bar sits directly under the editor, inside the editor's box (as
+  the plan says), not at the bottom of the workbench as in mockup B.
+- Save on a new tab is labelled **Save** (it was "Save as new"); **Save as
+  new…** is in Save's menu only when Save changes a saved query, so a new
+  tab has one save action (`DESIGN.md` §3). Save as new writes the save
+  draft with `mode: "create"` and the saved query's id, which the Save page
+  already treats as a copy of that query.
+- Run reads **Run** / **Run all** (was "Run query"); while running it is
+  **Stop · 2.4 s** (the time `aria-hidden`, with an `sr-only` `role=timer`
+  "Elapsed time" beside it).
+- The toolbar's **Estimate** button and the panel's Retry were one action
+  twice (inventory duplicate): Retry stays on an error (status bar and Plan
+  tab), and **Estimate again** is at the Plan tab's foot after a ready
+  estimate and in the command menu.
+- The Plan tab does not repeat the engine, Est. scan or Est. cost (the plan:
+  "the estimate and engine are shown here only"). Cache and data age are in
+  the status bar only when measured, and in the Plan tab's details always
+  (Cache "Not measured" when null), so "not measured" is said once.
+- **Make a chart** opens the builder of the built-in dashboard
+  (`/dashboards/default/charts/new`, draft `{ sqlSource }`); the builder's
+  own "Add to dashboard" picker moves it. It is offered only with
+  `dashboard:sql` (to write the source) and `builtInBoardEditable` (to reach
+  the builder); without the second the builder would show "no access".
+- The section label "Saved Queries" became **Saved** (mockup), and the
+  History page got a row menu: the plan places the rails' Load in "the Saved
+  and History pages' row menus", and History had none.
+- The schema browser lost its "Schema" heading and close button: the Schema
+  tab names it and the panel toggle closes it (one action, one button).
+
+**Not verified**
+
+- Anything in a browser (layout at 1280/390, dark mode, the sticky panel,
+  focus rings, motion). No screenshots.
+- ⌘/Ctrl+Shift+P on Firefox (Ctrl+Shift+P there opens a private window;
+  `preventDefault` may not win). Chrome and Safari bind nothing to it.
+- `DESIGN.md` "one side panel at a time": the AI Copilot sidebar and the
+  Schema | Plan panel can both be open. Nothing in the plan covers it; I
+  left the two independent. **Needs the planner/owner.**
+- Generate SQL (Write SQL only) switches to the SQL tab (`loadSql`), so its
+  Explanation card in the Ask tab is only seen on going back. This was so
+  before (inventory note 13); not changed.
+
+**Inventory map (section 3)** — "kept" means the same behaviour, labels and
+tests, restyled; files under `src/features/queries/` unless stated.
+
+| # | Where it lives now |
+|---|---|
+| 1 | Studio · Saved · History, one segmented control on the right of the title row of all three pages (`query-studio-tabs.tsx`); label "Saved Queries" → "Saved" |
+| 2 | Title "Query Studio" kept (`query-studio-page.tsx`); description removed (shared decision 1) |
+| 3 | `?saved=` alert kept, under the title row |
+| 4 | `?run=` alert kept, under the title row |
+| 5 | SQL \| Ask tabs in the toolbar row (`ModeTabs`, `studio-toolbar.tsx`); "Natural language" → "Ask"; also "Switch to Ask/SQL" in the command menu |
+| 6 | Unchanged (`studio.tab`) |
+| 7 | Ask tab textarea (`nl-panel.tsx`); label `sr-only` (the Ask tab is its visible name), `aria-required` kept |
+| 8 | **Ask** (primary; "Agent working…"), plus ⌘↵ in the textarea |
+| 9 | **Write SQL only** ("Writing…") |
+| 10 | One line: "Ask runs the query and explains it · Write SQL only fills the editor" |
+| 11 | Kept |
+| 12 | Kept (`agent-result-card.tsx` unchanged) |
+| 13 | Kept (see Not verified) |
+| 14 | Kept, one row above the toolbar that scrolls sideways (`query-tab-bar.tsx`) |
+| 15 | Kept (pencil, quiet until the tab is open/hovered/focused) + double-click on the name |
+| 16 | Kept |
+| 17 | Kept ("Add query tab", limit message) + "New query tab" in the command menu |
+| 18 | Unchanged |
+| 19 | `sr-only` "SQL" label; editor keeps `aria-labelledby` and `required` (`sql-panel.tsx`) |
+| 20–23 | Unchanged |
+| 24 | ⋯ → Keyboard shortcuts, and the command menu; the dialog also lists ⌘/Ctrl+Shift+P (`keyboard-shortcuts-dialog.tsx`, now controlled) |
+| 25 | Merged with the status bar hint "⌘↵ run · ⌘⇧P commands" and the ⌘↵ key on Run |
+| 26 | Kept, inside the editor box between the editor and the status bar |
+| 27–31 | Unchanged (`query-parameter-*`) |
+| 32 | Status bar "Fill in {{x}} for an estimate"; the Plan tab keeps the full sentence |
+| 33 | Status bar engine menu, an app menu with ClickHouse and Trino (`studio-status-bar.tsx`); "Run on …" in the command menu |
+| 34 | **Run** / **Run all** (`RunButton`); "Running…" is the result area's "Running on X…" |
+| 35 | Unchanged (alert under the editor) |
+| 36 | The Run button's place while a run or download is going, same titles; "Stop" in the command menu |
+| 37 | In the Stop label + `sr-only` `role=timer` "Elapsed time" |
+| 38 | **Save** (update or create as before); **Save as new…** in Save's menu when Save updates; "Select one statement" kept |
+| 39 | Save's menu (perm `dashboard:sql`) + command menu |
+| 40 | ⋯ → Format + command menu |
+| 41 | ⋯ → Format settings… → dialog with labelled Keyword case and Indent (`format-settings-dialog.tsx`) |
+| 42 | See 24 |
+| 43 | Side panel toggle "Show/Hide schema and plan" (`PanelToggle`); open by default at ≥ 1024 px; "Show schema" in the command menu |
+| 44 | Merged with Retry: **Estimate again** at the Plan tab's foot and in the command menu, same disabled reasons |
+| 45 | ⋯ → Explain with AI ("Explaining…") + command menu |
+| 46 | Kept as the items' titles |
+| 47 | Schema tab of the side panel (`studio-side-panel.tsx`); heading and close button removed (the tab names it, the toggle closes it) |
+| 48 | Kept ("Search tables", now `type=search`) |
+| 49–52 | Kept (`schema-browser.tsx` restyled; every label, reason and Retry unchanged) |
+| 53 | ⋯ / command menu → Time travel… → dialog with labelled Namespace, Table, Version and "Query this version" (`time-travel-dialog.tsx`, `time-travel-controls.tsx`); new: a pin chip by the editor, × reads the current version (`unpinSnapshots`); new: "The query does not read X" on Trino instead of nothing |
+| 54 | Kept in the dialog |
+| 55 | Both engines, as the code did; the stale page comment went with the old layout, the controls' doc says so |
+| 56 | Unchanged |
+| 57 | Kept, under the editor above the result |
+| 58–60 | Kept |
+| 61 | Kept (`query-result-tabs.tsx`) |
+| 62a | Copy as TSV, an icon button in the result's header row (same name, toast and disabling) |
+| 62b | Download, an icon menu (same four formats) |
+| 62c | Downloads-off sentence as a line under the header; "ClickHouse only" as Download's title |
+| 62d | Result ⋯ → View in Audit |
+| 63 | Unchanged; its Stop is the Run button's place |
+| 64 | Kept |
+| 65 | Behind **Filter rows** in the header row; hiding the fields clears them |
+| 66 | Result ⋯ → Column statistics (toggles the panel) |
+| 67–68 | Unchanged (same data table, cell inspector) |
+| 69 | One metrics line (rows, duration, scanned, cost, engine; workload and cache when known); Pushdowns and Policy obligations in the **Run details** popover |
+| 70 | Run details popover |
+| 71–77 | Kept; running shows a moving bar and "Running on X…" (`role=status`); stopped adds **Run again**; new empty state "Results show here" |
+| 78 | Removed: the Plan tab names it |
+| 79 | Each state: a short sentence in the status bar and the full one in the Plan tab (Trino, empty, waiting, error + Retry, estimating, no estimate, cannot be planned) |
+| 80 | Est. scan, Est. cost, Engine: status bar only; Workload, Cache, Freshness, Policy obligations, Sources (marks, governed tags, deprecation): Plan tab |
+| 81 | Plan tab |
+| 82 | Unchanged (debounce), Retry in the status bar and the Plan tab |
+| 83 | Removed; merged with the Saved page (section control) and its row menu "Open in Studio" (`?saved=`, opens with the query's parameters, in a new tab rather than the open one) |
+| 84 | Removed; merged with the History page (row click and row menu "Open in Studio", `?run=`) and the new row menu's "View in Audit" |
+| 85 | Removed with the rails |
+| 86–95 | Saved page unchanged; the section control moved into its header's actions |
+| 96–109 | History page unchanged; the section control in its header's actions, and a row menu as the last column |
+| 110–117 | Save page unchanged (Save as new arrives as `mode: "create"` with the source id) |
+| 118–121 | Save as SQL source unchanged; with `next: "chart"` it is titled Make a chart and opens the chart builder on the saved source |
+| 122 | Unchanged (Copilot page context) |
+| 123–126 | Unchanged |
