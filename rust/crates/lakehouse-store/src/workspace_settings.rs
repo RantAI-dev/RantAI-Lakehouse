@@ -29,6 +29,9 @@
 //! name changed cannot read the row first and compare afterwards: two saves
 //! that race would compare against each other's value, and the answer would
 //! be about a name that was never replaced (`ADM-2`, plan adm-120 step 3b).
+//! A concurrent `reset` can also delete the row between the two steps of a
+//! save's own transaction: the save re-inserts and locks again rather than
+//! fail on a row that is allowed to be missing (`PR #638 review 1`).
 
 use std::sync::Arc;
 
@@ -167,6 +170,59 @@ pub async fn get(pool: &PgPool) -> Result<Option<WorkspaceSettings>, StoreError>
     Ok(row.map(Into::into))
 }
 
+/// Create the singleton row when it is missing, and return the name the
+/// row holds under its lock, or `None` when the row was gone again after
+/// every try.
+///
+/// One try is the insert and the lock together, because a concurrent
+/// [`reset`] can commit between the two (`PR #638 review 1`): the insert
+/// skipped a row that was there, the lock then finds nothing, and a
+/// `fetch_one` read would turn that into a `RowNotFound` 500 for a row
+/// that is allowed to be missing. So the insert runs again and the lock
+/// is taken once more; after the third try the caller refuses the save
+/// ([`StoreError::Contended`]) instead of spinning on a row that keeps
+/// disappearing. The inner value is the name the save replaces, `None`
+/// when the row holds none; the outer `None` means "no lock was held
+/// after three tries", never "the row has no name".
+///
+/// The insert's `DO NOTHING` never overwrites a row a concurrent save
+/// created, and this statement waits for that creator to commit, so the
+/// lock read that follows finds the row the other save wrote. Every save
+/// takes the same steps in the same order, so two saves of a row that
+/// does not exist yet cannot deadlock: the second one's insert waits for
+/// the first one to commit, and it takes the row's lock only after that.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a statement fails.
+async fn insert_and_lock(
+    tx: &mut sqlx::PgConnection,
+) -> Result<Option<Option<String>>, StoreError> {
+    for _ in 0..3 {
+        sqlx::query(
+            "INSERT INTO workspace_settings (singleton) VALUES (TRUE) \
+             ON CONFLICT (singleton) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        // The row's lock, taken before the write. Under READ COMMITTED
+        // this read re-reads the row after it waits for a concurrent
+        // writer, so the value it returns IS the value the write that
+        // follows replaces. A plain `SELECT` would not: it reads the
+        // snapshot taken before the wait and would report the value
+        // that was there before the other save committed.
+        if let Some(name) = sqlx::query_scalar::<sqlx::Postgres, Option<String>>(
+            "SELECT workspace_name FROM workspace_settings WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
 /// Save the name (or clear it with `None`), leaving the pictures as they are,
 /// and return what is stored together with the name the write replaced.
 /// `updated_by` is the saving principal's id.
@@ -179,38 +235,26 @@ pub async fn get(pool: &PgPool) -> Result<Option<WorkspaceSettings>, StoreError>
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Database`] if the write fails, including when the
-/// table's `CHECK` refuses a name that is empty or longer than 60 characters.
+/// Returns [`StoreError::Database`] if a statement fails, including when the
+/// table's `CHECK` refuses a name that is empty or longer than 60
+/// characters, and [`StoreError::Contended`] when a concurrent save or
+/// reset deleted the row between this save's insert and its lock three
+/// tries in a row (`PR #638 review 1`).
 pub async fn upsert_name(
     pool: &PgPool,
     name: Option<&str>,
     updated_by: &str,
 ) -> Result<SavedWorkspaceName, StoreError> {
     let mut tx = pool.begin().await?;
-    // The row may not exist yet (nothing was ever saved), so it is created
-    // first. `DO NOTHING` never overwrites a row a concurrent save created,
-    // and this statement waits for that creator to commit, so the read
-    // below finds the row the other save wrote. Every save takes the same
-    // three steps in the same order, so two saves of a row that does not
-    // exist yet cannot deadlock: the second one's insert waits for the
-    // first one to commit, and it takes the row's lock only after that.
-    sqlx::query(
-        "INSERT INTO workspace_settings (singleton) VALUES (TRUE) \
-         ON CONFLICT (singleton) DO NOTHING",
-    )
-    .execute(&mut *tx)
-    .await?;
-    // The row's lock, taken before the write. Under READ COMMITTED this
-    // read re-reads the row after it waits for a concurrent writer, so the
-    // value it returns IS the value the write below replaces. A plain
-    // `SELECT` would not: it reads the snapshot taken before the wait and
-    // would report the value that was there before the other save
-    // committed.
-    let previous_name: Option<String> = sqlx::query_scalar(
-        "SELECT workspace_name FROM workspace_settings WHERE singleton = TRUE FOR UPDATE",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
+    // PR #638 review 1: the insert that makes the row exist and the lock
+    // that guards the write are one retried step, because a concurrent
+    // `reset` can delete the row between the two. The row is a singleton
+    // whose absence is normal — a workspace that never saved anything —
+    // so a missing row is re-inserted and locked again, and only a save
+    // that lost the race three times in a row is refused.
+    let Some(previous_name) = insert_and_lock(&mut tx).await? else {
+        return Err(StoreError::Contended);
+    };
     // The write itself, in the same transaction and under the lock the read
     // above took, so no other save can write between the two.
     let row: Row = sqlx::query_as(concat!(
@@ -549,6 +593,88 @@ mod tests {
         let cleared = upsert_name(&pool, None, "u").await.unwrap();
         assert_eq!(cleared.previous_name.as_deref(), Some("Atlas"));
         assert!(cleared.settings.workspace_name.is_none());
+        Ok(())
+    }
+
+    /// PR #638 review 1: a `reset` that commits between the save's insert
+    /// and its lock must not fail the save.
+    ///
+    /// The row exists first, so the save's insert has a row to skip.
+    /// Another transaction then holds the row's lock, so the save waits
+    /// for it AFTER its insert, and that transaction deletes the row and
+    /// commits while the save waits — the reset landed between the save's
+    /// two steps, and the lock read finds nothing. The save re-inserts
+    /// and locks again, and succeeds; the old `fetch_one` read turned the
+    /// same interleaving into a `RowNotFound` 500.
+    ///
+    /// The wait is a poll of `pg_stat_activity` and not a sleep, so the
+    /// test cannot pass without the save really waiting: every test owns
+    /// its database, so a session waiting on a lock in it is this save.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_name_save_survives_a_reset_that_commits_between_its_insert_and_its_lock(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        use std::time::Duration;
+
+        upsert_name(&pool, Some("Meridian"), "u").await.unwrap();
+
+        // Holds the row's lock, so the save waits for it after its insert.
+        let mut reset = pool.begin().await?;
+        sqlx::query(
+            "SELECT workspace_name FROM workspace_settings WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_one(&mut *reset)
+        .await?;
+
+        // The save runs on the pool it owns, so it can wait for the lock
+        // while this test holds the reset's transaction open.
+        let save = tokio::spawn({
+            let pool_of_the_save = pool.clone();
+            async move { upsert_name(&pool_of_the_save, Some("Atlas"), "u").await }
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() \
+                   AND wait_event_type = 'Lock' \
+                   AND pid <> pg_backend_pid()",
+            )
+            .fetch_one(&pool)
+            .await?;
+            if waiting >= 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the save never waited for the row's lock"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // The reset commits while the save waits for the lock: the row is
+        // gone when the save's lock read re-evaluates.
+        sqlx::query("DELETE FROM workspace_settings")
+            .execute(&mut *reset)
+            .await?;
+        reset.commit().await?;
+
+        let saved = tokio::time::timeout(Duration::from_secs(30), save)
+            .await
+            .expect("the save answers once the reset commits")
+            .expect("the save task is joined")
+            .unwrap();
+        assert_eq!(
+            saved.previous_name, None,
+            "the row the save locked was re-created empty by its own retry"
+        );
+        assert_eq!(saved.settings.workspace_name.as_deref(), Some("Atlas"));
+        assert_eq!(
+            get(&pool).await.unwrap().and_then(|row| row.workspace_name),
+            Some("Atlas".to_owned()),
+            "the save really landed"
+        );
         Ok(())
     }
 }
