@@ -84,3 +84,43 @@ Out of scope: the phone order (see above), any other chart change.
 -p MemorySwapMax=0 nice -n 15 …`; `bun x tsc --noEmit -p .`, `bun x eslint
 <changed>`, `bun test <touched tests>`; no real fetch in tests. No
 prettier, no full test/lint. CHANGELOG entry. Do not push.
+
+## Handoff
+
+Developer: Claude Sonnet. Branch `fix/bi-72-chart-polish`, not pushed.
+
+### Commits
+
+1. `7b712e061` BI-72 fix(dashboards): a goal label carries its number once
+2. `7ab407042` BI-72 fix(dashboards): a widened axis ends on a round tick, value labels never collide
+3. `7e985256f` BI-72 feat(dashboards): a web card says when its site refuses to be shown
+
+Each commit carries its CHANGELOG line (Unreleased, Fixed).
+
+### What was done, and where it differs from the plan's wording
+
+- **Decision 1:** `carriesNumber` in `chart-option.ts` compares the label, with grouping separators and spaces stripped, against the formatted and the plain number. Computed lines keep their suffix (the check needs `p.name`, which a computed line always has too, so "Average 1,234" is unchanged only because its name never holds the number: not separately tested).
+- **Decision 2:** `niceCeil` sets the widened max to the next 1, 2, 2.5 or 5 x 10^n step, sized for about five intervals from the axis minimum; a 15,700 line over data to 12,000 gives 20,000 (the plan allowed 16,000 or 20,000). A data max above the line is kept. `hideOverlap: true` on the value axes of `chart-option.ts` (the two builders, bar/line/area and hbar) and `combined-option.ts` (both sides). Value axes of other kinds (gauge, scatter, type-b, gantt) were not touched (out of the plan's list).
+- **Decision 3:**
+  - `rust/crates/lakehouse-api/src/routes/frame_check.rs` (new), route in `routes/mod.rs`, `POLICY_TABLE` entry `RequiresPermission("dashboard:read")`.
+  - Rule 4: the print view's image fetch built a pinned client inline; it is now `connector_probe::pinned_https_client` (+ `PinRefusal`), used by `render.rs::fetch_image` and the new route. This edits `fetch_image` (same refusals and fixed sentences, no behaviour change intended); the reviewer should read that hunk.
+  - `null` is also answered for a redirect, an error status, an unresolvable or refused host, and a `frame-ancestors` list when `CONSOLE_PUBLIC_URL` is unset (only `*` and `'none'` can be judged without it). `X-Frame-Options: SAMEORIGIN` is a refusal unless the site is the console's own origin.
+  - Cache: process-wide `LazyLock<Mutex<HashMap>>` (10 min, 512 entries, cleared when full), not a field of `AppState`.
+  - Console: `frameCheck` in the dashboards contract and client (any non-OK answer, including 401 on a public link or embed, is `null`), `WebCard` asks through `useService`; refused shows one line plus an outline `Button` (`render={<a/>}`, so it has the app's hover, press and focus states).
+  - The new route needs a session, so on a public link or a signed embed the card behaves as before (frame shown). Not extended to those paths (outside the plan).
+
+### Commands run (this VM)
+
+- `rustfmt --edition 2024 --check` over `frame_check.rs`, `connector_probe.rs`, `render.rs`, `routes/mod.rs`, `policy.rs`, `tests/frame_check.rs`, `tests/route_auth.rs`: clean after one `rustfmt` run on the new files.
+- `bun test src/features/dashboards/chart-option.test.ts src/features/dashboards/combined-option.test.ts`: 33 pass, 0 fail (with 3 new tests).
+- `bun test src/features/dashboards/content-cards.test.tsx src/features/dashboards/type-b-tiles.test.tsx src/features/dashboards/render-view.test.tsx`: 41 pass, 0 fail (4 new tests in `content-cards.test.tsx`; `type-b-tiles.test.tsx`'s web card tests now spy on `dashboardService.frameCheck` and wait for the frame).
+- `bun test src/services/clients/dashboards.test.ts`: 39 pass, 0 fail.
+- `bun x tsc --noEmit -p .`: no errors. `bun x eslint` over every changed `.ts`/`.tsx`: no output.
+- All bun runs under `flock` + `systemd-run` (MemoryMax 3G). `node_modules` was a symlink, removed before each commit; not committed.
+
+### Not verified
+
+- **No Rust was compiled or run** (`cargo build/check/clippy/test` forbidden on this VM). CI is the first compile of `frame_check.rs`, the `pinned_https_client` refactor, `tests/frame_check.rs`, the `route_auth` test and the `wiremock` unit tests. Likely places for a first-compile error: `reqwest::header` imports, the `match (Origin::parse(..), pinned_https_client(..).await)` in `frame_check`, `Err(not_allowed().into())`, and clippy pedantic on `frame_check.rs`.
+- `tests/frame_check.rs` relies on `https://frame-check.invalid` never resolving, and on the settings save accepting `contentSites` with a `CH_URL` mock answering zone count 1 (copied from `reporting_settings_route.rs`).
+- No `sec11_guard`, `bun run lint`, full `bun run test` or `bun run typecheck` run; no browser check of the card or the chart labels; the assistant-parity part (tool schema) is not affected (no assistant tool changed).
+- `docs/core/features/*` pages not updated for the new route (not in the plan).
