@@ -71,6 +71,11 @@ All seven defaults signed by the product owner on 2026-10-08 ("run everything as
   can, since `SRC-4`.)
 - A MongoDB source must run MongoDB 4.4 or later: the driver (`pymongo`
   4.18, `SEC-52`) no longer supports 4.0 and 4.2.
+- An SFTP source needs a server with SHA-2 key exchange and `rsa-sha2-*` or
+  Ed25519 signatures, as OpenSSH 7.2 (2016) and later offer with their
+  defaults: the client (`paramiko` 5.1) no longer accepts SHA-1 key exchange,
+  `ssh-rsa` (SHA-1) signatures or DSA keys, so an older server is refused at
+  connect instead of falling back to SHA-1.
 - An object-storage connector is tested only when it has an endpoint.
 - Google Sheets is not available.
 - Business-app connectors (`SRC-3`): the eight supported types are tested

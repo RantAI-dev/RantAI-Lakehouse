@@ -65,8 +65,8 @@ dependencies = [
     # 4.0 and 4.18 dropped 4.2, so a source must run MongoDB 4.4+; the
     # adapter reads `find` and collection names, which every supported
     # release carries.
-    # `oracledb` and `paramiko` stay as they are: out of `SEC-52`'s scope,
-    # and `paramiko` 3.5.0's low advisory has no fixed release to move to.
+    # `oracledb` stays as it is: out of `SEC-52`'s scope. `paramiko` moved
+    # later, for an advisory of its own -- see the comment at its pin.
     "pymongo==4.18.3",
     "oracledb==2.5.1",
     # adapters/sql.py builds mysql+pymysql / mssql+pyodbc connection
@@ -101,7 +101,18 @@ dependencies = [
     # wheel and an sdist -- pure Python, no native transport to link
     # against, so no system package is needed for Kafka at all).
     "kafka-python==3.0.11",
-    "paramiko==3.5.0",
+    # `adapters/sftp.py` and `ssrf_guard_sftp.py` dial SFTP with paramiko,
+    # and `ingest_errors.py` classifies its exceptions. 5.1.0, not 3.5.0:
+    # 3.5.0 is affected by GHSA-r374-rxx8-8654 (CVE-2026-44405: `rsakey.py`
+    # accepts SHA-1), fixed in 5.0.0. 4.0 dropped DSA keys and Python < 3.9;
+    # 5.0 dropped GSSAPI, SHA-1 key exchange and SHA-1 RSA signatures; 5.0.1
+    # fixed `RSAKey.sign_ssh_data`'s implicit default algorithm (#2628) and an
+    # `AgentKey` `AttributeError` (#2462); 5.1.0 adds the ML-KEM hybrid key
+    # exchange, which is used only when the server offers it. The cost is a
+    # server floor: SHA-2 (or ECDH) key exchange with `rsa-sha2-*` or Ed25519
+    # signatures -- OpenSSH 7.2 (2016) or later with its defaults -- and an
+    # older server is refused at connect rather than downgraded to SHA-1.
+    "paramiko==5.1.0",
 ]
 
 [build-system]
