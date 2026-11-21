@@ -728,7 +728,7 @@ def dagster_instance():
 def fail_orphaned_runs_at_start(
     args: argparse.Namespace,
     *,
-    instance,
+    instance_factory: Callable[[], Any],
     guard_started_at: float,
 ) -> None:
     """Ends the runs the previous code location left behind, ONCE.
@@ -743,7 +743,7 @@ def fail_orphaned_runs_at_start(
     opened, is logged and the guard goes on.
     """
     try:
-        the_instance = instance if instance is not None else dagster_instance()
+        the_instance = instance_factory()
     except Exception as error:
         logger.warning(
             "the Dagster instance could not be opened (%s): the runs of the previous code "
@@ -851,8 +851,8 @@ class CodeServerSupervisor:
 def run_guard(
     args: argparse.Namespace,
     *,
+    instance_factory: Callable[[], Any],
     spawn: Callable[..., subprocess.Popen] = spawn_child,
-    instance=None,
     probe_fn: Callable[..., bool] = probe,
     reload_fn: Callable[..., None] = reload_code,
     interval_seconds: float = PROBE_INTERVAL_SECONDS,
@@ -864,10 +864,9 @@ def run_guard(
     restarts the container, or the inner server shut down twice in a row
     (the reload did not help).
 
-    `instance`, `probe_fn`, `reload_fn` and `interval_seconds` are the
-    seams a test drives: the real instance is built when the step runs, the
-    real probe and reload talk to the code server, and the real interval is
-    the probe interval.
+    PR #636 review 2: the caller must supply the instance factory so a test
+    with a fake probe cannot silently open the deployment's storage. The
+    factory runs only after the first successful probe.
     """
     guard_started_at = time.time()
     ttl = HeartbeatTtlSettings.from_env()
@@ -940,7 +939,7 @@ def run_guard(
                     # the PREVIOUS code location left behind are ended.
                     orphan_checked = True
                     fail_orphaned_runs_at_start(
-                        args, instance=instance, guard_started_at=guard_started_at
+                        args, instance_factory=instance_factory, guard_started_at=guard_started_at
                     )
             if should_give_up(state, child_exited=child.poll() is not None):
                 logger.error("%s", give_up_reason(state))
@@ -1019,7 +1018,7 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["DAGSTER_GRPC_TIMEOUT_SECONDS"] = str(PROBE_TIMEOUT_SECONDS)
     if args.healthcheck:
         return run_healthcheck(port=args.port)
-    return run_guard(args)
+    return run_guard(args, instance_factory=dagster_instance)
 
 
 if __name__ == "__main__":

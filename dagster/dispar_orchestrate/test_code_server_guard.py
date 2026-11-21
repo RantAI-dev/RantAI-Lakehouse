@@ -30,6 +30,7 @@ Run with:
 from __future__ import annotations
 
 import errno
+import inspect
 import logging
 import os
 import signal
@@ -443,7 +444,9 @@ def test_a_sigterm_reaches_the_code_server_and_the_guard_exits_zero() -> None:
     timer.start()
     try:
         exit_code = code_server_guard.run_guard(
-            _guard_args(_closed_port()), spawn=lambda **_kwargs: child
+            _guard_args(_closed_port()),
+            instance_factory=lambda: _RecordingInstance([]),
+            spawn=lambda **_kwargs: child,
         )
     finally:
         timer.cancel()
@@ -460,7 +463,9 @@ def test_the_guard_exits_non_zero_when_the_code_server_process_dies() -> None:
     restarts the container."""
     child = subprocess.Popen([sys.executable, "-c", "raise SystemExit(3)"])
     exit_code = code_server_guard.run_guard(
-        _guard_args(_closed_port()), spawn=lambda **_kwargs: child
+        _guard_args(_closed_port()),
+        instance_factory=lambda: _RecordingInstance([]),
+        spawn=lambda **_kwargs: child,
     )
     assert exit_code == 1
 
@@ -530,6 +535,11 @@ def test_a_malformed_heartbeat_ttl_is_not_echoed_into_the_log(
 # --- the runs of the previous code location (decision 1) --------------------
 
 
+def test_the_guard_requires_the_caller_to_supply_the_instance_factory() -> None:
+    parameters = inspect.signature(code_server_guard.run_guard).parameters
+    assert parameters["instance_factory"].default is inspect.Parameter.empty
+
+
 def test_the_guard_fails_the_runs_of_the_previous_code_location_once_after_the_first_ping() -> None:
     """The step runs ONCE, and only after the code location answered for
     the first time: that is the moment the guard knows the code location is
@@ -542,7 +552,7 @@ def test_the_guard_fails_the_runs_of_the_previous_code_location_once_after_the_f
             code_server_guard.run_guard(
                 _guard_args(_closed_port()),
                 spawn=lambda **_kwargs: child,
-                instance=instance,
+                instance_factory=lambda: instance,
                 probe_fn=_probe_recording(events, answers=[False, True]),
                 interval_seconds=0.01,
             )
@@ -565,7 +575,7 @@ def test_the_guard_fails_the_runs_of_the_previous_code_location_only_once_when_s
             code_server_guard.run_guard(
                 _guard_args(_closed_port()),
                 spawn=lambda **_kwargs: child,
-                instance=instance,
+                instance_factory=lambda: instance,
                 probe_fn=_probe_recording(events, answers=[True, True]),
                 interval_seconds=0.01,
             )
@@ -596,7 +606,7 @@ def test_the_guard_goes_on_when_the_instance_cannot_be_read(
                 code_server_guard.run_guard(
                     _guard_args(_closed_port()),
                     spawn=lambda **_kwargs: child,
-                    instance=BrokenInstance(),
+                    instance_factory=BrokenInstance,
                     probe_fn=_probe_recording([], answers=[True, True]),
                     interval_seconds=0.01,
                 )
@@ -609,7 +619,7 @@ def test_the_guard_goes_on_when_the_instance_cannot_be_read(
 
 
 def test_the_guard_goes_on_when_the_dagster_instance_cannot_be_opened(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The instance is built when the step runs, not before: an instance
     that cannot be opened is logged and the guard goes on."""
@@ -617,7 +627,6 @@ def test_the_guard_goes_on_when_the_dagster_instance_cannot_be_opened(
     def broken() -> object:
         raise RuntimeError("DAGSTER_HOME is not set")
 
-    monkeypatch.setattr(code_server_guard, "dagster_instance", broken)
     child = _sleeping_child()
     try:
         with caplog.at_level(logging.WARNING):
@@ -625,6 +634,7 @@ def test_the_guard_goes_on_when_the_dagster_instance_cannot_be_opened(
                 code_server_guard.run_guard(
                     _guard_args(_closed_port()),
                     spawn=lambda **_kwargs: child,
+                    instance_factory=broken,
                     probe_fn=_probe_recording([], answers=[True, True]),
                     interval_seconds=0.01,
                 )
@@ -657,6 +667,7 @@ def test_the_missed_heartbeat_line_triggers_one_reload(
             code_server_guard.run_guard(
                 _guard_args(_closed_port()),
                 spawn=lambda **_kwargs: child,
+                instance_factory=lambda: _RecordingInstance([]),
                 probe_fn=_probe_waiting_for(
                     forwarded, HEARTBEAT_LINE, reloads=reloads, stop_when_reloads=1
                 ),
@@ -702,6 +713,7 @@ def test_another_line_does_not_trigger_a_reload(
             code_server_guard.run_guard(
                 _guard_args(_closed_port()),
                 spawn=lambda **_kwargs: child,
+                instance_factory=lambda: _RecordingInstance([]),
                 probe_fn=_probe_waiting_for(
                     forwarded, line, reloads=reloads, stop_when_reloads=1
                 ),
@@ -735,6 +747,7 @@ def test_a_second_heartbeat_line_within_ten_minutes_makes_the_guard_exit_non_zer
         exit_code = code_server_guard.run_guard(
             _guard_args(_closed_port()),
             spawn=lambda **_kwargs: child,
+            instance_factory=lambda: _RecordingInstance([]),
             probe_fn=_probe_waiting_for(
                 forwarded, HEARTBEAT_LINE, reloads=reloads, stop_when_reloads=99
             ),
@@ -771,6 +784,7 @@ def test_a_second_heartbeat_line_outside_the_ten_minute_window_reloads_again(
             code_server_guard.run_guard(
                 _guard_args(_closed_port()),
                 spawn=lambda **_kwargs: child,
+                instance_factory=lambda: _RecordingInstance([]),
                 probe_fn=_probe_waiting_for(
                     forwarded, HEARTBEAT_LINE, reloads=reloads, stop_when_reloads=2
                 ),
@@ -798,6 +812,7 @@ def test_the_code_servers_output_is_forwarded_to_the_guards_own_output(
             code_server_guard.run_guard(
                 _guard_args(_closed_port()),
                 spawn=lambda **_kwargs: child,
+                instance_factory=lambda: _RecordingInstance([]),
                 probe_fn=_probe_waiting_for(
                     forwarded,
                     "a line from the code server",
@@ -971,6 +986,7 @@ def test_a_non_utf8_line_does_not_stop_the_reader_and_the_heartbeat_line_still_r
                 code_server_guard.run_guard(
                     _guard_args(_closed_port()),
                     spawn=lambda **_kwargs: child,
+                    instance_factory=lambda: _RecordingInstance([]),
                     probe_fn=_probe_waiting_for(
                         forwarded,
                         HEARTBEAT_LINE,
