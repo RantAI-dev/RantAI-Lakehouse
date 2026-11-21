@@ -52,6 +52,7 @@ from dispar_orchestrate import (
     capacity_snapshot,
     discover,
     gold_export,
+    gold_latest_copy,
     ingest_factory,
     maintenance,
     storage_snapshot,
@@ -77,6 +78,7 @@ _SERIAL_JOBS = (
     (capacity_snapshot, "capacity_snapshot_job"),
     (discover, "discover_job"),
     (gold_export, "gold_export_job"),
+    (gold_latest_copy, "gold_latest_copy_job"),
     (storage_snapshot, "storage_snapshot_job"),
 )
 

@@ -48,11 +48,15 @@ The AI team reviews that part.
 | 3 | Alert after behind *(proposed)* | 3 checks in a row | Product owner, 2026-10-14 |
 | 4 | Assistant | Same PR | Product owner, 2026-10-14 |
 | 5 | How `BLD-2-AC4` is tested | Runs that fail while inputs change, not a stopped orchestrator: the orchestrator makes the lag checks, so with it stopped nothing is checked and the page shows "not measured" (`BLD-2-AC5`) | Product owner, 2026-10-15 |
+| 6 | How the trigger is named with a target lag *(D3, amended by R1)* | The target lag wins over a stored cron: "Within N min of its inputs" (hours over 59), "When a downstream pipeline needs it" or "Target lag (unknown kind)". Pause is hidden for a target-lag pipeline: pausing stops the `_after` sensor but the `_lag` sensor is only skipped at the next orchestrator reload (F10), so pausing is not offered here. Resume stays available once such a pipeline is paused | Planner default (`BLD-11`), owner may change |
+| 7 | "Current lag" when nothing is pending *(D4)* | `met` with no measured lag reads "Up to date"; `not_measured` reads "Not measured"; a number goes through the console's duration formatter, never raw seconds | Planner default (`BLD-11`), owner may change |
+| 8 | When the lag clock starts *(D5)* | A Bronze input's snapshot commit time; for a Silver or Gold input, the first check that saw the change. With several changed inputs, the earliest time, clamped to the last consumed run's start and to now | Planner default (`BLD-11`), owner may change |
 
 ## Limits to tell a customer
 
 - The smallest lag is 1 minute, the target, and it was measured: in the final 1-minute gate run every sample was within 60 s (worst 32.70 s, average 25.64 s; `docs/plans/BLD-2-TARGET-LAG-RESULT.md`, run on `29d889340b1a`).
 - Each refresh rebuilds the whole output table.
+- Lag is counted from when a Bronze input was loaded (its snapshot's commit time), and from the first check that saw the change for a Silver or Gold input (up to 30 s later).
 
 ## Acceptance checklist
 

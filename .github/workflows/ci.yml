@@ -3822,7 +3822,11 @@ jobs:
     runs-on: ubuntu-latest
     # DATA-2: raised from 20 by measured acceptance test execution time
     # (327s, ~6 minutes) plus 5 minutes of slack (11 minutes total raise).
-    timeout-minutes: 31
+    # DATA-6: raised from 31 by the five latest-copy steps' measured wall
+    # on the local stack (settle 2.3s + follow-up run 6.4s + switching-off
+    # job wait ~20s + the small refusals, ~40s ≈ 1 minute) plus 5 minutes
+    # of slack (6 minutes total raise).
+    timeout-minutes: 37
     env:
       LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
       LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
