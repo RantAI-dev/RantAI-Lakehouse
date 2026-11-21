@@ -1,6 +1,7 @@
 // BI-19 owner QA 2026-10-28, QA-3: `?comments=1` (the link a bell mention carries) opens the
-// Comments dialog once the board is loaded, and closing it removes the parameter while keeping
-// the others. Renders the real page, like `dashboard-stop.test.tsx`.
+// comments once the board is loaded, and closing them removes the parameter while keeping
+// the others. Renders the real page, like `dashboard-stop.test.tsx`, with the shell's side
+// panel the comments open in since BI-61 T6.
 const replaced: string[] = []
 mock.module("next/navigation", () => ({
   usePathname: () => "/dashboards/b_1",
@@ -19,6 +20,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import { AuthProvider } from "@/features/auth/auth-provider"
+import { SidePanelProvider } from "@/components/app-shell/side-panel"
+import { CopilotSidebar } from "@/features/copilot/copilot-sidebar"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
 import { DashboardPage } from "./dashboard-page"
 
@@ -32,7 +35,7 @@ const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
 
 describe("DashboardPage ?comments=1 (BI-19 QA-3)", () => {
-  it("opens the Comments dialog for a loaded board and drops only that parameter on close", async () => {
+  it("opens the Comments tab of the side panel for a loaded board and drops only that parameter on close", async () => {
     spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
       const path = String(input)
       if (path.includes("/api/auth/me")) {
@@ -48,14 +51,20 @@ describe("DashboardPage ?comments=1 (BI-19 QA-3)", () => {
       <AuthProvider>
         <TableProviders>
           <CopilotProvider>
-            <DashboardPage boardId="b_1" />
+            <SidePanelProvider>
+              <DashboardPage boardId="b_1" />
+              <CopilotSidebar />
+            </SidePanelProvider>
           </CopilotProvider>
         </TableProviders>
       </AuthProvider>,
     )
 
     expect(await screen.findByRole("list", { name: "Comments" })).toBeTruthy()
-    fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0])
+    expect(screen.getByRole("tab", { name: "Comments" }).getAttribute("aria-selected")).toBe("true")
+    // The panel has no close button (owner QA 2026-11-15): the page's own Comments button closes it again.
+    fireEvent.click(screen.getByRole("button", { name: "0 comments" }))
+    await waitFor(() => expect(screen.queryByRole("list", { name: "Comments" }) === null).toBe(true))
     await waitFor(() => expect(replaced.at(-1)).toBe("/dashboards/b_1?f=x"))
   })
 })

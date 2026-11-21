@@ -40,12 +40,13 @@ function DropdownMenuContent({
   className,
   sideOffset = 6,
   align = "end",
+  side,
   children,
   ...props
-}: Readonly<MenuPrimitive.Popup.Props & Pick<MenuPrimitive.Positioner.Props, "sideOffset" | "align">>) {
+}: Readonly<MenuPrimitive.Popup.Props & Pick<MenuPrimitive.Positioner.Props, "sideOffset" | "align" | "side">>) {
   return (
     <DropdownMenuPortal>
-      <MenuPrimitive.Positioner sideOffset={sideOffset} align={align} className="z-50 outline-none">
+      <MenuPrimitive.Positioner sideOffset={sideOffset} align={align} side={side} className="z-50 outline-none">
         <MenuPrimitive.Popup
           data-slot="dropdown-menu-content"
           className={cn(

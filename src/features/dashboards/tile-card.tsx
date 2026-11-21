@@ -10,17 +10,46 @@ import {
   DropdownMenuGroupLabel,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import type { GridItem } from "./dashboard-grid";
+import type { GridItem, TileLook, TileMenuItem } from "./dashboard-grid";
+import { EASE } from "./dashboard-header";
+import { OverflowText } from "./fit-text";
 
 /** The kinds drawn without a card: they have no data (BI-18 part C). */
 export function isSectionKind(kind: string | undefined): kind is "heading" | "divider" | "section" {
   return kind === "heading" || kind === "divider" || kind === "section";
 }
 
-function TileMenu({ item }: { item: GridItem }) {
+function MenuEntry({ m }: { m: TileMenuItem }) {
+  if (m.sub?.length) {
+    return (
+      <DropdownMenuSub>
+        <DropdownMenuSubTrigger>{m.icon}{m.label}</DropdownMenuSubTrigger>
+        <DropdownMenuSubContent className="w-52">
+          {m.sub.map((s) => (
+            <DropdownMenuItem key={s.label} variant={s.destructive ? "destructive" : "default"} onClick={s.onSelect}>
+              {s.icon}
+              {s.label}
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuSubContent>
+      </DropdownMenuSub>
+    );
+  }
+  return (
+    <DropdownMenuItem variant={m.destructive ? "destructive" : "default"} onClick={m.onSelect}>
+      {m.icon}
+      {m.label}
+    </DropdownMenuItem>
+  );
+}
+
+function TileMenu({ item, triggerClassName }: { item: GridItem; triggerClassName?: string }) {
   if (!item.menu?.length) return null;
   return (
     <div className="print:hidden" onPointerDown={(e) => e.stopPropagation()}>
@@ -30,15 +59,24 @@ function TileMenu({ item }: { item: GridItem }) {
             <Button
               variant="ghost"
               size="icon"
-              className="size-7 text-muted-foreground hover:text-foreground"
+              className={cn("size-7 text-muted-foreground hover:text-foreground", triggerClassName)}
               aria-label={`Actions for ${item.title}`}
             />
           }
         >
           <MoreHorizontal className="size-4" />
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-48">
-          {item.menuLabel ? (
+        <DropdownMenuContent align="end" className={item.menuNote ? "w-60" : "w-48"}>
+          {item.menuNote ? (
+            <>
+              {/* BI-61 T4, review round 1 SHOULD-FIX 3: one line that never wraps; a long name ends in "…" and the tooltip says it all. */}
+              <p className="truncate px-2 pt-1.5 pb-2 text-[12px] text-muted-foreground tabular-nums" data-slot="tile-menu-notes"
+                title={item.menuNote.detail} aria-label={item.menuNote.detail}>
+                {item.menuNote.label}
+              </p>
+              <DropdownMenuSeparator />
+            </>
+          ) : item.menuLabel ? (
             <DropdownMenuGroup>
               <DropdownMenuGroupLabel className="truncate font-mono text-[11px] font-normal">
                 {item.menuLabel}
@@ -48,10 +86,7 @@ function TileMenu({ item }: { item: GridItem }) {
           {item.menu.map((m, i) => (
             <React.Fragment key={m.label}>
               {m.separatorBefore && i > 0 ? <DropdownMenuSeparator /> : null}
-              <DropdownMenuItem variant={m.destructive ? "destructive" : "default"} onClick={m.onSelect}>
-                {m.icon}
-                {m.label}
-              </DropdownMenuItem>
+              <MenuEntry m={m} />
             </React.Fragment>
           ))}
         </DropdownMenuContent>
@@ -60,22 +95,111 @@ function TileMenu({ item }: { item: GridItem }) {
   );
 }
 
-/** A tile: header (drag handle in edit mode, title, badge, ⋯ menu) over its body. */
+/*
+ * The soft tile's three boxes (`BI-61` T4): a soft fill with no border, the
+ * header the title sits in (at least 40 px; the title's top is fixed, so a description line only grows it downward), and the body under it. Exported for the
+ * dashboard's loading placeholder (`dashboard-skeleton.tsx`), which draws the
+ * same boxes with grey shapes inside, so a tile fills in place instead of a
+ * differently drawn card being swapped for it (owner QA 2026-11-14).
+ *
+ * The frame is a size container (`@container/tile`): what its header shows
+ * follows the tile's own width, which a side panel changes without changing
+ * the window (owner QA 2026-11-15).
+ */
+export const SOFT_TILE_FRAME = "@container/tile group/tile flex h-full flex-col overflow-hidden rounded-2xl bg-muted/45 dark:bg-card";
+export const SOFT_TILE_HEADER = "flex min-h-10 shrink-0 items-start gap-1.5 pl-4 pr-2 pt-1";
+export const SOFT_TILE_BODY = "tile-body-fill min-h-0 flex-1 px-2 pb-2";
+
+/** The "Data from" chip shows on hover or focus only on a tile at least 360 px (22.5rem) wide (see `TileCard`). */
+const DATA_FROM_SHOWN = "@min-[22.5rem]/tile:group-hover/tile:inline @min-[22.5rem]/tile:group-focus-within/tile:inline";
+
+/**
+ * A tile: header (drag handle in edit mode, title, badge, ⋯ menu) over its body.
+ *
+ * `soft` (`BI-61` T4, the dashboard page): a soft fill with no border and no
+ * badge. Its ⋯ and the quiet "Data from" chip appear when the tile is hovered
+ * or the menu is focused; on a touch screen, which cannot hover, the ⋯ stays.
+ *
+ * Owner QA 2026-11-15 ("Data from 18:59" covered a narrow tile's title, and a
+ * cut title could not be read): the title has priority. The hover tools sit
+ * beside it, not over it, and take only their own width, so the title ends in
+ * "…" before them; a cut title or description reads in full in a tooltip. The
+ * chip shows only on a tile at least 360 px wide: the header's fixed
+ * parts (16 px left and 8 px right padding, the 6 px gap, the chip at about
+ * 100 px, its 4 px gap and the 28 px ⋯) take about 160 px, which leaves a
+ * narrower tile under 200 px of title. A narrow tile still says when its data
+ * is from: the page header does, and the first line of its ⋯.
+ */
 export function TileCard({
-  item, editable, dragging, onHeaderPointerDown,
+  item, editable, dragging, onHeaderPointerDown, look = "card",
 }: {
   item: GridItem;
   editable: boolean;
   dragging?: boolean;
   onHeaderPointerDown?: (e: React.PointerEvent) => void;
+  look?: TileLook;
 }) {
+  const handle = editable && onHeaderPointerDown;
+  if (look === "soft") {
+    return (
+      <div
+        data-slot="tile"
+        className={cn(
+          SOFT_TILE_FRAME,
+          EASE,
+          handle && "ring-1 ring-primary/25 ring-inset",
+          // Micro-interaction audit 2026-11-14: a picked-up tile lifts (a little larger, a soft wide
+          // shadow) and settles back when dropped, so the drag reads as holding something.
+          dragging && "scale-[1.01] shadow-[0_18px_40px_-16px_rgb(0_0_0/0.35)] ring-2 ring-primary/60",
+        )}
+      >
+        <div
+          className={cn(SOFT_TILE_HEADER, handle && "cursor-move select-none pl-2")}
+          style={handle ? { touchAction: "none" } : undefined}
+          onPointerDown={handle ? onHeaderPointerDown : undefined}
+        >
+          {handle ? <GripVertical className="mt-2.5 size-4 shrink-0 text-muted-foreground" aria-hidden /> : null}
+          <div className="min-w-0 flex-1 pt-[9px]">
+            <p className="flex items-center gap-1.5 truncate text-sm font-medium leading-tight">
+              <OverflowText text={item.title} className="min-w-0" />
+              {item.hint}
+            </p>
+            {item.subtitle ? <OverflowText as="p" text={item.subtitle} className="text-[11px] text-muted-foreground" /> : null}
+          </div>
+          <span className="mt-1 flex shrink-0 items-center gap-1">
+            {item.dataFrom ? (
+              <span
+                data-slot="tile-data-from"
+                className={cn(
+                  "pointer-events-none hidden whitespace-nowrap rounded-full bg-muted/90 px-2 py-0.5 text-[11px] text-muted-foreground tabular-nums dark:bg-card",
+                  DATA_FROM_SHOWN,
+                  // It fades in as it takes its place (`@starting-style`); leaving, it goes at once.
+                  "transition-opacity duration-150 ease-ui starting:opacity-0",
+                )}
+              >
+                {item.dataFrom}
+              </span>
+            ) : null}
+            <TileMenu
+              item={item}
+              triggerClassName={cn(
+                EASE,
+                !editable && "lg:pointer-fine:opacity-0 lg:pointer-fine:group-hover/tile:opacity-100 focus-visible:opacity-100 data-[popup-open]:opacity-100",
+              )}
+            />
+          </span>
+        </div>
+        <div className={SOFT_TILE_BODY}>{item.body}</div>
+      </div>
+    );
+  }
   return (
     <div className={cn("flex h-full flex-col overflow-hidden rounded-xl border border-border bg-card shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]", dragging && "ring-2 ring-primary/40")}>
       {/* Header / drag handle */}
-      <div className={cn("flex items-center gap-2 border-b border-border px-3 py-1.5", editable && onHeaderPointerDown && "cursor-move select-none bg-muted/40")}
-           style={editable && onHeaderPointerDown ? { touchAction: "none" } : undefined}
+      <div className={cn("flex items-center gap-2 border-b border-border px-3 py-1.5", handle && "cursor-move select-none bg-muted/40")}
+           style={handle ? { touchAction: "none" } : undefined}
            onPointerDown={editable ? onHeaderPointerDown : undefined}>
-        {editable && onHeaderPointerDown ? <GripVertical className="size-4 shrink-0 text-muted-foreground" /> : null}
+        {handle ? <GripVertical className="size-4 shrink-0 text-muted-foreground" /> : null}
         <div className="min-w-0 flex-1">
           <p className="flex items-center gap-1.5 truncate text-sm font-semibold leading-tight">
             <span className="truncate">{item.title}</span>
@@ -109,7 +233,7 @@ export function SectionTile({
 }) {
   const kind = item.kind;
   const chrome = editable
-    ? "rounded-md border border-dashed border-primary/40 bg-primary/5 px-2"
+    ? "rounded-lg bg-primary/5 px-2 ring-1 ring-primary/25 ring-inset"
     : "px-1";
   return (
     <div className={cn("flex h-full items-center gap-2", chrome)}

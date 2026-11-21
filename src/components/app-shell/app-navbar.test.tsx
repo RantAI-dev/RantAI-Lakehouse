@@ -24,7 +24,8 @@ import { AuthProvider } from "@/features/auth/auth-provider"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
 import { SidebarProvider } from "@/components/ui/sidebar"
 import { notificationsService } from "@/services"
-import { AppNavbar, UserMenu } from "./app-navbar"
+import { AppNavbar } from "./app-navbar"
+import { UserMenu } from "./user-menu"
 import { CONSOLE_VERSION } from "@/features/version/console-version"
 
 afterEach(() => {
@@ -130,6 +131,59 @@ describe("the account menu", () => {
     render(<UserMenu userName="Ada" userEmail="ada@example.com" onLogout={() => {}} />)
     fireEvent.click(screen.getByRole("button", { name: /Account menu/ }))
     expect(screen.getByText(`Version ${CONSOLE_VERSION}`)).toBeTruthy()
+  })
+
+  it("capitalises every word of a role name (owner decision 2026-11-15)", () => {
+    render(<UserMenu userName="Ada" userEmail="ada@example.com" roles={["data_analyst"]} onLogout={() => {}} />)
+    fireEvent.click(screen.getByRole("button", { name: /Account menu/ }))
+    expect(screen.getByText("Data Analyst")).toBeTruthy()
+  })
+
+  it("heads the menu with the role above the email, muted, and ends with Sign out", () => {
+    render(<UserMenu userName="Ada Lovelace" userEmail="ada@example.com" roles={["platform_admin", "viewer", "editor"]} onLogout={() => {}} />)
+    fireEvent.click(screen.getByRole("button", { name: /Account menu/ }))
+    expect(screen.getByText("ada@example.com")).toBeTruthy()
+    expect(screen.getByText("Platform Admin, Viewer +1")).toBeTruthy()
+    // Owner QA 2026-11-15: the role comes first, the email below it.
+    const role = screen.getByText("Platform Admin, Viewer +1")
+    expect(role.nextElementSibling?.textContent).toBe("ada@example.com")
+    const items = screen.getAllByRole("menuitem")
+    expect(items[items.length - 1].textContent).toBe("Sign out")
+  })
+})
+
+// Owner 2026-11-14 ("AI ini bisa ditempatkan di paling kanan dan kasih label dong"): the AI Copilot
+// is the navbar's last item, named, with the assistant's mark, and pressed while its panel is open.
+describe("AppNavbar AI Copilot entry", () => {
+  it("is the last button, labelled, and toggles its pressed state", async () => {
+    spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
+      if (String(input).includes("/api/auth/me")) {
+        return Promise.resolve(json({ id: "u1", name: "Analyst", email: null, roles: [], permissions: ["assistant:use"], tenants: [] }))
+      }
+      return Promise.resolve(json({}))
+    }) as unknown as typeof fetch)
+    spyOn(notificationsService, "list").mockResolvedValue({
+      supported: true, openAlerts: [], pendingApprovals: [], unreadMentions: [], unreadMentionsUnavailable: null,
+    } as never)
+
+    render(
+      <AuthProvider>
+        <CopilotProvider>
+          <SidebarProvider>
+            <AppNavbar />
+          </SidebarProvider>
+        </CopilotProvider>
+      </AuthProvider>,
+    )
+
+    const copilot = await screen.findByRole("button", { name: "Open AI Copilot" })
+    expect(copilot.textContent).toContain("AI Copilot")
+    expect(copilot.getAttribute("aria-pressed")).toBe("false")
+    const header = copilot.closest("header") as HTMLElement
+    const controls = header.querySelectorAll("button, a[href]")
+    expect(controls[controls.length - 1]).toBe(copilot)
+    fireEvent.click(copilot)
+    await waitFor(() => expect(screen.getByRole("button", { name: "Collapse AI Copilot" }).getAttribute("aria-pressed")).toBe("true"))
   })
 })
 

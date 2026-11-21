@@ -303,7 +303,7 @@ fn placed_charts(stored_blocks: &Value) -> HashMap<String, String> {
             blocks
                 .into_iter()
                 .filter_map(|block| match block {
-                    Block::Chart { chart, board } => Some((chart, board)),
+                    Block::Chart { chart, board, .. } => Some((chart, board)),
                     _ => None,
                 })
                 .collect()
@@ -347,8 +347,10 @@ async fn resolve_blocks(
     };
     let mut out = Vec::with_capacity(blocks.len());
     for (at, block) in blocks.into_iter().enumerate() {
-        let chart = match block {
-            Block::Chart { chart, .. } => chart,
+        // `BI-62`: the width is the writer's layout choice, taken from the save
+        // as it is, for a kept block too; only the dashboard is the server's.
+        let (chart, width) = match block {
+            Block::Chart { chart, width, .. } => (chart, width),
             other => {
                 out.push(other);
                 continue;
@@ -363,7 +365,11 @@ async fn resolve_blocks(
                 None => return Err(unplaceable(state, viewer, &chart, at + 1).await?),
             }
         };
-        out.push(Block::Chart { chart, board });
+        out.push(Block::Chart {
+            chart,
+            board,
+            width,
+        });
     }
     Ok(out)
 }
