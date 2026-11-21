@@ -419,6 +419,21 @@ pub struct AlertRule {
     /// did until it is saved again (`BI-39` D4).
     #[serde(rename = "ownerId", skip_serializing_if = "Option::is_none", default)]
     pub owner_id: Option<String>,
+    /// `BI-65`: when a digest is sent, in the shape a report subscription's
+    /// schedule has (`{"kind":"weekly","weekday":1,"hour":8,"minute":0}`).
+    /// `None` for every other kind, and for a digest saved before schedules,
+    /// which is sent once a day at 08:00 in the report time zone.
+    ///
+    /// Kept as the JSON the API validated, not as a typed schedule: the type and
+    /// its next-run arithmetic live in `lakehouse-store`
+    /// (`report_schedule::Schedule`), which this crate does not depend on (the
+    /// same low-level-crate rule as [`FreshnessSource`]). The API parses it, and
+    /// it is the only place that does.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub schedule: Option<Value>,
+    /// `BI-65`: the IANA zone `schedule` is read in. Set whenever `schedule` is.
+    #[serde(rename = "timeZone", skip_serializing_if = "Option::is_none", default)]
+    pub time_zone: Option<String>,
 }
 
 fn default_agg() -> String {
@@ -438,7 +453,13 @@ fn default_agg() -> String {
 /// a hard deserialize failure instead of that same permissive fallback, so
 /// this struct stays untyped and [`save_rule`] does the TypeScript's exact
 /// string-equality checks itself.
+///
+/// `BI-65`: unknown fields are refused (`deny_unknown_fields`), so a client
+/// that sends a field this version does not know gets a 400 that names it
+/// instead of a rule saved without it (a digest's schedule used to vanish this
+/// way). `owner_id` is `serde(skip)`, so a body that names it is refused too.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AlertRuleInput {
     /// Rule id, for `PUT` (update). Ignored by [`save_rule`] itself — the
     /// caller passes it separately as `id`; this field exists only so the
@@ -507,6 +528,13 @@ pub struct AlertRuleInput {
     /// cannot save a rule that reads as somebody with wider access.
     #[serde(skip)]
     pub owner_id: Option<String>,
+    /// `BI-65`: a digest's schedule (see [`AlertRule::schedule`]). Digest only;
+    /// the API checks its shape and replaces it with the canonical form before
+    /// [`save_rule`] stores it.
+    pub schedule: Option<Value>,
+    /// `BI-65`: the zone `schedule` is read in. Digest only.
+    #[serde(rename = "timeZone")]
+    pub time_zone: Option<String>,
 }
 
 /// The validated, normalized shape [`save_rule`] persists — split out of
@@ -538,6 +566,12 @@ struct NormalizedRule {
     asset: String,
 }
 
+/// The sentence for a schedule or time zone on a rule that is not a digest.
+const NOT_A_DIGEST: &str = "only a digest has a schedule.";
+
+/// The sentence for a new digest saved without a schedule (`BI-65`).
+const DIGEST_NEEDS_SCHEDULE: &str = "a digest needs a schedule.";
+
 /// Validate and normalize `input`, exactly reproducing `saveRule`'s
 /// validation order in `alert-store.ts`. Pure — no `ClickHouse` access, so
 /// this is fully unit-testable.
@@ -564,6 +598,15 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
             .unwrap_or(AlertKind::Alert),
         None => AlertKind::Alert,
     };
+    // BI-65: a schedule means "send at these times", which only a digest does;
+    // any other kind taking one would store it and never use it.
+    let has_time_zone = input
+        .time_zone
+        .as_deref()
+        .is_some_and(|z| !z.trim().is_empty());
+    if kind != AlertKind::Digest && (input.schedule.is_some() || has_time_zone) {
+        return Err(AlertError::Validation(NOT_A_DIGEST.to_owned()));
+    }
     let channel = if input.channel.as_deref() == Some("email") {
         AlertChannel::Email
     } else {
@@ -639,6 +682,10 @@ struct RuleExtras {
     filters_json: String,
     condition: String,
     owner_id: String,
+    /// `BI-65`: a digest's schedule as JSON text; empty for every other rule.
+    schedule: String,
+    /// `BI-65`: the zone of `schedule`; empty for every other rule.
+    time_zone: String,
 }
 
 impl RuleExtras {
@@ -646,10 +693,26 @@ impl RuleExtras {
     /// already valid; nothing but the owner is kept for any other rule.
     fn of(input: &AlertRuleInput, kind: AlertKind) -> Self {
         let owner_id = input.owner_id.clone().unwrap_or_default();
+        // BI-65: only a digest keeps a schedule ([`normalize_input`] refused it
+        // on any other kind).
+        let (schedule, time_zone) = if kind == AlertKind::Digest {
+            (
+                input
+                    .schedule
+                    .as_ref()
+                    .map(Value::to_string)
+                    .unwrap_or_default(),
+                input.time_zone.as_deref().map_or("", str::trim).to_owned(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
         let chart = input.chart.as_deref().map_or("", str::trim);
         if kind != AlertKind::Alert || chart.is_empty() {
             return Self {
                 owner_id,
+                schedule,
+                time_zone,
                 ..Self::default()
             };
         }
@@ -669,6 +732,8 @@ impl RuleExtras {
             },
             condition: condition.to_owned(),
             owner_id,
+            schedule,
+            time_zone,
         }
     }
 }
@@ -1215,7 +1280,18 @@ pub async fn ensure(ch: &ChClient) -> Result<(), ChError> {
     // person it reads as. All additive and `IF NOT EXISTS`, like `asset` above;
     // a rule saved before them reads back with every one absent, which is a
     // legacy rule (it keeps `op`, and reads as the fixed viewer role).
-    for column in ["chart", "series", "filters_json", "condition", "owner_id"] {
+    // `BI-65`: a digest's schedule (JSON text) and its zone. Additive, like the
+    // columns above; a digest saved before them reads back with neither, which
+    // is a digest sent once a day.
+    for column in [
+        "chart",
+        "series",
+        "filters_json",
+        "condition",
+        "owner_id",
+        "schedule",
+        "time_zone",
+    ] {
         ch.exec(
             &format!(
                 "ALTER TABLE console.alert_rule ADD COLUMN IF NOT EXISTS {column} String DEFAULT ''"
@@ -1227,7 +1303,7 @@ pub async fn ensure(ch: &ChClient) -> Result<(), ChError> {
     Ok(())
 }
 
-const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity,pipeline,metric,connector,asset,chart,series,filters_json,condition,owner_id";
+const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity,pipeline,metric,connector,asset,chart,series,filters_json,condition,owner_id,schedule,time_zone";
 
 fn row_str<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
     row.get(key).and_then(Value::as_str).unwrap_or("")
@@ -1310,6 +1386,10 @@ fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
         filters: serde_json::from_str(row_str(row, "filters_json")).unwrap_or_default(),
         condition: non_empty(row_str(row, "condition")),
         owner_id: non_empty(row_str(row, "owner_id")),
+        // BI-65: stored as the JSON text the API validated; a text that does
+        // not parse reads as none, so the digest keeps the daily default.
+        schedule: serde_json::from_str(row_str(row, "schedule")).ok(),
+        time_zone: non_empty(row_str(row, "time_zone")),
     }
 }
 
@@ -1362,6 +1442,12 @@ pub async fn save_rule(
 ) -> Result<AlertRule, AlertError> {
     ensure(ch).await?;
     let normalized = normalize_input(input)?;
+    // BI-65: a digest is sent on its schedule, so a new one must have one. An
+    // update without one keeps a digest saved before schedules working (it is
+    // sent once a day) instead of refusing a rename.
+    if normalized.kind == AlertKind::Digest && id.is_none() && input.schedule.is_none() {
+        return Err(AlertError::Validation(DIGEST_NEEDS_SCHEDULE.to_owned()));
+    }
     // SEC-10: refuse a webhook that points at an address webhooks may not
     // reach when the rule is SAVED, with the sender's fixed message, so the
     // author learns at once instead of from a failed delivery. A name can
@@ -1399,7 +1485,7 @@ pub async fn save_rule(
     // already turns `""` back into `None` on read, so the round-trip is
     // lossless).
     let sql = format!(
-        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity,pipeline,metric,connector,asset,chart,series,filters_json,condition,owner_id) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{},{},{},{},{},{},{},{},{},{})",
+        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity,pipeline,metric,connector,asset,chart,series,filters_json,condition,owner_id,schedule,time_zone) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{},{},{},{},{},{},{},{},{},{},{},{})",
         SqlLiteral::from(rid.as_str()),
         SqlLiteral::from(normalized.name.as_str()),
         SqlLiteral::from(normalized.kind.as_str()),
@@ -1420,6 +1506,8 @@ pub async fn save_rule(
         SqlLiteral::from(extras.filters_json.as_str()),
         SqlLiteral::from(extras.condition.as_str()),
         SqlLiteral::from(extras.owner_id.as_str()),
+        SqlLiteral::from(extras.schedule.as_str()),
+        SqlLiteral::from(extras.time_zone.as_str()),
     );
     ch.exec(&sql, None).await?;
     match get_rule(ch, &rid).await? {
@@ -1703,6 +1791,44 @@ pub trait StateSource: Send + Sync {
     /// the rule back in `previous` (only if it is still in `claimed`), so the
     /// next check sends again (the accepted resend-after-failure behaviour).
     async fn release(&self, rule_id: &str, claimed: AlertState, previous: AlertState);
+
+    /// `BI-65`: whether the digest `rule` is due now, and if so claim its send
+    /// before the message goes out, so two runners cannot both send it. The
+    /// implementation reads the rule's schedule and zone (a digest with none is
+    /// due once a day at 08:00 in the report time zone) and keeps the time it
+    /// counts from; a digest it has never seen only starts that clock and waits.
+    ///
+    /// # Errors
+    ///
+    /// A fixed, non-leaking sentence when the clock cannot be read or written,
+    /// or the schedule cannot be used; the digest is then skipped without
+    /// sending, since an unclaimed send is a repeat.
+    async fn digest_turn(&self, rule: &AlertRule) -> Result<DigestTurn, String>;
+
+    /// Undo a [`DigestTurn::Send`] whose message could not be delivered, so the
+    /// next tick sends again (the same resend-after-failure behaviour as
+    /// [`StateSource::release`]).
+    async fn digest_give_back(&self, rule_id: &str, claim: DigestClaim);
+}
+
+/// What a tick does about one digest ([`StateSource::digest_turn`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestTurn {
+    /// Not due, or not this runner's to send: nothing happens.
+    Wait,
+    /// Due, and this caller owns the send.
+    Send(DigestClaim),
+}
+
+/// The two clock values a claimed digest send moved between, in milliseconds
+/// since the Unix epoch, so [`StateSource::digest_give_back`] can undo it
+/// without this crate knowing the store's time type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DigestClaim {
+    /// The clock this claim set.
+    pub claimed_ms: i64,
+    /// The clock before it.
+    pub previous_ms: i64,
 }
 
 /// Whether `new` watches something other than `old` (`BI-19` C review SF-3): a
@@ -2971,6 +3097,14 @@ pub async fn run_rules(
 
     let mut out = Vec::with_capacity(rules.len());
     for rule in &rules {
+        // BI-65: a run of one named rule is a person asking for it now (a test
+        // from the console, the assistant's `run_alert_rule`), so a digest is
+        // sent whatever its schedule says and the schedule's clock does not
+        // move. Only the every-rule tick is held to the schedule.
+        if only.is_some() && rule.kind == AlertKind::Digest {
+            out.push(send_digest(ch, (http, email), silence, gate, rule).await);
+            continue;
+        }
         out.push(run_one(ch, http, email, freshness, (silence, state), gate, rule).await);
     }
     Ok(out)
@@ -2987,7 +3121,7 @@ async fn run_one(
 ) -> RunResult {
     match rule.kind {
         AlertKind::Alert => run_alert(ch, (http, email), (silence, state), gate, rule).await,
-        AlertKind::Digest => run_digest(ch, http, email, silence, gate, rule).await,
+        AlertKind::Digest => run_digest(ch, (http, email), (silence, state), gate, rule).await,
         AlertKind::Freshness => {
             run_freshness(freshness, http, email, silence, rule, now_millis()).await
         }
@@ -3288,10 +3422,57 @@ async fn run_alert(
     settle((http, email), silence, state, rule, reading).await
 }
 
+/// Evaluate one digest on the every-rule tick. It is sent only when it is due
+/// (`BI-65`): a digest used to go out on every 15-minute tick.
+/// The due check comes first, so a digest that is not due reads nothing from
+/// the engine. Without a [`StateSource`] there is no clock, and a digest is
+/// skipped with a reason rather than sent on every tick, the same fail-closed
+/// rule a threshold alert follows.
 async fn run_digest(
     ch: &ChClient,
-    http: &WebhookSender,
-    email: &EmailSender,
+    (http, email): (&WebhookSender, &EmailSender),
+    (silence, state): (Option<&dyn SilenceSource>, Option<&dyn StateSource>),
+    gate: &dyn SqlGate,
+    rule: &AlertRule,
+) -> RunResult {
+    let Some(state) = state else {
+        return skipped(rule, NO_DIGEST_CLOCK.to_owned());
+    };
+    let claim = match state.digest_turn(rule).await {
+        Ok(DigestTurn::Send(claim)) => claim,
+        Ok(DigestTurn::Wait) => return not_due(rule),
+        Err(reason) => return skipped(rule, reason),
+    };
+    let result = send_digest(ch, (http, email), silence, gate, rule).await;
+    // A digest that could not be built or delivered gives its claim back, so
+    // the next tick tries again.
+    if result.skipped.is_some() || result.delivered.as_ref().is_some_and(|d| !d.ok) {
+        state.digest_give_back(&rule.id, claim).await;
+    }
+    result
+}
+
+/// Why a digest is skipped when the run has nowhere to keep its clock.
+const NO_DIGEST_CLOCK: &str = "the digest's schedule could not be checked, so it was not sent.";
+
+/// A digest that is not due: not fired, nothing to say.
+fn not_due(rule: &AlertRule) -> RunResult {
+    RunResult {
+        id: rule.id.clone(),
+        name: rule.name.clone(),
+        kind: rule.kind,
+        fired: false,
+        value: None,
+        delivered: None,
+        skipped: None,
+        recovered: false,
+    }
+}
+
+/// Build and deliver one digest, whatever the schedule says.
+async fn send_digest(
+    ch: &ChClient,
+    (http, email): (&WebhookSender, &EmailSender),
     silence: Option<&dyn SilenceSource>,
     gate: &dyn SqlGate,
     rule: &AlertRule,
@@ -4926,6 +5107,8 @@ mod tests {
             filters: Vec::new(),
             condition: None,
             owner_id: None,
+            schedule: None,
+            time_zone: None,
         }
     }
 
@@ -5248,6 +5431,8 @@ mod tests {
             filters: Vec::new(),
             condition: None,
             owner_id: None,
+            schedule: None,
+            time_zone: None,
         }
     }
 
@@ -5945,12 +6130,16 @@ mod tests {
         let mut rule = freshness_rule("t");
         rule.kind = AlertKind::Digest;
         rule.board = Some("b_restricted".to_owned());
+        let state = FakeState {
+            digest: Some(DIGEST_DUE),
+            ..FakeState::default()
+        };
         let result = run_one(
             &ch,
             &http,
             &email,
             None,
-            (None, None),
+            (None, Some(&state)),
             &RestrictedGate,
             &rule,
         )
@@ -5965,6 +6154,144 @@ mod tests {
             result.skipped
         );
         assert!(server.received_requests().await.unwrap().is_empty());
+        // The send was claimed and never made, so the claim goes back and the
+        // next tick tries again.
+        assert_eq!(*state.given_back.lock().unwrap(), vec![DIGEST_DUE_CLAIM]);
+    }
+
+    /// `BI-65`: a digest that is not due reads nothing and sends nothing, and a
+    /// digest with nowhere to keep its clock is skipped with a reason instead of
+    /// being sent on every tick.
+    #[tokio::test]
+    async fn a_digest_that_is_not_due_sends_nothing_and_one_with_no_clock_is_skipped() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let mut rule = freshness_rule("t");
+        rule.kind = AlertKind::Digest;
+        rule.board = Some("b_any".to_owned());
+        let waiting = FakeState::default();
+        let result = run_one(
+            &ch,
+            &http,
+            &email,
+            None,
+            (None, Some(&waiting)),
+            &PassGate,
+            &rule,
+        )
+        .await;
+        assert!(!result.fired);
+        assert_eq!(result.skipped, None);
+        assert_eq!(result.delivered, None);
+        assert!(waiting.given_back.lock().unwrap().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        let none = run_one(&ch, &http, &email, None, (None, None), &PassGate, &rule).await;
+        assert_eq!(none.skipped.as_deref(), Some(NO_DIGEST_CLOCK));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// `BI-65` decision 4: a field this version does not know is refused by
+    /// name, not dropped (a digest's schedule used to vanish this way).
+    #[test]
+    fn an_unknown_field_is_refused_by_name() {
+        let err = serde_json::from_str::<AlertRuleInput>(
+            r#"{"name":"Weekly","type":"digest","schedul":{"kind":"daily"}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field `schedul`"), "{err}");
+        // A body that names the owner is refused too: the route sets it.
+        let err = serde_json::from_str::<AlertRuleInput>(r#"{"name":"x","owner_id":"u1"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `owner_id`"), "{err}");
+        let ok: AlertRuleInput = serde_json::from_str(
+            r#"{"name":"Weekly","type":"digest","timeZone":"Asia/Jakarta",
+                "schedule":{"kind":"weekly","weekday":1,"hour":8,"minute":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(ok.time_zone.as_deref(), Some("Asia/Jakarta"));
+        assert_eq!(ok.schedule.unwrap()["kind"], "weekly");
+    }
+
+    /// `BI-65` decision 1: a schedule or a zone on any rule but a digest is
+    /// refused, and a new digest must have a schedule.
+    #[tokio::test]
+    async fn only_a_digest_may_have_a_schedule_and_a_new_digest_must() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let schedule = serde_json::json!({"kind": "daily", "hour": 8, "minute": 0});
+        let mut alert = valid_alert_input();
+        alert.schedule = Some(schedule.clone());
+        let err = normalize_input(&alert).unwrap_err();
+        assert_eq!(err.to_string(), NOT_A_DIGEST);
+        let mut alert = valid_alert_input();
+        alert.time_zone = Some("Asia/Jakarta".to_owned());
+        assert_eq!(
+            normalize_input(&alert).unwrap_err().to_string(),
+            NOT_A_DIGEST
+        );
+
+        let digest = AlertRuleInput {
+            name: Some("Weekly".to_owned()),
+            kind: Some("digest".to_owned()),
+            board: Some("b_sales".to_owned()),
+            channel: Some("email".to_owned()),
+            target: Some("ops@example.invalid".to_owned()),
+            ..AlertRuleInput::default()
+        };
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let err = save_rule(&ch, &test_webhook_sender(), &digest, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), DIGEST_NEEDS_SCHEDULE);
+        // An update without one is allowed, so a digest saved before schedules
+        // keeps working; it fails later, on the mock's empty read-back, not here.
+        let kept = save_rule(&ch, &test_webhook_sender(), &digest, Some("al_old")).await;
+        assert!(
+            !matches!(&kept, Err(AlertError::Validation(m)) if m == DIGEST_NEEDS_SCHEDULE),
+            "{kept:?}"
+        );
+    }
+
+    /// `BI-65`: a digest keeps its schedule and zone in the row; any other rule
+    /// keeps none, and a row with no schedule reads as none.
+    #[test]
+    fn a_digests_schedule_is_stored_and_read_back() {
+        let schedule = serde_json::json!({"kind": "weekly", "weekday": 1, "hour": 8, "minute": 0});
+        let input = AlertRuleInput {
+            schedule: Some(schedule.clone()),
+            time_zone: Some(" Asia/Jakarta ".to_owned()),
+            ..AlertRuleInput::default()
+        };
+        let digest = RuleExtras::of(&input, AlertKind::Digest);
+        assert_eq!(digest.time_zone, "Asia/Jakarta");
+        let row = serde_json::json!({
+            "id": "al_1", "name": "Weekly", "type": "digest", "channel": "email",
+            "target": "ops@example.invalid", "enabled": "1",
+            "schedule": digest.schedule, "time_zone": digest.time_zone,
+        });
+        let rule = row_to_rule(row.as_object().unwrap());
+        assert_eq!(rule.schedule, Some(schedule));
+        assert_eq!(rule.time_zone.as_deref(), Some("Asia/Jakarta"));
+        let other = RuleExtras::of(&input, AlertKind::Alert);
+        assert!(other.schedule.is_empty() && other.time_zone.is_empty());
+        let legacy =
+            serde_json::json!({"id": "al_2", "name": "Old", "type": "digest", "schedule": ""});
+        let old = row_to_rule(legacy.as_object().unwrap());
+        assert_eq!((old.schedule, old.time_zone), (None, None));
     }
 
     #[tokio::test]
@@ -6553,6 +6880,13 @@ mod tests {
         assert_eq!(AlertState::parse("garbage"), AlertState::Ok);
     }
 
+    /// `BI-65`: a digest that is due, with a claim to give back.
+    const DIGEST_DUE_CLAIM: DigestClaim = DigestClaim {
+        claimed_ms: 2_000,
+        previous_ms: 1_000,
+    };
+    const DIGEST_DUE: DigestTurn = DigestTurn::Send(DIGEST_DUE_CLAIM);
+
     /// A state source in memory that counts its writes.
     #[derive(Default)]
     struct FakeState {
@@ -6562,6 +6896,10 @@ mod tests {
         /// When set, `state_of` answers this whatever is stored: a runner that
         /// read the state before another runner claimed the transition.
         stale: Option<AlertState>,
+        /// `BI-65`: what `digest_turn` answers; `None` reads as "wait".
+        digest: Option<DigestTurn>,
+        /// `BI-65`: the digest claims that were given back.
+        given_back: std::sync::Mutex<Vec<DigestClaim>>,
     }
 
     #[async_trait::async_trait]
@@ -6616,6 +6954,12 @@ mod tests {
             if states.get(rule_id).copied() == Some(claimed) {
                 states.insert(rule_id.to_owned(), previous);
             }
+        }
+        async fn digest_turn(&self, _rule: &AlertRule) -> Result<DigestTurn, String> {
+            Ok(self.digest.unwrap_or(DigestTurn::Wait))
+        }
+        async fn digest_give_back(&self, _rule_id: &str, claim: DigestClaim) {
+            self.given_back.lock().unwrap().push(claim);
         }
     }
 
