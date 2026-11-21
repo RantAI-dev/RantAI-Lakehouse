@@ -238,8 +238,8 @@ fn parse_transforms(
 
 /// D4a: whether this definition is today's shape — one input and either no
 /// step or exactly one `transform` step reading it — which is what compiles
-/// to today's statement (no `WITH`), and the only shape whose statement is
-/// noted for column lineage (D4b).
+/// to today's statement (no `WITH`). Every shape is noted for column lineage
+/// now (`DATA-57` D9), so this predicate no longer gates that.
 #[must_use]
 pub fn is_legacy_shape(inputs: &[PipelineInput], steps: &[PipelineStep]) -> bool {
     let [input] = inputs else {
@@ -1544,7 +1544,8 @@ mod tests {
     }
 
     /// J7: a pipeline with a new kind is not today's shape, so it compiles
-    /// to the `WITH` form and is not noted for column lineage (D4b).
+    /// to the `WITH` form, which every compiled statement is noted for
+    /// column lineage through (`DATA-57` D9).
     #[test]
     fn the_legacy_predicate_is_false_for_join_aggregate_and_filter_steps() {
         let inputs = one_input();

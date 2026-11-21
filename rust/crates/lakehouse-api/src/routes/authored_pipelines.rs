@@ -2108,14 +2108,12 @@ pub async fn compile_pipeline(
     // which would make every column partial); the mapping is written when the
     // run is reported successful.
     //
-    // BLD-1 part 1 review R1-B1 / D4b: only a definition of today's shape
-    // (D4a) is noted. Any other compiles to a `WITH`, which the lineage
-    // mapper cannot read — it would record a target column with no
-    // provenance, so no row is recorded instead (a `WITH`-aware mapper is a
-    // backlog item). Table lineage (D11) is unaffected.
-    if crate::pipeline_compile::is_legacy_shape(&definition.inputs, &definition.steps) {
-        super::lineage::columns::note_pipeline_sql(pool, &id, &compiled).await;
-    }
+    // DATA-57 review R5: #619 is merged, so its form steps are present now.
+    // DATA-57 D9: every compiled statement is noted. The mapper reads a
+    // `WITH`, so SQL steps, several inputs, several steps and join, aggregate
+    // and filter steps all yield mappings; anything it cannot prove is stored
+    // as a partial row with its reason, never a guessed edge.
+    super::lineage::columns::note_pipeline_sql(pool, &id, &compiled).await;
     Ok(ApiJson(json!({
         "sql": rewritten,
         // D8: whether any input is Bronze decides `allow_database_iceberg` on

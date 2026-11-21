@@ -98,6 +98,7 @@ export function SqlEditor({
   extensions,
   labelledBy,
   required,
+  placeholder,
 }: {
   value: string
   onChange: (v: string) => void
@@ -111,6 +112,8 @@ export function SqlEditor({
   labelledBy?: string
   /** Required semantics on the editor's textbox role (UX-1). */
   required?: boolean
+  /** Grey hint shown only while the document is empty (QS-11, D7). */
+  placeholder?: string
 }) {
   const { resolvedTheme } = useTheme()
   const cmTheme = resolvedTheme === "dark" ? "dark" : "light"
@@ -145,6 +148,7 @@ export function SqlEditor({
     >
       <CodeMirror
         value={value}
+        placeholder={placeholder}
         height={minHeight}
         extensions={editorExtensions}
         onChange={onChange}

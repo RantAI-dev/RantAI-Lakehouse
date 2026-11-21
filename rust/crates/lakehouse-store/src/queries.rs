@@ -1351,6 +1351,10 @@ impl From<QueryHistoryRow> for QueryHistoryItem {
 /// and the page's first view: the newest page of the last 14 days.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryFilter<'a> {
+    /// One run's id (`QS-12`, `LH-QS-4-07`): QS-12 opens a run by the id in
+    /// the address, never by its SQL. Still inside the owner scope and the
+    /// 14-day window — this does not reach anyone else's or older runs.
+    pub id: Option<&'a str>,
     /// `completed | failed | stopped | blocked` — the statuses `run`
     /// records. The route rejects anything else (`cancelled`, which only
     /// older rows carry, included) with a 400 before this is built.
@@ -1381,6 +1385,7 @@ impl Default for HistoryFilter<'_> {
     /// No filter, first page: the side panel's and the page's first view.
     fn default() -> Self {
         Self {
+            id: None,
             status: None,
             engine: None,
             min_duration_ms: None,
@@ -1402,8 +1407,8 @@ pub const HISTORY_PAGE_LIMIT: i64 = 50;
 
 /// The `WHERE` of [`list_history`] and [`count_history`], written once so
 /// `total` can never count a row the list would not show. It reads
-/// `$1..$7` — owner, status, engine, minimum duration, table, `from`,
-/// `to` — and both statements bind them in that order. The text is a
+/// `$1..$8` — owner, status, engine, minimum duration, table, `from`,
+/// `to`, `id` — and both statements bind them in that order. The text is a
 /// constant: every value is bound, none is interpolated.
 const HISTORY_WHERE: &str = "q.owner_id = $1 \
            AND ($2::text IS NULL OR q.status = $2) \
@@ -1414,7 +1419,8 @@ const HISTORY_WHERE: &str = "q.owner_id = $1 \
                 WHERE t.t ILIKE '%' || replace(replace(replace($5, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%')) \
            AND q.at >= GREATEST(COALESCE($6::timestamptz, now() - interval '14 days'), \
                                 now() - interval '14 days') \
-           AND ($7::timestamptz IS NULL OR q.at <= $7)";
+           AND ($7::timestamptz IS NULL OR q.at <= $7) \
+           AND ($8::text IS NULL OR q.id = $8)";
 
 /// List one user's recorded query executions, filtered, most recent
 /// first, one page at a time.
@@ -1499,7 +1505,7 @@ pub async fn list_history(
          ) ae ON true \
          WHERE {HISTORY_WHERE} \
          ORDER BY date_trunc('milliseconds', q.at) DESC, q.id DESC \
-         LIMIT $8 OFFSET $9"
+         LIMIT $9 OFFSET $10"
     );
     let rows: Vec<QueryHistoryRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(owner_id)
@@ -1509,6 +1515,7 @@ pub async fn list_history(
         .bind(filter.table)
         .bind(filter.from)
         .bind(filter.to)
+        .bind(filter.id)
         .bind(HISTORY_PAGE_LIMIT)
         .bind(offset)
         .fetch_all(pool)
@@ -1539,6 +1546,7 @@ pub async fn count_history(
         .bind(filter.table)
         .bind(filter.from)
         .bind(filter.to)
+        .bind(filter.id)
         .fetch_one(pool)
         .await?;
     Ok(total)

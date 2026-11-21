@@ -79,21 +79,28 @@ export function QueryColumnStatistics({
       </p>
 
       <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs sm:grid-cols-4">
-        <div>
+        {/* QS-11 (LH-QS-2-04), D14: min-w-0 lets a long value be truncated
+            inside its own cell instead of pushing its neighbours over. The
+            full value is in the title. */}
+        <div className="min-w-0">
           <dt className="text-muted-foreground">Empty cells</dt>
           <dd className="font-mono tabular-nums">{formatNumber(stats.empty)}</dd>
         </div>
-        <div>
+        <div className="min-w-0">
           <dt className="text-muted-foreground">Distinct values</dt>
           <dd className="font-mono tabular-nums">{formatNumber(stats.distinct)}</dd>
         </div>
-        <div>
+        <div className="min-w-0">
           <dt className="text-muted-foreground">Minimum</dt>
-          <dd className="font-mono tabular-nums">{stats.min ?? "—"}</dd>
+          <dd className="truncate font-mono tabular-nums" title={stats.min ?? undefined}>
+            {stats.min ?? "—"}
+          </dd>
         </div>
-        <div>
+        <div className="min-w-0">
           <dt className="text-muted-foreground">Maximum</dt>
-          <dd className="font-mono tabular-nums">{stats.max ?? "—"}</dd>
+          <dd className="truncate font-mono tabular-nums" title={stats.max ?? undefined}>
+            {stats.max ?? "—"}
+          </dd>
         </div>
       </dl>
 
