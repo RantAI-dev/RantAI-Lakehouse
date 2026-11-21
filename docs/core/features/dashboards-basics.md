@@ -67,7 +67,8 @@
   none by design, and gets one in `BI-73` with the other findings of the run (owner,
   2026-11-21).
 - [x] `BI-56-AC6`: a threshold alert fires over its threshold and not under it, from
-  "Test run now", and its e-mail arrives in the QA mailbox.
+  "Test run now", and its e-mail arrives in the QA mailbox. Pass through the API route
+  behind the button; the button itself was not clicked (see Result).
 - [x] `BI-56-AC7`: a Dashboard Viewer reads a shared dashboard and sees no edit, move or
   delete control; the API refuses an edit from that account.
 - [x] `BI-56-AC8`: at 390 px wide the gallery dashboard stacks, every tile is readable, and
