@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useServiceAction } from "@/hooks/use-service"
-import { formatDateTime } from "@/lib/format"
+import { formatDateTime, formatDuration } from "@/lib/format"
 import { pipelineService } from "@/services"
 import type { PipelineDetail, TargetLag } from "@/services/contracts/pipelines"
 
@@ -104,8 +104,18 @@ export function PipelineFreshnessPanel({
   // No `React.useMemo` here: the React compiler memoizes these itself and
   // rejects a hand-written dependency list that does not match what the
   // body reads (`react-hooks/preserve-manual-memoization`).
+  // BLD-11 F3/D4: `lagSeconds: null` is not one state. `met` with no pending
+  // change means caught up ("Up to date"); `not_measured` means nobody knows.
+  // A real number stays a number, formatted like every other duration here
+  // rather than shown as raw seconds.
   const currentLagDesc =
-    pipeline.lag?.lagSeconds != null ? `${pipeline.lag.lagSeconds}s` : "—"
+    pipeline.lag?.lagSeconds != null
+      ? formatDuration(pipeline.lag.lagSeconds * 1000)
+      : pipeline.lag?.status === "met"
+        ? "Up to date"
+        : pipeline.lag?.status === "not_measured"
+          ? "Not measured"
+          : "—"
 
   const lastCheckDesc = pipeline.lag?.lastCheckAt
     ? formatDateTime(pipeline.lag.lastCheckAt)
@@ -284,6 +294,12 @@ export function PipelineFreshnessPanel({
               { label: "Last check", value: lastCheckDesc },
             ]}
           />
+          {/* BLD-11 D6: say where the clock starts — a Bronze commit, or the
+              first check that saw a Silver/Gold change (up to 30 s later). */}
+          <p className="text-xs text-muted-foreground">
+            Lag counts from when a Bronze input was loaded, and from the first check that saw the change for a Silver or
+            Gold input.
+          </p>
           {pipeline.lag?.reason ? (
             <div className="rounded-md bg-muted/60 px-3 py-2 text-xs text-muted-foreground" role="note">
               {pipeline.lag.reason}
