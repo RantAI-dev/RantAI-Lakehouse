@@ -96,8 +96,6 @@ function Harness() {
 }
 
 function stubServices(options: { assets?: "ok" | "forbidden" } = {}) {
-  spyOn(queryService, "listSaved").mockResolvedValue([])
-  spyOn(queryService, "listHistory").mockResolvedValue([])
   spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
   if (options.assets === "forbidden") {
     spyOn(assetService, "listAssets").mockRejectedValue(

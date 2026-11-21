@@ -62,8 +62,6 @@ function stubNetwork(permissions: string[] = []) {
     if (path.includes("/api/ai/sessions")) return json({ sessions: [] })
     return json({})
   }) as unknown as typeof fetch)
-  spyOn(queryService, "listSaved").mockResolvedValue([])
-  spyOn(queryService, "listHistory").mockResolvedValue([])
   spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
   spyOn(assetService, "listAssets").mockResolvedValue([])
   spyOn(lakehouseService, "listNamespaces").mockResolvedValue([])
@@ -630,8 +628,6 @@ describe("QueryStudioPage draft owner", () => {
       if (path.includes("/api/ai/sessions")) return json({ sessions: [] })
       return json({})
     }) as unknown as typeof fetch)
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
     spyOn(lakehouseService, "listNamespaces").mockResolvedValue([])
@@ -864,6 +860,21 @@ describe("QueryStudioPage UX-9 layout", () => {
     renderPage()
 
     expect(await screen.findByText("Results show here")).toBeTruthy()
+  })
+
+  // PR #658 review 1: the Saved and History cards beside the editor are gone,
+  // and so are the two list reads that fed them. Studio · Saved · History is
+  // one control to the sections' own pages, which read those lists there.
+  it("reads neither the saved-query list nor the history list on load", async () => {
+    stubNetwork()
+    const saved = spyOn(queryService, "listSaved").mockResolvedValue([])
+    const history = spyOn(queryService, "listHistory").mockResolvedValue([])
+    seedDraft("SELECT 1")
+    renderPage()
+
+    await screen.findByRole("button", { name: "Run" })
+    expect(saved).not.toHaveBeenCalled()
+    expect(history).not.toHaveBeenCalled()
   })
 })
 

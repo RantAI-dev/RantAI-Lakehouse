@@ -17,8 +17,6 @@ afterEach(() => {
 })
 
 function stubServices() {
-  spyOn(queryService, "listSaved").mockResolvedValue([])
-  spyOn(queryService, "listHistory").mockResolvedValue([])
   spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
   spyOn(assetService, "listAssets").mockResolvedValue([])
 }

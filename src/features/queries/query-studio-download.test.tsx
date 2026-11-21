@@ -58,8 +58,6 @@ function stubNetwork() {
     if (path.includes("/api/ai/sessions")) return json({ sessions: [] })
     return json({})
   }) as unknown as typeof fetch)
-  spyOn(queryService, "listSaved").mockResolvedValue([])
-  spyOn(queryService, "listHistory").mockResolvedValue([])
   spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
   spyOn(assetService, "listAssets").mockResolvedValue([])
   spyOn(lakehouseService, "listNamespaces").mockResolvedValue([])

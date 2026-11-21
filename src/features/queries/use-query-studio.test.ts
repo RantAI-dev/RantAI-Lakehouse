@@ -70,8 +70,6 @@ const RESULT = {
 
 /** Mounts the hook with `sql` in the editor and no network answers for the lists. */
 function mountWith(sql: string) {
-  spyOn(queryService, "listSaved").mockResolvedValue([])
-  spyOn(queryService, "listHistory").mockResolvedValue([])
   spyOn(assetService, "listAssets").mockResolvedValue([])
   const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
   act(() => hook.result.current.setSql(sql))
@@ -83,8 +81,6 @@ function mountWith(sql: string) {
 describe("useQueryStudio starter text", () => {
   it("starts the first tab and every new tab with an empty document", () => {
     window.localStorage.clear()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(assetService, "listAssets").mockResolvedValue([])
     visit("/query-studio")
 
@@ -117,8 +113,6 @@ describe("useQueryStudio run link", () => {
   } as unknown as QueryHistoryItem
 
   function stubLists() {
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
   }
@@ -168,8 +162,6 @@ describe("useQueryStudio run link", () => {
 describe("useQueryStudio saved-query link", () => {
   it("opens the saved query the link names, with its id and the caller's level", async () => {
     window.localStorage.clear()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
     const getSaved = spyOn(queryService, "getSaved").mockResolvedValue(SAVED)
@@ -188,8 +180,6 @@ describe("useQueryStudio saved-query link", () => {
 
   it("says the query is not available and opens no tab when the caller may not see it", async () => {
     window.localStorage.clear()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
     spyOn(queryService, "getSaved").mockRejectedValue(
@@ -208,8 +198,6 @@ describe("useQueryStudio saved-query link", () => {
 
   it("does not ask for a saved query when the link names none", async () => {
     window.localStorage.clear()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
     const getSaved = spyOn(queryService, "getSaved").mockResolvedValue(SAVED)
@@ -222,8 +210,6 @@ describe("useQueryStudio saved-query link", () => {
 
   it("opens the saved query once when the page runs in StrictMode", async () => {
     window.localStorage.clear()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
     const getSaved = spyOn(queryService, "getSaved").mockResolvedValue(SAVED)
@@ -343,8 +329,6 @@ describe("useQueryStudio explain", () => {
 
 describe("useQueryStudio columns", () => {
   it("takes the columns of a table once, however often the statement names it", async () => {
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(assetService, "listAssets").mockResolvedValue([
       { id: "silver.orders", name: "Orders", namespace: "silver" },
     ] as never)
@@ -401,8 +385,6 @@ describe("useQueryStudio Bronze tables", () => {
   function mountWithBronze(
     options: { tableMissing?: boolean; tableError?: ServiceError } = {}
   ) {
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([
       { id: "demo_orders", name: "Demo Orders", namespace: "bronze", layer: "raw" },
@@ -585,8 +567,6 @@ describe("useQueryStudio Bronze proof on list load", () => {
   })
 
   function mountList(assets: unknown[], options: { tableError?: ServiceError } = {}) {
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue(assets as never)
     const getAsset = spyOn(assetService, "getAsset").mockImplementation(
@@ -1227,8 +1207,6 @@ describe("useQueryStudio parameter requests", () => {
 
   it("opens a saved query with its definitions and no values, so each field starts at its default", async () => {
     window.localStorage.clear()
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
     spyOn(assetService, "listAssets").mockResolvedValue([])
     const definitions = [
@@ -1293,8 +1271,6 @@ describe("useQueryStudio draft owner", () => {
 
   /** Stubs the lists the hook asks for, so nothing reaches the network. */
   function stubLists() {
-    spyOn(queryService, "listSaved").mockResolvedValue([])
-    spyOn(queryService, "listHistory").mockResolvedValue([])
     spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
     spyOn(assetService, "listAssets").mockResolvedValue([])
   }

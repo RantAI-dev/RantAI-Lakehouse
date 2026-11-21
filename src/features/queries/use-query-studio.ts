@@ -197,13 +197,12 @@ function targetStatementOf(
 }
 
 /**
- * The batch of requests that is in flight: which tab it belongs to, how
- * far it got, and whether the history has caught up with it already.
+ * The batch of requests that is in flight: which tab it belongs to, how far
+ * it got, and the statement it is on.
  */
 type Batch = {
   tabId: string
   index: number
-  reloaded: boolean
   active: boolean
   /**
    * BI-5 (plan D5): the id the statement in flight was sent under, which Stop
@@ -466,8 +465,6 @@ export function useQueryStudio(draftKey: string | null) {
     }
     return marked.size === 0 ? NO_NAMES : marked
   }, [refused, activeTabId, estimateError, parameters])
-  const savedState = useService((s) => queryService.listSaved(s), [])
-  const historyState = useService((s) => queryService.listHistory(undefined, s), [])
 
   // The tables the catalog shows, from the real catalog so suggestions
   // cannot drift from what exists.
@@ -1136,7 +1133,6 @@ export function useQueryStudio(draftKey: string | null) {
       const batch: Batch = {
         tabId,
         index: 0,
-        reloaded: false,
         active: true,
         runId: null,
         engine: runEngine,
@@ -1227,16 +1223,9 @@ export function useQueryStudio(draftKey: string | null) {
         batch.active = false
         setRunning(false)
         if (runControllerRef.current === controller) runControllerRef.current = null
-        // Every run is recorded, including the ones that failed, so the rail
-        // has to catch up — otherwise the query you just ran is missing from
-        // your own history until a reload. Once for the whole batch.
-        if (!batch.reloaded) {
-          batch.reloaded = true
-          historyState.reload()
-        }
       }
     },
-    [historyState]
+    []
   )
 
   /**
@@ -1319,11 +1308,7 @@ export function useQueryStudio(draftKey: string | null) {
       }
     })
     setRunning(false)
-    if (!batch.reloaded) {
-      batch.reloaded = true
-      historyState.reload()
-    }
-  }, [historyState, stopDownload])
+  }, [stopDownload])
 
   // Agentic ask: one call to the chat's engine, which writes the SQL, runs
   // it as the caller (masking and row filters apply), corrects itself on
@@ -1652,8 +1637,6 @@ export function useQueryStudio(draftKey: string | null) {
     estimateSupported,
     generateAct,
     estimateAct,
-    savedState,
-    historyState,
     agent: { busy: agentBusy, result: agentResult, error: agentError, ask },
     explain: {
       busy: explainBusy,

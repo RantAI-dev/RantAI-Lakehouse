@@ -6,7 +6,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import type { EditorState } from "@codemirror/state"
 import { EditorView, keymap, type KeyBinding } from "@codemirror/view"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
-import { assetService, queryService } from "@/services"
+import { assetService } from "@/services"
 import { EDITOR_SHORTCUTS } from "@/lib/editor-shortcuts"
 import { KeyboardShortcutsDialog } from "./keyboard-shortcuts-dialog"
 import { SqlPanel } from "./sql-panel"
@@ -20,8 +20,6 @@ afterEach(() => {
 })
 
 function stubServices() {
-  spyOn(queryService, "listSaved").mockResolvedValue([])
-  spyOn(queryService, "listHistory").mockResolvedValue([])
   spyOn(assetService, "listAssets").mockResolvedValue([])
   spyOn(assetService, "getAsset").mockResolvedValue({ schema: [] } as never)
 }
