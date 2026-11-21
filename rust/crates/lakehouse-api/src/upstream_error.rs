@@ -1105,7 +1105,13 @@ mod tests {
             api.to_string()
                 .starts_with("The database request failed. Reference: ")
         );
-        assert!(!api.to_string().contains("503"));
+        // The reference is random hex and can contain "503" by chance, so look
+        // for the upstream text only in the message that comes before it.
+        let shown = api.to_string();
+        let (message, _reference) = shown
+            .split_once("Reference: ")
+            .expect("a reference after the message");
+        assert!(!message.contains("503"), "{message}");
         let msg = ch_message_for_author(&DATABASE, &ChError::Cancelled);
         assert!(
             msg.starts_with("The database is unavailable. Reference: "),
@@ -1407,7 +1413,14 @@ mod tests {
             failure.recorded
         );
         assert_eq!(failure.recorded, failure.response.to_string());
-        assert!(!failure.recorded.contains("503"));
+        // The reference is 10 random hex characters and can contain "503" by
+        // chance (about 0.2% of runs), so look for the upstream text only in
+        // the message that comes before it.
+        let (message, _reference) = failure
+            .recorded
+            .split_once("Reference: ")
+            .expect("a reference after the message");
+        assert!(!message.contains("503"), "{message}");
     }
 
     #[test]

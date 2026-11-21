@@ -259,6 +259,7 @@ waits.
 | `DAGSTER_RUN_LIMIT_FILE_INGEST_JOB_SECONDS` | How long a file upload's load job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `21600` | No | commented |
 | `DAGSTER_RUN_LIMIT_CDC_APPLY_JOB_SECONDS` | How long the change-capture apply job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `21600` | No | commented |
 | `DAGSTER_RUN_LIMIT_AUTHORED_JOB_SECONDS` | How long an authored pipeline's job may run before it is cancelled and recorded as failed (`OPS-35`), read by `dagster-code-location` | `21600` | No | commented |
+| `DAGSTER_CODE_SERVER_HEARTBEAT_TTL_SECONDS` | How long the inner code server waits for the proxy's heartbeat before it shuts itself down, in seconds (`OPS-37`), read by `dagster-code-location` from that container's environment; the compose file passes this variable into the container, so an operator sets it in `.env`. The guard also honours Dagster's own `DAGSTER_GRPC_PROXY_HEARTBEAT_TTL_SECONDS` when this one is unset. Dagster's own default is 30 seconds and a loaded container missed that window on 2026-11-18 | `300` | No | commented |
 
 ### Secret managers and OAuth for connectors
 

@@ -133,13 +133,19 @@ impl Respond for FakeCh {
 /// `serving.mart_x`") — the fixture, not the route, was wrong. The membership
 /// is added here, where the app is built, so every test in this file has the
 /// same shape (`common::in_the_catalog_tenant`, as the other gated tests do).
-async fn app() -> TestApp {
-    app_with_connector_edits().await.0
+async fn app() -> (TestApp, MockServer) {
+    let (app, ch, _after_insert) = app_with_connector_edits().await;
+    (app, ch)
 }
 
 /// [`app`], with the handle that makes the fake apply a saved rule's new
 /// connector on the read `save_rule` does right after its insert.
-async fn app_with_connector_edits() -> (TestApp, Arc<Mutex<Option<String>>>) {
+///
+/// The mock server is returned with the app: wiremock hands a dropped server
+/// back to a shared pool and resets it, so a server dropped here could be
+/// taken by another test while this app still dials its `CH_URL`. Bind it
+/// to a named variable for the whole test.
+async fn app_with_connector_edits() -> (TestApp, MockServer, Arc<Mutex<Option<String>>>) {
     let ch = MockServer::start().await;
     let after_insert = Arc::new(Mutex::new(None));
     Mock::given(method("POST"))
@@ -168,7 +174,7 @@ async fn app_with_connector_edits() -> (TestApp, Arc<Mutex<Option<String>>>) {
         .await
         .expect("a seeded user");
     common::in_the_catalog_tenant(&app.pool, user).await;
-    (app, after_insert)
+    (app, ch, after_insert)
 }
 
 async fn test_run(app: &TestApp, cookie: &str, id: &str) -> (StatusCode, Value) {
@@ -197,7 +203,7 @@ async fn test_run(app: &TestApp, cookie: &str, id: &str) -> (StatusCode, Value) 
 /// not see answers exactly as an id that does not exist.
 #[tokio::test]
 async fn an_unknown_rule_and_one_the_caller_cannot_see_answer_the_same_not_found() {
-    let app = app().await;
+    let (app, _ch) = app().await;
     let andi = session_cookie_for_seeded_user(&app.pool, "andi@meridian.example").await;
 
     let (unknown_status, unknown) = test_run(&app, &andi, "al_does_not_exist").await;
@@ -216,7 +222,7 @@ async fn an_unknown_rule_and_one_the_caller_cannot_see_answer_the_same_not_found
 /// the rule instead.
 #[tokio::test]
 async fn a_threshold_rule_over_its_line_fires_and_saves_one_instance() {
-    let app = app().await;
+    let (app, _ch) = app().await;
     let bayu = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
 
     let (status, body) = test_run(&app, &bayu, PLAIN).await;
@@ -238,7 +244,7 @@ async fn a_threshold_rule_over_its_line_fires_and_saves_one_instance() {
 /// silence hides the message, not the fact).
 #[tokio::test]
 async fn a_second_test_while_still_over_the_line_sends_nothing() {
-    let app = app().await;
+    let (app, _ch) = app().await;
     let bayu = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
     silence(&app.pool).await;
 
@@ -286,7 +292,7 @@ async fn silence(pool: &sqlx::PgPool) {
 /// says so instead of pretending to check it.
 #[tokio::test]
 async fn a_late_pipeline_rule_answers_that_the_fifteen_minute_pass_checks_it() {
-    let app = app().await;
+    let (app, _ch) = app().await;
     let bayu = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
     let (status, body) = test_run(&app, &bayu, LATE).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -302,7 +308,7 @@ async fn a_late_pipeline_rule_answers_that_the_fifteen_minute_pass_checks_it() {
 /// B's connector rule.
 #[tokio::test]
 async fn the_assistant_refuses_another_tenants_rule_with_the_same_sentence() {
-    let app = app().await;
+    let (app, _ch) = app().await;
     let andi = session_cookie_for_seeded_user(&app.pool, "andi@meridian.example").await;
     let response = app
         .router
@@ -396,7 +402,7 @@ async fn record_delivery(app: &TestApp) {
 /// `routes::alerts::forget_state` is removed.
 #[tokio::test]
 async fn an_edit_that_changes_the_connector_drops_the_rules_last_delivery() {
-    let (app, after_insert) = app_with_connector_edits().await;
+    let (app, _ch, after_insert) = app_with_connector_edits().await;
     let bayu = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
     record_delivery(&app).await;
 
@@ -426,7 +432,7 @@ async fn an_edit_that_changes_the_connector_drops_the_rules_last_delivery() {
 /// rule still watches the same connector, and its "Last sent" still holds.
 #[tokio::test]
 async fn an_edit_of_the_name_alone_keeps_the_rules_last_delivery() {
-    let app = app().await;
+    let (app, _ch) = app().await;
     let bayu = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
     record_delivery(&app).await;
 
