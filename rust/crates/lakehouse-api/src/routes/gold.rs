@@ -101,6 +101,12 @@ impl From<GoldExportError> for ApiError {
             // not a 500: the fix is retrying with a smaller mart or a
             // deliberately raised cap, not anything server-side.
             | GoldExportError::RowCapExceeded { .. }
+            // DATA-6 D7: the target table is another mart's latest-copy
+            // table. It joins the same 422 group for the same reason: its
+            // `Display` is this repo's own fixed sentence (naming the
+            // mart, no upstream words), so the fix is renaming the mart,
+            // not anything server-side.
+            | GoldExportError::TargetIsLatestCopy { .. }
             // WS7 item D2: `err.to_string()` is safe here — the inner
             // string is already `policy_engine::enforcement_error_message`'s
             // own fixed, non-leaking text (`export_batch_sql` never wraps
@@ -501,13 +507,14 @@ pub async fn export(
         return Ok(ApiJson(body));
     }
 
-    // Held for the rest of this handler (dropped at function return,
-    // success or error alike) — see this function's "Single-flight" doc
+    // Held for the rest of this handler (dropped explicitly below, before
+    // the latest-copy launch — see this function's "Single-flight" doc
     // section above for why acquiring it is the very first thing done
-    // after validating the mart name. A `409` here records NO run (DATA-56):
-    // the publish that holds the lock records its own row, and a row written
-    // by the call it turned away would be newer and hide that result.
-    let _export_guard = state
+    // after validating the mart name. A `409` here records NO run
+    // (DATA-56): the publish that holds the lock records its own row, and
+    // a row written by the call it turned away would be newer and hide
+    // that result.
+    let export_guard = state
         .gold_export_locks
         .try_acquire(mart_ident.as_str())
         .await
@@ -586,6 +593,13 @@ pub async fn export(
 
     let result = export_result?;
 
+    // DATA-6 D6: a publish that wrote rows is followed by one
+    // `gold_latest_copy_job` run for this mart. The single-flight lock is
+    // released BEFORE the launch (the launch is a best-effort follow-up
+    // to a publish that already succeeded; the next publish must not
+    // queue behind an orchestrator round trip it does not need).
+    drop(export_guard);
+
     Ok(ApiJson(json!({
         "namespace": result.namespace,
         "table": result.table,
@@ -593,7 +607,42 @@ pub async fn export(
         "rowsExported": result.rows_exported,
         "snapshotId": result.snapshot_id,
         "exportedAt": result.exported_at_ms.and_then(millis_to_rfc3339),
+        // DATA-6 M2: the ONE stamp this publish wrote on every row, so
+        // "the rows of this publish" are addressable; microseconds are
+        // kept because two publishes can fall in one second.
+        "copyExportedAt": result
+            .copy_exported_at_micros
+            .and_then(crate::gold_latest_copy::micros_to_rfc3339),
+        "latestCopy": latest_copy_answer(&state, mart_ident.as_str(), &result).await,
     })))
+}
+
+/// The `latestCopy` field of [`export`]'s answer (D6, D13): the launched
+/// job's table name and status, or `null` when this publish wrote no
+/// copy (a zero-row publish — nothing to copy, and the field says so,
+/// rather than pretending a run was queued). The launch is best-effort:
+/// its own failure is recorded and answered as `"not_started"`, never
+/// propagated into the publish's answer.
+async fn latest_copy_answer(
+    state: &AppState,
+    mart: &str,
+    result: &gold_export::GoldExportResult,
+) -> Value {
+    let (true, Some(copy_micros)) = (result.rows_exported > 0, result.copy_exported_at_micros)
+    else {
+        return Value::Null;
+    };
+    let request = crate::gold_latest_copy::LatestCopyRequest {
+        mart,
+        table: &result.table,
+        copy_exported_at_micros: copy_micros,
+        rows: u64::try_from(result.rows_exported).unwrap_or(u64::MAX),
+    };
+    let status = crate::gold_latest_copy::launch(&state.dagster, &state.clickhouse, &request).await;
+    json!({
+        "table": format!("gold.{}", lakehouse_iceberg::gold::latest_table_name(&result.table)),
+        "status": status,
+    })
 }
 
 /// Best-effort history write for one finished export attempt: at most one row
@@ -1212,6 +1261,16 @@ async fn publication_body(
     let last_trim = gold_export_history::last_trim(&state.clickhouse, mart)
         .await
         .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    // DATA-6 D4: the latest-copy table's name, what it holds, and the
+    // newest run's outcome — the same classified-ClickHouse-failure shape
+    // as its neighbours (principle 4). `sanitize_mart_name` failing here
+    // is a 400 `invalid mart`, the same mapping `consumers` uses.
+    let sanitized_mart = lakehouse_iceberg::gold::sanitize_mart_name(mart)
+        .map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+    let (latest_holds, latest_run) =
+        crate::gold_latest_copy::latest_copy_state(&state.clickhouse, mart)
+            .await
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     Ok(json!({
         "mart": mart,
         "enabled": enabled,
@@ -1222,6 +1281,11 @@ async fn publication_body(
         "lastFailure": last_failure(newest_run.as_ref()),
         "canEdit": can_edit,
         "trim": last_trim,
+        "latestCopy": {
+            "table": format!("gold.{}", lakehouse_iceberg::gold::latest_table_name(&sanitized_mart)),
+            "holds": latest_holds,
+            "lastRun": latest_run,
+        },
     }))
 }
 
@@ -1855,8 +1919,35 @@ mod tests {
                 rows_exported: 1,
                 snapshot_id: Some(1),
                 exported_at_ms: Some(1_700_000_000_000),
+                copy_exported_at_micros: Some(1_700_000_000_123_456),
             }))
             .is_none()
+        );
+    }
+
+    /// `DATA-6` D7: a mart whose Iceberg table is another mart's
+    /// latest-copy table is refused with the fixed sentence, as a 422 —
+    /// the text names the mart and carries no upstream words (no catalog
+    /// address, no HTTP detail), so it is safe to answer as-is.
+    #[test]
+    fn a_latest_copy_target_answers_the_fixed_sentence_as_a_422() {
+        let err = ApiError::from(GoldExportError::TargetIsLatestCopy {
+            mart: "x_latest".to_owned(),
+        });
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let text = err.to_string();
+        assert!(
+            text.contains("x_latest"),
+            "the sentence names the mart: {text}"
+        );
+        assert!(text.contains("latest-copy table"), "{text}");
+        assert!(
+            !text.to_lowercase().contains("iceberg catalog"),
+            "no catalog address travels: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("http"),
+            "no HTTP detail travels: {text}"
         );
     }
 

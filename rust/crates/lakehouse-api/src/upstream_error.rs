@@ -565,6 +565,12 @@ pub fn ch_message_for_author(ctx: &Context, err: &ChError) -> String {
 /// the one for every cause this module does not name.
 pub const STATEMENT_FAILED_SENTENCE: &str = "The engine could not run this statement.";
 
+/// QS-11 (LH-QS-4-02), D6: the one sentence for a statement the parser cannot
+/// read. `ClickHouse` error code 62 and both policy-rewrite `Unparseable` paths
+/// use it, so a syntax error is never described as a policy or access-rule
+/// problem.
+pub const SYNTAX_SENTENCE: &str = "The statement could not be read: check its syntax.";
+
 /// The cause of a `ClickHouse` statement error, by the engine's own error
 /// code, as one fixed sentence (`QS-4` QA, 2026-11-05: History keeps a
 /// classified message, never the engine's text or a catalog name).
@@ -578,7 +584,7 @@ const fn clickhouse_statement_sentence(code: Option<u32>) -> &'static str {
     match code {
         Some(60 | 81) => "This query reads a table that does not exist or that you cannot read.",
         Some(47 | 16) => "This query names a column that does not exist.",
-        Some(62) => "The statement could not be read: check its syntax.",
+        Some(62) => SYNTAX_SENTENCE,
         Some(43 | 53 | 386) => "A value in this query has the wrong type.",
         Some(241) => "The query needed more memory than it is allowed.",
         _ => STATEMENT_FAILED_SENTENCE,
@@ -1099,7 +1105,13 @@ mod tests {
             api.to_string()
                 .starts_with("The database request failed. Reference: ")
         );
-        assert!(!api.to_string().contains("503"));
+        // The reference is random hex and can contain "503" by chance, so look
+        // for the upstream text only in the message that comes before it.
+        let shown = api.to_string();
+        let (message, _reference) = shown
+            .split_once("Reference: ")
+            .expect("a reference after the message");
+        assert!(!message.contains("503"), "{message}");
         let msg = ch_message_for_author(&DATABASE, &ChError::Cancelled);
         assert!(
             msg.starts_with("The database is unavailable. Reference: "),
@@ -1251,7 +1263,7 @@ mod tests {
             ),
             (47, "This query names a column that does not exist."),
             (16, "This query names a column that does not exist."),
-            (62, "The statement could not be read: check its syntax."),
+            (62, SYNTAX_SENTENCE),
             (43, "A value in this query has the wrong type."),
             (53, "A value in this query has the wrong type."),
             (386, "A value in this query has the wrong type."),
@@ -1401,7 +1413,14 @@ mod tests {
             failure.recorded
         );
         assert_eq!(failure.recorded, failure.response.to_string());
-        assert!(!failure.recorded.contains("503"));
+        // The reference is 10 random hex characters and can contain "503" by
+        // chance (about 0.2% of runs), so look for the upstream text only in
+        // the message that comes before it.
+        let (message, _reference) = failure
+            .recorded
+            .split_once("Reference: ")
+            .expect("a reference after the message");
+        assert!(!message.contains("503"), "{message}");
     }
 
     #[test]

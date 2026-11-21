@@ -28,7 +28,7 @@ import {
 import { useFormatSettings } from "./use-format-settings"
 import { KeyboardShortcutsDialog } from "./keyboard-shortcuts-dialog"
 import { QueryParameterFields } from "./query-parameter-fields"
-import type { useQueryStudio } from "./use-query-studio"
+import { SQL_PLACEHOLDER, type useQueryStudio } from "./use-query-studio"
 
 /** What the keyword case is called in the settings control. */
 const KEYWORD_CASE_LABELS: Record<KeywordCase, string> = {
@@ -93,6 +93,7 @@ export function SqlPanel({
     estimateSupported,
     runnable,
     targetStatement,
+    batchRefusal,
     runQuery,
     runSelectionOrAll,
     reEstimate,
@@ -134,6 +135,7 @@ export function SqlPanel({
       <SqlEditor
         value={sql}
         onChange={setSql}
+        placeholder={SQL_PLACEHOLDER}
         extensions={editorExtensions}
         onView={(view) => studio.setEditorView(view)}
         labelledBy="query-sql-label"
@@ -315,6 +317,13 @@ export function SqlPanel({
           ⌘/Ctrl+Enter to run
         </span>
       </div>
+      {/* QS-11 (LH-QS-1-12), D9: a batch over the limit is refused here, in
+          the page, not in a toast that disappears before it is read. */}
+      {batchRefusal ? (
+        <p role="alert" className="text-sm text-destructive">
+          {batchRefusal}
+        </p>
+      ) : null}
     </div>
   )
 }
