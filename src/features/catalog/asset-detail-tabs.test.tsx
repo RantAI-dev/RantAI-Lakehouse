@@ -1970,7 +1970,7 @@ describe("Sample tab: the data preview", () => {
       await openPreview({ profile: { supported: false, reason: "this table's engine cannot be profiled" } })
 
       fireEvent.click(within(headerOf("amount")).getByRole("button", { name: "amount" }))
-      expect(await within(inspector() as HTMLElement).findByText(/No column statistics: this table's engine cannot be profiled/)).toBeTruthy()
+      expect(await within(inspector() as HTMLElement).findByRole("button", { name: /this table's engine cannot be profiled/ })).toBeTruthy()
     })
 
     it("says in words when the profile failed to load, with a way to try again", async () => {
