@@ -365,12 +365,33 @@ pub async fn update(
     Ok(ApiJson(json!({ "ok": true, "source": source })))
 }
 
-/// `DELETE /api/dashboard/sources?id=` — tombstone a source nobody uses.
+/// The 409 sentence for a source that is still used (`BI-67`). `charts` are
+/// the ids of the charts the caller may see; `hidden_charts` says charts use
+/// the source but none of them is the caller's to see (named only as "a
+/// dashboard you cannot see"); `metrics` are metric names.
+fn in_use_message(charts: &[&str], hidden_charts: bool, metrics: &[&str]) -> String {
+    let mut users = Vec::new();
+    if !charts.is_empty() {
+        users.push(format!("{} chart(s): {}", charts.len(), charts.join(", ")));
+    } else if hidden_charts {
+        users.push("a dashboard you cannot see".to_owned());
+    }
+    if !metrics.is_empty() {
+        users.push(format!(
+            "{} metric(s): {}",
+            metrics.len(),
+            metrics.join(", ")
+        ));
+    }
+    format!("SQL source is still used by {}.", users.join(" and "))
+}
+
+/// `DELETE /api/dashboard/sources?id=` — tombstone a source no chart or metric uses.
 ///
 /// # Errors
 ///
-/// 400 without an id, 404 for an unknown one, 409 (naming the charts) while
-/// any chart still reads it, 422/503 on a `ClickHouse` failure.
+/// 400 without an id, 404 for an unknown one, 409 (naming the charts and
+/// metrics) while any chart or metric still reads it, 422/503 on a `ClickHouse` failure.
 pub async fn delete(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -392,21 +413,28 @@ pub async fn delete(
     let all = store::list_stored_charts(ch, &lakehouse_bi::access::Viewer::system())
         .await
         .map_err(|err| classify_ch_error(&err))?;
-    if !sources::charts_using_source(&all, &id).is_empty() {
-        // BI-19 B1 review R3: the resolved viewer, not the baseline.
-        let viewer = crate::routes::dashboard_access::usage_viewer_of(&state, &principal).await?;
-        let mine = store::list_stored_charts(ch, &viewer)
-            .await
-            .map_err(|err| classify_ch_error(&err))?;
-        let users = sources::charts_using_source(&mine, &id);
-        let message = if users.is_empty() {
-            "SQL source is still used by a dashboard you cannot see.".to_owned()
+    // `BI-67`: a metric over the source blocks the delete too. A metric over a
+    // deleted source cannot be evaluated (its alerts would fail), and metrics
+    // are the deployment's, not a person's, so they are named whoever asks. A
+    // metric list that cannot be read refuses the delete: nothing can be shown
+    // to be unused.
+    let all_metrics = lakehouse_bi::metrics::list_metrics(ch)
+        .await
+        .map_err(|err| classify_ch_error(&err))?;
+    let metric_users = sources::metrics_using_source(&all_metrics, &id);
+    let chart_blocked = !sources::charts_using_source(&all, &id).is_empty();
+    if chart_blocked || !metric_users.is_empty() {
+        let message = if chart_blocked {
+            // BI-19 B1 review R3: the resolved viewer, not the baseline.
+            let viewer =
+                crate::routes::dashboard_access::usage_viewer_of(&state, &principal).await?;
+            let mine = store::list_stored_charts(ch, &viewer)
+                .await
+                .map_err(|err| classify_ch_error(&err))?;
+            let users = sources::charts_using_source(&mine, &id);
+            in_use_message(&users, users.is_empty(), &metric_users)
         } else {
-            format!(
-                "SQL source is still used by {} chart(s): {}",
-                users.len(),
-                users.join(", ")
-            )
+            in_use_message(&[], false, &metric_users)
         };
         return Err(ApiError::Conflict(message).into());
     }

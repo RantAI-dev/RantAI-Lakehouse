@@ -3452,7 +3452,7 @@ mod alert_run_tenant_scope {
         assert_eq!(results.len(), 2, "both rules were evaluated: {results:?}");
         for result in &results {
             assert_eq!(
-                result["skipped"], JOB_NEEDS_CATALOG_TENANT,
+                result["failed"], JOB_NEEDS_CATALOG_TENANT,
                 "the refusal is D6's own sentence: {result}"
             );
             assert_eq!(result["fired"], false, "{result}");

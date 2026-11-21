@@ -1762,6 +1762,95 @@ async fn a_sql_source_used_by_a_private_chart_cannot_be_deleted_and_the_chart_is
     );
 }
 
+/// A stored metric row over `source_id`, as `console.bi_metric` returns it.
+fn metric_row(name: &str, source_kind: &str, source_id: &str) -> Value {
+    json!({
+        "id": format!("m_{name}"), "name": name, "label": name, "description": "",
+        "source_kind": source_kind, "source_id": source_id, "formula": "count()",
+        "filters_json": "[]", "time_column": "", "grain": "", "format": "",
+        "created_by": "", "updated_at": "",
+    })
+}
+
+/// The stored SQL source `s_1`, as `console.bi_source` returns it.
+fn source_row() -> Value {
+    json!({
+        "id": "s_1", "title": "src", "sql": "SELECT 1", "columns_json": "[]",
+        "folder_id": "", "created_by": "t", "updated_at": "2026-10-14 00:00:00",
+    })
+}
+
+/// `BI-67`: a SQL source a metric reads cannot be deleted, like one a chart
+/// reads; the metric is named and nothing is written.
+#[tokio::test]
+async fn a_sql_source_used_only_by_a_metric_cannot_be_deleted_and_the_metric_is_named() {
+    let server = engine(vec![
+        (&["FROM console.bi_source FINAL"], vec![source_row()]),
+        (
+            &["FROM console.bi_metric FINAL"],
+            vec![
+                metric_row("orphaned", "sql_source", "s_1"),
+                metric_row("elsewhere", "sql_source", "s_2"),
+            ],
+        ),
+    ])
+    .await;
+    let outcome = super::super::dashboard_sources::delete(
+        State(state_for(&server)),
+        Extension(person(ME, "dashboard:read, dashboard:write")),
+        Query(serde_json::from_value(json!({ "id": "s_1" })).unwrap()),
+    )
+    .await;
+    let response = axum::response::IntoResponse::into_response(match outcome {
+        Err(rejection) => rejection,
+        Ok(_) => panic!("a source used by a metric must not be deleted"),
+    });
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    let body = text_of(response).await;
+    let message = body["error"].as_str().unwrap();
+    assert_eq!(
+        message,
+        "SQL source is still used by 1 metric(s): orphaned."
+    );
+    assert!(
+        writes(&server).await.is_empty(),
+        "{:?}",
+        writes(&server).await
+    );
+}
+
+/// `BI-67`: a source no chart or metric uses is deleted; a metric over another
+/// source or over a mart of the same name does not hold it.
+#[tokio::test]
+async fn a_sql_source_no_metric_uses_is_still_deleted() {
+    let server = engine(vec![
+        (&["FROM console.bi_source FINAL"], vec![source_row()]),
+        (
+            &["FROM console.bi_metric FINAL"],
+            vec![
+                metric_row("elsewhere", "sql_source", "s_2"),
+                metric_row("mart_one", "mart", "s_1"),
+            ],
+        ),
+    ])
+    .await;
+    let outcome = super::super::dashboard_sources::delete(
+        State(state_for(&server)),
+        Extension(person(ME, "dashboard:read, dashboard:write")),
+        Query(serde_json::from_value(json!({ "id": "s_1" })).unwrap()),
+    )
+    .await;
+    assert!(outcome.is_ok(), "an unused source is deleted");
+    assert!(
+        writes(&server)
+            .await
+            .iter()
+            .any(|w| w.contains("console.bi_source") && w.contains("is_deleted")),
+        "{:?}",
+        writes(&server).await
+    );
+}
+
 // ── BI-18 part C review fix (BLOCKER) R1: no tile is left naming no tab ──
 
 const T_A: &str = r#"{"id":"t_a","title":"A"}"#;

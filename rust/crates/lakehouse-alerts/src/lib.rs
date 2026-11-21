@@ -2003,8 +2003,9 @@ async fn current_value(
 /// viewer role — `BI-39` D1, D4).
 ///
 /// Every way this can fail is a fixed sentence and the rule is recorded as
-/// skipped with it, so a rule whose metric is gone or cannot be evaluated is
-/// neither fired nor silently treated as fine, and no engine text is kept.
+/// failed with it (`BI-67`: reported as `failed`, not `skipped`), so a rule
+/// whose metric is gone or cannot be evaluated is neither fired nor silently
+/// treated as fine, and no engine text is kept.
 /// The statement a metric rule's check runs — the ONE builder the run and
 /// the rule save share (`SEC-50` slice 2 D7a: extracted from `metric_value`,
 /// never copied). It resolves the metric through the very builder path a KPI
@@ -2130,8 +2131,9 @@ pub async fn statement_for_input(
 /// saved before owners existed (`BI-39` D1, D4).
 ///
 /// Every way this can fail is a fixed sentence and the rule is recorded as
-/// skipped with it, so a rule whose metric is gone or cannot be evaluated is
-/// neither fired nor silently treated as fine, and no engine text is kept.
+/// failed with it (`BI-67`: reported as `failed`, not `skipped`), so a rule
+/// whose metric is gone or cannot be evaluated is neither fired nor silently
+/// treated as fine, and no engine text is kept.
 async fn metric_value(
     ch: &ChClient,
     gate: &dyn SqlGate,
@@ -2285,9 +2287,17 @@ pub struct RunResult {
     /// The delivery outcome, when a delivery was attempted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivered: Option<DeliverResult>,
-    /// Why this rule was skipped, if evaluating it failed.
+    /// Why this rule was deliberately not evaluated this check (no state, the
+    /// owner is disabled, not due, handled by another runner, ...). Distinct
+    /// from [`RunResult::failed`]: a skip is a choice, nothing is wrong.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
+    /// `BI-67`: why the rule could not be evaluated although it should have
+    /// been: the read or the statement failed (the metric's source is gone,
+    /// the governance gate refused it, the engine was down). The failure is
+    /// also recorded in the rule's state. Never set together with `skipped`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
     /// `BI-19` part C (D11): the value is back under the line and the recovery
     /// message was sent (or was silenced). `fired` is then `false`: it means a
     /// crossing was sent this check, not that the value is over the line.
@@ -3317,7 +3327,9 @@ pub async fn settle(
             if let Some(state) = state {
                 state.record_failed(&rule.id, &reason).await;
             }
-            return skipped(rule, reason);
+            // `BI-67`: the rule should have run and could not, so it reports
+            // `failed`, not `skipped` (a skip is a deliberate non-evaluation).
+            return failed(rule, reason);
         }
     };
     let Some(state) = state else {
@@ -3348,6 +3360,7 @@ pub async fn settle(
             value: Some(reading.value),
             delivered: None,
             skipped: None,
+            failed: None,
             recovered: false,
         };
     };
@@ -3376,6 +3389,7 @@ pub async fn settle(
         value: Some(reading.value),
         delivered,
         skipped: None,
+        failed: None,
         recovered: sending == Sending::Recovered,
     }
 }
@@ -3500,6 +3514,7 @@ async fn send_digest(
                 value: None,
                 delivered,
                 skipped: None,
+                failed: None,
                 recovered: false,
             }
         }
@@ -3565,6 +3580,7 @@ async fn run_freshness(
             value: Some(age_minutes),
             delivered: None,
             skipped: None,
+            failed: None,
             recovered: false,
         };
     }
@@ -3581,6 +3597,7 @@ async fn run_freshness(
         value: Some(age_minutes),
         delivered,
         skipped: None,
+        failed: None,
         recovered: false,
     }
 }
@@ -3594,6 +3611,23 @@ fn skipped(rule: &AlertRule, reason: String) -> RunResult {
         value: None,
         delivered: None,
         skipped: Some(reason),
+        failed: None,
+        recovered: false,
+    }
+}
+
+/// A rule that should have been evaluated and could not be (`BI-67`): the
+/// reading failed. `skipped` stays for deliberate non-evaluations.
+fn failed(rule: &AlertRule, reason: String) -> RunResult {
+    RunResult {
+        id: rule.id.clone(),
+        name: rule.name.clone(),
+        kind: rule.kind,
+        fired: false,
+        value: None,
+        delivered: None,
+        skipped: None,
+        failed: Some(reason),
         recovered: false,
     }
 }
@@ -3933,7 +3967,9 @@ mod tests {
 
         let result = run_one(&ch, &http, &email, None, (None, Some(&state)), &gate, &rule).await;
 
-        assert_eq!(result.skipped.as_deref(), Some(REFUSED));
+        // `BI-67`: a refusal means the rule could not be evaluated, so it is `failed`.
+        assert_eq!(result.failed.as_deref(), Some(REFUSED));
+        assert_eq!(result.skipped, None);
         assert_eq!(
             state.states.lock().unwrap()["al_1"],
             AlertState::Firing,
@@ -5444,11 +5480,55 @@ mod tests {
         }
     }
 
+    /// `BI-67`: a metric over a SQL source that was deleted could not be
+    /// evaluated, so the run says `failed` with the source sentence, not
+    /// `skipped`, and the rule never fires.
+    #[tokio::test]
+    async fn a_metric_whose_sql_source_is_gone_reports_failed_with_the_source_sentence() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The metric exists and names a SQL source; every other statement
+        // (the table setup, the source lookup) answers with no rows.
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.bi_metric"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [],
+                "data": [{
+                    "id": "m_1", "name": "orphaned", "label": "Orphaned",
+                    "description": "", "source_kind": "sql_source",
+                    "source_id": "src_gone", "formula": "count()",
+                    "filters_json": "[]", "time_column": "", "grain": "",
+                    "format": "", "created_by": "", "updated_at": "",
+                }],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "data": [], "rows": 0,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let http = WebhookSender::new(std::sync::Arc::new(RefuseAll));
+        let email = no_smtp_email_sender();
+        let rule = metric_rule("orphaned", AlertOp::Gt, 0.0);
+        let result = run_one(&ch, &http, &email, None, (None, None), &RewriteGate, &rule).await;
+        assert!(!result.fired);
+        assert_eq!(
+            result.failed.as_deref(),
+            Some("the metric's source is not available.")
+        );
+        assert_eq!(result.skipped, None);
+    }
+
     /// A metric that does not exist (or whose store cannot be read) makes the
     /// rule's evaluation fail with a fixed reason: it is neither fired nor
     /// reported as a value that did not breach.
     #[tokio::test]
-    async fn a_metric_that_is_gone_makes_the_rule_skip_with_a_fixed_reason_and_never_fire() {
+    async fn a_metric_that_is_gone_makes_the_rule_fail_with_a_fixed_reason_and_never_fire() {
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         Mock::given(wiremock::matchers::any())
@@ -5464,10 +5544,12 @@ mod tests {
         let result = run_one(&ch, &http, &email, None, (None, None), &RewriteGate, &rule).await;
         assert!(!result.fired);
         assert_eq!(result.value, None);
+        // `BI-67`: a metric whose source is gone could not be evaluated: `failed`, not `skipped`.
         assert_eq!(
-            result.skipped.as_deref(),
+            result.failed.as_deref(),
             Some("the metric no longer exists.")
         );
+        assert_eq!(result.skipped, None);
         // A store that cannot be read says so, without any engine text.
         let down = ChClient::new(
             "http://127.0.0.1:1".to_owned(),
@@ -5486,9 +5568,10 @@ mod tests {
         .await;
         assert!(!result.fired);
         assert_eq!(
-            result.skipped.as_deref(),
+            result.failed.as_deref(),
             Some("the metric could not be read.")
         );
+        assert_eq!(result.skipped, None);
     }
 
     struct PassGate;
@@ -5571,10 +5654,10 @@ mod tests {
         )
         .await;
         eprintln!(
-            "RULE no_such_metric_here -> fired {} skipped {:?}",
-            r.fired, r.skipped
+            "RULE no_such_metric_here -> fired {} failed {:?}",
+            r.fired, r.failed
         );
-        assert!(!r.fired && r.skipped.as_deref() == Some("the metric no longer exists."));
+        assert!(!r.fired && r.failed.as_deref() == Some("the metric no longer exists."));
     }
 
     // ── SRC-7: connector and upload kinds ───────────────────────────────
@@ -7109,7 +7192,8 @@ mod tests {
             &rule,
         )
         .await;
-        assert_eq!(r.skipped.as_deref(), Some("the value could not be read."));
+        assert_eq!(r.failed.as_deref(), Some("the value could not be read."));
+        assert_eq!(r.skipped, None);
         assert!(!r.fired && !r.recovered);
         assert_eq!(state.states.lock().unwrap()["al_1"], AlertState::Firing);
         assert_eq!(
