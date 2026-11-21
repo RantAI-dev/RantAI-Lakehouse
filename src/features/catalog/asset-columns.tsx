@@ -933,3 +933,64 @@ export function ColumnsCard({
     </SectionCard>
   )
 }
+
+/**
+ * The Overview's columns (`UX-8`, mockup A: the Overview reads like a
+ * readme): the first `count` columns in table order, each with its value
+ * profile, drawn with the very rows of the Columns tab — so a column opens
+ * the same way here — but without the tab's filter, page size and views.
+ * The tab has them, and the rest of the columns.
+ */
+export function ColumnsPreview({
+  rows,
+  profile,
+  sortingKey,
+  count,
+}: {
+  rows: SchemaRow[]
+  profile: ProfileState
+  sortingKey?: string | null
+  count: number
+}) {
+  const showStats = profile.kind === "ready" || profile.kind === "loading"
+  const [open, setOpen] = React.useState<ReadonlySet<string>>(() => new Set())
+  const toggle = (name: string) =>
+    setOpen((prev) => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
+    })
+  const sortKeys = sortKeyColumns(
+    sortingKey,
+    rows.map((r) => r.column.name)
+  )
+  if (rows.length === 0) return <p className="text-sm text-muted-foreground">No columns registered.</p>
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="@container overflow-hidden rounded-lg border border-border">
+        <div role="table" aria-label="Columns">
+          <div role="rowgroup">
+            <ColumnHeader showStats={showStats} />
+          </div>
+          <div role="rowgroup">
+            {rows.slice(0, count).map((row) => (
+              <ColumnRow
+                key={row.column.name}
+                row={row}
+                state={profile}
+                showStats={showStats}
+                sortKey={sortKeys.has(row.column.name)}
+                open={open.has(row.column.name)}
+                onToggle={() => toggle(row.column.name)}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        <ProfileNote state={profile} />
+      </p>
+    </div>
+  )
+}

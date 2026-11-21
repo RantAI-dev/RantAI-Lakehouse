@@ -1,18 +1,8 @@
 "use client"
 
 import * as React from "react"
-import Link from "next/link"
 import { useParams } from "next/navigation"
-import { EntityHeader } from "@/components/patterns/page-header"
-import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
-import { MetadataList } from "@/components/patterns/metadata-list"
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import {
-  CertificationBadge,
-  ClassificationBadge,
-  HealthBadge,
-  TierBadge,
-} from "@/components/patterns/status-badge"
+import { ErrorState } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -35,22 +25,13 @@ import { Textarea } from "@/components/ui/textarea"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { requestableAccessPermissions } from "@/lib/access-requests"
-import { formatBytes, formatCompactNumber, formatRelativeTime } from "@/lib/format"
-import { fmtMeasured } from "@/lib/measured"
-import { DATA_LAYER_LABEL, ENGINE_CATEGORY_LABEL } from "@/lib/status"
 import { assetService } from "@/services"
-import {
-  ASSET_TYPE_LABEL,
-  type AssetDetail,
-  type RequestAccessInput,
-} from "@/services/contracts/assets"
-import { classificationTitle, healthTitle, layerTitle, tierTitle } from "./asset-badges"
-import { CertificationAction, DeprecationNotice } from "./asset-certification"
+import type { AssetDetail, RequestAccessInput } from "@/services/contracts/assets"
 import { AssetDetailTabsView } from "./asset-detail-tabs"
+import { AssetHeader, AssetPageSkeleton, TrustStrip } from "./asset-header"
 import { useIcebergTable } from "./asset-storage"
 import type { MeaningState } from "./asset-meaning"
 import { useMeanings } from "./asset-column-data"
-import { MeaningBadge } from "./asset-meaning-view"
 
 /**
  * Candidate permissions the "Request access" dialog offers. Not every
@@ -65,7 +46,11 @@ import { MeaningBadge } from "./asset-meaning-view"
  */
 const REQUESTABLE_PERMISSIONS = ["catalog:write", "lineage:read", "query:read"] as const
 
-/** Asset detail with schema, freshness, lineage hops, policies, and snapshots. */
+/**
+ * An asset's page (`UX-8`, mockup A): the header with its ⋯ and Query, one
+ * strip of trust facts, then the tabs, with an Overview that reads like a
+ * readme.
+ */
 export function AssetDetailPage() {
   const params = useParams<{ assetId: string }>()
   // WEB-3 S3-D1: a column's sensitivity and masks change from inside the
@@ -111,41 +96,20 @@ export function AssetDetailPage() {
     if (ok !== null) setSubmitted(true)
   }
 
-  if (state.status === "loading") return <LoadingSkeleton rows={8} />
+  if (state.status === "loading") return <AssetPageSkeleton />
   if (state.status === "error")
     return <ErrorState error={state.error} onRetry={state.reload} />
   const a = state.data
 
   return (
-    <div className="flex flex-col gap-3">
-      <EntityHeader
-        className="pb-3"
-        eyebrow={<Link href="/catalog" className="hover:underline">Catalog</Link>}
-        title={a.name}
-        titleAccessory={
-          <>
-            <CertificationBadge certification={a.certification} />
-            <TierBadge tier={a.tier} title={tierTitle(a)} />
-            <ClassificationBadge
-              classification={a.classification}
-              title={classificationTitle(a)}
-            />
-            <HealthBadge health={a.health} title={healthTitle(a)} />
-            {hasPermission("governance:write") ? (
-              <CertificationAction asset={a} onChanged={state.reload} />
-            ) : null}
-            <MeaningBadge state={meanings} columns={a.schema.map((c) => c.name)} />
-            {missingPermissions.length > 0 ? (
-              <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
-                Request access
-              </Button>
-            ) : null}
-          </>
-        }
-        description={a.description}
+    <div className="flex flex-col gap-4">
+      <AssetBody
+        asset={a}
+        meanings={meanings}
+        missingPermissions={missingPermissions}
+        onRequestAccess={() => setOpen(true)}
+        onAssetChanged={state.reload}
       />
-      <DeprecationNotice asset={a} replacementHidden={a.shownWithTableGrant === true} />
-      <AssetFacts asset={a} meanings={meanings} onAssetChanged={state.reload} />
 
       <Dialog open={open} onOpenChange={(next) => (next ? setOpen(true) : closeDialog())}>
         <DialogContent className="sm:max-w-md">
@@ -216,67 +180,42 @@ export function AssetDetailPage() {
 }
 
 /**
- * The fact list and the tabs, which share one read of the asset's Iceberg
- * table: the header needs it for the row count and the tabs for their own
- * parts, and a second read would be a second answer (`DATA-54`).
+ * The header, the trust strip and the tabs, which share one read of the
+ * asset's Iceberg table: the header needs it for the Query link and the
+ * Drop table item, the tabs for their own parts, and a second read would be
+ * a second answer (`DATA-54`).
+ *
+ * `UX-8` (mockup A): the facts strip that sat here (namespace, type, layer,
+ * format, engine, rows, size, owner, residency, freshness, updated) is gone;
+ * each fact is said once — the address, layer and type in the header,
+ * freshness and updated in the trust strip, the rest in the Overview's
+ * Details.
  */
-function AssetFacts({
+function AssetBody({
   asset: a,
   meanings,
+  missingPermissions,
+  onRequestAccess,
   onAssetChanged,
 }: {
   asset: AssetDetail
   meanings: MeaningState
+  missingPermissions: readonly string[]
+  onRequestAccess: () => void
   onAssetChanged: () => void
 }) {
   const iceberg = useIcebergTable(a)
-  // QA `LH-DATA-15-07` F2 (`DATA-54`): the count is the registry's, and a
-  // table that is gone has no rows to count. Any other failure of the read
-  // keeps the count: it does not prove the table is gone.
-  const tableGone = iceberg.status === "error" && iceberg.error.code === "not_found"
   return (
     <>
-      <MetadataList
-        density="compact"
-        columns={3}
-        items={[
-          { label: "Namespace", value: <span className="font-mono text-xs">{a.namespace}</span> },
-          { label: "Type", value: ASSET_TYPE_LABEL[a.type] },
-          {
-            label: "Layer",
-            value: <span title={layerTitle(a)}>{DATA_LAYER_LABEL[a.layer]}</span>,
-          },
-          { label: "Format", value: a.format },
-          { label: "Engine", value: ENGINE_CATEGORY_LABEL[a.engine] },
-          {
-            label: "Rows",
-            value: tableGone ? (
-              <span title="No Iceberg table for this asset: the count the registry recorded is not shown.">
-                —
-              </span>
-            ) : (
-              fmtMeasured(a.rows, formatCompactNumber)
-            ),
-          },
-          { label: "Size", value: fmtMeasured(a.sizeBytes, formatBytes) },
-          { label: "Owner", value: a.owner },
-          { label: "Residency", value: a.residency },
-          {
-            label: "Freshness",
-            value: (
-              <FreshnessIndicator
-                lagSeconds={a.freshnessLagSeconds}
-                targetSeconds={a.freshnessTargetSeconds ?? null}
-                targetSource={a.freshnessTargetSource}
-              />
-            ),
-          },
-          {
-            label: "Updated",
-            value: a.lastUpdated === null ? "—" : formatRelativeTime(a.lastUpdated),
-          },
-        ]}
+      <AssetHeader
+        asset={a}
+        iceberg={iceberg}
+        meanings={meanings}
+        missingPermissions={missingPermissions}
+        onRequestAccess={onRequestAccess}
+        onChanged={onAssetChanged}
       />
+      <TrustStrip asset={a} />
       <AssetDetailTabsView
         asset={a}
         iceberg={iceberg}

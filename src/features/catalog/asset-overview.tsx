@@ -1,19 +1,11 @@
 "use client"
 
+import * as React from "react"
 import Link from "next/link"
-import { Copy } from "lucide-react"
+import { Copy, Play } from "lucide-react"
 import { CodeBlock } from "@/components/patterns/code-block"
-import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
-import { HealthTile } from "@/components/patterns/health-tile"
-import { EmptyState } from "@/components/patterns/page-states"
-import { SectionCard } from "@/components/patterns/section-card"
-import {
-  CheckBadge,
-  ClassificationBadge,
-  HealthBadge,
-  Pill,
-} from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
+import { useAuth } from "@/features/auth/auth-provider"
 import { formatRelativeTime } from "@/lib/format"
 import {
   assetHasReadableTable,
@@ -23,25 +15,15 @@ import {
   NO_READABLE_TABLE,
 } from "@/lib/asset-query"
 import { copyTextWithToast } from "@/lib/copy-text"
-import { isIcebergCandidate, snapshotRelativeTime } from "@/lib/lakehouse-view"
-import { cn } from "@/lib/utils"
+import { snapshotRelativeTime } from "@/lib/lakehouse-view"
 import type { AssetColumn, AssetDetail } from "@/services/contracts/assets"
-import { AssetAbout } from "./asset-about"
-import { NO_HEALTH_SIGNAL } from "./asset-badges"
-import {
-  assetDependents,
-  lineageSides,
-  relatedTables,
-  type AssetLineageState,
-} from "./asset-lineage"
-import { OpenFormatCard } from "./open-format-card"
+import { AssetDetails } from "./asset-about"
+import { schemaRows, useProfile } from "./asset-column-data"
+import { ColumnsPreview } from "./asset-columns"
+import type { AssetLineageState } from "./asset-lineage"
+import { LineageShortList } from "./asset-lineage-strip"
+import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { TableGrantNote } from "./table-grant-note"
-import {
-  AssetStorage,
-  ClickHouseStorage,
-  icebergTableOf,
-  type IcebergTableState,
-} from "./asset-storage"
 
 /** Tabs the overview can jump to; must match the `value`s in `AssetDetailTabs`. */
 export type AssetTab =
@@ -52,9 +34,6 @@ export type AssetTab =
   | "access"
   | "lineage"
   | "activity"
-
-/** How many recent changes the overview shows before pointing at History. */
-const RECENT_CHANGES = 3
 
 /**
  * A column a reader should know is sensitive before they query it: masked
@@ -85,10 +64,56 @@ export function qualitySummary(checks: AssetDetail["qualityChecks"]) {
   return { passed, warning, failed, evaluated, unevaluated: checks.length - evaluated, lastRun }
 }
 
+/** How many columns the Overview shows before pointing at the Columns tab. */
+const PREVIEW_COLUMNS = 6
+
 /**
- * The first tab of an asset: can I trust this data, who is it for, and how
- * do I start using it — answered from `AssetDetail` alone, with each
- * section pointing at the tab that holds the full story.
+ * The sensitive columns in one line (`UX-8`): each name with why it is
+ * sensitive. The rows above carry the same marks inline, so this is the
+ * summary, not a second list.
+ */
+export function sensitiveLine(columns: AssetColumn[]): string {
+  const sensitive = columns.filter(isSensitive)
+  if (sensitive.length === 0) return "No sensitive columns · nothing masked for you"
+  const why = (c: AssetColumn) =>
+    [c.masked ? "masked" : null, c.classification === "confidential" || c.classification === "restricted" ? c.classification : null]
+      .filter(Boolean)
+      .join(", ")
+  return `${sensitive.length} sensitive column${sensitive.length === 1 ? "" : "s"}: ${sensitive
+    .map((c) => `${c.name} (${why(c)})`)
+    .join(" · ")}`
+}
+
+/** A section of the Overview: its title, an optional action on the right, and its body. */
+function Section({
+  title,
+  action,
+  children,
+}: {
+  title: string
+  action?: React.ReactNode
+  children: React.ReactNode
+}) {
+  return (
+    <section aria-label={title} className="flex min-w-0 flex-col gap-2">
+      <div className="flex min-h-7 items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold">{title}</h2>
+        {action}
+      </div>
+      {children}
+    </section>
+  )
+}
+
+/**
+ * The first tab of an asset, read like a readme (`UX-8`, mockup A): its
+ * real columns with what they hold, the query to start from, then on the
+ * side the details and where it comes from and goes.
+ *
+ * What the old Overview's tiles and cards said is said once, elsewhere:
+ * health in the header, freshness, quality and access in the trust strip
+ * above the tabs, storage on the Activity tab, publishing in the ⋯ menu,
+ * the connections on the Lineage tab and the changes on the Activity tab.
  */
 export function AssetOverview({
   asset: a,
@@ -101,35 +126,26 @@ export function AssetOverview({
   iceberg: IcebergTableState
   lineage: AssetLineageState
   onNavigate: (tab: AssetTab) => void
-  /** Reloads the asset after its details were edited. */
+  /** Reloads the asset after its sensitivity was set. */
   onAssetChanged: () => void
 }) {
-  // The same recorded graph the Lineage tab draws, so the two never disagree.
-  const graph = lineage.status === "success" ? lineage.data : null
-  const sides = lineageSides(graph)
-  const connections = [
-    ["Upstream", sides.upstream.length],
-    ["Downstream", sides.downstream.length],
-    ["Dependents", assetDependents(a, graph).length],
-    ["Related tables", relatedTables(a, graph).length],
-  ] as const
-  // "Related tables" is the rare case; without one it is a row of noise.
-  const shownConnections = connections.filter(([label, n]) => label !== "Related tables" || n > 0)
+  const profile = useProfile(a.id)
+  const { hasPermission } = useAuth()
   // The Iceberg table, once loaded. It is what proves the table exists, so
   // the links below open Trino only when it is there (owner, 2026-11-08).
   const table = icebergTableOf(iceberg)
   // Whether this asset has a table the console can read at all. Without one
   // the starter query and the Query Studio link would name a table that is
-  // not there, so the card says so instead (owner, 2026-11-09). While the
+  // not there, so the section says so instead (owner, 2026-11-09). While the
   // Iceberg read is still running the asset is given the benefit of the
   // doubt: the sentence waits for the answer.
   const readable = assetHasReadableTable(a, table, iceberg.status === "loading")
-  // An Iceberg table's own snapshots, once loaded; the API's list otherwise.
-  const snapshotCount = table?.snapshots.length ?? a.snapshots.length
-  const quality = qualitySummary(a.qualityChecks)
-  const sensitive = a.schema.filter(isSensitive)
-  const maskedCount = a.schema.filter((c) => c.masked).length
-  const healthReasons = a.healthReasons ?? []
+  const canRun = hasPermission("query:read")
+  // QA `LH-DATA-15-07` F2 (`DATA-54`): the count is the registry's, and a
+  // table that is gone has no rows to count. Any other failure of the read
+  // keeps the count: it does not prove the table is gone.
+  const rowsGone = iceberg.status === "error" && iceberg.error.code === "not_found"
+  const { rows } = schemaRows(a.schema, table, a.type !== "iceberg-table")
   // The Iceberg table's current schema version, once loaded; the API's
   // own list otherwise — for a Silver or Gold table, the version the console
   // recorded. That one is dated when the console saw it, so it says
@@ -142,224 +158,69 @@ export function AssetOverview({
     : latestSchema
       ? `v${latestSchema.version} · recorded ${formatRelativeTime(latestSchema.at)}`
       : null
-  const recentChanges = a.changeHistory.slice(0, RECENT_CHANGES)
   const sql = assetStarterSql(a, table)
+  const engine = assetStudioTarget(a, table).engine === "trino" ? "Trino" : "ClickHouse"
 
   return (
-    <div className="flex flex-col gap-2">
-      {/* ── Can I trust it? ─────────────────────────────────────────── */}
-      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-        <HealthTile
-          label="Health"
-          hint={
-            // What the status rests on, signal by signal — or that there
-            // is nothing to judge it by.
-            healthReasons.length === 0 ? (
-              NO_HEALTH_SIGNAL
-            ) : (
-              <span className="flex flex-col gap-0.5">
-                {healthReasons.map((reason) => (
-                  <span key={reason}>{reason}</span>
-                ))}
-              </span>
-            )
-          }
-        >
-          <HealthBadge health={a.health} />
-        </HealthTile>
-        <HealthTile
-          label="Freshness"
-          hint={
-            snapshotCount > 0
-              ? `${snapshotCount} snapshot${snapshotCount === 1 ? "" : "s"}`
-              : undefined
-          }
-          onClick={() => onNavigate("activity")}
-        >
-          <FreshnessIndicator
-            lagSeconds={a.freshnessLagSeconds}
-            targetSeconds={a.freshnessTargetSeconds ?? null}
-            targetSource={a.freshnessTargetSource}
-          />
-        </HealthTile>
-        <HealthTile
-          label="Quality"
-          hint={
-            a.qualityChecks.length === 0
-              ? "No checks configured"
-              : quality.lastRun === null
-                ? "Not evaluated yet"
-                : `Last run ${formatRelativeTime(quality.lastRun)}`
-          }
-          onClick={() => onNavigate("quality")}
-        >
-          {a.qualityChecks.length === 0 ? (
-            <span className="text-muted-foreground">—</span>
-          ) : quality.evaluated === 0 ? (
-            <span className="tabular-nums">
-              {a.qualityChecks.length} rule{a.qualityChecks.length === 1 ? "" : "s"}
-            </span>
-          ) : (
-            <>
-              <span className="tabular-nums">
-                {quality.passed}/{quality.evaluated} passed
-              </span>
-              {quality.failed > 0 ? <CheckBadge status="failed" /> : null}
-              {quality.failed === 0 && quality.warning > 0 ? (
-                <CheckBadge status="warning" />
-              ) : null}
-            </>
-          )}
-        </HealthTile>
-        <HealthTile
-          label="Governance"
-          hint={`${maskedCount} masked column${maskedCount === 1 ? "" : "s"} · ${
-            a.classificationSource === "rule" ? "classified by rule" : "default level"
-          }`}
-          onClick={() => onNavigate("access")}
-        >
-          <ClassificationBadge classification={a.classification} />
-          <span className="tabular-nums text-muted-foreground">
-            {a.policySummary.length} polic{a.policySummary.length === 1 ? "y" : "ies"}
-          </span>
-        </HealthTile>
-      </div>
-
-      <div className="grid gap-2 lg:grid-cols-2">
-        {/* ── What is it? ───────────────────────────────────────────── */}
-        <AssetAbout asset={a} schemaLabel={schemaLabel} onChanged={onAssetChanged} />
-
-        {/* ── What should I be careful with? ────────────────────────── */}
-        <SectionCard
-          size="sm"
-          title="Sensitive columns"
-          description="Columns a policy masks, and columns classified confidential or above. A classification alone does not mask a column."
-        >
-          {sensitive.length === 0 ? (
-            <EmptyState title="No sensitive columns" className="py-4" />
-          ) : (
-            <ul className="divide-y divide-border text-sm">
-              {sensitive.map((c) => (
-                <li key={c.name} className="flex flex-wrap items-center gap-2 py-1.5">
-                  <span className="font-mono font-medium">{c.name}</span>
-                  <span className="text-muted-foreground">{c.dataType}</span>
-                  <span className="ml-auto flex items-center gap-1.5">
-                    {c.classification ? (
-                      <ClassificationBadge classification={c.classification} />
-                    ) : null}
-                    {c.masked ? <Pill tone="warning">masked</Pill> : null}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </SectionCard>
-      </div>
-
-      {/* ── Where and how is it stored? ─────────────────────────────── */}
-      {isIcebergCandidate(a) && a.tableName ? (
-        <AssetStorage tableName={a.tableName} detail={iceberg} />
-      ) : (
-        <ClickHouseStorage asset={a} />
-      )}
-
-      {/* ── Gold publish per mart (DATA-1): published as an open format ── */}
-      {a.layer === "gold" && <OpenFormatCard assetId={a.id} />}
-
-      {/* ── How do I use it? ────────────────────────────────────────── */}
-      <SectionCard
-        size="sm"
-        title="Use this data"
-        description={
-          readable
-            ? `A starter query for ${
-                assetStudioTarget(a, table).engine === "trino" ? "Trino" : "ClickHouse"
-              }. Masking still applies when it runs.`
-            : undefined
-        }
-        action={
-          readable ? (
-            <div className="flex gap-1.5">
-              <Button size="sm" variant="ghost" onClick={() => void copyTextWithToast(sql, "Copied SQL")}>
-                <Copy />
-                Copy
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                render={<Link href={assetQueryStudioHref(a, table)} />}
-              >
-                Open in Query Studio
-              </Button>
-            </div>
-          ) : undefined
-        }
-      >
-        {readable ? (
-          <CodeBlock>{sql}</CodeBlock>
-        ) : (
-          <p className="text-sm text-muted-foreground">{NO_READABLE_TABLE}</p>
-        )}
-      </SectionCard>
-
-      <div className="grid gap-2 lg:grid-cols-2">
-        {/* ── Where does it come from and go? ───────────────────────── */}
-        <SectionCard size="sm" title="Connections">
-          <ul className="divide-y divide-border text-sm">
-            {shownConnections.map(([label, count]) => (
-              <li key={label}>
-                <button
-                  type="button"
-                  onClick={() => onNavigate("lineage")}
-                  className="flex w-full items-center gap-2 py-1.5 text-left hover:text-primary"
-                >
-                  {label}
-                  <span
-                    className={cn(
-                      "ml-auto tabular-nums",
-                      count === 0 ? "text-muted-foreground/50" : "text-muted-foreground"
-                    )}
-                  >
-                    {count}
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
-          {/* GOV-11 (review round 1 R2): the counts are zero because the
-              API withheld them, not because the asset is unconnected. */}
-          <TableGrantNote asset={a} className="mt-2" />
-        </SectionCard>
-
-        {/* ── What changed lately? ──────────────────────────────────── */}
-        <SectionCard
-          size="sm"
-          title="Recent changes"
+    <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_300px]">
+      <div className="flex min-w-0 flex-col gap-6">
+        <Section
+          title="Columns"
           action={
-            a.changeHistory.length > RECENT_CHANGES ? (
-              <Button size="sm" variant="ghost" onClick={() => onNavigate("activity")}>
-                View all
+            rows.length > PREVIEW_COLUMNS ? (
+              <Button size="sm" variant="ghost" onClick={() => onNavigate("schema")}>
+                {`All ${rows.length}`}
               </Button>
             ) : undefined
           }
         >
-          {recentChanges.length === 0 ? (
-            <EmptyState title="No changes recorded" className="py-4" />
+          <ColumnsPreview rows={rows} profile={profile} sortingKey={a.storage?.sortingKey} count={PREVIEW_COLUMNS} />
+          <p className="text-xs text-muted-foreground">{sensitiveLine(a.schema)}</p>
+        </Section>
+
+        <Section
+          title="Start a query"
+          action={
+            readable ? (
+              <div className="flex gap-1.5">
+                <Button size="sm" variant="ghost" onClick={() => void copyTextWithToast(sql, "Copied SQL")}>
+                  <Copy />
+                  Copy
+                </Button>
+                {/* UX-8 review: the same check as the header's Query — running
+                    a query needs `query:read`; the SQL can still be copied. */}
+                {canRun ? (
+                  <Button size="sm" variant="outline" render={<Link href={assetQueryStudioHref(a, table)} />}>
+                    <Play />
+                    Open in Query Studio
+                  </Button>
+                ) : null}
+              </div>
+            ) : undefined
+          }
+        >
+          {readable ? (
+            <>
+              <CodeBlock>{sql}</CodeBlock>
+              <p className="text-xs text-muted-foreground">{`A starter query for ${engine}. Masking still applies when it runs.`}</p>
+            </>
           ) : (
-            <ul className="divide-y divide-border text-sm">
-              {recentChanges.map((c) => (
-                <li key={c.id} className="flex flex-wrap items-baseline gap-2 py-1.5">
-                  <span className="font-medium">{c.actor}</span>
-                  <span className="text-muted-foreground">{c.summary}</span>
-                  <span className="ml-auto text-xs text-muted-foreground">
-                    {formatRelativeTime(c.at)}
-                  </span>
-                </li>
-              ))}
-            </ul>
+            <p className="text-sm text-muted-foreground">{NO_READABLE_TABLE}</p>
           )}
-        </SectionCard>
+        </Section>
       </div>
+
+      <aside className="flex min-w-0 flex-col gap-6">
+        <Section title="Details">
+          <AssetDetails asset={a} schemaLabel={schemaLabel} rowsGone={rowsGone} onChanged={onAssetChanged} />
+        </Section>
+        <Section title="Lineage">
+          <LineageShortList asset={a} state={lineage} onOpen={() => onNavigate("lineage")} />
+          {/* GOV-11 (review round 1 R2): the API withheld what reads it and
+              what it relates to, so a short list is not "none". */}
+          <TableGrantNote asset={a} />
+        </Section>
+      </aside>
     </div>
   )
 }
