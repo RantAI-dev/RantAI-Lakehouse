@@ -255,3 +255,18 @@ test("a donut's legend pages when its entries do not fit, like a rose's and a fu
     assert.equal(legend.type, "scroll", `${kind}: the legend pages`)
   }
 })
+
+type Mark = { series: { markLine?: { label: { formatter: (p: { name?: string; value?: unknown }) => string } } }[] }
+const labelOf = (label: string | undefined, value: number): string => {
+  const base = buildOption({ kind: "bar", x: "k", y: "v", source: "ui" } as never, [{ k: "a", v: 100 }], false)
+  const option = withReferenceLines(base, [{ value, label }], false, false) as unknown as Mark
+  return option.series[0].markLine!.label.formatter({ name: label ?? "", value })
+}
+
+test("BI-72: a goal label carries its number once", () => {
+  assert.equal(labelOf("Goal 1,000", 1000), "Goal 1,000")
+  assert.equal(labelOf("Goal 1000", 1000), "Goal 1000")
+  assert.equal(labelOf("Goal", 1000), "Goal 1,000")
+  assert.equal(labelOf("Q4 target", 1000), "Q4 target 1,000")
+  assert.equal(labelOf(undefined, 1000), "1,000")
+})

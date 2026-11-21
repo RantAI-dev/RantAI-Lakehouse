@@ -698,6 +698,20 @@ export function forecastNote(lines: readonly ReferenceLine[] | undefined, ctx: L
   return forecastOf(lines, ctx, horizontal)?.plan.note;
 }
 
+/** Digits only: "Goal 1,000", "1.000" and "1 000" all read "1000". */
+const digitsOnly = (t: string) => t.replace(/[\s,.\u00a0\u202f']/g, "");
+
+/**
+ * Whether a person's own label already holds the line's number, compared
+ * without grouping separators or spaces against both the formatted value and
+ * the plain number (BI-72).
+ */
+function carriesNumber(label: string, formatted: string, value: number): boolean {
+  const text = digitsOnly(label);
+  const wanted = [digitsOnly(formatted), digitsOnly(String(value))].filter((w) => w !== "");
+  return wanted.some((w) => text.includes(w));
+}
+
 function withMarkLines(
   option: EChartsOption,
   lines: readonly ReferenceLine[] | undefined,
@@ -773,7 +787,9 @@ function withMarkLines(
       formatter: (p: { name?: string; value?: unknown }) => {
         // A trend line has two ends and no single value to write.
         const v = typeof p.value === "number" ? write(g.measure, p.value) : "";
-        return `${p.name ? `${p.name} ` : ""}${v}`.trim();
+        // BI-72: a label that already holds the number is not given it again ("Goal 1,000 1,000").
+        const written = typeof p.value === "number" && p.name && carriesNumber(p.name, v, p.value) ? "" : v;
+        return `${p.name ? `${p.name} ` : ""}${written}`.trim();
       },
     },
     data: g.lineData,
