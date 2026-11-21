@@ -52,13 +52,20 @@ reported, not quietly lowered.
   saved SQL. Reads pushed from outside tools leave no column mapping.
 - Lineage from external systems stays out (GOV-3).
 - A mapping marked partial covers only what was mapped; the reason is shown.
+- Mappings are read through a `WITH`, so every pipeline shape is covered — SQL
+  steps, several inputs, several steps, and join, aggregate and filter steps
+  (`DATA-57`). They are not read through a recursive `WITH`, a `WITH` name with
+  its own column list, a subquery in `FROM`, `UNION`/`INTERSECT`/`EXCEPT`, an
+  unqualified column that two joined tables both have, or a name that is also
+  another column's alias in the same `SELECT`; each is shown partial with its
+  reason, never as a guessed mapping.
 - Mappings older than 1 year are gone.
 
 ## Spec rows
 
 | Spec row | Status |
 | --- | --- |
-| Column mappings recorded for every pipeline, Gold build and saved SQL source | **Partly met.** Built for all three producers. Rows are written from now on: a pipeline gets rows at its next successful run, a SQL source when next saved (no backfill), builds on the next tick (first pass looks back 180 days, 200 statements per tick). A pipeline run only records if the orchestrator's sensor reports it. Whatever the parser cannot prove is stored partial with a reason; a statement that cannot be read at all clears its producer's rows and logs. |
+| Column mappings recorded for every pipeline, Gold build and saved SQL source | **Partly met.** Built for all three producers. Rows are written from now on: a pipeline gets rows at its next successful run, a SQL source when next saved (no backfill), builds on the next tick (first pass looks back 180 days, 200 statements per tick). A pipeline run only records if the orchestrator's sensor reports it. Whatever the parser cannot prove is stored partial with a reason (`DATA-57`: the mapper reads a `WITH`, so every pipeline shape is covered; the limits above say what stays partial); a statement that cannot be read at all clears its producer's rows and logs. |
 | View: column lineage on the Lineage tab, up and down | **Met** (code and component tests; not seen in a browser). |
 | Impact: from a source column, every downstream column, chart and dashboard | **Partly met.** Downstream columns and saved charts (matched on mart or SQL source plus any column the chart definition names) with their dashboards, for `dashboard:read`. Not covered: the built-in default dashboard's tiles, and legacy charts saved without a `def`. |
 | Retention 1 year | **Met in code**: purge on the 15-minute tick, and the answer states `days: 365` and the oldest visible record. Purge not run. |

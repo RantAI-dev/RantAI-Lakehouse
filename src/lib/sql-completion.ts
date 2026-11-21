@@ -83,6 +83,13 @@ export type CompletionRequest = {
 export type CompletionAnswer = {
   /** Where the word being completed starts. */
   from: number
+  /**
+   * QS round review R1 (D8): which place answered. `"names"` is a place where
+   * a table or column name is the only thing that fits — after `{{`, after a
+   * qualifier, or after `FROM`/`JOIN` — so names keep their boost. `"general"`
+   * leaves the ordering to CodeMirror's own match score against the keywords.
+   */
+  place: "names" | "general"
   /** The suggestions, in the order they should be read. */
   options: CompletionOption[]
 }
@@ -528,10 +535,11 @@ export function sqlCompletionOptions({
     // The braces in a comment or in a quoted run are text, not a
     // placeholder: they hold no name, so no name is offered there.
     if (insideText(tokens, cursor)) {
-      return { from, options: [] }
+      return { from, place: "names", options: [] }
     }
     return {
       from,
+      place: "names",
       options: parameters.map((name) => ({ label: name, kind: "parameter", apply: name })),
     }
   }
@@ -548,14 +556,14 @@ export function sqlCompletionOptions({
       !resolvesToAlias(qualifier, tokens, tables) &&
       unknownTableAliases(tokens, tables).has(qualifier.toLowerCase())
     ) {
-      return { from, options: [] }
+      return { from, place: "names", options: [] }
     }
     const table = resolveQualifier(qualifier, tokens, tables)
     if (table) {
       // The table behind the qualifier is known: its columns are the only
       // thing that fits here. A table whose columns have not been fetched
       // yet says so, rather than offering another table's columns.
-      return { from, options: columnOptions(columns[table.id]) }
+      return { from, place: "names", options: columnOptions(columns[table.id]) }
     }
     // The qualifier names nothing the catalog knows. The tables the
     // statement names may still help, so the general case answers.
@@ -563,11 +571,14 @@ export function sqlCompletionOptions({
 
   const previous = lastWordBefore(tokens, from)
   if (previous === "FROM" || previous === "JOIN") {
-    return { from, options: tableOptions(tables) }
+    return { from, place: "names", options: tableOptions(tables) }
   }
 
   return {
     from,
+    // QS round review R1 (D8): no boost here — a keyword that matches what
+    // was typed ranks by CodeMirror's own match score.
+    place: "general",
     options: [...namedColumnOptions(tokens, tables, columns), ...tableOptions(tables)],
   }
 }
