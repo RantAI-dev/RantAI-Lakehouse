@@ -116,3 +116,39 @@ empty.
   machine). `moka` 0.12.16 with only the `future` feature was already in `Cargo.lock` through
   `iceberg`; the lockfile change is the one line that adds `moka` to `lakehouse-api`'s
   dependency list, no new crate.
+
+## 5. `BI-4-AC3` timing on a real engine (`BI-66`, 2026-11-21)
+
+This closes the gap section 4.2 names: the open time of a 12-tile dashboard and the
+3-second target.
+
+- **Stack:** the QA stack (ClickHouse 26.8, 8 CPU, 11 GB; marts in `serving`, `mart_wisman`
+  720 rows; a 518,400-row SQL source for the heavy board).
+- **Boards:** `qa BI-56 twelve tiles`, 12 stored charts on three marts (KPI, bar, line,
+  donut, horizontal bar, area, heatmap, table, treemap, stacked bar, funnel, box plot); and
+  `qa BI-56 twelve tiles heavy`, 12 charts on the one 518,400-row source.
+- **Method:** `GET /api/dashboard?board=<id>`, timed from outside the stack's tunnel, 5 reads
+  each. Cold is `fresh=1` (what the console sends for Refresh: every tile computed again,
+  none remembered); remembered is the plain read right after (all 12 tiles
+  `remembered: true`). A second set times the console in headless Chrome, from navigation
+  to 12 drawn tiles with no skeleton, with the board's own freshness rule set to `fresh`
+  (cold) or `default` (remembered). The workspace setting was not changed.
+
+| Measure | Cold, median (range) | Remembered, median (range) |
+| --- | --- | --- |
+| 12 tiles, API through the tunnel | 0.321 s (0.296–0.496) | 0.318 s (0.282–0.344) |
+| 12 tiles, API on the machine | 0.229 s | 0.220 s |
+| Heavy board, API through the tunnel | 0.361 s (0.322–0.529) | 0.328 s (0.308–0.578) |
+| 12 tiles, console to all tiles drawn | 1.69 s (1.45–2.42) | 1.51 s (1.34–1.62) |
+| Heavy board, console to all tiles drawn | 1.30 s (1.13–1.40) | 1.25 s (1.20–1.30) |
+
+A trivial route costs about 0.08–0.12 s of the tunnel numbers.
+
+**Reading.** The 3-second target holds with and without remembered results. At this data
+size a remembered result gives no gain that stands out of the spread (about 0.02–0.03 s on
+the API): ClickHouse answers these tiles well under a second either way. The cache's gain
+shows only on slower queries than these, which this stack does not have.
+
+**Not measured:** a before/after against an API build without the cache, concurrent users,
+and tiles that take seconds each.
+

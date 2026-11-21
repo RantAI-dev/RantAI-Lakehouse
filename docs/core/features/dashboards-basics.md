@@ -6,14 +6,14 @@
 | Backlog | `BI-56` (and `BI-66`, the timing that `BI-4-AC3` still needs) |
 | Kind | Feature |
 | Spec | none: the row came from the feature-row audit of 2026-11-13, which found the base of the module without an acceptance run. The other `BI-` rows cover only additions |
-| Status | In Acceptance |
+| Status | Released (accepted by the product owner on 2026-11-21) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. |
 | Acceptor | The product owner. |
 | Plan | This page; the run is an acceptance run, not a build |
 | Started | 2026-11-21 |
 | Shipped | Before 2026-11-13 (the base of the module) |
-| Evidence | |
+| Evidence | Acceptance run of 2026-11-21 on the QA stack (agent, API and headless Chrome; gallery board of 33 tiles, one per chart kind); the owner looked at the gallery and found it tidy |
 
 ## What the user can do
 
@@ -51,19 +51,35 @@
 
 ## Acceptance checklist
 
-- [ ] `BI-56-AC1`: create, rename, describe, duplicate, move to a folder, move to the trash
+- [x] `BI-56-AC1`: create, rename, describe, duplicate, move to a folder, move to the trash
   and restore a dashboard; each step shows on the Dashboards page.
-- [ ] `BI-56-AC2`: search finds a dashboard by part of its name; a favourite is marked and
+- [x] `BI-56-AC2`: search finds a dashboard by part of its name; a favourite is marked and
   listed; Table and Gallery both show it.
-- [ ] `BI-56-AC3`: every chart kind the builder offers draws on one gallery dashboard with
+- [x] `BI-56-AC3`: every chart kind the builder offers draws on one gallery dashboard with
   real data, and the owner finds the gallery tidy.
-- [ ] `BI-56-AC4`: for at least five kinds (bar, line, pie, table, KPI), the numbers equal
+- [x] `BI-56-AC4`: for at least five kinds (bar, line, pie, table, KPI), the numbers equal
   the same question run in Query Studio.
-- [ ] `BI-56-AC5`: hovering each drawn chart shows a tooltip with its value.
-- [ ] `BI-56-AC6`: a threshold alert fires over its threshold and not under it, from
+- [x] `BI-56-AC5`: hovering each drawn chart shows a tooltip with its value. 25 of 26 charts
+  did; the density map has none by design, and gets one in `BI-73` with the other findings
+  of the run (owner, 2026-11-21).
+- [x] `BI-56-AC6`: a threshold alert fires over its threshold and not under it, from
   "Test run now", and its e-mail arrives in the QA mailbox.
-- [ ] `BI-56-AC7`: a Dashboard Viewer reads a shared dashboard and sees no edit, move or
+- [x] `BI-56-AC7`: a Dashboard Viewer reads a shared dashboard and sees no edit, move or
   delete control; the API refuses an edit from that account.
-- [ ] `BI-56-AC8`: at 390 px wide the gallery dashboard stacks, every tile is readable, and
+- [x] `BI-56-AC8`: at 390 px wide the gallery dashboard stacks, every tile is readable, and
   the page does not scroll sideways.
-- [ ] `BI-66` (`BI-4-AC3`): the 12-tile timing is in `docs/plans/BI-4-RESULT.md`.
+- [x] `BI-66` (`BI-4-AC3`): the 12-tile timing is in `docs/plans/BI-4-RESULT.md`.
+
+## Result (2026-11-21)
+
+Seven items passed outright; AC3 passed on the owner's look at the gallery; AC5 passed with
+the density map's missing tooltip moved to `BI-73`. No item failed. Checked through the API
+rather than the button: trash and restore, and "Test run now" (the same routes). Phone
+widths were emulated (390 px), not a real phone.
+
+Findings the owner chose to fix, all in `BI-73`: category labels dropped on a narrow tile,
+rotated labels clipped at the left, smoothed lines over unordered categories, the Gantt
+"Today" label over the axis, the alert e-mail's number format and emoji, and the density
+map's tooltip. Left as they are (owner): a long Sankey label and the pivot's in-tile scroll
+on a phone, maps filling half their tile, and the Version history, Subscriptions and Export
+items a Dashboard Viewer sees in the settings menu (no edit item is among them).
