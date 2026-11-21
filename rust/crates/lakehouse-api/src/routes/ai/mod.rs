@@ -4167,6 +4167,10 @@ mod tests {
             is_build: false,
             allowlisted: false,
             latest_user: question.to_owned(),
+            // PR #639 review finding 2: `AI-29..31` on main added the
+            // dashboard-on-screen view to `PreparedChat`; a turn a test
+            // builds has no screen, so it carries none.
+            view: None,
         }
     }
 
