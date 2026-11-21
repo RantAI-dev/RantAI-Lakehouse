@@ -9,6 +9,10 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Fixed
+
+- Embeds look right on the host page (backlog `BI-64`, from `BI-26-AC2` and `AC5`). With `background=transparent` the frame is transparent: the root layout's `body` background was what stayed opaque, and it is now cleared (with `html`) while the option is on; tiles keep their cards. The height posted to the host page now includes the 8 px padding, so the frame no longer scrolls by 16 px. A year (an integer from 1000 to 9999) in a column named `year`, `tahun`, `yr`, or ending `_year` / `_tahun` prints as "2020", not "2,020", in raw tables and table tiles, in the console too; an explicit thousands setting still wins.
+
 ### Added
 
 - Column lineage now covers every authored pipeline (backlog `DATA-57`): SQL steps, several inputs, several steps, and join, aggregate and filter steps. From its next successful run a pipeline records which source column feeds each output column; what the statement cannot prove is shown partial with the reason instead of being guessed. A name that is also another column's alias in the same `SELECT` is now shown partial rather than mapped to a column, because the engine reads the alias. There is no backfill: existing pipelines get rows at their next successful run.

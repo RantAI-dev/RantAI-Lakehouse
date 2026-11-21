@@ -151,3 +151,49 @@ MemoryMax=3G -p MemorySwapMax=0 nice -n 15 …`; `bun x tsc --noEmit -p .`,
 `bun x eslint <changed>`, `bun test <touched test files>`; tests restore
 globals and never let a real fetch through. No prettier, no full test/lint,
 no dev server. CHANGELOG entry per PR. Do not push.
+
+---
+
+## Handoff, PR 2 (`BI-64`)
+
+Branch `fix/bi-64-embed-polish`, not pushed.
+
+**Commits** (decisions 1 and 2 share the first commit, because both change
+`embed-view.tsx` hunks that sit side by side; tests for all four are in the
+last one):
+1. `BI-64 embed: clear html and body for background=transparent; height includes padding`
+   (`embed-view.tsx`, `globals.css`): an effect puts `embed-transparent` on
+   `<html>` while the option is on; `html.embed-transparent, html.embed-transparent body`
+   are transparent. `p-2` moved from the `min-h-screen` wrapper to the
+   measured root (`<div ref={measured} className="p-2">`).
+2. `BI-64 tables: print a year column without a thousands separator`:
+   `isYearColumn` / `isYearValue` in `value-format.ts`; `formatValue(..., column?)`
+   and `cellContent(..., column?)`; `CellValue` takes `column`, passed by
+   `raw-table.tsx` and the table tile in `tile-body.tsx`. Pivot cells are not
+   a named column, so they are unchanged.
+3. `BI-64 tests and changelog` (decision 4 and the CHANGELOG entry).
+
+**Which element painted:** `body`, by `body { @apply bg-background }` in
+`design-system/globals.css` (`@layer base`), reached through the root
+`layout.tsx`; `html` has no background of its own, the canvas takes the body's.
+The embed wrapper's own `!bg-transparent` was already there, which is why the
+frame stayed opaque. **Not verified in a browser**: the auto-mode classifier
+refused the login to the QA console, so this comes from reading the cascade
+(`globals.css`, `design-system/globals.css`, `layout.tsx`, `app-frame.tsx`,
+which skips all chrome for `/embed/*`, `.theme-light` tokens, which set
+variables only). The reviewer should check the computed `background-color` of
+`html` and `body` in an embed with `background=transparent`.
+
+**Commands** (bun wrapped in flock + systemd-run, `node_modules` symlinked and
+removed before every commit):
+- `bun test value-format.test.ts cell-format.test.ts embed-view.test.tsx` (+ a
+  `use-embed-height` pattern that matched no file): 58 pass, 0 fail; after the
+  last test edit `value-format.test.ts` alone: 29 pass, 0 fail.
+- `bun x tsc --noEmit -p .`: no output (clean).
+- `bun x eslint` on the 8 changed source and test files: no output (clean).
+- Not run: full test/lint, Rust, dev server, browser.
+
+**Gap:** the posted height cannot be measured in happy-dom, so the test asserts
+the structure (the measured root has `p-2`, the wrapper has none), not pixels.
+There is no `raw-table` test file; the year rule is tested on the formatters
+the table calls.
