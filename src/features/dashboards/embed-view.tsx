@@ -17,7 +17,7 @@ import { TabBar } from "./tab-bar";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { EMBED_UNAVAILABLE, embedRefusalMessage } from "./embed-refusal";
 import { PasswordGate, TICKET_HEADER, openPublic, readTicket } from "./public-link-access";
-import { DEFAULT_EMBED_LOOK, themeFor, type EmbedLook } from "@/lib/embed-look";
+import { DEFAULT_EMBED_LOOK, EMBED_TRANSPARENT_CLASS, themeFor, type EmbedLook } from "@/lib/embed-look";
 import { EmbedFilterBar, type EmbedFilter, type ViewerFilter } from "./embed-filter-bar";
 import { fetchFrameOrigins, useEmbedHeight } from "./use-embed-height";
 import { useBranding } from "@/hooks/use-branding";
@@ -181,11 +181,14 @@ export function EmbedView({
   // `body { @apply bg-background }` (design-system `globals.css`), outside this
   // component, so clearing the wrapper's own background was not enough: the
   // frame stayed opaque. `globals.css` clears `html` and `body` for this class.
+  // PR #648 review 1: the proxy marks the request and the root layout puts the
+  // class on `<html>` in the server render, so nothing opaque shows before
+  // hydration; this effect keeps it right in a client-only render (the tests).
   React.useEffect(() => {
     if (!look.transparent) return;
     const root = document.documentElement;
-    root.classList.add("embed-transparent");
-    return () => root.classList.remove("embed-transparent");
+    root.classList.add(EMBED_TRANSPARENT_CLASS);
+    return () => root.classList.remove(EMBED_TRANSPARENT_CLASS);
   }, [look.transparent]);
 
   if (state === "password") {
