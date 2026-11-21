@@ -36,6 +36,19 @@ function currencyDisplayOf(fmt: ValueFormat): "symbol" | "narrowSymbol" | "code"
   return (fmt.currency ?? "IDR") === "IDR" ? "narrowSymbol" : "symbol"
 }
 
+/**
+ * Whether a column's name says it holds a calendar year (`BI-64`, `BI-26-AC5`):
+ * `year`, `tahun`, `yr`, or a name ending `_year` / `_tahun`, in any case.
+ */
+export function isYearColumn(name: string | undefined): boolean {
+  return name !== undefined && /^(year|tahun|yr)$|_(year|tahun)$/i.test(name.trim())
+}
+
+/** A year as it is written: an integer from 1000 to 9999, which a thousands separator would turn into "2,020". */
+export function isYearValue(v: number): boolean {
+  return Number.isInteger(v) && v >= 1000 && v <= 9999
+}
+
 function fraction(decimals: number | undefined, fallbackMax: number): Intl.NumberFormatOptions {
   return decimals === undefined
     ? { maximumFractionDigits: fallbackMax }
@@ -75,8 +88,10 @@ function compactParts(v: number, decimals: number | undefined): { scaled: number
 }
 
 /** The number part of a format, without prefix and suffix. */
-function body(v: number, fmt: ValueFormat, locale: string, autoDecimals: number): string {
-  const grouping = fmt.thousands !== false
+function body(v: number, fmt: ValueFormat, locale: string, autoDecimals: number, column?: string): string {
+  // BI-64: a year column carries no separator unless the format sets `thousands` itself.
+  const year = fmt.thousands === undefined && isYearColumn(column) && isYearValue(v)
+  const grouping = fmt.thousands !== false && !year
   const style = fmt.style ?? "auto"
   switch (style) {
     case "number":
@@ -108,7 +123,7 @@ function body(v: number, fmt: ValueFormat, locale: string, autoDecimals: number)
       )
     }
     default:
-      return formatNumber(v, autoDecimals, locale)
+      return year ? String(v) : formatNumber(v, autoDecimals, locale)
   }
 }
 
@@ -132,17 +147,20 @@ function compactCurrency(v: number, fmt: ValueFormat, locale: string): string {
  * `v` under `fmt`. `autoDecimals` is what the `auto` style uses (read from
  * the data by `decimalsFor`). A value that is not a finite number is
  * returned as text. A compact format with a currency code is a compact
- * amount; a currency format without `compact` is written in full.
+ * amount; a currency format without `compact` is written in full. `column`
+ * is the column's name, for a table cell: a year column has no thousands
+ * separator (`BI-64`).
  */
 export function formatValue(
   v: number,
   fmt: ValueFormat | undefined,
   locale = "en-US",
   autoDecimals = 0,
+  column?: string,
 ): string {
   if (!Number.isFinite(v)) return String(v)
   const f = fmt ?? {}
-  const text = body(v, f, locale, autoDecimals)
+  const text = body(v, f, locale, autoDecimals, column)
   return `${f.prefix ?? ""}${text}${f.suffix ?? ""}`
 }
 
