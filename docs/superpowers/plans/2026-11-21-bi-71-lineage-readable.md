@@ -236,3 +236,10 @@ Not verified: no browser check (overlay look, fade, iPhone Safari, safe-area
 insets); no focus trap inside the overlay (Tab can reach the page behind it);
 an overlay opened inside another modal was not tried; the full test run and
 CI were not run. Nothing pushed.
+
+## Review of owner QA round 1 (planner, 2026-11-21)
+
+- **SHOULD-FIX 1:** the full-screen overlay (`role="dialog"`) has no focus
+  containment: Tab reaches the page behind it. Use the app's dialog
+  primitive (or its focus trap) so Tab stays inside, as every other dialog
+  does; keep Esc, `F` and the focus return. Fix with the next owner QA round.
