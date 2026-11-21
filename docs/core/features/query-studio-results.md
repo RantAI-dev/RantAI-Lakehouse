@@ -65,6 +65,7 @@ No new tool. The chat's `run_sql` keeps its own limit. Downloads are a console a
 | 7 | A download stops at 5 GB (Databricks). Excel stops at 1,048,575 data rows (1,048,576 with the header), the sheet's limit. Either cut is said in the file name and in a message, never silent | 5 GB, 1,048,575 data rows | Owner, 2026-10-28 |
 | 8 | A download honours the role download switch (`DOWNLOADS_OFF`), as dashboard exports do, and the run's time limit. A download in progress can be stopped with Stop. The run's answer says whether the person may download (`canDownload`); when they may not, the console turns Download and "Copy as TSV" off and shows "Downloads are switched off for your role." beside them. The route refuses either way. | none | Owner, 2026-10-28; changed 2026-11-12 (`QS-9`), *(proposed, not yet signed)* |
 | 9 | Elapsed time is counted in the browser from the moment Run is pressed | none | Owner, 2026-10-28 |
+| 10 | `QS-10`: the estimate route stays at `query:read`. Catalog facts — sources, their certification marks and freshness lag — need `catalog:read`: without it the estimate still answers its numbers, with `sources: []`, no `sourceMarks`, `freshnessLagSeconds: null` and `catalogHidden: true`, and neither the `system.parts` read nor the marks lookup runs. A plan that names no table lists no source, never an invented one. The rewrite already evaluates every mask and row filter before a run and before an estimate, so both answers carry `policyObligations`: `"Column masks"` then `"Row filters"`, each at most once, `[]` when neither applies — no table or column name *(planner default, owner may change)*. A Trino run carries the list too; the Trino estimate keeps `null`. The summary's Rows counts the rows actually shown, with " shown" when the result was cut, not the engine's pre-cut `rowCount` | none | Planner's choice, 2026-11-20 (QS-10), *(proposed, not yet signed)* |
 
 ## Limits to tell a customer
 
@@ -83,6 +84,10 @@ No new tool. The chat's `run_sql` keeps its own limit. Downloads are a console a
   can still be copied from the inspector, as it can be selected on the screen.
 - Downloads run on ClickHouse only; the button is off for a Trino result.
 - Stop and the time limit do not reach a Trino query.
+- A person without `catalog:read` still gets estimates and runs: the Execution
+  transparency panel shows no sources and no freshness lag for them, saying
+  catalog access is needed instead. An estimate whose plan names no table
+  lists no source.
 
 ## Acceptance checklist
 

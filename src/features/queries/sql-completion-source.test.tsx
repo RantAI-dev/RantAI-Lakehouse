@@ -19,6 +19,7 @@ import { sql } from "@codemirror/lang-sql"
 import { EditorState } from "@codemirror/state"
 import { EditorView } from "@codemirror/view"
 import { SqlEditor } from "@/components/sql-editor"
+import type { CompletionTable } from "@/lib/sql-completion"
 import {
   createSqlCompletionSource,
   sqlCompletionExtension,
@@ -38,9 +39,9 @@ afterEach(() => {
 /**
  * The console's own source, over the names the open tab defines.
  */
-function consoleSource() {
+function consoleSource(tables: CompletionTable[] = []) {
   return createSqlCompletionSource({
-    tables: [],
+    tables,
     columns: () => ({}),
     parameters: () => PARAMETERS,
   })
@@ -51,7 +52,7 @@ function consoleSource() {
  * Query Studio builds it: the language first, the console's own source
  * last, and the cursor at the end of the text.
  */
-function editor(doc: string): EditorView {
+function editor(doc: string, tables: CompletionTable[] = []): EditorView {
   const view = new EditorView({
     state: EditorState.create({
       doc,
@@ -61,7 +62,7 @@ function editor(doc: string): EditorView {
         // The editor's own basic setup brings the autocomplete plugin; the
         // console's extension then says which sources answer.
         autocompletion(),
-        sqlCompletionExtension(consoleSource()),
+        sqlCompletionExtension(consoleSource(tables)),
       ],
     }),
     parent: document.body,
@@ -117,6 +118,52 @@ describe("the list of the SQL editor", () => {
     const labels = await shownLabels(view)
 
     expect(labels).toEqual([])
+  })
+})
+
+// QS round review R1 (D8): outside FROM/JOIN and qualifiers, tables and
+// columns carry no boost, so a keyword matching the typed prefix ranks by
+// CodeMirror's own score. In a FROM position the table keeps its boost.
+describe("keyword ranking against a table whose name matches", () => {
+  const sales: CompletionTable = {
+    id: "silver.sales_selection",
+    label: "Sales selection",
+    reference: "silver.sales_selection",
+    layer: "silver",
+    names: ["silver.sales_selection", "Sales selection"],
+  }
+
+  // The review's `sel` example: a keyword that matches the prefix ranks above
+  // the table once the general list carries no boost. For a bare `s` the
+  // engine's own match score still favours the longer table name (recorded in
+  // the handoff); D8 changes the boost, not CodeMirror's scoring.
+  it("puts a keyword above a table for the sel prefix that matches both", async () => {
+    const view = editor("sel", [sales])
+    const labels = await shownLabels(view)
+    expect(labels[0]).toBe("select")
+    expect(labels).toContain("silver.sales_selection")
+  })
+
+  // The mechanism D8 changes: in the general list a table carries no boost,
+  // so the keyword's match score decides; after FROM it keeps TABLE_BOOST.
+  it("gives a table no boost in the general list", async () => {
+    const view = editor("s", [sales])
+    startCompletion(view)
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    const table = currentCompletions(view.state).find(
+      (completion) => completion.label === "silver.sales_selection"
+    )
+    expect(table?.boost).toBe(0)
+  })
+
+  it("keeps the table's boost after FROM", async () => {
+    const view = editor("SELECT * FROM sel", [sales])
+    startCompletion(view)
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    const table = currentCompletions(view.state).find(
+      (completion) => completion.label === "silver.sales_selection"
+    )
+    expect(table?.boost).toBe(99)
   })
 })
 
