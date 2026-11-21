@@ -1,7 +1,8 @@
 import { displayColumn } from "@/lib/chart-joins";
 import { escapeHtml } from "@/lib/geo-points";
 import type { EChartsOption } from "echarts";
-import { decimalsFor, formatNumber, monthlyAxisLabel } from "@/lib/chart-axis";
+import { decimalsFor, formatNumber, isOrderedAxis, monthlyAxisLabel } from "@/lib/chart-axis";
+import { categoryAxisLabel } from "./category-labels";
 import { DEFAULT_PALETTE, resolvePalette } from "@/lib/chart-palettes";
 import type { ResolvedReferenceLine, StyleFields, ValueFormat } from "@/lib/chart-style";
 import { formatAxisValue, formatValue } from "@/lib/value-format";
@@ -159,7 +160,7 @@ export function buildOption(
   });
   const catAxis = (data: string[]) => ({
     type: "category" as const, data,
-    axisLabel: { color: axis, fontSize: 11, interval: 0, hideOverlap: true, rotate: data.length > 6 ? 28 : 0, ...monthlyAxisLabel(data) },
+    axisLabel: { ...categoryAxisLabel(axis), ...monthlyAxisLabel(data) },
     axisLine: { lineStyle: { color: split } }, axisTick: { show: false },
   });
   type PieP = { name: string; value: number; percent: number };
@@ -272,7 +273,7 @@ export function buildOption(
       yAxis: [{ ...valAxis(labelOf(m1)), alignTicks: false }, { ...valAxis(labelOf(m2), true), alignTicks: false }],
       series: [
         { name: labelOf(m1), type: "bar", data: rows.map((r) => num(r[m1])), barMaxWidth: 34, itemStyle: { borderRadius: [4, 4, 0, 0] } },
-        { name: labelOf(m2), type: "line", yAxisIndex: 1, smooth: true, symbolSize: 6, lineStyle: { width: 2 }, data: rows.map((r) => num(r[m2])) },
+        { name: labelOf(m2), type: "line", yAxisIndex: 1, smooth: isOrderedAxis(cat), symbolSize: 6, lineStyle: { width: 2 }, data: rows.map((r) => num(r[m2])) },
       ],
     } as EChartsOption;
   }
@@ -312,7 +313,7 @@ export function buildOption(
     const maxV = Math.max(1, ...data.map((d) => d[2]));
     return { ...base, grid: { ...base.grid, top: 8, bottom: 48, left: 8, right: 12 },
       tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { value: number[] }; return `${escapeHtml(xCats[o.value[0]] ?? "")} · ${escapeHtml(yCats[o.value[1]] ?? "")}<br/><b>${fmtInt(o.value[2])}</b>`; } },
-      xAxis: { type: "category", data: xCats, splitArea: { show: true }, axisLabel: { color: axis, fontSize: 10, interval: 0, hideOverlap: true, rotate: xCats.length > 6 ? 30 : 0 }, axisLine: { lineStyle: { color: split } }, axisTick: { show: false } },
+      xAxis: { type: "category", data: xCats, splitArea: { show: true }, axisLabel: categoryAxisLabel(axis, 10), axisLine: { lineStyle: { color: split } }, axisTick: { show: false } },
       yAxis: { type: "category", data: yCats, splitArea: { show: true }, axisLabel: { color: axis, fontSize: 10 }, axisLine: { lineStyle: { color: split } }, axisTick: { show: false } },
       visualMap: { min: 0, max: maxV, calculable: false, orient: "horizontal", left: "center", bottom: 0, itemHeight: 60, textStyle: { color: axis, fontSize: 10 }, inRange: { color: dark ? ["#1e1b4b", "#6366f1", "#a5b4fc"] : ["#eef2ff", "#818cf8", "#4338ca"] } },
       series: [{ type: "heatmap", data, label: { show: false }, emphasis: { itemStyle: { shadowBlur: 6, shadowColor: "rgba(0,0,0,0.3)" } } }],
@@ -408,13 +409,10 @@ export function buildOption(
   const categoryAxis = {
     type: "category" as const,
     data: horizontal ? [...cat].reverse() : cat,
-    axisLabel: {
-      color: axis,
-      fontSize: 11,
-      interval: 0,
-      hideOverlap: true,
-      ...(horizontal ? {} : { rotate: cat.length > 6 ? 28 : 0, ...monthlyAxisLabel(cat) }),
-    },
+    // Horizontal bars name their categories on the value side: no rotation (BI-73 a).
+    axisLabel: horizontal
+      ? { color: axis, fontSize: 11, interval: 0, hideOverlap: true }
+      : { ...categoryAxisLabel(axis), ...monthlyAxisLabel(cat) },
     axisLine: { lineStyle: { color: split } },
     axisTick: { show: false },
   };
@@ -435,12 +433,13 @@ export function buildOption(
     }
     const orderedCats = horizontal ? [...cats].reverse() : cats;
     const isLine = spec.kind === "line" || spec.kind === "area";
+    const smoothAxis = isOrderedAxis(cats);
     const stack = spec.kind === "stacked";
     const series = groups.map((g) => ({
       name: g,
       type: isLine ? "line" : "bar",
       stack: stack ? "total" : undefined,
-      smooth: isLine,
+      smooth: isLine && smoothAxis,
       showSymbol: showsPointMarkers(spec.kind, orderedCats.length),
       symbolSize: 5,
       areaStyle: spec.kind === "area" ? { opacity: 0.15 } : undefined,
@@ -482,6 +481,8 @@ export function buildOption(
   // Bar / hbar / line / area — a single series, or (BI-6) one series per
   // measure when the chart lists several; they share the value axis.
   const isLine = spec.kind === "line" || spec.kind === "area";
+  // BI-73 (c): a line is smoothed only over an axis that has an order.
+  const smoothAxis = isOrderedAxis(cat);
   const measureCols = Array.isArray(spec.y) ? spec.y : [spec.y];
   if (measureCols.length > 1) {
     const ordered = horizontal ? [...rows].reverse() : rows;
@@ -497,7 +498,7 @@ export function buildOption(
         type: isLine ? "line" : "bar",
         data: ordered.map((r) => num(r[col])),
         barMaxWidth: 26,
-        smooth: isLine,
+        smooth: isLine && smoothAxis,
         showSymbol: showsPointMarkers(spec.kind, ordered.length),
         symbolSize: 6,
         lineStyle: isLine ? { width: 2 } : undefined,
@@ -523,7 +524,7 @@ export function buildOption(
         type: isLine ? "line" : "bar",
         data: values,
         barMaxWidth: 34,
-        smooth: isLine,
+        smooth: isLine && smoothAxis,
         showSymbol: showsPointMarkers(spec.kind, values.length),
         symbolSize: 6,
         lineStyle: isLine ? { width: 2 } : undefined,

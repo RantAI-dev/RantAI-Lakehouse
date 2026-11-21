@@ -1,6 +1,7 @@
 import { displayColumn } from "@/lib/chart-joins";
 import type { EChartsOption } from "echarts";
 import { decimalsFor, monthlyAxisLabel } from "@/lib/chart-axis";
+import { categoryAxisLabel } from "./category-labels";
 import { categoryLabel } from "@/lib/chart-transforms";
 import { resolvePalette } from "@/lib/chart-palettes";
 import type { StyleFields } from "@/lib/chart-style";
@@ -220,7 +221,7 @@ export function buildCombinedOption(input: CombinedInput, dark: boolean): Combin
     grid: { left: 8, right: 16, top: 34, bottom: 8, containLabel: true },
     xAxis: {
       type: "category", data: labels,
-      axisLabel: { color: ink, fontSize: 11, interval: 0, hideOverlap: true, rotate: labels.length > 6 ? 28 : 0, ...monthlyAxisLabel(labels) },
+      axisLabel: { ...categoryAxisLabel(ink), ...monthlyAxisLabel(labels) },
       axisLine: { lineStyle: { color: split } }, axisTick: { show: false },
     },
     yAxis: sides.map((side) => ({

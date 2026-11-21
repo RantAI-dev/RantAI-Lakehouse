@@ -64,6 +64,13 @@ describe("ganttOption", () => {
     expect((d.option.legend as { data: string[] }).data).toEqual(["Team 1", "Team 2"])
   })
 
+  it("BI-73 d: the Today label sits at the end of the line, not on the date axis labels", () => {
+    const d = drawn(ganttOption({ rows: [row("A", null, "2026-03-01", "2026-03-20")], dark: false, timeZone: "UTC", now: NOW }))
+    const mark = seriesOf(d).find((s) => s.markLine)?.markLine as unknown as { label: { position: string } }
+    expect(mark.label.position).toBe("end")
+    expect(((d.option.grid as { top: number }).top)).toBeGreaterThan(16)
+  })
+
   it("draws a line at today in the report zone, and none outside the range of the tasks", () => {
     const inside = drawn(ganttOption({ rows: [row("A", null, "2026-03-01", "2026-03-20")], dark: false, timeZone: "UTC", now: NOW }))
     const mark = seriesOf(inside).find((s) => s.markLine)
