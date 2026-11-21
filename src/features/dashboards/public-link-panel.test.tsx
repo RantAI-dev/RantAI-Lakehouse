@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { DEFAULT_EXPIRY, PublicLinkPanel, expiryFor } from "./public-link-panel"
+import { PRODUCT_NAME } from "@/lib/product-branding"
 
 const originalFetch = global.fetch
 afterEach(() => {
@@ -14,7 +15,14 @@ function json(body: unknown, status = 200) {
 
 type Call = { url: string; method: string; body: unknown }
 
-function stub(state: unknown, onWrite: (c: Call) => Response = () => json({ ok: true })): Call[] {
+/** The public branding answer of a workspace that set nothing. */
+const NO_BRANDING = { workspaceName: null, logo: null, logoDark: null, icon: null }
+
+function stub(
+  state: unknown,
+  onWrite: (c: Call) => Response = () => json({ ok: true }),
+  branding: unknown = NO_BRANDING,
+): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const call = {
@@ -23,6 +31,7 @@ function stub(state: unknown, onWrite: (c: Call) => Response = () => json({ ok: 
       body: init?.body ? JSON.parse(String(init.body)) : undefined,
     }
     calls.push(call)
+    if (call.url.includes("/api/branding")) return json(branding)
     if (call.method === "GET") return json(state)
     return onWrite(call)
   }) as unknown as typeof fetch
@@ -56,8 +65,8 @@ describe("PublicLinkPanel", () => {
   it("offers 30 days preselected and sends the expiry and the password when making a link", async () => {
     const calls = stub({ enabled: true, link: null }, () => json({ ok: true, link: LINK }))
     render(<PublicLinkPanel board="b_1" />)
-    const select = (await screen.findByLabelText("Link expires in")) as HTMLSelectElement
-    expect(select.value).toBe("30")
+    const select = await screen.findByRole("combobox", { name: "Link expires in" })
+    expect(select.textContent).toContain("30 days")
     fireEvent.change(screen.getByLabelText("Password (optional)"), { target: { value: "correct horse" } })
     fireEvent.click(screen.getByRole("button", { name: "Make a public link" }))
     await screen.findByText(/A password is needed/)
@@ -115,5 +124,27 @@ describe("PublicLinkPanel", () => {
     fireEvent.change(await screen.findByLabelText("Password (optional)"), { target: { value: "short" } })
     fireEvent.click(screen.getByRole("button", { name: "Make a public link" }))
     await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("8 to 128"))
+  })
+
+  it("titles the embed snippet's iframe after the workspace, not the product (adm-121)", async () => {
+    stub({ enabled: true, link: LINK }, undefined, { ...NO_BRANDING, workspaceName: "Acme Data" })
+    render(<PublicLinkPanel board="b_1" />)
+    const snippet = await screen.findByText(/<iframe /)
+    expect(snippet.textContent).toContain('title="Acme Data dashboard"')
+    expect(snippet.textContent).not.toContain(PRODUCT_NAME)
+  })
+
+  it("titles the iframe after the product when the workspace set no name, and keeps a quote in a name out of the attribute", async () => {
+    stub({ enabled: true, link: LINK })
+    render(<PublicLinkPanel board="b_1" />)
+    expect((await screen.findByText(/<iframe /)).textContent).toContain(`title="${PRODUCT_NAME} dashboard"`)
+    cleanup()
+
+    stub({ enabled: true, link: LINK }, undefined, { ...NO_BRANDING, workspaceName: 'A "B" <c>' })
+    render(<PublicLinkPanel board="b_1" />)
+    // A name is text: a quote in it must not end the attribute.
+    expect((await screen.findByText(/<iframe /)).textContent).toContain(
+      'title="A &quot;B&quot; &lt;c&gt; dashboard"',
+    )
   })
 })

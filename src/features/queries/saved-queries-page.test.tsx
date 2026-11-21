@@ -25,8 +25,14 @@ mock.module("next/navigation", () => ({
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
+import { chooseOption } from "@/components/patterns/select-field.testing"
+import { AuthProvider } from "@/features/auth/auth-provider"
 import { queryService } from "@/services"
-import type { QueryFolder, SavedQuery } from "@/services/contracts/queries"
+import type {
+  QueryFolder,
+  SavedQuery,
+  SavedQueryAccessList,
+} from "@/services/contracts/queries"
 import { ServiceError } from "@/services/errors"
 import { SavedQueriesPage } from "./saved-queries-page"
 
@@ -78,6 +84,7 @@ function saved(over: Partial<SavedQuery> = {}): SavedQuery {
     folderId: null,
     ownerId: "u1",
     level: "view",
+    parameters: [],
     ...over,
   }
 }
@@ -103,11 +110,54 @@ function stubServices(
   return { list }
 }
 
+/** A folder's access list with one rule for the caller (`u1`) and one for Dewi. */
+function sharedFolderAccess(): SavedQueryAccessList {
+  const rule = (userId: string, granteeName: string) => ({
+    id: `rule-${userId}`,
+    userId,
+    roleId: null,
+    granteeName,
+    granteeEmail: null,
+    level: "edit",
+    grantedBy: null,
+    grantedAt: "2026-11-01T09:00:00.000Z",
+  })
+  return {
+    itemType: "folder",
+    itemId: "quarterly",
+    yourLevel: "edit",
+    rules: [rule("u1", "Rina Wijaya"), rule("u2", "Dewi Lestari")],
+    inherited: [],
+  }
+}
+
 function renderPage() {
+  // The move dialogs read the access list of the folder they are aimed at;
+  // a test that cares about it spies the call again.
+  spyOn(queryService, "getFolderAccess").mockResolvedValue({
+    ...sharedFolderAccess(),
+    rules: [],
+  })
+  // The page reads the signed-in person from `AuthProvider`, as the root
+  // layout supplies it; the session read is answered here, not by a server.
+  spyOn(globalThis, "fetch").mockImplementation((async () =>
+    new Response(
+      JSON.stringify({
+        id: "u1",
+        name: "Rina Wijaya",
+        email: null,
+        roles: [],
+        permissions: [],
+        tenants: [],
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    )) as unknown as typeof fetch)
   return render(
-    <TableProviders>
-      <SavedQueriesPage />
-    </TableProviders>,
+    <AuthProvider>
+      <TableProviders>
+        <SavedQueriesPage />
+      </TableProviders>
+    </AuthProvider>,
   )
 }
 
@@ -570,9 +620,7 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "" },
-    })
+    chooseOption(await screen.findByRole("combobox", { name: "Target folder" }), "Shared")
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
 
     await waitFor(() => {
@@ -592,9 +640,7 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "team" },
-    })
+    chooseOption(await screen.findByRole("combobox", { name: "Target folder" }), "Team")
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
 
     await waitFor(() => {
@@ -615,9 +661,10 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "personal-1" },
-    })
+    chooseOption(
+      await screen.findByRole("combobox", { name: "Target folder" }),
+      "Personal space (only you)",
+    )
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
 
     // The console does not guess the rule and does not block the move
@@ -639,9 +686,10 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Costs" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "personal-1" },
-    })
+    chooseOption(
+      await screen.findByRole("combobox", { name: "Target folder" }),
+      "Personal space (only you)",
+    )
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
     expect((await screen.findByRole("alert")).textContent).toBe(
       "Only someone who manages this can move it.",
@@ -664,15 +712,47 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "quarterly" },
-    })
+    chooseOption(
+      await screen.findByRole("combobox", { name: "Target folder" }),
+      "Team / Quarterly",
+    )
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
 
     await waitFor(() => {
       expect(update.mock.calls.at(-1)?.[0]).toBe("team")
       expect(update.mock.calls.at(-1)?.[1]).toEqual({ parentId: "quarterly" })
     })
+  })
+
+  it("tells the person moving a query who the target folder is shared with, without themselves", async () => {
+    stubServices([saved({ id: "q1", title: "Revenue", level: "manage" })])
+    renderPage()
+    spyOn(queryService, "getFolderAccess").mockResolvedValue(sharedFolderAccess())
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Revenue" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
+    chooseOption(
+      await screen.findByRole("combobox", { name: "Target folder" }),
+      "Team / Quarterly",
+    )
+
+    // `u1` is the signed-in person (the session read in `renderPage`).
+    expect(await screen.findByText("Shared with 1 person or role: Dewi Lestari.")).toBeDefined()
+  })
+
+  it("tells the person moving a folder who the target folder is shared with, without themselves", async () => {
+    stubServices()
+    renderPage()
+    spyOn(queryService, "getFolderAccess").mockResolvedValue(sharedFolderAccess())
+
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
+    chooseOption(
+      await screen.findByRole("combobox", { name: "Target folder" }),
+      "Team / Quarterly",
+    )
+
+    expect(await screen.findByText("Shared with 1 person or role: Dewi Lestari.")).toBeDefined()
   })
 
   it("moves a folder into the shared space", async () => {
@@ -682,9 +762,7 @@ describe("the saved-queries console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Actions for Team" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: "Move" }))
-    fireEvent.change(await screen.findByLabelText("Target folder"), {
-      target: { value: "" },
-    })
+    chooseOption(await screen.findByRole("combobox", { name: "Target folder" }), "Shared")
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
 
     await waitFor(() => {

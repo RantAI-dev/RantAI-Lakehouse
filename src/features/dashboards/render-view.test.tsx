@@ -9,10 +9,14 @@ import { useRenderMode, type RenderMode } from "./render-mode"
 const tileBody = { ...realTileBody }
 const grid = { ...realGrid }
 const rendered: string[] = []
+/** The `dark` each chart was drawn with, so a test can see what the print view told it. */
+const darks: boolean[] = []
 let captured: RenderMode | null = null
+/** The map loader each chart was given. */
+const loaders: (((id: string) => Promise<Response>) | undefined)[] = []
 mock.module("./tile-body", () => ({
   ...tileBody,
-  TileBody: function Body({ spec }: { spec: { id: string } }) {
+  TileBody: function Body({ spec, dark, loadMap }: { spec: { id: string }; dark?: boolean; loadMap?: (id: string) => Promise<Response> }) {
     const mode = useRenderMode()
     React.useEffect(() => {
       if (spec.id !== "c_chart" || !mode) return
@@ -20,6 +24,8 @@ mock.module("./tile-body", () => ({
       mode.chartMounted()
     }, [mode, spec.id])
     rendered.push(spec.id)
+    loaders.push(loadMap)
+    darks.push(dark === true)
     return <div data-testid={`tile-${spec.id}`} />
   },
 }))
@@ -40,6 +46,11 @@ import * as React from "react"
 const { RenderView, NOT_IN_PDF, renderFailure } = await import("./render-view")
 
 const originalFetch = global.fetch
+// `quietImages` changes the window's address and the image-loading setting, which every file of the run shares
+// (one happy-dom window per `bun test` process); both are put back after each test.
+const happyDom = () => (window as unknown as { happyDOM?: { settings: Record<string, unknown>; setURL: (u: string) => void } }).happyDOM
+const originalUrl = window.location.href
+const originalImageLoading = happyDom()?.settings.disableImageLoading
 const flag = () => (window as unknown as { __lakehouseRenderReady?: boolean }).__lakehouseRenderReady
 
 beforeEach(() => {
@@ -49,8 +60,26 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   rendered.length = 0
+  loaders.length = 0
+  darks.length = 0
   global.fetch = originalFetch
+  delete (window as unknown as { __lakehouseRenderReady?: boolean }).__lakehouseRenderReady
+  const dom = happyDom()
+  if (dom) {
+    dom.settings.disableImageLoading = originalImageLoading
+    dom.setURL(originalUrl)
+  }
 })
+
+// happy-dom would load (and fail) a real picture the moment it is mounted, which would fire `error`
+// before the test does; the tests fire `load` and `error` themselves.
+function quietImages() {
+  const dom = happyDom()
+  if (dom) {
+    dom.settings.disableImageLoading = true
+    dom.setURL("http://localhost/")
+  }
+}
 
 function payload(extra: Record<string, unknown> = {}) {
   return {
@@ -105,6 +134,108 @@ describe("the PDF print view", () => {
     expect(sections[1].className).toContain("render-tab-break")
     expect(screen.getByTestId("item-c_text")).toBeTruthy()
     expect(screen.getByTestId("item-c_chart")).toBeTruthy()
+  })
+
+  // QA LH-BI-1-01 F2 (BI-53, D15): a dark dashboard printed as a dark box on
+  // the white page left white bands.
+  it("a dark dashboard is printed light: the page, the cards and the charts", async () => {
+    serve(payload({ theme: "dark" }))
+    const { container } = render(<RenderView token="t" />)
+    await screen.findByRole("heading", { name: "Visits" })
+    const view = container.querySelector("[data-render-view]")
+    expect(view).not.toBeNull()
+    expect(view!.className).toContain("theme-light")
+    expect(view!.className).not.toContain("dark")
+    await waitFor(() => expect(darks.length).toBeGreaterThan(0))
+    expect(darks.every((d) => d === false)).toBe(true)
+  })
+
+  it("a chart image keeps the dashboard's dark theme", async () => {
+    serve(payload({ theme: "dark" }))
+    const { container } = render(<RenderView token="t" chart />)
+    await screen.findByRole("heading", { name: "Note" })
+    const box = container.querySelector("[data-render-chart]")
+    expect(box).not.toBeNull()
+    expect(box!.className).toContain("dark")
+    await waitFor(() => expect(darks.length).toBeGreaterThan(0))
+    expect(darks.every((d) => d === true)).toBe(true)
+  })
+
+  // BI-53 (D17): the print view is as wide as the paper's printable width, so
+  // a chart is created in the layout that is printed.
+  it("the print view is as wide as the paper's printable width", async () => {
+    serve(payload())
+    const { container, unmount } = render(<RenderView token="t" />)
+    await screen.findByRole("heading", { name: "Visits" })
+    const view = container.querySelector("[data-render-view]") as HTMLElement
+    expect(view.style.width).toBe("697px")
+    unmount()
+    serve(payload({ render: { paper: "a4", orientation: "landscape" } }))
+    const second = render(<RenderView token="t" />)
+    await screen.findByRole("heading", { name: "Visits" })
+    const landscape = second.container.querySelector("[data-render-view]") as HTMLElement
+    expect(landscape.style.width).toBe("1027px")
+  })
+
+  // BI-36: the map's boundary is read through the render token, not through the
+  // signed-in loader, which a print view with no session cannot pass.
+  it("gives every chart a map loader that reads the boundary through the render token", async () => {
+    const calls = serve(payload())
+    render(<RenderView token="a.b.c" />)
+    await waitFor(() => expect(loaders.length).toBeGreaterThan(0))
+    const loader = loaders.find((l) => l !== undefined)
+    expect(loader).toBeDefined()
+    await loader!("m_0123456789ab")
+    const last = calls[calls.length - 1]
+    expect(last.url).toBe("/api/render/maps/m_0123456789ab/geojson")
+    expect(JSON.parse(last.body)).toEqual({ token: "a.b.c" })
+    const init = (global.fetch as unknown as { mock: { calls: [unknown, RequestInit][] } }).mock.calls.at(-1)![1]
+    expect(init.method).toBe("POST")
+  })
+
+  // BI-42 (plan D6b): an image card's picture comes through the console's own
+  // origin; the view waits for it, and the placeholder stands in when it fails.
+  it("points an image card at the render image route with the token, and waits for the picture", async () => {
+    const charts = [
+      { id: "c_img", title: "Logo", kind: "image", source: "ui", def: { url: "https://img.example/logo.png" } },
+      { id: "c_web", title: "Status", kind: "web", source: "ui", def: { url: "https://img.example/status" } },
+    ]
+    quietImages()
+    serve(payload({ charts, layout: { c_img: { x: 0, y: 0, w: 6, h: 3, tab: "t1" }, c_web: { x: 6, y: 0, w: 6, h: 3, tab: "t1" } } }))
+    const { container } = render(<RenderView token="a.b.c" />)
+    const img = (await waitFor(() => {
+      const found = container.querySelector("img")
+      expect(found).not.toBeNull()
+      return found
+    })) as HTMLImageElement
+    expect(img.getAttribute("src")).toBe(
+      `/api/render/image?token=${encodeURIComponent("a.b.c")}&src=${encodeURIComponent("https://img.example/logo.png")}`,
+    )
+    expect(img.getAttribute("loading")).toBe("eager")
+    // The web card keeps the placeholder and mounts no frame.
+    expect(screen.getAllByText(NOT_IN_PDF).length).toBe(1)
+    expect(container.querySelector("iframe")).toBeNull()
+    // Not ready while the picture is loading, ready after it has.
+    await new Promise((r) => setTimeout(r, 100))
+    expect(flag()).toBeUndefined()
+    act(() => { img.dispatchEvent(new Event("load")) })
+    await waitFor(() => expect(flag()).toBe(true))
+  })
+
+  it("prints the placeholder for an image card whose picture fails, and is ready", async () => {
+    quietImages()
+    const charts = [{ id: "c_img", title: "Logo", kind: "image", source: "ui", def: { url: "https://img.example/logo.png" } }]
+    serve(payload({ charts, layout: { c_img: { x: 0, y: 0, w: 6, h: 3, tab: "t1" } } }))
+    const { container } = render(<RenderView token="t" />)
+    const img = (await waitFor(() => {
+      const found = container.querySelector("img")
+      expect(found).not.toBeNull()
+      return found
+    })) as HTMLImageElement
+    act(() => { img.dispatchEvent(new Event("error")) })
+    await screen.findByText(NOT_IN_PDF)
+    expect(container.querySelector("img")).toBeNull()
+    await waitFor(() => expect(flag()).toBe(true))
   })
 
   it("prints an image or web-page card as a placeholder and never mounts it", async () => {

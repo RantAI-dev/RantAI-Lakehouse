@@ -49,9 +49,15 @@ describe("dagsterFlow", () => {
 })
 
 describe("authoredFlow", () => {
-  test("source, the transforms stacked in one column, then target", () => {
+  // BLD-1 part 1 D17: a pipeline is inputs, steps and an output, so a form
+  // step is one node (its operations are listed in its panel), where the
+  // chart of before drew one node per transform.
+  test("an input, one form step, then the target", () => {
     const { nodes, edges } = authoredFlow(
       {
+        // BLD-1 part 1 / D3: the API returns both forms of the definition.
+        inputs: [{ name: "events", zone: "silver", table: "events" }],
+        steps: [{ name: "transformed", kind: "transform", reads: "events", transforms: ["dedupe(id)", "select(id,name)"] }],
         sourceZone: "silver",
         sourceTable: "events",
         incrementalColumn: null,
@@ -63,13 +69,79 @@ describe("authoredFlow", () => {
       },
       describeTransform
     )
-    expect(nodes.map((n) => [n.id, n.column])).toEqual([
-      ["source", 0],
-      ["t0", 1],
-      ["t1", 1],
-      ["target", 2],
+    expect(nodes.map((n) => [n.id, n.column, n.label])).toEqual([
+      ["input:0", 0, "silver.events"],
+      ["step:0", 1, "transformed"],
+      ["target", 2, "gold.events_clean"],
     ])
-    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual(["source>t0", "t0>t1", "t1>target"])
+    expect(nodes[1].sublabel).toBe("dedupe, select")
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual(["input:0>step:0", "step:0>target"])
+  })
+
+  test("two inputs and a SQL step: each step sits right of what it reads, edges from what it names", () => {
+    const { nodes, edges } = authoredFlow(
+      {
+        inputs: [
+          { name: "orders", zone: "bronze", table: "orders_raw" },
+          { name: "customers", zone: "bronze", table: "customers" },
+        ],
+        steps: [
+          { name: "paid", kind: "transform", reads: "orders", transforms: ["filter(status = 'paid')"] },
+          {
+            name: "by_country",
+            kind: "sql",
+            sql: "SELECT c.country, sum(p.amount) FROM paid AS p LEFT JOIN customers AS c ON p.customer_id = c.id GROUP BY 1",
+          },
+        ],
+        sourceZone: "bronze",
+        sourceTable: "orders_raw",
+        incrementalColumn: null,
+        transforms: [],
+        fbicEnabled: false,
+        targetZone: "silver",
+        targetTable: "sales_by_country",
+        connectorId: null,
+      },
+      describeTransform
+    )
+    expect(nodes.map((n) => [n.id, n.column])).toEqual([
+      ["input:0", 0],
+      ["input:1", 0],
+      ["step:0", 1],
+      ["step:1", 2],
+      ["target", 3],
+    ])
+    // An input read under another name says so.
+    expect(nodes[0].sublabel).toBe("read as orders")
+    expect(nodes[3]).toMatchObject({ kind: "step", stepKind: "sql", sublabel: "SQL" })
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual([
+      "input:0>step:0",
+      "step:0>step:1",
+      "input:1>step:1",
+      "step:1>target",
+    ])
+  })
+
+  // BLD-1 part 1 S3 review R1-S2: a kind this console does not know is drawn
+  // with its name and kind and no edge in; the output still follows it.
+  test("a step of a kind this console does not know is drawn with its name and kind", () => {
+    const { nodes, edges } = authoredFlow(
+      {
+        inputs: [{ name: "orders", zone: "bronze", table: "orders" }],
+        steps: [{ name: "joined", kind: "join", left: "orders" }],
+        sourceZone: "bronze",
+        sourceTable: "orders",
+        incrementalColumn: null,
+        transforms: [],
+        fbicEnabled: false,
+        targetZone: "silver",
+        targetTable: "joined",
+        connectorId: null,
+      },
+      describeTransform
+    )
+    expect(nodes[1]).toMatchObject({ id: "step:0", label: "joined", sublabel: "join, not shown here", stepKind: "other" })
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual(["step:0>target"])
   })
 
   // BLD-10 D3: a pipeline with no transform copies its source as is. The
@@ -78,6 +150,8 @@ describe("authoredFlow", () => {
   test("a pipeline with no transform copies its source, and the target says so", () => {
     const { nodes, edges } = authoredFlow(
       {
+        inputs: [{ name: "orders_raw", zone: "bronze", table: "orders_raw" }],
+        steps: [],
         sourceZone: "bronze",
         sourceTable: "orders_raw",
         incrementalColumn: null,
@@ -89,12 +163,14 @@ describe("authoredFlow", () => {
       },
       describeTransform
     )
+    // The input's node id is `input:0` since BLD-1 part 1 D17 (it was
+    // `source` when a pipeline had one source); the layout is the same.
     expect(nodes.map((n) => [n.id, n.column])).toEqual([
-      ["source", 0],
+      ["input:0", 0],
       ["target", 1],
     ])
     expect(nodes.find((n) => n.id === "target")?.sublabel).toBe("plain copy of the source")
-    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual(["source>target"])
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual(["input:0>target"])
   })
 })
 
@@ -123,12 +199,147 @@ describe("layoutFlow", () => {
   test("an edge inside one column drops straight down", () => {
     const layout = layoutFlow(
       [
-        { id: "t0", column: 1, kind: "transform", label: "x" },
-        { id: "t1", column: 1, kind: "transform", label: "y" },
+        // BLD-1 part 1 S3 review R1-S9: the `transform` node kind is gone
+        // (nothing produces it since a form step is one node); the test of
+        // an edge inside one column uses the kind that replaced it.
+        { id: "t0", column: 1, kind: "step", label: "x" },
+        { id: "t1", column: 1, kind: "step", label: "y" },
       ],
       [{ from: "t0", to: "t1" }]
     )
     const { from, to } = layout.edges[0]
     expect(edgePath(from, to)).toMatch(/^M [\d.]+ [\d.]+ L /)
+  })
+})
+
+// ── BLD-16 (BLD-1 part 2) / J9: the form kinds' edges and sublabels ──────
+
+describe("authoredFlow: the form kinds (BLD-16)", () => {
+  const base = {
+    sourceZone: "bronze",
+    sourceTable: "orders_raw",
+    incrementalColumn: null,
+    transforms: [],
+    fbicEnabled: false,
+    targetZone: "silver",
+    targetTable: "sales_by_country",
+    connectorId: null,
+  }
+
+  test("a join draws two edges in, one per side, and a self-join one", () => {
+    const { nodes, edges } = authoredFlow(
+      {
+        ...base,
+        inputs: [
+          { name: "orders", zone: "bronze", table: "orders_raw" },
+          { name: "customers", zone: "bronze", table: "customers" },
+        ],
+        steps: [
+          {
+            name: "joined",
+            kind: "join",
+            left: "orders",
+            right: "customers",
+            joinType: "left",
+            on: [{ left: "customer_id", right: "id" }],
+            columns: [{ side: "left", column: "id" }],
+          },
+        ],
+      },
+      describeTransform
+    )
+    expect(nodes[2]).toMatchObject({ id: "step:0", label: "joined", stepKind: "join", sublabel: "left join" })
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual([
+      "input:0>step:0",
+      "input:1>step:0",
+      "step:0>target",
+    ])
+
+    // A self-join reads one item under two sides: one edge, not two
+    // identical ones.
+    const self = authoredFlow(
+      {
+        ...base,
+        inputs: [{ name: "orders", zone: "bronze", table: "orders_raw" }],
+        steps: [
+          {
+            name: "joined",
+            kind: "join",
+            left: "orders",
+            right: "orders",
+            joinType: "inner",
+            on: [{ left: "id", right: "parent_id" }],
+            columns: [{ side: "left", column: "id" }],
+          },
+        ],
+      },
+      describeTransform
+    )
+    expect(self.edges.map((e) => `${e.from}>${e.to}`)).toEqual(["input:0>step:0", "step:0>target"])
+  })
+
+  test("an aggregate and a filter each draw one edge in, with their own sublabels", () => {
+    const { nodes, edges } = authoredFlow(
+      {
+        ...base,
+        inputs: [{ name: "orders", zone: "bronze", table: "orders_raw" }],
+        steps: [
+          {
+            name: "by_country",
+            kind: "aggregate",
+            reads: "orders",
+            groupBy: ["country"],
+            measures: [{ function: "sum", column: "amount", name: "revenue" }],
+          },
+          {
+            name: "big_or_local",
+            kind: "filter",
+            reads: "by_country",
+            match: "any",
+            conditions: [
+              { column: "revenue", operator: ">=", value: "5000" },
+              { column: "country", operator: "=", value: "ID" },
+            ],
+          },
+        ],
+      },
+      describeTransform
+    )
+    expect(nodes[1]).toMatchObject({ id: "step:0", stepKind: "aggregate", sublabel: "group by country" })
+    expect(nodes[2]).toMatchObject({ id: "step:1", stepKind: "filter", sublabel: "any of 2 conditions" })
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual([
+      "input:0>step:0",
+      "step:0>step:1",
+      "step:1>target",
+    ])
+  })
+
+  // BLD-16 review R2: the sublabel said only what the step groups by, so an
+  // aggregate with a having read as "every group kept" while groups are
+  // dropped. It says the having is there.
+  test("an aggregate's having is in its sublabel", () => {
+    const { nodes } = authoredFlow(
+      {
+        ...base,
+        inputs: [{ name: "orders", zone: "bronze", table: "orders_raw" }],
+        steps: [
+          {
+            name: "big_spenders",
+            kind: "aggregate",
+            reads: "orders",
+            groupBy: ["country"],
+            measures: [{ function: "sum", column: "amount", name: "revenue" }],
+            havingMatch: "all",
+            having: [{ column: "revenue", operator: ">", value: "1000" }],
+          },
+        ],
+      },
+      describeTransform
+    )
+    expect(nodes[1]).toMatchObject({
+      id: "step:0",
+      stepKind: "aggregate",
+      sublabel: "group by country · keep groups where 1 condition",
+    })
   })
 })

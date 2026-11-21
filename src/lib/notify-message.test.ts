@@ -73,15 +73,15 @@ test("buildErrorDescription tetap memberi teks saat pesan error kosong", () => {
 })
 
 // BI-18 part C review fix (SHOULD-FIX) R20: the API's `code: detail` text never reaches the reader.
-test("a permission_denied message shows the hint sentence alone, with no code prefix", () => {
+test("a coded refusal becomes the one sentence, and the toast adds the next step", () => {
   const err = new ServiceError("permission_denied", "permission_denied: dashboard:write")
   assert.equal(
     buildErrorDescription(err),
-    "This account does not have permission. Ask a workspace admin."
+    "You don't have access. This needs the dashboard:write permission. Ask a workspace admin."
   )
   assert.equal(
     readableErrorMessage("permission_denied: dashboard:write"),
-    "This account does not have permission. Ask a workspace admin."
+    "You don't have access. This needs the dashboard:write permission."
   )
 })
 
@@ -107,15 +107,48 @@ test("a sentence after the code is shown as the server wrote it", () => {
   )
 })
 
-test("a bare permission id or a fragment after the code still reads as the generic hint", () => {
+test("a code with nothing after it is the fixed sentence, and a fragment under another code stays hidden", () => {
   assert.equal(
     readableErrorMessage("permission_denied: dashboard:write"),
-    "This account does not have permission. Ask a workspace admin."
+    "You don't have access. This needs the dashboard:write permission."
   )
   assert.equal(
     readableErrorMessage("permission_denied"),
-    "This account does not have permission. Ask a workspace admin."
+    "You don't have access."
   )
   // A space but no closing full stop is not taken for a sentence.
   assert.ok(!readableErrorMessage("not_found: row 12 in table x").includes("row 12"))
+})
+
+test("a refusal the client already put into words keeps them and gains the next step once", () => {
+  assert.equal(
+    buildErrorDescription(
+      new ServiceError(
+        "permission_denied",
+        "You don't have access. This needs the pipeline:write permission.",
+        403
+      )
+    ),
+    "You don't have access. This needs the pipeline:write permission. Ask a workspace admin."
+  )
+  assert.equal(
+    buildErrorDescription(new ServiceError("permission_denied", "")),
+    "You don't have access. Ask a workspace admin."
+  )
+})
+
+test("a coded refusal a client filed under another code still reads as a refusal", () => {
+  assert.equal(
+    buildErrorDescription(
+      new ServiceError("invalid_request", "permission_denied: connector:manage", 403)
+    ),
+    "You don't have access. This needs the connector:manage permission. Ask a workspace admin."
+  )
+})
+
+test("a fragment after the refusal code is given as the reason", () => {
+  assert.equal(
+    readableErrorMessage("permission_denied: manage on this item"),
+    "You don't have access. Reason given: manage on this item."
+  )
 })

@@ -34,6 +34,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::catalog::{GRANT_DAYS, annotation_pool, catalog_tenant_refusal, validate_annotation_id};
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -53,16 +54,11 @@ struct GrantBody {
 }
 
 /// Best-effort audit write, like the other catalog writes: a failed audit
-/// insert never fails the grant or revoke it describes.
-async fn audit(
-    pool: &lakehouse_store::PgPool,
-    principal: &Principal,
-    action: &str,
-    asset: &str,
-    args: Value,
-) {
-    let _ = lakehouse_store::audit::insert(
-        pool,
+/// insert never fails the grant or revoke it describes, and is counted
+/// ([`audit_coverage::record_best_effort`]).
+async fn audit(state: &AppState, principal: &Principal, action: &str, asset: &str, args: Value) {
+    audit_coverage::record_best_effort(
+        state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: Some(principal.id.uuid().to_string()),
             principal_kind: Some("user".to_owned()),
@@ -97,6 +93,8 @@ pub async fn list(
         return Err(ApiError::PermissionDenied(reason.to_owned()).into());
     }
     validate_annotation_id(&id)?;
+    // GOV-7 D6: a hidden asset's grants answer the same 404 as an unknown id.
+    crate::routes::catalog::ensure_asset_readable(&state, &principal, &id).await?;
     let pool = annotation_pool(&state)?;
     let grants = lakehouse_store::agents::list_asset_grants(pool, &id).await?;
     Ok(ApiJson(json!({ "grants": grants })))
@@ -204,7 +202,7 @@ pub async fn create(
     .await?;
     // PR #106 review R1 SHOULD-FIX DATA-15 3: name grantee by display name + email
     audit(
-        pool,
+        &state,
         &principal,
         "catalog.grant",
         &id,
@@ -249,7 +247,7 @@ pub async fn revoke(
         return Err(ApiError::NotFound("no such grant in force".to_owned()).into());
     };
     audit(
-        pool,
+        &state,
         &principal,
         "catalog.revoke",
         &id,

@@ -6,6 +6,7 @@
 //! target (`src/main.rs`) is a thin wrapper that invokes [`run`].
 #![allow(clippy::multiple_crate_versions)]
 
+pub mod audit_coverage;
 pub mod auth;
 pub mod bounded;
 pub mod bronze_stats_cache;
@@ -26,10 +27,13 @@ pub mod connector_secret_store;
 pub mod crypto_provider;
 pub mod csv_export;
 pub mod csv_safe;
+mod dashboard_visibility;
+pub mod db_roles;
 pub mod error;
 pub mod export;
 pub mod gold_export;
 pub mod gold_export_history;
+pub mod gold_latest_copy;
 pub mod gold_lock;
 pub mod health;
 pub mod internal_hosts;
@@ -40,11 +44,14 @@ pub mod lakekeeper_token;
 pub mod next_run;
 pub mod pdf;
 pub mod pg_probe;
+pub mod pipeline_compile;
+pub mod pipeline_forms;
 pub mod pipeline_lag;
 pub mod pipeline_source;
 pub mod policy;
 pub mod policy_engine;
 pub mod query_limits;
+pub mod query_params;
 pub mod readiness;
 pub mod result_cache;
 pub mod routes;
@@ -53,9 +60,11 @@ pub mod rustfs_client;
 pub mod secret_crypto;
 pub mod secret_manager;
 pub mod sql_guard;
+pub mod sql_lex;
 pub mod sql_lineage;
 pub mod sql_rewrite;
 pub mod state;
+pub mod table_access;
 pub mod tenant;
 pub mod tenant_scope;
 pub mod tile_pool;
@@ -104,11 +113,17 @@ pub async fn run() -> anyhow::Result<()> {
     let config = Config::from_env().context("failed to resolve configuration from environment")?;
     // SRC-12 decision 5: `lakehouse-api rotate-secrets-key` re-seals the
     // managed credentials and exits; it never starts the server.
+    // SEC-78 decision 2: `lakehouse-api migrate` runs the migrations and
+    // sets the console's own database role up; it never starts the server.
     if let Some(command) = std::env::args().nth(1) {
         return match command.as_str() {
             "rotate-secrets-key" => rotate_secrets_key(&config).await,
+            "migrate" => migrate_database(&config).await,
             other => {
-                anyhow::bail!("unknown command {other:?}; the only command is rotate-secrets-key")
+                anyhow::bail!(
+                    "unknown command {other:?}; the only commands are migrate and \
+                     rotate-secrets-key"
+                )
             }
         };
     }
@@ -122,13 +137,15 @@ pub async fn run() -> anyhow::Result<()> {
     // wrote and remove the leftovers of an interrupted change.
     seal_connector_secrets_at_startup(&state).await?;
 
-    // OPS-4: the application database's start-up step. `migrate` is
-    // idempotent (`sqlx` records applied versions in `_sqlx_migrations`),
-    // so running it on every boot is safe. The two ways it can fail are
-    // NOT the same thing, and `bring_database_up` decides between them:
-    // a reachable database whose schema is not this build's version stops
-    // the process, while an unreachable one degrades (Phase 1 routes
-    // serve) and retries loudly. See that function's doc comment.
+    // OPS-4: the application database's start-up step. The API does NOT
+    // migrate any more (`SEC-78` decision 4): the `migrate` command does
+    // that, with the owner's role, and this process only READS the
+    // database — it refuses to serve on a schema that is behind this build.
+    // The two ways that can fail are NOT the same thing, and
+    // `bring_database_up` decides between them: a reachable database whose
+    // schema is not this build's version stops the process, while an
+    // unreachable one degrades (Phase 1 routes serve) and retries loudly.
+    // See that function's doc comment.
     bring_database_up(&state).await?;
 
     // DATA-41 D4: build the catalog search copy once, in the background,
@@ -243,42 +260,116 @@ const DATABASE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_s
 
 /// The fixed line the start-up path and the retry loop log when the
 /// database ANSWERED and its schema is not this build's version (`OPS-4`
-/// decision 1) — the cause is in the logged error, this line is the one
-/// an operator greps for.
-const DATABASE_SCHEMA_MISMATCH: &str =
-    "the application database is not at this build's schema version";
+/// decision 1, `SEC-78` decision 4) — the cause is in the logged error,
+/// this line is the one an operator greps for.
+///
+/// It names the service that applies the migrations, because the API does
+/// not apply them any more: it refuses to serve on a database whose schema
+/// is behind this build, and the `lakehouse-db-migrate` service is what
+/// brings it up to date.
+pub const DATABASE_SCHEMA_MISMATCH: &str = "the application database is not at this build's schema version; run the \
+     lakehouse-db-migrate service before lakehouse-api";
 
 /// What the start-up migration step decided (`OPS-4`).
-enum DatabaseStartup {
+#[derive(Debug)]
+pub enum DatabaseStartup {
     /// The database answered and its schema is at this build's version.
     Ready,
+    /// The database answered and its schema is BEHIND this build's
+    /// version: the migrations this build embeds are pending. The API
+    /// refuses to serve (fail closed) — the `lakehouse-db-migrate` service
+    /// applies them, with the owner's role.
+    Pending(Vec<i64>),
     /// The database could not be reached at all; the error is kept for the
     /// log. Serve the Phase 1 routes and retry (decision 2).
     Unreachable(lakehouse_store::StoreError),
 }
 
+/// Why the start path refuses to serve.
+///
+/// The two reasons are kept apart because the operator reads two
+/// different sentences: one about the schema, one about the role.
+#[derive(Debug)]
+pub enum StartPathRefusal {
+    /// The database's schema version could not be read.
+    Schema(lakehouse_store::StoreError),
+    /// The role the console connects as may switch the append-only
+    /// triggers off.
+    Role(db_roles::RuntimeRoleRefusal),
+}
+
+impl std::fmt::Display for StartPathRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Schema(_) => f.write_str(DATABASE_SCHEMA_MISMATCH),
+            Self::Role(refusal) => write!(f, "{refusal}"),
+        }
+    }
+}
+
+/// The start path's check, on the console's own connection.
+///
+/// Two things, in this order:
+///
+/// 1. the database's schema is at this build's version (`SEC-78` decision
+///    4 — the API never migrates; the `lakehouse-db-migrate` service
+///    applies the migrations, with the owner's role);
+/// 2. the role the console connects as owns no table and is not a
+///    superuser (`SEC-78` decision 5 — either one can switch the
+///    audit trail's append-only triggers off).
+///
+/// The role check runs only when the schema is at this build's version:
+/// a database that is behind is refused for that reason alone, and the
+/// operator does not need a second sentence.
+///
+/// # Errors
+///
+/// Returns [`StartPathRefusal::Role`] when the role may change the audit
+/// trail, and [`StartPathRefusal::Schema`] when the schema version could
+/// not be read.
+pub async fn check_start_path(pool: &sqlx::PgPool) -> Result<DatabaseStartup, StartPathRefusal> {
+    let startup = check_database_schema(pool)
+        .await
+        .map_err(StartPathRefusal::Schema)?;
+    if let DatabaseStartup::Ready = startup {
+        db_roles::check_runtime_role(pool)
+            .await
+            .map_err(StartPathRefusal::Role)?;
+    }
+    Ok(startup)
+}
+
 /// `OPS-4`: bring the application database up to this build's schema
 /// version before serving, or decide how to serve without it.
+///
+/// `SEC-78` decision 4: the API does not MIGRATE any more. It reads the
+/// migration bookkeeping and refuses to serve on a database whose schema
+/// is behind this build; the `lakehouse-db-migrate` service applies the
+/// migrations, with the owner's role, before this process starts.
 ///
 /// * **No pool at all** (a `DATABASE_URL` that did not parse): every Phase
 ///   2 route answers `503`; log it as an error, since a deployment that
 ///   lost its database configuration has no working login either.
-/// * **A reachable database that refuses the migrations** (version
-///   mismatch, a failed statement, a changed checksum): refuse to start,
-///   non-zero exit, error logged (decision 1). PRs #106 and #199 showed
-///   what serving anyway costs: sqlx stops at the first mismatch, every
-///   newer route answers `500`, and the process looks healthy. Failing
-///   closed is the only honest option — compose restarts it and the log
-///   says why every time.
+/// * **A reachable database that refuses this build's schema**
+///   (a pending migration, or a bookkeeping table that cannot be read):
+///   refuse to start, non-zero exit, error logged (decision 1). PRs #106
+///   and #199 showed what serving anyway costs: sqlx stops at the first
+///   mismatch, every newer route answers `500`, and the process looks
+///   healthy. Failing closed is the only honest option — compose restarts
+///   it and the log says why every time.
 /// * **An unreachable database**: keep the Phase 1 routes serving and
 ///   retry loudly (decision 2). This is the pre-`OPS-4` behaviour, minus
 ///   the silence: `spawn_database_retry` logs an error every
 ///   [`DATABASE_RETRY_INTERVAL`] until a connection succeeds, and
 ///   `GET /health` reports the database as unavailable meanwhile.
+/// * **A role that may switch the append-only triggers off**
+///   (`SEC-78` decision 5): refuse to start, non-zero exit, with the
+///   fixed sentence [`db_roles::RUNTIME_ROLE_REFUSAL`].
 ///
 /// # Errors
 /// Returns the refusal of decision 1 (the schema is not at this build's
-/// version); nothing else in this function fails.
+/// version) or of `SEC-78` decision 5 (the role is a superuser or owns
+/// the tables); nothing else in this function fails.
 async fn bring_database_up(state: &AppState) -> anyhow::Result<()> {
     let Some(pool) = state.pg.as_deref() else {
         tracing::error!(
@@ -287,10 +378,12 @@ async fn bring_database_up(state: &AppState) -> anyhow::Result<()> {
         );
         return Ok(());
     };
-    match migration_outcome(lakehouse_store::migrate(pool).await) {
+    match check_start_path(pool).await {
         Ok(DatabaseStartup::Ready) => {
             state.mark_database_ready();
-            tracing::info!("database migrations applied");
+            tracing::info!(
+                "the database is at this build's schema version and the console's role may serve"
+            );
             Ok(())
         }
         Ok(DatabaseStartup::Unreachable(err)) => {
@@ -303,26 +396,64 @@ async fn bring_database_up(state: &AppState) -> anyhow::Result<()> {
             spawn_database_retry(state.clone());
             Ok(())
         }
-        Err(err) => {
-            tracing::error!(error = ?err, "failed to apply database migrations");
+        Ok(DatabaseStartup::Pending(versions)) => {
+            tracing::error!(
+                pending = ?versions,
+                "{DATABASE_SCHEMA_MISMATCH}; refusing to start"
+            );
             anyhow::bail!("{DATABASE_SCHEMA_MISMATCH}; refusing to start")
+        }
+        Err(StartPathRefusal::Schema(err)) => {
+            tracing::error!(
+                error = ?err,
+                "failed to read the application database's schema version"
+            );
+            anyhow::bail!("{DATABASE_SCHEMA_MISMATCH}; refusing to start")
+        }
+        // `SEC-78` decision 5: the console connects as a role that owns
+        // no table and is not a superuser, because either one can switch
+        // off the audit trail's append-only triggers. This check lives
+        // here, in the start path, and NOT in `AppState` or the router:
+        // the route tests build the state as the test superuser and must
+        // keep working.
+        Err(StartPathRefusal::Role(refusal)) => {
+            log_role_refusal(&refusal);
+            anyhow::bail!("{refusal}");
         }
     }
 }
 
-/// The decision [`bring_database_up`] takes from one `migrate` result,
+/// The start-up schema check (`SEC-78` decision 4): is the database at
+/// this build's schema version?
+///
+/// The API never migrates; it reads the migration bookkeeping and reports
+/// what is pending. The `migrate` subcommand applies the migrations, with
+/// the owner's role.
+///
+/// # Errors
+///
+/// Returns [`lakehouse_store::StoreError`] if the check could not be read
+/// and the failure is not an unreachable database.
+pub async fn check_database_schema(
+    pool: &sqlx::PgPool,
+) -> Result<DatabaseStartup, lakehouse_store::StoreError> {
+    migration_outcome(lakehouse_store::pending_migration_versions(pool).await)
+}
+
+/// The decision [`bring_database_up`] takes from one schema check,
 /// split from the I/O so a unit test can drive both outcomes without a
 /// database (and so no library code ever calls `process::exit`): the
 /// caller's `?` is what turns the refusal into a non-zero exit.
 /// # Errors
 ///
-/// Returns `lakehouse_store::StoreError` if the migration failed and the failure is not
+/// Returns `lakehouse_store::StoreError` if the check failed and the failure is not
 /// classified as an unreachable database.
 fn migration_outcome(
-    result: Result<(), lakehouse_store::StoreError>,
+    result: Result<Vec<i64>, lakehouse_store::StoreError>,
 ) -> Result<DatabaseStartup, lakehouse_store::StoreError> {
     match result {
-        Ok(()) => Ok(DatabaseStartup::Ready),
+        Ok(pending) if pending.is_empty() => Ok(DatabaseStartup::Ready),
+        Ok(pending) => Ok(DatabaseStartup::Pending(pending)),
         Err(err) if is_unreachable_database(&err) => Ok(DatabaseStartup::Unreachable(err)),
         Err(err) => Err(err),
     }
@@ -357,7 +488,9 @@ fn is_unreachable_database(err: &lakehouse_store::StoreError) -> bool {
 /// start that already happened. It logs the same fixed line the start-up
 /// path refuses with, and `/health` keeps reporting the database
 /// unavailable — the honest state, without pretending a restart loop is
-/// the answer.
+/// the answer. The same goes for the role check (`SEC-78` decision 5): a
+/// role that may switch the append-only triggers off does not become a
+/// safer one by waiting.
 fn spawn_database_retry(state: AppState) {
     tokio::spawn(async move {
         let Some(pool) = state.pg.clone() else {
@@ -365,12 +498,12 @@ fn spawn_database_retry(state: AppState) {
         };
         loop {
             tokio::time::sleep(DATABASE_RETRY_INTERVAL).await;
-            match migration_outcome(lakehouse_store::migrate(&pool).await) {
+            match check_start_path(&pool).await {
                 Ok(DatabaseStartup::Ready) => {
                     state.mark_database_ready();
                     tracing::info!(
-                        "application database is reachable again; migrations applied and \
-                         GET /health reports it usable"
+                        "application database is reachable again; the schema is at this \
+                         build's version and GET /health reports it usable"
                     );
                     return;
                 }
@@ -382,11 +515,23 @@ fn spawn_database_retry(state: AppState) {
                         DATABASE_RETRY_INTERVAL.as_secs()
                     );
                 }
-                Err(err) => {
+                Ok(DatabaseStartup::Pending(versions)) => {
                     tracing::error!(
-                        error = ?err,
+                        pending = ?versions,
                         "{DATABASE_SCHEMA_MISMATCH}; Phase 2 routes stay unavailable"
                     );
+                    return;
+                }
+                Err(StartPathRefusal::Schema(err)) => {
+                    tracing::error!(
+                        error = ?err,
+                        "failed to read the application database's schema version; \
+                         Phase 2 routes stay unavailable"
+                    );
+                    return;
+                }
+                Err(StartPathRefusal::Role(refusal)) => {
+                    log_role_refusal(&refusal);
                     return;
                 }
             }
@@ -488,6 +633,147 @@ async fn rotate_secrets_key(config: &Config) -> anyhow::Result<()> {
     }
 }
 
+/// How often `lakehouse-api migrate` retries the database connection, and
+/// how long it waits between two attempts (`SEC-78` decision 3).
+///
+/// 30 attempts 2 s apart is about a minute. The Postgres image restarts
+/// once after `pg_isready` first succeeds, so the first connection of a
+/// deploy can be refused for a moment; the same is true of the
+/// `openfga-db-init` service.
+const MIGRATE_CONNECT_ATTEMPTS: u32 = 30;
+const MIGRATE_CONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The fixed sentences the `migrate` command exits with.
+///
+/// The upstream error text never reaches them (`AGENTS.md` rule 4): it goes
+/// to the log under a reference id, and the message the operator reads is
+/// one of these two.
+const MIGRATE_CONTEXT: upstream_error::Context = upstream_error::Context::new(
+    "database migration",
+    "the database migration failed.",
+    "the database is unreachable.",
+);
+
+/// `lakehouse-api migrate` (`SEC-78` decision 2): the one place that sets
+/// the database up.
+///
+/// It connects with the OWNER's URL (`DATABASE_URL`, which in compose is
+/// the owner's), waits for the database to accept a connection, runs the
+/// migrations, sets the console's own database role up, and exits. The
+/// server never does this: it only reads the database
+/// ([`bring_database_up`]), so it never holds the owner's password.
+///
+/// The pool this command uses never logs a statement: the one statement
+/// that carries the console role's password is a statement whose TEXT the
+/// server builds, and `sqlx` logs a statement's text at the DEBUG level by
+/// default (`RUST_LOG=debug` would put the password in the log).
+///
+/// # Errors
+///
+/// Returns an error if the role's password is not configured, if the
+/// database cannot be reached, or if a migration or a grant fails. Every
+/// one of them exits non-zero with a fixed sentence.
+async fn migrate_database(config: &Config) -> anyhow::Result<()> {
+    let Some(password) = config.db_app_password.as_ref() else {
+        anyhow::bail!(
+            "LAKEHOUSE_DB_APP_PASSWORD must be set to run the migrate command; it is the \
+             password of the console's own database role"
+        );
+    };
+    // The pool that NEVER logs a statement: this command runs the one
+    // statement whose text carries the console role's password, and
+    // `sqlx` logs a statement's text at the DEBUG level.
+    let pool = match lakehouse_store::connect_lazy_without_statement_logging(&config.database_url) {
+        Ok(pool) => pool,
+        Err(err) => {
+            anyhow::bail!("{}", store_failure(&err));
+        }
+    };
+    connect_with_retry(&pool).await?;
+    if let Err(err) = lakehouse_store::migrate(&pool).await {
+        anyhow::bail!("{}", store_failure(&err));
+    }
+    if let Err(err) = db_roles::setup_app_role(&pool, password).await {
+        // A statement that did not carry the password: the upstream text
+        // goes to the log under a reference id.
+        if let Some(upstream) = err.upstream() {
+            let failure = upstream_error::report_sqlx(&MIGRATE_CONTEXT, upstream);
+            anyhow::bail!("{failure}");
+        }
+        // The statement that DID carry the password: only its SQLSTATE is
+        // logged. The server's own message for a refused statement can
+        // quote the statement, and that statement holds the password.
+        match err.sqlstate() {
+            Some(sqlstate) => {
+                tracing::error!(
+                    sqlstate = sqlstate,
+                    "the console's database role password could not be set"
+                );
+            }
+            None => {
+                tracing::error!("the console's database role password could not be set");
+            }
+        }
+        anyhow::bail!("{err}");
+    }
+    tracing::info!("the database is migrated and the console's database role is set up");
+    Ok(())
+}
+
+/// The message a store failure is reported as.
+///
+/// The upstream text goes to the log under a reference id; the operator
+/// reads the fixed sentence and the reference (`AGENTS.md` principle 4).
+fn store_failure(err: &lakehouse_store::StoreError) -> String {
+    match upstream_error::store(&MIGRATE_CONTEXT, err) {
+        upstream_error::Reported::Own(text) => text,
+        upstream_error::Reported::Upstream(failure) => failure.to_string(),
+    }
+}
+
+/// Log why the start path refuses the console's database role.
+///
+/// The refusal's own text is the fixed sentence the operator reads; the
+/// upstream error, when there is one, is what the log gets.
+fn log_role_refusal(refusal: &db_roles::RuntimeRoleRefusal) {
+    if let Some(err) = refusal.upstream() {
+        tracing::error!(error = %err, "{refusal}");
+    } else {
+        tracing::error!("{refusal}");
+    }
+}
+
+/// Wait for the database to accept a connection.
+///
+/// The Postgres image restarts once after `pg_isready` first succeeds, so
+/// the first connection of a deploy can be refused; the command retries
+/// for about a minute before it gives up.
+///
+/// # Errors
+///
+/// Returns an error with the fixed sentence when the database still
+/// refuses the connection after the last attempt.
+async fn connect_with_retry(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    for attempt in 1..=MIGRATE_CONNECT_ATTEMPTS {
+        match sqlx::query("SELECT 1").execute(pool).await {
+            Ok(_) => return Ok(()),
+            Err(err) if attempt == MIGRATE_CONNECT_ATTEMPTS => {
+                let failure = upstream_error::report_sqlx(&MIGRATE_CONTEXT, &err);
+                anyhow::bail!("{failure}");
+            }
+            Err(err) => {
+                tracing::warn!(
+                    attempt,
+                    error = %err,
+                    "the database is not accepting connections yet; retrying"
+                );
+                tokio::time::sleep(MIGRATE_CONNECT_DELAY).await;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Idempotently seed exactly one bootstrap admin account from
 /// `AUTH_BOOTSTRAP_EMAIL`/`AUTH_BOOTSTRAP_PASSWORD`
 /// ([`Config::auth_bootstrap_email`]/[`Config::auth_bootstrap_password`]),
@@ -497,12 +783,16 @@ async fn rotate_secrets_key(config: &Config) -> anyhow::Result<()> {
 ///
 /// This does not check "does the bootstrap admin already exist" before
 /// inserting — it just tries the insert and treats the natural outcome of
-/// re-running it (`app_user.email` already taken, surfaced as
-/// [`lakehouse_store::StoreError::Conflict`] from
-/// [`lakehouse_store::identity::create_user`]) as "already seeded, nothing
-/// to do", logged at `info`. Every other failure logs at `error` and
-/// leaves the process to boot anyway — a broken bootstrap-admin seed must
-/// not stop [`run`] from serving the rest of the API.
+/// re-running it (the bootstrap e-mail already taken) as "already seeded,
+/// nothing to do", logged at `info`. ADM-11 adds a second path to that
+/// same outcome: the username is the lowercased bootstrap e-mail (D12),
+/// so a re-run now trips the username side of [`lakehouse_store::StoreError::FieldConflict`]
+/// from [`lakehouse_store::identity::create_user`] before the insert even
+/// reaches the e-mail unique index's [`lakehouse_store::StoreError::Conflict`].
+/// Both mean "already seeded" and both are handled the same way. Every
+/// other failure logs at `error` and leaves the process to boot anyway —
+/// a broken bootstrap-admin seed must not stop [`run`] from serving the
+/// rest of the API.
 ///
 /// # What happens when the env vars are absent
 ///
@@ -533,13 +823,18 @@ async fn bootstrap_admin(state: &AppState) {
 
     let input = lakehouse_store::identity::InviteUserInput {
         name: "Bootstrap Admin".to_owned(),
-        email,
+        // ADM-11 D12: the username is the lowercased bootstrap e-mail —
+        // the local login accepts the same string for either field.
+        username: email.to_lowercase(),
+        email: Some(email),
         roles: vec!["Platform Admin".to_owned()],
         tenants: Vec::new(),
     };
     let user = match lakehouse_store::identity::create_user(pool, &input).await {
         Ok(user) => user,
-        Err(lakehouse_store::StoreError::Conflict) => {
+        Err(
+            lakehouse_store::StoreError::Conflict | lakehouse_store::StoreError::FieldConflict(_),
+        ) => {
             tracing::info!("bootstrap admin already exists; nothing to seed");
             return;
         }
@@ -1130,8 +1425,10 @@ fn spawn_upload_session_sweep(state: &AppState) {
 /// in the trash for more than 30 days (`BI-18` part C, part 2). Runs once at
 /// start and then every hour, like [`spawn_auth_cleanup`] (missed ticks
 /// skipped), on the API's own runtime: the dashboards live in `ClickHouse`, so
-/// no Postgres pool is needed and every replica may run it (the removal is
-/// idempotent).
+/// no Postgres pool is needed for them and every replica may run it (the
+/// removal is idempotent). Reports (`BI-18` part D) live in Postgres and are
+/// swept from it, by one `DELETE` of the rows past 30 days, when there is a
+/// pool.
 ///
 /// Fail closed: `lakehouse_bi::trash::purge_expired` reads the expired ids
 /// before it writes anything, so a sweep that cannot read deletes nothing; the
@@ -1145,6 +1442,24 @@ fn spawn_trash_sweep(state: &AppState) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            // BI-18 part D (T1): reports in the trash go after the same 30
+            // days. A failure is logged and the next tick tries again.
+            if let Some(pg) = pg.as_deref() {
+                match lakehouse_store::dashboard_reports::purge_expired(
+                    pg,
+                    lakehouse_bi::trash::RETENTION_DAYS,
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(reports) => {
+                        tracing::info!(reports, "dashboard trash sweep removed expired reports");
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "expired reports were not removed; the next sweep retries");
+                    }
+                }
+            }
             match lakehouse_bi::trash::purge_expired(&ch).await {
                 Ok(purged) if purged.boards + purged.charts > 0 => {
                     // BI-19 B1 review R8: a dashboard removed for good takes its
@@ -1275,6 +1590,20 @@ fn warn_if_catalog_tenant_unconfigured(config: &config::Config) {
     if config.catalog_tenant_id.is_none() {
         tracing::warn!("{CATALOG_TENANT_UNCONFIGURED_WARNING}");
     }
+}
+
+/// Drop the DATA MAP cache, so the next chat turn rebuilds it.
+///
+/// The cache is one entry for the whole process, kept for two minutes, and
+/// every chat turn reads it. A test that pins the system prompt's bytes needs
+/// the map it pins to be the one its own mocks produce, so it clears the
+/// cache before it chats (`AI-32`).
+///
+/// Production behaviour is unchanged: the same cache, the same TTL and the
+/// same cache hits. This is the seam that makes the pin deterministic in one
+/// process.
+pub async fn clear_data_map_cache() {
+    routes::ai::data_map::clear_cache().await;
 }
 
 #[cfg(test)]
@@ -1463,6 +1792,25 @@ mod tests {
                 Ok(DatabaseStartup::Unreachable(_))
             ),
             "the connect error is two `source` hops down: StoreError -> MigrateError -> sqlx::Error"
+        );
+    }
+
+    /// `SEC-78` decision 4: a database whose schema is BEHIND this build
+    /// is a refusal, not a degradation — the `migrate` command applies the
+    /// missing migrations with the owner's role, and the API serves
+    /// nothing until it has run.
+    #[test]
+    fn a_pending_migration_refuses_to_start() {
+        let outcome = migration_outcome(Ok(vec![142, 148]));
+        assert!(
+            matches!(outcome, Ok(DatabaseStartup::Pending(ref versions)) if versions == &[142, 148]),
+            "the pending versions are what the operator needs to see: {outcome:?}"
+        );
+
+        let outcome = migration_outcome(Ok(vec![]));
+        assert!(
+            matches!(outcome, Ok(DatabaseStartup::Ready)),
+            "a database at this build's version is ready: {outcome:?}"
         );
     }
 
@@ -1663,11 +2011,11 @@ mod tests {
     /// The three old agent endpoints ran a model's SQL straight on
     /// `ClickHouse` with no masking or row filter (`SEC-9`, `SEC-11`). They
     /// are gone: the console's natural-language box asks `/api/ai/chat`
-    /// instead. `auth_gate` fails closed on a path no route matched (it has
-    /// no `MatchedPath`, so the answer is a 500, not a 404, for every
-    /// caller, signed in or not), so "no longer mounted" is asserted as
-    /// "answers exactly like a path that never existed". A still-mounted
-    /// route would answer 401 here (`RequiresAuth`, no credentials).
+    /// instead. Since `SEC-72` (`DEC-19`), a path no route matched answers
+    /// 404 `No such address.` for every caller, signed in or not, so "no
+    /// longer mounted" is asserted as "answers exactly like a path that
+    /// never existed". A still-mounted route would answer 401 here
+    /// (`RequiresAuth`, no credentials).
     #[tokio::test]
     async fn removed_agent_endpoints_answer_like_an_unknown_path() {
         let unknown = post(test_router(), "/api/never-existed").await.status();

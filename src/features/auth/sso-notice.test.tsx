@@ -30,6 +30,16 @@ describe("SsoNotice (SEC-39)", () => {
     );
   });
 
+  it("shows the fixed email-not-verified notice (SEC-65 D2)", () => {
+    currentParams = new URLSearchParams({
+      [SSO_NOTICE_PARAM]: "email_not_verified",
+    });
+    render(<SsoNotice />);
+    expect(screen.getByRole("status").textContent).toContain(
+      "Your identity provider did not confirm your email address, so this sign-in cannot be joined to your existing account. Ask an administrator.",
+    );
+  });
+
   it("shows nothing on an ordinary sign-in", () => {
     render(<SsoNotice />);
     expect(screen.queryByRole("status")).toBeNull();

@@ -1,13 +1,13 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import { PlusIcon } from "lucide-react"
 
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { CreateSheet } from "@/components/patterns/create-sheet"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
@@ -30,10 +30,12 @@ import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useUrlTab } from "@/hooks/use-url-tab"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { identityService } from "@/services"
 import type { Role, Tenant, User } from "@/services"
+import { takeInvitePassword } from "./invite-password"
 import { SessionsPanel } from "./sessions-page"
 import { getUserColumns, PillList, UserStatusPill } from "./user-columns"
 
@@ -47,7 +49,7 @@ type UsersTab = (typeof USERS_TABS)[number]
  */
 export function UsersPage() {
   const [tab, setTab] = useUrlTab("tab", USERS_TABS)
-  const { hasPermission } = useAuth()
+  const { hasPermission, user } = useAuth()
   const canWrite = hasPermission("identity:write")
   const state = useService((s) => identityService.listUsers(s), [])
   // ADM-4 D7: the role editor needs the roles that exist, and the tenant
@@ -55,18 +57,15 @@ export function UsersPage() {
   const rolesState = useService((s) => identityService.listRoles(s), [])
   const tenantsState = useService((s) => identityService.listTenants(s), [])
   const [selected, setSelected] = React.useState<User | null>(null)
-  const [createOpen, setCreateOpen] = React.useState(false)
-  const [name, setName] = React.useState("")
-  const [email, setEmail] = React.useState("")
-  const [roles, setRoles] = React.useState("")
-  const [tenants, setTenants] = React.useState("")
-  // ADM-3 D1/D6: the temporary password the server generated, shown in
-  // the dialog below exactly ONCE. It is never persisted to
-  // localStorage, sessionStorage, or any service-layer cache entry — it
-  // is kept as local component state and cleared when the dialog closes,
-  // so a re-render of the table (a filter keystroke, a refetch landing)
-  // cannot leak it through a hook that stores its argument.
+  const [editTarget, setEditTarget] = React.useState<User | null>(null)
+  const [editUsername, setEditUsername] = React.useState("")
+  const [editEmail, setEditEmail] = React.useState("")
+  // ADM-3 D1/D6, WEB-7 D3: the temporary password the server generated,
+  // shown in the dialog below exactly ONCE. The invite form is its own page
+  // now; it hands the password over in memory (`invite-password.ts`), never
+  // through the URL or web storage.
   const [revealedPassword, setRevealedPassword] = React.useState<string | null>(null)
+  const [revealedMustChange, setRevealedMustChange] = React.useState(true)
   // ADM-4 D7: the user whose roles are being edited, and the role names
   // the editor currently has ticked.
   const [rolesTarget, setRolesTarget] = React.useState<User | null>(null)
@@ -78,10 +77,22 @@ export function UsersPage() {
   const [statusTarget, setStatusTarget] = React.useState<User | null>(null)
   const tableUrlState = useTableUrlState()
 
-  const create = useServiceAction(
-    (signal, input: Parameters<typeof identityService.inviteUser>[0]) =>
-      identityService.inviteUser(input, signal)
-  )
+  // WEB-7 D3: the invite page leaves the generated password here. Reading
+  // it in an effect (not during render) keeps the one-shot read out of the
+  // render pass; the store itself clears it as it is taken.
+  //
+  // WEB-7 S1 review round 1, S1: the read waits for the principal and asks
+  // for THAT id, so a password left by a signed-out administrator is
+  // cleared here (and not shown) instead of reaching whoever signs in next
+  // in this tab.
+  const authUserId = user?.id ?? null
+  React.useEffect(() => {
+    if (!authUserId) return
+    const pending = takeInvitePassword(authUserId)
+    if (!pending) return
+    setRevealedMustChange(pending.mustChangePassword)
+    setRevealedPassword(pending.password)
+  }, [authUserId])
 
   const reset = useServiceAction(
     (signal, id: string) => identityService.resetPassword(id, signal)
@@ -102,6 +113,11 @@ export function UsersPage() {
   // ADM-4 D3: switch a user off, and back on again.
   const setStatus = useServiceAction((signal, id: string, active: boolean) =>
     active ? identityService.reactivateUser(id, signal) : identityService.deactivateUser(id, signal)
+  )
+
+  const updateIdentity = useServiceAction(
+    (signal, id: string, input: Parameters<typeof identityService.updateUser>[1]) =>
+      identityService.updateUser(id, input, signal)
   )
 
   // `state.reload` is stable (it is a `useCallback` inside `useService`),
@@ -137,6 +153,11 @@ export function UsersPage() {
         onEditRoles: openRoleEditor,
         onRemoveFromTenant: (user) => setTenantTarget(user),
         onToggleStatus: (user) => setStatusTarget(user),
+        onEditIdentity: (user) => {
+          setEditTarget(user)
+          setEditUsername(user.username)
+          setEditEmail(user.email ?? "")
+        },
       }),
     [canWrite, handleResetPassword, openRoleEditor]
   )
@@ -147,7 +168,8 @@ export function UsersPage() {
       search: tableUrlState.search,
       searchFields: [
         (u) => u.name,
-        (u) => u.email,
+        (u) => u.username,
+        (u) => u.email ?? "",
         (u) => u.roles.join(" "),
         (u) => u.tenants.join(" "),
       ],
@@ -176,34 +198,15 @@ export function UsersPage() {
     },
   })
 
-  function resetForm() {
-    setName("")
-    setEmail("")
-    setRoles("")
-    setTenants("")
-  }
-
-  async function handleCreate() {
-    const result = await create.run({
-      name: name.trim(),
-      email: email.trim(),
-      roles: roles
-        .split(",")
-        .map((r) => r.trim())
-        .filter(Boolean),
-      tenants: tenants
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean),
+  async function handleSaveIdentity() {
+    if (!editTarget) return
+    const result = await updateIdentity.run(editTarget.id, {
+      username: editUsername.trim() || undefined,
+      email: editEmail.trim() || null,
     })
     if (result) {
-      setCreateOpen(false)
-      resetForm()
-      // ADM-3 D1: the server generated a temporary password and returned
-      // it once. Show it, and only here — the server never sends it
-      // again.
-      setRevealedPassword(result.temporaryPassword)
-      state.reload()
+      setEditTarget(null)
+      reloadUsers()
     }
   }
 
@@ -243,10 +246,11 @@ export function UsersPage() {
         description="People, their roles and tenants, and the browser sessions signed in."
         actions={
           // Inviting belongs to People; the Sessions tab has nothing to add.
+          // WEB-7 D2: the form is its own page at /admin/users/invite.
           tab === "people" ? (
             <Button
               size="sm"
-              onClick={() => setCreateOpen(true)}
+              render={<Link href="/admin/users/invite" />}
               disabled={!canWrite}
               title={canWrite ? undefined : "You don't have permission to invite users."}
             >
@@ -286,7 +290,7 @@ export function UsersPage() {
           if (!open) setSelected(null)
         }}
         title={selected?.name ?? ""}
-        description={selected?.email}
+        description={selected?.email ?? selected?.username}
       >
         {selected ? (
           <MetadataList
@@ -312,54 +316,7 @@ export function UsersPage() {
           />
         ) : null}
       </DetailDrawer>
-      <CreateSheet
-        open={createOpen}
-        onOpenChange={(open) => {
-          setCreateOpen(open)
-          if (!open) resetForm()
-        }}
-        title="Invite User"
-        description="Invite a user with roles and tenant membership."
-        canSubmit={Boolean(name.trim() && email.trim())}
-        submitting={create.status === "pending"}
-        onSubmit={handleCreate}
-        submitLabel="Invite"
-      >
-        <div className="space-y-1.5">
-          <Label htmlFor="user-name">Name</Label>
-          <Input id="user-name" value={name} onChange={(e) => setName(e.target.value)} />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="user-email">Email</Label>
-          <Input
-            id="user-email"
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="user-roles">Roles (comma-separated)</Label>
-          <Input
-            id="user-roles"
-            value={roles}
-            onChange={(e) => setRoles(e.target.value)}
-            placeholder="Analyst, Viewer"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="user-tenants">Tenants (comma-separated)</Label>
-          <Input
-            id="user-tenants"
-            value={tenants}
-            onChange={(e) => setTenants(e.target.value)}
-            placeholder="acme, demo"
-          />
-        </div>
-      </CreateSheet>
-      {/* ADM-3 D1/D6: the temporary password, shown exactly once. The
-          server keeps only the `Argon2id` hash, so it cannot be shown
-          again — the admin has to hand it over now. */}
+      {/* ADM-3 D1/D6: the temporary password, shown exactly once. */}
       <Dialog
         open={revealedPassword !== null}
         onOpenChange={(open) => {
@@ -370,7 +327,9 @@ export function UsersPage() {
           <DialogHeader>
             <DialogTitle>Temporary password</DialogTitle>
             <DialogDescription>
-              Shown once. The user must change it at first sign-in.
+              {revealedMustChange
+                ? "Shown once. The user must change it at first sign-in."
+                : "Shown once."}
             </DialogDescription>
           </DialogHeader>
           <code
@@ -385,7 +344,10 @@ export function UsersPage() {
               size="sm"
               onClick={() => {
                 if (revealedPassword === null) return
-                void navigator.clipboard.writeText(revealedPassword)
+                // The dialog lives inside `role=dialog`, which the textarea
+                // fallback already targets -- over plain http this is the
+                // only copy path there is (`UX-6`).
+                void copyTextWithToast(revealedPassword)
               }}
             >
               Copy
@@ -529,6 +491,55 @@ export function UsersPage() {
         confirming={setStatus.status === "pending"}
         onConfirm={() => void handleToggleStatus()}
       />
+
+      {/* ADM-11 D8: Edit username and email */}
+      <Dialog
+        open={editTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setEditTarget(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Edit username and email</DialogTitle>
+            <DialogDescription>
+              Update username and email for {editTarget?.name ?? "user"}.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="edit-username">Username</Label>
+              <Input
+                id="edit-username"
+                value={editUsername}
+                onChange={(e) => setEditUsername(e.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="edit-email">Email</Label>
+              <Input
+                id="edit-email"
+                type="email"
+                value={editEmail}
+                onChange={(e) => setEditEmail(e.target.value)}
+                placeholder="Empty clears email"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setEditTarget(null)}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              disabled={!editUsername.trim() || updateIdentity.status === "pending"}
+              onClick={handleSaveIdentity}
+            >
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

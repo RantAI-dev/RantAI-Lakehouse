@@ -145,7 +145,7 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
-| SQL editor, saved queries, result download | **Partial.** Autocomplete knows table names only; 2,000 rows shown; saved queries cannot be edited or shared; downloads are a browser CSV | Yes: Databricks shows 64,000 rows and downloads up to 5 GB | `QS-1` to `QS-4` |
+| SQL editor, saved queries, result download | **Partial.** The schema browser and autocomplete list the tables the catalog shows, with their columns; several statements per tab, each with its own result tab; up to 64,000 rows or 10 MB shown, with filters and column statistics; a full download of up to 5 GB as CSV, TSV, Excel or Parquet, on ClickHouse only; saved queries in folders, shared at three levels, with 15 versions and a 30-day trash; a History page of your own runs for 14 days; `{{name}}` parameters. Not yet: a dashboard cannot drive a query's parameters; a Trino tab has no estimate and no download | Yes: Databricks shows 64,000 rows and downloads up to 5 GB | `QS-5` part 2; `QS-10` to `QS-12` |
 | Ask in plain language, get SQL | **Partial.** The chat's SQL runs inside the user's permissions with masking and row filters. It learns what a table means from the source's registry and from drafted descriptions a person can correct in Data Explorer's Schema tab. | Yes, inside the user's permissions | `AI-16` |
 | Scale out across servers | **Missing.** One server | Yes: elastic | Wanted later (product owner, 2026-11-04; `OPS-3`) |
 | Query other systems in place, without loading | **Missing** | Yes | Yes |
@@ -161,7 +161,7 @@ hands-on testing.
 | Catalog and search | **Partial.** Search finds a table by its name, columns, tags, description or owner, forgives a typo and ranks (`DATA-11`, accepted 2026-10-23; speed on 10,000 tables not measured, and a typo that matches only a table's name carries no "approximate match" label, `DATA-24`, `DATA-32`). Certified and deprecated marks, governed tags, and the marks in the chart builder and Query Studio are built and accepted (`DATA-12`, 2026-10-23); per-user table visibility is not built | Yes: columns, tags, certification | `DATA-12`, `DATA-20`, `DATA-24` |
 | Lineage | **Partial** | Yes, including outside systems | Depth |
 | Data quality checks | **Partial.** Hand-written rules; freshness against a set target | Yes: ready check libraries, anomaly detection | `DATA-14` |
-| Audit trail | **Partial.** Pipeline runs and assistant actions; not every console change | Yes | Full coverage |
+| Audit trail | **Partial.** 182 of the 224 routes that change something record an audit row (identity, policies, governance, connectors, pipelines, sharing, the assistant's actions, and now dashboards, saved queries, alerts, report subscriptions and the settings); the other 42 are excluded, each with a listed reason. `GOV-1` closes it. | Yes | Full coverage |
 | Single sign-on | **Partial.** The sign-in start, callback and provider-list routes exist in the API; not tested against a real identity provider. | Yes | Test it |
 
 #### Business intelligence
@@ -175,7 +175,7 @@ hands-on testing.
 | Share by link and embed in other sites | **Partial.** Public links never expire; embed tokens can lack an expiry | Yes; often a paid extra | `BI-19`, `BI-26`, `SEC-12` |
 | Alerts on a threshold | **Partial.** Email and webhook; one aggregate per table, re-fires every check | Yes | `BI-19` |
 | Scheduled reports with PDF or spreadsheet attached | **Built, in acceptance** (#204, 2026-10-26). Email on a schedule with the dashboard as PDF and charts as Excel or CSV; needs SMTP and the PDF settings below. The assistant can set one up (`AI-10`) | Yes, all three BI tools | `RPT-1`, `BI-35` |
-| Export to PDF or spreadsheet | **Built, in acceptance** (#204, 2026-10-26). A server-made PDF of every tab (Gotenberg), chart data as Excel or CSV up to 1,000,000 rows, a chart as PNG (`BI-37`); the assistant gives the same links (`AI-10`). Off until `CONSOLE_INTERNAL_URL` is set (`docs/OPERATIONS.md`, `REL-18`); image and web cards and uploaded maps do not print yet | Yes | `BI-1`, `BI-36`, `BI-42`, `REL-18` |
+| Export to PDF or spreadsheet | **Released** (#204, 2026-10-26; accepted by the product owner 2026-11-16). A server-made PDF of every tab (Gotenberg), chart data as Excel or CSV up to 1,000,000 rows, a chart as PNG (`BI-37`); the assistant gives the same links (`AI-10`). Off until `CONSOLE_INTERNAL_URL` is set (`docs/OPERATIONS.md`, `REL-18`); image cards print from the content sites; web cards do not (`BI-42`) | Yes | `BI-1`, `BI-36`, `BI-42`, `REL-18` |
 | Shared business definitions (a governed metrics layer) | **Partial.** Built-in dashboard cards are defined once in code; users cannot define and reuse their own metrics | Yes, all three BI tools | User-defined metrics |
 | Mobile app | **Missing** | Tableau and Power BI | Decide if wanted |
 | Import dashboards from another BI tool | **Missing** | Databricks imports Tableau and Power BI | Helps switching |
@@ -201,7 +201,7 @@ hands-on testing.
 | Self-hosted | **Have** | Mostly no | A strength |
 | High availability | **Missing** | Yes | Yes |
 | Backup and restore | **Partial.** Procedures exist; no tested restore time | Yes, managed | Test it |
-| Usage and cost view | **Missing.** No usage page or API route | Yes | Yes |
+| Usage and cost view | **Have.** Usage page and API route | Yes | — |
 | API for everything | **Have** | Yes | — |
 | Several organisations in one install | **Partial.** One organisation's data per install | Yes | Later |
 
@@ -264,11 +264,13 @@ in `docs/KNOWN-LIMITATIONS.md` (moved from the README, 2026-11-05).
   at large sizes are not measured, `DATA-33`, `DATA-34`), no row cap, and
   guessed, editable column types.
 - Dashboards filter by year only; there are no calculated fields.
-- Query Studio shows at most 2,000 rows. A chart built on a saved query is
-  limited to 2,000 rows and 30 seconds.
-- PDF export and scheduled reports are built but in acceptance, and off on a
+- Query Studio shows up to 64,000 rows by default, or 10 MB of row data,
+  whichever comes first, and the banner says which limit cut the result. The
+  administrator's row limit ranges from 100 to 100,000. A chart built on a
+  saved query is limited to 2,000 rows and 30 seconds.
+- PDF export is released and scheduled reports are built but in acceptance; both are off on a
   fresh install until `CONSOLE_INTERNAL_URL` is set (`REL-18`). A PDF has no
-  image or web cards (`BI-42`) and may miss an uploaded map (`BI-36`).
+  web cards (`BI-42`).
 
 **AI**
 - Needs a model endpoint. Works over tables, not documents.
@@ -283,7 +285,7 @@ in `docs/KNOWN-LIMITATIONS.md` (moved from the README, 2026-11-05).
   (`SEC-15`, `SEC-10`); raw database errors reach the screen on dashboard
   tiles and embeds (`SEC-11`). The full list is `SEC-10` to `SEC-21` in
   `BACKLOG.md`.
-- The audit trail does not cover every console change.
+- The audit trail does not cover every console change: 42 of the 224 routes that change something are excluded, each with a listed reason (the audit trail's Decision 1).
 - The backend was ported and reviewed by AI agents, with no full human
   security review. A previously internal key is in the public git history
   (`SECURITY.md`).
@@ -351,7 +353,7 @@ customer would hit first, not matching every feature.
 
 | Item | Why |
 | --- | --- |
-| Accept the merged features: Gold publishing (`DATA-1`), login protection (`SEC-2`, `SEC-5`), file upload (`DATA-9`) | Blocker 1; merged is not accepted |
+| Accept the merged features: login protection (`SEC-2`, `SEC-5`), file upload (`DATA-9`). Gold publishing (`DATA-1`), result caching (`BI-4`), upload formats (`DATA-17`) and upload folders (`DATA-35`) were accepted on 2026-11-20 | Blocker 1; merged is not accepted |
 | Fix the security findings under Now: `SEC-10`, `SEC-11`, `SEC-13`, `SEC-14`, `SEC-15` | Blocker 6; they come before feature work |
 | Clear blockers 2 and 4 | Small, and they are embarrassing if found |
 
@@ -365,9 +367,9 @@ an order in its roadmap phase.
 | Dashboards | Filters, time grain, calculated fields, tables and KPIs first (`BI-18`, `BI-9`, `BI-8`, `BI-16`); then the builder, joins, metrics, formatting, layout, reports and sharing | The gaps a Metabase user hits on day one |
 | Assistant for dashboards | `AI-1`, `AI-12`, `AI-15` now; each other `AI-` item ships with its BI item | Agentic-first: what a user can click, they can ask for (`AGENTS.md`) |
 | Data | Fix and test every connector (`SRC-6`, `SRC-9`), failure alerts and schema changes (`SRC-7`, `SRC-8`), then the catalog (`DATA-11` to `DATA-16`) and upload depth (`DATA-17` to `DATA-19`) | Make what we advertise work before adding more |
-| Query Studio | Its security fixes (`SEC-19` to `SEC-21`), then editor, results, saved queries and history (`QS-1` to `QS-4`) | Every SQL user expects these |
+| Query Studio | Its security fixes (`SEC-19` to `SEC-21`); ~~editor, results, saved queries and history (`QS-1` to `QS-4`)~~ accepted 2026-11-14 | Every SQL user expects these |
 | Security and platform | `SEC-12`, `SEC-16` to `SEC-18`, single sign-on (`SEC-3`), audit coverage (`GOV-1`), row filters (`VER-1`), table cleanup (`OPS-1`), usage view (`OPS-8`) | Found in every evaluation |
-| Pipelines | Joins and aggregations in the builder (`BLD-1`) | Today these need SQL written outside the builder |
+| Pipelines | Pipelines built from steps: SQL steps first, then joins and aggregations as forms (`BLD-1`) | Today a pipeline reads one table and has five operations; anything else needs SQL written outside the builder |
 
 ### Later
 
@@ -375,7 +377,7 @@ an order in its roadmap phase.
 | --- | --- |
 | Run on several servers | A stated goal; larger work |
 | Business-app connectors, the rest (`SRC-3` follow-ups `SRC-26` to `SRC-31`): the second wave by customer demand, real-account tests | The first ten are built in #216 (eight supported); the second wave of about 45 waits for demand |
-| Parameters, snippets and charts from SQL results (`QS-5`) | The bridge from Query Studio to dashboards, after the basics |
+| Snippets, charts from SQL results, and dashboard filters and dropdowns from parameters (`QS-5` part 2 and later) | The bridge from Query Studio to dashboards, after the basics. Part 1 (parameters in SQL) accepted 2026-11-14 |
 | Instant copies of a table; self-refreshing tables | Expected by Snowflake users |
 | Open-first Gold: store curated data in Iceberg, serve from a fast copy | Removes publishing entirely; needs a fresh measurement |
 | Import dashboards from other BI tools | Eases switching |

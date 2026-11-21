@@ -70,14 +70,14 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray,
+    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatch,
+    StringArray, TimestampMicrosecondArray,
 };
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 use lakehouse_clickhouse::{ChClient, ChColumn, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
-use lakehouse_iceberg::{GoldTable, IcebergClient, IcebergClientConfig, IcebergError, gold};
+use lakehouse_iceberg::{IcebergClient, IcebergClientConfig, IcebergError, gold};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use time::Date;
@@ -89,6 +89,10 @@ use crate::state::AppState;
 #[derive(Debug, Error)]
 pub enum GoldExportError {
     /// Reading the source mart from `ClickHouse` failed.
+    ///
+    /// Its `Display` is for the log, never for a response or a stored row
+    /// (`DATA-49`, QA `LH-DATA-1-01`): `routes::gold`'s `From` impl classifies
+    /// it into fixed words and a reference first.
     #[error("reading Gold mart from ClickHouse failed: {0}")]
     ClickHouse(#[from] ChError),
     /// A `ClickHouse` column type has no supported Iceberg/Arrow mapping —
@@ -104,9 +108,18 @@ pub enum GoldExportError {
     },
     /// Building the Arrow batch from `ClickHouse` row data failed (a value
     /// did not parse as its declared column type).
+    ///
+    /// The text can hold a cell value and the Arrow or Iceberg library's own
+    /// words, so its `Display` is for the log, never for a response or a
+    /// stored row (`DATA-49`, QA `LH-DATA-1-01`): `routes::gold`'s `From` impl
+    /// classifies it into fixed words and a reference first.
     #[error("failed to build export batch: {0}")]
     Batch(String),
     /// The Iceberg catalog/write path failed.
+    ///
+    /// Its `Display` can hold catalog URLs and object keys, so it is for the
+    /// log, never for a response or a stored row (`DATA-49`, QA
+    /// `LH-DATA-1-01`): `routes::gold`'s `From` impl classifies it first.
     #[error("Iceberg export failed: {0}")]
     Iceberg(#[from] IcebergError),
     /// The source mart has more rows than `GOLD_EXPORT_MAX_ROWS` allows.
@@ -137,6 +150,12 @@ pub enum GoldExportError {
     /// any data is written to Iceberg at all.
     #[error("Gold export refused by the policy engine: {0}")]
     PolicyRefused(String),
+    /// `GOV-7` D5: the export reads a table the owner's roles do not
+    /// include. Carried as the answer itself, so the route returns the tenant
+    /// gate's own 404 and sentence (`D2`) instead of folding it into the 422
+    /// above.
+    #[error("{0}")]
+    PolicyTableRefused(ApiError),
     /// `SEC-50`: the tenant gate refused the export before it read
     /// anything. The gate's own error travels as it is, so the caller
     /// sees the status the gate would have answered — a fixed sentence,
@@ -149,6 +168,21 @@ pub enum GoldExportError {
     /// wraps its error explicitly (`PR #281` review round 1, NIT).
     #[error("{0}")]
     TenantGateRefused(ApiError),
+    /// `DATA-6` D7: the mart's own Iceberg table name is the latest-copy
+    /// table of ANOTHER published table (it carries the
+    /// `rantai.latest-copy-of` marker the Dagster op writes). Publishing
+    /// into it would make the two features fight over one table, so the
+    /// export refuses before it appends anything. The `Display` is a
+    /// fixed sentence naming the mart — safe for a response, no upstream
+    /// words — and the route maps it to a 422.
+    #[error(
+        "the Iceberg table for mart {mart:?} is the latest-copy table of another \
+         published table; rename the mart"
+    )]
+    TargetIsLatestCopy {
+        /// The mart whose sanitized name collides with a latest-copy table.
+        mart: String,
+    },
 }
 
 /// One column's resolved Iceberg + Arrow shape, plus enough to parse a
@@ -169,23 +203,103 @@ fn unwrap_nullable(ch_type: &str) -> (&str, bool) {
         .map_or((ch_type, false), |inner| (inner, true))
 }
 
+/// The most digits an Iceberg `decimal` holds (`iceberg::spec`'s
+/// `MAX_DECIMAL_PRECISION`): `Decimal128` is 16 bytes, and 38 digits is the
+/// largest base-10 precision that fits.
+const MAX_ICEBERG_DECIMAL_PRECISION: u32 = 38;
+
+/// The precision and scale of a `ClickHouse` decimal type name, or `None` when
+/// `base` is not one (`DATA-48`, QA `LH-DATA-1-51`).
+///
+/// Accepts `Decimal(P, S)`, `Decimal(P)` (scale 0) and the width aliases
+/// `Decimal32(S)` (9), `Decimal64(S)` (18), `Decimal128(S)` (38) and
+/// `Decimal256(S)` (76). Spaces around the numbers are trimmed, nothing else is
+/// lenient. A precision above [`MAX_ICEBERG_DECIMAL_PRECISION`] is an error
+/// here, before any row is read or written, because Iceberg cannot hold it and
+/// rounding would be a silent lie.
+fn ch_decimal(base: &str) -> Option<Result<(u32, u32), String>> {
+    let unreadable = || Some(Err("its precision and scale could not be read".to_owned()));
+    let (fixed_precision, args) = if let Some(rest) = base.strip_prefix("Decimal(") {
+        (None, rest.strip_suffix(')')?)
+    } else {
+        // The width aliases carry only the scale; their precision is fixed.
+        [
+            ("Decimal32(", 9_u32),
+            ("Decimal64(", 18),
+            ("Decimal128(", 38),
+            ("Decimal256(", 76),
+        ]
+        .into_iter()
+        .find_map(|(prefix, precision)| {
+            let args = base.strip_prefix(prefix)?.strip_suffix(')')?;
+            Some((Some(precision), args))
+        })?
+    };
+
+    let (precision, scale) = if let Some(precision) = fixed_precision {
+        let Ok(scale) = args.trim().parse::<u32>() else {
+            return unreadable();
+        };
+        (precision, scale)
+    } else {
+        let mut parts = args.split(',');
+        let (Some(precision), scale, None) = (parts.next(), parts.next(), parts.next()) else {
+            return unreadable();
+        };
+        let Ok(precision) = precision.trim().parse::<u32>() else {
+            return unreadable();
+        };
+        // `Decimal(P)` is scale 0; `Decimal(P, S)` names both.
+        let scale = match scale {
+            None => 0,
+            Some(scale) => {
+                let Ok(scale) = scale.trim().parse::<u32>() else {
+                    return unreadable();
+                };
+                scale
+            }
+        };
+        (precision, scale)
+    };
+
+    if precision == 0 || scale > precision {
+        return unreadable();
+    }
+    if precision > MAX_ICEBERG_DECIMAL_PRECISION {
+        return Some(Err(format!(
+            "open format (Iceberg) holds decimals of at most \
+             {MAX_ICEBERG_DECIMAL_PRECISION} digits, and this column has {precision}"
+        )));
+    }
+    Some(Ok((precision, scale)))
+}
+
 /// Maps one `ClickHouse` column to its Iceberg [`PrimitiveType`].
 ///
 /// Deliberately narrow: only the types a `serving.*` aggregate mart
 /// realistically carries (strings, integers, floats, booleans, dates,
-/// timestamps). Anything else — `Array(...)`, `Map(...)`, `Tuple(...)`,
-/// `AggregateFunction(...)`, `UUID`, `Decimal`, ... — is rejected with
+/// timestamps, decimals). Anything else — `Array(...)`, `Map(...)`, `Tuple(...)`,
+/// `AggregateFunction(...)`, `UUID`, ... — is rejected with
 /// [`GoldExportError::UnsupportedColumn`] rather than silently coerced to
 /// a string, so a mart with an unsupported column fails the export
 /// visibly instead of exporting corrupted data.
+///
+/// A `Decimal(P, S)` becomes an Iceberg `decimal(P, S)` of the same precision
+/// and scale (`DATA-48`, QA `LH-DATA-1-51`); a precision above 38 digits is
+/// refused, with a sentence naming the column and its type.
 ///
 /// # Errors
 ///
 /// Returns an error message (wrapped by the caller into
 /// [`GoldExportError::UnsupportedColumn`]) for any type not in the list
-/// above.
+/// above, and for a decimal whose precision and scale cannot be read or whose
+/// precision Iceberg cannot hold.
 fn ch_type_to_primitive(ch_type: &str) -> Result<(PrimitiveType, bool), String> {
     let (base, nullable) = unwrap_nullable(ch_type);
+    if let Some(decimal) = ch_decimal(base) {
+        let (precision, scale) = decimal?;
+        return Ok((PrimitiveType::Decimal { precision, scale }, nullable));
+    }
     let primitive = match base {
         "String" | "UUID" => PrimitiveType::String,
         s if s.starts_with("FixedString(") => PrimitiveType::String,
@@ -255,6 +369,89 @@ fn cell_as_str<'a>(row: &'a Map<String, Value>, name: &str) -> Option<&'a str> {
     match row.get(name) {
         Some(Value::String(s)) => Some(s.as_str()),
         _ => None,
+    }
+}
+
+/// The exact unscaled integer of a decimal's text, for a column of
+/// `precision`/`scale` (`DATA-48`, QA `LH-DATA-1-51`). Never a float.
+///
+/// The rules, in order:
+///
+/// 1. An optional leading `-`. Nothing else before the digits (no `+`, no
+///    spaces).
+/// 2. Digits, then optionally `.` and digits — a `.` with nothing after it is
+///    not a number. Nothing else (no exponent, no separators).
+/// 3. The fraction may be shorter than `scale` (`ClickHouse` drops trailing
+///    zeros by default): pad it on the right with `0`. A longer fraction is an
+///    error.
+/// 4. The unscaled value is the integer digits followed by the padded fraction,
+///    read as an `i128`, negated when there was a `-`. More than `precision`
+///    digits (after leading zeros) is an error.
+/// 5. A value that is not such a text is an error: nothing is rounded or
+///    coerced.
+fn decimal_text_to_unscaled(text: &str, precision: u32, scale: u32) -> Result<i128, String> {
+    let not_a_decimal = || format!("{text:?} is not a decimal number");
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (integer, fraction) = match digits.split_once('.') {
+        // A point with nothing after it is not a decimal number (D14 rule 2: digits,
+        // then optionally `.` and digits) — review round 1 R8; QA `LH-DATA-1-51`.
+        // `12.` used to pass as `12`, which is exact but not a shape ClickHouse prints.
+        Some((_, "")) => return Err(not_a_decimal()),
+        Some((integer, fraction)) => (integer, fraction),
+        None => (digits, ""),
+    };
+    if integer.is_empty()
+        || !integer.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(not_a_decimal());
+    }
+    if fraction.len() > scale as usize {
+        return Err(format!(
+            "{text:?} has more than {scale} fractional digits, so it cannot be stored exactly"
+        ));
+    }
+    let mut unscaled_text = format!("{integer}{fraction}");
+    unscaled_text.extend(std::iter::repeat_n('0', scale as usize - fraction.len()));
+    let significant = unscaled_text.trim_start_matches('0');
+    if significant.len() > precision as usize {
+        return Err(format!(
+            "{text:?} has more than {precision} digits, so it cannot be stored exactly"
+        ));
+    }
+    let unscaled = if significant.is_empty() {
+        0
+    } else {
+        unscaled_text
+            .parse::<i128>()
+            .map_err(|e| format!("{text:?} is not a decimal number: {e}"))?
+    };
+    Ok(if negative { -unscaled } else { unscaled })
+}
+
+/// One decimal cell, already projected as text by [`select_projection`].
+///
+/// A JSON `null` or a missing cell is `None` (an optional Iceberg field). A
+/// JSON string goes through [`decimal_text_to_unscaled`]; anything else — a
+/// JSON number included — is a [`GoldExportError::Batch`] naming the column, so
+/// a value that would need rounding fails the run instead of being coerced.
+fn cell_as_decimal(
+    row: &Map<String, Value>,
+    name: &str,
+    precision: u32,
+    scale: u32,
+) -> Result<Option<i128>, GoldExportError> {
+    match row.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => decimal_text_to_unscaled(s, precision, scale)
+            .map(Some)
+            .map_err(|reason| GoldExportError::Batch(format!("{name}: {reason}"))),
+        Some(other) => Err(GoldExportError::Batch(format!(
+            "{name}: expected a decimal as text, got {other}"
+        ))),
     }
 }
 
@@ -410,11 +607,19 @@ fn cell_as_u64(row: &Map<String, Value>, name: &str) -> Result<u64, GoldExportEr
 /// handled the same way: `toTimeZone` on a `NULL` `DateTime` still
 /// produces `NULL` (`ClickHouse`'s datetime functions are null-preserving
 /// over `Nullable` arguments), so no separate branch is needed.
+///
+/// A decimal is selected as `toString(col) AS col` (`DATA-48`, QA
+/// `LH-DATA-1-51`): `FORMAT JSON` would render it as a JSON number, and this
+/// crate's `serde_json` has no arbitrary precision, so the value would pass
+/// through a float. The text is converted exactly by
+/// [`decimal_text_to_unscaled`], and `toString` of a `NULL` is still `NULL`.
 fn select_projection(col: &ChColumn) -> String {
     let (base, _nullable) = unwrap_nullable(&col.ty);
     let quoted = format!("`{}`", col.name);
     if base == "DateTime" || base.starts_with("DateTime64(") || base.starts_with("DateTime(") {
         format!("toString(toTimeZone({quoted}, 'UTC')) AS {quoted}")
+    } else if ch_decimal(base).is_some() {
+        format!("toString({quoted}) AS {quoted}")
     } else {
         quoted
     }
@@ -519,10 +724,21 @@ pub(crate) async fn export_batch_sql(
         obligations,
     )
     .await
+    // GOV-7 D5: a table the owner's roles do not include answers the tenant
+    // gate's own 404 through the one mapping every caller uses; every other
+    // refusal keeps this variant's 422 with the fixed sentence.
     .map_err(|err| {
-        GoldExportError::PolicyRefused(
-            crate::policy_engine::enforcement_error_message(&err).to_owned(),
-        )
+        if matches!(
+            err,
+            crate::policy_engine::EnforcementError::TableNotReadable(_)
+                | crate::policy_engine::EnforcementError::Unresolvable
+        ) {
+            GoldExportError::PolicyTableRefused(crate::routes::support::enforcement_refusal(
+                &batch_sql, &err,
+            ))
+        } else {
+            GoldExportError::PolicyRefused(crate::policy_engine::enforcement_error_message(&err))
+        }
     })
 }
 
@@ -572,6 +788,33 @@ fn build_array(
                 .collect::<Result<Vec<_>, _>>()?;
             Arc::new(TimestampMicrosecondArray::from(values))
         }
+        PrimitiveType::Decimal { precision, scale } => {
+            let values = rows
+                .iter()
+                .map(|r| cell_as_decimal(r, &plan.name, precision, scale))
+                .collect::<Result<Vec<_>, _>>()?;
+            let precision = u8::try_from(precision).map_err(|e| {
+                GoldExportError::Batch(format!(
+                    "{}: decimal precision does not fit in u8: {e}",
+                    plan.name
+                ))
+            })?;
+            let scale = i8::try_from(scale).map_err(|e| {
+                GoldExportError::Batch(format!(
+                    "{}: decimal scale does not fit in i8: {e}",
+                    plan.name
+                ))
+            })?;
+            let array = Decimal128Array::from(values)
+                .with_precision_and_scale(precision, scale)
+                .map_err(|e| {
+                    GoldExportError::Batch(format!(
+                        "{}: the decimal array could not be built: {e}",
+                        plan.name
+                    ))
+                })?;
+            Arc::new(array)
+        }
         ref other => {
             return Err(GoldExportError::Batch(format!(
                 "internal error: no array builder for {other:?}"
@@ -599,6 +842,44 @@ pub struct GoldExportResult {
     /// When that snapshot was committed (Unix ms) — `None` under the same
     /// condition as `snapshot_id`.
     pub exported_at_ms: Option<i64>,
+    /// The ONE `_exported_at` value (microseconds, UTC) this publish
+    /// stamped on every row it wrote (`DATA-6` M2) — `None` only when
+    /// `rows_exported == 0`, where no copy exists to identify. One value
+    /// per publish, not per batch, so "the rows of this one publish" can
+    /// be picked out of the table (the latest-copy op filters on it), and
+    /// so `DATA-2`'s trim counts copies, not batches: a mart over
+    /// `GOLD_EXPORT_BATCH_SIZE` rows used to carry one value per batch,
+    /// and `run_trim_for_mart` counted distinct values, keeping 7
+    /// *batches* instead of 7 copies.
+    pub copy_exported_at_micros: Option<i64>,
+}
+
+/// The `_exported_at` value (microseconds, UTC) one publish stamps on
+/// every row it writes — computed ONCE per publish, not per batch
+/// (`DATA-6` M2), so the rows of one publish are identifiable in the
+/// Iceberg table and `DATA-2`'s trim counts copies, not batches. The
+/// nanosecond clock is truncated to microseconds because that is the
+/// column's Iceberg/Arrow precision; a value that overflows `i64`
+/// micros (year ~294 million) saturates rather than panicking — the
+/// caller treats it as an opaque stamp, never does arithmetic on it.
+pub(crate) fn copy_exported_at_micros(now: time::OffsetDateTime) -> i64 {
+    i64::try_from(now.unix_timestamp_nanos() / 1_000).unwrap_or(i64::MAX)
+}
+
+/// Builds the `_exported_at` column for one batch: the publish's ONE stamp
+/// (`copy_exported_at_micros`, computed once before the loop, `DATA-6` M2)
+/// repeated for every row of the batch — one value per publish, so a copy
+/// is identifiable (the latest-copy op filters on it) and the trim's
+/// distinct-value count is a copy count, not a batch count. It still
+/// matches the "one partition value per batch" assumption
+/// `gold::partition_key_for` documents (each batch is one Parquet
+/// file/append, so each needs exactly one partition value derived from
+/// it).
+fn exported_at_column(now_micros: i64, batch_rows: usize) -> ArrayRef {
+    Arc::new(TimestampMicrosecondArray::from(vec![
+        now_micros;
+        batch_rows
+    ]))
 }
 
 /// Reads every row of `source_table` (a fully-qualified `ClickHouse`
@@ -727,6 +1008,9 @@ pub(crate) async fn export_mart(
             rows_exported: 0,
             snapshot_id: None,
             exported_at_ms: None,
+            // No rows were written, so no copy exists to identify
+            // (`DATA-6` D6: a zero-row publish is a skip, not a copy).
+            copy_exported_at_micros: None,
         });
     }
 
@@ -744,6 +1028,20 @@ pub(crate) async fn export_mart(
     let mut table = client
         .create_or_load_gold_table(mart_name, domain_fields)
         .await?;
+    // DATA-6 D7: a mart whose own Iceberg table is ANOTHER mart's
+    // latest-copy table (the `rantai.latest-copy-of` marker the Dagster op
+    // writes) must never be published into — the two features would fight
+    // over one table (the op's overwrite would delete the publish's rows,
+    // the publish's appends would fake a copy). Refused before the grant
+    // and before any append: nothing has been written at this point.
+    // The check is on the LOADED table's marker, not on the mart's name,
+    // because the collision is about which Iceberg table the name lands
+    // on, and only the table itself knows whether it is a latest copy.
+    if table.latest_copy_of().is_some() {
+        return Err(GoldExportError::TargetIsLatestCopy {
+            mart: mart_name.to_owned(),
+        });
+    }
     // ADR 0016 point 3: the `outside-readers` principal must be able to
     // `select` in the `gold` namespace — and only there. The namespace
     // exists now (the export just created or loaded its table in it),
@@ -754,6 +1052,17 @@ pub(crate) async fn export_mart(
         iceberg::arrow::schema_to_arrow_schema(table.schema())
             .map_err(|e| GoldExportError::Batch(format!("schema_to_arrow_schema failed: {e}")))?,
     );
+
+    // DATA-6 M2: ONE `_exported_at` per publish, computed before the loop
+    // and reused by every batch. The batch loop below still writes one
+    // Parquet file per batch, but every row of this publish now carries
+    // the same stamp, so "the rows of this one publish" can be picked
+    // out of the table (the latest-copy op filters on it). This also
+    // corrects DATA-2's trim: `run_trim_for_mart` counts DISTINCT
+    // `_exported_at` values as copies, and a mart over the batch size
+    // used to carry one value per batch, so the trim kept 7 *batches*
+    // rather than 7 copies.
+    let copy_exported_at = copy_exported_at_micros(time::OffsetDateTime::now_utc());
 
     let mut offset = 0u64;
     let mut rows_exported = 0usize;
@@ -781,21 +1090,7 @@ pub(crate) async fn export_mart(
         let batch_rows = batch_result.data.len();
 
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(plan.len() + 1);
-        // `_exported_at` is the same instant for every row within THIS
-        // batch — matches the "one partition value per batch" assumption
-        // `gold::partition_key_for` documents (each batch is one Parquet
-        // file/append, so each needs exactly one partition value derived
-        // from it). Recomputed per batch rather than once for the whole
-        // run: consecutive batches of one export may therefore carry
-        // microseconds-apart `_exported_at` values rather than one
-        // identical instant — an acceptable, cosmetic divergence from the
-        // pre-batching behavior (a caller filtering `max(_exported_at)`
-        // per day-partition still sees them as the same run).
-        let now_micros = time::OffsetDateTime::now_utc().unix_timestamp() * 1_000_000;
-        arrays.push(Arc::new(TimestampMicrosecondArray::from(vec![
-            now_micros;
-            batch_rows
-        ])));
+        arrays.push(exported_at_column(copy_exported_at, batch_rows));
         for column in &plan {
             arrays.push(build_array(column, &batch_result.data)?);
         }
@@ -821,6 +1116,7 @@ pub(crate) async fn export_mart(
         rows_exported,
         snapshot_id: table.current_snapshot_id(),
         exported_at_ms: table.current_snapshot_timestamp_ms(),
+        copy_exported_at_micros: Some(copy_exported_at),
     })
 }
 
@@ -917,27 +1213,33 @@ pub struct GoldReadBack {
 /// currently visible — used by `routes::gold::read_back` to prove the
 /// export round trip without exposing the Gold data itself over the API.
 ///
+/// `Ok(None)` means the catalog says the table does not exist — a mart never
+/// published, which is a state and not an error (`DATA-49`, QA
+/// `LH-DATA-1-01`).
+///
 /// # Errors
 ///
-/// Returns [`GoldExportError::Iceberg`] if the table does not exist or the
-/// read fails.
+/// Returns [`GoldExportError::Iceberg`] if the catalog refuses or fails the
+/// call for any other reason, or if the read fails.
 pub async fn read_back_row_count(
     iceberg_config: &IcebergClientConfig,
     mart_name: &str,
-) -> Result<GoldReadBack, GoldExportError> {
+) -> Result<Option<GoldReadBack>, GoldExportError> {
     let client = IcebergClient::connect(iceberg_config).await?;
-    let table: GoldTable = client.load_gold_table(mart_name).await?;
+    let Some(table) = client.load_gold_table_if_exists(mart_name).await? else {
+        return Ok(None);
+    };
     let format_version = table.format_version() as u8;
     let snapshot_id = table.current_snapshot_id();
     let exported_at_ms = table.current_snapshot_timestamp_ms();
     let batches = table.read_all().await?;
     let rows = batches.iter().map(RecordBatch::num_rows).sum();
-    Ok(GoldReadBack {
+    Ok(Some(GoldReadBack {
         format_version,
         rows,
         snapshot_id,
         exported_at_ms,
-    })
+    }))
 }
 
 /// Builds an [`IcebergClientConfig`] for the Gold export path from
@@ -960,6 +1262,10 @@ pub fn iceberg_config(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::HashSet;
+
+    use arrow_array::Array as _;
+
     use super::*;
 
     #[test]
@@ -971,9 +1277,55 @@ mod tests {
             rows_exported: 7,
             snapshot_id: Some(123),
             exported_at_ms: Some(1_700_000_000_000),
+            copy_exported_at_micros: Some(1_763_632_800_123_456),
         };
         assert_eq!(result.snapshot_id, Some(123));
         assert_eq!(result.exported_at_ms, Some(1_700_000_000_000));
+        assert_eq!(result.copy_exported_at_micros, Some(1_763_632_800_123_456));
+    }
+
+    // DATA-6 M2: the copy stamp keeps microsecond precision, because two
+    // publishes can fall in one second and the latest-copy op must tell
+    // them apart (`run_config` carries this exact value). The asserted
+    // constant is the true epoch-micros of the stated datetime — the plan
+    // text wrote `1_763_632_800_123_456`, which is 2025-11-20; one year
+    // earlier than the datetime it named.
+    #[test]
+    fn copy_exported_at_micros_keeps_sub_second_precision() {
+        let now = time::macros::datetime!(2026-11-20 10:00:00.123456 UTC);
+        assert_eq!(copy_exported_at_micros(now), 1_795_168_800_123_456);
+    }
+
+    // DATA-6 review R4: the DATA-62 fix had no test that failed on the old
+    // code. The old loop recomputed the stamp for every batch at SECOND
+    // precision, so a mart over `batch_size` rows carried several distinct
+    // `_exported_at` values and DATA-2's trim kept 7 batches, not 7 copies.
+    // The stamp is now computed once, before the loop, and handed to every
+    // batch; this pins that invariant across three simulated batches.
+    #[test]
+    fn one_publish_stamps_every_batch_with_the_same_micros() {
+        let publish_stamp =
+            copy_exported_at_micros(time::macros::datetime!(2026-11-20 10:00:00.123456 UTC));
+        assert_ne!(
+            publish_stamp % 1_000_000,
+            0,
+            "the stamp keeps sub-second precision"
+        );
+        let batch_rows = [2usize, 1, 3];
+        let batches: Vec<ArrayRef> = batch_rows
+            .iter()
+            .map(|&rows| exported_at_column(publish_stamp, rows))
+            .collect();
+        let mut distinct: HashSet<i64> = HashSet::new();
+        for (batch, &rows) in batches.iter().zip(batch_rows.iter()) {
+            let stamps = batch
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("a timestamp-microsecond column");
+            assert_eq!(stamps.len(), rows);
+            distinct.extend(stamps.values().iter().copied());
+        }
+        assert_eq!(distinct, HashSet::from([publish_stamp]));
     }
 
     fn row_with(name: &str, value: Value) -> Map<String, Value> {
@@ -987,6 +1339,177 @@ mod tests {
             name: name.to_owned(),
             ty: ty.to_owned(),
         }
+    }
+
+    // -- decimals in open format (DATA-48, QA LH-DATA-1-51) ----------------
+
+    #[test]
+    fn a_clickhouse_decimal_maps_to_an_iceberg_decimal_of_the_same_precision_and_scale() {
+        for (ch_type, precision, scale) in [
+            ("Decimal(12, 2)", 12, 2),
+            ("Decimal(38, 10)", 38, 10),
+            ("Decimal(9, 0)", 9, 0),
+            ("Decimal(10)", 10, 0),
+        ] {
+            let (primitive, nullable) =
+                ch_type_to_primitive(ch_type).unwrap_or_else(|e| panic!("{ch_type}: {e}"));
+            assert_eq!(
+                primitive,
+                PrimitiveType::Decimal { precision, scale },
+                "{ch_type}"
+            );
+            assert!(!nullable, "{ch_type} is not nullable");
+        }
+    }
+
+    #[test]
+    fn a_nullable_decimal_is_an_optional_decimal() {
+        let plan = plan_columns(&[ch_column("amount", "Nullable(Decimal(12, 2))")])
+            .expect("a nullable decimal plans");
+        let fields = plan_to_iceberg_fields(&plan);
+        assert!(!fields[0].required, "an optional Iceberg field");
+        assert_eq!(fields[0].field_type.to_string(), "decimal(12, 2)");
+    }
+
+    #[test]
+    fn the_decimal_aliases_map_to_their_fixed_precisions() {
+        for (ch_type, precision, scale) in [
+            ("Decimal32(2)", 9, 2),
+            ("Decimal64(4)", 18, 4),
+            ("Decimal128(10)", 38, 10),
+        ] {
+            let (primitive, _) = ch_type_to_primitive(ch_type).expect(ch_type);
+            assert_eq!(
+                primitive,
+                PrimitiveType::Decimal { precision, scale },
+                "{ch_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decimal_wider_than_38_digits_is_refused_and_the_sentence_names_the_column() {
+        for ch_type in ["Decimal(76, 10)", "Decimal256(10)"] {
+            let err = plan_columns(&[ch_column("big", ch_type)])
+                .err()
+                .unwrap_or_else(|| panic!("{ch_type} must be refused"));
+            assert!(
+                matches!(err, GoldExportError::UnsupportedColumn { .. }),
+                "{err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "column \"big\" has unsupported ClickHouse type \"{ch_type}\": \
+                     open format (Iceberg) holds decimals of at most 38 digits, \
+                     and this column has 76"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn select_projection_reads_a_decimal_as_text() {
+        assert_eq!(
+            select_projection(&ch_column("amount", "Decimal(12, 2)")),
+            "toString(`amount`) AS `amount`"
+        );
+        assert_eq!(
+            select_projection(&ch_column("amount", "Nullable(Decimal(12, 2))")),
+            "toString(`amount`) AS `amount`"
+        );
+    }
+
+    #[test]
+    fn decimal_text_becomes_the_exact_unscaled_integer() {
+        for (text, precision, scale, expected) in [
+            ("12.5", 12, 2, 1250_i128),
+            ("12.50", 12, 2, 1250),
+            ("-0.01", 12, 2, -1),
+            ("-0.5", 3, 1, -5),
+            ("0", 12, 2, 0),
+            ("123", 9, 0, 123),
+            (
+                "-1234567890123456789012345678.0123456789",
+                38,
+                10,
+                -12_345_678_901_234_567_890_123_456_780_123_456_789_i128,
+            ),
+            // Review round 1 R8: the largest value a decimal(38, 0) can hold, which
+            // must not be refused as "more than 38 digits".
+            (
+                "99999999999999999999999999999999999999",
+                38,
+                0,
+                10_i128.pow(38) - 1,
+            ),
+        ] {
+            assert_eq!(
+                decimal_text_to_unscaled(text, precision, scale),
+                Ok(expected),
+                "{text} at decimal({precision}, {scale})"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_text_that_is_not_an_exact_decimal_is_refused() {
+        for (text, precision, scale) in [
+            ("1.234", 12_u32, 2_u32),
+            ("1e5", 12, 2),
+            ("+1", 12, 2),
+            ("", 12, 2),
+            ("abc", 12, 2),
+            ("1,5", 12, 2),
+            (" 1", 12, 2),
+            ("1234567890123", 12, 0),
+            // Review round 1 R8: D14 rule 2 is digits, then optionally `.` AND digits
+            // — a point with nothing after it is not a decimal number, and neither is
+            // any of these shapes.
+            ("12.", 12, 2),
+            ("-", 12, 2),
+            (".", 12, 2),
+            (".5", 12, 2),
+            ("-.5", 12, 2),
+            ("--1", 12, 2),
+            ("1.2.3", 12, 2),
+            // 11 integer digits and 2 fraction digits are 13 for a precision of 12.
+            ("12345678901.5", 12, 2),
+        ] {
+            assert!(
+                decimal_text_to_unscaled(text, precision, scale).is_err(),
+                "{text:?} at decimal({precision}, {scale}) must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decimal_cell_that_arrives_as_a_json_number_is_refused() {
+        let row = row_with("amount", serde_json::json!(12.5));
+        let err = cell_as_decimal(&row, "amount", 12, 2)
+            .expect_err("a JSON number is not an exact decimal");
+        assert!(err.to_string().contains("amount"), "{err}");
+        assert!(matches!(err, GoldExportError::Batch(_)), "{err}");
+    }
+
+    #[test]
+    fn build_array_makes_a_decimal128_column_with_the_columns_precision_and_scale_and_keeps_nulls()
+    {
+        let plan = plan_columns(&[ch_column("amount", "Decimal(12, 2)")]).expect("a decimal plans");
+        let rows = vec![
+            row_with("amount", Value::String("12.50".to_owned())),
+            row_with("amount", Value::Null),
+            row_with("amount", Value::String("-0.01".to_owned())),
+        ];
+        let array = build_array(&plan[0], &rows).expect("the column builds");
+        assert_eq!(array.data_type().to_string(), "Decimal128(12, 2)");
+        let decimals = array
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("a Decimal128 array");
+        assert_eq!(decimals.value(0), 1250);
+        assert!(decimals.is_null(1));
+        assert_eq!(decimals.value(2), -1);
     }
 
     // -- select_projection: the actual fix for defect (3) ------------------

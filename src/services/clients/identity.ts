@@ -4,17 +4,21 @@ import type {
   CreateTenantInput,
   IdentityService,
   InviteUserInput,
+  Permission,
   InviteUserResponse,
   ResetPasswordResponse,
   Role,
   RotateServiceIdentityResponse,
+  RoleTableAccess,
   ServiceIdentity,
+  SetRoleTableAccessInput,
   Tenant,
   UpdateRoleInput,
+  UpdateUserInput,
   User,
 } from "../contracts/identity";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
  * IdentityService is real — users, roles, tenants, and service identities
@@ -28,13 +32,18 @@ import { ServiceError } from "../errors";
  * separately, not something patched over in this adapter.
  */
 
-/** Map an error response body onto the ServiceError code its status implies. */
-function errorFor(status: number, message: string): ServiceError {
+/**
+ * Map an error response body onto the ServiceError code its status implies.
+ * A 401 or 403 goes through `deniedFor` (QA `LH-BLD-2-03`, WEB-12).
+ */
+function errorFor(status: number, body: { error?: string } | null, fallback: string): ServiceError {
+  // QA LH-BLD-2-03 (WEB-12): a refusal goes through deniedFor.
+  const denied = deniedFor(status, body);
+  if (denied) return denied;
+  const message = body?.error ?? fallback;
   if (status === 404) return new ServiceError("not_found", message);
   if (status === 400 || status === 409 || status === 422)
     return new ServiceError("invalid_request", message);
-  if (status === 401 || status === 403)
-    return new ServiceError("permission_denied", message);
   return new ServiceError("unavailable", message);
 }
 
@@ -46,7 +55,7 @@ async function request<T>(
   const res = await apiFetch(url, init);
   const json = await res.json().catch(() => null);
   if (!res.ok) {
-    throw errorFor(res.status, json?.error ?? fallback);
+    throw errorFor(res.status, json, fallback);
   }
   return json as T;
 }
@@ -70,6 +79,25 @@ function post<T>(
       method: "POST",
       headers: { "content-type": "application/json" },
       body: body === null || body === undefined ? undefined : JSON.stringify(body),
+      signal,
+    },
+    fallback
+  );
+}
+
+/** `PATCH` a JSON body (ADM-11 D8 user rename). */
+function patch<T>(
+  url: string,
+  body: unknown,
+  signal: AbortSignal | undefined,
+  fallback: string
+): Promise<T> {
+  return request<T>(
+    url,
+    {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
       signal,
     },
     fallback
@@ -105,6 +133,13 @@ function del<T>(
 }
 
 export const postgresIdentityService: IdentityService = {
+  listPermissions(signal) {
+    return get<Permission[]>(
+      "/api/identity/permissions",
+      signal,
+      "Failed to load permission list"
+    );
+  },
   listUsers(signal) {
     return get<User[]>("/api/identity/users", signal, "Failed to load user list");
   },
@@ -151,6 +186,25 @@ export const postgresIdentityService: IdentityService = {
       `/api/identity/roles/${encodeURIComponent(id)}`,
       signal,
       "Failed to delete role"
+    );
+  },
+  // GOV-7 D7: what a role may read. A `*:*` role and a name that is not a
+  // plain identifier are refused on the write with a 400; `errorFor` keeps
+  // the API's own sentence in `ServiceError.message`, so the page shows it
+  // unchanged.
+  getRoleTableAccess(id, signal) {
+    return get<RoleTableAccess>(
+      `/api/identity/roles/${encodeURIComponent(id)}/table-access`,
+      signal,
+      "Failed to load the role's tables"
+    );
+  },
+  setRoleTableAccess(id, input: SetRoleTableAccessInput, signal) {
+    return put<RoleTableAccess>(
+      `/api/identity/roles/${encodeURIComponent(id)}/table-access`,
+      input,
+      signal,
+      "Failed to save the role's tables"
     );
   },
   createTenant(input: CreateTenantInput, signal) {
@@ -210,6 +264,14 @@ export const postgresIdentityService: IdentityService = {
   },
   // ADM-4 D3: switch a user off, and back on again. Both routes take no
   // body, so both are empty-body POSTs.
+  updateUser(id: string, input: UpdateUserInput, signal) {
+    return patch<User>(
+      `/api/identity/users/${id}`,
+      input,
+      signal,
+      "Failed to update user"
+    );
+  },
   deactivateUser(id: string, signal) {
     return post<User>(
       `/api/identity/users/${id}/deactivate`,

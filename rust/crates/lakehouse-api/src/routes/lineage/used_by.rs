@@ -18,8 +18,11 @@
 //! Only a caller with `dashboard:read` is told any chart's name (`BI-14` review
 //! BLOCKER B1): the route needs `lineage:read`, which does not carry the right
 //! to see dashboards, so without `dashboard:read` every match is counted in
-//! `hiddenCount` and none is named. Charts come through the caller's [`Viewer`], so a chart in somebody else's
-//! personal space is not named. It is counted: `hiddenCount` is the number of
+//! `hiddenCount` and none is named. A caller the shared-catalog rule refuses
+//! (`SEC-20`, plan 96) gets `supported: false` and the rule's reason, no chart
+//! and no count. Charts come through
+//! the caller's [`Viewer`], so a chart in somebody else's personal space is
+//! not named. It is counted: `hiddenCount` is the number of
 //! charts that match for the system viewer and not for the caller, with no
 //! name, so the answer says "and N more you do not have access to" without
 //! telling anything about them. At most [`MAX_CHARTS`] are listed
@@ -108,10 +111,23 @@ pub(crate) async fn read(
     table: &str,
 ) -> Result<Value, ApiError> {
     let key = table_key(table).ok_or_else(|| ApiError::BadRequest(BAD_TABLE.to_owned()))?;
+    // `GOV-7` D6: a table the caller's roles hide is not described, and the
+    // charts that read it are not named — the answer is the same 404 an
+    // unknown asset gets, before any chart is read.
+    let access = crate::routes::catalog::table_access_for(state, principal).await?;
+    crate::routes::catalog::ensure_key_readable_with(&access, &key)?;
     let tenant = crate::tenant_scope::resolve(principal, headers)?;
-    let shared = crate::routes::catalog::catalog_tenant_refusal(state, principal, headers)
-        .await?
-        .is_none();
+    let refusal = crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await?;
+    let shared = refusal.is_none();
+    // SEC-20, plan 96: a chart has no tenant, so it belongs to the shared
+    // catalog. A caller the shared-catalog rule refuses gets that rule's own
+    // `supported: false` answer, as the catalog route and the assistant's tools
+    // give it, not an empty list: an empty list with a zero count would say that
+    // no chart reads the table. The sentence is the same for every table, so it
+    // says nothing about one. No chart store is asked.
+    if let Some(reason) = refusal {
+        return Ok(json!({ "supported": false, "reason": reason }));
+    }
     let ch = &state.clickhouse;
     let failed = |err: &lakehouse_clickhouse::ChError| {
         upstream_error::ch_error(&upstream_error::DATABASE, err)

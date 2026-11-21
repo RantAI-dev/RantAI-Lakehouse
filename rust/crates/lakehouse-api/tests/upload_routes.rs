@@ -37,7 +37,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use lakehouse_store::uploads::{self, LoadMode, NewUpload, Upload};
+use lakehouse_store::uploads::{self, LoadMode, NewTableDrop, NewUpload, Upload};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -57,8 +57,8 @@ use wiremock::matchers::{any, body_string_contains, method, path, path_regex, qu
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
-    session_cookie_for_user, spin_up_with_state,
+    TestApp, create_principal_with_permissions, mount_existing_iceberg_table,
+    session_cookie_for_seeded_user, session_cookie_for_user, spin_up_with_state,
 };
 
 const GROUP: &str = "11111111-1111-4111-8111-000000000001";
@@ -83,6 +83,11 @@ const SESSION_CAP: usize = 2 * 1024 * 1024 * 1024;
 /// told (it was `MAX_UPLOAD_BYTES`, 52,428,800, so the job refused a gzip above
 /// 50 MiB unpacked) and the most a gzip, a zip or a grouped load may add up to.
 const UNPACKED_CAP: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The display name of Bayu, one of the seeded users of `0002_seed_identity.sql`
+/// (`uploadedBy` of an upload he makes). `DATA-52`: the job's `author` is that name
+/// and ` (file upload)` after it, built from this one text rather than typed again.
+const BAYU_DISPLAY_NAME: &str = "Bayu Pratama";
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!(
@@ -629,7 +634,133 @@ async fn requests_containing(server: &MockServer, needle: &str) -> Vec<Value> {
         .collect()
 }
 
-// ── the stack ────────────────────────────────────────────────────────────
+/// A file holding a test token, for the reader the Iceberg client needs
+/// (`DATA-55` review R2's healing rule reads the catalog).
+fn token_file(name: &str) -> String {
+    let dir = tempfile::tempdir().expect("a temporary directory for the token");
+    let file = dir.path().join(name);
+    std::fs::write(&file, "test-token").expect("the token file is written");
+    std::mem::forget(dir);
+    file.to_str().expect("a UTF-8 path").to_owned()
+}
+
+/// The `ClickHouse` answer `plan_columns` asks for between `ensure_table_free`
+/// and `claim_load`, held until the test's own write is done: the window
+/// `DATA-55` review R3 closes. It answers "no such table", as an append into a
+/// table with no columns this deployment can read.
+struct HeldDescribe {
+    entered: Mutex<std::sync::mpsc::Sender<()>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Respond for HeldDescribe {
+    fn respond(&self, _request: &MockRequest) -> ResponseTemplate {
+        self.entered
+            .lock()
+            .unwrap()
+            .send(())
+            .expect("the test is still waiting for the load's column check");
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the test releases the load's column check");
+        ResponseTemplate::new(404).set_body_string(
+            "Code: 60. DB::Exception: Table icecat_api.`bronze.stock_raw` does not exist. \
+             (UNKNOWN_TABLE) (version 26.8.1.1 (official build))",
+        )
+    }
+}
+
+/// Holds incoming `ClickHouse` requests whose body contains `dataset_catalog`
+/// at a `tokio::sync::Barrier` until `parties` requests have arrived, then
+/// forwards every request to `upstream` (`stack.ch`).
+///
+/// `wiremock`'s `Respond::respond` runs synchronously while holding the
+/// server's single-threaded write lock, so blocking inside a `wiremock`
+/// responder would prevent the second request from arriving. Putting the async
+/// barrier in an `axum` gate in front of `stack.ch` suspends the first
+/// request without blocking `stack.ch`, while `stack.ch` still records every
+/// forwarded request.
+async fn start_dataset_catalog_barrier(
+    upstream: String,
+    parties: usize,
+) -> (String, tokio::sync::oneshot::Sender<()>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ClickHouse barrier listener");
+    let addr = listener.local_addr().unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(parties));
+    let released = Arc::new(AtomicBool::new(false));
+    let client = reqwest::Client::new();
+    let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let barrier = Arc::clone(&barrier);
+        let released = Arc::clone(&released);
+        let client = client.clone();
+        let upstream = upstream.clone();
+        async move {
+            let method = req.method().clone();
+            let path_and_query = req
+                .uri()
+                .path_and_query()
+                .map_or("/", axum::http::uri::PathAndQuery::as_str);
+            let url = format!("{upstream}{path_and_query}");
+            let headers = req.headers().clone();
+            let body = to_bytes(req.into_body(), 1024 * 1024).await.unwrap();
+            if std::str::from_utf8(&body).is_ok_and(|s| s.contains("dataset_catalog"))
+                && !released.load(Ordering::Acquire)
+            {
+                if tokio::time::timeout(Duration::from_secs(30), barrier.wait())
+                    .await
+                    .is_err()
+                {
+                    return axum::response::Response::builder()
+                        .status(StatusCode::GATEWAY_TIMEOUT)
+                        .body(Body::from("dataset_catalog barrier timed out"))
+                        .unwrap();
+                }
+                released.store(true, Ordering::Release);
+            }
+            let mut forwarded = client.request(
+                reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
+                url,
+            );
+            for (name, value) in &headers {
+                if name == axum::http::header::HOST || name == axum::http::header::CONTENT_LENGTH {
+                    continue;
+                }
+                forwarded = forwarded.header(name.as_str(), value.as_bytes());
+            }
+            let resp = forwarded.body(body).send().await.unwrap();
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap();
+            let resp_headers = resp.headers().clone();
+            let resp_body = resp.bytes().await.unwrap();
+            let mut reply = axum::response::Response::builder().status(status);
+            for (name, value) in &resp_headers {
+                if name == axum::http::header::TRANSFER_ENCODING
+                    || name == axum::http::header::CONTENT_LENGTH
+                {
+                    continue;
+                }
+                reply = reply.header(name.as_str(), value.as_bytes());
+            }
+            reply.body(Body::from(resp_body)).unwrap()
+        }
+    });
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    (format!("http://{addr}"), tx)
+}
+
+// ── the stack ─────────────────────────────────────────────────────────────
 
 /// What differs between stacks: the Iceberg query database, and where
 /// `Dagster` and `ClickHouse` are when a test wants them not to be at the
@@ -638,6 +769,9 @@ struct Options {
     iceberg_query_db: Option<&'static str>,
     dagster_url: Option<&'static str>,
     ch_url: Option<&'static str>,
+    /// `REL-27`: when set, hold `dataset_catalog` requests in an async barrier
+    /// gate until this many parties have arrived before forwarding to `stack.ch`.
+    dataset_catalog_barrier: Option<usize>,
     /// `SEC-22` D3: how many conversions run at once per API process.
     upload_max_conversions: Option<&'static str>,
     /// `SEC-22`: the child the runner starts, when it is not the binary
@@ -657,6 +791,11 @@ struct Options {
     /// `PR #187` review SHOULD-FIX 6: the most text the API reads from a
     /// child that converts. The real one is 16 MiB, and no test writes that.
     conversion_text_limit: Option<u64>,
+    /// `DATA-55` review R2: the Iceberg REST catalog a load asks "is this
+    /// table there" before it believes a drop record (the healing rule), and
+    /// the reader token file that call needs. `None` leaves it failing at the
+    /// missing token, as every other test has it.
+    catalog_url: Option<String>,
 }
 
 impl Default for Options {
@@ -665,12 +804,14 @@ impl Default for Options {
             iceberg_query_db: Some("icecat_api"),
             dagster_url: None,
             ch_url: None,
+            dataset_catalog_barrier: None,
             upload_max_conversions: None,
             conversion_child: None,
             conversion_output_cap: None,
             conversion_wall: None,
             conversion_parquet_limits: None,
             conversion_text_limit: None,
+            catalog_url: None,
         }
     }
 }
@@ -684,6 +825,7 @@ struct Stack {
     s3: MockServer,
     dagster: MockServer,
     ch: MockServer,
+    _barrier_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 struct Reply {
@@ -738,6 +880,14 @@ impl Stack {
         Self::with(Options::default()).await
     }
 
+    async fn with_dataset_catalog_barrier(parties: usize) -> Self {
+        Self::with(Options {
+            dataset_catalog_barrier: Some(parties),
+            ..Options::default()
+        })
+        .await
+    }
+
     async fn with(options: Options) -> Self {
         let s3 = MockServer::start().await;
         let dagster = MockServer::start().await;
@@ -768,6 +918,22 @@ impl Stack {
         }
         if let Some(url) = options.ch_url {
             env.insert("CH_URL".to_owned(), url.to_owned());
+        }
+        let mut barrier_shutdown = None;
+        if let Some(parties) = options.dataset_catalog_barrier {
+            let (proxy_url, shutdown) = start_dataset_catalog_barrier(ch.uri(), parties).await;
+            env.insert("CH_URL".to_owned(), proxy_url);
+            barrier_shutdown = Some(shutdown);
+        }
+        if let Some(url) = options.catalog_url {
+            // `DATA-55` review R2: the load's healing rule reads the Iceberg
+            // REST catalog, which needs a reader token file as well as the
+            // address.
+            env.insert("LAKEKEEPER_CATALOG_URI".to_owned(), url);
+            env.insert(
+                "LAKEKEEPER_READ_TOKEN_FILE".to_owned(),
+                token_file("read.jwt"),
+            );
         }
         if let Some(limit) = options.upload_max_conversions {
             env.insert("UPLOAD_MAX_CONVERSIONS".to_owned(), limit.to_owned());
@@ -804,6 +970,7 @@ impl Stack {
             s3,
             dagster,
             ch,
+            _barrier_shutdown: barrier_shutdown,
         }
     }
 
@@ -1156,7 +1323,7 @@ async fn an_upload_is_stored_under_a_server_made_key_and_answered_without_intern
     );
     assert_eq!(upload["sizeBytes"], bytes.len());
     assert_eq!(upload["status"], "uploaded");
-    assert_eq!(upload["uploadedBy"], "Bayu Pratama");
+    assert_eq!(upload["uploadedBy"], BAYU_DISPLAY_NAME);
     assert!(upload["createdAt"].as_str().unwrap().ends_with('Z'));
     for hidden in [
         "storageKey",
@@ -2032,6 +2199,7 @@ async fn an_ingest_launches_the_job_with_the_confirmed_options_and_records_the_r
             "header_row": 4,
         "columns": [],
         "on_bad_value": "stop",
+        "author": format!("{BAYU_DISPLAY_NAME} (file upload)"),
         } } } })
     );
     let row = stack.status_of(&id).await;
@@ -2382,19 +2550,16 @@ async fn a_third_large_load_is_429_with_the_large_load_sentence() {
 ///
 /// Both requests must be past the "is it loading?" check before either claims,
 /// or the early check would refuse the second and the claim would never be
-/// tested. The registry lookup in between is slowed down for that: it is the
-/// call both make after the early checks and before the claim.
+/// tested. The registry lookup in between is held behind a two-party barrier
+/// (`REL-27`) instead of a timer delay, so both requests deterministically reach
+/// it after the early checks and before either claims.
 #[tokio::test]
 async fn two_simultaneous_ingests_of_one_upload_launch_once() {
-    let stack = Stack::start().await;
+    let stack = Stack::with_dataset_catalog_barrier(2).await;
     let bayu = stack.bayu().await;
     Mock::given(method("POST"))
         .and(body_string_contains("dataset_catalog"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(Duration::from_millis(500))
-                .set_body_json(rows_body(&json!([]))),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(rows_body(&json!([]))))
         .mount(&stack.ch)
         .await;
     Mock::given(method("POST"))
@@ -2869,6 +3034,332 @@ async fn after_a_delete_the_claim_remains_and_a_new_upload_of_the_tenant_loads_i
     );
 }
 
+/// `DATA-55` D11 (QA `LH-DATA-15-06`, `TC-1731`): while a dropped table can
+/// still be restored, a file cannot be loaded into its name — a new table of
+/// that name would make the dropped one impossible to bring back.
+#[tokio::test]
+async fn a_load_into_a_table_that_was_dropped_and_can_still_be_restored_is_409_and_claims_marks_and_launches_nothing()
+ {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_registered(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-2").await;
+    stack.seed_ingested(GROUP, "up-first", "stock_raw").await;
+    uploads::record_table_drop(
+        &stack.app.pool,
+        &NewTableDrop {
+            bronze_table: "stock_raw",
+            tenant_id: GROUP.parse::<Uuid>().unwrap(),
+            asset_id: "stock-raw",
+            dropped_by: "Seeded Uploader",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    let second = stack.upload(&bayu, "again.csv", b"id,name\n1,a\n").await;
+
+    let reply = stack
+        .ingest(&bayu, &id_of(&second), ingest_body("stock_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.text);
+    assert_eq!(
+        reply.json["error"],
+        "That table was dropped and can still be restored. Restore it from its page in the Catalog, or choose another name."
+    );
+    assert_eq!(stack.status_of(&id_of(&second)).await.0, "uploaded");
+    assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+}
+
+/// `DATA-55` D11: after the window the name takes a new load as before.
+#[tokio::test]
+async fn once_the_restore_window_has_passed_the_name_takes_a_new_load() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_registered(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-2").await;
+    stack.seed_ingested(GROUP, "up-first", "stock_raw").await;
+    uploads::record_table_drop(
+        &stack.app.pool,
+        &NewTableDrop {
+            bronze_table: "stock_raw",
+            tenant_id: GROUP.parse::<Uuid>().unwrap(),
+            asset_id: "stock-raw",
+            dropped_by: "Seeded Uploader",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    sqlx::query(
+        "UPDATE upload_table_drop SET expires_at = now() - interval '1 second' \
+         WHERE bronze_table = 'stock_raw'",
+    )
+    .execute(&stack.app.pool)
+    .await
+    .unwrap();
+    let second = stack.upload(&bayu, "again.csv", b"id,name\n1,a\n").await;
+
+    let reply = stack
+        .ingest(&bayu, &id_of(&second), ingest_body("stock_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        requests_containing(&stack.dagster, "launchRun").await.len(),
+        1
+    );
+}
+
+/// `DATA-55` review R2, the healing rule as narrowed by review S1, on the load
+/// side: a record is believed whether or not the table is there, and a record
+/// for a table that IS there is healed only once it is old enough that no drop
+/// it records can still be in flight. This record is backdated past that grace,
+/// so the next load removes it and goes through instead of refusing a live
+/// table's name for a week.
+#[tokio::test]
+async fn a_stale_record_of_a_table_that_exists_is_removed_by_the_next_load_and_the_load_goes_through()
+ {
+    let catalog = MockServer::start().await;
+    mount_existing_iceberg_table(&catalog, "stock_raw").await;
+    let stack = Stack::with(Options {
+        catalog_url: Some(catalog.uri()),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    mount_registered(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-2").await;
+    stack.seed_ingested(GROUP, "up-first", "stock_raw").await;
+    uploads::record_table_drop(
+        &stack.app.pool,
+        &NewTableDrop {
+            bronze_table: "stock_raw",
+            tenant_id: GROUP.parse::<Uuid>().unwrap(),
+            asset_id: "stock-raw",
+            dropped_by: "Seeded Uploader",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    // `DATA-55` review S1: healing waits out the stretch a drop can be in
+    // flight (`HEAL_GRACE`, two minutes), so this record must be older than
+    // that to be stale at all. Ten minutes is unmistakably older.
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '10 minutes' \
+         WHERE bronze_table = 'stock_raw'",
+    )
+    .execute(&stack.app.pool)
+    .await
+    .unwrap();
+    let second = stack.upload(&bayu, "again.csv", b"id,name\n1,a\n").await;
+
+    let reply = stack
+        .ingest(&bayu, &id_of(&second), ingest_body("stock_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert!(
+        uploads::dropped_table(&stack.app.pool, "stock_raw")
+            .await
+            .unwrap()
+            .is_none(),
+        "the record of a table that exists was removed"
+    );
+    assert_eq!(
+        requests_containing(&stack.dagster, "launchRun").await.len(),
+        1
+    );
+}
+
+/// `DATA-55` review R3: the load writes its claim first and checks second, so a
+/// drop recorded between `ensure_table_free` and `claim_load` still closes the
+/// name. The record is written while the route waits on its column check, so it
+/// is provably on record after `ensure_table_free` and before `claim_load`; the
+/// load is refused with T6's `409`, nothing is launched, and the claim the load
+/// took is settled as failed rather than left `ingesting`.
+#[tokio::test]
+async fn a_load_whose_table_is_dropped_between_its_checks_is_409_and_settles_its_claim() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_registered(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-2").await;
+    stack.seed_ingested(GROUP, "up-first", "stock_raw").await;
+    let second = stack.upload(&bayu, "again.csv", b"id,name\n1,a\n").await;
+    let id = id_of(&second);
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    Mock::given(method("POST"))
+        .and(body_string_contains("DESCRIBE TABLE"))
+        .respond_with(HeldDescribe {
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        })
+        .with_priority(2)
+        .mount(&stack.ch)
+        .await;
+
+    let pool = stack.app.pool.clone();
+    let tenant = GROUP.parse::<Uuid>().unwrap();
+    let recorder = tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the load asks for its columns");
+        })
+        .await
+        .expect("the gate did not panic");
+        uploads::record_table_drop(
+            &pool,
+            &NewTableDrop {
+                bronze_table: "stock_raw",
+                tenant_id: tenant,
+                asset_id: "stock-raw",
+                dropped_by: "Ada Lovelace",
+                row_count: Some(1),
+                kept_seconds: 604_800,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the drop is recorded");
+        release_tx.send(()).expect("the load is waiting");
+    });
+
+    let mut body = ingest_body("stock_raw");
+    body["mode"] = json!("append");
+    body["columns"] = json!([
+        { "source": "id", "name": "id", "type": "integer" },
+        { "source": "name", "name": "name", "type": "text" },
+    ]);
+    body["onBadValue"] = json!("stop");
+    let reply = stack.ingest(&bayu, &id, body).await;
+    recorder.await.expect("the record was written");
+
+    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.text);
+    assert_eq!(
+        reply.json["error"],
+        "That table was dropped and can still be restored. Restore it from its page in the Catalog, or choose another name."
+    );
+    let (status, run_id, error) = stack.status_of(&id).await;
+    assert_ne!(status, "ingesting", "the claim was not left loading");
+    assert_eq!(status, "failed");
+    assert_eq!(run_id, None);
+    assert_eq!(error.as_deref(), Some("The load could not be started."));
+    assert!(
+        requests_containing(&stack.dagster, "launchRun")
+            .await
+            .is_empty(),
+        "nothing was launched"
+    );
+}
+
+/// `DATA-55` review S1, the load side: the drop's record is written before the
+/// catalog applies its `DELETE`, so the table still exists while the record is
+/// true. A load that reaches its post-claim check in that stretch must not heal
+/// the record away — the catalog is reachable and says "the table exists", and
+/// the load is still refused with T6's `409`, nothing is launched, and the
+/// record stays.
+#[tokio::test]
+async fn a_load_whose_table_is_dropped_between_its_checks_keeps_the_record_when_the_table_still_exists()
+ {
+    let catalog = MockServer::start().await;
+    mount_existing_iceberg_table(&catalog, "stock_raw").await;
+    let stack = Stack::with(Options {
+        catalog_url: Some(catalog.uri()),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    mount_registered(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-2").await;
+    stack.seed_ingested(GROUP, "up-first", "stock_raw").await;
+    let second = stack.upload(&bayu, "again.csv", b"id,name\n1,a\n").await;
+    let id = id_of(&second);
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    Mock::given(method("POST"))
+        .and(body_string_contains("DESCRIBE TABLE"))
+        .respond_with(HeldDescribe {
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        })
+        .with_priority(2)
+        .mount(&stack.ch)
+        .await;
+
+    let pool = stack.app.pool.clone();
+    let tenant = GROUP.parse::<Uuid>().unwrap();
+    let recorder = tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the load asks for its columns");
+        })
+        .await
+        .expect("the gate did not panic");
+        uploads::record_table_drop(
+            &pool,
+            &NewTableDrop {
+                bronze_table: "stock_raw",
+                tenant_id: tenant,
+                asset_id: "stock-raw",
+                dropped_by: "Ada Lovelace",
+                row_count: Some(1),
+                kept_seconds: 604_800,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the drop is recorded");
+        release_tx.send(()).expect("the load is waiting");
+    });
+
+    let mut body = ingest_body("stock_raw");
+    body["mode"] = json!("append");
+    body["columns"] = json!([
+        { "source": "id", "name": "id", "type": "integer" },
+        { "source": "name", "name": "name", "type": "text" },
+    ]);
+    body["onBadValue"] = json!("stop");
+    let reply = stack.ingest(&bayu, &id, body).await;
+    recorder.await.expect("the record was written");
+
+    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.text);
+    assert_eq!(
+        reply.json["error"],
+        "That table was dropped and can still be restored. Restore it from its page in the Catalog, or choose another name."
+    );
+    assert!(
+        uploads::dropped_table(&stack.app.pool, "stock_raw")
+            .await
+            .unwrap()
+            .is_some(),
+        "a drop that may still be in flight keeps its record"
+    );
+    let (status, run_id, error) = stack.status_of(&id).await;
+    assert_ne!(status, "ingesting", "the claim was not left loading");
+    assert_eq!(status, "failed");
+    assert_eq!(run_id, None);
+    assert_eq!(error.as_deref(), Some("The load could not be started."));
+    assert!(
+        requests_containing(&stack.dagster, "launchRun")
+            .await
+            .is_empty(),
+        "nothing was launched"
+    );
+}
+
 /// A failed load that named a table still holds it: "Try again" must be able
 /// to succeed.
 #[tokio::test]
@@ -3002,8 +3493,9 @@ async fn a_failed_claim_keeps_another_tenant_out_of_the_table_and_lets_its_own_t
 
 /// Review finding B4: two tenants asking for one new name at the same moment,
 /// one loads and the other is refused, and one run is launched. The registry
-/// lookup both make after the ownership check is slowed down so that both are
-/// past that check before either claims, as
+/// lookup both make after the ownership check is held behind a two-party
+/// barrier (`REL-27`) instead of a timer delay so that both are guaranteed to
+/// be past that check before either claims, as
 /// `two_simultaneous_ingests_of_one_upload_launch_once` does.
 ///
 /// What this pins is the outcome under a real race: one launch, one claim, and
@@ -3015,16 +3507,12 @@ async fn a_failed_claim_keeps_another_tenant_out_of_the_table_and_lets_its_own_t
 /// is the one that fixes the first path.
 #[tokio::test]
 async fn two_tenants_asking_for_one_new_name_at_the_same_moment_one_launches() {
-    let stack = Stack::start().await;
+    let stack = Stack::with_dataset_catalog_barrier(2).await;
     let bayu = stack.bayu().await;
     let andi = stack.andi().await;
     Mock::given(method("POST"))
         .and(body_string_contains("dataset_catalog"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(Duration::from_millis(500))
-                .set_body_json(rows_body(&json!([]))),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(rows_body(&json!([]))))
         .mount(&stack.ch)
         .await;
     Mock::given(method("POST"))
@@ -4569,6 +5057,7 @@ async fn a_workbook_ingest_stores_the_converted_sheet_beside_the_original_and_la
             "header_row": 0,
         "columns": [],
         "on_bad_value": "stop",
+        "author": format!("{BAYU_DISPLAY_NAME} (file upload)"),
         } } } }),
         "the job's own configuration, the converted object and the fixed dialect"
     );
@@ -5014,6 +5503,7 @@ async fn a_parquet_ingest_converts_nothing_and_launches_the_job_on_the_original_
             "header_row": 0,
         "columns": [],
         "on_bad_value": "stop",
+        "author": format!("{BAYU_DISPLAY_NAME} (file upload)"),
         } } } }),
         "the job's own configuration: the original object, read as Parquet"
     );
@@ -5610,6 +6100,39 @@ async fn a_binary_that_is_not_a_supported_file_is_refused_at_completion_and_remo
     let reply = stack.complete(&bayu, &id).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
     assert_eq!(reply.json["error"], OTHER_BINARY);
+    assert!(
+        stack.bucket.keys().is_empty(),
+        "the refused file was removed"
+    );
+    assert_eq!(stack.row_count(&id).await, 0);
+}
+
+/// A file named like a format this upload reads, whose bytes do not open as that format,
+/// is refused as a file that could not be opened -- not as a format this upload does not
+/// read (QA `LH-DATA-17-05`, `DATA-51`). A damaged Parquet file is the case QA sent.
+#[tokio::test]
+async fn a_damaged_parquet_file_is_refused_at_completion_as_a_file_that_could_not_be_opened() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    // The bytes of the "not text" case above: a NUL byte, so no reader takes it.
+    let bytes: Vec<u8> = (0..3000_u32)
+        .map(|n| u8::try_from(n % 251).unwrap())
+        .collect();
+    let id = stack.session(&bayu, "data.parquet", bytes.len()).await;
+    stack.put_part(&bayu, &id, "1", &bytes).await;
+
+    let reply = stack.complete(&bayu, &id).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    let expected = lakehouse_api::upload_parquet::ParquetFileError::Unreadable.to_string();
+    assert_eq!(reply.json["error"], expected.as_str(), "{}", reply.text);
+    assert!(
+        !reply.json["error"]
+            .as_str()
+            .unwrap()
+            .contains("not a file this upload reads"),
+        "{}",
+        reply.text
+    );
     assert!(
         stack.bucket.keys().is_empty(),
         "the refused file was removed"
@@ -6798,7 +7321,8 @@ async fn a_gzip_bomb_is_refused_when_it_arrives_and_nothing_is_stored() {
     std::io::Write::write_all(&mut encoder, b"a").unwrap();
     let bomb = encoder.finish().unwrap();
     assert!(bomb.len() < 8 * MIB, "the setup: a small file");
-    let unpacked = "The file is larger than the upload limit once unpacked.";
+    // `DATA-51` (`LH-DATA-17-13`): the sentence names the cap.
+    let unpacked = "The file is larger than the 2 GB limit once unpacked.";
 
     assert_eq!(
         refusal_of(&stack, &bayu, "bomb.csv.gz", bomb.clone()).await,

@@ -254,6 +254,7 @@ def run_bronze_ingest(
     plan: LoadPlan = LoadPlan(),
     *,
     gate: Callable[[schema_observer.ReflectedTable], schema_observer.Decision] | None = None,
+    author: str = "",
 ) -> dict[str, Any]:
     """Run the dlt pipeline once: build the Postgres `sql_database` source
     (SSRF-checked and `hostaddr`-pinned per WS3 item 20, the rest
@@ -265,6 +266,12 @@ def run_bronze_ingest(
     Dagster op in `assets.py`) to attach as metadata and pass on to Bronze
     catalog registration. `plan` is the load mode (`adapters/sink.py`'s
     "Load modes"); the default appends, as this function always did.
+
+    `author` is the run's label, recorded on the commits this load makes as
+    `rantai.author` through `SinkConfig.author` (`DATA-52`, review round 1 R2):
+    the PostgreSQL connector's own load was the one sink path that recorded no
+    author while the documents said a connector's replace and append name their
+    run. Empty when the caller has no run context, which records none.
 
     # Errors
 
@@ -343,7 +350,7 @@ def run_bronze_ingest(
     # `resource.add_map(_stamp_ingested_at)` here, which meant the column
     # only existed on the ONE code path (this one) that remembered to add
     # it.
-    result = load_via_sink(source, cfg.bronze_table_name, SinkConfig.from_bronze_ingest_config(cfg), plan)
+    result = load_via_sink(source, cfg.bronze_table_name, SinkConfig.from_bronze_ingest_config(cfg, author=author), plan)
     if result.has_failed_jobs:
         # `load_info_str` (`str(load_info)`) can contain a file path --
         # fine in a raised exception that stays server-side (this op is

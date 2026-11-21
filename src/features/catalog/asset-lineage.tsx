@@ -10,13 +10,15 @@ import { useAuth } from "@/features/auth/auth-provider"
 import { KIND_LABEL, focusIds, type LineageNode } from "@/features/governance/lineage-graph"
 import { UsedBy } from "@/features/governance/used-by"
 import { useService, type ServiceState } from "@/hooks/use-service"
-import { assetQueryStudioHref } from "@/lib/asset-query"
+import { assetHasReadableTable, assetQueryStudioHref } from "@/lib/asset-query"
 import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { LineageGraph } from "@/services/contracts/governance"
-import { LineageMindmap, edgePipeline, mindmapModel } from "./asset-lineage-map"
+import { LineageMindmap, edgePipeline, mindmapModel, useChartPlacement } from "./asset-lineage-map"
+import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { ColumnLineageCard, MappingList } from "./column-lineage"
+import { TableGrantNote } from "./table-grant-note"
 
 /**
  * What the lineage graph calls this asset: its table key
@@ -194,8 +196,15 @@ function RelatedList({ items }: { items: Related[] }) {
 }
 
 /** The recorded graph around the asset, or why there is none to draw. */
-function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
-  if (state.status === "loading") {
+export function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
+  // BI-71 decision 4: the charts that read the asset are grouped by
+  // dashboard, which needs the viewer's charts and dashboards. Asked only
+  // when the graph has charts; while they load the map keeps its one
+  // loading look rather than drawing every chart and then folding them.
+  const loaded = state.status === "success" ? state.data : null
+  const charted = !!loaded?.supported && loaded.nodes.some((n) => n.id.startsWith("chart:"))
+  const { loading: placing, placement } = useChartPlacement(charted)
+  if (state.status === "loading" || placing) {
     return (
       <SectionCard size="sm" title="Lineage">
         <div className="flex gap-3 py-1" role="status" aria-label="Loading lineage">
@@ -267,7 +276,7 @@ function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
           : `${upstream.length} upstream · ${downstream.length} downstream of this asset, by recorded lineage.`
       }
     >
-      <LineageMindmap model={model} />
+      <LineageMindmap model={model} placement={placement} />
       {/* What the graph cannot contain, so a missing step is not read as "there is none". */}
       {[graph.note, ...(graph.coverage ?? [])].filter(Boolean).map((caveat) => (
         <p key={caveat} className="mt-2 text-xs text-muted-foreground">
@@ -282,15 +291,34 @@ function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
  * The Lineage tab: the recorded graph around the asset, the column view
  * (which columns feed a column and what is built from it), what reads it, and any table the catalog relates to it
  * outside the graph.
+ *
+ * `iceberg` is the page's own state for the Iceberg table, so the query
+ * link opens Trino only when that table is there (owner, 2026-11-08).
  */
-export function AssetLineage({ asset: a, state }: { asset: AssetDetail; state: AssetLineageState }) {
+export function AssetLineage({
+  asset: a,
+  state,
+  iceberg,
+}: {
+  asset: AssetDetail
+  state: AssetLineageState
+  iceberg: IcebergTableState
+}) {
   const graph = state.status === "success" ? state.data : null
   const dependents = assetDependents(a, graph)
   const related = relatedTables(a, graph)
   const mappings = graph?.columnMappings ?? []
+  // The query link is offered only for an asset with a table the console can
+  // read: it would name a table that is not there otherwise (owner,
+  // 2026-11-09).
+  const table = icebergTableOf(iceberg)
+  const readable = assetHasReadableTable(a, table, iceberg.status === "loading")
 
   return (
     <div className="flex flex-col gap-2">
+      {/* GOV-11 (review round 1 R2): the API sent no related tables, so the
+          panels below are empty on purpose — say so instead of "none". */}
+      <TableGrantNote asset={a} />
       <div className="flex flex-wrap gap-2">
         <Button
           size="sm"
@@ -299,9 +327,11 @@ export function AssetLineage({ asset: a, state }: { asset: AssetDetail; state: A
         >
           Open lineage graph
         </Button>
-        <Button size="sm" variant="ghost" render={<Link href={assetQueryStudioHref(a)} />}>
-          Query this asset
-        </Button>
+        {readable ? (
+          <Button size="sm" variant="ghost" render={<Link href={assetQueryStudioHref(a, table)} />}>
+            Query this asset
+          </Button>
+        ) : null}
       </div>
 
       <GraphCard a={a} state={state} />

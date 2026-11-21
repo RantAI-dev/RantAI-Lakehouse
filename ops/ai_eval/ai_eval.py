@@ -91,6 +91,7 @@ import re
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -413,7 +414,8 @@ def where_matches(item: Any, where: dict[str, Any]) -> bool:
     own field; a dotted key reads into it (`def.grain` is the `grain` of the
     item's `def`, as `GET /api/dashboard/specs` nests it). A key that is absent
     does not match. A field that holds a list matches when the value is one of
-    its members (`def.measures` names a measure the chart uses)."""
+    its members, or when a member is an object whose `column` names it
+    (`def.measures` names a measure the chart uses)."""
     if not isinstance(item, dict):
         return False
     for key, want in where.items():
@@ -426,8 +428,23 @@ def where_matches(item: Any, where: dict[str, Any]) -> bool:
 
 
 def _is_or_holds(got: Any, want: Any) -> bool:
+    """Whether a value read from an item satisfies a `where` value.
+
+    A list matches when the wanted value is one of its members, or when the
+    wanted value is a string and a member is an object whose `column` names
+    it: the model writes a measure as `{"column": "per_event", "aggregate":
+    "sum"}`, so a case that asks for the measure `per_event` has to match
+    that object. Only the column names the measure; the aggregate does not.
+    The column match is exact and case-sensitive, like the string arm."""
     if isinstance(got, list):
-        return want in got
+        if want in got:
+            return True
+        if isinstance(want, str):
+            return any(
+                isinstance(member, dict) and member.get("column") == want
+                for member in got
+            )
+        return False
     return got == want
 
 
@@ -577,11 +594,19 @@ DELETE_ROUTES = {
     # BI-37: an alert or digest rule, deleted by id like the others
     # (`DELETE /api/alerts?id=`).
     "alert": "/api/alerts",
+    # BI-18 part D: a written report and a dashboard template, deleted by id
+    # in the path (`DELETE /api/dashboard/reports/{id}`), see `PATH_ID_KINDS`.
+    "report": "/api/dashboard/reports",
+    "template": "/api/dashboard/templates",
 }
+# The kinds whose delete names the id in the path, not in `?id=`.
+PATH_ID_KINDS = frozenset({"report", "template"})
 # Newest first: a chart may use a field, a field a source, and a board holds
 # charts, so the dependants go before what they depend on. An alert watches a
 # chart, so it goes before the charts.
-CLEANUP_ORDER = ("alert", "chart", "metric", "field", "source", "board")
+# A report places charts by reference, so it goes first too; a template copies
+# a board's definition and depends on nothing, so it goes last.
+CLEANUP_ORDER = ("alert", "report", "chart", "metric", "field", "source", "board", "template")
 
 
 def kind_of_path(path: str) -> str | None:
@@ -810,20 +835,36 @@ def confirm_problems(confirms: list[dict[str, Any]]) -> list[str]:
     return problems
 
 
+def new_run_id() -> str:
+    """An id unique to this setup run, for objects the API cannot delete.
+
+    A case that invites a user cannot clean it up (there is no delete-user
+    route), so a fixed username AND email would clash on the next run against
+    the same installation. `{run_id}` in a setup body keeps both distinct; it
+    is a harness substitution, not a name a setup call saves.
+    """
+    return uuid.uuid4().hex[:12]
+
+
 def run_setup(
     cfg: Config, session: requests.Session, setup: list[dict[str, Any]]
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Make the case's own objects through the API. Returns the ids saved under
     each name and the objects created, for cleanup. A call without an `id_at`
     only changes what an earlier call made: it saves no name and adds nothing
-    for the cleanup to delete."""
+    for the cleanup to delete. `{run_id}` is available to setup bodies and
+    paths but is not added to the returned names."""
     names: dict[str, str] = {}
     created: list[dict[str, str]] = []
+    run_id = new_run_id()
     for call in setup:
+        # Setup names win over nothing here; the harness's run id is reserved,
+        # so a case cannot shadow it with a setup name.
+        substitutions = {**names, "run_id": run_id}
         resp = session.request(
             call["method"],
-            f"{cfg.api_url}{fill_names(call['path'], names)}",
-            json=fill_value(call.get("body"), names),
+            f"{cfg.api_url}{fill_names(call['path'], substitutions)}",
+            json=fill_value(call.get("body"), substitutions),
             timeout=60,
         )
         if resp.status_code >= 400:
@@ -868,6 +909,15 @@ def collect_created(
             elif tool == "create_calculated_field" and result.get("ok") is True:
                 found.append({"kind": "field", "id": str(result["id"])})
             return
+        # BI-18 part D: `create_report` answers `{ok: true, report: {id, ...}}`
+        # and `create_dashboard_from_template` `{ok: true, board: {id, ...}}`.
+        nested = {"create_report": ("report", "report"), "create_dashboard_from_template": ("board", "board")}
+        if tool in nested and result.get("ok") is True:
+            key, kind = nested[tool]
+            obj = result.get(key)
+            if isinstance(obj, dict) and obj.get("id"):
+                found.append({"kind": kind, "id": str(obj["id"])})
+            return
         # BI-37: `create_alert_rule` answers `{ok: true, rule: {id, ...}}` — the
         # object to clean up is the rule, not the reply.
         rule = result.get("rule")
@@ -896,8 +946,13 @@ def run_cleanup(cfg: Config, session: requests.Session, created: list[dict[str, 
     problems: list[str] = []
     for obj in cleanup_plan(created):
         route = DELETE_ROUTES[obj["kind"]]
+        url = (
+            f"{cfg.api_url}{route}/{obj['id']}"
+            if obj["kind"] in PATH_ID_KINDS
+            else f"{cfg.api_url}{route}?id={obj['id']}"
+        )
         try:
-            resp = session.delete(f"{cfg.api_url}{route}?id={obj['id']}", timeout=60)
+            resp = session.delete(url, timeout=60)
         except requests.RequestException as err:
             problems.append(f"cleanup {obj['kind']} {obj['id']}: {type(err).__name__}")
             continue

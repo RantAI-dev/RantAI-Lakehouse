@@ -527,6 +527,38 @@ class CleanupPlanTests(unittest.TestCase):
             ],
         )
 
+    def test_a_report_and_a_template_are_deleted_by_the_id_in_the_path(self) -> None:
+        # BI-18 part D: their routes take the id in the path, not in `?id=`, and
+        # a report goes before the charts it places, a template after the boards.
+        cfg = make_cfg()
+        session = FakeSession()
+        created = [
+            {"kind": "template", "id": "t1"},
+            {"kind": "board", "id": "b1"},
+            {"kind": "chart", "id": "c1"},
+            {"kind": "report", "id": "r1"},
+        ]
+        self.assertEqual(m.run_cleanup(cfg, session, created), [])
+        self.assertEqual(
+            [url for _, url, _ in session.calls],
+            [
+                "http://api.test/api/dashboard/reports/r1",
+                "http://api.test/api/dashboard/specs?id=c1",
+                "http://api.test/api/dashboard/boards?id=b1",
+                "http://api.test/api/dashboard/templates/t1",
+            ],
+        )
+
+    def test_the_report_and_the_board_a_template_made_are_collected_for_the_cleanup(self) -> None:
+        traces = [[
+            {"tool": "create_report", "result": {"ok": True, "report": {"id": "r1", "title": "X"}}},
+            {"tool": "create_dashboard_from_template", "result": {"ok": True, "board": {"id": "b9"}}},
+            # A refused or pending call made nothing.
+            {"tool": "create_report", "result": {"status": "needs_confirmation"}},
+        ]]
+        found = m.collect_created([], traces, [])
+        self.assertEqual(found, [{"kind": "report", "id": "r1"}, {"kind": "board", "id": "b9"}])
+
     def test_a_failed_delete_is_a_problem_not_a_crash(self) -> None:
         cfg = make_cfg()
         session = FakeSession({("DELETE", "/api/dashboard/specs"): FakeResponse(409, {"error": "in use"})})
@@ -758,6 +790,31 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(names, {"b": "b-123"})
         self.assertEqual(created, [{"kind": "board", "id": "b-123"}])
 
+    def test_the_run_id_makes_an_invite_unique_per_run_without_becoming_a_saved_name(self) -> None:
+        # AI-29..31 review R2: no API deletes an invited user, so the case's
+        # username AND email must be unique per run or the second setup fails.
+        cfg = make_cfg()
+        session = FakeSession({
+            ("POST", "/api/identity/users"): {"id": "u-1", "name": "Eval Colleague"},
+        })
+        setup = [{
+            "name": "colleague_name", "method": "POST", "path": "/api/identity/users",
+            "body": {"name": "Eval Colleague", "username": "eval_colleague_{run_id}",
+                     "email": "eval.colleague.{run_id}@example.com"},
+            "id_at": "name",
+        }]
+        names, created = m.run_setup(cfg, session, setup)
+        self.assertEqual(names, {"colleague_name": "Eval Colleague"})
+        self.assertEqual(created, [], "no API deletes a user")
+        first = session.calls[0][2]
+        self.assertTrue(first["username"].startswith("eval_colleague_"))
+        self.assertNotIn("{run_id}", first["username"])
+        self.assertIn(first["username"][len("eval_colleague_"):], first["email"])
+        m.run_setup(cfg, session, setup)
+        second = session.calls[1][2]
+        self.assertNotEqual(first["username"], second["username"])
+        self.assertNotEqual(first["email"], second["email"])
+
     def test_the_kind_of_a_setup_object_comes_from_its_route(self) -> None:
         self.assertEqual(m.kind_of_path("/api/dashboard/specs"), "chart")
         self.assertEqual(m.kind_of_path("/api/dashboard/boards"), "board")
@@ -957,12 +1014,41 @@ class WhereMatchTests(unittest.TestCase):
         self.assertTrue(m.where_matches(REAL_SPEC_ITEM, {"def.measures": "jumlah"}))
         self.assertFalse(m.where_matches(REAL_SPEC_ITEM, {"def.measures": "other"}))
 
+    def test_a_measure_written_as_an_object_matches_by_its_column(self) -> None:
+        # The model writes a measure as `{"column": ..., "aggregate": ...}`,
+        # so a where value that names the column must still match it.
+        item = {"def": {"measures": [{"column": "per_event", "aggregate": "sum"}]}}
+        self.assertTrue(m.where_matches(item, {"def.measures": "per_event"}))
+
+    def test_a_measure_object_does_not_match_another_name_or_its_aggregate(self) -> None:
+        # Only the column names the measure; an aggregate is not a column.
+        item = {"def": {"measures": [{"column": "per_event", "aggregate": "sum"}]}}
+        self.assertFalse(m.where_matches(item, {"def.measures": "other"}))
+        self.assertFalse(m.where_matches(item, {"def.measures": "sum"}))
+
+    def test_a_list_that_mixes_a_string_and_a_measure_object_matches_either_name(self) -> None:
+        item = {"def": {"measures": ["jumlah", {"column": "per_event", "aggregate": "sum"}]}}
+        self.assertTrue(m.where_matches(item, {"def.measures": "jumlah"}))
+        self.assertTrue(m.where_matches(item, {"def.measures": "per_event"}))
+
     def test_a_state_check_with_a_dotted_key_counts_matching_charts(self) -> None:
         cfg = make_cfg()
         session = FakeSession({("GET", "/api/dashboard/specs"): {"charts": [REAL_SPEC_ITEM]}})
         check = {"path": "/api/dashboard/specs", "list": "charts",
                  "where": {"kind": "line", "def.grain": "month"}, "count": 1}
         self.assertEqual(m.expect_state_problems(cfg, session, check, own_ids={"c-real"}), [])
+
+    def test_a_state_check_counts_a_chart_whose_measure_is_written_as_an_object(self) -> None:
+        # The `calc_then_chart` case checks `{"mart": ..., "def.measures":
+        # "per_event"}`, and the model writes the measure as an object.
+        chart = {"id": "c-1", "mart": "mart_event",
+                 "def": {"mart": "mart_event",
+                         "measures": [{"column": "per_event", "aggregate": "sum"}]}}
+        cfg = make_cfg()
+        session = FakeSession({("GET", "/api/dashboard/specs"): {"charts": [chart]}})
+        check = {"path": "/api/dashboard/specs", "list": "charts",
+                 "where": {"mart": "mart_event", "def.measures": "per_event"}, "count": 1}
+        self.assertEqual(m.expect_state_problems(cfg, session, check, own_ids={"c-1"}), [])
 
     def test_a_path_with_an_index_reads_the_element_at_that_place_in_a_list(self) -> None:
         # `tabs[0].title` is the first tab's title, so a case can check the
@@ -1941,6 +2027,16 @@ class DashboardCasesTests(unittest.TestCase):
         )
         # The tab is named in the request, so the check can name it too.
         self.assertIn("called Maps", case["turns"][0])
+        # `BI-33`: with only the map chart on the board, a sloppy "move every
+        # chart" passed, and the case failed when the assistant was right in
+        # reading "the map charts" as one of two. A second chart is in the setup
+        # and must stay off the tab.
+        self.assertEqual([s["name"] for s in case["setup"]], ["board", "map_chart", "other_chart"])
+        self.assertIn(
+            {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}"},
+             "tile_on_tab": {"chart": "{other_chart}", "tab_title": "Maps"}, "count": 0},
+            case["expect_state"],
+        )
 
     def test_the_move_tab_case_checks_the_order_the_tabs_are_in(self) -> None:
         # Two tabs and a move: the order is the result, so it is checked
@@ -2013,6 +2109,46 @@ class DashboardCasesTests(unittest.TestCase):
         # name in `set_board_view_filters`.
         cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
         case = cases["view_filter_year"]
+        self.assertIn("{board}", case.get("context", ""))
+
+    def test_the_two_value_view_filter_case_narrows_the_view_in_build_mode(self) -> None:
+        # "show only 2024 and only Malaysia" is one request for two filters,
+        # not a request for a chart. The case runs in build mode, because that
+        # is the mode where the model drafted a chart instead, and it checks
+        # that the board's saved filters stay empty and that no chart was made.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["view_filter_two_values_build"]
+        self.assertEqual(case["mode"], "build")
+        # The tool is a read on the view, so the case waits for no confirm.
+        self.assertNotIn("confirm", case)
+        self.assertIn("{board}", case.get("context", ""))
+        self.assertEqual(
+            case["expect_tool"],
+            {"name": "set_board_view_filters", "args_contains": {"board": "{board}", "filters": "tahun"}},
+        )
+        self.assertEqual(case["expect_no_tool"], ["create_chart"])
+        self.assertIn(
+            {"path": "/api/dashboard/boards", "list": "boards",
+             "where": {"id": "{board}", "filters[].column": "tahun"}, "count": 0},
+            case["expect_state"],
+        )
+        self.assertIn(
+            {"path": "/api/dashboard/specs", "list": "charts",
+             "where": {"board": "{board}"}, "count": 1},
+            case["expect_state"],
+        )
+        # The mart carries both a year column and a country column, so one
+        # page can be narrowed by both.
+        setup = {step["name"]: step for step in case["setup"]}
+        self.assertEqual(setup["chart"]["body"]["mart"], "mart_wisman")
+        self.assertIn("Malaysia", case["turns"][0])
+
+    def test_the_save_filters_case_tells_the_assistant_which_board_to_save(self) -> None:
+        # The console always sends the open dashboard with its board id; a
+        # case without that context never tells the assistant whose default
+        # filters "Save this filter as the default for everyone" saves.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["save_filters_only_when_asked"]
         self.assertIn("{board}", case.get("context", ""))
 
 

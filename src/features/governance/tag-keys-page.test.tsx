@@ -84,20 +84,14 @@ describe("TagKeysPage", () => {
   it("shows the define, edit and delete buttons with governance:write", async () => {
     stubApi(["catalog:read", "governance:write"])
     renderPage()
-    expect(await screen.findByRole("button", { name: "New tag key" })).toBeTruthy()
-    expect(await screen.findByRole("button", { name: "Edit values of data_domain" })).toBeTruthy()
+    // WEB-7 D2: New tag key and Edit values open their own pages.
+    expect(
+      (await screen.findByRole("button", { name: "New tag key" })).getAttribute("href")
+    ).toBe("/admin/settings/tag-keys/new")
+    expect(
+      (await screen.findByRole("button", { name: "Edit values of data_domain" })).getAttribute("href")
+    ).toBe("/admin/settings/tag-keys/data_domain/edit")
     expect(await screen.findByRole("button", { name: "Delete tag key data_domain" })).toBeTruthy()
-  })
-
-  it("shows the API's sentence in the form when a save is refused", async () => {
-    stubApi(["catalog:read", "governance:write"], {
-      status: 400,
-      error: "allowedValues: \"Finance\" must be 1-64 characters matching ^[a-z0-9][a-z0-9_-]*$",
-    })
-    renderPage()
-    fireEvent.click(await screen.findByRole("button", { name: "Edit values of data_domain" }))
-    fireEvent.click(await screen.findByRole("button", { name: "Save values" }))
-    expect(await screen.findByText(/allowedValues: "Finance" must be 1-64 characters/)).toBeTruthy()
   })
 
   it("shows the number of tables in the dialog when a delete is refused", async () => {

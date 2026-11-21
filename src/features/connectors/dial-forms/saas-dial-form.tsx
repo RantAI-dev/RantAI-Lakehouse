@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { saasVendorForType, type SaasVendor } from "@/lib/connectors/saas-vendors"
@@ -76,15 +77,21 @@ export function SaasDialForm({
 
       <div className="space-y-1.5">
         <Label htmlFor="saas-dial-sign-in">How it signs in</Label>
-        <select
+        {/* WEB-9 D3/D2a: the same choices as before. A stored dial can name a
+            sign-in the vendor no longer offers (its integration option is not
+            listed), so the empty trigger says what to pick rather than drawing
+            the browser option as if it were chosen. */}
+        <SelectField
           id="saas-dial-sign-in"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={signIn}
-          onChange={(e) => setSignIn(e.target.value as SignIn)}
-        >
-          <option value="browser">Sign in to {vendor.label} in a browser window</option>
-          {vendor.integration ? <option value="integration">An integration credential</option> : null}
-        </select>
+          placeholder="Pick how it signs in"
+          options={[
+            { value: "browser", label: `Sign in to ${vendor.label} in a browser window` },
+            ...(vendor.integration ? [{ value: "integration", label: "An integration credential" }] : []),
+          ]}
+          onValueChange={(next) => setSignIn(next as SignIn)}
+        />
         {!vendor.integration ? (
           <p className="text-xs text-muted-foreground">
             {vendor.label} offers no integration credential that this product accepts, so the connector signs in

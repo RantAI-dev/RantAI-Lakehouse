@@ -107,6 +107,10 @@ const PDF_BUSY: &str = "The PDF service was busy; the next run will try again.";
 const PDF_TIMEOUT: &str = "The PDF took too long to make.";
 const PDF_UNREACHABLE: &str = "The PDF service is not reachable.";
 const PDF_FAILED: &str = "The PDF could not be made.";
+/// What a "Send now" that ran past its time budget records (`BI-35`): the run
+/// was stopped part-way, so it cannot say whether the email left.
+pub const RUN_TOO_LONG: &str =
+    "The report took longer than the time allowed and was stopped. It may not have been sent.";
 /// Paused after the fifth failure in a row (feature decision 7).
 pub const PAUSED_AFTER_FAILURES: &str =
     "Paused after 5 failed sends in a row. Fix the cause, then resume it.";
@@ -369,6 +373,56 @@ pub async fn run_subscription(
     Ok(delivery)
 }
 
+/// Record a "Send now" that was stopped at its time budget (`BI-35`): a failed
+/// manual delivery with [`RUN_TOO_LONG`], and an audit row with outcome
+/// `failed`, so the run history and the trail both say what happened instead of
+/// the request ending in a bare timeout with nothing written. Never counted
+/// toward the five failures, like any manual send. The audit row is best effort:
+/// a trail that cannot be written is logged, and the delivery is still recorded.
+///
+/// # Errors
+///
+/// [`StoreError`] when the delivery record cannot be written.
+pub async fn record_cut_run(
+    state: &AppState,
+    principal: &Principal,
+    sub: &Subscription,
+    started_at: OffsetDateTime,
+) -> Result<Delivery, StoreError> {
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(StoreError::Unavailable);
+    };
+    let delivery = subscriptions::record_delivery(
+        pool,
+        &NewDelivery {
+            subscription_id: sub.id,
+            started_at,
+            finished_at: OffsetDateTime::now_utc(),
+            status: DeliveryStatus::Failed,
+            manual: true,
+            recipient_count: 0,
+            reason: Some(RUN_TOO_LONG.to_owned()),
+        },
+    )
+    .await?;
+    let event = lakehouse_store::audit::NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: "report.send_now".to_owned(),
+        resource_kind: Some("dashboard".to_owned()),
+        resource_id: Some(sub.board.clone()),
+        args: Some(json!({ "subscription": sub.id, "board": sub.board, "origin": "manual" })),
+        outcome: "failed".to_owned(),
+        detail: Some(RUN_TOO_LONG.to_owned()),
+        ..lakehouse_store::audit::NewAuditEvent::default()
+    };
+    // GOV-1: the counted writer, so a row that cannot be written is logged by
+    // class and counted, as for every route.
+    crate::audit_coverage::record_best_effort(state, event).await;
+    Ok(delivery)
+}
+
 /// How long after a busy PDF service the send is tried again.
 const BUSY_RETRY_AFTER: time::Duration = time::Duration::minutes(5);
 
@@ -455,7 +509,7 @@ async fn deliver(
         .await
         .map_err(|_| stop(DASHBOARD_UNREADABLE))?;
     let gone = if sub.board == store::DEFAULT_BOARD_ID {
-        !viewer.sees_builtin()
+        !viewer.sees_builtin_board()
     } else {
         board.is_none()
     };
@@ -688,7 +742,7 @@ async fn users_who_may_receive(
         // only `dashboard:read`: somebody the rules leave out of a restricted
         // dashboard is not sent its report. A failure to resolve leaves them out.
         let sees_board = match viewer_for(state, &person).await {
-            Ok(viewer) if board == store::DEFAULT_BOARD_ID => viewer.sees_builtin(),
+            Ok(viewer) if board == store::DEFAULT_BOARD_ID => viewer.sees_builtin_board(),
             Ok(viewer) => store::get_board(&state.clickhouse, board, &viewer)
                 .await
                 .is_ok_and(|found| found.is_some()),
@@ -1029,11 +1083,16 @@ impl Collected<'_> {
             }
         };
         let title = file.chart.spec.title.clone();
-        let cap = crate::export::EXPORT_ROW_CAP;
+        // BI-27: a file the byte cap cut names the rows it holds, not the row cap.
+        let cap = crate::routes::dashboard::cut_rows(&file.written, crate::export::EXPORT_ROW_CAP);
         let cut = file.written.cut;
         let name = unique_name(
             &self.files.attachments,
-            &export_file_name(&title, file.format.extension(), cut.then_some(cap)),
+            &export_file_name(
+                &title,
+                file.format.extension(),
+                (cut.then_some(cap), file.filters_skipped),
+            ),
         );
         let len = usize::try_from(file.written.len).unwrap_or(usize::MAX);
         if !self.budget.take(len) {
@@ -1274,7 +1333,11 @@ async fn tell_owner(
         return;
     };
     let address = match lakehouse_store::identity::get_user(pool, &sub.owner_id.to_string()).await {
-        Ok(user) if user.status == "active" => normalise_address(&user.email),
+        Ok(user) if user.status == "active" => {
+            // ADM-11 D9: an owner without an email address has none to
+            // tell — `None`, not an empty string.
+            user.email.as_deref().and_then(normalise_address)
+        }
         _ => None,
     };
     let Some(address) = address else {
@@ -1516,6 +1579,26 @@ mod tests {
     /// BI-19 B1 owner decision Q-R12: for a restricted dashboard the runner
     /// passes no allowed domain, so every outside address is left out and
     /// counted while the console users who may receive it still get it.
+    /// ADM-11 D9: A user without an email address is skipped, and counted in `left_out`.
+    #[test]
+    fn a_user_without_an_email_address_is_left_out() {
+        let rows = vec![
+            RecipientRow {
+                user_id: Some(Uuid::new_v4()),
+                email: None,
+                user_name: Some("No Email User".to_owned()),
+                user_email: None,
+                user_status: Some("active".to_owned()),
+            },
+            user_row("active", "ann@company.example"),
+        ];
+        let everyone: std::collections::HashSet<uuid::Uuid> =
+            rows.iter().filter_map(|r| r.user_id).collect();
+        let got = audience_of(&rows, &["company.example".to_owned()], &everyone);
+        assert_eq!(got.addresses, ["ann@company.example"]);
+        assert_eq!(got.left_out, 1, "the user without an email is left out");
+    }
+
     #[test]
     fn a_restricted_dashboards_report_leaves_out_every_outside_address() {
         let rows = vec![

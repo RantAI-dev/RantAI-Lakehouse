@@ -16,6 +16,7 @@ import {
   LoadingSkeleton,
 } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useDataTable } from "@/hooks/use-data-table"
@@ -28,10 +29,18 @@ import { formatCost, formatRelativeTime } from "@/lib/format"
 import { agentService, assetService } from "@/services"
 import type { ApprovalItem } from "@/services/contracts/agents"
 import { accessPermission, getApprovalColumns, statusCell } from "./approval-columns"
+import { decisionOutcomeText } from "./decision-outcome"
+
+type StoredDecision = {
+  readonly executed: boolean
+  readonly result?: unknown
+  readonly notExecuted?: { readonly reason: string; readonly required: string }
+  readonly decision: "approved" | "rejected"
+}
 
 interface DrawerContentProps {
   readonly selected: ApprovalItem
-  readonly executionResult: { readonly executed: boolean; readonly result?: unknown } | null
+  readonly executionResult: StoredDecision | null
   readonly decidedGrants: Record<string, string>
   readonly selfApproval: boolean
   readonly onDecide: (decision: "approved" | "rejected") => void
@@ -181,16 +190,18 @@ function ApprovalDrawerContent({
       ) : null}
       {executionResult ? (
         <div>
+          {/* AI-28 / LH-AI-18-07: the heading says what the recorded
+              decision actually did, so a 200 with executed:false is not
+              shown as a generic failure. The JSON block stays for a tool
+              that ran; there is nothing to dump when it did not. */}
           <p className="text-xs font-medium text-muted-foreground">
-            {executionResult.executed
-              ? "Execution result"
-              : "Decision recorded — not executed"}
+            {decisionOutcomeText(executionResult, executionResult.decision)}
           </p>
-          <pre className="mt-1 max-h-64 overflow-auto rounded bg-muted/60 px-2 py-1.5 font-mono text-[11px] text-muted-foreground">
-            {executionResult.executed
-              ? JSON.stringify(executionResult.result, null, 2)
-              : "The tool was never executed — either the action was rejected, or the approver lacked the underlying tool's own permission."}
-          </pre>
+          {executionResult.executed ? (
+            <pre className="mt-1 max-h-64 overflow-auto rounded bg-muted/60 px-2 py-1.5 font-mono text-[11px] text-muted-foreground">
+              {JSON.stringify(executionResult.result, null, 2)}
+            </pre>
+          ) : null}
         </div>
       ) : null}
     </>
@@ -217,10 +228,7 @@ export function ApprovalsPage() {
     null
   )
   const [comment, setComment] = React.useState("")
-  const [executionResult, setExecutionResult] = React.useState<{
-    readonly executed: boolean
-    readonly result?: unknown
-  } | null>(null)
+  const [executionResult, setExecutionResult] = React.useState<StoredDecision | null>(null)
   // Grants this session decided, keyed by approval id — see `statusCell`'s
   // doc comment on why an already-decided access request otherwise has no
   // expiry to show.
@@ -336,7 +344,15 @@ export function ApprovalsPage() {
       setDecision(null)
       setComment("")
       setSelected(outcome.approval)
-      setExecutionResult({ executed: outcome.executed, result: outcome.result })
+      // AI-28 / LH-AI-18-07: keep the reason the 200 gave alongside the
+      // result, and the decision itself (the confirm dialog closes before
+      // the drawer shows the outcome).
+      setExecutionResult({
+        executed: outcome.executed,
+        result: outcome.result,
+        notExecuted: outcome.notExecuted,
+        decision,
+      })
       state.reload()
     }
   }
@@ -420,7 +436,11 @@ export function ApprovalsPage() {
         confirming={deciding}
         onConfirm={confirmDecision}
       >
+        <Label htmlFor="approval-comment" className="text-xs">
+          Comment <span className="font-normal text-muted-foreground">(optional)</span>
+        </Label>
         <Textarea
+          id="approval-comment"
           value={comment}
           onChange={(e) => setComment(e.target.value)}
           placeholder="Optional comment for the audit trail"

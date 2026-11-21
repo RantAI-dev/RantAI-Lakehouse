@@ -10,17 +10,19 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    TestApp, create_assistant_principal, create_principal_with_permissions,
+    session_cookie_for_user, spin_up_with_env,
 };
 use lakehouse_store::dashboard_access::{NewRule, replace_item};
 use serde_json::{Value, json};
+use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
@@ -93,6 +95,24 @@ impl Respond for Store {
                     .map(|(id, folder)| json!({ "id": id, "folder_id": folder, "owner_id": "" }))
                     .collect(),
             );
+        }
+        // GOV-17 review R2: two root-folder SQL sources, one reading an allowed
+        // mart and one a denied mart, for the assistant list_sql_sources test.
+        if sql.contains("FROM console.bi_source FINAL") {
+            return rows(vec![
+                json!({
+                    "id": "s_allowed", "title": "Allowed",
+                    "sql": "SELECT n FROM serving.allowed_mart", "folder_id": "",
+                    "columns_json": "[{\"name\":\"n\",\"type\":\"UInt64\"}]",
+                    "created_by": "u", "updated_at": "2026-01-01 00:00:00"
+                }),
+                json!({
+                    "id": "s_denied", "title": "Denied",
+                    "sql": "SELECT n FROM serving.denied_mart", "folder_id": "",
+                    "columns_json": "[{\"name\":\"n\",\"type\":\"UInt64\"}]",
+                    "created_by": "u", "updated_at": "2026-01-01 00:00:00"
+                }),
+            ]);
         }
         // Folders, a board's embed events and every other read: nothing.
         rows(vec![])
@@ -178,7 +198,7 @@ fn gate_passed(body: &Value) -> bool {
 #[tokio::test]
 async fn a_person_with_only_a_rule_is_judged_by_their_level_on_the_dashboard() {
     let (app, _ch, _llm) = app().await;
-    let analyst = create_principal_with_permissions(&app.pool, "query:read").await;
+    let analyst = create_assistant_principal(&app.pool, "query:read").await;
     replace_item(&app.pool, "board", "b1", &[view(analyst)], false, None)
         .await
         .unwrap();
@@ -227,7 +247,7 @@ async fn a_person_with_only_a_rule_is_judged_by_their_level_on_the_dashboard() {
 
     // Nothing else is widened: `run_sql` still needs `query:read`, which this
     // person does not hold (the same principal has it, so a second one).
-    let nobody = create_principal_with_permissions(&app.pool, "").await;
+    let nobody = create_assistant_principal(&app.pool, "").await;
     let nobody_cookie = session_cookie_for_user(&app.pool, nobody).await;
     let sql = call(
         &app,
@@ -246,7 +266,7 @@ async fn a_person_with_only_a_rule_is_judged_by_their_level_on_the_dashboard() {
 #[tokio::test]
 async fn edit_on_the_dashboard_lets_the_write_tools_reach_their_handler() {
     let (app, _ch, _llm) = app().await;
-    let editor = create_principal_with_permissions(&app.pool, "").await;
+    let editor = create_assistant_principal(&app.pool, "").await;
     replace_item(&app.pool, "board", "b1", &[edit(editor)], false, None)
         .await
         .unwrap();
@@ -284,7 +304,7 @@ async fn edit_on_the_dashboard_lets_the_write_tools_reach_their_handler() {
 async fn the_draft_of_an_update_that_moves_a_chart_onto_a_view_only_dashboard_is_refused_as_the_save_is()
  {
     let (app, _ch, _llm) = app().await;
-    let editor = create_principal_with_permissions(&app.pool, "").await;
+    let editor = create_assistant_principal(&app.pool, "").await;
     replace_item(&app.pool, "board", "b1", &[edit(editor)], false, None)
         .await
         .unwrap();
@@ -321,7 +341,7 @@ async fn the_draft_of_an_update_that_moves_a_chart_onto_a_view_only_dashboard_is
 #[tokio::test]
 async fn a_chat_offers_the_listed_tools_to_a_person_who_holds_only_a_rule() {
     let (app, _ch, llm) = app().await;
-    let analyst = create_principal_with_permissions(&app.pool, "catalog:read").await;
+    let analyst = create_assistant_principal(&app.pool, "catalog:read").await;
     replace_item(&app.pool, "board", "b1", &[view(analyst)], false, None)
         .await
         .unwrap();
@@ -371,7 +391,7 @@ async fn a_chat_offers_the_listed_tools_to_a_person_who_holds_only_a_rule() {
 async fn an_approved_delete_chart_runs_for_an_approver_with_a_rule_on_that_dashboard() {
     let (app, _ch, _llm) = app().await;
     // The requester holds manage on b1 only, and names no one else.
-    let requester = create_principal_with_permissions(&app.pool, "").await;
+    let requester = create_assistant_principal(&app.pool, "").await;
     replace_item(&app.pool, "board", "b1", &[manage(requester)], false, None)
         .await
         .unwrap();
@@ -403,9 +423,9 @@ async fn an_approved_delete_chart_runs_for_an_approver_with_a_rule_on_that_dashb
 }
 
 #[tokio::test]
-async fn an_approver_with_no_rule_is_refused_and_the_run_records_it() {
+async fn an_approver_with_no_rule_records_the_decision_and_the_run_does_not_run() {
     let (app, _ch, _llm) = app().await;
-    let requester = create_principal_with_permissions(&app.pool, "").await;
+    let requester = create_assistant_principal(&app.pool, "").await;
     replace_item(&app.pool, "board", "b1", &[manage(requester)], false, None)
         .await
         .unwrap();
@@ -431,7 +451,10 @@ async fn an_approver_with_no_rule_is_refused_and_the_run_records_it() {
     let approver = create_principal_with_permissions(&app.pool, "agent:approve").await;
     let approver_cookie = session_cookie_for_user(&app.pool, approver).await;
     let decided = decide(&app, &approver_cookie, &approval_id).await;
-    assert_eq!(decided.0, StatusCode::FORBIDDEN, "{}", decided.1);
+    // AI-28 / LH-AI-18-07: the decision is recorded, so the answer is a
+    // 200 with executed:false rather than a 403.
+    assert_eq!(decided.0, StatusCode::OK, "{}", decided.1);
+    assert_eq!(decided.1["executed"], json!(false), "{}", decided.1);
     let run = lakehouse_store::agents::get_run(&app.pool, &run_id)
         .await
         .unwrap()
@@ -460,4 +483,187 @@ async fn decide(app: &TestApp, cookie: &str, id: &str) -> (StatusCode, Value) {
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+// ── GOV-17 review R2: the assistant's list_sql_sources is table-gated ────
+
+/// Narrow every role of `user` to exactly `grants` (the same shape as the
+/// `table_access` test helper; GOV-7 D4 forbids narrowing a `*:*` role, so none
+/// is minted).
+async fn narrow_roles(pool: &PgPool, user: Uuid, grants: &[(&str, &str)]) {
+    let roles: Vec<Uuid> =
+        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert!(!roles.is_empty(), "the user must hold a role to narrow");
+    for role in roles {
+        sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        for (schema, table) in grants {
+            sqlx::query(
+                "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, $2, $3)",
+            )
+            .bind(role)
+            .bind(schema)
+            .bind(table)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
+fn listed_source_ids(body: &Value) -> Vec<String> {
+    body["result"]["sources"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// GOV-17 review R2: `list_sql_sources` uses the same narrowed viewer and
+/// shared `source_visible` guard as the console. A root-folder source reading
+/// a denied table must be omitted; a permitted source is the positive control.
+#[tokio::test]
+async fn a_narrowed_callers_list_sql_sources_omits_a_source_reading_a_denied_table() {
+    let (app, _ch, _llm) = app().await;
+
+    let narrowed = create_principal_with_permissions(
+        &app.pool,
+        "dashboard:read, assistant:use, assistant:ask",
+    )
+    .await;
+    narrow_roles(&app.pool, narrowed, &[("serving", "allowed_mart")]).await;
+    let cookie = session_cookie_for_user(&app.pool, narrowed).await;
+    let body = call(&app, &cookie, "list_sql_sources", json!({}), "ask").await;
+    let ids = listed_source_ids(&body);
+    assert!(ids.iter().any(|id| id == "s_allowed"), "control: {body}");
+    assert!(
+        !ids.iter().any(|id| id == "s_denied"),
+        "a source reading a denied table must be omitted: {body}"
+    );
+
+    let allowed = create_principal_with_permissions(
+        &app.pool,
+        "dashboard:read, assistant:use, assistant:ask",
+    )
+    .await;
+    narrow_roles(
+        &app.pool,
+        allowed,
+        &[("serving", "allowed_mart"), ("serving", "denied_mart")],
+    )
+    .await;
+    let cookie = session_cookie_for_user(&app.pool, allowed).await;
+    let body = call(&app, &cookie, "list_sql_sources", json!({}), "ask").await;
+    let ids = listed_source_ids(&body);
+    assert!(ids.iter().any(|id| id == "s_denied"), "control: {body}");
+}
+
+// ── GOV-17 review R10: assistant list_boards gates built-in Main ───────────
+
+/// A stand-in where built-in Main holds one stored tile reading
+/// `serving.m10_hidden`. A caller narrowed away from that mart loses Main in
+/// full, exactly as the dependency resolver decides for the HTTP chooser.
+struct MainBoardStore;
+
+impl Respond for MainBoardStore {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        let rows = |data: Vec<Value>| {
+            let n = data.len();
+            ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
+        };
+        if sql.contains("FROM console.bi_chart") {
+            let spec = json!({
+                "id": "c_m10", "title": "M", "kind": "kpi", "mart": "m10_hidden",
+                "sql": "SELECT n FROM serving.m10_hidden", "x": "", "y": "n"
+            });
+            let def = json!({
+                "title": "M", "mart": "m10_hidden", "kind": "kpi",
+                "measures": ["n"], "aggregate": "count"
+            });
+            return rows(vec![json!({
+                "id": "c_m10", "board": "", "created_by": "ui",
+                "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+            })]);
+        }
+        if sql.contains("FROM console.bi_board") {
+            return rows(vec![]);
+        }
+        ResponseTemplate::new(200).set_body_string("Ok.\n")
+    }
+}
+
+fn listed_board_ids(body: &Value) -> Vec<String> {
+    body["result"]["boards"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// GOV-17 review R10 (BLOCKER): `list_boards` used to prepend Main
+/// unconditionally, so an assistant caller discovered a dashboard whose data
+/// dependencies their grants hide. The same `sees_builtin_board` predicate the
+/// HTTP chooser uses now gates it. A fully granted caller is the control.
+#[tokio::test]
+async fn assistant_list_boards_omits_main_when_its_dependencies_are_hidden() {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(MainBoardStore)
+        .mount(&ch)
+        .await;
+    let env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+    let app = spin_up_with_env(&env).await;
+
+    let narrowed = create_principal_with_permissions(
+        &app.pool,
+        "dashboard:read, assistant:use, assistant:ask",
+    )
+    .await;
+    narrow_roles(&app.pool, narrowed, &[("serving", "m10_ok")]).await;
+    let cookie = session_cookie_for_user(&app.pool, narrowed).await;
+    let body = call(&app, &cookie, "list_boards", json!({}), "ask").await;
+    assert_eq!(body["outcome"], "executed", "{body}");
+    assert!(
+        !listed_board_ids(&body).iter().any(|id| id == "default"),
+        "a caller whose grants hide Main must not discover it: {body}"
+    );
+
+    let allowed = create_principal_with_permissions(
+        &app.pool,
+        "dashboard:read, assistant:use, assistant:ask",
+    )
+    .await;
+    narrow_roles(
+        &app.pool,
+        allowed,
+        &[("serving", "m10_ok"), ("serving", "m10_hidden")],
+    )
+    .await;
+    let cookie = session_cookie_for_user(&app.pool, allowed).await;
+    let body = call(&app, &cookie, "list_boards", json!({}), "ask").await;
+    assert_eq!(body["outcome"], "executed", "{body}");
+    assert!(
+        listed_board_ids(&body).iter().any(|id| id == "default"),
+        "Main is offered when every dependency is granted: {body}"
+    );
 }

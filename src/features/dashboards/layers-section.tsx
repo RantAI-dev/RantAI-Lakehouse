@@ -14,6 +14,7 @@ import { moveItem } from "@/lib/table-draft";
 import { columnKindOfType, type ColumnKind } from "@/lib/time-grain";
 import { apiFetch } from "@/services/http";
 import { ChartFilters, MeasureRows, type ColumnChoice } from "./chart-shape-section";
+import type { OwnSource } from "./filters/use-filter-values";
 
 /**
  * The chart builder's "More questions" section (`BI-13`): up to four more
@@ -48,6 +49,19 @@ type Props = {
 };
 
 const columnLabel = (name: string) => <ColumnLabel reference={columnRef(name)} />;
+
+
+/**
+ * `BI-47`: the source one question reads, for its filter value lists — its own
+ * mart with its joins, or its saved SQL source. A question with no source yet
+ * (or SQL not saved) has no list: see [`ownSourceOf`]( ./filters/use-filter-values).
+ */
+function layerSource(layer: LayerDraft): OwnSource {
+  const choice = decodeSourceChoice(layer.source);
+  if (!choice) return { unsaved: true };
+  if (choice.kind === "sql") return { sqlSource: choice.id };
+  return layer.joins.length ? { mart: choice.name, joins: layer.joins } : { mart: choice.name };
+}
 
 export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlSources, ownDraw, ownAxis, onOwnChange, blocked, disabled }: Props) {
   const [loaded, setLoaded] = React.useState<Record<string, SourceFields>>({});
@@ -96,7 +110,8 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
   };
   return (
     <div className="grid gap-2" data-testid="layers-section">
-      <Label>More questions</Label>
+      {/* `BI-58` T6: the person's word for `layers` (BI-13) is "second source"; the code keeps "layers". */}
+      <Label>Second source</Label>
       {blocked ? (
         <p className="flex items-start gap-1.5 text-xs text-amber-600 dark:text-amber-400" role="status">
           <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden /> {blocked}
@@ -126,7 +141,8 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
         const dimensions = fields ? matchingDimensions(baseKind, grained, fields.columns) : [];
         const choices = new Set(dimensions.map((d) => d.name));
         return (
-          <div key={i} className="grid gap-2 rounded-md border border-border p-2" data-testid={`layer-${n}`}>
+          // BI-58 review round 1 (SHOULD-FIX 3): set apart by a soft fill, not a box border.
+          <div key={i} className="grid gap-2 rounded-lg bg-muted/40 p-3" data-testid={`layer-${n}`}>
             <div className="flex items-center gap-1.5">
               <span className="text-xs font-medium text-muted-foreground">Question {n}</span>
               <span className="flex-1" />
@@ -155,7 +171,7 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
             {layer.source ? (
               <>
                 <div className="grid gap-1.5">
-                  <Label>Lined up on</Label>
+                  <Label>Matched on</Label>
                   <Select value={choices.has(layer.dimension) ? layer.dimension : ""} items={columnItems(dimensions.map((d) => d.name), columnLabel)} onValueChange={(v) => set(i, { dimension: v ?? "" })} disabled={disabled || !fields}>
                     <SelectTrigger className="w-full" aria-label={`Question ${n} dimension`}><SelectValue placeholder={fields ? "pick a column" : "loading"} /></SelectTrigger>
                     <SelectContent>{dimensions.map((d) => <SelectItem key={d.name} value={d.name}>{columnLabel(d.name)}</SelectItem>)}</SelectContent>
@@ -163,12 +179,12 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
                   {fields && !dimensions.length ? <p className="text-xs text-muted-foreground">{noMatchNote(baseKind)}</p> : null}
                 </div>
                 <MeasureRows
-                  rows={layer.measures} onChange={(measures) => set(i, { measures })} labels={(k) => (k === 0 ? "Measure" : `Measure ${k + 1}`)}
+                  rows={layer.measures} onChange={(measures) => set(i, { measures })} labels={(k) => (k === 0 ? "Value" : `Value ${k + 1}`)}
                   min={1} max={6} own columns={fields?.measures ?? []} defaultAggregate={layer.aggregate}
                   disabled={disabled || !fields} placeholder={fields ? "pick a column" : "loading"} wholeMeasure={new Set<string>()}
                   fieldLabel={columnLabel}
                 />
-                <ChartFilters value={layer.filters} onChange={(filters) => set(i, { filters })} columns={fields?.columns ?? []} disabled={disabled || !fields} />
+                <ChartFilters value={layer.filters} onChange={(filters) => set(i, { filters })} columns={fields?.columns ?? []} disabled={disabled || !fields} source={layerSource(layer)} />
               </>
             ) : null}
             <div className="grid gap-1.5">
@@ -188,13 +204,13 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
           </div>
         );
       })}
-      {layers.length < MAX_LAYERS ? (
-        <div>
-          <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={disabled || !!blocked} onClick={() => onChange([...layers, emptyLayer()])}>
-            <Plus className="size-3" aria-hidden /> Add a question
-          </Button>
-        </div>
-      ) : null}
+      {/* QA LH-BI-13-06: the button stays at the limit, off, with the reason under it (the chart's own question is the fifth). */}
+      <div className="space-y-1">
+        <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={disabled || !!blocked || layers.length >= MAX_LAYERS} onClick={() => onChange([...layers, emptyLayer()])}>
+          <Plus className="size-3" aria-hidden /> Add a question
+        </Button>
+        {layers.length >= MAX_LAYERS ? <p className="px-2 text-xs text-muted-foreground">A chart takes at most five questions.</p> : null}
+      </div>
     </div>
   );
 }

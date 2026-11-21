@@ -42,9 +42,11 @@ import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { LakehouseSchemaVersion } from "@/services/contracts/lakehouse"
 import { FreshnessTargetDialog } from "@/features/governance/freshness-target-dialog"
+import { DropTableAction } from "./asset-drop"
 import { lineageKey } from "./asset-lineage"
-import type { IcebergTableState } from "./asset-storage"
+import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { ALL, CountToggle } from "./count-toggle"
+import { TableGrantNote } from "./table-grant-note"
 
 /** How many snapshots, or changes, are listed before the reader asks for more. */
 const PAGE_SIZES = [10, 25, 50] as const
@@ -200,7 +202,7 @@ function IcebergSnapshots({
         </TableHeader>
         <TableBody>
           {snapshots.map((s, i) => {
-            const href = assetSnapshotQueryHref(a, s.id)
+            const href = assetSnapshotQueryHref(a, s.id, icebergTableOf(state))
             return (
               <TableRow key={s.id}>
                 <TableCell className="py-1.5 text-xs" title={formatDateTime(msToIso(s.timestampMs))}>
@@ -212,7 +214,10 @@ function IcebergSnapshots({
                   ) : null}
                 </TableCell>
                 <TableCell className="py-1.5 text-xs">{s.operation}</TableCell>
-                {/* DATA-15 F5: only the author a commit recorded; a load through dlt records none. */}
+                {/* DATA-15 F5, DATA-52: only the author a commit recorded. An upload records
+                    `<name> (file upload)`, a connector's replace or append its run; a merge
+                    load, which dlt writes itself, and a version written before 2026-11-12
+                    record none. */}
                 <TableCell className={cn("py-1.5 text-xs", s.author ? undefined : "text-muted-foreground")}>
                   {s.author ?? "unknown"}
                 </TableCell>
@@ -365,9 +370,21 @@ export function AssetActivity({
     iceberg.status === "success" ? (iceberg.data?.schemaVersions ?? []) : [],
     a.schemaVersions
   )
+  const { hasPermission } = useAuth()
   const [snapshotLimit, setSnapshotLimit] = React.useState<number>(PAGE_SIZES[0])
   const [changeLimit, setChangeLimit] = React.useState<number>(PAGE_SIZES[0])
   const snapshotCount = iceberg.status === "success" ? (iceberg.data?.snapshots.length ?? 0) : 0
+  // `DATA-55` (QA `LH-DATA-15-06`, `TC-1731`): Drop table is offered only to
+  // `governance:write` — the permission that restores (D6, proposed) — and only
+  // for a Bronze table that exists and an upload made. The check hides the
+  // control AND the request: without the permission nothing is asked of
+  // `/drop`, which would answer 403 anyway.
+  const canDrop =
+    hasPermission("governance:write") &&
+    iceberg.status === "success" &&
+    iceberg.data !== null &&
+    isIcebergCandidate(a) &&
+    Boolean(a.tableName)
   // DATA-16 D2: how far back versions go is what the list shows, never a promise.
   const retention =
     iceberg.status === "success" && iceberg.data && iceberg.data.snapshots.length > 0
@@ -384,6 +401,9 @@ export function AssetActivity({
 
   return (
     <div className="flex flex-col gap-2">
+      {/* GOV-11 (review round 1 R2): usage is withheld from a caller
+          admitted by a table grant, so its lists are empty on purpose. */}
+      <TableGrantNote asset={a} />
       <FreshnessCard asset={a} onChanged={onChanged} />
       <SectionCard
         size="sm"
@@ -392,14 +412,19 @@ export function AssetActivity({
           retention ? ` ${retention}.` : ""
         }${snapshotCount > snapshotLimit ? ` Showing the newest ${snapshotLimit} of ${snapshotCount}.` : ""}`}
         action={
-          snapshotCount > PAGE_SIZES[0] ? (
-            <CountToggle
-              label="Show"
-              ariaLabel="Snapshots to show"
-              options={sizesFor(snapshotCount)}
-              value={snapshotLimit}
-              onChange={setSnapshotLimit}
-            />
+          canDrop || snapshotCount > PAGE_SIZES[0] ? (
+            <div className="flex items-center gap-2">
+              {snapshotCount > PAGE_SIZES[0] ? (
+                <CountToggle
+                  label="Show"
+                  ariaLabel="Snapshots to show"
+                  options={sizesFor(snapshotCount)}
+                  value={snapshotLimit}
+                  onChange={setSnapshotLimit}
+                />
+              ) : null}
+              {canDrop ? <DropTableAction asset={a} onDropped={iceberg.reload} /> : null}
+            </div>
           ) : undefined
         }
       >
@@ -450,7 +475,12 @@ export function AssetActivity({
                 <li key={c.id} className="flex flex-wrap items-baseline gap-2 py-1.5">
                   <span className="font-medium">{c.actor}</span>
                   <span className="text-muted-foreground">{c.summary}</span>
-                  <span className="ml-auto text-xs text-muted-foreground">
+                  {/* QA `LH-DATA-12-01` F2 (`DATA-54`): the date and time on
+                      hover, as the Snapshots table of this file does. */}
+                  <span
+                    className="ml-auto text-xs text-muted-foreground"
+                    title={formatDateTime(c.at)}
+                  >
                     {formatRelativeTime(c.at)}
                   </span>
                 </li>
@@ -492,8 +522,14 @@ export function AssetActivity({
                 </p>
               ) : null}
               <UsageList title="Frequent users" empty="No one yet.">
-                {a.usage.frequentUsers.map((u) => (
-                  <UsageRow key={u.name} count={`${formatNumber(u.queries)} quer${u.queries === 1 ? "y" : "ies"}`}>
+                {/* `DATA-52` (QA `LH-DATA-12-01` F3): names are not unique -- two people
+                    may share one, and the API sends display names now -- so the rows are
+                    keyed by position and name. */}
+                {a.usage.frequentUsers.map((u, index) => (
+                  <UsageRow
+                    key={`${index}:${u.name}`}
+                    count={`${formatNumber(u.queries)} quer${u.queries === 1 ? "y" : "ies"}`}
+                  >
                     {u.name}
                   </UsageRow>
                 ))}

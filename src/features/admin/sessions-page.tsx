@@ -5,7 +5,7 @@ import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { formatRelativeTime } from "@/lib/format"
+import { formatDateTime, formatRelativeTime, formatTimeUntil, isPast } from "@/lib/format"
 import { authService } from "@/services"
 import type { Session } from "@/services/contracts/auth"
 
@@ -44,10 +44,33 @@ export function SessionsPanel() {
     {
       key: "expires",
       header: "Expires",
-      render: (r) => formatRelativeTime(r.expiresAt),
+      // QA LH-SEC-5-01 (ADM-14 D12): the time it expires and the time left.
+      // "Expires" read "just now" for every session before this, because a
+      // relative age has no answer for a future time.
+      render: (r) => (
+        <span className="flex flex-col">
+          <span>{formatDateTime(r.expiresAt)}</span>
+          <span className="text-xs text-muted-foreground">
+            {isPast(r.expiresAt) ? "expired" : formatTimeUntil(r.expiresAt)}
+          </span>
+        </span>
+      ),
     },
-    { key: "ip", header: "IP", render: (r) => r.createdIp ?? "—" },
-    { key: "ua", header: "User agent", render: (r) => r.userAgent ?? "—" },
+    // QA LH-SEC-5-01 (ADM-14 D9/D10): the browser the session came from, and
+    // "Not recorded" for the address the API cannot know.
+    { key: "ip", header: "IP", render: (r) => r.createdIp ?? "Not recorded" },
+    {
+      key: "ua",
+      header: "User agent",
+      render: (r) =>
+        r.userAgent ? (
+          <span className="block max-w-md truncate" title={r.userAgent}>
+            {r.userAgent}
+          </span>
+        ) : (
+          "Not recorded"
+        ),
+    },
     {
       key: "actions",
       header: "",

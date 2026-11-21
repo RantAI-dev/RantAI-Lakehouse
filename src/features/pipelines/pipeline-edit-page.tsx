@@ -4,10 +4,10 @@ import { useParams } from "next/navigation"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { useService } from "@/hooks/use-service"
 import { pipelineService } from "@/services"
-import { PipelineEditor } from "./pipeline-create-page"
+import { PipelineEditor } from "./pipeline-editor"
 
 /**
- * `/pipelines/[pipelineId]/edit`: the create form, filled from the stored
+ * `/pipelines/[pipelineId]/edit`: the pipeline editor, filled from the stored
  * definition. Only an authored pipeline has one; a Dagster job is defined
  * in code and is changed there.
  */

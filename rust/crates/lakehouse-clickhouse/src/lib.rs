@@ -158,6 +158,20 @@ pub struct QueryOptions {
     pub max_result_rows: Option<u64>,
     /// `query_id`: lets `KILL QUERY WHERE query_id ...` find this query.
     pub query_id: Option<String>,
+    /// `output_format_json_quote_decimals = 1`: the engine writes a decimal as JSON
+    /// TEXT, with every digit, instead of a number, which this client reads as a 64-bit
+    /// float and so keeps about fifteen digits of (`DATA-53`, QA `LH-DATA-9-32`). Read by
+    /// [`ChClient::query_with_options`] only: a caller whose cells are text anyway asks
+    /// for it; a chart's numbers are not changed. Review round 1 R6: the row stream and the
+    /// byte stream do not send it, so a tile and a download receive what they did before
+    /// (`D20`). Default `false`.
+    pub quote_decimals: bool,
+    /// `max_memory_usage`: the engine stops the query that would use more than
+    /// this many bytes, with its own error, instead of the host's memory killer
+    /// choosing a victim (`BI-34`). Sent by the row stream and the byte stream,
+    /// the two paths a download reads through; the buffered
+    /// [`ChClient::query_with_options`] leaves the engine's own default.
+    pub max_memory_usage: Option<u64>,
 }
 
 /// Most progress headers one limited request may receive; hyper's client
@@ -366,6 +380,9 @@ impl ChClient {
         }
         if let Some(id) = &options.query_id {
             settings.push(("query_id", id.clone()));
+        }
+        if options.quote_decimals {
+            settings.push(("output_format_json_quote_decimals", "1".to_owned()));
         }
         settings.push((
             "cancel_http_readonly_queries_on_client_close",
@@ -579,6 +596,9 @@ impl ChClient {
         if let Some(id) = &options.query_id {
             settings.push(("query_id", id.clone()));
         }
+        if let Some(bytes) = options.max_memory_usage {
+            settings.push(("max_memory_usage", bytes.to_string()));
+        }
         settings.push((
             "cancel_http_readonly_queries_on_client_close",
             "1".to_owned(),
@@ -661,6 +681,9 @@ impl ChClient {
         }
         if let Some(id) = &options.query_id {
             settings.push(("query_id", id.clone()));
+        }
+        if let Some(bytes) = options.max_memory_usage {
+            settings.push(("max_memory_usage", bytes.to_string()));
         }
         settings.push((
             "cancel_http_readonly_queries_on_client_close",
@@ -1407,6 +1430,8 @@ mod tests {
             max_execution_time: Some(std::time::Duration::from_secs(45)),
             max_result_rows: Some(2001),
             query_id: Some("u:r:1".to_owned()),
+            quote_decimals: false,
+            max_memory_usage: None,
         };
         let result = client(&server.uri())
             .query_with_options("SELECT n FROM t", &options, None)
@@ -1419,6 +1444,77 @@ mod tests {
             !body.contains("SETTINGS"),
             "the SQL text stays as written: {body}"
         );
+    }
+
+    /// `DATA-53` (QA `LH-DATA-9-32`): the setting goes on the request only when the
+    /// caller asks for it, so no other reader of this client changes.
+    #[tokio::test]
+    async fn query_with_options_asks_for_quoted_decimals_only_when_told() {
+        let server = MockServer::start().await;
+        // The row stream reads two header lines; the other calls take the JSON answer.
+        Mock::given(method("POST"))
+            .and(body_string_contains(
+                "FORMAT JSONCompactEachRowWithNamesAndTypes",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("[\"d\"]\n[\"Decimal(38, 9)\"]\n"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":[{"name":"d","type":"Decimal(38, 9)"}],"data":[{"d":"1.5"}],"rows":1}"#,
+            ))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let client = client(&server.uri());
+
+        let quoted = QueryOptions {
+            quote_decimals: true,
+            ..QueryOptions::default()
+        };
+        let result = client
+            .query_with_options("SELECT toDecimal64(1.5, 9) AS d", &quoted, None)
+            .await
+            .unwrap();
+        assert_eq!(result.rows, 1);
+
+        let plain = QueryOptions::default();
+        client
+            .query_with_options("SELECT 1 AS d", &plain, None)
+            .await
+            .unwrap();
+
+        // Review round 1 R6: the option is `query_with_options`'s only (`D20` keeps a
+        // tile's numbers and a download's bytes as they are), so a stream asked for it
+        // does not send the setting.
+        client
+            .query_stream_with_options("SELECT 1", std::time::Duration::from_secs(5), &quoted)
+            .await
+            .unwrap();
+        client
+            .byte_stream("SELECT 1 FORMAT Parquet", &quoted)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let queries: Vec<String> = requests
+            .iter()
+            .map(|request| request.url.query().unwrap_or_default().to_owned())
+            .collect();
+        assert!(
+            queries[0].contains("output_format_json_quote_decimals=1"),
+            "{}",
+            queries[0]
+        );
+        for (index, query) in queries.iter().enumerate().skip(1) {
+            assert!(
+                !query.contains("output_format_json_quote_decimals"),
+                "request {index}: {query}"
+            );
+        }
     }
 
     #[test]
@@ -1577,6 +1673,36 @@ mod tests {
             !settings.iter().any(|(key, _)| key == "wait_end_of_query"),
             "the row stream answers while the query runs: {settings:?}"
         );
+    }
+
+    /// `BI-34`: both download paths send the memory setting; the buffered
+    /// query does not.
+    #[tokio::test]
+    async fn the_row_stream_and_the_byte_stream_carry_max_memory_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[\"a\"]\n[\"Int64\"]\n"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let options = QueryOptions {
+            max_memory_usage: Some(2_147_483_648),
+            ..QueryOptions::default()
+        };
+        let ch = client(&server.uri());
+        ch.query_stream_with_options("SELECT 1", std::time::Duration::from_secs(5), &options)
+            .await
+            .unwrap();
+        ch.byte_stream("SELECT 1 FORMAT Parquet", &options)
+            .await
+            .unwrap();
+        for request in server.received_requests().await.unwrap() {
+            let settings = url_settings(&request);
+            assert!(
+                settings.contains(&("max_memory_usage".to_owned(), "2147483648".to_owned())),
+                "{settings:?}"
+            );
+        }
     }
 
     #[tokio::test]

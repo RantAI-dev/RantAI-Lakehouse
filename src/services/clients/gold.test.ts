@@ -87,3 +87,32 @@ describe("goldService.getConsumers", () => {
     expect(err.code).toBe("unavailable")
   })
 })
+
+describe("goldService refusals (WEB-12)", () => {
+  it("a refused read rejects as permission_denied, not unavailable", async () => {
+    stubFetch(() => json({ error: "permission_denied: gold:export" }, 403))
+    await expect(goldService.getLastExport("sales")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the gold:export permission.",
+    })
+  })
+
+  it("a refused export rejects as permission_denied, not invalid_request", async () => {
+    stubFetch(() => json({ error: "permission_denied: gold:export" }, 403))
+    await expect(goldService.triggerExport("sales")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the gold:export permission.",
+    })
+  })
+
+  it("a refused publication change rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: gold:export" }, 403))
+    await expect(goldService.setPublication("sales", true)).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the gold:export permission.",
+    })
+  })
+})

@@ -27,6 +27,9 @@ describe("WS4 pipelines contracts", () => {
       graph: null,
       config: [],
       definition: {
+        // BLD-1 part 1 / D3: the API returns both forms of the definition.
+        inputs: [{ name: "raw", zone: "silver", table: "raw" }],
+        steps: [{ name: "transformed", kind: "transform", reads: "raw", transforms: ["dedupe(id)"] }],
         sourceZone: "silver",
         sourceTable: "raw",
         incrementalColumn: null,

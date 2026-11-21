@@ -31,6 +31,11 @@ pub const MAX_VALUES_PER_KEY: usize = 50;
 /// Most governed tags one table may carry.
 pub const MAX_TAGS_PER_ASSET: usize = 20;
 
+/// What a tag word may be, in words: the shape `is_valid_word` checks. One sentence
+/// part for every refusal (QA LH-DATA-12-12, DATA-54), so no refusal prints a pattern.
+pub const WORD_RULE: &str = "can have only lower-case letters, digits, \"_\" and \"-\", \
+     must start with a letter or a digit, and can have at most 64 characters";
+
 /// One tag key and the values it allows. Keyed by `key`; never renamed.
 #[derive(Debug, Clone, FromRow)]
 pub struct TagKeyRow {
@@ -85,29 +90,27 @@ fn validate_key(key: &str) -> Result<(), StoreError> {
     if is_valid_word(key) {
         return Ok(());
     }
-    Err(invalid(format!(
-        "key must be 1-{WORD_MAX_LEN} characters matching ^[a-z0-9][a-z0-9_-]*$"
-    )))
+    Err(invalid(format!("A tag key {WORD_RULE}.")))
 }
 
 fn validate_allowed_values(values: &[String]) -> Result<(), StoreError> {
     if values.is_empty() {
-        return Err(invalid("allowedValues must have at least one value"));
+        return Err(invalid("A tag key needs at least one allowed value."));
     }
     if values.len() > MAX_VALUES_PER_KEY {
         return Err(invalid(format!(
-            "allowedValues must have at most {MAX_VALUES_PER_KEY} values"
+            "A tag key can have at most {MAX_VALUES_PER_KEY} allowed values."
         )));
     }
     for (i, value) in values.iter().enumerate() {
         if !is_valid_word(value) {
             return Err(invalid(format!(
-                "allowedValues: \"{value}\" must be 1-{WORD_MAX_LEN} characters matching ^[a-z0-9][a-z0-9_-]*$"
+                "The allowed value \"{value}\" is not accepted: a value {WORD_RULE}."
             )));
         }
         if values[..i].contains(value) {
             return Err(invalid(format!(
-                "allowedValues: \"{value}\" is listed more than once"
+                "The allowed value \"{value}\" is listed more than once."
             )));
         }
     }
@@ -234,7 +237,7 @@ pub async fn delete_key(pool: &PgPool, key: &str) -> Result<(), StoreError> {
             .await?;
     if in_use > 0 {
         return Err(invalid(format!(
-            "\"{key}\" is still given to {in_use} {}; remove it from {} first",
+            "\"{key}\" is still given to {in_use} {}. Remove it from {} first.",
             if in_use == 1 { "table" } else { "tables" },
             if in_use == 1 {
                 "that table"
@@ -307,12 +310,14 @@ pub async fn set_asset_tags_in(
 ) -> Result<(), StoreError> {
     if tags.len() > MAX_TAGS_PER_ASSET {
         return Err(invalid(format!(
-            "governedTags must have at most {MAX_TAGS_PER_ASSET} entries"
+            "A table can have at most {MAX_TAGS_PER_ASSET} governed tags."
         )));
     }
     for (i, (key, _)) in tags.iter().enumerate() {
         if tags[..i].iter().any(|(earlier, _)| earlier == key) {
-            return Err(invalid(format!("governedTags: \"{key}\" is given twice")));
+            return Err(invalid(format!(
+                "The governed tag \"{key}\" is given twice."
+            )));
         }
     }
     let keys: Vec<String> = tags.iter().map(|(k, _)| k.clone()).collect();
@@ -327,13 +332,11 @@ pub async fn set_asset_tags_in(
     .await?;
     for (key, value) in tags {
         let Some((_, allowed)) = defined.iter().find(|(k, _)| k == key) else {
-            return Err(invalid(format!(
-                "governedTags: \"{key}\" is not a defined tag key"
-            )));
+            return Err(invalid(format!("\"{key}\" is not a defined tag key.")));
         };
         if !allowed.contains(value) {
             return Err(invalid(format!(
-                "governedTags: \"{value}\" is not an allowed value for \"{key}\"; allowed values: {}",
+                "\"{value}\" is not an allowed value for \"{key}\". Allowed values: {}.",
                 allowed.join(", ")
             )));
         }
@@ -361,6 +364,23 @@ pub async fn set_asset_tags_in(
 }
 
 const TAG_COLUMNS: &str = "asset_id, tag_key, value, set_by, set_at";
+
+/// The tables that currently hold `key`, ordered by asset id: what the
+/// refusal to delete a key in use names (`QA LH-DATA-12-15`, `DATA-54`). The
+/// caller decides which of them the person may read; this lists them all.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn assets_with_key(pool: &PgPool, key: &str) -> Result<Vec<String>, StoreError> {
+    let ids = sqlx::query_scalar(
+        "SELECT asset_id FROM asset_governed_tag WHERE tag_key = $1 ORDER BY asset_id",
+    )
+    .bind(key)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids)
+}
 
 /// One table's governed tags, ordered by key.
 ///
@@ -403,6 +423,8 @@ pub async fn list_for_assets(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     #[test]
@@ -416,5 +438,37 @@ mod tests {
         assert!(!is_valid_word("a b"));
         assert!(!is_valid_word(&"a".repeat(65)));
         assert!(is_valid_word(&"a".repeat(64)));
+    }
+
+    // QA `LH-DATA-12-12` (`DATA-54`): a refusal is a sentence in words, never
+    // a pattern or an API field name. The one shape sentence (`WORD_RULE`) is
+    // shared, so its number cannot drift from the limit it describes.
+    #[test]
+    fn no_tag_refusal_prints_a_pattern_or_an_api_field() {
+        let message = |err: StoreError| match err {
+            StoreError::Validation(message) => message,
+            other => panic!("a shape refusal is a validation: {other:?}"),
+        };
+        let messages = [
+            message(validate_key("Bad Key").expect_err("must refuse")),
+            message(validate_allowed_values(&[]).expect_err("must refuse")),
+            message(validate_allowed_values(&["Finance".to_owned()]).expect_err("must refuse")),
+            message(
+                validate_allowed_values(&["a".to_owned(), "a".to_owned()])
+                    .expect_err("must refuse"),
+            ),
+        ];
+        for sentence in &messages {
+            assert!(!sentence.contains('^'), "{sentence}");
+            assert!(!sentence.contains("allowedValues"), "{sentence}");
+            assert!(!sentence.contains("governedTags"), "{sentence}");
+            assert!(sentence.ends_with('.'), "{sentence}");
+        }
+        assert!(messages[0].contains("lower-case"), "{}", messages[0]);
+        assert!(messages[2].contains("lower-case"), "{}", messages[2]);
+        assert!(
+            WORD_RULE.contains(&WORD_MAX_LEN.to_string()),
+            "the sentence names the limit: {WORD_RULE}"
+        );
     }
 }

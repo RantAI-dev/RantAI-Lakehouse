@@ -6,6 +6,7 @@ import { Pencil, Play, Plus, Trash2 } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
+import { SelectField } from "@/components/patterns/select-field"
 import { CheckBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -53,8 +54,6 @@ type Check = AssetDetail["qualityChecks"][number]
 
 const SEVERITY_TONE = { critical: "destructive", high: "destructive", medium: "warning" } as const
 
-const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
-
 // DATA-14 (F1/F7): the checks and their threshold text live in
 // `quality-checks.ts`, shared with the Data Quality page.
 export { ruleThreshold }
@@ -96,7 +95,9 @@ function AddRuleDialog({
     notifySuccess("Quality rule added")
     // DATA-14 (AC1): run it once now, so a check that already fails opens its
     // incident at once instead of at the next scheduled pass.
-    if (hasPermission("query:read") && created.evaluable !== false) {
+    // QA LH-DATA-14-04 (GOV-10): running a rule by hand needs
+    // `governance:write`, the same permission the Run button follows.
+    if (hasPermission("governance:write") && created.evaluable !== false) {
       try {
         await governanceService.runQualityRule(created.id)
       } catch (err) {
@@ -134,23 +135,25 @@ function AddRuleDialog({
           />
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="grid gap-1.5">
-              <Label htmlFor="rule-name">Name</Label>
-              <Input id="rule-name" value={ruleName} onChange={(e) => setName(e.target.value)} />
+              {/* UX-1-R4: a name is pre-filled, but clearing it blocks Save
+                  (the submit guard and the disabled Add-rule button), so the
+                  input is required — not "optional to change" as it read. */}
+              <Label htmlFor="rule-name" required>Name</Label>
+              <Input id="rule-name" aria-required value={ruleName} onChange={(e) => setName(e.target.value)} />
+              <p className="text-xs text-muted-foreground">Pre-filled from the check; it must stay non-empty to save.</p>
             </div>
             <div className="grid gap-1.5">
               <Label htmlFor="rule-severity">Severity if it fails</Label>
-              <select
+              <SelectField
                 id="rule-severity"
-                className={selectClassName}
+                className="w-full"
                 value={severity}
-                onChange={(e) => setSeverity(e.target.value as Severity)}
-              >
-                {(Object.keys(SEVERITY_LABEL) as Severity[]).map((s) => (
-                  <option key={s} value={s}>
-                    {SEVERITY_LABEL[s]}
-                  </option>
-                ))}
-              </select>
+                options={(Object.keys(SEVERITY_LABEL) as Severity[]).map((s) => ({
+                  value: s,
+                  label: SEVERITY_LABEL[s],
+                }))}
+                onValueChange={(next) => setSeverity(next as Severity)}
+              />
             </div>
           </div>
           <p className="text-xs text-muted-foreground">
@@ -284,6 +287,14 @@ export function AssetQuality({
   const [running, setRunning] = React.useState(false)
   const [deleting, setDeleting] = React.useState<Check | null>(null)
   const [editing, setEditing] = React.useState<Check | null>(null)
+  const [incidentsKey, setIncidentsKey] = React.useState(0)
+  // QA `LH-DATA-14-01` F1 (`DATA-54`): the page keeps this tab mounted while
+  // the asset reloads (`keepDataOnReload`), so the incidents panel has to be
+  // told to read again, not only the asset.
+  const changed = () => {
+    setIncidentsKey((k) => k + 1)
+    onChanged()
+  }
   const remove = useServiceAction((signal, id: string) =>
     governanceService.deleteQualityRule(id, signal)
   )
@@ -298,7 +309,7 @@ export function AssetQuality({
     }
     notifySuccess(`Deleted rule ${deleting.name}`)
     setDeleting(null)
-    onChanged()
+    changed()
   }
   const summary = qualitySummary(a.qualityChecks)
   const runnable = a.qualityChecks.filter((q) => q.origin === "rule" && q.evaluable !== false)
@@ -328,20 +339,23 @@ export function AssetQuality({
     } else {
       notifySuccess(`Ran ${runnable.length} check${runnable.length === 1 ? "" : "s"}`)
     }
-    onChanged()
+    changed()
   }
 
   return (
     <div className="flex flex-col gap-4">
       {/* DATA-14 (F7): what is wrong now on this table, above the checks. */}
-      <QualityIncidents asset={lineageKey(a)} />
+      <QualityIncidents asset={lineageKey(a)} reloadKey={incidentsKey} />
       <SectionCard
         size="sm"
         title="Quality checks"
         description={parts.length > 0 ? parts.join(" · ") : "Rules and recorded results for this asset."}
         action={
           <div className="flex flex-wrap justify-end gap-1.5">
-            {hasPermission("query:read") && runnable.length > 0 ? (
+            {/* QA LH-DATA-14-04 (GOV-10, DEC-17): running a rule by hand is a
+                governance action — the API takes `governance:write`, so the
+                button follows. */}
+            {canWrite && runnable.length > 0 ? (
               <Button size="sm" variant="outline" onClick={() => void runAll()} disabled={running}>
                 <Play />
                 {running ? "Running…" : "Run checks"}
@@ -418,7 +432,7 @@ export function AssetQuality({
             onClose={() => setEditing(null)}
             onSaved={() => {
               setEditing(null)
-              onChanged()
+              changed()
             }}
           />
         ) : null}
@@ -428,7 +442,7 @@ export function AssetQuality({
             onClose={() => setAdding(false)}
             onCreated={() => {
               setAdding(false)
-              onChanged()
+              changed()
             }}
           />
         ) : null}

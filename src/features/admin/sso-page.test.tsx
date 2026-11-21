@@ -1,11 +1,29 @@
-import { render, screen, waitFor } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock } from "bun:test"
-import { SsoPage } from "./sso-page"
+let search = new URLSearchParams()
+import { mock } from "bun:test"
+
+mock.module("next/navigation", () => ({
+  usePathname: () => "/admin/settings",
+  useSearchParams: () => search,
+  useRouter: () => ({
+    push: () => {},
+    replace: () => {},
+    refresh: () => {},
+    back: () => {},
+    forward: () => {},
+    prefetch: () => {},
+  }),
+}))
+
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { afterEach, describe, expect, it } from "bun:test"
+import { SsoPageForm } from "./sso-page"
 
 const originalFetch = global.fetch
 
 afterEach(() => {
+  cleanup()
   global.fetch = originalFetch
+  search = new URLSearchParams()
 })
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -15,59 +33,381 @@ function jsonResponse(body: unknown, status = 200): Response {
   })
 }
 
-/**
- * Stubs `GET /api/auth/providers` (the one network call `SsoPage` makes)
- * to a fixed body. Other paths return an empty 200 so any stray fetch
- * from a future contributor shows up in the failure message rather than
- * a swallowed `undefined`.
- */
-function mockProviders(body: unknown): void {
-  global.fetch = mock(
-    async (input: RequestInfo | URL) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input.url
-      if (url.includes("/api/auth/providers")) {
-        return jsonResponse(body)
-      }
-      return new Response("{}", { status: 200 })
-    },
-  ) as unknown as typeof fetch
+type Call = { method: string; path: string; body: string | null }
+
+const DEFAULT_SSO = {
+  issuer: { value: "https://auth.example.com", source: "console" },
+  clientId: { value: "lakehouse-client", source: "console" },
+  clientSecret: { set: true, source: "console" },
+  providerName: { value: "Okta", source: "console" },
+  groupsClaim: { value: "groups", source: "console" },
+  roleMap: {
+    value: [{ group: "engineering", role: "developer" }],
+    source: "console",
+  },
+  jitProvisioning: { value: true, source: "console" },
+  trustEmail: { value: false, source: "console" },
+  canEdit: true,
+  ready: true,
+  notReadyReason: null,
 }
 
-describe("SsoPage (reads live OIDC configuration)", () => {
-  it("states OIDC is not configured when providers() reports oidc:false", async () => {
-    mockProviders({ oidc: false, providerName: null })
-    render(<SsoPage />)
-    await waitFor(() =>
-      expect(screen.getByText(/OIDC is not configured/i)).toBeDefined(),
-    )
+const ROLES = [
+  { id: "r1", name: "admin" },
+  { id: "r2", name: "developer" },
+  { id: "r3", name: "viewer" },
+]
+
+function mockApi(
+  ssoSettings: unknown = DEFAULT_SSO,
+  roles: unknown = ROLES,
+  testResult: unknown = {
+    ok: true,
+    subject: "user-sub-123",
+    email: "test@example.com",
+    emailVerified: true,
+    groups: ["engineering", "admins"],
+    mappedRoles: ["developer", "admin"],
+    overage: false,
+  }
+) {
+  const calls: Call[] = []
+  global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url
+    const method = (init?.method ?? "GET").toUpperCase()
+    calls.push({
+      method,
+      path: url,
+      body: typeof init?.body === "string" ? init.body : null,
+    })
+
+    if (url.includes("/api/identity/roles")) {
+      return jsonResponse(roles)
+    }
+    if (url.includes("/api/settings/sso/test/")) {
+      return jsonResponse(testResult)
+    }
+    if (url.includes("/api/settings/sso/test")) {
+      return jsonResponse({
+        id: "test-run-uuid-456",
+        authorizeUrl: "https://auth.example.com/authorize?response_type=code",
+      })
+    }
+    if (url.includes("/api/settings/sso")) {
+      return jsonResponse(ssoSettings)
+    }
+    return jsonResponse({})
+  }) as unknown as typeof fetch
+  return calls
+}
+
+describe("SsoPageForm (ADM-12, D9)", () => {
+  it("server-owned fields are read-only", async () => {
+    mockApi({
+      ...DEFAULT_SSO,
+      issuer: { value: "https://auth.server.com", source: "server" },
+      clientId: { value: "server-client", source: "server" },
+      clientSecret: { set: true, source: "server" },
+      roleMap: {
+        value: [{ group: "ops", role: "admin" }],
+        source: "server",
+      },
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    const issuerInput = (await screen.findByLabelText("Issuer URL")) as HTMLInputElement
+    await waitFor(() => expect(issuerInput.value).toBe("https://auth.server.com"))
+    expect(issuerInput.disabled).toBe(true)
+
+    const clientIdInput = (await screen.findByLabelText("Client ID")) as HTMLInputElement
+    expect(clientIdInput.disabled).toBe(true)
+
+    const groupInput = (await screen.findByLabelText("IdP group row 1")) as HTMLInputElement
+    expect(groupInput.disabled).toBe(true)
+
+    expect(screen.getAllByText("Set by the server").length).toBeGreaterThan(0)
   })
 
-  it("shows the provider name and a working test sign-in link when oidc:true", async () => {
-    mockProviders({ oidc: true, providerName: "okta" })
-    render(<SsoPage />)
-    await waitFor(() => expect(screen.getByText("okta")).toBeDefined())
-    // The Button primitive renders the anchor with `role="button"` rather
-    // than `role="link"` (the `nativeButton` behaviour of
-    // `@base-ui/react/button`), so a role-based lookup fails even though
-    // the underlying element is `<a href="/api/auth/oidc/start">`. The
-    // href is the property the test really cares about (does the click
-    // reach the OIDC start route?), so find the element by its visible
-    // text — its only content is "Test sign-in" — and read the href.
-    const link = screen.getByText(/test sign-in/i).closest("a")
-    expect(link).not.toBeNull()
-    expect(link?.getAttribute("href")).toBe("/api/auth/oidc/start")
+  it("the secret is never in a GET payload", async () => {
+    mockApi({
+      ...DEFAULT_SSO,
+      clientSecret: { set: true, source: "console" },
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await screen.findByLabelText("Issuer URL")
+    // Client secret only indicates "Set" or "Not set", never exposes a plaintext secret
+    expect(screen.getByText("Set")).toBeDefined()
+    expect(screen.queryByDisplayValue(/secret/i)).toBeNull()
+    expect(screen.getByRole("button", { name: /replace/i })).toBeDefined()
+    expect(screen.getByRole("button", { name: /clear/i })).toBeDefined()
   })
 
-  it("states where OIDC_ROLE_MAP actually lives instead of fabricating a role-map API", async () => {
-    mockProviders({ oidc: true, providerName: "okta" })
-    render(<SsoPage />)
-    await waitFor(() =>
-      expect(screen.getByText(/OIDC_ROLE_MAP/)).toBeDefined(),
-    )
+  it("the role map rows send {group, role}", async () => {
+    const calls = mockApi()
+
+    render(<SsoPageForm canWrite />)
+
+    await screen.findByLabelText("Issuer URL")
+    const saveButton = screen.getByRole("button", { name: "Save" })
+    fireEvent.click(saveButton)
+
+    await waitFor(() => {
+      const putCall = calls.find(
+        (c) => c.method === "PUT" && c.path.includes("/api/settings/sso")
+      )
+      expect(putCall).toBeDefined()
+      const body = JSON.parse(putCall?.body ?? "{}")
+      expect(body.roleMap).toEqual([{ group: "engineering", role: "developer" }])
+    })
+  })
+
+  it("the trust-email checkbox is sent as trustEmail (SEC-65 D3)", async () => {
+    const calls = mockApi()
+
+    render(<SsoPageForm canWrite />)
+
+    // Radix renders the checkbox as a button with `role="checkbox"`, so
+    // its state is `aria-checked`, not `.checked`.
+    const checkbox = await screen.findByRole("checkbox", {
+      name: "Trust this provider's emails",
+    })
+    await waitFor(() => expect(checkbox.getAttribute("aria-checked")).toBe("false"))
+    fireEvent.click(checkbox)
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => {
+      const putCall = calls.find(
+        (c) => c.method === "PUT" && c.path.includes("/api/settings/sso")
+      )
+      expect(putCall).toBeDefined()
+      expect(JSON.parse(putCall?.body ?? "{}").trustEmail).toBe(true)
+    })
+  })
+
+  it("a server-owned trust-email switch is read-only and not sent", async () => {
+    // `SEC-65` D3: `OIDC_TRUST_EMAIL` owns the value; the console cannot
+    // change it.
+    const calls = mockApi({
+      ...DEFAULT_SSO,
+      trustEmail: { value: true, source: "server" },
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    const checkbox = await screen.findByRole("checkbox", {
+      name: "Trust this provider's emails",
+    })
+    await waitFor(() => expect(checkbox.getAttribute("aria-checked")).toBe("true"))
+    expect((checkbox as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => {
+      const putCall = calls.find(
+        (c) => c.method === "PUT" && c.path.includes("/api/settings/sso")
+      )
+      expect(putCall).toBeDefined()
+      expect(JSON.parse(putCall?.body ?? "{}").trustEmail).toBeUndefined()
+    })
+  })
+
+  it("says an unconfirmed email will not be joined unless the provider is trusted (SEC-65 D6)", async () => {
+    search = new URLSearchParams("ssoTest=test-run-uuid-456")
+    mockApi(DEFAULT_SSO, ROLES, {
+      ok: true,
+      subject: "oidc-sub-999",
+      email: "engineer@company.com",
+      emailVerified: false,
+      groups: [],
+      mappedRoles: [],
+      overage: false,
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await waitFor(() => {
+      const region = screen.getByRole("region", { name: "Test sign-in result" })
+      expect(region.textContent).toContain(
+        "This provider did not confirm the email. Existing accounts will not be joined unless you trust this provider's emails."
+      )
+    })
+  })
+
+  it("drops the SEC-65 sentence when the draft trusts the provider's emails", async () => {
+    search = new URLSearchParams("ssoTest=test-run-uuid-456")
+    mockApi({ ...DEFAULT_SSO, trustEmail: { value: true, source: "console" } }, ROLES, {
+      ok: true,
+      subject: "oidc-sub-999",
+      email: "engineer@company.com",
+      emailVerified: false,
+      groups: [],
+      mappedRoles: [],
+      overage: false,
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await waitFor(() => {
+      const region = screen.getByRole("region", { name: "Test sign-in result" })
+      expect(region.textContent).not.toContain("Existing accounts will not be joined")
+    })
+  })
+
+  it("the test result card renders", async () => {
+    search = new URLSearchParams("ssoTest=test-run-uuid-456")
+    mockApi(DEFAULT_SSO, ROLES, {
+      ok: true,
+      subject: "oidc-sub-999",
+      email: "engineer@company.com",
+      groups: ["engineering"],
+      mappedRoles: ["developer"],
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await waitFor(() => {
+      expect(screen.getByRole("region", { name: "Test sign-in result" })).toBeDefined()
+      expect(screen.getByText("oidc-sub-999")).toBeDefined()
+      expect(screen.getByText("engineer@company.com")).toBeDefined()
+    })
+  })
+
+  it("the test result card shows emailVerified and overage", async () => {
+    // `ADM-12` review round 2, S2 (D8): the two claims an administrator
+    // needs — `emailVerified` is what `SEC-65` will read, and an overage
+    // means no group-based role was applied.
+    search = new URLSearchParams("ssoTest=test-run-uuid-456")
+    mockApi(DEFAULT_SSO, ROLES, {
+      ok: true,
+      subject: "oidc-sub-999",
+      email: "engineer@company.com",
+      emailVerified: false,
+      groups: [],
+      mappedRoles: [],
+      overage: true,
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await waitFor(() => {
+      const region = screen.getByRole("region", { name: "Test sign-in result" })
+      expect(region.textContent).toContain("Email verified: No")
+      expect(region.textContent).toContain(
+        "Group overage: Yes: no group-based roles were applied"
+      )
+    })
+  })
+
+  it("the test result card says a claim the provider did not send was not reported", async () => {
+    search = new URLSearchParams("ssoTest=test-run-uuid-456")
+    mockApi(DEFAULT_SSO, ROLES, {
+      ok: true,
+      subject: "oidc-sub-999",
+      email: "engineer@company.com",
+      groups: ["engineering"],
+      mappedRoles: ["developer"],
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await waitFor(() => {
+      const region = screen.getByRole("region", { name: "Test sign-in result" })
+      expect(region.textContent).toContain("Email verified: Not reported")
+      expect(region.textContent).toContain("Group overage: Not reported")
+    })
+  })
+
+  it("opens the provider's page without an opener and without a referrer", async () => {
+    // `ADM-12` review round 2, S2: the page being tested must not get a
+    // handle on this console's tab.
+    mockApi()
+    const opened: unknown[][] = []
+    const originalOpen = window.open
+    window.open = ((...args: unknown[]) => {
+      opened.push(args)
+      return null
+    }) as unknown as typeof window.open
+
+    try {
+      render(<SsoPageForm canWrite />)
+      fireEvent.click(await screen.findByRole("button", { name: "Test sign-in" }))
+      await waitFor(() => expect(opened).toHaveLength(1))
+      expect(opened[0]).toEqual([
+        "https://auth.example.com/authorize?response_type=code",
+        "_blank",
+        "noopener,noreferrer",
+      ])
+    } finally {
+      window.open = originalOpen
+    }
+  })
+
+  it("the test result card renders error message when test fails", async () => {
+    search = new URLSearchParams("ssoTest=test-run-uuid-456")
+    mockApi(DEFAULT_SSO, ROLES, {
+      ok: false,
+      error: "The provider refused the client ID or secret.",
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await waitFor(() => {
+      expect(screen.getByRole("region", { name: "Test sign-in result" })).toBeDefined()
+      expect(
+        screen.getByText("The provider refused the client ID or secret.")
+      ).toBeDefined()
+    })
+  })
+
+  it("shows the reason when the saved connection is not ready", async () => {
+    // `ADM-12` review round 1, S6 / D10: a saved connection that cannot be
+    // used says why, so a Platform Admin knows what to set.
+    mockApi({
+      ...DEFAULT_SSO,
+      ready: false,
+      notReadyReason:
+        "Set CONSOLE_PUBLIC_URL to this deployment's public address: a sign-in has to return people here.",
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    await screen.findByLabelText("Issuer URL")
+    const notice = await screen.findByRole("status")
+    expect(notice.textContent).toContain("Sign-in is not ready.")
+    expect(notice.textContent).toContain("Set CONSOLE_PUBLIC_URL")
+    // The form still saves: readiness never blocks an administrator.
+    expect(screen.getByRole("button", { name: "Save" })).toBeDefined()
+  })
+
+  it("the page is read-only without canEdit", async () => {
+    mockApi({
+      ...DEFAULT_SSO,
+      canEdit: false,
+    })
+
+    render(<SsoPageForm canWrite />)
+
+    const issuerInput = (await screen.findByLabelText("Issuer URL")) as HTMLInputElement
+    await waitFor(() => expect(issuerInput.value).toBe("https://auth.example.com"))
+    expect(issuerInput.disabled).toBe(true)
+
+    const clientIdInput = (await screen.findByLabelText("Client ID")) as HTMLInputElement
+    expect(clientIdInput.disabled).toBe(true)
+
+    // Save button should not be present
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull()
+
+    // Platform Admin notice should be visible
+    expect(
+      screen.getByText(/Only a Platform Admin can change single sign-on settings/i)
+    ).toBeDefined()
   })
 })

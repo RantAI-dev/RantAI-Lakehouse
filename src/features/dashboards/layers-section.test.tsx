@@ -34,9 +34,17 @@ describe("LayersSection", () => {
     fireEvent.click(screen.getByText("Add a question"))
     expect(onChange.mock.calls[0][0]).toEqual([emptyLayer()])
     rerender(<LayersSection {...props} layers={[emptyLayer(), emptyLayer(), emptyLayer(), emptyLayer()]} onChange={onChange} />)
-    expect(screen.queryByText("Add a question")).toBeNull()
+    // QA LH-BI-13-06: at the limit the button stays, off, and the sentence says why (it used to vanish).
+    expect((screen.getByText("Add a question").closest("button") as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText("A chart takes at most five questions.")).toBeTruthy()
     fireEvent.click(screen.getByLabelText("Remove question 2"))
     expect(onChange.mock.calls[1][0]).toHaveLength(3)
+  })
+
+  it("keeps the button on and says nothing about a limit below four questions", () => {
+    render(<LayersSection {...props} layers={[emptyLayer(), emptyLayer(), emptyLayer()]} onChange={() => {}} />)
+    expect((screen.getByText("Add a question").closest("button") as HTMLButtonElement).disabled).toBe(false)
+    expect(screen.queryByText("A chart takes at most five questions.")).toBeNull()
   })
 
   it("offers no source columns until a source is picked, and no way to add one while the chart forbids it", () => {

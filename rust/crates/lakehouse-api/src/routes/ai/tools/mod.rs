@@ -16,6 +16,7 @@
 //!   download link, made when the person opens it.
 //! - [`reports`] — the scheduled-report tools (`AI-10`, with `RPT-1`).
 //! - [`tabs`] — the dashboard tab tools (`BI-18` part C, with `AI-9`).
+//! - [`written`] — the report and template tools (`BI-18` part D, with `AI-9`).
 //! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
 //! - [`embed`] — the signed-embed tools (`BI-26` slice 2, with `AI-11-AC3`):
 //!   enable, filter modes, withdraw, and the snippet.//! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
@@ -38,6 +39,7 @@ mod connectors;
 mod dashboards;
 mod embed;
 mod export;
+pub(super) use export::with_screen_filters;
 mod maps;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
 // SIBLING module of `routes::ai`, not a descendant — can reuse
@@ -50,6 +52,7 @@ mod ingest;
 mod lakehouse;
 mod limits;
 mod look;
+pub(super) use look::ADD_REFERENCE_LINES;
 #[cfg(test)]
 pub(super) use look::FORMAT_FIELDS;
 mod metrics;
@@ -60,6 +63,7 @@ mod queries;
 mod reports;
 pub(in crate::routes) use reports::{approval_args, report_audience};
 mod tabs;
+mod written;
 
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
@@ -158,9 +162,9 @@ pub(in crate::routes) async fn run_tool(
         "run_sql" => data::run_sql(state, principal, args).await,
         "ask_user" => ask::ask_user(args),
         "propose_sql" => propose::propose_sql(state, principal, args).await,
-        "list_datasets" => data::list_datasets(ch, args).await,
+        "list_datasets" => data::list_datasets(state, principal, args).await,
         "lakehouse_overview" => data::lakehouse_overview(state, principal).await,
-        "describe_dataset" => data::describe_dataset(ch, args).await,
+        "describe_dataset" => data::describe_dataset(state, principal, args).await,
         "get_lineage" => data::get_lineage(state, principal, args).await,
         "get_quality" => data::get_quality(ch).await,
         "trigger_lakehouse_build" => pipelines::trigger_build(state, principal).await,
@@ -194,7 +198,7 @@ pub(in crate::routes) async fn run_tool(
             Err(error) => error,
         },
         "list_sql_sources" | "suggest_join" => match viewer_for(state, principal).await {
-            Ok(viewer) => dashboards::chart_sources(ch, &viewer, name, args).await,
+            Ok(viewer) => dashboards::chart_sources(state, &viewer, principal, name, args).await,
             Err(error) => error,
         },
         "delete_chart" => match scope_for_write(state, principal).await {
@@ -229,6 +233,8 @@ pub(in crate::routes) async fn run_tool(
             comments::list_dashboard_comments(state, principal, args).await
         }
         n if embed::handles(n) => embed::run(state, principal, name, args).await,
+        // BI-18 part D (T4): reports and templates.
+        n if written::handles(n) => written::run(state, principal, name, args).await,
         "list_connectors" => connectors::list_connectors(state, principal).await,
         "create_connector" => connectors::create_connector(state, principal, args).await,
         "test_connector" => connectors::test_connector(state, principal, args).await,
@@ -243,11 +249,13 @@ pub(in crate::routes) async fn run_tool(
         "save_query" => queries::save_query(state, principal, args).await,
         "list_saved_queries" => queries::list_saved_queries(state, principal).await,
         "run_saved_query" => queries::run_saved_query(state, principal, args).await,
-        "get_audit_history" => governance::get_audit_history(state).await,
-        "list_classification_rules" => governance::list_classification_rules(state).await,
-        "list_quality_rules" => governance::list_quality_rules(state).await,
+        "get_audit_history" => governance::get_audit_history(state, principal).await,
+        "list_classification_rules" => {
+            governance::list_classification_rules(state, principal).await
+        }
+        "list_quality_rules" => governance::list_quality_rules(state, principal).await,
         "get_cdc_health" => governance::get_cdc_health(state).await,
-        "get_maintenance_metrics" => governance::get_maintenance_metrics(state).await,
+        "get_maintenance_metrics" => governance::get_maintenance_metrics(state, principal).await,
         "run_bronze_maintenance" => pipelines::run_bronze_maintenance(&state.dagster).await,
         "list_workloads" => ops::list_workloads(state).await,
         "kill_query" => ops::kill_query(state, args).await,
@@ -255,7 +263,7 @@ pub(in crate::routes) async fn run_tool(
         "get_gold_export" => gold::get_gold_export(state, args).await,
         "draft_policy" => governance::draft_policy(state, args).await,
         "draft_classification_rule" => governance::draft_classification_rule(state, args).await,
-        "draft_quality_rule" => governance::draft_quality_rule(state, args).await,
+        "draft_quality_rule" => governance::draft_quality_rule(state, principal, args).await,
         "get_ingest_spec" => ingest::get_ingest_spec(state, args).await,
         "set_ingest_spec" => ingest::set_ingest_spec(state, args).await,
         "discover_source" => ingest::discover_source(state, args).await,
@@ -270,10 +278,10 @@ pub(in crate::routes) async fn run_tool(
         "set_pipeline_target_lag" => {
             pipelines::set_pipeline_target_lag(state, principal, args).await
         }
-        "list_iceberg_tables" => lakehouse::list_iceberg_tables(state, args).await,
-        "describe_iceberg_table" => lakehouse::describe_iceberg_table(state, args).await,
-        "get_table_maintenance" => lakehouse::get_table_maintenance(state, args).await,
-        "set_table_maintenance" => lakehouse::set_table_maintenance(state, args).await,
+        "list_iceberg_tables" => lakehouse::list_iceberg_tables(state, principal, args).await,
+        "describe_iceberg_table" => lakehouse::describe_iceberg_table(state, principal, args).await,
+        "get_table_maintenance" => lakehouse::get_table_maintenance(state, principal, args).await,
+        "set_table_maintenance" => lakehouse::set_table_maintenance(state, principal, args).await,
         "get_capacity" => lakehouse::get_capacity(state).await,
         other => {
             unreachable!(
@@ -399,11 +407,12 @@ pub(super) async fn scope_for_write(
 }
 
 /// Who may make a `create_chart` or `update_chart` call and on which
-/// dashboards: a signed-in person ([`scope_for_write`]), then the level checks
-/// of the console's write routes (`specs_create`/`specs_update`), `edit` on the
-/// dashboard the chart is on and on the one it moves to (`BI-19` B2 review
-/// B2-1). The one copy of these checks: the dispatcher runs it before the save
-/// and [`check_draft`] runs it before the draft, so a draft is refused with the
+/// dashboards: a signed-in person ([`scope_for_write`]), then the map the call
+/// names ([`maps::require_known_map`]), then the level checks of the console's
+/// write routes (`specs_create`/`specs_update`), `edit` on the dashboard the
+/// chart is on and on the one it moves to (`BI-19` B2 review B2-1). The one
+/// copy of these checks: the dispatcher runs it before the save and
+/// [`check_draft`] runs it before the draft, so a draft is refused with the
 /// reply the save gives (`PR #391 review`, `PR #402 review`).
 ///
 /// Returns the caller's [`Scope`](crate::routes::dashboard_access::Scope),
@@ -415,6 +424,17 @@ async fn require_chart_call_allowed(
     args: &Map<String, Value>,
 ) -> Result<crate::routes::dashboard_access::Scope, Value> {
     let scope = scope_for_write(state, principal).await?;
+    // `AI-6`: a chart call that names a map that does not exist is refused
+    // here, so the draft and the save refuse it with one sentence. It runs
+    // after the writer check (a caller with neither `dashboard:read` nor a
+    // rule is refused there) and before the board checks (the map catalogue
+    // needs no dashboard). The uploaded maps it names are the ones
+    // `list_maps` already shows any assistant caller, so nothing new is
+    // disclosed.
+    // (PR #524 security review)
+    // The update branch reads the stored chart as the caller, so a chart the
+    // caller may not see is never named in the refusal.
+    maps::require_known_map(state, name, args, &scope.viewer).await?;
     if name == "create_chart" {
         require_edit_on(state, &scope, &arg_str(args, "board")).await?;
     } else {
@@ -779,6 +799,45 @@ mod tests {
         /// The owner of `b2`: empty for a dashboard nobody owns, otherwise
         /// somebody's personal space.
         b2_owner: &'static str,
+        /// The stored chart `c1` the caller may see: `None` for a store that
+        /// holds no chart at all.
+        stored: Option<StoredChart>,
+    }
+
+    /// A stored chart the stand-in `ClickHouse` holds: the kind it was saved
+    /// with and the map it has (empty for a chart with none).
+    #[derive(Clone, Copy)]
+    struct StoredChart {
+        kind: &'static str,
+        map: &'static str,
+    }
+
+    /// The document the store keeps for the chart `c1`: its spec and the
+    /// definition the update path carries the fields over from.
+    fn stored_document(stored: &StoredChart) -> Value {
+        let mut def = json!({
+            "title": "T",
+            "kind": stored.kind,
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+        });
+        if !stored.map.is_empty() {
+            def["map"] = json!(stored.map);
+        }
+        json!({
+            "spec": {
+                "id": "c1",
+                "title": "T",
+                "kind": stored.kind,
+                "mart": "mart_x",
+                "sql": "SELECT province, sum(visitors) FROM serving.mart_x GROUP BY province",
+                "x": "province",
+                "y": "visitors",
+            },
+            "def": def,
+            "hasYear": false,
+        })
     }
 
     impl wiremock::Respond for TwoBoards {
@@ -786,6 +845,18 @@ mod tests {
             let sql = String::from_utf8_lossy(&request.body).into_owned();
             let rows: Vec<Value> = if sql.contains("FROM console.bi_chart FINAL WHERE id = 'c1'") {
                 vec![json!({ "is_deleted": 0, "board": "b1" })]
+            } else if sql.contains("FROM console.bi_chart FINAL WHERE is_deleted = 0") {
+                // `list_stored_charts`: the stored chart the caller may see.
+                match self.stored {
+                    Some(stored) => vec![json!({
+                        "id": "c1",
+                        "spec_json": stored_document(&stored).to_string(),
+                        "board": "b1",
+                        "created_by": "ai",
+                        "created_at": "2026-01-01 00:00:00",
+                    })],
+                    None => Vec::new(),
+                }
             } else if sql.contains("SELECT is_deleted, owner_id FROM console.bi_board FINAL") {
                 // `board_row_state`: the dashboard exists, live, unowned.
                 ["b1", "b2"]
@@ -907,6 +978,174 @@ mod tests {
         }
     }
 
+    /// `SEC-20`, plan 96: the classification list names tables, so a person's
+    /// list is narrowed to the tables in their reach (here there is no
+    /// database to read a reach from, so none is). `SEC-76`: a
+    /// headless run (a scheduled agent, no person) used to read the list
+    /// whole. It is refused now, with no rows.
+    #[tokio::test]
+    async fn the_classification_list_is_narrowed_for_a_person_and_refused_for_a_headless_run() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "rows": 2,
+                "data": [
+                    { "slug": "ds_a", "table_name": "orders_a", "tier": "confidential" },
+                    { "slug": "ds_b", "table_name": "orders_b", "tier": "restricted" },
+                ],
+            })))
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let args = Map::new();
+
+        let headless = run_tool(&state, None, "list_classification_rules", &args).await;
+        assert_eq!(
+            headless,
+            json!({ "error": governance::CLASSIFICATION_RULES_NEED_A_USER }),
+            "{headless}"
+        );
+
+        let person = caller_with("governance:read");
+        let narrowed = run_tool(&state, Some(&person), "list_classification_rules", &args).await;
+        assert_eq!(narrowed["classifications"], json!([]), "{narrowed}");
+    }
+
+    /// `SEC-20`, plan 97: a scheduled run holds no principal, and the three
+    /// tools that read table metadata used to read every tenant's for it.
+    /// Each one now refuses with a fixed sentence and asks nothing of the
+    /// engine (the mock would count the request) or the database.
+    #[tokio::test]
+    async fn the_table_metadata_tools_refuse_a_run_with_no_principal_and_read_nothing() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "rows": 1,
+                "data": [{ "slug": "ds_a", "title": "A", "table_name": "orders_a", "tier": "bronze" }],
+            })))
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let mut args = Map::new();
+        args.insert("slug".to_owned(), json!("ds_a"));
+
+        for (tool, sentence) in [
+            ("list_datasets", "reading datasets needs a signed-in user"),
+            (
+                "describe_dataset",
+                "reading datasets needs a signed-in user",
+            ),
+            (
+                "get_maintenance_metrics",
+                "reading the maintenance history needs a signed-in user",
+            ),
+        ] {
+            let reply = run_tool(&state, None, tool, &args).await;
+            assert_eq!(reply, json!({ "error": sentence }), "{tool}");
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a refused call must not have asked the engine anything"
+        );
+    }
+
+    /// `SEC-76`: a scheduled run holds no principal, and the readers
+    /// below used to read every tenant's rows for it. Each one answers with
+    /// its sentence and asks the engine nothing. Each call boxes this future:
+    /// it holds an `AppState`, over clippy's `large_futures` limit when awaited
+    /// inline in a test.
+    async fn a_run_with_no_principal_gets_the_refusal_and_no_rows(
+        tool: &str,
+        args: &Map<String, Value>,
+        sentence: &str,
+    ) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "rows": 1,
+                "data": [{
+                    "slug": "ds_a", "title": "A", "name": "mart_a", "mart": "mart_a",
+                    "table_name": "orders_a", "asset": "bronze.orders_a", "tier": "confidential",
+                    "left": "mart_a", "right": "mart_b",
+                }],
+            })))
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let reply = run_tool(&state, None, tool, args).await;
+        assert_eq!(reply, json!({ "error": sentence }), "{tool}");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "{tool}: a refused call must not have asked the engine anything"
+        );
+    }
+
+    /// `SEC-76`: the quality list is not narrowed for a headless run,
+    /// so it is refused for one.
+    #[tokio::test]
+    async fn the_quality_list_refuses_a_run_with_no_principal_and_reads_nothing() {
+        Box::pin(a_run_with_no_principal_gets_the_refusal_and_no_rows(
+            "list_quality_rules",
+            &Map::new(),
+            governance::QUALITY_RULES_NEED_A_USER,
+        ))
+        .await;
+    }
+
+    /// `SEC-76`: a quality rule is created through the console's
+    /// handler as the person, and a headless run has none, so it writes nothing.
+    #[tokio::test]
+    async fn draft_quality_rule_refuses_a_run_with_no_principal_and_writes_nothing() {
+        let mut args = Map::new();
+        args.insert("name".to_owned(), json!("rule_a"));
+        args.insert("table".to_owned(), json!("bronze.orders_a"));
+        Box::pin(a_run_with_no_principal_gets_the_refusal_and_no_rows(
+            "draft_quality_rule",
+            &args,
+            governance::CREATING_QUALITY_RULE_NEEDS_A_USER,
+        ))
+        .await;
+    }
+
+    /// `SEC-76`: a join suggestion names the columns of two marts,
+    /// and a headless run has no role to narrow them by, so it is refused.
+    #[tokio::test]
+    async fn suggest_join_refuses_a_run_with_no_principal_and_reads_nothing() {
+        let mut args = Map::new();
+        args.insert("left".to_owned(), json!("mart_a"));
+        args.insert("right".to_owned(), json!("mart_b"));
+        Box::pin(a_run_with_no_principal_gets_the_refusal_and_no_rows(
+            "suggest_join",
+            &args,
+            "reading datasets needs a signed-in user",
+        ))
+        .await;
+    }
+
+    /// `SEC-76`: the Gold mart list and a mart's columns are read for
+    /// a person only, so a headless run gets the refusal for both shapes of
+    /// the call (the list, and one named mart).
+    #[tokio::test]
+    async fn describe_mart_refuses_a_run_with_no_principal_and_reads_nothing() {
+        Box::pin(a_run_with_no_principal_gets_the_refusal_and_no_rows(
+            "describe_mart",
+            &Map::new(),
+            "reading datasets needs a signed-in user",
+        ))
+        .await;
+        let mut named = Map::new();
+        named.insert("mart".to_owned(), json!("mart_a"));
+        Box::pin(a_run_with_no_principal_gets_the_refusal_and_no_rows(
+            "describe_mart",
+            &named,
+            "reading datasets needs a signed-in user",
+        ))
+        .await;
+    }
+
     /// The draft of a chart call gets the save's answer, whole: the same value
     /// `run_tool` gives, and no draft (`PR #391 review`, `PR #402 review`).
     async fn assert_the_draft_is_refused_as_the_save_is(
@@ -967,6 +1206,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(TwoBoards {
                 b2_owner: "somebody-else",
+                ..Default::default()
             })
             .mount(&server)
             .await;
@@ -1006,6 +1246,285 @@ mod tests {
                 .is_some_and(|message| message.contains("there is none")),
             "{saved}"
         );
+    }
+
+    /// `AI-6`: a chart call that names a map that does not exist is refused by
+    /// the draft check and by the save, with one sentence that names the maps
+    /// the model may use.
+    #[tokio::test]
+    async fn the_draft_of_a_create_on_a_map_that_does_not_exist_is_refused_as_the_save_is() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards::default())
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        let args = json!({
+            "board": "b1", "title": "T", "kind": "geomap", "map": "indonesia",
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let saved = assert_the_draft_is_refused_as_the_save_is(
+            &state,
+            Some(&writer),
+            "create_chart",
+            &args,
+        )
+        .await;
+        assert_eq!(
+            saved["error"],
+            json!(
+                "map 'indonesia' does not exist. Use one of: dki-jakarta, id-provinces, id-regencies, world, adm1-<iso3> for a country's provinces, or an uploaded map from list_maps."
+            ),
+            "{saved}"
+        );
+    }
+
+    /// A chart on a map that exists is not refused by the map check: the
+    /// built-in ids and a country's map pass it.
+    #[tokio::test]
+    async fn a_chart_on_a_map_that_exists_is_not_refused_by_the_map_check() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards::default())
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        for map in ["id-provinces", "world", "adm1-usa"] {
+            let args = json!({
+                "board": "b1", "title": "T", "kind": "geomap", "map": map,
+            })
+            .as_object()
+            .cloned()
+            .unwrap();
+            let saved = run_tool(&state, Some(&writer), "create_chart", &args).await;
+            assert!(
+                !saved["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("does not exist. Use one of:"),
+                "{map} may be named: {saved}"
+            );
+        }
+    }
+
+    /// An update that names no map — none at all, a `null` one or a blank one
+    /// — keeps the stored one, so the map check has nothing to refuse.
+    #[tokio::test]
+    async fn an_update_that_names_no_map_is_not_refused_by_the_map_check() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards::default())
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        for map in [None, Some(json!(null)), Some(json!("   "))] {
+            let mut args = json!({ "id": "c1", "title": "T", "kind": "bar" })
+                .as_object()
+                .cloned()
+                .unwrap();
+            if let Some(map) = map.as_ref() {
+                args.insert("map".to_owned(), map.clone());
+            }
+            let saved = run_tool(&state, Some(&writer), "update_chart", &args).await;
+            assert!(
+                !saved["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("does not exist. Use one of:"),
+                "{map:?}: {saved}"
+            );
+        }
+    }
+
+    /// `AI-6`: a new region map chart has no stored map to keep, so a
+    /// `create_chart` of that kind that names no map is refused: the draft
+    /// check and the save refuse it with one sentence that names the maps the
+    /// model may use.
+    #[tokio::test]
+    async fn a_new_region_map_chart_that_names_no_map_is_refused_as_the_save_is() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards::default())
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        for map in [None, Some(json!(null)), Some(json!("   "))] {
+            let mut args = json!({ "board": "b1", "title": "T", "kind": "geomap" })
+                .as_object()
+                .cloned()
+                .unwrap();
+            if let Some(map) = map.as_ref() {
+                args.insert("map".to_owned(), map.clone());
+            }
+            let saved = assert_the_draft_is_refused_as_the_save_is(
+                &state,
+                Some(&writer),
+                "create_chart",
+                &args,
+            )
+            .await;
+            assert_eq!(
+                saved["error"],
+                json!(
+                    "a geomap chart needs `map`. Use one of: dki-jakarta, id-provinces, id-regencies, world, adm1-<iso3> for a country's provinces, or an uploaded map from list_maps."
+                ),
+                "{map:?}: {saved}"
+            );
+        }
+    }
+
+    /// Only a new region map chart needs a map of its own: a chart of another
+    /// kind draws from its columns, and an update of a chart of another kind
+    /// keeps the map it was saved with, so neither is refused by the map
+    /// check.
+    #[tokio::test]
+    async fn a_chart_that_needs_no_map_of_its_own_is_not_refused_by_the_map_check() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards::default())
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        let calls = [
+            (
+                "create_chart",
+                json!({ "board": "b1", "title": "T", "kind": "bar" }),
+            ),
+            (
+                "create_chart",
+                json!({ "board": "b1", "title": "T", "kind": "pointmap" }),
+            ),
+            (
+                "update_chart",
+                json!({ "id": "c1", "title": "T", "kind": "bar" }),
+            ),
+        ];
+        for (tool, args) in calls {
+            let args = args.as_object().cloned().unwrap();
+            let saved = run_tool(&state, Some(&writer), tool, &args).await;
+            let error = saved["error"].as_str().unwrap_or_default();
+            assert!(!error.contains("needs `map`"), "{tool}: {saved}");
+            assert!(
+                !error.contains("does not exist. Use one of:"),
+                "{tool}: {saved}"
+            );
+        }
+    }
+
+    /// `AI-6`: an update that changes a chart to a region map needs a map
+    /// too. The update keeps the map the stored chart was saved with, and a
+    /// stored chart with no map would draw no region at all, so the call is
+    /// refused: by the draft check and by the save, with the sentence a new
+    /// region map chart gets.
+    #[tokio::test]
+    async fn an_update_that_changes_a_chart_to_a_region_map_without_a_map_is_refused_as_the_save_is()
+     {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards {
+                stored: Some(StoredChart {
+                    kind: "bar",
+                    map: "",
+                }),
+                ..Default::default()
+            })
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        let args = json!({
+            "id": "c1", "title": "T", "kind": "geomap", "mart": "mart_x",
+            "dimension": "province", "measures": ["visitors"],
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let saved = assert_the_draft_is_refused_as_the_save_is(
+            &state,
+            Some(&writer),
+            "update_chart",
+            &args,
+        )
+        .await;
+        assert_eq!(
+            saved["error"],
+            json!(
+                "a geomap chart needs `map`. Use one of: dki-jakarta, id-provinces, id-regencies, world, adm1-<iso3> for a country's provinces, or an uploaded map from list_maps."
+            ),
+            "{saved}"
+        );
+    }
+
+    /// The other half: an update of a region map that has a map keeps it, so
+    /// the map check has nothing to refuse.
+    #[tokio::test]
+    async fn an_update_of_a_region_map_that_has_a_map_is_not_refused_by_the_map_check() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards {
+                stored: Some(StoredChart {
+                    kind: "geomap",
+                    map: "id-provinces",
+                }),
+                ..Default::default()
+            })
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        let args = json!({
+            "id": "c1", "title": "T", "kind": "geomap", "mart": "mart_x",
+            "dimension": "province", "measures": ["visitors"],
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let saved = run_tool(&state, Some(&writer), "update_chart", &args).await;
+        assert!(
+            !saved["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("needs `map`"),
+            "{saved}"
+        );
+    }
+
+    /// An update that names a map that exists passes the map check, whatever
+    /// the stored chart has: the map the call names is the one the chart is
+    /// drawn on.
+    #[tokio::test]
+    async fn an_update_that_names_a_map_that_exists_is_not_refused_by_the_map_check() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards {
+                stored: Some(StoredChart {
+                    kind: "bar",
+                    map: "",
+                }),
+                ..Default::default()
+            })
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        let args = json!({
+            "id": "c1", "title": "T", "kind": "geomap", "map": "id-provinces",
+            "mart": "mart_x", "dimension": "province", "measures": ["visitors"],
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let saved = run_tool(&state, Some(&writer), "update_chart", &args).await;
+        let error = saved["error"].as_str().unwrap_or_default();
+        assert!(!error.contains("needs `map`"), "{saved}");
+        assert!(!error.contains("does not exist. Use one of:"), "{saved}");
     }
 
     // PR review fix (SHOULD-FIX): `AI_ASK_BACK=false` only hid `ask_user` from

@@ -50,8 +50,10 @@ pub enum SqlDriver {
 /// the same `secretRef`-style indirection as a password: a username is
 /// not a credential, and the seeded `conn-pg-lakehouse` row already
 /// encodes its username directly in `host`
-/// (`lakehouse@postgres:5432/lakehouse`,
-/// `0022_prune_connector_seed.sql`) rather than through any resolver — see
+/// (`lakehouse_app@postgres:5432/lakehouse`,
+/// `0022_prune_connector_seed.sql`, repointed from the owner's name to
+/// the runtime role's by `0149_seed_connector_dials_as_app_role.sql`)
+/// rather than through any resolver — see
 /// `docs/adr/0013-registry-driven-ingestion.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -1465,9 +1467,12 @@ fn validate_saas_dial_post_parse(adapter: &str, dial: &SaasDial) -> Result<(), I
     let Some(vendor) = crate::saas_vendors::vendor(&dial.vendor) else {
         return Err(refuse("vendor is not one this build offers"));
     };
+    // QA LH-SRC-3-11 (SRC-41): `InvalidAccount`'s own text already names
+    // the field ("account is not in the form this vendor uses"); prefixing it
+    // again doubled the word in the refusal the console showed.
     vendor
         .validate_account(&dial.account)
-        .map_err(|err| refuse(&format!("account: {err}")))?;
+        .map_err(|err| refuse(&err.to_string()))?;
     match &dial.auth {
         SaasAuth::Oauth2AuthorizationCode { client_id } => {
             if client_id.trim().is_empty()
@@ -1895,6 +1900,82 @@ pub fn validate_oracle_change_capture_tables(
         }
     }
     Ok(())
+}
+
+/// Why an ingest mode cannot go with an adapter (`SRC-44`, QA `LH-SRC-6-41`).
+///
+/// The text is fixed and never echoes the request, so it is safe to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidIngestMode {
+    /// A `kafka` connector saved as anything but `stream`: the loader runs it
+    /// only as a stream, so every run would stop with `UnknownAdapter`.
+    #[error("a Kafka connector runs as a stream: its ingestMode must be stream")]
+    KafkaNeedsStream,
+    /// `stream` on an adapter other than `kafka`: only the Kafka consumer
+    /// reads as a stream, so the run would have no loader.
+    #[error("ingestMode stream is only for a Kafka connector")]
+    StreamNeedsKafka,
+}
+
+/// Check the pairing of an adapter and its `ingestMode` (`SRC-44`): `kafka`
+/// goes with `stream` and only `kafka` does. The pairing of `cdc` with its mode
+/// is not checked here (unchanged); any other mode is left to the database's
+/// `connector_ingest_mode_check`.
+///
+/// # Errors
+///
+/// Returns [`InvalidIngestMode::KafkaNeedsStream`] for a `kafka` adapter with
+/// a mode other than `stream`, and [`InvalidIngestMode::StreamNeedsKafka`] for
+/// `stream` with any other adapter.
+pub fn validate_ingest_mode(adapter: &str, ingest_mode: &str) -> Result<(), InvalidIngestMode> {
+    match (adapter == "kafka", ingest_mode == "stream") {
+        (true, false) => Err(InvalidIngestMode::KafkaNeedsStream),
+        (false, true) => Err(InvalidIngestMode::StreamNeedsKafka),
+        _ => Ok(()),
+    }
+}
+
+/// The `sourceObjects` a Kafka spec is stored with (`SRC-45`, QA `LH-SRC-6-41`).
+///
+/// The console saves a Kafka connector's topic in `dial.topic` and sends no
+/// source object, but the loader takes its Bronze table from
+/// `source_objects[0].target`, so the first run that read a message stopped
+/// with an unclassified error. The server therefore gives the spec its target:
+/// the body's own `source_objects` when it already holds exactly one object
+/// named as the topic (an API caller's chosen target stands), otherwise a
+/// single `{name: <topic>, target: <default>}` built with
+/// [`default_bronze_target`]. A change of topic gets the new topic's default.
+///
+/// Anything that is not a Kafka spec, or whose `dial.topic` is not a non-empty
+/// string, is returned as it came: the dial's own validation reports that.
+#[must_use]
+pub fn kafka_source_objects(
+    adapter: &str,
+    dial: &serde_json::Value,
+    connector_name: &str,
+    source_objects: &serde_json::Value,
+) -> serde_json::Value {
+    if adapter != "kafka" {
+        return source_objects.clone();
+    }
+    let Some(topic) = dial
+        .get("topic")
+        .and_then(serde_json::Value::as_str)
+        .filter(|topic| !topic.is_empty())
+    else {
+        return source_objects.clone();
+    };
+    let kept = source_objects.as_array().is_some_and(|objects| {
+        objects.len() == 1
+            && objects[0].get("name").and_then(serde_json::Value::as_str) == Some(topic)
+    });
+    if kept {
+        return source_objects.clone();
+    }
+    serde_json::json!([{
+        "name": topic,
+        "target": default_bronze_target(connector_name, topic),
+    }])
 }
 
 /// Check each source object's load mode, the one part of `sourceObjects`
@@ -2948,6 +3029,68 @@ mod tests {
         )
         .expect("valid");
         assert_eq!(without.load_mode, None);
+    }
+
+    #[test]
+    fn a_kafka_connector_is_saved_as_a_stream_and_only_a_kafka_connector_is() {
+        assert_eq!(validate_ingest_mode("kafka", "stream"), Ok(()));
+        assert_eq!(
+            validate_ingest_mode("kafka", "batch"),
+            Err(InvalidIngestMode::KafkaNeedsStream)
+        );
+        assert_eq!(
+            validate_ingest_mode("kafka", "cdc"),
+            Err(InvalidIngestMode::KafkaNeedsStream)
+        );
+        assert_eq!(
+            validate_ingest_mode("sql", "stream"),
+            Err(InvalidIngestMode::StreamNeedsKafka)
+        );
+        // Everything else is as it was.
+        assert_eq!(validate_ingest_mode("sql", "batch"), Ok(()));
+        assert_eq!(validate_ingest_mode("cdc", "cdc"), Ok(()));
+    }
+
+    /// `SRC-45` (QA `LH-SRC-6-41`): the server gives a Kafka spec its target.
+    #[test]
+    fn a_kafka_spec_gets_the_default_target_of_its_topic() {
+        let dial = serde_json::json!({ "topic": "orders" });
+        let target = default_bronze_target("Shop Kafka", "orders");
+        let expected = serde_json::json!([{ "name": "orders", "target": target }]);
+        // No object, as the console sends it.
+        assert_eq!(
+            kafka_source_objects("kafka", &dial, "Shop Kafka", &serde_json::json!([])),
+            expected
+        );
+        // One object named as the topic is kept as sent.
+        let chosen = serde_json::json!([{ "name": "orders", "target": "my_orders" }]);
+        assert_eq!(
+            kafka_source_objects("kafka", &dial, "Shop Kafka", &chosen),
+            chosen
+        );
+        // A topic that changed gets the new topic's default.
+        let stale = serde_json::json!([{ "name": "old", "target": "shop_kafka_old" }]);
+        assert_eq!(
+            kafka_source_objects("kafka", &dial, "Shop Kafka", &stale),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_spec_that_is_not_kafka_or_has_no_topic_keeps_its_source_objects() {
+        let objects = serde_json::json!([{ "name": "public.orders", "target": "orders" }]);
+        let dial = serde_json::json!({ "topic": "orders" });
+        assert_eq!(kafka_source_objects("sql", &dial, "c", &objects), objects);
+        for no_topic in [
+            serde_json::json!({}),
+            serde_json::json!({ "topic": "" }),
+            serde_json::json!({ "topic": 3 }),
+        ] {
+            assert_eq!(
+                kafka_source_objects("kafka", &no_topic, "c", &objects),
+                objects
+            );
+        }
     }
 
     #[test]
@@ -4770,6 +4913,21 @@ mod saas_dial_tests {
                 "{account}"
             );
         }
+    }
+
+    #[test]
+    fn a_refused_saas_account_names_the_field_once() {
+        // QA LH-SRC-3-11 (SRC-41): the refusal read "account: account is not
+        // in the form this vendor uses"; `InvalidAccount` already names the
+        // field, so it is carried as it is.
+        let err = Dial::parse("saas", &dial("dynamics365", "127.0.0.1", &oauth())).unwrap_err();
+        let IngestSpecError::InvalidDial { source, .. } = err else {
+            panic!("expected InvalidDial, got {err:?}");
+        };
+        assert_eq!(
+            source.to_string(),
+            "account is not in the form this vendor uses"
+        );
     }
 
     #[test]

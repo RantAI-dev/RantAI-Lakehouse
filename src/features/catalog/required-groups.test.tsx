@@ -1,0 +1,167 @@
+// UX-1-R4: group requirements must be starred at the group level when an
+// either/or choice satisfies them, and a pre-filled name that blocks Save is
+// required, not optional. These render the real dialogs through their tabs.
+import * as realNavigation from "next/navigation"
+// Restore the real module after this file: `mock.module` outlives it in
+// `bun test src` and would otherwise replace navigation for later files.
+const realNav = { ...realNavigation }
+mock.module("next/navigation", () => ({
+  ...realNav,
+  usePathname: () => "/catalog/demo",
+  useSearchParams: () => new URLSearchParams(),
+  useRouter: () => ({
+    push: () => {},
+    replace: () => {},
+    refresh: () => {},
+    back: () => {},
+    forward: () => {},
+    prefetch: () => {},
+  }),
+}))
+
+import { fireEvent, render, screen } from "@testing-library/react"
+import { afterAll, afterEach, describe, expect, it, mock } from "bun:test"
+import type { AssetDetail } from "@/services/contracts/assets"
+import { AuthProvider } from "@/features/auth/auth-provider"
+import { AssetAccess } from "./asset-access"
+import { AssetQuality } from "./asset-quality"
+import { CheckFields } from "@/features/governance/quality-check-fields"
+import { EMPTY_FORM } from "@/features/governance/quality-checks"
+
+afterAll(() => {
+  mock.module("next/navigation", () => realNav)
+})
+
+const originalFetch = global.fetch
+afterEach(() => {
+  global.fetch = originalFetch
+})
+
+function stubFetch() {
+  global.fetch = mock(async (input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes("/api/auth/me")) {
+      return new Response(
+        JSON.stringify({
+          id: "u1",
+          name: "Owner",
+          email: null,
+          roles: [],
+          permissions: ["*:*"],
+          tenants: [{ id: "t1", name: "Acme", slug: "acme" }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    }
+    // The current Quality tab reads incidents through useService; an object
+    // here made that list crash before the Add-rule dialog could render.
+    if (url.includes("/api/governance/quality/incidents")) {
+      return new Response('{"incidents":[]}', { status: 200, headers: { "Content-Type": "application/json" } })
+    }
+    if (url.includes("/api/governance/quality/schedules")) {
+      return new Response('{"schedules":[]}', { status: 200, headers: { "Content-Type": "application/json" } })
+    }
+    if (url.includes("/api/governance/quality/learning")) {
+      return new Response('{"enabled":false,"suggestions":[]}', { status: 200, headers: { "Content-Type": "application/json" } })
+    }
+    if (url.includes("/runs")) {
+      return new Response('{"runs":[]}', { status: 200, headers: { "Content-Type": "application/json" } })
+    }
+    return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } })
+  }) as unknown as typeof fetch
+}
+
+const asset = (a: Partial<AssetDetail>) =>
+  ({
+    id: "demo-orders",
+    name: "orders",
+    tableKey: "bronze.demo_orders",
+    classification: "internal",
+    schema: [{ name: "email", typeName: "text", masked: false, classification: null }],
+    classificationRules: [],
+    policySummary: [],
+    qualityChecks: [],
+    ...a,
+  }) as AssetDetail
+
+const markerIn = (el: Element | null) => el?.querySelector('span[aria-hidden="true"][class*="before:content-"]') != null
+
+describe("catalog group requirements (UX-1-R4)", () => {
+  it("stars the masking-or-filter group but neither alternative on its own", async () => {
+    stubFetch()
+    render(
+      <AuthProvider>
+        <AssetAccess asset={asset({})} onChanged={mock()} />
+      </AuthProvider>
+    )
+    fireEvent.click(await screen.findByText("Add policy"))
+
+    const restriction = Array.from(document.querySelectorAll("legend")).find((l) =>
+      l.textContent?.includes("Restriction")
+    ) as HTMLElement
+    expect(restriction).toBeDefined()
+    expect(markerIn(restriction)).toBe(true)
+    expect(document.getElementById("policy-restriction-help")?.textContent).toContain("At least one")
+    const mask = Array.from(document.querySelectorAll("legend")).find((l) =>
+      l.textContent?.includes("Columns to mask")
+    ) as HTMLElement
+    expect(mask).toBeDefined()
+    expect(markerIn(mask)).toBe(false)
+    // Each alternative is individually optional; the group carries the star.
+    expect(document.querySelector('label[for="policy-filter"]')?.textContent).toContain("optional")
+  })
+
+  it("stars the range-bounds group and marks the generated rule name required", async () => {
+    // The range group now lives in the shared CheckFields component; render
+    // it directly with a range form (its check picker is a SelectField, not a
+    // native select, so a fireEvent.change could not drive it here).
+    render(<CheckFields form={{ ...EMPTY_FORM, kind: "range" }} onChange={mock()} columns={["email"]} idPrefix="rule" />)
+    const bounds = Array.from(document.querySelectorAll("legend")).find((l) =>
+      l.textContent?.includes("Bounds")
+    ) as HTMLElement
+    expect(bounds).toBeDefined()
+    expect(markerIn(bounds)).toBe(true)
+    expect(document.getElementById("rule-bounds-help")?.textContent).toContain("At least one bound")
+    expect(document.querySelector('label[for="rule-min"]')?.getAttribute("data-required")).toBeNull()
+    expect(document.querySelector('label[for="rule-max"]')?.getAttribute("data-required")).toBeNull()
+  })
+
+  // UX-1-R10: the starred check arguments must carry matching semantics on
+  // the actual column picker / numeric input, in both the picker and typed
+  // fallback. The bounds group stays a group (neither endpoint required).
+  it("requires a check's column and numeric arguments where a star is shown", () => {
+    const { unmount } = render(
+      <CheckFields form={{ ...EMPTY_FORM, kind: "not-null" }} onChange={mock()} columns={["email"]} idPrefix="rq" />
+    )
+    expect(document.querySelector('label[for="rq-column"]')?.getAttribute("data-required")).toBe("")
+    expect(screen.getByRole("combobox", { name: "Column" }).getAttribute("aria-required")).toBe("true")
+    expect(document.querySelector('label[for="rq-percent"]')?.getAttribute("data-required")).toBe("")
+    expect(document.getElementById("rq-percent")?.getAttribute("aria-required")).toBe("true")
+    unmount()
+
+    render(
+      <CheckFields form={{ ...EMPTY_FORM, kind: "not-null" }} onChange={mock()} columns={null} idPrefix="rn" />
+    )
+    // With no known columns the column field falls back to a textbox.
+    expect(screen.getByLabelText("Column").getAttribute("aria-required")).toBe("true")
+    unmount()
+
+    render(<CheckFields form={{ ...EMPTY_FORM, kind: "rows" }} onChange={mock()} columns={null} idPrefix="rr" />)
+    expect(document.getElementById("rr-rows")?.getAttribute("aria-required")).toBe("true")
+  })
+
+  it("marks the asset quality rule name required", async () => {
+    stubFetch()
+    render(
+      <AuthProvider>
+        <AssetQuality asset={asset({})} onChanged={mock()} />
+      </AuthProvider>
+    )
+    fireEvent.click(await screen.findByText("Add rule"))
+
+    const nameLabel = document.querySelector('label[for="rule-name"]')
+    expect(nameLabel?.getAttribute("data-required")).toBe("")
+    expect(nameLabel?.textContent).not.toContain("optional")
+    expect(document.getElementById("rule-name")?.getAttribute("aria-required")).toBe("true")
+  })
+})

@@ -23,7 +23,11 @@ migrations directory at *compile* time, so it must exist in the build
 context or `cargo build` fails outright. The current `rust/Dockerfile`
 pins `rust:1.99.1-slim` to match `rust-toolchain.toml`, copies
 `migrations/` into the build context before the build step, installs
-`sqlx-cli`, and uses `entrypoint.api.sh` to apply migrations at boot.
+`sqlx-cli`, and the image's `entrypoint.api.sh` passes its arguments to
+the `lakehouse-api` binary. The entrypoint does **not** apply migrations
+any more (`SEC-78`): the one-shot `lakehouse-db-migrate` service runs the
+same image with the binary's `migrate` subcommand before the API starts —
+see "Database roles" below.
 
 ## Local stack: what's in `docker-compose.yml`
 
@@ -43,6 +47,7 @@ The stack:
 | Service | Image | Purpose |
 | --- | --- | --- |
 | `postgres` | `postgres:16` | OLTP store (identity, governance, pipelines, connectors, alerts, ...) |
+| `lakehouse-db-migrate` | built from `rust/Dockerfile` | One-shot: the same image as `lakehouse-api`, run with `command: ["migrate"]` — applies the schema migrations and creates the console's runtime role `lakehouse_app` with the OWNER's credentials, then exits; `lakehouse-api` starts only after it succeeded (`SEC-78`, see "Database roles" below) |
 | `clickhouse` | `clickhouse/clickhouse-server:26.8` | Analytics store (catalog, overview, governance, dashboards, ...); also the Iceberg query engine once `DataLakeCatalog` is wired up in P1b |
 | `lakehouse-api` | built from `rust/Dockerfile` | the axum API, port 8080 |
 | `console` | built from `Dockerfile.frontend` | the Next.js console, port 3000 (REL-2 S1-T2) — waits for `lakehouse-api` to report healthy, and proxies `/api/*` to it |
@@ -59,15 +64,18 @@ The stack:
 
 Both data stores have healthchecks; `lakehouse-api` waits for both to
 report healthy (`depends_on: condition: service_healthy`) before starting,
-so first-boot migrations and the bootstrap-admin seed (both of which need
-Postgres) get a real chance to run instead of racing container startup.
-This is a start-order convenience, not a hard runtime dependency — see
-"Postgres: unreachable is loud, a mismatched schema refuses to start,"
-below.
+and since `SEC-78` it also waits for `lakehouse-db-migrate` to complete —
+the migrations and the bootstrap-admin seed both need Postgres, and the
+migrate run has to have finished before the API checks the schema it is
+supposed to find. This is a start-order convenience, not a hard runtime
+dependency — see "Postgres: unreachable is loud, a mismatched schema
+refuses to start," below.
 
 `lakehouse-api` carries a healthcheck of its own (`/health`, liveness), and
 the `console` waits for it — so the console starts after the API can
-answer, not while the API is still applying migrations. The console's
+answer. The API does not apply migrations any more (`SEC-78`), so nothing
+starts while a migration is still running; the one-shot
+`lakehouse-db-migrate` does that before the API starts. The console's
 `/api/*` proxy target is baked into its image at build time
 (`RUST_API_URL`, the `lakehouse-api` service's address on the compose
 network); `CONSOLE_INTERNAL_URL` is the address the OTHER way round (the
@@ -139,12 +147,16 @@ variable while one is empty, whatever profile is active:
 
 | Variable | What it is |
 | --- | --- |
-| `POSTGRES_PASSWORD` | PostgreSQL password (also inside the connection strings compose builds for the API, Lakekeeper and OpenFGA) |
+| `LAKEHOUSE_DB_DAGSTER_PASSWORD` | Dagster's instance database role (`lakehouse_dagster`) password (`SEC-78`). `dagster-db-init` sets it on every start, so a rotation applies on the next `up` of the `dagster` profile. Not the owner's, and not the console's |
+| `POSTGRES_PASSWORD` | PostgreSQL password: the database OWNER's password. The `postgres` image itself reads it when the data directory is first created; after that it reaches only the operator-side services — `lakehouse-db-migrate` (the migrations and the console role's setup run with it), Lakekeeper's and OpenFGA's own services (init, migrate and runtime — they dial their own databases), the three Dagster services (Dagster's own instance database), the backup job and the gate runners. It is not in `lakehouse-api`'s connection string any more (`SEC-78`) |
+| `LAKEHOUSE_DB_APP_PASSWORD` | the console's runtime database role's (`lakehouse_app`) password (`SEC-78`) — see "Database roles" below |
 | `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` | RustFS root key pair |
 | `LAKEKEEPER_ENCRYPTION_KEY` | Encrypts what Lakekeeper stores in its own schema |
 
-`CONNECTOR_PG_PASSWORD` and `CONNECTOR_S3_ACCESS_KEY` / `_SECRET_KEY` fall
-back to those, never to a literal. `SEAWEEDFS_ACCESS_KEY` /
+`CONNECTOR_PG_PASSWORD` falls back to `LAKEHOUSE_DB_APP_PASSWORD` (the
+runtime role's — a connector that dials the console's own database does so
+as `lakehouse_app`, not as the owner) and `CONNECTOR_S3_ACCESS_KEY` /
+`_SECRET_KEY` fall back to the RustFS keys, never to a literal. `SEAWEEDFS_ACCESS_KEY` /
 `SEAWEEDFS_SECRET_KEY` are used only by `--profile seaweedfs`; compose
 interpolates the whole file whatever profiles are active, so `${X:?}` there
 would stop a default `up` that never starts SeaweedFS. They default to
@@ -246,6 +258,29 @@ verification trusts, and (before this review) its `/token` endpoint could
 mint an admin-bypass token for anyone who could reach it with no
 credential. Reach it via `docker compose exec` or a container on the
 compose network for debugging, not by republishing `OIDC_MOCK_HOST_PORT`.
+
+#### oidc-mock: token lifetime
+
+The tokens the mock pre-mints live on the `lakehouse_oidc_tokens` volume,
+and that volume is PERSISTENT: they survive a container restart and every
+deploy. They are therefore **replaced** when they get close to expiring —
+`mint_tokens` re-mints a principal whose token has expired or that expires
+within `TOKEN_REFRESH_MARGIN_SECONDS` (7 days), and a background thread
+runs that check hourly. A replaced token is not revoked: the old one stays
+valid until its own `exp`, and the `sub` claim (the identity Lakekeeper's
+grants were given to) never changes.
+
+This is what the volume did NOT do: a token volume that is only ever
+written when it is first created keeps the tokens it minted that day, and
+they expire on their own `exp` with nothing replacing them. On the staging
+VM that expiry was **2026-12-05 07:04 UTC**, and the one-shot init jobs
+that read `admin.jwt` off the volume (`lakekeeper-warehouse-init`,
+`lakekeeper-authz-init`) would have failed from that moment on — `admin`
+is the one principal the on-demand `/token` endpoint refuses to mint, so
+there was no way to renew it without touching the volume by hand.
+
+If the mock is replaced with a real IdP, none of this applies — see ADR
+0011's "what a real IdP swap has to account for".
 
 ### SeaweedFS (opt-in, P2 — storage-compatibility matrix only)
 
@@ -381,6 +416,19 @@ compose up`. Brings up `dagster-db-init` (one-shot: creates Dagster's own
 `dagster/Dockerfile` — see ADR 0005), `dagster-webserver` (GraphQL API +
 UI, container port `3000`), and `dagster-daemon` (schedules/sensors/run
 queueing).
+
+**How many steps the code location runs at once**
+(`DAGSTER_MULTIPROCESS_EXECUTOR_MAX_CONCURRENT`, compose default `2`). The
+code location's multiprocess executor defaults to the CPU count of the machine
+(`multiprocessing.cpu_count()`), and every step it runs is a spawned Python
+process of its own (~235 MB RSS). On the 8-vCPU staging VM that was eight
+steps at once: the container was measured at 1012 MiB and 268% CPU while
+`bronze_maintenance_job` fanned out over its 513 bronze tables — and a deploy
+running `cargo build --release` on the same 8 cores starved next to it until
+the build stalled. Two keeps every table in the fan-out and bounds the
+footprint; the host cannot give the VM more RAM (the Proxmox host is at 96% of
+its 62 GiB), so the bound comes from here. Raise it in `.env` on a machine
+with more cores to spare.
 
 **The Dagster UI is published on the host's loopback only**
 (`127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000`, REL-2 S4b review
@@ -1088,10 +1136,14 @@ its own version and says so when the two differ.
 
 `database` is what `OPS-4` added:
 
-- `ok` — the start-up step connected and applied every migration, so the
-  schema is at this build's version.
+- `ok` — the start-up step connected, found the schema at this build's
+  version (it reads the migration bookkeeping; the `lakehouse-db-migrate`
+  service applied the migrations — `SEC-78`), and the role it connected
+  as is neither a superuser nor a table owner.
 - `unavailable` — no pool at all (`DATABASE_URL` did not parse), the
-  database could not be reached, or it refused the migrations. Phase 2
+  database could not be reached, or the schema is not this build's
+  version (a pending migration; the API refuses to start on one, so this
+  answers only while the retry loop is still waiting). Phase 2
   routes (identity, auth, governance writes, pipelines, connectors,
   alerts, ...) are degraded; Phase 1 answers.
 
@@ -1161,40 +1213,67 @@ ADM-3 every account created that way comes with a password — **no
 identity provider is required**.
 
 **In the console (the normal way).** Administration → Users → **Invite
-User**: fill in the name, the email, the roles and the tenants, and press
-**Invite**. The console shows a **temporary password** once, in a dialog,
-with a Copy button and the line "Shown once. The user must change it at
-first sign-in."
+User**: fill in the name, the username, the optional email (empty if the
+user has none), the roles and the tenants. Choose the first password mode:
 
-The temporary password:
+- **Generate**: the console requests a server-generated temporary password
+  and shows it once in a dialog with a Copy button and the notice
+  "Shown once. The user must change it at first sign-in."
+- **Set it now**: the administrator provides the initial password upfront,
+  meeting the password rules. No temporary password dialog is shown.
+
+The administrator can also toggle "Must change password at first sign-in"
+(checked by default).
+
+**Password rules.** Any password set by an administrator or user must meet
+the deployment rules (`GET /api/auth/password-rules`):
+- Between 8 and 1024 characters.
+- Must not equal the user's username or email (case-insensitive).
+
+The temporary password (when generated):
 
 - is generated by the **server**, from the operating system's random
   source — neither the administrator nor the person signing in chooses it;
 - is shown **once**. The server keeps only the `Argon2id` hash, so it
   cannot be shown again, and it is never logged, never audited, and never
   listed on the Users page;
-- forces a change at the first sign-in. The user signs in with it and is
-  taken to the change-password screen; every other page is refused until
-  the password is changed.
+- forces a change at first sign-in (when `mustChangePassword` is set). The
+  user signs in with it (using their username or email) and is taken to
+  the change-password screen; every other page is refused until the password
+  is changed.
+
+**Updating username or email.** The row's **⋮** menu → **Edit username and email**:
+update the username and/or email address. Leaving the email field empty clears
+the user's email address.
 
 **Resetting a lost password.** The row's **⋮** menu → **Reset password**.
 The reset hands out a **new** temporary password, shows it once the same
 way, and **ends every session that user holds** — including the one they
 were using. The user signs in again with the new password and changes it.
 
-**From the API.** The same two calls, with the same one-shot answer. Both
-need a session that holds `identity:write` (Platform Admin does):
+**From the API.** Calls need a session that holds `identity:write` (Platform
+Admin does):
 
 ```bash
-# Sign in first, and keep the session cookie.
+# Sign in first, and keep the session cookie (accepts username or email).
 curl -sS -X POST "$LAKEHOUSE_URL/api/auth/login" \
   -H 'content-type: application/json' \
-  -d '{"email":"admin@example.com","password":"…"}' -c cookies.txt
+  -d '{"identifier":"admin","password":"…"}' -c cookies.txt
 
-# Invite. The response carries `temporaryPassword` ONCE.
+# Invite with generated temporary password. The response carries `temporaryPassword` ONCE.
 curl -sS -X POST "$LAKEHOUSE_URL/api/identity/users" \
   -H 'content-type: application/json' -b cookies.txt \
-  -d '{"name":"Rina Wijaya","email":"rina@example.com","roles":["Analyst"],"tenants":[]}'
+  -d '{"name":"Rina Wijaya","username":"rinaw","email":"rina@example.com","roles":["Analyst"],"tenants":[],"password":{"mode":"generate"},"mustChangePassword":true}'
+
+# Invite with admin-set initial password (optional email omitted).
+curl -sS -X POST "$LAKEHOUSE_URL/api/identity/users" \
+  -H 'content-type: application/json' -b cookies.txt \
+  -d '{"name":"Budi Santoso","username":"budi","roles":["Analyst"],"tenants":[],"password":{"mode":"set","value":"InitialPassword123!"},"mustChangePassword":true}'
+
+# Rename / change email.
+curl -sS -X PATCH "$LAKEHOUSE_URL/api/identity/users/<user-id>" \
+  -H 'content-type: application/json' -b cookies.txt \
+  -d '{"username":"rina.wijaya","email":null}'
 
 # Reset. The response carries `temporaryPassword` ONCE.
 curl -sS -X POST "$LAKEHOUSE_URL/api/identity/users/<user-id>/reset-password" \
@@ -1288,6 +1367,299 @@ The bootstrap admin is **not** re-activated by a restart: it is seeded
 only when an account with that email does not exist yet, so a bootstrap
 admin an administrator deliberately switched off stays off.
 
+## Roles and pages per role (ADM-13)
+
+Under ADM-13, the console enforces per-role page gating: users only see navigation
+links and pages their role permissions permit. Direct navigation to an unauthorized
+page renders an access-denied state without issuing backend API requests.
+
+### A user with no role sees no page after the upgrade
+
+Until ADM-13, a signed-in user with no assigned role (such as a user authenticated
+through SSO without a mapped group) could still open the assistant and read operational
+status lists.
+
+Because the console now gates pages fail-closed on permissions, **a user with no role sees
+no page after the upgrade** and lands on an access-denied state. An administrator must assign
+them at least one role (for example `Dashboard Viewer`, `Analyst`, or `Assistant only`) so they
+can access the pages they need.
+
+### Seeded roles and what the upgrade adds
+
+The platform's seeded roles are defined in `0002_seed_identity.sql`:
+- **Analyst**: `query:read, catalog:read, lineage:read`
+- **Approver**: `agent:approve, policy:review`
+- **Governance Admin**: `policy:*, residency:*, audit:read`
+- **Data Engineer**: `pipeline:*, catalog:write, connector:manage`
+- **Data Scientist**: `query:read, feature:write, notebook:run`
+- **Platform Admin**: `*:*` (unrestricted administration)
+- **Dashboard Viewer**: `dashboard:read` (read published dashboards only)
+
+Migration `0133_pages_per_role.sql` introduces four new read permissions (`assistant:use`,
+`ops:read`, `alert:read`, `governance:read`) and one new built-in role:
+
+1. **The added role: Assistant only**
+   - **ID:** `22222222-2222-4222-8222-000000000008`
+   - **Permissions:** `assistant:ask,dashboard:read`
+   - **Access:** Home (`/`), History (`/copilot/history`), Dashboards (`/dashboards`), and the Copilot dock.
+   - **Restrictions:** Operates in ask-only mode (`assistant:ask`). Can ask conversational questions and run read-only tools. Cannot perform write or mutate actions (`is_build = false`), cannot create charts or dashboards via tools, and cannot edit assets.
+
+2. **Existing roles upgrade (`role` table):**
+   Migration `0133_pages_per_role.sql` appends `,assistant:use,ops:read,alert:read,governance:read`
+   to all existing roles in the `role` table that do not hold wildcard permissions (`*:*`) and are
+   not `Dashboard Viewer` or `Assistant only`. This ensures existing roles retain access to pages
+   they previously used:
+
+| Role | Initial Permissions (`0002_seed_identity.sql`) | Added Permissions (`0133_pages_per_role.sql`) | Resulting Capabilities |
+| --- | --- | --- | --- |
+| `Analyst` | `query:read, catalog:read, lineage:read` | `assistant:use, ops:read, alert:read, governance:read` | Full Copilot, Query Studio, Catalog, Lineage, System status, Alerts, and Governance |
+| `Approver` | `agent:approve, policy:review` | `assistant:use, ops:read, alert:read, governance:read` | Full Copilot, Approvals, System status, Alerts, and Governance |
+| `Governance Admin` | `policy:*, residency:*, audit:read` | `assistant:use, ops:read, alert:read, governance:read` | Full Copilot, Policies, Data Quality, Audit, System status, Alerts |
+| `Data Engineer` | `pipeline:*, catalog:write, connector:manage` | `assistant:use, ops:read, alert:read, governance:read` | Full Copilot, Pipelines, Sources, System status, Alerts, Governance |
+| `Data Scientist` | `query:read, feature:write, notebook:run` | `assistant:use, ops:read, alert:read, governance:read` | Full Copilot, Query Studio, System status, Alerts, Governance |
+| `Platform Admin` | `*:*` | *(None)* | Unrestricted `*:*` platform administration |
+| `Dashboard Viewer` | `dashboard:read` | *(None)* | Retains `dashboard:read` only; assistant dock and operational pages hidden |
+
+Any custom roles created before the upgrade similarly have `assistant:use,ops:read,alert:read,governance:read` appended unless they held `*:*` or already held one of the four.
+
+Migration `0138_data_engineer_catalog_read.sql` adds `catalog:read` to the role named `Data Engineer` when it does not already hold it (or a wildcard that covers it), so the role that edits catalog entries can open the Catalog and a table's page (`GOV-11`). A renamed or custom role is not changed, and re-running the migration adds nothing.
+
+### How to take the assistant away from a role
+
+To revoke the AI Copilot assistant from any role, use **Administration → Roles**: edit the
+role and uncheck both:
+
+- `assistant:use` (Full interactive build and query assistant)
+- `assistant:ask` (Read-only conversational analytics assistant)
+
+**Effect on users with that role:**
+- The Copilot dock and composer toggle disappear entirely.
+- The Home (`/`) and History (`/copilot/history`) items are hidden in the sidebar.
+- Visiting `/` automatically redirects to the first available page (e.g. `/dashboards`).
+- Any direct API requests to `/api/ai/*` return `403 Forbidden`.
+
+## Limiting a role to some schemas or tables (`GOV-7`)
+
+Until `GOV-7`, a role that could read anything read every table. A role
+can now be limited to whole schemas or to single tables, and the limit
+holds everywhere data is read: Query Studio, dashboards, embeds and
+public links, alerts, reports, authored pipelines, Gold export, the
+assistant, the catalog and its search.
+
+**In the console.** Administration → Roles → the row's **⋮** → **Edit
+role** → *Tables this role can read*:
+
+- **All tables** (the default) leaves the role as it was.
+- **Only these** reads only what is ticked: a schema's **Whole schema**,
+  or, with the schema opened, individual tables. A table a pipeline has
+  not created yet is typed in as `schema.table`; the grant names it now
+  and starts covering it when the table appears.
+- **Save** writes the role, and writes its tables too only when the scope
+  or the ticked grants changed while the page was open. They are two
+  requests; if the second fails the page says the role was saved but its
+  tables were not, and stays open. An untouched section — and one whose
+  stored grants could not be loaded — sends no table-access request at all.
+- A role holding `*:*` cannot be narrowed: the section is disabled and
+  says why, and the API refuses the write with a 400 ("A role with full
+  access cannot be narrowed"), so an administrator cannot lock everyone
+  out by narrowing the role that administers the platform.
+- The Roles list shows **All tables**, or how many schemas and single
+  tables each role may read.
+
+**Create role** offers the same *Tables this role can read* section
+(`GOV-8`), so a role is narrowed as it is made instead of being opened a
+second time. A new role starts on **All tables**. **Create** sends the role
+first and its tables second, only when the section differs from All tables;
+a role whose permissions include `*:*` has the section disabled, as on Edit
+role, and sends no table-access request.
+
+If that second request fails, the role exists and reads every table, and the
+page opens the new role's Edit page with a notice saying the tables were not
+saved. The draft is not carried over: pick the tables again there and
+**Save**. The Create page offers no retry, because a second click would
+create another role or be refused for the name. A role that was just created
+is held by nobody, so nobody reads more than intended meanwhile.
+
+**Masks and row filters on a role.** Edit role lists the column masks and
+row filters that name the role, below the tables section, under *Masks and
+row filters on this role*. The list is read-only and names each rule's
+table (a link to its Access tab when the API resolved one), what it does and
+its status, so a draft rule does not read as enforced. The rules are still
+made, enforced, stopped and deleted on the table's **Access** tab; the list
+needs the permission `policy:read` and sends no request without it. A rule
+written as plain text is not listed: the engine skips it, so it names no
+role in a form the console can match.
+
+A **Bronze** table is listed by its registry table name under the schema
+`bronze` (`bronze.orders`), which is the key the rule compares. A dataset
+whose registry records no table name is not listed: nothing names a table
+a grant could match, so it stays hidden from a role limited to these
+tables, in that role's catalog lists and in its search.
+
+**From the API.** `identity:read` reads a role's access, `identity:write`
+changes it (Platform Admin holds both):
+
+```bash
+# What a role may read. An unnarrowed role answers {"scope":"all","grants":[]}.
+curl -sS "$LAKEHOUSE_URL/api/identity/roles/<role-id>/table-access" \
+  -b cookies.txt
+
+# Limit a role to the finance schema and one serving table.
+curl -sS -X PUT "$LAKEHOUSE_URL/api/identity/roles/<role-id>/table-access" \
+  -H 'content-type: application/json' -b cookies.txt \
+  -d '{"scope":"listed","grants":[{"schema":"finance","table":"*"},
+        {"schema":"serving","table":"daily_sales"}]}'
+
+# Back to every table. A scope of "all" stores no grants.
+curl -sS -X PUT "$LAKEHOUSE_URL/api/identity/roles/<role-id>/table-access" \
+  -H 'content-type: application/json' -b cookies.txt \
+  -d '{"scope":"all","grants":[]}'
+```
+
+The `PUT` replaces the whole set, not a delta: a grant left out is a
+grant the role no longer holds. Each name must be a plain identifier
+(letters, digits and underscores, not starting with a digit), and `*` is
+allowed only for the table part, meaning the whole schema. A name needs
+no table behind it yet. The change is audited as
+`identity.role.table_access.update`, naming the role and the scope and
+grants before and after.
+
+### Limits to tell a customer
+
+- **The default is every table.** An upgrade changes nobody's access: a
+  role nobody narrows reads every table, and so does a role created
+  after it.
+- **Several roles combine as a union**, and any one role on **All
+  tables** means all tables for that person.
+- **A table a person may not read is hidden entirely**, not shown as
+  forbidden: it is missing from every list, and a query naming it answers
+  the same "Table not found or not available to your organisation" as a
+  table that does not exist. Opening its address directly answers the
+  same 404.
+- **Names are compared without regard to case**, as column masks are.
+  `Finance.Orders` and `finance.orders` are one grant.
+- **The check is one database read per request.** It is not cached. On
+  the development measurement it cost about 3.4 ms at the median and 4.6
+  to 5.1 ms at p95 per governed read (unoptimised test build, 10 roles
+  and 200 grants); a release build was not measured.
+- **A run with no person behind it is not narrowed.** A service identity
+  reads what its scopes allow, and a scheduled agent run, Dagster's own
+  builds and its quality checks run as the system.
+- **Narrowing Dashboard Viewer narrows every embed and public link**,
+  because they read with that fixed role.
+- **A temporary access grant gives a permission, not a table**
+  (`DATA-15`). To give a narrowed person a table, add it to one of their
+  roles.
+- **A statement the server cannot resolve to concrete tables is refused**
+  for a narrowed role. `SHOW TABLES` and `SHOW DATABASES` answer "This
+  statement is not available to your organisation."; a `DESCRIBE` of a
+  table the role may not read, and a statement that reads only
+  `system.*` or `information_schema.*` tables, answer the same not-found
+  as a query on a hidden table. Table functions (`s3`, `url`, `remote`,
+  `file`, `iceberg`, …) are refused for every role, not only narrowed
+  ones.
+
+## Database roles (`SEC-78`)
+
+The console does not connect to its own Postgres database as a superuser.
+A superuser, or the owner of a table, can run
+`ALTER TABLE audit_event DISABLE TRIGGER` or
+`SET session_replication_role = replica` and change or delete the audit
+trail that `0142_audit_event_append_only.sql` makes append-only in the
+database itself. So the console runs as a second role that owns no table
+and is not a superuser, and the role that applies the schema keeps the
+owner's privileges:
+
+| Role | Who holds its password | What it may do |
+| --- | --- | --- |
+| the owner (`POSTGRES_USER`, default `lakehouse`) | `POSTGRES_PASSWORD`, held by `lakehouse-db-migrate`, Lakekeeper's and OpenFGA's own services (init, migrate and runtime — they dial their own databases), the backup job and the gate runners | everything: it applies the migrations and sets the runtime role up |
+| `lakehouse_app` | `LAKEHOUSE_DB_APP_PASSWORD`, held by `lakehouse-api`, `dagster-code-location` and the connectors that dial this database | read and write the console's tables in `public` and `bronze_meta`; nothing more |
+| `lakehouse_dagster` | `LAKEHOUSE_DB_DAGSTER_PASSWORD`, held by `dagster-db-init` (which sets it on every start), `dagster-code-location`, `dagster-webserver` and `dagster-daemon` | owns the `dagster` database and every object in it; nothing in the console's database (`SEC-78`, second change) |
+
+The one-shot `lakehouse-db-migrate` service runs `lakehouse-api migrate`
+with the owner's URL on every deploy, before `lakehouse-api` starts. It
+applies the migrations, then sets `lakehouse_app` up idempotently:
+`LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`,
+`CONNECT` on the database, `USAGE` on the `public` and `bronze_meta`
+schemas, the table, sequence and function grants in those schemas, the
+same grants as the owner's `ALTER DEFAULT PRIVILEGES` (so a table a later
+migration creates is covered without another grant), and the built-in
+`pg_monitor` role (read-only statistics — the queries that read this
+database as a source need them, and they cannot switch a trigger off).
+
+Two tables are narrower than those blanket grants, each matching what its
+own trigger already enforces: `audit_event` (`0142`) is append-only, and
+the role may `UPDATE` only its `run_id` and `approval_id` columns — that
+is what clearing a link through the foreign keys' `ON DELETE SET NULL`
+does; and `usage_rate` (`0148`) is append-only with no `UPDATE` at all.
+The role's grants and the triggers say the same thing.
+
+`lakehouse-api` connects as `lakehouse_app` (compose builds its
+`DATABASE_URL` from it) and refuses to start otherwise. At start it reads
+the migration bookkeeping and the role's attributes; if the schema is
+behind this build, or the role it connected as is a superuser or owns any
+table in `public` or `bronze_meta`, the process exits non-zero with
+
+> The console's database role must not be a superuser or own the tables;
+> see docs/OPERATIONS.md, 'Database roles'
+
+A deployment that overrides `DATABASE_URL` back to the owner therefore
+does not start (fail closed). A pending migration is refused too, with a
+message naming the `lakehouse-db-migrate` service.
+
+**Rotating the console's database password:** change
+`LAKEHOUSE_DB_APP_PASSWORD` in `.env`, run the migrate service once
+(`docker compose run --rm lakehouse-db-migrate` — it sets the role's
+password on every run), then restart `lakehouse-api`. `ops/init-env.sh`
+generates the role's password independently of `POSTGRES_PASSWORD`; keep
+the two different — they belong to two different roles.
+
+**Dagster's role** (`lakehouse_dagster`, `SEC-78`, second change) owns the
+`dagster` database, and nothing in the console's database. The one-shot
+`dagster-db-init` service creates the role and sets its password on every
+`dagster` start, creates the database owned by the role if it is missing,
+and hands an existing `dagster` database (one a superuser owns, from
+before this change) and every object in it to the role. Objects are
+re-owned one by one: `REASSIGN OWNED` would also move objects of the
+console's database. To rotate Dagster's password: change
+`LAKEHOUSE_DB_DAGSTER_PASSWORD` in `.env`, run `dagster-db-init` again, then
+restart the three Dagster services.
+
+**The migrate owner must be a superuser.** The migrate service sets the
+console role's password inside a transaction with `log_statement` and
+`log_min_error_statement` switched off, so the plain password is not written
+to the server log. Those settings need a superuser. The owner is the image's
+`POSTGRES_USER`, which is one. A managed Postgres whose owner is not a
+superuser is not supported today: setup fails closed there, and the
+`dagster-db-init` service does the same.
+
+### What each job runs against this database
+
+Every query a job runs against the console's database, and the grant of
+`lakehouse_app` that covers it:
+
+| Job | What it runs against this database | Covered by |
+| --- | --- | --- |
+| `replication_slot_check_job` (`dagster/dispar_orchestrate/replication_metrics.py:349-355`) | one read of `pg_replication_slots` for the logical slots, plus `pg_wal_lsn_diff(pg_current_wal_lsn(), …)` | the `pg_monitor` grant; reading the view needs no `REPLICATION` attribute |
+| `cdc_apply_job` (`dagster/dispar_orchestrate/cdc_apply.py`) | nothing: it reads Kafka and the API over HTTP and writes Iceberg through Lakekeeper — logical replication lives on the connector's source database, not here | — |
+| the maintenance job (`dagster/dispar_orchestrate/maintenance.py`) | nothing: it works on ClickHouse, Trino and Lakekeeper | — |
+| the bronze ingest path (`dagster/dispar_orchestrate/dlt_pipeline.py:239-353`) | runs the dlt `sql_database` source, which reflects `information_schema` and reads the source table with `SELECT` | the schema and table grants |
+| the seeded connector's probe and discovery (`rust/crates/lakehouse-api/src/routes/connectors.rs`, `rust/crates/lakehouse-api/src/connector_probe.rs`, `rust/crates/lakehouse-api/src/connector_discover.rs`) | the probe runs `SELECT 1`; discovery reads `information_schema` only | `CONNECT` and the schema grants |
+| deprovisioning a CDC connector whose source is this database (`rust/crates/lakehouse-api/src/connector_deprovision.rs:332-447`) | drops the publication and the replication slot and terminates the backends consuming them | nothing, on purpose: it needs `REPLICATION`, publication ownership or `pg_signal_backend`, which the role has not — the limit below |
+
+Known limits, stated so nobody has to find them in a failed job:
+
+- A CDC connector whose SOURCE is the console's own database cannot be
+  deprovisioned by the console — the last row of the table above names
+  what it would need. No seeded connector does this today
+  (`conn-pg-lakehouse` is `adapter='sql'`).
+- The role's grants cover `public` and `bronze_meta` only. A schema
+  something else creates must be granted to the role by whoever creates
+  it: in this repository, the `g3a-source-init` gate fixture grants
+  `lakehouse_app` on `ingest_demo`, and the g6 scale-test script grants it
+  on its own schema. A connector pointed at a schema nobody granted the
+  role sees no tables in it.
+
 ## Postgres: unreachable is loud, a mismatched schema refuses to start
 
 `lakehouse_store::connect_lazy` never does network I/O at startup, so a
@@ -1297,26 +1669,34 @@ overview, query, storage) do not touch Postgres, and an unreachable
 database must not take the whole console down — but makes it loud, and
 draws one hard line:
 
-- **The database is reachable but the migrations fail** (a `_sqlx_migrations`
-  row this build does not have or has changed, a failed statement):
-  `lakehouse-api` **refuses to start** and exits non-zero, logging the
-  migration error and the line `the application database is not at this
-  build's schema version`. Compose restarts it and it says the same thing
-  every time. This is deliberate: before `OPS-4` the API started anyway,
-  sqlx stopped at the first mismatch, and every newer route answered
-  `500` while the process looked healthy (PRs #106 and #199). The fix for
-  a real mismatch is to run the matching migrations, not to restart until
-  it works.
+- **The database is reachable but the schema is not this build's version**
+  (a migration this build embeds is not recorded in `_sqlx_migrations`, or
+  the bookkeeping table cannot be read): `lakehouse-api` **refuses to
+  start** and exits non-zero, logging what is pending and the line
+  `the application database is not at this build's schema version; run
+  the lakehouse-db-migrate service before lakehouse-api`. Compose
+  restarts it and it says the same thing every time. This is deliberate:
+  before `OPS-4` the API started anyway, sqlx stopped at the first
+  mismatch, and every newer route answered `500` while the process looked
+  healthy (PRs #106 and #199). The API does not apply the migrations any
+  more (`SEC-78`) — the fix for a real mismatch is to run the
+  `lakehouse-db-migrate` service, not to restart until it works.
 - **The database cannot be reached at all** (connection refused, a
   timeout, a closed pool): the API serves the Phase 1 routes and logs an
-  `error!` at start and again every 60 s until a connection succeeds, at
-  which point the migrations apply and the retries stop. `GET /health`
-  reports `"database": "unavailable"` meanwhile (see "Healthcheck"
-  above). If the database becomes reachable later with a schema that
+  `error!` at start and again every 60 s until a connection succeeds. The
+  retry loop re-checks the schema the same read-only way, never applies a
+  migration; if the database becomes reachable later with a schema that
   still does not match this build, the retry loop logs the same
   schema-mismatch line once and stops — a mismatch does not heal by
   waiting, and a background task cannot un-start a process that is
-  already serving.
+  already serving. `GET /health` reports `"database": "unavailable"`
+  meanwhile (see "Healthcheck" above).
+- **The role the API connected as is a superuser or owns a table**
+  (`SEC-78`): the API refuses to start, non-zero exit, with the fixed
+  sentence quoted under "Database roles" above. A superuser or a table
+  owner can switch off the audit trail's append-only triggers, so the
+  console never serves as one — a deployment that points `DATABASE_URL`
+  back at the owner does not start, by design.
 - **No pool at all** (`DATABASE_URL` is not a parsable Postgres URL):
   every Phase 2 route answers `503`, `/health` says the database is
   unavailable, and the log carries the reason.
@@ -1517,13 +1897,13 @@ immediately.
 | Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay; for a relay behind a private CA, set `SMTP_CA_FILE` as well (see "Email through an internal relay" above) |
 | Scheduled reports by email (`RPT-1`) | SMTP, plus `RENDER_TOKEN_SECRET` for PDF attachments | A subscription can be saved but nothing is sent | Set `SMTP_HOST` (and friends) and `CONSOLE_PUBLIC_URL` (the link in the email) |
 | Signed dashboard embeds | `EMBED_SECRET` | `POST /api/embed/data` answers `503` "embedding is not configured"; the Share dialog says so | Set `EMBED_SECRET` (see "Signed dashboard embeds (`SEC-12`)") |
-| SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (and, for the browser flow, the four URLs); `OIDC_JWKS_URL` is optional — see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
+| SSO / OIDC login | An OIDC provider | Local password auth only | Set in **Settings → Sign-in** (by a Platform Admin, no restart needed) or set `OIDC_ISSUER` + `OIDC_CLIENT_ID` in `.env` (and, for the browser flow, the four URLs) — see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
 
 ## Login throttling and session cleanup
 
-`POST /api/auth/login` is throttled per email. After
+`POST /api/auth/login` is throttled per identifier (username or email). After
 `LOGIN_MAX_FAILURES` failures (default 5) inside a
-`LOGIN_FAILURE_WINDOW_SECS` rolling window (default 900 s), that email is
+`LOGIN_FAILURE_WINDOW_SECS` rolling window (default 900 s), that identifier is
 locked out for `LOGIN_LOCKOUT_SECS` (default 300 s); every further attempt
 gets `429` with a `Retry-After` header, regardless of whether the password
 is right, and regardless of whether the account exists. A failed attempt
@@ -1538,8 +1918,8 @@ fail boot and never disable the feature.
 
 Notes an operator should know:
 
-- The throttle key is a SHA-256 of the trimmed, lower-cased email — the
-  API never stores raw addresses in `login_throttle`. The account lookup
+- The throttle key is a SHA-256 of the trimmed, lower-cased identifier
+  (username or email) — the API never stores raw credentials in `login_throttle`. The account lookup
   itself is case-sensitive (`WHERE u.email = $1`), so two spellings that
   differ only by case are different accounts but one throttle key.
 - A successful login clears the failure count for that email, and a
@@ -1664,7 +2044,42 @@ client also sets `OIDC_CLIENT_SECRET`.
 | `OIDC_GROUPS_CLAIM` | no | `groups` | Which token claim carries the caller's groups. |
 | `OIDC_ROLE_MAP` | no | empty | `group=Role Name,...`; a group not named here is ignored. |
 | `OIDC_JIT_PROVISIONING` | no | `false` | Exactly the string `true` (not `TRUE`/`1`/`yes`) creates an `app_user` on first sign-in. |
+| `OIDC_TRUST_EMAIL` | no | `false` | Exactly the string `true` joins an existing account by email even when the token does not carry `email_verified: true` (`SEC-65`). Only for a provider that never sends the claim; check yours with the test sign-in. |
 | `OIDC_CLOCK_SKEW_SECONDS` | no | `60` | Leeway on `exp`/`nbf`; an unparseable value falls back to `60` instead of failing boot. |
+| `OIDC_POST_LOGOUT_REDIRECT_URI` | no | unset | Where the provider sends the browser back to after the sign-out ends the provider's session too. Must be registered with the provider as a valid post-logout redirect URI, or the provider refuses the logout. Unset (the default): the sign-out ends this deployment's session only. |
+| `OIDC_PROMPT` | no | `login` | The `prompt` the browser sign-in sends the provider (`login`, `consent`, `select_account`). `login` makes the provider show its **login form** on every sign-in, so the person at the keyboard picks the account. `off` sends no prompt at all and the provider reuses the session it already holds for that browser — see "Sign out, then sign in again" below. An empty value is the default. |
+
+**Sign out, then sign in again.** Two things have to end for the next
+sign-in to be a fresh one, and this deployment ends both:
+
+1. **This deployment's session.** The sign-out revokes it and clears the
+   cookie (`routes/auth.rs`'s `logout`).
+2. **The provider's session.** The provider holds one too, for that
+   browser, and it is what a sign-in is answered from when the browser
+   still has it — which is why "sign out, then sign in" used to land on
+   whoever used that machine last. The sign-out therefore sends the browser
+   to the provider's own logout address as well
+   (`end_session_endpoint`, read from the provider's discovery document),
+   and the provider ends its session and sends the browser back to
+   `OIDC_POST_LOGOUT_REDIRECT_URI`. For a connection set in the
+   environment, which reads no discovery document for its addresses, the
+   sign-out reads it when it needs the logout address, waiting at most 5
+   seconds; a provider that does not answer then keeps its own session,
+   and this deployment's session ends regardless.
+
+The second one needs that address registered with the provider as a valid
+post-logout redirect URI (Keycloak: the client's **Valid post logout
+redirect URIs**); without it the provider refuses the logout, so the
+deployment does not send the browser there at all.
+
+With the provider's session gone, the next sign-in shows the provider's
+**login form** with the username field again — the account is the person's
+choice, every time. `OIDC_PROMPT=login` (the default) makes the provider
+ask again even when its session is still there; `OIDC_PROMPT=off` sends no
+prompt at all and lets the provider reuse its own session, which is the
+comfortable behaviour on a private machine and the surprising one on a
+shared one. An empty value is the default, not an opt-out: compose always
+passes the variable, so "empty" cannot mean "the operator said nothing".
 
 **Where the signing keys come from.** With `OIDC_JWKS_URL` unset, the API
 reads the provider's discovery document
@@ -1679,6 +2094,107 @@ otherwise every token is refused with the same generic 401 and a `warn` line
 names the failed check. Set `OIDC_JWKS_URL` to skip discovery entirely, for
 a provider that publishes no discovery document or one this deployment
 cannot reach.
+
+### Setting up single sign-on in Settings
+
+Platform Admins can configure OIDC single sign-on directly from the console under **Settings → Sign-in** without restarting the API service. The configuration takes effect immediately upon saving.
+
+**Set `CONSOLE_PUBLIC_URL` first.** A sign-in has to return the person to
+this deployment, so the callback address is
+`<CONSOLE_PUBLIC_URL>/api/auth/oidc/callback` (the API's own configuration,
+never a request header). `OIDC_REDIRECT_URI` still wins when it is set. With
+neither set, the connection cannot be used: **Settings → Sign-in** shows
+`ready: false` with the sentence "Set CONSOLE_PUBLIC_URL …", and the sign-in
+page shows no SSO button. Saving still works, so an administrator can fill the
+form first and set the address afterwards.
+
+**The addresses come from the provider's discovery document.** A connection
+saved in Settings stores only the issuer, the client ID and the secret. The
+authorize address, the token address and the key set are read from
+`<issuer>/.well-known/openid-configuration` (`authorization_endpoint`,
+`token_endpoint`, `jwks_uri`) the first time the connection is used, and cached
+with the settings. Each of them must be an `https://` address outside this
+deployment's network, checked the same way the issuer is; one that is not
+leaves the connection "not ready" and nothing is sent to it. A value set in
+`.env` (`OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, `OIDC_JWKS_URL`,
+`OIDC_REDIRECT_URI`) still wins per value and shows as "Set by the server".
+
+The settings form provides:
+- **Issuer URL**: The base URL of the OIDC provider (must be a valid `https://` endpoint).
+- **Client ID**: The OIDC client identifier.
+- **Client secret**: Stored securely as a sealed secret in the database and never returned over the wire; can be replaced or cleared.
+- **Provider display name**: Optional friendly name shown on the sign-in button (defaults to `default`).
+- **Groups claim**: The claim key in the ID token that carries groups (defaults to `groups`).
+- **Just-in-time provisioning**: When enabled, creates local user accounts automatically upon first successful sign-in.
+- **Trust this provider's emails**: Off by default. When on, a first sign-in joins an existing account by email even though the provider did not confirm the address (`SEC-65`, below). Read-only when `OIDC_TRUST_EMAIL` is set in the environment.
+- **Role mapping**: Maps external IdP group names to local deployment roles (`admin`, `developer`, `viewer`, etc.).
+
+#### Joining an existing account: a confirmed email is required
+
+When single sign-on creates an account (just-in-time provisioning on) and
+the token carries an email, the API joins it to an existing local account
+with that address only when the provider confirmed the address: the ID
+token must carry `email_verified: true` (backlog `SEC-65`; OpenID Connect
+Core 1.0 section 5.1). A missing claim and `false` mean the same thing — not
+confirmed — because a provider that lets people type any address would
+otherwise let them sign in as an existing Lakehouse user, a Platform Admin
+included.
+
+- **Not confirmed, an account has that address:** the sign-in is refused.
+  Nothing is created and the existing account's row is not changed. The
+  person is sent back to the sign-in page with "Your identity provider did
+  not confirm your email address, so this sign-in cannot be joined to your
+  existing account. Ask an administrator.", and the Audit Log gains
+  `auth.oidc.link_refused` (outcome `refused`) with the provider label and
+  the subject — never the email.
+- **Not confirmed, no account has that address:** a new account is created
+  **without** the email. The unconfirmed address is not stored and is not
+  used as the display name; the username falls back to
+  `preferred_username`, else `sub@<provider>`.
+- **Confirmed, an account has that address:** joined, exactly as before.
+- **A deactivated account** answers as it did before this change (`ADM-4`):
+  the generic credentials refusal, whether the email was confirmed or not.
+- **Someone already joined** (an `auth_identity` row exists for this
+  provider and subject) signs in as before; the rule only decides a *new*
+  join, by email.
+
+**Trusting a provider's emails (`OIDC_TRUST_EMAIL`, default off).** Some
+providers do not send `email_verified`. This document does not claim which
+ones: use **Test sign-in** (Settings → Sign-in), which shows `Email
+verified: Yes`, `No` or `Not reported` for a real token from your provider.
+If it is not `Yes` and those people must reach existing accounts, turn on
+**Trust this provider's emails** in Settings → Sign-in, or set
+`OIDC_TRUST_EMAIL=true` in `.env`. It is one switch for the deployment's one
+provider, off by default; a value in the environment owns it and the console
+shows it read-only. Turning it on says "whatever address this provider
+reports is this person's address", so turn it on only for a provider whose
+accounts you trust to hold the right one. Every change is recorded by the
+existing `settings.sso.update` audit row, naming the field.
+
+**On upgrade.** A first sign-in through single sign-on is no longer joined
+to an existing account unless the provider confirms the email or the switch
+is on. People already joined are unaffected. After the upgrade, check the
+Audit Log for `auth.oidc.link_refused`.
+
+**Testing sign-in.** The **Test sign-in** button tests the current draft settings before saving:
+- It launches an authorization-code flow in a new browser window, using the draft's own discovery document for the authorize, token and key-set addresses — never the saved connection's.
+- Upon completion, the IdP redirects back to the deployment's callback, which validates the token claims and role mapping without creating a user, session, or login audit row.
+- A result card displays the returned subject, email, whether the provider verified that email, extracted groups, mapped roles and whether the groups claim was replaced by an overage marker, or any classified error (for example, "The provider refused the client ID or secret", or "The identity provider could not be reached").
+- A run uses only the client secret sealed into it when it was created; it never falls back to `OIDC_CLIENT_SECRET`.
+
+#### Environment variable precedence (`.env` wins)
+
+Settings defined in the environment (`/opt/rantai-lakehouse/.env`) take precedence over values saved in the console:
+- **Connection as a unit**: If `OIDC_ISSUER` or `OIDC_CLIENT_ID` is set in the environment, the connection parameters (`issuer`, `client ID`, `client secret`, `authorize URL`, `token URL`, `JWKS URL`, and `redirect URI`) are server-owned and become read-only in the console with the label "Set by the server". The server refuses updates to any server-owned field with HTTP 409 (`SET_BY_THE_SERVER`).
+- **Individual settings**: `OIDC_PROVIDER_NAME`, `OIDC_GROUPS_CLAIM`, `OIDC_ROLE_MAP`, `OIDC_JIT_PROVISIONING` and `OIDC_TRUST_EMAIL` are server-owned only if their specific environment variable is set.
+
+#### Internal IdP via `.env`
+
+For security, the console restricts `Issuer URL` to public `https://` endpoints that resolve outside private network IP ranges (SSRF protection). If you run an internal or development identity provider (such as Keycloak inside the Docker compose network or a private IdP reachable only via HTTP or internal IP), configure it in `/opt/rantai-lakehouse/.env`:
+- Set `OIDC_ISSUER` (and endpoints such as `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, and `OIDC_JWKS_URL`) in `.env`.
+- Ensure `CONNECTOR_INTERNAL_HOSTS` includes the host name or IP of the internal IdP so the API's SSRF probe permits connections to it.
+
+The staging deployment does exactly this — see "Keycloak on the staging deployment" below.
 
 ### Keycloak
 
@@ -1720,6 +2236,114 @@ docker compose -p sso -f docker-compose.yml \
 docker compose -p sso -f docker-compose.yml \
   -f ops/sso/docker-compose.keycloak.override.yml --profile sso down -v
 ```
+
+#### Keycloak on the staging deployment
+
+The staging deployment signs people in through its **own** Keycloak, started
+by the same deploy that starts the rest of the stack:
+`ops/sso/docker-compose.staging-keycloak.override.yml` (profile `sso`) adds
+the provider, a one-shot database initialiser and a one-shot realm renderer
+next to the base `docker-compose.yml`. It is a second override file on
+purpose: the gate's own override (above) is a CI-only stack that publishes no
+host port and runs `start-dev` with an in-container H2 database, and the two
+contexts want opposite things.
+
+The staging provider differs from the gate's in four ways, and each is a
+decision, not an accident:
+
+| | Gate (`ops/sso/docker-compose.keycloak.override.yml`) | Staging (`ops/sso/docker-compose.staging-keycloak.override.yml`) |
+| --- | --- | --- |
+| Address | `http://keycloak:8080`, in the compose network only | a published host port, so a browser can reach it |
+| Database | in-container H2 (`start-dev`) | its own database on the `postgres` service (`start`) |
+| Realm | `ops/sso/realm.template.json`, `ops/sso/render_realm.py` | `ops/sso/staging-realm.template.json`, `ops/sso/render_staging_realm.py` |
+| Image | `quay.io/keycloak/keycloak:26.8.1` (pinned by digest) | the same image, the same pin |
+
+**Where the address comes from.** It is this deployment's own address, so it
+is not in the repository (`AGENTS.md` rule 12). The `staging` environment
+carries two variables (Settings → Environments → staging → Configuration
+variables):
+
+| Variable | What it is |
+| --- | --- |
+| `SSO_PUBLIC_BASE_URL` | the address the browser reaches the provider on, e.g. `http://<host>:<port>` |
+| `SSO_CONSOLE_URL` | the address of the console the browser comes back to; defaults to `SSO_PUBLIC_BASE_URL` |
+| `SSO_REALM` | the realm's name; defaults to `lakehouse` |
+
+The deploy workflow turns them into the whole connection and writes it into
+`.env`:
+
+| Setting | Value on staging |
+| --- | --- |
+| `OIDC_ISSUER` | `{SSO_PUBLIC_BASE_URL}/realms/{SSO_REALM}` |
+| `OIDC_CLIENT_ID` | `lakehouse` |
+| `OIDC_CLIENT_SECRET` | the `STAGING_OIDC_CLIENT_SECRET` repository secret |
+| `OIDC_AUTHORIZE_URL` / `OIDC_TOKEN_URL` | `{OIDC_ISSUER}/protocol/openid-connect/{auth,token}` |
+| `OIDC_JWKS_URL` | `{OIDC_ISSUER}/protocol/openid-connect/certs` (not `{issuer}/.well-known/jwks.json` — Keycloak publishes its keys here) |
+| `OIDC_REDIRECT_URI` | `{SSO_CONSOLE_URL}/api/auth/oidc/callback` |
+| `OIDC_PROVIDER_NAME` | `keycloak` |
+| `OIDC_GROUPS_CLAIM` | `groups` |
+| `OIDC_ROLE_MAP` | `analysts=Analyst,lakehouse-admins=Platform Admin` |
+| `OIDC_JIT_PROVISIONING` | `true` |
+| `OIDC_TRUST_EMAIL` | `false` |
+
+The credentials — the provider's bootstrap admin password, the confidential
+client's secret and the three test users' passwords — are repository secrets
+named `STAGING_KEYCLOAK_ADMIN_PASSWORD`, `STAGING_OIDC_CLIENT_SECRET` and
+`STAGING_SSO_USER_{A,B,C}_PASSWORD`. The secret the realm imports and the
+secret the API sends are the same value; the realm renderer
+(`ops/sso/render_staging_realm.py`) writes it into the realm file and fails
+closed when it is missing.
+
+**The callback returns to the console, not to the API.** The session cookie
+is set on the origin the browser signed in on, so the callback address is
+the console's own address; the console proxies `/api/*` to the API
+(`next.config.ts`'s rewrites), so the API receives the callback on the same
+origin the person came from. A callback pointing at the API's own address
+would set the cookie on a different origin, and the sign-in would end at a
+logged-out console.
+
+**The login button is a build-time flag.** The console renders "Continue with
+SSO" only when `NEXT_PUBLIC_SSO_ENABLED=true` was baked into the bundle
+(`src/features/auth/login-page.tsx`), so the staging deploy builds the
+frontend with that flag. Without it the backend is ready and the UI shows
+nothing — a build-time split, not a runtime one; "SSO is gated by a
+build-time flag" in `docs/KNOWN-LIMITATIONS.md` says why.
+
+**The realm.** `ops/sso/staging-realm.template.json` holds the realm with
+the client secret, the users' passwords and the callback address left empty;
+the renderer fills them in before the provider starts. The realm has the
+confidential client `lakehouse`, the groups `analysts` and
+`lakehouse-admins`, and three users — one in `analysts`, one in
+`lakehouse-admins`, one in no group (the case that must end with no
+permissions at all). The groups reach the token as bare names because the
+realm's mapper runs with `full.path=false`.
+
+**Verifying it.** Sign in through the console and read `GET /api/auth/me`:
+a user in `analysts` gets the Analyst role's permissions, a user in
+`lakehouse-admins` gets the admin wildcard, and a user in no group gets
+none. The provider's own admin console is at `{SSO_PUBLIC_BASE_URL}/admin`,
+with the bootstrap admin from the repository secret.
+
+**Limits, honestly.** The provider speaks plain HTTP on the office LAN
+(`KC_HTTP_ENABLED`), because the staging deployment has no TLS terminator;
+its issuer is therefore an `http://` address, which is exactly why the
+connection lives in `.env` and not in the console's own SSO form (the form
+refuses an issuer that is not `https://` or that resolves inside the
+deployment's network). The provider's admin console is reachable from the
+LAN. `--import-realm` only fills an **empty** realm, so a realm an
+administrator has changed is not overwritten by a later deploy — but a
+realm that is deleted is re-imported. Changing `SSO_PUBLIC_BASE_URL` breaks
+every sign-in until the provider's own hostname, the issuer and the
+registered callback move together, which is one deploy's work: change the
+variable, redeploy, and the realm is imported into a fresh database.
+
+**Rotating a credential needs two changes.** The imported realm is not
+overwritten by a later deploy, so a new `STAGING_OIDC_CLIENT_SECRET` (or a
+new test user's password) reaches the API but **not** the provider: the
+client's secret in the provider's admin console has to be changed as well,
+or the realm's database dropped so the next start imports it again. A
+deployment whose secret and its realm disagree fails at the token exchange
+("invalid_client"), not at the login form.
 
 ### Microsoft Entra ID
 
@@ -2139,14 +2763,45 @@ shows the gate's 404. With the setting set, the members of that tenant
 read the shared catalog as before, and the other tenants read only their
 own uploads. A **single-tenant** deployment is unaffected either way.
 
+### How an authored pipeline gets its SQL (`BLD-1` part 1)
+
+The orchestrator no longer builds a pipeline's statement. On a run it posts
+neither SQL nor a body to `POST /api/pipelines/runnable/{id}/compile`, and
+the API compiles the stored definition (its named inputs and steps) and
+rewrites the result as the pipeline's author — the same masking and row
+filters every other surface gets. The answer is
+`{"sql": "...", "readsIceberg": <bool>}`; `readsIceberg` is true exactly
+when an input is Bronze, and the orchestrator attaches
+`allow_database_iceberg = 1` to every statement that reads it.
+
+The answer says which of these it is, and the orchestrator treats all three
+as final (no retry):
+
+| Status | Meaning | Message |
+| --- | --- | --- |
+| 409 | no author, an author who is no longer active, or a pipeline with no tenant | a fixed sentence saying which |
+| 404 | a table whose roles do not include it (`GOV-7`) — the same answer Query Studio gives | the SEC-20 sentence |
+| 422 | the stored definition no longer compiles, or the rewrite refused it | starts with `inputs[i]: ` or `steps[i]: ` — the item at fault — then fixed text |
+
+A 422 is also what a **save** or a **restore** answers for the same reasons,
+with the same `inputs[i]`/`steps[i]` prefix, so a definition that could never
+run is refused where a person can fix it. An outage at save keeps its own
+status (a 503 or 500), never a 422.
+
+`ICEBERG_QUERY_DB` must be set on `lakehouse-api`: compiling a Bronze input
+names the catalog database through it, and a deployment without it refuses a
+Bronze pipeline when it is saved. The orchestrator (`dagster-code-location`)
+no longer needs the variable — it runs the statement the API returns and
+attaches `allow_database_iceberg` from the answer's `readsIceberg`.
+
 ### Authored pipelines with no tenant (`SEC-50`)
 
 Migration `0042_tenant_provisioning.sql` added `tenant_id` to
 `pipeline_definition` and **backfilled nothing**: every pipeline created
 before that migration has a NULL tenant, and so has every pipeline an
 operator created without a tenant. `SEC-50` refuses such a pipeline — its
-enforce call (`POST /api/pipelines/runnable/{id}/enforce`, the one the
-orchestrator makes) answers **409** with:
+compile call (`POST /api/pipelines/runnable/{id}/compile`, the one the
+orchestrator makes to get the SQL it runs) answers **409** with:
 
 ```
 This pipeline belongs to no tenant. An administrator assigns one with PUT /api/pipelines/{id}/tenant.
@@ -2283,6 +2938,18 @@ catalog = load_catalog(
 )
 table = catalog.load_table(("gold", "gold_export_smoke"))
 print(table.scan().to_arrow().num_rows)
+```
+
+Reading `gold.<table>` WITHOUT a filter counts every kept copy — the
+table holds one full copy per publish and `DATA-2`'s trim keeps the
+newest 7 — so a tool that just counts rows sees seven times the truth.
+`DATA-6` added the latest-copy table for exactly that reader:
+`gold.<table>_latest` always holds only the newest copy, so it needs no
+filter:
+
+```python
+table = catalog.load_table(("gold", "gold_export_smoke_latest"))
+print(table.scan().to_arrow().num_rows)  # one copy, no filter needed
 ```
 
 **DuckDB.** The `iceberg` extension attaches the REST catalog as a

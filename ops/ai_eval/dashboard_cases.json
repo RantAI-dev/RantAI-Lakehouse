@@ -69,6 +69,19 @@
     ]
   },
   {
+    "id": "chart_top_n_breakdown_over_time",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "src", "method": "POST", "path": "/api/dashboard/sources", "body": {"title": "Eval Visitors Top Regions", "sql": "SELECT makeDate(tahun, bulan_no, 1) AS bulan, negara, kawasan, jumlah FROM serving.mart_wisman"}, "id_at": "source.id"}
+    ],
+    "turns": ["Draw a line chart of foreign visitors per month from the saved source \"Eval Visitors Top Regions\", one line per region (kawasan), top 3 regions only."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"sqlSource": "{src}", "grain": "month", "breakdown": "kawasan", "limit": 3}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "line", "def.grain": "month", "def.breakdown": "kawasan", "def.limit": 3}, "count": 1}
+    ]
+  },
+  {
     "id": "chart_quarterly_id",
     "mode": "build",
     "lang": "id",
@@ -143,6 +156,20 @@
     "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "pivot"}},
     "expect_state": [
       {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "pivot", "def.rows": "tahun", "def.columns": "bulan_no", "def.totals": "grand"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_to_pivot_with_totals",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Pivot Totals Board"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Pivot Totals", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "turns": ["Show chart {chart} as a pivot table with totals."],
+    "expect_tool": {"name": "update_chart", "args_contains": {"kind": "pivot"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "kind": "pivot"}, "count": 1}
     ]
   },
   {
@@ -403,6 +430,25 @@
     ]
   },
   {
+    "id": "board_move_tile_to_top",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Move To Top Board"}, "id_at": "board.id"},
+      {"method": "PUT", "path": "/api/dashboard/boards", "body": {"id": "{board}", "tabs": [{"id": "t_top", "title": "Top"}]}},
+      {"name": "chart_a", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Top Alpha", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"},
+      {"name": "chart_b", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Top Beta", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"},
+      {"name": "chart_c", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Top Gamma", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "turns": ["Move chart {chart_c} to the top left of dashboard {board}."],
+    "expect_tool": {"name": "arrange_board", "args_contains": {"board": "{board}"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "layout.{chart_c}.y": 0}, "count": 1},
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "layout.{chart_a}.y": 0}, "count": 0},
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "layout.{chart_b}.y": 0}, "count": 0}
+    ]
+  },
+  {
     "id": "chart_move",
     "mode": "build",
     "confirm": true,
@@ -446,12 +492,29 @@
     ]
   },
   {
+    "id": "view_filter_two_values_build",
+    "mode": "build",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval View Two Values"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval View Two Values Chart", "kind": "kpi", "mart": "mart_wisman", "measures": ["jumlah"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "context": "The user is viewing the dashboard \"Eval View Two Values\" (board id: {board}). Time grain: each chart's own. Active filters: none. Tiles and the data they currently show (built-in tiles are not editable):\n- \"Eval View Two Values Chart\" (kpi, id {chart}; mart_wisman): not loaded",
+    "turns": ["Show only 2024 and only Malaysia."],
+    "expect_tool": {"name": "set_board_view_filters", "args_contains": {"board": "{board}", "filters": "tahun"}},
+    "expect_no_tool": ["create_chart"],
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "filters[].column": "tahun"}, "count": 0},
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"board": "{board}"}, "count": 1}
+    ]
+  },
+  {
     "id": "save_filters_only_when_asked",
     "modes": ["ask", "build"],
     "confirm": true,
     "setup": [
       {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Save Filters"}, "id_at": "board.id"}
     ],
+    "context": "The user is viewing the dashboard \"Eval Save Filters\" (board id: {board}). Time grain: each chart's own. Active filters: none. Tiles and the data they currently show (built-in tiles are not editable):\nnone yet",
     "turns": [
       "Show me 2024 only.",
       "Save this filter as the default for everyone."
@@ -562,13 +625,15 @@
     "confirm": true,
     "setup": [
       {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Map Tab Board"}, "id_at": "board.id"},
-      {"name": "map_chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Provinces Map", "kind": "geomap", "mart": "mart_kuliner", "dimension": "wilayah", "measures": ["jumlah_usaha"], "map": "id-provinces", "board": "{board}"}, "id_at": "chart.id"}
+      {"name": "map_chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Provinces Map", "kind": "geomap", "mart": "mart_kuliner", "dimension": "wilayah", "measures": ["jumlah_usaha"], "map": "id-provinces", "board": "{board}"}, "id_at": "chart.id"},
+      {"name": "other_chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Businesses Per Province", "kind": "bar", "mart": "mart_kuliner", "dimension": "wilayah", "measures": ["jumlah_usaha"], "board": "{board}"}, "id_at": "chart.id"}
     ],
     "turns": ["Put the map charts in a separate tab called Maps on dashboard {board}."],
     "expect_tool": {"name": "move_charts_to_tab", "args_contains": {"board": "{board}", "chartIds": "{map_chart}"}},
     "expect_state": [
       {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Maps"}, "count": 1},
-      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}"}, "tile_on_tab": {"chart": "{map_chart}", "tab_title": "Maps"}, "count": 1}
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}"}, "tile_on_tab": {"chart": "{map_chart}", "tab_title": "Maps"}, "count": 1},
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}"}, "tile_on_tab": {"chart": "{other_chart}", "tab_title": "Maps"}, "count": 0}
     ]
   },
   {
@@ -583,6 +648,34 @@
     "expect_state": [
       {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "def.referenceLines[].value": 1000, "def.format.style": "currency", "def.format.currency": "IDR"}, "count": 1}
     ]
+  },
+  {
+    "id": "dash_target_parameter_line",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "eval_target", "method": "POST", "path": "/api/dashboard/params", "body": {"name": "eval_target", "label": "Eval target", "type": "number", "default": 20000}, "id_at": "param.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Parameter Target", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"], "referenceLines": [{"value": {"param": "eval_target"}, "label": "Target"}]}, "id_at": "chart.id"}
+    ],
+    "turns": ["Add a target line at 20,000 on chart {chart}."],
+    "expect_tool": {"name": "format_chart", "args_contains": {"chart": "{chart}"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "def.referenceLines[].value.param": "eval_target"}, "count": 1},
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "def.referenceLines[].value": 20000}, "count": 1}
+    ],
+    "cleanup": [
+      {"method": "DELETE", "path": "/api/dashboard/params?id={eval_target}"}
+    ]
+  },
+  {
+    "id": "report_to_colleague",
+    "mode": "build",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Report Board"}, "id_at": "board.id"},
+      {"name": "colleague_name", "method": "POST", "path": "/api/identity/users", "body": {"name": "Eval Colleague", "username": "eval_colleague_{run_id}", "email": "eval.colleague.{run_id}@example.com", "roles": [], "tenants": []}, "id_at": "name"}
+    ],
+    "turns": ["Send dashboard {board} every Monday at 08:00 as a PDF to {colleague_name}."],
+    "expect_tool": {"name": "find_report_recipients"}
   },
   {
     "id": "dash_set_dashboard_theme",
@@ -932,5 +1025,51 @@
     "turns": ["How do I embed this dashboard on our site?"],
     "expect_tool": {"name": "get_embed_snippet", "args_contains": {"board": "{board}"}},
     "forbid": ["[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}"]
+  },
+  {
+    "id": "chart_radar_two_measures",
+    "mode": "build",
+    "confirm": true,
+    "note": "BI-49 (QA LH-BI-6-25): a radar compares two measures of one source on one scale; the server already saved several, the console drew only the first until this slice.",
+    "setup": [
+      {"name": "src", "method": "POST", "path": "/api/dashboard/sources", "body": {"title": "Eval Radar Two Measures", "sql": "SELECT negara, sum(jumlah) AS kunjungan, count() AS baris FROM serving.mart_wisman GROUP BY negara"}, "id_at": "source.id"}
+    ],
+    "turns": ["Draw a radar chart from the saved source \"Eval Radar Two Measures\" that compares kunjungan and baris per country (negara)."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"sqlSource": "{src}", "kind": "radar"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "radar"}, "count": 1},
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "radar", "def.measures": "kunjungan"}, "count": 1},
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "radar", "def.measures": "baris"}, "count": 1}
+    ]
+  },
+  {
+    "id": "report_with_one_chart",
+    "mode": "build",
+    "confirm": true,
+    "note": "BI-18 part D (BI-18D-AC9): a short written report with one live chart placed by reference; the chat names what it made.",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Report Source Board"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Report Events Total", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "turns": ["Write a short report titled \"Eval Events Report\" with one paragraph saying events are tracked here, followed by the chart {chart}."],
+    "expect_tool": {"name": "create_report", "args_contains": {"title": "Eval Events Report"}},
+    "expect_state": [
+      {"path": "/api/dashboard/reports", "list": "reports", "where": {"title": "Eval Events Report", "chartCount": 1}, "count": 1}
+    ]
+  },
+  {
+    "id": "dashboard_from_template",
+    "mode": "build",
+    "confirm": true,
+    "note": "BI-18 part D (BI-18D-AC9, AI-9 templates): start a new, independent dashboard from a saved template.",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Template Source Board"}, "id_at": "board.id"},
+      {"name": "template", "method": "POST", "path": "/api/dashboard/templates", "body": {"board": "{board}", "name": "Eval Sales Overview"}, "id_at": "template.id"}
+    ],
+    "turns": ["Start a new dashboard called \"Eval From Template\" from the \"Eval Sales Overview\" template."],
+    "expect_tool": {"name": "create_dashboard_from_template", "args_contains": {"template": "{template}", "name": "Eval From Template"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"name": "Eval From Template"}, "count": 1}
+    ]
   }
 ]

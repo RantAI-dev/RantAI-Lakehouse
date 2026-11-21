@@ -19,6 +19,7 @@ mock.module("next/navigation", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { ConnectorEditPage } from "./connector-edit-page"
 
@@ -497,7 +498,8 @@ describe("ConnectorEditPage", () => {
     const page = renderPage()
     await waitFor(() => page.getByLabelText("Name"))
     next(page)
-    fireEvent.change(page.getByLabelText("Auth type"), { target: { value: "basic" } })
+    // WEB-9 D5: the auth type is chosen from the combobox by its label.
+    chooseOption(page.getByLabelText("Auth type"), "basic")
     expect(page.getByText(/sign-in method changed/)).toBeDefined()
     // Blank no longer means "keep": the stored token does not fit basic auth.
     expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true)

@@ -9,10 +9,11 @@ import { notifyDashboardsChanged } from "@/features/dashboards/dashboard-events"
 import { changedABoard, takeNewBoardChanges } from "./board-change";
 import { readNdjson } from "@/lib/ndjson";
 import { notifyError, notifySuccess } from "@/lib/notify";
-import { chatSessionService, chatTermService } from "@/services";
+import { agentService, chatSessionService, chatTermService } from "@/services";
 import { isServiceError } from "@/services/errors";
 import { apiFetch } from "@/services/http";
 import { answerAsk, type AskAnswer } from "./answer-ask";
+import { approvalStateOf } from "./approval-state";
 
 export type Mode = "ask" | "build";
 export type DockPosition = "bottom" | "right";
@@ -193,7 +194,53 @@ export const MAX_CONTINUATIONS = 3;
  * left out of the JSON, so a reopened conversation shows its answers whole.
  */
 function savedMessages(msgs: Msg[]): Msg[] {
-  return msgs.map((m) => ({ ...m, streamed: undefined }));
+  // AI-28 / LH-AI-18-09: `approvalState` is read from the run on open,
+  // never stored, so a later open reads the run again instead of showing
+  // a state that has since changed.
+  return msgs.map((m) => ({
+    ...m,
+    streamed: undefined,
+    tools: m.tools?.map((s) => {
+      const copy = { ...s };
+      delete copy.approvalState;
+      return copy;
+    }),
+  }));
+}
+
+/**
+ * AI-28 review R2: tag a reopened approval step by the ids stored in the
+ * conversation — the run id, or an approval id the run carries — never by the
+ * position the step had when the chat was loaded. A message can be sent or
+ * removed while the lookups are in flight, so an index would point at the
+ * wrong step. The caller applies this inside a `setMessages` updater so it
+ * runs against the latest state, not a snapshot taken at load time.
+ */
+function tagApprovalStep(
+  messages: Msg[],
+  run: { id: string; status: string; approvals?: { id: string }[]; steps?: { label: string }[] },
+): Msg[] {
+  const approvalIds = new Set(run.approvals?.map((a) => a.id) ?? []);
+  const steps = run.steps ?? [];
+  const state = approvalStateOf(run.status, steps[steps.length - 1]?.label);
+  let changed = false;
+  const next = messages.map((msg) => {
+    if (!msg.tools) return msg;
+    let touched = false;
+    const tools = msg.tools.map((step) => {
+      const result = step.result as { approval_id?: unknown; run_id?: unknown } | null | undefined;
+      const matches =
+        (typeof result?.run_id === "string" && result.run_id === run.id) ||
+        (typeof result?.approval_id === "string" && approvalIds.has(result.approval_id));
+      if (!matches || step.approvalState === state) return step;
+      touched = true;
+      return { ...step, approvalState: state };
+    });
+    if (!touched) return msg;
+    changed = true;
+    return { ...msg, tools };
+  });
+  return changed ? next : messages;
 }
 
 /** A copy of `messages` with one tool step swapped out; `null` if it no longer exists. */
@@ -251,6 +298,10 @@ function useCopilotState() {
   /** A line about the last picked answer (not remembered); any later send, new chat or opened chat clears it. */
   const [askNotice, setAskNotice] = React.useState<string | null>(null);
   const [sessionId, setSessionId] = React.useState<string | null>(null);
+  // AI-28 / LH-AI-18-09: the run lookups started by `loadSession` resolve
+  // later; this says which conversation is still open when they do.
+  const sessionIdRef = React.useRef(sessionId);
+  sessionIdRef.current = sessionId;
   /**
    * The open conversation's title, from the server — not from `sessions`,
    * which holds only the newest 20 (`AI-24` D2). A conversation reopened
@@ -392,6 +443,7 @@ function useCopilotState() {
           stream: true,
           tools: toolsFromCaps(enabledCaps, mode),
           context: pageContextRef.current?.system,
+          view: pageContextRef.current?.view,
           messages: chatHistory(next),
         }),
       });
@@ -624,10 +676,53 @@ function useCopilotState() {
     setAskNotice(null);
     try {
       const session = await chatSessionService.get(id);
-      setMessages(((session.messages ?? []) as Msg[]).map((m) => (m.id ? m : { ...m, id: newMsgId() })));
+      const loaded = ((session.messages ?? []) as Msg[]).map((m) =>
+        m.id ? m : { ...m, id: newMsgId() }
+      );
+      setMessages(loaded);
       if (session.mode === "build" || session.mode === "ask") setMode(session.mode);
       setSessionId(session.id);
       setSessionTitle(session.title);
+
+      // AI-28 / LH-AI-18-09: a saved step holds the approval request, not
+      // its outcome. Read each run again on open (at most 20) and show
+      // what happened; the state is never persisted back into the chat.
+      const approvalRunIds: string[] = [];
+      loaded.forEach((m) => {
+        m.tools?.forEach((step) => {
+          const result = step.result as
+            | { needs_approval?: unknown; run_id?: unknown }
+            | null
+            | undefined;
+          if (
+            result?.needs_approval === true &&
+            typeof result.run_id === "string" &&
+            approvalRunIds.length < 20
+          ) {
+            approvalRunIds.push(result.run_id);
+          }
+        });
+      });
+      if (approvalRunIds.length > 0) {
+        void Promise.allSettled(approvalRunIds.map((runId) => agentService.getRun(runId))).then(
+          (results) => {
+            // Another conversation (or a new chat) was opened meanwhile.
+            if (sessionIdRef.current !== session.id) return;
+            // AI-28 review R2: resolve against the latest state. A concrete
+            // `setMessages` built from a ref captured at load time would
+            // overwrite a message sent or removed while the lookups ran.
+            setMessages((prev) => {
+              let next = prev;
+              results.forEach((r) => {
+                // A failed lookup leaves the step as it was stored.
+                if (r.status !== "fulfilled") return;
+                next = tagApprovalStep(next, r.value);
+              });
+              return next;
+            });
+          }
+        );
+      }
     } catch (e) {
       // AI-24 D3: a plain sentence, never the API's own text (its 404 body
       // says "sesi tidak ditemukan", which is not something to show).
@@ -710,21 +805,116 @@ export type CopilotStreamValue = ReturnType<typeof useCopilotState>["stream"];
 const CopilotContext = React.createContext<CopilotValue | null>(null);
 const CopilotStreamContext = React.createContext<CopilotStreamValue | null>(null);
 
+/**
+ * BI-32 review: the same value as a store, so a page can read one derived
+ * piece of it (`useCopilotSelect`) and re-render only when that piece
+ * changes, not on every new message or step.
+ */
+type CopilotStore = { value: CopilotValue; listeners: Set<() => void>; set: (v: CopilotValue) => void };
+function makeStore(value: CopilotValue): CopilotStore {
+  const store: CopilotStore = {
+    value, listeners: new Set(),
+    set: (v) => { store.value = v; store.listeners.forEach((l) => l()); },
+  };
+  return store;
+}
+const CopilotStoreContext = React.createContext<CopilotStore | null>(null);
+
 /** A single provider — wraps the app so dock/page/sidebar share one conversation. */
 export function CopilotProvider({ children }: { children: React.ReactNode }) {
   const { main, stream } = useCopilotState();
+  const [store] = React.useState<CopilotStore>(() => makeStore(main));
+  React.useLayoutEffect(() => {
+    store.set(main);
+  }, [main, store]);
   return React.createElement(
-    CopilotContext.Provider,
-    { value: main },
-    React.createElement(CopilotStreamContext.Provider, { value: stream }, children),
+    CopilotStoreContext.Provider,
+    { value: store },
+    React.createElement(
+      CopilotContext.Provider,
+      { value: main },
+      React.createElement(CopilotStreamContext.Provider, { value: stream }, children),
+    ),
   );
 }
 
-/** Access the shared Copilot brain. */
+const NOOP_COPILOT: CopilotValue = {
+  sessionTitle: "",
+  mode: "ask",
+  setMode: () => {},
+  messages: [],
+  busy: false,
+  error: null,
+  askNotice: null,
+  sessionId: null,
+  sessions: [],
+  enabledCaps: new Set<string>(),
+  toggleCap: () => {},
+  pageContext: derivePageContext("/"),
+  setPageContext: () => {},
+  send: async () => {},
+  newChat: () => {},
+  loadSession: async () => {},
+  removeSession: async () => false,
+  renameSession: async () => false,
+  refreshSessions: async () => {},
+  stop: () => {},
+  retry: () => {},
+  editAndResend: () => {},
+  deleteMessage: () => {},
+  clearError: () => {},
+  answerAskOption: async () => {},
+  confirmTool: async () => {},
+  cancelTool: () => {},
+  completeToolStep: () => {},
+  confirmingKey: null,
+  dockPosition: "bottom",
+  setDockPosition: () => {},
+  expanded: false,
+  setExpanded: () => {},
+  sidebarWidth: 380,
+  setSidebarWidth: () => {},
+};
+
+const NOOP_STREAM: CopilotStreamValue = {
+  draft: "",
+  liveReasoning: "",
+  progress: null,
+};
+
+/**
+ * Access the shared Copilot brain.
+ *
+ * When rendered outside `CopilotProvider` (such as in `AppFrame` for users
+ * who lack assistant permissions like `assistant:use` or `assistant:ask`),
+ * this returns a no-op fallback (`NOOP_COPILOT`) instead of throwing.
+ * This keeps pages and components that report their context or offer optional
+ * assistant hooks (such as dashboard pages) working seamlessly for users
+ * without assistant access (ADM-13 review round 1, S6).
+ */
 export function useCopilot(): CopilotValue {
   const ctx = React.useContext(CopilotContext);
-  if (!ctx) throw new Error("useCopilot must be used within a CopilotProvider");
-  return ctx;
+  return ctx ?? NOOP_COPILOT;
+}
+
+const NOOP_STORE: CopilotStore = makeStore(NOOP_COPILOT);
+
+/**
+ * BI-32 review: read a derived part of the Copilot without subscribing to all
+ * of it. The component re-renders only when `select` returns a different
+ * value (`Object.is`), so return a primitive or a stable function; streaming,
+ * new messages and tool steps that leave it alone do not reach the caller.
+ */
+export function useCopilotSelect<T>(select: (c: CopilotValue) => T): T {
+  const store = React.useContext(CopilotStoreContext) ?? NOOP_STORE;
+  return React.useSyncExternalStore(
+    (cb) => {
+      store.listeners.add(cb);
+      return () => { store.listeners.delete(cb); };
+    },
+    () => select(store.value),
+    () => select(store.value),
+  );
 }
 
 /**
@@ -734,8 +924,7 @@ export function useCopilot(): CopilotValue {
  */
 export function useCopilotStream(): CopilotStreamValue {
   const ctx = React.useContext(CopilotStreamContext);
-  if (!ctx) throw new Error("useCopilotStream must be used within a CopilotProvider");
-  return ctx;
+  return ctx ?? NOOP_STREAM;
 }
 
 /** A stream value for a test or a story that renders the message list alone. */

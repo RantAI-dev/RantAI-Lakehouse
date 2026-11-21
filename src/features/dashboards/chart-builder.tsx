@@ -5,23 +5,16 @@ import { Pill } from "@/components/patterns/status-badge"
 
 import * as React from "react";
 import { useTheme } from "next-themes";
-import {
-  CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronDown, ChevronRight, Code, Flame, Gauge, Workflow,
-  Map, MapPin, PanelLeftClose, PanelLeftOpen, Pencil, Plus, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
-  ChartNoAxesColumn, ChartNoAxesGantt, Globe, Image as ImageIcon, Target,
-} from "lucide-react";
-import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
-  DialogFooter, DialogTrigger, DialogClose,
-} from "@/components/ui/dialog";
+import { ArrowLeft, ChartColumn, CircleAlert, Code, Database, Pencil, RefreshCw, SlidersHorizontal, Table2 } from "lucide-react";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { EmptyState } from "@/components/patterns/page-states";
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { RequiredMarker } from "@/components/ui/required";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
-import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import {
   Select, SelectContent, SelectGroup, SelectLabel, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
@@ -37,6 +30,7 @@ import {
   NEW_SQL_CHOICE, fieldsFromColumns, keepIfOffered,
 } from "@/lib/sql-source-draft";
 import { dashboardService, metricService, paramService } from "@/services";
+import type { ChartClick } from "@/services";
 import type { Metric, Segment } from "@/services/contracts/metrics";
 import {
   columnSwitchParams, limitParam, numberParams, refLinesFromDef, refLinesPayload, slotParam, slotText,
@@ -44,7 +38,6 @@ import {
 } from "@/lib/params";
 import { ParamDialog } from "./param-dialog";
 import { ReferenceLinesEditor } from "./reference-lines-editor";
-import type { ChartClick } from "@/services/clients/bi-store";
 import { kindHasClickValue } from "@/lib/chart-click";
 import { clickProblem } from "@/lib/click-destination";
 import { ClickSetting } from "./click-setting";
@@ -55,7 +48,6 @@ import { draftFromDef, draftPayload, draftProblems, emptyTableDraft, type TableD
 import type { TableDefFields } from "@/lib/table-types";
 import type { SqlSource, SqlSourceColumn } from "@/services/contracts/dashboards";
 import { apiFetch } from "@/services/http";
-import { filterKindGroups } from "@/lib/chart-kind-search";
 import { previewKey } from "@/lib/preview-key";
 import {
   effectiveOrder, emptyShapeDraft, entriesFromRows, columnRef, isMetricColumn, metricColumn, metricNameOf, measureLabel, measureLimits, parseSortChoice, resultName,
@@ -69,25 +61,37 @@ import { withPreviewDef } from "@/lib/preview-spec";
 import { suggestChartTitle } from "@/lib/chart-title";
 import { guessCoordinateColumns, pointLimit } from "@/lib/geo-points";
 import {
-  GRAIN_LABELS, columnKindOfType, grainChoices, isGrain, isTruncation, limitAfterGrainPick, limitHasEffect, type ColumnKind, type Grain,
+  BREAKDOWN_GRAINS, GRAIN_LABELS, breakdownGrainChoices, columnKindOfType, grainChoices, isGrain, isTruncation, limitAfterBreakdownPick, limitAfterGrainPick,
+  limitHasEffect, takesBreakdownGrain, type ColumnKind, type Grain,
 } from "@/lib/time-grain";
 import { cn } from "@/lib/utils";
 import { MapPicker } from "./map-picker";
 import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, mapCredit } from "./echarts-maps";
 import { useMapCatalogue } from "./use-map-catalogue";
-import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
+import { SqlRowsTable } from "@/components/patterns/sql-rows-table";
+import { SqlSourcePanel } from "./sql-source-panel";
 import { selectedMart, type Mart } from "./mart-marks";
 import { JoinsSection, type JoinTableInfo } from "./joins-section";
 import { LayersSection } from "./layers-section";
 import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
-import { displayColumnFull, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
-import { AccordionSection, ColumnLabel, FoldSection, columnItems, focusFirstEmpty } from "./builder-sections";
-import { missingSection, sectionSummaries, type SectionNumber } from "@/lib/section-summary";
-import { readKindListPref, writeKindListPref } from "@/lib/kind-list-pref";
+import { displayColumnFull, joinedAlias, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
+import { columnGroup, type ColumnUse } from "@/lib/column-click";
+import { ColumnList, type PanelColumn } from "./data-panel";
+import { KindPicker, type GalleryPreview } from "./kind-picker";
+import type { SourceFacts } from "@/lib/kind-gallery";
+
+export { KIND_GROUPS } from "./chart-kinds";
+import type { OwnSource } from "./filters/use-filter-values";
+import { ColumnLabel, SettingGroup, SpanPicker, WholeNumberInput, columnItems, focusFirstEmpty } from "./builder-sections";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { asSentence, formatLocaleNumber } from "@/lib/format";
+import { missingPlace, missingSection, sectionSummaries, type MissingPlace } from "@/lib/section-summary";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs as TabsPrimitive } from "@base-ui/react/tabs";
 import { CustomFieldsMenu } from "./custom-fields-menu";
-import { builderRules, carryOverOnKindSwitch, moreOptionsUsed } from "@/lib/builder-rules";
+import { builderRules, carryOverOnKindSwitch, limitTakesParam } from "@/lib/builder-rules";
 import type { StyleFields } from "@/lib/chart-style";
-import { effectivePalette, formatRules, formatUsed, styleFromDef, stylePayload, withCompanyPalette } from "@/lib/style-draft";
+import { effectivePalette, formatRules, styleFromDef, stylePayload, withCompanyPalette } from "@/lib/style-draft";
 import { FormatSection } from "./format-section";
 import { FormulaEditorDialog } from "./formula-editor";
 import { isValueGroup, type CalcField } from "@/services/contracts/calc-fields";
@@ -145,73 +149,11 @@ type Preview = {
 };
 
 /**
- * Chart types grouped by the question they answer (Metabase/Tableau-style
- * visualization picker). Exported so a caller can offer the type choice
- * earlier (e.g. a "New chart" dropdown in a header) without duplicating
- * the list.
- */
-export const KIND_GROUPS: { group: string; items: { value: ChartKind; label: string }[] }[] = [
-  { group: "Comparison", items: [
-    { value: "bar", label: "Bar" },
-    { value: "hbar", label: "Horizontal bar (ranking)" },
-    { value: "stacked", label: "Stacked bar (≥2 measures)" },
-    { value: "combo", label: "Combo (bar + line)" },
-  ] },
-  { group: "Trend", items: [
-    { value: "line", label: "Line" },
-    { value: "area", label: "Area" },
-    { value: "waterfall", label: "Waterfall (cumulative)" },
-    { value: "calendar", label: "Calendar heatmap (daily)" },
-  ] },
-  { group: "Composition", items: [
-    { value: "pie", label: "Donut / pie" },
-    { value: "rose", label: "Rose (nightingale)" },
-    { value: "funnel", label: "Funnel" },
-    { value: "treemap", label: "Treemap" },
-    { value: "sunburst", label: "Sunburst (2 levels)" },
-  ] },
-  { group: "Relationship / distribution", items: [
-    { value: "scatter", label: "Scatter (X vs Y)" },
-    { value: "bubble", label: "Bubble (X, Y, size)" },
-    { value: "heatmap", label: "Heatmap (2 dimensions)" },
-    { value: "radar", label: "Radar" },
-    { value: "boxplot", label: "Box plot (distribution)" },
-    { value: "histogram", label: "Histogram (spread of a number)" },
-  ] },
-  { group: "Schedule", items: [
-    { value: "gantt", label: "Gantt (tasks over time)" },
-  ] },
-  { group: "Flow", items: [
-    { value: "sankey", label: "Sankey (flow between 2 dimensions)" },
-  ] },
-  { group: "Geographic", items: [
-    { value: "geomap", label: "Map — regions (choropleth)" },
-    { value: "pointmap", label: "Map — points / bubbles" },
-    { value: "geoheat", label: "Map — density heatmap" },
-  ] },
-  { group: "Single value", items: [
-    { value: "kpi", label: "KPI — big number" },
-    { value: "gauge", label: "Gauge" },
-    { value: "progress", label: "Progress bar (value vs goal)" },
-    { value: "bullet", label: "Bullet graph (value, target, bands)" },
-  ] },
-  { group: "Other", items: [
-    { value: "table", label: "Data table" },
-    { value: "pivot", label: "Pivot table" },
-    { value: "text", label: "Text / note" },
-    { value: "image", label: "Image" },
-    { value: "web", label: "Web page" },
-  ] },
-];
-/**
  * Value → label maps for the base-ui selects below. Without `items`, a
  * base-ui `Select.Value` renders the raw value (`hbar`, `b_54e05896`,
  * `desc`, `__none__`) in the closed trigger even though the open list shows
  * labels.
  */
-const KIND_LABELS: Record<string, string> = Object.fromEntries(
-  KIND_GROUPS.flatMap((g) => g.items.map((i) => [i.value, i.label]))
-);
 const NO_BREAKDOWN = "__none__";
 const FIXED_LIMIT = "__fixed_limit__";
 const NO_GRAIN = "__no_grain__";
@@ -238,98 +180,46 @@ function withCalculated(base: Fields, columns: string[], calculated: CalcField[]
 }
 /** Map id → label for the base-ui select (see KIND_LABELS). */
 const NO_LABEL_ITEMS: Record<string, string> = { [NO_BREAKDOWN]: "— no label —" };
-const SPAN_LABELS: Record<string, string> = { "1": "Half width", "2": "Full width" };
-/** Whether the viewport is at least `px` wide; false on the server. */
-function useMinWidth(px: number): boolean {
-  const query = `(min-width: ${px}px)`;
-  return React.useSyncExternalStore(
-    (onChange) => {
-      const mql = window.matchMedia(query);
-      mql.addEventListener("change", onChange);
-      return () => mql.removeEventListener("change", onChange);
-    },
-    () => window.matchMedia(query).matches,
-    () => false,
-  );
+
+/** One focus ring and easing for the title and description edited in place (owner taste: 150–250 ms, eased). */
+const INLINE_EDIT = "outline-none transition-[background-color,color,box-shadow] duration-200 ease-[cubic-bezier(0.2,0,0,1)] focus-visible:ring-3 focus-visible:ring-ring/50";
+
+/** The canvas's empty, loading and error states, centred where the chart will be. */
+function StateBox({ children }: { children: React.ReactNode }) {
+  return <div className="grid h-full place-content-center justify-items-center gap-3 p-6 text-center">{children}</div>;
 }
 
-/** Marks a field the chart cannot be drawn without. */
-function Req() {
-  return <span aria-hidden className="text-destructive">*</span>;
-}
-const KIND_DESCRIPTIONS: Record<ChartKind, string> = {
-  bar: "Compare values across categories", hbar: "Rank categories clearly",
-  stacked: "Compare totals and their parts", combo: "Compare two metrics on different scales",
-  line: "Show change over time", area: "Show trend and magnitude",
-  waterfall: "Explain contributions to a total", pie: "Show parts of a whole",
-  rose: "Compare composition with radial bars", funnel: "Show drop-off through stages",
-  treemap: "Compare hierarchical proportions", scatter: "Reveal correlation between two metrics",
-  bubble: "Compare relationships with a third metric", heatmap: "Find patterns across two dimensions",
-  radar: "Compare profiles across metrics", geomap: "Colour the regions of a map by value",
-  pointmap: "Plot locations as points sized and coloured by a value",
-  geoheat: "Show where locations are concentrated",
-  kpi: "Highlight one important number", gauge: "Track a value against a target",
-  table: "Inspect detailed rows and values", pivot: "Cross-tabulate with totals and subtotals", text: "Add context, notes, or instructions",
-  sankey: "Show how a total flows from one dimension to another",
-  sunburst: "Break each category into its parts, as rings",
-  boxplot: "Compare the spread of a measure across categories",
-  calendar: "Spot daily patterns on a calendar",
-  progress: "Show a value against its goal, with the percentage reached",
-  histogram: "Count how many rows fall in each range of a number",
-  gantt: "Lay tasks on a time axis, one bar from start to end, with a line at today",
-  bullet: "Compare a value with a target and ranges such as poor, fair and good",
-  image: "Show a picture from an allowed site", web: "Show a web page from an allowed site",
-  // BI-18 part C: added from the dashboard's "Add" menu, never picked here; present only to satisfy the record.
-  heading: "A heading between tiles", divider: "A rule between tiles", section: "A heading that folds the tiles below it",
-};
 /**
- * Extra words the type search matches, beyond label and description: the
- * Indonesian ones (peta = map, titik = point, lokasi = location, kepadatan =
- * density) a user of this console is as likely to type.
+ * BI-58 review round 2, SHOULD-FIX 7 (owner; DESIGN.md §3, "Panel yang bersebelahan sejajar"): the
+ * header rows of zones that sit side by side (the canvas's toolbar, the inspector's tabs) share one
+ * height, 44 px, so their dividers are one line. Below the two-column width the toolbar may wrap,
+ * since nothing sits beside it there. (The tab row repeats `h-11` under the tabs' group variant,
+ * which the base TabsList sets its own height with.)
  */
-const KIND_KEYWORDS: Partial<Record<ChartKind, string>> = {
-  geomap: "map peta region wilayah choropleth spatial geo",
-  pointmap: "map peta points titik lokasi bubble spatial geo",
-  geoheat: "map peta heatmap density kepadatan spatial geo",
-  pivot: "pivot cross tab crosstab matrix totals subtotals",
-  table: "table rows raw columns grid",
-  histogram: "distribution spread frequency bins ranges buckets",
-  gantt: "timeline schedule project plan tasks milestones jadwal",
-  progress: "goal target percent percentage bar completion",
-  bullet: "target bands goal poor fair good performance",
-  image: "picture logo photo png jpg gambar",
-  web: "iframe page embed website url status halaman",
-};
-function kindIcon(kind: ChartKind): LucideIcon {
-  if (["bar", "hbar", "stacked", "combo"].includes(kind)) return kind === "bar" ? ChartColumn : ChartBar;
-  if (["line", "area", "waterfall"].includes(kind)) return ChartLine;
-  if (["pie", "rose", "funnel", "treemap"].includes(kind)) return ChartPie;
-  if (["scatter", "bubble", "heatmap", "radar"].includes(kind)) return ScatterChart;
-  if (kind === "geomap") return Map;
-  if (kind === "pointmap") return MapPin;
-  if (kind === "geoheat") return Flame;
-  if (kind === "sankey") return Workflow;
-  if (kind === "sunburst") return ChartPie;
-  if (kind === "boxplot") return ChartCandlestick;
-  if (kind === "calendar") return CalendarDays;
-  if (kind === "kpi" || kind === "gauge" || kind === "progress") return Gauge;
-  if (kind === "histogram") return ChartNoAxesColumn;
-  if (kind === "gantt") return ChartNoAxesGantt;
-  if (kind === "bullet") return Target;
-  if (kind === "image") return ImageIcon;
-  if (kind === "web") return Globe;
-  return kind === "table" || kind === "pivot" ? Table2 : Type;
+const ZONE_HEADER = "min-h-11 shrink-0 @3xl:h-11";
+
+/** The inspector's tabs (`BI-58` T4). */
+type InspectorTab = "data" | "sort" | "style";
+
+/**
+ * UX-1-R11: one shared decorative marker. Delegating to `RequiredMarker`
+ * keeps the star on every chart-kind rule below while using the one CSS
+ * glyph (a hidden aria-hidden span) the rest of the console uses, so a
+ * literal `*` never leaks into a label's text content.
+ */
+function Req() {
+  return <RequiredMarker />;
 }
 /** Measure labels that vary by kind (X/Y/size, bar/line, etc.). */
 const MEASURE_LABELS: Partial<Record<ChartKind, string[]>> = {
   scatter: ["X metric", "Y metric"],
   bubble: ["X metric", "Y metric", "Size metric"],
   combo: ["Bar metric", "Line metric"],
-  stacked: ["Measure", "2nd measure"],
-  pointmap: ["Measure (size and colour)"],
+  stacked: ["Value", "2nd value"],
+  pointmap: ["Value (size and colour)"],
   progress: ["Value"],
   bullet: ["Value"],
-  geoheat: ["Measure (weight)"],
+  geoheat: ["Value (weight)"],
 };
 
 /**
@@ -343,31 +233,34 @@ function measureRowsOf(def: ChartDef): MeasureRow[] {
 }
 
 /**
- * Chart builder — the MANUAL path (Tableau-style). Used in two modes:
- *  - CREATE (has its own "New chart" trigger),
- *  - EDIT (controlled by the parent: `open`, `initial` carries id+def).
- * Writes to the SAME artifact as the chat path (console.bi_chart).
+ * Chart builder — the MANUAL path (Tableau-style), as a page (`WEB-7` D6).
+ *
+ * It used to be a dialog opened over the dashboard and over a chat draft.
+ * It is now the body of `/dashboards/[id]/charts/new` and
+ * `.../[chartId]/edit`, inside `FormPage`: the chart-type sidebar, the form
+ * and the live preview in the page's column, with Cancel and Save in its
+ * footer. The small contextual dialogs it opens (parameters, formulas, value
+ * groups, hierarchies) stay dialogs, because they are about one field.
+ *
+ * Saving writes the same artifact as the chat path (console.bi_chart) and
+ * hands the payload to `onSaved`, which the page answers by going back to
+ * the dashboard; the dashboard reloads, which is what used to be done by
+ * re-fetching in place.
  */
 export function ChartBuilder({
-  onSaved, board = "default", boards = [], initial, editId, paramValues,
-  open: openProp, onOpenChange, hideTrigger,
+  onSaved, onCancel, board = "default", boards = [], initial, editId, paramValues,
 }: {
-  /** Receives the definition that was saved. */
+  /** Receives the definition that was saved; the page leaves for the dashboard with it. */
   onSaved: (saved: ChartDef) => void;
+  /** Leaving by the back arrow or Esc (after "Discard changes?" when something changed); the page goes back to where it came from. */
+  onCancel: () => void;
   board?: string;
   boards?: BoardOpt[];
   initial?: ChartDef;
   editId?: string;
   /** The parameter values the dashboard shows now; the preview is drawn with them (BI-11). */
   paramValues?: Record<string, ParamValue>;
-  open?: boolean;
-  onOpenChange?: (o: boolean) => void;
-  hideTrigger?: boolean;
 }) {
-  const controlled = openProp !== undefined;
-  const [openState, setOpenState] = React.useState(false);
-  const open = controlled ? openProp! : openState;
-  const setOpen = (o: boolean) => { onOpenChange?.(o); if (!controlled) setOpenState(o); };
 
   const [marts, setMarts] = React.useState<Mart[]>([]);
   const [sqlSources, setSqlSources] = React.useState<SqlSource[]>([]);
@@ -397,18 +290,22 @@ export function ChartBuilder({
   const [preview, setPreview] = React.useState<Preview | null>(null);
   const [previewBusy, setPreviewBusy] = React.useState(false);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
+  // `BI-58` T3: "Try again" on a failed preview asks once more with the same inputs.
+  const [retry, setRetry] = React.useState(0);
+  // The rows under the chart: null follows the chart (open with steps), a boolean is the person's choice.
+  const [showData, setShowData] = React.useState<boolean | null>(null);
   const { resolvedTheme } = useTheme();
-  // Side-by-side, resizable form and preview from the `lg` breakpoint.
-  const wide = useMinWidth(1024);
 
   const [title, setTitle] = React.useState("");
+  // `BI-58` T3: the chart's description, edited under its title; saved as `subtitle`, which the
+  // dashboard shows under a tile's title (and the assistant already writes).
+  const [subtitle, setSubtitle] = React.useState("");
+  const [describing, setDescribing] = React.useState(false);
   // Encoded data-source choice (`mart:<name>` / `sql:<id>`, lib/chart-source).
   const [source, setSource] = React.useState("");
   const choice = decodeSourceChoice(source);
   const chosenMart = selectedMart(marts, choice);
   const [kind, setKind] = React.useState<ChartKind>("hbar");
-  const [kindQuery, setKindQuery] = React.useState("");
-  const kindGroups = React.useMemo(() => filterKindGroups(KIND_GROUPS, KIND_DESCRIPTIONS, kindQuery, KIND_KEYWORDS), [kindQuery]);
   const [dimension, setDimension] = React.useState("");
   // The measures, each with an aggregate of its own or the chart's (BI-6). The
   // first three are also read as `measure`, `measure2` and `measure3`.
@@ -443,21 +340,19 @@ export function ChartBuilder({
   const [cacheDraft, setCacheDraft] = React.useState<RuleDraft>(draftOf(null));
   // BI-17 part A: the chart's formats, colours, axes, labels, notes, tooltip and conditional colours (section 5).
   const [style, setStyle] = React.useState<StyleFields>({});
-  const [formatOpen, setFormatOpen] = React.useState(false);
   // BI-13: the chart's other questions, and how its own series is drawn when it has them ("" = the kind's default).
   const [layers, setLayers] = React.useState<LayerDraft[]>([]);
   const [ownDraw, setOwnDraw] = React.useState("");
   const [ownAxis, setOwnAxis] = React.useState("");
   const [paramsOpen, setParamsOpen] = React.useState(false);
-  // Phase 2 QA R3: "More options" is folded unless the chart being edited uses something in it.
-  const [moreOpen, setMoreOpen] = React.useState(false);
-  // Phase 2 QA R10: sections 1 to 3 are an accordion (one open, or none); a new chart starts on 1, an edited one folded.
-  const [active, setActive] = React.useState<1 | 2 | 3 | null>(1);
-  const panelRefs = React.useRef<Partial<Record<SectionNumber | 5, HTMLElement | null>>>({});
-  const [focusAsk, setFocusAsk] = React.useState<{ section: SectionNumber; n: number } | null>(null);
-  // Phase 2 QA R9: the type list at the left is open or folded; a remembered choice wins, else open for a new chart until a type is chosen.
-  const [listOpen, setListOpen] = React.useState(true);
-  const [kindMenu, setKindMenu] = React.useState(false);
+  // `BI-58` T4: the inspector's tab; every chart opens on Data.
+  const [tab, setTab] = React.useState<InspectorTab>("data");
+  // Where a missing field is: 1 the data panel, 2 the Data tab, 3 the Sort & filter tab.
+  const panelRefs = React.useRef<Partial<Record<1 | 2 | 3, HTMLElement | null>>>({});
+  const [focusAsk, setFocusAsk] = React.useState<{ section: 1 | 2 | 3; n: number } | null>(null);
+  // `BI-58` T5: below 1280 px of builder width the data panel folds into "Pick data", which opens it as a sheet.
+  const [dataSheet, setDataSheet] = React.useState(false);
+  const sheetPanel = React.useRef<HTMLDivElement | null>(null);
   const numberParamDefs = React.useMemo(() => numberParams(paramDefs), [paramDefs]);
   const [targetBoard, setTargetBoard] = React.useState(board);
   // What a click does instead of the drill menu (BI-18·B); undefined = the menu.
@@ -592,7 +487,9 @@ export function ChartBuilder({
     // A grouped chart reads best in date order; the editor can still change it.
     if (next && !grain && shape.sortChoice === "order:desc") setSortChoice("order:none");
     // BI-9 review fix (SHOULD-FIX) R2: a day-grained chart should not open at 20 days.
-    setLimit((l) => limitAfterGrainPick(next, l, limitTouched));
+    // `BI-46` review round 1, R7: beside a breakdown the limit counts breakdown
+    // values, so the untouched 20 stays 20.
+    setLimit((l) => limitAfterGrainPick(next, l, limitTouched, capsBreakdown));
     setGrain(next);
   }
   // Latitude and longitude can be any column the source returns (numbers are
@@ -607,6 +504,17 @@ export function ChartBuilder({
     setLon((l) => l || guessed.lon || "");
   }, [isPoints, fields, coordinateColumns]);
   const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || needsBreakdown || isGantt;
+  // `BI-46` (QA `LH-BI-6-01`): a date or timestamp breakdown on a bar, hbar,
+  // line or area chart can be grouped by a period, and on those charts the
+  // limit keeps the N breakdown values with the largest total.
+  const breakdownKind = breakdown ? fields?.kinds?.[breakdown] : undefined;
+  const breakdownGrainOptions = React.useMemo(() => breakdownGrainChoices(kind, breakdownKind), [kind, breakdownKind]);
+  // `BI-46` review round 1, R4: a chart whose measure is a table calculation
+  // gets no breakdown cap on the server — its windows run over the whole
+  // grouped result — so the limit keeps the label such a chart always had, and
+  // does not promise a cut that does not happen.
+  const measureIsTableCalc = (fields?.calculated ?? []).some((f) => f.level === "table" && f.name === measure);
+  const capsBreakdown = !!breakdown && takesBreakdownGrain(kind) && !measureIsTableCalc;
   // BI-10: a number column can be the dimension or the breakdown when it is put in bins; a table does
   // that per grouping, a pivot on its first number row or column field.
   const onSqlSource = choice?.kind === "sql" || source === NEW_SQL_CHOICE;
@@ -615,7 +523,7 @@ export function ChartBuilder({
     kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)), breakdown: canBreakdown && !!breakdown,
     other: shape.other, steps: shape.steps.length, layers: layers.length,
     multiGrouped: isGroupedTable && shape.groupings.length > 1,
-    limitHasEffect: limitHasEffect(grain, isCalendar ? "none" : order),
+    limitHasEffect: limitHasEffect(grain, isCalendar ? "none" : order, capsBreakdown),
     hasSource: !!choice || source === NEW_SQL_CHOICE,
   });
   const binKind = takesBin(kind, rowsMode) && !isGroupedTable && !isPivot && rules.bins;
@@ -623,7 +531,9 @@ export function ChartBuilder({
     () => (fields?.measures ?? []).filter((m) => !wholeMeasure.has(m) && fields?.kinds?.[m] === "number"),
     [fields, wholeMeasure],
   );
-  const dimensionChoices = isHistogram ? numberColumns : binKind ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? [];
+  // QA LH-BI-13-01: bins are off beside more questions (builder-rules), but a number column (a year) is still a
+  // real column the server takes as the dimension, so it stays offered, unbinned (`pickDimension` clears the bin).
+  const dimensionChoices = isHistogram ? numberColumns : binKind || (layers.length > 0 && takesLayers(kind) && !rowsMode) ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? [];
   const breakdownChoices = (binKind ? [...(fields?.dimensions ?? []), ...numberColumns] : fields?.dimensions ?? []).filter((d) => d !== dimension);
   const startingBin = onSqlSource ? ({ mode: "width", count: "10", width: "" } as const) : AUTO_BIN;
   const isNumber = (column: string) => fields?.kinds?.[column] === "number";
@@ -639,13 +549,26 @@ export function ChartBuilder({
   }
   function pickBreakdown(column: string) {
     setBreakdown(column);
-    setShape((d) => ({ ...d, breakdownBin: binKind && column && isNumber(column) ? d.breakdownBin ?? startingBin : null }));
+    const pickedKind = column ? fields?.kinds?.[column] : undefined;
+    // `BI-46` review round 1, R7: from here the limit counts breakdown values,
+    // so an untouched grained maximum (1000) that a grain pick left behind goes
+    // back to the default 20. A limit the person set is kept.
+    const capsAfterPick = !!column && takesBreakdownGrain(kind) && !(fields?.calculated ?? []).some((f) => f.level === "table" && f.name === measure);
+    if (capsAfterPick) setLimit((l) => limitAfterBreakdownPick(l, limitTouched));
+    setShape((d) => ({
+      ...d,
+      breakdownBin: binKind && column && isNumber(column) ? d.breakdownBin ?? startingBin : null,
+      // `BI-46`: a period only cuts a date or timestamp; another column drops it.
+      breakdownGrain: pickedKind === "date" || pickedKind === "datetime" ? d.breakdownGrain : "",
+    }));
   }
   const pivotNumberField = isPivot ? [...tableDraft.pivotRows, ...tableDraft.pivotColumns].find((c) => isNumber(c)) : undefined;
-  const mLabels = isSingle ? ["Measure"] : MEASURE_LABELS[kind] ?? ["Measure (Y)"];
-  const measureTitle = (i: number) => (limits.max > 1 && limits.max === limits.min ? mLabels[i] ?? `Measure ${i + 1}` : i === 0 ? mLabels[0] : `Measure ${i + 1}`);
-  const dimensionLabel = isChoropleth ? "Region column" : isPoints ? "Label" : isHistogram ? "Number column" : isGantt ? "Task column" : isBullet ? "Category" : "Dimension (X)";
-  const breakdownLabel = isGantt ? "Group" : kind === "sankey" ? "Flows to" : kind === "sunburst" ? "Outer ring" : isHeatmap ? "2nd dimension (Y)" : "Breakdown / series";
+  // `BI-58` T6: the labels say "X axis", "Split" and "Value", the words of the data panel's chips;
+  // the code keeps dimension, breakdown and measure, which the assistant and the docs use.
+  const mLabels = isSingle ? ["Value"] : MEASURE_LABELS[kind] ?? ["Value"];
+  const measureTitle = (i: number) => (limits.max > 1 && limits.max === limits.min ? mLabels[i] ?? `Value ${i + 1}` : i === 0 ? mLabels[0] : `Value ${i + 1}`);
+  const dimensionLabel = isChoropleth ? "Region column" : isPoints ? "Label" : isHistogram ? "Number column" : isGantt ? "Task column" : isBullet ? "Category" : "X axis";
+  const breakdownLabel = isGantt ? "Group" : kind === "sankey" ? "Flows to" : kind === "sunburst" ? "Outer ring" : isHeatmap ? "2nd dimension (Y)" : "Split into series";
   // Phase 2 QA R20: the title is built from the labels the pickers show (a metric's label, a
   // joined column's own name), never the stored reference (`metric:name`, `table__column`).
   const titleText = (name: string) => (name ? columnRef(name, {
@@ -707,16 +630,15 @@ export function ChartBuilder({
   // The tables of a chart being edited (or a base table just picked) are learned once.
   const joinMarts = [...new Set([baseMart, ...shape.joins.map((j) => j.mart)].filter(Boolean))].join(",");
   React.useEffect(() => {
-    if (!open) return;
     for (const mart of joinMarts.split(",").filter(Boolean)) {
       if (!joinInfo[mart]) void learnTable(mart, baseMart);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `joinInfo` and `learnTable` only cache what `joinMarts` names
-  }, [open, joinMarts]);
+  }, [joinMarts]);
   // The pickers list the flat relation's columns, so they follow the joins that are complete.
   const joinsKey = JSON.stringify(joinsPayload(shape.joins).joins ?? []);
   React.useEffect(() => {
-    if (!open || !baseMart || joinsSeen.current === joinsKey) return;
+    if (!baseMart || joinsSeen.current === joinsKey) return;
     joinsSeen.current = joinsKey;
     void loadFields(source).then((f) => {
       setDimension((v) => keepIfOffered(v, f.dimensions));
@@ -724,12 +646,12 @@ export function ChartBuilder({
       setBreakdown((v) => keepIfOffered(v, f.dimensions));
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reload only when the complete joins change
-  }, [open, joinsKey]);
+  }, [joinsKey]);
   // BI-13: questions can be added to a bar, line, area or combo chart; they are matched on its
   // dimension, so a breakdown, "Other", steps or bins on the chart are refused with the questions.
   const layersApply = takesLayers(kind) && !rowsMode && layers.length > 0;
   const layersBlocked = [
-    ...(canBreakdown && breakdown ? ["a breakdown"] : []),
+    ...(canBreakdown && breakdown ? ["the split"] : []),
     ...(shape.other ? ["the 'Other' group"] : []),
     ...(shape.steps.length ? ["steps"] : []),
     ...(shape.bin || shape.breakdownBin ? ["bins"] : []),
@@ -770,7 +692,7 @@ export function ChartBuilder({
     ...sqlSources.map((s) => [encodeSourceChoice({ kind: "sql", id: s.id }), `SQL · ${s.title}`]),
     [NEW_SQL_CHOICE, "Custom SQL · new source"],
   ]);
-  const breakdownLabels: Record<string, string> = { [NO_BREAKDOWN]: "— no breakdown —" };
+  const breakdownLabels: Record<string, string> = { [NO_BREAKDOWN]: "— no split —" };
 
   async function loadFields(value: string, joins: readonly JoinDraft[] = shape.joins): Promise<Fields> {
     const picked = decodeSourceChoice(value);
@@ -805,20 +727,18 @@ export function ChartBuilder({
     return f;
   }
 
-  // On open: load the marts, and prefill from initial — EDIT, or a draft
-  // (e.g. from Copilot) whose kind is already chosen.
+  // On mount: load the marts, and prefill from initial — EDIT, or a draft
+  // (e.g. from Copilot) whose kind is already chosen. The page mounts this
+  // only once it holds the board, the chart and any draft, so `initial` is
+  // settled by then (`WEB-7` D6).
   React.useEffect(() => {
-    if (!open) return;
     draft.cancel();
     void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
     // A viewer without the list (or with the API down) still gets marts.
     void dashboardService.listSqlSources().then(setSqlSources).catch(() => setSqlSources([]));
-    const pref = readKindListPref();
-    setListOpen(pref ? pref === "expanded" : !editId);
-    setKindMenu(false);
-    setActive(editId ? null : 1);
     if (initial) {
       setTitle(initial.title ?? "");
+      setSubtitle(initial.subtitle ?? "");
       setKind((initial.kind as ChartKind) ?? "hbar");
       // Phase 2 QA R4: a measure that stores no aggregate shows this one; saving it back sends the same `aggregate`.
       setAggregate(initial.aggregate ?? "sum");
@@ -844,18 +764,10 @@ export function ChartBuilder({
       setCacheDraft(draftOf(initial.cache));
       setTypeDraft(typeDraftFromDef(initial));
       setStyle(styleFromDef(initial));
-      setFormatOpen(formatUsed(styleFromDef(initial), initial.referenceLines?.length ?? 0));
       setLayers(layerDraftsFromDef(initial.layers));
       setOwnDraw(initial.draw ?? "");
       setOwnAxis(initial.axis ?? "");
       setLimitTouched(true);
-      setMoreOpen(moreOptionsUsed({
-        steps: savedShape.steps.length, layers: initial.layers?.length ?? 0,
-        click: !!initial.click,
-        columnSettings: initial.kind === "table" && initial.tableMode !== "rows" ? Object.keys(initial.columnSettings ?? {}).length : 0,
-        compare: initial.kind === "kpi" && !!initial.compare,
-        freshness: !!initial.cache && initial.cache.mode !== "default",
-      }));
       setTargetBoard(initial.board ?? board);
       setClick(initial.click);
       setGrain(isGrain(initial.grain) ? initial.grain : "");
@@ -871,20 +783,9 @@ export function ChartBuilder({
       }
     } else {
       setTargetBoard(board);
-      setMoreOpen(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
-
-  function reset() {
-    setTitle(""); setSource(""); setKind("hbar"); setKindQuery(""); setDimension("");
-    setMeasureRows([{ column: "", aggregate: "" }]); setBreakdown(""); setMapId(""); setLat(""); setLon("");
-    setAggregate("sum"); setSpan(1);
-    setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false); setLimitParamName(""); setRefLines([]); setStyle({}); setTypeDraft(emptyTypeDraft()); setFormatOpen(false); setLayers([]); setOwnDraw(""); setOwnAxis("");
-    setTargetBoard(board); setClick(undefined); setMoreOpen(false); setActive(1); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
-    draft.cancel();
-    joinsSeen.current = "[]";
-  }
+  }, []);
 
   // User changes the data source → reset the column selections and reload.
   function onSourceChange(value: string) {
@@ -929,10 +830,63 @@ export function ChartBuilder({
     ...(takesMetrics ? (fields?.metrics ?? []).map((m) => metricColumn(m.name)) : []),
   ];
   // Columns a filter or a grouping may name: the source's, with its per-row calculated fields.
+  // `BI-47` (plan D11): a dashboard parameter slot (`{ukuran}`) is a dimension,
+  // a breakdown and a measure, never a filter or grouping column — the server
+  // has no column to list its values from.
   const columnChoices = React.useMemo<ColumnChoice[]>(() => {
-    const names = [...new Set([...(fields?.dimensions ?? []), ...(fields?.measures ?? [])])].filter((n) => !wholeMeasure.has(n));
+    const names = [...new Set([...(fields?.dimensions ?? []), ...(fields?.measures ?? [])])]
+      .filter((n) => !wholeMeasure.has(n) && !slotParam(n));
     return names.map((name) => ({ name, kind: fields?.kinds?.[name] ?? "text" }));
   }, [fields, wholeMeasure]);
+  // `BI-47` (QA `LH-BI-6-01`): a filter's value list reads the chart's OWN
+  // relation, not every mart that has the column. SQL that is new or edited and
+  // not saved has no list (the saved text would show the old values), and a
+  // chart with no source chosen has none either.
+  const filterSource: OwnSource = heldPreview || !choice
+    ? { unsaved: true }
+    : choice.kind === "sql"
+      ? { sqlSource: choice.id }
+      : { mart: choice.name, joins: joinsPayload(shape.joins).joins };
+  // `BI-58` T2: the data panel's columns, each with its use now and the uses the chart's own
+  // pickers offer it (a column a picker would not list is not offered there either).
+  const takesX = !isStaticTile && !isSingle && !ownColumns && !isGroupedTable;
+  const xChoices = isPoints || isBullet ? fields?.dimensions ?? [] : dimensionChoices;
+  const panelColumns: PanelColumn[] = fields ? [...new Set([
+    ...fields.dimensions, ...fields.measures,
+    ...(takesMetrics ? (fields.metrics ?? []).map((m) => metricColumn(m.name)) : []),
+  ])].filter((name) => !slotParam(name)).map((name) => ({
+    name,
+    group: isMetricColumn(name) ? "number" : columnGroup(fields.kinds?.[name] ?? (fields.measures.includes(name) ? "number" : "text")),
+    table: joinedAlias(name),
+    role: takesX && name === dimension ? (isGantt ? "Task" : "X axis")
+      : !noMeasures && measureRows.some((r) => r.column === name) ? "Value"
+      : canBreakdown && name === breakdown ? (isGantt ? "Group" : "Split")
+      : null,
+    offers: {
+      x: takesX && xChoices.includes(name),
+      value: !noMeasures && measureColumns.includes(name),
+      split: canBreakdown && !rules.breakdownLocked && breakdownChoices.includes(name),
+      filter: rules.filters && columnChoices.some((c) => c.name === name),
+    },
+  })) : [];
+  // A filter asked for from the panel opens in the filters, which the sort-and-filter section shows.
+  const [filterAsk, setFilterAsk] = React.useState<{ column: string; n: number } | null>(null);
+  function applyColumnUse(name: string, use: ColumnUse) {
+    if (use === "x") {
+      // The X axis and the split are two different columns.
+      if (name === breakdown) pickBreakdown("");
+      if (isPoints || isBullet) setDimension(name); else pickDimension(name);
+    } else if (use === "value") {
+      // The first value, with the chart's default aggregate.
+      setMeasureRows((rows) => [{ column: name, aggregate: "" }, ...rows.slice(1)]);
+    } else if (use === "split") {
+      pickBreakdown(name);
+    } else {
+      setTab("sort");
+      setFilterAsk({ column: name, n: Date.now() });
+    }
+  }
+
   // The chart's grouped result, and (BI-6 part 2) what is left after its steps: the sort names the last one's columns.
   const baseResult: ResultColumns = {
     groups: (isGroupedTable ? shape.groupings : [{ column: dimension } as { column: string; grain?: string }]).filter((g) => g.column).map((g) => {
@@ -948,6 +902,10 @@ export function ChartBuilder({
     bases: Object.fromEntries(measureRows.filter((r) => r.column).map((r) => [resultName(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure), r.column])),
   };
   const stepsOn = stepsApply(shape, shapeContext);
+  // `BI-58` T6 (QA 2026-11-14): the server refuses a parameter as the limit of a chart with steps or
+  // of a kind that does not list groups along one dimension; the choice is hidden then, with why.
+  const limitParamOk = limitTakesParam(kind, { steps: stepsOn, rowsMode });
+  const limitParamUsed = limitParamOk ? limitParamName : "";
   const finalResult = stepsOn ? columnsAfterSteps(baseResult, shape.steps) : baseResult;
   const sortChoices = sortOptions(
     finalResult.groups.map((g) => g.name),
@@ -970,32 +928,24 @@ export function ChartBuilder({
     measures: measureRows.filter((r) => r.column).map((r) => measureLabel(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure, aggregate)),
     mapLabel: isMap ? mapLabels[effectiveMap] ?? "" : "", lat, lon,
     sort: rules.sort === "choice" ? sortLabels[shape.sortChoice] ?? "" : rules.sort === "by-date" ? "by date" : rules.sort === "by-category" ? "by category" : "",
-    limit: rules.limit ? (limitParamName ? "param" : Math.min(limit, maxLimit)) : null,
+    limit: rules.limit ? (limitParamUsed ? "param" : Math.min(limit, maxLimit)) : null,
     filters: rules.filters ? shape.filters.length : 0, other: shape.other && rules.other.shown,
   });
-  /** Opens the section that holds a missing field and moves focus to that field. */
-  function revealSection(n: SectionNumber) {
-    if (n === 4) setMoreOpen(true); else setActive(n);
-    setFocusAsk({ section: n, n: Date.now() });
+  /** Shows the place that holds a missing field (the data panel or a tab) and moves focus to that field. */
+  function revealMissing(place: MissingPlace) {
+    if (place !== "source") setTab(place);
+    // The data panel is folded away below 1280 px of builder width; then its sheet opens instead.
+    else if (panelRefs.current[1]?.checkVisibility?.() === false) setDataSheet(true);
+    setFocusAsk({ section: place === "source" ? 1 : place === "data" ? 2 : 3, n: Date.now() });
   }
   React.useEffect(() => {
     if (!focusAsk) return;
-    focusFirstEmpty(panelRefs.current[focusAsk.section] ?? null);
-    setFocusAsk(null);
+    if (!(focusAsk.section === 1 && dataSheet)) { focusFirstEmpty(panelRefs.current[focusAsk.section] ?? null); return; }
+    // The sheet's content mounts in a portal on its first frame; the field is looked for after it.
+    const timer = window.setTimeout(() => focusFirstEmpty(sheetPanel.current), 80);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `dataSheet` is read as it was when the focus was asked for
   }, [focusAsk]);
-  /** A type was chosen from the list or the menu; with no remembered choice the list folds away. */
-  function chooseKind(next: ChartKind) {
-    pickKind(next);
-    setKindMenu(false);
-    if (!readKindListPref()) setListOpen(false);
-  }
-  function toggleList() {
-    const next = !listOpen;
-    setListOpen(next);
-    setKindMenu(false);
-    writeKindListPref(next ? "expanded" : "collapsed");
-  }
-
   /** The shape fields to send; a pivot's bin only while it still has a number field to bin (BI-10). */
   function shapeOut(): Record<string, unknown> {
     const out = shapePayload(shape, shapeContext);
@@ -1031,8 +981,12 @@ export function ChartBuilder({
       };
     } else if (isSingle) {
       const goalColumn = goalMeasureColumn(kind, typeDraft);
+      // QA LH-BI-2-01: a reusable metric must go out as `{ metric }` like on the other paths; the raw row
+      // column `"metric:…"` is refused by the server (400 "invalid or missing measure column"). A plain
+      // column, and an empty row (kept as today so the preview says what is missing), still go as the name.
+      const [firstMeasure] = entriesFromRows(measureRows.slice(0, 1), limits.own);
       payload = {
-        title: payloadTitle, kind, ...sourcePayload(withSource), measures: [measure, ...(goalColumn ? [goalColumn] : [])], aggregate, span, board: targetBoard,
+        title: payloadTitle, kind, ...sourcePayload(withSource), measures: [firstMeasure ?? measure, ...(goalColumn ? [goalColumn] : [])], aggregate, span, board: targetBoard,
         caption: (isKpi || isProgress) && caption ? caption : undefined,
         target: isGauge && Number(target) > 0 ? Number(target) : undefined,
         ...draftPayload(kind, tableDraft),
@@ -1062,7 +1016,7 @@ export function ChartBuilder({
         // A point map has a fixed cap of its own (lakehouse_bi::builder::POINT_LIMIT) and is not sorted.
         order: isCalendar ? "none" : isPoints ? undefined : legacyOrder,
         // A bullet graph without a category is one row and has no limit.
-        limit: isPoints || (isBullet && !dimension) ? undefined : limitParamName ? { param: limitParamName } : Math.min(limit, maxLimit),
+        limit: isPoints || (isBullet && !dimension) ? undefined : limitParamUsed ? { param: limitParamUsed } : Math.min(limit, maxLimit),
         referenceLines: takesLines && refLinesPayload(refLines).length ? refLinesPayload(refLines) : undefined,
         // BI-4 part B: left out when it follows the dashboard, which clears a rule the chart had.
         cache: forPreview || cacheDraft.mode === "default" || draftProblem(cacheDraft) ? undefined : ruleOf(cacheDraft),
@@ -1092,6 +1046,8 @@ export function ChartBuilder({
     if (freshProblem && !forPreview && !isStaticTile) throw new Error(freshProblem);
     if (clickable && click && !problem) payload.click = click;
     if (isEdit) payload.id = editId;
+    // Sent only when there is one, so a chart without a description is saved as it always was.
+    if (!isStaticTile && subtitle.trim()) payload.subtitle = subtitle;
     // BI-11: the preview is drawn with the values the dashboard shows; they are not part of the chart.
     if (forPreview && paramValues && Object.keys(paramValues).length) payload.params = paramValues;
     return payload;
@@ -1109,14 +1065,13 @@ export function ChartBuilder({
     // BI-8: a changed formula changes the rows a chart over the field returns.
     calc: JSON.stringify((fields?.calculated ?? []).map((f) => [f.name, f.formula])),
     // BI-11: the values the preview is drawn with, the limit's parameter and the reference lines.
-    params: JSON.stringify({ values: paramValues ?? null, limit: limitParamName, lines: refLines }),
+    params: JSON.stringify({ values: paramValues ?? null, limit: limitParamUsed, lines: refLines }),
     // BI-17: formats and colours change how the preview is drawn, and the rules of a kind change what is sent.
     style: JSON.stringify(stylePayload(style, fmtRules)),
     // BI-13: each question, and how the chart's own series is drawn, reaches the statements and the drawing.
     layers: JSON.stringify(layersApply ? { layers, ownDraw, ownAxis } : null),
   });
   React.useEffect(() => {
-    if (!open) return;
     if (isText) {
       setPreview(text.trim() ? {
         spec: { id: "preview", title: title || "Chart preview", kind: "text", mart: "", x: "", y: "", source: "ui", text },
@@ -1169,14 +1124,16 @@ export function ChartBuilder({
     // BI-9 review fix (BLOCKER) R3: `previewInputsKey` holds every field that affects the
     // generated SQL or render spec, `grain` included (lib/preview-key.ts).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, previewInputsKey, heldPreview, previewSql]);
+  }, [previewInputsKey, heldPreview, previewSql, retry]);
 
   async function save() {
     setError(null);
     if (sqlActive && draft.blocker) { draft.markSaveAttempted(); setError(draft.blocker); return; }
     // Phase 2 QA R10: a required field that is missing opens its section and takes focus.
     if (missing.length) {
-      revealSection(missing.map(missingSection).reduce((a, b) => (b < a ? b : a)));
+      // The first missing field in the order of the old sections.
+      const first = missing.reduce((a, b) => (missingSection(b) < missingSection(a) ? b : a));
+      revealMissing(missingPlace(first));
       setError(`Still needed: ${missing.join(", ")}.`);
       return;
     }
@@ -1213,13 +1170,9 @@ export function ChartBuilder({
         }
       }
       try {
-        const res = await apiFetch("/api/dashboard/specs", {
-          method: isEdit ? "PUT" : "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        const json = await res.json();
-        if (!res.ok) throw new Error(json?.error ?? "Failed to save chart");
+        // `WEB-7` D6: the write goes through the dashboard service, so no
+        // feature file calls `/api/dashboard/specs` by hand.
+        await dashboardService.saveChart(payload, isEdit);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         if (!savedSource) { setError(message); return; }
@@ -1232,8 +1185,6 @@ export function ChartBuilder({
         setError(`The SQL source “${savedSource.title}” was ${sourceVerb}, but the chart was not saved: ${message}. The builder now uses that source, so saving again will not create it twice.`);
         return;
       }
-      setOpen(false);
-      if (!isEdit) reset();
       onSaved(payload as ChartDef);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1255,64 +1206,41 @@ export function ChartBuilder({
     </div>
   ) : null;
 
+  // `BI-46` (plan D20): the period a date or timestamp breakdown is grouped by.
+  const breakdownGrainPicker = breakdownGrainOptions.length > 0 ? (
+    <div className="grid gap-1.5">
+      <Label>Group the split by</Label>
+      <Select
+        value={shape.breakdownGrain || NO_GRAIN} items={GRAIN_ITEMS}
+        onValueChange={(v) => setShape((d) => ({
+          ...d,
+          breakdownGrain: v && v !== NO_GRAIN && (BREAKDOWN_GRAINS as readonly string[]).includes(v) ? (v as Grain) : "",
+        }))}
+      >
+        <SelectTrigger className="w-full" aria-label="Group the split by"><SelectValue /></SelectTrigger>
+        <SelectContent>
+          <SelectItem value={NO_GRAIN}>No grouping</SelectItem>
+          {breakdownGrainOptions.map((g) => <SelectItem key={g} value={g}>{GRAIN_LABELS[g]}</SelectItem>)}
+        </SelectContent>
+      </Select>
+    </div>
+  ) : null;
+
   // Phase 2 QA R15: which conditional controls the dimension and the breakdown bring (they sit in a row below the fields).
   const binDimension = !isGroupedTable && !!binKind && isNumber(dimension);
   const dimensionExtras = !isGroupedTable && (!!grainPicker || binDimension);
-  const breakdownExtras = canBreakdown && !!binKind && !!breakdown && isNumber(breakdown);
+  const breakdownBinPicker = canBreakdown && !!binKind && !!breakdown && isNumber(breakdown);
+  const breakdownExtras = !!breakdownGrainPicker || breakdownBinPicker;
 
-  const formFields = (
-    // Phase 2 QA R14, the cause of the sideways scroll: a grid with no column template has one `auto`
-    // track, whose minimum is the widest unbreakable content in it (a trigger's `nowrap` value), so
-    // one long column name widened the whole form. Every grid of the form without columns of its own
-    // gets a `minmax(0, 1fr)` track, which the container, not the content, sizes.
-    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 px-5 pt-1 pb-5 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]">
-      {/* Phase 2 QA R11: title wide, dashboard and width narrow, on one row. */}
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_9rem_8rem]">
-        <div className="grid gap-1.5">
-          <Label htmlFor="ch-title">Title {isStaticTile ? <Req /> : null}</Label>
-          <Input
-            id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)}
-            placeholder={suggestedTitle || "e.g. Visitors by Region"}
-          />
-        </div>
-        <div className="grid gap-1.5">
-          <Label>Dashboard</Label>
-          <Select value={targetBoard} items={boardLabels} onValueChange={(v) => setTargetBoard(v ?? "default")}>
-            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              {boardOptions.map((b) => (
-                <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="grid gap-1.5">
-          <Label>Width</Label>
-          <Select value={String(span)} items={SPAN_LABELS} onValueChange={(v) => setSpan(v === "2" ? 2 : 1)}>
-            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="1">{SPAN_LABELS["1"]}</SelectItem>
-              <SelectItem value="2">{SPAN_LABELS["2"]}</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-      </div>
-
-      {isText ? (
-        <div className="grid gap-1.5">
-          <Label>Content (markdown) <Req /></Label>
-          <Textarea rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder="Title **bold**, - bullets, or | table | GFM |." />
-        </div>
-      ) : isCard ? (
-        <CardFields kind={kind === "web" ? "web" : "image"} draft={typeDraft} onChange={changeType} sites={sites} />
-      ) : (
-        <>
-          {/* Phase 2 QA R3: four ordered sections; the last is folded. */}
-          <AccordionSection number={1} title="Data" summary={summaries.data} open={active === 1} onOpenChange={(o) => setActive(o ? 1 : null)} panelRef={(n) => { panelRefs.current[1] = n; }}>
+  /**
+   * `BI-58` T1: the source, its joins, its SQL and its custom fields sit in the data
+   * panel at the left of the page (they were section 1 of the form).
+   */
+  const sourcePanel = (
             <div className="grid gap-1.5">
-            <Label>Data source <Req /></Label>
+            <Label htmlFor="ch-source">Data source <Req /></Label>
             <Select value={source} items={sourceLabels} onValueChange={(v) => onSourceChange(v ?? "")}>
-              <SelectTrigger className="w-full"><SelectValue placeholder={canWriteSql ? "pick a mart or SQL source, or write SQL" : "pick a mart or SQL source"} /></SelectTrigger>
+              <SelectTrigger id="ch-source" aria-required className="w-full"><SelectValue placeholder={canWriteSql ? "pick a mart or SQL source, or write SQL" : "pick a mart or SQL source"} /></SelectTrigger>
               <SelectContent>
                 <SelectGroup>
                   <SelectLabel>Gold marts</SelectLabel>
@@ -1322,7 +1250,7 @@ export function ChartBuilder({
                     return (
                       <SelectItem key={m.name} value={encodeSourceChoice({ kind: "mart", name: m.name })}>
                         <span className="flex items-center gap-1.5 flex-wrap">
-                          <span>{m.name} · {m.rows.toLocaleString("id-ID")}</span>
+                          <span>{m.name} · {formatLocaleNumber(m.rows)}</span>
                           {/* DATA-12 part 3 & PR #106 review R1 BLOCKER 2: mark and tags */}
                           <CertificationBadge certification={m.certification} />
                           {governed.map((pair) => (
@@ -1360,6 +1288,18 @@ export function ChartBuilder({
                 ) : null}
               </SelectContent>
             </Select>
+            {/* QA LH-DATA-12-17 F1 (DATA-54): the trigger shows the mart's name
+                only, so the mark of the list row was lost once a mart was
+                chosen. A deprecated mart has the notice below. */}
+            {chosenMart?.certification === "certified" ? (
+              <p
+                data-testid="chosen-mart-mark"
+                className="flex items-center gap-1.5 text-xs text-muted-foreground"
+              >
+                <CertificationBadge certification="certified" />
+                This mart is certified.
+              </p>
+            ) : null}
             {/* DATA-12 part 3: a deprecated mart still works; it warns, with the
                 note and a link to its replacement, and never blocks. */}
             {chosenMart ? <DeprecationNotice asset={chosenMart} /> : null}
@@ -1406,9 +1346,75 @@ export function ChartBuilder({
                 />
               ) : null}
             </div>
-          </AccordionSection>
+  );
 
-          <AccordionSection number={2} title="What to show" summary={summaries.show} open={active === 2} onOpenChange={(o) => setActive(o ? 2 : null)} panelRef={(n) => { panelRefs.current[2] = n; }}>
+  // Phase 2 QA R14, the cause of the sideways scroll: a grid with no column template has one `auto`
+  // track, whose minimum is the widest unbreakable content in it (a trigger's `nowrap` value), so
+  // one long column name widened the whole form. Every grid of the form without columns of its own
+  // gets a `minmax(0, 1fr)` track, which the container, not the content, sizes.
+  // The data panel's content: inline at the left from 1280 px of builder width, else in the "Pick data" sheet.
+  const dataPanel = (
+    <>
+      {sourcePanel}
+      <ColumnList
+        columns={panelColumns} fieldLabel={fieldLabel} textOf={titleText}
+        xEmpty={!dimension} valueEmpty={!measureRows[0]?.column} onUse={applyColumnUse}
+      />
+      {chosenMart ? <p className="px-2 text-xs text-muted-foreground tabular-nums">{formatLocaleNumber(chosenMart.rows)} rows in {chosenMart.name}</p> : null}
+    </>
+  );
+  const FORM_GRID = "grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 px-5 py-4 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]";
+  /** A group of settings under the main ones of a tab, set apart by a rule. */
+  const group = (children: React.ReactNode) => <div className="grid grid-cols-[minmax(0,1fr)] gap-4 border-t border-border/60 pt-5">{children}</div>;
+
+  // `BI-58` T4: every control of the old five sections, in three tabs. Data: what the chart shows
+  // and where from (old sections 2 and 4 but steps); Sort & filter: old section 3 and the steps;
+  // Style: the Format section as it is. A kind's own panels show only for it, as before.
+  const inspector = isStaticTile ? (
+    <div className={FORM_GRID}>
+      {/* BI-58 review round 1, SHOULD-FIX 5 (owner): a note, an image or a web page keeps its width here. */}
+      <SettingGroup title="Size on dashboard">
+        <SpanPicker value={span} onChange={setSpan} />
+      </SettingGroup>
+      {isText ? (
+        <div className="grid gap-1.5">
+          <Label htmlFor="ch-content">Content (markdown) <Req /></Label>
+          <Textarea id="ch-content" aria-required rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder="Title **bold**, - bullets, or | table | GFM |." />
+        </div>
+      ) : (
+        <CardFields kind={kind === "web" ? "web" : "image"} draft={typeDraft} onChange={changeType} sites={sites} />
+      )}
+    </div>
+  ) : (
+    <Tabs value={tab} onValueChange={(v) => setTab(v as InspectorTab)} className="flex min-h-0 flex-1 flex-col gap-0">
+      {/* BI-58 review round 2, SHOULD-FIX 6 (owner): the tab row spans the inspector. Three equal tabs
+          with centred labels, a 44 px row with its divider across the panel, and one underline the
+          width of the active tab that slides to it (no slide under reduced motion). An inactive tab
+          is muted but readable; hover and focus show. Round 1's padded row still looked cramped. */}
+      <TabsList variant="line" className={cn("relative w-full gap-0 rounded-none border-b border-border/60 p-0", ZONE_HEADER, "group-data-horizontal/tabs:h-11")}>
+        {([["data", "Data", summaries.show], ["sort", "Sort & filter", summaries.sortAndFilter], ["style", "Style", undefined]] as const).map(([value, label, title]) => (
+          <TabsTrigger
+            key={value} value={value} title={title} data-slot="inspector-tab"
+            className={cn(
+              "h-full min-w-0 flex-1 justify-center rounded-none border-0 px-1 text-[13px] whitespace-nowrap @[18rem]:text-sm",
+              "text-muted-foreground transition-[color,background-color] duration-200 ease-[cubic-bezier(0.2,0,0,1)] hover:text-foreground group-data-[variant=line]/tabs-list:hover:bg-muted/50",
+              "focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:ring-inset focus-visible:outline-none",
+              "data-active:text-foreground dark:text-muted-foreground dark:data-active:text-foreground",
+              // The sliding indicator below draws the underline; the tab's own one stays hidden.
+              "after:hidden",
+            )}
+          >
+            {label}
+          </TabsTrigger>
+        ))}
+        <TabsPrimitive.Indicator
+          aria-hidden
+          className="absolute bottom-[-1px] left-0 h-0.5 w-(--active-tab-width) translate-x-(--active-tab-left) bg-foreground transition-[translate,width] duration-200 ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none"
+        />
+      </TabsList>
+      <div className="@container min-h-0 flex-1 overflow-y-auto">
+        <TabsContent value="data">
+          <div className={FORM_GRID} ref={(n) => { panelRefs.current[2] = n; }}>
           {isMap ? (
             <div className="grid gap-1.5">
               <Label>Map</Label>
@@ -1423,7 +1429,7 @@ export function ChartBuilder({
 
           {kind === "table" ? <TableSection part="shape" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
           {!isSingle && !ownColumns ? (
-            <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-1 items-start gap-3 @md:grid-cols-2">
               {isGroupedTable ? (
                 <GroupingsEditor
                   value={shape.groupings}
@@ -1436,10 +1442,12 @@ export function ChartBuilder({
                 />
               ) : (
               <div className="grid content-start gap-1.5" data-slot="dimension-field">
-                <Label>{dimensionLabel} {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : isBullet ? <span className="font-normal text-muted-foreground">(optional, one bullet per category)</span> : <Req />}</Label>
+                <Label htmlFor="ch-dimension">{dimensionLabel} {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : isBullet ? <span className="font-normal text-muted-foreground">(optional, one bullet per category)</span> : <Req />}</Label>
                 {isPoints || isBullet ? (
                   <Select value={dimension || NO_BREAKDOWN} items={{ ...NO_LABEL_ITEMS, ...columnItems(fields?.dimensions ?? [], fieldLabel, dimension) }} onValueChange={(v) => setDimension(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
-                    <SelectTrigger className="w-full" title={dimension ? displayColumnFull(dimension) : undefined}><SelectValue placeholder={fields ? (isBullet ? "one bullet" : "no label") : noFieldsHint} /></SelectTrigger>
+                    {/* UX-1-R11: keep the `ch-dimension` id on the optional
+                        branch too, so the visible Label still names its control. */}
+                    <SelectTrigger id="ch-dimension" className="w-full" title={dimension ? displayColumnFull(dimension) : undefined}><SelectValue placeholder={fields ? (isBullet ? "one bullet" : "no label") : noFieldsHint} /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value={NO_BREAKDOWN}>{isBullet ? "— no category —" : "— no label —"}</SelectItem>
                       {fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
@@ -1447,7 +1455,7 @@ export function ChartBuilder({
                   </Select>
                 ) : (
                   <Select value={dimension} items={columnItems(dimensionChoices, fieldLabel, dimension)} onValueChange={(v) => pickDimension(v ?? "")} disabled={!fields}>
-                    <SelectTrigger className="w-full" title={dimension ? displayColumnFull(dimension) : undefined}><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
+                    <SelectTrigger id="ch-dimension" aria-required={!isPoints && !isBullet} className="w-full" title={dimension ? displayColumnFull(dimension) : undefined}><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                     <SelectContent>{dimensionChoices.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}</SelectContent>
                   </Select>
                 )}
@@ -1455,11 +1463,11 @@ export function ChartBuilder({
               )}
               {canBreakdown ? (
                 <div className="grid content-start gap-1.5" data-slot="breakdown-field">
-                  <Label>{breakdownLabel} {needsBreakdown ? <Req /> : <span className="font-normal text-muted-foreground">(optional)</span>}</Label>
+                  <Label htmlFor="ch-breakdown">{breakdownLabel} {needsBreakdown ? <Req /> : <span className="font-normal text-muted-foreground">(optional)</span>}</Label>
                   <Select value={breakdown || NO_BREAKDOWN} items={{ ...breakdownLabels, ...columnItems(breakdownChoices, fieldLabel, breakdown) }} onValueChange={(v) => pickBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields || !!rules.breakdownLocked}>
-                    <SelectTrigger className="w-full" title={breakdown ? displayColumnFull(breakdown) : undefined}><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
+                    <SelectTrigger id="ch-breakdown" aria-required={needsBreakdown} className="w-full" title={breakdown ? displayColumnFull(breakdown) : undefined}><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no split"} /></SelectTrigger>
                     <SelectContent>
-                      {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
+                      {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no split —</SelectItem>}
                       {breakdownChoices.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
@@ -1475,7 +1483,7 @@ export function ChartBuilder({
                 cannot stretch them.
               */}
               {dimensionExtras || breakdownExtras ? (
-                <div className="grid grid-cols-1 gap-3 sm:col-span-2 sm:grid-cols-2" data-slot="conditional-row">
+                <div className="grid grid-cols-1 gap-3 @md:col-span-2 @md:grid-cols-2" data-slot="conditional-row">
                   {dimensionExtras ? (
                     <div className="grid content-start gap-3">
                       {grainPicker}
@@ -1486,9 +1494,12 @@ export function ChartBuilder({
                     </div>
                   ) : null}
                   {breakdownExtras ? (
-                    <div className="grid content-start gap-3 sm:col-start-2">
-                      <BinPicker label="Group the breakdown in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
-                        onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
+                    <div className="grid content-start gap-3 @md:col-start-2">
+                      {breakdownGrainPicker}
+                      {breakdownBinPicker ? (
+                        <BinPicker label="Group the split in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the split in bins"
+                          onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
+                      ) : null}
                     </div>
                   ) : null}
                 </div>
@@ -1496,28 +1507,23 @@ export function ChartBuilder({
             </div>
           ) : null}
           {isPoints ? (
-            <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-1 items-start gap-3 @md:grid-cols-2">
               <div className="grid gap-1.5">
-                <Label>Latitude <Req /></Label>
+                <Label htmlFor="ch-lat">Latitude <Req /></Label>
                 <Select value={lat} items={columnItems(coordinateColumns, fieldLabel, lat)} onValueChange={(v) => setLat(v ?? "")} disabled={!fields}>
-                  <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
+                  <SelectTrigger id="ch-lat" aria-required className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                   <SelectContent>{coordinateColumns.filter((c) => c !== lon).map((c) => <SelectItem key={c} value={c}>{fieldLabel(c)}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               <div className="grid gap-1.5">
-                <Label>Longitude <Req /></Label>
+                <Label htmlFor="ch-lon">Longitude <Req /></Label>
                 <Select value={lon} items={columnItems(coordinateColumns, fieldLabel, lon)} onValueChange={(v) => setLon(v ?? "")} disabled={!fields}>
-                  <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
+                  <SelectTrigger id="ch-lon" aria-required className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                   <SelectContent>{coordinateColumns.filter((c) => c !== lat).map((c) => <SelectItem key={c} value={c}>{fieldLabel(c)}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
             </div>
           ) : null}
-          {isPoints ? <GridPicker value={shape.grid} onChange={(grid) => setShape((d) => ({ ...d, grid }))} disabled={!fields} /> : null}
-          {isCalendar ? (
-            <p className="-mt-2 text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
-          ) : null}
-
           {isPoints ? <GridPicker value={shape.grid} onChange={(grid) => setShape((d) => ({ ...d, grid }))} disabled={!fields} /> : null}
           {isCalendar ? (
             <p className="text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
@@ -1543,7 +1549,7 @@ export function ChartBuilder({
             </div>
           ) : isPoints ? (
             <p className="text-xs text-muted-foreground">
-              Up to {pointLimit(choice?.kind === "sql" ? choice.id : undefined).toLocaleString("en-US")} points, largest values first.
+              Up to {formatLocaleNumber(pointLimit(choice?.kind === "sql" ? choice.id : undefined))} points, largest values first.
               One point per distinct latitude and longitude{dimension ? " and label" : ""}.
             </p>
           ) : null}
@@ -1572,11 +1578,38 @@ export function ChartBuilder({
               ) : null}
             </>
           ) : null}
-          </AccordionSection>
-
-          <AccordionSection number={3} title="Sort and filter" summary={summaries.sortAndFilter} open={active === 3} onOpenChange={(o) => setActive(o ? 3 : null)} panelRef={(n) => { panelRefs.current[3] = n; }}>
+            {rules.layers ? group(
+              <LayersSection
+                layers={layers} onChange={setLayers}
+                baseKind={dimension ? fields?.kinds?.[dimension] : undefined} grained={!!(grain && grainOptions.includes(grain))}
+                marts={marts.map((m) => m.name)} sqlSources={sqlSources.map((s) => ({ id: s.id, title: s.title }))}
+                ownDraw={ownDraw} ownAxis={ownAxis} onOwnChange={(patch) => { if (patch.draw !== undefined) setOwnDraw(patch.draw); if (patch.axis !== undefined) setOwnAxis(patch.axis); }}
+                blocked={layersBlocked.length ? `Remove ${layersBlocked.join(", ")} to add a second source.` : isNewSql ? "Save the SQL as a source first to add a second source to it." : undefined}
+                disabled={!fields}
+              />,
+            ) : null}
+            {isKpi ? group(<KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} metric={pickedMetric ? { label: pickedMetric.label, timeColumn: pickedMetric.timeColumn, grain: pickedMetric.grain } : undefined} />) : null}
+            {isGroupedTable ? group(<TableSection part="format" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} />) : null}
+            {group(
+              <>
+                {rules.parameters ? (
+                  <div>
+                    <Button type="button" size="sm" variant="ghost" className="-ml-2 h-7 px-2 text-xs" onClick={() => setParamsOpen(true)}>
+                      <SlidersHorizontal className="size-3" aria-hidden /> Parameters
+                    </Button>
+                  </div>
+                ) : null}
+                {rules.click ? <ClickSetting value={click} onChange={setClick} boards={boardOptions} /> : null}
+                <FreshnessField id="chart-freshness" draft={cacheDraft} onChange={setCacheDraft}
+                  help="How long this chart's result is remembered. Follow the default uses the dashboard's setting." />
+              </>,
+            )}
+          </div>
+        </TabsContent>
+        <TabsContent value="sort">
+          <div className={FORM_GRID} ref={(n) => { panelRefs.current[3] = n; }}>
             {rules.sort !== "none" ? (
-              <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+              <div className="grid grid-cols-1 items-start gap-3 @md:grid-cols-2">
                 {rules.sort === "by-date" || rules.sort === "by-category" ? (
                   <div className="grid gap-1.5">
                     <Label>Sort</Label>
@@ -1594,11 +1627,17 @@ export function ChartBuilder({
                   </div>
                 )}
                 {rules.limit ? <div className="grid gap-1.5">
-                  <Label>{grain ? "Buckets (max 1000, latest kept)" : isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
-                  {limitParamName ? null : (
-                    <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => { setLimitTouched(true); setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20))); }} />
+                  <Label>{capsBreakdown
+                    ? (grain ? "Split values (Top N)" : "Limit (Top N, X axis and split)")
+                    : grain ? "Buckets (max 1000, latest kept)" : isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
+                  {limitParamUsed ? null : (
+                    <WholeNumberInput aria-label="Limit" min={1} max={maxLimit} value={Math.min(limit, maxLimit)} onCommit={(n) => { setLimitTouched(true); setLimit(n); }} />
                   )}
-                  {numberParamDefs.length ? (
+                  {numberParamDefs.length && !limitParamOk ? (
+                    <p className="text-xs text-muted-foreground">
+                      {stepsOn ? "A parameter cannot set the limit of a chart with steps." : "A parameter cannot set the limit of this chart type."}
+                    </p>
+                  ) : numberParamDefs.length ? (
                     <Select value={limitParamName || FIXED_LIMIT} items={{ [FIXED_LIMIT]: "A fixed number", ...Object.fromEntries(numberParamDefs.map((p) => [p.name, p.label || p.name])) }}
                       onValueChange={(v) => setLimitParamName(v && v !== FIXED_LIMIT ? v : "")}>
                       <SelectTrigger className="w-full" aria-label="Limit from a parameter"><SelectValue /></SelectTrigger>
@@ -1622,310 +1661,374 @@ export function ChartBuilder({
               </div>
             ) : null}
 
-            {rules.filters ? <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} /> : null}
-          </AccordionSection>
-
-          <FoldSection number={4} title="More options" open={moreOpen} onOpenChange={setMoreOpen} panelRef={(n) => { panelRefs.current[4] = n; }}>
-            {rules.steps ? <StepsEditor value={shape.steps} onChange={(steps) => setShape((d) => ({ ...d, steps }))} base={baseResult} disabled={!fields} /> : null}
-
-            {rules.layers ? (
-              <LayersSection
-                layers={layers} onChange={setLayers}
-                baseKind={dimension ? fields?.kinds?.[dimension] : undefined} grained={!!(grain && grainOptions.includes(grain))}
-                marts={marts.map((m) => m.name)} sqlSources={sqlSources.map((s) => ({ id: s.id, title: s.title }))}
-                ownDraw={ownDraw} ownAxis={ownAxis} onOwnChange={(patch) => { if (patch.draw !== undefined) setOwnDraw(patch.draw); if (patch.axis !== undefined) setOwnAxis(patch.axis); }}
-                blocked={layersBlocked.length ? `Remove ${layersBlocked.join(", ")} to combine questions.` : isNewSql ? "Save the SQL as a source first to combine it with other questions." : undefined}
-                disabled={!fields}
-              />
-            ) : null}
-
-            {isKpi ? <KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} metric={pickedMetric ? { label: pickedMetric.label, timeColumn: pickedMetric.timeColumn, grain: pickedMetric.grain } : undefined} /> : null}
-            {isGroupedTable ? <TableSection part="format" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
-            {rules.click ? <ClickSetting value={click} onChange={setClick} boards={boardOptions} /> : null}
-            {!isStaticTile ? (
-              <FreshnessField id="chart-freshness" draft={cacheDraft} onChange={setCacheDraft}
-                help="How long this chart's result is remembered. Follow the default uses the dashboard's setting." />
-            ) : null}
-            {rules.parameters ? (
-              <div>
-                <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setParamsOpen(true)}>
-                  <SlidersHorizontal className="size-3" aria-hidden /> Parameters
-                </Button>
-              </div>
-            ) : null}
-            {paramsOpen ? <ParamDialog open onOpenChange={setParamsOpen} canWrite onChanged={() => { if (source) void loadFields(source); }} /> : null}
-          </FoldSection>
-
+            {rules.filters ? <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} source={filterSource} startWith={filterAsk} /> : null}
+            {rules.steps ? group(<StepsEditor value={shape.steps} onChange={(steps) => setShape((d) => ({ ...d, steps }))} base={baseResult} disabled={!fields} />) : null}
+          </div>
+        </TabsContent>
+        <TabsContent value="style">
           {/* BI-17 part A: formats, colours, axes, labels, reference lines, notes, tooltip; conditional colours for tables and KPIs. */}
-          <FoldSection number={5} title="Format" open={formatOpen} onOpenChange={setFormatOpen} panelRef={(n) => { panelRefs.current[5] = n; }}>
+          <div className={FORM_GRID}>
+            {/* BI-58 review round 1, SHOULD-FIX 5 (owner): the width moved here from the header. */}
+            <SettingGroup title="Size on dashboard">
+              <SpanPicker value={span} onChange={setSpan} />
+            </SettingGroup>
             <FormatSection rules={fmtRules} style={style} onChange={setStyle} valueNames={formatValueNames} seriesNames={formatValueNames} paletteValue={effectivePalette(style, palette, isEdit)}>
               {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} valueNames={resultNames} takesForecast={kind !== "hbar"} /> : null}
             </FormatSection>
-          </FoldSection>
-        </>
+          </div>
+        </TabsContent>
+      </div>
+      {paramsOpen ? <ParamDialog open onOpenChange={setParamsOpen} canWrite onChanged={() => { if (source) void loadFields(source); }} /> : null}
+    </Tabs>
+  );
+
+  // `BI-58` T3: the preview's rows, for the "Data" view under the chart and for the type gallery.
+  const resultRows = preview && "rows" in preview.result ? preview.result : null;
+  const rowsView: PreviewRows | null = preview?.previewRows?.rows.length ? preview.previewRows
+    : resultRows ? { columns: resultRows.columns, rows: resultRows.rows, truncated: false, limit: resultRows.rows.length } : null;
+  const galleryPreview: GalleryPreview | null = preview && resultRows?.rows.length
+    ? { spec: preview.spec, columns: resultRows.columns, rows: resultRows.rows } : null;
+  const sourceFacts: SourceFacts | null = fields ? {
+    dates: Object.values(fields.kinds ?? {}).filter((k) => k === "date" || k === "datetime").length,
+    groups: fields.dimensions.filter((d) => !slotParam(d)).length,
+    numbers: fields.measures.filter((m) => !slotParam(m)).length + (fields.metrics?.length ?? 0),
+  } : null;
+  // A chart with steps opens its rows, as the rows under its preview always did (BI-6 part 2); the person's toggle wins.
+  const hasSteps = !!(preview?.spec as { def?: ShapeDefFields } | undefined)?.def?.steps?.length;
+  const dataOpen = (showData ?? hasSteps) && !!rowsView && !showRows;
+  /** What the preview holds, in plain words, under the chart. */
+  const resultNote = showRows ? "Rows from your SQL"
+    : !resultRows ? (previewBusy ? "Running the query…" : "No result yet")
+    : isSingle ? "One value"
+    : (() => {
+        const n = resultRows.rows.length;
+        const noun = rowsMode ? (n === 1 ? "row" : "rows") : isGantt ? (n === 1 ? "task" : "tasks") : n === 1 ? "group" : "groups";
+        const before = preview?.previewRows;
+        return before && before.rows.length > n
+          ? `Showing ${formatLocaleNumber(n)} of ${before.truncated ? "more than " : ""}${formatLocaleNumber(before.rows.length)} ${noun}`
+          : `${formatLocaleNumber(n)} ${noun}`;
+      })();
+
+  const previewBody = showRows ? (
+    <div className="flex h-full flex-col gap-3 overflow-auto">
+      {chartHold ? <p className="text-sm text-muted-foreground">{chartHold}</p> : null}
+      {draft.result && draft.phase !== "empty" ? (
+        <SqlRowsTable result={draft.result} stale={draft.phase === "stale"} className="min-h-0 flex-1" />
+      ) : (
+        <EmptyState className="py-6" title="Run the SQL" description="Its first rows appear here." />
       )}
     </div>
-  );
-  /** The type search and the grouped type buttons, shared by the open list and the menu of the folded one (phase 2 QA R9). */
-  const kindSearch = (
-    <>
-      <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
-      <Input
-        value={kindQuery}
-        onChange={(e) => setKindQuery(e.target.value)}
-        onKeyDown={(e) => {
-          // Enter picks the first match, so "sank⏎" is enough.
-          const first = kindGroups[0]?.items[0];
-          if (e.key === "Enter" && first) { e.preventDefault(); chooseKind(first.value); }
-        }}
-        placeholder="Search chart types"
-        aria-label="Search chart types"
-        className="h-8 bg-background pl-8"
-      />
-    </>
-  );
-  const kindList = (direction: string) => (
-    <>
-      {kindGroups.length === 0 ? (
-        <p className="px-2 py-1.5 text-xs text-muted-foreground">No chart type matches “{kindQuery.trim()}”.</p>
+  ) : preview ? (
+    <div className={cn("grid h-full min-h-0 gap-3", dataOpen ? "grid-rows-[minmax(0,3fr)_minmax(0,2fr)]" : "grid-rows-1")}>
+      <div className="min-h-0">
+        <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} />
+      </div>
+      {dataOpen && rowsView ? (
+        <div className="min-h-0 overflow-auto" data-slot="preview-rows">
+          <PreviewRowsTable data={rowsView} labels={finalResult.labels} values={finalResult.measures} open />
+        </div>
       ) : null}
-      {kindGroups.map((group) => (
-        <div key={group.group} className={cn("flex shrink-0 gap-1", direction)}>
-          <p className={cn("px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground", direction === "md:flex-col" && "hidden md:block")}>
-            {group.group}
-          </p>
-          {group.items.map((item) => {
-            const Icon = kindIcon(item.value);
-            const active = item.value === kind;
-            return (
-              <button
-                key={item.value}
-                type="button"
-                aria-pressed={active}
-                title={KIND_DESCRIPTIONS[item.value]}
-                onClick={() => chooseKind(item.value)}
-                className={cn(
-                  "flex shrink-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm whitespace-nowrap transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                  active ? "bg-primary/10 font-medium text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground",
-                )}
-              >
-                <Icon className={cn("size-4 shrink-0", active ? "text-primary" : "opacity-70")} />
-                <span className="md:truncate">{item.label}</span>
-              </button>
-            );
-          })}
-        </div>
-      ))}
-    </>
-  );
-  const previewPane = (
-    <section aria-label="Preview" className={cn("flex flex-col gap-3 px-5 pb-5", wide ? "h-full pt-1" : "min-h-96 border-t border-border pt-4")}>
-      <div className="flex flex-wrap items-center justify-between gap-x-3">
-        <p className="text-sm font-medium">Preview</p>
-        {heldPreview && chartHold === null && draft.result ? (
-          <div role="group" aria-label="Preview content" className="flex gap-1">
-            {(["chart", "rows"] as const).map((tab) => (
-              <Button
-                key={tab} type="button" size="xs" variant={paneTab === tab ? "secondary" : "ghost"}
-                aria-pressed={paneTab === tab} onClick={() => setPaneTab(tab)}
-              >
-                {tab === "chart" ? "Chart" : "Rows"}
-              </Button>
-            ))}
-          </div>
-        ) : (
-          <p className="text-xs text-muted-foreground">{showRows ? "Rows from your SQL" : "Live data, updates as you edit"}</p>
-        )}
+    </div>
+  ) : previewBusy || (!previewError && !missing.length) ? (
+    <StateBox>
+      <Spinner className="size-5 text-muted-foreground" />
+      <p className="text-sm text-muted-foreground">Running the query…</p>
+    </StateBox>
+  ) : previewError ? (
+    <StateBox>
+      <span className="grid size-10 place-items-center rounded-xl bg-destructive/10 text-destructive"><CircleAlert className="size-5" aria-hidden /></span>
+      <div className="grid max-w-sm gap-1">
+        <p className="text-sm font-medium text-foreground">Preview unavailable</p>
+        <p className="text-sm text-muted-foreground">{asSentence(previewError)}</p>
       </div>
-      <div className="relative min-h-72 flex-1">
-        <div className="absolute inset-0">
-          {showRows ? (
-            <div className="flex h-full flex-col gap-3 overflow-auto">
-              {chartHold ? <p className="text-sm text-muted-foreground">{chartHold}</p> : null}
-              {draft.result && draft.phase !== "empty" ? (
-                <SqlRowsTable result={draft.result} stale={draft.phase === "stale"} className="min-h-0 flex-1" />
-              ) : (
-                <EmptyState className="py-6" title="Run the SQL" description="Its first rows appear here." />
-              )}
-            </div>
-          ) : preview ? (
-            <div className="flex h-full flex-col gap-2">
-              <div className="min-h-0 flex-1">
-                <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} />
-              </div>
-              {preview.previewRows && preview.previewRows.rows.length ? <PreviewRowsTable data={preview.previewRows} labels={finalResult.labels} open={(preview.spec as { def?: ShapeDefFields }).def?.steps?.length ? true : false} /> : null}
-            </div>
-          ) : previewBusy ? (
-            <div className="h-full animate-pulse rounded-md bg-muted/50" />
-          ) : (
-            <EmptyState
-              className="h-full py-6"
-              title={previewError ? "Preview unavailable" : missing.length ? "Nothing to preview yet" : "Loading preview…"}
-              description={previewError ?? (missing.length ? `Fill in ${missing.join(", ")} to see real data here.` : undefined)}
-            />
-          )}
-        </div>
+      <Button type="button" variant="outline" size="sm" onClick={() => setRetry((n) => n + 1)}>
+        <RefreshCw aria-hidden /> Try again
+      </Button>
+    </StateBox>
+  ) : (
+    <StateBox>
+      <span className="grid size-10 place-items-center rounded-xl bg-muted text-muted-foreground"><ChartColumn className="size-5" aria-hidden /></span>
+      <div className="grid max-w-xs gap-1">
+        <p className="text-sm font-medium text-foreground">Your chart appears here</p>
+        <p className="text-sm text-muted-foreground">{`Fill in ${missing.join(", ")} to see real data here.`}</p>
       </div>
-    </section>
+      {!choice && !isNewSql ? (
+        <Button type="button" variant="outline" size="sm" className="@7xl:hidden" onClick={() => setDataSheet(true)}>
+          <Database aria-hidden /> Pick data
+        </Button>
+      ) : null}
+    </StateBox>
   );
+
+  const canSubmit = !busy && !(sqlActive && !!draft.runBlocker);
+
+  // BI-58 review round 1, SHOULD-FIX 4 (owner): with no Cancel button, leaving asks first when the
+  // chart changed. Everything the chart is saved with is in this key; until the person first
+  // touches the builder, the baseline follows it, so the loading and the builder's own settling of
+  // an edited chart do not count as changes.
+  const dirtyKey = JSON.stringify([previewInputsKey, subtitle, cacheDraft, click ?? null, sqlActive ? [draft.sql, draft.name] : null]);
+  const [touched, setTouched] = React.useState(false);
+  const [baseline, setBaseline] = React.useState<string | null>(null);
+  React.useEffect(() => { if (!touched) setBaseline(dirtyKey); }, [dirtyKey, touched]);
+  const dirty = touched && baseline !== null && baseline !== dirtyKey && !busy;
+  const markTouched = () => { if (!touched) setTouched(true); };
+  /** The confirm is open: for the back arrow or Esc (no anchor), or for a link that was held back. */
+  const [leaving, setLeaving] = React.useState<{ anchor?: HTMLAnchorElement } | null>(null);
+  const passLink = React.useRef(false);
+  function leave() {
+    if (dirty) setLeaving({}); else onCancel();
+  }
+  function discard() {
+    const anchor = leaving?.anchor;
+    setLeaving(null);
+    if (!anchor) { onCancel(); return; }
+    // The held-back link goes on as the person clicked it, past the guard this once.
+    passLink.current = true;
+    anchor.click();
+    passLink.current = false;
+  }
+  // Esc leaves when nothing is open over the page (a popover, a list, a menu or a dialog closes first).
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (document.querySelector('[role="dialog"], [role="alertdialog"], [role="listbox"], [role="menu"]')) return;
+      if (dirty) setLeaving({}); else onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [dirty, onCancel]);
+  // A link inside the console (the sidebar, a breadcrumb) is held back while there are changes.
+  // Next has no way to stop its router, so the click is stopped before its handler sees it. The
+  // browser's own back button cannot be held back this way; a reload or a tab close asks below.
+  React.useEffect(() => {
+    if (!dirty) return;
+    const onClick = (e: MouseEvent) => {
+      if (passLink.current || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      const anchor = (e.target as Element | null)?.closest?.("a[href]") as HTMLAnchorElement | null;
+      if (!anchor || anchor.target === "_blank" || anchor.hasAttribute("download")) return;
+      if (new URL(anchor.href, window.location.href).origin !== window.location.origin) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setLeaving({ anchor });
+    };
+    const onUnload = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("click", onClick, true);
+    window.addEventListener("beforeunload", onUnload);
+    return () => {
+      window.removeEventListener("click", onClick, true);
+      window.removeEventListener("beforeunload", onUnload);
+    };
+  }, [dirty]);
 
   return (
-    <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o && !isEdit) reset(); }}>
-      {hideTrigger ? null : (
-        <DialogTrigger render={<Button variant="outline" size="sm" />}>
-          <Plus className="size-4" /> New chart
-        </DialogTrigger>
-      )}
-      <DialogContent className="h-[min(90vh,52rem)] overflow-hidden p-0 sm:max-w-6xl">
+    // `BI-58` T1 (layout A of 2026-11-14): the chart is the page. A header row (where the chart
+    // comes from and goes, and the two actions), then three zones: the data panel, the canvas and
+    // the inspector. The zones follow the builder's own width (a container query), not the
+    // window's, because the app's sidebar takes a different share of each window.
+    // `BI-58` T5: from two columns up the builder fits the window instead of scrolling it: the
+    // navbar (4rem) and `main`'s top padding (1.5rem) above, and the frame's `--content-bottom` below.
+    // Owner QA 2026-11-14, composer: that bottom room is now just the composer and a small gap, the
+    // same token `main` pads with, so the zones end about 14 px above the composer.
+    <div className="@container" data-slot="chart-builder" onPointerDownCapture={markTouched} onKeyDownCapture={markTouched} onInputCapture={markTouched}>
+      <div className="flex flex-col gap-4 @3xl:h-[calc(100dvh-5.5rem-var(--content-bottom,1.5rem))] @3xl:min-h-[30rem] @3xl:transition-[height] @3xl:duration-200 @3xl:ease-out motion-reduce:transition-none">
         {/*
-          Chart types live in a sidebar next to the form (like a settings
-          dialog) instead of a separate gallery step: switching type keeps
-          everything else filled in and the live preview follows at once.
-          The dialog has a fixed height so the actions stay at the bottom
-          edge whatever the form's length.
+          BI-58 review round 1, SHOULD-FIX 4 and 5 (owner): one action, one button. The back arrow
+          leaves (asking first when something changed), the dashboard name in the breadcrumb is
+          where the chart goes (the old "Add to" select), and Save is the only other button. The
+          width moved to the Style tab.
         */}
-        <div className={cn("grid h-full min-h-0", listOpen ? "grid-rows-[auto_minmax(0,1fr)] md:grid-cols-[14rem_minmax(0,1fr)] md:grid-rows-1" : "grid-rows-[minmax(0,1fr)]")}>
-          {listOpen ? (
-          <nav aria-label="Chart type" className="flex min-h-0 flex-col border-b border-border bg-muted/30 md:border-r md:border-b-0">
-            <div className="flex items-center gap-1 p-2 md:p-3 md:pb-2">
-              <div className="relative min-w-0 flex-1">{kindSearch}</div>
-              <Button type="button" size="icon-sm" variant="ghost" className="shrink-0" aria-label="Fold the chart type list" title="Fold the chart type list" onClick={toggleList}>
-                <PanelLeftClose aria-hidden />
-              </Button>
-            </div>
-            <div className="flex min-h-0 gap-1 overflow-x-auto px-2 pb-2 md:flex-col md:gap-3 md:overflow-y-auto md:px-3 md:pb-3">
-              {kindList("md:flex-col")}
-            </div>
-          </nav>
-          ) : null}
-
-          <div className="flex min-h-0 flex-col">
-            <div className="px-5 pt-5 pb-4">
-              <DialogHeader>
-                <DialogTitle className="flex items-center gap-1.5 text-base">
-                  <span className="text-muted-foreground">{isEdit ? "Edit chart" : "New chart"}</span>
-                  {/* Phase 2 QA R20: the chevron only when the kind follows it (folded, the kind is on the menu button). */}
-                  {listOpen ? (
-                    <>
-                      <ChevronRight className="size-4 text-muted-foreground" aria-hidden />
-                      <span>{KIND_LABELS[kind]}</span>
-                    </>
-                  ) : null}
-                </DialogTitle>
-                <DialogDescription className="sr-only">{KIND_DESCRIPTIONS[kind]}. Review live data before adding it to the dashboard.</DialogDescription>
-              </DialogHeader>
-              {listOpen ? null : (
-                // Phase 2 QA R9: with the list folded, the type is changed from here, and the search stays.
-                <div className="mt-2 flex items-center gap-1.5">
-                  {/*
-                    Phase 2 QA R17: a popover of the base-ui family the dialog is made of, so it nests in the
-                    dialog's layer stack: an outside press and Escape close only the popover, and focus
-                    returns to the trigger. (The hand-made inline panel closed on neither.)
-                  */}
-                  <PopoverPrimitive.Root open={kindMenu} onOpenChange={setKindMenu}>
-                    <PopoverPrimitive.Trigger
-                      render={<Button type="button" size="sm" variant="outline" aria-label={`Change chart type, now ${KIND_LABELS[kind]}`} />}
-                    >
-                      {React.createElement(kindIcon(kind), { className: "size-4", "aria-hidden": true })}
-                      {KIND_LABELS[kind]} <ChevronDown className="size-3.5" aria-hidden />
-                    </PopoverPrimitive.Trigger>
-                    <PopoverPrimitive.Portal>
-                      <PopoverPrimitive.Positioner side="bottom" align="start" sideOffset={4} className="z-[60]">
-                        <PopoverPrimitive.Popup
-                          role="group" aria-label="Chart type"
-                          className="flex max-h-80 w-72 flex-col gap-2 rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-md outline-hidden"
-                        >
-                          <div className="relative">{kindSearch}</div>
-                          <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">{kindList("flex-col")}</div>
-                        </PopoverPrimitive.Popup>
-                      </PopoverPrimitive.Positioner>
-                    </PopoverPrimitive.Portal>
-                  </PopoverPrimitive.Root>
-                  <Button type="button" size="icon-sm" variant="ghost" aria-label="Show the chart type list" title="Show the chart type list" onClick={toggleList}>
-                    <PanelLeftOpen aria-hidden />
-                  </Button>
-                </div>
-              )}
-            </div>
-            {/*
-              Form and preview are split by a divider rather than a card
-              around the preview, so the chart gets the whole column height.
-              On a wide screen the divider is a drag handle (double-click
-              resets it); a narrow one stacks them and scrolls instead.
-            */}
-            {wide ? (
-              <ResizablePanelGroup className="min-h-0 flex-1">
-                <ResizablePanel defaultSize="50" minSize="30">
-                  <div className="h-full min-w-0 overflow-y-auto">{formFields}</div>
-                </ResizablePanel>
-                <ResizableHandle withHandle />
-                <ResizablePanel defaultSize="50" minSize="30">{previewPane}</ResizablePanel>
-              </ResizablePanelGroup>
-            ) : (
-              <div className="min-h-0 flex-1 overflow-y-auto">
-                {formFields}
-                {previewPane}
-              </div>
-            )}
-
-            {/* Error sits beside the button that caused it, not at the end of a long form. */}
-            <DialogFooter className="items-center border-t border-border px-5 py-3">
-              {error ? <p role="alert" className="text-sm text-destructive sm:mr-auto">{error}</p> : null}
-              {!error && sqlActive && draft.blocker ? <p className="text-sm text-muted-foreground sm:mr-auto">{draft.blocker}</p> : null}
-              <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
-              <Button size="sm" onClick={() => void save()} disabled={busy || (sqlActive && !!draft.runBlocker)}>
-                {busy ? "Saving…" : isEdit ? "Save changes" : "Create chart"}
-              </Button>
-            </DialogFooter>
+        <header className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+          <div className="flex min-w-0 items-center gap-1">
+            <Button type="button" variant="ghost" size="icon-sm" aria-label="Back to dashboard" title="Back to dashboard" onClick={leave}>
+              <ArrowLeft aria-hidden />
+            </Button>
+            <Select value={targetBoard} items={boardLabels} onValueChange={(v) => setTargetBoard(v ?? "default")}>
+              <SelectTrigger
+                aria-label="Add to dashboard" title="The dashboard this chart is saved on"
+                className="h-8 w-auto max-w-56 min-w-0 gap-1 border-transparent bg-transparent px-2 text-sm text-muted-foreground shadow-none transition-colors duration-200 hover:bg-muted hover:text-foreground dark:bg-transparent dark:hover:bg-muted"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {boardOptions.map((b) => (
+                  <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <span aria-hidden className="text-sm text-muted-foreground">/</span>
+            <h1 className="ml-1.5 truncate text-sm font-medium text-foreground">{isEdit ? "Edit chart" : "New chart"}</h1>
           </div>
+          {/* The SQL source of a new chart must be run once before the chart can be saved over it;
+              until then the builder says so (`draft.runBlocker`). */}
+          <Button type="button" className="min-w-28" disabled={!canSubmit} onClick={() => void save()}>
+            {busy ? (isEdit ? "Saving…" : "Creating…") : isEdit ? "Save changes" : "Create chart"}
+          </Button>
+        </header>
+
+        {error ? <p role="alert" className="text-sm text-destructive">{asSentence(error)}</p> : null}
+        {/* Why the chart cannot be saved yet; the API's own error is the line above. */}
+        {!error && sqlActive && draft.blocker ? <p className="text-sm text-muted-foreground">{draft.blocker}</p> : null}
+
+        <div className={cn(
+          "grid min-h-0 flex-1 gap-4",
+          isStaticTile ? "@3xl:grid-cols-[minmax(0,1fr)_20rem]" : "@3xl:grid-cols-[minmax(0,1fr)_20rem] @7xl:grid-cols-[16rem_minmax(0,1fr)_20rem]",
+        )}>
+          {isStaticTile ? null : (
+            <aside
+              aria-label="Data" ref={(n) => { panelRefs.current[1] = n; }}
+              className="hidden min-h-0 min-w-0 flex-col gap-4 overflow-y-auto rounded-xl bg-card p-3 ring-1 ring-foreground/6 @7xl:flex"
+            >
+              {dataPanel}
+            </aside>
+          )}
+
+          <section aria-label="Chart" className="@container/canvas flex min-h-[26rem] min-w-0 flex-col rounded-xl bg-card ring-1 ring-foreground/6">
+            <div data-slot="canvas-toolbar" className={cn("flex items-center gap-2 border-b border-border/60 px-3", ZONE_HEADER)}>
+              {isStaticTile ? null : (
+                <Button
+                  type="button" variant="outline" size="sm" className="max-w-44 shrink-0 @7xl:hidden"
+                  aria-haspopup="dialog" aria-label={choice || isNewSql ? `Data: ${sourceLabels[source] ?? source}` : "Pick data"} onClick={() => setDataSheet(true)}
+                >
+                  <Database aria-hidden /> <span className="truncate">{choice || isNewSql ? sourceLabels[source] ?? source : "Pick data"}</span>
+                </Button>
+              )}
+              <KindPicker kind={kind} onPick={pickKind} facts={sourceFacts} preview={galleryPreview} dark={resolvedTheme === "dark"} />
+            </div>
+            <div className="flex min-h-0 flex-1 flex-col gap-3 px-5 pt-4 pb-4">
+              <div className="grid">
+                <Label htmlFor="ch-title" className="sr-only">Title</Label>
+                <input
+                  id="ch-title" aria-required={isStaticTile || undefined} value={title} onChange={(e) => setTitle(e.target.value)}
+                  placeholder={suggestedTitle || "e.g. Visitors by Region"}
+                  className={cn("-mx-1.5 min-w-0 rounded-md bg-transparent px-1.5 py-0.5 text-xl font-semibold tracking-tight placeholder:text-muted-foreground/70 hover:bg-muted/70 focus-visible:bg-muted/70", INLINE_EDIT)}
+                />
+                {isStaticTile ? null : describing || subtitle ? (
+                  <div className="mt-1 grid">
+                    <Label htmlFor="ch-description" className="sr-only">Description</Label>
+                    <input
+                      id="ch-description" value={subtitle} autoFocus={describing} onChange={(e) => setSubtitle(e.target.value)}
+                      onBlur={() => setDescribing(false)} placeholder="One line under the title"
+                      className={cn("-mx-1.5 min-w-0 rounded-md bg-transparent px-1.5 py-0.5 text-sm text-muted-foreground placeholder:text-muted-foreground/60 hover:bg-muted/70 focus-visible:bg-muted/70", INLINE_EDIT)}
+                    />
+                  </div>
+                ) : (
+                  <button
+                    type="button" onClick={() => setDescribing(true)}
+                    className={cn("justify-self-start rounded text-xs text-muted-foreground hover:text-foreground", INLINE_EDIT)}
+                  >
+                    + Add a description
+                  </button>
+                )}
+              </div>
+              <section aria-label="Preview" className="relative min-h-56 flex-1">
+                <div className="absolute inset-0">{previewBody}</div>
+                <span
+                  aria-live="polite"
+                  className={cn(
+                    "pointer-events-none absolute top-0 right-0 inline-flex items-center gap-1.5 rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground transition-opacity duration-200",
+                    previewBusy && preview ? "opacity-100" : "opacity-0",
+                  )}
+                >
+                  {previewBusy && preview ? <><Spinner className="size-3" /> Updating</> : null}
+                </span>
+              </section>
+            </div>
+            <footer className="flex min-h-11 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border/60 px-3 py-2">
+              <p className="text-xs text-muted-foreground tabular-nums" data-slot="result-note">{resultNote}</p>
+              {rowsView && !heldPreview ? (
+                <Button type="button" size="sm" variant={dataOpen ? "secondary" : "ghost"} aria-pressed={dataOpen} onClick={() => setShowData(!dataOpen)}>
+                  <Table2 aria-hidden /> Data
+                </Button>
+              ) : null}
+              {heldPreview && chartHold === null && draft.result ? (
+                <div role="group" aria-label="Preview content" className="flex gap-1">
+                  {(["chart", "rows"] as const).map((tab) => (
+                    <Button
+                      key={tab} type="button" size="xs" variant={paneTab === tab ? "secondary" : "ghost"}
+                      aria-pressed={paneTab === tab} onClick={() => setPaneTab(tab)}
+                    >
+                      {tab === "chart" ? "Chart" : "Rows"}
+                    </Button>
+                  ))}
+                </div>
+              ) : null}
+            </footer>
+          </section>
+
+          <aside aria-label="Settings" className="@container flex min-h-0 min-w-0 flex-col overflow-hidden rounded-xl bg-card ring-1 ring-foreground/6">
+            {inspector}
+          </aside>
         </div>
-        {fields?.columns && choice ? (
-          <FormulaEditorDialog
-            open={formulaOpen}
-            onOpenChange={setFormulaOpen}
+      </div>
+      <Dialog open={leaving !== null} onOpenChange={(open) => { if (!open) setLeaving(null); }}>
+        <DialogContent className="sm:max-w-sm" showCloseButton={false}>
+          <DialogHeader>
+            <DialogTitle>Discard changes?</DialogTitle>
+            <DialogDescription>Your changes to this chart are not saved.</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setLeaving(null)}>Keep editing</Button>
+            <Button type="button" variant="destructive" onClick={discard}>Discard</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      {isStaticTile ? null : (
+        <Sheet open={dataSheet} onOpenChange={setDataSheet}>
+          <SheetContent side="left" className="w-[min(22rem,calc(100vw-2rem))] gap-0 p-0 sm:max-w-none">
+            <SheetHeader className="p-4 pb-2">
+              <SheetTitle className="text-base">Data</SheetTitle>
+              <SheetDescription>Pick the source, then click a column to use it.</SheetDescription>
+            </SheetHeader>
+            <div ref={sheetPanel} className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-3 pb-6">{dataPanel}</div>
+          </SheetContent>
+        </Sheet>
+      )}
+      {fields?.columns && choice ? (
+        <FormulaEditorDialog
+          open={formulaOpen}
+          onOpenChange={setFormulaOpen}
+          source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
+          columns={fields.columns}
+          params={paramDefs}
+          fields={(fields.calculated ?? []).filter((f) => !isValueGroup(f))}
+          existing={editing}
+          onSaved={() => { void loadFields(source); }}
+          onDeleted={(gone) => {
+            void loadFields(source).then((f) => {
+              setDimension((v) => (v === gone.name ? "" : keepIfOffered(v, f.dimensions)));
+              keepMeasures(f.measures);
+              setBreakdown((v) => keepIfOffered(v, f.dimensions));
+            });
+          }}
+        />
+      ) : null}
+      {fields?.columns && choice ? (
+        <>
+          <ValueGroupDialog
+            open={groupOpen}
+            onOpenChange={setGroupOpen}
             source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
-            columns={fields.columns}
-            params={paramDefs}
-            fields={(fields.calculated ?? []).filter((f) => !isValueGroup(f))}
-            existing={editing}
+            textColumns={fields.columns.filter((c) => fields.kinds?.[c] === "text")}
+            existing={editingGroup}
             onSaved={() => { void loadFields(source); }}
             onDeleted={(gone) => {
               void loadFields(source).then((f) => {
                 setDimension((v) => (v === gone.name ? "" : keepIfOffered(v, f.dimensions)));
-                keepMeasures(f.measures);
                 setBreakdown((v) => keepIfOffered(v, f.dimensions));
               });
             }}
           />
-        ) : null}
-        {fields?.columns && choice ? (
-          <>
-            <ValueGroupDialog
-              open={groupOpen}
-              onOpenChange={setGroupOpen}
-              source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
-              textColumns={fields.columns.filter((c) => fields.kinds?.[c] === "text")}
-              existing={editingGroup}
-              onSaved={() => { void loadFields(source); }}
-              onDeleted={(gone) => {
-                void loadFields(source).then((f) => {
-                  setDimension((v) => (v === gone.name ? "" : keepIfOffered(v, f.dimensions)));
-                  setBreakdown((v) => keepIfOffered(v, f.dimensions));
-                });
-              }}
-            />
-            <HierarchyDialog
-              open={hierarchyOpen}
-              onOpenChange={setHierarchyOpen}
-              source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
-              columns={fields.columns}
-              existing={editingHierarchy}
-              onSaved={() => { void loadFields(source); }}
-              onDeleted={() => { void loadFields(source); }}
-            />
-          </>
-        ) : null}
-      </DialogContent>
-    </Dialog>
+          <HierarchyDialog
+            open={hierarchyOpen}
+            onOpenChange={setHierarchyOpen}
+            source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
+            columns={fields.columns}
+            existing={editingHierarchy}
+            onSaved={() => { void loadFields(source); }}
+            onDeleted={() => { void loadFields(source); }}
+          />
+        </>
+      ) : null}
+    </div>
   );
 }

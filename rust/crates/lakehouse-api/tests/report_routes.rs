@@ -8,14 +8,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_state,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -70,6 +70,12 @@ impl Respond for FakeCh {
             ]);
         }
         if sql.contains("FROM console.bi_board") {
+            // GOV-17 review R4: a narrowed viewer carries the dependency
+            // deny-list; honour it like a real engine so a hidden board reads as
+            // missing. No narrowing in the other tests means no deny-list.
+            if sql.contains(&format!("NOT IN ('{BOARD}')")) {
+                return rows(vec![]);
+            }
             if sql.contains("AND id=") && !sql.contains(&format!("AND id='{BOARD}'")) {
                 return rows(vec![]);
             }
@@ -93,6 +99,9 @@ impl Respond for FakeCh {
 
 struct F {
     app: TestApp,
+    /// The state the router was built from, so a test can drive the runner
+    /// (`RPT-1`'s `tick`) the way the scheduler does.
+    state: lakehouse_api::state::AppState,
     owner: Uuid,
     owner_cookie: String,
     _ch: MockServer,
@@ -119,11 +128,12 @@ async fn fixture(extra_env: &[(&str, &str)]) -> F {
     for (k, v) in extra_env {
         env.insert((*k).to_owned(), (*v).to_owned());
     }
-    let app = spin_up_with_env(&env).await;
+    let (app, state) = spin_up_with_state(&env, |_| {}).await;
     let owner = create_principal_with_permissions(&app.pool, "dashboard:read").await;
     let owner_cookie = session_cookie_for_user(&app.pool, owner).await;
     F {
         app,
+        state,
         owner,
         owner_cookie,
         _ch: ch,
@@ -190,21 +200,134 @@ fn body(recipients: Value) -> Value {
 
 async fn user_id(pool: &PgPool, name: &str, status: &str) -> Uuid {
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, $2, $3, $4)")
-        .bind(id)
-        .bind(name)
-        .bind(format!(
-            "{}@company.example",
-            name.to_lowercase().replace(' ', ".")
-        ))
-        .bind(status)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO app_user (id, name, username, email, status) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(name.to_lowercase().replace(' ', "."))
+    .bind(format!(
+        "{}@company.example",
+        name.to_lowercase().replace(' ', ".")
+    ))
+    .bind(status)
+    .execute(pool)
+    .await
+    .unwrap();
     id
 }
 
 const SUBS: &str = "/api/reports/subscriptions";
+
+/// Narrow every role of `user` to exactly `grants` (GOV-17 R4 before/after
+/// grant-change control). `*:*` roles are never minted here (GOV-7 D4).
+async fn narrow(pool: &PgPool, user: Uuid, grants: &[(&str, &str)]) {
+    let roles: Vec<Uuid> =
+        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert!(!roles.is_empty(), "the user must hold a role to narrow");
+    for role in roles {
+        sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        for (schema, table) in grants {
+            sqlx::query(
+                "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, $2, $3)",
+            )
+            .bind(role)
+            .bind(schema)
+            .bind(table)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
+/// GOV-17 review R4: by-id report metadata and history are gated on the
+/// caller's CURRENT table grants, not just subscription ownership. The board's
+/// tile reads `serving.mart_x` (the fixture's `FakeCh`), so narrowing the owner
+/// away from it after creation makes the known id read as an unknown report.
+#[tokio::test]
+async fn a_report_owner_whose_role_was_narrowed_after_creation_cannot_read_its_metadata() {
+    let f = fixture(&[]).await;
+    let colleague = user_id(&f.app.pool, "Colleague", "active").await;
+    let (status, made) = call(
+        &f,
+        "POST",
+        SUBS,
+        &f.owner_cookie,
+        Some(body(json!([{ "userId": colleague.to_string() }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    let id = made["id"].as_str().unwrap().to_owned();
+
+    let (status, before) = call(&f, "GET", &format!("{SUBS}/{id}"), &f.owner_cookie, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "readable before the grant change: {before}"
+    );
+
+    narrow(&f.app.pool, f.owner, &[("serving", "other_mart")]).await;
+
+    let (status, after) = call(&f, "GET", &format!("{SUBS}/{id}"), &f.owner_cookie, None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "hidden after the grant change: {after}"
+    );
+    let text = after.to_string();
+    assert!(!text.contains(BOARD), "no board id: {text}");
+    assert!(!text.contains("mart_x"), "no dependent table name: {text}");
+
+    let (unknown_status, unknown) = call(
+        &f,
+        "GET",
+        &format!("{SUBS}/{}", Uuid::new_v4()),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+    assert_eq!(after, unknown, "a hidden report is the unknown report");
+
+    // GOV-17 review R8: a non-owner cannot use the ownership error to confirm
+    // that a report exists on a dashboard their table grants hide.
+    let outsider = create_principal_with_permissions(&f.app.pool, "dashboard:read").await;
+    let outsider_cookie = session_cookie_for_user(&f.app.pool, outsider).await;
+    let (visible_status, _) =
+        call(&f, "GET", &format!("{SUBS}/{id}"), &outsider_cookie, None).await;
+    assert_eq!(visible_status, StatusCode::FORBIDDEN);
+    narrow(&f.app.pool, outsider, &[("serving", "other_mart")]).await;
+    let (hidden_status, hidden_body) =
+        call(&f, "GET", &format!("{SUBS}/{id}"), &outsider_cookie, None).await;
+    assert_eq!(hidden_status, StatusCode::NOT_FOUND);
+    assert_eq!(hidden_body, unknown);
+
+    // An administrator whose OWN grants are unrestricted keeps legitimate
+    // management of the report; the narrowed owner's grants are not borrowed.
+    let admin =
+        create_principal_with_permissions(&f.app.pool, "dashboard:read, settings:write").await;
+    let admin_cookie = session_cookie_for_user(&f.app.pool, admin).await;
+    let (status, body) = call(&f, "GET", &format!("{SUBS}/{id}"), &admin_cookie, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a fully-granted admin keeps access: {body}"
+    );
+}
 
 #[tokio::test]
 async fn a_viewer_who_may_download_subscribes_and_sees_it_listed_with_the_email_and_pdf_flags() {
@@ -576,6 +699,81 @@ async fn send_now_records_a_delivery_and_says_why_when_it_cannot_send() {
     );
 }
 
+/// `BI-35`: a second "Send now" on the same subscription inside the interval is
+/// refused with 429 and a `Retry-After`, another subscription is not held back,
+/// and the first press recorded one delivery only.
+#[tokio::test]
+async fn a_second_send_now_inside_the_interval_is_refused_with_a_retry_after() {
+    let f = fixture(&[]).await;
+    let colleague = user_id(&f.app.pool, "Colleague", "active").await;
+    let recipients = json!([{ "userId": colleague.to_string() }]);
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let (_, made) = call(
+            &f,
+            "POST",
+            SUBS,
+            &f.owner_cookie,
+            Some(body(recipients.clone())),
+        )
+        .await;
+        ids.push(format!("{SUBS}/{}", made["id"].as_str().unwrap()));
+    }
+    let (status, first) = call(
+        &f,
+        "POST",
+        &format!("{}/send", ids[0]),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+
+    let resp = f
+        .app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{}/send", ids[0]))
+                .header("cookie", &f.owner_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let wait: u64 = resp
+        .headers()
+        .get("retry-after")
+        .expect("a Retry-After header")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=61).contains(&wait), "{wait}");
+
+    let (_, history) = call(
+        &f,
+        "GET",
+        &format!("{}/deliveries", ids[0]),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(history["items"].as_array().unwrap().len(), 1);
+    let (status, other) = call(
+        &f,
+        "POST",
+        &format!("{}/send", ids[1]),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{other}");
+}
+
 #[tokio::test]
 async fn send_now_to_an_unreachable_mail_server_gives_the_fixed_reason_only() {
     // Nothing listens on this port; the driver's error must not reach the record.
@@ -882,4 +1080,133 @@ async fn a_non_owner_administrator_may_only_pause_delete_and_remove_recipients()
     assert_eq!(got["recipients"].as_array().unwrap().len(), 1);
     let (status, _) = call(&f, "DELETE", &one, &cookie, None).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// QA `LH-RPT-1-06` (`RPT-2`, `DEC-18`): with e-mail not set up, the list says
+/// on the subscription that it is not being sent, and names the last attempt
+/// once there is one — while nothing is counted towards the pause.
+///
+/// The delivery that must not be counted is a SCHEDULED one (review round 1,
+/// R7): `run_subscription` returns before counting for a "Send now" whatever its
+/// reason, so assertions made after only a manual send hold with the
+/// e-mail-not-set-up half of the rule deleted. The scheduled run is driven here
+/// the way the runner loop drives it, with an `EmailSender` built from the
+/// deployment's saved settings.
+#[tokio::test]
+async fn the_list_says_a_subscription_is_not_sent_while_email_is_not_set_up_and_nothing_is_counted()
+{
+    let f = fixture(&[]).await;
+    let colleague = user_id(&f.app.pool, "Colleague", "active").await;
+    let (status, made) = call(
+        &f,
+        "POST",
+        SUBS,
+        &f.owner_cookie,
+        Some(body(json!([{ "userId": colleague.to_string() }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    let one = format!("{SUBS}/{}", made["id"].as_str().unwrap());
+
+    let (_, list) = call(
+        &f,
+        "GET",
+        &format!("{SUBS}?board={BOARD}"),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(list["emailSetUp"], json!(false), "no SMTP_HOST here");
+    let before = &list["items"][0]["notSent"];
+    assert_eq!(
+        *before,
+        json!({ "cause": "email_not_set_up", "lastAttemptAt": null }),
+        "nothing has been attempted yet: {list}"
+    );
+
+    let (status, delivery) = call(&f, "POST", &format!("{one}/send"), &f.owner_cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{delivery}");
+    assert_eq!(
+        delivery["reason"],
+        "Email is not set up on this deployment."
+    );
+
+    // R7: the scheduled delivery the counting rule is about. Make the one
+    // subscription due and run the runner once, with the mailer the loop builds.
+    sqlx::query(
+        "UPDATE report_subscription SET next_run_at = now() - interval '1 minute' WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(made["id"].as_str().unwrap()).unwrap())
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+    let mailer = lakehouse_notify::EmailSender::new(
+        lakehouse_api::runtime_settings::email(&f.state)
+            .await
+            .smtp(),
+    );
+    let taken = lakehouse_api::routes::report_runner::tick(&f.state, &mailer).await;
+    assert_eq!(taken, 1, "the due subscription is claimed and run");
+
+    let (_, list) = call(
+        &f,
+        "GET",
+        &format!("{SUBS}?board={BOARD}"),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    let item = &list["items"][0];
+    assert_eq!(
+        item["notSent"]["cause"],
+        json!("email_not_set_up"),
+        "{list}"
+    );
+    let at = item["notSent"]["lastAttemptAt"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the failed attempt names its time: {list}"));
+    time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+        .expect("the time is RFC 3339 as written");
+    assert_eq!(item["lastDelivery"]["status"], "failed", "{list}");
+    assert_eq!(
+        item["consecutiveFailures"],
+        json!(0),
+        "DEC-18: a scheduled delivery that fails for this reason is not counted"
+    );
+    assert_eq!(item["paused"], json!(false), "DEC-18: nothing is paused");
+}
+
+/// The other side of the same rule (`RPT-2`): with e-mail set up the list says
+/// nothing of the kind. The mail server is named on a closed local port, so the
+/// send itself still fails — the point is that the LIST does not claim e-mail is
+/// missing.
+#[tokio::test]
+async fn the_list_says_nothing_of_the_kind_while_email_is_set_up() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let f = fixture(&[("SMTP_HOST", "127.0.0.1"), ("SMTP_PORT", &port.to_string())]).await;
+    let colleague = user_id(&f.app.pool, "Colleague", "active").await;
+    let (status, made) = call(
+        &f,
+        "POST",
+        SUBS,
+        &f.owner_cookie,
+        Some(body(json!([{ "userId": colleague.to_string() }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+
+    let (status, list) = call(
+        &f,
+        "GET",
+        &format!("{SUBS}?board={BOARD}"),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["emailSetUp"], json!(true), "{list}");
+    assert_eq!(list["items"][0]["notSent"], Value::Null, "{list}");
 }

@@ -1,4 +1,4 @@
-import type { FilterDef } from "../clients/bi-store"
+import type { ChartKind } from "@/lib/dashboard-specs"
 import type { TileLimit } from "./settings"
 
 /**
@@ -75,7 +75,79 @@ export type Board = {
   embedEnabled?: boolean;
 };
 
+// `BI-29`: these shapes were in `clients/bi-store`, so the contract imported a
+// client and 21 dashboard files imported the client. They live here now, and
+// `@/services` exports them (`services/index.ts`).
+/** How a dashboard filter compares its column; absent means `in`. Mirrors `FilterOp` in `lakehouse-bi`. */
+export type FilterOp = "in" | "not_in" | "between" | "relative" | "contains" | "starts_with" | "ends_with" | "not_contains";
+export type RelativeUnit = "day" | "week" | "month" | "quarter" | "year";
+/** `next`: the `n` units starting tomorrow, today excluded (BI-18 round two). */
+export type RelativeAnchor = "last" | "this" | "previous" | "next";
+/** What a column holds, as far as filtering cares; derived server-side from its ClickHouse type. */
+export type FilterKind = "number" | "date" | "datetime" | "text";
+/**
+ * Dashboard filter, applied to every tile whose data has the column. The
+ * typed fields are optional so a filter saved before typed filters
+ * (`{ column, values }`) is still valid and means `in`.
+ */
+export type FilterDef = {
+  column: string;
+  values: string[];
+  op?: FilterOp;
+  /** `between` bounds: a number, or a date as `YYYY-MM-DD`; either may be absent. */
+  min?: string;
+  max?: string;
+  /** `relative`: `n` units ending today (`last`) or starting tomorrow (`next`), or this / the previous calendar unit. */
+  unit?: RelativeUnit;
+  n?: number;
+  anchor?: RelativeAnchor;
+  /** `contains` / `starts_with` / `ends_with` / `not_contains`, at most 200 characters. */
+  text?: string;
+  /** `between` leaves out `min` / `max` itself ("after", "before", "greater than", "less than"). Absent means inclusive. */
+  minExclusive?: boolean;
+  maxExclusive?: boolean;
+  /** The filter cannot be removed in the console. Meaningful only on a board's saved default. */
+  required?: boolean;
+  /** BI-2: a reference to a saved segment of the chart's table, `{ column: "", values: [], segment }`; it stands for the segment's filters. */
+  segment?: string;
+  /** BI-18 part C: the ids of the tabs this filter applies to. Absent or empty: every tab. */
+  tabs?: string[];
+};
+/** A column a filter can target, with how many tiles of the board have it. */
+export type FilterField = { column: string; kind: FilterKind | string; tiles: number };
+/** A filter an active tile could not honour, so the tile can say so. */
+export type FilterSkip = { column: string; reason: "no_column" | "wrong_type" | string };
+
+/**
+ * What a click on a chart does instead of opening the drill menu (BI-18·B).
+ * Mirrors `lakehouse_bi::click::ClickAction`. Absent = the drill menu, which
+ * is what every chart saved before this existed does. The server checks the
+ * shape and the URL rule only, not that the board, column or query exists.
+ */
+export type ChartClick =
+  | { kind: "dashboard"; board: string; column: string }
+  | { kind: "query"; id: string }
+  | { kind: "url"; url: string };
+
+/** Where a filter's value list is read from: a board's charts, one mart (with its joins) or a saved SQL source. */
+export type FilterValuesScope =
+  | { board: string }
+  | { mart: string; joins?: unknown[] }
+  | { sqlSource: string };
+
+/** The values a filter can pick for one column. `truncated`: the list stopped at the server's cap. */
+export type FilterValues = { values: string[]; truncated: boolean };
+
 export type DashboardService = {
+  /**
+   * The values of `column` for a filter's value list (`GET /api/dashboard/values`),
+   * narrowed by the `others` filters and by `search`. `BI-29` D7: the hook that
+   * lists them reads through this, not through `apiFetch` of its own.
+   */
+  filterValues(
+    input: { column: string; scope: FilterValuesScope; others: FilterDef[]; search: string },
+    signal?: AbortSignal,
+  ): Promise<FilterValues>
   /** Semua board, board bawaan (`default`) di urutan pertama. */
   listBoards(signal?: AbortSignal): Promise<Board[]>
   createBoard(input: CreateBoardInput, signal?: AbortSignal): Promise<Board>
@@ -93,6 +165,37 @@ export type DashboardService = {
    * `dashboard:write`.
    */
   deleteChart(id: string, signal?: AbortSignal): Promise<void>
+  /**
+   * Save a chart from the builder's own high-level input
+   * (`POST /api/dashboard/specs`), or change the stored chart `input.id`
+   * names when `edit` is set (`PUT`). `WEB-7` D6 moved the builder's own
+   * `fetch` here. Needs edit on the dashboard it lands on, or
+   * `dashboard:write`; the server's refusal arrives as the error's message.
+   *
+   * Answers the saved chart's id (`BI-48`: a tile's Duplicate places the new
+   * chart below the original), as `""` when the answer does not carry one.
+   */
+  saveChart(input: Record<string, unknown>, edit: boolean, signal?: AbortSignal): Promise<{ id: string }>
+  /**
+   * The marts a chart or an alert rule can be built on
+   * (`GET /api/dashboard/fields`), by name. `WEB-7` D7 moved the alerts
+   * page's own `fetch` here; only the names are returned, which is all the
+   * rule form's picker needs.
+   */
+  listMarts(signal?: AbortSignal): Promise<{ name: string }[]>
+  /**
+   * The measures of the mart `mart` (`GET /api/dashboard/fields?mart=`) — the
+   * columns an alert rule may watch. `WEB-7` D7.
+   */
+  listMartMeasures(mart: string, signal?: AbortSignal): Promise<string[]>
+  /**
+   * One stored chart's saved definition and the dashboard it sits on, read
+   * from the chart list the console already calls
+   * (`GET /api/dashboard/specs`), or `null` when nothing the caller may see
+   * has that id. `WEB-7` D6: the Edit chart page loads the chart by id, so a
+   * reload works.
+   */
+  getChart(id: string, signal?: AbortSignal): Promise<StoredChart | null>
 
   listSqlSources(signal?: AbortSignal): Promise<SqlSource[]>
   createSqlSource(input: SaveSqlSourceInput, signal?: AbortSignal): Promise<SqlSource>
@@ -138,6 +241,13 @@ export type DashboardService = {
   setEmbedFilterModes(board: string, modes: Record<string, FilterMode>, signal?: AbortSignal): Promise<void>
   /** `BI-26`: the charts of a dashboard, for the chart picker of the embed section. */
   listBoardCharts(board: string, signal?: AbortSignal): Promise<BoardChart[]>
+  /**
+   * `BI-59` (decision P3): every stored chart the caller can see, reduced to
+   * what a picture of its dashboard needs (which board, which kind, how
+   * wide). One read of `GET /api/dashboard/specs` for the whole Dashboards
+   * page; it runs no query.
+   */
+  listChartOutlines(signal?: AbortSignal): Promise<ChartOutline[]>
   /** `BI-19` part A. Needs `dashboard:write`. */
   getPublicLink(board: string, signal?: AbortSignal): Promise<PublicLinkState>
   /** Make a link or change its expiry or password; refusals carry the server's sentence. */
@@ -203,7 +313,7 @@ export type DashboardService = {
   /** Deleted dashboards and charts the caller may see (`GET /api/dashboard/trash`). */
   listTrash(signal?: AbortSignal): Promise<TrashList>
   /** Bring one back (`POST /api/dashboard/trash/restore`). Needs `dashboard:write`. */
-  restoreFromTrash(kind: ItemKind, id: string, signal?: AbortSignal): Promise<RestoredItem>
+  restoreFromTrash(kind: TrashKind, id: string, signal?: AbortSignal): Promise<RestoredItem>
   /** The caller's personal space, created on first use. Needs `dashboard:write`. */
   ensurePersonalSpace(signal?: AbortSignal): Promise<DashboardFolder>
   /** The caller's favourites and recent dashboards and charts. */
@@ -224,6 +334,8 @@ export type DashboardService = {
 
 /** What a favourite, a recent item, a search hit or a trash entry points at. */
 export type ItemKind = "board" | "chart"
+/** What the trash holds: dashboards, charts and (`BI-18` part D) reports. */
+export type TrashKind = ItemKind | "report"
 
 /** One version of a dashboard (`lakehouse_bi::versions::VersionEntry`). */
 export type VersionEntry = {
@@ -255,7 +367,7 @@ export type RevertResult = {
 
 /** `lakehouse_bi::trash::TrashItem`. */
 export type TrashItem = {
-  kind: ItemKind
+  kind: TrashKind
   id: string
   name: string
   /** For a chart, the dashboard it was on. */
@@ -272,7 +384,7 @@ export type TrashItem = {
 export type TrashList = { items: TrashItem[]; retentionDays: number }
 
 export type RestoredItem = {
-  kind: ItemKind
+  kind: TrashKind
   id: string
   /** For a dashboard, how many charts came back with it. */
   charts: number
@@ -320,7 +432,30 @@ export type EmbedInfo = {
 export type FilterMode = "locked" | "editable" | "hidden"
 
 /** A chart of a dashboard, for the embed chart picker. */
-export type BoardChart = { id: string; title: string }
+/** `kind` lets a picker leave out the tiles that carry no data (`BI-18` part D). */
+export type BoardChart = { id: string; title: string; kind?: string }
+
+/**
+ * A stored chart as the Dashboards page draws it (`BI-59`, P3): its board,
+ * its kind (`| string`: a kind this console does not know is drawn as a
+ * neutral tile, not dropped) and its width (`span: 2` is the full row).
+ */
+export type ChartOutline = { id: string; board: string; kind: ChartKind | string; span?: 1 | 2 }
+
+/**
+ * One stored chart, as `GET /api/dashboard/specs` answers it (`WEB-7` D6).
+ *
+ * `def` is the definition the builder wrote, kept as loose JSON because the
+ * contract cannot import the builder's own type (`features/dashboards`);
+ * the page hands it back to the builder that wrote it.
+ */
+export type StoredChart = {
+  id: string
+  title: string
+  /** The dashboard it sits on. */
+  board: string
+  def: Record<string, unknown>
+}
 
 /**
  * A dashboard's public link (`BI-19` part A), from `GET`/`PUT
@@ -393,7 +528,7 @@ export type ItemAccessInput = {
 }
 
 export type GranteeMatches = {
-  people: { id: string; name: string; email: string }[]
+  people: { id: string; name: string; email: string | null }[]
   roles: { id: string; name: string }[]
 }
 

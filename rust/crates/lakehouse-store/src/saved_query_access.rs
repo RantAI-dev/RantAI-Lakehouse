@@ -1392,8 +1392,9 @@ pub struct GranteePerson {
     pub id: Uuid,
     /// The person's display name.
     pub name: String,
-    /// The person's email address.
-    pub email: String,
+    /// The person's email address; `None` when the account has none
+    /// (ADM-11 D1 made the column nullable).
+    pub email: Option<String>,
 }
 
 /// One role a saved query may be shared with.
@@ -1458,12 +1459,12 @@ pub async fn search_grantees(
     let limit = limit.max(0);
     let pattern = escape_like_pattern(needle.trim());
     let people: Vec<GranteePerson> = sqlx::query_as(
-        "SELECT u.id, u.name, u.email FROM app_user u \
+        "SELECT u.id, u.name, COALESCE(u.email, u.username) AS email FROM app_user u \
          WHERE u.status = 'active' \
            AND ($1::uuid IS NULL OR EXISTS ( \
                 SELECT 1 FROM app_user_tenant t \
                  WHERE t.user_id = u.id AND t.tenant_id = $1)) \
-           AND (u.name ILIKE $2 OR u.email ILIKE $2) \
+           AND (u.name ILIKE $2 OR u.username ILIKE $2 OR u.email ILIKE $2) \
          ORDER BY u.name, u.email LIMIT $3",
     )
     .bind(tenant_id)
@@ -1477,6 +1478,62 @@ pub async fn search_grantees(
             .bind(limit)
             .fetch_all(pool)
             .await?;
+    Ok(GranteeMatches { people, roles })
+}
+
+/// The name (and, for a person, the email) of the grantees a list of rules
+/// names, so the console can say who a rule is for instead of showing an
+/// id.
+///
+/// This is the one lookup behind every access list: at most two queries
+/// whatever the number of rules, and none when both slices are empty.
+///
+/// The tenant boundary is the one of [`search_grantees`] and
+/// [`tenant_user_ids`]: a person is named only when they are a member of
+/// `tenant_id` (through `app_user_tenant`), and with no tenant every person
+/// of the deployment is. A person outside the tenant is left out of the
+/// answer, so the caller shows no name for them: the list never carries
+/// the name or email of another organisation's person, and never makes one
+/// up (`AGENTS.md` principle 2). Unlike the search, an inactive person is
+/// named, because the rule that names them still applies.
+///
+/// A role belongs to the deployment rather than to a tenant — the `role`
+/// table has no tenant column — so every role that exists is named.
+///
+/// An id the database does not hold is absent from the answer.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn grantee_labels(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+    user_ids: &[Uuid],
+    role_ids: &[Uuid],
+) -> Result<GranteeMatches, StoreError> {
+    let people: Vec<GranteePerson> = if user_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT u.id, u.name, u.email FROM app_user u \
+             WHERE u.id = ANY($1::uuid[]) \
+               AND ($2::uuid IS NULL OR EXISTS ( \
+                    SELECT 1 FROM app_user_tenant t \
+                     WHERE t.user_id = u.id AND t.tenant_id = $2))",
+        )
+        .bind(user_ids.to_vec())
+        .bind(tenant_id)
+        .fetch_all(pool)
+        .await?
+    };
+    let roles: Vec<GranteeRole> = if role_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as("SELECT id, name FROM role WHERE id = ANY($1::uuid[])")
+            .bind(role_ids.to_vec())
+            .fetch_all(pool)
+            .await?
+    };
     Ok(GranteeMatches { people, roles })
 }
 

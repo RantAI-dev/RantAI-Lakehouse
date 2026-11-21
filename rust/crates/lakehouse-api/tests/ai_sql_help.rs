@@ -8,7 +8,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -19,7 +19,8 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
+    CLICKHOUSE_UNKNOWN_IDENTIFIER, COLUMN_DOES_NOT_EXIST, TestApp, create_assistant_principal,
+    mock_clickhouse_refusing, model_tool_result, session_cookie_for_seeded_user,
     session_cookie_for_user, spin_up_with_env,
 };
 
@@ -94,6 +95,39 @@ async fn statements(ch: &MockServer) -> Vec<String> {
         .collect()
 }
 
+/// Posts `body` to `/api/ai/chat` with the switch and returns the status and
+/// the raw response bytes.
+async fn post_chat(
+    llm: &MockServer,
+    ch: &MockServer,
+    switch: &str,
+    body: &Value,
+) -> (StatusCode, bytes::Bytes) {
+    let mut env = std::collections::HashMap::new();
+    env.insert("LLM_URL".to_owned(), llm.uri());
+    env.insert("CH_URL".to_owned(), ch.uri());
+    env.insert("AI_SQL_HELP".to_owned(), switch.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ai/chat")
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, bytes)
+}
+
 /// Sends one chat turn with the given allowlist (`None` for no allowlist)
 /// and the switch, and returns the status and the body.
 async fn chat(
@@ -103,32 +137,11 @@ async fn chat(
     tools: Option<Value>,
     question: &str,
 ) -> (StatusCode, Value) {
-    let mut env = std::collections::HashMap::new();
-    env.insert("LLM_URL".to_owned(), llm.uri());
-    env.insert("CH_URL".to_owned(), ch.uri());
-    env.insert("AI_SQL_HELP".to_owned(), switch.to_owned());
-    let TestApp { router, pool } = spin_up_with_env(&env).await;
-    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
     let mut body = json!({ "messages": [{ "role": "user", "content": question }] });
     if let Some(tools) = tools {
         body["tools"] = tools;
     }
-    let resp = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/ai/chat")
-                .header("content-type", "application/json")
-                .header("cookie", &cookie)
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
+    let (status, bytes) = post_chat(llm, ch, switch, &body).await;
     (
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
@@ -163,6 +176,9 @@ const FIX_MESSAGE: &str = "Why does this query fail? Fix it.\n\nEngine: clickhou
 
 const WRONG_PROPOSAL: &str = r#"{"sql":"SELECT no_such_col FROM silver.orders","reason":"Used the wrong column.","engine":"clickhouse"}"#;
 const RIGHT_PROPOSAL: &str = r#"{"sql":"SELECT order_id FROM silver.orders","reason":"The column is order_id, not no_such_col.","engine":"clickhouse"}"#;
+
+/// A `run_sql` call whose statement the engine refuses.
+const RUN_SQL_FAILING: &str = r#"{"sql":"SELECT pengunjungg FROM silver.orders"}"#;
 
 #[tokio::test]
 async fn an_allowlist_naming_propose_sql_offers_it_with_the_rules() {
@@ -214,15 +230,22 @@ async fn a_proposal_clickhouse_rejects_returns_to_the_model_and_a_second_one_end
     );
     assert_eq!(trace[0]["tool"], "propose_sql");
     assert_eq!(trace[0]["ok"], false);
+    // LH-QS-2-08 (owner 2026-11-12): the person reads a fixed sentence and
+    // a reference, never the engine's text. The engine's diagnosis is the
+    // MODEL's copy, and it is in the model's next request.
     let error = trace[0]["result"]["error"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("no_such_col"),
-        "the engine's text, cleaned: {error}"
-    );
-    assert!(
-        !error.contains("DB::Exception"),
-        "the prefix is cleaned: {error}"
-    );
+    let reference = error
+        .strip_prefix(&format!("{COLUMN_DOES_NOT_EXIST} Reference: "))
+        .unwrap_or_else(|| panic!("the fixed sentence and a reference: {error}"));
+    assert!(!reference.is_empty(), "{error}");
+    for engine_text in [
+        "no_such_col",
+        "DB::Exception",
+        "Code:",
+        "UNKNOWN_IDENTIFIER",
+    ] {
+        assert!(!error.contains(engine_text), "{engine_text} in {error}");
+    }
     assert_eq!(trace[1]["ok"], true);
     assert_eq!(trace[1]["result"]["proposed"], json!(true));
     assert_eq!(
@@ -231,6 +254,199 @@ async fn a_proposal_clickhouse_rejects_returns_to_the_model_and_a_second_one_end
     );
     let model_calls = llm.received_requests().await.expect("recording").len();
     assert_eq!(model_calls, 2, "no round runs after the accepted proposal");
+}
+
+/// Plan 86, step 2 (b): the same check for `propose_sql` — the model's copy
+/// keeps the engine's diagnosis and the SAME reference the person reads.
+#[tokio::test]
+async fn a_rejected_proposal_keeps_the_diagnosis_for_the_model_and_the_fixed_sentence_for_the_person()
+ {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "propose_sql", WRONG_PROPOSAL)]),
+        model_round(Some("Explained."), &[]),
+    ])
+    .await;
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("no_such_col"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            "Code: 47. DB::Exception: Unknown identifier: no_such_col (UNKNOWN_IDENTIFIER) (version 26.8.1)",
+        ))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .mount(&ch)
+        .await;
+
+    let (status, body) = chat(&llm, &ch, "true", Some(json!(["propose_sql"])), FIX_MESSAGE).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "one step, the rejected proposal: {trace:?}");
+    let error = trace[0]["result"]["error"].as_str().unwrap_or_default();
+    let reference = error
+        .strip_prefix(&format!("{COLUMN_DOES_NOT_EXIST} Reference: "))
+        .unwrap_or_else(|| panic!("the fixed sentence and a reference: {error}"));
+    // The model reads the engine's diagnosis, with the SAME reference.
+    let model = model_tool_result(&llm, 1).await;
+    let model_error = model["error"].as_str().unwrap_or_default();
+    assert!(
+        model_error.contains("UNKNOWN_IDENTIFIER"),
+        "the model reads the diagnosis: {model}"
+    );
+    assert!(
+        model_error.contains(&format!(" Reference: {reference}")),
+        "the model's copy carries the same reference: {model}"
+    );
+}
+
+/// Plan 86, step 2 (a): `run_sql` whose statement the engine refuses. The
+/// person reads the fixed sentence and the reference; the model keeps the
+/// engine's diagnosis, byte for byte (SEC-11, the query-author exception).
+#[tokio::test]
+async fn a_failed_run_sql_shows_the_person_a_fixed_sentence_and_the_model_the_diagnosis() {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "run_sql", RUN_SQL_FAILING)]),
+        model_round(Some("The column is order_id."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse_refusing(
+        "pengunjungg",
+        ResponseTemplate::new(400).set_body_string(CLICKHOUSE_UNKNOWN_IDENTIFIER),
+    )
+    .await;
+
+    let (status, body) = chat(
+        &llm,
+        &ch,
+        "true",
+        Some(json!(["run_sql"])),
+        "berapa tamu bulan ini?",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "one step, the failed run: {trace:?}");
+    assert_eq!(trace[0]["tool"], "run_sql");
+    assert_eq!(trace[0]["ok"], false);
+
+    // The person's copy: the fixed sentence and the reference, and nothing of
+    // the engine's own text.
+    let error = trace[0]["result"]["error"].as_str().unwrap_or_default();
+    let reference = error
+        .strip_prefix(&format!("{COLUMN_DOES_NOT_EXIST} Reference: "))
+        .unwrap_or_else(|| panic!("the fixed sentence and a reference: {error}"));
+    assert!(!reference.is_empty(), "{error}");
+    for engine_text in [
+        "DB::Exception",
+        "Code:",
+        "pengunjungg",
+        "UNKNOWN_IDENTIFIER",
+    ] {
+        assert!(!error.contains(engine_text), "{engine_text} in {error}");
+    }
+
+    // The model's copy: the engine's diagnosis and the SAME reference.
+    let model = model_tool_result(&llm, 1).await;
+    let model_error = model["error"].as_str().unwrap_or_default();
+    assert!(
+        model_error.contains("Unknown expression identifier 'pengunjungg' in scope."),
+        "the model reads the engine's diagnosis: {model}"
+    );
+    assert!(
+        model_error.contains(&format!(" Reference: {reference}")),
+        "the model's copy carries the same reference: {model}"
+    );
+}
+
+/// Plan 86, step 2 (d): an engine failure that is not the statement's own
+/// (a proxy answering instead of the engine) keeps the same fixed message in
+/// both copies, as today.
+#[tokio::test]
+async fn a_run_sql_that_fails_for_another_reason_gives_both_copies_the_same_text() {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "run_sql", RUN_SQL_FAILING)]),
+        model_round(Some("The engine is not answering."), &[]),
+    ])
+    .await;
+    // A proxy's page, not the engine answering that the STATEMENT is wrong:
+    // the text is this repository's own, so there is nothing to keep from the
+    // engine and both copies are the same.
+    let ch = mock_clickhouse_refusing(
+        "pengunjungg",
+        ResponseTemplate::new(502).set_body_string("<html><body>502 Bad Gateway</body></html>"),
+    )
+    .await;
+
+    let (status, body) = chat(
+        &llm,
+        &ch,
+        "true",
+        Some(json!(["run_sql"])),
+        "berapa tamu bulan ini?",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "one step, the failed run: {trace:?}");
+    let error = trace[0]["result"]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.starts_with("The database request failed. Reference: "),
+        "the fixed message and a reference: {error}"
+    );
+    let model = model_tool_result(&llm, 1).await;
+    let model_error = model["error"].as_str().unwrap_or_default();
+    assert_eq!(
+        error, model_error,
+        "both copies are the same fixed message: {model}"
+    );
+}
+
+/// Plan 86, step 2 (e): the key the browser's copy travels under is the
+/// server's alone. It reaches neither the browser nor the model.
+#[tokio::test]
+async fn the_server_only_key_reaches_neither_the_browser_nor_the_model() {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "propose_sql", WRONG_PROPOSAL)]),
+        model_round(Some("Explained."), &[]),
+    ])
+    .await;
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("no_such_col"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            "Code: 47. DB::Exception: Unknown identifier: no_such_col (UNKNOWN_IDENTIFIER) (version 26.8.1)",
+        ))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .mount(&ch)
+        .await;
+
+    let (status, body) = chat(&llm, &ch, "true", Some(json!(["propose_sql"])), FIX_MESSAGE).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.to_string().contains("_browserError"),
+        "the key never reaches the browser: {body}"
+    );
+    for (index, request) in llm
+        .received_requests()
+        .await
+        .expect("recording")
+        .iter()
+        .enumerate()
+    {
+        let text = String::from_utf8_lossy(&request.body);
+        assert!(
+            !text.contains("_browserError"),
+            "the key never reaches the model, round {index}: {text}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -391,8 +607,32 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
 // the old bytes plus exactly those two sentences (hashing the prompt with them
 // removed gives the previous pin `7842304c...b590`). The AI team reviews the
 // sentences (Assistant parity).
+//
+// Updated by hand again (PR #395 review): the two timeout sentences in
+// `limits_and_freshness!` became one. The first clause no longer repeats the
+// timeout question ("or \"why did this chart time out?\"" is gone), and the
+// second one, which answers it from `get_query_limits` without SQL on
+// `system.*` tables, stays. (Before: `534a2e9b...1e91`.)
+//
+// Updated by hand for plan 72 (`AI-4`): the Ask suffix gained one sentence of
+// its own, that a name `describe_mart` does not list may be a calculated field
+// and that `list_calculated_fields` explains it. The new hash is the old bytes
+// plus exactly that sentence (hashing the prompt with that sentence removed
+// gives the previous pin `a3836866...2a09`). The offered-tool list above is
+// untouched, because the test's turn ("berapa tamu bulan ini?") holds no word
+// of the new domain. The AI team reviews the sentence (Assistant parity).
+//
+// Updated by hand for `AI-7`: the Ask suffix gained the named-metrics rule
+// (`named_metrics_first!`, the opening and closing words Build already had):
+// call `list_metrics` before writing a query, use `query_metric` for a match
+// and name the metric in the answer, and say so when none matches. This chat
+// sends no mode, so it runs in Ask and the rule reaches its prompt. The new
+// bytes are the old bytes plus exactly that rule (a space and its three
+// sentences), placed at the end of the Ask suffix, and the Build prompt's
+// bytes are unchanged. (Before: `bdb95459...f810`.) The AI team reviews the
+// sentence (Assistant parity).
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
-    "534a2e9b4308299cf453babc3fdd017e4fe735396928dbce39b3758026e79e91";
+    "f77c95e5d54877e61a80a4ef1dee442a31e92a5ecda832d3f803148f762ae1ed";
 
 fn sha256_hex(text: &str) -> String {
     use std::fmt::Write as _;
@@ -407,6 +647,13 @@ fn sha256_hex(text: &str) -> String {
 #[tokio::test]
 async fn a_chat_with_no_allowlist_is_offered_today_s_tools_and_today_s_prompt() {
     for switch in ["true", "false"] {
+        // The DATA MAP cache is one entry for the whole process, kept for two
+        // minutes: a chat that ran before this one in the same process would
+        // leave its map behind, and the prompt's bytes would then be the ones
+        // of that map instead of the ones this test mocks. The cache is
+        // cleared here, so the pin is the same in one process as it is alone
+        // (`AI-32`).
+        lakehouse_api::clear_data_map_cache().await;
         let llm = mock_model(vec![model_round(Some("Hi."), &[])]).await;
         let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
 
@@ -679,7 +926,8 @@ async fn the_explain_sentence_inside_a_comment_does_not_end_the_offer() {
     assert!(names.contains(&"propose_sql".to_owned()), "{names:?}");
 }
 
-/// Sends one chat turn as a fresh user who holds exactly `permissions`, and
+/// Sends one chat turn as a fresh user who holds `permissions` besides
+/// `assistant:use` (every request here is to `/api/ai/chat`), and
 /// returns the system prompt the model received and the statements that
 /// reached `ClickHouse`.
 async fn system_prompt_for_user_holding(permissions: &str) -> (String, Vec<String>) {
@@ -689,7 +937,7 @@ async fn system_prompt_for_user_holding(permissions: &str) -> (String, Vec<Strin
     env.insert("LLM_URL".to_owned(), llm.uri());
     env.insert("CH_URL".to_owned(), ch.uri());
     let TestApp { router, pool } = spin_up_with_env(&env).await;
-    let user = create_principal_with_permissions(&pool, permissions).await;
+    let user = create_assistant_principal(&pool, permissions).await;
     let cookie = session_cookie_for_user(&pool, user).await;
     let body = json!({ "messages": [{ "role": "user", "content": "berapa tamu bulan ini?" }] });
     let resp = router
@@ -732,4 +980,327 @@ async fn a_user_with_catalog_read_is_not_refused_the_data_map_for_a_missing_perm
     let (system, _) = system_prompt_for_user_holding("catalog:read").await;
 
     assert!(!system.contains(MAP_NEEDS_CATALOG_READ), "{system}");
+}
+
+// ── `AI-17` (plan 80): the server-side script gate ─────────────────────
+//
+// On staging the model answered the Latin-script question "Berapa total
+// kunjungan?" with text holding 吸引力, ignoring the prompt's "never in
+// Chinese" line, so the server now asks once — with no tools — for a
+// rewrite when the latest user message is in Latin script and the answer
+// holds a CJK character. These tests count the model's requests, so the
+// mock answers carry no digits: a bare figure would trip the citation
+// repair (WS7), which adds its own round and would mask the rewrite under
+// test.
+
+#[tokio::test]
+async fn an_answer_with_a_cjk_character_to_a_latin_question_is_asked_once_for_a_rewrite_and_the_clean_rewrite_is_the_reply()
+ {
+    let llm = mock_model(vec![
+        model_round(Some("Total kunjungan adalah 吸引力."), &[]),
+        model_round(Some("Total kunjungan tercatat."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["answer"], "Total kunjungan tercatat.",
+        "the clean rewrite is the reply: {body}"
+    );
+    let model_calls = llm.received_requests().await.expect("recording").len();
+    assert_eq!(
+        model_calls, 2,
+        "exactly one rewrite round was added: {model_calls}"
+    );
+}
+
+#[tokio::test]
+async fn a_rewrite_that_still_holds_a_cjk_character_is_discarded_and_the_first_answer_is_the_reply()
+{
+    let llm = mock_model(vec![
+        model_round(Some("Total kunjungan adalah 吸引力."), &[]),
+        model_round(Some("Jawabannya tetap 吸引力."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["answer"], "Total kunjungan adalah 吸引力.",
+        "the first answer is kept when the rewrite is not clean: {body}"
+    );
+    let model_calls = llm.received_requests().await.expect("recording").len();
+    assert_eq!(
+        model_calls, 2,
+        "no round runs after the discarded rewrite: {model_calls}"
+    );
+}
+
+#[tokio::test]
+async fn a_latin_answer_to_a_latin_question_sends_no_rewrite_round() {
+    let llm = mock_model(vec![model_round(Some("Total kunjungan tercatat."), &[])]).await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["answer"], "Total kunjungan tercatat.", "{body}");
+    let model_calls = llm.received_requests().await.expect("recording").len();
+    assert_eq!(
+        model_calls, 1,
+        "a clean Latin answer is not rewritten: {model_calls}"
+    );
+}
+
+#[tokio::test]
+async fn a_chinese_answer_to_a_chinese_question_sends_no_rewrite_round() {
+    let llm = mock_model(vec![model_round(Some("总共四次。"), &[])]).await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "总共多少?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["answer"], "总共四次。", "{body}");
+    let model_calls = llm.received_requests().await.expect("recording").len();
+    assert_eq!(
+        model_calls, 1,
+        "a question in another script is not checked: {model_calls}"
+    );
+}
+
+/// The `messages` array of the model's `n`th request (0-based), without the
+/// system prompt, as roles and contents, so a test can see what the model was
+/// shown in a later round.
+async fn model_request_messages(llm: &MockServer, n: usize) -> Vec<(String, String)> {
+    let requests = llm.received_requests().await.expect("recording is on");
+    let request: Value = serde_json::from_slice(&requests[n].body).expect("a JSON request");
+    request["messages"]
+        .as_array()
+        .expect("a messages array")
+        .iter()
+        .skip(1)
+        .map(|m| {
+            (
+                m["role"].as_str().unwrap_or_default().to_owned(),
+                m["content"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// `AI-17` review fix (BLOCKER 1): a clean rewrite that then trips the
+/// citation repair (the figure is in no tool result) must reach the repair
+/// round as the model's own assistant message. Before the fix the rewrite's
+/// reply was never pushed, so the repair request followed the rewrite
+/// request, the model repaired its CJK answer, and the repaired answer was
+/// returned with no CJK check.
+#[tokio::test]
+async fn a_clean_rewrite_the_citation_check_flags_is_shown_to_the_model_as_its_own_message_in_the_repair_round()
+ {
+    let llm = mock_model(vec![
+        model_round(Some("Total kunjungan adalah 吸引力."), &[]),
+        model_round(Some("Total kunjungan adalah 48213."), &[]),
+        model_round(Some("Total kunjungan tercatat."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["answer"], "Total kunjungan tercatat.",
+        "the repaired answer is the reply: {body}"
+    );
+    let model_calls = llm.received_requests().await.expect("recording").len();
+    assert_eq!(
+        model_calls, 3,
+        "the answer, one rewrite, one repair: {model_calls}"
+    );
+    let repair = model_request_messages(&llm, 2).await;
+    let roles: Vec<&str> = repair.iter().map(|(role, _)| role.as_str()).collect();
+    assert_eq!(
+        roles,
+        ["user", "assistant", "user", "assistant", "user"],
+        "question, answer, rewrite request, rewrite, repair request: {repair:?}"
+    );
+    assert!(
+        repair[3].1.contains("Total kunjungan adalah 48213."),
+        "the repair round shows the model its rewrite: {repair:?}"
+    );
+}
+
+/// `AI-17` review fix (BLOCKER 1): a rewrite that is discarded leaves the
+/// conversation as it was before the rewrite request, so a later repair
+/// round does not see two user messages in a row.
+#[tokio::test]
+async fn a_discarded_rewrite_leaves_no_trace_in_the_conversation_the_repair_round_sees() {
+    let llm = mock_model(vec![
+        model_round(Some("Total kunjungan adalah 48213 吸引力."), &[]),
+        model_round(Some("Jawabannya tetap 吸引力."), &[]),
+        model_round(Some("Total kunjungan tercatat."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["answer"], "Total kunjungan tercatat.", "{body}");
+    let repair = model_request_messages(&llm, 2).await;
+    let roles: Vec<&str> = repair.iter().map(|(role, _)| role.as_str()).collect();
+    assert_eq!(
+        roles,
+        ["user", "assistant", "user"],
+        "question, answer, repair request: {repair:?}"
+    );
+}
+
+/// `AI-17` review fix (BLOCKER 2): the iteration-budget path runs the same
+/// check. `MAX_ITER` (8) rounds that call a tool, then a final answer with a
+/// CJK character, then the rewrite: ten requests in all.
+///
+/// Every round calls the unknown tool with its own arguments, so the rounds
+/// are different calls: plan 111 stops the loop after three failures of the
+/// *same* call, and this test is about the rounds' budget, not about that
+/// bound.
+#[tokio::test]
+async fn a_final_answer_after_the_tool_call_limit_with_a_cjk_character_is_replaced_by_its_clean_rewrite()
+ {
+    let mut rounds: Vec<Value> = (1..=8)
+        .map(|n| {
+            model_round(
+                None,
+                &[(
+                    &format!("call_{n}"),
+                    "no_such_tool",
+                    &format!(r#"{{"n":{n}}}"#),
+                )],
+            )
+        })
+        .collect();
+    rounds.push(model_round(Some("Total kunjungan adalah 吸引力."), &[]));
+    rounds.push(model_round(Some("Total kunjungan tercatat."), &[]));
+    let llm = mock_model(rounds).await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["answer"], "Total kunjungan tercatat.",
+        "the clean rewrite is the reply: {body}"
+    );
+    assert_eq!(body["note"], "tool-call limit reached", "{body}");
+    let model_calls = llm.received_requests().await.expect("recording").len();
+    assert_eq!(
+        model_calls, 10,
+        "eight tool rounds, the final answer, one rewrite: {model_calls}"
+    );
+    // `AI-17` review fix round 2 (BLOCKER): the rewrite request follows the
+    // answer it asks about. Before the fix the answer was never pushed, so
+    // the request came right after "Give your final answer now" and the model
+    // was asked to rewrite an answer it had not seen.
+    let rewrite_round = model_request_messages(&llm, 9).await;
+    let tail: Vec<(&str, &str)> = rewrite_round[rewrite_round.len() - 3..]
+        .iter()
+        .map(|(role, content)| (role.as_str(), content.as_str()))
+        .collect();
+    assert_eq!(
+        tail.iter().map(|(role, _)| *role).collect::<Vec<_>>(),
+        ["user", "assistant", "user"],
+        "final-answer request, the CJK answer, the rewrite request: {tail:?}"
+    );
+    assert_eq!(tail[1].1, "Total kunjungan adalah 吸引力.", "{tail:?}");
+}
+
+/// `AI-17` review fix round 2 (optional item): the rewrite round offers no
+/// tools, so a structured tool call in its reply has no tool result to
+/// follow it. The message kept for the repair round carries none.
+#[tokio::test]
+async fn a_clean_rewrite_that_carries_a_tool_call_is_kept_for_the_repair_round_without_it() {
+    let llm = mock_model(vec![
+        model_round(Some("Total kunjungan adalah 吸引力."), &[]),
+        model_round(
+            Some("Total kunjungan adalah 48213."),
+            &[("call_x", "no_such_tool", "{}")],
+        ),
+        model_round(Some("Total kunjungan tercatat."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+
+    let (status, body) = chat(&llm, &ch, "true", None, "Berapa total kunjungan?").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["answer"], "Total kunjungan tercatat.", "{body}");
+    let requests = llm.received_requests().await.expect("recording is on");
+    assert_eq!(requests.len(), 3, "answer, rewrite, repair");
+    let repair: Value = serde_json::from_slice(&requests[2].body).expect("a JSON request");
+    let kept = repair["messages"]
+        .as_array()
+        .expect("a messages array")
+        .iter()
+        .find(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("Total kunjungan adalah 48213."))
+        })
+        .expect("the rewrite is in the repair round");
+    assert!(
+        kept.get("tool_calls").is_none_or(Value::is_null),
+        "the kept rewrite has no tool call: {kept}"
+    );
+}
+
+/// `AI-17` review fix (SHOULD-FIX 2): a streaming client clears its draft
+/// only on a `status` or `tool` event, so the rewrite round sends a status
+/// before the model writes, or its deltas would be appended to the CJK
+/// answer's text.
+#[tokio::test]
+async fn a_streamed_rewrite_round_announces_itself_with_a_status_event_before_its_deltas() {
+    let llm = mock_model(vec![
+        model_round(Some("Total kunjungan adalah 吸引力."), &[]),
+        model_round(Some("Total kunjungan tercatat."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
+    let body = json!({
+        "stream": true,
+        "messages": [{ "role": "user", "content": "Berapa total kunjungan?" }],
+    });
+
+    let (status, bytes) = post_chat(&llm, &ch, "true", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let events: Vec<Value> = String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("every line is one JSON event"))
+        .collect();
+    let rewrite_delta = events
+        .iter()
+        .position(|e| e["type"] == "delta" && e["text"] == "Total kunjungan tercatat.")
+        .unwrap_or_else(|| panic!("the rewrite streams as a delta: {events:?}"));
+    let status_before = events[..rewrite_delta]
+        .iter()
+        .rposition(|e| e["type"] == "status");
+    let first_answer_delta = events
+        .iter()
+        .position(|e| e["type"] == "delta")
+        .expect("the first answer streams");
+    assert!(
+        status_before.is_some_and(|s| s > first_answer_delta),
+        "a status event sits between the first answer's text and the rewrite's: {events:?}"
+    );
+    assert_eq!(
+        events.last().expect("events")["body"]["answer"],
+        "Total kunjungan tercatat.",
+        "{events:?}"
+    );
 }

@@ -58,22 +58,31 @@
 
 use axum::Extension;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::multipart::MultipartError;
+use axum::extract::{Multipart, Path, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
 use lakehouse_auth::Principal;
 use lakehouse_bi::embed_access::validate_content_sites;
 use lakehouse_bi::formatting::{COMPANY_PALETTE_LEN, NUMBER_LOCALES, SHIPPED_FONTS, is_hex_color};
 use lakehouse_bi::grain::{TimeContext, WeekStart};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::SqlLiteral;
-use lakehouse_store::PgPool;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
+use lakehouse_store::workspace_settings::{self, ImageKind, StoredImage, WorkspaceSettings};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::Digest as _;
+use std::collections::BTreeSet;
+use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::runtime_settings::{
-    EffectiveAssistant, EffectiveEmail, EffectiveSignIn, Source, check_assistant_address,
+    EffectiveAssistant, EffectiveEmail, EffectiveSignIn, EffectiveSso, Source,
+    check_assistant_address,
 };
 use crate::state::AppState;
 use crate::upstream_error;
@@ -591,6 +600,10 @@ pub async fn get_reporting(
 /// `PUT /api/settings/reporting` — save `{timeZone, weekStart}` and, when
 /// sent, `{numberLocale, companyPalette, fonts, contentSites}`.
 ///
+/// The route's audit rows are the handler's (plan D3): the save writes one
+/// naming the settings that changed, and a save this handler refuses writes
+/// its own `refused` row.
+///
 /// # Errors
 ///
 /// 400 with a fixed message when the body is not those fields, the first
@@ -603,6 +616,57 @@ pub async fn put_reporting(
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    let reply = save_reporting(&state, &principal, body).await;
+    match reply {
+        Ok(reply) => Ok(reply),
+        Err(err) => {
+            // Plan D3: the route's refusal row is now the handler's to write;
+            // the gate's 403 row is separate and already written there.
+            if let Some(status) = handler_refusal_status(&err) {
+                audit_settings_refusal(
+                    &state,
+                    &principal,
+                    "settings.reporting.update",
+                    "reporting",
+                    status,
+                )
+                .await;
+            }
+            Err(err.into())
+        }
+    }
+}
+
+/// The settings as the console names them, under `reporting` (plan D3): the
+/// snapshot the save's row diffs against, so the paths read
+/// `reporting.resultCache.mode` the way the console's answer names them.
+fn reporting_snapshot(row: &lakehouse_store::reporting_settings::ReportingSettings) -> Value {
+    json!({
+        "reporting": {
+            "timeZone": row.time_zone,
+            "weekStart": row.week_start,
+            "numberLocale": row.number_locale,
+            "companyPalette": row.company_palette,
+            "fonts": row.fonts,
+            "contentSites": row.content_sites,
+            "downloadDeniedRoles": row.download_denied_roles,
+            "reportAllowedDomains": row.report_allowed_domains,
+            "publicLinksEnabled": row.public_links_enabled,
+            "resultCache": {
+                "mode": row.result_cache_mode,
+                "minutes": row.result_cache_minutes,
+            },
+        }
+    })
+}
+
+/// The save behind [`put_reporting`], whose errors the wrapper turns into the
+/// refusal row.
+async fn save_reporting(
+    state: &AppState,
+    principal: &Principal,
+    body: Bytes,
+) -> Result<ApiJson<Value>, ApiError> {
     // Parsed by hand so a malformed body gets this module's message.
     let parsed: SettingsBody =
         serde_json::from_slice(&body).map_err(|_| ApiError::BadRequest(BODY_SHAPE.to_owned()))?;
@@ -613,10 +677,9 @@ pub async fn put_reporting(
     let Some(pool) = state.pg.as_deref() else {
         return Err(ApiError::Unavailable(
             "Settings need a database, and none is configured.".to_owned(),
-        )
-        .into());
+        ));
     };
-    let current = format_settings(&state).await?;
+    let current = format_settings(state).await?;
     // Role names are read only when the body sends the list.
     let known_roles = if parsed.download_denied_roles.is_some() {
         Some(
@@ -631,10 +694,13 @@ pub async fn put_reporting(
         None
     };
     let format = checked_formatting(&parsed, &current, known_roles.as_deref())?;
-    if !engine_knows_zone(&state, ctx.zone()).await? {
-        return Err(ApiError::BadRequest("Unknown time zone.".to_owned()).into());
+    if !engine_knows_zone(state, ctx.zone()).await? {
+        return Err(ApiError::BadRequest("Unknown time zone.".to_owned()));
     }
-    let stored = lakehouse_store::reporting_settings::upsert(
+    // Plan D3b: the save returns the row it replaced, read in the save's own
+    // transaction, so two racing saves cannot name each other's settings as
+    // unchanged.
+    let (replaced, stored) = lakehouse_store::reporting_settings::upsert(
         pool,
         &lakehouse_store::reporting_settings::ReportingSettings {
             time_zone: ctx.zone().to_owned(),
@@ -656,6 +722,26 @@ pub async fn put_reporting(
     )
     .await
     .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    // Plan D3: the row names the settings that changed, from the row this
+    // save replaced against the row now stored — the paths only, never a
+    // value. No row existed before: the save set every part of it, so it
+    // diffs against an empty `reporting`.
+    let paths = changed_setting_paths(
+        &replaced
+            .as_ref()
+            .map_or_else(|| json!({ "reporting": {} }), reporting_snapshot),
+        &reporting_snapshot(&stored),
+    );
+    let detail = (!paths.is_empty()).then(|| paths.join(", "));
+    audit_settings_event(
+        state,
+        principal,
+        "settings.reporting.update",
+        "reporting",
+        json!({ "fields": paths }),
+        detail.as_deref(),
+    )
+    .await;
     // Echo what was stored, through the same constructor reads use.
     let echoed = WeekStart::parse(&stored.week_start)
         .and_then(|w| TimeContext::new(&stored.time_zone, w).ok())
@@ -758,7 +844,8 @@ const EMAIL_FIELDS: [&str; 7] = [
 ///
 /// `fields` are the names the body may carry; anything else is refused with
 /// `shape`, the fixed sentence that names them.
-fn parse_body(
+// ADM-11 review 1 S3: pub(crate) so routes::identity reuses this helper for PATCH parsing.
+pub(crate) fn parse_body(
     body: &Bytes,
     fields: &[&str],
     shape: &str,
@@ -1044,6 +1131,8 @@ fn deployment_features(
     state: &AppState,
     email: &EffectiveEmail,
     assistant: &EffectiveAssistant,
+    sso: &crate::runtime_settings::EffectiveSso,
+    single_sign_on: bool,
 ) -> Vec<Value> {
     let config = &state.config;
     // PDF export needs all three of these (feature decision 6).
@@ -1057,17 +1146,12 @@ fn deployment_features(
     if config.render_token_secret.is_none() {
         pdf_missing.push("RENDER_TOKEN_SECRET");
     }
-    // Single sign-on is on when the `OIDC` authenticator was built, which
-    // needs an issuer and a client id (`state.rs`'s `oidc_config`).
-    let single_sign_on = state
-        .auth
-        .as_ref()
-        .and_then(|auth| auth.oidc.as_ref())
-        .is_some();
     let sso_missing: Vec<&str> = if single_sign_on {
         Vec::new()
-    } else {
+    } else if sso.issuer_source == Source::Server {
         vec!["OIDC_ISSUER", "OIDC_CLIENT_ID"]
+    } else {
+        vec!["issuer", "clientId"]
     };
     // The assistant is on when it has a key — the environment's or the
     // console's (`ADM-9` reads the saved one; the environment owns the key
@@ -1115,7 +1199,16 @@ fn deployment_features(
                 "console"
             },
         ),
-        feature("singleSignOn", single_sign_on, &sso_missing, "server"),
+        feature(
+            "singleSignOn",
+            single_sign_on,
+            &sso_missing,
+            if sso.issuer_source == Source::Server {
+                "server"
+            } else {
+                "console"
+            },
+        ),
         feature(
             "assistant",
             assistant_on,
@@ -1148,8 +1241,12 @@ pub async fn get_deployment(State(state): State<AppState>) -> ApiResult<ApiJson<
     let assistant = crate::runtime_settings::assistant_or_fail(&state)
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let sso = crate::runtime_settings::sso_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let single_sign_on = crate::runtime_settings::oidc(&state).await.is_some();
     Ok(ApiJson(json!({
-        "features": deployment_features(&state, &email, &assistant),
+        "features": deployment_features(&state, &email, &assistant, &sso, single_sign_on),
     })))
 }
 
@@ -1210,9 +1307,16 @@ pub async fn put_email(
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     // The save is visible to the next send on this process at once (D3).
-    state.email_settings_cache.clear().await;
+    state.settings_caches.email.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
-    audit_settings_update(pool, &principal, "settings.email.update", "email", &changed).await;
+    audit_settings_update(
+        &state,
+        &principal,
+        "settings.email.update",
+        "email",
+        &changed,
+    )
+    .await;
 
     let effective = crate::runtime_settings::email_or_fail(&state)
         .await
@@ -1264,7 +1368,11 @@ pub async fn post_email_test(
     let user = lakehouse_store::identity::get_user(pool, &user_id.to_string())
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
-    let Some(address) = crate::routes::report_runner::normalise_address(&user.email) else {
+    let Some(address) = user
+        .email
+        .as_deref()
+        .and_then(crate::routes::report_runner::normalise_address)
+    else {
         return Err(ApiError::BadRequest(NO_ACCOUNT_ADDRESS.to_owned()).into());
     };
     // The effective settings: what a send would use, saved or from the
@@ -1567,10 +1675,10 @@ pub async fn put_sign_in(
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     // The save is visible to the next sign-in on this process at once (D3).
-    state.sign_in_settings_cache.clear().await;
+    state.settings_caches.sign_in.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
     audit_settings_update(
-        pool,
+        &state,
         &principal,
         "settings.sign_in.update",
         "sign-in",
@@ -1624,6 +1732,78 @@ fn assistant_url_sentence(problem: crate::runtime_settings::AddressProblem) -> &
         AddressProblem::Unresolved => URL_UNRESOLVED_REFUSED,
         AddressProblem::Internal => URL_INTERNAL_REFUSED,
     }
+}
+
+/// What the person is told when the issuer address is not https.
+pub(crate) const ISSUER_NOT_HTTPS: &str = "issuer must start with https://.";
+
+/// What the person is told when the issuer address resolves to an internal network.
+pub(crate) const ISSUER_INTERNAL_REFUSED: &str =
+    "issuer must be an external address, not an address inside this deployment's network.";
+
+/// What the person is told when the issuer address does not resolve.
+pub(crate) const ISSUER_UNRESOLVED_REFUSED: &str =
+    "issuer must be an address this deployment can reach: its name did not resolve.";
+
+/// The sentence for each way an issuer address is refused (plan D6).
+pub(crate) fn issuer_url_sentence(
+    problem: crate::runtime_settings::AddressProblem,
+) -> &'static str {
+    use crate::runtime_settings::AddressProblem;
+    match problem {
+        AddressProblem::NotHttps | AddressProblem::NoHost => ISSUER_NOT_HTTPS,
+        AddressProblem::Unresolved => ISSUER_UNRESOLVED_REFUSED,
+        AddressProblem::Internal => ISSUER_INTERNAL_REFUSED,
+    }
+}
+
+/// Validate a console-supplied issuer address (plan D6).
+pub(crate) async fn validate_sso_issuer(
+    url: &str,
+    internal_hosts: &crate::internal_hosts::InternalHosts,
+) -> Result<String, ApiError> {
+    let text = url.trim().trim_end_matches('/');
+    if text.is_empty() {
+        return Err(ApiError::BadRequest(ISSUER_NOT_HTTPS.to_owned()));
+    }
+    crate::runtime_settings::check_issuer_address(text, internal_hosts)
+        .await
+        .map_err(|problem| ApiError::BadRequest(issuer_url_sentence(problem).to_owned()))?;
+    Ok(text.to_owned())
+}
+
+/// Validate role map rows: each entry must have group and role text, and the role
+/// must exist in the deployment (plan D7).
+pub(crate) fn validate_role_map_entries(
+    items: &[serde_json::Value],
+    known_roles: &[String],
+) -> Result<Vec<crate::runtime_settings::RoleMapEntry>, ApiError> {
+    let mut entries = Vec::new();
+    for item in items {
+        let (Some(group), Some(role)) = (
+            item.get("group").and_then(Value::as_str),
+            item.get("role").and_then(Value::as_str),
+        ) else {
+            return Err(ApiError::BadRequest(
+                "Each roleMap entry must have group and role text.".to_owned(),
+            ));
+        };
+        let group = group.trim();
+        let role = role.trim();
+        if group.is_empty() || role.is_empty() {
+            return Err(ApiError::BadRequest(
+                "roleMap group and role must not be empty.".to_owned(),
+            ));
+        }
+        if !known_roles.iter().any(|r| r == role) {
+            return Err(ApiError::BadRequest(format!("Unknown role: \"{role}\".")));
+        }
+        entries.push(crate::runtime_settings::RoleMapEntry {
+            group: group.to_owned(),
+            role: role.to_owned(),
+        });
+    }
+    Ok(entries)
 }
 
 /// The assistant answer: the effective address and model, and whether a key
@@ -1776,10 +1956,10 @@ pub async fn put_assistant(
     .await
     .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     // The save is visible to the next message on this process at once (D3).
-    state.assistant_settings_cache.clear().await;
+    state.settings_caches.assistant.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
     audit_settings_update(
-        pool,
+        &state,
         &principal,
         "settings.assistant.update",
         "assistant",
@@ -1845,13 +2025,38 @@ pub async fn post_assistant_test(State(state): State<AppState>) -> ApiResult<Api
 /// the NAMES of the fields that changed, never a value and never a secret.
 ///
 /// Best effort, like every other audit write: a failed audit write never
-/// fails, or undoes, the save it records.
-async fn audit_settings_update(
-    pool: &PgPool,
+/// fails, or undoes, the save it records, and is counted
+/// ([`audit_coverage::record_best_effort`]).
+pub(crate) async fn audit_settings_update(
+    state: &AppState,
     principal: &Principal,
     action: &str,
     resource: &str,
     fields: &[&str],
+) {
+    audit_settings_event(
+        state,
+        principal,
+        action,
+        resource,
+        json!({ "fields": fields }),
+        None,
+    )
+    .await;
+}
+
+/// The same audit row with any `args`, for a save whose record is not a list
+/// of field names (`ADM-2`: a picture's kind, type and size). The caller owns
+/// the rule that `args` never holds a value or a secret. `detail` is the row's
+/// own sentence (the names of what changed, or `None` for a save whose row
+/// needs no more than `args`).
+pub(crate) async fn audit_settings_event(
+    state: &AppState,
+    principal: &Principal,
+    action: &str,
+    resource: &str,
+    args: Value,
+    detail: Option<&str>,
 ) {
     let event = NewAuditEvent {
         principal_id: Some(principal.id.uuid().to_string()),
@@ -1860,16 +2065,1270 @@ async fn audit_settings_update(
         action: action.to_owned(),
         resource_kind: Some("settings".to_owned()),
         resource_id: Some(resource.to_owned()),
-        args: Some(json!({ "fields": fields })),
+        args: Some(args),
         outcome: "executed".to_owned(),
-        detail: None,
+        detail: detail.map(str::to_owned),
         run_id: None,
         approval_id: None,
         session_id: None,
     };
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, action, "failed to record the settings audit event");
+    audit_coverage::record_best_effort(state, event).await;
+}
+
+/// The dotted paths where two settings snapshots differ, sorted (plan D3). A
+/// key added or removed counts, an array compares whole, and a path is a
+/// name only, never a value: whoever reads the trail reads these paths.
+///
+/// A key that exists on one side only is walked key by key like any other
+/// object, so the path names the setting that changed
+/// (`roles.Viewer.timeoutSeconds`), not the object that holds it.
+///
+/// Both arguments are the settings as JSON objects with the console's
+/// camelCase names, so the paths read like the console's fields
+/// (`install.chartRows`, `roles.Analyst.timeoutSeconds`,
+/// `reporting.resultCache.mode`).
+pub(crate) fn changed_setting_paths(before: &Value, after: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    changed_paths("", before, after, &mut paths);
+    paths.sort();
+    paths
+}
+
+/// The walker behind [`changed_setting_paths`]: two objects are walked key by
+/// key, a key on one side only is walked into (its other side is nothing),
+/// and anything else — a scalar or an array — is a leaf compared whole.
+fn changed_paths(prefix: &str, before: &Value, after: &Value, out: &mut Vec<String>) {
+    let empty = serde_json::Map::new();
+    match (before, after) {
+        (Value::Object(before_map), Value::Object(after_map)) => {
+            changed_keys(prefix, before_map, after_map, out);
+        }
+        // A key that exists on one side only: the side that has it is walked
+        // key by key, so the path names the setting, not the object.
+        (Value::Object(before_map), Value::Null) => {
+            changed_keys(prefix, before_map, &empty, out);
+        }
+        (Value::Null, Value::Object(after_map)) => {
+            changed_keys(prefix, &empty, after_map, out);
+        }
+        _ if before != after => out.push(prefix.to_owned()),
+        _ => {}
     }
+}
+
+/// The key-by-key walk behind [`changed_paths`]: every key of either side,
+/// and for each of them the two values (nothing on the side that does not
+/// have the key).
+fn changed_keys(
+    prefix: &str,
+    before: &serde_json::Map<String, Value>,
+    after: &serde_json::Map<String, Value>,
+    out: &mut Vec<String>,
+) {
+    let keys: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    for key in keys {
+        let path = if prefix.is_empty() {
+            (*key).clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        changed_paths(
+            &path,
+            before.get(key).unwrap_or(&Value::Null),
+            after.get(key).unwrap_or(&Value::Null),
+            out,
+        );
+    }
+}
+
+/// The fixed sentence of a settings save the handler refused (plan D3). It
+/// names the status the way the central writer's row named it, and nothing
+/// else: never the payload that did not parse.
+fn settings_refusal_detail(status: u16) -> String {
+    format!("The settings save was refused with HTTP {status}; the values sent were not valid.")
+}
+
+/// The status that makes a handler's own error a refusal for the trail (plan
+/// D3): the validation failures it answers with `400`/`422`. A `403` never
+/// reaches the handler (the gate writes that refusal row), and a `5xx` is a
+/// failure, not a refusal. Shared by both settings routes' save wrappers.
+pub(crate) fn handler_refusal_status(err: &ApiError) -> Option<u16> {
+    match err {
+        ApiError::BadRequest(_) | ApiError::Unprocessable(_) => {
+            Some(if matches!(err, ApiError::BadRequest(_)) {
+                400
+            } else {
+                422
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The `refused` row of a settings save the handler itself turned away with
+/// `400`/`422` (plan D3). The route's rows are now the handler's to write, so
+/// a refused save keeps its row: outcome `refused`, the paths unknown (the
+/// payload may never have parsed), and the fixed sentence in `detail` — never
+/// the payload. Best effort, like [`audit_settings_event`].
+pub(crate) async fn audit_settings_refusal(
+    state: &AppState,
+    principal: &Principal,
+    action: &str,
+    resource: &str,
+    status: u16,
+) {
+    let event = NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: action.to_owned(),
+        resource_kind: Some("settings".to_owned()),
+        resource_id: Some(resource.to_owned()),
+        args: Some(json!({ "fields": [] })),
+        outcome: "refused".to_owned(),
+        detail: Some(settings_refusal_detail(status)),
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    };
+    audit_coverage::record_best_effort(state, event).await;
+}
+
+// ── Single Sign-On / OIDC (`ADM-12`) ─────────────────────────────────────
+
+/// What the person is told when the body is not the SSO fields.
+const SSO_BODY_SHAPE: &str = "body must be {\"issuer\"?: string|null, \"clientId\"?: string|null, \
+\"clientSecret\"?: string|null, \"providerName\"?: string|null, \"groupsClaim\"?: string|null, \
+\"roleMap\"?: array|null, \"jitProvisioning\"?: boolean|null, \"trustEmail\"?: boolean|null}";
+
+/// The fields the body of an SSO save may carry (`ADM-12`, plan D1;
+/// `SEC-65` D3 adds `trustEmail`).
+const SSO_FIELDS: [&str; 8] = [
+    "issuer",
+    "clientId",
+    "clientSecret",
+    "providerName",
+    "groupsClaim",
+    "roleMap",
+    "jitProvisioning",
+    "trustEmail",
+];
+
+/// What the person is told when the client ID is not text.
+const CLIENT_ID_REFUSED: &str = "clientId must be text.";
+
+/// What the person is told when the client secret is not text.
+const CLIENT_SECRET_REFUSED: &str = "clientSecret must be text.";
+
+/// What the person is told when the provider name is not text.
+const PROVIDER_NAME_REFUSED: &str = "providerName must be text.";
+
+/// What the person is told when the groups claim is not text.
+const GROUPS_CLAIM_REFUSED: &str = "groupsClaim must be text.";
+
+/// What the person is told when the role map is not a list.
+const ROLE_MAP_REFUSED: &str = "roleMap must be a list of {group, role} objects.";
+
+/// What the person is told when the JIT provisioning toggle is not a boolean.
+const JIT_REFUSED: &str = "jitProvisioning must be a boolean.";
+
+/// What the person is told when the "trust this provider's emails" toggle is
+/// not a boolean (`SEC-65` D3).
+const TRUST_EMAIL_REFUSED: &str = "trustEmail must be a boolean.";
+
+/// The new value of a boolean field, and whether the stored value moves.
+fn boolean_field(
+    sent: Option<&Value>,
+    old: Option<bool>,
+    refused: &str,
+) -> Result<(Option<bool>, bool), ApiError> {
+    let Some(value) = sent else {
+        return Ok((old, false));
+    };
+    if value.is_null() {
+        return Ok((None, old.is_some()));
+    }
+    let Some(b) = value.as_bool() else {
+        return Err(ApiError::BadRequest(refused.to_owned()));
+    };
+    let changed = old != Some(b);
+    Ok((Some(b), changed))
+}
+
+/// The new value of the role map field, and whether the stored value moves.
+fn role_map_field(
+    sent: Option<&Value>,
+    old: Option<&Value>,
+    known_roles: &[String],
+) -> Result<(Option<Value>, bool), ApiError> {
+    let Some(value) = sent else {
+        return Ok((old.cloned(), false));
+    };
+    if value.is_null() {
+        return Ok((None, old.is_some()));
+    }
+    let Some(arr) = value.as_array() else {
+        return Err(ApiError::BadRequest(ROLE_MAP_REFUSED.to_owned()));
+    };
+    let entries = validate_role_map_entries(arr, known_roles)?;
+    let new_val = serde_json::to_value(&entries)
+        .map_err(|_| ApiError::BadRequest(ROLE_MAP_REFUSED.to_owned()))?;
+    let changed = old != Some(&new_val);
+    Ok((Some(new_val), changed))
+}
+
+/// The new console-supplied issuer address, and whether the stored one moves.
+async fn sso_issuer_field(
+    state: &AppState,
+    sent: Option<&Value>,
+    old: Option<&str>,
+) -> Result<(Option<String>, bool), ApiError> {
+    let Some(value) = sent else {
+        return Ok((old.map(str::to_owned), false));
+    };
+    let Some(text) = string_field(ISSUER_NOT_HTTPS, value)? else {
+        return Ok((None, old.is_some()));
+    };
+    let checked = validate_sso_issuer(&text, &state.config.connector_internal_hosts()).await?;
+    let changed = old != Some(checked.as_str());
+    Ok((Some(checked), changed))
+}
+
+/// Format the single sign-on settings response with each field's value and
+/// source, plus whether a sign-in can be offered and why not (`ADM-12`
+/// D10). `notReadyReason` is a fixed sentence naming what to set; nothing
+/// from the provider appears in it.
+fn sso_settings_json(
+    effective: &EffectiveSso,
+    can_edit: bool,
+    not_ready_reason: Option<&'static str>,
+) -> Value {
+    json!({
+        "issuer": field_json(effective.issuer.clone(), effective.issuer_source),
+        "clientId": field_json(effective.client_id.clone(), effective.client_id_source),
+        "clientSecret": {
+            "set": effective.client_secret_set,
+            "source": effective.client_secret_source.as_str(),
+        },
+        "providerName": field_json(effective.provider_name.clone(), effective.provider_name_source),
+        "groupsClaim": field_json(effective.groups_claim.clone(), effective.groups_claim_source),
+        "roleMap": field_json(
+            serde_json::to_value(&effective.role_map_rows).unwrap_or_default(),
+            effective.role_map_source,
+        ),
+        "jitProvisioning": field_json(effective.jit_provisioning, effective.jit_provisioning_source),
+        "trustEmail": field_json(effective.trust_email, effective.trust_email_source),
+        "canEdit": can_edit,
+        "ready": not_ready_reason.is_none(),
+        "notReadyReason": not_ready_reason,
+    })
+}
+
+/// `GET /api/settings/sso` — the effective single sign-on settings, and where
+/// each value comes from (`ADM-12`, plan D1, D3, D10).
+///
+/// Floor: `RequiresPermission("settings:write")`.
+/// Returns `canEdit: bool`, true if caller is unrestricted (`*:*`), and
+/// `ready` with `notReadyReason` when a saved connection cannot be used.
+///
+/// # Errors
+///
+/// 5xx through `upstream_error` when the saved row cannot be read: the
+/// answer must not claim a value is "not set" when the database could not
+/// be asked.
+pub async fn get_sso(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<ApiJson<Value>> {
+    let runtime = crate::runtime_settings::sso_runtime_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let can_edit = crate::routes::catalog::is_unrestricted(&principal);
+    Ok(ApiJson(sso_settings_json(
+        &runtime.settings,
+        can_edit,
+        runtime.not_ready_reason(),
+    )))
+}
+
+/// `PUT /api/settings/sso` — save the SSO / OIDC settings (`ADM-12`, plan D1, D5).
+///
+/// Floor: `RequiresPermission("settings:write")`.
+/// Choke point: Also requires `crate::routes::catalog::is_unrestricted(&principal)`
+/// returning 403 Forbidden because a role map can grant Platform Admin.
+#[allow(
+    clippy::too_many_lines,
+    reason = "validates each SSO setting field against server ownership, saves sealed secret and role map, clears cache and records audit"
+)]
+pub async fn put_sso(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    // Choke point (D5): only a Platform Admin (*:*) may configure SSO or role mapping,
+    // because role mapping can grant Platform Admin.
+    if !crate::routes::catalog::is_unrestricted(&principal) {
+        return Err(ApiError::Forbidden.into());
+    }
+
+    let parsed = parse_body(&body, &SSO_FIELDS, SSO_BODY_SHAPE)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Unavailable(
+            "Settings need a database, and none is configured.".to_owned(),
+        )
+        .into());
+    };
+
+    let effective = crate::runtime_settings::sso_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+
+    for (sent, source) in [
+        (parsed.contains_key("issuer"), effective.issuer_source),
+        (parsed.contains_key("clientId"), effective.client_id_source),
+        (
+            parsed.contains_key("clientSecret"),
+            effective.client_secret_source,
+        ),
+        (
+            parsed.contains_key("providerName"),
+            effective.provider_name_source,
+        ),
+        (
+            parsed.contains_key("groupsClaim"),
+            effective.groups_claim_source,
+        ),
+        (parsed.contains_key("roleMap"), effective.role_map_source),
+        (
+            parsed.contains_key("jitProvisioning"),
+            effective.jit_provisioning_source,
+        ),
+        (
+            parsed.contains_key("trustEmail"),
+            effective.trust_email_source,
+        ),
+    ] {
+        if sent && source == Source::Server {
+            return Err(ApiError::Conflict(SET_BY_THE_SERVER.to_owned()).into());
+        }
+    }
+
+    let current = lakehouse_store::sso_settings::get(pool)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+
+    let old_issuer = current.as_ref().and_then(|c| c.oidc_issuer.as_deref());
+    let old_client_id = current.as_ref().and_then(|c| c.oidc_client_id.as_deref());
+    let old_secret = current
+        .as_ref()
+        .and_then(|c| c.oidc_client_secret.as_deref());
+    let old_provider_name = current
+        .as_ref()
+        .and_then(|c| c.oidc_provider_name.as_deref());
+    let old_groups_claim = current
+        .as_ref()
+        .and_then(|c| c.oidc_groups_claim.as_deref());
+    let old_role_map = current.as_ref().and_then(|c| c.oidc_role_map.as_ref());
+    let old_jit = current.as_ref().and_then(|c| c.oidc_jit_provisioning);
+    let old_trust = current.as_ref().and_then(|c| c.oidc_trust_email);
+
+    let (issuer, issuer_changed) =
+        sso_issuer_field(&state, parsed.get("issuer"), old_issuer).await?;
+    let (client_id, client_id_changed) = text_field(
+        parsed.get("clientId"),
+        old_client_id,
+        CLIENT_ID_REFUSED,
+        |text| {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        },
+    )?;
+    let (client_secret, secret_changed) = secret_field(
+        &state,
+        parsed.get("clientSecret"),
+        old_secret,
+        crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME,
+        CLIENT_SECRET_REFUSED,
+    )?;
+    let (provider_name, provider_name_changed) = text_field(
+        parsed.get("providerName"),
+        old_provider_name,
+        PROVIDER_NAME_REFUSED,
+        |text| {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        },
+    )?;
+    let (groups_claim, groups_claim_changed) = text_field(
+        parsed.get("groupsClaim"),
+        old_groups_claim,
+        GROUPS_CLAIM_REFUSED,
+        |text| {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        },
+    )?;
+
+    // `ADM-12` review round 1, S3: the store already lists roles
+    // (`lakehouse_store::identity::list_roles`, rule 4) — the role map is
+    // validated against its names, not a second query.
+    let known_roles: Vec<String> = lakehouse_store::identity::list_roles(pool)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?
+        .into_iter()
+        .map(|role| role.name)
+        .collect();
+
+    let (role_map, role_map_changed) =
+        role_map_field(parsed.get("roleMap"), old_role_map, &known_roles)?;
+    let (jit_provisioning, jit_changed) =
+        boolean_field(parsed.get("jitProvisioning"), old_jit, JIT_REFUSED)?;
+    let (trust_email, trust_changed) =
+        boolean_field(parsed.get("trustEmail"), old_trust, TRUST_EMAIL_REFUSED)?;
+
+    let mut changed: Vec<&'static str> = Vec::new();
+    if issuer_changed {
+        changed.push("issuer");
+    }
+    if client_id_changed {
+        changed.push("clientId");
+    }
+    if secret_changed {
+        changed.push("clientSecret");
+    }
+    if provider_name_changed {
+        changed.push("providerName");
+    }
+    if groups_claim_changed {
+        changed.push("groupsClaim");
+    }
+    if role_map_changed {
+        changed.push("roleMap");
+    }
+    if jit_changed {
+        changed.push("jitProvisioning");
+    }
+    if trust_changed {
+        changed.push("trustEmail");
+    }
+
+    lakehouse_store::sso_settings::upsert(
+        pool,
+        &lakehouse_store::sso_settings::SsoSettings {
+            oidc_issuer: issuer,
+            oidc_client_id: client_id,
+            oidc_client_secret: client_secret,
+            oidc_provider_name: provider_name,
+            oidc_groups_claim: groups_claim,
+            oidc_role_map: role_map,
+            oidc_jit_provisioning: jit_provisioning,
+            oidc_trust_email: trust_email,
+        },
+        &principal.id.uuid().to_string(),
+    )
+    .await
+    .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+
+    // Clear runtime settings cache and swappable OIDC authenticator so the next request
+    // picks up the changes immediately.
+    state.settings_caches.sso.clear().await;
+    *state.oidc.write().await = None;
+
+    audit_settings_update(&state, &principal, "settings.sso.update", "sso", &changed).await;
+
+    // `ADM-12` D10: `PUT` saves even when the connection cannot be used
+    // yet; the answer says whether it can, and why not.
+    let runtime = crate::runtime_settings::sso_runtime_or_fail(&state)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+    let can_edit = crate::routes::catalog::is_unrestricted(&principal);
+    Ok(ApiJson(sso_settings_json(
+        &runtime.settings,
+        can_edit,
+        runtime.not_ready_reason(),
+    )))
+}
+
+/// `POST /api/settings/sso/test` — begin a test sign-in flow against a draft configuration (`ADM-12`, plan D8).
+///
+/// Floor: `RequiresPermission("settings:write")`.
+/// Choke point: Also requires `crate::routes::catalog::is_unrestricted(&principal)`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "validates test draft configuration, seals secret, creates temporary test run and builds authorization URL"
+)]
+pub async fn post_sso_test(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<Response> {
+    // Choke point (D5): only a Platform Admin (*:*) may test SSO settings.
+    if !crate::routes::catalog::is_unrestricted(&principal) {
+        return Err(ApiError::Forbidden.into());
+    }
+
+    let parsed = parse_body(&body, &SSO_FIELDS, SSO_BODY_SHAPE)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Unavailable(
+            "Settings need a database, and none is configured.".to_owned(),
+        )
+        .into());
+    };
+
+    let issuer_val = parsed
+        .get("issuer")
+        .ok_or_else(|| ApiError::BadRequest("issuer is required for a test sign-in.".to_owned()))?;
+    let issuer_str = string_field(ISSUER_NOT_HTTPS, issuer_val)?
+        .ok_or_else(|| ApiError::BadRequest("issuer is required for a test sign-in.".to_owned()))?;
+    let validated_issuer =
+        validate_sso_issuer(&issuer_str, &state.config.connector_internal_hosts()).await?;
+
+    let client_id_val = parsed.get("clientId").ok_or_else(|| {
+        ApiError::BadRequest("clientId is required for a test sign-in.".to_owned())
+    })?;
+    let client_id_str = string_field(CLIENT_ID_REFUSED, client_id_val)?.ok_or_else(|| {
+        ApiError::BadRequest("clientId is required for a test sign-in.".to_owned())
+    })?;
+    let client_id_str = client_id_str.trim().to_owned();
+    if client_id_str.is_empty() {
+        return Err(ApiError::BadRequest(CLIENT_ID_REFUSED.to_owned()).into());
+    }
+
+    let provider_name = if let Some(v) = parsed.get("providerName") {
+        string_field(PROVIDER_NAME_REFUSED, v)?.unwrap_or_else(|| "default".to_owned())
+    } else {
+        "default".to_owned()
+    };
+
+    let groups_claim = if let Some(v) = parsed.get("groupsClaim") {
+        string_field(GROUPS_CLAIM_REFUSED, v)?.unwrap_or_else(|| "groups".to_owned())
+    } else {
+        "groups".to_owned()
+    };
+
+    // `ADM-12` review round 1, S3: one store call, the same one `PUT` uses.
+    let known_roles: Vec<String> = lakehouse_store::identity::list_roles(pool)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?
+        .into_iter()
+        .map(|role| role.name)
+        .collect();
+
+    let role_map_json = if let Some(v) = parsed.get("roleMap") {
+        if v.is_null() {
+            None
+        } else {
+            let Some(arr) = v.as_array() else {
+                return Err(ApiError::BadRequest(ROLE_MAP_REFUSED.to_owned()).into());
+            };
+            let entries = validate_role_map_entries(arr, &known_roles)?;
+            Some(
+                serde_json::to_value(&entries)
+                    .map_err(|_| ApiError::BadRequest(ROLE_MAP_REFUSED.to_owned()))?,
+            )
+        }
+    } else {
+        None
+    };
+
+    let jit_provisioning = if let Some(v) = parsed.get("jitProvisioning") {
+        if v.is_null() {
+            None
+        } else {
+            let Some(b) = v.as_bool() else {
+                return Err(ApiError::BadRequest(JIT_REFUSED.to_owned()).into());
+            };
+            Some(b)
+        }
+    } else {
+        None
+    };
+
+    // `SEC-65` D3: the draft carries the switch, so a test sign-in shows
+    // what a provider that does not confirm the email would do with it on.
+    let trust_email = if let Some(v) = parsed.get("trustEmail") {
+        if v.is_null() {
+            None
+        } else {
+            let Some(b) = v.as_bool() else {
+                return Err(ApiError::BadRequest(TRUST_EMAIL_REFUSED.to_owned()).into());
+            };
+            Some(b)
+        }
+    } else {
+        None
+    };
+
+    // Client secret: if provided in draft, seal it.
+    // If not provided in draft (or null), reuse saved sealed secret or env secret.
+    let draft_secret = if let Some(v) = parsed.get("clientSecret") {
+        if let Some(plain) = string_field(CLIENT_SECRET_REFUSED, v)? {
+            let keyring = state
+                .connector_secret_store
+                .keyring()
+                .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?;
+            Some(
+                keyring
+                    .seal(
+                        crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME,
+                        plain.as_bytes(),
+                    )
+                    .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        // Reuse saved secret if any
+        let current = lakehouse_store::sso_settings::get(pool)
+            .await
+            .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+        if let Some(s) = current.and_then(|c| c.oidc_client_secret) {
+            Some(s)
+        } else if let Some(ref env_sec) = state.config.oidc_client_secret {
+            let keyring = state
+                .connector_secret_store
+                .keyring()
+                .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?;
+            Some(
+                keyring
+                    .seal(
+                        crate::runtime_settings::SSO_CLIENT_SECRET_SEAL_NAME,
+                        env_sec.as_bytes(),
+                    )
+                    .map_err(|_| ApiError::Unavailable(NO_INSTALLATION_KEY.to_owned()))?,
+            )
+        } else {
+            None
+        }
+    };
+
+    // `ADM-12` review round 1, B2: the authorize address comes from the
+    // DRAFT's own discovery document, through the same builder the live path
+    // uses — never from the live connection, and never a guessed
+    // `<issuer>/authorize`. A draft that cannot be used is a 400 with the
+    // builder's fixed sentence, before a run is created.
+    let draft = json!({
+        "issuer": validated_issuer,
+        "clientId": client_id_str,
+        "providerName": provider_name,
+        "groupsClaim": groups_claim,
+        "roleMap": role_map_json,
+        "jitProvisioning": jit_provisioning,
+        "trustEmail": trust_email,
+    });
+    let draft_runtime = crate::runtime_settings::sso_runtime_for_settings(
+        &state,
+        crate::runtime_settings::draft_sso_settings(&state.config, &draft),
+    )
+    .await;
+    let (Some(authorize_base), Some(redirect_uri)) = (
+        draft_runtime.settings.authorize_url.as_deref(),
+        draft_runtime.settings.redirect_uri.as_deref(),
+    ) else {
+        return Err(ApiError::BadRequest(
+            draft_runtime
+                .not_ready_reason()
+                .unwrap_or("The draft connection cannot be used to test a sign-in.")
+                .to_owned(),
+        )
+        .into());
+    };
+
+    let test_run_id = Uuid::new_v4();
+
+    let new_run = lakehouse_store::sso_settings::NewSsoTestRun {
+        id: test_run_id,
+        created_by: principal.id.uuid(),
+        draft,
+        draft_secret,
+        expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(10),
+    };
+
+    lakehouse_store::sso_settings::create_test_run(pool, &new_run)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+
+    let state_token = lakehouse_auth::generate_opaque_token();
+    let nonce = lakehouse_auth::generate_opaque_token();
+    let code_verifier = lakehouse_auth::generate_opaque_token();
+    let challenge_digest = sha2::Sha256::digest(code_verifier.expose().as_bytes());
+    let code_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge_digest);
+
+    let flow = crate::routes::auth::OidcFlow {
+        state: state_token.expose().to_owned(),
+        nonce: nonce.expose().to_owned(),
+        code_verifier: code_verifier.expose().to_owned(),
+        next: String::new(),
+        test_run_id: Some(test_run_id),
+    };
+
+    let mut redirect = url::Url::parse(authorize_base)
+        .map_err(|_| ApiError::Unavailable("OIDC authorize URL is not a valid URL".to_owned()))?;
+    redirect
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &client_id_str)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", "openid email profile")
+        .append_pair("state", &flow.state)
+        .append_pair("nonce", &flow.nonce)
+        .append_pair("code_challenge", &code_challenge)
+        .append_pair("code_challenge_method", "S256");
+
+    let authorize_url = redirect.to_string();
+
+    let mut response = (
+        StatusCode::OK,
+        ApiJson(json!({
+            "id": test_run_id,
+            "authorizeUrl": authorize_url,
+        })),
+    )
+        .into_response();
+
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        crate::routes::auth::oidc_flow_cookie_header(state.config.is_dev, Some(&flow)),
+    );
+
+    Ok(response)
+}
+
+/// `GET /api/settings/sso/test/{id}` — read the result of a test sign-in run (`ADM-12`, plan D8).
+///
+/// Floor: `RequiresPermission("settings:write")`.
+/// Only `created_by` may read it, and only before expiry. Anyone else gets 404.
+pub async fn get_sso_test(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> ApiResult<ApiJson<Value>> {
+    // Choke point (D5): only a Platform Admin (*:*) may view SSO test results.
+    if !crate::routes::catalog::is_unrestricted(&principal) {
+        return Err(ApiError::Forbidden.into());
+    }
+
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(ApiError::Unavailable(
+            "Settings need a database, and none is configured.".to_owned(),
+        )
+        .into());
+    };
+
+    let run = lakehouse_store::sso_settings::get_test_run(pool, id)
+        .await
+        .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
+
+    let Some(run) = run else {
+        return Err(ApiError::NotFound("test run not found".to_owned()).into());
+    };
+
+    // Plan D8: Only created_by may read it, and only before expiry. Anyone else gets 404.
+    if run.created_by != principal.id.uuid() || run.expires_at <= time::OffsetDateTime::now_utc() {
+        return Err(ApiError::NotFound("test run not found".to_owned()).into());
+    }
+
+    Ok(ApiJson(run.result.unwrap_or(serde_json::Value::Null)))
+}
+
+// ── ADM-2: the workspace's name, logo, dark-mode logo and icon ───────────
+
+/// What the person is told when the body is not the one field.
+const GENERAL_BODY_SHAPE: &str = "body must be {\"workspaceName\": string|null}";
+
+/// What the person is told when the name is over 60 characters. There is no
+/// "too short" sentence: an empty name clears it.
+const NAME_TOO_LONG: &str = "The workspace name must be at most 60 characters.";
+
+/// What the person is told when the name holds a control character.
+const NAME_CONTROL: &str = "The workspace name cannot contain control characters.";
+
+/// What the person is told when a logo is not PNG, JPEG or WebP.
+const LOGO_TYPE_REFUSED: &str = "The logo must be a PNG, JPEG or WebP image.";
+
+/// What the person is told when a logo is over 512 KB.
+const LOGO_SIZE_REFUSED: &str = "The logo must be at most 512 KB.";
+
+/// What the person is told when the icon is not a PNG of at most 64 KB.
+const ICON_REFUSED: &str = "The icon must be a PNG image of at most 64 KB.";
+
+/// What the person is told when the form has no `file` part.
+const NO_PICTURE_PART: &str = "The form has no part named file.";
+
+/// What the person is told when the form cannot be read to its end.
+const PICTURE_UNREADABLE: &str = "The upload could not be read.";
+
+/// What the person is told for a picture kind outside the list.
+const NO_SUCH_PICTURE: &str = "No such picture.";
+
+/// What the person is told when the public route is asked for a kind outside
+/// the list.
+const KIND_REFUSED: &str = "The picture must be logo, logo-dark or icon.";
+
+/// The largest request body of the picture route, 1 MiB: the 512 KB logo
+/// limit and the form's own framing fit, and no other route takes more than
+/// the default for it (`routes/mod.rs` sets it on this route only).
+pub const PICTURE_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// The longest logo, 512 KB (migration `0147`'s `CHECK` says the same).
+const LOGO_MAX_BYTES: usize = 524_288;
+
+/// The longest icon, 64 KB (migration `0147`'s `CHECK` says the same).
+const ICON_MAX_BYTES: usize = 65_536;
+
+/// The longest name, in characters (migration `0147`'s `CHECK` says the same).
+const NAME_MAX_CHARS: usize = 60;
+
+/// The media type a file's first bytes say it is, from the three the console
+/// accepts: PNG, JPEG and WebP. The file name and the part's `Content-Type`
+/// are the sender's claim and are never read; an SVG or a text file named
+/// `logo.png` has none of these first bytes and is `None`.
+fn sniff_picture_type(bytes: &[u8]) -> Option<&'static str> {
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
+    if bytes.starts_with(PNG) {
+        Some("image/png")
+    } else if bytes.starts_with(JPEG) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice()) {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// The picture kind a path names, from the fixed list. A `match`, never
+/// text put into a path or a column name.
+///
+/// `pub(crate)`, not private: `routes::picture_drain` reads the same list,
+/// so a kind it refuses to drain is a kind the route does not serve.
+///
+/// # Errors
+///
+/// 404 through `ApiError::NotFound` when the kind is not one of the three
+/// the route serves (`logo`, `logo-dark`, `icon`): a picture that does not
+/// exist.
+pub(crate) fn picture_kind(kind: &str) -> Result<ImageKind, ApiError> {
+    match kind {
+        "logo" => Ok(ImageKind::Logo),
+        "logo-dark" => Ok(ImageKind::LogoDark),
+        "icon" => Ok(ImageKind::Icon),
+        _ => Err(ApiError::NotFound(NO_SUCH_PICTURE.to_owned())),
+    }
+}
+
+/// The kind as the audit trail and the address spell it.
+fn picture_label(kind: ImageKind) -> &'static str {
+    match kind {
+        ImageKind::Logo => "logo",
+        ImageKind::LogoDark => "logo-dark",
+        ImageKind::Icon => "icon",
+    }
+}
+
+/// The sentence for a picture that breaks the size rule of its kind.
+///
+/// `pub(crate)`, not private: `routes::picture_drain` answers a body over
+/// its cap with the same sentence, so the rule the person is told about is
+/// the rule the server keeps.
+pub(crate) fn picture_size_sentence(kind: ImageKind) -> &'static str {
+    match kind {
+        ImageKind::Icon => ICON_REFUSED,
+        ImageKind::Logo | ImageKind::LogoDark => LOGO_SIZE_REFUSED,
+    }
+}
+
+/// The media type of an accepted picture, or the 422 that names the rule it
+/// breaks. The type comes from the first bytes only ([`sniff_picture_type`]).
+fn check_picture(kind: ImageKind, bytes: &[u8]) -> Result<&'static str, ApiError> {
+    let found = sniff_picture_type(bytes);
+    let refused = |sentence: &str| ApiError::Unprocessable(sentence.to_owned());
+    match kind {
+        ImageKind::Icon => match found {
+            Some(media_type @ "image/png") if bytes.len() <= ICON_MAX_BYTES => Ok(media_type),
+            _ => Err(refused(ICON_REFUSED)),
+        },
+        ImageKind::Logo | ImageKind::LogoDark => {
+            let media_type = found.ok_or_else(|| refused(LOGO_TYPE_REFUSED))?;
+            if bytes.len() > LOGO_MAX_BYTES {
+                return Err(refused(LOGO_SIZE_REFUSED));
+            }
+            Ok(media_type)
+        }
+    }
+}
+
+/// A form that could not be read to its end. A body over the route's limit is
+/// the size rule broken, in the sentence of the kind.
+fn refused_picture_read(err: &MultipartError, kind: ImageKind) -> ApiError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::Unprocessable(picture_size_sentence(kind).to_owned());
+    }
+    tracing::warn!(%err, "a workspace picture form could not be read");
+    ApiError::BadRequest(PICTURE_UNREADABLE.to_owned())
+}
+
+/// The bytes of the form's `file` part. Other parts are skipped, unread.
+async fn read_picture(mut form: Multipart, kind: ImageKind) -> Result<Vec<u8>, ApiError> {
+    while let Some(field) = form
+        .next_field()
+        .await
+        .map_err(|err| refused_picture_read(&err, kind))?
+    {
+        if field.name() == Some("file") {
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|err| refused_picture_read(&err, kind))?;
+            return Ok(bytes.to_vec());
+        }
+    }
+    Err(ApiError::BadRequest(NO_PICTURE_PART.to_owned()))
+}
+
+/// The name a body carries, trimmed: `None` clears it (`null`, an empty
+/// string, or spaces only), `Some` is 1 to 60 characters with no control
+/// character.
+fn parse_workspace_name(body: &Bytes) -> Result<Option<String>, ApiError> {
+    let parsed = parse_body(body, &["workspaceName"], GENERAL_BODY_SHAPE)?;
+    let sent = parsed
+        .get("workspaceName")
+        .ok_or_else(|| ApiError::BadRequest(GENERAL_BODY_SHAPE.to_owned()))?;
+    let Some(text) = string_field(GENERAL_BODY_SHAPE, sent)? else {
+        return Ok(None);
+    };
+    // The name is trimmed: the spaces around it are the sender's typing, and
+    // a name of spaces alone is the empty name, which clears it (decision 4).
+    let name = text.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if name.chars().any(char::is_control) {
+        return Err(ApiError::Unprocessable(NAME_CONTROL.to_owned()));
+    }
+    if name.chars().count() > NAME_MAX_CHARS {
+        return Err(ApiError::Unprocessable(NAME_TOO_LONG.to_owned()));
+    }
+    Ok(Some(name.to_owned()))
+}
+
+/// One picture as the administrator's answer shows it: whether it is set, its
+/// type and its size, never the file.
+fn picture_summary(image: Option<&StoredImage>) -> Value {
+    json!({
+        "set": image.is_some(),
+        "type": image.map(|image| image.content_type.as_str()),
+        "bytes": image.map(|image| image.bytes.len()),
+    })
+}
+
+/// The administrator's answer: the name, each picture's summary and when the
+/// row was last saved. Nothing saved is all-empty with a `null` date.
+fn general_settings_json(row: Option<&WorkspaceSettings>) -> Value {
+    json!({
+        "workspaceName": row.and_then(|row| row.workspace_name.as_deref()),
+        "logo": picture_summary(row.and_then(|row| row.logo.as_ref())),
+        "logoDark": picture_summary(row.and_then(|row| row.logo_dark.as_ref())),
+        "icon": picture_summary(row.and_then(|row| row.icon.as_ref())),
+        "updatedAt": row.and_then(|row| {
+            row.updated_at.format(&time::format_description::well_known::Rfc3339).ok()
+        }),
+    })
+}
+
+/// One picture as the public answer shows it: its type and a version that
+/// changes with its bytes, so the console can bypass a cached older picture.
+fn picture_public(image: Option<&StoredImage>) -> Value {
+    match image {
+        Some(image) => json!({ "type": image.content_type, "version": image.version }),
+        None => Value::Null,
+    }
+}
+
+/// The error a failed store call becomes: the raw text goes to the log under a
+/// reference id and the caller gets a fixed sentence (principle 4).
+fn workspace_store_failed(err: &lakehouse_store::StoreError) -> ApiError {
+    upstream_error::internal_error(&upstream_error::STORE, err)
+}
+
+/// The refusal when the deployment has no database to save into.
+fn workspace_needs_a_database() -> ApiError {
+    ApiError::Unavailable("Settings need a database, and none is configured.".to_owned())
+}
+
+/// `GET /api/settings/general` — the name and the three pictures as the
+/// administrator sees them (`ADM-2`): whether each picture is set, its type
+/// and its size. Needs `settings:write`. Nothing saved is the empty answer.
+///
+/// # Errors
+///
+/// 5xx through `upstream_error` when the database fails.
+pub async fn get_general(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+    let row = crate::runtime_settings::workspace_settings_row(&state)
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    Ok(ApiJson(general_settings_json(row.as_ref())))
+}
+
+/// `PUT /api/settings/general` with `{ "workspaceName": string|null }` — save
+/// the name. An empty string, spaces only or `null` clears it, so the
+/// product's own name is shown. One audit row names `workspaceName` when it
+/// changed.
+///
+/// # Errors
+///
+/// 400 when the body is not the one field; 422 with a fixed sentence when the
+/// name is over 60 characters or holds a control character; 503 without a
+/// Postgres pool; 5xx through `upstream_error` when the database fails.
+pub async fn put_general(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let name = parse_workspace_name(&body)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(workspace_needs_a_database().into());
+    };
+
+    let saved =
+        workspace_settings::upsert_name(pool, name.as_deref(), &principal.id.uuid().to_string())
+            .await
+            .map_err(|err| workspace_store_failed(&err))?;
+    // The save is visible to the next reader on this process at once (decision 6).
+    state.settings_caches.workspace.clear().await;
+    // The changed list comes from the name the write replaced, which the
+    // store read under the row's lock in the write's own transaction. A
+    // read before the write cannot say that: when two saves race, it is the
+    // value the other save wrote, and the row would be logged as unchanged
+    // although the name did change (`ADM-2`, plan adm-120 step 3b).
+    //
+    // The direct comparison this route used is gone: the governance plan's
+    // D3b left the route to `adm-120`, which owns the race.
+    let changed = saved.previous_name.as_deref() != name.as_deref();
+    let fields: &[&str] = if changed { &["workspaceName"] } else { &[] };
+    audit_settings_update(
+        &state,
+        &principal,
+        "settings.general.update",
+        "general",
+        fields,
+    )
+    .await;
+    Ok(ApiJson(general_settings_json(Some(&saved.settings))))
+}
+
+/// `PUT /api/settings/general/images/{kind}` — store one picture from a form
+/// with one part named `file`. `kind` is `logo`, `logo-dark` or `icon`. The
+/// type comes from the file's first bytes, never from its name or the part's
+/// own type; a logo is a PNG, JPEG or WebP of at most 512 KB, the icon a PNG
+/// of at most 64 KB. One audit row names the kind, the type and the size.
+///
+/// # Errors
+///
+/// 404 for a kind outside the list; 400 when the form has no `file` part or
+/// cannot be read; 422 with the sentence of the rule broken for a file that is
+/// the wrong type or too large; 503 without a Postgres pool; 5xx through
+/// `upstream_error` when the database fails.
+pub async fn put_general_image(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(kind): Path<String>,
+    form: Multipart,
+) -> ApiResult<ApiJson<Value>> {
+    let kind = picture_kind(&kind)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(workspace_needs_a_database().into());
+    };
+    let bytes = read_picture(form, kind).await?;
+    let media_type = check_picture(kind, &bytes)?;
+
+    let saved = workspace_settings::set_image(
+        pool,
+        kind,
+        media_type,
+        &bytes,
+        &principal.id.uuid().to_string(),
+    )
+    .await
+    .map_err(|err| workspace_store_failed(&err))?;
+    state.settings_caches.workspace.clear().await;
+    // The kind, the type and the size, never the picture.
+    audit_settings_event(
+        &state,
+        &principal,
+        "settings.general.image_upload",
+        "general",
+        json!({ "kind": picture_label(kind), "type": media_type, "bytes": bytes.len() }),
+        None,
+    )
+    .await;
+    Ok(ApiJson(general_settings_json(Some(&saved))))
+}
+
+/// `DELETE /api/settings/general/images/{kind}` — remove one picture. Removing
+/// one that is not set is not an error. One audit row names the kind and what
+/// was removed (its type and size, or `null` and 0 when nothing was set).
+///
+/// # Errors
+///
+/// 404 for a kind outside the list; 503 without a Postgres pool; 5xx through
+/// `upstream_error` when the database fails.
+pub async fn delete_general_image(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(kind): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    let kind = picture_kind(&kind)?;
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(workspace_needs_a_database().into());
+    };
+    let current = workspace_settings::get(pool)
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    let removed = current.as_ref().and_then(|row| match kind {
+        ImageKind::Logo => row.logo.as_ref(),
+        ImageKind::LogoDark => row.logo_dark.as_ref(),
+        ImageKind::Icon => row.icon.as_ref(),
+    });
+    let args = json!({
+        "kind": picture_label(kind),
+        "type": removed.map(|image| image.content_type.as_str()),
+        "bytes": removed.map_or(0, |image| image.bytes.len()),
+    });
+
+    let saved = workspace_settings::clear_image(pool, kind, &principal.id.uuid().to_string())
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    state.settings_caches.workspace.clear().await;
+    audit_settings_event(
+        &state,
+        &principal,
+        "settings.general.image_remove",
+        "general",
+        args,
+        None,
+    )
+    .await;
+    Ok(ApiJson(general_settings_json(Some(&saved))))
+}
+
+/// `DELETE /api/settings/general` — reset: clear the name and all three
+/// pictures, so the console shows the product's own name and pictures.
+///
+/// # Errors
+///
+/// 503 without a Postgres pool; 5xx through `upstream_error` when the
+/// database fails.
+pub async fn delete_general(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<ApiJson<Value>> {
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(workspace_needs_a_database().into());
+    };
+    workspace_settings::reset(pool)
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    state.settings_caches.workspace.clear().await;
+    audit_settings_event(
+        &state,
+        &principal,
+        "settings.general.reset",
+        "general",
+        json!({}),
+        None,
+    )
+    .await;
+    Ok(ApiJson(general_settings_json(None)))
+}
+
+/// `GET /api/branding` — public: the name and each picture's type and
+/// version, for the sign-in page that loads before any session exists. It
+/// holds nothing else from the settings row (not who saved it, not when) and
+/// no picture bytes. Read through the 30-second cache.
+///
+/// # Errors
+///
+/// 5xx through `upstream_error` when the database fails.
+pub async fn get_branding(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+    let row = crate::runtime_settings::workspace_settings_row(&state)
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    let row = row.as_ref();
+    Ok(ApiJson(json!({
+        "workspaceName": row.and_then(|row| row.workspace_name.as_deref()),
+        "logo": picture_public(row.and_then(|row| row.logo.as_ref())),
+        "logoDark": picture_public(row.and_then(|row| row.logo_dark.as_ref())),
+        "icon": picture_public(row.and_then(|row| row.icon.as_ref())),
+    })))
+}
+
+/// `GET /api/branding/images/{kind}` — public: one stored picture with its
+/// own type. The headers keep a stored file from being anything but a picture
+/// (`nosniff`, a sandboxing `Content-Security-Policy`, `inline`), and the
+/// `ETag` is the picture's version, so a matching `If-None-Match` answers 304.
+///
+/// # Errors
+///
+/// 400 for a kind outside the list; 404 for a picture that is not set; 5xx
+/// through `upstream_error` when the database fails.
+pub async fn get_branding_image(
+    State(state): State<AppState>,
+    Path(kind): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    // A kind outside the list is a 400 here, unlike the admin routes' 404:
+    // `routes::route_policy_tests` probes every `POLICY_TABLE` pattern with a
+    // placeholder segment and reads a 404 as "this entry is not mounted", so a
+    // public route with a `{kind}` must not answer the placeholder with one.
+    let kind = picture_kind(&kind).map_err(|_| ApiError::BadRequest(KIND_REFUSED.to_owned()))?;
+    let row = crate::runtime_settings::workspace_settings_row(&state)
+        .await
+        .map_err(|err| workspace_store_failed(&err))?;
+    let image = row
+        .and_then(|row| match kind {
+            ImageKind::Logo => row.logo,
+            ImageKind::LogoDark => row.logo_dark,
+            ImageKind::Icon => row.icon,
+        })
+        .ok_or_else(|| ApiError::NotFound(NO_SUCH_PICTURE.to_owned()))?;
+
+    let etag = format!("\"{}\"", image.version);
+    let cache = "public, max-age=60";
+    let unchanged = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|sent| {
+            sent.split(',')
+                .any(|tag| tag.trim().trim_start_matches("W/") == etag)
+        });
+    if unchanged {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, cache.to_owned()),
+            ],
+        )
+            .into_response());
+    }
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, image.content_type.clone()),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, cache.to_owned()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; sandbox".to_owned(),
+            ),
+            (header::CONTENT_DISPOSITION, "inline".to_owned()),
+        ],
+        Bytes::copy_from_slice(&image.bytes),
+    )
+        .into_response())
 }
 
 #[cfg(test)]
@@ -1877,6 +3336,168 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// Plan D3: the helper behind the settings rows names the dotted paths
+    /// that differ — a changed leaf, a key added, a key removed, an array
+    /// compared whole — sorted, and never a value.
+    #[test]
+    fn changed_setting_paths_names_the_dotted_paths_that_differ_sorted_and_holds_no_value() {
+        let before = json!({
+            "install": { "timeoutSeconds": 60, "chartRows": 2000 },
+            "reporting": { "weekStart": "monday", "fonts": ["inter", "system"] },
+            "roles": { "Analyst": { "timeoutSeconds": 300 } },
+        });
+        let after = json!({
+            "install": { "timeoutSeconds": 60, "chartRows": 3000 },
+            "reporting": { "weekStart": "sunday", "fonts": ["inter"] },
+            "roles": { "Analyst": { "timeoutSeconds": 300 }, "Viewer": { "timeoutSeconds": 120 } },
+        });
+        assert_eq!(
+            changed_setting_paths(&before, &after),
+            vec![
+                "install.chartRows".to_owned(),
+                "reporting.fonts".to_owned(),
+                "reporting.weekStart".to_owned(),
+                "roles.Viewer.timeoutSeconds".to_owned(),
+            ],
+            "a changed leaf, a whole-array change and an added role, sorted"
+        );
+        // Removed keys count too, and the paths hold no value from either
+        // side.
+        let after_removal = json!({
+            "install": { "timeoutSeconds": 60 },
+            "reporting": { "weekStart": "monday", "fonts": ["inter", "system"] },
+            "roles": { "Analyst": { "timeoutSeconds": 300 } },
+        });
+        assert_eq!(
+            changed_setting_paths(&before, &after_removal),
+            vec!["install.chartRows".to_owned()],
+        );
+        let no_path_holds_a_value = changed_setting_paths(&before, &after).iter().all(|path| {
+            !path.contains("2000")
+                && !path.contains("3000")
+                && !path.contains("monday")
+                && !path.contains("sunday")
+        });
+        assert!(
+            no_path_holds_a_value,
+            "a path is a name: {:#?}",
+            changed_setting_paths(&before, &after)
+        );
+    }
+
+    /// A save that changes nothing records `fields: []`, so two equal
+    /// snapshots name no path (plan D3).
+    #[test]
+    fn identical_snapshots_name_no_changed_path() {
+        let one = json!({
+            "install": { "timeoutSeconds": 60, "chartRows": 2000 },
+            "roles": { "Analyst": { "timeoutSeconds": 300 } },
+        });
+        let two = json!({
+            "roles": { "Analyst": { "timeoutSeconds": 300 } },
+            "install": { "chartRows": 2000, "timeoutSeconds": 60 },
+        });
+        assert!(
+            changed_setting_paths(&one, &two).is_empty(),
+            "key order is not a change"
+        );
+    }
+
+    /// The first save diffs against an empty `reporting`, so every part of
+    /// the settings counts as set by it.
+    #[test]
+    fn a_first_save_against_no_stored_settings_names_every_part_of_them() {
+        let stored = json!({ "reporting": { "timeZone": "UTC", "weekStart": "monday" } });
+        assert_eq!(
+            changed_setting_paths(&json!({ "reporting": {} }), &stored),
+            vec![
+                "reporting.timeZone".to_owned(),
+                "reporting.weekStart".to_owned(),
+            ]
+        );
+    }
+
+    /// The first bytes decide the type: the three accepted signatures, and the
+    /// near misses that must not pass for them.
+    #[test]
+    fn workspace_picture_type_comes_from_the_first_bytes_only() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+        assert_eq!(sniff_picture_type(&png), Some("image/png"));
+        assert_eq!(
+            sniff_picture_type(&[0xFF, 0xD8, 0xFF, 0xE0, 0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            sniff_picture_type(b"RIFF\x10\0\0\0WEBPVP8 "),
+            Some("image/webp")
+        );
+
+        assert_eq!(
+            sniff_picture_type(b"RIFF\x10\0\0\0WAVEfmt "),
+            None,
+            "RIFF but not WebP"
+        );
+        assert_eq!(sniff_picture_type(b"RIFF\x10\0\0\0WEB"), None, "cut short");
+        assert_eq!(
+            sniff_picture_type(b"WEBPRIFF\x10\0\0\0"),
+            None,
+            "tags swapped"
+        );
+        assert_eq!(
+            sniff_picture_type(&png[..7]),
+            None,
+            "PNG signature cut short"
+        );
+        assert_eq!(
+            sniff_picture_type(&[0xFF, 0xD8]),
+            None,
+            "JPEG signature cut short"
+        );
+        assert_eq!(sniff_picture_type(b"GIF89a"), None, "a GIF");
+        assert_eq!(
+            sniff_picture_type(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            None
+        );
+        assert_eq!(sniff_picture_type(b"<?xml version=\"1.0\"?><svg/>"), None);
+        assert_eq!(sniff_picture_type(b""), None);
+    }
+
+    #[test]
+    fn workspace_picture_rules_differ_for_the_logo_and_the_icon() {
+        let png = |len: usize| {
+            let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+            bytes.resize(len, 0);
+            bytes
+        };
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0];
+
+        assert_eq!(check_picture(ImageKind::Logo, &jpeg).unwrap(), "image/jpeg");
+        assert_eq!(
+            check_picture(ImageKind::LogoDark, &png(524_288)).unwrap(),
+            "image/png"
+        );
+        assert!(check_picture(ImageKind::Logo, &png(524_289)).is_err());
+        assert_eq!(
+            check_picture(ImageKind::Icon, &png(65_536)).unwrap(),
+            "image/png"
+        );
+        assert!(check_picture(ImageKind::Icon, &png(65_537)).is_err());
+        assert!(
+            check_picture(ImageKind::Icon, &jpeg).is_err(),
+            "the icon is PNG only"
+        );
+    }
+
+    #[test]
+    fn workspace_picture_kinds_are_the_fixed_list() {
+        assert_eq!(picture_kind("logo").unwrap(), ImageKind::Logo);
+        assert_eq!(picture_kind("logo-dark").unwrap(), ImageKind::LogoDark);
+        assert_eq!(picture_kind("icon").unwrap(), ImageKind::Icon);
+        for other in ["", "Logo", "logo_dark", "logo/../icon", "icon "] {
+            assert!(picture_kind(other).is_err(), "{other:?}");
+        }
+    }
 
     #[test]
     fn the_body_requires_both_fields_and_refuses_extra_ones() {
@@ -2103,6 +3724,26 @@ mod tests {
             must_change_password: false,
             role_names: roles.iter().map(|r| (*r).to_owned()).collect(),
         }
+    }
+
+    /// `GOV-1` Decision 4: a settings save whose audit row cannot be written
+    /// still succeeds and the failed write is counted. A state with no
+    /// database fails every audit write without a container.
+    #[tokio::test]
+    async fn a_failed_settings_audit_write_is_counted() {
+        let state = AppState::without_a_database();
+        assert_eq!(state.audit_write_failure_count(), 0);
+
+        audit_settings_update(
+            &state,
+            &person(&[]),
+            "settings.email.update",
+            "email",
+            &["host"],
+        )
+        .await;
+
+        assert_eq!(state.audit_write_failure_count(), 1);
     }
 
     #[test]
@@ -2332,6 +3973,124 @@ mod tests {
         assert_eq!(
             body_json(&TimeContext::default(), &f, true, true)["reportAllowedDomains"],
             json!(["x.example"])
+        );
+    }
+
+    #[test]
+    fn sso_body_shape_refuses_unknown_fields_and_malformed_json() {
+        let valid = Bytes::from(r#"{"issuer":"https://idp.example.com","clientId":"client-1"}"#);
+        assert!(parse_body(&valid, &SSO_FIELDS, SSO_BODY_SHAPE).is_ok());
+
+        // `SEC-65` D3: the new switch is an accepted field of a save.
+        let with_trust = Bytes::from(r#"{"trustEmail":true}"#);
+        assert!(parse_body(&with_trust, &SSO_FIELDS, SSO_BODY_SHAPE).is_ok());
+
+        let unknown = Bytes::from(r#"{"issuer":"https://idp.example.com","extra":123}"#);
+        let err = parse_body(&unknown, &SSO_FIELDS, SSO_BODY_SHAPE).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg == SSO_BODY_SHAPE));
+
+        let malformed = Bytes::from("not-json");
+        let err = parse_body(&malformed, &SSO_FIELDS, SSO_BODY_SHAPE).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg == SSO_BODY_SHAPE));
+    }
+
+    #[test]
+    fn sso_boolean_field_accepts_bool_and_null_and_refuses_other() {
+        let true_val = json!(true);
+        let (val, changed) = boolean_field(Some(&true_val), None, JIT_REFUSED).unwrap();
+        assert_eq!(val, Some(true));
+        assert!(changed);
+
+        let null_val = Value::Null;
+        let (val, changed) = boolean_field(Some(&null_val), Some(true), JIT_REFUSED).unwrap();
+        assert_eq!(val, None);
+        assert!(changed);
+
+        let bad_val = json!("not-a-bool");
+        assert!(boolean_field(Some(&bad_val), None, JIT_REFUSED).is_err());
+    }
+
+    #[test]
+    fn sso_role_map_field_validates_roles_and_refuses_unknown_roles() {
+        let known = vec!["Platform Admin".to_owned(), "Analyst".to_owned()];
+        let valid_rows = json!([{"group": "admins", "role": "Platform Admin"}]);
+        let (val, changed) = role_map_field(Some(&valid_rows), None, &known).unwrap();
+        assert!(val.is_some());
+        assert!(changed);
+
+        let unknown_role = json!([{"group": "admins", "role": "Superuser"}]);
+        let err = role_map_field(Some(&unknown_role), None, &known).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("Unknown role")));
+
+        let missing_role = json!([{"group": "admins"}]);
+        let err = role_map_field(Some(&missing_role), None, &known).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("Each roleMap entry")));
+    }
+
+    #[test]
+    fn sso_settings_json_formats_sources_and_can_edit() {
+        let effective = EffectiveSso {
+            issuer: Some("https://idp.example.com".to_owned()),
+            issuer_source: Source::Console,
+            client_id: Some("client-123".to_owned()),
+            client_id_source: Source::Console,
+            client_secret: lakehouse_core::secret::SecretValue::new("secret"),
+            client_secret_set: true,
+            client_secret_source: Source::Console,
+            provider_name: "okta".to_owned(),
+            provider_name_source: Source::Console,
+            groups_claim: "groups".to_owned(),
+            groups_claim_source: Source::Default,
+            role_map: std::collections::HashMap::new(),
+            role_map_rows: vec![crate::runtime_settings::RoleMapEntry {
+                group: "admins".to_owned(),
+                role: "Platform Admin".to_owned(),
+            }],
+            role_map_source: Source::Console,
+            jit_provisioning: true,
+            jit_provisioning_source: Source::Console,
+            trust_email: false,
+            trust_email_source: Source::Default,
+            authorize_url: None,
+            authorize_url_source: Source::Default,
+            token_url: None,
+            token_url_source: Source::Default,
+            jwks_url: None,
+            jwks_url_source: Source::Default,
+            redirect_uri: None,
+            redirect_uri_source: Source::Default,
+            prompt: None,
+            end_session_endpoint: None,
+            prompt_source: Source::Default,
+            clock_skew_seconds: 60,
+        };
+
+        let json_val = sso_settings_json(&effective, true, None);
+        assert_eq!(json_val["issuer"]["value"], "https://idp.example.com");
+        assert_eq!(json_val["issuer"]["source"], "console");
+        assert_eq!(json_val["clientSecret"]["set"], true);
+        assert_eq!(json_val["clientSecret"]["source"], "console");
+        // `SEC-65` D3: the switch is reported like every other field, with
+        // where its value came from.
+        assert_eq!(json_val["trustEmail"]["value"], false);
+        assert_eq!(json_val["trustEmail"]["source"], "default");
+        assert_eq!(json_val["canEdit"], true);
+        assert_eq!(json_val["ready"], true);
+        assert_eq!(json_val["notReadyReason"], serde_json::Value::Null);
+
+        let json_readonly = sso_settings_json(&effective, false, None);
+        assert_eq!(json_readonly["canEdit"], false);
+
+        // `ADM-12` D10: a connection that cannot be used says why.
+        let not_ready = sso_settings_json(
+            &effective,
+            true,
+            Some(crate::runtime_settings::SsoNotReady::NoPublicAddress.sentence()),
+        );
+        assert_eq!(not_ready["ready"], false);
+        assert_eq!(
+            not_ready["notReadyReason"],
+            "Set CONSOLE_PUBLIC_URL to this deployment's public address: a sign-in has to return people here."
         );
     }
 }

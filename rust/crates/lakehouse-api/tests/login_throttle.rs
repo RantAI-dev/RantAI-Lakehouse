@@ -14,7 +14,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 
@@ -22,7 +22,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use common::{TestApp, spin_up_with_env};
+use common::{TestApp, audit_rows, spin_up_with_env};
 
 const THROTTLED_EMAIL: &str = "fajar@meridian.example";
 const REAL_PASSWORD: &str = "Co7rect!Passw0rd";
@@ -46,12 +46,27 @@ fn env_with(max_failures: &str, lockout_secs: &str) -> HashMap<String, String> {
 }
 
 async fn login(app: &axum::Router, email: &str, password: &str) -> axum::http::Response<Body> {
+    login_with_user_agent(app, email, password, None).await
+}
+
+/// [`login`] with the browser the sign-in claims to come from (`ADM-14`):
+/// the header the session records, or none when the request carries none.
+async fn login_with_user_agent(
+    app: &axum::Router,
+    email: &str,
+    password: &str,
+    user_agent: Option<&str>,
+) -> axum::http::Response<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header("content-type", "application/json");
+    if let Some(user_agent) = user_agent {
+        request = request.header("user-agent", user_agent);
+    }
     app.clone()
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header("content-type", "application/json")
+            request
                 .body(Body::from(format!(
                     r#"{{"email": "{email}", "password": "{password}"}}"#
                 )))
@@ -195,20 +210,61 @@ async fn the_lock_sets_exactly_one_audit_event_naming_neither_the_email_nor_the_
     let resp = login(&router, THROTTLED_EMAIL, WRONG_PASSWORD).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    let (count, resource_id, args): (i64, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT count(*), max(resource_id), max(args::text) FROM audit_event \
-         WHERE action = 'auth.login_locked'",
+    // The row as the trail holds it: one row, and every field of it read
+    // here.
+    let rows = audit_rows(&pool, "auth.login_locked").await;
+    assert_eq!(rows.len(), 1, "one lock, one audit event");
+    let row = &rows[0];
+    // QA LH-SEC-2-06 (SEC-70): the event happened before anybody signed in,
+    // so it carries no principal at all and says what caused it in
+    // `actor_label` instead of being handed to the assistant by the list.
+    assert_eq!(
+        row["actor_label"].as_str(),
+        Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM),
+        "the lock names the sign-in form as its cause"
+    );
+    assert!(
+        row["principal_kind"].is_null(),
+        "no principal kind: nobody signed in"
+    );
+    assert!(
+        row["principal_id"].is_null(),
+        "no principal id: nobody signed in"
+    );
+    // Plan D5b: the row holds no identifier material. It used to carry the
+    // first 12 hex characters of the identifier's unsalted SHA-256 in
+    // `resource_id` — the hash a reader could match against guessed emails,
+    // and a prefix of the hash of a password typed into the identifier box.
+    // The old assertion here described that leak.
+    assert!(
+        row["resource_kind"].is_null(),
+        "the lock row names no resource kind at all"
+    );
+    assert!(
+        row["resource_id"].is_null(),
+        "the lock row holds no id, not even a hash prefix of the identifier"
+    );
+    assert_eq!(
+        row["detail"].as_str(),
+        Some("Too many failed sign-ins; this sign-in is locked for a while."),
+        "the lock row says only what happened"
+    );
+    // Nothing of the identifier or of its throttle key is anywhere in the
+    // row, and the password is in none of it either.
+    let key = lakehouse_auth::throttle::key_for(THROTTLED_EMAIL);
+    let text = row.to_string();
+    for forbidden in [THROTTLED_EMAIL, WRONG_PASSWORD, &key[..12]] {
+        assert!(
+            !text.contains(forbidden),
+            "the lock row must not carry {forbidden}: {text}"
+        );
+    }
+    let args = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT max(args::text) FROM audit_event WHERE action = 'auth.login_locked'",
     )
     .fetch_one(&pool)
     .await
     .expect("query audit_event");
-    assert_eq!(count, 1, "one lock, one audit event");
-    let resource_id = resource_id.expect("resource_id on the lock event");
-    assert_eq!(resource_id.len(), 12, "resource_id is the first 12 hex");
-    assert!(
-        !resource_id.chars().any(|c| !c.is_ascii_hexdigit()),
-        "resource_id is hex, not a raw identifier"
-    );
     let args = args.unwrap_or_default();
     for forbidden in [THROTTLED_EMAIL, WRONG_PASSWORD] {
         assert!(
@@ -216,6 +272,86 @@ async fn the_lock_sets_exactly_one_audit_event_naming_neither_the_email_nor_the_
             "audit args must not carry {forbidden}"
         );
     }
+}
+
+/// QA LH-SEC-2-06 (SEC-70), decision D4: the lockout happened before anybody
+/// signed in, so the audit list shows what caused it — the sign-in form, a
+/// service, the system — never the assistant.
+#[tokio::test]
+async fn a_lock_is_listed_in_the_audit_log_as_the_sign_in_forms_and_not_the_assistants() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    // `SEC-20` (plan 100): the trail is read per tenant, and the lock is a
+    // row nobody signed in caused, so it belongs to the deployment and only
+    // the tenant that owns the shared catalog reads it. This test is about
+    // the row's actor, so the deployment becomes a one-tenant one and the
+    // reach covers every row.
+    common::leave_no_seeded_tenants(&pool).await;
+    seed_password_identity(&pool).await;
+    // Walk the account into the lock exactly as the audit test above does.
+    for _ in 0..2 {
+        let resp = login(&router, THROTTLED_EMAIL, WRONG_PASSWORD).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let cookie = common::session_cookie_for_seeded_user(&pool, THROTTLED_EMAIL).await;
+    let mut resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/governance/audit")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_string(&mut resp).await).expect("audit body is JSON");
+    let entry = body["audit"]
+        .as_array()
+        .expect("audit is an array")
+        .iter()
+        .find(|row| row["action"] == "auth.login_locked")
+        .expect("the lock is listed");
+    assert_eq!(entry["actor"], "Sign-in form");
+    assert_eq!(entry["actorKind"], "service");
+    assert_eq!(entry["source"], "system");
+}
+
+/// QA LH-SEC-5-01 (`ADM-14` decisions D9 and D14): a sign-in records the
+/// browser it came from, records no network address (the API has no trusted
+/// source for one), and creates exactly one session — the six rows QA saw for
+/// one administrator are six sign-ins, not one sign-in that repeats.
+#[tokio::test]
+async fn a_sign_in_records_the_browser_and_creates_exactly_one_session() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+
+    let resp = login_with_user_agent(
+        &router,
+        THROTTLED_EMAIL,
+        REAL_PASSWORD,
+        Some("QA-Browser/1.0"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (count, user_agent, created_ip): (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT count(*), max(s.user_agent), max(s.created_ip) FROM session s \
+         JOIN app_user u ON u.id = s.app_user_id WHERE u.email = $1",
+    )
+    .bind(THROTTLED_EMAIL)
+    .fetch_one(&pool)
+    .await
+    .expect("query session");
+    assert_eq!(count, 1, "one sign-in, one session");
+    assert_eq!(user_agent.as_deref(), Some("QA-Browser/1.0"));
+    assert_eq!(
+        created_ip, None,
+        "the network address is not recorded (ADM-14 D10)"
+    );
 }
 
 #[tokio::test]
@@ -342,4 +478,233 @@ async fn twenty_concurrent_wrong_logins_let_at_most_the_limit_reach_the_password
     // The correct password is refused for the lock's lifetime.
     let resp = login(&router, THROTTLED_EMAIL, REAL_PASSWORD).await;
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// `GOV-1`: a sign-in that works is on the audit trail. Nobody was signed in
+/// when the form was submitted, so the actor is the form; the principal is
+/// known only because the password verified.
+#[tokio::test]
+async fn a_successful_sign_in_writes_one_auth_login_row_without_the_email_or_the_password() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+
+    let mut resp = login(&router, THROTTLED_EMAIL, REAL_PASSWORD).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let answer = body_string(&mut resp).await;
+    let user_id =
+        serde_json::from_str::<serde_json::Value>(&answer).expect("login body is JSON")["id"]
+            .as_str()
+            .expect("login body names the user")
+            .to_owned();
+
+    let rows = audit_rows(&pool, "auth.login").await;
+    assert_eq!(rows.len(), 1, "one sign-in, one row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(
+        row["actor_label"],
+        lakehouse_store::audit::ACTOR_SIGN_IN_FORM
+    );
+    assert_eq!(row["principal_id"], user_id.as_str());
+    assert_eq!(row["principal_kind"], "user");
+    assert_eq!(row["resource_kind"], "user");
+    assert_eq!(row["resource_id"], user_id.as_str());
+    let text = row.to_string();
+    for forbidden in [THROTTLED_EMAIL, REAL_PASSWORD] {
+        assert!(
+            !text.contains(forbidden),
+            "the row must not carry {forbidden}: {text}"
+        );
+    }
+}
+
+/// `GOV-1`: a refused sign-in is on the audit trail too, with no principal
+/// (nobody proved who they were) and nothing the visitor typed.
+#[tokio::test]
+async fn a_wrong_password_writes_one_refused_auth_login_row_without_the_email_or_the_password() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+
+    let resp = login(&router, THROTTLED_EMAIL, WRONG_PASSWORD).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // The same sentence for an account that does not exist: the trail must
+    // not become the oracle the response is built not to be.
+    let resp = login(&router, GHOST_EMAIL, WRONG_PASSWORD).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let rows = audit_rows(&pool, "auth.login").await;
+    assert_eq!(rows.len(), 2, "two refused tries, two rows: {rows:?}");
+    for row in &rows {
+        assert_eq!(row["outcome"], "refused");
+        assert_eq!(
+            row["actor_label"],
+            lakehouse_store::audit::ACTOR_SIGN_IN_FORM
+        );
+        assert!(row["principal_id"].is_null(), "nobody signed in: {row}");
+        assert!(row["principal_kind"].is_null(), "nobody signed in: {row}");
+        assert_eq!(row["detail"], "The email or the password did not match.");
+        // `GOV-1 review`: the first 48 bits of an unsalted hash of what the
+        // visitor typed would let a reader of the trail test guessed emails
+        // against it (and a password typed into the identifier box leaks a
+        // prefix of its hash), so the row names no key at all.
+        assert!(row["resource_id"].is_null(), "no key prefix: {row}");
+        let text = row.to_string();
+        for forbidden in [THROTTLED_EMAIL, GHOST_EMAIL, WRONG_PASSWORD, REAL_PASSWORD] {
+            assert!(
+                !text.contains(forbidden),
+                "the row must not carry {forbidden}: {text}"
+            );
+        }
+    }
+    assert_eq!(
+        rows[0]["detail"], rows[1]["detail"],
+        "an existing and a missing account read the same"
+    );
+}
+
+/// `GOV-1`: signing out is on the audit trail, naming the person and never
+/// the session cookie.
+#[tokio::test]
+async fn signing_out_writes_one_auth_logout_row_for_the_signed_in_user() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    let cookie = common::session_cookie_for_seeded_user(&pool, THROTTLED_EMAIL).await;
+    let (user_id,): (uuid::Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+        .bind(THROTTLED_EMAIL)
+        .fetch_one(&pool)
+        .await
+        .expect("seeded user");
+
+    let mut resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/logout")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    // The answer is a 200 with a body, not the 204 this route answered
+    // before: the body names the identity provider's own logout address, so
+    // the provider's session ends with this deployment's. A deployment with
+    // no provider configured names none.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let answer = body_string(&mut resp).await;
+    assert!(
+        answer.contains("providerLogoutUrl"),
+        "the answer names the provider's logout address: {answer}"
+    );
+
+    let rows = audit_rows(&pool, "auth.logout").await;
+    assert_eq!(rows.len(), 1, "one sign-out, one row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(row["principal_id"], user_id.to_string().as_str());
+    assert_eq!(row["principal_kind"], "user");
+    assert!(row["actor_label"].is_string(), "the person is named: {row}");
+    let token = cookie.trim_start_matches("lh_session=");
+    assert!(
+        !row.to_string().contains(token),
+        "the row must not carry the session token: {row}"
+    );
+}
+
+async fn change_password(
+    app: &axum::Router,
+    cookie: &str,
+    body: serde_json::Value,
+) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/change-password")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright")
+}
+
+const NEW_PASSWORD: &str = "An0ther!Passw0rd7";
+
+/// `GOV-1`: a password change is on the audit trail, and neither password is.
+#[tokio::test]
+async fn changing_the_password_writes_one_auth_password_change_row_without_either_password() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+    let cookie = common::session_cookie_for_seeded_user(&pool, THROTTLED_EMAIL).await;
+
+    let resp = change_password(
+        &router,
+        &cookie,
+        serde_json::json!({ "oldPassword": REAL_PASSWORD, "newPassword": NEW_PASSWORD }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let rows = audit_rows(&pool, "auth.password_change").await;
+    assert_eq!(rows.len(), 1, "one change, one row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(row["principal_kind"], "user");
+    assert_eq!(row["resource_kind"], "user");
+    assert_eq!(
+        row["resource_id"], row["principal_id"],
+        "the caller's own account"
+    );
+    let text = row.to_string();
+    for forbidden in [REAL_PASSWORD, NEW_PASSWORD] {
+        assert!(
+            !text.contains(forbidden),
+            "the row must not carry a password: {text}"
+        );
+    }
+}
+
+/// `GOV-1`: a refused password change (the current password is wrong, or the
+/// new one breaks the rules) is on the audit trail as refused.
+#[tokio::test]
+async fn a_refused_password_change_writes_a_refused_auth_password_change_row() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+    let cookie = common::session_cookie_for_seeded_user(&pool, THROTTLED_EMAIL).await;
+
+    let resp = change_password(
+        &router,
+        &cookie,
+        serde_json::json!({ "oldPassword": WRONG_PASSWORD, "newPassword": NEW_PASSWORD }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = change_password(
+        &router,
+        &cookie,
+        serde_json::json!({ "oldPassword": REAL_PASSWORD, "newPassword": "short" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let rows = audit_rows(&pool, "auth.password_change").await;
+    assert_eq!(rows.len(), 2, "two refusals, two rows: {rows:?}");
+    for row in &rows {
+        assert_eq!(row["outcome"], "refused");
+        assert_eq!(row["principal_kind"], "user");
+        let text = row.to_string();
+        for forbidden in [REAL_PASSWORD, WRONG_PASSWORD, NEW_PASSWORD, "short"] {
+            assert!(
+                !text.contains(forbidden),
+                "the row must not carry a password: {text}"
+            );
+        }
+    }
+    assert_eq!(rows[0]["detail"], "The current password did not match.");
+    assert_eq!(
+        rows[1]["detail"],
+        "The new password does not meet the password rules."
+    );
 }

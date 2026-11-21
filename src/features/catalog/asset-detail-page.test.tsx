@@ -170,6 +170,33 @@ describe("AssetDetailPage deprecation notice", () => {
     expect(link.getAttribute("title")).toBe("serving.monthly_orders")
   })
 
+  // QA `LH-DATA-12-05` F1 (`DATA-54`): a replacement is optional, so the
+  // notice says when there is none.
+  it("says no replacement is named for a deprecated table without one", async () => {
+    stubApi({ certification: "deprecated", certificationNote: "Old" })
+    renderPage()
+    const notice = await screen.findByRole("note")
+    expect(notice.textContent).toContain("No replacement is named.")
+  })
+
+  it("does not say so when a replacement is named, or when the page is opened with a table grant", async () => {
+    stubApi({
+      certification: "deprecated",
+      certificationNote: "Old",
+      replacementAssetId: "silver.orders_v2",
+    })
+    renderPage()
+    const notice = await screen.findByRole("note")
+    expect(notice.textContent).not.toContain("No replacement is named.")
+    cleanup()
+
+    // A grant hides the replacement rather than there being none.
+    stubApi({ certification: "deprecated", certificationNote: "Old", shownWithTableGrant: true })
+    renderPage()
+    const granted = await screen.findByRole("note")
+    expect(granted.textContent).not.toContain("No replacement is named.")
+  })
+
   it("shows no notice for a certified table or one without a mark", async () => {
     stubApi({ certification: "certified" })
     renderPage()
@@ -193,7 +220,7 @@ describe("AssetDetailPage certification control", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Certification" }))
     fireEvent.click(screen.getByLabelText("Deprecated"))
     fireEvent.change(screen.getByLabelText("Note"), { target: { value: " Superseded " } })
-    fireEvent.change(screen.getByLabelText("Replacement asset id"), {
+    fireEvent.change(screen.getByLabelText("Replacement table id (optional)"), {
       target: { value: "serving.monthly_orders" },
     })
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
@@ -227,10 +254,58 @@ describe("AssetDetailPage certification control", () => {
     renderPage()
     fireEvent.click(await screen.findByRole("button", { name: "Certification" }))
     fireEvent.click(screen.getByLabelText("Deprecated"))
-    fireEvent.change(screen.getByLabelText("Replacement asset id"), { target: { value: "serving.old" } })
+    fireEvent.change(screen.getByLabelText("Replacement table id (optional)"), { target: { value: "serving.old" } })
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
     expect(await screen.findByText("the replacement is itself deprecated")).toBeTruthy()
-    expect(screen.getByLabelText("Replacement asset id")).toBeTruthy()
+    expect(screen.getByLabelText("Replacement table id (optional)")).toBeTruthy()
   })
 })
 
+
+describe("AssetDetailPage row count (QA LH-DATA-15-07)", () => {
+  it("shows no row count when the Iceberg table is not there", async () => {
+    // The stub answers every address it does not know with 404, which is what
+    // the table read gets here.
+    stubApi({ layer: "bronze", type: "iceberg-table", tableName: "orders", tableKey: "bronze.orders", rows: 720 })
+    renderPage()
+    expect(await screen.findByText("Orders Silver")).toBeTruthy()
+    // The header stops showing the registry's count once the read says the
+    // table is gone.
+    expect(
+      await screen.findByTitle(
+        "No Iceberg table for this asset: the count the registry recorded is not shown."
+      )
+    ).toBeTruthy()
+    expect(screen.queryByText("720")).toBeNull()
+  })
+
+  it("keeps the row count of a table that is not an Iceberg table", async () => {
+    stubApi({})
+    renderPage()
+    expect(await screen.findByText("Orders Silver")).toBeTruthy()
+    await waitFor(() => expect(screen.getByText("10")).toBeTruthy())
+  })
+
+  it("keeps the row count when the table read fails for another reason", async () => {
+    const fetchSpy = stubApi({
+      layer: "bronze",
+      type: "iceberg-table",
+      tableName: "orders",
+      tableKey: "bronze.orders",
+      rows: 720,
+    })
+    // A 503 is not a 404: it does not prove the table is gone.
+    const base = fetchSpy.getMockImplementation()
+    fetchSpy.mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.includes("/api/lakehouse/tables/bronze/orders")) {
+        return json({ error: "unavailable" }, 503)
+      }
+      return base ? base(input, init) : json({ error: "not stubbed" }, 404)
+    }) as unknown as typeof fetch)
+    renderPage()
+    await waitFor(() => expect(screen.getByText("720")).toBeTruthy())
+    const rows = screen.getByText("Rows").parentElement as HTMLElement
+    expect(rows.textContent).not.toContain("—")
+  })
+})

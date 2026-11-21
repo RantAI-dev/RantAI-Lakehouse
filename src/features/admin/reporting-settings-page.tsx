@@ -437,9 +437,12 @@ export function ReportingSettingsForm({
                 Block downloads for these roles
               </h2>
               <p className="text-xs text-muted-foreground">
-                A checked role cannot download PDF, Excel, CSV, images or dashboard files. A
-                person who also holds an unchecked role still can, and Platform Admin is never
-                blocked. With none checked, everyone who can see a dashboard can download it.
+                A checked role cannot use the console&apos;s export actions: PDF, Excel, CSV,
+                image and dashboard-file downloads, a Query Studio result download, and
+                &quot;Copy as TSV&quot;. It does not stop a person from selecting and copying
+                what is on the screen. A person who also holds an unchecked role still can, and
+                Platform Admin is never blocked. With none checked, everyone who can see a
+                dashboard or run a query can export it.
               </p>
               {roleNames.map((name) => (
                 <div key={name} className="flex items-center gap-2">

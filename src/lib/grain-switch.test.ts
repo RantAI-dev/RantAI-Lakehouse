@@ -3,6 +3,7 @@ import test from "node:test"
 
 import {
   differsFromSaved,
+  grainNotAppliedSentence,
   grainQuery,
   readGrainParam,
   savedGrainBody,
@@ -54,4 +55,23 @@ test("Save as default is offered only when the shown grain differs from the save
   assert.equal(differsFromSaved("", ""), false)
   assert.equal(savedGrainBody(""), "", "an empty body value clears the saved grain")
   assert.equal(savedGrainBody("year"), "year")
+})
+
+// QA LH-BI-9-05 (BI-50): the four reasons the server sends, one general
+// sentence for a reason this console does not know yet, and nothing without
+// a reason.
+test("each reason the server gives has its sentence, an unknown reason the general one, and no reason none", () => {
+  assert.equal(grainNotAppliedSentence("kind"), "Group dates by does not apply to this type of chart.")
+  assert.equal(
+    grainNotAppliedSentence("part"),
+    "Group dates by does not apply: this chart groups by a part of the date, such as the day of the week.",
+  )
+  assert.equal(grainNotAppliedSentence("not_a_date"), "Group dates by does not apply: this chart's dimension is not a date.")
+  assert.equal(
+    grainNotAppliedSentence("no_grain"),
+    "Group dates by does not apply: this chart has no date grouping of its own to change.",
+  )
+  assert.equal(grainNotAppliedSentence("something_new"), "Group dates by does not apply to this chart.")
+  assert.equal(grainNotAppliedSentence(undefined), null)
+  assert.equal(grainNotAppliedSentence(""), null)
 })

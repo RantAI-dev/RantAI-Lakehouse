@@ -68,6 +68,10 @@ export function savedQueryHref(id: string): string {
 /** A failed read as a card says it: refused for this person, or failed. */
 export type CardRead = "loading" | "ok" | "denied" | "error"
 
+// A refusal is `permission_denied`, because every client maps a 401 or 403
+// through `deniedFor` (WEB-12). The status check stays as a second line: it
+// costs nothing and it keeps a caller that files a 403 under another code
+// from reading as a plain failure.
 export function cardRead(status: string, error: { code: string; status?: number } | null): CardRead {
   if (status === "loading") return "loading"
   if (status !== "error") return "ok"

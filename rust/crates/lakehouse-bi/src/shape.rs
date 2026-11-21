@@ -519,6 +519,16 @@ pub struct ShapeFields {
         default
     )]
     pub breakdown_bin: Option<BinSpec>,
+    /// The period a date or timestamp `breakdown` is grouped by (`BI-46`, plan
+    /// D13; QA `LH-BI-6-01`): `day`, `week`, `month`, `quarter` or `year`, for
+    /// a bar, hbar, line or area chart. Read back through
+    /// [`crate::grain::Grain::parse`]; never set together with a bin.
+    #[serde(
+        rename = "breakdownGrain",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub breakdown_grain: Option<String>,
     /// `pointmap`, `geoheat`: group the points by grid cell (`BI-10`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub grid: Option<GridSpec>,
@@ -613,6 +623,7 @@ impl ShapeFields {
             || !self.joins_list().is_empty()
             || self.bin.is_some()
             || self.breakdown_bin.is_some()
+            || self.breakdown_grain.is_some()
             || self.grid.is_some()
             || self.resolved_params
             || self.layer_query
@@ -757,8 +768,40 @@ pub fn check_kind_fields(
         return Err("groupings are only for a grouped table.".to_owned());
     }
     check_joins_kind(shape, kind)?;
+    check_breakdown_grain_kind(shape, kind)?;
     check_bins_kind(shape, kind, rows_mode)?;
     check_steps_kind(shape, kind, rows_mode)
+}
+
+/// `BI-46` (plan D13): a grain on a breakdown is for the four kinds whose
+/// second column is a series, names one of the five periods, and is not
+/// combined with a bin on the same column (the grain and the bin would both
+/// group it).
+fn check_breakdown_grain_kind(shape: &ShapeFields, kind: ChartKind) -> Result<(), String> {
+    let Some(raw) = &shape.breakdown_grain else {
+        return Ok(());
+    };
+    if !kind.breakdown_is_series() {
+        return Err("a breakdown grain is for bar, hbar, line and area charts.".to_owned());
+    }
+    if !matches!(
+        crate::grain::Grain::parse(raw),
+        Some(
+            crate::grain::Grain::Day
+                | crate::grain::Grain::Week
+                | crate::grain::Grain::Month
+                | crate::grain::Grain::Quarter
+                | crate::grain::Grain::Year
+        )
+    ) {
+        return Err(format!(
+            "invalid breakdown grain '{raw}': use day, week, month, quarter or year."
+        ));
+    }
+    if shape.bin.is_some() || shape.breakdown_bin.is_some() {
+        return Err("a chart groups by a grain or by bins, not both.".to_owned());
+    }
+    Ok(())
 }
 
 /// Kinds whose dimension (and breakdown) can be binned: the charts that list
@@ -937,6 +980,17 @@ pub fn check_against_relation(
     }
     check_groupings(shape, cols, kinds)?;
     check_bins_against_relation(shape, check)?;
+    // `BI-46` (plan D13): a grain on the breakdown needs that column, and a
+    // date or timestamp to cut — the same call a grouping's grain makes.
+    if let Some(raw) = &shape.breakdown_grain {
+        if check.breakdown.is_empty() {
+            return Err("a breakdown grain needs a breakdown column.".to_owned());
+        }
+        let grain = crate::grain::Grain::parse(raw).ok_or_else(|| {
+            format!("invalid breakdown grain '{raw}': use day, week, month, quarter or year.")
+        })?;
+        grain.validate_column(kinds.get(check.breakdown).copied())?;
+    }
     let has_table_calc = resolved
         .iter()
         .any(|m| from.table_calc(m.column.as_str()).is_some());
@@ -1507,6 +1561,83 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "invalid aggregate: median");
+    }
+
+    /// `BI-46` (plan D13; QA `LH-BI-6-01`): a breakdown grain is for the four
+    /// kinds whose second column is a series, names one of the five periods, is
+    /// not combined with a bin, and needs a date or timestamp breakdown to cut.
+    #[test]
+    fn a_breakdown_grain_is_refused_without_a_breakdown_on_a_text_column_on_a_pie_and_beside_a_bin()
+    {
+        let shape = |json: &str| -> ShapeFields { serde_json::from_str(json).unwrap() };
+        let list = measures(r#"["x"]"#);
+        let err = check_kind_fields(
+            &list,
+            &shape(r#"{"breakdownGrain":"month"}"#),
+            ChartKind::Pie,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "a breakdown grain is for bar, hbar, line and area charts."
+        );
+        let err = check_kind_fields(
+            &list,
+            &shape(r#"{"breakdownGrain":"fortnight"}"#),
+            ChartKind::Bar,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "invalid breakdown grain 'fortnight': use day, week, month, quarter or year."
+        );
+        let err = check_kind_fields(
+            &list,
+            &shape(r#"{"breakdownGrain":"month","breakdownBin":{"mode":"width","width":10}}"#),
+            ChartKind::Bar,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err, "a chart groups by a grain or by bins, not both.");
+        let c = cols(&[("d", ColumnKind::Date), ("x", ColumnKind::Number)]);
+        let from = Relation::Mart(Ident::new("m").unwrap());
+        let t = time();
+        let err = check_against_relation(
+            &list,
+            &shape(r#"{"breakdownGrain":"month"}"#),
+            &relation_check(&c, &from, &t, "d"),
+        )
+        .unwrap_err();
+        assert_eq!(err, "a breakdown grain needs a breakdown column.");
+        let c = cols(&[
+            ("d", ColumnKind::Date),
+            ("p", ColumnKind::Text),
+            ("x", ColumnKind::Number),
+        ]);
+        let mut check = relation_check(&c, &from, &t, "d");
+        check.breakdown = "p";
+        let err = check_against_relation(&list, &shape(r#"{"breakdownGrain":"month"}"#), &check)
+            .unwrap_err();
+        assert_eq!(err, "a grain needs a date or timestamp column.");
+    }
+
+    /// `BI-46` (plan D13): the grain is written back as it was saved, and only
+    /// when it is set.
+    #[test]
+    fn a_breakdown_grain_reads_back_as_it_was_saved() {
+        let shape: ShapeFields = serde_json::from_str(r#"{"breakdownGrain":"month"}"#).unwrap();
+        assert_eq!(shape.breakdown_grain.as_deref(), Some("month"));
+        assert!(shape.is_used());
+        assert_eq!(
+            serde_json::to_string(&shape).unwrap(),
+            r#"{"breakdownGrain":"month"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ShapeFields::default()).unwrap(),
+            "{}"
+        );
     }
 
     #[test]

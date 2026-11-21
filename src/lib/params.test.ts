@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
-  columnSwitchParams, limitParam, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, refLinesFromDef, refLinesPayload, isComputedLine,
+  acceptedParams, columnSwitchParams, limitParam, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, refLinesFromDef, refLinesPayload, isComputedLine,
   savedParamsBody, slotParam, slotText, withParamsParam, withValue, type ParamControl, type ParamDef,
 } from "./params"
 
@@ -108,4 +108,17 @@ test("a forecast with no whole horizon from 1 to 60 is not sent, and only the fi
 test("a chart saved before forecasts is sent back byte for byte", () => {
   const lines = [{ value: 5, label: "Goal" }, { kind: "average" }, { kind: "band", value: 1, to: 2 }]
   assert.deepEqual(refLinesPayload(refLinesFromDef(lines)), lines)
+})
+
+// QA LH-BI-11-06 (BI-52): the address keeps what the server accepted, and
+// nothing it refused or does not know.
+test("a refused value and a name the answer does not know leave what the address carries, and nothing left is no parameter at all", () => {
+  const sent = { target: 51, pick: "b", gone: 1 }
+  assert.deepEqual(
+    acceptedParams(sent, [{ name: "target", reason: "parameter 'target' must be at most 50." }], { pick: "b", target: 30 }),
+    { pick: "b" },
+  )
+  assert.equal(acceptedParams({ target: 51 }, [{ name: "target", reason: "x" }], { target: 30 }), null)
+  assert.equal(acceptedParams(null, [], {}), null)
+  assert.deepEqual(acceptedParams({ pick: "b" }, [], { pick: "b" }), { pick: "b" })
 })

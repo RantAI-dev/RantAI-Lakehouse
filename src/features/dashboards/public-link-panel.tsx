@@ -2,9 +2,12 @@
 
 import * as React from "react";
 import { Check, Code2, Copy, Globe, Link2 } from "lucide-react";
+import { SelectField } from "@/components/patterns/select-field";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { useBranding } from "@/hooks/use-branding";
 import { copyText as copyToClipboard } from "@/lib/copy-text";
+import { escapeHtml } from "@/lib/geo-points";
 import { readableErrorMessage } from "@/lib/notify-message";
 // BI-19 part A review fix (SHOULD-FIX) R4: features import `@/services` only.
 import { dashboardService, type PublicLink, type PublicLinkState } from "@/services";
@@ -58,18 +61,18 @@ function ExpiryPicker({
 }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <select
+      <SelectField
         aria-label="Link expires in"
         value={choice}
-        onChange={(e) => onChoice(e.target.value as ExpiryChoice)}
-        className="h-8 rounded-md border border-border bg-background px-2 text-xs"
-      >
-        <option value="1">1 day</option>
-        <option value="7">7 days</option>
-        <option value="30">30 days</option>
-        <option value="90">90 days</option>
-        <option value="date">A date…</option>
-      </select>
+        options={[
+          { value: "1", label: "1 day" },
+          { value: "7", label: "7 days" },
+          { value: "30", label: "30 days" },
+          { value: "90", label: "90 days" },
+          { value: "date", label: "A date…" },
+        ]}
+        onValueChange={(next) => onChoice(next as ExpiryChoice)}
+      />
       {choice === "date" ? (
         <Input type="date" aria-label="Link expires on" value={date} onChange={(e) => onDate(e.target.value)} className="h-8 w-40 text-xs" />
       ) : null}
@@ -105,13 +108,20 @@ export function PublicLinkPanel({ board }: { readonly board: string }) {
     return () => { cancelled = true; };
   }, [board]);
 
+  // `adm-121`: the snippet names the workspace, as the sign-in page and the
+  // sidebar do (`ADM-2`); the product's own name stands in when none is set.
+  const branding = useBranding();
   const link = state?.link ?? null;
   const live = link !== null && !link.expired;
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const shareUrl = live ? `${origin}/public/dashboard/${link.token}` : "";
   const embedUrl = live ? `${origin}/embed/dashboard/${link.token}` : "";
-  const iframe = live
-    ? `<iframe src="${embedUrl}" width="100%" height="600" frameborder="0" style="border:1px solid #e5e7eb;border-radius:12px" title="Rantai Lake dashboard"></iframe>`
+  // The name is text a person typed: it goes into the attribute escaped, so
+  // a quote in it cannot end the attribute. Nothing is offered to copy
+  // until the name is known, so no snippet carries a name that is about to
+  // change.
+  const iframe = live && !branding.loading
+    ? `<iframe src="${embedUrl}" width="100%" height="600" frameborder="0" style="border:1px solid #e5e7eb;border-radius:12px" title="${escapeHtml(branding.name)} dashboard"></iframe>`
     : "";
 
   async function run(work: () => Promise<PublicLink | null>) {
@@ -219,7 +229,7 @@ export function PublicLinkPanel({ board }: { readonly board: string }) {
             <div className="rounded-md border border-border bg-muted/30 p-2">
               <code className="block max-h-20 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-foreground">{iframe}</code>
             </div>
-            <Button size="sm" variant="outline" onClick={() => void copy(iframe, "embed")}>{copyLabel("embed", "Copy iframe")}</Button>
+            <Button size="sm" variant="outline" disabled={iframe === ""} onClick={() => void copy(iframe, "embed")}>{copyLabel("embed", "Copy iframe")}</Button>
           </div>
 
           <div className="flex items-center justify-between gap-2 border-t border-border pt-2">

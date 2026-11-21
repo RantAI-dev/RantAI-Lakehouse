@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { ServiceError } from "../errors"
-import type { SavedQueryAccessList } from "../contracts/queries"
+import type { QueryParamDef, SavedQueryAccessList } from "../contracts/queries"
 import { clickhouseQueryService } from "./queries"
 
 const originalFetch = global.fetch
@@ -463,6 +463,7 @@ describe("the saved-query console client (QS-3)", () => {
     folderId: null,
     ownerId: "u-1",
     level: "manage",
+    parameters: [],
   }
 
   const FOLDER = {
@@ -483,13 +484,23 @@ describe("the saved-query console client (QS-3)", () => {
         id: "rule-1",
         userId: "u-2",
         roleId: null,
+        granteeName: "Dewi Lestari",
+        granteeEmail: "dewi@example.com",
         level: "edit",
         grantedBy: "u-1",
         grantedAt: "2026-11-04T10:00:00Z",
       },
     ],
     inherited: [
-      { folderId: "f-1", folderName: "Reports", userId: null, roleId: "r-1", level: "view" },
+      {
+        folderId: "f-1",
+        folderName: "Reports",
+        userId: null,
+        roleId: "r-1",
+        granteeName: "Finance",
+        granteeEmail: null,
+        level: "view",
+      },
     ],
   }
 
@@ -694,6 +705,7 @@ describe("the saved-query console client (QS-3)", () => {
           authorName: "Rina Wijaya",
           label: "Restored version 1",
           createdAt: "2026-11-04T10:00:00.000Z",
+          parameters: [],
         },
       ]),
     )
@@ -707,6 +719,7 @@ describe("the saved-query console client (QS-3)", () => {
         authorName: "Rina Wijaya",
         label: "Restored version 1",
         createdAt: "2026-11-04T10:00:00.000Z",
+        parameters: [],
       },
     ])
     expect(calls[0]!.url).toBe("/api/query/saved/q-1/versions")
@@ -898,5 +911,159 @@ describe("the saved-query console client (QS-3)", () => {
     expect(err.message).toBe(
       "This folder still holds queries, some of them in the trash. Move or restore them first.",
     )
+  })
+})
+
+describe("query parameters on the wire (QS-5)", () => {
+  const DEFINITIONS: QueryParamDef[] = [
+    { name: "region", type: "text", default: "EU" },
+    {
+      name: "tier",
+      type: "dropdown",
+      default: "gold",
+      options: [
+        { value: "gold", label: "Gold" },
+        { value: "silver", label: "Silver" },
+      ],
+    },
+  ]
+  const VALUES = { region: "US", span: { start: "2026-11-01", end: "2026-11-07" }, ids: ["a", "b"] }
+  const SQL = "SELECT {{region}}"
+
+  it("posts exactly {sql, engine} to run when the caller has no parameters and no definitions", async () => {
+    const calls = stubFetch(() => json({ id: "r", columns: [], rows: [] }))
+    await clickhouseQueryService.run("SELECT 1", { engine: "trino" })
+    expect(calls[0]!.init.body).toBe('{"sql":"SELECT 1","engine":"trino"}')
+  })
+
+  it("posts the values and the definitions to run when the caller gives them", async () => {
+    const calls = stubFetch(() => json({ id: "r", columns: [], rows: [] }))
+    await clickhouseQueryService.run(SQL, {
+      engine: "clickhouse",
+      parameters: VALUES,
+      definitions: DEFINITIONS,
+    })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      sql: SQL,
+      engine: "clickhouse",
+      parameters: VALUES,
+      definitions: DEFINITIONS,
+    })
+  })
+
+  it("posts the values to run without definitions when the caller has none", async () => {
+    const calls = stubFetch(() => json({ id: "r", columns: [], rows: [] }))
+    await clickhouseQueryService.run(SQL, { engine: "clickhouse", parameters: { region: "US" } })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      sql: SQL,
+      engine: "clickhouse",
+      parameters: { region: "US" },
+    })
+  })
+
+  it("posts exactly {sql} to estimate when the caller has no parameters and no definitions", async () => {
+    const calls = stubFetch(() => json({ estimatedBytes: null }))
+    await clickhouseQueryService.estimate("SELECT 1")
+    expect(calls[0]!.url).toBe("/api/query/estimate")
+    expect(calls[0]!.init.body).toBe('{"sql":"SELECT 1"}')
+  })
+
+  it("posts the values and the definitions to estimate when the caller gives them", async () => {
+    const calls = stubFetch(() => json({ estimatedBytes: null }))
+    await clickhouseQueryService.estimate(SQL, { parameters: VALUES, definitions: DEFINITIONS })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      sql: SQL,
+      parameters: VALUES,
+      definitions: DEFINITIONS,
+    })
+  })
+
+
+  it("stops an estimate through the signal that follows the parameters", async () => {
+    const calls = stubFetch(() => json({ estimatedBytes: null }))
+    const controller = new AbortController()
+    await clickhouseQueryService.estimate("SELECT 1", undefined, controller.signal)
+    expect(calls[0]!.init.signal).toBe(controller.signal)
+  })
+
+  it("saves a query with its definitions", async () => {
+    const calls = stubFetch(() => json({}, 201))
+    await clickhouseQueryService.saveQuery({
+      title: "By region",
+      sql: SQL,
+      tags: [],
+      parameters: DEFINITIONS,
+    })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({
+      title: "By region",
+      sql: SQL,
+      tags: [],
+      parameters: DEFINITIONS,
+    })
+  })
+
+  it("changes the definitions of a query, and an empty list clears them", async () => {
+    const calls = stubFetch(() => json({}))
+    await clickhouseQueryService.updateSaved("q-1", { parameters: DEFINITIONS })
+    await clickhouseQueryService.updateSaved("q-1", { parameters: [] })
+    expect(JSON.parse(String(calls[0]!.init.body))).toStrictEqual({ parameters: DEFINITIONS })
+    expect(JSON.parse(String(calls[1]!.init.body))).toStrictEqual({ parameters: [] })
+  })
+
+  it("leaves the definitions of a query alone when the change names none", async () => {
+    const calls = stubFetch(() => json({}))
+    await clickhouseQueryService.updateSaved("q-1", { title: "By region" })
+    expect(calls[0]!.init.body).toBe('{"title":"By region"}')
+  })
+
+  it("hands back the definitions a saved query and its versions carry", async () => {
+    stubFetch(() => json({ id: "q-1", parameters: DEFINITIONS }))
+    const saved = await clickhouseQueryService.getSaved("q-1")
+    expect(saved.parameters).toEqual(DEFINITIONS)
+    stubFetch(() => json([{ version: 1, parameters: DEFINITIONS }]))
+    const versions = await clickhouseQueryService.listSavedVersions("q-1")
+    expect(versions[0]!.parameters).toEqual(DEFINITIONS)
+  })
+})
+
+describe("refusals carry their status (WEB-12)", () => {
+  it("a refused saved query rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: query:read" }, 403))
+    await expect(clickhouseQueryService.getSaved("q-9")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the query:read permission.",
+    })
+  })
+
+  it("a refused delete rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: query:write" }, 403))
+    await expect(clickhouseQueryService.deleteSaved("q-1")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the query:write permission.",
+    })
+  })
+
+  it("a refused download keeps the server's sentence and gains its status", async () => {
+    stubFetch(() =>
+      json({ error: "permission_denied: Downloads are switched off for your role." }, 403),
+    )
+    await expect(
+      clickhouseQueryService.download("q-1", "csv", "7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f"),
+    ).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "Downloads are switched off for your role.",
+    })
+  })
+
+  it("a refused question to AI Copilot rejects as permission_denied, not unavailable", async () => {
+    stubFetch(() => json({ error: "permission_denied: assistant:use" }, 403))
+    await expect(clickhouseQueryService.askQuestion("q")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the assistant:use permission.",
+    })
   })
 })

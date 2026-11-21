@@ -100,8 +100,16 @@ from dagster import (
 )
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, record_maintenance_run
+from dispar_orchestrate.ingest_factory import job_tags
 from dispar_orchestrate.maintenance import maintenance_paused
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
+
+# How long one run of this job may run, in seconds. A daily export gets
+# room for a slow day. Not measured on staging, 2026-11-16 -- the job has
+# been failing there since 13 Nov -- so the limit follows the plan's
+# default rather than a measured run.
+RUN_LIMIT_ENV = "DAGSTER_RUN_LIMIT_GOLD_EXPORT_JOB_SECONDS"
+DEFAULT_RUN_LIMIT_SECONDS = 7_200
 
 
 def _env(name: str, default: str) -> str:
@@ -627,6 +635,59 @@ def load_gold_catalog(cfg: GoldExportConfig) -> Any:
     )
 
 
+def expire_all_but_current_snapshot(table: Any) -> int:
+    """Expire every snapshot of `table` except its current one, and
+    return how many were expired (DATA-2's trim step 4b, extracted for
+    `DATA-6` D11: the latest-copy op runs the exact same cleanup after
+    its replace, so the two paths share one implementation instead of
+    two copies that can drift — AGENTS.md rule 4).
+
+    The ids are read from `table.snapshots()` BEFORE the commit, so the
+    caller's `table` object stays a pre-commit view; the caller that
+    needs the post-commit state reloads the table itself.
+    """
+    current_snapshot = table.current_snapshot()
+    current_snapshot_id = current_snapshot.snapshot_id if current_snapshot else None
+    older_snapshot_ids = [
+        s.snapshot_id for s in table.snapshots() if s.snapshot_id != current_snapshot_id
+    ]
+    if older_snapshot_ids:
+        table.maintenance.expire_snapshots().by_ids(older_snapshot_ids).commit()
+    return len(older_snapshot_ids)
+
+
+def remove_gold_orphan_files(cfg: GoldExportConfig, table_name: str, older_than_seconds: int) -> int:
+    """Remove the orphan files of one `gold.*` Iceberg table through
+    ClickHouse, and return how many data files were deleted (DATA-2's
+    trim step 4c, extracted for `DATA-6` D11 — same shared-implementation
+    reason as `expire_all_but_current_snapshot` above).
+
+    `table_name` is the catalog's own two-part name (`gold.<mart>`), and
+    `older_than_seconds` is passed straight through to the verb: DATA-2
+    review BLOCKER 1 — files younger than the age stay, so a concurrent
+    writer's in-flight files are never deleted. `cfg` is used only for
+    its `ch_auth_settings()`/`lakekeeper_*`/`rustfs_*` fields by the
+    maintenance helpers, the same fields the trim reads.
+    """
+    from dispar_orchestrate.maintenance import (
+        ensure_catalog_database,
+        run_remove_orphan_files,
+    )
+
+    catalog_db = "icecat_gold_export"
+    ensure_catalog_database(cfg, db_name=catalog_db)
+    # DATA-2 review BLOCKER 1: pass orphan_min_age_seconds to prevent
+    # deleting in-flight uncommitted files from concurrent exports.
+    orphan_res = run_remove_orphan_files(
+        cfg,
+        table_name,
+        dry_run=False,
+        catalog_db=catalog_db,
+        older_than_seconds=older_than_seconds,
+    )
+    return int(orphan_res.get("deleted_data_files_count", 0))
+
+
 def run_trim_for_mart(
     cfg: GoldExportConfig, mart: str, context: Any = None
 ) -> dict[str, Any]:
@@ -837,20 +898,10 @@ def run_trim_for_mart(
                 log.warning(f"failed to record gold_trim_run for {mart}: {e}")
         return {"status": "failed", "reason": fixed_reason}
 
-    # 4b. Expire snapshots
+    # 4b. Expire snapshots (shared helper — `DATA-6` D11 reuses the trim's
+    # cleanup for the latest-copy op, so this step and that op cannot drift)
     try:
-        current_snapshot = table.current_snapshot()
-        current_snapshot_id = (
-            current_snapshot.snapshot_id if current_snapshot else None
-        )
-        older_snapshot_ids = [
-            s.snapshot_id
-            for s in table.snapshots()
-            if s.snapshot_id != current_snapshot_id
-        ]
-        if older_snapshot_ids:
-            table.maintenance.expire_snapshots().by_ids(older_snapshot_ids).commit()
-        snapshots_expired = len(older_snapshot_ids)
+        snapshots_expired = expire_all_but_current_snapshot(table)
     except Exception as exc:
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         if log:
@@ -870,26 +921,11 @@ def run_trim_for_mart(
                 log.warning(f"failed to record gold_trim_run for {mart}: {e}")
         return {"status": "failed", "reason": fixed_reason}
 
-    # 4c. ClickHouse remove_orphan_files (amendment A1)
+    # 4c. ClickHouse remove_orphan_files (amendment A1, shared helper — same
+    # DATA-6 D11 reasoning as the snapshot expiry above)
     files_removed = 0
     try:
-        from dispar_orchestrate.maintenance import (
-            ensure_catalog_database,
-            run_remove_orphan_files,
-        )
-
-        catalog_db = "icecat_gold_export"
-        ensure_catalog_database(cfg, db_name=catalog_db)
-        # DATA-2 review BLOCKER 1: pass orphan_min_age_seconds to prevent
-        # deleting in-flight uncommitted files from concurrent exports.
-        orphan_res = run_remove_orphan_files(
-            cfg,
-            f"gold.{mart}",
-            dry_run=False,
-            catalog_db=catalog_db,
-            older_than_seconds=orphan_min_age_seconds,
-        )
-        files_removed = int(orphan_res.get("deleted_data_files_count", 0))
+        files_removed = remove_gold_orphan_files(cfg, f"gold.{mart}", orphan_min_age_seconds)
     except Exception as exc:
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         if log:
@@ -994,7 +1030,11 @@ def summarize_gold_export(context, results: list[dict[str, Any]]) -> list[dict[s
     return results
 
 
-@job
+# The `dagster/max_runtime` tag is what run monitoring enforces: a run
+# whose process died is cancelled and failed by the daemon, so it does not
+# hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
+# is a tag and not `run_monitoring.max_runtime_seconds`.
+@job(tags=job_tags("gold_export_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def gold_export_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `gold_export_job`. A fan-out
     op (`list_gold_marts`) yields one `DynamicOutput` per mart; the

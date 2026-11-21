@@ -429,7 +429,35 @@ impl ChartInput {
     /// rebuilt from its definition at read time, like a grained one.
     #[must_use]
     pub fn uses_shaping(&self) -> bool {
-        self.measures.has_own_aggregates() || self.shape.is_used()
+        // `BI-46` (plan D14; QA `LH-BI-6-01`): a chart whose limit keeps the
+        // breakdown's top values is rebuilt from its definition on every read,
+        // like a grained one, so the rule reaches charts saved before it — with
+        // or without a dashboard filter. `finish_shaping` builds the stored
+        // statement from the same builder, so the two cannot disagree.
+        self.measures.has_own_aggregates() || self.shape.is_used() || self.caps_breakdown()
+    }
+
+    /// Whether the chart's limit keeps the breakdown's top values (`BI-46`,
+    /// plan D12): a bar, hbar, line or area chart with a breakdown, where the
+    /// second column is a series and the N values with the largest total of
+    /// the chart's measure are kept.
+    #[must_use]
+    pub fn caps_breakdown(&self) -> bool {
+        self.kind.breakdown_is_series()
+            && self
+                .breakdown
+                .as_ref()
+                .is_some_and(|breakdown| !breakdown.is_empty())
+    }
+
+    /// Whether a grained chart of this definition keeps the LATEST buckets
+    /// (`BI-46`, plan D12): only when its limit is not the breakdown's. A
+    /// chart with a breakdown keeps every period; its budget is the
+    /// breakdown's, and a relative date filter is how it narrows to recent
+    /// periods.
+    #[must_use]
+    pub fn keeps_latest_buckets(&self, grain: crate::grain::Grain) -> bool {
+        !self.caps_breakdown() && crate::grain::cuts_to_latest(grain, &self.effective_order())
     }
 
     /// The fixed limit, or `None` when the chart has none or takes it from a
@@ -641,7 +669,11 @@ fn new_board_id() -> String {
     format!("b_{}", random_hex(4))
 }
 
-fn new_chart_id() -> String {
+/// A fresh chart id (`u_` and 8 hex characters). Public for the copy a
+/// dashboard template makes (`BI-18` part D, T3), which gives every chart of
+/// the new dashboard its own id, as [`duplicate_board`] does.
+#[must_use]
+pub fn new_chart_id() -> String {
     format!("u_{}", random_hex(4))
 }
 
@@ -3167,6 +3199,22 @@ pub fn stored_from_document(doc: &Value, board: &str, created_by: &str) -> Optio
     })
 }
 
+/// A stored chart's document (`{ spec, def, hasYear }`), the exact shape
+/// `spec_json` holds and [`stored_from_document`] reads back: what a dashboard
+/// template keeps of each chart (`BI-18` part D, T3), so a dashboard started
+/// from it is a copy of the charts as they were, like [`duplicate_board`]'s,
+/// and not a rebuild against today's schema (a chart whose table is gone then
+/// keeps its tile and says so, decision T2). No row of data is in it.
+#[must_use]
+pub fn stored_document(chart: &StoredChartSpec) -> Value {
+    serde_json::to_value(StoredPayload {
+        spec: &chart.spec,
+        def: &chart.def,
+        has_year: chart.has_year,
+    })
+    .unwrap_or(Value::Null)
+}
+
 fn empty_chart_input() -> ChartInput {
     ChartInput {
         title: String::new(),
@@ -3889,6 +3937,9 @@ fn grained_chart_sql(
         limit: crate::grain::effective_limit(grain, input.order, input.limit),
         // A chart with a sort is saved by `finish_shaping`, which rebuilds it.
         sort: None,
+        // `BI-46` (plan D12, D14): so is a chart whose limit caps its
+        // breakdown, so this path never sees one; it keeps every bucket.
+        cap_breakdown: false,
     };
     crate::builder::grained_sql(from, Vec::new(), &chart, input.column, time).ok_or_else(|| {
         BiError::Validation("a grain needs a date or timestamp dimension.".to_owned())
@@ -4139,7 +4190,7 @@ struct CommonFields {
 /// Validate/normalize the fields shared by every `specFromInput` branch:
 /// `title` (required), `kind` (must be one of [`KINDS`]), `id` (generated if
 /// absent), `board` (defaults to `"default"`), `span` (`1` or `2`), and
-/// `subtitle` (blank becomes `None`).
+/// `subtitle` (blank becomes `None`, and so does the word "null").
 fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<CommonFields, BiError> {
     let title = input.title.trim().to_owned();
     if title.is_empty() {
@@ -4162,11 +4213,17 @@ fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<Common
         .unwrap_or("default")
         .to_owned();
     let span = if input.span == Some(2) { 2 } else { 1 };
+    // A blank subtitle is no subtitle, and so is the word "null": the field is
+    // normalised for every caller of the store, the assistant's tools and the
+    // console's own chart builder alike, so whoever sends the text "null" gets
+    // no subtitle and never sees that word under the title (AI-3, 2026-11-08).
+    // The whole subtitle is compared, so a subtitle that only starts with the
+    // word ("Null values by province") is kept.
     let subtitle = input
         .subtitle
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
         .map(str::to_owned);
     Ok(CommonFields {
         title,
@@ -4315,6 +4372,15 @@ pub async fn ensure_sources_visible(
     keep: &[String],
 ) -> Result<(), BiError> {
     let named = sql_sources_named(input);
+    // GOV-17 review R7: chart create/preview/update use this BI-side guard,
+    // not the API's source-list predicate. Keeping an existing source may
+    // preserve its folder access, but must never override current table denial.
+    if let Some(id) = named
+        .iter()
+        .find(|id| viewer.hidden_source_ids().contains(id))
+    {
+        return Err(BiError::Validation(format!("SQL source '{id}' not found.")));
+    }
     for id in named.iter().filter(|id| !keep.contains(id)) {
         if let Some(found) = crate::sources::get_source(ch, id).await?
             && !found.folder_id.is_empty()
@@ -5897,6 +5963,26 @@ mod tests {
 
     use super::*;
 
+    /// GOV-17 review R7: the preserved-source exemption is for folder access,
+    /// never a bypass of the caller's fresh table dependency restriction.
+    #[tokio::test]
+    async fn keeping_a_source_does_not_override_its_table_visibility() {
+        let mut input = empty_chart_input();
+        input.sql_source = Some("s_hidden".to_owned());
+        let viewer = Viewer::user("u", false).with_hidden_sources(vec!["s_hidden".to_owned()]);
+        // Both the old keep exemption and the new denial return before any
+        // network read, so this regression needs no external source server.
+        let ch = ChClient::new(
+            "http://example.invalid".to_owned(),
+            "default".to_owned(),
+            String::new(),
+        );
+        let result = ensure_sources_visible(&ch, &input, &viewer, &["s_hidden".to_owned()]).await;
+        assert!(
+            matches!(result, Err(BiError::Validation(message)) if message == "SQL source 's_hidden' not found.")
+        );
+    }
+
     // BI-9: the builders take the time settings; the tests that predate it
     // call these shims, which pass the default context and no grain.
     static DEFAULT_TIME: std::sync::LazyLock<TimeContext> =
@@ -6275,7 +6361,7 @@ mod tests {
             "avg",
         )
         .unwrap();
-        assert!(sql.contains("round(avg(visitors)) AS visitors"), "{sql}");
+        assert!(sql.contains("round(avg(visitors), 6) AS visitors"), "{sql}");
         assert!(sql.ends_with("LIMIT 5000"), "{sql}");
     }
 
@@ -7094,6 +7180,33 @@ mod tests {
         assert_eq!(input.measures, vec!["total".to_owned()]);
     }
 
+    // ── the subtitle ───────────────────────────────────────────────────
+
+    /// A subtitle that is only the word "null" is no subtitle: the
+    /// assistant's model writes that text when it follows the build prompt's
+    /// "send `subtitle: null`" against a schema that types the field as a
+    /// string (AI-3, 2026-11-08).
+    #[test]
+    fn a_subtitle_that_is_only_the_word_null_is_no_subtitle() {
+        let subtitle_of = |subtitle: &str| -> Option<String> {
+            let input: ChartInput = serde_json::from_value(serde_json::json!({
+                "title": "t", "kind": "bar", "mart": "mart_x", "subtitle": subtitle,
+            }))
+            .expect("the chart input decodes");
+            derive_common_fields(&input, None)
+                .expect("the common fields derive")
+                .subtitle
+        };
+        for cleared in ["null", " Null ", "NULL", "nUlL", ""] {
+            assert_eq!(subtitle_of(cleared), None, "{cleared:?} is no subtitle");
+        }
+        // A subtitle that only starts with the word is a subtitle.
+        assert_eq!(
+            subtitle_of("Null values by province"),
+            Some("Null values by province".to_owned())
+        );
+    }
+
     // ── charts over SQL that is not stored (`spec_from_inline_sql`) ──────
 
     fn source_columns(pairs: &[(&str, &str)]) -> Vec<crate::sources::SourceColumn> {
@@ -7229,7 +7342,7 @@ mod tests {
             spec.spec.sql
         );
         assert!(
-            spec.spec.sql.contains("round(sum(double)) AS double"),
+            spec.spec.sql.contains("round(sum(double), 6) AS double"),
             "{}",
             spec.spec.sql
         );
@@ -7839,7 +7952,7 @@ mod tests {
         assert!(
             goal.spec
                 .sql
-                .starts_with("SELECT round(sum(visitors)) AS v FROM"),
+                .starts_with("SELECT round(sum(visitors), 6) AS v FROM"),
             "{}",
             goal.spec.sql
         );
@@ -7901,12 +8014,14 @@ mod tests {
             ChartY::Multi(vec!["visitors".to_owned(), "avg_stay".to_owned()])
         );
         assert!(
-            spec.spec.sql.contains("round(avg(stay)) AS avg_stay"),
+            spec.spec.sql.contains("round(avg(stay), 6) AS avg_stay"),
             "{}",
             spec.spec.sql
         );
         assert!(
-            spec.spec.sql.contains("round(sum(visitors)) AS visitors"),
+            spec.spec
+                .sql
+                .contains("round(sum(visitors), 6) AS visitors"),
             "{}",
             spec.spec.sql
         );
@@ -7917,6 +8032,94 @@ mod tests {
             serde_json::json!(["visitors", {"column": "stay", "aggregate": "avg"}])
         );
         assert!(spec.def.uses_shaping());
+    }
+
+    /// QA `LH-BI-6-25` (`BI-49`, plan D8): a radar is a grouped kind, so the
+    /// server already saves it with several measures, each keeping its own
+    /// aggregate. The console starts to rely on this in T8; the test pins it
+    /// so a later change cannot take it away unseen.
+    #[test]
+    fn a_radar_with_two_measures_is_saved_with_both_columns() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "radar",
+            "measures": ["visitors", {"column": "stay", "aggregate": "avg"}],
+        }))
+        .expect("a radar takes several measures (plan D8)");
+        assert_eq!(
+            spec.spec.y,
+            ChartY::Multi(vec!["visitors".to_owned(), "avg_stay".to_owned()])
+        );
+        assert!(
+            spec.spec
+                .sql
+                .contains("round(sum(visitors), 6) AS visitors"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.contains("round(avg(stay), 6) AS avg_stay"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    /// QA `LH-BI-6-25` (`BI-49`, plan D7): a radar has no breakdown, before and
+    /// after this slice, so the "a breakdown or several measures" rule is never
+    /// reached for one. Pinned for the console's benefit.
+    #[test]
+    fn a_radar_is_refused_a_breakdown() {
+        assert!(
+            bi6_refusal(&serde_json::json!({ "kind": "radar", "breakdown": "cat" }))
+                .contains("breakdown is only for"),
+        );
+    }
+
+    /// `BI-46` (plan D12, D14; QA `LH-BI-6-01`): a bar chart with a breakdown
+    /// is marked as shaped — it is rebuilt on every read — and the statement it
+    /// is saved with already holds the breakdown cap, so the stored statement
+    /// and the read agree.
+    #[test]
+    fn a_bar_chart_with_a_breakdown_is_saved_with_the_capped_statement() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "bar", "breakdown": "cat", "limit": 3,
+        }))
+        .unwrap();
+        assert!(spec.def.caps_breakdown());
+        assert!(spec.def.uses_shaping(), "rebuilt on every read (D14)");
+        assert!(
+            spec.spec.sql.contains(
+                "(isNull(cat), ifNull(toString(cat), '')) IN \
+                 (SELECT isNull(cat), ifNull(toString(cat), '') FROM ("
+            ),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec
+                .sql
+                .contains("GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 3)"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    /// `BI-46` (plan D12) review round 1, R5: the exact statement a chart with
+    /// no breakdown is saved with — today's one, byte for byte, not just a
+    /// statement that happens to lack a cap.
+    #[test]
+    fn a_chart_without_a_breakdown_is_saved_with_the_statement_it_always_had() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "bar", "breakdown": serde_json::Value::Null, "limit": 3,
+        }))
+        .unwrap();
+        assert!(!spec.def.caps_breakdown());
+        assert_eq!(
+            spec.spec.sql,
+            "SELECT place, round(sum(visitors), 6) AS visitors FROM (\n\
+             SELECT place, cat, d, visitors, stay FROM serving.mart_x\n\
+             ) AS src GROUP BY place ORDER BY visitors DESC LIMIT 3 SETTINGS \
+             max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60"
+        );
     }
 
     #[test]
@@ -8431,7 +8634,7 @@ mod tests {
             rooms
                 .spec
                 .sql
-                .contains("round(avg(capacity__rooms)) AS capacity__rooms"),
+                .contains("round(avg(capacity__rooms), 6) AS capacity__rooms"),
             "{}",
             rooms.spec.sql
         );
@@ -8949,7 +9152,7 @@ mod tests {
             fixed
                 .spec
                 .sql
-                .starts_with("SELECT round(sum(visitors)) AS v FROM")
+                .starts_with("SELECT round(sum(visitors), 6) AS v FROM")
         );
         assert_eq!(
             fixed.def.types.goal,

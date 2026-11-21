@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import {
   ConnectorIngestPanel,
   cronProblem,
@@ -55,7 +56,8 @@ function found(options: { discovered?: unknown[] }): Found[] {
 function stubFetch(
   spec: typeof SPEC = SPEC,
   // SRC-11: the run record (`GET .../runs`) and the log of each run by id (`GET .../runs/{id}/log`).
-  history: { runs: unknown[]; logs?: Record<string, unknown> } = { runs: [] },
+  // SRC-39: `maxRuntimeSeconds` is the run limit the API judges runs by (absent in an older answer).
+  history: { runs: unknown[]; logs?: Record<string, unknown>; maxRuntimeSeconds?: number } = { runs: [] },
   // SRC-10: what discovery finds, and how a run of the connector is answered (the default launches run 0123456789abcdef).
   // SRC-11: how Resume is answered (the default lifts the pause).
   options: {
@@ -77,7 +79,7 @@ function stubFetch(
       const scheduleCron = body.scheduleCron ?? null
       return json({ ...spec, ...body, scheduleCron, nextRunAt: scheduleCron ? "2026-10-01T02:00:00Z" : null })
     }
-    if (url.endsWith("/runs")) return json({ runs: history.runs })
+    if (url.endsWith("/runs")) return json({ runs: history.runs, maxRuntimeSeconds: history.maxRuntimeSeconds })
     const log = /\/runs\/([^/]+)\/log(\?format=text)?$/.exec(url)
     if (log) {
       if (log[2]) return new Response("run 0123 (schedule), succeeded\n", { status: 200, headers: { "Content-Type": "text/plain" } })
@@ -194,7 +196,7 @@ describe("ConnectorIngestPanel", () => {
     const target = screen.getByLabelText("Bronze table for public.orders") as HTMLInputElement
     expect(target.value).toBe("northwind_orders")
 
-    fireEvent.change(screen.getByLabelText("Schedule"), { target: { value: "0 2 * * *" } })
+    chooseOption(screen.getByLabelText("Schedule"), "Every day at 02:00 UTC")
     // A saved schedule applies on its own, with no orchestrator reload.
     expect(screen.getByText("Runs on this schedule within a minute of saving.")).toBeDefined()
     // Unsaved changes block a run.
@@ -240,14 +242,16 @@ describe("ConnectorIngestPanel", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
 
-    const mode = screen.getByLabelText("Load mode for public.orders") as HTMLSelectElement
-    expect(mode.value).toBe("replace")
-    fireEvent.change(mode, { target: { value: "incremental" } })
+    const mode = screen.getByLabelText("Load mode for public.orders")
+    // WEB-9 D5: the trigger shows the mode's label, where the select held its value.
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Replace all rows")
+    chooseOption(mode, "Add only new rows")
     // No column yet: the reason is shown and the save is off.
     expect(screen.getByText(/Pick the column that marks new rows/)).toBeDefined()
     const save = screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
     expect(save.disabled).toBe(true)
 
+    // The source cannot list this table's columns here, so the cursor is typed.
     fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "order_id" } })
     expect(screen.getByText(/later runs add rows whose order_id is higher/)).toBeDefined()
     expect(save.disabled).toBe(false)
@@ -266,15 +270,17 @@ describe("ConnectorIngestPanel", () => {
   it("shows a table saved without a mode as replace, and offers incremental to SQL only", async () => {
     stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
     const sql = render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-    const mode = (await screen.findByLabelText("Load mode for public.orders")) as HTMLSelectElement
-    expect(mode.value).toBe("replace")
-    expect([...mode.options].map((o) => o.value)).toEqual([
-      "replace",
-      "incremental",
-      "append",
-      "replace_dedup",
-      "incremental_dedup",
-      "history",
+    const mode = await screen.findByLabelText("Load mode for public.orders")
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Replace all rows")
+    // WEB-9 D5: the modes are read from the opened list, by the words a person reads.
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add only new rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Add only new rows, one per key",
+      "Keep history",
     ])
     expect((screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement).disabled).toBe(true)
     sql.unmount()
@@ -286,8 +292,14 @@ describe("ConnectorIngestPanel", () => {
       sourceObjects: [{ name: "orders", target: "api_orders" }],
     })
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
-    const restMode = (await screen.findByLabelText("Load mode for orders")) as HTMLSelectElement
-    expect([...restMode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "history"])
+    const restMode = await screen.findByLabelText("Load mode for orders")
+    fireEvent.click(restMode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Keep history",
+    ])
   })
 
   it("does not save a Bronze name that is not an identifier", async () => {
@@ -360,7 +372,7 @@ describe("ConnectorIngestPanel layout", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Find tables" }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
     expect((screen.getByLabelText("Bronze table for public.orders") as HTMLInputElement).value).toBe("northwind_orders")
-    fireEvent.change(screen.getByLabelText("Schedule"), { target: { value: "0 2 * * *" } })
+    chooseOption(screen.getByLabelText("Schedule"), "Every day at 02:00 UTC")
     fireEvent.click(screen.getByRole("button", { name: "Save tables and schedule" }))
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
     expect((calls.find((c) => c.method === "PUT")?.body as { scheduleCron: string }).scheduleCron).toBe("0 2 * * *")
@@ -377,7 +389,9 @@ describe("ConnectorIngestPanel layout", () => {
 
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     expect((await screen.findByLabelText("Bronze table for public.orders")).className).not.toContain("max-w-")
-    expect(screen.getByLabelText("Schedule").className).not.toContain("max-w-")
+    // WEB-9 D3: the trigger always carries the design system's `max-w-full`, so
+    // the page's own cap is the one to look for (absent here).
+    expect(screen.getByLabelText("Schedule").className).not.toContain("max-w-xs")
   })
 
   /**
@@ -509,13 +523,14 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     sourceObjects: [{ name: "public.orders", target: "northwind_orders", ...extra }],
   })
   const saveButton = () => screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
-  const modeOf = async (name: string) => (await screen.findByLabelText(`Load mode for ${name}`)) as HTMLSelectElement
+  const modeOf = async (name: string) => await screen.findByLabelText(`Load mode for ${name}`)
 
   it("offers six modes to a SQL source, labelled in plain words", async () => {
     stubFetch(saved())
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
-    expect([...mode.options].map((o) => o.textContent)).toEqual([
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
       "Replace all rows",
       "Add only new rows",
       "Add all rows again",
@@ -536,7 +551,13 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     })
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
     const mode = await modeOf("orders")
-    expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "history"])
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Keep history",
+    ])
     expect(screen.getByText(/Adding only new rows, with or without one row per key, is offered for SQL sources and business apps only/)).toBeDefined()
   })
 
@@ -549,7 +570,14 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     })
     render(<ConnectorIngestPanel connectorId="conn-saas" connectorName="acme" />)
     const mode = await modeOf("tickets")
-    expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "incremental_dedup", "history"])
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Replace all rows",
+      "Add all rows again",
+      "Replace all rows, one per key",
+      "Add only new rows, one per key",
+      "Keep history",
+    ])
     expect(screen.queryByText(/offered for SQL sources and business apps only/)).toBeNull()
   })
 
@@ -564,8 +592,16 @@ describe("ConnectorIngestPanel load modes and keys", () => {
       incremental: /keep the rows already there/,
       incremental_dedup: /merge .* into the rows already there/,
     }
+    // WEB-9 D5: each mode is chosen by the label the trigger shows for it.
+    const labels: Record<string, string> = {
+      replace: "Replace all rows",
+      append: "Add all rows again",
+      replace_dedup: "Replace all rows, one per key",
+      incremental: "Add only new rows",
+      incremental_dedup: "Add only new rows, one per key",
+    }
     for (const [value, hint] of Object.entries(hints)) {
-      fireEvent.change(mode, { target: { value } })
+      chooseOption(mode, labels[value])
       if (value.startsWith("incremental")) {
         fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "order_id" } })
       }
@@ -581,16 +617,17 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
 
-    fireEvent.change(mode, { target: { value: "replace_dedup" } })
+    chooseOption(mode, "Replace all rows, one per key")
     expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
     expect(saveButton().disabled).toBe(true)
     fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id" } })
     expect(screen.queryByText(/cannot be saved without a key/)).toBeNull()
     expect(saveButton().disabled).toBe(false)
 
-    fireEvent.change(mode, { target: { value: "incremental_dedup" } })
+    chooseOption(mode, "Add only new rows, one per key")
     expect(screen.getByText(/Pick the column that marks new rows/)).toBeDefined()
     expect(saveButton().disabled).toBe(true)
+    // No column list from this source, so the cursor is typed.
     fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "updated_at" } })
     expect(saveButton().disabled).toBe(false)
 
@@ -605,7 +642,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
     fireEvent.change(await screen.findByLabelText("Add by name"), { target: { value: "orders" } })
     fireEvent.click(screen.getByRole("button", { name: "Add" }))
-    fireEvent.change(await modeOf("orders"), { target: { value: "replace_dedup" } })
+    chooseOption(await modeOf("orders"), "Replace all rows, one per key")
     fireEvent.change(screen.getByLabelText("Key columns for orders"), { target: { value: "id, region" } })
     fireEvent.click(saveButton())
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
@@ -632,8 +669,8 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "incremental_dedup" } })
-    fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "updated_at" } })
+    chooseOption(await modeOf("public.orders"), "Add only new rows, one per key")
+    chooseOption(screen.getByLabelText("New-row column for public.orders"), "updated_at")
 
     const ticked = (name: string) =>
       (screen.getByLabelText(`${name} is part of the key of public.orders`) as HTMLInputElement).checked
@@ -661,7 +698,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.customers/))
-    fireEvent.change(await modeOf("public.customers"), { target: { value: "replace_dedup" } })
+    chooseOption(await modeOf("public.customers"), "Replace all rows, one per key")
     // Declares no key: nothing is ticked, and Save says why it is off.
     expect((screen.getByLabelText("customer_id is part of the key of public.customers") as HTMLInputElement).checked).toBe(false)
     expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
@@ -672,9 +709,37 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     stubFetch(saved({ loadMode: "replace_dedup", primaryKey: ["id"] }))
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
-    expect(mode.value).toBe("replace_dedup")
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Replace all rows, one per key")
     expect((screen.getByLabelText("Key columns for public.orders") as HTMLInputElement).value).toBe("id")
     expect(saveButton().disabled).toBe(true)
+  })
+
+  // UX-1-R6: aria-required is unsupported on a native fieldset's implicit
+  // group role. The star belongs on a visible legend with linked instructions,
+  // and no individual checkbox should claim to be required.
+  // UX-1-R6: the star belongs on a visible group label, not on the fieldset
+  // role or any individual checkbox. The current form renders a wrapping row
+  // with a labelled span and a fieldset with aria-label.
+  it("uses a visible legend for the key group instead of aria-required on the fieldset", async () => {
+    stubFetch(SPEC, undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
+    fireEvent.click(await screen.findByLabelText(/public\.orders/))
+    chooseOption(await modeOf("public.orders"), "Replace all rows, one per key")
+
+    const checkbox = screen.getByLabelText("order_id is part of the key of public.orders")
+    const fieldset = checkbox.closest("fieldset") as HTMLFieldSetElement
+    expect(fieldset).not.toBeNull()
+    expect(fieldset.hasAttribute("aria-required")).toBe(false)
+    expect(fieldset.getAttribute("aria-label")).toContain("Key columns")
+    expect(checkbox.hasAttribute("aria-required")).toBe(false)
+
+    const keyLabel = Array.from(document.querySelectorAll("span")).find((s) =>
+      s.textContent?.trim().startsWith("Key")
+    )
+    expect(keyLabel).not.toBeNull()
+    expect(keyLabel?.querySelector('span[aria-hidden="true"][class*="before:content-"]')).not.toBeNull()
+    expect(document.querySelector('p[id$="-help"]')?.textContent).toContain("at least one")
   })
 })
 
@@ -688,13 +753,13 @@ describe("ConnectorIngestPanel history mode", () => {
     sourceObjects: [{ name: "public.orders", target: "northwind_orders", ...extra }],
   })
   const saveButton = () => screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
-  const modeOf = async (name: string) => (await screen.findByLabelText(`Load mode for ${name}`)) as HTMLSelectElement
+  const modeOf = async (name: string) => await screen.findByLabelText(`Load mode for ${name}`)
   const BOUNDARY = "After saving, use Refresh, removing rows on this table: its rows must be rebuilt for the new mode."
 
   it("says in one line what is kept and that each run reads the whole table", async () => {
     stubFetch(saved())
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id" } })
     expect(
       screen.getByText(
@@ -706,7 +771,7 @@ describe("ConnectorIngestPanel history mode", () => {
   it("asks for a key like the deduplicating modes, and shows no cursor field", async () => {
     stubFetch(saved())
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     expect(screen.getByText(/cannot be saved without a key/)).toBeDefined()
     expect(saveButton().disabled).toBe(true)
     expect(screen.queryByLabelText("New-row column for public.orders")).toBeNull()
@@ -718,7 +783,7 @@ describe("ConnectorIngestPanel history mode", () => {
   it("saves the key and no cursor, even if the table had a cursor before", async () => {
     const calls = stubFetch(saved({ loadMode: "incremental", incrementalKey: "updated_at" }))
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     fireEvent.change(screen.getByLabelText("Key columns for public.orders"), { target: { value: "order_id, region" } })
     fireEvent.click(saveButton())
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
@@ -740,7 +805,7 @@ describe("ConnectorIngestPanel history mode", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     expect((screen.getByLabelText("order_id is part of the key of public.orders") as HTMLInputElement).checked).toBe(true)
     expect(saveButton().disabled).toBe(false)
   })
@@ -750,11 +815,11 @@ describe("ConnectorIngestPanel history mode", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
-    fireEvent.change(mode, { target: { value: "append" } })
+    chooseOption(mode, "Add all rows again")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
-    fireEvent.change(mode, { target: { value: "history" } })
+    chooseOption(mode, "Keep history")
     expect(screen.getByText(BOUNDARY)).toBeDefined()
-    fireEvent.change(mode, { target: { value: "replace" } })
+    chooseOption(mode, "Replace all rows")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
   })
 
@@ -762,9 +827,9 @@ describe("ConnectorIngestPanel history mode", () => {
     stubFetch(saved({ loadMode: "history", primaryKey: ["id"] }))
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     const mode = await modeOf("public.orders")
-    expect(mode.value).toBe("history")
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Keep history")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
-    fireEvent.change(mode, { target: { value: "replace_dedup" } })
+    chooseOption(mode, "Replace all rows, one per key")
     expect(screen.getByText(BOUNDARY)).toBeDefined()
   })
 
@@ -775,7 +840,7 @@ describe("ConnectorIngestPanel history mode", () => {
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
-    fireEvent.change(await modeOf("public.orders"), { target: { value: "history" } })
+    chooseOption(await modeOf("public.orders"), "Keep history")
     expect(screen.queryByText(BOUNDARY)).toBeNull()
   })
 
@@ -957,9 +1022,10 @@ describe("ConnectorIngestPanel refresh and clear", () => {
       sourceObjects: [{ name: "public.orders", target: "northwind_orders", loadMode: "incremental_dedup", primaryKey: ["id"] }],
     })
     render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
-    const mode = (await screen.findByLabelText("Load mode for public.orders")) as HTMLSelectElement
-    expect([...mode.options].map((o) => o.text)).toEqual(["Current row per key", "Keep history"])
-    expect(mode.value).toBe("incremental_dedup")
+    const mode = await screen.findByLabelText("Load mode for public.orders")
+    fireEvent.click(mode)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["Current row per key", "Keep history"])
+    expect(mode.querySelector('[data-slot="select-value"]')?.textContent).toBe("Current row per key")
     expect(screen.queryByLabelText("New-row column for public.orders")).toBeNull()
     expect(screen.getByText(/The table holds the current row of each key/)).toBeDefined()
   })
@@ -1037,6 +1103,17 @@ describe("ConnectorIngestPanel runs from the run record", () => {
     expect(screen.getByText("The connector was paused, so nothing was loaded.")).toBeDefined()
   })
 
+  // SRC-39 (QA TC-1702): a run the time limit stopped says so, in plain words.
+  it("says a run that outlived its limit was stopped", async () => {
+    stubFetch(SPEC, {
+      runs: [record({ runId: "run-timed-0001", status: "failed", endReason: "timed_out" })],
+    })
+    panel()
+    expect(
+      await screen.findByText("The run did not finish within the time limit and was stopped."),
+    ).toBeDefined()
+  })
+
   it("says there are no runs yet when the record is empty", async () => {
     stubFetch(SPEC)
     panel()
@@ -1052,6 +1129,20 @@ describe("ConnectorIngestPanel runs from the run record", () => {
     expect(screen.getByText("This run never reported its end. It may have been stopped before it finished.")).toBeDefined()
     expect(screen.queryByText(/is running/)).toBeNull()
     await waitFor(() => expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(false))
+  })
+
+  // SRC-39 (review round 1, R8): the limit is the API's setting, not a copy of six hours here. A
+  // raised limit must keep the page and the API in step, or "Run now" is offered for a run the API
+  // still refuses (that is QA TC-1702 itself).
+  it("keeps a run going for the limit the API sends, not for six hours", async () => {
+    stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] }, {
+      maxRuntimeSeconds: 12 * 60 * 60,
+      runs: [record({ runId: "run-long-0001", status: "running", startedAt: new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString(), endedAt: null, durationSeconds: null, endReason: null })],
+    })
+    panel()
+    expect(await screen.findByText(/Run run-long is running/)).toBeDefined()
+    expect(screen.queryByText("No end reported")).toBeNull()
+    await waitFor(() => expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(true))
   })
 
   it("shows a run recorded as running a moment ago as active, with Run now disabled", async () => {
@@ -1167,6 +1258,101 @@ describe("ConnectorIngestPanel run log", () => {
   })
 })
 
+describe("ConnectorIngestPanel run log follows its run (SRC-46, QA LH-SRC-6-43)", () => {
+  const ID = "run-live-00001"
+  const attempt = (n: number, result: string) => ({
+    table: "orders",
+    attempt: n,
+    startedAt: "2026-11-19T08:00:01.000Z",
+    endedAt: "2026-11-19T08:00:02.000Z",
+    rowsLoaded: 0,
+    result,
+    errorClass: result === "succeeded" ? null : "timeout",
+    waitSeconds: null,
+  })
+  const running = () =>
+    record({ runId: ID, status: "running", attempts: 3, startedAt: new Date().toISOString(), endedAt: null, durationSeconds: null, endReason: null })
+  const panel = () =>
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+  const logCalls = (calls: Call[]) => calls.filter((c) => c.url.endsWith(`/runs/${ID}/log`)).length
+  const runListCalls = (calls: Call[]) => calls.filter((c) => c.url.endsWith("/runs")).length
+
+  it("reads an open log again when the run's next poll says it failed with a fourth attempt", async () => {
+    const history: { runs: unknown[]; logs: Record<string, unknown> } = {
+      runs: [running()],
+      logs: { [ID]: { run: running(), attempts: [1, 2, 3].map((n) => attempt(n, "failed")), lines: [] } },
+    }
+    const calls = stubFetch(SPEC, history)
+    panel()
+    fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+    await waitFor(() => expect(screen.getAllByText(/attempt \d/)).toHaveLength(3))
+    expect(logCalls(calls)).toBe(1)
+
+    const failed = record({ runId: ID, status: "failed", attempts: 4, endedAt: new Date().toISOString(), durationSeconds: 90, endReason: "table_failed" })
+    history.runs = [failed]
+    history.logs = {
+      [ID]: {
+        run: failed,
+        attempts: [1, 2, 3, 4].map((n) => attempt(n, "failed")),
+        lines: [{ at: "2026-11-19T08:27:33.000Z", event: "run_ended", table: null, attempt: null, text: "Run ended: a table failed" }],
+      },
+    }
+    await waitFor(() => expect(screen.getAllByText(/attempt \d/)).toHaveLength(4), { timeout: 6000 })
+    expect(screen.getByText("Run ended")).toBeDefined()
+    expect(logCalls(calls)).toBe(2)
+  }, 15000)
+
+  it("does not read the log again across polls while the run does not change", async () => {
+    const history = {
+      runs: [running()],
+      logs: { [ID]: { run: running(), attempts: [1, 2, 3].map((n) => attempt(n, "failed")), lines: [] } },
+    }
+    const calls = stubFetch(SPEC, history)
+    panel()
+    fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+    await waitFor(() => expect(screen.getAllByText(/attempt \d/)).toHaveLength(3))
+    const listed = runListCalls(calls)
+    // Two polls of the run list pass; the run is the same, so the log is not asked for again.
+    await waitFor(() => expect(runListCalls(calls)).toBeGreaterThanOrEqual(listed + 2), { timeout: 8000 })
+    expect(logCalls(calls)).toBe(1)
+  }, 15000)
+})
+
+describe("ConnectorIngestPanel onRunEnded (SRC-46, QA LH-SRC-6-43)", () => {
+  const ID = "run-live-00001"
+  const running = () =>
+    record({ runId: ID, status: "running", attempts: 3, startedAt: new Date().toISOString(), endedAt: null, durationSeconds: null, endReason: null })
+  const failed = () => record({ runId: ID, status: "failed", attempts: 4, endedAt: new Date().toISOString(), durationSeconds: 90, endReason: "table_failed" })
+
+  it("tells the page once, with the run as the list returned it, when a run it watched has failed", async () => {
+    const history: { runs: unknown[] } = { runs: [running()] }
+    stubFetch(SPEC, history)
+    const onRunEnded = mock((_run: { runId: string; status: string }) => {})
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" onRunEnded={onRunEnded} />)
+    await screen.findByText(/Run run-live is running/)
+    expect(onRunEnded).not.toHaveBeenCalled()
+
+    history.runs = [failed()]
+    await waitFor(() => expect(onRunEnded).toHaveBeenCalledTimes(1), { timeout: 6000 })
+    expect(onRunEnded.mock.calls[0]![0].runId).toBe(ID)
+    expect(onRunEnded.mock.calls[0]![0].status).toBe("failed")
+    // A later poll or render does not call it again.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 200))
+    })
+    expect(onRunEnded).toHaveBeenCalledTimes(1)
+  }, 15000)
+
+  it("does not throw when the panel has no handler and a run ends", async () => {
+    const history: { runs: unknown[] } = { runs: [running()] }
+    stubFetch(SPEC, history)
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText(/Run run-live is running/)
+    history.runs = [failed()]
+    await waitFor(() => expect(screen.getByText("Failed")).toBeDefined(), { timeout: 6000 })
+  }, 15000)
+})
+
 describe("ConnectorIngestPanel resume", () => {
   const AUTO = "Paused after 30 failed runs in a row"
   const panel = (props: Partial<React.ComponentProps<typeof ConnectorIngestPanel>> = {}) =>
@@ -1252,7 +1438,9 @@ describe("ConnectorIngestPanel column choice", () => {
 
   async function openColumns() {
     fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
-    await screen.findByText("1 tables found")
+    // QA LH-SRC-6-50 (SRC-41 D18): a count of one is singular; the line used
+    // to read "1 tables found".
+    await screen.findByText("1 table found")
     fireEvent.click(await screen.findByText(/^Columns/, { selector: "summary" }))
     // The columns are read through the preview route when the section opens (SRC-13), so they arrive after the click.
     await screen.findAllByLabelText(/^Load column /)
@@ -1304,6 +1492,89 @@ describe("ConnectorIngestPanel column choice", () => {
     expect(screen.getByText("Key column: it identifies a row of this table.")).toBeDefined()
     expect(screen.getByText("Cursor column: it marks which rows are new.")).toBeDefined()
     expect(box("region").disabled).toBe(false)
+  })
+
+  // WEB-13: a source column name is arbitrary data. happy-dom computes no
+  // geometry, so the wrapping is asserted as structure; the measured fit is a
+  // manual-QA item (see the plan).
+  it("keeps a long loaded-column name whole, wraps it, and saves the exact exclusion", async () => {
+    const LONG_COLUMN = "source_generated_extremely_long_column_name_" + "segment_".repeat(6) + "final"
+    const found = [
+      {
+        name: "public.orders",
+        columns: [
+          { name: LONG_COLUMN, typeName: "text" },
+          { name: "id", typeName: "integer" },
+        ],
+        primaryKey: [],
+      },
+    ]
+    const calls = stubFetch(saved(), undefined, { discovered: found })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+
+    const input = screen.getByLabelText(`Load column ${LONG_COLUMN} of public.orders`) as HTMLInputElement
+    const label = input.closest("label") as HTMLElement
+    const text = within(label).getByText(LONG_COLUMN)
+    expect(text.textContent).toBe(LONG_COLUMN)
+    expect(text.className).toContain("break-all")
+    expect(label.className).toContain("min-w-0")
+    expect(input.className).toContain("shrink-0")
+
+    fireEvent.click(input)
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      { name: "public.orders", target: "northwind_orders", loadMode: "replace", excludedColumns: [LONG_COLUMN] },
+    ])
+  })
+
+  it("keeps a long key column name whole and selectable, with its locked reason", async () => {
+    const LONG_KEY = "dedup_key_extremely_long_column_name_" + "segment_".repeat(6) + "final"
+    const found = [
+      {
+        name: "public.orders",
+        columns: [
+          { name: LONG_KEY, typeName: "text" },
+          { name: "id", typeName: "integer" },
+        ],
+        primaryKey: [LONG_KEY, "id"],
+      },
+    ]
+    const calls = stubFetch(
+      saved({ loadMode: "replace_dedup", primaryKey: [LONG_KEY, "id"] }),
+      undefined,
+      { discovered: found }
+    )
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await openColumns()
+
+    // The locked-column reason is still there for the long key column.
+    const loadedBox = box(LONG_KEY)
+    expect(loadedBox.disabled).toBe(true)
+    expect(
+      within(loadedBox.closest("label") as HTMLElement).getByText(
+        "Key column: it identifies a row of this table."
+      )
+    ).toBeTruthy()
+
+    // The key choice shows the full name and toggles to the exact value.
+    const keyInput = screen.getByLabelText(`${LONG_KEY} is part of the key of public.orders`) as HTMLInputElement
+    const keyLabel = keyInput.closest("label") as HTMLElement
+    const keyText = within(keyLabel).getByText(LONG_KEY)
+    expect(keyText.className).toContain("break-all")
+    expect(keyLabel.className).toContain("min-w-0")
+    expect(keyInput.className).toContain("shrink-0")
+    expect(keyInput.checked).toBe(true)
+    fireEvent.click(keyInput)
+    expect(keyInput.checked).toBe(false)
+
+    fireEvent.click(saveButton())
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const savedBody = (calls.find((c) => c.method === "PUT")?.body as {
+      sourceObjects: { primaryKey: string[] }[]
+    }).sourceObjects[0]
+    expect(savedBody.primaryKey).toEqual(["id"])
   })
 
   it("never sends a key or cursor column as excluded, even if it was unticked before the mode needed it", async () => {
@@ -1467,7 +1738,7 @@ describe("ConnectorIngestPanel table discovery", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Find tables" }))
     fireEvent.click(await screen.findByLabelText(/public\.orders/))
     await waitFor(() => expect(calls.filter((c) => c.url.endsWith("/discovery/preview")).length).toBe(1))
-    fireEvent.change(await screen.findByLabelText("Load mode for public.orders"), { target: { value: "history" } })
+    chooseOption(await screen.findByLabelText("Load mode for public.orders"), "Keep history")
     await screen.findByLabelText("order_id is part of the key of public.orders")
     expect(calls.filter((c) => c.url.endsWith("/discovery/preview")).length).toBe(1)
   })
@@ -1520,5 +1791,39 @@ describe("ConnectorIngestPanel table discovery", () => {
     expect(await screen.findByLabelText("Add by name")).toBeDefined()
     expect(screen.getByText("This connector type cannot list its objects, so type each one as the source names it.")).toBeDefined()
     expect(screen.queryByRole("button", { name: /^Find / })).toBeNull()
+  })
+})
+
+// QA LH-SRC-6-16 (SRC-41 D17): a run's status is closed by the orchestrator's
+// run-status sensor, which can report minutes after the last table's rows are
+// counted. The card says so once an attempt has ended; nothing is retimed.
+describe("the Runs card says the status follows the orchestrator's report (LH-SRC-6-16)", () => {
+  const SENTENCE = /The status changes when the orchestrator reports the end of the run/
+  const live = (attempts: number, status = "running") =>
+    record({
+      runId: "run-live-0001",
+      status,
+      startedAt: new Date().toISOString(),
+      endedAt: status === "running" ? null : new Date().toISOString(),
+      attempts,
+    })
+
+  it("says the status follows the orchestrator's report once an attempt has ended", async () => {
+    stubFetch(SPEC, { runs: [live(1)] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText(/Run run-live is running/)
+    expect(screen.getByText(SENTENCE)).toBeDefined()
+
+    cleanup()
+    stubFetch(SPEC, { runs: [live(0)] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText(/Run run-live is running/)
+    expect(screen.queryByText(SENTENCE)).toBeNull()
+
+    cleanup()
+    stubFetch(SPEC, { runs: [live(1, "succeeded")] })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" layout="page" />)
+    await screen.findByText("Succeeded")
+    expect(screen.queryByText(SENTENCE)).toBeNull()
   })
 })

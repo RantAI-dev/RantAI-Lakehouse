@@ -5,7 +5,7 @@ import { UploadCloudIcon, XIcon } from "lucide-react"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { formatBytes } from "@/lib/format"
 import type { QueueFile } from "@/lib/upload-queue"
-import { MAX_FILES } from "@/lib/uploads"
+import { ACCEPTED_FILES, MAX_FILES } from "@/lib/uploads"
 import { cn } from "@/lib/utils"
 import type { Upload } from "@/services/contracts/uploads"
 import { FileMark } from "./upload-parts"
@@ -18,7 +18,7 @@ const ACCEPT =
 
 /** The limits as short facts. They repeat what the API and `fileProblem` enforce; the sheet fact repeats the Check step. */
 const FACTS: readonly { label: string; value: string }[] = [
-  { label: "Accepted", value: "CSV, TSV, JSON, JSON Lines, Avro, .xls, .xlsx, .parquet, .gz and .zip" },
+  { label: "Accepted", value: ACCEPTED_FILES },
   { label: "Files", value: `Up to ${MAX_FILES} at once, sent in pieces; they load into one table when their columns match, in any order` },
   { label: "Size", value: "Up to 2 GB in all; an Excel workbook up to 50 MB" },
   { label: "Not accepted", value: ".xlsm, .xlsb, .ods, .tar, .7z and other archives" },
@@ -214,12 +214,15 @@ export function FileStep({
           dragging ? "border-primary bg-primary/5" : "border-border bg-muted/20"
         )}
       >
+        {/* UX-4: the file picker is this box's one required input, so no
+            star and no legend; the input keeps `aria-required`. */}
         <input
           id={INPUT_ID}
           type="file"
           multiple
           accept={ACCEPT}
           className="sr-only"
+          aria-required
           onChange={(e) => {
             take(e.target.files)
             // The same file may be picked again after it was removed.

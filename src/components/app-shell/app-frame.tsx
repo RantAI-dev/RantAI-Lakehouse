@@ -5,7 +5,7 @@ import { usePathname } from "next/navigation";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/app-shell/app-sidebar";
 import { AppNavbar } from "@/components/app-shell/app-navbar";
-import { CopilotDock, dockHiddenOn } from "@/features/copilot/copilot-dock";
+import { CopilotDock } from "@/features/copilot/copilot-dock";
 import { cn } from "@/lib/utils";
 import { CopilotSidebar } from "@/features/copilot/copilot-sidebar";
 import { CopilotProvider } from "@/features/copilot/use-copilot";
@@ -14,6 +14,9 @@ import { isPublicPath, useAuth } from "@/features/auth/auth-provider";
 import { SsoNotice } from "@/features/auth/sso-notice";
 import { VersionBanner } from "@/features/version/version-banner";
 import { AppShellSkeleton } from "@/components/app-shell/app-shell-skeleton";
+
+import { RouteGuard } from "@/components/app-shell/route-guard";
+import { BrandingProvider } from "@/components/app-shell/branding-provider";
 
 /**
  * The app frame (sidebar + navbar + AI dock + command palette). For PUBLIC
@@ -35,15 +38,18 @@ export function AppFrame({ children }: Readonly<{ children: React.ReactNode }>) 
 
   return (
     <SidebarProvider>
-      <CopilotProvider>
-        <AuthenticatedFrame>{children}</AuthenticatedFrame>
-      </CopilotProvider>
+      {/* The workspace's name and pictures are read once for the whole
+          shell (`adm-121`); the branding route is public, so the request
+          needs no session and starts beside the session check. */}
+      <BrandingProvider>
+        <AuthenticatedShell>{children}</AuthenticatedShell>
+      </BrandingProvider>
     </SidebarProvider>
   );
 }
 
-function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }>) {
-  const { status } = useAuth();
+function AuthenticatedShell({ children }: Readonly<{ children: React.ReactNode }>) {
+  const { status, hasPermission } = useAuth();
   const pathname = usePathname();
 
   if (status !== "authenticated") {
@@ -55,23 +61,56 @@ function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }
     return <AppShellSkeleton pathname={pathname ?? "/"} />;
   }
 
+  const hasAssistant =
+    hasPermission("assistant:use") || hasPermission("assistant:ask");
+
+  if (hasAssistant) {
+    return (
+      <CopilotProvider>
+        <AuthenticatedFrame hasAssistant={true}>{children}</AuthenticatedFrame>
+      </CopilotProvider>
+    );
+  }
+
+  return <AuthenticatedFrame hasAssistant={false}>{children}</AuthenticatedFrame>;
+}
+
+function AuthenticatedFrame({
+  children,
+  hasAssistant,
+}: Readonly<{ children: React.ReactNode; hasAssistant: boolean }>) {
   return (
     <>
       <AppSidebar />
-      <SidebarInset className="min-w-0 bg-muted/25">
+      {/*
+        Owner QA 2026-11-14, composer (DESIGN.md §3, "Elemen melayang diletakkan di tengah area
+        konten"): two variables every page and the dock share.
+        - `--content-left`: where the content area starts, past the sidebar (none on a phone, the
+          icon rail when it is collapsed); the floating composer centres on what is right of it.
+        - `--content-bottom`: the room kept under the content. Owner QA 2026-11-14, composer
+          reserve: it follows the composer's actual visibility. While the composer shows, the dock
+          sets `--dock-reserve` (its height, its 16 px offset and a 14 px gap) and a page ends just
+          above it; when the dock hides itself (the Copilot side panel, a page without it) the
+          variable is gone and the room is the frame's usual 1.5rem.
+      */}
+      <SidebarInset
+        className={cn(
+          "min-w-0 bg-muted/25",
+          "md:[--content-left:var(--sidebar-width)] md:peer-data-[collapsible=icon]:[--content-left:var(--sidebar-width-icon)] md:peer-data-[collapsible=offcanvas]:[--content-left:0px]",
+          "[--content-bottom:var(--dock-reserve,1.5rem)]",
+        )}
+      >
         <AppNavbar />
         <div className="flex flex-1 min-h-0 min-w-0">
           {/* The Copilot dock is `fixed bottom-4`, so without this the
               last thing on every page sits underneath it. Pages used to
               add their own bottom spacing (or forget to). Where the dock
               is hidden the space is dropped: /copilot sizes itself to the
-              viewport, and the extra padding made the window scroll. */}
-          <main
-            className={cn(
-              "flex-1 min-w-0 p-4 sm:p-5 lg:p-6",
-              !dockHiddenOn(pathname) && "pb-24 sm:pb-24 lg:pb-28",
-            )}
-          >
+              viewport, and the extra padding made the window scroll.
+              Owner QA 2026-11-14, composer: the room is `--content-bottom`,
+              just the composer and a small gap (it was 7rem here plus a
+              5rem spacer from the dock, about 12rem of empty page). */}
+          <main className="flex-1 min-w-0 p-4 pb-(--content-bottom) transition-[padding-bottom] duration-200 ease-out motion-reduce:transition-none sm:p-5 sm:pb-(--content-bottom) lg:p-6 lg:pb-(--content-bottom)">
             {/* `SEC-39`: the SSO callback redirects into the console with
                 a notice code in the query when the sign-in succeeded with
                 a caveat (a group overage on Entra ID). Mounted once here
@@ -86,11 +125,11 @@ function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }
                 banner names both versions; it renders nothing when they
                 match. */}
             <VersionBanner />
-            {children}
+            <RouteGuard>{children}</RouteGuard>
           </main>
-          <CopilotSidebar />
+          {hasAssistant && <CopilotSidebar />}
         </div>
-        <CopilotDock />
+        {hasAssistant && <CopilotDock />}
       </SidebarInset>
       <CommandPalette />
     </>

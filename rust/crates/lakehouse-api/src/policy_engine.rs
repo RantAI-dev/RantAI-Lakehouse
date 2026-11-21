@@ -118,9 +118,26 @@ pub fn condition_names_role(conditions: Option<&str>, role: &str) -> bool {
     PolicyCondition::parse_opt(conditions).is_some_and(|cond| cond.roles.iter().any(|r| r == role))
 }
 
+/// The one sentence a table a caller may not read is refused with.
+///
+/// Defined here, in the module that refuses such a table (`GOV-7` D2), and
+/// reused by `SEC-20`'s tenant gate in `routes::query::table_not_available`:
+/// a table hidden from a role and a table outside the caller's tenant are
+/// refused with the SAME words and the same 404, so the refusal says nothing
+/// about which of the two it was.
+#[must_use]
+pub fn table_not_available_message(table: &str) -> String {
+    format!("Table not found or not available to your organisation: {table}")
+}
+
+/// The one sentence a statement that lists objects without naming one table
+/// is refused with (`SEC-20`, reused by `GOV-7` D5 for a narrowed principal
+/// whose sources cannot be resolved).
+pub const LISTING_NOT_AVAILABLE: &str = "This statement is not available to your organisation.";
+
 /// Errors resolving real obligations for a principal's query — never
 /// forwarded verbatim to an HTTP response (`AGENTS.md` rule 4); callers
-/// map every variant through [`engine_error_message`] instead.
+/// map every variant through [`enforcement_error_message`] instead.
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyEngineError {
     /// `sql` did not parse under the configured dialect at all — this
@@ -146,13 +163,15 @@ pub enum PolicyEngineError {
 #[must_use]
 pub fn engine_error_message(err: &PolicyEngineError) -> &'static str {
     match err {
-        PolicyEngineError::Unparseable => {
-            "kebijakan tidak dapat dievaluasi: query tidak dapat diproses"
+        // QS-11 (LH-QS-4-02), D6: a statement that does not parse is a syntax
+        // problem; no policy was in question, so no access-rule wording.
+        PolicyEngineError::Unparseable => crate::upstream_error::SYNTAX_SENTENCE,
+        PolicyEngineError::Store(_) => {
+            "Access rules could not be checked because of a database error."
         }
-        PolicyEngineError::Store(_) => "kebijakan tidak dapat dievaluasi: kesalahan basis data",
         PolicyEngineError::UnenforceableAuthoredCondition { .. } => {
-            "kebijakan tidak dapat dievaluasi: ada kebijakan aktif dengan kondisi yang tidak \
-             dapat ditegakkan"
+            "Access rules could not be checked because an active policy has a condition that \
+             cannot be enforced."
         }
     }
 }
@@ -164,42 +183,42 @@ pub fn engine_error_message(err: &PolicyEngineError) -> &'static str {
 #[must_use]
 pub fn refusal_message(err: &sql_rewrite::RewriteError) -> &'static str {
     match err {
-        sql_rewrite::RewriteError::Unparseable => {
-            "Query tidak dapat diproses oleh mesin kebijakan (sintaks tidak dikenali)."
-        }
+        // QS-11 (LH-QS-4-02), D6: same reason as `PolicyEngineError::Unparseable`
+        // — the statement's syntax, not the policy engine, is the problem.
+        sql_rewrite::RewriteError::Unparseable => crate::upstream_error::SYNTAX_SENTENCE,
         sql_rewrite::RewriteError::UnprovableSubstitution { .. } => {
-            "Query menyentuh tabel yang diatur kebijakan melalui konstruksi yang tidak didukung \
-             (mis. table function, ARRAY JOIN)."
+            "The query reads a policy-governed table through a construct the policy engine does \
+             not support, such as a table function or ARRAY JOIN."
         }
         sql_rewrite::RewriteError::InvalidRowFilter { .. } => {
-            "Filter baris yang diautorisasi untuk tabel ini tidak valid; hubungi admin \
-             kebijakan."
+            "The row filter authorized for this table is not valid. Ask a policy administrator."
         }
         sql_rewrite::RewriteError::TableFunctionDenied { .. } => {
-            "Table function tidak diizinkan pada query yang diatur kebijakan."
+            "Table functions are not allowed in a query that policies govern."
         }
         sql_rewrite::RewriteError::SensitiveSystemTable { .. } => {
-            "Tabel sistem ini tidak bisa dibaca dari sini; gunakan halaman Audit."
+            "This system table cannot be read from here. Use the Audit page."
         }
         sql_rewrite::RewriteError::DictOrJoinFunctionDenied { .. } => {
-            "Fungsi dictGet/joinGet tidak diizinkan untuk principal dengan kebijakan aktif — \
-             sumber dictionary/join table tidak dapat diverifikasi."
+            "dictGet and joinGet are not allowed while a policy applies to you, because their \
+             source table cannot be checked."
         }
         sql_rewrite::RewriteError::ViewOverGovernedTable { .. } => {
-            "Query membaca view yang menyingkap tabel yang diatur kebijakan; tidak didukung."
+            "The query reads a view over a policy-governed table, which is not supported."
         }
         sql_rewrite::RewriteError::InvalidPastVersion => {
-            "Versi lampau dipilih dengan id versinya, bukan dengan timestamp."
+            "Pick a past version by its version id, not by a timestamp."
         }
     }
 }
 
 /// Either failure source [`rewrite_sql_for_roles`] can hit: resolving
 /// obligations (a Store failure, or Hard Requirement 1's unenforceable
-/// authored condition) or rewriting `sql` once obligations are known (a
+/// authored condition), rewriting `sql` once obligations are known (a
 /// table function, sensitive `system.*` read, `dictGet`/`joinGet` call, a
-/// view over a governed table, or an unparseable/unprovable statement).
-/// Never forwarded verbatim to an HTTP response — see
+/// view over a governed table, or an unparseable/unprovable statement), or a
+/// table the principal's roles do not include (`GOV-7` D2/D5). Never
+/// forwarded verbatim to an HTTP response — see
 /// [`enforcement_error_message`].
 #[derive(Debug, thiserror::Error)]
 pub enum EnforcementError {
@@ -209,16 +228,72 @@ pub enum EnforcementError {
     /// See [`sql_rewrite::RewriteError`].
     #[error(transparent)]
     Rewrite(#[from] sql_rewrite::RewriteError),
+    /// A table the statement reads is not one the principal's roles include
+    /// (`GOV-7` D2). Carries the canonical `"schema.table"` name, which is
+    /// the caller's own SQL text, never an upstream error's.
+    #[error("table `{0}` is not readable by this principal")]
+    TableNotReadable(String),
+    /// A narrowed principal's statement names sources that cannot be
+    /// resolved to concrete `schema.table` names — it lists objects rather
+    /// than naming a table (`GOV-7` D5). It is refused rather than passed,
+    /// because no per-table answer exists to check.
+    #[error("the statement names no resolvable table")]
+    Unresolvable,
 }
 
 /// [`engine_error_message`]/[`refusal_message`], dispatched over
-/// [`EnforcementError`]'s two variants — the one non-leaking message
-/// function every [`rewrite_sql_for_roles`] caller uses.
+/// [`EnforcementError`]'s variants — the one non-leaking message function
+/// every [`rewrite_sql_for_roles`] caller uses.
+///
+/// A table the principal may not read answers with [`table_not_available_message`]
+/// and a listing with [`LISTING_NOT_AVAILABLE`], the sentences `SEC-20`'s
+/// tenant gate already uses (`GOV-7` D2): same text, and `routes::support::enforcement_refusal`
+/// gives them the same status.
 #[must_use]
-pub fn enforcement_error_message(err: &EnforcementError) -> &'static str {
+pub fn enforcement_error_message(err: &EnforcementError) -> String {
     match err {
-        EnforcementError::Engine(e) => engine_error_message(e),
-        EnforcementError::Rewrite(e) => refusal_message(e),
+        EnforcementError::Engine(e) => engine_error_message(e).to_owned(),
+        EnforcementError::Rewrite(e) => refusal_message(e).to_owned(),
+        EnforcementError::TableNotReadable(table) => table_not_available_message(table),
+        EnforcementError::Unresolvable => LISTING_NOT_AVAILABLE.to_owned(),
+    }
+}
+
+/// A statement a narrowed principal may not read, as [`hidden_read`] finds it
+/// (`GOV-7` D5, `BI-51` plan D19): one table its roles do not include, or a
+/// statement that lists objects and so names no table to answer for.
+enum HiddenRead {
+    /// `schema.table`, named by the statement, that the roles do not read.
+    Table(String),
+    /// The statement lists objects (`SHOW TABLES` and the like).
+    Listing,
+}
+
+/// Which part of a narrowed principal's access a statement runs into, or
+/// `None` for a statement every table of which its roles read.
+///
+/// A narrowed principal reads only what its roles name. `gate_targets` is the
+/// tenant gate's own resolver (one parse, one collector, rule 4): the tables
+/// the statement names, or the fact that it lists objects without naming one.
+/// A listing, and a statement whose sources cannot be resolved to concrete
+/// `schema.table` names, are refused rather than passed — no per-table answer
+/// exists (D5). An unparseable statement is left to the rewrite's own
+/// `Unparseable`.
+fn hidden_read<D: Dialect>(
+    sql: &str,
+    dialect: &D,
+    access: &crate::table_access::TableAccess,
+) -> Option<HiddenRead> {
+    if access.is_all() {
+        return None;
+    }
+    match sql_rewrite::gate_targets(sql, dialect) {
+        Some(sql_rewrite::GateTargets::Tables(named)) => named
+            .into_iter()
+            .find(|table| !access.allows_key(table))
+            .map(HiddenRead::Table),
+        Some(sql_rewrite::GateTargets::ListsObjects) => Some(HiddenRead::Listing),
+        None => None,
     }
 }
 
@@ -227,6 +302,7 @@ pub fn enforcement_error_message(err: &EnforcementError) -> &'static str {
 /// D2) all go through — never a parallel, simplified masking primitive
 /// (WS7 plan Hard Requirement 1's "apply the same engine", read
 /// literally). Resolves every table `sql` references under `dialect`,
+/// refuses a table the principal's roles do not include (`GOV-7` D5),
 /// prefetches real obligations for `roles` from `obligations_source`,
 /// then rewrites through [`sql_rewrite::enforce`].
 ///
@@ -249,9 +325,90 @@ pub fn enforcement_error_message(err: &EnforcementError) -> &'static str {
 /// the argument existed.
 ///
 /// # Errors
-/// [`EnforcementError::Engine`] if obligations cannot be resolved;
+/// [`EnforcementError::Engine`] if obligations or the principal's table
+/// access cannot be resolved; [`EnforcementError::TableNotReadable`] if the
+/// statement reads a table the principal's roles do not include;
+/// [`EnforcementError::Unresolvable`] if a narrowed principal's statement
+/// names sources that cannot be resolved to tables; and
 /// [`EnforcementError::Rewrite`] if `sql` fails classification or
 /// substitution once obligations are known.
+/// QS-10 (LH-QS-2-05), D4: the obligations a rewrite can report, in the
+/// order the console lists them. No table or column name is included — the
+/// result already shows the masked values, and `BI-51` does not name masked
+/// columns.
+pub const OBLIGATION_COLUMN_MASKS: &str = "Column masks";
+/// QS-10 (LH-QS-2-05), D4: the second reportable obligation, listed after
+/// [`OBLIGATION_COLUMN_MASKS`].
+pub const OBLIGATION_ROW_FILTERS: &str = "Row filters";
+
+/// A rewrite's output alongside the obligations it applied (QS-10, D4).
+pub struct RoleRewrite {
+    /// The statement the engine runs, rewritten for the caller's roles.
+    pub sql: String,
+    /// The obligations the rewrite applied, in report order, each at most
+    /// once.
+    pub obligations: Vec<&'static str>,
+}
+
+/// The shared rewrite, also reporting which obligations it applied.
+///
+/// # Errors
+/// [`EnforcementError::Engine`] if obligations or the principal's table
+/// access cannot be resolved; [`EnforcementError::TableNotReadable`] if the
+/// statement reads a table the principal's roles do not include;
+/// [`EnforcementError::Unresolvable`] if a narrowed principal's statement
+/// names sources that cannot be resolved to tables; and
+/// [`EnforcementError::Rewrite`] if `sql` fails classification or
+/// substitution once obligations are known.
+pub async fn rewrite_sql_for_roles_reporting<D: Dialect + Sync>(
+    sql: &str,
+    dialect: &D,
+    engine: sql_rewrite::Engine,
+    roles: &[String],
+    placeholders: &sql_rewrite::PlaceholderValues,
+    obligations_source: &PolicyEngineObligations<'_>,
+) -> Result<RoleRewrite, EnforcementError> {
+    let tables =
+        sql_rewrite::referenced_tables(sql, dialect).ok_or(PolicyEngineError::Unparseable)?;
+    // GOV-7 D5: what the principal may read at all is settled BEFORE any
+    // obligation is prefetched, so a hidden table never reaches the mask
+    // path (which would answer "no policy", not "hidden").
+    let access = obligations_source.table_access(roles).await?;
+    if !access.is_all() {
+        match hidden_read(sql, dialect, &access) {
+            Some(HiddenRead::Table(table)) => {
+                return Err(EnforcementError::TableNotReadable(table));
+            }
+            Some(HiddenRead::Listing) => return Err(EnforcementError::Unresolvable),
+            None => {}
+        }
+    }
+    let (obligations, views) = obligations_source
+        .prefetch_for_tables(&tables, roles)
+        .await?;
+    // QS-10 (LH-QS-2-05), D4: read what the rewrite is about to apply before
+    // handing the obligations to `enforce` — it borrows them, so nothing is
+    // consumed and the report stays truthful.
+    let applied = obligations.applied();
+    let sql = sql_rewrite::enforce(
+        sql,
+        dialect,
+        engine,
+        roles,
+        placeholders,
+        &obligations,
+        &views,
+    )?;
+    Ok(RoleRewrite {
+        sql,
+        obligations: applied,
+    })
+}
+
+/// The shared rewrite's SQL, for callers that do not report obligations.
+///
+/// # Errors
+/// Every [`EnforcementError`] [`rewrite_sql_for_roles_reporting`] can return.
 pub async fn rewrite_sql_for_roles<D: Dialect + Sync>(
     sql: &str,
     dialect: &D,
@@ -260,20 +417,16 @@ pub async fn rewrite_sql_for_roles<D: Dialect + Sync>(
     placeholders: &sql_rewrite::PlaceholderValues,
     obligations_source: &PolicyEngineObligations<'_>,
 ) -> Result<String, EnforcementError> {
-    let tables =
-        sql_rewrite::referenced_tables(sql, dialect).ok_or(PolicyEngineError::Unparseable)?;
-    let (obligations, views) = obligations_source
-        .prefetch_for_tables(&tables, roles)
-        .await?;
-    Ok(sql_rewrite::enforce(
+    Ok(rewrite_sql_for_roles_reporting(
         sql,
         dialect,
         engine,
         roles,
         placeholders,
-        &obligations,
-        &views,
-    )?)
+        obligations_source,
+    )
+    .await?
+    .sql)
 }
 
 /// Loads every `status = 'ready'` policy's `conditions`, applying Hard
@@ -480,13 +633,32 @@ impl<'a> PolicyEngineObligations<'a> {
         Some(columns.into_iter().map(|(name, ..)| name).collect())
     }
 
+    /// What a principal holding `roles` may read at all (`GOV-7` D4),
+    /// resolved through THIS engine's pool so every governed read path asks
+    /// the same deployment with the same credentials as the mask read.
+    ///
+    /// `pg: None` → [`TableAccess::All`], the same degradation
+    /// [`Self::obligations_for_async`] makes and for the same reason: there
+    /// is no store to answer "may this role read that table", and a
+    /// deployment running without Postgres has no roles to narrow either.
+    ///
+    /// # Errors
+    /// [`PolicyEngineError::Store`] if the roles cannot be read. The caller
+    /// refuses the statement — a database that cannot say who may read what
+    /// must not be read as "everyone".
+    pub async fn table_access(
+        &self,
+        roles: &[String],
+    ) -> Result<crate::table_access::TableAccess, PolicyEngineError> {
+        Ok(crate::table_access::for_roles(self.pg, roles).await?)
+    }
+
     /// The mask/row-filter obligations `table` carries for a principal
     /// holding `roles`, unioning every matching `status = 'ready'` policy
     /// (masks union; row filters `AND` together) — or `None` if none
-    /// apply. `mask`/`real_columns` in the returned
-    /// [`TableObligations`] are extended through
-    /// [`transitive_mask_closure`] whenever `table` resolves against
-    /// `system.columns` (N2).
+    /// apply. `mask`/`real_columns` in the returned [`TableObligations`]
+    /// are extended through [`transitive_mask_closure`] whenever `table`
+    /// resolves against `system.columns` (N2).
     ///
     /// # Errors
     /// See [`PolicyEngineError`].
@@ -690,6 +862,63 @@ impl<'a> PolicyEngineObligations<'a> {
             PrefetchedViews(views),
         ))
     }
+
+    /// Why a statement that already failed gave no rows, when the viewer's own
+    /// access explains it (`BI-51`, QA `LH-BI-13-03`, plan D16–D18): a table
+    /// their roles do not read, or a column the policy masks that is among
+    /// `columns` — the columns the question itself names, never read out of the
+    /// statement. Called only after a question has failed, to word its sentence
+    /// without a reference.
+    ///
+    /// It never decides whether data may be read — the rewrite did that, before
+    /// this runs. `None` means "cannot tell", so the caller keeps the sentence
+    /// it had. A masked column reached through a join (`table__column`), a
+    /// calculated field, a metric or a reassigning SQL source is not
+    /// recognised: such a statement keeps its reference.
+    pub async fn access_cause<D: Dialect + Sync>(
+        &self,
+        sql: &str,
+        dialect: &D,
+        columns: &[String],
+        roles: &[String],
+    ) -> Option<AccessCause> {
+        let tables = sql_rewrite::referenced_tables(sql, dialect)?;
+        let access = self.table_access(roles).await.ok()?;
+        if matches!(
+            hidden_read(sql, dialect, &access),
+            Some(HiddenRead::Table(_))
+        ) {
+            return Some(AccessCause::HiddenTable);
+        }
+        let (obligations, _views) = self.prefetch_for_tables(&tables, roles).await.ok()?;
+        for table in &tables {
+            let Some(found) = obligations.obligations_for(table, roles) else {
+                continue;
+            };
+            if found
+                .mask
+                .iter()
+                .any(|masked| columns.iter().any(|c| c.eq_ignore_ascii_case(masked)))
+            {
+                return Some(AccessCause::MaskedColumn);
+            }
+        }
+        None
+    }
+}
+
+/// Why a failed statement gave no rows that the viewer's access explains
+/// (`BI-51`, plan D16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessCause {
+    /// The statement reads a table the viewer's roles do not include (the
+    /// tenant gate is not seen by this function): the rewrite refused it with
+    /// [`EnforcementError::TableNotReadable`], or `access_cause` found the
+    /// same.
+    HiddenTable,
+    /// One of the statement's own columns is masked for the viewer's roles on
+    /// a table it reads, so the engine refused what the rewrite produced.
+    MaskedColumn,
 }
 
 /// The sync `sql_rewrite::ObligationsSource` adapter over what
@@ -700,6 +929,24 @@ impl<'a> PolicyEngineObligations<'a> {
 pub struct PrefetchedObligations {
     map: std::collections::HashMap<String, TableObligations>,
     has_any: bool,
+}
+
+impl PrefetchedObligations {
+    /// The obligations this rewrite applied, in report order (QS-10, D4):
+    /// column masks first, then row filters, each at most once. No table or
+    /// column names — the result already shows the masked values, and
+    /// `BI-51` does not name masked columns.
+    #[must_use]
+    pub fn applied(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.map.values().any(|obl| !obl.mask.is_empty()) {
+            out.push(OBLIGATION_COLUMN_MASKS);
+        }
+        if self.map.values().any(|obl| obl.row_filter.is_some()) {
+            out.push(OBLIGATION_ROW_FILTERS);
+        }
+        out
+    }
 }
 
 impl ObligationsSource for PrefetchedObligations {
@@ -731,6 +978,149 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    // QS-10 (LH-QS-2-05), D4: the report lists each obligation once, in
+    // order, and names no table or column.
+    #[test]
+    fn applied_lists_masks_then_filters_once_each() {
+        let obligation = |mask: Vec<String>, row_filter: Option<String>| TableObligations {
+            mask,
+            row_filter,
+            real_columns: None,
+        };
+        let both = PrefetchedObligations {
+            map: std::collections::HashMap::from([
+                (
+                    "silver.a".to_owned(),
+                    obligation(vec!["email".to_owned()], None),
+                ),
+                (
+                    "silver.b".to_owned(),
+                    obligation(vec!["phone".to_owned()], None),
+                ),
+                (
+                    "silver.c".to_owned(),
+                    obligation(Vec::new(), Some("region != 'zz'".to_owned())),
+                ),
+            ]),
+            has_any: true,
+        };
+        assert_eq!(
+            both.applied(),
+            vec![OBLIGATION_COLUMN_MASKS, OBLIGATION_ROW_FILTERS]
+        );
+
+        let none = PrefetchedObligations {
+            map: std::collections::HashMap::from([(
+                "silver.plain".to_owned(),
+                obligation(Vec::new(), None),
+            )]),
+            has_any: true,
+        };
+        assert_eq!(none.applied(), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn engine_error_messages_are_distinct_english_sentences() {
+        // The three user-facing texts are English, and each
+        // variant keeps its own sentence so a reader can tell a syntax
+        // problem from a database fault or an unenforceable policy.
+        let unparseable = engine_error_message(&PolicyEngineError::Unparseable);
+        let store = engine_error_message(&PolicyEngineError::Store(
+            lakehouse_store::StoreError::NotFound,
+        ));
+        let unenforceable =
+            engine_error_message(&PolicyEngineError::UnenforceableAuthoredCondition {
+                policy_name: "p".to_owned(),
+            });
+
+        assert_eq!(unparseable, crate::upstream_error::SYNTAX_SENTENCE);
+        assert_eq!(
+            store,
+            "Access rules could not be checked because of a database error."
+        );
+        assert_eq!(
+            unenforceable,
+            "Access rules could not be checked because an active policy has a condition that cannot be enforced."
+        );
+        assert_ne!(unparseable, store);
+        assert_ne!(unparseable, unenforceable);
+        assert_ne!(store, unenforceable);
+        for text in [unparseable, store, unenforceable] {
+            assert!(
+                !text.contains("kebijakan") && !text.contains("tidak"),
+                "{text}"
+            );
+        }
+    }
+
+    /// QS-14: every rewrite refusal reaches the person in English, one
+    /// distinct sentence per variant, with no em dash or other non-ASCII
+    /// character. Most expected texts are the plan's, typed here as literals;
+    /// the syntax one is the shared `SYNTAX_SENTENCE` (QS-11, D6), so the two
+    /// parse-failure paths cannot drift apart.
+    #[test]
+    fn refusal_messages_are_distinct_ascii_english_sentences() {
+        use sql_rewrite::RewriteError;
+
+        let cases: [(RewriteError, &str); 8] = [
+            (
+                RewriteError::Unparseable,
+                crate::upstream_error::SYNTAX_SENTENCE,
+            ),
+            (
+                RewriteError::UnprovableSubstitution {
+                    table: "serving.t".to_owned(),
+                },
+                "The query reads a policy-governed table through a construct the policy engine does not support, such as a table function or ARRAY JOIN.",
+            ),
+            (
+                RewriteError::InvalidRowFilter {
+                    reason: "r".to_owned(),
+                },
+                "The row filter authorized for this table is not valid. Ask a policy administrator.",
+            ),
+            (
+                RewriteError::TableFunctionDenied {
+                    name: "f".to_owned(),
+                },
+                "Table functions are not allowed in a query that policies govern.",
+            ),
+            (
+                RewriteError::SensitiveSystemTable {
+                    table: "system.processes".to_owned(),
+                },
+                "This system table cannot be read from here. Use the Audit page.",
+            ),
+            (
+                RewriteError::DictOrJoinFunctionDenied {
+                    name: "dictGet".to_owned(),
+                },
+                "dictGet and joinGet are not allowed while a policy applies to you, because their source table cannot be checked.",
+            ),
+            (
+                RewriteError::ViewOverGovernedTable {
+                    view: "serving.v".to_owned(),
+                },
+                "The query reads a view over a policy-governed table, which is not supported.",
+            ),
+            (
+                RewriteError::InvalidPastVersion,
+                "Pick a past version by its version id, not by a timestamp.",
+            ),
+        ];
+        for (err, expected) in &cases {
+            let message = refusal_message(err);
+            assert_eq!(message, *expected, "{err:?}");
+            assert!(message.is_ascii(), "{message}");
+            assert!(!message.contains('\u{2014}'), "{message}");
+        }
+        for (i, (_, a)) in cases.iter().enumerate() {
+            for (_, b) in &cases[i + 1..] {
+                assert_ne!(a, b, "two variants share one sentence");
+            }
+        }
+    }
 
     #[test]
     fn parses_a_well_formed_condition() {
@@ -953,6 +1343,50 @@ mod tests {
             assert!(
                 sql.contains("replaceRegexpOne(toString(`email`)"),
                 "sql={sql}"
+            );
+            Ok(())
+        }
+
+        /// QA `LH-BI-13-03` (`BI-51`, plan D17, T6): the cause is found only
+        /// when a column the statement itself names is masked for the viewer's
+        /// roles; another column, or a role the policy does not name, gives
+        /// `None` ("cannot tell", so the caller keeps its reference).
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_mask_on_a_column_the_statement_names_is_the_cause_and_another_column_is_not(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            seed(&pool).await;
+            let server = clickhouse().await;
+            let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+            let db = Ident::new("icecat_api").unwrap();
+            let source = PolicyEngineObligations::new(Some(&pool), &ch).with_iceberg_db(Some(&db));
+            let sql = "SELECT sum(email) FROM icecat_api.`bronze.orders`";
+            let dialect = sqlparser::dialect::ClickHouseDialect {};
+            let analyst = ["Analyst".to_owned()];
+            assert_eq!(
+                source
+                    .access_cause(sql, &dialect, &["email".to_owned()], &analyst)
+                    .await,
+                Some(AccessCause::MaskedColumn)
+            );
+            assert_eq!(
+                source
+                    .access_cause(sql, &dialect, &["id".to_owned()], &analyst)
+                    .await,
+                None
+            );
+            // A seeded role the policy does not name reads every table and
+            // carries no mask, so nothing explains the failure.
+            assert_eq!(
+                source
+                    .access_cause(
+                        sql,
+                        &dialect,
+                        &["email".to_owned()],
+                        &["Data Scientist".to_owned()]
+                    )
+                    .await,
+                None
             );
             Ok(())
         }

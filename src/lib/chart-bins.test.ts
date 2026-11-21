@@ -67,6 +67,37 @@ test("a clicked bin filters with the lower edge in and the upper out, except the
   assert.equal(isLastBin(0, 500, undefined), false)
 })
 
+test("a bin of one over whole numbers reads as its value, with no separator", () => {
+  assert.equal(binLabel(2020, 1, true), "2020")
+  assert.equal(binLabel(-3, 1, true), "-3")
+  assert.equal(binLabel(2020, 1), "2,020 – 2,021")
+  assert.equal(binLabel(2014, 2, true), "2,014 – 2,016")
+  assert.equal(binLabel(0.5, 1, true), "0.5 – 1.5")
+})
+
+test("the tile's bins say whole only when the server said so", () => {
+  const meta = { tahun: { mode: "auto", width: 1, min: 2020, max: 2024, whole: 1 } }
+  assert.deepEqual(binsOfTile(meta, undefined), { tahun: { width: 1, max: 2024, whole: true } })
+  assert.deepEqual(binsOfTile({ tahun: { mode: "auto", width: 1, min: 2020, max: 2024, whole: true } }, undefined), { tahun: { width: 1, max: 2024, whole: true } })
+  assert.deepEqual(binsOfTile({ tahun: { mode: "auto", width: 1, min: 2020, max: 2024, whole: 0 } }, undefined), { tahun: { width: 1, max: 2024 } })
+  assert.deepEqual(binsOfTile({ tahun: { mode: "auto", width: 1, min: 2020, max: 2024 } }, undefined), { tahun: { width: 1, max: 2024 } })
+})
+
+test("a year in a bin of one reads as the year", () => {
+  assert.deepEqual(
+    relabelBins([{ tahun: 2020, v: 1 }, { tahun: 2024, v: 2 }], { tahun: { width: 1, max: 2024, whole: true } }),
+    [{ tahun: "2020", v: 1 }, { tahun: "2024", v: 2 }],
+  )
+})
+
+test("in bins of one over whole numbers no bin is closed above", () => {
+  assert.equal(isLastBin(2023, 1, 2024, true), false)
+  assert.equal(isLastBin(2024, 1, 2024, true), false)
+  assert.equal(isLastBin(2023, 1, 2024), true)
+  assert.equal(isLastBin(2022, 2, 2024, true), true)
+  assert.deepEqual(binRangeFilter("tahun", 2023, 1, isLastBin(2023, 1, 2024, true)), { column: "tahun", values: [], op: "between", min: "2023", max: "2024", maxExclusive: true })
+})
+
 test("a second click on the same bin removes its filter, another bin replaces it", () => {
   const a = binRangeFilter("v", 0, 500, false)
   const b = binRangeFilter("v", 500, 500, false)

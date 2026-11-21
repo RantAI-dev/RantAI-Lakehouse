@@ -33,9 +33,9 @@ Found by reading the code on 2026-10-08; evidence is in the plan, section 2.
 
 ## Not included
 
-- A live connection test for Oracle, MongoDB, Kafka and SFTP. These connect
+- A live connection test for batch MongoDB, Kafka and SFTP. These connect
   from the orchestrator, not from the API; a test that runs there is new work
-  (follow-up backlog item, see Decisions 1).
+  (`SRC-5`). Oracle has had one since `SRC-4`: Test runs it on the orchestrator.
 - Testing public AWS S3 with no endpoint set (Decision 3).
 - Making Google Sheets work.
 - Table discovery for these types: `SRC-13`. Gate tests for them: `SRC-9`.
@@ -66,8 +66,9 @@ All seven defaults signed by the product owner on 2026-10-08 ("run everything as
 
 ## Limits to tell a customer
 
-- Oracle, MongoDB, Kafka and SFTP connectors cannot be tested from the
-  console. A wrong credential shows on the first load, not on save.
+- Batch MongoDB, Kafka and SFTP connectors cannot be tested from the
+  console. A wrong credential shows on the first load, not on save. (Oracle
+  can, since `SRC-4`.)
 - A MongoDB source must run MongoDB 4.4 or later: the driver (`pymongo`
   4.18, `SEC-52`) no longer supports 4.0 and 4.2.
 - An object-storage connector is tested only when it has an endpoint.
@@ -92,6 +93,8 @@ Run on a real deployment. Mark each Pass, Fail, or Not run with the reason.
 | 8 | Open Sources | The header names business apps (since `SRC-3`) and does not mention federation | Pass 2026-10-23 (product owner), on main `0e5498d2`, where the header named neither SaaS nor federation; the business-app wording came with `SRC-3` after this run and is checked in its acceptance |
 | 9 | As a user without `connector:manage`, try steps 1 and 5 | Refused | Pass 2026-10-23 (product owner) |
 | 10 | Point an object-storage connector at an endpoint that is down; test | A plain failure message with no address or server text in it | Pass 2026-10-23 (product owner) |
+| 11 | In the wizard, enter connection settings the product refuses (a business-app account that is not in the vendor's form, or a database at an internal address) and create | Refused with a sentence that names the field; no connector appears in the list | Not run |
+| 12 | Create a Kafka connector with no authentication; open its page | The Credential fact reads "None: this connection authenticates with none" | Not run |
 
 Pre-merge check, 2026-10-12, product owner, on a separate instance built from PR #101 at `f9d488f` (own database; the shared orchestrator, so no run could be started): the screens were reported as conforming ("QA sudah sesuai"). The instance afterwards held one object-storage connector made in the wizard with an endpoint, tested and healthy (rows 1, 7, 8). It held no Oracle connector, so rows 5 and 6 left no trace there. Rows 3, 9 and 10 were not in the check. This is not the acceptance run: the table above is filled on a real deployment.
 

@@ -448,8 +448,11 @@ def test_the_sink_writes_a_type_changing_replace_through_the_transaction_and_oth
     purges: list[str] = []
     monkeypatch.setattr(type(table.catalog), "purge_table", lambda self, name: purges.append(str(name)), raising=False)
     monkeypatch.setattr(type(table.catalog), "drop_table", lambda self, name: purges.append(str(name)), raising=False)
+    # DATA-52: the sink reads the author out of its configuration now, so this test passes a
+    # real `SinkConfig` (the one `Lab.config` builds) instead of `None`.
+    config = sink_module.SinkConfig("u", "w", "e", "a", "s", "b", "", author="a person (file upload)")
     result = sink_module.load_via_sink(
-        _source(typed, hints), "t", None, sink_module.LoadPlan(mode="replace"),
+        _source(typed, hints), "t", config, sink_module.LoadPlan(mode="replace"),
         column_types={"a": "long", "b": "string", "c": "string"},
     )
     assert (result.rows, result.has_failed_jobs) == (3, False)
@@ -457,9 +460,11 @@ def test_the_sink_writes_a_type_changing_replace_through_the_transaction_and_oth
     assert dict(_iceberg_fields(directory))["a"] == "long"
     reopened = sink_module.history.open_table(pipeline, "t", sync=False)  # the sink held its own client's table
     assert _state(reopened)[1] == [7, 8, 9]
+    # DATA-52: the type-changing replace records who started the load on its one snapshot.
+    assert reopened.current_snapshot().summary.additional_properties["rantai.author"] == "a person (file upload)"
     # Same types: dlt loads, as before.
     again = sink_module.load_via_sink(
-        _source(typed, hints), "t", None, sink_module.LoadPlan(mode="replace"),
+        _source(typed, hints), "t", config, sink_module.LoadPlan(mode="replace"),
         column_types={"a": "long", "b": "string", "c": "string"},
     )
     assert again.rows == 3

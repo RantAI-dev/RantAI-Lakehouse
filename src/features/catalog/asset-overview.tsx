@@ -15,9 +15,15 @@ import {
 } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { formatRelativeTime } from "@/lib/format"
-import { assetQueryStudioHref, assetStarterSql, assetStudioTarget } from "@/lib/asset-query"
+import {
+  assetHasReadableTable,
+  assetQueryStudioHref,
+  assetStarterSql,
+  assetStudioTarget,
+  NO_READABLE_TABLE,
+} from "@/lib/asset-query"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { isIcebergCandidate, snapshotRelativeTime } from "@/lib/lakehouse-view"
-import { notifyError, notifySuccess } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import type { AssetColumn, AssetDetail } from "@/services/contracts/assets"
 import { AssetAbout } from "./asset-about"
@@ -29,6 +35,7 @@ import {
   type AssetLineageState,
 } from "./asset-lineage"
 import { OpenFormatCard } from "./open-format-card"
+import { TableGrantNote } from "./table-grant-note"
 import {
   AssetStorage,
   ClickHouseStorage,
@@ -78,15 +85,6 @@ export function qualitySummary(checks: AssetDetail["qualityChecks"]) {
   return { passed, warning, failed, evaluated, unevaluated: checks.length - evaluated, lastRun }
 }
 
-async function copyText(value: string, what: string) {
-  try {
-    await navigator.clipboard.writeText(value)
-    notifySuccess(`Copied ${what}`)
-  } catch (err) {
-    notifyError("Failed to copy", err)
-  }
-}
-
 /**
  * The first tab of an asset: can I trust this data, who is it for, and how
  * do I start using it — answered from `AssetDetail` alone, with each
@@ -117,8 +115,17 @@ export function AssetOverview({
   ] as const
   // "Related tables" is the rare case; without one it is a row of noise.
   const shownConnections = connections.filter(([label, n]) => label !== "Related tables" || n > 0)
+  // The Iceberg table, once loaded. It is what proves the table exists, so
+  // the links below open Trino only when it is there (owner, 2026-11-08).
+  const table = icebergTableOf(iceberg)
+  // Whether this asset has a table the console can read at all. Without one
+  // the starter query and the Query Studio link would name a table that is
+  // not there, so the card says so instead (owner, 2026-11-09). While the
+  // Iceberg read is still running the asset is given the benefit of the
+  // doubt: the sentence waits for the answer.
+  const readable = assetHasReadableTable(a, table, iceberg.status === "loading")
   // An Iceberg table's own snapshots, once loaded; the API's list otherwise.
-  const snapshotCount = icebergTableOf(iceberg)?.snapshots.length ?? a.snapshots.length
+  const snapshotCount = table?.snapshots.length ?? a.snapshots.length
   const quality = qualitySummary(a.qualityChecks)
   const sensitive = a.schema.filter(isSensitive)
   const maskedCount = a.schema.filter((c) => c.masked).length
@@ -127,7 +134,7 @@ export function AssetOverview({
   // own list otherwise — for a Silver or Gold table, the version the console
   // recorded. That one is dated when the console saw it, so it says
   // "recorded", not a time that would read as the table's own age.
-  const icebergSchema = icebergTableOf(iceberg)?.schemaVersions?.find((v) => v.current)
+  const icebergSchema = table?.schemaVersions?.find((v) => v.current)
   const latestSchema = a.schemaVersions.find((v) => v.current) ?? a.schemaVersions[0]
   const schemaLabel = icebergSchema
     ? `v${icebergSchema.schemaId}` +
@@ -136,7 +143,7 @@ export function AssetOverview({
       ? `v${latestSchema.version} · recorded ${formatRelativeTime(latestSchema.at)}`
       : null
   const recentChanges = a.changeHistory.slice(0, RECENT_CHANGES)
-  const sql = assetStarterSql(a)
+  const sql = assetStarterSql(a, table)
 
   return (
     <div className="flex flex-col gap-2">
@@ -226,7 +233,7 @@ export function AssetOverview({
         <SectionCard
           size="sm"
           title="Sensitive columns"
-          description="Masked by policy or classified confidential and above."
+          description="Columns a policy masks, and columns classified confidential or above. A classification alone does not mask a column."
         >
           {sensitive.length === 0 ? (
             <EmptyState title="No sensitive columns" className="py-4" />
@@ -263,26 +270,36 @@ export function AssetOverview({
       <SectionCard
         size="sm"
         title="Use this data"
-        description={`A starter query for ${
-          assetStudioTarget(a).engine === "trino" ? "Trino" : "ClickHouse"
-        }. Masking still applies when it runs.`}
+        description={
+          readable
+            ? `A starter query for ${
+                assetStudioTarget(a, table).engine === "trino" ? "Trino" : "ClickHouse"
+              }. Masking still applies when it runs.`
+            : undefined
+        }
         action={
-          <div className="flex gap-1.5">
-            <Button size="sm" variant="ghost" onClick={() => void copyText(sql, "SQL")}>
-              <Copy />
-              Copy
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              render={<Link href={assetQueryStudioHref(a)} />}
-            >
-              Open in Query Studio
-            </Button>
-          </div>
+          readable ? (
+            <div className="flex gap-1.5">
+              <Button size="sm" variant="ghost" onClick={() => void copyTextWithToast(sql, "Copied SQL")}>
+                <Copy />
+                Copy
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                render={<Link href={assetQueryStudioHref(a, table)} />}
+              >
+                Open in Query Studio
+              </Button>
+            </div>
+          ) : undefined
         }
       >
-        <CodeBlock>{sql}</CodeBlock>
+        {readable ? (
+          <CodeBlock>{sql}</CodeBlock>
+        ) : (
+          <p className="text-sm text-muted-foreground">{NO_READABLE_TABLE}</p>
+        )}
       </SectionCard>
 
       <div className="grid gap-2 lg:grid-cols-2">
@@ -309,6 +326,9 @@ export function AssetOverview({
               </li>
             ))}
           </ul>
+          {/* GOV-11 (review round 1 R2): the counts are zero because the
+              API withheld them, not because the asset is unconnected. */}
+          <TableGrantNote asset={a} className="mt-2" />
         </SectionCard>
 
         {/* ── What changed lately? ──────────────────────────────────── */}

@@ -193,10 +193,10 @@ describe("write controls (R18)", () => {
     expect(screen.queryByText("New chart")).toBeNull()
   })
 
-  it("a chart tile's menu has Edit chart and Delete chart for an editor of its own chart only", () => {
-    const base = { own: true, hasDef: true, onEdit: () => {}, onDelete: () => {} }
+  it("a chart tile's menu has Edit chart, Duplicate and Delete chart for an editor of its own chart only", () => {
+    const base = { own: true, hasDef: true, onEdit: () => {}, onDuplicate: () => {}, onDelete: () => {} }
     const editor = chartWriteItems({ ...base, canWrite: true })
-    expect(editor.edit.map((i) => i.label)).toEqual(["Edit chart"])
+    expect(editor.edit.map((i) => i.label)).toEqual(["Edit chart", "Duplicate"])
     expect(editor.remove.map((i) => i.label)).toEqual(["Delete chart"])
     expect(chartWriteItems({ ...base, canWrite: false })).toEqual({ edit: [], remove: [] })
     expect(chartWriteItems({ ...base, canWrite: true, own: false })).toEqual({ edit: [], remove: [] })

@@ -3,8 +3,9 @@
 //! `get_cdc_health`, `get_maintenance_metrics`, `draft_policy`,
 //! `draft_classification_rule`, `draft_quality_rule`.
 //!
-//! Every read here calls `routes::governance::get` (the SAME `{kind}`
-//! dispatch `GET /api/governance/{kind}` uses) via [`super::response_to_value`]
+//! Every read here except `get_audit_history` calls
+//! `routes::governance::get` (the SAME `{kind}` dispatch
+//! `GET /api/governance/{kind}` uses) via [`super::response_to_value`]
 //! — including its existing degrade-cleanly behaviour: `get_cdc_health`
 //! (`kind = "replication"`) and `get_maintenance_metrics`
 //! (`kind = "maintenance"`) read `ClickHouse` tables that only exist once
@@ -15,6 +16,14 @@
 //! as a normal tool-result `{"error": ...}` — no special-casing needed
 //! here.
 //!
+//! `get_audit_history` is the exception (`SEC-20`, plan 100): it reads the
+//! trail through `routes::governance::audit_trail` — the one read of the
+//! trail `GET /api/governance/audit` uses too — with the person's own
+//! scope, so the route and the tool cannot disagree about which rows the
+//! caller may see. A headless call answers
+//! `{"error": "reading the audit trail needs a signed-in user"}` instead
+//! of rows.
+//!
 //! The three draft tools call the real `routes::governance::create_policy`/
 //! `create_quality_rule`/`create_classification_rule` handlers (via
 //! [`super::api_result_to_value`]), never a second copy of the insert
@@ -22,29 +31,127 @@
 //! (and its siblings) for why each of the three genuinely can only ever
 //! create a non-active record with today's schema.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
+use lakehouse_auth::Principal;
 use serde_json::{Map, Value, json};
 
 use super::{api_result_to_value, arg_str, response_to_value};
 use crate::state::AppState;
 
 async fn governance_kind(state: &AppState, kind: &str) -> Value {
+    // No principal: this is the headless path, and it does not narrow the
+    // rows it reads. A call with no person is not narrowed, the convention
+    // `ensure_rule_table` has (`GOV-15` D7). A person's maintenance history is
+    // narrowed by `read_kind` when `get_maintenance_metrics` or
+    // `list_classification_rules` passes the principal.
     response_to_value(
-        crate::routes::governance::get(State(state.clone()), Path(kind.to_owned())).await,
+        crate::routes::governance::read_kind(state, None, &axum::http::HeaderMap::new(), kind)
+            .await,
     )
     .await
 }
 
-pub(super) async fn get_audit_history(state: &AppState) -> Value {
-    governance_kind(state, "audit").await
+/// `SEC-20` (plan 100): the audit trail, as the person behind the chat may
+/// read it.
+///
+/// The trail is read per tenant: the person's own organisation's rows, plus
+/// the deployment's own rows when that organisation owns the shared
+/// catalog. The `audit:read` permission is not checked here: the tool's
+/// own spec asks the gate for it (`GOV-1`), the same permission the audit
+/// page asks for on top of the `governance:read` that opens its route, so
+/// a person without it is refused before this body runs. The reach is
+/// resolved from the person's own tenant, the convention the other
+/// governance tools follow (the tool has no request headers of its own).
+pub(super) async fn get_audit_history(state: &AppState, principal: Option<&Principal>) -> Value {
+    let Some(principal) = principal else {
+        // A headless run has no person behind it: it belongs to no tenant
+        // and owns no row of the trail.
+        return json!({ "error": "reading the audit trail needs a signed-in user" });
+    };
+    let scope = match crate::routes::audit_scope::scope_for_principal(
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+    )
+    .await
+    {
+        Ok(scope) => scope,
+        Err(err) => {
+            tracing::warn!(error = %err, "the audit trail could not be read");
+            return json!({ "error": "the audit trail is not available" });
+        }
+    };
+    match crate::routes::governance::audit_trail(state, &scope).await {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(error = %err, "the audit trail could not be read");
+            json!({ "error": "the audit trail is not available" })
+        }
+    }
 }
 
-pub(super) async fn list_classification_rules(state: &AppState) -> Value {
-    governance_kind(state, "classification").await
+/// Refusal for the classification list without a person (`SEC-76`): a headless
+/// run has no person whose reach narrows the list.
+pub(super) const CLASSIFICATION_RULES_NEED_A_USER: &str =
+    "reading classification rules needs a signed-in user";
+
+/// Refusal for the quality list without a person (`SEC-76`): a headless run
+/// has no person whose reach narrows the list.
+pub(super) const QUALITY_RULES_NEED_A_USER: &str = "reading quality rules needs a signed-in user";
+
+/// Refusal for drafting a quality rule without a person (`SEC-76`): the rule
+/// is written as the person, and a headless run has none.
+pub(super) const CREATING_QUALITY_RULE_NEEDS_A_USER: &str =
+    "creating a quality rule needs a signed-in user";
+
+/// `SEC-20` (plan 96): the classification list, as the person behind the chat
+/// may read it. The rows name the tables of the shared catalog and the upload
+/// tables of every tenant, so a person's list is narrowed to the tables in
+/// their reach by [`crate::routes::governance::read_kind`], the rule
+/// `GET /api/governance/classification` applies. The tool has no request
+/// headers, so the reach is the person's own tenant's, the convention
+/// `get_maintenance_metrics` follows. No principal is a headless run, which has
+/// no person whose reach narrows the list: it is refused and reads nothing
+/// (`SEC-76`; it used to read the whole list).
+pub(super) async fn list_classification_rules(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Value {
+    let Some(principal) = principal else {
+        return json!({ "error": CLASSIFICATION_RULES_NEED_A_USER });
+    };
+    response_to_value(
+        crate::routes::governance::read_kind(
+            state,
+            Some(principal),
+            &axum::http::HeaderMap::new(),
+            "classification",
+        )
+        .await,
+    )
+    .await
 }
 
-pub(super) async fn list_quality_rules(state: &AppState) -> Value {
-    governance_kind(state, "quality").await
+pub(super) async fn list_quality_rules(state: &AppState, principal: Option<&Principal>) -> Value {
+    // SEC-76: the quality list is not narrowed for a headless run
+    // (`read_kind` leaves it whole for `None`), so a headless run is refused.
+    let Some(principal) = principal else {
+        return json!({ "error": QUALITY_RULES_NEED_A_USER });
+    };
+    response_to_value(
+        // The tool has no request headers of its own, so the tenant rule reads
+        // the person's own tenant — the same convention `draft_quality_rule`
+        // follows below. Refused for a person outside the tenant, and narrowed
+        // to the tables their roles read (`GOV-15` D7).
+        crate::routes::governance::read_kind(
+            state,
+            Some(principal),
+            &axum::http::HeaderMap::new(),
+            "quality",
+        )
+        .await,
+    )
+    .await
 }
 
 pub(super) async fn get_cdc_health(state: &AppState) -> Value {
@@ -99,8 +206,42 @@ fn latest_per_slot(result: Value) -> Value {
     json!({ "slots": slots, "note": "each slot's most recent check" })
 }
 
-pub(super) async fn get_maintenance_metrics(state: &AppState) -> Value {
-    governance_kind(state, "maintenance").await
+/// `SEC-20` (plan 95): every table's maintenance history, as the person
+/// behind the chat may read it.
+///
+/// The history names every table the Bronze job ever compacted, upload
+/// tables included. A person the shared-catalog rule refuses gets that rule's
+/// answer and no row; a person it admits gets the rows of the tables in the
+/// caller's reach, by the rule Query Studio keeps. The route
+/// `GET /api/governance/maintenance` narrows its rows the same way, in
+/// [`crate::routes::governance::read_kind`], and this tool reads through it,
+/// so the two cannot disagree.
+///
+/// No principal is a scheduled run, which has no person whose reach to read
+/// the history through, so it is refused and reads nothing (`SEC-20`, plan 97;
+/// it used to read the whole history).
+pub(super) async fn get_maintenance_metrics(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Value {
+    let Some(principal) = principal else {
+        return json!({ "error": "reading the maintenance history needs a signed-in user" });
+    };
+    if let Some(refusal) = super::data::shared_catalog_refusal(state, principal).await {
+        return refusal;
+    }
+    // The tool has no request headers of its own, so the reach is the
+    // person's own tenant's, the convention `list_quality_rules` follows.
+    response_to_value(
+        crate::routes::governance::read_kind(
+            state,
+            Some(principal),
+            &axum::http::HeaderMap::new(),
+            "maintenance",
+        )
+        .await,
+    )
+    .await
 }
 
 /// Builds the `POST /api/governance/policies` body from the tool's args,
@@ -148,11 +289,25 @@ pub(super) async fn draft_classification_rule(
     .await
 }
 
-pub(super) async fn draft_quality_rule(state: &AppState, args: &Map<String, Value>) -> Value {
+/// `draft_quality_rule` creates the rule through the console's own handler, as
+/// the person behind the chat: the table they may not read is refused exactly
+/// as the form refuses it, and a table that is not there is refused too
+/// (QA `LH-DATA-14-01` F2, `DATA-54`; review round 1 R1). A headless run (no
+/// signed-in person) is refused before the write (`SEC-76`): with no
+/// person there is nobody to hold the table to, and `create_quality_rule`
+/// would not narrow the check.
+pub(super) async fn draft_quality_rule(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let name = arg_str(args, "name");
     if name.is_empty() {
         return json!({ "error": "name is required" });
     }
+    let Some(principal) = principal else {
+        return json!({ "error": CREATING_QUALITY_RULE_NEEDS_A_USER });
+    };
     let bytes = match serde_json::to_vec(&Value::Object(args.clone())) {
         Ok(bytes) => bytes,
         // Serialising our own `Value` (infallible in practice): not an upstream error.
@@ -161,6 +316,10 @@ pub(super) async fn draft_quality_rule(state: &AppState, args: &Map<String, Valu
     api_result_to_value(
         crate::routes::governance::create_quality_rule(
             State(state.clone()),
+            Some(principal),
+            // The tool has no request headers of its own, so the tenant rule
+            // reads the person's own tenant (`tenant_scope::resolve`).
+            &axum::http::HeaderMap::new(),
             axum::body::Bytes::from(bytes),
         )
         .await,
@@ -201,7 +360,7 @@ mod tests {
             json!({ "error": "asset is required" })
         );
         assert_eq!(
-            draft_quality_rule(&s, &Map::new()).await,
+            draft_quality_rule(&s, None, &Map::new()).await,
             json!({ "error": "name is required" })
         );
     }

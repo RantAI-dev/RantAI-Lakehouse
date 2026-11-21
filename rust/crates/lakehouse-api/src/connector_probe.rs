@@ -564,7 +564,16 @@ async fn probe_dial(
             };
             dial_postgres(&target, &info.secret_ref, resolver, internal_hosts, ca).await
         }
-        SqlDriver::Mysql => probe_mysql(&target, &info.secret_ref, resolver, internal_hosts).await,
+        SqlDriver::Mysql => {
+            probe_mysql(
+                &target,
+                &info.secret_ref,
+                resolver,
+                internal_hosts,
+                mysql_family_label(&info.kind),
+            )
+            .await
+        }
         SqlDriver::Mssql => {
             Box::pin(probe_mssql(
                 &target,
@@ -593,6 +602,7 @@ async fn probe_mysql(
     secret_ref: &str,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    label: &'static str,
 ) -> Outcome {
     let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
         Ok(approved) => approved,
@@ -623,18 +633,30 @@ async fn probe_mysql(
     let elapsed = started.elapsed();
 
     match attempt {
-        Ok(Ok(())) => Outcome::success(elapsed, "Connected via MySQL and ran SELECT 1."),
+        Ok(Ok(())) => Outcome::success(elapsed, format!("Connected via {label} and ran SELECT 1.")),
         Ok(Err(err)) => Outcome::failure(
             elapsed,
-            format!("MySQL connection failed: {}", classify_sqlx_error(&err)),
+            format!("{label} connection failed: {}", classify_sqlx_error(&err)),
         ),
         Err(_) => Outcome::failure(
             elapsed,
             format!(
-                "MySQL connection timed out after {}s",
+                "{label} connection timed out after {}s",
                 DIAL_TIMEOUT.as_secs()
             ),
         ),
+    }
+}
+
+/// What a `mysql`-driver connector's test calls its server (`SRC-41` D19, QA
+/// `LH-SRC-6-19`): `MariaDB` for the type named exactly that (`0035`), `MySQL`
+/// for `MySQL` and any other text (`MySQL CDC`, a stale label). `kind` itself
+/// is never put into the sentence.
+fn mysql_family_label(kind: &str) -> &'static str {
+    if kind == "MariaDB" {
+        "MariaDB"
+    } else {
+        "MySQL"
     }
 }
 
@@ -2915,6 +2937,7 @@ mod tests {
             "env:UNUSED",
             &PanicIfCalledResolver,
             &InternalHosts::NONE,
+            "MySQL",
         )
         .await;
         assert!(!outcome.ok);
@@ -2928,6 +2951,52 @@ mod tests {
             "{}",
             outcome.message
         );
+    }
+
+    /// `SRC-41` D19 (QA `LH-SRC-6-19`): a failed test of a `MariaDB` connector
+    /// names `MariaDB`, and a `MySQL` one names `MySQL`. Fails if the call
+    /// passes the constant `"MySQL"`.
+    #[tokio::test]
+    async fn a_mariadb_connectors_failed_test_names_mariadb_and_a_mysql_connectors_names_mysql() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("PG_TEST_PASSWORD".to_owned(), "irrelevant".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let info = |kind: &str| ConnectorDialInfo {
+            kind: kind.to_owned(),
+            host: "127.0.0.1".to_owned(),
+            secret_ref: "env:PG_TEST_PASSWORD".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("sql".to_owned()),
+            dial: serde_json::json!({
+                "driver": "mysql", "host": "127.0.0.1", "port": 1,
+                "database": "x", "user": "u",
+            }),
+        };
+
+        let maria = probe(&info("MariaDB"), &resolver, &InternalHosts::ALL, None).await;
+        assert!(
+            maria.message.contains("MariaDB connection failed"),
+            "{}",
+            maria.message
+        );
+        assert!(!maria.message.contains("MySQL"), "{}", maria.message);
+
+        let mysql = probe(&info("MySQL"), &resolver, &InternalHosts::ALL, None).await;
+        assert!(
+            mysql.message.contains("MySQL connection failed"),
+            "{}",
+            mysql.message
+        );
+    }
+
+    /// The label is one of two constants, chosen by the type's exact name; the
+    /// type's own text never reaches the sentence (`SRC-41` D19).
+    #[test]
+    fn the_label_is_one_of_two_constants() {
+        assert_eq!(mysql_family_label("MariaDB"), "MariaDB");
+        assert_eq!(mysql_family_label("MySQL"), "MySQL");
+        assert_eq!(mysql_family_label("MySQL CDC"), "MySQL");
+        assert_eq!(mysql_family_label("mariadb; x"), "MySQL");
     }
 
     /// A `sql`-adapter Postgres connector as the console wizard creates it:

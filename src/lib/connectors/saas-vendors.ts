@@ -356,6 +356,123 @@ export const SAAS_VENDORS: readonly SaasVendor[] = [
   }
 ] as const satisfies readonly SaasVendor[]
 
+/**
+ * Why `account` is not in the form `vendor` uses, or `null` when it is
+ * (`SRC-41` D13, QA `LH-SRC-3-11`). A copy of `SaasVendor::validate_account`
+ * (`lakehouse-store/src/saas_vendors.rs`): the form can say this before the
+ * connector is created, and the server stays the authority (`D11`: it checks
+ * the same dial and refuses it before a row exists). ASCII classes only, so a
+ * character outside them fails — the account is never rewritten, only judged.
+ */
+export function saasAccountProblem(vendor: SaasVendor, account: string): string | null {
+  return accountFits(vendor.account, account)
+    ? null
+    : `This is not in the form ${vendor.label} uses.`
+}
+
+/**
+ * `text` with its ASCII letters lower-cased, and nothing else (`SRC-41` D13,
+ * review round 1, R4). `String.prototype.toLowerCase` follows Unicode, where
+ * U+212A (KELVIN SIGN) becomes `k`; Rust's `to_ascii_lowercase` in
+ * `SaasVendor::validate_account` leaves it as it is. Judging with the Unicode
+ * rule let the form pass an account (`wd2.worKday.com/t`) the server refuses,
+ * so this copy lowers exactly what the server lowers.
+ */
+function asciiLower(text: string): string {
+  return text.replace(/[A-Z]/g, (letter) => letter.toLowerCase())
+}
+
+/** 1 to 63 of `[A-Za-z0-9-]`, not starting or ending with `-`. */
+function isLabel(text: string): boolean {
+  return text.length <= 63 && !text.startsWith("-") && !text.endsWith("-") && /^[A-Za-z0-9-]+$/.test(text)
+}
+
+/** 1 to 64 of `[A-Za-z0-9_-]`. */
+function isTenantWord(text: string): boolean {
+  return text.length <= 64 && /^[A-Za-z0-9_-]+$/.test(text)
+}
+
+/**
+ * A Microsoft Entra tenant: a GUID (36 characters, `-` at positions 8, 13, 18
+ * and 23), or a domain of at least two labels whose last holds a letter.
+ */
+function isEntraTenant(text: string): boolean {
+  const isGuid =
+    text.length === 36 &&
+    [...text].every((c, index) =>
+      index === 8 || index === 13 || index === 18 || index === 23 ? c === "-" : /[0-9A-Fa-f]/.test(c)
+    )
+  if (isGuid) return true
+  const labels = text.split(".")
+  return (
+    text.length <= 253 &&
+    labels.length >= 2 &&
+    labels.every(isLabel) &&
+    /[A-Za-z]/.test(labels[labels.length - 1] ?? "")
+  )
+}
+
+/** `<organisation>.<region>.dynamics.com`, the region `crm` plus at most two digits. */
+function isDataverseHost(account: string): boolean {
+  const lowered = asciiLower(account)
+  const suffix = ".dynamics.com"
+  if (!lowered.endsWith(suffix)) return false
+  const rest = lowered.slice(0, lowered.length - suffix.length)
+  const dot = rest.lastIndexOf(".")
+  if (dot < 0) return false
+  return /^crm[0-9]{0,2}$/.test(rest.slice(dot + 1)) && isLabel(rest.slice(0, dot))
+}
+
+/** `<inner>/<tenant>`: the first `/` splits; the tenant is an Entra tenant. */
+function splitTenant(account: string): { inner: string; tenant: string } | null {
+  const slash = account.indexOf("/")
+  if (slash < 0) return null
+  const split = { inner: account.slice(0, slash), tenant: account.slice(slash + 1) }
+  return isEntraTenant(split.tenant) ? split : null
+}
+
+/** `<host>/<tenant>`: a Workday suffix, one to three labels before it, a tenant word after. */
+function isHostTenant(account: string, suffixes: readonly string[]): boolean {
+  const slash = account.indexOf("/")
+  if (slash < 0) return false
+  const host = asciiLower(account.slice(0, slash))
+  const tenant = account.slice(slash + 1)
+  if (!isTenantWord(tenant)) return false
+  return suffixes.some((suffix) => {
+    if (!host.endsWith(suffix)) return false
+    const labels = host.slice(0, host.length - suffix.length).split(".")
+    return labels.length <= 3 && labels.every(isLabel)
+  })
+}
+
+function accountFits(rule: SaasAccountRule, account: string): boolean {
+  switch (rule.kind) {
+    case "label":
+      return isLabel(account)
+    case "digits":
+      return /^[0-9]{1,20}$/.test(account)
+    case "account_id":
+      return /^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,38}[A-Za-z0-9])?$/.test(account)
+    case "dataverse_host":
+      return isDataverseHost(account)
+    case "label_tenant": {
+      const split = splitTenant(account)
+      return split !== null && isLabel(split.inner)
+    }
+    case "dataverse_host_tenant": {
+      const split = splitTenant(account)
+      return split !== null && isDataverseHost(split.inner)
+    }
+    case "host_tenant":
+      return isHostTenant(account, rule.suffixes)
+    default: {
+      // A new `kind` in the table must not compile until it has a rule here.
+      const unhandled: never = rule
+      return unhandled
+    }
+  }
+}
+
 /** The vendor a connector type name stands for, or `undefined`. */
 export function saasVendorForType(typeName: string | null | undefined): SaasVendor | undefined {
   return SAAS_VENDORS.find((vendor) => vendor.connectorType === typeName)

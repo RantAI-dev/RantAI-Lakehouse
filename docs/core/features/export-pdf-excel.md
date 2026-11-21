@@ -36,15 +36,16 @@ A chart's data downloads only as CSV, only from a raw table, and only up to
 | --- | --- | --- |
 | 1 | The PDF is made by a Gotenberg container (Chromium) in the deployment, which opens a print view of the dashboard in the console over the internal network. | **Owner, 2026-10-17** |
 | 2 | The print view reads the data **as the person who asked** (their masking and row filters), not as the embed viewer role: a short-lived render token names the person, and the API re-reads that person's roles when the view asks for data. The token lives 2 minutes and is good only for that dashboard and those filter values. | Planner |
-| 3 | Every tab is printed, each starting on a new page with its title; sections print unfolded. Image and web-page cards print as "Shown in the console only": the PDF renderer may open only the console itself, so it never fetches anything from outside the deployment. | Planner |
+| 3 | Every tab is printed, each starting on a new page with its title; sections print unfolded. Image and web-page cards print as "Shown in the console only": the PDF renderer may open only the console itself, so it never fetches anything from outside the deployment. The exception is an image card whose site is in the board's content sites: the PDF asks the console's own API for the picture (`GET /api/render/image`, `BI-42`), which fetches only that card's saved address (https, no redirects, PNG/JPEG/GIF/WebP up to 5 MiB); web-page cards stay the placeholder. | Planner, owner 2026-11-15 |
 | 4 | The first page lists the dashboard's name, the filters and parameters applied, who downloaded it and when (in the report time zone). Pages are numbered. | Planner |
 | 5 | A PDF that is not ready in 60 seconds fails with a plain sentence; at most 2 PDFs are made at once per API process, a third waits its turn. | Planner |
 | 6 | When the deployment has no Gotenberg (`GOTENBERG_URL` unset), the PDF item says "PDF export is not set up on this deployment" and the browser's print stays available as before. | Planner |
-| 7 | Excel keeps numbers as numbers: "formatted" sets each column's Excel number format from the chart's value format (`BI-17` A); "raw" writes plain values. CSV "formatted" writes the text shown on the chart; CSV "raw" the plain values. Cells that start like a formula are neutralised in both (as the CSV export does today). | Planner |
+| 7 | Excel keeps numbers as numbers: "formatted" sets each column's Excel number format from the chart's value format (`BI-17` A); "raw" writes plain values. CSV "formatted" writes the text shown on the chart; CSV "raw" the plain values. A text that starts like a formula is never run: in CSV it gets a leading apostrophe; in Excel it is a text cell and holds the text as it is (changed 2026-11-20, `BI-55`, *(proposed, not yet signed)*). | Planner; changed: planner default (QA `LH-BI-1-08`) |
 | 8 | A raw table exports up to 1,000,000 rows (Metabase's limit), also over a SQL source; a grouped chart exports its own result. A file that reached the limit says so in its name and in the download message. | Planner |
 | 9 | Downloads stay governed by `dashboard:read`. An administrator can switch them off per role in Admin > Settings ("Roles that may not download"); a user whose every role is switched off cannot download, and the menu items are hidden. Nothing changes until an administrator chooses. | Planner |
 | 10 | Every download (PDF, Excel, CSV) is written to the audit log before the file is sent, as the CSV export does today; with the audit log down, the download is refused. | Planner |
 | 11 | The assistant's export tool returns a download link to the same export the menu uses; the file is made when the person opens it, with their permissions. Nothing is stored. | Planner |
+| 12 | The PDF is printed in the light theme, whatever theme the dashboard has; a chart image keeps the dashboard's theme. The print view is laid out at the paper's printable width, so a chart is as wide as its card on the page | Planner default (QA round, `BI-53`), *(proposed, not yet signed)* |
 
 ## Owner decisions at the phase 4 QA (2026-10-23)
 
@@ -53,9 +54,10 @@ A chart's data downloads only as CSV, only from a raw table, and only up to
 ## Limits to tell a customer
 
 - PDFs need the Gotenberg container; without it, only the browser's print.
-- Image and web-page cards do not appear in the PDF.
+- Web-page cards do not appear in the PDF; image cards do when their site is a content site and the picture is a PNG, JPEG, GIF or WebP up to 5 MiB.
 - 1,000,000 rows at most per download.
 - A PDF takes a few seconds per tab and fails after 60 seconds.
+- An Excel file keeps a text that starts with =, +, - or @ as a text cell, without an apostrophe. If the reader saves that file as CSV with their own program, the new file is not guarded. *(proposed, not yet signed; `BI-55`)*
 
 ## Switching it on
 
@@ -97,3 +99,14 @@ Run by the product owner on a running console. A step not performed is never a p
 - `BI-1-AC4` A user whose roles are switched off cannot download, a deployment without Gotenberg says so, and a failure shows a plain sentence.
 - `BI-1-AC5` Excel "formatted" shows Rp 1,2 M style values that are still numbers in Excel.
 - `AI-10-AC2` "Give me this dashboard as a PDF" returns a link that downloads it.
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-1-AC1`: pass.
+- `BI-1-AC2`: pass.
+- `BI-1-AC3`: pass.
+- `BI-1-AC4`: partial: the refusals and plain failure sentences were seen; switching Gotenberg off was not done on the shared QA stack.
+- `BI-1-AC5`: pass.
+- `AI-10-AC2`: pass.

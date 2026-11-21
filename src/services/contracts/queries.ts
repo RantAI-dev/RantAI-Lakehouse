@@ -19,6 +19,71 @@ export type QueryEngine = "clickhouse" | "trino"
 export type SavedQueryLevel = "view" | "edit" | "manage"
 
 /**
+ * The type of a query parameter (`QS-5`, `{{name}}` in SQL). The server
+ * reads exactly these six words and refuses any other, so the type is not
+ * widened with `| string`: the console cannot show a control for a type it
+ * does not know.
+ */
+export type QueryParamType =
+  | "text"
+  | "number"
+  | "date"
+  | "dateRange"
+  | "dropdown"
+  | "multiSelect"
+
+/**
+ * One choice of a dropdown or multi-select. The server accepts a text or a
+ * number as the value (all options of one list are one or the other) and
+ * keeps the label the control shows.
+ */
+export type QueryParamOption = {
+  value: string | number
+  label: string
+}
+
+/** A date range as the server reads it: exactly these two keys, each `YYYY-MM-DD`. */
+export type QueryDateRange = { start: string; end: string }
+
+/**
+ * A parameter's value, as a run or a default carries it. Text is a string,
+ * a number is a finite JSON number, a date is `YYYY-MM-DD`, a date range is
+ * a {@link QueryDateRange}, a dropdown is one option's value and a
+ * multi-select is a non-empty list of option values. Absent or `null` means
+ * "not given", and the default applies.
+ */
+export type QueryParamValue =
+  | string
+  | number
+  | QueryDateRange
+  | (string | number)[]
+
+/**
+ * One parameter's definition, as a saved query keeps it and as a run may
+ * carry it (`QS-5`). The server omits `default` and `options` when there
+ * are none, so both are optional here; a multi-select default of `[]` is
+ * refused, so leave the default out instead.
+ */
+export type QueryParamDef = {
+  name: string
+  type: QueryParamType
+  default?: QueryParamValue
+  options?: QueryParamOption[]
+}
+
+/**
+ * What a run or an estimate may carry for the `{{name}}` placeholders in its
+ * SQL. Both are optional: a request that carries neither is the request
+ * sent before parameters existed.
+ */
+export type QueryParamInputs = {
+  /** The value of each parameter, by name. */
+  parameters?: Record<string, QueryParamValue>
+  /** The definitions those values are checked against. */
+  definitions?: QueryParamDef[]
+}
+
+/**
  * One saved query, as the server sends it (`QS-3`).
  *
  * The nine fields are the server's own: `folderId` says where the query
@@ -39,6 +104,8 @@ export type SavedQuery = {
   ownerId: string | null
   /** The level the caller holds on it. */
   level: SavedQueryLevel | string
+  /** The query's parameter definitions; the server always sends the list, empty when there are none. */
+  parameters: QueryParamDef[]
 }
 
 /**
@@ -89,6 +156,8 @@ export type SavedQueryVersion = {
   label: string
   /** When it was written, ISO 8601. */
   createdAt: string
+  /** The parameter definitions this version held; the server always sends the list. */
+  parameters: QueryParamDef[]
 }
 
 /**
@@ -121,6 +190,10 @@ export type SavedQueryAccessRule = {
   userId: string | null
   /** The role the rule names; `null` when the rule names a person. */
   roleId: string | null
+  /** The grantee's name; `null` when the server cannot find it in the organisation. */
+  granteeName: string | null
+  /** The person's email; `null` for a role and for a person the server cannot find. */
+  granteeEmail: string | null
   /** What the rule gives. */
   level: SavedQueryLevel | string
   /** Who wrote the rule; `null` when nobody is recorded. */
@@ -139,6 +212,10 @@ export type InheritedAccessRule = {
   userId: string | null
   /** The role the rule names; `null` when the rule names a person. */
   roleId: string | null
+  /** The grantee's name; `null` when the server cannot find it in the organisation. */
+  granteeName: string | null
+  /** The person's email; `null` for a role and for a person the server cannot find. */
+  granteeEmail: string | null
   /** What the rule gives. */
   level: SavedQueryLevel | string
 }
@@ -179,7 +256,7 @@ export type AccessRuleInput = {
 export type SavedQueryAccessInput = { rules: AccessRuleInput[] }
 
 /** One person the caller may share a saved query with (`GET /api/query/grantees`). */
-export type GranteePerson = { id: string; name: string; email: string }
+export type GranteePerson = { id: string; name: string; email: string | null }
 
 /** One role the caller may share a saved query with. */
 export type GranteeRole = { id: string; name: string }
@@ -232,6 +309,11 @@ export type QueryHistoryItem = {
  * last 14 days whatever the caller sends (decision 2).
  */
 export type QueryHistoryFilter = {
+  /**
+   * QS-12 (LH-QS-4-07): one run's id, for the `/query-studio?run=` handoff.
+   * The server still scopes it to the caller and the last 14 days.
+   */
+  id?: string
   status?: QueryHistoryItem["status"]
   engine?: string
   minDurationMs?: number
@@ -265,14 +347,32 @@ export type QueryPlanStage = {
 }
 
 export type QueryEstimate = {
+  /**
+   * `QS-6` (decision 7): whether the server could estimate this statement at
+   * all. Absent from an older server, which only ever answered a ClickHouse
+   * estimate — so absent reads as supported.
+   */
+  supported?: boolean
+  /** Why there is no estimate, as the server's fixed sentence (`QS-6`). */
+  reason?: string | null
+  /**
+   * `QS-6`: which engine answered. `null`/absent from an older server, whose
+   * estimate always described ClickHouse.
+   */
+  queryEngine?: QueryEngine | string
   /** Null when the query could not be planned — see `error`. */
   estimatedBytes: number | null
   estimatedCostMin: number | null
   estimatedCostMax: number | null
-  /** Why there is no estimate, in ClickHouse's words. */
+  /**
+   * Why there is no estimate, as the server sends it: today the engine's
+   * trimmed diagnosis (`SEC-11`, decision 4).
+   */
   error?: string | null
-  workloadClass: WorkloadClass
-  engine: EngineCategory
+  /** Null for a Trino statement, which has no ClickHouse workload class. */
+  workloadClass: WorkloadClass | null
+  /** Null for a Trino statement, which has no ClickHouse storage tier. */
+  engine: EngineCategory | null
   /**
    * `EXPLAIN ESTIMATE` doesn't report cache eligibility — null until a
    * real cache-eligibility check exists.
@@ -280,8 +380,20 @@ export type QueryEstimate = {
   cacheEligible: boolean | null
   /** Lag of the stalest source table (`freshness_lag`, ClickHouse `system.parts`); null when no source is known. */
   freshnessLagSeconds: number | null
-  /** No policy engine exists yet — WS7 builds one. */
+  /**
+   * QS-10 (LH-QS-2-05): the obligations the rewrite applied to this statement
+   * — "Column masks" then "Row filters", each once — or an empty list when
+   * neither applies. "Column masks"/"Row filters" name kinds, never the
+   * masked columns. `null` comes only from an older server (which reported no
+   * policy engine) or from a Trino estimate, which is not rewritten.
+   */
   policyObligations: string[] | null
+  /**
+   * QS-10 (LH-QS-1-11), D2: true when the caller lacks `catalog:read`, so the
+   * server withheld `sources`, their marks and `freshnessLagSeconds`. Absent
+   * from an older server, which never withheld them — read as false.
+   */
+  catalogHidden?: boolean
   sources: string[]
   /**
    * `DATA-12` part 3: the certified or deprecated mark of each table a
@@ -334,15 +446,30 @@ export type QueryResult = {
     durationMs: number
     scannedBytes: number
     costUnits: number
-    engine: EngineCategory
-    workloadClass: WorkloadClass
+    /** Null for a Trino run, which has no ClickHouse storage tier. */
+    engine: EngineCategory | null
+    /** Null for a Trino run, which has no ClickHouse workload class. */
+    workloadClass: WorkloadClass | null
     /** ClickHouse's response carries no cache-hit flag — not measured. */
     cacheHit: boolean | null
     /** No pushdown computation exists — not measured. */
     pushdowns: string[] | null
-    /** No policy engine exists yet — WS7 builds one. */
+    /**
+     * QS-10 (LH-QS-2-05), D4: the obligations the rewrite applied to this run
+     * — "Column masks" then "Row filters", each once — or an empty list when
+     * neither applied. `null` comes only from an older server that reported
+     * no policy engine.
+     */
     policyObligations: string[] | null
   }
+  /**
+   * QA `LH-QS-2-06` (`QS-9`): whether this person may download a result at
+   * all. `false` when every role they hold is switched off from downloading
+   * (the same switch the dashboard reads); the console turns Download and
+   * "Copy as TSV" off with it. Absent from an older server, which counts as
+   * allowed — and the download route refuses on its own either way.
+   */
+  canDownload?: boolean
   /**
    * WS1 task 1.6: the old plan was a single hardcoded stage claiming
    * "scan + aggregate" for every query. Null until a real plan exists.
@@ -379,6 +506,8 @@ export type SaveQueryInput = {
    * absent for the caller's own personal space.
    */
   folderId?: string | null
+  /** The definitions of the `{{name}}` parameters in `sql`; absent when it has none. */
+  parameters?: QueryParamDef[]
 }
 
 /**
@@ -398,6 +527,8 @@ export type UpdateSavedQueryInput = {
   tags?: string[]
   /** The folder the query moves to: an id, `null` for the shared space, absent to leave it where it is. */
   folderId?: string | null
+  /** New definitions; absent leaves them as they are and an empty list clears them. */
+  parameters?: QueryParamDef[]
 }
 
 /**
@@ -547,12 +678,23 @@ export interface QueryService {
    * History page's page numbers. `filter.page` is 1-based.
    */
   listHistoryPage(filter?: QueryHistoryFilter, signal?: AbortSignal): Promise<QueryHistoryPage>
-  estimate(sql: string, signal?: AbortSignal): Promise<QueryEstimate>
+  /**
+   * `options` carries the `{{name}}` values and definitions (`QS-5`): with
+   * none, the request is the one sent before parameters existed. The console
+   * asks only from a ClickHouse tab (M2 of the round-3 rulings): a `Trino`
+   * statement has no pre-run estimate, and the route still takes an `engine`
+   * from any other caller and answers `supported: false` with the reason.
+   */
+  estimate(sql: string, options?: QueryParamInputs, signal?: AbortSignal): Promise<QueryEstimate>
   /**
    * `runId` (`BI-5` plan D5) goes out as `X-Run-Id`, so a Stop can name the
    * run; absent, the server makes one and the run cannot be stopped by id.
    */
-  run(sql: string, options: { engine: QueryEngine; runId?: string }, signal?: AbortSignal): Promise<QueryResult>
+  run(
+    sql: string,
+    options: { engine: QueryEngine; runId?: string } & QueryParamInputs,
+    signal?: AbortSignal
+  ): Promise<QueryResult>
   /**
    * `POST /api/query/cancel { runId }` (`BI-5` plan D5): ends the caller's own
    * queries of that run on the engine and answers how many it found running.

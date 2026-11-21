@@ -46,8 +46,8 @@ export type ColumnState =
 export type CompletionOption = {
   /** What the person reads in the list. */
   label: string
-  /** What the suggestion is: a column, a table, or a note about the catalog. */
-  kind: "column" | "table" | "message"
+  /** What the suggestion is: a column, a table, a query parameter, or a note about the catalog. */
+  kind: "column" | "table" | "parameter" | "message"
   /** The type shown next to the label, e.g. `Int64`. */
   detail?: string
   /**
@@ -75,12 +75,21 @@ export type CompletionRequest = {
   tables: CompletionTable[]
   /** The columns fetched so far, keyed by the catalog id of the table. */
   columns: Record<string, ColumnState>
+  /** The names of the tab's `{{name}}` parameter definitions (`QS-5`). Absent means none. */
+  parameters?: readonly string[]
 }
 
 /** What the completion answers. */
 export type CompletionAnswer = {
   /** Where the word being completed starts. */
   from: number
+  /**
+   * QS round review R1 (D8): which place answered. `"names"` is a place where
+   * a table or column name is the only thing that fits — after `{{`, after a
+   * qualifier, or after `FROM`/`JOIN` — so names keep their boost. `"general"`
+   * leaves the ordering to CodeMirror's own match score against the keywords.
+   */
+  place: "names" | "general"
   /** The suggestions, in the order they should be read. */
   options: CompletionOption[]
 }
@@ -167,6 +176,9 @@ const NOT_AN_ALIAS = new Set([
   "WITH",
 ])
 
+/** `{{`, with blanks allowed after it, right before the word being completed. */
+const OPENS_PLACEHOLDER = /\{\{\s*$/
+
 /**
  * The dotted name right before the word being completed: `o` in `o.am`,
  * `silver.orders` in `silver.orders.amount`.
@@ -244,14 +256,34 @@ function aliasAfter(tokens: SqlToken[], last: number): string | null {
 }
 
 /**
- * The table references the statement makes.
+ * What one pass over the statement finds in its table positions.
+ *
+ * `references` are the tables the catalog knows, with the alias each is
+ * given. `unknownAliases` are the aliases (lower-cased) the statement gives
+ * to a table the catalog does not know: `x` in `FROM x q` and `JOIN a.b AS q`
+ * is not in the list, so `q` is declared but names no table in it
+ * (`references` records nothing for such a table). QS-4-AC8.
+ */
+type TableScan = {
+  references: Reference[]
+  unknownAliases: Set<string>
+}
+
+/**
+ * Scans the statement once for both of the above, so the walk over `FROM` and
+ * `JOIN` positions lives in one place.
  *
  * A reference is a word, or a chain of words joined by dots, that the
  * catalog knows. Only a reference in a table position (`FROM`, `JOIN`) can
- * have an alias: an alias names the table it follows.
+ * have an alias: an alias names the table it follows. The `AS` and the alias
+ * of an unknown table are never taken for tables of their own.
  */
-function references(tokens: SqlToken[], tables: CompletionTable[]): Reference[] {
-  const found: Reference[] = []
+function scanTables(tokens: SqlToken[], tables: CompletionTable[]): TableScan {
+  const references: Reference[] = []
+  const unknownAliases = new Set<string>()
+  // Token indexes of the `AS` and the alias after an unknown table: the
+  // alias scan does not read them again as table names.
+  const declaredAt = new Set<number>()
   let inTableClause = false
   let i = 0
   while (i < tokens.length) {
@@ -276,15 +308,31 @@ function references(tokens: SqlToken[], tables: CompletionTable[]): Reference[] 
     for (let k = i + 2; k <= last; k += 2) written += `.${tokens[k]?.text ?? ""}`
     const table = resolveTable(written, tables)
     if (table) {
-      found.push({
+      references.push({
         table,
         written,
         alias: inTableClause ? aliasAfter(tokens, last) : null,
       })
+    } else if (inTableClause && !declaredAt.has(i)) {
+      const alias = aliasAfter(tokens, last)
+      if (alias !== null) {
+        unknownAliases.add(alias.toLowerCase())
+        const hasAs = tokens[last + 1]?.text.toUpperCase() === "AS"
+        if (hasAs) declaredAt.add(last + 1)
+        declaredAt.add(hasAs ? last + 2 : last + 1)
+      }
     }
     i = last + 1
   }
-  return found
+  return { references, unknownAliases }
+}
+
+function references(tokens: SqlToken[], tables: CompletionTable[]): Reference[] {
+  return scanTables(tokens, tables).references
+}
+
+function unknownTableAliases(tokens: SqlToken[], tables: CompletionTable[]): Set<string> {
+  return scanTables(tokens, tables).unknownAliases
 }
 
 /** Where the word the cursor is in starts. */
@@ -328,6 +376,18 @@ function resolveQualifier(
     if (reference.alias?.toLowerCase() === wanted) return reference.table
   }
   return resolveTable(qualifier, tables)
+}
+
+/** Whether `qualifier` is an alias the statement gives to a table of the list. */
+function resolvesToAlias(
+  qualifier: string,
+  tokens: SqlToken[],
+  tables: CompletionTable[]
+): boolean {
+  const wanted = qualifier.toLowerCase()
+  return references(tokens, tables).some(
+    (reference) => reference.alias?.toLowerCase() === wanted
+  )
 }
 
 /** The columns of one table, or the note that says they are not there yet. */
@@ -391,9 +451,67 @@ export function tablesInStatement(sql: string, tables: CompletionTable[]): Named
 }
 
 /**
+ * Whether the token ends with the marker that closes it: a quoted run with
+ * its own quote, a block comment with its closing marker. A line comment
+ * has no such marker: it ends with the text it holds.
+ */
+function closesToken(token: SqlToken): boolean {
+  if (token.kind === "quoted") {
+    const quote = token.text[0] ?? ""
+    return token.text.length > 1 && token.text.endsWith(quote)
+  }
+  return token.text.endsWith("*/")
+}
+
+/**
+ * Whether the cursor is inside a token: a comment or a quoted run.
+ *
+ * The end of a token that closes with a marker is outside it: the cursor
+ * right after a closed quote, or after a closed block comment, writes code
+ * again. A line comment and an open quote end with the text they hold, so
+ * the cursor at their end is still inside them.
+ */
+function insideToken(token: SqlToken, cursor: number): boolean {
+  if (cursor < token.from) return false
+  if (cursor < token.to) return true
+  return !closesToken(token)
+}
+
+/**
+ * Whether the cursor sits inside a comment or a quoted run.
+ *
+ * A `{{` there is text, not a placeholder, so no parameter name belongs
+ * there.
+ */
+export function inCommentOrString(sql: string, cursor: number): boolean {
+  return insideText(tokenizeSql(sql), cursor)
+}
+
+/** Whether the cursor sits inside a comment or a quoted run of these tokens. */
+function insideText(tokens: SqlToken[], cursor: number): boolean {
+  return tokens.some(
+    (token) =>
+      (token.kind === "comment" || token.kind === "quoted") && insideToken(token, cursor)
+  )
+}
+
+/**
+ * Whether the cursor is right after a `{{` that opens a placeholder.
+ *
+ * The name may be half typed: `{{re` is still inside the placeholder, so
+ * the braces are read before the name.
+ */
+export function inPlaceholder(sql: string, cursor: number): boolean {
+  const from = wordStart(sql, cursor)
+  return OPENS_PLACEHOLDER.test(sql.slice(0, from))
+}
+
+/**
  * The suggestions for the place the cursor is in.
  *
- * Three places, in order:
+ * Four places, in order:
+ * - after `{{`: the names of the tab's parameter definitions, and nothing
+ *   else, because nothing else can be written there;
  * - after a qualifier (`o.`, `silver.orders.`): the columns of that one
  *   table, or the note that says they are not there yet;
  * - after `FROM` or `JOIN`: the tables;
@@ -408,18 +526,44 @@ export function sqlCompletionOptions({
   cursor,
   tables,
   columns,
+  parameters = [],
 }: CompletionRequest): CompletionAnswer {
   const tokens = tokenizeSql(sql)
   const from = wordStart(sql, cursor)
 
+  if (OPENS_PLACEHOLDER.test(sql.slice(0, from))) {
+    // The braces in a comment or in a quoted run are text, not a
+    // placeholder: they hold no name, so no name is offered there.
+    if (insideText(tokens, cursor)) {
+      return { from, place: "names", options: [] }
+    }
+    return {
+      from,
+      place: "names",
+      options: parameters.map((name) => ({ label: name, kind: "parameter", apply: name })),
+    }
+  }
+
   const qualifier = qualifierBefore(sql, from)
   if (qualifier) {
+    // An alias for a table the list does not hold: the statement does name a
+    // table there, so another table's columns, or the table list, would be
+    // a wrong answer for it (QS-4-AC8). An alias of a listed table, and a
+    // qualifier that is a schema or catalog name, are answered below. The
+    // alias is one word: a dotted qualifier is never one.
+    if (
+      !qualifier.includes(".") &&
+      !resolvesToAlias(qualifier, tokens, tables) &&
+      unknownTableAliases(tokens, tables).has(qualifier.toLowerCase())
+    ) {
+      return { from, place: "names", options: [] }
+    }
     const table = resolveQualifier(qualifier, tokens, tables)
     if (table) {
       // The table behind the qualifier is known: its columns are the only
       // thing that fits here. A table whose columns have not been fetched
       // yet says so, rather than offering another table's columns.
-      return { from, options: columnOptions(columns[table.id]) }
+      return { from, place: "names", options: columnOptions(columns[table.id]) }
     }
     // The qualifier names nothing the catalog knows. The tables the
     // statement names may still help, so the general case answers.
@@ -427,11 +571,14 @@ export function sqlCompletionOptions({
 
   const previous = lastWordBefore(tokens, from)
   if (previous === "FROM" || previous === "JOIN") {
-    return { from, options: tableOptions(tables) }
+    return { from, place: "names", options: tableOptions(tables) }
   }
 
   return {
     from,
+    // QS round review R1 (D8): no boost here — a keyword that matches what
+    // was typed ranks by CodeMirror's own match score.
+    place: "general",
     options: [...namedColumnOptions(tokens, tables, columns), ...tableOptions(tables)],
   }
 }

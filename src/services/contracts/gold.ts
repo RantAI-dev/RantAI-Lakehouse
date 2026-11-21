@@ -21,20 +21,38 @@ export type GoldExportResult = {
   rowsExported: number
   snapshotId: Measured
   exportedAt: string | null
+  /**
+   * The ONE `_exported_at` stamp this publish wrote on every row
+   * (`DATA-6` M2), RFC 3339 with microseconds, or `null` on a zero-row
+   * publish (no copy exists to identify).
+   */
+  copyExportedAt: string | null
+  /**
+   * What happened to the follow-up run that replaces
+   * `gold.<table>_latest` with this copy (`DATA-6` D6/D13): `queued`, or
+   * `not_started` when the orchestrator refused or could not be reached.
+   * `null` on a zero-row publish.
+   */
+  latestCopy: { table: string; status: "queued" | "not_started" | string } | null
 }
 
 /**
  * `GET /api/gold/export/{mart}` response — the Gold Iceberg table read
  * straight back through `iceberg-rust`, independent of whatever the last
- * `POST` claimed. 500s when the table has never been exported; the client
- * classifies that as `ServiceError` for the page to render as "Never
- * exported" rather than a generic error.
+ * `POST` claimed.
+ *
+ * A mart never published answers 200 with `published: false` and every other
+ * fact `null` (`DATA-49`, D11): "no export yet" is a normal state, not an
+ * error, so the console reads it from this field. A failed request is a
+ * failure and is shown as one, never as "Never exported".
  */
 export type GoldReadBack = {
   namespace: string
   table: string
-  formatVersion: number
-  rowsInIceberg: number
+  /** Whether the catalog holds this mart's published table at all. */
+  published: boolean
+  formatVersion: number | null
+  rowsInIceberg: number | null
   snapshotId: Measured
   exportedAt: string | null
 }
@@ -117,6 +135,56 @@ export type GoldTrimSummary = {
   reason: string | null
 }
 
+/**
+ * What the latest-copy table holds (DATA-6 D4), from the newest `success`
+ * row of `console.gold_latest_copy_run`
+ * (`gold_latest_copy::latest_copy_state` in `routes/gold.rs`).
+ * `copyExportedAt` keeps microseconds — two publishes can fall in one
+ * second — and is `null` only on a broken record, never on a healthy one.
+ */
+export type GoldLatestCopyHolds = {
+  copyExportedAt: string | null
+  rows: number | null
+  replacedAt: string | null
+}
+
+/**
+ * The newest latest-copy run of any status (DATA-6 D12). `reason` and
+ * `cleanup` come from closed sets of fixed strings on the API side —
+ * never exception text — widened per this repo's `"a" | "b" | string`
+ * convention rather than treated as a closed union.
+ */
+export type GoldLatestCopyRun = {
+  status: "success" | "failed" | "skipped" | "superseded" | string
+  reason: string | null
+  cleanup: string | null
+  finishedAt: string | null
+}
+
+/**
+ * The latest-copy block of a publication detail (DATA-6 D4): a second
+ * Iceberg table, `gold.<table>_latest`, that always holds only the newest
+ * copy, for tools that do not filter on export time. `holds`/`lastRun`
+ * are `null` before the first update; the table's name is always there,
+ * so a tool can be pointed at it ahead of time. The whole block is
+ * `null` when this publish wrote no copy.
+ */
+export type GoldLatestCopy = {
+  table: string
+  holds: GoldLatestCopyHolds | null
+  lastRun: GoldLatestCopyRun | null
+}
+
+/**
+ * The mart's newest export run, when it FAILED (`DATA-49`). `failedAt` is when
+ * that run started, RFC 3339, or `null` when it cannot be read; `reason` is the
+ * sentence the API stored for it — the same one the failed response carried.
+ */
+export type GoldPublicationFailure = {
+  failedAt: string | null
+  reason: string
+}
+
 export type GoldPublication = {
   mart: string
   enabled: boolean
@@ -124,8 +192,15 @@ export type GoldPublication = {
   lastChangedAt: string | null
   lastExportedAt: string | null
   changedSinceExport: boolean | null
+  /**
+   * `null` unless the mart's newest run failed, whatever the last successful
+   * publish says (`DATA-49`, `publication_body` in `routes/gold.rs`).
+   */
+  lastFailure: GoldPublicationFailure | null
   canEdit: boolean
   trim?: GoldTrimSummary | null
+  /** The latest-copy table's name, what it holds, its newest run (DATA-6). */
+  latestCopy: GoldLatestCopy | null
 }
 
 export interface GoldService {

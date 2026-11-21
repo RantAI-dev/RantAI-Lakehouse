@@ -1,6 +1,6 @@
-import type { OpsService, PlatformService } from "../contracts/ops";
+import type { OpsService, ServicesReport } from "../contracts/ops";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
  * OpsService is real: the service list comes from ClickHouse system.* +
@@ -13,12 +13,17 @@ import { ServiceError } from "../errors";
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await apiFetch(url, { signal });
   const json = await res.json();
-  if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Failed to load ops");
+  if (!res.ok) {
+    // WEB-12: a refusal is a refusal, not the service being unavailable.
+    const denied = deniedFor(res.status, json);
+    if (denied) throw denied;
+    throw new ServiceError("unavailable", json?.error ?? "Failed to load ops");
+  }
   return json as T;
 }
 
 export const clickhouseOpsService: OpsService = {
   async listServices(s) {
-    return (await get<{ services: PlatformService[] }>("/api/ops/services", s)).services;
+    return get<ServicesReport>("/api/ops/services", s);
   },
 };

@@ -49,15 +49,22 @@ describe("calculated fields client", () => {
     expect(JSON.parse(String(calls[1].init.body))).toEqual({ id: "f_1", formula: "[a] + [b]" })
   })
 
-  it("a refusal carries the server's sentence as invalid_request, a missing permission as permission_denied", async () => {
+  it("a refusal carries the server's sentence as invalid_request", async () => {
     stubFetch(() => json({ error: "the field is still used by chart c_1." }, 409))
     const err = await calcFieldService.remove("f_1").catch((e) => e)
     expect(err).toBeInstanceOf(ServiceError)
     expect(err.code).toBe("invalid_request")
     expect(err.message).toContain("still used")
+  })
+
+  // QA LH-BI-8-04 (WEB-11): the console showed the API's code, not a sentence.
+  it("a missing permission reads as the sentence that names it, with the status", async () => {
     stubFetch(() => json({ error: "permission_denied: dashboard:write" }, 403))
     const denied = await calcFieldService.create({ mart: "m" }, "x", "1").catch((e) => e)
+    expect(denied).toBeInstanceOf(ServiceError)
     expect(denied.code).toBe("permission_denied")
+    expect(denied.status).toBe(403)
+    expect(denied.message).toBe("You don't have access. This needs the dashboard:write permission.")
   })
 
   it("functions returns the catalog", async () => {

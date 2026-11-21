@@ -11,7 +11,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { calcFieldService } from "@/services";
 import { MAX_GROUPS, groupDefOf, type CalcField, type CalcFieldSource, type ValueGroup } from "@/services/contracts/calc-fields";
 import { addGroup, groupOf, groupPayload, groupProblems, toggleValue } from "@/lib/value-groups";
-import { useFilterValues } from "./filters/use-filter-values";
+import { ownSourceOf, useFilterValues } from "./filters/use-filter-values";
 
 const REST_ITEMS = { keep: "Keep their own names", other: "Call them Other" } as const;
 
@@ -55,7 +55,7 @@ export function ValueGroupDialog({
     setProblem(null);
   }, [open, existing]);
 
-  const list = useFilterValues({ board: "", column, others: [], search });
+  const list = useFilterValues({ board: "", column, others: [], search, source: ownSourceOf(source) });
   const missing = groupProblems(name, column, groups, rest);
   const nameOk = existing ? true : /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name);
 

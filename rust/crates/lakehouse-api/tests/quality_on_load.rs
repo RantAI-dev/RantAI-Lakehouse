@@ -10,7 +10,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
@@ -225,6 +225,8 @@ async fn seed_pipeline(pool: &PgPool, target_zone: &str, target_table: &str) -> 
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: "quality-on-load".to_owned(),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),

@@ -1,11 +1,11 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import { PlusIcon } from "lucide-react"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
-import { CreateSheet } from "@/components/patterns/create-sheet"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -16,14 +16,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useDataTable } from "@/hooks/use-data-table"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { filterDataClientSide } from "@/lib/data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { withNotify } from "@/lib/notify"
 import { identityService } from "@/services"
 import { getServiceIdentityColumns } from "./service-identities-columns"
 
@@ -31,10 +29,6 @@ export function ServiceIdentitiesPage() {
   const { hasPermission } = useAuth()
   const canWrite = hasPermission("identity:write")
   const state = useService((s) => identityService.listServiceIdentities(s), [])
-  const [createOpen, setCreateOpen] = React.useState(false)
-  const [name, setName] = React.useState("")
-  const [scopes, setScopes] = React.useState("")
-  const [environment, setEnvironment] = React.useState("")
   // The rotated secret is shown in the
   // dialog below exactly once and is NEVER persisted to localStorage,
   // sessionStorage, or any service-layer cache entry. Kept as local
@@ -42,23 +36,6 @@ export function ServiceIdentitiesPage() {
   // table (filter/search input, a refetch landing) cannot leak it via any
   // hook that stores its argument.
   const [revealedSecret, setRevealedSecret] = React.useState<string | null>(null)
-  // The console address an outside tool points at (DATA-5 D10, ADR
-  // 0016). It is read when the admin opens the sheet — a click handler,
-  // so the server-rendered pass never touches `window`, and the value
-  // cannot differ between the two renders.
-  const [consoleOrigin, setConsoleOrigin] = React.useState("")
-  const create = useServiceAction(
-    withNotify(
-      {
-        success: "Service identity created",
-        error: "Failed to create service identity",
-      },
-      (
-        signal,
-        input: Parameters<typeof identityService.createServiceIdentity>[0]
-      ) => identityService.createServiceIdentity(input, signal)
-    )
-  )
   const rotate = useServiceAction(
     (signal, id: string) => identityService.rotateServiceIdentity(id, signal),
   )
@@ -124,33 +101,6 @@ export function ServiceIdentitiesPage() {
     getRowId: (row) => row.id,
   })
 
-  function resetForm() {
-    setName("")
-    setScopes("")
-    setEnvironment("")
-  }
-
-  function openCreateSheet() {
-    setConsoleOrigin(typeof window !== "undefined" ? window.location.origin : "")
-    setCreateOpen(true)
-  }
-
-  async function handleCreate() {
-    const result = await create.run({
-      name: name.trim(),
-      scopes: scopes
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean),
-      environment: environment.trim(),
-    })
-    if (result) {
-      setCreateOpen(false)
-      resetForm()
-      state.reload()
-    }
-  }
-
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
@@ -159,7 +109,7 @@ export function ServiceIdentitiesPage() {
         actions={
           <Button
             size="sm"
-            onClick={() => openCreateSheet()}
+            render={<Link href="/admin/service-identities/new" />}
             disabled={!canWrite}
             title={canWrite ? undefined : "You don't have permission to create service identities."}
           >
@@ -184,48 +134,6 @@ export function ServiceIdentitiesPage() {
           </div>
         </div>
       ) : null}
-      <CreateSheet
-        open={createOpen}
-        onOpenChange={(open) => {
-          setCreateOpen(open)
-          if (!open) resetForm()
-        }}
-        title="Create Service Identity"
-        description="Issue a new non-human service identity."
-        canSubmit={Boolean(name.trim() && scopes.trim() && environment.trim())}
-        submitting={create.status === "pending"}
-        onSubmit={handleCreate}
-      >
-        <div className="space-y-1.5">
-          <Label htmlFor="si-name">Name</Label>
-          <Input id="si-name" value={name} onChange={(e) => setName(e.target.value)} />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="si-scopes">Scopes (comma-separated)</Label>
-          <Input
-            id="si-scopes"
-            value={scopes}
-            onChange={(e) => setScopes(e.target.value)}
-            placeholder="query:read, storage:write"
-          />
-          {/* DATA-5 D10: an admin who grants `iceberg:read` needs the
-              address the outside tool points at, and the fact that the
-              key comes from Rotate, not from this form. */}
-          <p className="text-xs text-muted-foreground">
-            <code>iceberg:read</code> lets an outside tool read published Gold tables at{" "}
-            <code data-testid="outside-reader-address">{consoleOrigin}/api/iceberg</code>. Use Rotate to get its key.
-          </p>
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="si-env">Environment</Label>
-          <Input
-            id="si-env"
-            value={environment}
-            onChange={(e) => setEnvironment(e.target.value)}
-            placeholder="production"
-          />
-        </div>
-      </CreateSheet>
       <Dialog
         open={revealedSecret !== null}
         onOpenChange={(open) => {
@@ -252,7 +160,10 @@ export function ServiceIdentitiesPage() {
               size="sm"
               onClick={() => {
                 if (revealedSecret === null) return
-                void navigator.clipboard.writeText(revealedSecret)
+                // Same as the password reveal above: the textarea fallback is
+                // appended inside this dialog, so the copy works over plain
+                // http, where the browser has no clipboard API (`UX-6`).
+                void copyTextWithToast(revealedSecret)
               }}
             >
               Copy

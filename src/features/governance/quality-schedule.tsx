@@ -1,14 +1,13 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { notifySuccess } from "@/lib/notify"
 import { governanceService } from "@/services"
 import type { QualitySchedule } from "@/services/contracts/governance"
-
-const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
 /** The intervals offered, in minutes: one hour to one day. */
 export const INTERVAL_CHOICES = [60, 120, 180, 360, 720, 1440] as const
@@ -80,30 +79,26 @@ export function ScheduleControls({
     <div className="flex flex-wrap items-end gap-3">
       <div className="grid gap-1">
         <Label htmlFor={`${id}-mode`}>Run the checks</Label>
-        <select
+        <SelectField
           id={`${id}-mode`}
-          className={selectClassName}
+          className="w-full"
           value={mode}
-          onChange={(e) => setMode(e.target.value as "interval" | "on_load")}
-        >
-          <option value="interval">On a timer</option>
-          <option value="on_load">On every load</option>
-        </select>
+          options={[
+            { value: "interval", label: "On a timer" },
+            { value: "on_load", label: "On every load" },
+          ]}
+          onValueChange={(next) => setMode(next as "interval" | "on_load")}
+        />
       </div>
       <div className="grid gap-1">
         <Label htmlFor={`${id}-interval`}>{mode === "on_load" ? "And at least every" : "Every"}</Label>
-        <select
+        <SelectField
           id={`${id}-interval`}
-          className={selectClassName}
-          value={minutes}
-          onChange={(e) => setMinutes(Number(e.target.value))}
-        >
-          {choices.map((m) => (
-            <option key={m} value={m}>
-              {intervalLabel(m)}
-            </option>
-          ))}
-        </select>
+          className="w-full"
+          value={String(minutes)}
+          options={choices.map((m) => ({ value: String(m), label: intervalLabel(m) }))}
+          onValueChange={(next) => setMinutes(Number(next))}
+        />
       </div>
       <Button size="sm" variant="outline" onClick={() => void submit()} disabled={save.status === "pending"}>
         {save.status === "pending" ? "Saving…" : "Save schedule"}

@@ -1,5 +1,5 @@
 import { cleanup, render, waitFor } from "@testing-library/react"
-import { afterEach, beforeAll, describe, expect, it, mock } from "bun:test"
+import { afterAll, afterEach, beforeAll, describe, expect, it, mock } from "bun:test"
 import { existsSync, readdirSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import type { ChartRenderSpec } from "@/lib/dashboard-specs"
@@ -20,6 +20,10 @@ const realFile = (url: string) => readFileSync(join(PUBLIC, url), "utf8")
 
 // Serve the app's static files from public/, as Next does, but only the ones asked for.
 const requested: string[] = []
+// OPS-33: `bun test` runs every file in one process, so this global stub outlives
+// the file. A file the runner loads later takes it for the real `fetch` and never
+// gets the real one back, so keep it here and put it back when this file is done.
+const originalFetch = globalThis.fetch
 beforeAll(() => {
   globalThis.fetch = (async (url: string) => {
     requested.push(url)
@@ -29,6 +33,7 @@ beforeAll(() => {
       : new Response("not found", { status: 404 })
   }) as unknown as typeof fetch
 })
+afterAll(() => { globalThis.fetch = originalFetch })
 afterEach(() => { cleanup(); drawn.length = 0; requested.length = 0 })
 
 const spec = (map: string | undefined, x = "country") =>

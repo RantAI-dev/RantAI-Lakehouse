@@ -1,4 +1,4 @@
-import { toServiceError, type ServiceErrorCode } from "@/services/errors"
+import { ASK_ADMIN, isDeniedText, readDenied, toServiceError, type ServiceErrorCode } from "@/services/errors"
 
 /**
  * Penyusunan pesan notifikasi — sengaja dipisah dari `notify.ts`.
@@ -16,8 +16,7 @@ import { toServiceError, type ServiceErrorCode } from "@/services/errors"
  */
 const HINTS: Record<ServiceErrorCode, string> = {
   not_found: "It may already have been deleted. Reload the list.",
-  permission_denied:
-    "This account does not have permission. Ask a workspace admin.",
+  permission_denied: ASK_ADMIN,
   unavailable: "The service is unavailable right now. Try again shortly.",
   invalid_request: "Check the input before sending it again.",
   too_many_requests: "Wait for the lockout to end, then try again.",
@@ -35,6 +34,15 @@ const HINTS: Record<ServiceErrorCode, string> = {
 export function buildErrorDescription(err: unknown): string | null {
   const serviceError = toServiceError(err)
   if (serviceError.code === "aborted") return null
+
+  // QA LH-DATA-9-20, TC-1734 (WEB-11): a refusal is the one sentence and the
+  // next step, whether the client already wrote the sentence or the message
+  // is still the API's code-first text.
+  const said = serviceError.message.trim()
+  if (serviceError.code === "permission_denied" || isDeniedText(said)) {
+    const sentence = said === "" || isDeniedText(said) ? readDenied(said).message : said
+    return `${sentence} ${ASK_ADMIN}`
+  }
 
   const hint = HINTS[serviceError.code]
   const known = prefixedHint(serviceError.message)
@@ -57,11 +65,14 @@ function prefixedHint(message: string): string | null {
 
 /**
  * The text to show for a raw error message (a banner, an inline error): the
- * hint sentence alone when it starts with a known code, else the message as it
- * is. BI-18 part C review fix (SHOULD-FIX) R20; the dashboard page's red
- * banner used to print the raw text, code first.
+ * one sentence for a refusal (`readDenied`), the hint sentence alone when it
+ * starts with another known code, else the message as it is. BI-18 part C
+ * review fix (SHOULD-FIX) R20; the dashboard page's red banner used to print
+ * the raw text, code first.
  */
 export function readableErrorMessage(message: string): string {
+  // WEB-11: the one sentence for a refusal (errors.ts, readDenied).
+  if (isDeniedText(message)) return readDenied(message).message
   const hint = prefixedHint(message)
   if (hint === null) return message
   // BI-18 part C review fix R20 (follow-up: keep the server's sentence): when

@@ -3,6 +3,7 @@
 import * as React from "react"
 import { Pencil } from "lucide-react"
 import { MetadataList } from "@/components/patterns/metadata-list"
+import { SelectField } from "@/components/patterns/select-field"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
@@ -166,19 +167,19 @@ function EditDialog({
                     <Label htmlFor={`asset-governed-${tagKey.key}`} className="font-mono text-xs">
                       {tagKey.key}
                     </Label>
-                    <select
+                    <SelectField
                       id={`asset-governed-${tagKey.key}`}
-                      className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                      className="w-full"
                       value={governed[tagKey.key] ?? ""}
-                      onChange={(e) => setGoverned({ ...governed, [tagKey.key]: e.target.value })}
-                    >
-                      <option value="">None</option>
-                      {tagKey.allowedValues.map((value) => (
-                        <option key={value} value={value}>
-                          {value}
-                        </option>
-                      ))}
-                    </select>
+                      options={[
+                        /* WEB-9 D2: "None" is a real choice, not a prompt. */
+                        { value: "", label: "None" },
+                        ...tagKey.allowedValues.map((value) => ({ value, label: value })),
+                      ]}
+                      onValueChange={(next) =>
+                        setGoverned({ ...governed, [tagKey.key]: next })
+                      }
+                    />
                   </div>
                 ))}
               </div>

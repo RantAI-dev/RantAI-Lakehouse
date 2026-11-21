@@ -164,13 +164,18 @@ export function ChatComposer({
   if (compact) {
     return (
       <div className={cn("flex items-center gap-2 rounded-full border py-2 pl-4 pr-2 transition-all", glassCls)}>
+        {/* UX-4 (decision 4): back to the pre-#568 pill — no visible
+            "Message" label, no tooltip, no hidden requirement text. The
+            input names itself and keeps `aria-required` (decision 3). */}
         <input
+          id="copilot-compact-message"
+          aria-required
+          aria-label="Message AI Copilot"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onFocus={onFocus}
           onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } }}
           placeholder={placeholder ?? "Ask anything about your lakehouse…"}
-          aria-label="Message AI Copilot"
           className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
         />
         {busy && onStop ? (
@@ -195,8 +200,16 @@ export function ChatComposer({
 
   const body = (
     <>
+      {/* UX-4 (decision 4): back to the pre-#568 composer — no visible
+          "Message AI Copilot" label and no "* Required" line. The textarea
+          names itself and keeps `aria-required` (decision 3). The wrapper
+          stays `relative`: the animated example below is absolutely
+          positioned and needs a positioned ancestor. */}
       <div className="relative">
         <Textarea
+          id="copilot-message"
+          aria-required
+          aria-label="Message AI Copilot"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onFocus={onFocus}
@@ -210,7 +223,6 @@ export function ChatComposer({
           // With examples the placeholder is the animated overlay below: a
           // native placeholder cannot cross-fade.
           placeholder={example ? "" : placeholder ?? "Ask anything about your lakehouse data…"}
-          aria-label="Message AI Copilot"
           className="resize-none border-0 bg-transparent px-2 py-1.5 shadow-none focus-visible:ring-0 dark:bg-transparent"
         />
         {cycling && example ? (

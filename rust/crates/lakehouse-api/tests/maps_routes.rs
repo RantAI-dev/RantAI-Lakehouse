@@ -9,7 +9,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -18,7 +18,9 @@ use tower::ServiceExt;
 
 use std::collections::HashMap;
 
-use lakehouse_embed::{EmbedClaims, EmbedResource, sign_embed, unix_now};
+use lakehouse_embed::{
+    EmbedClaims, EmbedResource, RenderClaims, sign_embed, sign_render, unix_now,
+};
 use lakehouse_store::public_links as links;
 use time::{Duration, OffsetDateTime};
 use wiremock::matchers::{body_string_contains, method};
@@ -743,6 +745,106 @@ async fn an_embed_reads_the_boundary_of_a_map_its_board_uses_and_refuses_a_bad_t
         bad.json()["error"],
         json!("embed token is invalid or expired")
     );
+}
+
+/// The secret the PDF print view's render token is signed with (a test value).
+const RENDER_SECRET: &str = "test-render-secret-not-real";
+
+/// A render token for `board_id`, naming `person`, valid for two minutes.
+fn render_token(person: uuid::Uuid, board_id: &str) -> String {
+    let now = unix_now().floor();
+    sign_render(
+        &RenderClaims {
+            aud: "render".to_owned(),
+            board: board_id.to_owned(),
+            chart: None,
+            principal: person.to_string(),
+            filters: None,
+            params: None,
+            grain: None,
+            report: None,
+            paper: "a4".to_owned(),
+            orientation: "portrait".to_owned(),
+            exp: now + 120.0,
+            iat: now,
+            jti: uuid::Uuid::new_v4().to_string(),
+        },
+        RENDER_SECRET,
+    )
+}
+
+/// `BI-36`: the print view has no session, so the signed-in loader answered it
+/// with a 401 and the map tile of a PDF did not draw. It reads the boundary
+/// through its render token instead, with the rule the public link and the embed
+/// have: the token opens its board's maps and nothing else.
+#[tokio::test]
+async fn the_print_view_reads_the_boundary_of_a_map_its_board_uses_through_its_token() {
+    let (app, engine) = with_engine_env(HashMap::from([(
+        "RENDER_TOKEN_SECRET".to_owned(),
+        RENDER_SECRET.to_owned(),
+    )]))
+    .await;
+    let cookie = admin(&app).await;
+    let id = upload(&app, &cookie, "Sales regions").await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    mount_board_and_chart(&engine, "b_printed", "tok", &id).await;
+    let reader = create_principal_with_permissions(&app.pool, "dashboard:read").await;
+    let token = render_token(reader, "b_printed");
+    let ask = |map: String, body: String| {
+        let app = &app;
+        async move {
+            send(
+                app,
+                "",
+                "POST",
+                &format!("/api/render/maps/{map}/geojson"),
+                Some(("application/json".to_owned(), body.into_bytes())),
+                &[],
+            )
+            .await
+        }
+    };
+
+    // With the token and no session, the boundary is served.
+    let file = ask(id.clone(), json!({ "token": token }).to_string()).await;
+    assert_eq!(file.status, StatusCode::OK);
+    assert_eq!(
+        file.json()["features"][0]["properties"],
+        json!({ "name": "North" })
+    );
+
+    // The signed-in route, with no session, is what the print view used and
+    // could not pass.
+    let signed_in = send(
+        &app,
+        "",
+        "GET",
+        &format!("/api/maps/{id}/geojson"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(signed_in.status, StatusCode::UNAUTHORIZED);
+
+    // A map no chart on that board draws on: the same 404 as a map that does
+    // not exist.
+    for other in ["m_000000000000", "not-an-id"] {
+        let refused = ask(other.to_owned(), json!({ "token": token }).to_string()).await;
+        assert_eq!(refused.status, StatusCode::NOT_FOUND, "{other}");
+    }
+
+    // A token that does not verify gets the fixed 401, a body without a token
+    // a 400.
+    let bad = ask(id.clone(), json!({ "token": "not.a.token" }).to_string()).await;
+    assert_eq!(bad.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        bad.json()["error"],
+        json!("render token is invalid or expired")
+    );
+    let none = ask(id, "{}".to_owned()).await;
+    assert_eq!(none.status, StatusCode::BAD_REQUEST);
 }
 
 // ── a region chart on an uploaded map (`BI-16` C2b QA fix Q1) ────────────

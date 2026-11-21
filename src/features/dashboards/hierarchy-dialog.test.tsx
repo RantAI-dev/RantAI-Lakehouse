@@ -35,12 +35,23 @@ describe("HierarchyDialog", () => {
     expect(JSON.parse(String(calls[0].body))).toEqual({ mart: "m", name: "Geo", levels: ["provinsi", "kab_kota"] })
   })
 
+  // QA LH-BI-10-08 (BI-54): the rule changed — the button used to vanish at
+  // the limit; it now stays, off, with the sentence under it (the pattern
+  // `layers-section.tsx` set for "Add a question").
   it("adds levels up to six and never fewer than two", () => {
     render(<HierarchyDialog open onOpenChange={() => {}} source={{ mart: "m" }} columns={["a", "b", "c"]} onSaved={() => {}} />)
     expect((screen.getByLabelText("Remove level 1") as HTMLButtonElement).disabled).toBe(true)
     for (let i = 0; i < 4; i += 1) fireEvent.click(screen.getByText("Add a level"))
-    expect(screen.queryByText("Add a level")).toBeNull()
+    expect((screen.getByText("Add a level") as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText("A hierarchy takes at most six levels.")).toBeTruthy()
     expect(screen.getAllByLabelText(/^Level \d$/)).toHaveLength(6)
+  })
+
+  it("says nothing about a limit below six levels", () => {
+    render(<HierarchyDialog open onOpenChange={() => {}} source={{ mart: "m" }} columns={["a", "b", "c"]} onSaved={() => {}} />)
+    for (let i = 0; i < 3; i += 1) fireEvent.click(screen.getByText("Add a level"))
+    expect((screen.getByText("Add a level") as HTMLButtonElement).disabled).toBe(false)
+    expect(screen.queryByText("A hierarchy takes at most six levels.")).toBeNull()
   })
 
   it("shows a refusal as the server's own sentence", async () => {

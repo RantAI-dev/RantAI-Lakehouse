@@ -31,6 +31,14 @@ function isDownloadableEngine(engine: string): boolean {
 }
 
 /**
+ * What the console says when a role's downloads are switched off. The
+ * server's own sentence (`DOWNLOADS_OFF`, `routes/settings.rs`), so what the
+ * person reads here matches the refusal a direct request gets (`QS-9`,
+ * `LH-QS-2-06`, decision 10).
+ */
+export const DOWNLOADS_OFF_REASON = "Downloads are switched off for your role."
+
+/**
  * The menu that asks for the result as a file.
  *
  * The server makes the file, not the browser: it re-runs the stored
@@ -41,6 +49,7 @@ export function QueryDownloadMenu({
   resultId,
   engine,
   busy,
+  canDownload,
   onDownload,
 }: {
   /** The run's id to download, or null when there is nothing to download. */
@@ -49,20 +58,25 @@ export function QueryDownloadMenu({
   readonly engine: string
   /** The file kind being downloaded, or null when none is. */
   readonly busy: QueryDownloadFormat | null
+  /**
+   * QA `LH-QS-2-06` (`QS-9`): false when the person's roles may not
+   * download. It turns the menu off before the engine reason does.
+   */
+  readonly canDownload: boolean
   readonly onDownload: (format: QueryDownloadFormat) => void
 }) {
   const downloadable = isDownloadableEngine(engine)
-  const disabled = resultId === null || !downloadable || busy !== null
+  const disabled = resultId === null || !canDownload || !downloadable || busy !== null
+  const reason = !canDownload
+    ? DOWNLOADS_OFF_REASON
+    : downloadable
+      ? undefined
+      : "Downloads run on ClickHouse only."
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
         render={
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={disabled}
-            title={downloadable ? undefined : "Downloads run on ClickHouse only."}
-          />
+          <Button size="sm" variant="outline" disabled={disabled} title={reason} />
         }
       >
         <Download className="size-4" aria-hidden />

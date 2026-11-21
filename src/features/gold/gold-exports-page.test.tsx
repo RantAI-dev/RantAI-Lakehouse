@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react"
+import { fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { GoldExportsPage } from "./gold-exports-page"
 
@@ -53,6 +53,7 @@ function mockApi(consumers?: unknown): void {
         lastChangedAt: "2026-10-02T03:30:00Z",
         lastExportedAt: null,
         changedSinceExport: null,
+        lastFailure: null,
         canEdit: true,
       })
     }
@@ -63,9 +64,18 @@ function mockApi(consumers?: unknown): void {
       return jsonResponse({ mart: "sales", runs: [] })
     }
     if (url.includes("/api/gold/export/sales")) {
-      // The mart has never been exported: read_back 500s, same as the
-      // real route when the Iceberg table does not exist yet.
-      return jsonResponse({ error: "table not found" }, 500)
+      // The mart has never been published: the route answers 200 with
+      // `published: false` and every fact null (DATA-49, D11). The API changed,
+      // not the assertion.
+      return jsonResponse({
+        namespace: "gold",
+        table: "sales",
+        published: false,
+        formatVersion: null,
+        rowsInIceberg: null,
+        snapshotId: null,
+        exportedAt: null,
+      })
     }
     throw new Error(`unexpected fetch: ${url}`)
   }) as unknown as typeof fetch
@@ -88,6 +98,89 @@ describe("GoldExportsPage", () => {
       "Outside reading is not set up: OUTSIDE_S3_ENDPOINT is not set.",
     )
     expect(refusal.textContent).toBe("Not measured")
+  })
+
+  // QA LH-DATA-1-01 (DATA-49): the route answers 200 with `published: false` for
+  // a mart never published, and that is what the cell reads.
+  //
+  // Review round 1 R5: the body carries a stray `snapshotId`, so the snapshot cell
+  // is the assertion — with `published` dropped from its condition, the stray value
+  // is printed and this test fails.
+  it("says Never exported, and no snapshot, for a mart the API reports as not published", async () => {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/api/dashboard/fields")) {
+        return jsonResponse({ marts: [{ name: "sales", rows: 42 }] })
+      }
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          mart: "sales",
+          enabled: false,
+          updatedAt: null,
+          lastChangedAt: "2026-10-02T03:30:00Z",
+          lastExportedAt: null,
+          changedSinceExport: null,
+          lastFailure: null,
+          canEdit: true,
+        })
+      }
+      if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
+      if (url.includes("/api/gold/exports")) return jsonResponse({ mart: "sales", runs: [] })
+      if (url.includes("/api/gold/export/sales")) {
+        return jsonResponse({
+          namespace: "gold",
+          table: "sales",
+          published: false,
+          formatVersion: null,
+          rowsInIceberg: null,
+          snapshotId: { value: 999, measured: true },
+          exportedAt: "2026-10-02T04:00:00Z",
+        })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }) as unknown as typeof fetch
+
+    render(<GoldExportsPage />)
+    const row = (await screen.findByText("sales")).closest("tr") as HTMLTableRowElement
+    const cells = row.querySelectorAll("td")
+    // Column order: mart, rows, enabled, last export, snapshot, history, consumers, actions.
+    await waitFor(() => expect(cells[3]?.textContent).toBe("Never exported"))
+    expect(cells[4]?.textContent).toBe("—")
+  })
+
+  it("shows a dash, not Never exported, when the read-back fails", async () => {
+    const original = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/api/dashboard/fields")) {
+        return jsonResponse({ marts: [{ name: "sales", rows: 42 }] })
+      }
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          mart: "sales",
+          enabled: false,
+          updatedAt: null,
+          lastChangedAt: null,
+          lastExportedAt: null,
+          changedSinceExport: null,
+          lastFailure: null,
+          canEdit: true,
+        })
+      }
+      if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
+      if (url.includes("/api/gold/exports")) return jsonResponse({ mart: "sales", runs: [] })
+      if (url.includes("/api/gold/export/sales")) {
+        return jsonResponse({ error: "The catalog request failed. Reference: abc123" }, 500)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }) as unknown as typeof fetch
+    expect(original).toBeDefined()
+
+    render(<GoldExportsPage />)
+    await waitFor(() => expect(screen.getByText("sales")).toBeDefined())
+    await waitFor(() => expect(screen.queryByText("Never exported")).toBeNull())
+    const dashes = screen.getAllByText("—")
+    expect(dashes.some((dash) => dash.className.includes("text-destructive"))).toBe(true)
   })
 
   it("counts the tools that read the mart and names each one in the cell's tooltip", async () => {
@@ -136,5 +229,85 @@ describe("GoldExportsPage", () => {
     // Column order: mart, rows, enabled, last export, snapshot,
     // history, consumers, actions.
     expect(cells[6]?.textContent).toBe("No reads in 7 days")
+  })
+
+  // QA LH-DATA-1-01 (DATA-49), review round 1 R1: the page's own "Export now" left
+  // the label and the run count where they were after a failed publish, so the row
+  // read "On · Up to date" and 0 runs until the page was loaded again.
+  it("reads the publication and the run count again after a failed Export now", async () => {
+    const reason = "This mart has 12000000 rows, exceeding GOLD_EXPORT_MAX_ROWS."
+    let publications = 0
+    let histories = 0
+    let posts = 0
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/api/dashboard/fields")) {
+        return jsonResponse({ marts: [{ name: "sales", rows: 42 }] })
+      }
+      if (url.includes("/publication")) {
+        publications += 1
+        return jsonResponse({
+          mart: "sales",
+          enabled: true,
+          updatedAt: null,
+          lastChangedAt: "2026-10-02T03:30:00Z",
+          lastExportedAt: "2026-10-02T04:00:00Z",
+          changedSinceExport: false,
+          lastFailure: publications === 1 ? null : { failedAt: "2026-10-02T05:00:00Z", reason },
+          canEdit: true,
+        })
+      }
+      if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
+      if (url.includes("/api/gold/exports")) {
+        histories += 1
+        return jsonResponse({
+          mart: "sales",
+          runs:
+            histories === 1
+              ? []
+              : [
+                  {
+                    id: "run-1",
+                    status: "failed",
+                    rowsExported: null,
+                    formatVersion: null,
+                    snapshotId: null,
+                    error: reason,
+                    triggeredBy: "manual",
+                    startedAt: "2026-10-02T05:00:00Z",
+                    finishedAt: "2026-10-02T05:00:02Z",
+                  },
+                ],
+        })
+      }
+      if (init?.method === "POST" && url.includes("/api/gold/export/sales")) {
+        posts += 1
+        return jsonResponse({ error: reason }, 422)
+      }
+      if (url.includes("/api/gold/export/sales")) {
+        return jsonResponse({
+          namespace: "gold",
+          table: "sales",
+          published: true,
+          formatVersion: 2,
+          rowsInIceberg: 42,
+          snapshotId: { value: 12345, measured: true },
+          exportedAt: "2026-10-02T04:00:00Z",
+        })
+      }
+      throw new Error(`unexpected fetch: ${init?.method} ${url}`)
+    }) as unknown as typeof fetch
+
+    render(<GoldExportsPage />)
+    const row = (await screen.findByText("sales")).closest("tr") as HTMLTableRowElement
+    const cells = () => row.querySelectorAll("td")
+    // Column order: mart, rows, enabled, last export, snapshot, history, consumers, actions.
+    await waitFor(() => expect(cells()[2]?.textContent).toBe("On · Up to date"))
+    expect(cells()[5]?.textContent).toBe("0")
+
+    fireEvent.click(screen.getByRole("button", { name: "Export now" }))
+    await waitFor(() => expect(posts).toBe(1))
+    await waitFor(() => expect(cells()[2]?.textContent).toBe("On · Last publish failed"))
+    expect(cells()[5]?.textContent).toBe("1")
   })
 })

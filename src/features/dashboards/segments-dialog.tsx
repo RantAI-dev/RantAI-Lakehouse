@@ -10,18 +10,24 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { useService } from "@/hooks/use-service"
 import { metricService } from "@/services"
-import type { FilterDef } from "@/services/clients/bi-store"
+import type { FilterDef } from "@/services"
 import type { Segment } from "@/services/contracts/metrics"
 import { ChartFilters } from "./chart-shape-section"
 import { SourceChoiceLabel, sourceChoiceItems } from "./source-choice-label"
+import { ownSourceOf } from "./filters/use-filter-values"
 import { useSourceChoices, useSourceColumns } from "./use-source-columns"
 
 /**
  * Segments (BI-2): a named list of filters on one table, such as "domestic visitors", used in
  * metrics and as a filter of any chart on that table. Its name and table stay once saved; deleting
- * one that a chart or metric uses is refused with the server's sentence.
+ * one that a chart or metric uses is refused with the server's sentence. Without `metric:write`
+ * the dialog is a list to read: no "New segment" and no "Edit" (BI-54, QA `LH-BI-2-05`).
  */
-export function SegmentsDialog({ open, onOpenChange }: { readonly open: boolean; readonly onOpenChange: (open: boolean) => void }) {
+export function SegmentsDialog({ open, onOpenChange, canWrite }: {
+  readonly open: boolean;
+  readonly onOpenChange: (open: boolean) => void;
+  readonly canWrite: boolean;
+}) {
   const state = useService((signal) => metricService.listSegments(signal), [open])
   const choices = useSourceChoices(open)
   const [editing, setEditing] = React.useState<Segment | "new" | null>(null)
@@ -89,14 +95,14 @@ export function SegmentsDialog({ open, onOpenChange }: { readonly open: boolean;
               {segments.map((s) => (
                 <li key={s.id} className="flex items-center gap-2 rounded-md border border-border px-2 py-1.5 text-sm">
                   <span className="min-w-0 flex-1 truncate"><span className="font-medium">{s.label || s.name}</span> <span className="font-mono text-xs text-muted-foreground">{s.name} · {s.sourceId}</span></span>
-                  <Button type="button" size="xs" variant="ghost" onClick={() => edit(s)}>Edit</Button>
+                  {canWrite ? <Button type="button" size="xs" variant="ghost" onClick={() => edit(s)}>Edit</Button> : null}
                 </li>
               ))}
             </ul>
             {problem ? <p role="alert" className="text-sm text-destructive">{problem}</p> : null}
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>Close</Button>
-              <Button type="button" onClick={() => edit("new")}><Plus className="size-4" aria-hidden /> New segment</Button>
+              {canWrite ? <Button type="button" onClick={() => edit("new")}><Plus className="size-4" aria-hidden /> New segment</Button> : null}
             </DialogFooter>
           </div>
         ) : (
@@ -120,7 +126,7 @@ export function SegmentsDialog({ open, onOpenChange }: { readonly open: boolean;
                 <Input id="segment-label" value={label} placeholder="Domestic visitors" maxLength={100} onChange={(e) => setLabel(e.target.value)} />
               </div>
             </div>
-            <ChartFilters value={filters} onChange={setFilters} columns={columns} disabled={!source} />
+            <ChartFilters value={filters} onChange={setFilters} columns={columns} disabled={!source} source={ownSourceOf(source)} />
             {problem ? <p role="alert" className="text-sm text-destructive">{problem}</p> : null}
             <DialogFooter>
               {existing ? <Button type="button" variant="outline" className="sm:mr-auto" disabled={busy} onClick={() => void remove()}>Delete</Button> : null}

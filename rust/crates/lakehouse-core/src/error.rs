@@ -139,6 +139,15 @@ pub enum ApiError {
         /// How many seconds until the caller should retry.
         retry_after_secs: u64,
     },
+    /// A permission token the request ADDS that no check anywhere knows
+    /// (`WEB-8` D3). Maps to HTTP 400. Like [`Self::NotReady`]'s `code`,
+    /// the refused tokens are rendered as a structured body field beside
+    /// the fixed message — `{"error": "unknown permissions", "unknown":
+    /// ["…"]}` — so the console can name each one instead of parsing
+    /// prose. A token the role or identity already holds never lands
+    /// here: old roles keep their seeded-but-unchecked strings.
+    #[error("unknown permissions")]
+    UnknownPermissions(Vec<String>),
 }
 
 impl ApiError {
@@ -160,7 +169,7 @@ impl ApiError {
     #[must_use]
     pub const fn status(&self) -> u16 {
         match self {
-            Self::BadRequest(_) => 400,
+            Self::BadRequest(_) | Self::UnknownPermissions(_) => 400,
             Self::Unauthorized(_) => 401,
             Self::Forbidden | Self::PermissionDenied(_) => 403,
             Self::NotFound(_) => 404,
@@ -178,6 +187,13 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_permissions_maps_to_400() {
+        let err = ApiError::UnknownPermissions(vec!["unknown:perm".to_owned()]);
+        assert_eq!(err.status(), 400);
+        assert_eq!(err.to_string(), "unknown permissions");
+    }
 
     #[test]
     fn bad_request_maps_to_400() {

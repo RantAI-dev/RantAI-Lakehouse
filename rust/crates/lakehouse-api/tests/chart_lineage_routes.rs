@@ -13,7 +13,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 
@@ -25,7 +25,8 @@ use wiremock::matchers::{body_string_contains, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    CATALOG_TENANT, TestApp, create_principal_with_permissions, in_the_catalog_tenant,
+    session_cookie_for_user, spin_up_with_env,
 };
 
 async fn rows(server: &MockServer, needle: &str, data: Vec<Value>) {
@@ -85,7 +86,12 @@ impl Stack {
             vec![json!({ "target": "serving.mart_visits", "read": "silver.visits", "at": "2026-09-22 10:03", "kind": "Insert" })],
         )
         .await;
-        let env = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
+        // `SEC-20`, plan 96: the charts belong to the shared catalog, which the
+        // seeded deployment (several tenants) opens only to the tenant it names.
+        let env = HashMap::from([
+            ("CH_URL".to_owned(), ch.uri()),
+            ("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned()),
+        ]);
         Self {
             app: spin_up_with_env(&env).await,
             ch,
@@ -111,6 +117,14 @@ impl Stack {
 
     async fn caller(&self, permissions: &str) -> String {
         let id = create_principal_with_permissions(&self.app.pool, permissions).await;
+        session_cookie_for_user(&self.app.pool, id).await
+    }
+
+    /// A caller of the tenant that owns the shared catalog, which is the caller
+    /// the chart and its lineage are shown to.
+    async fn catalog_member(&self, permissions: &str) -> String {
+        let id = create_principal_with_permissions(&self.app.pool, permissions).await;
+        in_the_catalog_tenant(&self.app.pool, id).await;
         session_cookie_for_user(&self.app.pool, id).await
     }
 }
@@ -188,7 +202,7 @@ async fn a_chart_in_somebody_elses_personal_space_is_not_found() {
     let stack = Stack::start().await;
     // A chart on a board the caller does not own: the store lists it only to its owner, so the
     // stand-in returns nothing to this caller and the answer is the one an unknown id gets.
-    let cookie = stack.caller("lineage:read").await;
+    let cookie = stack.catalog_member("lineage:read").await;
     let (status, body) = stack
         .get(&cookie, "/api/dashboard/charts/c_private/lineage")
         .await;
@@ -257,7 +271,7 @@ async fn a_caller_with_lineage_read_only_is_told_no_chart_names() {
         vec![chart_row("c_1", "Visitors", "b_1", "ui")],
     )
     .await;
-    let cookie = stack.caller("lineage:read").await;
+    let cookie = stack.catalog_member("lineage:read").await;
     let (status, body) = stack
         .get(
             &cookie,
@@ -279,7 +293,7 @@ async fn a_caller_with_lineage_read_only_is_told_no_chart_names() {
     assert_eq!(status, StatusCode::OK);
     assert!(!graph.to_string().contains("Visitors"), "{graph}");
     // With `dashboard:read` as well, the chart is named.
-    let both = stack.caller("lineage:read,dashboard:read").await;
+    let both = stack.catalog_member("lineage:read,dashboard:read").await;
     let (_, named) = stack
         .get(
             &both,

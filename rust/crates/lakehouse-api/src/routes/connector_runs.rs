@@ -48,7 +48,7 @@ use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
-use lakehouse_store::audit as store_audit;
+use lakehouse_store::PgPool;
 use lakehouse_store::connector_run::{
     self, AttemptReport, EndReason, ErrorClass, LogEvent, RUN_HISTORY_LIMIT, RunStatus, RunSummary,
     RunTrigger,
@@ -59,7 +59,9 @@ use serde_json::json;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use super::load_alerts::{FinalStatus, close_run_record};
 use super::schema_changes::{check_name, require_orchestrator};
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::connectors::{connector_audit_event, parse_body, pool};
@@ -80,6 +82,12 @@ const NOT_PAUSED: &str = "This connector is not paused.";
 const PAUSED_FOR_ANOTHER_REASON: &str = "This connector is not paused because of repeated \
      failures. If a schema change is waiting, approve it under Schema changes to resume it.";
 
+/// The most records one read of the run list asks the orchestrator about
+/// (`SRC-43` D16). A list with no `running` record asks nothing; the rest
+/// wait for a later read, so a page that polls every three seconds does not
+/// turn one stuck record into an unbounded list of questions.
+const RECONCILE_PER_READ: usize = 10;
+
 // ── The person's routes ────────────────────────────────────────────────────
 
 /// `GET /api/connectors/{id}/runs`.
@@ -88,12 +96,26 @@ const PAUSED_FOR_ANOTHER_REASON: &str = "This connector is not paused because of
 pub struct RunsResponse {
     /// The connector's newest runs, newest first, at most 50.
     runs: Vec<RunSummary>,
+    /// How long a run of this connector may run, in seconds, before the API
+    /// stops holding the connector for it (`INGEST_RUN_MAX_RUNTIME_SECONDS`,
+    /// `SRC-39`, QA `TC-1702`; `review round 1, R8`). The console shows a run
+    /// whose record still says `running` as going until this limit, and it
+    /// must not keep its own copy of the number: raising the setting would
+    /// otherwise bring the QA symptom back (the page would offer "Run now"
+    /// while the API still answers 409).
+    max_runtime_seconds: u32,
 }
 
 /// `GET /api/connectors/{id}/runs` -- the connector's last 50 runs with
-/// status, trigger, rows, duration and attempts (`SRC-11` decision D7).
+/// status, trigger, rows, duration and attempts (`SRC-11` decision D7), and
+/// the run limit the API judges them by.
 /// Exact for any number of connectors: the rows are the product's own, keyed
 /// by connector, not a search of a shared run list.
+///
+/// Before it answers, it closes a record whose run has ended in the
+/// orchestrator but whose end was never recorded (`SRC-43`), and reads the
+/// list once more so the answer shows the closed record. The read repeats, so
+/// whatever went wrong the first time is tried again.
 ///
 /// # Errors
 ///
@@ -103,9 +125,108 @@ pub async fn list(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<RunsResponse>> {
+    let pool = pool(&state)?;
+    let runs = connector_run::list_runs(pool, &id, RUN_HISTORY_LIMIT).await?;
+    let runs = if close_ended_runs(&state, pool, &id, &runs).await {
+        connector_run::list_runs(pool, &id, RUN_HISTORY_LIMIT)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, connector_id = %id, "the run list could not be read again after a record was closed");
+                runs
+            })
+    } else {
+        runs
+    };
     Ok(ApiJson(RunsResponse {
-        runs: connector_run::list_runs(pool(&state)?, &id, RUN_HISTORY_LIMIT).await?,
+        runs,
+        max_runtime_seconds: state.config.ingest_run_max_runtime_seconds,
     }))
+}
+
+/// Close a record whose run has ended in the orchestrator but whose end was
+/// never recorded (`SRC-43` (#485 review, round 2 (R2))): the "Run now" route
+/// cancels an overdue run and then closes its record, and a store failure
+/// between the two leaves the record `running` for good, because a cancelled
+/// run is not an active run to anything else.
+///
+/// What is closed: a record that says `running` and whose run the
+/// orchestrator ended as `SUCCESS`, `FAILURE` or `CANCELED` — by
+/// [`close_run_record`], the same mapping the sensor's report uses. What is
+/// left alone: a run that is still going or being cancelled, a word this build
+/// does not know, and a run the orchestrator no longer knows (the record keeps
+/// saying `running`; nothing is guessed). What a failure does: one warning and
+/// the loop stops, so a dead orchestrator or a failing store costs one call per
+/// read and the list is returned as it was read. What it never does: insert a
+/// record, count a run, deliver an alert, cancel or launch a run, or write an
+/// audit entry — counting and alerting stay with the sensor's report.
+///
+/// Returns whether it closed anything.
+async fn close_ended_runs(
+    state: &AppState,
+    pool: &PgPool,
+    connector_id: &str,
+    runs: &[RunSummary],
+) -> bool {
+    let mut closed = false;
+    let mut asked = 0;
+    for run in runs {
+        if run.status != RunStatus::Running.as_str() {
+            continue;
+        }
+        if asked == RECONCILE_PER_READ {
+            break;
+        }
+        asked += 1;
+        let answer = tokio::time::timeout(
+            super::uploads::SETTLE_CALL_TIMEOUT,
+            state.dagster.pipeline_run_status(&run.run_id),
+        )
+        .await;
+        match answer {
+            Ok(Ok(Some(info))) => {
+                let Some(ended) = FinalStatus::of(&info.status) else {
+                    continue;
+                };
+                match close_run_record(state, pool, connector_id, &run.run_id, ended, &info).await {
+                    Ok(()) => closed = true,
+                    Err(err) => {
+                        tracing::warn!(
+                            %err,
+                            connector_id = %connector_id,
+                            run_id = %run.run_id,
+                            "a run record that ended could not be closed"
+                        );
+                        break;
+                    }
+                }
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!(
+                    connector_id = %connector_id,
+                    run_id = %run.run_id,
+                    "the orchestrator does not know a run whose record says running"
+                );
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    %err,
+                    connector_id = %connector_id,
+                    run_id = %run.run_id,
+                    "the orchestrator could not be asked about a run"
+                );
+                break;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    connector_id = %connector_id,
+                    run_id = %run.run_id,
+                    "the orchestrator did not answer about a run in time"
+                );
+                break;
+            }
+        }
+    }
+    closed
 }
 
 /// The `?format=` of the log route.
@@ -235,9 +356,7 @@ pub async fn resume(
         json!({ "pausedBy": "auto_disable" }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.resume audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(ApiJson(ResumeResponse { resumed: true }))
 }
 
@@ -285,9 +404,7 @@ pub async fn pause(
         return Err(err.into());
     }
     let event = connector_audit_event(&principal, "connector.pause", &id, json!({}), "executed");
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.pause audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(ApiJson(PauseResponse { paused: true }))
 }
 
@@ -659,11 +776,13 @@ pub struct EndBody {
 /// `POST /api/connectors/{id}/run-reports/{runId}/end` -- the run ended
 /// (`SRC-11` decisions D5, D7, D13: `paused` is a run that loaded nothing
 /// because the connector is paused). The first end wins; a repeat, or an end
-/// after the run sensor already closed the run, answers `recorded: false`.
+/// after the run sensor or a read of the run list already closed the run,
+/// answers `recorded: false`.
 ///
 /// # Errors
 ///
-/// 403 as [`report_start`]; 400 for an invalid body or `status: running`;
+/// 403 as [`report_start`]; 400 for an invalid body, `status: running`, or
+/// `reason: timed_out` (D11: that word has two writers, and this is not one);
 /// 404 for an unknown connector or a run that is not this connector's;
 /// 503/500 as the store reports.
 pub async fn report_end(
@@ -676,6 +795,19 @@ pub async fn report_end(
     let req: EndBody = parse_body(&body)?;
     if req.status == RunStatus::Running {
         return Err(ApiError::BadRequest("a run cannot end as running".to_owned()).into());
+    }
+    // D11: `timed_out` is written by `close_run_record` in `load_alerts` (the
+    // sensor's failure report and the read of the run list) and by the run
+    // route, and nowhere else — so this report, whose vocabulary stays the
+    // four words of `SRC-11`, may not set it (`review round 1, R11`; `SRC-43`
+    // added the run list). The orchestrator's own list (`END_REASONS`,
+    // `dagster/dispar_orchestrate/run_reports.py`) does not know the word
+    // either, so nothing sends it today.
+    if req.reason == EndReason::TimedOut {
+        return Err(ApiError::BadRequest(
+            "a run's end report cannot end it as timed_out".to_owned(),
+        )
+        .into());
     }
     let ended_at = report_time("endedAt", req.ended_at.as_deref())?;
     require_connector(&state, &id).await?;
@@ -746,7 +878,9 @@ mod tests {
         tenant: Uuid,
     }
 
-    /// Postgres only: these routes touch neither the orchestrator nor the
+    /// Postgres only. The list route asks the orchestrator about a record still
+    /// `running` (`SRC-43`); here it cannot be reached, so the list answers
+    /// unchanged. No other route of this module touches the orchestrator or the
     /// rule store.
     async fn harness(pool: &sqlx::PgPool) -> Harness {
         harness_with(pool, &[]).await
@@ -764,6 +898,12 @@ mod tests {
         );
         let mut env = HashMap::new();
         env.insert("DATABASE_URL".to_owned(), database_url);
+        // The dead address `tests/common/mod.rs` uses (`DEAD_UPSTREAM`, which a
+        // unit test cannot see): the run list asks the orchestrator about a
+        // record still `running`, and without this it would call whatever
+        // listens on the default orchestrator address of the developer's
+        // machine.
+        env.insert("DAGSTER_URL".to_owned(), "http://127.0.0.1:1".to_owned());
         for (key, value) in extra {
             env.insert((*key).to_owned(), (*value).to_owned());
         }
@@ -940,6 +1080,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{listed}");
         let run = &listed["runs"][0];
         assert_eq!(listed["runs"].as_array().unwrap().len(), 1);
+        // `review round 1, R8`: the run limit travels with the list, so the
+        // console shows a run as going for as long as the API holds it.
+        assert_eq!(listed["maxRuntimeSeconds"], 21_600);
         assert_eq!(run["runId"], "run-1");
         assert_eq!(run["trigger"], "schedule");
         assert_eq!(run["status"], "succeeded");
@@ -1122,6 +1265,41 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "an end before the start");
+    }
+
+    /// D11 (`review round 1, R11`): the orchestrator's end report may not end a
+    /// run as `timed_out`. That word is written by `close_run_record` in
+    /// `load_alerts` (the sensor's failure report and the read of the run list)
+    /// and by the run route, and nowhere else (`SRC-43` added the run list), so
+    /// this body is a 400 and the record is untouched.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_end_report_cannot_write_the_timed_out_reason(pool: sqlx::PgPool) {
+        let h = harness(&pool).await;
+        let id = connector(&h, "runs six").await;
+        let me = user(&[h.tenant]);
+        report(
+            &h,
+            &id,
+            "",
+            json!({ "runId": "run-1", "trigger": "schedule" }),
+        )
+        .await;
+
+        let (status, answer) = report(
+            &h,
+            &id,
+            "/run-1/end",
+            json!({ "status": "succeeded", "reason": "timed_out" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+
+        let (_, listed) = call(&h, &me, "GET", &format!("/api/connectors/{id}/runs"), None).await;
+        assert_eq!(
+            listed["runs"][0]["status"], "running",
+            "the refused end wrote nothing: {listed}"
+        );
+        assert_eq!(listed["runs"][0]["endReason"], Value::Null);
     }
 
     /// D8: history, log and resume answer another tenant's user as an

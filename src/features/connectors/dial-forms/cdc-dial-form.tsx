@@ -1,10 +1,12 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import type { CdcDial, SqlDriver } from "@/services/contracts/connectors"
 import { DEFAULT_SQL_PORT } from "./sql-dial-form"
+import { CDC_SSL_MODES, ORACLE_SSL_MODES } from "./ssl-modes"
 
 /**
  * `dial` for the `cdc` adapter — `SqlDialForm`'s fields plus the setting of
@@ -19,23 +21,6 @@ import { DEFAULT_SQL_PORT } from "./sql-dial-form"
  * so the form starts there and only asks when a stored dial disagrees.
  */
 export const DEFAULT_CDC_SSL_MODE = "require"
-
-/** The TLS modes a person can choose (`SEC-14`: a stored credential is not dialled in plain text unless
- * `disable` is chosen, and it is labelled as such). */
-const CDC_SSL_MODES: { value: string; label: string }[] = [
-  { value: "require", label: "Require (encrypted, certificate not checked)" },
-  { value: "verify-ca", label: "Verify CA" },
-  { value: "verify-full", label: "Verify CA and host name" },
-  { value: "disable", label: "Disable (not encrypted)" },
-]
-
-/** Oracle takes two modes (`SRC-4` slice 6, S6-c): its JDBC driver does TLS only over TCPS with a Java trust store
- * (`SRC-37`), so `require` is Oracle's native network encryption (AES256, SHA256 checksum: encrypted, the server
- * not authenticated) and the verify modes are not offered. */
-const ORACLE_SSL_MODES: { value: string; label: string }[] = [
-  { value: "require", label: "Require (native network encryption, server not authenticated)" },
-  { value: "disable", label: "Disable (not encrypted)" },
-]
 
 /** The dial as the driver wants it: only its own setting, PostgreSQL's two names
  * kept as typed (empty until typed), MySQL's server id only when a number was given, Oracle's
@@ -86,24 +71,27 @@ export function CdcDialForm({
       {askDriver ? (
         <div className="space-y-1.5 sm:col-span-2">
           <Label htmlFor="cdc-dial-driver">Driver</Label>
-          <select
+          {/* WEB-9 D3: the four drivers this form serves, in the same order. */}
+          <SelectField
             id="cdc-dial-driver"
-            className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+            className="w-full"
             value={dial.driver}
-            onChange={(e) => set("driver", e.target.value as CdcDial["driver"])}
-          >
-            <option value="postgres">PostgreSQL</option>
-            <option value="mysql">MySQL</option>
-            <option value="mssql">SQL Server</option>
-            <option value="oracle">Oracle</option>
-          </select>
+            options={[
+              { value: "postgres", label: "PostgreSQL" },
+              { value: "mysql", label: "MySQL" },
+              { value: "mssql", label: "SQL Server" },
+              { value: "oracle", label: "Oracle" },
+            ]}
+            onValueChange={(next) => set("driver", next as CdcDial["driver"])}
+          />
         </div>
       ) : null}
       <div className="grid gap-3 sm:col-span-2 sm:grid-cols-[minmax(0,1fr)_7rem]">
         <div className="space-y-1.5">
-          <Label htmlFor="cdc-dial-host">Host</Label>
+          <Label htmlFor="cdc-dial-host" required>Host</Label>
           <Input
             id="cdc-dial-host"
+            aria-required
             value={dial.host}
             onChange={(e) => set("host", e.target.value)}
             placeholder="db.internal.example.com"
@@ -111,9 +99,10 @@ export function CdcDialForm({
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="cdc-dial-port">Port</Label>
+          <Label htmlFor="cdc-dial-port" required>Port</Label>
           <Input
             id="cdc-dial-port"
+            aria-required
             type="number"
             value={dial.port}
             onChange={(e) => set("port", Number(e.target.value))}
@@ -122,9 +111,10 @@ export function CdcDialForm({
         </div>
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-database">{isOracle ? "Container database (service name)" : "Database"}</Label>
+        <Label htmlFor="cdc-dial-database" required>{isOracle ? "Container database (service name)" : "Database"}</Label>
         <Input
           id="cdc-dial-database"
+          aria-required
           value={dial.database}
           onChange={(e) => set("database", e.target.value)}
           placeholder={isOracle ? "FREE" : "sales"}
@@ -132,9 +122,10 @@ export function CdcDialForm({
         />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-user">User</Label>
+        <Label htmlFor="cdc-dial-user" required>User</Label>
         <Input
           id="cdc-dial-user"
+          aria-required
           value={dial.user}
           onChange={(e) => set("user", e.target.value)}
           placeholder="lakehouse_cdc"
@@ -143,21 +134,20 @@ export function CdcDialForm({
       </div>
       <div className="space-y-1.5 sm:col-span-2">
         <Label htmlFor="cdc-dial-ssl-mode">TLS mode</Label>
-        <select
+        {/* WEB-9 D3: the adapter's modes, plus a stored mode it no longer
+            lists, kept last and shown as it is. */}
+        <SelectField
           id="cdc-dial-ssl-mode"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={dial.sslMode || DEFAULT_CDC_SSL_MODE}
-          onChange={(e) => set("sslMode", e.target.value)}
-        >
-          {sslModes.map((m) => (
-            <option key={m.value} value={m.value}>
-              {m.label}
-            </option>
-          ))}
-          {dial.sslMode && !sslModes.some((m) => m.value === dial.sslMode) ? (
-            <option value={dial.sslMode}>{dial.sslMode}</option>
-          ) : null}
-        </select>
+          options={[
+            ...sslModes,
+            ...(dial.sslMode && !sslModes.some((m) => m.value === dial.sslMode)
+              ? [{ value: dial.sslMode, label: dial.sslMode }]
+              : []),
+          ]}
+          onValueChange={(next) => set("sslMode", next)}
+        />
         <p className="text-xs text-muted-foreground">
           {isOracle
             ? "Oracle's driver cannot check the server's certificate, so there are only two modes: the connection is encrypted with Oracle's own network encryption, or it is not."
@@ -183,9 +173,10 @@ export function CdcDialForm({
       {dial.driver === "postgres" ? (
         <>
           <div className="space-y-1.5">
-            <Label htmlFor="cdc-dial-slot-name">Replication slot name</Label>
+            <Label htmlFor="cdc-dial-slot-name" required>Replication slot name</Label>
             <Input
               id="cdc-dial-slot-name"
+              aria-required
               value={dial.slotName ?? ""}
               onChange={(e) => set("slotName", e.target.value)}
               placeholder="lakehouse_slot"
@@ -193,9 +184,10 @@ export function CdcDialForm({
             />
           </div>
           <div className="space-y-1.5">
-            <Label htmlFor="cdc-dial-publication-name">Publication name</Label>
+            <Label htmlFor="cdc-dial-publication-name" required>Publication name</Label>
             <Input
               id="cdc-dial-publication-name"
+              aria-required
               value={dial.publicationName ?? ""}
               onChange={(e) => set("publicationName", e.target.value)}
               placeholder="lakehouse_pub"

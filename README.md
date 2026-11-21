@@ -79,13 +79,13 @@ sign-in:
 
 ```text
 lakehousectl: the console is at http://<this host>:3000
-lakehousectl: the first administrator is admin@example.com.
+lakehousectl: the first administrator is admin (email admin@example.com).
 lakehousectl: its password is shown once, and it must be changed at first
 lakehousectl: sign-in:
   <generated password>
 ```
 
-Open that address, sign in, and set a new password. **Copy the password
+Open that address, sign in with `admin` (or `admin@example.com`), and set a new password. **Copy the password
 before you close the terminal: it is shown only once.**
 
 To install somewhere else, add `--dir <path>`. To skip one of the checks,
@@ -128,7 +128,7 @@ linked section.
 | AI assistant and plain-language queries | An OpenAI-compatible model: `LLM_URL`, `LLM_MODEL`, `LLM_KEY` |
 | Dashboard PDF export | `CONSOLE_INTERNAL_URL=http://console:3000` (the secret it also needs is already generated) |
 | Email: alerts, digests and scheduled reports | `SMTP_HOST` and the other `SMTP_*` settings; `CONSOLE_PUBLIC_URL` for the link in a report |
-| Single sign-on | `OIDC_ISSUER`, `OIDC_CLIENT_ID` and the sign-in URLs |
+| Single sign-on | Set in the console under **Settings → Sign-in**, or in `/opt/rantai-lakehouse/.env` with `OIDC_ISSUER`, `OIDC_CLIENT_ID` and the sign-in URLs |
 | Signed dashboard embeds | `EMBED_SECRET` |
 
 Each one is explained in [docs/OPERATIONS.md](docs/OPERATIONS.md), "Features

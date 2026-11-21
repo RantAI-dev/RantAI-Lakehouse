@@ -23,6 +23,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { formatRelativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { SessionMeta } from "./use-copilot";
@@ -137,12 +138,16 @@ export function RenameSessionDialog({
             <DialogTitle>Rename conversation</DialogTitle>
             <DialogDescription>Shown in your history and the AI Copilot header.</DialogDescription>
           </DialogHeader>
+          {/* UX-4: the title is this dialog's one required input, so no star
+              and no legend; the input keeps `aria-required`. */}
+          <Label htmlFor="conversation-title">Title</Label>
           <Input
+            id="conversation-title"
             autoFocus
+            aria-required
             value={title}
             maxLength={120}
             onChange={(e) => setTitle(e.target.value)}
-            aria-label="Conversation title"
           />
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>

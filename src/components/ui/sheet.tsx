@@ -53,7 +53,7 @@ function SheetContent({
         data-slot="sheet-content"
         data-side={side}
         className={cn(
-          "fixed z-50 flex flex-col gap-4 bg-background text-sm text-foreground shadow-xl outline-none transition duration-300 ease-in-out data-ending-style:opacity-0 data-starting-style:opacity-0",
+          "fixed z-50 flex flex-col gap-4 bg-background text-sm text-foreground shadow-xl outline-none transition-[opacity,scale,translate] duration-300 ease-drawer data-ending-style:duration-200 data-ending-style:opacity-0 data-starting-style:opacity-0",
           side === "right" &&
             "inset-y-0 right-0 h-full w-3/4 border-l border-border data-ending-style:translate-x-full data-starting-style:translate-x-full sm:max-w-md",
           side === "left" &&

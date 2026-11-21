@@ -6,7 +6,7 @@ import type { BoardTab, LayoutMap } from "@/services";
 import type { FilterDef } from "@/services/clients/bi-store";
 import {
   addTab, appliesOnTab, bottomOfTab, collapseLayout, defaultTileHeight, deleteTab, filtersOnTab, foldedTiles, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeUnboxed,
-  phoneOrder, readingOrder, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, withTies, movePhoneTile, resizePhoneTile,
+  phoneOrder, placeCopyBelow, readingOrder, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, withTies, movePhoneTile, resizePhoneTile,
 } from "./dashboard-tabs"
 import { decodeFilters, encodeFilters, normalizeFilters } from "./dashboard-filter-state"
 
@@ -272,4 +272,39 @@ test("a new block starts below the charts drawn at the bottom of the tab, stored
   assert.equal(bottomOfTab([], shown, SHOWN_IDS, undefined), 24)
   // The stored map alone would have said 6, which is what put the block in the middle.
   assert.equal(bottomOfTab([A, B], STORED, SHOWN_IDS, "t_a"), 6)
+})
+
+// ── BI-48 (QA LH-BI-6-40): a chart's copy sits below it, on its tab ──────────
+
+const COPY_TABS: BoardTab[] = [A, B]
+const COPY_LAYOUT: LayoutMap = {
+  // `orig` on tab A with two rows below it there, and a tile on tab B at the same y.
+  orig: { x: 0, y: 2, w: 6, h: 3 },
+  below: { x: 6, y: 5, w: 6, h: 2 },
+  under: { x: 0, y: 7, w: 6, h: 2, tab: "t_a" },
+  other: { x: 0, y: 2, w: 6, h: 3, tab: "t_b" },
+}
+const COPY_IDS = ["orig", "below", "under", "other"]
+
+test("a copy sits directly below its original with the same size and tab", () => {
+  const out = placeCopyBelow(COPY_TABS, COPY_LAYOUT, COPY_IDS, "orig", "copy_1")
+  assert.deepEqual(out.copy_1, { x: 0, y: 5, w: 6, h: 3 })
+  // No tab key: the original has none either, so it is the first tab.
+  assert.equal(tabOf(COPY_TABS, out, "copy_1"), "t_a")
+})
+
+test("every tile at or below the original's bottom on that tab moves down by the copy's height", () => {
+  const out = placeCopyBelow(COPY_TABS, COPY_LAYOUT, COPY_IDS, "orig", "copy_1")
+  assert.equal(out.below.y, 8)
+  assert.equal(out.under.y, 10)
+  assert.equal(out.orig.y, 2)
+})
+
+test("tiles on another tab do not move", () => {
+  const out = placeCopyBelow(COPY_TABS, COPY_LAYOUT, COPY_IDS, "orig", "copy_1")
+  assert.deepEqual(out.other, COPY_LAYOUT.other)
+})
+
+test("an original with no box leaves the layout as it is", () => {
+  assert.equal(placeCopyBelow(COPY_TABS, COPY_LAYOUT, COPY_IDS, "none", "copy_1"), COPY_LAYOUT)
 })

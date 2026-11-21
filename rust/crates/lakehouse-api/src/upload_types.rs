@@ -32,9 +32,11 @@
 //!   asks ([`Guess::ask_date_order`]); values that contradict each other make the
 //!   column text.
 //! - **Timestamp**: a date as above, `T` or a space, `HH:MM`, optional `:SS`, an
-//!   optional fraction of one to six digits, and an optional zone (`Z`, `+HH:MM`,
-//!   `+HHMM`). A column whose values all have a zone holds instants (stored in
-//!   UTC); none, local times; a mix is text.
+//!   optional fraction of one to nine digits, and an optional zone (`Z`, `+HH:MM`,
+//!   `+HHMM`). The GUESS takes one to six (what the table keeps, microseconds); a
+//!   Timestamp a person chose takes nine, and the load cuts the digits after the
+//!   sixth (`DATA-53`). A column whose values all have a zone holds instants
+//!   (stored in UTC); none, local times; a mix is text.
 //! - **Float**: the syntax of a floating-point number, `NaN` and `inf` included.
 //!
 //! # Names (decision 8)
@@ -67,6 +69,15 @@ const DECIMAL_INTEGER_DIGITS: usize = 29;
 
 /// The most digits after the point of a decimal.
 const DECIMAL_FRACTION_DIGITS: usize = 9;
+
+/// The most digits of a timestamp's fraction the GUESS takes: what the table keeps
+/// (`DATA-53`, QA `LH-DATA-9-32`; Iceberg format version 2 holds microseconds).
+const GUESS_FRACTION_DIGITS: usize = 6;
+
+/// The most digits of a timestamp's fraction that FIT a Timestamp column: what a
+/// nanosecond Parquet file carries. The load cuts the digits after the sixth, it does
+/// not round them (`DATA-53`, D17).
+const MAX_FRACTION_DIGITS: usize = 9;
 
 /// The most columns a table may have (`SEC-17`); also `upload_parse::MAX_COLUMNS`.
 const MAX_COLUMNS: usize = 1_000;
@@ -301,8 +312,9 @@ fn date_readings(text: &str) -> Vec<DateFormat> {
 }
 
 /// Split a timestamp into its date text, and whether it carries a zone, if its
-/// time and zone are well formed.
-fn split_timestamp(value: &str) -> Option<(&str, bool)> {
+/// time and zone are well formed. `max_fraction` is how many digits of a fraction are
+/// accepted: six for the guess, nine for a type a person chose (`DATA-53`).
+fn split_timestamp(value: &str, max_fraction: usize) -> Option<(&str, bool)> {
     let at = value.find(['T', ' '])?;
     let (date, rest) = (&value[..at], &value[at + 1..]);
     let rest = rest.trim_start();
@@ -348,7 +360,7 @@ fn split_timestamp(value: &str) -> Option<(&str, bool)> {
         _ => {}
     }
     if let Some(fraction) = fraction
-        && !(all_digits(fraction) && fraction.len() <= 6)
+        && !(all_digits(fraction) && fraction.len() <= max_fraction)
     {
         return None;
     }
@@ -420,7 +432,7 @@ fn guess_dates(present: &[&str]) -> Option<Guess> {
     let mut zone_flags = Vec::with_capacity(present.len());
     let mut readings = Vec::with_capacity(present.len());
     for value in present {
-        let (date, zoned) = split_timestamp(value)?;
+        let (date, zoned) = split_timestamp(value, GUESS_FRACTION_DIGITS)?;
         zone_flags.push(zoned);
         readings.push(date_readings(date));
     }
@@ -469,7 +481,7 @@ pub fn fits(
             let Some(format) = date_format else {
                 return false;
             };
-            split_timestamp(value)
+            split_timestamp(value, MAX_FRACTION_DIGITS)
                 .is_some_and(|(date, zoned)| zoned == timezone && date_in(date, format))
         }
     }
@@ -501,17 +513,21 @@ impl Declared {
 
 /// The starting type of a Parquet column, from the label the footer reading
 /// gives it (`int64`, `decimal(10,2)`, `date`, `timestamp (us, UTC)` ...;
-/// `upload_parquet::type_label`). Integers are integer (a `uint64` past 64 bits
-/// will not fit and the check says so); a decimal that does not fit 38 digits
+/// `upload_parquet::type_label`). Integers are integer, except a `uint64`, which
+/// starts as Decimal: Decimal holds every value of it, where 64-bit signed Integer
+/// does not (`DATA-53`, QA `LH-DATA-9-32`); a decimal that does not fit 38 digits
 /// with 9 after the point, a time of day and a string are text; a float keeps its
 /// floating-point type (decision 10).
 #[must_use]
 pub fn declared_from_parquet(label: &str) -> Declared {
     let label = label.trim();
     match label {
-        "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64" => {
+        "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" => {
             Declared::of(ColumnType::Integer)
         }
+        // `DATA-53`: a `uint64` goes up to 18446744073709551615, past what a 64-bit
+        // signed Integer holds; Decimal holds every value of it.
+        "uint64" => Declared::of(ColumnType::Decimal),
         "boolean" => Declared::of(ColumnType::Boolean),
         "float16" | "float32" | "float64" => Declared::of(ColumnType::Float),
         "date" => Declared {
@@ -847,6 +863,49 @@ mod tests {
         assert!(checked > 80);
     }
 
+    /// `DATA-53` (QA `LH-DATA-9-32`): the largest `uint64` fits the type its column
+    /// starts with; it did not fit the Integer a `uint64` used to start as.
+    #[test]
+    fn a_uint64_s_largest_value_fits_the_type_its_column_starts_with() {
+        assert!(fits(
+            declared_from_parquet("uint64").column_type,
+            None,
+            false,
+            "18446744073709551615"
+        ));
+        assert_eq!(
+            declared_from_parquet("uint64").column_type,
+            ColumnType::Decimal
+        );
+    }
+
+    /// `DATA-53` (D17): the guess wants at most six fractional digits (what the table
+    /// keeps); a Timestamp a person chose takes nine, and the load cuts after the sixth.
+    #[test]
+    fn the_guess_keeps_six_digits_of_a_fraction_and_a_chosen_timestamp_takes_nine() {
+        assert_eq!(
+            guess_column(&["2026-10-16T13:30:05.1234567"]).column_type,
+            ColumnType::Text
+        );
+        assert_eq!(
+            guess_column(&["2026-10-16T13:30:05.123456"]).column_type,
+            ColumnType::Timestamp
+        );
+        let iso = Some(DateFormat::Iso);
+        for value in [
+            "2026-10-16T13:30:05.1234567",
+            "2026-10-16T13:30:05.123456789",
+        ] {
+            assert!(fits(ColumnType::Timestamp, iso, false, value), "{value}");
+        }
+        assert!(!fits(
+            ColumnType::Timestamp,
+            iso,
+            false,
+            "2026-10-16T13:30:05.1234567891"
+        ));
+    }
+
     #[test]
     fn the_names_are_those_the_load_makes_of_the_header() {
         let cases = fixture("names.json");
@@ -966,10 +1025,13 @@ mod tests {
         for (label, expected, zone) in [
             ("int64", ColumnType::Integer, None),
             ("uint8", ColumnType::Integer, None),
+            // `DATA-53` (QA `LH-DATA-9-32`): a `uint64` does not fit 64-bit signed.
+            ("uint64", ColumnType::Decimal, None),
             ("boolean", ColumnType::Boolean, None),
             ("float64", ColumnType::Float, None),
             ("date", ColumnType::Date, None),
             ("timestamp (us, UTC)", ColumnType::Timestamp, Some(true)),
+            ("timestamp (ns, UTC)", ColumnType::Timestamp, Some(true)),
             ("timestamp (ms)", ColumnType::Timestamp, Some(false)),
             ("decimal(10,2)", ColumnType::Decimal, None),
             ("decimal(38,9)", ColumnType::Decimal, None),

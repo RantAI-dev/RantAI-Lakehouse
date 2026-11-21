@@ -17,6 +17,7 @@ use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::SqlLiteral;
 use lakehouse_store::PgPool;
+use lakehouse_store::audit::AuditScope;
 use lakehouse_store::governance::{
     self, ClassificationRule, CreateClassificationRuleInput, CreatePolicyInput,
     CreateQualityRuleInput, CreateResidencyRuleInput, Policy, QualityRule, ResidencyRule,
@@ -25,7 +26,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
-use crate::error::ApiResult;
+use crate::audit_coverage;
+use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::routes::catalog::NOT_IN_PRIMARY;
 use crate::routes::lakehouse::{is_unknown_table_error, is_unknown_table_or_database_error};
@@ -86,6 +88,23 @@ enum Kind {
 }
 
 impl Kind {
+    /// `SEC-20` (plan 95, plan 96, plan ai-118): the list a kind answers with table names,
+    /// and the field of each row that holds the table, for the kinds a
+    /// caller's reach narrows ([`retain_rows_in_reach`]). The match has no
+    /// wildcard, so a kind added later must decide whether its rows name tables.
+    fn reach_rows(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Classification => Some(("classifications", "asset")),
+            Self::Maintenance => Some(("maintenance", "tableName")),
+            // A quality rule names the table it checks, and the rules of
+            // every tenant's upload are in the list, so the quality list is
+            // narrowed by the caller's reach like the maintenance history
+            // and the classification list (`SEC-20`, plan ai-118).
+            Self::Quality => Some(("quality", "asset")),
+            Self::Audit | Self::Residency | Self::Replication | Self::Unknown => None,
+        }
+    }
+
     fn parse(kind: &str) -> Self {
         match kind {
             "quality" => Self::Quality,
@@ -115,15 +134,152 @@ enum GovError {
 }
 
 /// `GET /api/governance/{kind}`.
-pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Response {
-    match Kind::parse(&kind) {
+///
+/// The quality list names rules of every table; it is narrowed by the
+/// catalog's tenant rule and the caller's table access, as
+/// [`read_kind`] does (`GOV-15`).
+pub async fn get(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(kind): Path<String>,
+) -> Response {
+    read_kind(&state, Some(&principal), &headers, &kind).await
+}
+
+/// The refusal for the audit list read without `audit:read` (`GOV-1`
+/// Decision 9): a fixed sentence that names the permission to ask for.
+const AUDIT_READ_DENIED: &str = "reading the audit trail needs the audit:read permission";
+
+/// The `{kind}` dispatch as one person reads it.
+///
+/// The route is one caller; the assistant's tools are the other, with the
+/// person behind the chat and no request headers of their own. A quality list
+/// is narrowed by the catalog's tenant rule and by the caller's table access
+/// (`GOV-15 (GOV-12 plan, section 4)`), because every row is a rule on a
+/// table. A maintenance history is narrowed by the caller's reach over
+/// tables (`SEC-20`, plan 95), because every row names a table and the
+/// history names upload tables of every tenant: see
+/// [`retain_rows_in_reach`]. The classification list is narrowed the same way
+/// (`SEC-20`, plan 96), by each row's `asset`: it names the tables of the
+/// shared catalog and the upload tables of every tenant. The quality list is
+/// narrowed the same way (`SEC-20`, plan ai-118): every rule names the table
+/// it checks. The audit trail is narrowed per tenant (`SEC-20`, plan 100):
+/// the reader's scope is resolved with
+/// [`crate::routes::audit_scope::scope_for_principal`] and the rows are read
+/// through [`audit_trail`], so a reader sees its own organisation's rows plus
+/// the deployment's rows when that organisation owns the shared catalog. The
+/// residency list and the replication list are not narrowed. No principal is
+/// a system call: the quality list leaves one as it was, which
+/// [`crate::routes::quality::quality_table_access`] documents, while the
+/// audit list gives a headless call (no principal behind it) no row of the
+/// trail, through [`crate::routes::audit_scope::scope_without_principal`].
+/// The assistant's `get_audit_history` tool is not that caller: it does not
+/// come through this function for the audit kind, and reads the trail
+/// itself (`routes/ai/tools/governance.rs`) through [`audit_trail`] with
+/// the person's own scope.
+pub(crate) async fn read_kind(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &HeaderMap,
+    kind: &str,
+) -> Response {
+    let parsed = Kind::parse(kind);
+    // `GOV-1` (feature page Decision 9): every role holds `governance:read`,
+    // which opens this route, so the console's audit list needs `audit:read`
+    // on top of it. This check guards the console route only: the
+    // assistant's `get_audit_history` tool is not refused here, because it
+    // does not come through this function — it reads the trail itself, with
+    // the person's own scope. The tool's own permission is the assistant's
+    // registry's business (`GOV-1`): the tool asks the gate for the
+    // permission its spec names, and the spec names `audit:read` (`GOV-1`,
+    // feature page Decision 9), so a person without it is refused there.
+    if parsed == Kind::Audit
+        && let Some(principal) = principal
+        && !principal.has("audit:read")
+    {
+        return ApiRejection(ApiError::PermissionDenied(AUDIT_READ_DENIED.to_owned()))
+            .into_response();
+    }
+    // The gate runs before `run`, so a caller the catalog refuses causes no
+    // `ClickHouse` query at all (`GOV-15` D8).
+    let narrowing = if parsed == Kind::Quality {
+        match crate::routes::quality::quality_table_access(state, principal, headers).await {
+            Ok(access) => Some(access),
+            Err(err) => return ApiRejection(err).into_response(),
+        }
+    } else {
+        None
+    };
+    // `SEC-20` (plan 95, plan 96 for the classification list): the reach is
+    // resolved here for the same reason, so a header naming a tenant the caller
+    // does not belong to is the 404 every route answers, and causes no
+    // `ClickHouse` query. It is not a refusal of the whole list: a caller the
+    // shared catalog is closed to still reads the rows of the upload tables its
+    // own tenant holds.
+    let row_reach = match principal {
+        Some(principal) if parsed.reach_rows().is_some() => {
+            match crate::routes::query::resolve_reach(state, principal, headers).await {
+                Ok(reach) => Some(reach),
+                Err(err) => return ApiRejection(err).into_response(),
+            }
+        }
+        _ => None,
+    };
+    // `SEC-20` (plan 100): the audit trail is read per tenant, so the
+    // reader's reach is resolved before any row of it is read — for the
+    // same reason the table reach is: a header naming a tenant the caller
+    // does not belong to is the 404 every route answers, and no row of the
+    // trail is read before it. The other kinds do not read the trail, so
+    // their reach is never asked for.
+    if parsed == Kind::Audit {
+        let scope = if let Some(principal) = principal {
+            match crate::routes::audit_scope::scope_for_principal(state, principal, headers).await {
+                Ok(scope) => scope,
+                Err(err) => return ApiRejection(err).into_response(),
+            }
+        } else {
+            // A headless call has no person behind it: it belongs to no
+            // tenant and owns no row of the trail.
+            crate::routes::audit_scope::scope_without_principal()
+        };
+        return match audit_trail(state, &scope).await {
+            Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+            Err(message) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({ "error": message })),
+            )
+                .into_response(),
+        };
+    }
+    match parsed {
         Kind::Unknown => (
             StatusCode::BAD_REQUEST,
             ApiJson(json!({ "error": format!("unknown kind: {kind}") })),
         )
             .into_response(),
-        parsed => match run(&state, parsed).await {
-            Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        parsed => match run(state, parsed).await {
+            Ok(mut body) => {
+                if let Some(access) = narrowing {
+                    retain_readable_rules(&access, &mut body);
+                }
+                if let Some(reach) = row_reach
+                    && let Some((rows, table)) = parsed.reach_rows()
+                    && let Err(err) =
+                        retain_rows_in_reach(state, reach, &mut body, rows, table).await
+                {
+                    return ApiRejection(err).into_response();
+                }
+                // The observed rows are numbered after every filter has run,
+                // so an id says nothing about the rows a filter dropped
+                // (`GOV-15`, review round 1 (R1)). The other kinds carry ids
+                // of their own — a classification row's slug, an audit run's
+                // id, a maintenance row none — and are left as they are.
+                if parsed == Kind::Quality {
+                    renumber_observed_quality_rows(&mut body);
+                }
+                (StatusCode::OK, ApiJson(body)).into_response()
+            }
             // Every branch shares one outer `catch (e)` returning
             // `{ error: String(e) }` at 503.
             Err(err) => (
@@ -133,6 +289,115 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
                 .into_response(),
         },
     }
+}
+
+/// Drops every quality row whose `asset` the caller's table access hides, in
+/// place — the rule [`crate::routes::catalog::retain_visible`] applies to the
+/// catalog's own rows (`GOV-15` D6).
+///
+/// `retain_visible` itself cannot be called: it reads a row's `tableKey` or
+/// dotted `id`, while a quality row's key is its `asset` (an authored rule's
+/// `id` is a UUID, an observed row's `q-<n>`). A row with no `asset` string is
+/// hidden from a narrowed caller, as is an `asset` with no schema: nothing
+/// proves the grant covers it (fail closed).
+///
+/// The ids of the rows that are left are not renumbered here: this filter is
+/// one of the two that hide rows, and a row the other one drops would leave a
+/// gap in them. [`renumber_observed_quality_rows`] numbers them once both
+/// have run.
+fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut Value) {
+    if access.is_all() {
+        return;
+    }
+    let Some(rows) = body.get_mut("quality").and_then(Value::as_array_mut) else {
+        return;
+    };
+    rows.retain(|row| {
+        row.get("asset")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|asset| access.allows_key(asset))
+    });
+}
+
+/// Numbers the observed rows of the quality list from the order they are left
+/// in, in place.
+///
+/// An observed row's id is `q-<n>`, and that number counts the observations of
+/// every tenant's tables, so an id taken before the filters ran would tell
+/// the caller how many rows of another organisation's tables sorted before a
+/// visible one (`GOV-15`, review round 1 (R1)). The numbers are therefore
+/// taken once every filter has run, so an id says nothing about what a filter
+/// dropped.
+///
+/// Only an observed row is renumbered: its id starts with `q-`, while an
+/// authored rule's id is a UUID and stays as it is.
+fn renumber_observed_quality_rows(body: &mut Value) {
+    let Some(rows) = body.get_mut("quality").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (index, row) in rows
+        .iter_mut()
+        .filter(|row| {
+            row.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("q-"))
+        })
+        .enumerate()
+    {
+        row["id"] = json!(format!("q-{index}"));
+    }
+}
+
+/// `SEC-20` (plan 95, plan 96): drops, in place, the rows of `body[rows_key]`
+/// whose table, read from the `table_key` string of the row, `reach` does not
+/// cover.
+///
+/// The maintenance history names every table the Bronze job ever compacted and
+/// the classification list names every table the registry holds, upload tables
+/// included, so a person reads the rows of the tables in their reach by the
+/// rule Query Studio keeps ([`crate::routes::query::reachable_names`]):
+/// another tenant's upload table is left out even for the tenant that owns the
+/// shared catalog, and the shared catalog's tables are left out for a tenant
+/// that does not own it. The claims are read once for the distinct tables,
+/// because the history holds every run and a table appears many times. A
+/// maintenance row always carries a `tableName` string
+/// ([`maintenance_run_row_json`] writes one even when the column is empty),
+/// and an empty name is an unclaimable name: it is kept only where an
+/// unclaimed table is, for a reach that is everything and for the tenant that
+/// owns the shared catalog. So is a classification `asset` that is a dataset
+/// slug or an authored rule's own text, which no upload can claim. A row with
+/// no string at all is left out of a narrowed answer. An answer with no
+/// `rows_key` list is left as it is.
+///
+/// # Errors
+///
+/// The 503 of [`crate::routes::query::claims_on`] when the claims cannot be
+/// read; the response carries its fixed sentence, never the cause.
+async fn retain_rows_in_reach(
+    state: &AppState,
+    reach: crate::routes::query::TenantReach,
+    body: &mut Value,
+    rows_key: &str,
+    table_key: &str,
+) -> Result<(), ApiError> {
+    if reach == crate::routes::query::TenantReach::All {
+        return Ok(());
+    }
+    let Some(rows) = body.get_mut(rows_key).and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let table_of = |row: &Value| {
+        row.get(table_key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let mut tables: Vec<String> = rows.iter().filter_map(table_of).collect();
+    tables.sort();
+    tables.dedup();
+    let reachable = crate::routes::query::reachable_names(state, reach, &tables).await?;
+    rows.retain(|row| table_of(row).is_some_and(|table| reachable.contains(&table)));
+    Ok(())
 }
 
 /// A fixed, classified message for a failed governance read. The raw
@@ -163,12 +428,13 @@ fn ch_error_message(err: &ChError) -> String {
 async fn run(state: &AppState, kind: Kind) -> Result<Value, GovError> {
     match kind {
         Kind::Quality => quality(&state.clickhouse, state.pg.as_deref()).await,
-        Kind::Audit => audit(&state.dagster, state.pg.as_deref()).await,
         Kind::Classification => classification(&state.clickhouse, state.pg.as_deref()).await,
         Kind::Residency => residency(state.pg.as_deref()).await,
         Kind::Maintenance => maintenance(&state.clickhouse).await,
         Kind::Replication => replication(&state.clickhouse).await,
-        Kind::Unknown => unreachable!("Kind::Unknown is handled before `run` is called"),
+        Kind::Audit | Kind::Unknown => {
+            unreachable!("the audit kind is answered before `run` is called")
+        }
     }
 }
 
@@ -307,14 +573,76 @@ pub(crate) async fn observed_quality(
 /// `"schedule"` principal kinds onto `"agent"` — the closest existing
 /// meaning — rather than emit a value the frontend type doesn't know,
 /// preserving the existing response shape for existing consumers.
-fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
+///
+/// `None` is a service, not an agent (`SEC-70`, decision D4): an event with
+/// no recorded principal is one nobody signed in caused — a refused sign-in,
+/// a locked public link, a refused single sign-on link — and the platform
+/// recorded it. The actor's own name comes from `actor_label`
+/// ([`actor_of`]). The audit page's person filter lists the same kinds
+/// (`GOV-1` acceptance follow-up, D2), so the list narrows them the same
+/// way.
+pub(super) fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
     match principal_kind {
         Some("user") => "user",
-        Some("service") => "service",
         // "copilot" and "schedule" are both non-human actors from the
         // frontend's point of view.
-        _ => "agent",
+        Some("copilot" | "schedule") => "agent",
+        // A recorded service, and no recorded kind at all (`SEC-70` D4).
+        _ => "service",
     }
+}
+
+/// The `source` an `audit_event` row reports (QA LH-DATA-15-03 F3, plan D9):
+/// where the action came from, following `principal_kind`. No recorded kind
+/// is the system, never the assistant (`SEC-70`, decision D4): the event
+/// happened before anybody signed in, so nobody else can have sent it.
+fn source_of(principal_kind: Option<&str>) -> &'static str {
+    match principal_kind {
+        Some("user") => "console",
+        Some("copilot") => "copilot",
+        Some("schedule") => "schedule",
+        Some("service") => "service",
+        _ => "system",
+    }
+}
+
+/// The name for an event nobody recorded an actor for. `AI-23` keeps one name
+/// for the assistant, but only for an event whose kind *is* `copilot`.
+const UNKNOWN_ACTOR: &str = "System";
+
+/// The `actor` an `audit_event` row reports, in order of what the row knows
+/// (`SEC-70`, decision D4): the stored label, then the principal id, then —
+/// only for an event whose kind is `copilot` and that carries no name —
+/// `AI-23`'s one name for the assistant, and otherwise [`UNKNOWN_ACTOR`],
+/// which is what rows stored before `SEC-70` read as.
+pub(super) fn actor_of(
+    label: Option<&str>,
+    principal_id: Option<&str>,
+    principal_kind: Option<&str>,
+) -> String {
+    if let Some(label) = label {
+        return label.to_owned();
+    }
+    if let Some(id) = principal_id {
+        return id.to_owned();
+    }
+    if principal_kind == Some("copilot") {
+        return lakehouse_store::agents::COPILOT_EMPLOYEE_NAME.to_owned();
+    }
+    UNKNOWN_ACTOR.to_owned()
+}
+
+/// One sentence saying what a catalog grant or revoke did, for the audit
+/// row's `detail` (QA LH-DATA-15-03 F1, plan D9). Built by
+/// `catalog_governance::grant_summary` from the stored `permission`,
+/// `grantee` and `expiresAt` only, so an unknown `args` blob is never
+/// echoed; every other action has no detail.
+fn detail_of(action: &str, args: &Value) -> Option<String> {
+    if action != "catalog.grant" && action != "catalog.revoke" {
+        return None;
+    }
+    let arg = |key: &str| args.get(key).and_then(Value::as_str);
+    Some(super::catalog_governance::grant_summary(action, arg))
 }
 
 /// Same narrowing for `outcome`: `audit_event.outcome` has eight values,
@@ -324,7 +652,13 @@ fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
 /// `"denied"` — the policy refused nothing — and not to `"success"`,
 /// because a viewer scanning for problems must not read a still-pending
 /// gate as clean (`GOV-5`).
-fn outcome_of(outcome: &str) -> &'static str {
+///
+/// The one mapping for every shape that names an outcome: the events JSON,
+/// the single-event JSON (`audit_event_row`) and the CSV export
+/// (`routes::audit_events`) all call it, so the page and the file agree
+/// (`GOV-1` acceptance follow-up, D4). The stored value travels beside it
+/// as `outcomeDetail` / `outcome_detail`.
+pub(super) fn outcome_of(outcome: &str) -> &'static str {
     match outcome {
         "allowed" | "executed" | "approved" => "success",
         "failed" => "error",
@@ -338,20 +672,96 @@ fn outcome_of(outcome: &str) -> &'static str {
 /// The policy decision a row reports beside its outcome. A row whose
 /// decision is still open reports `"pending"` too: the policy allowed
 /// nothing and denied nothing, so neither `"allow"` nor `"deny"` would be
-/// true (`GOV-5`). A success row stays `"allow"`, everything else stays
-/// `"deny"`.
+/// true (`GOV-5`).
+///
+/// `failed` reports `"allow"` (`GOV-1` acceptance follow-up, D4): the policy
+/// let the call through the gate and the execution failed afterwards — the
+/// outcome says so with its own word, `error` — so a failed row must not
+/// read as a policy refusal. Only the gate's own refusals, `refused` and
+/// `rejected`, report `"deny"`; a success row stays `"allow"`.
 fn policy_decision_of(outcome: &str) -> &'static str {
     match outcome_of(outcome) {
-        "success" => "allow",
+        // `error` is in the same arm: it is the one word the four-word
+        // vocabulary derives only from `failed`, and `failed` is an
+        // execution's failure, not a policy refusal — the gate allowed
+        // the call (`GOV-1` acceptance follow-up, D4).
+        "success" | "error" => "allow",
         "pending" => "pending",
+        // "refused" | "rejected": the gate itself said no.
         _ => "deny",
     }
 }
 
+/// One stored `audit_event` as the JSON object the audit list shows: the shape
+/// `GET /api/governance/audit` has always answered, and the shape every event of
+/// the search and single-event routes (`routes::audit_events`) has too, so a
+/// console or a tool reads one object for one event whichever route it came
+/// from.
+///
+/// Every event also carries, beside the keys the shape has always had: the
+/// actor's id as `actorId` (`GOV-1` acceptance follow-up, D2 — null when
+/// nobody signed in caused the event), the stored outcome value as
+/// `outcomeDetail` beside the four words of `outcome` (D4), and the stored
+/// `detail` column as `reason` (D4b — null when nothing was stored; the
+/// derived grant summary below stays `detail`).
+pub(super) fn audit_event_row(e: &lakehouse_store::audit::AuditEvent) -> Value {
+    let resource = match (&e.resource_kind, &e.resource_id) {
+        (Some(kind), Some(id)) => format!("{kind}:{id}"),
+        (Some(kind), None) => kind.clone(),
+        (None, Some(id)) => id.clone(),
+        (None, None) => e.action.clone(),
+    };
+    let mut row = json!({
+        "id": e.id,
+        "at": e.at,
+        // `GOV-1` acceptance follow-up (D2): the id sits beside the
+        // name, so the person filter can send it back; an event nobody
+        // signed in caused carries null.
+        "actorId": e.principal_id,
+        // AI-23 (product owner 2026-11-02): one name for the
+        // assistant — "AI Copilot", for an event whose kind is
+        // `copilot`; SEC-70 D4: an event nobody signed in caused
+        // carries only its label, and reads as "System" otherwise.
+        "actor": actor_of(
+            e.actor_label.as_deref(),
+            e.principal_id.as_deref(),
+            e.principal_kind.as_deref(),
+        ),
+        "actorKind": actor_kind_of(e.principal_kind.as_deref()),
+        "action": e.action,
+        "resource": resource,
+        "outcome": outcome_of(&e.outcome),
+        // `GOV-1` acceptance follow-up (D4): the stored value, beside
+        // the four words above — the detail view shows both.
+        "outcomeDetail": e.outcome,
+        "policyDecision": policy_decision_of(&e.outcome),
+        "obligations": [],
+        "approvalId": e.approval_id,
+        // QA LH-DATA-15-03 F3 (plan D9): every row used to say
+        // "copilot", whoever acted.
+        "source": source_of(e.principal_kind.as_deref()),
+        // `GOV-1` acceptance follow-up (D4b): the stored `detail`
+        // column — a refusal reason, a status code — as `reason`, null
+        // when nothing was stored. The derived grant summary below
+        // stays `detail`.
+        "reason": e.detail.as_deref().filter(|detail| !detail.is_empty()),
+    });
+    // QA LH-DATA-15-03 F1 (plan D9): the row names who got which
+    // permission, from the stored fields only.
+    if let (Some(detail), Some(o)) = (detail_of(&e.action, &e.args), row.as_object_mut()) {
+        o.insert("detail".to_owned(), json!(detail));
+    }
+    row
+}
+
 /// `GET /api/governance/audit`. Unions `audit_event` rows (copilot/console
 /// actions) onto the `Dagster`-run-derived pipeline history, adding a
-/// `source: "copilot" | "pipeline"` field so a consumer can filter by
-/// origin. This is additive: every field the pre-existing response shape
+/// `source` field (`"console" | "copilot" | "schedule" | "service" |
+/// "system"` for stored events, `"pipeline"` for runs) so a consumer can
+/// filter by origin. `"system"` is an event nobody signed in caused
+/// (`SEC-70` D4); no source is ever the assistant unless the event's kind
+/// is `copilot`. This is additive: every field the pre-existing response
+/// shape
 /// had is still present with the same meaning, so
 /// `src/services/clients/governance.ts` and the `/audit` page keep
 /// working unchanged (see `AuditEvent` in
@@ -360,67 +770,60 @@ fn policy_decision_of(outcome: &str) -> &'static str {
 /// currently narrows on it). When `pg` is `None` (no `DATABASE_URL`), this
 /// degrades to the pre-fix `Dagster`-only view, matching `quality`'s and
 /// `classification`'s same-shaped gap fixes.
-async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
+///
+/// `SEC-20` (plan 100): `scope` is the reader's reach over the trail. The
+/// stored rows are the ones of the caller's own organisation, and the
+/// deployment's own rows — the `Dagster` runs, which no person signed in
+/// caused — belong to the tenant that owns the shared catalog, so they are
+/// unioned only for a reader that may read them ([`AuditScope::sees_deployment_rows`]).
+async fn audit(
+    dagster: &DgClient,
+    pg: Option<&PgPool>,
+    scope: &AuditScope,
+) -> Result<Value, GovError> {
     // Dagster is optional here. It used to be required, so with no
     // orchestrator reachable — which is every local stack, since compose
     // has no Dagster service — the whole audit trail answered 503 even
     // though the console's own events live in Postgres and were right
     // there. Losing the pipeline half of the trail is a gap; losing all
     // of it is a broken page.
-    let runs = match dagster.list_runs(50).await {
-        Ok(runs) => runs,
-        Err(err) => {
-            tracing::warn!(%err, "audit: no pipeline history (Dagster unreachable)");
-            Vec::new()
-        }
-    };
-    let mut audit: Vec<Value> = runs
-        .iter()
-        .map(|r| {
-            json!({
-                "id": r.run_id,
-                "at": r.start_time.map_or_else(String::new, iso_from_unix_seconds),
-                "actor": "Dagster",
-                "actorKind": "service",
-                "tenant": TENANT_ID.as_str(),
-                "action": format!("pipeline {}: {}", map_run_status(&r.status), r.job_name),
-                "resource": r.job_name,
-                "outcome": if r.status == "FAILURE" { "error" } else { "success" },
-                "policyDecision": "allow",
-                "obligations": [],
-                "engineCategory": "hot-store",
-                "source": "pipeline",
+    //
+    // The run list is asked for only when the reader may read the
+    // deployment's own rows: for any other reader it is a row set it is
+    // not allowed to see, and the orchestrator is not asked for it.
+    let mut audit: Vec<Value> = if scope.sees_deployment_rows() {
+        let runs = match dagster.list_runs(50).await {
+            Ok(runs) => runs,
+            Err(err) => {
+                tracing::warn!(%err, "audit: no pipeline history (Dagster unreachable)");
+                Vec::new()
+            }
+        };
+        runs.iter()
+            .map(|r| {
+                json!({
+                    "id": r.run_id,
+                    "at": r.start_time.map_or_else(String::new, iso_from_unix_seconds),
+                    "actor": "Dagster",
+                    "actorKind": "service",
+                    "action": format!("pipeline {}: {}", map_run_status(&r.status), r.job_name),
+                    "resource": r.job_name,
+                    "outcome": if r.status == "FAILURE" { "error" } else { "success" },
+                    "policyDecision": "allow",
+                    "obligations": [],
+                    "engineCategory": "hot-store",
+                    "source": "pipeline",
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        Vec::new()
+    };
     if let Some(pg) = pg {
         let events =
-            lakehouse_store::audit::list(pg, lakehouse_store::audit::AuditFilter::default())
+            lakehouse_store::audit::list(pg, lakehouse_store::audit::AuditFilter::default(), scope)
                 .await?;
-        audit.extend(events.iter().map(|e| {
-            let resource = match (&e.resource_kind, &e.resource_id) {
-                (Some(kind), Some(id)) => format!("{kind}:{id}"),
-                (Some(kind), None) => kind.clone(),
-                (None, Some(id)) => id.clone(),
-                (None, None) => e.action.clone(),
-            };
-            json!({
-                "id": e.id,
-                "at": e.at,
-                // AI-23 (product owner 2026-11-02): one name for the
-                // assistant — "AI Copilot", the same name the console shows.
-                "actor": e.actor_label.clone().or_else(|| e.principal_id.clone()).unwrap_or_else(|| "AI Copilot".to_owned()),
-                "actorKind": actor_kind_of(e.principal_kind.as_deref()),
-                "tenant": TENANT_ID.as_str(),
-                "action": e.action,
-                "resource": resource,
-                "outcome": outcome_of(&e.outcome),
-                "policyDecision": policy_decision_of(&e.outcome),
-                "obligations": [],
-                "approvalId": e.approval_id,
-                "source": "copilot",
-            })
-        }));
+        audit.extend(events.iter().map(audit_event_row));
     }
     // Newest first across both sources: both `at` values are the same
     // fixed-width `YYYY-MM-DDTHH:MM:SS.mmmZ` format, so lexicographic
@@ -431,6 +834,25 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
         b_at.cmp(a_at)
     });
     Ok(json!({ "audit": audit }))
+}
+
+/// The audit trail, as the reader's reach reads it.
+///
+/// `SEC-20` (plan 100): the one read of the trail, shared by the route and
+/// the assistant's `get_audit_history` tool, so the two cannot disagree
+/// about which rows the caller may see.
+///
+/// # Errors
+///
+/// The message of [`gov_error_message`], when the read fails: a `Dagster`
+/// failure is a warning (the run list is optional), a `Postgres` failure
+/// is the fixed `database error`. The message is returned instead of the
+/// error type, because the type is this module's own and this function is
+/// read by the assistant's tools.
+pub(crate) async fn audit_trail(state: &AppState, scope: &AuditScope) -> Result<Value, String> {
+    audit(&state.dagster, state.pg.as_deref(), scope)
+        .await
+        .map_err(|err| gov_error_message(&err))
 }
 
 /// The product's classification levels: the four the console's badge shows
@@ -735,7 +1157,9 @@ pub struct LineageQuery {
 /// # Errors
 ///
 /// 404 when `X-Tenant` names a tenant the caller does not belong to; 503
-/// when the shared-catalog rule cannot be evaluated.
+/// when the shared-catalog rule cannot be evaluated, when the deployment's
+/// tenant count cannot be read, or when an upload table's claim cannot be
+/// read.
 pub async fn lineage(
     State(state): State<AppState>,
     axum::Extension(principal): axum::Extension<lakehouse_auth::Principal>,
@@ -750,7 +1174,8 @@ pub async fn lineage(
 /// (`DATA-13`): the columns a column comes from, or the columns (and saved
 /// charts, with their dashboards) built from it, following recorded mappings
 /// up to ten hops. Same permission and tenant rules as [`lineage`]; charts
-/// and dashboards are listed only to a caller with `dashboard:read`.
+/// and dashboards are listed only to a caller with `dashboard:read` whom the
+/// shared catalog is open to (`SEC-20`, plan 96).
 ///
 /// # Errors
 ///
@@ -937,15 +1362,12 @@ pub(crate) async fn audit_table_change(
     action: &str,
     args: Value,
 ) {
-    let Some(pg) = state.pg.as_deref() else {
-        return;
-    };
     let table = table.trim().to_lowercase();
     if table.is_empty() {
         return;
     }
-    let _ = lakehouse_store::audit::insert(
-        pg,
+    audit_coverage::record_best_effort(
+        state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: actor.map(|p| p.id.uuid().to_string()),
             principal_kind: actor.map(|_| "user".to_owned()),
@@ -971,30 +1393,35 @@ pub(crate) async fn audit_table_change(
 ///
 /// # Errors
 ///
-/// 400 for an unrecognized `kind` or a malformed body; 503/500 as above.
+/// 400 for an unrecognized `kind` or a malformed body; 403 for the quality
+/// kind when the caller is outside the tenant that owns the shared catalog
+/// (PR review round 1 R3); 503/500 as above.
 pub async fn create_rule(
     State(state): State<AppState>,
     Path(kind): Path<String>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let actor = principal.as_ref().map(|Extension(p)| p);
     match Kind::parse(&kind) {
-        Kind::Quality => match create_quality_rule(State(state.clone()), body).await {
-            Ok(resp) => {
-                let rule = &resp.1.0;
-                audit_table_change(
-                    &state,
-                    actor,
-                    &rule.asset,
-                    "quality.rule_create",
-                    json!({ "name": rule.name, "threshold": rule.threshold }),
-                )
-                .await;
-                resp.into_response()
+        Kind::Quality => {
+            match create_quality_rule(State(state.clone()), actor, &headers, body).await {
+                Ok(resp) => {
+                    let rule = &resp.1.0;
+                    audit_table_change(
+                        &state,
+                        actor,
+                        &rule.asset,
+                        "quality.rule_create",
+                        json!({ "name": rule.name, "threshold": rule.threshold }),
+                    )
+                    .await;
+                    resp.into_response()
+                }
+                Err(err) => err.into_response(),
             }
-            Err(err) => err.into_response(),
-        },
+        }
         Kind::Classification => {
             match create_classification_rule(State(state.clone()), body).await {
                 Ok(resp) => {
@@ -1131,6 +1558,47 @@ impl PolicyView {
     }
 }
 
+/// The body of `GET /api/governance/row-filter-grammar` (`WEB-8` S2 T8,
+/// D8; forms added by S2 review round 1, S2): the function names, operator
+/// tokens and expression forms [`row_filter_grammar`] serves, read directly
+/// from the constants in [`crate::sql_rewrite`] — never a second list, so a
+/// change to what a save accepts changes the console's help line with it.
+#[derive(Debug, Serialize)]
+pub struct RowFilterGrammar {
+    /// Function names, in `ALLOWED_ROW_FILTER_FUNCTIONS`'s order.
+    functions: &'static [&'static str],
+    /// Operator tokens, in `ALLOWED_ROW_FILTER_OPERATORS`'s order.
+    operators: &'static [&'static str],
+    /// Expression forms, in `ALLOWED_ROW_FILTER_FORMS`'s order.
+    forms: &'static [&'static str],
+}
+
+/// `GET /api/governance/row-filter-grammar` (`WEB-8` S2 T8, D8; forms added
+/// by S2 review round 1, S2) — the functions, operators and forms a row
+/// filter may use. Gated by `policy:read` in
+/// [`POLICY_TABLE`](crate::policy::POLICY_TABLE): the same grant that lists
+/// the policies this grammar authors.
+///
+/// The answer is built from
+/// [`crate::sql_rewrite::ALLOWED_ROW_FILTER_FUNCTIONS`],
+/// [`crate::sql_rewrite::ALLOWED_ROW_FILTER_OPERATORS`] and
+/// [`crate::sql_rewrite::ALLOWED_ROW_FILTER_FORMS`] (rule 4: no second copy,
+/// in Rust or TypeScript). The forms are shapes rather than a membership
+/// list; the test below feeds each name back to the validator, which is what
+/// keeps this list honest.
+///
+/// # Errors
+///
+/// This handler has no failing path; it returns `ApiResult` only so every
+/// route in this crate has the same `ApiResult<ApiJson<T>>` shape.
+pub async fn row_filter_grammar() -> ApiResult<ApiJson<RowFilterGrammar>> {
+    Ok(ApiJson(RowFilterGrammar {
+        functions: crate::sql_rewrite::ALLOWED_ROW_FILTER_FUNCTIONS,
+        operators: crate::sql_rewrite::ALLOWED_ROW_FILTER_OPERATORS,
+        forms: crate::sql_rewrite::ALLOWED_ROW_FILTER_FORMS,
+    }))
+}
+
 /// `GET /api/governance/policies` — every authored policy, each with the
 /// engine's verdict on whether it can be enforced (`SEC-61`) and the catalog
 /// asset it governs, where one can be named (`WEB-3` S3a-D1).
@@ -1252,19 +1720,36 @@ pub async fn create_policy_route(
 ) -> ApiResult<(StatusCode, ApiJson<PolicyView>)> {
     let created = create_policy(State(state.clone()), body).await?;
     let policy = &created.1.0.policy;
-    if let Some(cond) =
-        crate::policy_engine::PolicyCondition::parse_opt(policy.conditions.as_deref())
-    {
-        audit_table_change(
-            &state,
-            principal.as_ref().map(|Extension(p)| p),
-            &cond.table,
-            "policy.create",
-            json!({ "name": policy.name }),
-        )
-        .await;
-    }
+    // A policy that binds no table is recorded on the policy itself
+    // (`audit_policy_change`): it used to leave no row at all (`GOV-1`).
+    audit_policy_change(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        policy,
+        "policy.create",
+        policy_definition_args(policy, json!({ "newStatus": policy.status })),
+    )
+    .await;
     Ok(created)
+}
+
+/// What a policy was or became, for the audit row of its creation or its
+/// deletion (`GOV-1` Decision 3): the definition fields, never `conditions`
+/// (the authored obligation can name columns and filter literals). The
+/// assistant's redaction runs over it as over every audit `args`: a key
+/// naming a secret is replaced and a long string is cut.
+fn policy_definition_args(policy: &Policy, extra: Value) -> Value {
+    let mut args = json!({
+        "name": policy.name,
+        "kind": policy.kind,
+        "effect": policy.effect,
+        "subjects": policy.subjects,
+        "resources": policy.resources,
+    });
+    if let (Some(args), Value::Object(extra)) = (args.as_object_mut(), extra) {
+        args.extend(extra);
+    }
+    super::ai::audit::redact(&args)
 }
 
 /// Records a change to a policy in the audit trail: on the table its
@@ -1284,11 +1769,8 @@ async fn audit_policy_change(
         audit_table_change(state, actor, &cond.table, action, args).await;
         return;
     }
-    let Some(pg) = state.pg.as_deref() else {
-        return;
-    };
-    let _ = lakehouse_store::audit::insert(
-        pg,
+    audit_coverage::record_best_effort(
+        state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: actor.map(|p| p.id.uuid().to_string()),
             principal_kind: actor.map(|_| "user".to_owned()),
@@ -1357,7 +1839,11 @@ pub async fn set_policy_status(
             principal.as_ref().map(|Extension(p)| p),
             &policy,
             action,
-            json!({ "name": policy.name }),
+            json!({
+                "name": policy.name,
+                "oldStatus": before.status,
+                "newStatus": policy.status,
+            }),
         )
         .await;
     }
@@ -1385,7 +1871,10 @@ pub async fn delete_policy(
         principal.as_ref().map(|Extension(p)| p),
         &policy,
         "policy.delete",
-        json!({ "name": policy.name, "enforced": policy.status == "ready" }),
+        policy_definition_args(
+            &policy,
+            json!({ "enforced": policy.status == "ready", "oldStatus": policy.status }),
+        ),
     )
     .await;
     Ok(ApiJson(json!({ "ok": true, "id": policy.id })))
@@ -1559,12 +2048,19 @@ pub struct CreateQualityRuleBody {
 ///
 /// # Errors
 ///
-/// 400 on a malformed body; 409 if the name is taken; 503/500 as above.
+/// 400 on a malformed body, or for a table that is not there or that the
+/// author's roles do not let them read (QA `LH-DATA-14-01` F2, `DATA-54`);
+/// 403 when the caller is outside the tenant that owns the shared catalog
+/// (PR review round 1 R3); 409 if the name is taken; 503 when the table
+/// cannot be checked; 500 on a store failure.
 pub async fn create_quality_rule(
     State(state): State<AppState>,
+    actor: Option<&Principal>,
+    headers: &HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<QualityRule>)> {
     let body: CreateQualityRuleBody = parse_body(&body)?;
+    crate::routes::quality::ensure_rule_table(&state, actor, headers, &body.asset).await?;
     let input = CreateQualityRuleInput {
         name: body.name,
         asset: body.asset,
@@ -1827,11 +2323,8 @@ fn tag_key_json(row: &lakehouse_store::governed_tag::TagKeyRow) -> Value {
 /// not a catalog table, so it has no Change history to join). Best-effort
 /// like every audit write here: it never fails the change it records.
 async fn audit_tag_key(state: &AppState, actor: &Principal, key: &str, action: &str, args: Value) {
-    let Some(pg) = state.pg.as_deref() else {
-        return;
-    };
-    let _ = lakehouse_store::audit::insert(
-        pg,
+    audit_coverage::record_best_effort(
+        state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: Some(actor.id.uuid().to_string()),
             principal_kind: Some("user".to_owned()),
@@ -1982,9 +2475,11 @@ pub async fn update_tag_key(
 }
 
 /// `DELETE /api/governance/tag-keys/{key}` — remove a key nobody uses.
-/// Needs `governance:write`. Refused while any table has a value for it, with
-/// the number of tables in the sentence: a tag is never lost silently.
-/// Audited as `governance.tag_key_delete`.
+/// Needs `governance:write`. Refused while any table has a value for it: a
+/// tag is never lost silently. The sentence counts the tables and names up to
+/// three of them — only the ones the caller may read, the rest are counted
+/// (QA `LH-DATA-12-15`, `DATA-54`). Audited as
+/// `governance.tag_key_delete`.
 ///
 /// # Errors
 ///
@@ -2002,12 +2497,37 @@ pub async fn delete_tag_key(
     {
         return Err(ApiError::PermissionDenied(reason.to_owned()).into());
     }
-    lakehouse_store::governed_tag::delete_key(pool(&state)?, &key)
-        .await
-        .map_err(|err| match err {
-            lakehouse_store::StoreError::NotFound => tag_key_not_found(&key),
-            other => ApiError::from(other),
-        })?;
+    match lakehouse_store::governed_tag::delete_key(pool(&state)?, &key).await {
+        Ok(()) => {}
+        Err(lakehouse_store::StoreError::NotFound) => {
+            return Err(tag_key_not_found(&key).into());
+        }
+        // QA `LH-DATA-12-15` (`DATA-54`): only tables the caller may read are
+        // named, the rest are counted. A catalog that cannot be read keeps the
+        // store's sentence, which still counts them, and the refusal stands.
+        Err(lakehouse_store::StoreError::Validation(counted)) => {
+            let ids = lakehouse_store::governed_tag::assets_with_key(pool(&state)?, &key).await;
+            let sentence = match ids {
+                Ok(ids) => {
+                    match crate::routes::catalog::readable_asset_names(&state, &principal, &ids)
+                        .await
+                    {
+                        Some(names) => tag_key_in_use_sentence(&key, ids.len(), &names),
+                        None => counted,
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "the tables holding a tag key could not be read"
+                    );
+                    counted
+                }
+            };
+            return Err(ApiError::BadRequest(sentence).into());
+        }
+        Err(other) => return Err(ApiError::from(other).into()),
+    }
     audit_tag_key(
         &state,
         &principal,
@@ -2019,6 +2539,31 @@ pub async fn delete_tag_key(
     Ok(ApiJson(json!({ "ok": true, "key": key })))
 }
 
+/// The refusal to delete a tag key in use: the count of every table that
+/// holds it, then up to three of them by name and "and N more" for the rest
+/// (QA `LH-DATA-12-15`, `DATA-54`). `names` are the ones the caller may read;
+/// `total` is the count of all of them, so a caller never learns of a table
+/// it may not read.
+fn tag_key_in_use_sentence(key: &str, total: usize, names: &[String]) -> String {
+    let (noun, them) = if total == 1 {
+        ("table", "that table")
+    } else {
+        ("tables", "those tables")
+    };
+    let head = format!("\"{key}\" is still given to {total} {noun}");
+    if names.is_empty() {
+        return format!("{head}. Remove it from {them} first.");
+    }
+    let shown: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
+    let rest = total.saturating_sub(shown.len());
+    let list = if rest > 0 {
+        format!("{} and {rest} more", shown.join(", "))
+    } else {
+        shown.join(", ")
+    };
+    format!("{head}: {list}. Remove it from {them} first.")
+}
+
 fn tag_key_not_found(key: &str) -> ApiError {
     ApiError::NotFound(format!("the tag key \"{key}\" is not defined"))
 }
@@ -2028,6 +2573,106 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    // QA `LH-DATA-12-15` (`DATA-54`): the refusal names up to three tables
+    // and counts the rest; with no table to name it says which forms to
+    // remove the key from.
+    #[test]
+    fn the_refusal_names_up_to_three_tables_and_counts_the_rest() {
+        let names = ["A", "B", "C", "D"].map(str::to_owned);
+        assert_eq!(
+            tag_key_in_use_sentence("data_domain", 5, &names),
+            "\"data_domain\" is still given to 5 tables: A, B, C and 2 more. \
+             Remove it from those tables first."
+        );
+        assert_eq!(
+            tag_key_in_use_sentence("data_domain", 1, &[]),
+            "\"data_domain\" is still given to 1 table. Remove it from that table first."
+        );
+    }
+
+    /// `WEB-8` S2 T8 (D8): the grammar route's answer is what the validator
+    /// accepts. Every function and operator the route names is accepted in a
+    /// filter, and a function and an operator it does not name are refused —
+    /// which is why the route reads the validator's own constants instead of
+    /// carrying a list of its own.
+    #[tokio::test]
+    async fn row_filter_grammar_names_only_what_the_validator_accepts() {
+        use crate::sql_rewrite::{Engine, validate_row_filter_expr};
+
+        let columns = vec!["a".to_owned(), "b".to_owned()];
+        let grammar = row_filter_grammar()
+            .await
+            .expect("the route has no failure path")
+            .0;
+
+        for function in grammar.functions {
+            let filter = format!("{function}(a) = 1");
+            assert!(
+                validate_row_filter_expr(&filter, &columns, Engine::ClickHouse).is_ok(),
+                "the route names function '{function}' but the validator refuses '{filter}'"
+            );
+        }
+        for operator in grammar.operators {
+            let filter = match *operator {
+                "=" => "a = 1".to_owned(),
+                "<>" => "a <> 1".to_owned(),
+                "<" => "a < 1".to_owned(),
+                "<=" => "a <= 1".to_owned(),
+                ">" => "a > 1".to_owned(),
+                ">=" => "a >= 1".to_owned(),
+                "AND" => "a = 1 AND b = 2".to_owned(),
+                "OR" => "a = 1 OR b = 2".to_owned(),
+                "+" => "a + 1 = 2".to_owned(),
+                "-" => "a - 1 = 0".to_owned(),
+                "*" => "a * 2 = 2".to_owned(),
+                "/" => "a / 2 = 1".to_owned(),
+                "%" => "a % 2 = 1".to_owned(),
+                "NOT" => "NOT a = 1".to_owned(),
+                other => panic!("the route names operator '{other}' with no filter in this test"),
+            };
+            assert!(
+                validate_row_filter_expr(&filter, &columns, Engine::ClickHouse).is_ok(),
+                "the route names operator '{operator}' but the validator refuses '{filter}'"
+            );
+        }
+
+        assert!(
+            validate_row_filter_expr("nope(a) = 1", &columns, Engine::ClickHouse).is_err(),
+            "the validator accepts a function the route does not name"
+        );
+        assert!(
+            validate_row_filter_expr("a || b", &columns, Engine::ClickHouse).is_err(),
+            "the validator accepts an operator the route does not name"
+        );
+
+        // `WEB-8` S2 review round 1, S2: one filter per named form, checked
+        // on both engines the validator knows — the forms are match arms, not
+        // a membership list, so this loop is what ties the constant to the
+        // arms. `a IS TRUE` is a shape the validator refuses and the route
+        // does not name.
+        for form in grammar.forms {
+            let filter = match *form {
+                "LIKE" => "a LIKE 'x%'",
+                "ILIKE" => "a ILIKE 'x%'",
+                "BETWEEN" => "a BETWEEN 1 AND 2",
+                "IN" => "a IN (1, 2)",
+                "IS NULL" => "a IS NULL",
+                "IS NOT NULL" => "a IS NOT NULL",
+                other => panic!("the route names form '{other}' with no filter in this test"),
+            };
+            for engine in [Engine::ClickHouse, Engine::Trino] {
+                assert!(
+                    validate_row_filter_expr(filter, &columns, engine).is_ok(),
+                    "the route names form '{form}' but the validator refuses '{filter}' on {engine:?}"
+                );
+            }
+        }
+        assert!(
+            validate_row_filter_expr("a IS TRUE", &columns, Engine::ClickHouse).is_err(),
+            "the validator accepts a form the route does not name"
+        );
+    }
 
     #[test]
     fn create_policy_rejects_a_conditions_blob_with_no_real_obligation() {
@@ -2625,6 +3270,23 @@ mod tests {
         assert_eq!(severity_of("pass"), "info");
     }
 
+    /// The principal the auth gate always inserts before [`get`] runs. An
+    /// administrator is the right caller here: `replication` is not narrowed
+    /// by role (`GOV-15` covers the quality rules only). `tag_key_handlers`'s
+    /// own `admin()` lives in a sibling module and is not reachable from here,
+    /// so this is the same principal inline.
+    fn replication_admin() -> Principal {
+        Principal {
+            id: lakehouse_auth::PrincipalId::User(uuid::Uuid::new_v4()),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Admin".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("governance:write,*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
     /// `GET /api/governance/replication` against a `ClickHouse` stub that
     /// answers every query with `status` and `body`; returns the route's
     /// status and JSON body.
@@ -2653,6 +3315,7 @@ mod tests {
         let cfg = crate::config::Config::from_map(&env).unwrap();
         let router = axum::Router::new()
             .route("/api/governance/{kind}", axum::routing::get(get))
+            .layer(Extension(replication_admin()))
             .with_state(AppState::new(cfg));
 
         let resp = router
@@ -2773,7 +3436,95 @@ mod tests {
         // than leak an unrecognized string into a typed field.
         assert_eq!(actor_kind_of(Some("copilot")), "agent");
         assert_eq!(actor_kind_of(Some("schedule")), "agent");
-        assert_eq!(actor_kind_of(None), "agent");
+        // Changed by SEC-70 D4: this line asserted "agent" until the QA case
+        // showed the list handing a pre-sign-in lockout to the assistant.
+        // With no recorded kind nobody signed in, so the platform recorded
+        // the event: a service.
+        assert_eq!(actor_kind_of(None), "service");
+    }
+
+    #[test]
+    fn source_of_follows_the_principal_kind() {
+        assert_eq!(source_of(Some("user")), "console");
+        assert_eq!(source_of(Some("copilot")), "copilot");
+        assert_eq!(source_of(Some("schedule")), "schedule");
+        assert_eq!(source_of(Some("service")), "service");
+        // Changed by SEC-70 D4: this line asserted "copilot" until the QA
+        // case showed an event nobody signed in caused listed as the
+        // assistant's. No recorded kind is the system.
+        assert_eq!(source_of(None), "system");
+    }
+
+    #[test]
+    fn actor_of_names_the_label_then_the_id_then_the_assistant_only_for_a_copilot_event() {
+        // A label is the name, whatever the kind: that is how an event
+        // nobody signed in caused names itself (SEC-70 D3).
+        assert_eq!(
+            actor_of(Some("Sign-in form"), None, None),
+            "Sign-in form".to_owned()
+        );
+        assert_eq!(
+            actor_of(Some("Sign-in form"), Some("u_1"), Some("user")),
+            "Sign-in form".to_owned()
+        );
+        // No label: the principal id is what the row knows.
+        assert_eq!(actor_of(None, Some("u_1"), Some("user")), "u_1".to_owned());
+        // The one name for the assistant is only for a copilot event (AI-23),
+        // and a copilot event with a label keeps the label.
+        assert_eq!(
+            actor_of(None, None, Some("copilot")),
+            lakehouse_store::agents::COPILOT_EMPLOYEE_NAME.to_owned()
+        );
+        // Nothing at all: a row stored before SEC-70, or before the label.
+        assert_eq!(actor_of(None, None, None), "System".to_owned());
+        assert_eq!(
+            actor_of(None, None, Some("service")),
+            "System".to_owned(),
+            "a service with no name is not the assistant"
+        );
+    }
+
+    #[test]
+    fn detail_of_a_grant_names_the_permission_the_grantee_and_the_day_it_ends() {
+        let args = json!({
+            "permission": "query:read",
+            "grantee": "QA Approver <qa-approver@example.test>",
+            "expiresAt": "2026-12-06T08:00:00Z",
+            "unrelated": "never echoed",
+        });
+        let detail = detail_of("catalog.grant", &args).expect("a grant has a detail");
+        assert_eq!(
+            detail,
+            "Granted query:read to QA Approver <qa-approver@example.test> until 2026-12-06"
+        );
+        assert!(!detail.contains("never echoed"));
+    }
+
+    #[test]
+    fn detail_of_a_grant_without_an_expiry_does_not_invent_a_date() {
+        let args = json!({ "permission": "query:read", "grantee": "A <a@example.test>" });
+        let detail = detail_of("catalog.grant", &args).expect("a grant has a detail");
+        assert_eq!(
+            detail,
+            "Granted query:read to A <a@example.test> until its expiry"
+        );
+    }
+
+    #[test]
+    fn detail_of_a_revoke_names_the_permission_and_the_grantee() {
+        let args = json!({ "permission": "query:read", "grantee": "A <a@example.test>" });
+        assert_eq!(
+            detail_of("catalog.revoke", &args).as_deref(),
+            Some("Revoked query:read from A <a@example.test>")
+        );
+    }
+
+    #[test]
+    fn detail_of_any_other_action_is_none() {
+        assert_eq!(
+            detail_of("catalog.annotate", &json!({ "fields": ["x"] })),
+            None
+        );
     }
 
     #[test]
@@ -2794,7 +3545,9 @@ mod tests {
 
     /// `GOV-5`: a row whose decision is still open reports `"pending"` as
     /// its policy decision as well — it allowed nothing and denied
-    /// nothing.
+    /// nothing. `failed` reports `"allow"` (`GOV-1` acceptance follow-up,
+    /// D4): the policy let the call through the gate and the execution
+    /// failed afterwards, so it must not read as a policy refusal.
     #[test]
     fn policy_decision_of_reports_pending_for_a_gate_still_waiting() {
         assert_eq!(policy_decision_of("allowed"), "allow");
@@ -2804,7 +3557,7 @@ mod tests {
         assert_eq!(policy_decision_of("needs_approval"), "pending");
         assert_eq!(policy_decision_of("refused"), "deny");
         assert_eq!(policy_decision_of("rejected"), "deny");
-        assert_eq!(policy_decision_of("failed"), "deny");
+        assert_eq!(policy_decision_of("failed"), "allow");
     }
 
     /// The merge sort in [`audit`] compares `at` strings lexicographically;
@@ -2987,12 +3740,12 @@ mod tests {
             let state = state_for(&pool);
             let cases = [
                 (r#"{"key":"Bad Key","allowedValues":["a"]}"#, "key"),
-                (r#"{"key":"k","allowedValues":[]}"#, "allowedValues"),
+                (r#"{"key":"k","allowedValues":[]}"#, "allowed value"),
                 (
                     r#"{"key":"k","allowedValues":["Finance"]}"#,
-                    "allowedValues",
+                    "allowed value",
                 ),
-                (r#"{"key":"k","allowedValues":["a","a"]}"#, "allowedValues"),
+                (r#"{"key":"k","allowedValues":["a","a"]}"#, "allowed value"),
                 (r#"{"key":"k"}"#, "allowedValues"),
                 ("not json", "invalid JSON"),
             ];
@@ -3082,6 +3835,121 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(kept, vec!["finance", "ops"], "a refusal changes nothing");
+        }
+
+        // QA `LH-DATA-12-15` (`DATA-54`): the refusal names up to three of
+        // the tables that hold the key, and only ones the caller may read.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn deleting_a_key_in_use_names_the_tables_that_hold_it(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool);
+            create(
+                &state,
+                r#"{"key":"data_domain","allowedValues":["finance","ops"]}"#,
+            )
+            .await;
+            for asset in ["silver.a", "silver.b"] {
+                lakehouse_store::governed_tag::set_asset_tags(
+                    &pool,
+                    asset,
+                    &[("data_domain".to_owned(), "ops".to_owned())],
+                    "Rina",
+                )
+                .await
+                .unwrap();
+            }
+            crate::routes::catalog::prime_search_copy_for_test(
+                &state,
+                vec![
+                    json!({ "id": "silver.a", "name": "Orders" }),
+                    json!({ "id": "silver.b", "name": "Customers" }),
+                ],
+            )
+            .await;
+
+            let (status, refused) = remove(&state, "data_domain").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("2 tables: Orders, Customers."),
+                "{refused}"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM governed_tag_key")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                1,
+                "a refusal changes nothing"
+            );
+        }
+
+        // Review round 1 R8 (`DATA-54`): a caller who may not open the catalog
+        // is told how many tables hold the key, and named none of them.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_caller_without_catalog_read_is_told_the_count_and_no_name(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool);
+            // A deployment with no tenant of the seeded ones: the catalog's
+            // tenant rule then changes nothing, and the permissions are what
+            // is under test.
+            sqlx::query("DELETE FROM app_user_tenant")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM tenant")
+                .execute(&pool)
+                .await
+                .unwrap();
+            create(
+                &state,
+                r#"{"key":"data_domain","allowedValues":["finance","ops"]}"#,
+            )
+            .await;
+            for asset in ["silver.a", "silver.b"] {
+                lakehouse_store::governed_tag::set_asset_tags(
+                    &pool,
+                    asset,
+                    &[("data_domain".to_owned(), "ops".to_owned())],
+                    "Rina",
+                )
+                .await
+                .unwrap();
+            }
+            crate::routes::catalog::prime_search_copy_for_test(
+                &state,
+                vec![
+                    json!({ "id": "silver.a", "name": "Orders" }),
+                    json!({ "id": "silver.b", "name": "Customers" }),
+                ],
+            )
+            .await;
+
+            // Governance Admin without `catalog:read`: it may delete a key, but
+            // it may not list the tables the sentence would name.
+            let writer = Principal {
+                permissions: PermissionSet::parse("governance:write"),
+                ..admin()
+            };
+            let (status, refused) = answer(
+                delete_tag_key(
+                    State(state.clone()),
+                    Extension(writer),
+                    Path("data_domain".to_owned()),
+                    HeaderMap::new(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let message = refused["error"].as_str().unwrap();
+            assert!(message.contains("2 tables."), "{refused}");
+            assert!(!message.contains("Orders"), "{refused}");
+            assert!(!message.contains("Customers"), "{refused}");
         }
 
         // PR #106 review R1 BLOCKER 1

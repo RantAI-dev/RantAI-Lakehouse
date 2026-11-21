@@ -75,9 +75,11 @@ than served.
 
 ## Limits to tell a customer
 
-- Search covers table names, ids, namespaces, owners, descriptions, tags,
-  column names and column descriptions. It does not search the data inside
-  tables.
+- Search covers table names (the name shown and the physical `schema.table`
+  name), namespaces, owners, descriptions, tags, column names and column
+  descriptions. It does not search the data inside tables, and it does not
+  search a Bronze table's internal registry id (`DATA-54`, 2026-11-12;
+  *proposed, not yet signed*).
 - A table loaded for the first time can take up to 30 seconds to appear in
   search.
 - A search is never delayed by the copy's rebuild: the copy is refreshed in
@@ -85,6 +87,12 @@ than served.
   at once (`DATA-38`).
 - A typo is forgiven only in words of four letters or more, one letter per
   word.
+- A typed word with no letter or digit (`_`, `%`) is ignored; a search made
+  only of such words finds nothing (`DATA-54`).
+- The ⌘K box lists eight tables. When more matched it says "Showing 8 of N:
+  refine the search". It takes at most 100 characters.
+- A result found through its description shows up to 80 characters of the
+  description around the word. A column's description is named, not quoted.
 - Everyone who may open the catalog finds every table in it. Search does not
   hide single tables from single users.
 - There is no certification filter until certification exists.

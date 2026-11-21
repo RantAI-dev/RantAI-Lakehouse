@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -11,8 +12,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { levelAtLeast } from "@/lib/access-level"
 import { readableErrorMessage } from "@/lib/notify-message"
 import type { QueryFolder } from "@/services/contracts/queries"
+import { FolderSharingNote } from "./folder-sharing-note"
 import {
   PERSONAL_SPACE_LABEL,
   SHARED_SPACE_LABEL,
@@ -72,6 +75,7 @@ export function SavedQueryMoveDialog({
   onMove,
   busy,
   error,
+  viewerId,
 }: {
   /** The folders the caller may see, as the server sent them. */
   readonly folders: QueryFolder[]
@@ -89,6 +93,8 @@ export function SavedQueryMoveDialog({
   readonly busy?: boolean
   /** The refusal, in the server's own words. */
   readonly error?: string | null
+  /** The signed-in person, who is left out of "Shared with"; `undefined` leaves nobody out. */
+  readonly viewerId: string | undefined
 }) {
   const targets = React.useMemo(
     () => moveTargets(folders, excludeId),
@@ -96,6 +102,20 @@ export function SavedQueryMoveDialog({
   )
   const [target, setTarget] = React.useState(currentFolderId ?? "")
   const pickerId = React.useId()
+  // The shared space (value "") and the caller's own space hold no rule, so
+  // the dialog neither asks nor says anything for them. A folder inside the
+  // own space is a real folder and can be shared.
+  const personalRootId = folders.find(
+    (folder) => folder.isPersonal && folder.parentId === null,
+  )?.id
+  // The server refuses the access list to a caller below edit on the folder,
+  // and the picker offers every folder, so such a folder is not asked
+  // (QS-3 review).
+  const targetLevel = folders.find((folder) => folder.id === target)?.level
+  const sharedFolderId =
+    target === "" || target === personalRootId || !levelAtLeast(targetLevel, "edit")
+      ? null
+      : target
 
   return (
     <Dialog
@@ -117,29 +137,39 @@ export function SavedQueryMoveDialog({
           <label htmlFor={pickerId} className="text-sm font-medium">
             Target folder
           </label>
-          <select
+          {/* WEB-9 D3: the two `<optgroup>`s are SelectOptionGroups. D2: the
+              shared space is a real target, so it keeps the empty value. */}
+          <SelectField
             id={pickerId}
+            className="w-full"
             value={target}
-            onChange={(event) => setTarget(event.target.value)}
-            className="h-8 w-full min-w-0 rounded-lg border border-input bg-transparent px-2.5 py-1 text-sm transition-colors outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {targets.personal.length > 0 ? (
-              <optgroup label={PERSONAL_SPACE_LABEL}>
-                {targets.personal.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </optgroup>
-            ) : null}
-            <optgroup label={SHARED_SPACE_LABEL}>
-              {targets.shared.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </optgroup>
-          </select>
+            options={[
+              ...(targets.personal.length > 0
+                ? [{
+                    label: PERSONAL_SPACE_LABEL,
+                    options: targets.personal.map((option) => ({
+                      value: option.value,
+                      label: option.label,
+                    })),
+                  }]
+                : []),
+              {
+                label: SHARED_SPACE_LABEL,
+                options: targets.shared.map((option) => ({
+                  value: option.value,
+                  label: option.label,
+                })),
+              },
+            ]}
+            onValueChange={setTarget}
+          />
+          {/* The key drops the previous folder's names at once; the hook
+              keeps them until its effect resets (QS-3 review). */}
+          <FolderSharingNote
+            key={sharedFolderId ?? ""}
+            folderId={sharedFolderId}
+            viewerId={viewerId}
+          />
         </div>
         {error ? (
           <p role="alert" className="text-sm text-destructive">

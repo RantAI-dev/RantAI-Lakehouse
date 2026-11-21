@@ -379,10 +379,14 @@ def test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipel
         return _StubCfg()
 
     plans = []
+    authors = []
 
-    def fake_run_bronze_ingest(cfg, plan, gate=None):
+    def fake_run_bronze_ingest(cfg, plan, gate=None, author=""):
         assert isinstance(cfg, _StubCfg)
         plans.append(plan)
+        # `DATA-52`, review round 1 R2: this branch used to carry no author, so a
+        # PostgreSQL connector's replace and append versions still said "unknown".
+        authors.append(author)
         return {"rows": 42, "bronze_table_name": "orders", "source_schema": "public", "source_table": "orders"}
 
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(fake_from_dial))
@@ -417,7 +421,7 @@ def test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipel
         "secretRefSecondary": None,
     }
     obj = {"name": "public.orders", "target": "orders"}
-    f._run_one_object(connector, obj)
+    f._run_one_object(connector, obj, run_id="1a2b3c4d-5e6f")
 
     assert from_dial_calls == [(connector["dial"], {"password": "s3cret"}, [obj])]
     assert recorded[0]["status"] == "succeeded"
@@ -425,9 +429,13 @@ def test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipel
     # A source object saved before load modes existed replaces: its next
     # run leaves one copy of the table, not one more.
     assert plans == [f.LoadPlan(mode="replace")]
+    # `DATA-52`, review round 1 R2: the run's label reaches the sink, and it is the
+    # one `_run_author` writes (`connector <id>, run <first 8>`; no invented run part).
+    assert authors == ["connector conn-pg-lakehouse, run 1a2b3c4d"]
 
     f._run_one_object(connector, {**obj, "loadMode": "incremental", "incrementalKey": "order_id"})
     assert plans[1] == f.LoadPlan(mode="incremental", cursor="order_id")
+    assert authors[1] == "connector conn-pg-lakehouse"
 
 
 def test_load_plan_offers_incremental_to_sql_connectors_only() -> None:
@@ -451,7 +459,7 @@ def test_run_one_object_records_an_unrunnable_load_mode_as_rejected(monkeypatch)
     monkeypatch.setattr(
         f.dlt_pipeline,
         "run_bronze_ingest",
-        lambda cfg, plan: (_ for _ in ()).throw(AssertionError("must not load")),
+        lambda cfg, plan, author="": (_ for _ in ()).throw(AssertionError("must not load")),
     )
     connector = {
         "id": "conn-pg",
@@ -801,6 +809,87 @@ def test_stream_dispatch_commits_offset_only_after_a_successful_sink_write(monke
     assert recorded[0]["rows"] == 1  # the real SinkResult.rows count, never fabricated
 
 
+def test_a_stream_batch_records_the_runs_author_on_its_commits(monkeypatch) -> None:
+    """`DATA-52`, review round 1 R2: a Kafka micro-batch is a load like any other, and
+    its sink config used to carry no author, so its versions said "unknown" while the
+    documents said a connector's replace and append name their run."""
+    configs: list = []
+
+    def sink(_rows, _target, config):
+        configs.append(config)
+        return SinkResult(rows=1, has_failed_jobs=False, load_info_str="ok")
+
+    _stub_stream_batch(monkeypatch, rows=[{"id": 1}], sink=sink)
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"target": "kafka_orders"}],
+        consumer=_FakeStreamConsumer(),
+        run_id="9z8y",
+    )
+    assert [config.author for config in configs] == ["connector conn-x, run 9z8y"]
+
+
+def test_a_stream_spec_with_no_bronze_target_fails_classified_before_it_consumes(monkeypatch) -> None:
+    """`SRC-45` (QA `LH-SRC-6-41`): a Kafka connector saved with no source object
+    used to stop at its first message with an unclassified `IndexError`. It now
+    fails closed, as a rejected setting with a sentence that says what to do,
+    before a consumer is built or a message is read."""
+    import dispar_orchestrate.ingest_factory as f
+    from dispar_orchestrate import ingest_errors
+
+    def never(*_a, **_k):
+        raise AssertionError("nothing may be consumed or built for a spec with no target")
+
+    monkeypatch.setattr(f, "KafkaConsumer", never)
+    monkeypatch.setattr(f, "consume_one_batch", never)
+    for objects in ([], [{"name": "orders"}], [{"name": "orders", "target": ""}]):
+        with pytest.raises(ingest_errors.KafkaTargetMissing) as raised:
+            run_kafka_stream_batch(
+                connector_id="conn-x", spec={"topic": "orders"}, secrets={}, source_objects=objects
+            )
+        assert ingest_errors.classify(raised.value).error_class == ingest_errors.SETTING_REJECTED
+        assert str(raised.value) == (
+            "This Kafka connector has no Bronze table yet: pick its topic again on the Ingest tab."
+        )
+
+
+def test_the_stream_consumer_reads_a_new_group_from_the_start_of_the_topic(monkeypatch) -> None:
+    """`SRC-45` (QA `LH-SRC-6-41`): kafka-python's default `latest` made the first
+    run of a new group skip every message already in the topic."""
+    import dispar_orchestrate.ingest_factory as f
+
+    built: list = []
+
+    class _Consumer(_FakeStreamConsumer):
+        def __init__(self, **kwargs):
+            super().__init__()
+            built.append(kwargs)
+
+        def subscribe(self, topics):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(f, "KafkaConsumer", _Consumer)
+    monkeypatch.setattr(f, "consume_one_batch", lambda *a, **k: BatchResult(rows=[], offsets_to_commit={}))
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={
+            "topic": "orders",
+            "bootstrapServers": ["broker:9092"],
+            "groupId": "g",
+            "auth": {"type": "none"},
+        },
+        secrets={},
+        source_objects=[{"name": "orders", "target": "kafka_orders"}],
+    )
+    assert [kwargs["auto_offset_reset"] for kwargs in built] == ["earliest"]
+    assert built[0]["enable_auto_commit"] is False
+
+
 def _stub_stream_batch(monkeypatch, *, rows, sink) -> list:
     """A micro-batch of `rows` whose sink write is `sink`; returns the list
     the catalog registrations are collected in."""
@@ -1056,7 +1145,7 @@ def test_run_one_object_registers_a_loaded_table_in_the_catalog(monkeypatch) -> 
     monkeypatch.setattr(f, "record_ingest_run", lambda **kw: None)
     monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
-    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan, gate=None: {"rows": 836})
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan, gate=None, author="": {"rows": 836})
     registered = []
     monkeypatch.setattr(
         f.connector_catalog, "register_connector_table", lambda cid, obj: registered.append((cid, obj)) or 1672
@@ -1084,7 +1173,7 @@ def test_a_catalog_registration_failure_never_fails_a_load_that_succeeded(monkey
     monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
     monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
-    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan, gate=None: {"rows": 836})
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan, gate=None, author="": {"rows": 836})
 
     def _broken(*a, **k):
         raise RuntimeError("clickhouse is down")
@@ -1561,7 +1650,7 @@ def test_a_wait_answer_for_a_postgres_table_loads_nothing_and_records_waiting(mo
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
     gates: list = []
 
-    def fake_run_bronze_ingest(cfg, plan, gate=None):
+    def fake_run_bronze_ingest(cfg, plan, gate=None, author=""):
         gates.append(gate(_reflected_table()))
         return {"rows": None, "waiting": True}
 

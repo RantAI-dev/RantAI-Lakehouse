@@ -23,19 +23,27 @@ use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::queries::{
     FolderMove, HistoryFilter, RecordHistoryInput, SavedQueryPatch, SavedQueryPlacement,
     SavedQueryScope, SavedQueryViewer, VERSION_KEEP, count_history, create_saved_query,
-    create_saved_query_at, get_history_item, get_saved, history_mentioning, history_recent,
-    list_history, list_saved, list_saved_matching, list_saved_trash_entries, list_versions,
-    purge_trashed_before, record_history, restore_saved_query, trash_saved_query,
-    update_saved_query,
+    create_saved_query_at, create_saved_query_with_parameters, get_history_item, get_saved,
+    history_mentioning, history_recent, list_history, list_saved, list_saved_matching,
+    list_saved_trash_entries, list_versions, purge_trashed_before, record_history,
+    restore_saved_query, revert_to_version, trash_saved_query, update_saved_query,
 };
 use lakehouse_store::saved_query_access::{
     FolderError, Level, NewGrant, create_folder, delete_folder, ensure_personal_space,
-    grants_for_viewer, manages_folder_and_contents, move_folder_for_viewer, rename_folder,
-    replace_grants, rules_for_item, search_grantees,
+    grantee_labels, grants_for_viewer, manages_folder_and_contents, move_folder_for_viewer,
+    rename_folder, replace_grants, rules_for_item, search_grantees,
 };
+use serde_json::{Value, json};
 use sqlx::PgPool;
+use sqlx::migrate::Migrator;
+use std::borrow::Cow;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+/// The migration set this repository applies, compiled in (`sqlx::migrate!`
+/// embeds the files at compile time, so a migration edit needs a rebuild
+/// before a test result means anything).
+static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 /// The seed lands two saved queries, pointed at marts this lakehouse
 /// actually serves (`0027_query_ownership.sql` repointed them — the
@@ -89,6 +97,7 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -114,6 +123,170 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
     Ok(())
 }
 
+/// QS-12 (LH-QS-4-07): `?id=` finds one run inside the owner's own history,
+/// and another owner's id finds nothing — an id is a lookup, not a way out of
+/// the owner scope.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_id_filter_finds_one_run_of_the_owner_only(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    for (id, who, sql) in [
+        ("q-100", owner, "SELECT first"),
+        ("q-200", owner, "SELECT second"),
+        ("q-300", other, "SELECT other"),
+    ] {
+        record_history(
+            &pool,
+            &RecordHistoryInput {
+                id,
+                sql,
+                user: "Bootstrap Admin",
+                owner_id: Some(who),
+                status: "completed",
+                duration_ms: 42,
+                scanned_bytes: 1024,
+                cost_units: 0.5,
+                workload_class: "hot-analytics",
+                engine: "hot-store",
+                cache_assisted: false,
+                tables_read: &[],
+                message: None,
+                tenant_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let one = HistoryFilter {
+        id: Some("q-100"),
+        ..Default::default()
+    };
+    let found = list_history(&pool, owner, &one).await.unwrap();
+    assert_eq!(row_ids(&found), ["q-100"]);
+    assert_eq!(found[0].sql, "SELECT first");
+    assert_eq!(count_history(&pool, owner, &one).await.unwrap(), 1);
+
+    let stranger = HistoryFilter {
+        id: Some("q-300"),
+        ..Default::default()
+    };
+    assert_eq!(
+        list_history(&pool, owner, &stranger).await.unwrap(),
+        [] as [lakehouse_store::queries::QueryHistoryItem; 0]
+    );
+    assert_eq!(count_history(&pool, owner, &stranger).await.unwrap(), 0);
+    Ok(())
+}
+
+/// `OPS-8`: the tenant a run acted as is stored with it, so a usage view
+/// can sum per tenant. The tenant is one the seeded identity migration
+/// creates, because `query_history.tenant_id` references `tenant(id)`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_history_stores_the_tenant_the_run_acted_as(pool: PgPool) -> sqlx::Result<()> {
+    let tenant = Uuid::parse_str("11111111-1111-4111-8111-000000000002").unwrap();
+    record_history(
+        &pool,
+        &RecordHistoryInput {
+            id: "q-tenant",
+            sql: "SELECT 1",
+            user: "Bootstrap Admin",
+            owner_id: Some(Uuid::new_v4()),
+            status: "completed",
+            duration_ms: 1,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine: "clickhouse",
+            cache_assisted: false,
+            tables_read: &[],
+            message: None,
+            tenant_id: Some(tenant),
+        },
+    )
+    .await
+    .unwrap();
+
+    let stored: Option<Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM query_history WHERE id = 'q-tenant'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(stored, Some(tenant));
+    Ok(())
+}
+
+/// `OPS-8`, migration `0144`: a caller with no tenant (a service identity)
+/// records `NULL`, and a row inserted the way every row was before the
+/// column existed (no `tenant_id` in the statement) reads back `NULL` too,
+/// not a guessed tenant. The column and its index exist.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_history_row_with_no_tenant_reads_back_null_and_the_column_has_its_index(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO query_history \
+         (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
+          workload_class, engine, cache_assisted) \
+         VALUES ('q-old', 'SELECT 1', 'someone', 'completed', 1, 1, 0.1, \
+                 'hot-analytics', 'hot-store', false)",
+    )
+    .execute(&pool)
+    .await?;
+    record_history(
+        &pool,
+        &RecordHistoryInput {
+            id: "q-service",
+            sql: "SELECT 1",
+            user: "gold-export-scheduler",
+            owner_id: Some(Uuid::new_v4()),
+            status: "completed",
+            duration_ms: 1,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine: "clickhouse",
+            cache_assisted: false,
+            tables_read: &[],
+            message: None,
+            tenant_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let unattributed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM query_history \
+         WHERE id IN ('q-old', 'q-service') AND tenant_id IS NULL",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(unattributed, 2, "no row is attributed to a guessed tenant");
+
+    let column: Option<String> = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns \
+         WHERE table_name = 'query_history' AND column_name = 'tenant_id'",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    assert_eq!(
+        column.as_deref(),
+        Some("YES"),
+        "a nullable tenant_id column"
+    );
+    let index: Option<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes \
+         WHERE tablename = 'query_history' AND indexname = 'query_history_tenant_at_idx'",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    let definition = index.expect("the (tenant_id, at DESC) index exists");
+    assert!(
+        definition.contains("(tenant_id, at DESC)"),
+        "the index is per tenant, newest first: {definition}"
+    );
+    Ok(())
+}
+
 /// Recording the same id twice must not fail or duplicate the row — a
 /// caller retrying, or a genuinely reused id, degrades to a no-op rather
 /// than a 500 that would (per `routes::query::run`'s contract) still not
@@ -135,6 +308,7 @@ async fn record_history_is_idempotent_per_id(pool: PgPool) -> sqlx::Result<()> {
         cache_assisted: false,
         tables_read: &[],
         message: None,
+        tenant_id: None,
     };
     record_history(&pool, &input).await.unwrap();
     record_history(&pool, &input).await.unwrap();
@@ -181,6 +355,7 @@ async fn history_item_has_no_audit_id_without_a_real_event(pool: PgPool) -> sqlx
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -216,6 +391,7 @@ async fn history_item_resolves_the_real_audit_event_id(pool: PgPool) -> sqlx::Re
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -281,6 +457,7 @@ async fn history_item_uses_the_newest_of_several_events_without_duplicating_the_
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -334,6 +511,7 @@ async fn record_history_carries_the_real_engine_and_is_scoped_by_owner_id(
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -368,6 +546,7 @@ async fn get_history_item_fetches_one_row_by_id(pool: PgPool) -> sqlx::Result<()
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -424,6 +603,7 @@ async fn history_mentioning_finds_queries_by_substring_across_users(
                     cache_assisted: false,
                     tables_read: &[],
                     message: None,
+                    tenant_id: None,
                 },
             )
             .await
@@ -502,6 +682,7 @@ async fn history_recent_is_newest_first_and_respects_days_and_limit(
                 cache_assisted: false,
                 tables_read: &[],
                 message: None,
+                tenant_id: None,
             },
         )
         .await
@@ -690,6 +871,7 @@ async fn insert_history_row(
             cache_assisted: false,
             tables_read: &tables,
             message,
+            tenant_id: None,
         },
     )
     .await
@@ -721,6 +903,7 @@ async fn insert_history_row_at(pool: &PgPool, id: &str, owner: Uuid, at: OffsetD
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -1711,6 +1894,212 @@ async fn a_version_is_written_for_a_change_and_skipped_when_nothing_changed(
     assert_eq!(versions.len(), 2, "a new title is a new version");
     assert_eq!(versions[0].version, 2);
     assert_eq!(versions[0].title, "Second");
+    Ok(())
+}
+
+/// The two definitions the `QS-5` tests save (decision 3): the store keeps them as
+/// the JSON the route validated and never reads inside them.
+fn region_definitions() -> Value {
+    json!([{"name": "region", "type": "text", "default": "EU"}])
+}
+
+/// The same query with a different default, so a patch that changes only
+/// this differs from the stored list by a single value.
+fn region_definitions_with_default_us() -> Value {
+    json!([{"name": "region", "type": "text", "default": "US"}])
+}
+
+/// `query-parameters.md` decision 3: a saved query keeps its parameters beside its SQL. A change
+/// of the parameters alone writes a version, a change that leaves them as
+/// they were writes none, a change of the title alone keeps them, and a
+/// revert brings back the parameters of the version it went back to.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_saved_query_keeps_its_parameters_in_every_version_and_a_revert_restores_them(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let caller = viewer(Some(person(RINA)), Some(tenant(GROUP_TENANT)));
+    let scope = SavedQueryScope::All {
+        viewer: caller.clone(),
+    };
+    let saved = create_saved_query_with_parameters(
+        &pool,
+        &caller,
+        "By region",
+        "SELECT {{region}}",
+        &region_definitions(),
+        "Rina Wijaya",
+        &[],
+        SavedQueryPlacement::SharedSpace,
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.parameters, region_definitions());
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    let read = get_saved(&pool, &saved.id, &scope).await.unwrap().unwrap();
+    assert_eq!(read.parameters, region_definitions(), "get carries them");
+    let listed = list_saved(&pool, scope.clone()).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .find(|q| q.id == saved.id)
+            .map(|q| q.parameters.clone()),
+        Some(region_definitions()),
+        "the list carries them"
+    );
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].parameters, region_definitions());
+
+    // The same list sent again changes nothing.
+    update_saved_query(
+        &pool,
+        &caller,
+        &saved.id,
+        &SavedQueryPatch {
+            parameters: Some(region_definitions()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        list_versions(&pool, query_id).await.unwrap().len(),
+        1,
+        "parameters that are as they were write no version"
+    );
+
+    // A change of the parameters alone is a version.
+    let patched = update_saved_query(
+        &pool,
+        &caller,
+        &saved.id,
+        &SavedQueryPatch {
+            parameters: Some(region_definitions_with_default_us()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(patched.parameters, region_definitions_with_default_us());
+    assert_eq!(patched.sql, "SELECT {{region}}", "the SQL did not move");
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 2, "a parameters-only change is a version");
+    assert_eq!(
+        versions[0].parameters,
+        region_definitions_with_default_us(),
+        "the new version holds the new parameters"
+    );
+    assert_eq!(
+        versions[1].parameters,
+        region_definitions(),
+        "the old version keeps the old ones"
+    );
+
+    // A title-only patch leaves the parameters where they are.
+    let renamed = update_saved_query(
+        &pool,
+        &caller,
+        &saved.id,
+        &SavedQueryPatch {
+            title: Some("By region, renamed".to_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(renamed.parameters, region_definitions_with_default_us());
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 3);
+    assert_eq!(
+        versions[0].parameters,
+        region_definitions_with_default_us(),
+        "a version written for a new title still holds the current parameters"
+    );
+
+    // Going back to version 1 brings back its parameters with its SQL.
+    let reverted = revert_to_version(&pool, &caller, query_id, 1)
+        .await
+        .unwrap();
+    assert_eq!(reverted.parameters, region_definitions());
+    assert_eq!(reverted.title, "By region");
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions.len(), 4, "the revert is itself a version");
+    assert_eq!(versions[0].label, "Restored version 1");
+    assert_eq!(versions[0].parameters, region_definitions());
+    Ok(())
+}
+
+/// A query saved the way every caller did before `QS-5` has no parameters:
+/// the list is empty, not missing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_query_saved_without_parameters_reads_an_empty_list(pool: PgPool) -> sqlx::Result<()> {
+    let caller = viewer(Some(person(RINA)), Some(tenant(GROUP_TENANT)));
+    let saved = create_saved_query(
+        &pool,
+        &caller,
+        "Plain",
+        "SELECT 1",
+        "Rina Wijaya",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.parameters, json!([]));
+    let query_id = Uuid::parse_str(&saved.id).expect("the saved query id");
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions[0].parameters, json!([]));
+    Ok(())
+}
+
+/// The migrations a database that stopped at `version` would have applied.
+fn migrations_up_to(version: i64) -> Migrator {
+    let upto: Vec<_> = MIGRATOR
+        .iter()
+        .filter(|m| m.version <= version)
+        .cloned()
+        .collect();
+    Migrator {
+        migrations: Cow::Owned(upto),
+        ..Migrator::DEFAULT
+    }
+}
+
+/// `0131` gives every row written before it an empty parameter list, on the
+/// query and on its versions, and the store reads them back as such.
+#[sqlx::test(migrations = false)]
+async fn migration_0131_gives_old_queries_and_versions_an_empty_parameter_list(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    migrations_up_to(130).run(&pool).await.unwrap();
+    let query_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO saved_query (id, title, sql, owner) VALUES ($1, 'Old', 'SELECT 1', 'Rina Wijaya')")
+        .bind(query_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO saved_query_version (query_id, version, title, sql, author_name, label) \
+         VALUES ($1, 7, 'Old', 'SELECT 1', 'Rina Wijaya', '')",
+    )
+    .bind(query_id)
+    .execute(&pool)
+    .await?;
+
+    MIGRATOR.run(&pool).await.unwrap();
+
+    let on_query: Value = sqlx::query_scalar("SELECT parameters FROM saved_query WHERE id = $1")
+        .bind(query_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(on_query, json!([]));
+    let on_version: Value =
+        sqlx::query_scalar("SELECT parameters FROM saved_query_version WHERE query_id = $1")
+            .bind(query_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(on_version, json!([]));
+    let versions = list_versions(&pool, query_id).await.unwrap();
+    assert_eq!(versions[0].parameters, json!([]));
     Ok(())
 }
 
@@ -3491,7 +3880,8 @@ async fn the_grantee_search_finds_a_person_by_name_and_by_email(pool: PgPool) ->
         .unwrap();
     assert!(
         by_name.people.iter().any(|grantee| {
-            grantee.name == "Rina Wijaya" && grantee.email == "rina@meridian.example"
+            grantee.name == "Rina Wijaya"
+                && grantee.email.as_deref() == Some("rina@meridian.example")
         }),
         "the person is found by their name"
     );
@@ -3535,11 +3925,14 @@ async fn the_grantee_search_finds_a_role_by_name(pool: PgPool) -> sqlx::Result<(
 async fn the_grantee_search_treats_the_wildcards_literally(pool: PgPool) -> sqlx::Result<()> {
     let group = tenant(GROUP_TENANT);
     let person_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO app_user (id, name, email) VALUES ($1, 'Fifty % Off', $2)")
-        .bind(person_id)
-        .bind("fifty@meridian.example")
-        .execute(&pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO app_user (id, name, username, email) VALUES ($1, 'Fifty % Off', $2, $3)",
+    )
+    .bind(person_id)
+    .bind("fifty")
+    .bind("fifty@meridian.example")
+    .execute(&pool)
+    .await?;
     sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
         .bind(person_id)
         .bind(group)
@@ -3575,9 +3968,11 @@ async fn the_grantee_search_answers_with_the_tenants_people_only(pool: PgPool) -
     let group = tenant(GROUP_TENANT);
     let inactive = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Sleepy Person', $2, 'inactive')",
+        "INSERT INTO app_user (id, name, username, email, status) \
+         VALUES ($1, 'Sleepy Person', $2, $3, 'inactive')",
     )
     .bind(inactive)
+    .bind(format!("sleepy-{inactive}"))
     .bind("sleepy@meridian.example")
     .execute(&pool)
     .await?;
@@ -3618,5 +4013,121 @@ async fn the_grantee_search_answers_with_the_tenants_people_only(pool: PgPool) -
 
     let none = search_grantees(&pool, Some(group), "", 0).await.unwrap();
     assert!(none.people.is_empty(), "a limit of zero asks for no rows");
+    Ok(())
+}
+
+/// A rule's grantee is named the way the share panel shows it: a person of
+/// the viewer's tenant by name and email, a role by name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_name_a_person_of_the_tenant_and_a_role(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+
+    let labels = grantee_labels(&pool, Some(group), &[person(RINA)], &[person(ANALYST_ROLE)])
+        .await
+        .unwrap();
+
+    assert_eq!(labels.people.len(), 1, "{labels:?}");
+    assert_eq!(labels.people[0].id, person(RINA));
+    assert_eq!(labels.people[0].name, "Rina Wijaya");
+    assert_eq!(
+        labels.people[0].email.as_deref(),
+        Some("rina@meridian.example")
+    );
+    assert_eq!(labels.roles.len(), 1, "{labels:?}");
+    assert_eq!(labels.roles[0].id, person(ANALYST_ROLE));
+    assert_eq!(labels.roles[0].name, "Analyst");
+    Ok(())
+}
+
+/// A person who is not a member of the viewer's tenant gets no label: the
+/// name and email of another organisation's person never reach the list.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_leave_out_a_person_of_another_tenant(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+
+    let labels = grantee_labels(&pool, Some(group), &[person(RINA), person(SARI)], &[])
+        .await
+        .unwrap();
+
+    assert!(
+        labels.people.iter().any(|found| found.id == person(RINA)),
+        "CONTROL: the member of the tenant is named"
+    );
+    assert!(
+        !labels.people.iter().any(|found| found.id == person(SARI)),
+        "Sari belongs to the Retail tenant only: {labels:?}"
+    );
+    Ok(())
+}
+
+/// A rule still applies to a person who has been deactivated, so the list
+/// keeps naming them, unlike the grantee search.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_keep_the_name_of_an_inactive_person(pool: PgPool) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+    let inactive = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO app_user (id, name, username, email, status) \
+         VALUES ($1, 'Sleepy Person', $2, $3, 'inactive')",
+    )
+    .bind(inactive)
+    .bind(format!("sleepy-{inactive}"))
+    .bind("sleepy@meridian.example")
+    .execute(&pool)
+    .await?;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(inactive)
+        .bind(group)
+        .execute(&pool)
+        .await?;
+
+    let labels = grantee_labels(&pool, Some(group), &[inactive], &[])
+        .await
+        .unwrap();
+
+    assert_eq!(labels.people.len(), 1, "{labels:?}");
+    assert_eq!(labels.people[0].name, "Sleepy Person");
+    assert_eq!(
+        labels.people[0].email.as_deref(),
+        Some("sleepy@meridian.example")
+    );
+    Ok(())
+}
+
+/// An id the database does not hold is absent from the answer, and an
+/// empty input is an empty answer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_leave_out_an_unknown_id_and_answer_nothing_for_no_ids(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let group = tenant(GROUP_TENANT);
+
+    let unknown = grantee_labels(
+        &pool,
+        Some(group),
+        &[Uuid::new_v4(), person(RINA)],
+        &[Uuid::new_v4()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(unknown.people.len(), 1, "{unknown:?}");
+    assert_eq!(unknown.people[0].id, person(RINA));
+    assert!(unknown.roles.is_empty(), "{unknown:?}");
+
+    let none = grantee_labels(&pool, Some(group), &[], &[]).await.unwrap();
+    assert!(none.people.is_empty() && none.roles.is_empty(), "{none:?}");
+    Ok(())
+}
+
+/// With no tenant every person of the deployment is named, the same
+/// reading of "no tenant" as the grantee search and the tenant check.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grantee_labels_with_no_tenant_name_every_person(pool: PgPool) -> sqlx::Result<()> {
+    let labels = grantee_labels(&pool, None, &[person(RINA), person(SARI)], &[])
+        .await
+        .unwrap();
+
+    assert_eq!(labels.people.len(), 2, "{labels:?}");
+    assert!(labels.people.iter().any(|found| found.id == person(SARI)));
     Ok(())
 }

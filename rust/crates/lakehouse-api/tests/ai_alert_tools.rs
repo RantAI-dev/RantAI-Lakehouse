@@ -8,16 +8,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
-use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
-};
+use common::{TestApp, create_assistant_principal, session_cookie_for_user, spin_up_with_env};
 use lakehouse_store::dashboard_access::replace_item;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -131,13 +129,14 @@ impl Respond for FakeCh {
 struct Fixture {
     app: TestApp,
     fake: FakeCh,
-    /// The email `create_principal_with_permissions` gave the person.
+    /// The email `create_assistant_principal` gave the person.
     email: String,
     _ch: MockServer,
 }
 
-/// A person with `permissions`, and a chart the caller can see unless
-/// `chart_visible` says otherwise.
+/// A person with `permissions` besides `assistant:use` (every test here calls
+/// `POST /api/ai/tool`), and a chart the caller can see unless `chart_visible`
+/// says otherwise.
 async fn fixture(permissions: &str, chart_visible: bool) -> (Fixture, Uuid) {
     let fake = FakeCh {
         held: Arc::new(Mutex::new(Held {
@@ -167,7 +166,7 @@ async fn fixture(permissions: &str, chart_visible: bool) -> (Fixture, Uuid) {
         ),
     ]);
     let app = spin_up_with_env(&env).await;
-    let user = create_principal_with_permissions(&app.pool, permissions).await;
+    let user = create_assistant_principal(&app.pool, permissions).await;
     common::in_the_catalog_tenant(&app.pool, user).await;
     let fixture = Fixture {
         app,
@@ -352,7 +351,12 @@ async fn a_restricted_dashboard_refuses_another_target() {
 }
 
 /// T1's state reset through the tool: a rule that now watches another chart
-/// starts over.
+/// starts over. `SRC-40` D5 (review round 1, R2) is the same moment for the
+/// rule's latest delivery: the assistant's save path goes through
+/// `routes::alerts::forget_state`, so its row goes too. Fails if the
+/// `alert_delivery::delete` call there is removed. (`delete_alert_rule` cannot
+/// cover this here: it is `WriteHigh` and returns a pending approval, never the
+/// delete itself — `tests/tier1_writehigh_approval.rs`.)
 #[tokio::test]
 async fn update_alert_rule_changing_the_chart_resets_the_state() {
     let (f, person) = fixture("dashboard:read, alert:write", true).await;
@@ -367,6 +371,16 @@ async fn update_alert_rule_changing_the_chart_resets_the_state() {
     )
     .bind(RULE)
     .execute(&f.app.pool)
+    .await
+    .unwrap();
+    lakehouse_store::alert_delivery::record(
+        &f.app.pool,
+        RULE,
+        lakehouse_store::overview::DeliveryRecord::NotDelivered(
+            "the webhook server answered with an error",
+        ),
+        time::OffsetDateTime::now_utc(),
+    )
     .await
     .unwrap();
 
@@ -392,6 +406,16 @@ async fn update_alert_rule_changing_the_chart_resets_the_state() {
         .await
         .unwrap();
     assert_eq!(left, 0, "a rule watching a new line starts from ok");
+    let deliveries: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM alert_rule_delivery WHERE rule_id = $1")
+            .bind(RULE)
+            .fetch_one(&f.app.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        deliveries, 0,
+        "a rule watching a new line starts with no last delivery"
+    );
 }
 
 /// D2/D5: Ask mode still refuses both tools, and an unconfirmed call returns a
@@ -424,8 +448,10 @@ async fn ask_mode_refuses_and_an_unconfirmed_call_names_the_chart_and_condition(
         summary.contains(CHART),
         "the card names the chart: {summary}"
     );
+    // AI-31 D11: the confirmation card is English, the console's language.
+    // The old assertion pinned the Indonesian "di bawah" and failed CI.
     assert!(
-        summary.contains("di bawah") && summary.contains("1000"),
+        summary.contains("when its value is below 1000"),
         "the card names the condition and the threshold: {summary}"
     );
     assert!(saved(&f).is_empty(), "nothing was saved before the Confirm");

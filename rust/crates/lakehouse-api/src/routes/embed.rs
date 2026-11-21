@@ -72,6 +72,44 @@ fn token_refused() -> Response {
         .into_response()
 }
 
+/// GOV-17: a public link or signed embed reads as the effective Dashboard
+/// Viewer role, never a new unrestricted principal. Its current table grants
+/// decide whether the named board exists at all: a hidden board gets the same
+/// fixed refusal as an unknown token, with no board or table name.
+async fn embed_visibility(
+    state: &AppState,
+    board_id: &str,
+) -> Result<crate::dashboard_visibility::TableVisibility, Box<Response>> {
+    let roles = [EMBED_VIEWER_ROLE.to_owned()];
+    let visibility = crate::dashboard_visibility::resolve_visibility_for_roles(state, &roles)
+        .await
+        .map_err(|err| Box::new(crate::error::ApiRejection(err).into_response()))?;
+    let hidden = if board_id == store::DEFAULT_BOARD_ID {
+        !visibility.builtin_visible
+    } else {
+        visibility.hidden_boards.iter().any(|id| id == board_id)
+    };
+    if hidden {
+        return Err(Box::new(token_refused()));
+    }
+    Ok(visibility)
+}
+
+/// The time zone and formatting settings an embed payload needs, read once.
+async fn embed_time_and_format(
+    state: &AppState,
+) -> Result<
+    (
+        lakehouse_bi::grain::TimeContext,
+        crate::routes::settings::FormatSettings,
+    ),
+    lakehouse_core::ApiError,
+> {
+    let time = crate::routes::settings::time_context(state).await?;
+    let format = crate::routes::settings::format_settings(state).await?;
+    Ok((time, format))
+}
+
 /// Take the column of a hidden filter out of every tile's `filtersSkipped`
 /// (`BI-26` review NOTE): a tile that says which active filters it could not
 /// honour would otherwise name a filter the viewer is not meant to know of.
@@ -432,16 +470,18 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         resolved.editable
     };
 
-    let time = match crate::routes::settings::time_context(&state).await {
-        Ok(t) => t,
-        Err(err) => return crate::error::ApiRejection(err).into_response(),
-    };
     // BI-17 part A: the number locale, company palette and fonts ride in the
     // payload's `reporting` object like the zone, so an embed formats as the
     // console does.
-    let format = match crate::routes::settings::format_settings(&state).await {
-        Ok(f) => f,
+    let (time, format) = match embed_time_and_format(&state).await {
+        Ok(pair) => pair,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    // GOV-17: the embed's effective viewer role must still read every data
+    // dependency of this board; a hidden board is the fixed token refusal.
+    let visibility = match embed_visibility(&state, &board_id).await {
+        Ok(visibility) => visibility,
+        Err(response) => return *response,
     };
     let payload = crate::result_cache::scoped(
         crate::result_cache::CacheScope::new(
@@ -467,6 +507,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
                 editable: &editable,
             },
             &format,
+            &visibility,
         ),
     )
     .await;
@@ -566,6 +607,9 @@ pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
     match crate::routes::dashboard::values_with_limit(
         &state.clickhouse,
         crate::routes::dashboard::ValuesQuery::for_board(&column, &subject.board_id, filters_json),
+        // A board's value list reads no joined mart: the chart's own list is
+        // the page's, not the embed's (`QA LH-BI-6-01` review round 1, R10).
+        &[],
         (&roles, &Viewer::anonymous()),
         (
             &crate::sql_rewrite::PlaceholderValues::none(),
@@ -789,7 +833,10 @@ async fn board_for_frame(state: &AppState, body: FrameBody) -> Result<Option<Boa
 /// the frame answer's content sites ([`board_content_sites`]) select the
 /// board's cards here and only here, so the page and its policy cannot
 /// disagree about which cards are on the board.
-fn board_cards<'a>(stored: &'a [StoredChartSpec], board_id: &str) -> Vec<&'a StoredChartSpec> {
+pub(crate) fn board_cards<'a>(
+    stored: &'a [StoredChartSpec],
+    board_id: &str,
+) -> Vec<&'a StoredChartSpec> {
     stored
         .iter()
         .filter(|c| {
@@ -1020,6 +1067,10 @@ pub async fn public_dashboard(
         Ok(f) => f,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
+    let visibility = match embed_visibility(&state, &board_id).await {
+        Ok(visibility) => visibility,
+        Err(response) => return *response,
+    };
     let payload = crate::result_cache::scoped(
         crate::result_cache::CacheScope::new(
             std::sync::Arc::clone(&state.result_cache),
@@ -1036,6 +1087,7 @@ pub async fn public_dashboard(
             (&time, &state.tile_slots),
             Narrowing::default(),
             &format,
+            &visibility,
         ),
     )
     .await;
@@ -1090,7 +1142,7 @@ pub async fn public_map_geojson(
         }
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
-    map_for_board(&state, &board.id, &id, &headers).await
+    map_for_board(&state, &board.id, &id, &headers, &Viewer::anonymous()).await
 }
 
 /// `POST /api/embed/maps/{id}/geojson` — the boundary file of a map one of
@@ -1118,7 +1170,14 @@ pub async fn embed_map_geojson(
         Ok(subject) => subject,
         Err(refusal) => return *refusal,
     };
-    map_for_board(&state, &subject.board_id, &id, &headers).await
+    map_for_board(
+        &state,
+        &subject.board_id,
+        &id,
+        &headers,
+        &Viewer::anonymous(),
+    )
+    .await
 }
 
 /// The map file `id` for a board that may open it.
@@ -1128,13 +1187,18 @@ pub async fn embed_map_geojson(
 /// answer is a 404 otherwise — the same answer for a map the board does not
 /// use, for a map that does not exist and for a map id that is not
 /// server-made, so the route is no oracle for what a board holds.
-async fn map_for_board(
+///
+/// `viewer` decides which charts count as "on the board": an embed and a public
+/// link read as nobody in particular; the print view (`BI-36`) reads as the
+/// person its token names, so a map on their own personal board is found.
+pub(crate) async fn map_for_board(
     state: &AppState,
     board_id: &str,
     id: &str,
     headers: &HeaderMap,
+    viewer: &Viewer,
 ) -> Response {
-    let maps = match board_map_ids(state, board_id).await {
+    let maps = match board_map_ids(state, board_id, viewer).await {
         Ok(maps) => maps,
         Err(err) => return database_failure(&err),
     };
@@ -1149,11 +1213,15 @@ async fn map_for_board(
 
 /// The map ids the charts on `board_id` draw on.
 ///
-/// The charts are read as nobody in particular, exactly as the embed and the
-/// public payload read them ([`board_cards`]): a chart in the trash or on a
-/// personal board is not on this board.
-async fn board_map_ids(state: &AppState, board_id: &str) -> Result<Vec<String>, ChError> {
-    let stored = store::list_stored_charts(&state.clickhouse, &Viewer::anonymous()).await?;
+/// The charts are read as `viewer`: for an embed and a public link nobody in
+/// particular, exactly as the payload reads them ([`board_cards`]), so a chart
+/// in the trash or on a personal board is not on this board.
+async fn board_map_ids(
+    state: &AppState,
+    board_id: &str,
+    viewer: &Viewer,
+) -> Result<Vec<String>, ChError> {
+    let stored = store::list_stored_charts(&state.clickhouse, viewer).await?;
     Ok(board_cards(&stored, board_id)
         .into_iter()
         .filter_map(|c| c.def.map.clone())
@@ -1435,12 +1503,18 @@ async fn render_board_payload(
     (time, tile_slots): (&lakehouse_bi::grain::TimeContext, &tokio::sync::Semaphore),
     narrowing: Narrowing<'_>,
     format: &crate::routes::settings::FormatSettings,
+    visibility: &crate::dashboard_visibility::TableVisibility,
 ) -> Result<(Value, Vec<String>), lakehouse_clickhouse::ChError> {
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
     // An embed or a public link is read by nobody in particular: a chart in the
-    // trash or on a personal board is not in it (BI-18 part C, part 2).
-    let stored = store::list_stored_charts(ch, &Viewer::anonymous()).await?;
+    // trash or on a personal board is not in it (BI-18 part C, part 2). GOV-17:
+    // it still reads as the EFFECTIVE Dashboard Viewer role's table grants, so
+    // a board that role cannot read is not assembled here either.
+    let viewer = Viewer::anonymous()
+        .narrowed_by_tables(visibility.hidden_boards.clone(), visibility.builtin_visible)
+        .with_hidden_sources(visibility.hidden_sources.clone());
+    let stored = store::list_stored_charts(ch, &viewer).await?;
     let field_catalog = catalog_or_empty(ch).await;
     let stored_for_board = charts_of(&stored, board_id, narrowing.only_chart);
 
@@ -1825,6 +1899,7 @@ mod typed_filters {
             ),
             Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
+            &crate::dashboard_visibility::TableVisibility::unrestricted(),
         )
         .await
         .unwrap();
@@ -1979,6 +2054,7 @@ mod typed_filters {
             ),
             Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
+            &crate::dashboard_visibility::TableVisibility::unrestricted(),
         )
         .await
         .unwrap();
@@ -2094,6 +2170,7 @@ mod typed_filters {
             ),
             Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
+            &crate::dashboard_visibility::TableVisibility::unrestricted(),
         )
         .await
         .unwrap();
@@ -2201,6 +2278,7 @@ mod typed_filters {
             ),
             Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
+            &crate::dashboard_visibility::TableVisibility::unrestricted(),
         )
         .await
         .unwrap();

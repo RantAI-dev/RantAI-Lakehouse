@@ -726,6 +726,8 @@ jobs:
       - name: The rendered Compose file must be a valid one
         env:
           POSTGRES_PASSWORD: ci-only-pg-password-0001
+          LAKEHOUSE_DB_APP_PASSWORD: ci-only-app-password-0001
+          LAKEHOUSE_DB_DAGSTER_PASSWORD: ci-only-dagster-password-0001
           RUSTFS_ACCESS_KEY: ci-only-rustfs-access-0001
           RUSTFS_SECRET_KEY: ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY: ci-only-lakekeeper-key-0001
@@ -735,6 +737,8 @@ jobs:
           env_file="$RUNNER_TEMP/release-check.env"
           {
             echo "POSTGRES_PASSWORD=$POSTGRES_PASSWORD"
+            echo "LAKEHOUSE_DB_APP_PASSWORD=$LAKEHOUSE_DB_APP_PASSWORD"
+            echo "LAKEHOUSE_DB_DAGSTER_PASSWORD=$LAKEHOUSE_DB_DAGSTER_PASSWORD"
             echo "RUSTFS_ACCESS_KEY=$RUSTFS_ACCESS_KEY"
             echo "RUSTFS_SECRET_KEY=$RUSTFS_SECRET_KEY"
             echo "LAKEKEEPER_ENCRYPTION_KEY=$LAKEKEEPER_ENCRYPTION_KEY"
@@ -881,7 +885,7 @@ jobs:
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

@@ -11,7 +11,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -23,7 +23,8 @@ use wiremock::matchers::{body_string_contains, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    TestApp, create_assistant_principal, create_principal_with_permissions,
+    session_cookie_for_user, spin_up_with_env,
 };
 
 async fn app() -> (axum::Router, PgPool, MockServer) {
@@ -59,6 +60,17 @@ async fn app() -> (axum::Router, PgPool, MockServer) {
         .await;
     let mut overrides = std::collections::HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch.uri());
+    // The deployment names the tenant that owns the shared catalog: the
+    // seeded identity migration creates four tenants, so without it every
+    // caller but an unrestricted one is refused (PR review round 1 R3).
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        common::CATALOG_TENANT.to_owned(),
+    );
+    // A Bronze rule's table is asked of the Iceberg query database, so the
+    // deployment has one here; the stand-in's empty answer reads as "no such
+    // table" (review round 1 R7).
+    overrides.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     (router, pool, ch)
 }
@@ -91,12 +103,12 @@ async fn call(
     )
 }
 
-async fn rule(pool: &PgPool, name: &str, threshold: &str) -> String {
+async fn rule_on(pool: &PgPool, name: &str, asset: &str, threshold: &str) -> String {
     create_quality_rule(
         pool,
         &CreateQualityRuleInput {
             name: name.to_owned(),
-            asset: "silver.orders".to_owned(),
+            asset: asset.to_owned(),
             dimension: "completeness".to_owned(),
             threshold: threshold.to_owned(),
             severity: "high".to_owned(),
@@ -107,12 +119,45 @@ async fn rule(pool: &PgPool, name: &str, threshold: &str) -> String {
     .id
 }
 
+async fn rule(pool: &PgPool, name: &str, threshold: &str) -> String {
+    rule_on(pool, name, "silver.orders", threshold).await
+}
+
 /// A session for a principal who may run a rule, change one and resolve an
 /// incident. None of the requests below logs out, so one session serves a test.
 async fn admin(pool: &PgPool) -> String {
     // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: *:* passes catalog tenant gate
     let user = create_principal_with_permissions(pool, "*:*,query:read,governance:write").await;
     session_cookie_for_user(pool, user).await
+}
+
+/// Narrows a person's only role to `silver.orders` — the three statements
+/// `tests/table_access.rs` writes inline. Both the form's test and the
+/// assistant's use it, so the narrowing is one thing (`AGENTS.md` rule 4).
+async fn narrow_to_orders(pool: &PgPool, user: uuid::Uuid) {
+    let role: uuid::Uuid =
+        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, 'silver', 'orders')",
+    )
+    .bind(role)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn incidents(router: &axum::Router, cookie: &str, status: &str) -> Vec<Value> {
@@ -135,6 +180,47 @@ async fn sent_to_clickhouse(ch: &MockServer) -> Vec<String> {
         .iter()
         .map(|r| String::from_utf8_lossy(&r.body).into_owned())
         .collect()
+}
+
+/// A session for a person outside the tenant that owns the shared catalog:
+/// `governance:write,governance:read`, a member of seeded tenant 2, which no
+/// deployment here names as the catalog's (`GOV-15`; the block the `GOV-12`
+/// tests write inline).
+async fn outsider(pool: &PgPool) -> String {
+    let outsider =
+        create_principal_with_permissions(pool, "governance:write,governance:read").await;
+    // Seeded tenant 2, not the one the catalog names.
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(outsider)
+        .bind(
+            "11111111-1111-4111-8111-000000000002"
+                .parse::<uuid::Uuid>()
+                .unwrap(),
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    session_cookie_for_user(pool, outsider).await
+}
+
+/// A session for a person in the catalog's tenant whose only role reads
+/// `silver.orders` (`GOV-15`; the block the `GOV-12` tests write inline).
+async fn narrowed(pool: &PgPool) -> String {
+    let user = create_principal_with_permissions(pool, "governance:write,governance:read").await;
+    narrow_to_orders(pool, user).await;
+    common::in_the_catalog_tenant(pool, user).await;
+    session_cookie_for_user(pool, user).await
+}
+
+/// How many audit events `action` has. A refusal writes none and a permitted
+/// change writes its own, so a test compares the number before and after
+/// (`GOV-15` D8: a refused request changes no row and records nothing).
+async fn audit_events(pool: &PgPool, action: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE action = $1")
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 /// `DATA-14-AC1`: a 'no nulls' style check that fails opens an incident,
@@ -424,6 +510,1441 @@ async fn deleting_a_rule_resolves_its_open_incidents() {
             .any(|b| b.contains("ALTER TABLE console.quality_run DELETE")),
         "deleting a rule still forgets its runs"
     );
+}
+
+/// QA `LH-DATA-14-01` F2 (`DATA-54`): a rule is written for a table that is
+/// there, and one that does not exist is refused and stores nothing. "Not
+/// there" and "not yours" are one sentence, so the answer says neither.
+#[tokio::test]
+async fn a_rule_for_a_table_that_is_not_there_is_refused_and_nothing_is_stored() {
+    let (router, pool, ch) = app().await;
+    let cookie = admin(&pool).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("no_such_table"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+
+    let body = |name: &str, asset: &str| {
+        json!({
+            "name": name, "asset": asset, "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })
+    };
+    let (code, refused) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("t8_missing", "silver.no_such_table")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("is not a table you can read"),
+        "{refused}"
+    );
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM quality_rule WHERE name = 't8_missing'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 0, "a refused rule is not stored");
+
+    let (code, created) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("t8_present", "silver.orders")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{created}");
+
+    // Review round 1 R7: a name that is not a plain identifier is refused like
+    // any other not-table, and not left as a 503 that no retry can fix.
+    for asset in ["orders", "lake.orders", "bronze.orders-2024", "bronze."] {
+        let (code, refused) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/governance/quality",
+            Some(body("t8_other", asset)),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{asset}: {refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("is not a table you can read"),
+            "{asset}: {refused}"
+        );
+    }
+}
+
+/// `DATA-54`, D17's other half (review round 1 R7): a table the engine did not
+/// answer about is a 503 that says so — a check that cannot be made is not a
+/// refusal — and nothing is stored.
+#[tokio::test]
+async fn a_table_that_cannot_be_checked_is_a_503_not_a_refusal() {
+    let (router, pool, ch) = app().await;
+    let cookie = admin(&pool).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("broken_table"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Code: 999. DB::Exception"))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(json!({
+            "name": "d17_unchecked", "asset": "silver.broken_table", "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"], "The table could not be checked. Try again.",
+        "a check that could not be made says so, in a fixed sentence"
+    );
+    let (stored,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM quality_rule WHERE name = 'd17_unchecked'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 0, "a rule that could not be checked is not stored");
+}
+
+/// QA `LH-DATA-14-01` F2 (`DATA-54`): a table the author's roles hide is
+/// refused with the same sentence as a missing one, so the answer is not an
+/// oracle. The two refusals come from different branches: the narrowed
+/// caller's hidden table is refused by the role's access, and an unrestricted
+/// caller's missing one by the existence check (review round 1 R6 — comparing
+/// two access refusals proved nothing).
+#[tokio::test]
+async fn a_rule_for_a_table_the_role_may_not_read_is_refused_with_the_same_sentence() {
+    let (router, pool, ch) = app().await;
+    // The stand-in answers no columns for the table that is not there.
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("no_such_table"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let user = create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    narrow_to_orders(&pool, user).await;
+    // The person is a member of the tenant that owns the catalog, so the
+    // catalog's tenant rule lets them through to the role's own table access
+    // (PR review round 1 R3).
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let body = |asset: &str| {
+        json!({
+            "name": "t8_narrowed", "asset": asset, "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })
+    };
+    let (code, hidden) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.customers")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{hidden}");
+    // A caller whose role hides nothing asks for a table that is not there:
+    // the existence check's refusal, not the access check's.
+    let admin_cookie = admin(&pool).await;
+    let (code, missing) = call(
+        &router,
+        &admin_cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(json!({
+            "name": "t8_admin_missing", "asset": "silver.no_such_table",
+            "dimension": "volume", "threshold": "rows >= 1", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{missing}");
+    let (hidden, missing) = (
+        hidden["error"].as_str().unwrap(),
+        missing["error"].as_str().unwrap(),
+    );
+    assert_eq!(
+        hidden.replace("silver.customers", "T"),
+        missing.replace("silver.no_such_table", "T"),
+        "a hidden table and a missing one read alike"
+    );
+
+    let (code, created) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.orders")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{created}");
+}
+
+/// QA `LH-DATA-14-01` F2 (`DATA-54`), review round 1 R1: the assistant drafts a
+/// rule as the person behind the chat, so a table their role hides is refused
+/// with the very sentence the form gives that person, and nothing is stored.
+#[tokio::test]
+async fn the_assistant_cannot_draft_a_rule_on_a_table_the_person_may_not_read() {
+    let (router, pool, _ch) = app().await;
+    let user = create_assistant_principal(&pool, "governance:write,governance:read").await;
+    narrow_to_orders(&pool, user).await;
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let draft = |name: &str, asset: &str| {
+        json!({
+            "tool": "draft_quality_rule",
+            "args": {
+                "name": name, "asset": asset, "dimension": "volume",
+                "threshold": "rows >= 1", "severity": "high", "confirmed": true,
+            },
+            "mode": "build",
+        })
+    };
+
+    let (code, tool) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/ai/tool",
+        Some(draft("r1_hidden", "silver.customers")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{tool}");
+    assert_eq!(tool["outcome"], "failed", "{tool}");
+
+    // The sentence the form gives the same person, for the same table.
+    let (code, form) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(json!({
+            "name": "r1_hidden_form", "asset": "silver.customers", "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{form}");
+    assert_eq!(
+        tool["result"]["error"], form["error"],
+        "the assistant refuses a hidden table as the form does"
+    );
+
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM quality_rule WHERE name LIKE 'r1_hidden%'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 0, "a refused draft stores nothing");
+
+    let (_, tool) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/ai/tool",
+        Some(draft("r1_orders", "silver.orders")),
+    )
+    .await;
+    assert_eq!(tool["outcome"], "executed", "{tool}");
+}
+
+/// A caller outside the tenant that owns the shared catalog is refused before
+/// the table is asked about (PR review round 1 R3, plan gap in T8): the
+/// answer is the catalog's own refusal, the same for a table that is there
+/// and one that is not, so it says neither.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_is_refused_before_the_table_is_asked_about() {
+    let (router, pool, _ch) = app().await;
+    let outsider =
+        create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    // Seeded tenant 2, not the one the catalog names.
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(outsider)
+        .bind(
+            "11111111-1111-4111-8111-000000000002"
+                .parse::<uuid::Uuid>()
+                .unwrap(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, outsider).await;
+    let body = |asset: &str| {
+        json!({
+            "name": "r3_outside", "asset": asset, "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })
+    };
+
+    let (code, present) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.orders")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{present}");
+    let (code, missing) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(body("silver.no_such_table")),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{missing}");
+    assert_eq!(
+        present, missing,
+        "the tenant refusal is the same for every table, so it names none"
+    );
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM quality_rule WHERE name = 'r3_outside'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored, 0,
+        "a caller outside the catalog tenant stores nothing"
+    );
+}
+
+/// `GOV-12` (#493 review, round 1 (R3)): a person outside the tenant that owns
+/// the shared catalog cannot run an existing rule by hand, whether its table
+/// is there or not, and the refusal measures and records nothing. The two
+/// answers are equal, so a run says nothing about which tables exist.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_cannot_run_a_rule_and_nothing_is_measured() {
+    let (router, pool, ch) = app().await;
+    let present = rule(&pool, "g12_present", "email not null >= 90%").await;
+    let missing = rule_on(&pool, "g12_missing", "silver.no_such_table", "rows >= 1").await;
+    let outsider =
+        create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    // Seeded tenant 2, not the one the catalog names.
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(outsider)
+        .bind(
+            "11111111-1111-4111-8111-000000000002"
+                .parse::<uuid::Uuid>()
+                .unwrap(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, outsider).await;
+    let last_run = "SELECT last_status || '|' || last_run_at::text \
+                    FROM quality_rule WHERE id::text = $1";
+    let before_present: String = sqlx::query_scalar(last_run)
+        .bind(&present)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let before_missing: String = sqlx::query_scalar(last_run)
+        .bind(&missing)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let (code, on_present) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{present}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{on_present}");
+    let (code, on_missing) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{missing}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{on_missing}");
+    assert_eq!(
+        on_present, on_missing,
+        "the tenant refusal is the same for every table, so it names none"
+    );
+
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent.iter().any(|b| b.contains("countIf(isNotNull")),
+        "a refused run measures nothing"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("INSERT INTO console.quality_run")),
+        "a refused run records nothing"
+    );
+    for table in ["orders", "no_such_table"] {
+        assert!(
+            !sent
+                .iter()
+                .any(|b| b.contains("system.columns") && b.contains(table)),
+            "{table} was not asked about"
+        );
+    }
+    let incidents_open: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_incident")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(incidents_open, 0, "a refused run opens no incident");
+    let after_present: String = sqlx::query_scalar(last_run)
+        .bind(&present)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let after_missing: String = sqlx::query_scalar(last_run)
+        .bind(&missing)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        before_present, after_present,
+        "a refused run writes nothing"
+    );
+    assert_eq!(
+        before_missing, after_missing,
+        "a refused run writes nothing"
+    );
+}
+
+/// `GOV-12` (#493 review, round 1 (R3)): a person whose role does not read the
+/// rule's table cannot run it, and nothing is measured or recorded; their own
+/// table still runs.
+#[tokio::test]
+async fn a_caller_whose_role_does_not_read_the_rules_table_cannot_run_it() {
+    let (router, pool, ch) = app().await;
+    let hidden = rule_on(
+        &pool,
+        "g12_customers",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+    let own = rule(&pool, "g12_orders", "email not null >= 70%").await;
+    let user = create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    narrow_to_orders(&pool, user).await;
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+    let last_run = "SELECT last_status || '|' || last_run_at::text \
+                    FROM quality_rule WHERE id::text = $1";
+    let before: String = sqlx::query_scalar(last_run)
+        .bind(&hidden)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let (code, refused) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{hidden}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("is not a table you can read"),
+        "{refused}"
+    );
+
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent.iter().any(|b| b.contains("countIf(isNotNull")),
+        "a refused run measures nothing"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("INSERT INTO console.quality_run")),
+        "a refused run records nothing"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("system.columns") && b.contains("customers")),
+        "the role's refusal asks about no table"
+    );
+    let incidents_open: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_incident")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(incidents_open, 0, "a refused run opens no incident");
+    let after: String = sqlx::query_scalar(last_run)
+        .bind(&hidden)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before, after, "a refused run writes nothing");
+
+    let (code, run) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{own}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{run}");
+    assert_eq!(run["status"], "passed", "their own table still runs");
+}
+
+/// `GOV-12` (#493 review, round 1 (R3)): "not there" and "not yours" are one
+/// sentence and one status, so a run cannot be used to find out which tables
+/// exist. The two refusals come from different branches: the narrowed
+/// caller's hidden table is refused by the role's access, and an unrestricted
+/// caller's missing one by the existence check.
+#[tokio::test]
+async fn running_a_rule_answers_the_same_for_a_table_that_is_not_there_and_one_the_caller_may_not_read()
+ {
+    let (router, pool, ch) = app().await;
+    let id = rule_on(
+        &pool,
+        "g12_customers",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+    let narrowed =
+        create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    narrow_to_orders(&pool, narrowed).await;
+    common::in_the_catalog_tenant(&pool, narrowed).await;
+    let cookie = session_cookie_for_user(&pool, narrowed).await;
+
+    let (code_hidden, hidden) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{id}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code_hidden, StatusCode::BAD_REQUEST, "{hidden}");
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("system.columns") && b.contains("customers")),
+        "the role's refusal asks about no table"
+    );
+
+    // The stand-in answers no columns for the table that is not there.
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("customers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let admin_cookie = admin(&pool).await;
+    let (code_missing, missing) = call(
+        &router,
+        &admin_cookie,
+        "POST",
+        &format!("/api/governance/quality/{id}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code_missing, StatusCode::BAD_REQUEST, "{missing}");
+    assert_eq!(
+        code_hidden, code_missing,
+        "a hidden table and a missing one read alike"
+    );
+    assert_eq!(
+        hidden, missing,
+        "a hidden table and a missing one read alike"
+    );
+}
+
+/// `GOV-12` (#493 review, round 1 (R3)): the gate does not shut out a person
+/// who may read the rule's table — the run still measures, records and opens
+/// its incident.
+#[tokio::test]
+async fn a_permitted_caller_still_runs_a_rule_and_gets_its_value() {
+    let (router, pool, ch) = app().await;
+    let id = rule(&pool, "g12_permitted", "email not null >= 90%").await;
+    let user = create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (code, run) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{id}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{run}");
+    assert_eq!(run["status"], "failed");
+    assert!(
+        run["value"].as_str().unwrap().contains("75.0% not null"),
+        "{run}"
+    );
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        sent.iter()
+            .any(|b| b.contains("INSERT INTO console.quality_run")),
+        "a permitted run records its verdict"
+    );
+    let open = incidents(&router, &cookie, "open").await;
+    assert_eq!(open.len(), 1, "a failed run opens one incident");
+}
+
+/// `GOV-12` (#493 review, round 1 (R3)): a table the engine did not answer
+/// about is a 503 that says so — a check that cannot be made is not a
+/// refusal — and the run measures nothing.
+#[tokio::test]
+async fn running_a_rule_whose_table_cannot_be_checked_is_a_503_and_measures_nothing() {
+    let (router, pool, ch) = app().await;
+    let id = rule_on(&pool, "g12_broken", "silver.broken_table", "rows >= 1").await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("broken_table"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Code: 999. DB::Exception"))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let cookie = admin(&pool).await;
+
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{id}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"], "The table could not be checked. Try again.",
+        "a check that could not be made says so, in a fixed sentence"
+    );
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent.iter().any(|b| b.contains("countIf(isNotNull")),
+        "a run whose table cannot be checked measures nothing"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("INSERT INTO console.quality_run")),
+        "a run whose table cannot be checked records nothing"
+    );
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): a person outside the tenant that owns
+/// the shared catalog cannot edit or delete a rule, whether it exists or not,
+/// and the refusal changes nothing. The answers are equal, so an edit says
+/// nothing about which rule ids exist.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_cannot_edit_or_delete_a_rule_and_nothing_changes() {
+    let (router, pool, ch) = app().await;
+    let id = rule(&pool, "g15_kept", "email not null >= 90%").await;
+    let cookie = outsider(&pool).await;
+    let kept = json!({
+        "asset": "silver.orders",
+        "threshold": "email not null >= 70%", "severity": "high",
+    });
+    let unknown = "00000000-0000-4000-8000-000000000000";
+    let before = (
+        audit_events(&pool, "quality.rule_update").await,
+        audit_events(&pool, "quality.rule_delete").await,
+    );
+
+    let (code, on_kept) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(kept.clone()),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{on_kept}");
+    let (code, deleted) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        &format!("/api/governance/quality/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{deleted}");
+    let (code, on_unknown) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{unknown}"),
+        Some(kept),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{on_unknown}");
+    let (code, deleted_unknown) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        &format!("/api/governance/quality/{unknown}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{deleted_unknown}");
+    for other in [&deleted, &on_unknown, &deleted_unknown] {
+        assert_eq!(
+            &on_kept, other,
+            "the tenant refusal is the same for every rule, so it names none"
+        );
+    }
+
+    let after: String =
+        sqlx::query_scalar("SELECT threshold FROM quality_rule WHERE id::text = $1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(after, "email not null >= 90%", "a refusal changes nothing");
+    assert_eq!(
+        (
+            audit_events(&pool, "quality.rule_update").await,
+            audit_events(&pool, "quality.rule_delete").await,
+        ),
+        before,
+        "a refusal records no audit event"
+    );
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("ALTER TABLE console.quality_run DELETE")),
+        "a refusal forgets no runs"
+    );
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): a rule on a table the caller's role
+/// does not read is not on their list, so it answers 404 exactly as an
+/// unknown rule does — it cannot be edited, moved into view, or deleted.
+#[tokio::test]
+async fn a_rule_on_a_table_the_role_may_not_read_cannot_be_edited_or_deleted_and_reads_as_not_found()
+ {
+    let (router, pool, ch) = app().await;
+    let id = rule_on(
+        &pool,
+        "g15_hidden",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+    let cookie = narrowed(&pool).await;
+    let unknown = "00000000-0000-4000-8000-000000000000";
+    let before = (
+        audit_events(&pool, "quality.rule_update").await,
+        audit_events(&pool, "quality.rule_delete").await,
+    );
+    let kept = json!({
+        "asset": "silver.customers",
+        "threshold": "email not null >= 70%", "severity": "high",
+    });
+
+    let (code, hidden) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(kept.clone()),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{hidden}");
+    let (_, unknown_rule) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{unknown}"),
+        Some(kept),
+    )
+    .await;
+    assert_eq!(hidden, unknown_rule, "reads as an unknown rule");
+
+    let (code, moved) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(json!({
+            "asset": "silver.orders",
+            "threshold": "email not null >= 70%", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::NOT_FOUND,
+        "a hidden rule cannot be moved into view: {moved}"
+    );
+
+    let (code, deleted) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        &format!("/api/governance/quality/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{deleted}");
+    let (_, deleted_unknown) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        &format!("/api/governance/quality/{unknown}"),
+        None,
+    )
+    .await;
+    assert_eq!(deleted, deleted_unknown, "reads as an unknown rule");
+
+    let (asset, threshold): (String, String) =
+        sqlx::query_as("SELECT asset, threshold FROM quality_rule WHERE id::text = $1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(asset, "silver.customers", "a refusal moves no rule");
+    assert_eq!(
+        threshold, "email not null >= 90%",
+        "a refusal changes nothing"
+    );
+    assert_eq!(
+        (
+            audit_events(&pool, "quality.rule_update").await,
+            audit_events(&pool, "quality.rule_delete").await,
+        ),
+        before,
+        "a refusal records no audit event"
+    );
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("ALTER TABLE console.quality_run DELETE")),
+        "a refusal forgets no runs"
+    );
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): the gate shuts out nobody permitted —
+/// a narrowed person still edits and deletes a rule on their own table, and a
+/// person who may read every table still edits and deletes one whose table is
+/// gone (keeping a table is not an existence check, `DATA-54`).
+#[tokio::test]
+async fn a_permitted_caller_still_edits_and_deletes_rules_including_one_whose_table_is_gone() {
+    let (router, pool, ch) = app().await;
+    let id = rule(&pool, "g15_own", "email not null >= 90%").await;
+    let cookie = narrowed(&pool).await;
+
+    let (code, edited) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(json!({
+            "asset": "silver.orders",
+            "threshold": "email not null >= 70%", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{edited}");
+    assert_eq!(edited["threshold"], "email not null >= 70%");
+    let (code, deleted) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        &format!("/api/governance/quality/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{deleted}");
+
+    // A person in the catalog's tenant who may read every table: "not there"
+    // is not checked when the rewrite keeps the table.
+    let user = create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+    let gone = rule_on(
+        &pool,
+        "g15_gone",
+        "silver.no_such_table",
+        "email not null >= 90%",
+    )
+    .await;
+    let (code, edited) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{gone}"),
+        Some(json!({
+            "asset": "silver.no_such_table",
+            "threshold": "email not null >= 70%", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{edited}");
+    let (code, deleted) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        &format!("/api/governance/quality/{gone}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{deleted}");
+
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("system.columns") && b.contains("no_such_table")),
+        "keeping a table is not an existence check"
+    );
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): a person outside the tenant that owns
+/// the shared catalog cannot read the rule list at all — the same refusal the
+/// incident list beside it gives — and the refusal queries nothing.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_cannot_list_the_rules() {
+    let (router, pool, ch) = app().await;
+    rule(&pool, "g15_listed", "email not null >= 90%").await;
+    let cookie = outsider(&pool).await;
+    let before = sent_to_clickhouse(&ch).await.len();
+
+    let (code, rules) = call(&router, &cookie, "GET", "/api/governance/quality", None).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{rules}");
+    let (code, listed) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/incidents",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{listed}");
+    assert_eq!(
+        rules, listed,
+        "the rule list refuses as the list beside it does"
+    );
+    assert_eq!(
+        sent_to_clickhouse(&ch).await.len(),
+        before,
+        "a refused list queries nothing"
+    );
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): the rule list hides a row the way the
+/// catalog list hides a table — every row when the caller reads every table,
+/// otherwise only the rows on tables their role reads, a row naming no table
+/// included in the hiding (D6).
+#[tokio::test]
+async fn the_rule_list_hides_rules_on_tables_the_role_may_not_read() {
+    let (router, pool, ch) = app().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("_silver_meta.quality"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [
+                {"name": "tabel", "type": "String"},
+                {"name": "cek", "type": "String"},
+                {"name": "verdict", "type": "String"},
+                {"name": "nilai", "type": "String"},
+                {"name": "at", "type": "String"},
+            ],
+            // In the order the query's `ORDER BY tabel, cek` returns them, so
+            // the hidden rows sort before the one `silver.orders` keeps.
+            "data": [
+                {"tabel": "orders", "cek": "row_count", "verdict": "pass",
+                 "nilai": "1", "at": "2026-11-13 00:00:00"},
+                {"tabel": "silver.customers", "cek": "row_count", "verdict": "pass",
+                 "nilai": "1", "at": "2026-11-13 00:00:00"},
+                {"tabel": "silver.orders", "cek": "row_count", "verdict": "pass",
+                 "nilai": "1", "at": "2026-11-13 00:00:00"},
+            ],
+            "rows": 3,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    rule(&pool, "g15_visible", "email not null >= 90%").await;
+    rule_on(
+        &pool,
+        "g15_hidden_rule",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+
+    let cookie = narrowed(&pool).await;
+    let (code, body) = call(&router, &cookie, "GET", "/api/governance/quality", None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let mut narrowed_assets: Vec<&str> = body["quality"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .collect();
+    narrowed_assets.sort_unstable();
+    assert_eq!(
+        narrowed_assets,
+        ["silver.orders", "silver.orders"],
+        "only the rows on a table the role reads, observed and authored"
+    );
+    let first_observed = body["quality"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with("q-")))
+        .expect("the observed row on silver.orders is kept");
+    assert_eq!(
+        first_observed["id"], "q-0",
+        "the kept observed rows are renumbered, so an id says nothing about hidden rows"
+    );
+
+    let cookie = admin(&pool).await;
+    let (code, body) = call(&router, &cookie, "GET", "/api/governance/quality", None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let rows = body["quality"].as_array().unwrap();
+    // Three observed, two authored, and the two `0004_seed_governance.sql`
+    // seeds — every row there is.
+    assert_eq!(
+        rows.len(),
+        7,
+        "a caller who reads every table sees them all"
+    );
+    let assets: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .collect();
+    assert!(assets.contains(&"silver.customers"), "{assets:?}");
+    assert!(assets.contains(&"orders"), "{assets:?}");
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4), D7: the assistant reads the rule list
+/// as the person behind the chat, so a table their role hides is not in the
+/// tool's answer either.
+#[tokio::test]
+async fn the_assistant_lists_only_the_rules_on_tables_the_person_may_read() {
+    let (router, pool, _ch) = app().await;
+    rule(&pool, "g15_ai_visible", "email not null >= 90%").await;
+    rule_on(
+        &pool,
+        "g15_ai_hidden",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+    let user = create_assistant_principal(&pool, "governance:write,governance:read").await;
+    narrow_to_orders(&pool, user).await;
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/ai/tool",
+        Some(json!({"tool": "list_quality_rules", "args": {}, "mode": "ask"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "executed", "{body}");
+    let mut assets: Vec<&str> = body["result"]["quality"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .collect();
+    assets.sort_unstable();
+    assert_eq!(assets, ["silver.orders"], "the tool reads as the person");
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): a person outside the tenant that owns
+/// the shared catalog cannot set or reset a schedule, and the refusal stores
+/// and records nothing. The two answers are equal, so a schedule says nothing
+/// about which tables exist.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_cannot_set_or_reset_a_schedule_and_nothing_is_stored()
+{
+    let (router, pool, _ch) = app().await;
+    let cookie = admin(&pool).await;
+    let body = json!({"mode": "interval", "intervalMinutes": 180});
+    let (code, stored) = call(
+        &router,
+        &cookie,
+        "PUT",
+        "/api/governance/quality/schedules/silver.orders",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{stored}");
+
+    let cookie = outsider(&pool).await;
+    let (code, set) = call(
+        &router,
+        &cookie,
+        "PUT",
+        "/api/governance/quality/schedules/silver.customers",
+        Some(body),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{set}");
+    let (code, reset) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        "/api/governance/quality/schedules/silver.orders",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{reset}");
+    assert_eq!(
+        set, reset,
+        "the tenant refusal is the same for every table, so it names none"
+    );
+
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT asset || '|' || interval_minutes::text FROM quality_schedule")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, ["silver.orders|180"], "a refusal stores nothing");
+    assert_eq!(
+        audit_events(&pool, "quality.schedule_update").await,
+        1,
+        "only the permitted setting is recorded"
+    );
+    assert_eq!(
+        audit_events(&pool, "quality.schedule_reset").await,
+        0,
+        "a refused reset records nothing"
+    );
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): a schedule on a table the caller's
+/// role does not read is refused with the sentence a rule on that table gets
+/// (`DATA-54`'s create), and the table's existence is not checked then — so
+/// neither refusal says which tables exist.
+#[tokio::test]
+async fn a_schedule_on_a_table_the_role_may_not_read_is_refused_with_the_rule_sentence() {
+    let (router, pool, _ch) = app().await;
+    let cookie = narrowed(&pool).await;
+    let body = json!({"mode": "interval", "intervalMinutes": 180});
+
+    let (code, set) = call(
+        &router,
+        &cookie,
+        "PUT",
+        "/api/governance/quality/schedules/silver.customers",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{set}");
+    let (code, refused_rule) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(json!({
+            "name": "g15_s", "asset": "silver.customers", "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{refused_rule}");
+    assert_eq!(
+        set["error"], refused_rule["error"],
+        "a schedule gives the sentence a rule on that table gets"
+    );
+    let (code, reset) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        "/api/governance/quality/schedules/silver.customers",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{reset}");
+    assert_eq!(reset["error"], set["error"], "resetting says the same");
+
+    let (code, missing) = call(
+        &router,
+        &cookie,
+        "PUT",
+        "/api/governance/quality/schedules/silver.no_such_table",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{missing}");
+    let sentence = |body: &Value, asset: &str| body["error"].as_str().unwrap().replace(asset, "T");
+    assert_eq!(
+        sentence(&missing, "silver.no_such_table"),
+        sentence(&set, "silver.customers"),
+        "a hidden table and a missing one read alike"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_schedule")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "a refused schedule stores nothing");
+    assert_eq!(audit_events(&pool, "quality.schedule_update").await, 0);
+    assert_eq!(audit_events(&pool, "quality.schedule_reset").await, 0);
+
+    // Their own table is unchanged by the gate.
+    let (code, stored) = call(
+        &router,
+        &cookie,
+        "PUT",
+        "/api/governance/quality/schedules/silver.orders",
+        Some(body),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{stored}");
+    let (code, _) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        "/api/governance/quality/schedules/silver.orders",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): a person outside the tenant that owns
+/// the shared catalog cannot resolve an incident, whether it exists or not,
+/// and the refusal closes nothing. The two answers are equal, so a resolve
+/// says nothing about which incident ids exist.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_cannot_resolve_an_incident_and_it_stays_open() {
+    let (router, pool, _ch) = app().await;
+    let admin_cookie = admin(&pool).await;
+    let id = rule(&pool, "g15_incident", "email not null >= 90%").await;
+    call(
+        &router,
+        &admin_cookie,
+        "POST",
+        &format!("/api/governance/quality/{id}/run"),
+        None,
+    )
+    .await;
+    let incident = incidents(&router, &admin_cookie, "open").await[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let unknown = "00000000-0000-4000-8000-000000000000";
+
+    let cookie = outsider(&pool).await;
+    let (code, on_incident) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/incidents/{incident}/resolve"),
+        Some(json!({"resolution": "x"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{on_incident}");
+    let (code, on_unknown) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/incidents/{unknown}/resolve"),
+        Some(json!({"resolution": "x"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{on_unknown}");
+    assert_eq!(
+        on_incident, on_unknown,
+        "the tenant refusal is the same for every incident, so it names none"
+    );
+
+    assert_eq!(
+        incidents(&router, &admin_cookie, "open").await.len(),
+        1,
+        "a refused resolve closes nothing"
+    );
+    assert_eq!(audit_events(&pool, "quality.incident_resolve").await, 0);
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): an incident on a table the caller's
+/// role does not read is not on their list, so resolving it answers 404
+/// exactly as an unknown incident does; their own table's incident still
+/// resolves.
+#[tokio::test]
+async fn an_incident_on_a_table_the_role_may_not_read_cannot_be_resolved_and_reads_as_not_found() {
+    let (router, pool, _ch) = app().await;
+    let admin_cookie = admin(&pool).await;
+    let hidden = rule_on(
+        &pool,
+        "g15_hidden_incident",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+    call(
+        &router,
+        &admin_cookie,
+        "POST",
+        &format!("/api/governance/quality/{hidden}/run"),
+        None,
+    )
+    .await;
+    let open = incidents(&router, &admin_cookie, "open").await;
+    let incident = open
+        .iter()
+        .find(|row| row["asset"] == "silver.customers")
+        .and_then(|row| row["id"].as_str())
+        .expect("the failing rule opened an incident on its table")
+        .to_owned();
+    let unknown = "00000000-0000-4000-8000-000000000000";
+
+    let cookie = narrowed(&pool).await;
+    let (code, hidden_body) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/incidents/{incident}/resolve"),
+        Some(json!({"resolution": "x"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{hidden_body}");
+    let (_, unknown_body) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/incidents/{unknown}/resolve"),
+        Some(json!({"resolution": "x"})),
+    )
+    .await;
+    assert_eq!(hidden_body, unknown_body, "reads as an unknown incident");
+    assert!(
+        incidents(&router, &admin_cookie, "open")
+            .await
+            .iter()
+            .any(|row| row["id"] == incident.as_str()),
+        "a refused resolve closes nothing"
+    );
+    assert_eq!(audit_events(&pool, "quality.incident_resolve").await, 0);
+
+    // Their own table's incident still resolves.
+    let visible = rule(&pool, "g15_visible_incident", "email not null >= 90%").await;
+    call(
+        &router,
+        &admin_cookie,
+        "POST",
+        &format!("/api/governance/quality/{visible}/run"),
+        None,
+    )
+    .await;
+    let open = incidents(&router, &admin_cookie, "open").await;
+    let own = open
+        .iter()
+        .find(|row| row["asset"] == "silver.orders")
+        .and_then(|row| row["id"].as_str())
+        .expect("the rule on silver.orders opened its own incident")
+        .to_owned();
+    let (code, resolved) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/incidents/{own}/resolve"),
+        Some(json!({"resolution": "fixed"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{resolved}");
+    assert_eq!(resolved["status"], "resolved");
+}
+
+/// QA `LH-DATA-14-01` F2 (`DATA-54`): a rewrite that changes the table is
+/// checked, and a refusal leaves the rule on its old table. A rewrite that
+/// keeps the table is not checked, so a rule on a dropped table can still be
+/// edited.
+#[tokio::test]
+async fn changing_a_rule_to_a_table_that_is_not_there_is_refused_and_the_rule_keeps_its_table() {
+    let (router, pool, ch) = app().await;
+    let cookie = admin(&pool).await;
+    let id = rule(&pool, "email_filled", "email not null >= 90%").await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("no_such_table"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+
+    let (code, refused) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(json!({
+            "asset": "silver.no_such_table",
+            "threshold": "email not null >= 90%", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{refused}");
+    let asset: String = sqlx::query_scalar("SELECT asset FROM quality_rule WHERE name = $1")
+        .bind("email_filled")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(asset, "silver.orders", "a refused rewrite changes nothing");
+
+    // The threshold change with the table kept is not checked.
+    let (code, edited) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(json!({
+            "asset": "silver.orders",
+            "threshold": "email not null >= 70%", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{edited}");
 }
 
 /// `DATA-14` (F2): editing a rule keeps the runs it has (each now records

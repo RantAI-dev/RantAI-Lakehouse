@@ -57,31 +57,41 @@ pub async fn list(
             "reason": "no Postgres pool configured for this deployment",
         })));
     };
-    let alerts = lakehouse_store::overview::list_alerts(pool).await?;
-    let approvals = lakehouse_store::agents::list_pending_approvals(pool).await?;
-
-    let open_alerts: Vec<Value> = alerts
-        .iter()
-        .filter(|a| a.status == "open")
-        .map(|a| {
-            json!({
-                "id": a.id,
-                "title": a.title,
-                "severity": a.severity,
-                "at": a.at,
+    // ADM-13 (D10.2), ADM-13 review round 1, B3: openAlerts is empty unless the caller
+    // holds alert:read or alert:write; pendingApprovals is empty unless the caller holds
+    // agent:approve. Empty list, not an error.
+    let open_alerts: Vec<Value> = if principal.has("alert:read") || principal.has("alert:write") {
+        let alerts = lakehouse_store::overview::list_alerts(pool).await?;
+        alerts
+            .iter()
+            .filter(|a| a.status == "open")
+            .map(|a| {
+                json!({
+                    "id": a.id,
+                    "title": a.title,
+                    "severity": a.severity,
+                    "at": a.at,
+                })
             })
-        })
-        .collect();
-    let pending_approvals: Vec<Value> = approvals
-        .iter()
-        .map(|a| {
-            json!({
-                "id": a.id,
-                "title": a.action,
-                "requestedAt": a.requested_at,
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let pending_approvals: Vec<Value> = if principal.has("agent:approve") {
+        let approvals = lakehouse_store::agents::list_pending_approvals(pool).await?;
+        approvals
+            .iter()
+            .map(|a| {
+                json!({
+                    "id": a.id,
+                    "title": a.action,
+                    "requestedAt": a.requested_at,
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // BI-19 part E (D15): unread mentions in dashboard comments, per person.
     // These have a real read cursor (`dashboard_comment_mention.read_at`), so

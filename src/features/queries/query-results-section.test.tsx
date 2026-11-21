@@ -22,6 +22,7 @@ mock.module("next/navigation", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import * as notify from "@/lib/notify"
 import type { QueryResult } from "@/services/contracts/queries"
@@ -190,7 +191,45 @@ describe("the column filters", () => {
   })
 })
 
+// QS-11 (LH-QS-2-01), D12: the summary counts the rows on screen, not the
+// engine's pre-cut rowCount.
+describe("the result summary", () => {
+  it("counts the rows shown and not the engine's rowCount when the result was cut", () => {
+    renderSection(result({ rowCount: 65600, truncated: true }))
+
+    const value = screen.getByText("Rows").nextElementSibling
+    expect(value?.textContent).toBe("3 shown")
+    expect(screen.queryByText("65,600")).toBeNull()
+  })
+
+  it("counts the rows shown with no suffix when nothing was cut", () => {
+    renderSection(result())
+
+    expect(screen.getByText("Rows").nextElementSibling?.textContent).toBe("3")
+  })
+})
+
 describe("the statistics panel", () => {
+  // QS-11 (LH-QS-2-04), D14: a long value is cut inside its own cell and its
+  // full text is in the cell's title.
+  it("keeps a long minimum in its cell's title and truncates the cell", () => {
+    const long = "x".repeat(200)
+    renderSection(
+      result({
+        columns: ["note", "amount"],
+        rows: [{ note: long, amount: 1 }],
+        rowCount: 1,
+      })
+    )
+
+    // One row means min and max are the same string: both cells carry it.
+    const cells = panel().getAllByTitle(long)
+    expect(cells.length).toBe(2)
+    for (const cell of cells) {
+      expect(cell.className).toContain("truncate")
+    }
+  })
+
   it("says how many rows the grid shows", () => {
     renderSection(result())
     expect(screen.getByText(/of the 3 rows shown/)).toBeTruthy()
@@ -231,9 +270,7 @@ describe("the statistics panel", () => {
 
   it("follows the column the reader picks", () => {
     renderSection(result())
-    fireEvent.change(screen.getByLabelText("Column"), {
-      target: { value: "amount" },
-    })
+    chooseOption(screen.getByRole("combobox", { name: "Column" }), "amount")
     // The smallest amount is 10 and the largest is 30.
     expect(panel().getByText("Minimum").parentElement?.textContent).toContain(
       "10"
@@ -252,9 +289,7 @@ describe("the statistics panel", () => {
 
   it("says the histogram of a numeric column shows value ranges", () => {
     renderSection(result())
-    fireEvent.change(screen.getByLabelText("Column"), {
-      target: { value: "amount" },
-    })
+    chooseOption(screen.getByRole("combobox", { name: "Column" }), "amount")
     expect(panel().getByText("Value range")).toBeTruthy()
     expect(panel().queryAllByText("Most frequent values")).toHaveLength(0)
   })
@@ -366,6 +401,36 @@ describe("copy as TSV", () => {
   })
 })
 
+// QA LH-QS-2-06 (QS-9), decision 10: a role whose downloads are switched off
+// may not copy the rows out either, and the reason is on the screen, not only
+// in a tooltip.
+describe("the result's export actions and the download switch", () => {
+  it("turns Copy as TSV and Download off and says why when the person's roles may not download", async () => {
+    renderSection(result({ canDownload: false }))
+
+    const copy = screen.getByRole("button", { name: "Copy as TSV" }) as HTMLButtonElement
+    const download = screen.getByRole("button", { name: /Download/ }) as HTMLButtonElement
+    expect(copy.disabled).toBe(true)
+    expect(download.disabled).toBe(true)
+    expect(screen.getByText("Downloads are switched off for your role.")).toBeTruthy()
+
+    // A click on a disabled button copies nothing.
+    fireEvent.click(copy)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(copied).toEqual([])
+  })
+
+  it("leaves both on when the result carries no flag", async () => {
+    renderSection(result())
+
+    const copy = screen.getByRole("button", { name: "Copy as TSV" }) as HTMLButtonElement
+    const download = screen.getByRole("button", { name: /Download/ }) as HTMLButtonElement
+    expect(copy.disabled).toBe(false)
+    expect(download.disabled).toBe(false)
+    expect(screen.queryByText("Downloads are switched off for your role.")).toBeNull()
+  })
+})
+
 describe("the banner of a cut result", () => {
   it("names the row limit that cut the result", () => {
     render(<QueryResultBanner rowCount={10} rowLimit={64000} cutBy="rows" />)
@@ -398,5 +463,39 @@ describe("the banner of a cut result", () => {
   it("does not claim a result is cut when it is not", () => {
     renderSection(result())
     expect(screen.queryAllByText(/Showing the first/)).toHaveLength(0)
+  })
+})
+
+// `QS-6` (`LH-QS-2-10`), decision 8 and 13: the summary names the engine that
+// really ran, as the tab's picker spells it, and a Trino run states no
+// ClickHouse workload class.
+describe("the result summary engine", () => {
+  /** The value beside a metadata label, as the person reads it. */
+  function summaryValue(label: string): string {
+    const term = screen.getByText(label)
+    return term.parentElement?.querySelector("dd")?.textContent ?? ""
+  }
+
+  it("names Trino as the engine of a Trino run and shows no workload class for it", () => {
+    renderSection(
+      result({
+        engine: "trino",
+        metrics: {
+          ...result().metrics,
+          engine: null,
+          workloadClass: null,
+        },
+      })
+    )
+
+    expect(summaryValue("Engine")).toBe("Trino")
+    expect(summaryValue("Workload")).toBe("—")
+  })
+
+  it("names ClickHouse as the engine of a ClickHouse run", () => {
+    renderSection(result())
+
+    expect(summaryValue("Engine")).toBe("ClickHouse")
+    expect(summaryValue("Workload")).toBe("Hot analytics")
   })
 })

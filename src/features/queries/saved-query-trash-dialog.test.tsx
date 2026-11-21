@@ -69,6 +69,7 @@ function saved(over: Partial<SavedQuery> = {}): SavedQuery {
     folderId: null,
     ownerId: "u1",
     level: "view",
+    parameters: [],
     ...over,
   }
 }

@@ -11,11 +11,10 @@ import { Pill } from "@/components/patterns/status-badge"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
 import { useDataTable } from "@/hooks/use-data-table"
-import { copyText } from "@/lib/copy-text"
+import { copyTextWithToast } from "@/lib/copy-text"
 import { toTsv } from "@/lib/csv"
 import { formatBytes, formatCost, formatDuration, formatNumber } from "@/lib/format"
-import { notifyFailure, notifySuccess } from "@/lib/notify"
-import { ENGINE_CATEGORY_LABEL, WORKLOAD_CLASS_LABEL } from "@/lib/status"
+import { queryEngineLabel, WORKLOAD_CLASS_LABEL } from "@/lib/status"
 import type {
   QueryCell,
   QueryDownloadFormat,
@@ -24,7 +23,7 @@ import type {
 import { QueryCellInspector } from "./query-cell-inspector"
 import { QueryColumnFilters } from "./query-column-filters"
 import { QueryColumnStatistics } from "./query-column-statistics"
-import { QueryDownloadMenu } from "./query-download-menu"
+import { DOWNLOADS_OFF_REASON, QueryDownloadMenu } from "./query-download-menu"
 import { QueryResultBanner } from "./query-result-banner"
 import { cellText, filterRows, type QueryRow } from "./query-grid-tools"
 import { QueryPlanPanel } from "./query-transparency-panel"
@@ -187,19 +186,14 @@ export function QueryResultsSection(props: QueryResultsSectionProps) {
   })
 
   async function copyAsTsv() {
-    const copied = await copyText(toTsvText(result.columns, rows))
-    if (copied) {
-      notifySuccess(
-        "Copied the rows as TSV",
-        `${formatNumber(rows.length)} rows copied to the clipboard.`
-      )
-    } else {
-      notifyFailure(
-        "Could not copy the rows",
-        "The browser refused the copy."
-      )
-    }
+    // The one toast pair every copy site shares (`UX-6` review R1).
+    await copyTextWithToast(toTsvText(result.columns, rows), "Copied the rows as TSV")
   }
+
+  // QA LH-QS-2-06 (QS-9), decision 10: the copy is an export of the rows like
+  // the file is, so a role whose downloads are switched off gets neither.
+  // An absent flag is an older server, which counts as allowed.
+  const canDownload = result.canDownload !== false
 
   return (
     <SectionCard
@@ -207,10 +201,14 @@ export function QueryResultsSection(props: QueryResultsSectionProps) {
       contentClassName="space-y-4"
       action={
         <div className="flex flex-wrap items-center gap-2">
+          {!canDownload ? (
+            <span className="text-xs text-muted-foreground">{DOWNLOADS_OFF_REASON}</span>
+          ) : null}
           <Button
             size="sm"
             variant="outline"
-            disabled={rows.length === 0}
+            disabled={rows.length === 0 || !canDownload}
+            title={canDownload ? undefined : DOWNLOADS_OFF_REASON}
             onClick={() => void copyAsTsv()}
           >
             <Copy className="size-4" aria-hidden />
@@ -220,6 +218,7 @@ export function QueryResultsSection(props: QueryResultsSectionProps) {
             resultId={props.runId === null ? null : result.id}
             engine={result.engine}
             busy={props.downloadBusy}
+            canDownload={canDownload}
             onDownload={props.onDownload}
           />
           {result.auditEventId ? (
@@ -273,12 +272,27 @@ export function QueryResultsSection(props: QueryResultsSectionProps) {
       <MetadataList
         columns={3}
         items={[
-          { label: "Rows", value: formatNumber(result.rowCount) },
+          // QS-11 (LH-QS-2-01), D12: count the rows actually on screen; the
+          // server's rowCount is what the engine sent before the cut.
+          {
+            label: "Rows",
+            value: result.truncated
+              ? `${formatNumber(result.rows.length)} shown`
+              : formatNumber(result.rows.length),
+          },
           { label: "Duration", value: formatDuration(result.metrics.durationMs) },
           { label: "Scanned", value: formatBytes(result.metrics.scannedBytes) },
           { label: "Cost", value: formatCost(result.metrics.costUnits) },
-          { label: "Engine", value: ENGINE_CATEGORY_LABEL[result.metrics.engine] },
-          { label: "Workload", value: WORKLOAD_CLASS_LABEL[result.metrics.workloadClass] },
+          // QA LH-QS-2-10 (QS-6), decision 8: the engine that really ran, as
+          // the tab's picker spells it; a Trino run has no ClickHouse workload
+          // class, so it says "—" rather than a tier it never touched.
+          { label: "Engine", value: queryEngineLabel(result.engine) },
+          {
+            label: "Workload",
+            value: result.metrics.workloadClass
+              ? WORKLOAD_CLASS_LABEL[result.metrics.workloadClass]
+              : "—",
+          },
           {
             label: "Cache",
             // ClickHouse's response carries no cache-hit flag — null

@@ -75,3 +75,127 @@ describe("QueryTransparencyPanel sources", () => {
     expect(screen.getByText("pii")).toBeTruthy()
   })
 })
+
+// `QS-6` (`LH-QS-4-08`, `LH-QS-2-10`), decisions 7 and 13: the panel names
+// the engine that answered, and a Trino statement says there is no estimate
+// instead of showing a ClickHouse answer about Trino SQL.
+describe("QueryTransparencyPanel engine", () => {
+  it("says a Trino query has no pre-run estimate, names Trino, and shows no source and no error", () => {
+    panel({
+      ...BASE,
+      supported: false,
+      reason: "A Trino query has no pre-run estimate.",
+      queryEngine: "trino",
+      estimatedBytes: null,
+      estimatedCostMin: null,
+      estimatedCostMax: null,
+      error: null,
+      workloadClass: null,
+      engine: null,
+      sources: [],
+    })
+
+    expect(screen.getByText("No pre-run estimate")).toBeTruthy()
+    expect(screen.getByText("A Trino query has no pre-run estimate.")).toBeTruthy()
+    expect(screen.getByText("Trino")).toBeTruthy()
+    // Nothing was read, so no table is named and no failure is reported.
+    expect(screen.queryByText("Sources")).toBeNull()
+    expect(screen.queryByText("This query cannot be planned")).toBeNull()
+  })
+
+  it("names ClickHouse as the engine of an estimate", () => {
+    panel({ ...BASE, supported: true, queryEngine: "clickhouse" })
+
+    expect(screen.queryByText("No pre-run estimate")).toBeNull()
+    expect(screen.getByText("ClickHouse")).toBeTruthy()
+    expect(screen.getByText("Hot analytics")).toBeTruthy()
+  })
+
+  it("shows the fixed sentence and its reference when a query cannot be planned", () => {
+    panel({
+      ...BASE,
+      supported: true,
+      queryEngine: "clickhouse",
+      estimatedBytes: null,
+      estimatedCostMin: null,
+      estimatedCostMax: null,
+      error: "This query names a column that does not exist. Reference: a1b2c3d4e5",
+      sources: [],
+    })
+
+    expect(screen.getByText("This query cannot be planned")).toBeTruthy()
+    expect(
+      screen.getByText("This query names a column that does not exist. Reference: a1b2c3d4e5")
+    ).toBeTruthy()
+  })
+})
+
+// LH-QS-4-08 and QS-5-AC14: what the panel says when there is
+// no estimate to show.
+describe("QueryTransparencyPanel without an estimate", () => {
+  const IDLE: ActionState<QueryEstimate> = { status: "idle", data: null, error: null }
+
+  it("names the first parameter the estimate waits for, spelled as the run's sentence spells it", () => {
+    render(<QueryTransparencyPanel state={IDLE} estimatable={false} waitingFor="region" onRetry={() => {}} />)
+    expect(screen.getByText("Fill in {{region}} for a pre-run estimate.")).toBeTruthy()
+    expect(screen.queryByText("Type SQL for a pre-run estimate.")).toBeNull()
+  })
+
+  it("keeps the empty-editor sentence for an empty editor", () => {
+    render(<QueryTransparencyPanel state={IDLE} estimatable={false} waitingFor={null} onRetry={() => {}} />)
+    expect(screen.getByText("Type SQL for a pre-run estimate.")).toBeTruthy()
+    expect(screen.queryByText(/Fill in/)).toBeNull()
+  })
+
+  it("says there is no estimate for Trino, and nothing else, whatever state the action holds", () => {
+    const refused: ActionState<QueryEstimate> = {
+      status: "success",
+      data: { ...BASE, error: "Unknown table" },
+      error: null,
+    }
+    const { rerender } = render(
+      <QueryTransparencyPanel state={refused} estimatable estimateSupported={false} onRetry={() => {}} />
+    )
+    expect(screen.getByText("No pre-run estimate for Trino queries.")).toBeTruthy()
+    expect(screen.queryByText("This query cannot be planned")).toBeNull()
+    expect(screen.queryByText("Unknown table")).toBeNull()
+
+    const failed: ActionState<QueryEstimate> = {
+      status: "error",
+      data: null,
+      error: { code: "unavailable", message: "down" } as never,
+    }
+    rerender(<QueryTransparencyPanel state={failed} estimatable estimateSupported={false} onRetry={() => {}} />)
+    expect(screen.getByText("No pre-run estimate for Trino queries.")).toBeTruthy()
+    expect(screen.queryByText(/Estimate unavailable/)).toBeNull()
+
+    rerender(<QueryTransparencyPanel state={IDLE} estimatable={false} estimateSupported={false} onRetry={() => {}} />)
+    expect(screen.getByText("No pre-run estimate for Trino queries.")).toBeTruthy()
+    expect(screen.queryByText("Type SQL for a pre-run estimate.")).toBeNull()
+  })
+})
+
+// QS-10 (LH-QS-1-11, LH-QS-2-05): the panel says what the estimate does and
+// does not hold — withheld catalog facts, reported obligations, an empty plan.
+describe("QueryTransparencyPanel withheld facts and obligations", () => {
+  it("says catalog access is needed for both freshness and sources, and names no source", () => {
+    panel({ ...BASE, catalogHidden: true })
+
+    expect(screen.getAllByText("Needs catalog access").length).toBe(2)
+    expect(screen.queryByText("silver.orders")).toBeNull()
+    expect(screen.queryByText("serving.stock")).toBeNull()
+  })
+
+  it("shows a reported obligation as a pill, not 'Not evaluated'", () => {
+    panel({ ...BASE, policyObligations: ["Column masks"] })
+
+    expect(screen.getByText("Column masks")).toBeTruthy()
+    expect(screen.queryByText("Not evaluated")).toBeNull()
+  })
+
+  it("says the plan named no table when sources are empty and nothing is hidden", () => {
+    panel({ ...BASE, sources: [] })
+
+    expect(screen.getByText("No table found in the plan")).toBeTruthy()
+  })
+})

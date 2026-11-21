@@ -130,6 +130,18 @@ test("a tile with bins says what its numbers stand for", () => {
   assert.match(out, /binned: visitors in bins of 500 \(a value is the bin's lower edge\)/)
 })
 
+// QA LH-BI-9-05 (BI-50): the reason the dashboard's date grouping left a
+// chart as it was is on the tile's line, in the words of the page.
+test("a tile the date grouping does not apply to says so on its line", () => {
+  const out = summarizeTiles(
+    [{ id: "c1", title: "By city", kind: "bar", source: "ui", mart: "m" }],
+    { c1: { columns: ["city", "n"], rows: [{ city: "Bali", n: 4 }], grainNotApplied: "not_a_date" } },
+  )
+  assert.match(out, /; date grouping: Group dates by does not apply: this chart's dimension is not a date\./)
+  const plain = summarizeTiles([{ id: "c2", title: "T", kind: "bar", source: "ui", mart: "m" }], { c2: { columns: ["c", "n"], rows: [{ c: "A", n: 1 }] } })
+  assert.doesNotMatch(plain, /date grouping/)
+})
+
 test("BI-11: summarizeParams lists each shown parameter with its value and type, or says none", () => {
   assert.equal(summarizeParams([]), "none")
   assert.equal(

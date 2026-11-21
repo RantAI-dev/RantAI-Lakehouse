@@ -6,10 +6,11 @@ import type {
   SaveAlertRuleInput,
 } from "../contracts/alerts";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
- * AlertRuleService over `/api/alerts` (rule CRUD) and `/api/alerts/test`
+ * AlertRuleService over `/api/alerts` (rule CRUD), `/api/alerts/mine` (`listMine`,
+ * `BI-43`) and `/api/alerts/test`
  * (`testRule`, one rule at a time: `BI-40` D1; the scheduler's
  * `/api/alerts/run` is not a person's door). WS1 task 1.15: this client (and
  * its contract) did not exist before — the feature fetched `/api/alerts` directly with no `res.ok`
@@ -27,14 +28,15 @@ async function request<T>(
   const res = await apiFetch(url, init);
   const json = await res.json();
   if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json);
+    if (denied) throw denied;
     const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500 || res.status === 503
-            ? "unavailable"
-            : "invalid_request";
+      res.status === 404
+        ? "not_found"
+        : res.status >= 500 || res.status === 503
+          ? "unavailable"
+          : "invalid_request";
     throw new ServiceError(kind, json?.error ?? fallbackMessage);
   }
   return json as T;
@@ -50,6 +52,14 @@ export const clickhouseAlertRuleService: AlertRuleService = {
       "/api/alerts",
       { cache: "no-store", signal },
       "Alert rules could not be loaded"
+    );
+    return json.rules;
+  },
+  async listMine(chart, signal) {
+    const json = await request<{ rules: AlertRule[] }>(
+      `/api/alerts/mine?chart=${encodeURIComponent(chart)}`,
+      { cache: "no-store", signal },
+      "Your alerts on this chart could not be loaded"
     );
     return json.rules;
   },

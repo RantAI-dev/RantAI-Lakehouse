@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { SelectField } from "@/components/patterns/select-field";
 
 /** One editable filter as `POST /api/embed/data` describes it (`BI-26` plan D4). */
 export type EmbedFilter = {
@@ -72,16 +73,22 @@ export function EmbedFilterBar({
         return (
           <label key={f.column} className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <span>{f.column}</span>
-            <select
+            {/* WEB-9 D2: "All" is a real choice that clears the filter, so it
+                stays an option with the empty value. D6: the open list is
+                portalled to `<body>`, outside this dashboard's `.theme-light`
+                subtree, so it takes the console's tokens — exactly what the
+                `Select`s already on this surface do. */}
+            <SelectField
               aria-label={f.column}
               value={current}
-              onChange={(e) => pick(f.column, e.target.value)}
-              className="h-7 rounded-md border border-border bg-background px-2 text-xs text-foreground"
-            >
-              <option value="">All</option>
-              {current && !list.includes(current) ? <option value={current}>{current}</option> : null}
-              {list.map((v) => <option key={v} value={v}>{v}</option>)}
-            </select>
+              size="sm"
+              options={[
+                { value: "", label: "All" },
+                ...(current && !list.includes(current) ? [{ value: current, label: current }] : []),
+                ...list.map((v) => ({ value: v, label: v })),
+              ]}
+              onValueChange={(next) => pick(f.column, next)}
+            />
           </label>
         );
       })}

@@ -615,9 +615,15 @@ def step_verify_the_silver_rows_match_the_bronze_source() -> None:
     print(f"[g7] silver.{SILVER_TABLE_NAME} holds {silver_rows} rows = the {bronze_rows} distinct ids of bronze.{BRONZE_TABLE_NAME}")
 
 
-def step_verify_column_lineage_of_the_pipeline_target(pipeline_id: str) -> None:
-    """`DATA-13-AC1` on CI: the Silver column the pipeline wrote names the
-    Bronze column it comes from.
+def step_verify_column_lineage_of_the_pipeline_target(
+    table: str, pipeline_id: str, expectations: list[tuple[str, str, str, str]]
+) -> None:
+    """`DATA-13-AC1` on CI: a Silver column names the Bronze column behind it.
+
+    `expectations` is a list of `(to_column, from_table, from_column,
+    transform)`. One poller serves every caller (`DATA-57` T7, rule 4): the
+    legacy pipeline passes `select(id, customer)`'s two copy mappings, and a
+    form-step pipeline passes its join's copy and its aggregate's expression.
 
     The pipeline's column lineage is written when Dagster's run-status sensor
     reports the run `SUCCESS` to `POST /api/pipelines/events/run-finished`
@@ -626,19 +632,18 @@ def step_verify_column_lineage_of_the_pipeline_target(pipeline_id: str) -> None:
     with the last answer if no mapping appears: a lineage that never arrives
     must fail the gate, not be waited out silently.
 
-    The pipeline is `select(id, customer)` over `bronze.<BRONZE_TABLE_NAME>`,
-    so `id` and `customer` of the Silver table must each map back to the
-    column of the same name in the Bronze table, recorded by this pipeline
-    (`producer.kind == "pipeline"`, `producer.ref == <its id>`), and the
-    answer must state the one-year retention."""
-    table = f"silver.{SILVER_TABLE_NAME}"
-    source = f"bronze.{BRONZE_TABLE_NAME}"
+    The answer must state the one-year retention, and the mapping must be a
+    proven one (`partial` false) recorded by this pipeline
+    (`producer.kind == "pipeline"`, `producer.ref == <its id>`). The
+    `transform` is read from the route's `mapping_json` field of the same
+    name; it is asserted because a copy reported as an expression (or the
+    other way round) is a wrong answer even when the endpoints agree."""
     last: dict = {}
 
-    def mapped(column: str) -> bool:
+    def mapped(to_column: str, source: str, from_column: str, transform: str) -> bool:
         resp = API.get(
             f"{API_URL}/api/governance/lineage/columns",
-            params={"table": table, "column": column, "direction": "up"},
+            params={"table": table, "column": to_column, "direction": "up"},
             timeout=10,
         )
         if not resp.ok:
@@ -649,19 +654,25 @@ def step_verify_column_lineage_of_the_pipeline_target(pipeline_id: str) -> None:
         if body.get("supported") is not True or body.get("retention", {}).get("days") != 365:
             raise G7Failure(f"column lineage must say supported true and a 365-day retention, got: {body}")
         return any(
-            m.get("from") == {"table": source, "column": column}
-            and m.get("to") == {"table": table, "column": column}
+            m.get("from") == {"table": source, "column": from_column}
+            and m.get("to") == {"table": table, "column": to_column}
+            and m.get("transform") == transform
             and not m.get("partial")
             and m.get("producer") == {"kind": "pipeline", "ref": pipeline_id}
             for m in body.get("mappings", [])
         )
 
-    for column in ("id", "customer"):
+    for to_column, source, from_column, transform in expectations:
         try:
-            _wait_for(f"column lineage {table}.{column} <- {source}.{column}", lambda c=column: mapped(c), 180)
+            _wait_for(
+                f"column lineage {table}.{to_column} <- {source}.{from_column} ({transform})",
+                lambda t=to_column, s=source, f=from_column, tr=transform: mapped(t, s, f, tr),
+                180,
+            )
         except G7Failure as exc:
             raise G7Failure(f"{exc}; last answer: {last}") from exc
-    print(f"[g7] {table} maps id and customer back to {source}, recorded by the pipeline")
+    pairs = ", ".join(f"{e[0]} <- {e[1]}.{e[2]}" for e in expectations)
+    print(f"[g7] {table} maps {pairs}, recorded by the pipeline")
 
 
 # ── BLD-4: a chain after `ingest_job` fires only for its own table ──────
@@ -1211,6 +1222,267 @@ TARGET_LAG_MINUTES = 1
 TARGET_LAG_SECONDS = float(TARGET_LAG_MINUTES * 60)
 
 
+def step_a_two_input_sql_pipeline_matches_a_direct_query() -> None:
+    """BLD-1 part 1 (D1, D4, D8): a pipeline written as inputs and a SQL step
+    runs the statement the API compiles, and its output equals the same query
+    run directly against the Bronze source.
+
+    The stack this gate runs on guarantees ONE loaded Bronze table, so the two
+    inputs are that table under two names — the case is D1's shape (two
+    inputs, a join through them, an aggregate by a column), the compile, the
+    author rewrite and the run, not the second table's contents.
+
+    The totals are compared through the same client the row assertions use,
+    against `CATALOG_DB` (this gate's own `DataLakeCatalog` database), so a
+    compiled statement that reads somewhere else shows up as a difference
+    rather than a pass.
+    """
+    # BLD-16: the create-activate-run sequence is
+    # `_create_and_run_authored_pipeline`, shared with the form-step case
+    # below (AGENTS.md rule 4).
+    _create_and_run_authored_pipeline(
+        {
+            "name": "g7_two_input_join",
+            "kind": "batch",
+            "inputs": [
+                {"name": "left_orders", "zone": "bronze", "table": BRONZE_TABLE_NAME},
+                {"name": "right_orders", "zone": "bronze", "table": BRONZE_TABLE_NAME},
+            ],
+            "steps": [
+                {
+                    "name": "joined",
+                    "kind": "sql",
+                    "sql": (
+                        "SELECT l.customer AS customer, sum(l.amount) AS total "
+                        "FROM left_orders AS l "
+                        "JOIN right_orders AS r ON l.id = r.id "
+                        "GROUP BY l.customer"
+                    ),
+                }
+            ],
+            "targetZone": "silver",
+            "targetTable": "g7_two_input_out",
+            "schedule": "manual",
+        },
+        "two-input SQL step",
+    )
+
+    # R1-S5: the direct query is the SAME join the pipeline runs, against the
+    # catalog database, and it carries the Iceberg read setting every other
+    # read of that database in this file carries.
+    direct = ch_query(
+        f"SELECT l.customer, sum(l.amount) FROM {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS l "
+        f"JOIN {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS r ON l.id = r.id "
+        "GROUP BY l.customer ORDER BY l.customer "
+        "SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
+    ).strip()
+    written = ch_query(
+        f"SELECT customer, total FROM silver.`g7_two_input_out` ORDER BY customer FORMAT TabSeparated"
+    ).strip()
+    if direct != written:
+        raise G7Failure(
+            f"the SQL step's output differs from the same query run directly:\n"
+            f"direct:\n{direct}\nwritten:\n{written}"
+        )
+    print(f"[g7] two-input SQL step output equals the direct query ({len(written.splitlines())} rows)")
+
+
+def _create_and_run_authored_pipeline(body: dict, label: str) -> str:
+    """Create an authored pipeline from `body`, mark it ready, run it once,
+    and fail the gate on any failed step. Returns its id so a caller can
+    assert the column lineage that run recorded.
+
+    The create-activate-wait-trigger-wait sequence the two pipeline cases
+    below share, in one place so the two stay byte-identical in every step
+    but the definition itself."""
+    create = API.post(f"{API_URL}/api/pipelines", json=body, timeout=30)
+    if not create.ok:
+        raise G7Failure(f"POST /api/pipelines ({label}) failed: {create.status_code} {create.text}")
+    pipeline_id = create.json()["id"]
+    activate = API.post(
+        f"{API_URL}/api/pipelines/{pipeline_id}/status",
+        json={"status": "ready"},
+        timeout=30,
+    )
+    if not activate.ok:
+        raise G7Failure(f"POST .../status failed: {activate.status_code} {activate.text}")
+    job = f"authored__{pipeline_id.replace('-', '_')}"
+    _wait_for(f"{job} to load", lambda: _dagster_job_is_loaded(job), 180)
+    trigger = _post_trigger(f"{API_URL}/api/pipelines/{pipeline_id}/trigger", job)
+    if not trigger.ok:
+        raise G7Failure(f"POST .../trigger failed: {trigger.status_code} {trigger.text}")
+    run_id = trigger.json().get("id") or trigger.json().get("runId")
+    if not run_id:
+        raise G7Failure(f"trigger response had no run id: {trigger.json()}")
+
+    def steps_are_terminal() -> bool:
+        resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs/{run_id}/steps", timeout=30)
+        resp.raise_for_status()
+        steps = resp.json().get("steps", [])
+        return bool(steps) and all(s.get("status") in TERMINAL_STEP_STATUSES for s in steps)
+
+    _wait_for(
+        f"run {run_id} terminal",
+        steps_are_terminal,
+        timeout_s=RUN_TERMINAL_TIMEOUT_S,
+        interval_s=3.0,
+    )
+    steps = API.get(
+        f"{API_URL}/api/pipelines/{pipeline_id}/runs/{run_id}/steps", timeout=30
+    ).json()["steps"]
+    failed = [s for s in steps if s.get("status") == "failed"]
+    if failed:
+        raise G7Failure(
+            f"the {label} run FAILED on step(s) {[s.get('stepKey') for s in failed]}:\n"
+            f"{_run_failure_message(pipeline_id, run_id)}"
+        )
+    return pipeline_id
+
+
+def step_a_form_step_pipeline_matches_its_sql_twin_and_a_direct_query() -> None:
+    """BLD-16 (`BLD-1` part 2): a pipeline written as form steps -- a join,
+    an aggregate and a filter -- runs the statement the API compiles, its
+    output equals a pipeline whose steps are the same bodies as SQL steps
+    (exactly what "Switch to SQL step" writes), and both equal the same
+    query run directly against the Bronze source.
+
+    The join names the right side's `id` `id` -- an output name equal to a
+    join key, the alias question of F2 for joins -- and the filter's
+    `match: "any"` is the OR the compiler renders.
+
+    The stack this gate runs on guarantees ONE loaded Bronze table, so the
+    two inputs are that table under two names, exactly as the two-input
+    SQL-step case above.
+    """
+    inputs = [
+        {"name": "left_orders", "zone": "bronze", "table": BRONZE_TABLE_NAME},
+        {"name": "right_orders", "zone": "bronze", "table": BRONZE_TABLE_NAME},
+    ]
+    form_steps = [
+        {
+            "name": "joined",
+            "kind": "join",
+            "left": "left_orders",
+            "right": "right_orders",
+            "joinType": "inner",
+            "on": [{"left": "id", "right": "id"}],
+            "columns": [
+                {"side": "left", "column": "customer"},
+                {"side": "left", "column": "amount"},
+                {"side": "right", "column": "id", "name": "id"},
+            ],
+        },
+        {
+            "name": "by_customer",
+            "kind": "aggregate",
+            "reads": "joined",
+            "groupBy": ["customer"],
+            "measures": [
+                {"function": "sum", "column": "amount", "name": "total"},
+                {"function": "count", "name": "rows_n"},
+            ],
+            "havingMatch": "all",
+            "having": [{"column": "rows_n", "operator": ">=", "value": "1"}],
+        },
+        {
+            "name": "big_or_local",
+            "kind": "filter",
+            "reads": "by_customer",
+            "match": "any",
+            "conditions": [
+                {"column": "total", "operator": ">", "value": "0"},
+                {"column": "customer", "operator": "!=", "value": ""},
+            ],
+        },
+    ]
+    form_pipeline_id = _create_and_run_authored_pipeline(
+        {
+            "name": "g7_form_steps",
+            "kind": "batch",
+            "inputs": inputs,
+            "steps": form_steps,
+            "targetZone": "silver",
+            "targetTable": "g7_form_steps_out",
+            "schedule": "manual",
+        },
+        "form-steps",
+    )
+    # DATA-57 T7: the form steps' compiled `WITH` is mapped too. `customer`
+    # is carried through the join as a copy; `total` is `sum(amount)` in the
+    # aggregate, so its transform is an expression. Both must be proven and
+    # recorded by this pipeline, not by its SQL twin.
+    step_verify_column_lineage_of_the_pipeline_target(
+        "silver.g7_form_steps_out",
+        form_pipeline_id,
+        [
+            ("customer", f"bronze.{BRONZE_TABLE_NAME}", "customer", "copy"),
+            ("total", f"bronze.{BRONZE_TABLE_NAME}", "amount", "expression"),
+        ],
+    )
+
+    # J6: the SQL of each form step, as the console's "Switch to SQL step"
+    # would take it over. Nothing is stored on the way.
+    sql_steps = []
+    for step in form_steps:
+        answer = API.post(
+            f"{API_URL}/api/pipelines/step-sql",
+            json={"inputs": inputs, "steps": form_steps, "step": step["name"]},
+            timeout=30,
+        )
+        if not answer.ok:
+            raise G7Failure(
+                f"POST /api/pipelines/step-sql for {step['name']} failed: "
+                f"{answer.status_code} {answer.text}"
+            )
+        sql_steps.append({"name": step["name"], "kind": "sql", "sql": answer.json()["sql"]})
+
+    _create_and_run_authored_pipeline(
+        {
+            "name": "g7_form_steps_sql_twin",
+            "kind": "batch",
+            "inputs": inputs,
+            "steps": sql_steps,
+            "targetZone": "silver",
+            "targetTable": "g7_form_steps_sql_out",
+            "schedule": "manual",
+        },
+        "SQL-twin",
+    )
+
+    # The same query the three steps compute, against the catalog database
+    # and with the Iceberg read setting every other read of that database in
+    # this file carries (the pattern of the two-input case above).
+    direct = ch_query(
+        "SELECT customer, sum(amount) AS total, count() AS rows_n "
+        f"FROM {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS l "
+        f"JOIN {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS r ON l.id = r.id "
+        "GROUP BY customer HAVING count() >= 1 AND (sum(amount) > 0 OR customer != '') "
+        "ORDER BY customer SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
+    ).strip()
+    written_form = ch_query(
+        "SELECT customer, total, rows_n FROM silver.`g7_form_steps_out` "
+        "ORDER BY customer FORMAT TabSeparated"
+    ).strip()
+    written_sql = ch_query(
+        "SELECT customer, total, rows_n FROM silver.`g7_form_steps_sql_out` "
+        "ORDER BY customer FORMAT TabSeparated"
+    ).strip()
+    if written_form != written_sql:
+        raise G7Failure(
+            "the form-step pipeline and its SQL twin wrote different outputs:\n"
+            f"form:\n{written_form}\nSQL twin:\n{written_sql}"
+        )
+    if direct != written_form:
+        raise G7Failure(
+            "the form-step pipeline's output differs from the same query run directly:\n"
+            f"direct:\n{direct}\nwritten:\n{written_form}"
+        )
+    print(
+        f"[g7] form steps, their SQL twin and the direct query agree "
+        f"({len(written_form.splitlines())} rows)"
+    )
+
+
 def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
     """BLD-2 D11 gate: measure Bronze-to-Silver lag with the measured
     floor as target on the compose stack.
@@ -1420,9 +1692,18 @@ def main() -> int:
         pipeline_id = step_create_and_activate_authored_pipeline()
         step_trigger_and_wait_for_real_row_materializations(pipeline_id)
         step_verify_the_silver_rows_match_the_bronze_source()
-        step_verify_column_lineage_of_the_pipeline_target(pipeline_id)
+        step_verify_column_lineage_of_the_pipeline_target(
+            f"silver.{SILVER_TABLE_NAME}",
+            pipeline_id,
+            [
+                ("id", f"bronze.{BRONZE_TABLE_NAME}", "id", "copy"),
+                ("customer", f"bronze.{BRONZE_TABLE_NAME}", "customer", "copy"),
+            ],
+        )
         step_verify_graph_and_source()
         step_verify_target_lag_bronze_to_silver(pipeline_id)
+        step_a_two_input_sql_pipeline_matches_a_direct_query()
+        step_a_form_step_pipeline_matches_its_sql_twin_and_a_direct_query()
     except G7Failure as exc:
         print(f"[g7] FAILED: {exc}", file=sys.stderr)
         return 1

@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -17,8 +18,7 @@ import { useServiceAction } from "@/hooks/use-service"
 import { notifyError, notifySuccess } from "@/lib/notify"
 import { governanceService } from "@/services"
 import type { DatasetSla } from "@/services/contracts/governance"
-
-const selectClassName = "h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm"
+import { TablePicker, useTableCatalog } from "./table-picker"
 
 const UNIT_MINUTES = { minutes: 1, hours: 60, days: 1440 } as const
 type Unit = keyof typeof UNIT_MINUTES
@@ -76,6 +76,8 @@ export function FreshnessTargetDialog({
   const remove = useServiceAction((signal, name: string) =>
     governanceService.deleteDatasetSla(name, signal)
   )
+  // WEB-8 D8: a new target's table is picked from the catalog.
+  const catalog = useTableCatalog()
   const minutes = slaMinutes(amount, unit)
   const tableName = table ?? tableText.trim()
   const hasSla = currentMinutes !== null && table !== undefined
@@ -109,43 +111,43 @@ export function FreshnessTargetDialog({
           </DialogDescription>
         </DialogHeader>
         {table === undefined ? (
-          <div className="grid gap-1.5">
-            <Label htmlFor="sla-table">Table</Label>
-            <Input
-              id="sla-table"
-              placeholder="silver.orders"
-              value={tableText}
-              onChange={(e) => setTableText(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              The table as <span className="font-mono">namespace.table</span>, the key its
-              freshness is checked under.
-            </p>
-          </div>
+          <TablePicker
+            id="sla-table"
+            label="Table"
+            value={tableText}
+            onChange={setTableText}
+            catalog={catalog}
+            description={
+              <>
+                The table as <span className="font-mono">namespace.table</span>, the key its freshness
+                is checked under.
+              </>
+            }
+          />
         ) : null}
+        {/* UX-4: every input in this dialog is required, so no star and no
+            legend; the amount keeps `aria-required`. */}
         <div className="grid gap-1.5">
           <Label htmlFor="sla-amount">New data at least every</Label>
           <div className="flex gap-2">
             <Input
               id="sla-amount"
+              aria-required
               inputMode="numeric"
               className="w-24"
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
               aria-invalid={minutes === null}
             />
-            <select
+            <SelectField
               aria-label="Unit"
-              className={selectClassName}
               value={unit}
-              onChange={(e) => setUnit(e.target.value as Unit)}
-            >
-              {(Object.keys(UNIT_MINUTES) as Unit[]).map((u) => (
-                <option key={u} value={u}>
-                  {u}
-                </option>
-              ))}
-            </select>
+              options={(Object.keys(UNIT_MINUTES) as Unit[]).map((u) => ({
+                value: u,
+                label: u,
+              }))}
+              onValueChange={(next) => setUnit(next as Unit)}
+            />
           </div>
           {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}
         </div>

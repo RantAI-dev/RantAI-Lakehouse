@@ -140,10 +140,21 @@ from dispar_orchestrate.adapters import mongodb as mongodb_adapter
 from dispar_orchestrate.adapters import sink as sink_adapter
 from dispar_orchestrate.adapters.kafka import compute_lag
 from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types_from_sample
-from dispar_orchestrate.ingest_factory import IngestFactoryConfig, _fetch_connector_for_run, _headers
+from dispar_orchestrate.ingest_factory import (
+    IngestFactoryConfig,
+    _fetch_connector_for_run,
+    _headers,
+    job_tags,
+)
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 logger = logging.getLogger(__name__)
+
+# How long one run of this job may run, in seconds. A change-capture
+# apply is a load, so it gets the same six hours `ingest_job` gets. Not
+# measured on staging, 2026-11-16 -- the job had no run there to measure.
+RUN_LIMIT_ENV = "DAGSTER_RUN_LIMIT_CDC_APPLY_JOB_SECONDS"
+DEFAULT_RUN_LIMIT_SECONDS = 21_600
 
 # The applier's two ways of writing; the connector's load mode names map onto them.
 MODES = ("current", "history")
@@ -916,7 +927,11 @@ def _trigger_of(context: Any) -> str:
     return tag if tag in run_reports.TRIGGERS else "other"
 
 
-@job
+# The `dagster/max_runtime` tag is what run monitoring enforces: a run
+# whose process died is cancelled and failed by the daemon, so it does not
+# hold a run-queue slot forever (`OPS-35`). `ingest_factory.py` says why it
+# is a tag and not `run_monitoring.max_runtime_seconds`.
+@job(tags=job_tags("cdc_apply_job", RUN_LIMIT_ENV, DEFAULT_RUN_LIMIT_SECONDS))
 def cdc_apply_job() -> None:
     """Config: `ops.cdc_apply_op.config.connector_id`, a change-capture connector."""
     cdc_apply_op()

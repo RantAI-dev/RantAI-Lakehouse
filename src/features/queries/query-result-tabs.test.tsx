@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { assetService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
 import { QueryResultTabs } from "./query-result-tabs"
+import { queryDraftKey } from "@/lib/query-draft"
 import { useQueryStudio } from "./use-query-studio"
 
 afterEach(() => {
@@ -46,7 +47,7 @@ const RESULT = {
 
 /** Runs a buffer and draws the bar over what came back. */
 async function barOver(sql: string) {
-  const hook = renderHook(() => useQueryStudio())
+  const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
   await act(async () => {
     hook.result.current.setSql(sql)
   })

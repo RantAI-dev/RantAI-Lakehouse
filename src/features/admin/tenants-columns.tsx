@@ -18,6 +18,7 @@ import {
   formatNumber,
   formatPercent,
 } from "@/lib/format"
+import { copyTextWithToast } from "@/lib/copy-text"
 import type { Tenant } from "@/services/contracts/identity"
 
 function computeQuota(r: Tenant): string {
@@ -157,7 +158,7 @@ export function getTenantColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
-                    navigator.clipboard?.writeText(item.slug)
+                    void copyTextWithToast(item.slug)
                   }}
                 >
                   Copy tenant slug

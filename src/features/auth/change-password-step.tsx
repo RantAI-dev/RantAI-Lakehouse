@@ -146,6 +146,8 @@ export function ChangePasswordStep({
         </CardHeader>
         <CardContent>
           <form onSubmit={onSubmit} className="flex flex-col gap-5" noValidate>
+            {/* UX-4: every input on this form is required, so no star and no
+                legend; each control keeps its native `required`. */}
             {!forced ? (
               <PasswordField
                 id="old-password"

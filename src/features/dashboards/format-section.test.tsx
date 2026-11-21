@@ -50,6 +50,29 @@ describe("ValueFormatEditor", () => {
     expect(onChange).toHaveBeenCalledWith({ style: "compact", currency: "USD" })
   })
 
+  // QA LH-BI-1-06 (BI-55, D12): Compact takes a currency code, and the list
+  // must say so.
+  it("offers a compact amount of money as one choice and stores it as the compact style with the currency", () => {
+    const onChange = mock<(f: ValueFormat) => void>(() => {})
+    const { rerender } = render(<ValueFormatEditor value={{ style: "currency", currency: "USD" }} onChange={onChange} label="Format" />)
+    choose(screen.getByLabelText("Format style"), "Currency, compact (1.2 M)")
+    expect(onChange).toHaveBeenLastCalledWith({ style: "compact", currency: "USD" })
+    rerender(<ValueFormatEditor value={{ style: "number" }} onChange={onChange} label="Format" />)
+    choose(screen.getByLabelText("Format style"), "Currency, compact (1.2 M)")
+    expect(onChange).toHaveBeenLastCalledWith({ style: "compact", currency: "IDR" })
+  })
+
+  it("shows a stored compact amount as that choice, and plain Compact drops the currency", () => {
+    const onChange = mock<(f: ValueFormat) => void>(() => {})
+    render(<ValueFormatEditor value={{ style: "compact", currency: "IDR", currencyDisplay: "code" }} onChange={onChange} label="Format" />)
+    expect(screen.getByLabelText("Format style").textContent).toContain("Currency, compact")
+    choose(screen.getByLabelText("Format style"), "Compact (1.2 K)")
+    const next = onChange.mock.calls.at(-1)![0]
+    expect(next.style).toBe("compact")
+    expect(next.currency).toBeUndefined()
+    expect(next.currencyDisplay).toBeUndefined()
+  })
+
   it("turns the thousands separator off and sets decimals", () => {
     const onChange = mock<(f: ValueFormat) => void>(() => {})
     render(<ValueFormatEditor value={{ style: "number" }} onChange={onChange} label="Format" />)

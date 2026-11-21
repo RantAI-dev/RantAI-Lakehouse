@@ -9,11 +9,12 @@
  * Mirrors `lakehouse_store::sessions::SessionRow` in
  * `rust/crates/lakehouse-store/src/sessions.rs` — the `#[serde(rename_all
  * = "camelCase")]` on the Rust struct produces `{ id, userId, userName,
- * createdAt, expiresAt, createdIp, userAgent }` on the wire. `createdIp`
- * and `userAgent` round-trip as honest `null` for every session minted
- * today (both `routes/auth.rs::login` and `routes/auth.rs::oidc_callback`
- * pass `None` for them), so the shape keeps the null rather than a
- * fabricated placeholder.
+ * createdAt, expiresAt, createdIp, userAgent }` on the wire. Both times are
+ * RFC 3339 in UTC with milliseconds (`ADM-14` D11), which every browser's
+ * `Date` parses. `userAgent` is the browser at sign-in (`ADM-14` D9) and
+ * `null` for a session older than that change; `createdIp` is always `null`
+ * — the API has no trusted source for the client's address, so the page says
+ * "Not recorded" rather than showing a wrong one (`ADM-14` D10).
  */
 export type Session = {
   id: string;
@@ -23,4 +24,22 @@ export type Session = {
   expiresAt: string;
   createdIp: string | null;
   userAgent: string | null;
+};
+/**
+ * `POST /api/auth/logout` (`routes/auth.rs`): where the browser should also
+ * be sent, so the identity provider's own session ends with this
+ * deployment's. `null` when the deployment has no post-logout address or
+ * the provider publishes no logout endpoint — then the sign-out ends this
+ * deployment's session only.
+ */
+export type LogoutResult = {
+  providerLogoutUrl: string | null;
+};
+/**
+ * `GET /api/auth/password-rules` (`ADM-11` D4): the lengths the server
+ * actually enforces, so the invite form states them instead of a guess.
+ */
+export type PasswordRulesResponse = {
+  minLength: number;
+  maxLength: number;
 };

@@ -14,6 +14,7 @@ import { PageHeader } from "@/components/patterns/page-header"
 import { EmptyState, ErrorState } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { useAuth } from "@/features/auth/auth-provider"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
@@ -64,6 +65,8 @@ function SavedQueryDrawerContent({ query }: { readonly query: SavedQuery }) {
 }
 
 export function SavedQueriesPage() {
+  // The move dialogs leave the signed-in person out of "Shared with".
+  const { user } = useAuth()
   // The search is the server's to apply (P9): the console may not see every
   // row the server would send, so it asks for the text and shows the answer
   // as it comes (C1).
@@ -220,6 +223,7 @@ export function SavedQueriesPage() {
             <SavedQueryFolderTree
               folders={folders.data ?? []}
               selected={folder}
+              viewerId={user?.id}
               onSelect={setFolder}
               onChanged={() => {
                 folders.reload()
@@ -344,6 +348,7 @@ export function SavedQueriesPage() {
           }}
           busy={moveAct.status === "pending"}
           error={moveAct.error?.message ?? null}
+          viewerId={user?.id}
         />
       ) : null}
       {historyFor ? (

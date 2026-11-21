@@ -21,9 +21,10 @@ use crate::state::AppState;
 pub(in crate::routes) const CATALOG_UNION: &str = "(SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta.dataset_catalog` \
      UNION ALL SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta_sec.dataset_catalog`)";
 
-/// WS7 item C3: delegates to the SAME `routes::query::run` Query Studio
-/// and saved queries already call — closing the divergent-guard gap this
-/// task's own name cites (`WS7 plan §0 item 7`): before this change,
+/// WS7 item C3: delegates to the SAME run (`routes::query::run_statement`,
+/// the end of `routes::query::run`) Query Studio and saved queries already
+/// call — closing the divergent-guard gap this task's own name cites
+/// (`WS7 plan §0 item 7`): before this change,
 /// `run_sql` called `ch.query` directly, so `sql_rewrite::enforce`'s
 /// masking/row-filter/table-function/sensitive-table/view refusal (WS7
 /// items B3-B6, wired into `routes::query::run` by WS7 item C2) never ran
@@ -44,7 +45,20 @@ pub(super) async fn run_sql(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
-    let sql = arg_str(args, "sql");
+    // `query-parameters.md` decision 7: the model's `{{name}}` placeholders are filled FIRST, with
+    // the function the run route uses (`ClickHouse`, this tool's only engine),
+    // so every check below, the policy rewrite and the run read the final
+    // statement. A refusal is the tool's error: the model reads the sentence
+    // and asks the person. This is the one scan of what the model wrote; the
+    // run at the end is of the final statement and never scans again.
+    let sql = match crate::routes::query::fill_tool_parameters(
+        &arg_str(args, "sql"),
+        args.get("parameters").cloned(),
+        None,
+    ) {
+        Ok(filled) => filled,
+        Err(refusal) => return json!({ "error": refusal.to_string() }),
+    };
     if !is_read_only_sql(&sql) {
         return json!({ "error": "Only a read-only SELECT is allowed." });
     }
@@ -93,9 +107,9 @@ pub(super) async fn run_sql(
     // the dry run then asks the engine about the statement the run will really
     // send (rewritten for the caller's current roles, with the run route's own
     // function), and a statement the rewrite refuses is refused here with the
-    // run's status and fixed message and never sent. `routes::query::run`
-    // rewrites once more from the original text, so the two never rewrite an
-    // already-rewritten statement.
+    // run's status and fixed message and never sent. `run_statement`
+    // rewrites once more from the final, unrewritten statement, so the two
+    // never rewrite an already-rewritten statement.
     let rewritten =
         match crate::routes::query::rewrite_sql_for_principal(state, &sql, "clickhouse", principal)
             .await
@@ -112,19 +126,30 @@ pub(super) async fn run_sql(
     if dry_run.get("error").is_some() {
         return dry_run;
     }
-    let body = axum::body::Bytes::from(json!({ "sql": sql }).to_string());
-    let extension = Some(axum::Extension(principal.clone()));
-    let result = api_result_to_value(
-        crate::routes::query::run(
-            axum::extract::State(state.clone()),
-            extension,
-            axum::http::HeaderMap::new(),
-            body,
-        )
-        .await,
+    // The final statement, so `run_statement` and not `run`: `run` would scan
+    // it again and refuse a text value that reads `'{{x}}'`.
+    //
+    // LH-QS-2-08 (owner 2026-11-12): a failure comes in two copies — the
+    // model's copy (the engine's trimmed diagnosis, so the model can
+    // correct its SQL) and the browser's copy (a fixed sentence and the same
+    // reference). The model's copy goes in `error`, as it always did; the
+    // browser's copy goes next to it, in the one key only the server reads.
+    let (result, browser) = match crate::routes::query::run_statement(
+        state,
+        Some(principal),
+        &axum::http::HeaderMap::new(),
+        &sql,
+        "clickhouse",
     )
-    .await;
-    compact_query_result(result)
+    .await
+    {
+        Ok(ok) => (api_result_to_value(Ok(ok)).await, None),
+        Err(failure) => {
+            let failed: ApiResult<ApiJson<Value>> = Err(failure.response.into());
+            (api_result_to_value(failed).await, Some(failure.browser))
+        }
+    };
+    compact_query_result(result, browser)
 }
 
 /// Rows a `run_sql` result hands the model.
@@ -144,19 +169,29 @@ const MAX_RESULT_ROWS: usize = 100;
 /// that names the limit which cut it — the route names it in `cutBy` — so
 /// the model is never told the wrong limit did it.
 ///
+/// `browser` is the browser's copy of a failure (owner 2026-11-12,
+/// LH-QS-2-08): a fixed sentence and the reference, which the chat loop
+/// shows to the person instead of the engine's text. It travels next to the
+/// error, in the one key only the server reads
+/// (`routes::ai::BROWSER_ERROR_KEY`); the model's copy stays in `error`.
+///
 /// `DATA-29`: the cells are handed over as the route built them, so a
 /// `NULL` cell reaches the model as `null` and an empty cell as `""` — the
 /// two are told apart, and this tool does not flatten them again on the way
 /// to the model.
-fn compact_query_result(result: Value) -> Value {
+fn compact_query_result(result: Value, browser: Option<String>) -> Value {
     let Value::Object(mut body) = result else {
         return result;
     };
     if let Some(Value::String(err)) = body.get("error") {
-        return json!({
+        let mut compact = json!({
             "error": clean_sql_error(err),
             "hint": "Check table and column names against the DATA MAP and fix the query.",
         });
+        if let Some(browser) = browser {
+            compact = crate::routes::ai::with_browser_error(compact, &browser);
+        }
+        return compact;
     }
     let rows = match body.remove("rows") {
         Some(Value::Array(rows)) => rows,
@@ -231,6 +266,18 @@ pub(super) fn clean_sql_error(err: &str) -> String {
 /// — the cheap first filter [`run_sql`] applies to the model's SQL. Distinct
 /// from `query/run`'s guard (`routes::query::is_read_only`): only
 /// `with`/`select` are allowed here (no `show`/`describe`/`explain`).
+///
+/// This filter reads the raw text: it does not lex SQL and knows no
+/// engine's quoting or comment rules, so it cannot be moved onto the
+/// shared lexer (`crate::sql_lex`) without changing what it refuses. That
+/// is why it is stricter than the shared guard and never weaker — it
+/// refuses a statement whose text holds a denied word anywhere, inside a
+/// quoted run included (`SELECT 'drop' AS a` is refused here and allowed
+/// by the shared guard), so it can refuse more than the shared guard,
+/// never less. It stays the cheap first filter (`WS7 item F4`), and the
+/// authoritative guard behind it — `routes::query::run`'s `is_read_only`,
+/// which reads the statement with the rules of the engine the run names —
+/// decides whether the statement runs.
 fn is_read_only_sql(sql: &str) -> bool {
     starts_with_with_or_select(sql) && !contains_denied_keyword_full(sql)
 }
@@ -351,6 +398,174 @@ fn tier_filter(raw: &str) -> &str {
     }
 }
 
+/// The refusal of a dataset reader called with no principal (a scheduled run).
+/// `pub(super)`: the governance and dashboard readers that list tables refuse
+/// a headless run with the same sentence (`SEC-76`).
+pub(super) const DATASETS_NEED_A_USER: &str = "reading datasets needs a signed-in user";
+
+/// `SEC-20`, plan 97: the tenant reach a reader of the dataset registry
+/// narrows its rows by.
+///
+/// The registry is shared, and an upload another tenant made is a registry
+/// row whose `bronze.<table_name>` that tenant claimed. A caller in the
+/// catalog-owner tenant passes [`shared_catalog_refusal`] and a role's table
+/// access ([`dataset_visible`]) and would still read the row's slug, title,
+/// description and columns. The answer to "may this caller read that table" is
+/// [`crate::routes::query::reachable_names`], the one rule the catalog routes
+/// and the maintenance readers use, so it is asked here and never copied
+/// (`AGENTS.md` rule 4; ADR 0018 moves these rules later and they must change
+/// in one place).
+#[derive(Clone, Copy)]
+pub(crate) struct RegistryReach<'a> {
+    state: &'a AppState,
+    reach: crate::routes::query::TenantReach,
+}
+
+impl<'a> RegistryReach<'a> {
+    /// The reach of `principal`, resolved as the catalog routes resolve it.
+    ///
+    /// # Errors
+    ///
+    /// The error of [`crate::routes::query::resolve_reach`]: `headers` name a
+    /// tenant the caller does not belong to, or the deployment's tenant count
+    /// cannot be read.
+    pub(crate) async fn of(
+        state: &'a AppState,
+        principal: &Principal,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<Self, ApiError> {
+        let reach = crate::routes::query::resolve_reach(state, principal, headers).await?;
+        Ok(Self { state, reach })
+    }
+
+    /// A reach that covers no table, for a reader that could not resolve one
+    /// (fail closed).
+    pub(crate) fn nothing(state: &'a AppState) -> Self {
+        Self {
+            state,
+            reach: crate::routes::query::TenantReach::NoTenant,
+        }
+    }
+
+    /// Which of the registry's Bronze `tables` this reach covers, in one
+    /// claims read. `None` when the reach is everything, so nothing is
+    /// narrowed and nothing is read.
+    ///
+    /// # Errors
+    ///
+    /// The 503 of [`crate::routes::query::claims_on`] when the claims cannot
+    /// be read.
+    pub(crate) async fn bronze_in_reach<'t>(
+        &self,
+        tables: impl IntoIterator<Item = &'t str>,
+    ) -> Result<Option<std::collections::HashSet<String>>, ApiError> {
+        if self.reach == crate::routes::query::TenantReach::All {
+            return Ok(None);
+        }
+        let tables: std::collections::BTreeSet<&str> = tables.into_iter().collect();
+        let keys: Vec<String> = tables
+            .iter()
+            .map(|table| format!("bronze.{table}"))
+            .collect();
+        let reachable =
+            crate::routes::query::reachable_names(self.state, self.reach, &keys).await?;
+        Ok(Some(
+            tables
+                .into_iter()
+                .filter(|table| reachable.contains(&format!("bronze.{table}")))
+                .map(str::to_owned)
+                .collect(),
+        ))
+    }
+}
+
+/// [`RegistryReach::bronze_in_reach`] for a tool: the tables of `rows` the
+/// reach covers, or the tool's own fixed refusal when the claims cannot be
+/// read (the cause never reaches the model).
+///
+/// # Errors
+///
+/// The tool's answer `{"error": "the dataset claims could not be read right
+/// now"}` when the claims cannot be read. `Ok(None)` means nothing narrows.
+async fn registry_rows_in_reach(
+    reach: Option<RegistryReach<'_>>,
+    rows: &[Map<String, Value>],
+) -> Result<Option<std::collections::HashSet<String>>, Value> {
+    let Some(reach) = reach else {
+        return Ok(None);
+    };
+    reach
+        .bronze_in_reach(
+            rows.iter()
+                .map(|r| r.get("table_name").and_then(Value::as_str).unwrap_or("")),
+        )
+        .await
+        .map_err(|_| json!({ "error": "the dataset claims could not be read right now" }))
+}
+
+/// [`RegistryReach::of`] for a tool, with the tool's fixed refusal when the
+/// reach cannot be resolved. The tools have no request headers, so the reach
+/// is the person's own tenant's, the convention the maintenance tool follows.
+///
+/// # Errors
+///
+/// The tool's answer `{"error": "the shared-catalog rule could not be
+/// evaluated"}` when the reach cannot be resolved.
+async fn callers_registry_reach<'a>(
+    state: &'a AppState,
+    principal: &Principal,
+) -> Result<RegistryReach<'a>, Value> {
+    RegistryReach::of(state, principal, &axum::http::HeaderMap::new())
+        .await
+        .map_err(|_| json!({ "error": "the shared-catalog rule could not be evaluated" }))
+}
+
+/// `GOV-7` D6: what the caller's roles may read, or an error sentence for the
+/// tool. Every caller refuses a run with no principal before asking
+/// (`SEC-20`, plan 97), so a principal is required here.
+async fn table_access(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<crate::table_access::TableAccess, &'static str> {
+    crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names)
+        .await
+        .map_err(|_| "the table access rule could not be read right now")
+}
+
+/// `SEC-20` (plan 95): the shared catalog's own rule, asked for a tool that
+/// answers from the shared catalog.
+///
+/// `None` when the caller may read it. Otherwise the answer the tool returns
+/// as it is: `supported: false` with the rule's own reason for a refused
+/// caller, or a fixed error when the rule cannot be evaluated (the cause is
+/// not forwarded, `AGENTS.md` principle 4). The tool has no request headers,
+/// so the rule reads the person's own tenant, as `run_sql` does. It is
+/// [`crate::routes::catalog::catalog_tenant_refusal`], never a second copy.
+pub(super) async fn shared_catalog_refusal(
+    state: &AppState,
+    principal: &Principal,
+) -> Option<Value> {
+    match crate::routes::catalog::catalog_tenant_refusal(
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+    )
+    .await
+    {
+        Ok(None) => None,
+        Ok(Some(reason)) => Some(json!({ "supported": false, "reason": reason })),
+        Err(_) => Some(json!({ "error": "the shared-catalog rule could not be evaluated" })),
+    }
+}
+
+/// Whether the dataset behind Bronze table `table` is visible: any of its
+/// layers the caller may read makes the dataset itself visible (`GOV-7` D6).
+fn dataset_visible(access: &crate::table_access::TableAccess, table: &str) -> bool {
+    access.is_all()
+        || access.allows_key(&format!("bronze.{table}"))
+        || access.allows_key(&format!("serving.{table}"))
+}
+
 /// Row counts of every table in `serving` and `silver`, keyed
 /// `"db.table"`. `None` for a view (no stored row count).
 async fn table_rows(
@@ -404,7 +619,41 @@ fn layers_for(
     })
 }
 
-pub(super) async fn list_datasets(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn list_datasets(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    // SEC-20, plan 97: no principal is a scheduled run, which has no tenant
+    // to read the shared registry as.
+    let Some(principal) = principal else {
+        return json!({ "error": DATASETS_NEED_A_USER });
+    };
+    // SEC-20, plan 95: the registry is the shared catalog's, so a tenant that
+    // does not own it is refused before the registry is read.
+    if let Some(refusal) = shared_catalog_refusal(state, principal).await {
+        return refusal;
+    }
+    let access = match table_access(state, principal).await {
+        Ok(access) => access,
+        Err(sentence) => return json!({ "error": sentence }),
+    };
+    let reach = match callers_registry_reach(state, principal).await {
+        Ok(reach) => reach,
+        Err(refusal) => return refusal,
+    };
+    list_datasets_with(&state.clickhouse, &access, Some(reach), args).await
+}
+
+/// [`list_datasets`] over an already resolved access rule and tenant reach —
+/// the body the tests drive without a `Principal`. `reach` is `None` for a
+/// caller that narrows nothing.
+pub(super) async fn list_datasets_with(
+    ch: &ChClient,
+    access: &crate::table_access::TableAccess,
+    reach: Option<RegistryReach<'_>>,
+    args: &Map<String, Value>,
+) -> Value {
     let Ok(rows) = ch
         .rows(
             &format!("SELECT slug, title, tier, table_name FROM {CATALOG_UNION} LIMIT 500"),
@@ -413,6 +662,12 @@ pub(super) async fn list_datasets(ch: &ChClient, args: &Map<String, Value>) -> V
         .await
     else {
         return json!({ "error": "the dataset catalog could not be read (the catalog registry is not available)" });
+    };
+    // SEC-20, plan 97: a dataset whose Bronze table another tenant holds is
+    // not listed. One claims read for the whole registry page.
+    let in_reach = match registry_rows_in_reach(reach, &rows).await {
+        Ok(in_reach) => in_reach,
+        Err(refusal) => return refusal,
     };
     let term = arg_str(args, "search").to_lowercase();
     let wanted = tier_filter(&{
@@ -427,6 +682,13 @@ pub(super) async fn list_datasets(ch: &ChClient, args: &Map<String, Value>) -> V
     let hits: Vec<Value> = rows
         .iter()
         .filter(|r| {
+            let table = r.get("table_name").and_then(Value::as_str).unwrap_or("");
+            if !dataset_visible(access, table) {
+                return false;
+            }
+            if in_reach.as_ref().is_some_and(|set| !set.contains(table)) {
+                return false;
+            }
             let row_tier = r.get("tier").and_then(Value::as_str).unwrap_or("");
             if !wanted.is_empty() && row_tier != wanted {
                 return false;
@@ -452,7 +714,38 @@ pub(super) async fn list_datasets(ch: &ChClient, args: &Map<String, Value>) -> V
     json!({ "total": hits.len(), "datasets": hits })
 }
 
-pub(super) async fn describe_dataset(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn describe_dataset(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    // SEC-20, plans 95 and 97: as in `list_datasets`.
+    let Some(principal) = principal else {
+        return json!({ "error": DATASETS_NEED_A_USER });
+    };
+    if let Some(refusal) = shared_catalog_refusal(state, principal).await {
+        return refusal;
+    }
+    let access = match table_access(state, principal).await {
+        Ok(access) => access,
+        Err(sentence) => return json!({ "error": sentence }),
+    };
+    let reach = match callers_registry_reach(state, principal).await {
+        Ok(reach) => reach,
+        Err(refusal) => return refusal,
+    };
+    describe_dataset_with(&state.clickhouse, &access, Some(reach), args).await
+}
+
+/// [`describe_dataset`] over an already resolved access rule and tenant
+/// reach — the body the tests drive without a `Principal`. `reach` is `None`
+/// for a caller that narrows nothing.
+pub(super) async fn describe_dataset_with(
+    ch: &ChClient,
+    access: &crate::table_access::TableAccess,
+    reach: Option<RegistryReach<'_>>,
+    args: &Map<String, Value>,
+) -> Value {
     let slug_raw = arg_str(args, "slug");
     let slug = SqlLiteral::from(slug_raw.as_str());
     let Ok(meta_rows) = ch
@@ -474,6 +767,18 @@ pub(super) async fn describe_dataset(ch: &ChClient, args: &Map<String, Value>) -
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    // SEC-20, plan 97: a dataset whose Bronze table another tenant holds is
+    // refused with the sentence a table out of reach gets everywhere else
+    // (`describe_iceberg_table`), before its columns are read. The sentence
+    // names the slug the caller asked for, never the registry's own table
+    // name, which would give away the other tenant's upload id.
+    match registry_rows_in_reach(reach, std::slice::from_ref(meta)).await {
+        Ok(Some(in_reach)) if !in_reach.contains(&table) => {
+            return json!({ "error": crate::policy_engine::table_not_available_message(&slug_raw) });
+        }
+        Ok(_) => {}
+        Err(refusal) => return refusal,
+    }
     // DATA-39 (the assistant part of `#315`): the same rule as the DATA
     // MAP's description read above. `FINAL` makes a column a re-run
     // registered one row instead of one per run, and the shared clause
@@ -492,13 +797,41 @@ pub(super) async fn describe_dataset(ch: &ChClient, args: &Map<String, Value>) -
         .await
         .unwrap_or_default();
     let counts = table_rows(ch).await.unwrap_or_default();
+    // `GOV-7` D6: a dataset every one of whose layers this caller may not
+    // read is not described at all — the same answer an unknown slug gets.
+    let visible = ["bronze", "silver", "serving"]
+        .iter()
+        .any(|db| access.is_all() || access.allows_key(&format!("{db}.{table}")));
+    if !visible {
+        return json!({ "error": format!("no dataset with slug '{slug_raw}'; call list_datasets for the slugs") });
+    }
+    let mut layers = layers_for(&slug_raw, &table, &counts);
+    // The layer entries name their tables; drop the ones the caller may not
+    // read (Bronze keeps its `registered` flag, which names no table).
+    if !access.is_all()
+        && let Some(o) = layers.as_object_mut()
+    {
+        for (db, key) in [("silver", "silver"), ("serving", "gold")] {
+            if !access.allows_key(&format!("{db}.{table}"))
+                && let Some(layer) = o.get_mut(key)
+            {
+                *layer = json!({ "present": false });
+            }
+        }
+    }
+    // The columns are the Bronze table's own; hidden Bronze hides them.
+    let columns = if access.is_all() || access.allows_key(&format!("bronze.{table}")) {
+        cols
+    } else {
+        Vec::new()
+    };
     json!({
         "slug": slug_raw,
         "title": meta.get("title"),
         "description": meta.get("description"),
         "sourceKind": source_kind(meta.get("tier").and_then(Value::as_str).unwrap_or("")),
-        "layers": layers_for(&slug_raw, &table, &counts),
-        "columns": cols,
+        "layers": layers,
+        "columns": columns,
     })
 }
 
@@ -512,18 +845,18 @@ pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Prin
     let Some(principal) = principal else {
         return json!({ "error": "the lakehouse overview needs a signed-in user" });
     };
-    match crate::routes::catalog::catalog_tenant_refusal(
-        state,
-        principal,
-        &axum::http::HeaderMap::new(),
-    )
-    .await
-    {
-        Ok(None) => {}
-        Ok(Some(reason)) => return json!({ "supported": false, "reason": reason }),
-        Err(_) => return json!({ "error": "the shared-catalog rule could not be evaluated" }),
+    if let Some(refusal) = shared_catalog_refusal(state, principal).await {
+        return refusal;
     }
     let ch = &state.clickhouse;
+    let access = match table_access(state, principal).await {
+        Ok(access) => access,
+        Err(sentence) => return json!({ "error": sentence }),
+    };
+    let reach = match callers_registry_reach(state, principal).await {
+        Ok(reach) => reach,
+        Err(refusal) => return refusal,
+    };
     let counts = match table_rows(ch).await {
         Ok(c) => c,
         Err(err) => return json!({ "error": err }),
@@ -536,9 +869,23 @@ pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Prin
             None,
         )
         .await;
+    // SEC-20, plan 97: a dataset whose Bronze table another tenant holds is
+    // not listed. One claims read for the whole registry page.
+    let in_reach = match &datasets {
+        Ok(rows) => match registry_rows_in_reach(Some(reach), rows).await {
+            Ok(in_reach) => in_reach,
+            Err(refusal) => return refusal,
+        },
+        Err(_) => None,
+    };
     let (bronze, catalog_note) = match &datasets {
         Ok(rows) => (
             rows.iter()
+                .filter(|r| {
+                    let table = r.get("table_name").and_then(Value::as_str).unwrap_or("");
+                    dataset_visible(&access, table)
+                        && in_reach.as_ref().is_none_or(|set| set.contains(table))
+                })
                 .map(|r| {
                     let table = r.get("table_name").and_then(Value::as_str).unwrap_or("");
                     json!({
@@ -558,7 +905,7 @@ pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Prin
     let layer = |db: &str| -> Vec<Value> {
         tables
             .iter()
-            .filter(|(k, _)| k.starts_with(&format!("{db}.")))
+            .filter(|(k, _)| k.starts_with(&format!("{db}.")) && access.allows_key(k))
             .map(|(k, rows)| json!({ "table": k, "rows": rows }))
             .collect()
     };
@@ -592,6 +939,14 @@ pub(super) async fn get_lineage(
     let Some(principal) = principal else {
         return json!({ "error": "lineage needs a signed-in user" });
     };
+    // SEC-20, plan 95: a caller the shared-catalog rule refuses gets no graph
+    // at all from the tool. (`GET /api/governance/lineage` keeps drawing the
+    // tenant's own records for such a caller, and since plan 96 its builder
+    // leaves the dashboard charts out for them, so this refusal is the tool's
+    // stricter answer, not the only gate.)
+    if let Some(refusal) = shared_catalog_refusal(state, principal).await {
+        return refusal;
+    }
     let Ok(graph) =
         crate::routes::lineage::build(state, principal, &axum::http::HeaderMap::new(), &focus)
             .await
@@ -667,13 +1022,15 @@ pub(super) async fn describe_mart(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
+    // SEC-76: a headless run has no person whose reach narrows the
+    // marts, so it reads none of them, not the whole list.
     let allowed = match principal {
         Some(p) => matches!(
             crate::routes::catalog::catalog_tenant_refusal(state, p, &axum::http::HeaderMap::new())
                 .await,
             Ok(None)
         ),
-        None => true,
+        None => return json!({ "error": DATASETS_NEED_A_USER }),
     };
     let ch = &state.clickhouse;
     let mart = strip_non_ident(&arg_str(args, "mart"));
@@ -1166,6 +1523,266 @@ mod run_sql_delegation {
         Ok(())
     }
 
+    /// Every body the mock engine received, in order.
+    async fn engine_bodies(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    fn args_with(sql: &str, parameters: Value) -> Map<String, Value> {
+        let mut args = Map::new();
+        args.insert("sql".to_owned(), json!(sql));
+        args.insert("parameters".to_owned(), parameters);
+        args
+    }
+
+    /// `query-parameters.md` decision 7: the model's `{{region}}` is filled before the dry run and
+    /// before the run, so the engine never sees a brace and both calls carry
+    /// the one literal.
+    #[tokio::test]
+    async fn run_sql_fills_a_placeholder_before_the_engine_sees_the_statement() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+        let args = args_with("SELECT {{region}} AS region", json!({ "region": "EU" }));
+
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert!(result.get("error").is_none(), "{result}");
+        let bodies = engine_bodies(&server).await;
+        assert_eq!(bodies.len(), 2, "dry run then execution: {bodies:?}");
+        for body in &bodies {
+            assert!(body.contains("SELECT 'EU' AS region"), "{body}");
+            assert!(!body.contains("{{"), "{body}");
+        }
+    }
+
+    /// A text value is one string literal: a quote inside it is escaped and
+    /// cannot close it, on the dry run and on the run.
+    #[tokio::test]
+    async fn run_sql_prints_a_hostile_text_value_as_one_literal() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+        let args = args_with("SELECT {{v}} AS v", json!({ "v": "x' OR '1'='1" }));
+
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert!(result.get("error").is_none(), "{result}");
+        let bodies = engine_bodies(&server).await;
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        for body in &bodies {
+            assert!(
+                body.contains(r"SELECT 'x\' OR \'1\'=\'1' AS v"),
+                "the value must stay in one escaped literal: {body}"
+            );
+        }
+    }
+
+    /// A value that spells a write cannot make the tool write: the tool's own
+    /// read-only filter reads the final statement, and it refuses the word
+    /// `drop` even inside a literal (as it does for any statement). The
+    /// engine receives nothing.
+    #[tokio::test]
+    async fn run_sql_does_not_let_a_value_make_it_write() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+        let args = args_with("SELECT {{v}} AS v", json!({ "v": "'; DROP TABLE x; --" }));
+
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert_eq!(
+            result,
+            json!({ "error": "Only a read-only SELECT is allowed." })
+        );
+        assert!(engine_bodies(&server).await.is_empty(), "nothing is sent");
+    }
+
+    /// `query-parameters.md` decision 7: a number the model passes for a placeholder with no
+    /// definition is a number, not text. Negative ones are wrapped.
+    #[tokio::test]
+    async fn run_sql_reads_a_number_for_an_undefined_placeholder_as_a_number() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+
+        for (value, printed) in [
+            (json!(7), "SELECT 7 AS id"),
+            (json!(-7), "SELECT (-7) AS id"),
+        ] {
+            let args = args_with("SELECT {{id}} AS id", json!({ "id": value }));
+            let result = run_sql(&state, Some(&principal), &args).await;
+            assert!(result.get("error").is_none(), "{result}");
+            let bodies = engine_bodies(&server).await;
+            let last = bodies.last().expect("the run reached the engine");
+            assert!(last.contains(printed), "{last}");
+        }
+        // A list has no definition to say what it is.
+        let args = args_with("SELECT {{id}} AS id", json!({ "id": [1, 2] }));
+        let before = engine_bodies(&server).await.len();
+        let result = run_sql(&state, Some(&principal), &args).await;
+        assert_eq!(
+            result,
+            json!({ "error": "parameter 'id' is a list: a multi-select needs a saved query's definition." })
+        );
+        assert_eq!(
+            engine_bodies(&server).await.len(),
+            before,
+            "nothing is sent"
+        );
+    }
+
+    /// The scanner reads what the model wrote once: a value that itself reads
+    /// `{{x}}` is printed in its literal and is not read as a placeholder
+    /// when the final statement is run.
+    #[tokio::test]
+    async fn run_sql_does_not_scan_a_value_that_reads_like_a_placeholder() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+        let args = args_with("SELECT {{v}} AS v", json!({ "v": "{{x}}" }));
+
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert!(result.get("error").is_none(), "{result}");
+        let bodies = engine_bodies(&server).await;
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        for body in &bodies {
+            assert!(body.contains("SELECT '{{x}}' AS v"), "{body}");
+        }
+    }
+
+    /// A refusal is the tool's error, in the sentence the person would read,
+    /// and the engine receives nothing, not even the dry run.
+    #[tokio::test]
+    async fn run_sql_returns_a_refusal_as_its_error_and_sends_nothing() {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, "not a postgres url".to_owned());
+        let principal = analyst_principal();
+
+        for (args, sentence) in [
+            (
+                // No value and no default.
+                args_with("SELECT {{region}} AS region", json!({})),
+                "Fill in {{region}} to run this query.",
+            ),
+            (
+                // Inside quotes.
+                args_with("SELECT '{{region}}' AS region", json!({ "region": "EU" })),
+                "{{region}} is inside quotes: write it without them, for example = {{region}}.",
+            ),
+            (
+                // A shape that is not an object.
+                args_with("SELECT {{region}} AS region", json!("EU")),
+                "parameters must be an object that maps a parameter name to its value.",
+            ),
+        ] {
+            let result = run_sql(&state, Some(&principal), &args).await;
+            assert_eq!(result, json!({ "error": sentence }), "{args:?}");
+        }
+        assert!(
+            engine_bodies(&server).await.is_empty(),
+            "the engine received a request for a refused statement"
+        );
+    }
+
+    /// Without a placeholder and without `parameters` the tool behaves as it
+    /// did: the statement reaches the engine byte for byte, and History holds
+    /// it as written. With a placeholder, History holds the statement that ran.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_sql_records_the_statement_that_ran_in_history(pool: PgPool) -> sqlx::Result<()> {
+        let server = recording_clickhouse().await;
+        let state = state_for(&server, database_url_for(&pool));
+        let principal = analyst_principal();
+
+        let mut plain = Map::new();
+        plain.insert("sql".to_owned(), json!("SELECT 1 AS one"));
+        let result = run_sql(&state, Some(&principal), &plain).await;
+        assert!(result.get("error").is_none(), "{result}");
+        let result = run_sql(
+            &state,
+            Some(&principal),
+            &args_with("SELECT {{region}} AS region", json!({ "region": "EU" })),
+        )
+        .await;
+        assert!(result.get("error").is_none(), "{result}");
+
+        let history = lakehouse_store::queries::list_history(
+            &pool,
+            Uuid::nil(),
+            &lakehouse_store::queries::HistoryFilter::default(),
+        )
+        .await
+        .expect("query_history is readable");
+        let ran: std::collections::BTreeSet<&str> =
+            history.iter().map(|h| h.sql.as_str()).collect();
+        assert_eq!(
+            ran,
+            ["SELECT 'EU' AS region", "SELECT 1 AS one"]
+                .into_iter()
+                .collect()
+        );
+        Ok(())
+    }
+
+    /// The role's row filter and mask govern a parameterised statement: the
+    /// rewrite reads the filled statement (a literal in `WHERE email = '…'`), finds
+    /// the governed table and masks it. A rewrite over the unfilled text would
+    /// not parse, and a rewrite after the fill order would have missed it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_sql_masks_a_parameterised_statement_over_a_governed_table(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        lakehouse_store::governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "run-sql-parameter-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: "serving.mart_x".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+        let server = MockServer::start().await;
+        mount_governed_table_responses(&server).await;
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), server.uri());
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
+        let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+        let principal = analyst_principal();
+        let args = args_with(
+            "SELECT * FROM serving.mart_x WHERE email = {{who}}",
+            json!({ "who": "ana@example.test" }),
+        );
+
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert!(result.get("error").is_none(), "{result}");
+        let bodies = engine_bodies(&server).await;
+        assert!(
+            bodies
+                .iter()
+                .any(|b| b.contains("replaceRegexpOne") && b.contains("'ana@example.test'")),
+            "the query the engine ran must be the masked form of the filled statement: {bodies:?}"
+        );
+        assert!(bodies.iter().all(|b| !b.contains("{{")), "{bodies:?}");
+        Ok(())
+    }
+
     /// `DATA-29`: a `NULL` cell reaches the model as `null`, and an empty
     /// cell stays `""` — the tool must not flatten the two again on the way
     /// to the model.
@@ -1330,6 +1947,21 @@ mod describe_mart_marks {
         AppState::new(Config::from_map(&env).expect("valid config from a map"))
     }
 
+    /// A person with every permission. The shared-catalog gate lets an
+    /// unrestricted principal through, so these tests read the mark and not
+    /// the gate. A headless run is refused before any mark is read (`SEC-76`).
+    fn an_unrestricted_person() -> lakehouse_auth::Principal {
+        lakehouse_auth::Principal {
+            id: lakehouse_auth::PrincipalId::User(uuid::Uuid::from_u128(9)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
     async fn mark_old_deprecated(pool: &PgPool) {
         lakehouse_store::annotation::set_certification(
             pool,
@@ -1360,7 +1992,8 @@ mod describe_mart_marks {
         )
         .await;
         let state = state_for(&pool, &server);
-        let result = describe_mart(&state, None, &Map::new()).await;
+        let person = an_unrestricted_person();
+        let result = describe_mart(&state, Some(&person), &Map::new()).await;
         let marts = result["marts"].as_array().expect("marts array");
         let old = marts
             .iter()
@@ -1400,7 +2033,8 @@ mod describe_mart_marks {
         let state = state_for(&pool, &server);
         let mut args = Map::new();
         args.insert("mart".to_owned(), json!("mart_old"));
-        let result = describe_mart(&state, None, &args).await;
+        let person = an_unrestricted_person();
+        let result = describe_mart(&state, Some(&person), &args).await;
         assert_eq!(result["mart"], json!("mart_old"));
         assert_eq!(result["dimensions"], json!(["customer_id"]));
         assert_eq!(result["measures"], json!(["amount"]));
@@ -1469,7 +2103,7 @@ mod truncated_note {
 
     /// The note of a cut result.
     fn note_for(body: Value) -> String {
-        let out = compact_query_result(body);
+        let out = compact_query_result(body, None);
         out["truncated"]
             .as_str()
             .expect("a cut result carries the note")
@@ -1507,13 +2141,13 @@ mod truncated_note {
 
     #[test]
     fn a_result_that_was_not_cut_carries_no_note() {
-        let out = compact_query_result(run_body(false, None));
+        let out = compact_query_result(run_body(false, None), None);
         assert!(out.get("truncated").is_none(), "{out}");
 
         // A response without the field at all is not cut either.
         let mut body = run_body(false, None);
         body.as_object_mut().expect("an object").remove("truncated");
-        let out = compact_query_result(body);
+        let out = compact_query_result(body, None);
         assert!(out.get("truncated").is_none(), "{out}");
     }
 }
@@ -1605,7 +2239,13 @@ mod registry_clash {
         )
         .await;
 
-        let out = describe_dataset(&ch, &args_for("twice_columns")).await;
+        let out = describe_dataset_with(
+            &ch,
+            &crate::table_access::TableAccess::All,
+            None,
+            &args_for("twice_columns"),
+        )
+        .await;
         let amount = columns_named(&out, "amount");
         assert_eq!(
             amount.len(),
@@ -1676,7 +2316,13 @@ mod registry_clash {
         )
         .await;
 
-        let out = describe_dataset(&ch, &args_for("clash_columns")).await;
+        let out = describe_dataset_with(
+            &ch,
+            &crate::table_access::TableAccess::All,
+            None,
+            &args_for("clash_columns"),
+        )
+        .await;
         let id = columns_named(&out, "id");
         assert_eq!(
             id.len(),
@@ -1720,7 +2366,13 @@ mod registry_clash {
         )
         .await;
 
-        let out = describe_dataset(&ch, &args_for("sec_only_columns")).await;
+        let out = describe_dataset_with(
+            &ch,
+            &crate::table_access::TableAccess::All,
+            None,
+            &args_for("sec_only_columns"),
+        )
+        .await;
         let id = columns_named(&out, "id");
         assert_eq!(id.len(), 1, "the secondary registry's own dataset: {out}");
         assert_eq!(

@@ -27,7 +27,9 @@
 //! somebody else's personal space is not in the graph and the chart route
 //! answers 404 for it as for an unknown id. The column mappings of SQL
 //! sources are `dashboard:read` rows and follow the same `Scope` as the rest
-//! of the column lineage. A store that cannot be read is said in `coverage`
+//! of the column lineage. A caller the shared catalog refuses sees no chart in
+//! the graph and gets the unknown-id 404 on the chart route (`SEC-20`, plan
+//! 96): a chart has no tenant, so it belongs to the shared catalog. A store that cannot be read is said in `coverage`
 //! on the chart route; the lineage page leaves the dashboard objects out and
 //! logs it (its answer is the table graph, which stays honest without them).
 
@@ -270,7 +272,8 @@ fn sources_in_use(dash: &Dash) -> BTreeSet<String> {
 /// Adds the charts `principal` may see, with their SQL sources and metrics,
 /// downstream of the tables they read (`BI-14` D2 and D5): `?focus=` on a
 /// chart, or on a table, then shows them. A store that cannot be read leaves
-/// them out (logged); the table graph is unchanged.
+/// them out (logged); the table graph is unchanged. A caller the shared
+/// catalog is closed to (`shared` false) sees none.
 pub(super) async fn add_dashboard_nodes(
     state: &AppState,
     principal: &Principal,
@@ -281,6 +284,18 @@ pub(super) async fn add_dashboard_nodes(
     // BI-14 review BLOCKER B1: chart, SQL source and metric names are
     // dashboard objects; without `dashboard:read` the graph stays tables only.
     if !principal.has("dashboard:read") {
+        return;
+    }
+    // SEC-20, plan 96: a chart has no tenant, so it belongs to the shared
+    // catalog, and a caller the shared-catalog rule refuses (`shared` is that
+    // rule's answer, from `assemble`) gets none. The rest of its graph, its own
+    // connectors, uploads and pipelines, is drawn as before.
+    if !shared {
+        g.coverage.push(
+            "dashboard charts, SQL sources and metrics are not shown: they belong to the shared \
+             catalog, which is not available to your organisation"
+                .to_owned(),
+        );
         return;
     }
     // BI-19 B1 (with BI-14 D2): the caller's resolved reach, not the baseline;
@@ -570,8 +585,9 @@ async fn steps_json(
 ///
 /// # Errors
 ///
-/// [`ApiError::NotFound`] for a chart the caller cannot see (an unknown id and
-/// somebody else's personal chart are the same answer); the errors of
+/// [`ApiError::NotFound`] for a chart the caller cannot see (an unknown id,
+/// somebody else's personal chart, and any chart for a caller the shared
+/// catalog is closed to are the same answer); the errors of
 /// [`super::assemble`]; a `ClickHouse` failure through `upstream_error`.
 pub(crate) async fn read(
     state: &AppState,
@@ -582,6 +598,18 @@ pub(crate) async fn read(
     // BI-14 review BLOCKER B1: without `dashboard:read` no chart is named, so
     // the answer is the one an unknown id gets.
     if !principal.has("dashboard:read") {
+        return Err(ApiError::NotFound(NOT_FOUND.to_owned()));
+    }
+    // SEC-20, plan 96: the shared-catalog rule is asked before any chart is
+    // read, through the graph's own builder, so a caller it refuses gets the
+    // answer an unknown id gets and nothing says the chart exists. A chart has
+    // no tenant, so it belongs to the shared catalog.
+    let Assembled {
+        mut g,
+        tenant,
+        shared,
+    } = super::assemble(state, principal, headers).await?;
+    if !shared {
         return Err(ApiError::NotFound(NOT_FOUND.to_owned()));
     }
     let ch = &state.clickhouse;
@@ -596,11 +624,6 @@ pub(crate) async fn read(
         .iter()
         .find(|c| c.spec.id == chart_id)
         .ok_or_else(|| ApiError::NotFound(NOT_FOUND.to_owned()))?;
-    let Assembled {
-        mut g,
-        tenant,
-        shared,
-    } = super::assemble(state, principal, headers).await?;
     let scope = scope_for(principal, tenant, shared);
     let reads = reads_of(&chart.def, &dash.metrics);
     let mut wanted = reads.sql_sources.clone();
@@ -615,7 +638,21 @@ pub(crate) async fn read(
     add_chart(&mut g, chart, &deps);
 
     let start = chart_node(&chart.spec.id);
-    let keep = upstream(&g, std::slice::from_ref(&start));
+    let mut keep = upstream(&g, std::slice::from_ref(&start));
+    // `GOV-7` D6: a chart's lineage does not draw a table the caller's roles
+    // hide (nor the edges that touch it), exactly as the graph route does.
+    let access = crate::routes::catalog::table_access_for(state, principal).await?;
+    if !access.is_all() {
+        let hidden: Vec<String> = g
+            .nodes
+            .iter()
+            .filter(|(id, _)| super::node_table_key(id).is_some_and(|key| !access.allows_key(&key)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in hidden {
+            keep.remove(&id);
+        }
+    }
     let dist = distances(&g, &start, &keep);
     let (steps, not_recorded) = steps_json(state, &g, &keep, &dist).await;
     let edges: Vec<Value> = g

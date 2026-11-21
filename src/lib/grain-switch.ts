@@ -54,3 +54,28 @@ export function withGrainParam(search: string, choice: GrainChoice): string {
   else q.set(GRAIN_PARAM, choice)
   return q.toString()
 }
+
+/**
+ * Why the dashboard's grain left a chart as it was, as the server names it on
+ * the tile's `grainNotApplied` (`BI-50`; QA `LH-BI-9-05`). The type mirrors
+ * `lakehouse_bi::grain::SwitchSkip`; `| string` below widens it for a reason a
+ * newer server sends and this console does not know.
+ */
+export type GrainNotApplied = "kind" | "part" | "not_a_date" | "no_grain"
+
+/** The one-line sentence of a reason, or null when the mark does not apply. */
+export function grainNotAppliedSentence(reason: string | undefined): string | null {
+  if (!reason) return null
+  switch (reason) {
+    case "kind":
+      return "Group dates by does not apply to this type of chart."
+    case "part":
+      return "Group dates by does not apply: this chart groups by a part of the date, such as the day of the week."
+    case "not_a_date":
+      return "Group dates by does not apply: this chart's dimension is not a date."
+    case "no_grain":
+      return "Group dates by does not apply: this chart has no date grouping of its own to change."
+    default:
+      return "Group dates by does not apply to this chart."
+  }
+}

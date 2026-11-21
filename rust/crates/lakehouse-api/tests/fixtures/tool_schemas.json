@@ -10,6 +10,10 @@
           "sql": {
             "type": "string",
             "description": "A ClickHouse SELECT statement"
+          },
+          "parameters": {
+            "type": "object",
+            "description": "Number or text for each {{name}} in sql; {start,end} dates for {{name.start}} and {{name.end}}."
           }
         },
         "required": [
@@ -151,7 +155,10 @@
             "type": "string"
           },
           "subtitle": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mart": {
             "type": "string"
@@ -352,7 +359,7 @@
                 ]
               }
             ],
-            "description": "the number of groups to show; with `sort` it keeps the first N in that order"
+            "description": "the number of groups to show; with `sort` it keeps the first N in that order; on a bar, hbar, line or area chart with a breakdown it keeps that many breakdown values, the ones with the largest total"
           },
           "span": {
             "type": "number",
@@ -1204,6 +1211,17 @@
               "mode"
             ]
           },
+          "breakdownGrain": {
+            "type": "string",
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ],
+            "description": "group a date or timestamp `breakdown` by this period; bar, hbar, line and area only; not with a bin"
+          },
           "grid": {
             "type": "object",
             "properties": {
@@ -1656,7 +1674,10 @@
             "type": "string"
           },
           "subtitle": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mart": {
             "type": "string"
@@ -1848,6 +1869,9 @@
           },
           "breakdownBin": {
             "type": "object"
+          },
+          "breakdownGrain": {
+            "type": "string"
           },
           "grid": {
             "type": "object"
@@ -2050,8 +2074,7 @@
                     "currency",
                     "scientific",
                     "compact"
-                  ],
-                  "description": "percent multiplies by 100 (0.125 is 12.5%); compact is 1.2 K, 3.4 M, 5 B, 2 T; auto is how it looked before"
+                  ]
                 },
                 "decimals": {
                   "type": "integer",
@@ -2059,12 +2082,10 @@
                   "maximum": 10
                 },
                 "thousands": {
-                  "type": "boolean",
-                  "description": "group thousands (default true)"
+                  "type": "boolean"
                 },
                 "currency": {
-                  "type": "string",
-                  "description": "an ISO 4217 code such as IDR or USD, upper case; with the currency or compact style. Rupiah is IDR"
+                  "type": "string"
                 },
                 "currencyDisplay": {
                   "type": "string",
@@ -2074,12 +2095,10 @@
                   ]
                 },
                 "prefix": {
-                  "type": "string",
-                  "description": "at most 16 characters"
+                  "type": "string"
                 },
                 "suffix": {
-                  "type": "string",
-                  "description": "at most 16 characters"
+                  "type": "string"
                 }
               }
             },
@@ -2450,6 +2469,88 @@
               }
             },
             "description": "up to 5 marks on the value axis (bar, hbar, line, area, stacked, combo), for example a target at 1,000, the average, a trend or a band. Use a parameter for a line the viewer can move. A computed line describes the rows on screen"
+          },
+          "addReferenceLines": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "value",
+                    "average",
+                    "median",
+                    "min",
+                    "max",
+                    "trend",
+                    "band",
+                    "forecast"
+                  ],
+                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`; forecast: the series continued `horizon` periods ahead with a 95 % band (bar, line, area, stacked, combo with the date dimension grouped by minute to year, no breakdown, at most one per chart)"
+                },
+                "horizon": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 60,
+                  "description": "forecast only, required: how many periods ahead"
+                },
+                "value": {
+                  "oneOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    }
+                  ],
+                  "description": "where on the value axis: a number, or {param: <a number parameter>}. Required for kind value and band; leave out for a computed line"
+                },
+                "to": {
+                  "oneOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    }
+                  ],
+                  "description": "band only: the other edge"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "at most 60 characters"
+                },
+                "color": {
+                  "type": "string",
+                  "description": "#rrggbb"
+                },
+                "measure": {
+                  "type": "string",
+                  "description": "a computed line: which value of the chart it describes (a result name); default the first"
+                }
+              }
+            },
+            "description": "lines to add to the chart's own, which stay (at most 5 in all). Use this to add a line; referenceLines replaces every line the chart has."
           }
         },
         "required": [
@@ -3059,7 +3160,7 @@
     "type": "function",
     "function": {
       "name": "set_board_view_filters",
-      "description": "Change the filters visible to the person on this page, this time only. Nothing is saved; the board's default and every other viewer's view are unchanged. Empty filters clear the view. Available in every chat mode, including Ask.",
+      "description": "Change the filters visible to the person on this page, this time only. Use it for a request to see only some data on this page (\"show only 2026\", \"only Bali\", \"tampilkan hanya …\"), instead of a new chart; a year is an `in` filter with the year on a year column (such as `tahun`), or a between filter on a date column's first and last day of that year when the source has no year column. Nothing is saved; the board's default and every other viewer's view are unchanged. Empty filters clear the view. Available in every chat mode, including Ask.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -3610,8 +3711,7 @@
                   "type": "object",
                   "properties": {
                     "segment": {
-                      "type": "string",
-                      "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -3635,19 +3735,16 @@
                         "starts_with",
                         "ends_with",
                         "not_contains"
-                      ],
-                      "description": "default in"
+                      ]
                     },
                     "values": {
                       "type": "array",
                       "items": {
                         "type": "string"
-                      },
-                      "description": "in / not_in"
+                      }
                     },
                     "min": {
-                      "type": "string",
-                      "description": "between: a number or a date YYYY-MM-DD"
+                      "type": "string"
                     },
                     "max": {
                       "type": "string"
@@ -3659,8 +3756,7 @@
                       "type": "boolean"
                     },
                     "text": {
-                      "type": "string",
-                      "description": "contains, starts_with, ends_with, not_contains"
+                      "type": "string"
                     },
                     "anchor": {
                       "type": "string",
@@ -3669,8 +3765,7 @@
                         "this",
                         "previous",
                         "next"
-                      ],
-                      "description": "relative"
+                      ]
                     },
                     "unit": {
                       "type": "string",
@@ -4676,6 +4771,10 @@
         "properties": {
           "id": {
             "type": "string"
+          },
+          "parameters": {
+            "type": "object",
+            "description": "Values for the query's parameters, by name. Ask the user for a missing one."
           }
         },
         "required": [
@@ -5172,7 +5271,7 @@
     "type": "function",
     "function": {
       "name": "create_pipeline",
-      "description": "Author a new pipeline that reads a source table, applies transforms and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold -- a pipeline never writes bronze, which is written by ingestion. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
+      "description": "Author a new pipeline that reads tables and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold -- a pipeline never writes bronze, which is written by ingestion. A pipeline is 1-5 named inputs and 0-20 named steps. Give the shape one of two ways: (a) inputs and steps, which is the fuller one -- a step is one of: { name, kind: 'sql', sql } with ONE read-only SELECT over the inputs and earlier steps by their names (joins, aggregations, CASE, subqueries and window functions are allowed; a table that is not an input is refused, so list every table you read under inputs), { name, kind: 'transform', reads, transforms } with the five operations below, or a form step: { name, kind: 'join', left, right, joinType, on, columns }, { name, kind: 'aggregate', reads, groupBy, measures, havingMatch, having }, { name, kind: 'filter', reads, match, conditions }; or (b) today's sourceZone, sourceTable and transforms, which is one input and one transform step. Send one form, never both. Prefer a form step (join, aggregate, filter, transform) when it can say what the person asked, because they can then change it in the form; use a SQL step for anything else (a CASE, a calculated column, a window function, a join that is not on equal columns, all and any mixed). A join matches on equal columns only, 1-10 pairs; look its sides' columns up first with describe_mart, describe_dataset or run_sql and list every output column. A measure's name cannot be a column the step reads; a having names a group-by column or a measure; values are text, except a count, sum or average is compared with a number. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
       "parameters": {
         "type": "object",
         "properties": {
@@ -5181,6 +5280,275 @@
           },
           "description": {
             "type": "string"
+          },
+          "inputs": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "description": "the tables the pipeline reads, each with the short name its steps use",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "name steps read it by, letters digits and _ only"
+                },
+                "zone": {
+                  "type": "string",
+                  "enum": [
+                    "bronze",
+                    "silver",
+                    "gold"
+                  ]
+                },
+                "table": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "zone",
+                "table"
+              ]
+            }
+          },
+          "steps": {
+            "type": "array",
+            "maxItems": 20,
+            "description": "the pipeline's steps in order; the last one's result is the output",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "sql",
+                    "transform",
+                    "join",
+                    "aggregate",
+                    "filter"
+                  ]
+                },
+                "sql": {
+                  "type": "string",
+                  "description": "kind=sql: one read-only SELECT over the inputs and earlier steps"
+                },
+                "reads": {
+                  "type": "string",
+                  "description": "kind=transform/aggregate/filter: the input or earlier step it reads"
+                },
+                "transforms": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "kind=transform: the operations, one per entry"
+                },
+                "left": {
+                  "type": "string",
+                  "description": "kind=join: the input or earlier step on the left side"
+                },
+                "right": {
+                  "type": "string",
+                  "description": "kind=join: the input or earlier step on the right side"
+                },
+                "joinType": {
+                  "type": "string",
+                  "enum": [
+                    "inner",
+                    "left",
+                    "right",
+                    "full"
+                  ],
+                  "description": "kind=join: the join type"
+                },
+                "on": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 10,
+                  "description": "kind=join: the column pairs matched on, equal columns only",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "left": {
+                        "type": "string",
+                        "description": "the left side's column"
+                      },
+                      "right": {
+                        "type": "string",
+                        "description": "the right side's column"
+                      }
+                    },
+                    "required": [
+                      "left",
+                      "right"
+                    ]
+                  }
+                },
+                "columns": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 300,
+                  "description": "kind=join: the output columns, listed after looking them up",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "side": {
+                        "type": "string",
+                        "enum": [
+                          "left",
+                          "right"
+                        ],
+                        "description": "which side the column comes from"
+                      },
+                      "column": {
+                        "type": "string",
+                        "description": "the side's column"
+                      },
+                      "name": {
+                        "type": "string",
+                        "description": "the output name; leave out to keep the column's own"
+                      }
+                    },
+                    "required": [
+                      "side",
+                      "column"
+                    ]
+                  }
+                },
+                "groupBy": {
+                  "type": "array",
+                  "maxItems": 20,
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "kind=aggregate: the columns to group by; empty means one row"
+                },
+                "measures": {
+                  "type": "array",
+                  "maxItems": 50,
+                  "description": "kind=aggregate: the measures; a name may not be a column the step reads",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "function": {
+                        "type": "string",
+                        "enum": [
+                          "count",
+                          "countDistinct",
+                          "sum",
+                          "avg",
+                          "min",
+                          "max"
+                        ]
+                      },
+                      "column": {
+                        "type": "string",
+                        "description": "the column; only count may leave it out"
+                      },
+                      "name": {
+                        "type": "string",
+                        "description": "the output name"
+                      }
+                    },
+                    "required": [
+                      "function",
+                      "name"
+                    ]
+                  }
+                },
+                "havingMatch": {
+                  "type": "string",
+                  "enum": [
+                    "all",
+                    "any"
+                  ],
+                  "description": "kind=aggregate: how the having conditions combine; default all"
+                },
+                "match": {
+                  "type": "string",
+                  "enum": [
+                    "all",
+                    "any"
+                  ],
+                  "description": "kind=filter: how the conditions combine; default all"
+                },
+                "having": {
+                  "type": "array",
+                  "maxItems": 20,
+                  "description": "kind=aggregate: conditions on the group-by columns and measures",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "column": {
+                        "type": "string",
+                        "description": "a group-by column or a measure's name"
+                      },
+                      "operator": {
+                        "type": "string",
+                        "enum": [
+                          "=",
+                          "!=",
+                          "<",
+                          ">",
+                          "<=",
+                          ">="
+                        ]
+                      },
+                      "value": {
+                        "type": "string",
+                        "description": "text, except a count, sum or average is compared with a number"
+                      }
+                    },
+                    "required": [
+                      "column",
+                      "operator",
+                      "value"
+                    ]
+                  }
+                },
+                "conditions": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 20,
+                  "description": "kind=filter: the rows to keep",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "column": {
+                        "type": "string"
+                      },
+                      "operator": {
+                        "type": "string",
+                        "enum": [
+                          "=",
+                          "!=",
+                          "<",
+                          ">",
+                          "<=",
+                          ">="
+                        ]
+                      },
+                      "value": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "column",
+                      "operator",
+                      "value"
+                    ]
+                  }
+                }
+              },
+              "required": [
+                "name",
+                "kind"
+              ]
+            }
           },
           "sourceZone": {
             "type": "string",
@@ -5220,8 +5588,6 @@
         },
         "required": [
           "name",
-          "sourceZone",
-          "sourceTable",
           "targetZone",
           "targetTable"
         ]
@@ -5744,6 +6110,25 @@
   {
     "type": "function",
     "function": {
+      "name": "find_report_recipients",
+      "description": "Find people of this installation to send a scheduled report to, by part of their name or email address (at most 20). Gives each person's id, name and email; pass the id as recipients[].userId on create_report_subscription or update_report_subscription.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "q": {
+            "type": "string",
+            "description": "part of a name or an email address"
+          }
+        },
+        "required": [
+          "q"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "update_report_subscription",
       "description": "Change a scheduled report the person set up: the schedule, time zone, attachments, filters or recipients, or pause or resume it. Give only what changes; everything left out stays. Naming recipients in `recipients` needs a human's approval.",
       "parameters": {
@@ -6048,6 +6433,310 @@
         },
         "required": [
           "board"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_reports",
+      "description": "List the written reports the person can read: id, title, folder, when it was last saved and how many charts it holds, newest first. Use the id with update_report.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_report",
+      "description": "Write a report: a page of headings, paragraphs, lists and links with live charts between them, picked from existing dashboards by chart id (list_charts). Each reader sees every chart with their own access, as on its dashboard. At most 30 charts. Needs a confirm in this chat.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "the report's title"
+          },
+          "folderId": {
+            "type": "string",
+            "description": "a dashboard folder id to file it in; leave out for no folder"
+          },
+          "blocks": {
+            "type": "array",
+            "description": "the blocks in reading order",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "heading",
+                    "paragraph",
+                    "list",
+                    "link",
+                    "chart"
+                  ]
+                },
+                "text": {
+                  "type": "string",
+                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                },
+                "level": {
+                  "type": "integer",
+                  "enum": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "description": "heading size, 1 the largest; 2 when left out"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "a list's items"
+                },
+                "ordered": {
+                  "type": "boolean",
+                  "description": "a numbered list when true"
+                },
+                "url": {
+                  "type": "string",
+                  "description": "a link's address: https://, http://, mailto: or a console path such as /dashboards/<id>"
+                },
+                "chart": {
+                  "type": "string",
+                  "description": "a chart block's chart id, from list_charts"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            }
+          }
+        },
+        "required": [
+          "title"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_report",
+      "description": "Change a report: its title, its folder, all its blocks (blocks), blocks added at the end (append), or one chart added at the end (chart, for \"add this chart to the report\"). Give only what changes. Needs a confirm in this chat.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "the report's id, from create_report or the page context"
+          },
+          "title": {
+            "type": "string",
+            "description": "a new title"
+          },
+          "folderId": {
+            "type": "string",
+            "description": "a dashboard folder to move it to; \"\" for no folder"
+          },
+          "blocks": {
+            "type": "array",
+            "description": "every block, replacing the report's blocks in this order",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "heading",
+                    "paragraph",
+                    "list",
+                    "link",
+                    "chart"
+                  ]
+                },
+                "text": {
+                  "type": "string",
+                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                },
+                "level": {
+                  "type": "integer",
+                  "enum": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "description": "heading size, 1 the largest; 2 when left out"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "a list's items"
+                },
+                "ordered": {
+                  "type": "boolean",
+                  "description": "a numbered list when true"
+                },
+                "url": {
+                  "type": "string",
+                  "description": "a link's address: https://, http://, mailto: or a console path such as /dashboards/<id>"
+                },
+                "chart": {
+                  "type": "string",
+                  "description": "a chart block's chart id, from list_charts"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            }
+          },
+          "append": {
+            "type": "array",
+            "description": "blocks added after the last one",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "heading",
+                    "paragraph",
+                    "list",
+                    "link",
+                    "chart"
+                  ]
+                },
+                "text": {
+                  "type": "string",
+                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                },
+                "level": {
+                  "type": "integer",
+                  "enum": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "description": "heading size, 1 the largest; 2 when left out"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "a list's items"
+                },
+                "ordered": {
+                  "type": "boolean",
+                  "description": "a numbered list when true"
+                },
+                "url": {
+                  "type": "string",
+                  "description": "a link's address: https://, http://, mailto: or a console path such as /dashboards/<id>"
+                },
+                "chart": {
+                  "type": "string",
+                  "description": "a chart block's chart id, from list_charts"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            }
+          },
+          "chart": {
+            "type": "string",
+            "description": "one chart id, from list_charts, added as a chart block at the end"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_report",
+      "description": "Delete a report: it goes to the trash and can be restored for 30 days. Needs human approval.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "the report's id"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_templates",
+      "description": "List the dashboard templates: saved dashboard layouts with their charts and filters (no data), with the id, name, the dashboard each was saved from, who saved it and when.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_dashboard_from_template",
+      "description": "Start a new dashboard from a template (list_templates): an independent copy of its layout, charts and filters, under a name you give, in a folder or none. A chart over a table that is gone keeps its tile and says the source is not available. Needs a confirm in this chat.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "template": {
+            "type": "string",
+            "description": "the template's id, from list_templates"
+          },
+          "name": {
+            "type": "string",
+            "description": "the new dashboard's name"
+          },
+          "folderId": {
+            "type": "string",
+            "description": "a dashboard folder id; leave out for no folder"
+          }
+        },
+        "required": [
+          "template",
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_template",
+      "description": "Delete a dashboard template for good. Dashboards already made from it stay. Needs human approval.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "the template's id, from list_templates"
+          }
+        },
+        "required": [
+          "id"
         ]
       }
     }

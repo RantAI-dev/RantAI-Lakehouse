@@ -17,7 +17,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -205,6 +205,46 @@ async fn offered_for(question: &str, mode: &str, allow: Option<Value>) -> Vec<St
     first_request(question, mode, allow).await.0
 }
 
+/// The tools the model was offered in the LAST request it received: the
+/// tools of one principal, asked on an app that already served another one.
+async fn offered_to(
+    router: &axum::Router,
+    llm: &MockServer,
+    cookie: &str,
+    question: &str,
+    mode: &str,
+) -> Vec<String> {
+    let body = json!({
+        "mode": mode,
+        "messages": [{ "role": "user", "content": question }],
+    });
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ai/chat")
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let requests = llm.received_requests().await.expect("recording is on");
+    let last = requests
+        .last()
+        .expect("the model received this turn's request");
+    let first: Value = serde_json::from_slice(&last.body).expect("a JSON request");
+    first["tools"]
+        .as_array()
+        .expect("the request carries a tool list")
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
 #[tokio::test]
 async fn a_build_turn_about_a_chart_offers_the_chart_tools_whatever_it_says() {
     for message in CHART_MESSAGES {
@@ -382,5 +422,98 @@ async fn the_offered_tools_of_a_build_turn_fit_a_small_context() {
         compact.chars().count() <= SIZE_BAR,
         "the offered tools are {} characters, the bar is {SIZE_BAR}",
         compact.chars().count()
+    );
+}
+
+/// ADM-13 (D6): an assistant:ask-only user is forced into Ask mode even when
+/// the request asks for "build" mode. Only Read tools are offered, no write tools
+/// (like `create_chart`) are offered, and the system prompt declares Ask mode.
+#[tokio::test]
+async fn an_assistant_ask_only_user_in_build_mode_receives_only_read_tools() {
+    let llm = mock_model().await;
+    let ch = mock_clickhouse().await;
+    let mut env = std::collections::HashMap::new();
+    env.insert("LLM_URL".to_owned(), llm.uri());
+    env.insert("CH_URL".to_owned(), ch.uri());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+
+    let user_id = common::create_principal_with_permissions(&pool, "assistant:ask").await;
+    let cookie = common::session_cookie_for_user(&pool, user_id).await;
+
+    let body = json!({
+        "mode": "build",
+        "messages": [{ "role": "user", "content": "Show the share of foreign visitors by country as a pie." }],
+    });
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ai/chat")
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let requests = llm.received_requests().await.expect("recording is on");
+    let first: Value = serde_json::from_slice(&requests[0].body).expect("a JSON request");
+    let tools = first["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+
+    for write in CHART_CORE_WRITES {
+        assert!(
+            !names.contains(write),
+            "ask-only user must not be offered write tool {write}: {names:?}"
+        );
+    }
+    assert!(names.contains(&"run_sql"), "must offer run_sql: {names:?}");
+
+    let system = first["messages"][0]["content"].as_str().unwrap_or_default();
+    assert!(
+        system.contains("MODE: ASK (read-only)"),
+        "system prompt must declare Ask mode: {system}"
+    );
+}
+
+/// `GOV-1` (feature page Decision 9): the assistant's audit history tool
+/// reads the whole audit trail, so it needs `audit:read` — the permission
+/// the audit page asks for. A turn for a person who holds `governance:read`
+/// and no `audit:read` must not offer it, while the same question from a
+/// person who holds `audit:read` must: the two differ in that permission
+/// alone.
+#[tokio::test]
+async fn a_turn_offers_the_audit_history_tool_only_to_a_caller_with_audit_read() {
+    let llm = mock_model().await;
+    let ch = mock_clickhouse().await;
+    let mut env = std::collections::HashMap::new();
+    env.insert("LLM_URL".to_owned(), llm.uri());
+    env.insert("CH_URL".to_owned(), ch.uri());
+    let TestApp { router, pool } = spin_up_with_env(&env).await;
+
+    let reader = common::create_assistant_principal(&pool, "governance:read").await;
+    let reader_cookie = common::session_cookie_for_user(&pool, reader).await;
+    let auditor = common::create_assistant_principal(&pool, "governance:read,audit:read").await;
+    let auditor_cookie = common::session_cookie_for_user(&pool, auditor).await;
+
+    // A question of the audit domain, so the tool is one the turn wants.
+    let question = "Siapa yang mengubah kebijakan terakhir?";
+
+    let offered = offered_to(&router, &llm, &reader_cookie, question, "build").await;
+    assert!(
+        !offered.contains(&"get_audit_history".to_owned()),
+        "a caller without audit:read must not be offered the audit history tool: {offered:?}"
+    );
+
+    let offered = offered_to(&router, &llm, &auditor_cookie, question, "build").await;
+    assert!(
+        offered.contains(&"get_audit_history".to_owned()),
+        "a caller with audit:read must be offered the audit history tool: {offered:?}"
     );
 }

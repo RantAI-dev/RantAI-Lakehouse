@@ -600,6 +600,33 @@ pub struct Resolved {
     pub value: ParamValue,
 }
 
+/// A parameter of this read whose value did not fit, and why (`BI-52`, QA
+/// `LH-BI-11-05`, plan D26). `name` is the definition's name, read from the
+/// store, never the request's text; `reason` is [`check_value`]'s sentence,
+/// which names the parameter and the rule and never repeats the value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefusedParam {
+    /// The definition's name.
+    pub name: String,
+    /// The fixed sentence naming the parameter and the rule.
+    pub reason: String,
+}
+
+/// What a read makes of the request it was given (`BI-52`, plan D25, D26): the
+/// values that fit, the refusals it lists, and whether the request named a
+/// parameter that does not exist (ignored, and never repeated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestOutcome {
+    /// The values the request and the board's saved values give.
+    pub values: ParamValues,
+    /// The parameters whose requested value did not fit, in the order of
+    /// `defs`.
+    pub refused: Vec<RefusedParam>,
+    /// The request named a parameter that does not exist (a link kept after a
+    /// parameter was deleted).
+    pub unknown_name: bool,
+}
+
 /// A name saved on a board with the value its editor saved for it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -663,21 +690,58 @@ impl ParamValues {
         saved: &[BoardParam],
         request: Option<&Map<String, Value>>,
     ) -> Result<Self, String> {
-        if let Some(sent) = request
-            && sent.keys().any(|k| !defs.iter().any(|d| d.name == *k))
-        {
+        let outcome = Self::resolve_each(defs, saved, request);
+        if outcome.unknown_name {
             return Err("the request names a parameter that does not exist.".to_owned());
         }
+        if let Some(first) = outcome.refused.into_iter().next() {
+            return Err(first.reason);
+        }
+        Ok(outcome.values)
+    }
+
+    /// The loop of [`Self::resolve`], made tolerant of one refusal so the
+    /// dashboard's own read can draw the rest (`BI-52`, plan D24–D26): a value
+    /// the request sent that does not fit is pushed to `refused` (the
+    /// definition's name and the fixed sentence), and that parameter takes the
+    /// value it has without the request — the board's saved one, else its
+    /// default — as [`Self::resolve`] does for a parameter the request does
+    /// not name. A name no definition has is ignored and only sets
+    /// `unknown_name`.
+    #[must_use]
+    pub fn resolve_each(
+        defs: &[ParamDef],
+        saved: &[BoardParam],
+        request: Option<&Map<String, Value>>,
+    ) -> RequestOutcome {
+        let unknown_name =
+            request.is_some_and(|sent| sent.keys().any(|k| !defs.iter().any(|d| d.name == *k)));
         let mut by_name = BTreeMap::new();
+        let mut refused = Vec::new();
         for def in defs {
-            let chosen = match request.and_then(|r| r.get(&def.name)) {
-                Some(raw) => Some(check_value(def, raw)?),
-                None => saved
+            let counted = request
+                .and_then(|r| r.get(&def.name))
+                .map(|raw| check_value(def, raw));
+            let chosen = match counted {
+                Some(Ok(value)) => Some(value),
+                Some(Err(reason)) => {
+                    refused.push(RefusedParam {
+                        name: def.name.clone(),
+                        reason,
+                    });
+                    None
+                }
+                None => None,
+            };
+            // A refused value falls through to the saved one and then the
+            // default, exactly as a parameter the request does not name.
+            let chosen = chosen.or_else(|| {
+                saved
                     .iter()
                     .find(|b| b.name == def.name)
                     .and_then(|b| b.value.as_ref())
-                    .and_then(|raw| check_value(def, raw).ok()),
-            };
+                    .and_then(|raw| check_value(def, raw).ok())
+            });
             if let Some(value) = chosen.or_else(|| def.default_value()) {
                 by_name.insert(
                     def.name.clone(),
@@ -688,7 +752,11 @@ impl ParamValues {
                 );
             }
         }
-        Ok(Self { by_name })
+        RequestOutcome {
+            values: Self { by_name },
+            refused,
+            unknown_name,
+        }
     }
 
     /// One parameter.
@@ -1755,6 +1823,82 @@ mod tests {
             ParamValues::resolve(&defs, &[], req(json!({ "evil'; --": 1 })).as_ref()).unwrap_err();
         assert!(!e.contains("evil"), "an unknown name is not echoed: {e}");
         assert!(parse_request(Some("[1]")).is_err() && parse_request(Some("")).unwrap().is_none());
+    }
+
+    /// QA `LH-BI-11-05` (`BI-52`, plan D24, D26): the dashboard's read keeps
+    /// the values that fit, lists the one that does not with its fixed
+    /// sentence, and uses the value the parameter has without the request.
+    #[test]
+    fn a_refused_value_keeps_the_saved_value_and_is_listed_with_its_reason() {
+        let defs = refused_defs();
+        let saved = [BoardParam {
+            name: "target".to_owned(),
+            value: Some(json!(20)),
+        }];
+        let request = json!({ "target": 51, "pick": "b" });
+        let outcome = ParamValues::resolve_each(&defs, &saved, request.as_object());
+        assert_eq!(
+            outcome.values.get("target").unwrap().value,
+            ParamValue::Number(20.0),
+            "the saved value, as if the request had not named it"
+        );
+        assert_eq!(
+            outcome.values.get("pick").unwrap().value,
+            ParamValue::Text("b".to_owned())
+        );
+        assert_eq!(outcome.refused.len(), 1);
+        assert_eq!(outcome.refused[0].name, "target");
+        assert_eq!(
+            outcome.refused[0].reason,
+            check_value(&defs[0], &json!(51)).unwrap_err()
+        );
+        assert!(outcome.refused[0].reason.contains("at most 50"));
+        assert!(!outcome.unknown_name);
+        let outcome = ParamValues::resolve_each(&defs, &[], request.as_object());
+        assert_eq!(
+            outcome.values.get("target").unwrap().value,
+            ParamValue::Number(10.0),
+            "no saved value -> the default"
+        );
+    }
+
+    /// QA `LH-BI-11-05` (`BI-52`, plan D25): a name no definition has is
+    /// ignored and never appears anywhere in the outcome.
+    #[test]
+    fn an_unknown_name_is_ignored_and_never_repeated() {
+        let defs = refused_defs();
+        let request = json!({ "evil'; --": 1, "target": 30 });
+        let outcome = ParamValues::resolve_each(&defs, &[], request.as_object());
+        assert!(outcome.unknown_name);
+        assert_eq!(outcome.refused, Vec::new());
+        assert_eq!(
+            outcome.values.get("target").unwrap().value,
+            ParamValue::Number(30.0)
+        );
+        assert!(!format!("{outcome:?}").contains("evil"));
+    }
+
+    /// QA `LH-BI-11-05` (`BI-52`, plan D26, D27): the sentence names the rule
+    /// and never the value it refused.
+    #[test]
+    fn a_refused_value_is_not_in_its_reason() {
+        let defs = refused_defs();
+        let request = json!({ "target": "1; DROP TABLE t" });
+        let outcome = ParamValues::resolve_each(&defs, &[], request.as_object());
+        assert_eq!(outcome.refused.len(), 1);
+        assert!(!outcome.refused[0].reason.contains("DROP"));
+    }
+
+    /// The two definitions the refusal tests share: `target` (a number, default
+    /// 10, at most 50) and `pick` (a list of `a` and `b`, default `a`).
+    fn refused_defs() -> Vec<ParamDef> {
+        let mut target = base("target", ParamType::Number, json!(10));
+        target.max = Some(json!(50));
+        [
+            validate_def(&target).unwrap(),
+            validate_def(&list("pick", &["a", "b"], "a")).unwrap(),
+        ]
+        .to_vec()
     }
 
     fn chart(extra: &Value) -> StoredChartSpec {

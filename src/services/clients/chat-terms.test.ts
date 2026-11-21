@@ -60,3 +60,14 @@ describe("chatTermService.saveTerm", () => {
     }
   })
 })
+
+describe("chat-term refusals (WEB-12)", () => {
+  it("a refused term rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: assistant:use" }, 403))
+    await expect(chatTermService.saveTerm({ term: "x", meaning: "y" })).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the assistant:use permission.",
+    })
+  })
+})

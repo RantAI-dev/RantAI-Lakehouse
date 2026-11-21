@@ -3,6 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
+import { SelectField } from "@/components/patterns/select-field"
 import { ClassificationBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -18,8 +19,6 @@ import { lineageKey } from "./asset-lineage"
 import { policyCondition, policyTable } from "./asset-policy"
 
 type PolicySummary = AssetDetail["policySummary"][number]
-
-const selectClassName = "h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
 /** Least to most restrictive, as the Access tab offered them. */
 export const SENSITIVITY_LEVELS: Classification[] = ["public", "internal", "confidential", "restricted"]
@@ -220,18 +219,15 @@ export function SensitivityControls({
             <Label htmlFor={fieldId} className="text-xs">
               Sensitivity of {column ?? "the whole table"}
             </Label>
-            <select
+            <SelectField
               id={fieldId}
-              className={selectClassName}
               value={choice}
-              onChange={(e) => setChoice(e.target.value as Classification)}
-            >
-              {SENSITIVITY_LEVELS.map((l) => (
-                <option key={l} value={l}>
-                  {CLASSIFICATION_LABEL[l]}
-                </option>
-              ))}
-            </select>
+              options={SENSITIVITY_LEVELS.map((l) => ({
+                value: l,
+                label: CLASSIFICATION_LABEL[l],
+              }))}
+              onValueChange={(next) => setChoice(next as Classification)}
+            />
           </div>
           <Button
             size="sm"

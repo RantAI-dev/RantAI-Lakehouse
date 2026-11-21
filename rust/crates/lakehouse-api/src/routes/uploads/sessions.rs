@@ -67,9 +67,10 @@ use uuid::Uuid;
 use super::{
     Accepted, CONVERSION_FAILED, CreateResponse, EMPTY_FILE, MAX_UNPACKED_BYTES, MAX_UPLOAD_BYTES,
     NO_TENANT, ParquetFile, UploadView, blocking, classify_head, conversion_error, display_name,
-    not_found, parquet_footer, pool, record_audit, sha256_hex, sheets_key, sheets_of_answer,
-    storage_key, upload_audit_event,
+    not_found, parquet_footer, pool, sha256_hex, sheets_key, sheets_of_answer, storage_key,
+    upload_audit_event,
 };
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -596,7 +597,7 @@ pub async fn complete(
         json!({ "fileName": done.original_filename, "sizeBytes": done.size_bytes, "chunked": true }),
         "executed",
     );
-    record_audit(pool, event).await;
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(ApiJson(CreateResponse {
         upload: done.into(),
         duplicate_of: duplicate.map(Into::into),

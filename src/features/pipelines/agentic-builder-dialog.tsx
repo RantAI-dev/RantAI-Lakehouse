@@ -83,10 +83,13 @@ export function AgenticBuilderDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-4">
+          {/* UX-4: the instruction is required while the database is not,
+              so the star stays; two inputs are too few for a legend. */}
           <div className="grid gap-2">
-            <Label htmlFor="ab-instruction">Instruction</Label>
+            <Label htmlFor="ab-instruction" required>Instruction</Label>
             <Textarea
               id="ab-instruction"
+              aria-required
               value={instruction}
               onChange={(e) => setInstruction(e.target.value)}
               placeholder="Roll up hourly order events into a daily table, keyed by region…"

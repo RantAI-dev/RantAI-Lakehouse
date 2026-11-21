@@ -1,8 +1,10 @@
 "use client"
 
-import { StandardSQL, type keywordCompletionSource } from "@codemirror/lang-sql"
+import { autocompletion } from "@codemirror/autocomplete"
+import { StandardSQL, keywordCompletionSource } from "@codemirror/lang-sql"
 import type { Extension } from "@codemirror/state"
 import {
+  inPlaceholder,
   sqlCompletionOptions,
   type ColumnState,
   type CompletionOption,
@@ -12,9 +14,10 @@ import {
 /**
  * The console's own suggestions for the SQL editor.
  *
- * The editor's language extension already offers the SQL keywords. This
- * adds what only the catalog knows: the tables, and the columns of the
- * table behind an alias.
+ * The SQL language offers the keywords. This adds what only the catalog
+ * knows: the tables, and the columns of the table behind an alias; and,
+ * after `{{`, the names of the tab's parameters. After a `{{` the keywords
+ * stay out: a placeholder holds a parameter name and nothing else.
  *
  * The source is synchronous over the column cache. A keystroke never waits
  * for the network: the cache says whether the columns are there yet, and
@@ -22,9 +25,8 @@ import {
  */
 
 /**
- * The completion source type, taken from the language package that is a
- * dependency: the autocomplete package is not one, so its types are read
- * through the source it hands out.
+ * The completion source type, taken from the language package that hands
+ * the source out: the autocomplete package does not export it.
  */
 type CompletionSource = ReturnType<typeof keywordCompletionSource>
 
@@ -43,14 +45,21 @@ type CompletionResult = NonNullable<
 /** One suggestion, as CodeMirror wants it. */
 type Completion = CompletionResult["options"][number]
 
-/** How far a column is lifted above the keywords the language extension offers. */
+/**
+ * How far a column is lifted above the keywords. Used only in a "names"
+ * place (QS round review R1, D8): in the general list names have no boost and
+ * a keyword that matches what was typed ranks by CodeMirror's own score.
+ */
 const COLUMN_BOOST = 100
 
-/** How far a table is lifted above the keywords, and below the columns. */
+/**
+ * How far a table is lifted above the keywords, and below the columns, after
+ * `FROM`/`JOIN` (D8). In the general list a table gets no boost at all.
+ */
 const TABLE_BOOST = 99
 
 /** One suggestion of ours, as CodeMirror wants it. */
-function toCompletion(option: CompletionOption): Completion {
+function toCompletion(option: CompletionOption, place: "names" | "general"): Completion {
   if (option.kind === "message") {
     // A message says something about the catalog; it is not part of the
     // query and inserts nothing. An empty text would be read as "no
@@ -65,10 +74,17 @@ function toCompletion(option: CompletionOption): Completion {
   }
   return {
     label: option.label,
-    type: option.kind === "column" ? "property" : "class",
+    type: option.kind === "column" ? "property" : option.kind === "parameter" ? "variable" : "class",
     detail: option.detail,
     apply: option.apply,
-    boost: option.kind === "column" ? COLUMN_BOOST : TABLE_BOOST,
+    // QS round review R1 (D8): only a "names" place boosts a table or column.
+    // The message branch above and the `{{` parameter list are unchanged.
+    boost:
+      place === "general"
+        ? 0
+        : option.kind === "table"
+          ? TABLE_BOOST
+          : COLUMN_BOOST,
   }
 }
 
@@ -81,11 +97,14 @@ function toCompletion(option: CompletionOption): Completion {
 export function createSqlCompletionSource({
   tables,
   columns,
+  parameters,
 }: {
   /** The tables the catalog shows. */
   tables: CompletionTable[]
   /** The columns fetched so far, keyed by the catalog id of the table. */
   columns: () => Record<string, ColumnState>
+  /** The names of the open tab's parameter definitions, read when `{{` is completed. */
+  parameters: () => readonly string[]
 }): CompletionSource {
   return (context: CompletionContext): CompletionResult => {
     const sql = context.state.doc.toString()
@@ -94,20 +113,44 @@ export function createSqlCompletionSource({
       cursor: context.pos,
       tables,
       columns: columns(),
+      parameters: parameters(),
     })
     return {
       from: answer.from,
-      options: answer.options.map(toCompletion),
+      options: answer.options.map((option) => toCompletion(option, answer.place)),
     }
   }
 }
 
 /**
- * The extension that adds the console's suggestions to the SQL language.
+ * The keywords the SQL language offers.
  *
- * The language's data facet is additive: the keywords the SQL extension
- * offers stay, and this source is asked beside them.
+ * The editor asks for the standard dialect's keywords directly, so they come
+ * out as the dialect spells them, not upper-cased. Naming the answering
+ * sources replaces the language's own completion, which the `sql()` extension
+ * would install.
+ */
+const keywordSource = keywordCompletionSource(StandardSQL, false)
+
+/**
+ * The keywords, without the ones that would show after a `{{`.
+ *
+ * A placeholder holds a parameter name, so a keyword cannot be written
+ * there and does not belong in the list (#422 S2).
+ */
+const keywords: CompletionSource = (context) => {
+  if (inPlaceholder(context.state.doc.toString(), context.pos)) return null
+  return keywordSource(context)
+}
+
+/**
+ * The extension that gives the SQL editor its suggestions.
+ *
+ * It names the sources that answer, so the console's own source and the
+ * language's keywords are the only two: the keywords stay out of a
+ * placeholder, and the console's source does not offer a parameter name
+ * inside a comment or a quoted run.
  */
 export function sqlCompletionExtension(source: CompletionSource): Extension {
-  return StandardSQL.language.data.of({ autocomplete: source })
+  return autocompletion({ override: [source, keywords] })
 }

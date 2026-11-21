@@ -202,3 +202,58 @@ not one withheld to hide the gap. The acceptance test
 `snapshotId`/`exportedAt` populated after a real export, the export
 history listing the run the test itself triggered with a matching
 `rowsExported`, and the consumers stub's `supported: false` shape.
+
+## Update — the latest-copy table (`DATA-6`)
+
+Each published Gold table gained a companion, `gold.<table>_latest`,
+which always holds only the newest copy — for outside tools that count
+rows without filtering on the newest export time and would otherwise
+count every kept copy (`DATA-2` keeps 7).
+
+Three decisions this update records:
+
+**Why the companion is written by `PyIceberg` in Dagster, not by the
+Rust export (the M1 mismatch).** `iceberg` 0.10.1 offers no replace:
+`Transaction` exposes `fast_append` and a few metadata updates only, the
+action trait a replace would implement (`TransactionAction`) is
+`pub(crate)`, and so is `TableCommit`'s builder. The Rust side
+*cannot* write "delete everything, add this copy" as one commit.
+`PyIceberg`'s `Transaction.overwrite` stages the delete and the append
+and sends both in ONE catalog commit — measured by the acceptance gate
+on the real stack (`DATA-6` T6, AC2: the overwrite grew the catalog's
+metadata log by exactly 1, and a continuous reader through `ClickHouse`
+saw only whole copies). So `routes::gold::export` launches one `gold_latest_copy_job`
+run per successful publish, and the op (`gold_latest_copy.py`) reads
+that publish's rows back out of `gold.<table>` — never out of
+`ClickHouse` — so the copy is exactly the rows the publish wrote, with
+the masking applied at publish time. The delay (one orchestrator run
+after the publish) is a customer-visible limit, measured by the
+acceptance gate, not assumed.
+
+**Consistency (D3): one commit.** The table is replaced in a single
+catalog commit — `create_table_transaction` + `append` for the first
+copy (so it never exists empty), `Transaction.overwrite` for every copy
+after that, never a separate delete and append (that would be two
+commits, and a reader could see the gap). Iceberg catalogs swap the
+table's metadata pointer atomically, so a reader loading the table gets
+either the old copy or the new one. The gate proves it (T6, AC2) by
+reading the table continuously during a real publish and failing on any
+sample that is not one whole copy, and by asserting that the catalog's
+metadata log grew by exactly one across the replace.
+
+**The marker (D7): the two tables can never collide.** A mart may
+itself be named `<other>_latest`, and `sanitize_mart_name` would land
+it on the same Iceberg table as another mart's latest copy. Every
+latest table therefore carries the table property
+`rantai.latest-copy-of = <table>`, and both directions fail closed: the
+Rust export refuses to publish into a table that carries the marker
+(`GoldExportError::TargetIsLatestCopy`, a fixed-sentence 422), and the
+op refuses to write a `gold.<table>_latest` that exists without the
+marker or whose marker names another table (`name_taken`).
+
+As a side effect, `_exported_at` is now ONE value per publish (epoch
+microseconds, computed before the batch loop), not one value per batch.
+That is what makes "the rows of this one publish" addressable at all —
+and it also corrects `DATA-2`'s trim, which counts DISTINCT
+`_exported_at` values as copies and therefore kept 7 *batches*, not 7
+copies, for a mart over `GOLD_EXPORT_BATCH_SIZE` rows.

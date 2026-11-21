@@ -1,6 +1,6 @@
 import type { TagKey, TagKeysService } from "../contracts/tag-keys"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 
 /**
  * The governed tag keys over `/api/governance/tag-keys`. An error body's text
@@ -10,9 +10,11 @@ import { ServiceError } from "../errors"
 const BASE = "/api/governance/tag-keys"
 
 function errorFor(status: number, json: { error?: string } | null, failure: string): ServiceError {
+  // QA TC-1724 (WEB-12): a refusal goes through deniedFor.
+  const denied = deniedFor(status, json)
+  if (denied) return denied
   const message = json?.error ?? failure
   if (status === 404) return new ServiceError("not_found", message, status)
-  if (status === 401 || status === 403) return new ServiceError("permission_denied", message, status)
   if (status === 400 || status === 409 || status === 422) {
     return new ServiceError("invalid_request", message, status)
   }

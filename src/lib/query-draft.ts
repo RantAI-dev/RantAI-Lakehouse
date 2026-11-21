@@ -10,11 +10,42 @@
  * engine, and the browser keeps the active one. The single draft that came
  * before is read as one tab, so the first read after this change finds the
  * query that was there and nothing else.
+ *
+ * Whose draft it is: one person's, in one tenant (`QS-8`, `LH-QS-1-04` F1).
+ * The key is built by [`queryDraftKey`] from the signed-in person and their
+ * active tenant, so the next person on the same browser reads their own tabs
+ * and never this one's. Signing out clears nothing: the entry stays under its
+ * owner's key for their next sign-in on that browser. Before `QS-8` every
+ * person shared one entry ([`LEGACY_QUERY_DRAFT_KEY`]); its owner is unknown,
+ * so it is dropped rather than migrated ([`dropLegacyDraft`]).
  */
 
-import type { QueryEngine } from "@/services/contracts/queries"
+import type { QueryEngine, QueryParamDef, QueryParamValue } from "@/services/contracts/queries"
+import { parseDefinitions, parseValues } from "@/lib/query-params"
 
-export const QUERY_DRAFT_KEY = "rantai-lakehouse:query-studio-draft"
+/**
+ * The key every person on a browser shared before `QS-8`. Nothing reads it:
+ * whose tabs it holds cannot be known, so it is removed on the first load
+ * (`dropLegacyDraft`) instead of being handed to whoever signs in next.
+ */
+export const LEGACY_QUERY_DRAFT_KEY = "rantai-lakehouse:query-studio-draft"
+
+/**
+ * QS-11 (LH-QS-1-01), D7: the old placeholder was stored as real SQL. A tab
+ * that still holds exactly this text is read back as empty; any other text,
+ * including a comment the person wrote, is kept as it is.
+ */
+const LEGACY_STARTER_SQL = "-- Write SQL here, or generate it from a question"
+
+/**
+ * The key one person's draft lives under: the person and their active tenant
+ * (`QS-8`, decision 12). `-` stands in for no active tenant, which is a real
+ * state for a person who belongs to none; a person's key never collides with
+ * another person's or another tenant's.
+ */
+export function queryDraftKey(userId: string, tenantId: string | null | undefined): string {
+  return `${LEGACY_QUERY_DRAFT_KEY}:${userId}:${tenantId || "-"}`
+}
 
 /**
  * How many query tabs one browser keeps. A browser that could hold more
@@ -35,6 +66,14 @@ export type QueryTab = {
   name: string
   sql: string
   engine: QueryEngine
+  /**
+   * The definitions of the tab's `{{name}}` parameters (`QS-5`). A name that
+   * leaves the SQL keeps its definition until the tab is closed or saved,
+   * so a cut and paste does not lose it.
+   */
+  parameters: QueryParamDef[]
+  /** The value each parameter has right now, by name. Not what a save stores: that is the default. */
+  values: Record<string, QueryParamValue>
   /**
    * The saved query this tab came from, when it came from one (`QS-3` C4).
    * Absent for a tab that holds a query nobody saved.
@@ -89,7 +128,20 @@ function parseTab(value: unknown): QueryTab | null {
   if (typeof tab.name !== "string") return null
   if (typeof tab.sql !== "string") return null
   if (!isEngine(tab.engine)) return null
-  const parsed: QueryTab = { id: tab.id, name: tab.name, sql: tab.sql, engine: tab.engine }
+  // A tab stored before parameters existed has neither field and gets none.
+  // A malformed definition or value is dropped on its own: it must not take
+  // the tab, and the SQL in it, along.
+  const parameters = parseDefinitions(tab.parameters)
+  const parsed: QueryTab = {
+    id: tab.id,
+    name: tab.name,
+    // QS-11 (LH-QS-1-01), D7: the old starter text was a comment in the
+    // document, not a grey hint. Read that one value back as empty.
+    sql: tab.sql === LEGACY_STARTER_SQL ? "" : tab.sql,
+    engine: tab.engine,
+    parameters,
+    values: parseValues(tab.values, parameters),
+  }
   // A tab that came from a saved query keeps its id and the caller's level:
   // they say what "Save" may do with the query. A draft written before this
   // change has neither and stays usable, and a field that is not one of
@@ -150,7 +202,16 @@ export function parseTabs(raw: string | null): QueryTabs | null {
   const sql = typeof stored.sql === "string" ? stored.sql : ""
   if (!sql.trim() && !question.trim()) return null
   return {
-    tabs: [{ id: "tab-1", name: "Query 1", sql, engine: "clickhouse" }],
+    tabs: [
+      {
+        id: "tab-1",
+        name: "Query 1",
+        sql,
+        engine: "clickhouse",
+        parameters: [],
+        values: {},
+      },
+    ],
     activeId: "tab-1",
     question,
     tab: editor,
@@ -158,25 +219,25 @@ export function parseTabs(raw: string | null): QueryTabs | null {
 }
 
 /**
- * Read the draft. Every access is guarded: storage throws in a private
- * window and is simply absent during server rendering.
+ * Read the tabs stored under `key`. Every access is guarded, like
+ * `parseTabs`: storage throws in a private window and is simply absent
+ * during server rendering.
  */
-export function readDraft(): QueryDraft | null {
+export function readTabs(key: string): QueryTabs | null {
   try {
-    return parseDraft(window.localStorage.getItem(QUERY_DRAFT_KEY))
+    return parseTabs(window.localStorage.getItem(key))
   } catch {
     return null
   }
 }
 
-/** Store the draft, or clear it when there is nothing left to keep. */
-export function writeDraft(draft: QueryDraft): void {
+/**
+ * Store the tabs under `key`, the owner's own entry (`QS-8`). A tab keeps no
+ * result: only what the person wrote.
+ */
+export function writeTabs(key: string, tabs: QueryTabs): void {
   try {
-    if (!draft.sql.trim() && !draft.question.trim()) {
-      window.localStorage.removeItem(QUERY_DRAFT_KEY)
-      return
-    }
-    window.localStorage.setItem(QUERY_DRAFT_KEY, JSON.stringify(draft))
+    window.localStorage.setItem(key, JSON.stringify(tabs))
   } catch {
     // A draft that cannot be saved is a lost convenience, not an error
     // worth interrupting anyone over.
@@ -184,26 +245,48 @@ export function writeDraft(draft: QueryDraft): void {
 }
 
 /**
- * Read the tabs. Every access is guarded, like `readDraft`: storage throws
- * in a private window and is simply absent during server rendering.
+ * Remove the entry every person shared before `QS-8` (`QS-8`, decision 12).
+ *
+ * It is dropped, not migrated: nothing on this browser says whose tabs it
+ * holds, and handing them to whoever signs in next is the bug `QS-8`
+ * answers. Guarded like the reads: a private window has no storage to
+ * remove from.
  */
-export function readTabs(): QueryTabs | null {
+export function dropLegacyDraft(): void {
   try {
-    return parseTabs(window.localStorage.getItem(QUERY_DRAFT_KEY))
+    window.localStorage.removeItem(LEGACY_QUERY_DRAFT_KEY)
   } catch {
-    return null
+    // Nothing to clean in a browser that refuses storage.
   }
 }
 
 /**
- * Store the tabs under the same key the old draft used, so the shape in
- * the browser tells the two apart on the next read.
+ * Point a stored tab at the saved query a save produced (`WEB-7` D5).
+ *
+ * The save happens on its own page now, so the editor is unmounted while it
+ * runs and cannot update the tab itself, as it did when the save was a sheet
+ * over it. Without this the tab still names the query it was opened from: a
+ * copy just made would be offered "Save as new" again, and a change would be
+ * offered a change of the query it already changed. The tab is written here
+ * after the server answers; a draft that cannot be written leaves the
+ * editor's button as it was, and nothing else changes.
+ *
+ * `key` is the owner's draft key: the tab belongs to the person who saved.
  */
-export function writeTabs(tabs: QueryTabs): void {
-  try {
-    window.localStorage.setItem(QUERY_DRAFT_KEY, JSON.stringify(tabs))
-  } catch {
-    // A draft that cannot be saved is a lost convenience, not an error
-    // worth interrupting anyone over.
-  }
+export function rememberSavedTab(
+  key: string,
+  tabId: string,
+  savedId: string,
+  level: string | undefined
+): void {
+  const stored = readTabs(key)
+  if (!stored) return
+  writeTabs(key, {
+    ...stored,
+    tabs: stored.tabs.map((tab) =>
+      tab.id === tabId
+        ? { ...tab, savedId, ...(typeof level === "string" ? { level } : {}) }
+        : tab
+    ),
+  })
 }

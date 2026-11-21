@@ -11,6 +11,8 @@ import { clickhouseGovernanceService } from "./clients/governance"
 import { postgresIdentityService } from "./clients/identity"
 import { postgresConnectorService } from "./clients/connectors"
 import { clickhouseDashboardService } from "./clients/dashboards"
+import { dashboardReportService as dashboardReportClientService } from "./clients/dashboard-reports"
+import { dashboardTemplateService as dashboardTemplateClientService } from "./clients/dashboard-templates"
 import { calcFieldService as calcFieldClientService } from "./clients/calc-fields"
 import { metricService as metricClientService } from "./clients/metrics"
 import { hierarchyService as hierarchyClientService } from "./clients/hierarchies"
@@ -24,11 +26,16 @@ import { uploadService as uploadClientService } from "./clients/uploads"
 import { homeService as homeClientService } from "./clients/home"
 import { reportService as reportClientService } from "./clients/reports"
 import { settingsService as settingsClientService } from "./clients/settings"
+import {
+  brandingImageUrl as brandingImageUrlClient,
+  brandingService as brandingClientService,
+} from "./clients/branding"
 import { mapService as mapClientService } from "./clients/maps"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
 import { chatSessionService as chatSessionClientService } from "./clients/chat-sessions"
 import { semanticService as semanticClientService } from "./clients/semantic"
 import { tagKeysService as tagKeysClientService } from "./clients/tag-keys"
+import { usageService as usageClientService } from "./clients/usage"
 import { httpVersionService } from "./clients/version"
 import * as authClient from "./clients/auth"
 
@@ -37,6 +44,12 @@ import * as authClient from "./clients/auth"
 // has been deleted.
 export const overviewService = clickhouseOverviewService
 export const assetService = clickhouseAssetService
+/**
+ * The catalog's list-row shape (`GOV-7` S2). The contract owns it, and it is
+ * exported here so a feature imports it from `@/services` rather than from
+ * the contract module (`GOV-7 S2 review 2 R2-S1`).
+ */
+export type { Asset } from "./contracts/assets"
 // Pipelines is now fully real — list/get/runs/trigger from Dagster,
 // create/generate from Postgres + LLM, cancel/retry/pause/resume are
 // real Dagster mutations. mock/pipelines.ts has been deleted.
@@ -53,6 +66,12 @@ export const agentService = postgresAgentService
 // Governance is now fully real — reads from ClickHouse/Dagster,
 // policies + create*Rule from Postgres. mock/governance.ts has been deleted.
 export const governanceService = clickhouseGovernanceService
+/**
+ * The row filter grammar the server's validator accepts (`WEB-8` S2 D8).
+ * The contract owns the shape, and it is exported here so a feature imports
+ * it from `@/services`.
+ */
+export type { RowFilterGrammar } from "./contracts/governance"
 // Ops is real — the service list from ClickHouse+Dagster. WEB-3 slice 1
 // removed the observability and workloads reads with their pages; the
 // backend routes stay registered (WEB-4 retires them).
@@ -70,9 +89,13 @@ export const identityService = postgresIdentityService
 export type {
   InviteUserInput,
   InviteUserResponse,
+  Permission,
   ResetPasswordResponse,
   Role,
+  RoleTableAccess,
+  RoleTableGrant,
   ServiceIdentity,
+  SetRoleTableAccessInput,
   SetUserRolesInput,
   Tenant,
   User,
@@ -96,9 +119,21 @@ export const dashboardService = clickhouseDashboardService
  * (`PR #199 review M SHOULD-FIX BI-16 7`).
  */
 export type {
-  AccessKind, AccessLevel, Board, BoardChart, BoardTab, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
-  ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, TileBox,
+  AccessKind, AccessLevel, Board, BoardChart, BoardTab, ChartOutline, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
+  ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, ShortcutItem, TileBox,
+  // `BI-29`: the filter and click shapes, formerly imported from `clients/bi-store`.
+  ChartClick, FilterDef, FilterField, FilterKind, FilterOp, FilterSkip, FilterValues, FilterValuesScope, RelativeAnchor, RelativeUnit,
 } from "./contracts/dashboards"
+// Reports (BI-18 part D): written pages with live charts, in Postgres over
+// `/api/dashboard/reports`. Real from the start: no mock ever existed.
+export const dashboardReportService = dashboardReportClientService
+export type {
+  Report, ReportBlock, ReportBlockType, ReportChartEntry, ReportList, ReportSummary, ReportView,
+} from "./contracts/dashboard-reports"
+// Dashboard templates (BI-18 part D): saved dashboard definitions in Postgres
+// over `/api/dashboard/templates`. Real from the start: no mock ever existed.
+export const dashboardTemplateService = dashboardTemplateClientService
+export type { DashboardTemplate, LeftOutChart, StartedBoard, TemplateList } from "./contracts/dashboard-templates"
 /** Calculated fields of a mart or SQL source (BI-8). */
 export const calcFieldService = calcFieldClientService
 /** Reusable metrics and segments (BI-2). */
@@ -178,6 +213,44 @@ export type {
   AssistantSettingsInput,
   AssistantTestResult,
 } from "./contracts/settings"
+/**
+ * The deployment's SSO / OIDC settings (`ADM-12`): issuer, client ID, secret,
+ * provider name, groups claim, role map rows and JIT provisioning, each with
+ * its source, and test sign-in shapes.
+ */
+export type {
+  RoleMapRow,
+  SsoSettings,
+  SsoSettingsInput,
+  SsoTestResult,
+  SsoTestStartResult,
+} from "./contracts/settings"
+/**
+ * The workspace's own name and pictures (`ADM-2`), as the administrator reads
+ * them: the name, each picture's type and size, and when the row was saved.
+ * The contract owns the shapes, and they are exported here so a feature
+ * imports them from `@/services`.
+ */
+export type {
+  WorkspacePicture,
+  WorkspaceSettings,
+  WorkspaceSettingsInput,
+} from "./contracts/settings"
+/**
+ * The workspace's branding as everybody sees it (`ADM-2`): the name and each
+ * picture's type and version. The route is public, so the sign-in page reads
+ * it before any session exists (feature decision 6).
+ */
+export const brandingService = brandingClientService
+/**
+ * The URL of one stored picture (`GET /api/branding/images/<kind>`). The
+ * `version` busts the browser's cache for a picture that changed.
+ */
+export const brandingImageUrl = brandingImageUrlClient
+/**
+ * The branding shapes the console's features read from `@/services`.
+ */
+export type { Branding, BrandingImageKind, BrandingPicture } from "./contracts/branding"
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService
@@ -196,6 +269,17 @@ export const semanticService = semanticClientService
 // The governed tag keys and their allowed values (`/api/governance/tag-keys`,
 // `DATA-12` part 2). Free tags are not part of this.
 export const tagKeysService = tagKeysClientService
+// The Usage page: the runs of a period summed per day, person, engine or
+// tenant, the same sums as a CSV file, the rates behind the estimate in
+// money, and the size of every layer (`/api/usage/*`, `OPS-8` part B and C).
+// No mock ever existed.
+export const usageService = usageClientService
+/** The usage shapes the Usage feature reads from `@/services`. */
+export type {
+  NewUsageRate, UsageExport, UsageGroup, UsageQuery, UsageRate, UsageRateKind, UsageRates,
+  UsageReport, UsageRow, UsageService, UsageStorageBucket, UsageStorageQuery, UsageStorageReport,
+  UsageStorageRow,
+} from "./contracts/usage"
 // The server's own health answer (`/api/health` — the API's `/health`,
 // exposed through the console's rewrite), read for the version it runs so
 // the console can say when it and the server are not the same build
@@ -210,12 +294,15 @@ export type { ServerHealth } from "./contracts/version"
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and
 // `DELETE /api/auth/sessions/{id}`. Only `providers`,
-// `listSessions`, and `deleteSession` are registered — the other auth
-// methods (login/logout/me/change-password) stay imported directly by
-// `AuthProvider` and the login/change-password pages; see
+// `listSessions`, `deleteSession` and `passwordRules` are registered — the
+// other auth methods (login/logout/me/change-password) stay imported
+// directly by `AuthProvider` and the login/change-password pages; see
 // `services/clients/auth.ts`'s module doc comment for why the split.
 export const authService = {
   providers: authClient.providers,
   listSessions: authClient.listSessions,
   deleteSession: authClient.deleteSession,
+  // WEB-7: the invite form is its own page, and it states the lengths the
+  // server enforces; registering the read keeps the page on `@/services`.
+  passwordRules: authClient.passwordRules,
 }

@@ -6,13 +6,13 @@
 | Backlog | `QS-3` |
 | Kind | Feature |
 | Spec | `docs/core/specs/qs-3.md` |
-| Status | In Acceptance |
+| Status | Released: accepted by the product owner on 2026-11-14 (every row Pass; AC2 with findings; AC7 passed: the refusal part on 2026-11-12, the database part via the API on 2026-11-14; the owner's NUL-byte exception was not needed, because the failure could be triggered and answered `database error` with no Postgres or sqlx text) |
 | Priority | P2 |
 | Owner | Held in the base. |
 | Acceptor | Held in the base. |
 | Started | 2026-10-30; also in `BACKLOG.md` Dates |
-| Shipped | Not yet |
-| Evidence | API in #361 (2026-11-03) and its review fixes in #382 (2026-11-05); console in #389 (2026-11-05), with moving a folder needing manage on everything in it in #393 (2026-11-06) and sharing a folder needing the same in #409: the folder tree with the personal and the shared space, server-side search, the level-gated row and folder actions, the move dialog, the trash with restore at edit, version history with revert behind a confirmation, the share panel for queries and folders at manage, and the studio saving back into the query it came from; TypeScript suite 3449 pass / 1 skip / 0 fail on #389's head; every refusal surfaces the server's own sentence through the standard renderer, and the console writes none of its own. |
+| Shipped | API 2026-11-03 (#361); console 2026-11-05 (#389); move fix 2026-11-06 (#393); #409 2026-11-07; folder sharing warning 2026-11-07 (#416); Bronze link and the review fixes 2026-11-08 (#437) |
+| Evidence | API in #361 (2026-11-03) and its review fixes in #382 (2026-11-05); console in #389 (2026-11-05), with moving a folder needing manage on everything in it in #393 (2026-11-06) and sharing a folder needing the same in #409, and a folder naming who it is shared with before a save or a move in #416: the folder tree with the personal and the shared space, server-side search, the level-gated row and folder actions, the move dialog, the trash with restore at edit, version history with revert behind a confirmation, the share panel for queries and folders at manage, with the grantees' names, and the studio saving back into the query it came from; TypeScript suite 3449 pass / 1 skip / 0 fail on #389's head; every refusal surfaces the server's own sentence through the standard renderer, and the console writes none of its own. |
 | Plan | Plan files are not kept in the repository. |
 
 ## Problem
@@ -53,13 +53,13 @@ saves into the person's personal space. No new tool: organising and sharing are 
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Three levels, the same as dashboards (`BI-19`): view (see and run), edit (change SQL, title and tags; rename a folder), manage (also move, share, and delete a folder). The spec's separate "run" level is dropped: anyone who can see a query's SQL can copy it and run it under their own `query:read`, so view-but-not-run would protect nothing. Sharing or moving a folder needs manage on everything in it | 3 levels | Owner, 2026-11-05; changed: Owner, 2026-11-06 |
+| 1 | Three levels, the same as dashboards (`BI-19`): view (see and run), edit (change SQL, title and tags; rename a folder), manage (also move, share, and delete a folder). The spec's separate "run" level is dropped: anyone who can see a query's SQL can copy it and run it under their own `query:read`, so view-but-not-run would protect nothing. Sharing or moving a folder needs manage on everything in it. Anyone with edit on a folder sees who it is shared with: the access list answers at edit, every rule in it carries the grantee's name and email, the save sheet and the move dialog name who a chosen folder is shared with, and the share panel shows names instead of ids | 3 levels | Owner, 2026-11-05; changed: Owner, 2026-11-06; changed: Owner, 2026-11-07 |
 | 2 | A level is granted to a person or a role of the same organisation, on a query or a folder. A folder's grant covers what is inside it | none | Owner, 2026-10-30 |
 | 3 | A new saved query goes to the author's personal space unless they pick a folder. Only the author sees the personal space. The **shared space** is the root of the tree, a query that sits in no folder. Every holder of `query:read` in the organisation sees what is in it, at **view**. The **personal space** is one folder per person, and only its owner sees it | personal | Owner, 2026-10-30 |
 | 4 | Every query saved before this release moves to the organisation's shared space with view for everyone in the organisation and manage for its author, so nobody loses a query they see today. A query with no author (seeded, or saved by the assistant before this release) gets manage for administrators only. A grant adds a person or a role to an item in either space. In the shared space it raises the level; in a personal space it is the only way anybody else sees the item. So the acceptance check `QS-3-AC1` (share at view with a second user) is a personal query shared with them | none | Owner, 2026-10-30 |
 | 5 | A person with every permission (`*:*`) sees and manages every saved query of the organisation | none | Owner, 2026-10-30 |
 | 6 | Delete moves to a trash for 30 days (as dashboards), then the query is removed for good. Edit or manage may delete and restore | 30 days | Owner, 2026-10-30 |
-| 7 | A version is kept on every change of SQL or title, the last 15 (Metabase, and dashboards' `KEEP`). Going back writes a new version "Restored version N", so nothing is lost | 15 | Owner, 2026-10-30 |
+| 7 | A version is kept on every change of SQL, title or parameters, the last 15 (Metabase, and dashboards' `KEEP`). Going back writes a new version "Restored version N", so nothing is lost. A revert restores the SQL and the parameters together (`query-parameters.md`, decision 14) | 15 | Owner, 2026-10-30 |
 | 8 | Folders can hold folders, as on the dashboard side | none | Owner, 2026-10-30 |
 | 9 | Search matches the name or the SQL text, containing the text typed, case-insensitive, over the queries the person may see | none | Owner, 2026-10-30 |
 | 10 | Everything else that lists saved queries uses the same check: the home card, the dashboard click setting, the catalog's "used by" and lineage. A dashboard click target pointing at a query the viewer may not see says "This query is not available to you" | none | Owner, 2026-10-30 |
@@ -68,8 +68,13 @@ saves into the person's personal space. No new tool: organising and sharing are 
 ## Limits to tell a customer
 
 - A shared query shows its SQL to everyone it is shared with; sharing at view level does not hide the SQL.
-- A query saved into a folder that is already shared is shared with the same people, because a folder's grant covers what is inside it. Choosing that folder when saving is the saver's choice.
+- A query saved into a folder that is already shared is shared with the same people, because a folder's grant covers what is inside it. The save sheet and the move dialog name who the chosen folder is shared with before the user confirms, so the choice is an informed one.
 - Sharing a folder needs manage on the folder and on every sub-folder and query under it, trashed ones included. Otherwise the share is refused with 403 and "Only someone who manages everything in this folder can share it."
+- A `PUT` that only removes rules is refused too when the folder holds a query the caller does not manage, so the
+  author of such a folder cannot revoke its rules. The query's manager can move the query out, or an administrator
+  changes the rules.
+- A rule set on an empty folder applies to what is saved or moved into it later. The save sheet and the move dialog
+  name who that is, for anyone with edit on the folder.
 - Queries saved before this release start in the shared space, visible to the whole organisation, as they were.
 - After 30 days in the trash, a query is gone.
 - A folder is deleted only when it holds nothing live and nothing in the trash. Otherwise the delete is refused with
@@ -93,22 +98,25 @@ Run on a running console by the product owner. A step not performed is never a p
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `QS-3-AC1` | Share a query at view with a second user; as that user, run it, then try to save a change | The run works; the change is refused | Not run |
-| `QS-3-AC2` | Change a query four times, open its history, go back to version 3 | The SQL is version 3's, and the history shows "Restored version 3" on top | Not run |
-| `QS-3-AC3` | Delete a query, open the trash, restore it | It is back in its folder with its history | Not run |
-| `QS-3-AC4` | Save a query without picking a folder; as a second user of the same organisation, search for it | Not found | Not run |
-| `QS-3-AC5` | Share a folder with a role; as a user of that role, open a query inside it | Visible at the folder's level | Not run |
-| `QS-3-AC6` | In the chat, as the second user, ask for the saved queries | The private query is not listed | Not run |
-| `QS-3-AC7` | A user without `query:read` opens the saved queries, and an edit fails on the database | Refused; the failure shows a fixed message (principles 2 and 4) | Not run |
+| `QS-3-AC1` | Share a query at view with a second user; as that user, run it, then try to save a change | The run works; the change is refused | Pass (2026-11-12, 273d89e6, no case) |
+| `QS-3-AC2` | Change a query four times, open its history, go back to version 3 | The SQL is version 3's, and the history shows "Restored version 3" on top | Pass with findings (2026-11-12, 3cdd8332, no case). One save of version 4 failed silently; the history once showed "Query failed (500)" |
+| `QS-3-AC3` | Delete a query, open the trash, restore it | It is back in its folder with its history | Pass (2026-11-12, 3cdd8332, no case) |
+| `QS-3-AC4` | Save a query without picking a folder; as a second user of the same organisation, search for it | Not found | Pass (2026-11-12, 3cdd8332, no case) |
+| `QS-3-AC5` | Share a folder with a role; as a user of that role, open a query inside it | Visible at the folder's level | Pass (2026-11-12, 273d89e6, no case) |
+| `QS-3-AC6` | In the chat, as the second user, ask for the saved queries | The private query is not listed | Pass (2026-11-13, 80fb2f68, no case) |
+| `QS-3-AC7` | A user without `query:read` opens the saved queries, and an edit fails on the database | Refused; the failure shows a fixed message (principles 2 and 4) | Pass (2026-11-14, 240d2e62, no case). Refusal part (2026-11-12, 3cdd8332): the page says "You don't have access". Database part, through the API: a PATCH with a NUL byte in the title, and separately in the SQL, returned 500 `{"error":"database error"}` both times, with no Postgres or sqlx text; the query stayed at one version; the throwaway query was deleted |
+| `QS-3-AC8` | As a user with edit on a shared folder, pick that folder in the save sheet, then in the move dialog | Both name who the folder is shared with, without you, before you confirm | Pass (2026-11-12, 3cdd8332, no case) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): product owner (recorded in the base) **Date:** 2026-11-14 **Build:** 240d2e62
 
 Exceptions, each with an owner and a date:
+
+- `QS-3-AC7`, owner 2026-11-14: the auditor tries a NUL byte (`\u0000`) in an edit's SQL or title through the API; if no database failure can be triggered, the code path (`saved_queries.rs:658` to `From<StoreError>`, `lakehouse-store/src/error.rs:169`) and the unit test `internal_message_never_leaks_source_error_text` are accepted as an exception. The exception was not needed: the database failure could be triggered, and the API answered `database error` with no Postgres or sqlx text (see the row above).
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
-- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
+- [x] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base (done by the auditor)
 - [ ] `CHANGELOG.md` entry a customer can read

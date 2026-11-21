@@ -139,20 +139,16 @@ describe("AuthProvider tenant-state (activeTenantId + setActiveTenant)", () => {
   })
 
   it("setActiveTenant writes lh_active_tenant and a sibling useAuth consumer observes the change", async () => {
-    function Switcher(): null {
+    // ADM-15 (#483 review): this test used to give the person NO tenants and
+    // switch to "a" — a state the console cannot reach (no switcher is drawn)
+    // and one the new rule refuses, because the stored tenant must be one of
+    // the person's own. The person now has `TENANTS`, starts on the first, and
+    // switches to "b" through the button the switcher wires `onSwitch` to.
+    function Switcher(): React.ReactElement {
       const { setActiveTenant } = useAuth()
-      // Ref-guard so the switch fires exactly once even though the
-      // context re-renders after the state update — otherwise the test
-      // would oscillate between "a" and the post-set value.
-      const calledRef = React.useRef(false)
-      React.useEffect(() => {
-        if (calledRef.current) return
-        calledRef.current = true
-        setActiveTenant("a")
-      }, [setActiveTenant])
-      return null
+      return <button onClick={() => setActiveTenant("b")}>switch to Beta</button>
     }
-    mockAuthMe([])
+    mockAuthMe(TENANTS)
     render(
       <AuthProvider>
         <Switcher />
@@ -163,6 +159,11 @@ describe("AuthProvider tenant-state (activeTenantId + setActiveTenant)", () => {
       expect(screen.getByTestId("active").textContent).toBe("a"),
     )
     expect(localStorage.getItem(ACTIVE_TENANT_STORAGE_KEY)).toBe("a")
+    fireEvent.click(screen.getByRole("button", { name: "switch to Beta" }))
+    await waitFor(() =>
+      expect(screen.getByTestId("active").textContent).toBe("b"),
+    )
+    expect(localStorage.getItem(ACTIVE_TENANT_STORAGE_KEY)).toBe("b")
   })
 
   it("defaults activeTenantId to tenants[0].id when localStorage is empty and the principal has tenants", async () => {

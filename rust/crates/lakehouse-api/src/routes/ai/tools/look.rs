@@ -67,6 +67,11 @@ pub(crate) const FORMAT_FIELDS: [&str; 11] = [
     "referenceLines",
 ];
 
+/// `AI-29`: lines to APPEND to a chart's own reference lines. Deliberately not
+/// in [`FORMAT_FIELDS`] — that loop would store it in the chart's definition —
+/// so `merge_format` handles it before and after the loop instead.
+pub(crate) const ADD_REFERENCE_LINES: &str = "addReferenceLines";
+
 /// Dispatch one of the two tools by name.
 pub(super) async fn run(
     state: &AppState,
@@ -92,14 +97,30 @@ pub(super) async fn run(
 /// The sentence for the model: no formatting field was given, the merged
 /// definition is not a chart, or the style or the reference lines are refused
 /// (the console's own sentence).
+/// The parameter names a list of reference lines is bound to (`AI-29`). A
+/// line's `value` or a band's `to` is `{param: <name>}` when it follows a
+/// parameter; a fixed number has no `param` key.
+fn bound_line_params(lines: Option<&Vec<Value>>) -> HashSet<&str> {
+    lines
+        .into_iter()
+        .flatten()
+        .flat_map(|line| [line.get("value"), line.get("to")])
+        .flatten()
+        .filter_map(|v| v.get("param").and_then(Value::as_str))
+        .collect()
+}
+
 pub(crate) fn merge_format(
     stored: &ChartInput,
     args: &Map<String, Value>,
 ) -> Result<ChartInput, String> {
-    if !FORMAT_FIELDS.iter().any(|f| args.contains_key(*f)) {
+    if !FORMAT_FIELDS.iter().any(|f| args.contains_key(*f))
+        && !args.contains_key(ADD_REFERENCE_LINES)
+    {
         return Err(format!(
-            "format_chart changes formatting only: give at least one of {}.",
-            FORMAT_FIELDS.join(", ")
+            "format_chart changes formatting only: give at least one of {}, {}.",
+            FORMAT_FIELDS.join(", "),
+            ADD_REFERENCE_LINES
         ));
     }
     // `PR #199 review M SHOULD-FIX BI-17 3`: a key that is not a formatting
@@ -108,7 +129,11 @@ pub(crate) fn merge_format(
     // the chart had changed when it had not.
     let unknown: Vec<String> = args
         .keys()
-        .filter(|key| key.as_str() != "chart" && !FORMAT_FIELDS.contains(&key.as_str()))
+        .filter(|key| {
+            key.as_str() != "chart"
+                && !FORMAT_FIELDS.contains(&key.as_str())
+                && key.as_str() != ADD_REFERENCE_LINES
+        })
         .map(|key| format!("\"{key}\""))
         .collect();
     if !unknown.is_empty() {
@@ -121,6 +146,21 @@ pub(crate) fn merge_format(
     let Ok(mut def) = serde_json::to_value(stored) else {
         return Err("the chart's definition could not be read.".to_owned());
     };
+    // `AI-29` (LH-BI-11-07): replacing the whole list must not silently drop a
+    // line bound to a parameter — the chart would stop following it. Refuse,
+    // with the way to add a line while keeping the bound one.
+    if let Some(replacement) = args.get("referenceLines").and_then(Value::as_array) {
+        let stored_params = bound_line_params(def.get("referenceLines").and_then(Value::as_array));
+        let new_params = bound_line_params(Some(replacement));
+        let mut removed: Vec<&str> = stored_params.difference(&new_params).copied().collect();
+        removed.sort_unstable();
+        if !removed.is_empty() {
+            return Err(format!(
+                "this would remove the reference line bound to parameter {}. To add a line, send it in addReferenceLines, which keeps the lines already there; to keep that line, send it in referenceLines too; to remove every line, send referenceLines: null.",
+                removed.join(", ")
+            ));
+        }
+    }
     let Some(fields) = def.as_object_mut() else {
         return Err("the chart's definition could not be read.".to_owned());
     };
@@ -133,6 +173,26 @@ pub(crate) fn merge_format(
             Some(value) => {
                 fields.insert(field.to_owned(), value.clone());
             }
+        }
+    }
+    // `AI-29`: append to the chart's own lines instead of replacing them. The
+    // limit of five is enforced below by `check_reference_lines`, so a sixth
+    // line is refused the same way the console refuses it.
+    if let Some(add) = args.get(ADD_REFERENCE_LINES) {
+        let Some(add) = add.as_array() else {
+            return Err("addReferenceLines must be a list of reference lines.".to_owned());
+        };
+        if !add.is_empty() {
+            let lines = fields
+                .entry("referenceLines".to_owned())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if lines.is_null() {
+                *lines = Value::Array(Vec::new());
+            }
+            let Some(existing) = lines.as_array_mut() else {
+                return Err("the chart's definition could not be read.".to_owned());
+            };
+            existing.extend(add.iter().cloned());
         }
     }
     let merged = match serde_json::from_value::<ChartInput>(def.clone()) {
@@ -379,9 +439,12 @@ async fn save_edited_chart(
     )
     .await
     .map_err(|err| upstream_error::bi(&upstream_error::DATABASE, &err).to_json())?;
-    store::insert_chart(ch, &spec)
+    // QA `LH-BI-5-01` (`BI-45`, plan D5): the reformat saves the chart through
+    // the checked save, so a limit that ends its statement is the tile's
+    // answer and nothing is stored.
+    crate::routes::support::insert_chart_checked(ch, &spec)
         .await
-        .map_err(|err| upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json())?;
+        .map_err(crate::routes::support::failure_as_tool_reply)?;
     snapshot_as(ch, &spec.board, principal).await;
     Ok(spec)
 }
@@ -841,6 +904,83 @@ mod tests {
         for field in FORMAT_FIELDS.iter().filter(|f| **f != "referenceLines") {
             assert!(json.get(*field).is_some(), "{field} is not a style field");
         }
+        // `AI-29`: the append field is handled before and after this loop, and
+        // must never become a field of the stored definition.
+        assert!(!FORMAT_FIELDS.contains(&ADD_REFERENCE_LINES));
+    }
+
+    /// `AI-29` (LH-BI-11-07): adding a line keeps the one bound to a parameter,
+    /// with the bound line still first.
+    #[test]
+    fn adding_a_line_keeps_a_line_bound_to_a_parameter() {
+        let bound = stored_with(&json!({
+            "referenceLines": [{ "value": { "param": "target" }, "label": "Target" }]
+        }));
+        let after = merge_format(
+            &bound,
+            &args(json!({
+                "chart": "c1",
+                "addReferenceLines": [{ "value": 20000.0, "label": "Fixed" }],
+            })),
+        )
+        .unwrap();
+        let saved = serde_json::to_value(&after).unwrap();
+        let lines = saved["referenceLines"].as_array().unwrap();
+        assert_eq!(lines.len(), 2, "{saved}");
+        assert_eq!(lines[0]["value"]["param"], json!("target"), "{saved}");
+        assert_eq!(lines[1]["value"], json!(20000.0), "{saved}");
+    }
+
+    /// `AI-29`: a replacement that would drop a bound line is refused, and the
+    /// message names the parameter and both ways to proceed.
+    #[test]
+    fn replacing_the_lines_without_the_bound_one_is_refused_and_names_the_parameter() {
+        let bound = stored_with(&json!({
+            "referenceLines": [{ "value": { "param": "target" }, "label": "Target" }]
+        }));
+        let e = merge_format(
+            &bound,
+            &args(json!({
+                "chart": "c1",
+                "referenceLines": [{ "value": 20000.0, "label": "Target" }],
+            })),
+        )
+        .unwrap_err();
+        assert!(e.contains("parameter target"), "{e}");
+        assert!(e.contains("addReferenceLines"), "{e}");
+        assert!(e.contains("referenceLines: null"), "{e}");
+    }
+
+    /// `AI-29`: `referenceLines: null` still removes every line, bound or not.
+    #[test]
+    fn removing_every_line_with_null_is_allowed() {
+        let bound = stored_with(&json!({
+            "referenceLines": [{ "value": { "param": "target" } }]
+        }));
+        let after = merge_format(
+            &bound,
+            &args(json!({ "chart": "c1", "referenceLines": null })),
+        )
+        .unwrap();
+        assert!(after.shape.reference_lines.is_none());
+    }
+
+    /// `AI-29`: the console's five-line limit applies to appended lines too.
+    #[test]
+    fn a_sixth_line_is_refused() {
+        let five: Vec<Value> = (1..=5)
+            .map(|n| json!({ "value": n, "label": format!("Line {n}") }))
+            .collect();
+        let stored = stored_with(&json!({ "referenceLines": five }));
+        let e = merge_format(
+            &stored,
+            &args(json!({
+                "chart": "c1",
+                "addReferenceLines": [{ "value": 6, "label": "Sixth" }],
+            })),
+        )
+        .unwrap_err();
+        assert!(e.contains("at most 5 reference lines"), "{e}");
     }
 
     /// `PR #199 review O SHOULD-FIX 2`: a chart that was purged for good

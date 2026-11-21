@@ -27,6 +27,7 @@ import { useMentionsRead } from "@/lib/mention-events"
 import { pageTitleFor } from "./nav-config"
 import { openCommandPalette } from "@/components/command-palette"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useBranding } from "@/hooks/use-branding"
 import { useService } from "@/hooks/use-service"
 import { notificationsService } from "@/services"
 import { TenantSwitcher } from "./tenant-switcher"
@@ -40,10 +41,16 @@ import { CONSOLE_VERSION } from "@/features/version/console-version"
  */
 export function AppNavbar() {
   const pathname = usePathname()
-  const pageTitle = pageTitleFor(pathname)
+  // ADM-2 decision 13: a page the menu does not name is called after the
+  // workspace, not after the product. `pageTitleFor` stays pure, so the
+  // name comes in here; the product's own name stands in for a workspace
+  // that set none.
+  const branding = useBranding()
+  const pageTitle = pageTitleFor(pathname, branding.name)
   const router = useRouter()
-  const { user, logout, activeTenantId, setActiveTenant } = useAuth()
+  const { user, logout, activeTenantId, setActiveTenant, hasPermission } = useAuth()
   const copilot = useCopilot()
+  const hasAssistant = hasPermission("assistant:use") || hasPermission("assistant:ask")
   const isCopilotPage = pathname?.startsWith("/copilot")
   // Bell dot lights only for a real, currently open/pending item — never
   // on `supported: false` (an unsupported deployment shows no dot, not a
@@ -88,7 +95,7 @@ export function AppNavbar() {
             className="size-9 shrink-0 rounded-lg border-border bg-background shadow-xs"
           />
           {/* Page title only. There used to be a second line reading
-              "Rantai Lake workspace" — fixed text that never changed, so
+              "RantAI Lakehouse workspace" — fixed text that never changed, so
               it conveyed nothing while repeating the brand already shown
               in the sidebar header right next to it. That slot is
               normally used for a breadcrumb or the active workspace
@@ -136,7 +143,7 @@ export function AppNavbar() {
               router.refresh()
             }}
           />
-          {!isCopilotPage && (
+          {!isCopilotPage && hasAssistant && (
             <Button
               variant="ghost"
               size="icon"

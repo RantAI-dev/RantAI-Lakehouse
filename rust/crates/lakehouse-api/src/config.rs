@@ -62,6 +62,18 @@ pub const DEFAULT_LLM_URL: &str = "https://api.minimax.io/v1";
 /// The model the assistant uses when neither the environment's `LLM_MODEL`
 /// nor the console's saved row names one (`ADM-9`).
 pub const DEFAULT_LLM_MODEL: &str = "MiniMax-M3";
+/// The `prompt` the browser sign-in sends when `OIDC_PROMPT` says nothing
+/// (`Config::oidc_prompt`): `"login"`, so the provider shows its login form
+/// and the person in front of the browser chooses the account. See that
+/// field's doc comment for why the provider's own session is not the
+/// default answer.
+pub const DEFAULT_OIDC_PROMPT: &str = "login";
+/// `OIDC_PROMPT`'s spelling for "send no prompt parameter at all": the
+/// provider decides, and reuses the session it holds for that browser. This
+/// deployment's own word, not an OIDC value — the OIDC standard's `none`
+/// means something else (show no UI at all, fail when there is no session)
+/// and is forwarded verbatim when it is named.
+pub const OIDC_PROMPT_OFF: &str = "off";
 
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
@@ -559,17 +571,16 @@ pub struct Config {
     /// This application's client id as registered with the `OIDC`
     /// provider. `None` when unset.
     pub oidc_client_id: Option<String>,
-    /// `OIDC` client secret. `None` when unset. Reserved for a future
-    /// authorization-code exchange (a login-UI concern, out of this task's
-    /// scope) — `lakehouse_auth::oidc::OidcAuthenticator` verifies already-
-    /// issued bearer tokens against the provider's public JWKS and needs no
-    /// shared secret to do that, so this field is parsed (and kept out of
-    /// `Debug`) but not currently read by anything.
+    /// `OIDC` client secret. `None` when unset. Sent during authorization-code
+    /// exchange at `routes/auth.rs` (`oidc_callback`) when configured. Kept
+    /// out of `Debug`.
     pub oidc_client_secret: Option<String>,
     /// A short, operator-chosen label for the configured provider (e.g.
     /// `"okta"`, `"entra"`). Combined with `"oidc:"` to form
     /// `auth_identity.provider`. Default `"default"`.
     pub oidc_provider_name: String,
+    /// Whether `OIDC_PROVIDER_NAME` was set and non-empty in the environment.
+    pub oidc_provider_name_from_env: bool,
     /// Explicit override for the JWKS endpoint URL. `None` when unset, in
     /// which case `SEC-38` applies: the address is the `jwks_uri` from the
     /// provider's discovery document
@@ -585,14 +596,28 @@ pub struct Config {
     /// for why the default matters. `true` only when `OIDC_JIT_PROVISIONING`
     /// is exactly `"true"`.
     pub oidc_jit_provisioning: bool,
+    /// Whether `OIDC_JIT_PROVISIONING` was set and non-empty in the environment.
+    pub oidc_jit_provisioning_from_env: bool,
+    /// Whether this provider's emails are trusted even when the token does
+    /// not carry `email_verified: true` (`SEC-65` D3). Default `false` —
+    /// the safe value the task establishes. `true` only when
+    /// `OIDC_TRUST_EMAIL` is exactly `"true"` (`AGENTS.md`: booleans from
+    /// the environment are parsed that way).
+    pub oidc_trust_email: bool,
+    /// Whether `OIDC_TRUST_EMAIL` was set and non-empty in the environment.
+    pub oidc_trust_email_from_env: bool,
     /// Maps an `OIDC` group/role claim value to a local `role.name`, parsed
     /// from `OIDC_ROLE_MAP` (e.g.
     /// `"lakehouse-admins=Platform Admin,analysts=Analyst"`). Empty when
     /// unset. See [`parse_role_map`].
     pub oidc_role_map: HashMap<String, String>,
+    /// Whether `OIDC_ROLE_MAP` was set and non-empty in the environment.
+    pub oidc_role_map_from_env: bool,
     /// Which claim in an `OIDC` token carries the caller's groups/roles.
     /// Default `"groups"`.
     pub oidc_groups_claim: String,
+    /// Whether `OIDC_GROUPS_CLAIM` was set and non-empty in the environment.
+    pub oidc_groups_claim_from_env: bool,
     /// Clock-skew tolerance (seconds) `OIDC` token validation applies to
     /// `exp`/`nbf`. Default `60`. An unparseable value falls back to the
     /// default (like [`Self::smtp_port`], not load-bearing enough to fail
@@ -615,6 +640,45 @@ pub struct Config {
     /// `OIDC_REDIRECT_URI` — never taken from a request, closing the open-
     /// redirect class a request-supplied `redirect_uri` would allow.
     pub oidc_redirect_uri: Option<String>,
+    /// This deployment's address the provider sends the browser back to
+    /// after an RP-initiated logout (`OIDC_POST_LOGOUT_REDIRECT_URI`). It
+    /// must be registered with the provider as a valid post-logout redirect
+    /// URI, or the provider refuses the logout. `None` when unset: the
+    /// sign-out then ends this deployment's session only, and the provider
+    /// keeps its own session for that browser — which is why the next
+    /// sign-in would land on the account that signed in last.
+    ///
+    /// Read ONLY from the environment — never from a request, so a caller
+    /// cannot steer a sign-out to an arbitrary host.
+    pub oidc_post_logout_redirect_uri: Option<String>,
+    /// The `prompt` parameter the browser sign-in sends to the provider
+    /// (`"login"`, `"consent"`, `"select_account"`, …). Read ONLY from
+    /// `OIDC_PROMPT` — never from a request, so a caller cannot change how
+    /// the provider is asked to authenticate.
+    ///
+    /// Default [`DEFAULT_OIDC_PROMPT`] (`"login"`): the provider shows its
+    /// login form on every sign-in, so the person in front of the browser
+    /// chooses the account. Without it a provider that still holds a session
+    /// for that browser answers the sign-in request from it and the person is
+    /// silently signed in as whoever used that browser last — a surprise on
+    /// a shared machine, and the reason "sign out, then sign in again" could
+    /// land on the previous person's account.
+    ///
+    /// [`OIDC_PROMPT_OFF`] (`"off"`) is this deployment's own spelling for
+    /// "send no prompt parameter at all": the provider then decides, and
+    /// reuses the session it holds for that browser. It is not an OIDC
+    /// value and is never forwarded — the OIDC standard's own `none` (which
+    /// asks the provider to show no UI at all, and to fail when there is no
+    /// session) is forwarded verbatim when it is named.
+    ///
+    /// An empty value is the default, not an opt-out: compose always passes
+    /// this variable (as every other `OIDC_*` one), so "empty" cannot mean
+    /// "the operator said nothing".
+    pub oidc_prompt: String,
+    /// Whether `OIDC_PROMPT` was set and non-empty in the environment — the
+    /// difference between "the operator named a prompt" and "the operator
+    /// said nothing, so the default applies".
+    pub oidc_prompt_from_env: bool,
     /// Lakekeeper Iceberg REST catalog base URI (P1,
     /// `lakehouse-iceberg::IcebergClientConfig::catalog_uri`). Default
     /// matches `docker-compose.yml`'s `lakekeeper` service port mapping.
@@ -704,6 +768,16 @@ pub struct Config {
     /// and any problem with it surfaces lazily, at first use, as an ordinary
     /// request-time error.
     pub database_url: String,
+    /// The password of the console's OWN database role
+    /// (`LAKEHOUSE_DB_APP_PASSWORD`, `SEC-78` decision 1). `None` when unset
+    /// or empty.
+    ///
+    /// Only the `migrate` command needs it: it is what sets the role's
+    /// password, and the server path never holds it (the server connects
+    /// with the role, not with its password). It is a
+    /// [`lakehouse_core::secret::SecretValue`], so it is neither logged nor
+    /// printed.
+    pub db_app_password: Option<lakehouse_core::secret::SecretValue>,
     /// ADR 0010/0011 — path to a file holding the `gold-export` Lakekeeper
     /// principal's pre-minted static bearer token (`iceberg-catalog-rest`'s
     /// `token` property — see `lakehouse-iceberg::catalog`'s module doc on
@@ -900,6 +974,14 @@ pub struct Config {
     /// non-load-bearing parsing posture as
     /// [`Self::gold_export_max_rows`]. Default `20_000`.
     pub gold_export_batch_size: u64,
+    /// The least number of seconds between two "Send now" presses on the same
+    /// scheduled-report subscription (`BI-35`): each press makes the whole
+    /// report (a PDF, chart files) and emails the recipients, so a double click
+    /// or a loop would send the same report over and over. The count is kept in
+    /// the process, so it resets on a restart and is per replica. `0` turns the
+    /// limit off. Not load-bearing in the sense of [`Self::port`]: an
+    /// unparsable override falls back to the default. Default `60`.
+    pub report_send_now_interval_secs: u64,
     /// Shared token gating `POST /api/agents/employees/{id}/run`
     /// (Tier 3, copilot-operations-handover plan), same D4 shape as
     /// [`Self::gold_export_run_token`]/[`Self::alerts_run_token`]: with
@@ -986,7 +1068,7 @@ pub struct Config {
     pub catalog_tenant_id: Option<Uuid>,
     /// Language the copilot replies in when the latest chat message is too
     /// short for `routes::ai::prompt::reply_language` to detect one
-    /// (`Jelaskan chart ini`, `2024?`). `None` when unset or empty: the
+    /// (`total revenue`, `2024?`). `None` when unset or empty: the
     /// prompt's wording is then unchanged from before the setting existed
     /// (the Latin-script line keeps its English fallback, a message with no
     /// letters gets none). A detected language always wins over this
@@ -1117,6 +1199,24 @@ pub struct Config {
     /// lowers it for its own job and says so; it is not a per-connector
     /// setting.
     pub connector_auto_disable_after: i32,
+    /// How long one connector run may run before the API stops treating it as
+    /// going (`SRC-39`, QA `TC-1702`): `INGEST_RUN_MAX_RUNTIME_SECONDS`,
+    /// default 21600 (six hours). The run route cancels a run older than this
+    /// plus its grace, records it as failed with `timed_out`, and lets the
+    /// next run start; the orchestrator's own run monitoring enforces the
+    /// same number through the `dagster/max_runtime` tag. Zero, negative, or
+    /// unparseable values keep the default.
+    pub ingest_run_max_runtime_seconds: u32,
+    /// How long a connector run the orchestrator has taken off its queue may
+    /// take to start before the API stops holding the connector for it
+    /// (`SRC-39`, QA `TC-1702`): `INGEST_RUN_START_TIMEOUT_SECONDS`, default
+    /// 600 (ten minutes). A run still waiting in the orchestrator's queue is
+    /// judged by [`Config::ingest_run_max_runtime_seconds`] instead
+    /// (`review round 1, R1`): its run monitoring never ends a queued run.
+    /// It MUST equal `start_timeout_seconds` in `dagster/dagster.yaml`:
+    /// whoever changes one changes both. Zero, negative, or unparseable
+    /// values keep the default.
+    pub ingest_run_start_timeout_seconds: u32,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -1217,10 +1317,25 @@ impl std::fmt::Debug for Config {
                 &self.oidc_client_secret.as_ref().map(|_| REDACTED),
             )
             .field("oidc_provider_name", &self.oidc_provider_name)
+            .field(
+                "oidc_provider_name_from_env",
+                &self.oidc_provider_name_from_env,
+            )
             .field("oidc_jwks_url", &self.oidc_jwks_url)
             .field("oidc_jit_provisioning", &self.oidc_jit_provisioning)
+            .field(
+                "oidc_jit_provisioning_from_env",
+                &self.oidc_jit_provisioning_from_env,
+            )
+            .field("oidc_trust_email", &self.oidc_trust_email)
+            .field("oidc_trust_email_from_env", &self.oidc_trust_email_from_env)
             .field("oidc_role_map", &self.oidc_role_map)
+            .field("oidc_role_map_from_env", &self.oidc_role_map_from_env)
             .field("oidc_groups_claim", &self.oidc_groups_claim)
+            .field(
+                "oidc_groups_claim_from_env",
+                &self.oidc_groups_claim_from_env,
+            )
             .field(
                 "connector_probe_allow_internal_hosts",
                 &self.connector_probe_allow_internal_hosts,
@@ -1266,7 +1381,17 @@ impl std::fmt::Debug for Config {
             .field("oidc_authorize_url", &self.oidc_authorize_url)
             .field("oidc_token_url", &self.oidc_token_url)
             .field("oidc_redirect_uri", &self.oidc_redirect_uri)
+            .field(
+                "oidc_post_logout_redirect_uri",
+                &self.oidc_post_logout_redirect_uri,
+            )
+            .field("oidc_prompt", &self.oidc_prompt)
+            .field("oidc_prompt_from_env", &self.oidc_prompt_from_env)
             .field("database_url", &REDACTED)
+            .field(
+                "db_app_password",
+                &self.db_app_password.as_ref().map(|_| REDACTED),
+            )
             .field(
                 "lakekeeper_gold_export_token_file",
                 &self.lakekeeper_gold_export_token_file,
@@ -1324,6 +1449,10 @@ impl std::fmt::Debug for Config {
             )
             .field("gold_export_max_rows", &self.gold_export_max_rows)
             .field("gold_export_batch_size", &self.gold_export_batch_size)
+            .field(
+                "report_send_now_interval_secs",
+                &self.report_send_now_interval_secs,
+            )
             .field(
                 "agent_run_token",
                 &self.agent_run_token.as_ref().map(|_| REDACTED),
@@ -1391,6 +1520,14 @@ impl std::fmt::Debug for Config {
                 "connector_auto_disable_after",
                 &self.connector_auto_disable_after,
             )
+            .field(
+                "ingest_run_max_runtime_seconds",
+                &self.ingest_run_max_runtime_seconds,
+            )
+            .field(
+                "ingest_run_start_timeout_seconds",
+                &self.ingest_run_start_timeout_seconds,
+            )
             .finish()
     }
 }
@@ -1444,6 +1581,42 @@ fn parse_positive_u32_or_default(env: &HashMap<String, String>, key: &str, defau
         .filter(|v| *v > 0)
         .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(default)
+}
+
+/// Reads one of the two run limits of `SRC-39` (QA `TC-1702`; `review round
+/// 1, R9`).
+///
+/// The same rule the orchestrator's `RunLimitSettings.from_env` applies
+/// (`dagster/dispar_orchestrate/ingest_factory.py`): surrounding spaces
+/// trimmed, ASCII digits only, a value from 1 to `u32::MAX`. It is not
+/// [`parse_positive_u32_or_default`]: that one accepts a leading `+` and
+/// rejects a padded number, so `"86_400"` or `" 900 "` would be read one way
+/// here and another there, and the API would cancel a run the orchestrator
+/// still believes in.
+///
+/// A value that cannot be read keeps `default`, with a warning that names the
+/// variable and never the value (the orchestrator's own rule; the API used to
+/// fall back without a word). An empty value is unset — the normal case in
+/// compose, which passes `${X:-}` — and warns about nothing.
+fn parse_run_limit(env: &HashMap<String, String>, key: &str, default: u32) -> u32 {
+    let Some(raw) = env.get(key) else {
+        return default;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default;
+    }
+    if trimmed.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(value) = trimmed.parse::<u32>()
+        && value > 0
+    {
+        return value;
+    }
+    tracing::warn!(
+        variable = key,
+        "a run limit is not a whole number of seconds of 1 or more; using the default"
+    );
+    default
 }
 
 /// Whether the environment names `key` with a whole number of 1 or more
@@ -1791,13 +1964,21 @@ impl Config {
             oidc_issuer: truthy(env, "OIDC_ISSUER"),
             oidc_client_id: truthy(env, "OIDC_CLIENT_ID"),
             oidc_client_secret: truthy(env, "OIDC_CLIENT_SECRET"),
-            oidc_provider_name: or_default(env, "OIDC_PROVIDER_NAME", "default"),
+            oidc_provider_name: truthy(env, "OIDC_PROVIDER_NAME")
+                .unwrap_or_else(|| "default".to_owned()),
+            oidc_provider_name_from_env: truthy(env, "OIDC_PROVIDER_NAME").is_some(),
             oidc_jwks_url: truthy(env, "OIDC_JWKS_URL"),
             oidc_jit_provisioning: env
                 .get("OIDC_JIT_PROVISIONING")
                 .is_some_and(|v| v == "true"),
+            oidc_jit_provisioning_from_env: truthy(env, "OIDC_JIT_PROVISIONING").is_some(),
+            oidc_trust_email: env.get("OIDC_TRUST_EMAIL").is_some_and(|v| v == "true"),
+            oidc_trust_email_from_env: truthy(env, "OIDC_TRUST_EMAIL").is_some(),
             oidc_role_map: parse_role_map(env.get("OIDC_ROLE_MAP").map_or("", String::as_str)),
-            oidc_groups_claim: or_default(env, "OIDC_GROUPS_CLAIM", "groups"),
+            oidc_role_map_from_env: truthy(env, "OIDC_ROLE_MAP").is_some(),
+            oidc_groups_claim: truthy(env, "OIDC_GROUPS_CLAIM")
+                .unwrap_or_else(|| "groups".to_owned()),
+            oidc_groups_claim_from_env: truthy(env, "OIDC_GROUPS_CLAIM").is_some(),
             connector_probe_allow_internal_hosts: env
                 .get("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS")
                 .is_some_and(|v| v == "true"),
@@ -1847,6 +2028,16 @@ impl Config {
             oidc_authorize_url: truthy(env, "OIDC_AUTHORIZE_URL"),
             oidc_token_url: truthy(env, "OIDC_TOKEN_URL"),
             oidc_redirect_uri: truthy(env, "OIDC_REDIRECT_URI"),
+            oidc_post_logout_redirect_uri: truthy(env, "OIDC_POST_LOGOUT_REDIRECT_URI"),
+            // An empty value is the DEFAULT, not an opt-out: compose always
+            // passes this variable (as every other `OIDC_*` one), so empty
+            // cannot mean "the operator said nothing". `off` is the
+            // spelling for "send no prompt at all".
+            oidc_prompt: match env.get("OIDC_PROMPT") {
+                Some(value) if !value.trim().is_empty() => value.trim().to_owned(),
+                _ => DEFAULT_OIDC_PROMPT.to_owned(),
+            },
+            oidc_prompt_from_env: env.get("OIDC_PROMPT").is_some_and(|v| !v.trim().is_empty()),
             lakekeeper_catalog_uri: or_default(
                 env,
                 "LAKEKEEPER_CATALOG_URI",
@@ -1866,6 +2057,8 @@ impl Config {
             rustfs_access_key_secret_ref: truthy(env, "RUSTFS_ACCESS_KEY_SECRET_REF"),
             rustfs_secret_key_secret_ref: truthy(env, "RUSTFS_SECRET_KEY_SECRET_REF"),
             database_url: or_default(env, "DATABASE_URL", ""),
+            db_app_password: truthy(env, "LAKEHOUSE_DB_APP_PASSWORD")
+                .map(lakehouse_core::secret::SecretValue::new),
             lakekeeper_gold_export_token_file: or_default(
                 env,
                 "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
@@ -1911,6 +2104,11 @@ impl Config {
             gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
             gold_export_max_rows: parse_u64_or_default(env, "GOLD_EXPORT_MAX_ROWS", 5_000_000),
             gold_export_batch_size: parse_u64_or_default(env, "GOLD_EXPORT_BATCH_SIZE", 20_000),
+            report_send_now_interval_secs: parse_u64_or_default(
+                env,
+                "REPORT_SEND_NOW_INTERVAL_SECS",
+                60,
+            ),
             agent_run_token: truthy(env, "AGENT_RUN_TOKEN"),
             lakehouse_maintenance_token: truthy(env, "LAKEHOUSE_MAINTENANCE_TOKEN"),
             ingest_service_token: truthy(env, "INGEST_SERVICE_TOKEN"),
@@ -1990,6 +2188,16 @@ impl Config {
                 30,
             ))
             .unwrap_or(lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER),
+            ingest_run_max_runtime_seconds: parse_run_limit(
+                env,
+                "INGEST_RUN_MAX_RUNTIME_SECONDS",
+                21_600,
+            ),
+            ingest_run_start_timeout_seconds: parse_run_limit(
+                env,
+                "INGEST_RUN_START_TIMEOUT_SECONDS",
+                600,
+            ),
         })
     }
 
@@ -2340,6 +2548,20 @@ mod tests {
         assert_eq!(cfg.gold_export_batch_size, 7);
     }
 
+    /// `BI-35`: "Send now" waits 60 seconds between presses unless told
+    /// otherwise; `0` turns it off; garbage falls back to the default.
+    #[test]
+    fn the_send_now_interval_defaults_to_sixty_seconds_and_is_overridable() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 60);
+        let cfg = Config::from_map(&map(&[("REPORT_SEND_NOW_INTERVAL_SECS", "5")])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 5);
+        let cfg = Config::from_map(&map(&[("REPORT_SEND_NOW_INTERVAL_SECS", "0")])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 0);
+        let cfg = Config::from_map(&map(&[("REPORT_SEND_NOW_INTERVAL_SECS", "soon")])).unwrap();
+        assert_eq!(cfg.report_send_now_interval_secs, 60);
+    }
+
     /// Same non-load-bearing posture as `OIDC_CLOCK_SKEW_SECONDS`: a
     /// garbage override must not fail config resolution — it falls back to
     /// the documented default instead.
@@ -2372,6 +2594,46 @@ mod tests {
         }
         let cfg = Config::from_map(&map(&[("CONNECTOR_AUTO_DISABLE_AFTER", "4")])).unwrap();
         assert_eq!(cfg.connector_auto_disable_after, 4);
+    }
+
+    /// `SRC-39` (QA `TC-1702`): six hours a run may run, ten minutes a run
+    /// the orchestrator launched may take to start; a value that is not a
+    /// whole number of 1 or more keeps the default.
+    ///
+    /// `review round 1, R9`: the orchestrator reads the same setting by the
+    /// same rule, so `"86_400"` (which `int()` would take), a number above
+    /// `u32::MAX` and a padded value are all decided here as they are there:
+    /// `" 900 "` is 900, `"86_400"` and `"4294967296"` keep the default.
+    #[test]
+    fn the_run_limits_default_to_six_hours_and_ten_minutes_and_ignore_garbage() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 21_600);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 600);
+        for bad in ["0", "-3", "many", "", "86_400", "4294967296", "+900", "1.5"] {
+            let cfg = Config::from_map(&map(&[
+                ("INGEST_RUN_MAX_RUNTIME_SECONDS", bad),
+                ("INGEST_RUN_START_TIMEOUT_SECONDS", bad),
+            ]))
+            .unwrap();
+            assert_eq!(cfg.ingest_run_max_runtime_seconds, 21_600, "{bad:?}");
+            assert_eq!(cfg.ingest_run_start_timeout_seconds, 600, "{bad:?}");
+        }
+        let cfg = Config::from_map(&map(&[
+            ("INGEST_RUN_MAX_RUNTIME_SECONDS", "900"),
+            ("INGEST_RUN_START_TIMEOUT_SECONDS", "120"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 900);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 120);
+        // `review round 1, R9`: both services trim, so a padded value is read,
+        // not thrown away.
+        let cfg = Config::from_map(&map(&[
+            ("INGEST_RUN_MAX_RUNTIME_SECONDS", " 900 "),
+            ("INGEST_RUN_START_TIMEOUT_SECONDS", " 120 "),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 900);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 120);
     }
 
     /// The compose stack's documented opt-out — only the literal string
@@ -2840,6 +3102,11 @@ mod tests {
         assert_eq!(cfg.oidc_authorize_url, None);
         assert_eq!(cfg.oidc_token_url, None);
         assert_eq!(cfg.oidc_redirect_uri, None);
+        // The sign-in asks the provider for its login form by default, so a
+        // shared browser does not silently sign the next person in as the
+        // previous one.
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(!cfg.oidc_prompt_from_env);
 
         let mut env = HashMap::new();
         env.insert(
@@ -2867,6 +3134,35 @@ mod tests {
             cfg.oidc_redirect_uri.as_deref(),
             Some("https://lake.invalid/api/auth/oidc/callback")
         );
+    }
+
+    // `OIDC_PROMPT` says what the browser sign-in asks the provider for.
+    // An empty value is the DEFAULT (compose always passes the variable, so
+    // empty cannot mean "the operator said nothing"); `off` is the
+    // deployment's own spelling for "send no prompt at all".
+    #[test]
+    fn oidc_prompt_defaults_to_login_and_off_is_the_deployments_own_spelling() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(!cfg.oidc_prompt_from_env);
+
+        // Empty is the default, not an opt-out.
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(!cfg.oidc_prompt_from_env);
+
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "consent")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "consent");
+        assert!(cfg.oidc_prompt_from_env);
+
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "off")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "off");
+        assert!(cfg.oidc_prompt_from_env);
+
+        // Surrounding whitespace is not part of the value.
+        let cfg = Config::from_map(&map(&[("OIDC_PROMPT", "  login  ")])).unwrap();
+        assert_eq!(cfg.oidc_prompt, "login");
+        assert!(cfg.oidc_prompt_from_env);
     }
 
     // An operator-stated owning tenant for the shared catalog/Dagster-job

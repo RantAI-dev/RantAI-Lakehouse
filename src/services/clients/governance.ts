@@ -11,6 +11,9 @@ import type { UsedBy,
   LineageGraph,
   ColumnLineage,
   AuditEvent,
+  AuditPage,
+  AuditActorsPage,
+  AuditSearchQuery,
   ClassificationRule,
   MaintenanceRun,
   ReplicationSlot,
@@ -19,9 +22,11 @@ import type { UsedBy,
   UpdateQualityRuleInput,
   CreateClassificationRuleInput,
   DatasetSla,
+  RowFilterGrammar,
 } from "../contracts/governance";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { fileNameOf } from "@/lib/browser-file";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
  * GovernanceService: quality/lineage/audit/classification/residency are real,
@@ -37,21 +42,46 @@ import { ServiceError } from "../errors";
  * results), per the Rust backend's design.
  */
 
-/** Map an error response body onto the ServiceError code its status implies. */
-function errorFor(status: number, message: string): ServiceError {
+/**
+ * Map an error response body onto the ServiceError code its status implies.
+ * A 401 or 403 goes through `deniedFor` (QA `TC-1724`, WEB-12).
+ */
+function errorFor(status: number, body: { error?: string } | null, fallback: string): ServiceError {
+  const denied = deniedFor(status, body);
+  if (denied) return denied;
+  const message = body?.error ?? fallback;
   if (status === 404) return new ServiceError("not_found", message);
   if (status === 400 || status === 409 || status === 422)
     return new ServiceError("invalid_request", message);
-  if (status === 401 || status === 403)
-    return new ServiceError("permission_denied", message);
   return new ServiceError("unavailable", message);
 }
 
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await apiFetch(url, { signal });
   const json = await res.json().catch(() => null);
-  if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to load governance");
+  if (!res.ok) throw errorFor(res.status, json, "Failed to load governance");
   return json as T;
+}
+
+/** The query string of an audit search: only the filters that hold a value. */
+function auditQueryString(query: AuditSearchQuery, withPaging: boolean): string {
+  const params = new URLSearchParams();
+  const set = (key: string, value: string | number | undefined) => {
+    if (value !== undefined && value !== "") params.set(key, String(value));
+  };
+  set("actor", query.actor);
+  set("action", query.action);
+  set("resourceKind", query.resourceKind);
+  set("resourceId", query.resourceId);
+  set("outcome", query.outcome);
+  set("from", query.from);
+  set("to", query.to);
+  if (withPaging) {
+    set("limit", query.limit);
+    set("cursor", query.cursor);
+  }
+  const text = params.toString();
+  return text ? `?${text}` : "";
 }
 
 async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
@@ -62,7 +92,7 @@ async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promis
     signal,
   });
   const json = await res.json().catch(() => null);
-  if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save governance");
+  if (!res.ok) throw errorFor(res.status, json, "Failed to save governance");
   return json as T;
 }
 
@@ -70,7 +100,7 @@ async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promis
 async function del(url: string, failure: string, signal?: AbortSignal): Promise<void> {
   const res = await apiFetch(url, { method: "DELETE", signal });
   const json = await res.json().catch(() => null);
-  if (!res.ok) throw errorFor(res.status, json?.error ?? failure);
+  if (!res.ok) throw errorFor(res.status, json, failure);
 }
 
 // WS5 item E1 (judge amendment 2): the plan's `putDatasetSla` calls a
@@ -86,7 +116,7 @@ async function put<T>(url: string, body: unknown, signal?: AbortSignal): Promise
     signal,
   });
   const json = await res.json().catch(() => null);
-  if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save governance");
+  if (!res.ok) throw errorFor(res.status, json, "Failed to save governance");
   return json as T;
 }
 
@@ -94,8 +124,39 @@ export const clickhouseGovernanceService: GovernanceService = {
   async listQuality(signal) {
     return (await get<{ quality: QualityRule[] }>("/api/governance/quality", signal)).quality;
   },
-  async listAudit(signal) {
-    return (await get<{ audit: AuditEvent[] }>("/api/governance/audit", signal)).audit;
+  async searchAudit(query, signal) {
+    return get<AuditPage>(`/api/governance/audit/events${auditQueryString(query, true)}`, signal);
+  },
+  // plan D2: the distinct principals that acted, for the person filter's
+  // picker — `audit:read`, no query string, one list.
+  async listAuditActors(signal) {
+    return get<AuditActorsPage>("/api/governance/audit/actors", signal);
+  },
+  async getAuditEvent(id, signal) {
+    const res = await apiFetch(`/api/governance/audit/events/${encodeURIComponent(id)}`, { signal });
+    const json = await res.json().catch(() => null);
+    // A 404 is an answer ("no event has that id"), not a failure: a link to an
+    // event that is gone shows nothing, and the page says so.
+    if (res.status === 404) return null;
+    if (!res.ok) throw errorFor(res.status, json, "Failed to load governance");
+    return (json as { event: AuditEvent }).event;
+  },
+  async exportAuditCsv(query, signal) {
+    const res = await apiFetch(`/api/governance/audit/export.csv${auditQueryString(query, false)}`, {
+      signal,
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      const json = await res.json().catch(() => null);
+      throw errorFor(res.status, json, "The export failed.");
+    }
+    const total = Number(res.headers.get("x-audit-export-total"));
+    return {
+      blob: await res.blob(),
+      fileName: fileNameOf(res.headers.get("content-disposition"), "audit-events.csv"),
+      truncated: res.headers.get("x-audit-export-truncated") === "true",
+      total: Number.isFinite(total) && res.headers.has("x-audit-export-total") ? total : null,
+    };
   },
   async getLineage(focusId, signal) {
     return get<LineageGraph>(`/api/governance/lineage?focus=${encodeURIComponent(focusId)}`, signal);
@@ -121,6 +182,11 @@ export const clickhouseGovernanceService: GovernanceService = {
   listPolicies(signal) {
     return get<Policy[]>("/api/governance/policies", signal);
   },
+  // WEB-8 S2 T8 (D8): the row filter grammar, read from the server so the
+  // console never carries a second copy of the validator's list.
+  getRowFilterGrammar(signal) {
+    return get<RowFilterGrammar>("/api/governance/row-filter-grammar", signal);
+  },
   createPolicy(input: CreatePolicyInput, signal) {
     return post<Policy>("/api/governance/policies", input, signal);
   },
@@ -133,7 +199,7 @@ export const clickhouseGovernanceService: GovernanceService = {
       signal,
     });
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to delete the policy");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to delete the policy");
   },
   createQualityRule(input: CreateQualityRuleInput, signal) {
     return post<QualityRule>("/api/governance/quality", input, signal);
@@ -147,7 +213,7 @@ export const clickhouseGovernanceService: GovernanceService = {
       signal,
     });
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to delete the rule");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to delete the rule");
   },
   runQualityRule(id, signal) {
     return post<QualityRunResult>(

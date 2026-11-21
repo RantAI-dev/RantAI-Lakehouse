@@ -58,6 +58,13 @@ f. The log is honest (D5). The text download of step b's run is `text/plain`,
    `Traceback`.
 g. History (D7). `GET .../runs` lists every run this gate launched through
    `POST .../ingest/run` with the trigger `user`.
+h. Run monitoring is on and a run carries its limit (SRC-39, QA `TC-1702`).
+   The orchestrator's `MONITORING` daemon is `required` and becomes healthy,
+   and step b's run carries a `dagster/max_runtime` tag holding a whole number
+   of 1 or more. It does not make a run hang until monitoring stops it: that
+   is the orchestrator's own behaviour and would take six hours. What it
+   proves is what this slice configured — the daemon that ends a stuck run is
+   on, and every ingest run carries the limit it enforces.
 
 # Settings (environment)
 
@@ -379,11 +386,21 @@ def launch_run(connector_id: str) -> str:
     return run_id
 
 
+def dagster_graphql(query: str, variables: dict | None = None) -> dict:
+    """POST one GraphQL query to the orchestrator and return its `data`."""
+    resp = requests.post(
+        matrix.DAGSTER_URL,
+        json={"query": query, "variables": variables or {}},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json().get("data") or {}
+
+
 def dagster_status(run_id: str) -> str:
     query = "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename ... on Run { status } } }"
-    resp = requests.post(matrix.DAGSTER_URL, json={"query": query, "variables": {"rid": run_id}}, timeout=10)
-    resp.raise_for_status()
-    return str((resp.json().get("data", {}).get("pipelineRunOrError", {}) or {}).get("status"))
+    data = dagster_graphql(query, {"rid": run_id})
+    return str((data.get("pipelineRunOrError", {}) or {}).get("status"))
 
 
 def wait_dagster(run_id: str, want: str, what: str, timeout_s: int = RUN_TIMEOUT_S) -> None:
@@ -823,6 +840,48 @@ def step_history() -> None:
     say(f"g. the history lists all {len(LAUNCHED)} runs the gate launched through POST ingest/run, each with trigger 'user'")
 
 
+def step_stuck_runs_are_ended(run_id: str) -> None:
+    """h. SRC-39 (QA TC-1702, LH-SRC-11-11): run monitoring is required and
+    healthy, and an ingest run carries the limit it enforces.
+
+    It does not make a run hang until monitoring stops it: that is the
+    orchestrator's own behaviour and would take six hours, so what this step
+    proves is what the slice configured — `run_monitoring.enabled` in
+    `dagster/dagster.yaml` and the `dagster/max_runtime` tag `ingest_job`
+    carries. A missing tag is a run that no monitoring will ever end.
+    """
+    health_query = (
+        '{ instance { daemonHealth { daemonStatus(daemonType: "MONITORING") '
+        "{ required healthy } } } }"
+    )
+
+    def monitoring_is_healthy() -> bool:
+        data = dagster_graphql(health_query)
+        status = ((data.get("instance") or {}).get("daemonHealth") or {}).get("daemonStatus") or {}
+        if status.get("required") is not True:
+            raise OpsGateFailure(
+                "the MONITORING daemon is not required: run monitoring is off "
+                "(dagster/dagster.yaml's run_monitoring.enabled)"
+            )
+        return status.get("healthy") is True
+
+    poll("the MONITORING daemon to be healthy", monitoring_is_healthy, 120, interval_s=3.0)
+
+    tags_query = "query($rid:ID!){ runOrError(runId:$rid){ __typename ... on Run { tags { key value } } } }"
+    run = dagster_graphql(tags_query, {"rid": run_id}).get("runOrError") or {}
+    tags = {t.get("key"): t.get("value") for t in run.get("tags") or []}
+    limit = tags.get("dagster/max_runtime")
+    if limit is None:
+        raise OpsGateFailure(f"run {run_id} carries no dagster/max_runtime tag: {sorted(tags)}")
+    try:
+        seconds = int(limit)
+    except (TypeError, ValueError):
+        raise OpsGateFailure(f"the dagster/max_runtime tag of run {run_id} is not a whole number: {limit!r}") from None
+    if seconds < 1:
+        raise OpsGateFailure(f"the dagster/max_runtime tag of run {run_id} is {seconds}, expected 1 or more")
+    say(f"h. run monitoring is required and healthy; run {run_id} carries dagster/max_runtime={seconds}")
+
+
 def named(step: str, fn, *args):
     """Run a step; whatever it raises comes out as OpsGateFailure naming it."""
     try:
@@ -861,6 +920,7 @@ def run() -> None:
                 src17.delete_rule(state["rule_id"])
         named("e. a left-out column", step_left_out_column, sfx)
         named("g. history", step_history)
+        named("h. run monitoring is on and a run carries its limit", step_stuck_runs_are_ended, pg_run)
     finally:
         receiver.stop()
 

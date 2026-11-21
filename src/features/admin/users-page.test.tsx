@@ -35,6 +35,7 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import type { User } from "@/services"
+import { rememberInvitePassword, takeInvitePassword } from "./invite-password"
 import { UsersPage } from "./users-page"
 
 const originalFetch = global.fetch
@@ -61,6 +62,7 @@ const RESET_PASSWORD = "test-only-reset-password"
 const ROW: User = {
   id: "11111111-1111-4111-8111-000000000001",
   name: "Rina Wijaya",
+  username: "rina",
   email: "rina@meridian.example",
   status: "active",
   roles: ["Analyst"],
@@ -240,6 +242,18 @@ function setupFetch(opts: {
         return jsonResponse(TENANTS, status)
       }
 
+      if (url.includes("/api/auth/password-rules")) {
+        return jsonResponse({ minLength: 8, maxLength: 1024 })
+      }
+
+      if (method === "PATCH" && url.includes("/api/identity/users/")) {
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          username?: string
+          email?: string | null
+        }
+        return jsonResponse({ ...row, ...body }, 200)
+      }
+
       if (method === "POST" && url.endsWith("/reset-password")) {
         const status = opts.resetStatus ?? 200
         if (status >= 400) {
@@ -253,8 +267,26 @@ function setupFetch(opts: {
         if (status >= 400) {
           return jsonResponse({ error: "invite failed" }, status)
         }
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          name?: string
+          username?: string
+          email?: string | null
+          roles?: string[]
+          tenants?: string[]
+          password?: { mode?: string; value?: string }
+          mustChangePassword?: boolean
+        }
+        const tempPassword =
+          body.password?.mode === "set" ? null : TEMPORARY_PASSWORD
         return jsonResponse(
-          { ...ROW, id: "22222222-2222-4222-8222-000000000002", temporaryPassword: TEMPORARY_PASSWORD },
+          {
+            ...ROW,
+            id: "22222222-2222-4222-8222-000000000002",
+            name: body.name ?? "New User",
+            username: body.username ?? "newuser",
+            email: body.email ?? null,
+            temporaryPassword: tempPassword,
+          },
           status
         )
       }
@@ -297,18 +329,6 @@ function renderPage() {
   )
 }
 
-/** Fill the invite sheet and submit it. */
-async function inviteUser() {
-  fireEvent.click(screen.getByRole("button", { name: /invite user/i }))
-  fireEvent.change(await screen.findByLabelText("Name"), {
-    target: { value: "Rina Guest" },
-  })
-  fireEvent.change(screen.getByLabelText("Email"), {
-    target: { value: "rina.guest@meridian.example" },
-  })
-  fireEvent.click(screen.getByRole("button", { name: "Invite" }))
-}
-
 /** Open the row actions menu and click "Reset password". */
 async function resetPassword() {
   // The row menu is a Radix dropdown (`@rantai/design-system/ui/dropdown-menu`),
@@ -326,88 +346,6 @@ async function openRowAction(name: RegExp) {
   fireEvent.click(item)
 }
 
-describe("UsersPage invite (temporary password shown once, never persisted)", () => {
-  it("the invite shows the temporary password in a Dialog alongside the 'shown once' warning", async () => {
-    setupFetch({})
-    renderPage()
-    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
-    await inviteUser()
-
-    // The password lands in a `<code data-testid="revealed-password">` so
-    // the assertion reads like "the dialog displays the password
-    // verbatim", not "the dialog has a copyable button" — the design is
-    // immediate one-shot display, with the Copy button as a courtesy.
-    const password = await screen.findByTestId("revealed-password")
-    expect(password.textContent).toBe(TEMPORARY_PASSWORD)
-    expect(screen.getByText(/shown once/i)).toBeDefined()
-    expect(screen.getByText(/must change it at first sign-in/i)).toBeDefined()
-  })
-
-  it("the invite calls POST /api/identity/users and then refetches the list", async () => {
-    setupFetch({})
-    renderPage()
-    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
-    const getsBefore = fetchCalls.filter(
-      (c) => c.method === "GET" && c.url.includes("/api/identity/users")
-    ).length
-    await inviteUser()
-    await screen.findByTestId("revealed-password")
-    const post = fetchCalls.find(
-      (c) => c.method === "POST" && c.url.endsWith("/api/identity/users")
-    )
-    expect(post).toBeDefined()
-    await waitFor(() => {
-      const getsAfter = fetchCalls.filter(
-        (c) => c.method === "GET" && c.url.includes("/api/identity/users")
-      ).length
-      expect(getsAfter).toBeGreaterThan(getsBefore)
-    })
-  })
-
-  it("the password is gone once the dialog is closed", async () => {
-    setupFetch({})
-    renderPage()
-    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
-    await inviteUser()
-    await screen.findByTestId("revealed-password")
-
-    fireEvent.click(screen.getByRole("button", { name: "Close" }))
-    await waitFor(() => {
-      expect(screen.queryByTestId("revealed-password")).toBeNull()
-    })
-    expect(document.body.textContent).not.toContain(TEMPORARY_PASSWORD)
-  })
-
-  it("the password is never written to localStorage", async () => {
-    setupFetch({})
-    renderPage()
-    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
-    await inviteUser()
-    await screen.findByTestId("revealed-password")
-    // The password must never be persisted client-side beyond the
-    // one-shot dialog prop. `JSON.stringify(localStorage)` collapses
-    // every key+value into one string; if the password (or any fragment
-    // long enough to be a fingerprint of it) leaked into storage, it
-    // would surface here.
-    const snapshot = JSON.stringify(localStorage)
-    expect(snapshot.includes(TEMPORARY_PASSWORD)).toBe(false)
-  })
-
-  it("a failed invite does NOT open the dialog", async () => {
-    setupFetch({ inviteStatus: 500 })
-    renderPage()
-    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
-    await inviteUser()
-    await waitFor(() => {
-      const posts = fetchCalls.filter(
-        (c) => c.method === "POST" && c.url.endsWith("/api/identity/users")
-      )
-      expect(posts.length).toBeGreaterThan(0)
-    })
-    expect(screen.queryByTestId("revealed-password")).toBeNull()
-  })
-})
-
 describe("UsersPage reset password (a new password shown once)", () => {
   it("the reset action calls POST /api/identity/users/{id}/reset-password with the row id and shows the new password", async () => {
     setupFetch({})
@@ -424,6 +362,59 @@ describe("UsersPage reset password (a new password shown once)", () => {
         c.url.endsWith(`/api/identity/users/${ROW.id}/reset-password`)
     )
     expect(call).toBeDefined()
+  })
+
+  it("copies the once-shown password over plain http, from inside the dialog", async () => {
+    setupFetch({})
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    await resetPassword()
+    const password = await screen.findByTestId("revealed-password")
+
+    // The staging console is opened by IP over http, where
+    // `navigator.clipboard` does not exist (`UX-6`). The copy must fall back
+    // to the textarea, and the textarea must be appended inside the open
+    // dialog: everything outside it is inert, so a textarea on `document.body`
+    // would not be selectable and the copy would fail.
+    const clipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard")
+    const execCommand = Object.getOwnPropertyDescriptor(document, "execCommand")
+    Object.defineProperty(navigator, "clipboard", {
+      value: undefined,
+      configurable: true,
+      writable: true,
+    })
+    const captured: { value: string; inDialog: boolean }[] = []
+    Object.defineProperty(document, "execCommand", {
+      value: mock((command: string) => {
+        const area = document.activeElement as HTMLTextAreaElement | null
+        captured.push({
+          value: area?.value ?? "",
+          inDialog: area?.closest('[role="dialog"]') !== null,
+        })
+        return command === "copy"
+      }),
+      configurable: true,
+      writable: true,
+    })
+
+    try {
+      // `fireEvent.click` does not move focus in happy-dom, while a real
+      // click on the button does (Chrome and Firefox focus a button on
+      // mousedown), and the helper picks the textarea's host from the active
+      // element. Focusing first reproduces the real click.
+      const copyButton = screen.getByRole("button", { name: "Copy" })
+      copyButton.focus()
+      fireEvent.click(copyButton)
+      await waitFor(() => expect(captured).toHaveLength(1))
+      expect(captured[0]).toEqual({ value: RESET_PASSWORD, inDialog: true })
+    } finally {
+      if (clipboard) Object.defineProperty(navigator, "clipboard", clipboard)
+      else delete (navigator as unknown as Record<string, unknown>).clipboard
+      if (execCommand) Object.defineProperty(document, "execCommand", execCommand)
+      else delete (document as unknown as Record<string, unknown>).execCommand
+    }
+    // The password is still on screen with the dialog open.
+    expect(password.textContent).toBe(RESET_PASSWORD)
   })
 
   it("a failed reset does NOT open the dialog", async () => {
@@ -554,7 +545,10 @@ describe("UsersPage tabs (WEB-3 S3-D7)", () => {
     renderPage()
     expect(await screen.findByText("Rina Wijaya")).toBeTruthy()
     expect(screen.getByRole("tab", { name: "People" }).getAttribute("aria-selected")).toBe("true")
-    expect(screen.getByRole("button", { name: /invite user/i })).toBeTruthy()
+    // WEB-7 D2: the invite form is its own page, so this opens its address.
+    expect(
+      screen.getByRole("button", { name: /invite user/i }).getAttribute("href")
+    ).toBe("/admin/users/invite")
     expect(fetchCalls.some((c) => c.url.includes("/api/auth/sessions"))).toBe(false)
   })
 
@@ -566,5 +560,91 @@ describe("UsersPage tabs (WEB-3 S3-D7)", () => {
     expect(screen.getByRole("tab", { name: "Sessions" }).getAttribute("aria-selected")).toBe("true")
     expect(screen.queryByRole("button", { name: /invite user/i })).toBeNull()
     expect(screen.getByRole("button", { name: "Revoke" })).toBeTruthy()
+  })
+})
+
+describe("UsersPage shown-once invite password (ADM-3, WEB-7 D3)", () => {
+  it("opens the dialog for the password the invite page left in memory, then forgets it", async () => {
+    rememberInvitePassword(
+      {
+        password: TEMPORARY_PASSWORD,
+        mustChangePassword: false,
+      },
+      "u1"
+    )
+    setupFetch()
+    const { unmount } = renderPage()
+
+    const password = await screen.findByTestId("revealed-password")
+    expect(password.textContent).toBe(TEMPORARY_PASSWORD)
+    expect(screen.getByText(/Shown once\.$/)).toBeTruthy()
+    expect(JSON.stringify(localStorage)).not.toContain(TEMPORARY_PASSWORD)
+    expect(JSON.stringify(sessionStorage)).not.toContain(TEMPORARY_PASSWORD)
+    // The store was read once; nothing is left to reopen it.
+    expect(takeInvitePassword("u1")).toBeNull()
+
+    // Leaving and coming back does not show it again. (The dialog's own
+    // close button starts a Base UI exit animation that happy-dom never
+    // settles, so the property is asserted by a remount instead.)
+    unmount()
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    expect(screen.queryByTestId("revealed-password")).toBeNull()
+  })
+
+  // WEB-7 S1 review round 1, S1: signing out is a client-side push, so a
+  // value left by a different administrator in this tab must not reach the
+  // one who signs in next.
+  it("does not show a password another user left in this tab, and forgets it", async () => {
+    rememberInvitePassword(
+      {
+        password: TEMPORARY_PASSWORD,
+        mustChangePassword: false,
+      },
+      "u-other"
+    )
+    setupFetch()
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    expect(screen.queryByTestId("revealed-password")).toBeNull()
+    // Cleared by the mismatched read, not kept for a later visit.
+    expect(takeInvitePassword("u-other")).toBeNull()
+  })
+})
+
+
+describe("UsersPage edit username and email (ADM-11 D8/D11)", () => {
+  it("editing username and email calls PATCH /api/identity/users/{id} and reloads", async () => {
+    setupFetch({})
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    await openRowAction(/edit username and email/i)
+
+    const usernameInput = await screen.findByLabelText("Username")
+    const emailInput = screen.getByLabelText("Email")
+    fireEvent.change(usernameInput, { target: { value: "rinanew" } })
+    fireEvent.change(emailInput, { target: { value: "rinanew@meridian.example" } })
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => {
+      const patch = fetchCalls.find(
+        (c) => c.method === "PATCH" && c.url.endsWith(`/api/identity/users/${ROW.id}`)
+      )
+      expect(patch).toBeDefined()
+      expect(JSON.parse(patch?.body ?? "{}")).toEqual({
+        username: "rinanew",
+        email: "rinanew@meridian.example",
+      })
+    })
+  })
+})
+
+describe("UsersPage email display (ADM-11 D2/D11)", () => {
+  it("a user with null email displays an em dash in the email column", async () => {
+    setupFetch({ row: { ...ROW, email: null } })
+    renderPage()
+    await waitFor(() => expect(screen.getByText("Rina Wijaya")).toBeDefined())
+    expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(1)
   })
 })

@@ -3,6 +3,8 @@
 //! Moved out of `ai.rs` unchanged (T0.1 registry refactor).
 
 use lakehouse_auth::Principal;
+
+use crate::state::AppState;
 use lakehouse_bi::access::Viewer;
 use lakehouse_bi::layout::tab_of;
 use lakehouse_bi::specs::{ChartKind, ChartSource};
@@ -15,7 +17,7 @@ use super::look::{FORMAT_FIELDS, check_layers_name_a_source, wrong_field};
 use crate::routes::dashboard_organise::{
     Gate, drop_tile, place_new_chart, require_chart_board, require_editable_chart, snapshot_as,
 };
-use crate::routes::support::is_numeric_type;
+use crate::routes::support::{failure_as_tool_reply, insert_chart_checked, is_numeric_type};
 use crate::upstream_error;
 
 /// The tool's error for a refused dashboard or chart: the route's own
@@ -72,6 +74,98 @@ fn parse_chart_input(args: &Map<String, Value>) -> Result<ChartInput, String> {
 /// The longest digest, in characters.
 const DIGEST_MAX: usize = 300;
 
+/// The `limit: …` part of [`definition_digest`] (`BI-46`, plan D15), or `None`
+/// when the chart has no limit and nothing to say about one.
+///
+/// What the limit counts is not what a reader assumes: on a bar, hbar, line or
+/// area chart with a breakdown it keeps the N breakdown values with the
+/// largest total, and with a truncation grain ordered by bucket on the
+/// dimension it keeps the latest buckets. A bare `limit: 10` beside a
+/// breakdown was read as "10 of the breakdown" (`BI-6-06` of the QA of
+/// 2026-11-07), and it was the wrong reading until `BI-46` — the rule then was
+/// "the breakdown is not limited".
+///
+/// `caps_built` is whether the statement that was built for the chart holds
+/// the breakdown cap (`BI-46` review round 1, R4). It is read from the saved
+/// statement, not from `ChartInput::caps_breakdown` alone: a measure that is a
+/// table calculation is resolved from the deployment's calculated fields while
+/// the statement is built and gets no cap, so the kind-and-breakdown rule
+/// alone would promise a cut the chart does not make.
+///
+/// The other rules are `ChartInput::keeps_latest_buckets` and
+/// `grain::effective_limit`, fed the order the query builder feeds them — the
+/// builder's own methods, so the sentence and the statement cannot disagree. A
+/// pivot has no dimension (its grain applies to its first date field) and the
+/// builder never cuts it to its latest buckets, so a chart without a dimension
+/// makes no claim about what its limit counts. One gap stays: the builder
+/// resolves the grain against the column type (`grain::resolve`), which a
+/// synchronous digest cannot do, so this reads only the grain the chart names.
+fn limit_digest(def: &ChartInput, breakdown: Option<&str>, caps_built: bool) -> Option<String> {
+    let counted = match &def.limit {
+        Some(lakehouse_bi::params::Limit::Fixed(n)) => Some((n.to_string(), Some(*n))),
+        Some(lakehouse_bi::params::Limit::Param(p)) => {
+            Some((format!("parameter {}", p.param), None))
+        }
+        None => None,
+    };
+    if let Some((limit, number)) = counted {
+        use lakehouse_bi::grain::{Grain, effective_limit};
+        let order = def.effective_order();
+        let grain = def
+            .grain
+            .as_deref()
+            .and_then(Grain::parse)
+            .filter(|_| !def.dimension.is_empty());
+        if let Some(breakdown) = breakdown.filter(|_| caps_built) {
+            // `BI-46` (plan D12, D15): the limit counts the breakdown's
+            // values, the N with the largest total; every bucket of a time
+            // grain on the dimension is kept. A parameter names the N in the
+            // number's place, so the sentence never invents one.
+            let top = number.map_or_else(
+                || format!("{breakdown} values"),
+                |n| format!("{n} {breakdown} values"),
+            );
+            return Some(match grain {
+                Some(grain) => format!(
+                    "limit: {limit} (the {top} with the largest total; every {} bucket of {} is \
+                     kept)",
+                    grain.as_str(),
+                    def.dimension
+                ),
+                None => format!(
+                    "limit: {limit} {} values, and the {top} with the largest total",
+                    def.dimension
+                ),
+            });
+        }
+        let mut part = match grain {
+            Some(grain) if def.keeps_latest_buckets(grain) => format!(
+                "limit: {limit} (the latest {}{} buckets of {})",
+                number.map(|n| format!("{n} ")).unwrap_or_default(),
+                grain.as_str(),
+                def.dimension
+            ),
+            // A date part in its own order returns its whole range: the
+            // builder swaps the limit for the range, so asking what it
+            // would do with the largest limit tells whether this one is
+            // dropped.
+            Some(grain) if effective_limit(grain, &order, u32::MAX) != u32::MAX => format!(
+                "limit: {limit} (not applied: {} returns its whole range)",
+                grain.as_str()
+            ),
+            _ if def.dimension.is_empty() => format!("limit: {limit}"),
+            _ => format!("limit: {limit} {} values", def.dimension),
+        };
+        if breakdown.is_some() {
+            part.push_str("; the breakdown is not limited");
+        }
+        return Some(part);
+    } else if def.shape.sort.is_some() || breakdown.is_some() {
+        return Some("limit: none (default applies)".to_owned());
+    }
+    None
+}
+
 /// What a chart holds, in one line the model can read back: the fields that
 /// decide what the chart shows, and only those that are set. A model told
 /// "saved" and nothing else describes the arguments it meant to send; this
@@ -83,8 +177,14 @@ const DIGEST_MAX: usize = 300;
 /// `limit` is the exception to "set only": beside a sort or a breakdown it
 /// reads `none (default applies)` when the chart sets none, because a missing
 /// limit there is the difference between a top N and the builder's own cap,
-/// and the cap depends on the kind, so no number is named. The line is cut to
-/// [`DIGEST_MAX`] characters, the last one `…`.
+/// and the cap depends on the kind, so no number is named. What a limit counts
+/// is [`limit_digest`]'s own sentence. The line is cut to [`DIGEST_MAX`]
+/// characters, the last one `…`.
+///
+/// `caps_built` says whether the statement built for this definition carries
+/// the breakdown cap (`BI-46` review round 1, R4): [`caps_in_statement`] reads
+/// it from the saved statement, so a chart whose measure is a table
+/// calculation — no cap is built for one — is not described as cut to N.
 ///
 /// It reads the definition the save is built from, not the one it stores: the
 /// store fills every chart's `limit` with the one it built with, which would
@@ -92,7 +192,7 @@ const DIGEST_MAX: usize = 300;
 /// same `ChartInput`, so one chart gives one line. An update gets its line
 /// only in its saved reply, where the input is the stored chart merged with
 /// the call, read as the caller; its draft carries none.
-pub(super) fn definition_digest(def: &ChartInput) -> String {
+pub(super) fn definition_digest(def: &ChartInput, caps_built: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !def.dimension.is_empty() {
         parts.push(format!("dimension: {}", def.dimension));
@@ -107,15 +207,25 @@ pub(super) fn definition_digest(def: &ChartInput) -> String {
     if let Some(sort) = &def.shape.sort {
         parts.push(format!("sort: {} {}", sort.by, sort.dir));
     }
-    match &def.limit {
-        Some(lakehouse_bi::params::Limit::Fixed(n)) => parts.push(format!("limit: {n}")),
-        Some(lakehouse_bi::params::Limit::Param(p)) => {
-            parts.push(format!("limit: parameter {}", p.param));
-        }
-        None if def.shape.sort.is_some() || breakdown.is_some() => {
-            parts.push("limit: none (default applies)".to_owned());
-        }
-        None => {}
+    // What the limit counts is not what a reader assumes: on a bar, hbar, line
+    // or area chart with a breakdown it keeps the N breakdown values with the
+    // largest total, and with a truncation grain ordered by bucket on the
+    // dimension it keeps the latest buckets. A bare `limit: 10` beside a
+    // breakdown was read as "10 of the breakdown" (BI-6-06 of the QA of
+    // 2026-11-07), and it was the wrong reading until `BI-46`: the rule then
+    // was "the breakdown is not limited".
+    //
+    // The rules are `ChartInput::caps_breakdown`, `ChartInput::keeps_latest_buckets`
+    // and `grain::effective_limit`, fed the order the query builder feeds them
+    // — the builder's own methods, so the sentence and the statement cannot
+    // disagree. The builder also leaves a pivot out of "the latest buckets"
+    // (it has no dimension, and its grain applies to its first date field), so
+    // a chart without a dimension makes no claim about what its limit counts.
+    // One gap stays: the builder resolves the grain against the column type
+    // (`grain::resolve`), which a synchronous digest cannot do, so this reads
+    // only the grain the chart names.
+    if let Some(limit) = limit_digest(def, breakdown, caps_built) {
+        parts.push(limit);
     }
     if let Some(bin) = &def.shape.bin {
         parts.push(match (bin.mode.as_str(), bin.width, bin.count) {
@@ -126,6 +236,16 @@ pub(super) fn definition_digest(def: &ChartInput) -> String {
     }
     if let Some(grain) = def.grain.as_deref().filter(|g| !g.is_empty()) {
         parts.push(format!("grain: {grain}"));
+    }
+    // `BI-46` (plan D13, D15): the breakdown can be grouped by a period, and
+    // the sentence says so right after the dimension's own grain.
+    if let Some(grain) = def
+        .shape
+        .breakdown_grain
+        .as_deref()
+        .filter(|g| !g.is_empty())
+    {
+        parts.push(format!("breakdown grain: {grain}"));
     }
     let filters = def.shape.filters.as_deref().map_or(0, <[_]>::len);
     if filters > 0 {
@@ -142,6 +262,20 @@ pub(super) fn definition_digest(def: &ChartInput) -> String {
     let mut cut: String = digest.chars().take(DIGEST_MAX - 1).collect();
     cut.push('…');
     cut
+}
+
+/// Whether the statement built for `def` caps its breakdown (`BI-46` review
+/// round 1, R4), for [`definition_digest`].
+///
+/// The builder is the only place that knows whether a cap was made: a measure
+/// that is a table calculation gets none, and that is resolved from the
+/// deployment's calculated fields, which the definition does not carry. The
+/// saved statement is the fact, so it is asked ([`statement_caps_breakdown`]).
+fn caps_in_statement(def: &ChartInput, statement: &str) -> bool {
+    def.breakdown
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .is_some_and(|b| lakehouse_bi::builder::statement_caps_breakdown(statement, b))
 }
 
 /// The call's args with the formatting the call does not name filled in from
@@ -214,9 +348,10 @@ fn args_with_kept_source(
 }
 
 /// The fields `args_with_kept_fields` leaves alone because each has its own
-/// rule: `title` and `kind` are required in every call, `board` is kept by
-/// `update_chart` itself, and `mart` and `sqlSource` go through
-/// `args_with_kept_source`.
+/// rule: `title` and `kind` are required in every call (the kind a call
+/// leaves out is read from the stored chart, by [`args_with_stored_kind`]),
+/// `board` is kept by `update_chart` itself, and `mart` and `sqlSource` go
+/// through `args_with_kept_source`.
 const NOT_CARRIED: [&str; 5] = ["title", "kind", "board", "mart", "sqlSource"];
 
 /// The only fields a kind without data carries, and the kinds that take each.
@@ -259,6 +394,92 @@ fn is_static_content(field: &str, kind: ChartKind) -> bool {
 /// on every other kind, so they are carried only into a Gantt chart.
 const GANTT_FIELDS: [&str; 4] = ["start", "end", "progress", "todayLine"];
 
+/// The kinds that take a stored field, so a kind change leaves out a field
+/// the new kind refuses.
+///
+/// A kind that is not listed refuses the field. The rules are the checks that
+/// refuse the field, not rules of their own: a pivot and a table in rows mode
+/// name their columns in their own fields, not in `dimension`, `measures` or
+/// `breakdown` (`lakehouse-bi/src/store.rs`, `check_measures`), and the
+/// `BI-16` fields are only for the kinds that read them
+/// (`lakehouse-bi/src/tables.rs`, `only_for`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Takes {
+    /// The kind takes the field.
+    Kind(ChartKind),
+    /// A table in rows mode takes the field.
+    RowsTable,
+    /// Every kind but a pivot takes the field. A table in rows mode takes
+    /// none of it: it names its columns in its own fields.
+    AllButPivot,
+}
+
+/// The stored fields and the kinds that take each.
+///
+/// AI-5 AC1 (2026-11-08): a call that changes the kind leaves out a stored
+/// field the new kind refuses, so the model need not clear it with `null`.
+const TAKEN_BY_KIND: [(&str, &[Takes]); 13] = [
+    // A pivot and a table in rows mode name their columns in their own fields
+    // (`lakehouse-bi/src/store.rs`, `check_measures`).
+    ("dimension", &[Takes::AllButPivot]),
+    ("measures", &[Takes::AllButPivot]),
+    ("breakdown", &[Takes::AllButPivot]),
+    // The pivot's own fields (`lakehouse-bi/src/tables.rs`, `only_for`).
+    ("rows", &[Takes::Kind(ChartKind::Pivot)]),
+    ("values", &[Takes::Kind(ChartKind::Pivot)]),
+    ("totals", &[Takes::Kind(ChartKind::Pivot)]),
+    // The columns of a table in rows mode and of a pivot (`only_for`).
+    (
+        "columns",
+        &[Takes::Kind(ChartKind::Pivot), Takes::RowsTable],
+    ),
+    // The sort of a table in rows mode (`only_for`).
+    ("sortColumn", &[Takes::RowsTable]),
+    ("sortDir", &[Takes::RowsTable]),
+    // The fields of a table (`only_for`).
+    ("tableMode", &[Takes::Kind(ChartKind::Table)]),
+    (
+        "columnSettings",
+        &[Takes::Kind(ChartKind::Table), Takes::Kind(ChartKind::Pivot)],
+    ),
+    // The comparison of a KPI (`only_for`).
+    ("compare", &[Takes::Kind(ChartKind::Kpi)]),
+    ("goodDirection", &[Takes::Kind(ChartKind::Kpi)]),
+];
+
+/// Whether the chart of this kind takes the stored field.
+///
+/// A field no rule names is taken by every kind: only the fields the checks
+/// refuse are listed.
+fn kind_takes(field: &str, kind: ChartKind, rows_table: bool) -> bool {
+    let Some((_, takers)) = TAKEN_BY_KIND.iter().find(|(name, _)| *name == field) else {
+        return true;
+    };
+    takers.iter().any(|taker| match taker {
+        Takes::Kind(k) => *k == kind,
+        Takes::RowsTable => rows_table,
+        Takes::AllButPivot => kind != ChartKind::Pivot && !rows_table,
+    })
+}
+
+/// Whether the chart the call describes is a table in rows mode.
+///
+/// The mode is the one the call names, or the stored one the call leaves out:
+/// a table in rows mode names its columns in `columns`, and the checks treat
+/// it as a table of its own.
+fn is_rows_table(args: &Map<String, Value>, call: &ChartInput, stored: &ChartInput) -> bool {
+    if call.kind != ChartKind::Table {
+        return false;
+    }
+    let mode = match args.get("tableMode") {
+        Some(Value::String(text)) => Some(text.as_str()),
+        // A `null` clears the mode: the table is the grouped one.
+        Some(_) => None,
+        None => stored.tables.table_mode.as_deref(),
+    };
+    mode == Some("rows")
+}
+
 /// The args without the keys the call sent as `null`.
 ///
 /// `null` means "clear this field", so the key must behave as if it were left
@@ -295,9 +516,13 @@ fn is_blank(value: &Value) -> bool {
 /// data (a note, a heading, an image) carries only its own content
 /// ([`STATIC_CONTENT`]), and the Gantt fields are carried only into a Gantt
 /// chart. `text` is carried only into a kind that shows it: a data kind drops
-/// it when it builds the chart, so naming it as kept would be wrong. A field
-/// the new kind refuses is not dropped here: the build refuses it as it
-/// refuses any field, and the call clears it with `null`.
+/// it when it builds the chart, so naming it as kept would be wrong.
+///
+/// A call that changes the kind leaves out a stored field the new kind
+/// refuses ([`TAKEN_BY_KIND`]): a bar turned into a pivot keeps no dimension,
+/// no measures and no breakdown, so the build has nothing to refuse (AI-5
+/// AC1, 2026-11-08). The fields the call names itself are sent as given, so a
+/// call that asks for a refused field is still refused by the build.
 ///
 /// The second value is the sorted names of the fields carried over.
 fn args_with_kept_fields(
@@ -306,6 +531,10 @@ fn args_with_kept_fields(
     stored: &ChartInput,
 ) -> (Map<String, Value>, Vec<String>) {
     let mut merged = args.clone();
+    // A call that changes the kind takes other fields: a stored field the new
+    // kind refuses is left out (AI-5 AC1, 2026-11-08).
+    let kind_changed = stored.kind != call.kind;
+    let rows_table = is_rows_table(args, call, stored);
     let Ok(stored) = serde_json::to_value(stored) else {
         return (merged, Vec::new());
     };
@@ -321,6 +550,7 @@ fn args_with_kept_fields(
             || (call.kind.is_static() && !is_static_content(key, call.kind))
             || (key == "text" && !call.kind.is_static())
             || (GANTT_FIELDS.contains(&key.as_str()) && call.kind != ChartKind::Gantt)
+            || (kind_changed && !kind_takes(key, call.kind, rows_table))
         {
             continue;
         }
@@ -329,6 +559,22 @@ fn args_with_kept_fields(
     }
     carried.sort();
     (merged, carried)
+}
+
+/// The call's args with the stored kind filled in when the call leaves the
+/// kind out.
+///
+/// A rename names the chart and its new title and nothing else, and `#377`'s
+/// rule is that a field the call leaves out keeps its saved value, so the
+/// kind comes from the stored chart. It comes from there only when the call
+/// does not name the kind at all: a `null` clears a field, so a call that
+/// names `null` is refused, as it was before.
+fn args_with_stored_kind(args: &Map<String, Value>, stored: &ChartInput) -> Map<String, Value> {
+    let mut merged = args.clone();
+    if !merged.contains_key("kind") {
+        merged.insert("kind".to_owned(), json!(stored.kind));
+    }
+    merged
 }
 
 /// What a call carries over from the chart it changes: the call's own
@@ -374,10 +620,17 @@ async fn kept_formatting(
         },
         None => None,
     };
+    // A call that leaves the kind out keeps the stored one: a rename names
+    // the chart and its new title and nothing else, and `#377`'s rule is
+    // that a field the call leaves out keeps its saved value.
+    let args = match stored.as_ref() {
+        Some(stored) => args_with_stored_kind(args, &stored.def),
+        None => args.clone(),
+    };
     // The call is read without its `null` keys: `null` clears a field, so
     // a field of any type may be sent as `null` (`title` and `kind` then
     // read as missing, and the call is refused).
-    let call = match parse_chart_input(&without_nulls(args)) {
+    let call = match parse_chart_input(&without_nulls(&args)) {
         Ok(i) => i,
         Err(e) => return Err(json!({ "error": e })),
     };
@@ -388,9 +641,9 @@ async fn kept_formatting(
         return Ok(KeptFormatting {
             kept: true,
             args: if id.is_some() {
-                without_nulls(args)
+                without_nulls(&args)
             } else {
-                args.clone()
+                args
             },
             source_kept: false,
             fields_kept: Vec::new(),
@@ -401,15 +654,16 @@ async fn kept_formatting(
     // charts, a second axis for a bar), so the stored formatting is dropped
     // rather than carried into a kind that would refuse it.
     let (kept, args) = if stored.def.kind == call.kind {
-        (true, args_with_kept_formatting(args, &stored.def))
+        (true, args_with_kept_formatting(&args, &stored.def))
     } else {
-        (false, args.clone())
+        (false, args)
     };
     // The data source is carried over whatever the kind becomes: a chart
     // that names no source of its own reads the one the stored chart has.
     let (args, source_kept) = args_with_kept_source(&args, &call, &stored.def);
     // Every other field the call leaves out is carried over too, also when the
-    // kind changes. The `null` keys stay in `args` until here so that they
+    // kind changes, except the ones the new kind refuses (AI-5 AC1,
+    // 2026-11-08). The `null` keys stay in `args` until here so that they
     // count as named and are not carried; they are removed last.
     let (args, fields_kept) = args_with_kept_fields(&args, &call, &stored.def);
     Ok(KeptFormatting {
@@ -447,7 +701,10 @@ pub(super) async fn create_chart(
         Err(reply) => return reply,
     };
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
-        Ok(spec) => match store::insert_chart(ch, &spec).await {
+        // QA `LH-BI-5-01` (`BI-45`, plan D5): the save runs its statement
+        // under the caller's limit; a limit that ends it is the tile's answer
+        // with its `limit`, so the model can say it.
+        Ok(spec) => match insert_chart_checked(ch, &spec).await {
             Ok(()) => {
                 place_new_chart(ch, &spec.board, &spec.spec.id).await;
                 snapshot_as(ch, &spec.board, principal).await;
@@ -458,12 +715,12 @@ pub(super) async fn create_chart(
                 "kind": spec.spec.kind,
                 "mart": spec.spec.mart,
                 "board": spec.board,
-                "definition": definition_digest(&input),
+                "definition": definition_digest(&input, caps_in_statement(&input, &spec.spec.sql)),
                 "url": "/dashboards",
                 "note": "Chart tersimpan & langsung tampil di halaman Dashboards.",
                 })
             }
-            Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+            Err(failure) => failure_as_tool_reply(failure),
         },
         Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
     }
@@ -631,7 +888,10 @@ pub(super) async fn check_chart_draft(
 ) -> Result<String, Value> {
     let PreparedChart { input, .. } = prepare_chart(ch, viewer, id.as_deref(), args, time).await?;
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
-        Ok(_) => Ok(definition_digest(&input)),
+        Ok(spec) => Ok(definition_digest(
+            &input,
+            caps_in_statement(&input, &spec.spec.sql),
+        )),
         Err(err) => Err(upstream_error::bi(&upstream_error::DATABASE, &err).to_json()),
     }
 }
@@ -669,7 +929,7 @@ pub(super) async fn update_chart(
             {
                 return upstream_error::bi(&upstream_error::DATABASE, &err).to_json();
             }
-            match store::insert_chart(ch, &spec).await {
+            match insert_chart_checked(ch, &spec).await {
                 Ok(()) => {
                     if old_board != spec.board {
                         snapshot_as(ch, &old_board, principal).await;
@@ -682,7 +942,10 @@ pub(super) async fn update_chart(
                         "kind": spec.spec.kind,
                         "mart": spec.spec.mart,
                         "board": spec.board,
-                        "definition": definition_digest(&input),
+                        "definition": definition_digest(
+                            &input,
+                            caps_in_statement(&input, &spec.spec.sql),
+                        ),
                         "formattingKept": formatting_kept,
                     });
                     if source_kept {
@@ -698,7 +961,7 @@ pub(super) async fn update_chart(
                     }
                     reply
                 }
-                Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+                Err(failure) => failure_as_tool_reply(failure),
             }
         }
         Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
@@ -736,7 +999,16 @@ pub(super) async fn create_board(
 pub(super) async fn list_boards(ch: &ChClient, viewer: &Viewer) -> Value {
     match store::list_boards(ch, viewer).await {
         Ok(boards) => {
-            let mut out = vec![json!({ "id": "default", "name": "Main" })];
+            let mut out = Vec::new();
+            // GOV-17 review R10 (BLOCKER): Main used to be prepended
+            // unconditionally, so the assistant discovered a dashboard the
+            // caller's current table grants hide. Gate its synthesis on the
+            // same ACL-plus-dependency predicate the HTTP board chooser uses
+            // (`dashboard::boards_list`); `sees_builtin_board()` already ANDs
+            // the built-in ACL with the dependency resolver's verdict.
+            if viewer.sees_builtin_board() {
+                out.push(json!({ "id": store::DEFAULT_BOARD_ID, "name": "Main" }));
+            }
             // BI-18 part C: a board's tabs, when it has any, so the assistant can name them.
             out.extend(boards.iter().map(|b| {
                 let mut entry = json!({ "id": b.id, "name": b.name });
@@ -855,24 +1127,51 @@ pub(super) async fn list_charts(ch: &ChClient, viewer: &Viewer) -> Value {
 /// `list_sql_sources` and `suggest_join` (one dispatch arm, `run_tool` is at
 /// clippy's line limit).
 pub(super) async fn chart_sources(
-    ch: &ChClient,
+    state: &AppState,
     viewer: &Viewer,
+    principal: Option<&Principal>,
     name: &str,
     args: &Map<String, Value>,
 ) -> Value {
     if name == "suggest_join" {
-        suggest_join(ch, args).await
+        suggest_join(state, principal, args).await
     } else {
-        list_sql_sources(ch, viewer).await
+        list_sql_sources(&state.clickhouse, viewer).await
     }
 }
 
 /// `suggest_join` (`BI-7`): the route's answer for two marts. A refusal that is
 /// ours (unknown mart, bad name) is told in its words; a database failure is
 /// the fixed message the route would give, never the database's text.
-pub(super) async fn suggest_join(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn suggest_join(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let (left, right) = (arg_str(args, "left"), arg_str(args, "right"));
-    match crate::routes::dashboard::join_suggestions_value(ch, Some(&left), Some(&right)).await {
+    // `GOV-7` D6: the marts the caller's roles hide are not described to the
+    // model either; the route's own 404 sentence is the tool's error. No
+    // principal is a headless run: `SEC-76` refuses it, because the
+    // columns of every mart would be described with no role to narrow them.
+    let access = match principal {
+        Some(principal) => {
+            match crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names).await {
+                Ok(access) => access,
+                Err(_) => {
+                    return json!({ "error": "the tables' columns could not be read right now" });
+                }
+            }
+        }
+        None => return json!({ "error": super::data::DATASETS_NEED_A_USER }),
+    };
+    match crate::routes::dashboard::join_suggestions_value(
+        &state.clickhouse,
+        &access,
+        Some(&left),
+        Some(&right),
+    )
+    .await
+    {
         Ok(body) => body,
         Err(
             lakehouse_core::ApiError::BadRequest(sentence)
@@ -1360,6 +1659,53 @@ mod tests {
         );
     }
 
+    /// `BI-45` review round 1 R3 (QA `LH-BI-5-01`): the assistant's save runs
+    /// its statement under the caller's limit, and a statement the engine stops
+    /// at the limit is the tile's answer — the sentence plus its limit — not an
+    /// upstream error. This is the reply the Confirm button posts through
+    /// `POST /api/ai/tool`, which now waits for the limit before its own
+    /// deadline (`routes::limit_bearing`).
+    #[tokio::test]
+    async fn a_create_chart_tool_call_whose_statement_hits_the_limit_answers_with_the_sentence() {
+        let server = mart_server().await;
+        // The chart's own statement (it names the mart in a FROM), not the
+        // mart's metadata (system.tables/system.columns): a higher priority
+        // than the catch-all, which would answer 200 with no row.
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM serving.mart_x"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 159. DB::Exception: planted-marker Timeout exceeded (TIMEOUT_EXCEEDED)",
+            ))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = create_chart(
+            &ch,
+            &as_viewer(None),
+            None,
+            &arguments(json!({
+                "title": "Visitors", "kind": "bar", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors"],
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(
+            reply["error"], "This chart stopped after 60 seconds, the limit for this install.",
+            "{reply}"
+        );
+        assert_eq!(reply["limit"]["kind"], json!("time"), "{reply}");
+        assert!(
+            !reply.to_string().contains("planted-marker"),
+            "the engine's text reached the reply: {reply}"
+        );
+        // Nothing was written: the statement ran under the limit before the row.
+        let all = sent(&server).await;
+        assert!(writes(&all).is_empty(), "{all:#?}");
+    }
+
     /// `PR #199 review O BLOCKER 2`: a kind that takes no colours must not be
     /// given the company palette — the style check refuses colours on a
     /// table, a KPI or a static tile, so the assistant could create none of
@@ -1422,7 +1768,7 @@ mod tests {
             statements(&all)
                 .first()
                 .map(|s| s.trim_end_matches("\nFORMAT JSON")),
-            Some("SELECT round(sum(visitors)) AS v FROM serving.mart_x")
+            Some("SELECT round(sum(visitors), 6) AS v FROM serving.mart_x")
         );
         let stored = writes(&all);
         assert!(
@@ -2172,6 +2518,13 @@ mod tests {
         })
     }
 
+    /// The same stored bar, with a subtitle the update has to clear.
+    fn stored_bar_with_subtitle() -> Value {
+        let mut def = stored_bar_with_data();
+        def["subtitle"] = json!("Visitors by province");
+        def
+    }
+
     /// The call that renames a chart and sends nothing but `id`, `title` and
     /// `kind`: the shape the tool's description asks for.
     fn bare_rename_call(extra: Value) -> Map<String, Value> {
@@ -2239,6 +2592,60 @@ mod tests {
         assert!(row.contains("\"measures\":[\"visitors\"]"), "{row}");
     }
 
+    /// A call that sends the word "null" as the subtitle stores no subtitle:
+    /// the assistant's model writes that text when it follows the build
+    /// prompt's "send `subtitle: null`" against a schema that types the
+    /// field as a string (AI-3, 2026-11-08).
+    ///
+    /// The prepared chart's subtitle is read off the written row, not off the
+    /// reply: the reply's definition digest carries no subtitle field, while
+    /// the stored chart has a `subtitle` key only when it has a subtitle.
+    #[tokio::test]
+    async fn an_update_that_sends_the_word_null_as_the_subtitle_stores_no_subtitle() {
+        let server =
+            stored_chart_server_on(wide_mart_server().await, stored_bar_with_subtitle()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({ "subtitle": "null" })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(!row.contains("\"subtitle\""), "{row}");
+    }
+
+    /// A call that clears the subtitle with a real `null` stores no subtitle
+    /// either: the server drops the key, so the subtitle the chart had is
+    /// not carried over. This is the "null clears it" contract the tool's
+    /// description promises, and it held before the store guard of
+    /// AI-3 (2026-11-08); that guard is what handles the *text* "null", while
+    /// this test pins the contract around it rather than the guard itself.
+    ///
+    /// The prepared chart's subtitle is read off the written row, not off the
+    /// reply: the reply's definition digest carries no subtitle field, while
+    /// the stored chart has a `subtitle` key only when it has a subtitle.
+    #[tokio::test]
+    async fn an_update_that_clears_the_subtitle_with_null_stores_no_subtitle() {
+        let server =
+            stored_chart_server_on(wide_mart_server().await, stored_bar_with_subtitle()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({ "subtitle": null })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(!row.contains("\"subtitle\""), "{row}");
+    }
+
     /// A chart changed to another kind keeps its data fields, but not its
     /// formatting.
     #[tokio::test]
@@ -2261,6 +2668,132 @@ mod tests {
         assert!(row.contains("\"dimension\":\"province\""), "{row}");
         assert!(row.contains("\"measures\":[\"visitors\"]"), "{row}");
         assert!(!row.contains("muted"), "{row}");
+    }
+
+    /// A bar chart turned into a pivot keeps no field the pivot refuses: the
+    /// dimension, the measures and the breakdown are left out, because the
+    /// pivot names its columns in its own fields (AI-5 AC1, 2026-11-08).
+    #[test]
+    fn a_kind_change_leaves_out_the_fields_the_new_kind_refuses() {
+        let stored = input(stored_bar_with_data());
+        let args = arguments(json!({
+            "id": "c_1",
+            "title": "Visitors",
+            "kind": "pivot",
+            "rows": ["province"],
+            "values": [{ "column": "visitors", "aggregate": "sum" }],
+            "totals": "grand",
+        }));
+        let call = input(json!({
+            "title": "Visitors",
+            "kind": "pivot",
+            "rows": ["province"],
+            "values": [{ "column": "visitors", "aggregate": "sum" }],
+            "totals": "grand",
+        }));
+        let (merged, carried) = args_with_kept_fields(&args, &call, &stored);
+        assert_eq!(carried, vec!["filters".to_owned()]);
+        assert!(!merged.contains_key("dimension"), "{merged:?}");
+        assert!(!merged.contains_key("measures"), "{merged:?}");
+        assert!(!merged.contains_key("breakdown"), "{merged:?}");
+    }
+
+    /// A pivot turned into a bar chart keeps no field the bar refuses: the
+    /// pivot's own fields are left out, and the bar takes the dimension and
+    /// the measures the call names.
+    #[test]
+    fn a_kind_change_to_a_bar_leaves_out_the_pivot_fields() {
+        let stored = input(json!({
+            "title": "Visitors",
+            "kind": "pivot",
+            "mart": "mart_x",
+            "rows": ["province"],
+            "columns": ["region"],
+            "values": [{ "column": "visitors", "aggregate": "sum" }],
+            "totals": "grand",
+        }));
+        let args = arguments(json!({
+            "id": "c_1",
+            "title": "Visitors",
+            "kind": "bar",
+            "dimension": "province",
+            "measures": ["visitors"],
+        }));
+        let call = input(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "dimension": "province",
+            "measures": ["visitors"],
+        }));
+        let (merged, carried) = args_with_kept_fields(&args, &call, &stored);
+        assert!(carried.is_empty(), "{carried:?}");
+        assert!(!merged.contains_key("rows"), "{merged:?}");
+        assert!(!merged.contains_key("values"), "{merged:?}");
+        assert!(!merged.contains_key("totals"), "{merged:?}");
+        assert!(!merged.contains_key("columns"), "{merged:?}");
+    }
+
+    /// A bar chart turned into a pivot table is built without a refusal: the
+    /// pivot names its columns in its own fields, so the fields of the bar
+    /// are left out and the build has nothing to refuse (AI-5 AC1,
+    /// 2026-11-08).
+    #[tokio::test]
+    async fn a_chart_turned_into_a_pivot_is_built_without_a_refusal() {
+        let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({
+                "kind": "pivot",
+                "rows": ["province"],
+                "values": [{ "column": "visitors", "aggregate": "sum" }],
+                "totals": "grand",
+            })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["kind"], json!("pivot"), "{reply}");
+        assert_eq!(reply["fieldsKept"], json!(["filters"]), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        // The definition holds the empty dimension and the empty measures of
+        // a pivot, and no breakdown at all.
+        assert!(row.contains("\"dimension\":\"\""), "{row}");
+        assert!(row.contains("\"measures\":[]"), "{row}");
+        assert!(!row.contains("\"breakdown\""), "{row}");
+        assert!(row.contains("\"rows\":[\"province\"]"), "{row}");
+        assert!(row.contains("\"totals\":\"grand\""), "{row}");
+    }
+
+    /// A call that names a field the new kind refuses is refused by the
+    /// build: the model asked for it on purpose, so the tool says why.
+    #[tokio::test]
+    async fn a_pivot_call_that_names_the_measures_is_refused_by_the_build() {
+        let server = stored_chart_server_on(wide_mart_server().await, stored_bar_with_data()).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            &as_viewer(Some(&person(7))),
+            Some(&person(7)),
+            &bare_rename_call(json!({
+                "kind": "pivot",
+                "rows": ["province"],
+                "values": [{ "column": "visitors", "aggregate": "sum" }],
+                "totals": "grand",
+                "measures": ["visitors"],
+            })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(
+            reply["error"],
+            json!(
+                "a pivot names its columns in its own fields, not in dimension, measures or breakdown."
+            ),
+            "{reply}"
+        );
     }
 
     /// `null` clears a field of any type, not only an optional one: a call
@@ -2668,53 +3201,339 @@ mod tests {
     /// digest cannot take it for something that was made.
     #[test]
     fn a_definition_digest_leaves_out_what_the_chart_does_not_hold() {
-        let digest = definition_digest(&input(json!({
-            "title": "Visitors",
-            "kind": "bar",
-            "mart": "mart_x",
-            "dimension": "province",
-            "measures": ["visitors"],
-        })));
+        let digest = definition_digest(
+            &input(json!({
+                "title": "Visitors",
+                "kind": "bar",
+                "mart": "mart_x",
+                "dimension": "province",
+                "measures": ["visitors"],
+            })),
+            false,
+        );
         assert_eq!(digest, "dimension: province; measures: visitors");
     }
 
     #[test]
     fn a_definition_digest_lists_every_field_it_covers_when_the_chart_holds_them_all() {
-        let digest = definition_digest(&input(json!({
-            "title": "Visitors",
-            "kind": "bar",
-            "mart": "mart_x",
-            "dimension": "arrival",
-            "breakdown": "province",
-            "measures": ["visitors", { "column": "spend", "aggregate": "avg" }],
-            "sort": { "by": "visitors", "dir": "desc" },
-            "limit": 10,
-            "grain": "month",
-            "filters": [
-                { "column": "province", "values": ["a"] },
-                { "column": "region", "values": ["b"] },
-            ],
-        })));
+        let digest = definition_digest(
+            &input(json!({
+                "title": "Visitors",
+                "kind": "bar",
+                "mart": "mart_x",
+                "dimension": "arrival",
+                "breakdown": "province",
+                "measures": ["visitors", { "column": "spend", "aggregate": "avg" }],
+                "sort": { "by": "visitors", "dir": "desc" },
+                "limit": 10,
+                "grain": "month",
+                "filters": [
+                    { "column": "province", "values": ["a"] },
+                    { "column": "region", "values": ["b"] },
+                ],
+            })),
+            true,
+        );
+        // `BI-46` (plan D12, D15): with a breakdown the limit counts the
+        // breakdown's values, so the line says so instead of "the breakdown is
+        // not limited" (QA `LH-BI-6-06`).
         assert_eq!(
             digest,
             "dimension: arrival; breakdown: province; measures: visitors, spend; \
-             sort: visitors desc; limit: 10; grain: month; filters: 2"
+             sort: visitors desc; limit: 10 (the 10 province values with the largest total; \
+             every month bucket of arrival is kept); grain: month; filters: 2"
         );
+    }
+
+    /// A limit with a time grain ordered by bucket keeps the latest buckets
+    /// of the dimension. The digest says which, so a model cannot read
+    /// "limit: 10" as "10 periods" (BI-6-06 of the QA of 2026-11-07).
+    ///
+    /// `BI-46` (plan D12): this rule is the one a chart WITHOUT a breakdown
+    /// follows; with a breakdown the limit counts the breakdown, and
+    /// `a_definition_digest_says_a_limit_beside_a_breakdown_counts_the_breakdown`
+    /// pins that.
+    #[test]
+    fn a_definition_digest_says_a_limit_beside_a_grain_keeps_the_latest_buckets() {
+        let by_bucket = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
+                "measures": ["visitors"],
+                "grain": "month", "limit": 10,
+            })),
+            false,
+        );
+        assert!(
+            by_bucket.contains("limit: 10 (the latest 10 month buckets of tanggal)"),
+            "{by_bucket}"
+        );
+        // A sort by the dimension itself is the bucket order too.
+        let by_dimension = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
+                "measures": ["visitors"],
+                "sort": { "by": "tanggal", "dir": "asc" },
+                "grain": "month", "limit": 10,
+            })),
+            false,
+        );
+        assert!(
+            by_dimension.contains("limit: 10 (the latest 10 month buckets of tanggal)"),
+            "{by_dimension}"
+        );
+    }
+
+    /// QA `LH-BI-6-06` (`BI-46`, plan D12, D15): on a bar, hbar, line or
+    /// area chart with a breakdown the limit keeps the N breakdown values with
+    /// the largest total. With a time grain on the dimension every bucket is
+    /// kept; without one the dimension keeps its own top N as well. A heatmap
+    /// is not capped and keeps the old words, and a breakdown grain is listed.
+    #[test]
+    fn a_definition_digest_says_a_limit_beside_a_breakdown_counts_the_breakdown() {
+        let grained = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
+                "breakdown": "provinsi", "measures": ["visitors"],
+                "grain": "month", "limit": 10,
+            })),
+            true,
+        );
+        assert!(
+            grained.contains(
+                "limit: 10 (the 10 provinsi values with the largest total; every month bucket \
+                 of tanggal is kept)"
+            ),
+            "{grained}"
+        );
+        assert!(!grained.contains("latest"), "{grained}");
+        let plain = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "kab",
+                "breakdown": "kawasan", "measures": ["visitors"], "limit": 10,
+            })),
+            true,
+        );
+        assert!(
+            plain
+                .contains("limit: 10 kab values, and the 10 kawasan values with the largest total"),
+            "{plain}"
+        );
+        // A heatmap's second column is an axis, not a series: still uncapped.
+        let heatmap = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "heatmap", "mart": "mart_x", "dimension": "kab",
+                "breakdown": "kawasan", "measures": ["visitors"], "limit": 10,
+            })),
+            false,
+        );
+        assert!(
+            heatmap.contains("limit: 10 kab values; the breakdown is not limited"),
+            "{heatmap}"
+        );
+        let with_grain = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "kab",
+                "breakdown": "tanggal", "breakdownGrain": "month",
+                "measures": ["visitors"], "limit": 10,
+            })),
+            true,
+        );
+        assert!(
+            with_grain.contains("breakdown grain: month"),
+            "{with_grain}"
+        );
+    }
+
+    /// `BI-46` review round 1, R4: a chart whose measure is a table
+    /// calculation gets no breakdown cap — its windows run over the whole
+    /// grouped result — so the digest must not promise a cut. `caps_in_statement`
+    /// reads the built statement, and the builder test
+    /// `a_table_calculations_statement_carries_no_breakdown_cap` pins that such
+    /// a statement has none.
+    #[test]
+    fn a_definition_digest_says_a_breakdown_is_not_limited_when_the_statement_has_no_cap() {
+        let plain = input(json!({
+            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "kab",
+            "breakdown": "kawasan", "measures": ["running"], "limit": 10,
+        }));
+        let digest = definition_digest(&plain, false);
+        assert!(
+            digest.contains("limit: 10 kab values; the breakdown is not limited"),
+            "{digest}"
+        );
+        let grained = input(json!({
+            "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
+            "breakdown": "provinsi", "measures": ["running"],
+            "grain": "month", "limit": 10,
+        }));
+        let digest = definition_digest(&grained, false);
+        assert!(digest.contains("the breakdown is not limited"), "{digest}");
+        assert!(!digest.contains("largest total"), "{digest}");
+    }
+
+    #[test]
+    fn a_definition_digest_says_a_limit_beside_a_sort_counts_dimension_values() {
+        let top_n = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "provinsi",
+                "measures": ["visitors"],
+                "sort": { "by": "visitors", "dir": "desc" }, "limit": 10,
+            })),
+            false,
+        );
+        assert!(top_n.contains("limit: 10 provinsi values"), "{top_n}");
+        assert!(!top_n.contains("latest"), "{top_n}");
+        // No breakdown, so nothing to say about one.
+        assert!(!top_n.contains("breakdown"), "{top_n}");
+    }
+
+    /// A part of the date (`day_of_week`) ordered by value is a top N of its
+    /// values, and a truncation ordered by value is a top N of buckets: both
+    /// count dimension values, neither keeps "the latest".
+    #[test]
+    fn a_definition_digest_reads_a_limit_on_a_date_part_or_a_value_order_as_dimension_values() {
+        let part = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
+                "measures": ["visitors"],
+                "sort": { "by": "visitors", "dir": "desc" },
+                "grain": "day_of_week", "limit": 3,
+            })),
+            false,
+        );
+        assert!(part.contains("limit: 3 arrival values"), "{part}");
+        assert!(!part.contains("latest"), "{part}");
+        let by_value = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
+                "measures": ["visitors"],
+                "sort": { "by": "visitors", "dir": "desc" },
+                "grain": "month", "limit": 3,
+            })),
+            false,
+        );
+        assert!(by_value.contains("limit: 3 arrival values"), "{by_value}");
+        assert!(!by_value.contains("latest"), "{by_value}");
+    }
+
+    /// A date part ordered by its own value (no sort, or a sort by the
+    /// dimension) always returns its whole range: the builder replaces the
+    /// limit with the part's range (`grain::effective_limit`). The digest must
+    /// not claim a count of values the chart does not cut to.
+    #[test]
+    fn a_definition_digest_says_a_limit_on_a_date_part_in_its_own_order_cuts_nothing() {
+        let digest = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
+                "measures": ["visitors"], "grain": "day_of_week", "limit": 3,
+            })),
+            false,
+        );
+        assert!(
+            digest.contains("limit: 3 (not applied: day_of_week returns its whole range)"),
+            "{digest}"
+        );
+        assert!(!digest.contains("arrival values"), "{digest}");
+        assert!(!digest.contains("latest"), "{digest}");
+    }
+
+    /// A pivot has no dimension (its grain applies to its first date field)
+    /// and the builder never cuts it to its latest buckets, so the digest
+    /// makes no claim about what the limit counts and names no empty column.
+    #[test]
+    fn a_definition_digest_makes_no_latest_claim_for_a_pivot_with_a_grain_and_a_limit() {
+        let digest = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "pivot", "mart": "mart_x",
+                "rows": ["place"], "columns": ["day"],
+                "values": [{ "column": "visitors", "aggregate": "sum" }],
+                "grain": "month", "limit": 10,
+            })),
+            false,
+        );
+        assert!(digest.contains("limit: 10; grain: month"), "{digest}");
+        assert!(!digest.contains("latest"), "{digest}");
+        assert!(!digest.contains("buckets"), "{digest}");
+        assert!(!digest.contains("values"), "{digest}");
+    }
+
+    /// A parameter limit has no number to print, so the text names the
+    /// parameter in the number's place and stays true either way.
+    #[test]
+    fn a_definition_digest_names_a_limit_parameter_in_place_of_the_number() {
+        let latest = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "line", "mart": "mart_x", "dimension": "tanggal",
+                "breakdown": "provinsi", "measures": ["visitors"],
+                "grain": "month", "limit": { "param": "top_n" },
+            })),
+            true,
+        );
+        // `BI-46` (plan D15): with a breakdown the parameter names the N of
+        // the breakdown's values, so no number is invented.
+        assert!(
+            latest.contains(
+                "limit: parameter top_n (the provinsi values with the largest total; every month \
+                 bucket of tanggal is kept)"
+            ),
+            "{latest}"
+        );
+        let values = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "provinsi",
+                "measures": ["visitors"],
+                "sort": { "by": "visitors", "dir": "desc" }, "limit": { "param": "top_n" },
+            })),
+            false,
+        );
+        assert!(
+            values.contains("limit: parameter top_n provinsi values"),
+            "{values}"
+        );
+    }
+
+    /// The longer limit text must not push the line past the cap, nor drop
+    /// the cut mark.
+    #[test]
+    fn a_definition_digest_with_a_limit_text_stays_within_three_hundred_characters() {
+        let digest = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "line", "mart": "mart_x",
+                "dimension": "a_dimension_with_a_rather_long_column_name_that_keeps_going_on",
+                "breakdown": "a_breakdown_with_a_rather_long_column_name_that_keeps_going_on",
+                "measures": ["visitors", { "column": "spend", "aggregate": "avg" }],
+                "sort": { "by": "visitors", "dir": "desc" },
+                "limit": 10, "grain": "month",
+                "filters": [
+                    { "column": "province", "values": ["a"] },
+                    { "column": "region", "values": ["b"] },
+                ],
+            })),
+            true,
+        );
+        assert!(digest.chars().count() <= 300, "{digest}");
+        assert!(digest.ends_with('…'), "{digest}");
     }
 
     #[test]
     fn a_definition_digest_names_a_bin_by_its_width_or_count() {
-        let wide = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
-            "measures": ["spend"],
-            "bin": { "mode": "width", "width": 500 },
-        })));
+        let wide = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
+                "measures": ["spend"],
+                "bin": { "mode": "width", "width": 500 },
+            })),
+            false,
+        );
         assert!(wide.contains("bin: width 500"), "{wide}");
-        let counted = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
-            "measures": ["spend"],
-            "bin": { "mode": "count", "count": 10 },
-        })));
+        let counted = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "visitors",
+                "measures": ["spend"],
+                "bin": { "mode": "count", "count": 10 },
+            })),
+            false,
+        );
         assert!(counted.contains("bin: 10 bins"), "{counted}");
     }
 
@@ -2722,15 +3541,21 @@ mod tests {
     /// digest says so, because that is what "top N" is not.
     #[test]
     fn a_definition_digest_reads_limit_none_beside_a_breakdown_or_a_sort() {
-        let with_breakdown = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
-            "breakdown": "province", "measures": ["visitors"],
-        })));
+        let with_breakdown = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "arrival",
+                "breakdown": "province", "measures": ["visitors"],
+            })),
+            false,
+        );
         assert!(with_breakdown.contains("limit: none"), "{with_breakdown}");
-        let with_sort = definition_digest(&input(json!({
-            "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "province",
-            "measures": ["visitors"], "sort": { "by": "visitors", "dir": "asc" },
-        })));
+        let with_sort = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "bar", "mart": "mart_x", "dimension": "province",
+                "measures": ["visitors"], "sort": { "by": "visitors", "dir": "asc" },
+            })),
+            false,
+        );
         assert!(with_sort.contains("limit: none"), "{with_sort}");
     }
 
@@ -2739,10 +3564,13 @@ mod tests {
         let names: Vec<String> = (0..12)
             .map(|i| format!("{i:02}_{}", "x".repeat(37)))
             .collect();
-        let digest = definition_digest(&input(json!({
-            "title": "T", "kind": "stacked", "mart": "mart_x", "dimension": "province",
-            "measures": names,
-        })));
+        let digest = definition_digest(
+            &input(json!({
+                "title": "T", "kind": "stacked", "mart": "mart_x", "dimension": "province",
+                "measures": names,
+            })),
+            false,
+        );
         assert_eq!(digest.chars().count(), 300, "{digest}");
         assert!(digest.ends_with('…'), "{digest}");
         assert!(

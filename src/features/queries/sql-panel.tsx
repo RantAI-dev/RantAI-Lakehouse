@@ -16,6 +16,7 @@ import { SqlEditor } from "@/components/sql-editor"
 import { formatSql, type KeywordCase } from "@/lib/sql-format"
 import { formatDuration } from "@/lib/format"
 import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import {
   Select,
@@ -26,7 +27,8 @@ import {
 } from "@/components/ui/select"
 import { useFormatSettings } from "./use-format-settings"
 import { KeyboardShortcutsDialog } from "./keyboard-shortcuts-dialog"
-import type { useQueryStudio } from "./use-query-studio"
+import { QueryParameterFields } from "./query-parameter-fields"
+import { SQL_PLACEHOLDER, type useQueryStudio } from "./use-query-studio"
 
 /** What the keyword case is called in the settings control. */
 const KEYWORD_CASE_LABELS: Record<KeywordCase, string> = {
@@ -75,6 +77,12 @@ export function SqlPanel({
     setSql,
     engine,
     setEngine,
+    parameters,
+    parameterValues,
+    setParameterValue,
+    setParameterDefinition,
+    invalidParameters,
+    activeTabId,
     editorExtensions,
     statements,
     running,
@@ -82,8 +90,10 @@ export function SqlPanel({
     elapsedMs,
     download,
     estimateAct,
+    estimateSupported,
     runnable,
     targetStatement,
+    batchRefusal,
     runQuery,
     runSelectionOrAll,
     reEstimate,
@@ -116,14 +126,30 @@ export function SqlPanel({
 
   return (
     <div className="space-y-3">
+      {/* UX-4: the editor is this panel's one required input, so no star and
+          no legend; the editor keeps its `required` association. */}
+      <Label id="query-sql-label">SQL</Label>
       {/* The editor gets the console's own completion source, not the
           language extension's schema: the tables and columns come from the
           catalog, under the names a query can actually use. */}
       <SqlEditor
         value={sql}
         onChange={setSql}
+        placeholder={SQL_PLACEHOLDER}
         extensions={editorExtensions}
         onView={(view) => studio.setEditorView(view)}
+        labelledBy="query-sql-label"
+        required
+      />
+      {/* One field per `{{name}}` in the SQL (`QS-5`); none, and nothing is drawn.
+          The tab is the key: another tab starts its fields over. */}
+      <QueryParameterFields
+        key={activeTabId}
+        definitions={parameters}
+        values={parameterValues}
+        invalid={invalidParameters}
+        onValueChange={setParameterValue}
+        onDefinitionChange={setParameterDefinition}
       />
       <div className="flex flex-wrap items-center gap-2">
         <Select value={engine} onValueChange={(v) => setEngine(v as typeof engine)}>
@@ -265,8 +291,15 @@ export function SqlPanel({
           size="sm"
           variant="ghost"
           onClick={reEstimate}
-          disabled={estimateAct.status === "pending" || !oneStatement}
-          title={oneStatement ? undefined : "Select one statement"}
+          disabled={estimateAct.status === "pending" || !oneStatement || !estimateSupported}
+          title={
+            !estimateSupported
+              ? // LH-QS-4-08: the same sentence the panel says.
+                "No pre-run estimate for Trino queries."
+              : oneStatement
+                ? undefined
+                : "Select one statement"
+          }
         >
           Estimate
         </Button>
@@ -284,6 +317,13 @@ export function SqlPanel({
           ⌘/Ctrl+Enter to run
         </span>
       </div>
+      {/* QS-11 (LH-QS-1-12), D9: a batch over the limit is refused here, in
+          the page, not in a toast that disappears before it is read. */}
+      {batchRefusal ? (
+        <p role="alert" className="text-sm text-destructive">
+          {batchRefusal}
+        </p>
+      ) : null}
     </div>
   )
 }

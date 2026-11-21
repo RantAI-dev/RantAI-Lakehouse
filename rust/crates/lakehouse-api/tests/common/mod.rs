@@ -350,6 +350,148 @@ async fn build_state_and_pool(
     (state, pool)
 }
 
+/// A minimal but spec-valid Iceberg REST `LoadTableResult` for `bronze.<table>`:
+/// format version 2, one schema, one snapshot. It is what
+/// `lakehouse_iceberg::rest::load_table_summary` parses without an error, so
+/// `routes::catalog_restore::table_exists` reads the table as there.
+///
+/// Hand-written from the shape the Iceberg REST spec requires, and proven by
+/// `lakehouse-iceberg`'s own fixture of the same shape; a test-only stand-in,
+/// never captured from a live catalog.
+pub fn load_table_fixture(table: &str) -> String {
+    format!(
+        r#"{{
+            "metadata-location": "s3://lakehouse-warehouse/bronze/{table}/metadata/00001.metadata.json",
+            "metadata": {{
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-4bb1-8e5c-b2e7c1a04a3d",
+                "location": "s3://lakehouse-warehouse/bronze/{table}",
+                "last-sequence-number": 1,
+                "last-updated-ms": 1700000000000,
+                "last-column-id": 1,
+                "schemas": [
+                    {{
+                        "schema-id": 0,
+                        "type": "struct",
+                        "fields": [{{"id": 1, "name": "id", "required": true, "type": "long"}}]
+                    }}
+                ],
+                "current-schema-id": 0,
+                "partition-specs": [{{"spec-id": 0, "fields": []}}],
+                "default-spec-id": 0,
+                "last-partition-id": 999,
+                "properties": {{}},
+                "current-snapshot-id": 1,
+                "snapshots": [
+                    {{
+                        "snapshot-id": 1,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1700000000000,
+                        "manifest-list": "s3://lakehouse-warehouse/bronze/{table}/metadata/snap-1.avro",
+                        "summary": {{ "operation": "append", "total-records": "1" }}
+                    }}
+                ],
+                "metadata-log": [],
+                "sort-orders": [{{"order-id": 0, "fields": []}}],
+                "default-sort-order-id": 0
+            }}
+        }}"#
+    )
+}
+
+/// Mount the Iceberg REST catalog so that `bronze.<table>` exists: the
+/// `/v1/config` every Iceberg client asks first, and the table's load
+/// (`DATA-55` review R2 — the healing rule and the restore's mirror case need
+/// the "the table is there" answer from the catalog the restore itself reads).
+///
+/// `server` is whatever the deployment's `LAKEKEEPER_CATALOG_URI` points at.
+pub async fn mount_existing_iceberg_table(server: &wiremock::MockServer, table: &str) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"defaults":{},"overrides":{}}"#),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/namespaces/bronze/tables/{table}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(load_table_fixture(table)))
+        .mount(server)
+        .await;
+}
+
+/// The fixed sentence `ClickHouse`'s code 47 (`UNKNOWN_IDENTIFIER`) gets, and
+/// so the browser's copy of a statement failure (owner 2026-11-12,
+/// LH-QS-2-08): the person reads this sentence and a reference, never the
+/// engine's own text.
+pub const COLUMN_DOES_NOT_EXIST: &str = "This query names a column that does not exist.";
+
+/// The engine's own answer for a statement that names a column that does not
+/// exist: code 47, `DB::Exception`, the identifier and the server version.
+pub const CLICKHOUSE_UNKNOWN_IDENTIFIER: &str = "Code: 47. DB::Exception: Unknown expression identifier 'pengunjungg' in scope. (UNKNOWN_IDENTIFIER) (version 26.8.1)";
+
+/// `ClickHouse` for a `run_sql` whose statement the engine answers with
+/// `answer`: the dry run (`EXPLAIN AST`) confirms a `SELECT`, a statement
+/// that contains `failing` gets the engine's own answer, and any other
+/// statement succeeds with one row.
+///
+/// The mocks are mounted in that order because `wiremock` answers with the
+/// FIRST matching mock in mount order: the dry run's body carries the
+/// statement too, so its mock has to come first to keep the statement's own
+/// answer out of the dry run.
+pub async fn mock_clickhouse_refusing(
+    failing: &str,
+    answer: wiremock::ResponseTemplate,
+) -> wiremock::MockServer {
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let ch = wiremock::MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("EXPLAIN AST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("SelectWithUnionQuery (children 1)\n ExpressionList ...\n"),
+        )
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(failing))
+        .respond_with(answer)
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "meta": [{"name": "n", "type": "UInt64"}],
+            "data": [{"n": 5}],
+            "rows": 1,
+        })))
+        .mount(&ch)
+        .await;
+    ch
+}
+
+/// The last tool result the model had in front of it in the request at
+/// `index` (`0` is the first request), exactly as the model received it: the
+/// tool's own result, with the model's copy of a failure in `error`.
+pub async fn model_tool_result(llm: &wiremock::MockServer, index: usize) -> serde_json::Value {
+    let requests = llm.received_requests().await.expect("recording is on");
+    let request: serde_json::Value =
+        serde_json::from_slice(&requests[index].body).expect("a JSON model request");
+    let message = request["messages"]
+        .as_array()
+        .expect("messages are a list")
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .unwrap_or_else(|| panic!("the model read a tool result: {request}"));
+    serde_json::from_str(message["content"].as_str().unwrap_or_default())
+        .expect("the tool result is a JSON object")
+}
+
 /// Swaps the database name in `postgres://user:pass@host:port/dbname` for
 /// `new_db`, without pulling in a URL-parsing crate for one substitution.
 fn swap_database_name(url: &str, new_db: &str) -> String {
@@ -473,9 +615,10 @@ pub async fn create_zero_permission_principal(pool: &PgPool) -> Uuid {
 
     let user_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Zero Perm Test User', $2, 'active')",
+        "INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Zero Perm Test User', $2, $3, 'active')",
     )
     .bind(user_id)
+    .bind(format!("zero-perm-{user_id}"))
     .bind(format!("zero-perm-{user_id}@test.invalid"))
     .execute(pool)
     .await
@@ -489,6 +632,31 @@ pub async fn create_zero_permission_principal(pool: &PgPool) -> Uuid {
         .expect("attach the zero-permission role to the test user");
 
     user_id
+}
+
+/// Creates a fresh `app_user` who may use the assistant (`assistant:use`)
+/// and who holds `permissions` besides — the principal a test about what a
+/// tool does *inside* `/api/ai/*` needs since `ADM-13` D5 put that permission
+/// on every assistant route (before it, any signed-in person reached the
+/// tools; now a tool's own gate is only reached by somebody who may use the
+/// assistant at all).
+///
+/// `permissions` is a `role.permissions`-shaped string and may be empty: a
+/// person whose only grant is the assistant is what a test proving "each tool
+/// refuses somebody without *its* permission" wants, because the request has
+/// to reach the tool for the tool's refusal to be the thing under test.
+///
+/// Not a change to [`create_principal_with_permissions`]: that helper's other
+/// callers are tests about non-assistant surfaces (dashboards, connectors,
+/// the identity routes), where holding `assistant:use` would make the
+/// principal something the test does not mean.
+pub async fn create_assistant_principal(pool: &PgPool, permissions: &str) -> Uuid {
+    let permissions = if permissions.is_empty() {
+        "assistant:use".to_owned()
+    } else {
+        format!("{permissions},assistant:use")
+    };
+    create_principal_with_permissions(pool, &permissions).await
 }
 
 /// Creates a fresh `app_user` holding a role that grants EXACTLY
@@ -517,9 +685,10 @@ pub async fn create_principal_with_permissions(pool: &PgPool, permissions: &str)
 
     let user_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Single Perm Test User', $2, 'active')",
+        "INSERT INTO app_user (id, name, username, email, status) VALUES ($1, 'Single Perm Test User', $2, $3, 'active')",
     )
     .bind(user_id)
+    .bind(format!("single-perm-{user_id}"))
     .bind(format!("single-perm-{user_id}@test.invalid"))
     .execute(pool)
     .await
@@ -533,4 +702,16 @@ pub async fn create_principal_with_permissions(pool: &PgPool, permissions: &str)
         .expect("attach the single-permission role to the test user");
 
     user_id
+}
+
+/// Every `audit_event` row with this `action`, oldest first, each as the JSON
+/// of the whole row. A test that must prove a secret never reached the audit
+/// log checks `row.to_string()`, so a value in any column is caught, not only
+/// in `args`.
+pub async fn audit_rows(pool: &PgPool, action: &str) -> Vec<serde_json::Value> {
+    sqlx::query_scalar("SELECT to_jsonb(a) FROM audit_event a WHERE action = $1 ORDER BY at, id")
+        .bind(action)
+        .fetch_all(pool)
+        .await
+        .expect("read audit_event")
 }
