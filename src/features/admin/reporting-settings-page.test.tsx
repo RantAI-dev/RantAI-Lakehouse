@@ -128,6 +128,34 @@ describe("ReportingSettingsForm", () => {
     })
   })
 
+  it("saves a zone typed in full and left, not the one the form held (PR #635 review SHOULD-FIX 2)", async () => {
+    const calls = mockSettings(DEFAULTS)
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+    const input = (await screen.findByLabelText("Report time zone")) as HTMLInputElement
+    await waitFor(() => expect(input.value).toBe("Asia/Jakarta"))
+    // Typed, never picked from the list: leaving the field chooses it.
+    fireEvent.change(input, { target: { value: "Europe/Berlin" } })
+    fireEvent.blur(input)
+    const save = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement
+    await waitFor(() => expect(save.disabled).toBe(false))
+    fireEvent.click(save)
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const put = calls.find((c) => c.method === "PUT")
+    expect(JSON.parse(put?.body ?? "{}").timeZone).toBe("Europe/Berlin")
+  })
+
+  it("puts the held zone back when the text names no zone, so the field and the form agree (PR #635 review SHOULD-FIX 2)", async () => {
+    mockSettings(DEFAULTS)
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+    const input = (await screen.findByLabelText("Report time zone")) as HTMLInputElement
+    await waitFor(() => expect(input.value).toBe("Asia/Jakarta"))
+    fireEvent.change(input, { target: { value: "Mars/Olympus" } })
+    fireEvent.blur(input)
+    await waitFor(() => expect(input.value).toBe("Asia/Jakarta"))
+    // Nothing was chosen, so nothing can be saved.
+    expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it("switches public links off for everyone on Save and warns first", async () => {
     const calls = mockSettings(DEFAULTS)
     render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
