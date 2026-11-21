@@ -145,6 +145,10 @@ const INVALID_TABLE: &str =
 const READS_NOT_INPUT: &str = "this step reads a table that is not an input; add it under Inputs";
 const READS_LATER_STEP: &str = "this step reads a step that comes after it; reorder the steps";
 const TRANSFORM_REFUSED: &str = "this transform is not in the supported grammar";
+/// BLD-11 review R5: a rename that would leave two output columns with one
+/// name is refused when the pipeline is saved, not left to fail on its next
+/// run with a duplicate-column error from the engine.
+const DUPLICATE_OUTPUT_COLUMN: &str = "two columns would have the same name after this step; give the renamed column a different name";
 const OUTPUT_IS_INPUT: &str =
     "the output table is one of the inputs; the output cannot be one of the inputs";
 const BRONZE_NEEDS_CATALOG: &str =
@@ -234,6 +238,43 @@ fn parse_transforms(
             })
         })
         .collect()
+}
+
+/// BLD-11 review R5: refuse a transform step whose own transforms would emit
+/// two columns with one name. With an explicit `select` the emitted names are
+/// the selected columns after renaming; without one, the renamed columns are
+/// appended to `*` and only collisions between rename targets are knowable —
+/// the source table's columns are not part of a saved definition.
+fn check_output_names(parsed: &[Transform], index: usize) -> Result<(), DefinitionError> {
+    let renames: Vec<(&Ident, &Ident)> = parsed
+        .iter()
+        .filter_map(|transform| match transform {
+            Transform::Rename { from, to } => Some((from, to)),
+            _ => None,
+        })
+        .collect();
+    let emitted: Vec<String> = match parsed.iter().find_map(|transform| match transform {
+        Transform::Select { columns } => Some(columns),
+        _ => None,
+    }) {
+        Some(selected) => selected
+            .iter()
+            .map(|column| {
+                renames
+                    .iter()
+                    .find(|(from, _)| *from == column)
+                    .map_or_else(|| column.to_string(), |(_, to)| to.to_string())
+            })
+            .collect(),
+        None => renames.iter().map(|(_, to)| to.to_string()).collect(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    for name in emitted {
+        if !seen.insert(name) {
+            return Err(DefinitionError::step(index, DUPLICATE_OUTPUT_COLUMN));
+        }
+    }
+    Ok(())
 }
 
 /// D4a: whether this definition is today's shape — one input and either no
@@ -358,6 +399,8 @@ fn validate(
     };
 
     for (index, step) in steps[..limit].iter().enumerate() {
+        // BLD-16 / J1 moved the per-step rules into `check_step` so the save,
+        // the preview, the run and the compile route all refuse identically.
         check_step(step, index, inputs, steps)?;
     }
     Ok((limit, last))
@@ -383,14 +426,22 @@ fn check_step(
         PipelineStep::Transform {
             reads, transforms, ..
         } => {
-            for (position, text) in transforms.iter().enumerate() {
-                parse_transform(text).map_err(|_| {
-                    DefinitionError::at(
-                        format!("steps[{index}].transforms[{position}]"),
-                        TRANSFORM_REFUSED,
-                    )
-                })?;
-            }
+            let parsed = transforms
+                .iter()
+                .enumerate()
+                .map(|(position, text)| {
+                    parse_transform(text).map_err(|_| {
+                        DefinitionError::at(
+                            format!("steps[{index}].transforms[{position}]"),
+                            TRANSFORM_REFUSED,
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // BLD-11 review R5: a duplicate output name is refused here, at
+            // save, instead of failing on the pipeline's next run. Re-applied
+            // on top of BLD-16's `check_step` extraction in the merge.
+            check_output_names(&parsed, index)?;
             // R1-B6 / D6a: a step names what it reads EXACTLY, case
             // included — `ClickHouse` matches a `WITH` name by exact case,
             // so a reference that differs only in case would be looked up
@@ -690,6 +741,48 @@ fn step_body(step: &PipelineStep, index: usize) -> Result<String, DefinitionErro
     }
 }
 
+/// Build the projection for a transform step that has no explicit `select`
+/// (BLD-11 F7, D11). A plain `*` would ignore `cast`/`rename` entirely, so
+/// renamed columns are cut from `*` with `EXCEPT` and appended at the end as
+/// `<old> AS <new>` (cast under the new name when it is also cast), while
+/// casts on columns that keep their name go into `REPLACE`. `EXCEPT` comes
+/// before `REPLACE` — the order `sqlparser`'s `ClickHouse` dialect parses. With
+/// neither transform this is the unchanged `*`.
+fn render_star_with_transforms(renames: &[(String, String)], casts: &[(String, String)]) -> String {
+    use std::fmt::Write as _;
+
+    if renames.is_empty() && casts.is_empty() {
+        return "*".to_owned();
+    }
+    let mut projection = "*".to_owned();
+    if !renames.is_empty() {
+        let excluded = renames
+            .iter()
+            .map(|(from, _)| from.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(projection, " EXCEPT ({excluded})");
+    }
+    // A cast on a renamed column is applied to the appended expression, not
+    // to `*`; only the columns that keep their name are replaced in place.
+    let in_place = casts
+        .iter()
+        .filter(|(column, _)| !renames.iter().any(|(from, _)| from == column))
+        .map(|(column, ty)| format!("CAST({column} AS {ty}) AS {column}"))
+        .collect::<Vec<_>>();
+    if !in_place.is_empty() {
+        let _ = write!(projection, " REPLACE ({})", in_place.join(", "));
+    }
+    for (from, to) in renames {
+        let expression = casts
+            .iter()
+            .find(|(column, _)| column == from)
+            .map_or_else(|| from.clone(), |(_, ty)| format!("CAST({from} AS {ty})"));
+        let _ = write!(projection, ", {expression} AS {to}");
+    }
+    projection
+}
+
 /// BLD-16 / J6: the SQL of one form step, as a person reads it — the body
 /// the compiler puts inside that step's `WITH` entry, over the inputs and
 /// the earlier steps by their names, before the access rewrite (the
@@ -734,6 +827,14 @@ pub fn step_sql(
 /// rename), filters are joined by `AND`, and the last `dedupe` key gives
 /// `ORDER BY k LIMIT 1 BY k`. Every dynamic piece is rendered through
 /// [`Transform::render_clickhouse`], never string-interpolated here.
+///
+/// BLD-11 F7 (D11): with an explicit `select`, nothing below changes. With no
+/// `select` the step used to be plain `SELECT *`, silently dropping every
+/// `cast`/`rename` (the Gold table kept the source type). Now a cast or
+/// rename with no select is applied to all columns through `ClickHouse`'s
+/// `* EXCEPT`/`* REPLACE`: renamed columns are excluded from `*` and appended
+/// at the end as `<old> AS <new>` (or `CAST(<old> AS T) AS <new>` when cast),
+/// while cast columns that keep their name are replaced in place.
 #[must_use]
 pub fn render_transform_step(from: &str, transforms: &[Transform]) -> String {
     let mut columns: Option<Vec<String>> = None;
@@ -758,7 +859,7 @@ pub fn render_transform_step(from: &str, transforms: &[Transform]) -> String {
     }
 
     let select_columns = columns.map_or_else(
-        || "*".to_owned(),
+        || render_star_with_transforms(&renames, &casts),
         |columns| {
             columns
                 .iter()
@@ -933,6 +1034,79 @@ mod tests {
             "SELECT id, CAST(amount AS Float64) AS amount_usd FROM silver.`orders` \
              WHERE status = 'active' ORDER BY id LIMIT 1 BY id"
         );
+    }
+
+    fn render_from(from: &str, transforms: &[&str]) -> String {
+        let parsed: Vec<crate::transform_grammar::Transform> = transforms
+            .iter()
+            .map(|text| crate::transform_grammar::parse_transform(text).expect("a valid transform"))
+            .collect();
+        super::render_transform_step(from, &parsed)
+    }
+
+    fn render(transforms: &[&str]) -> String {
+        render_from("silver.`orders`", transforms)
+    }
+
+    /// BLD-11 F7 (D11): a cast with no `select` used to be dropped (plain
+    /// `SELECT *`), leaving the Gold column at the source type. It now goes
+    /// into `* REPLACE`, replacing the column in place.
+    #[test]
+    fn a_cast_with_no_select_replaces_the_column_in_place() {
+        assert_eq!(
+            render(&["cast(amount,Float64)"]),
+            "SELECT * REPLACE (CAST(amount AS Float64) AS amount) FROM silver.`orders`"
+        );
+    }
+
+    /// BLD-11 F7 (D11): a rename with no `select` used to be dropped. It now
+    /// cuts the old name from `*` and appends the renamed column at the end.
+    #[test]
+    fn a_rename_with_no_select_moves_the_column_to_the_end() {
+        assert_eq!(
+            render(&["rename(amount,amount_usd)"]),
+            "SELECT * EXCEPT (amount), amount AS amount_usd FROM silver.`orders`"
+        );
+    }
+
+    /// BLD-11 F7 (D11): a column cast and renamed with no `select` is cast
+    /// under its new name, appended at the end.
+    #[test]
+    fn a_cast_and_rename_of_one_column_with_no_select_cast_it_under_its_new_name() {
+        assert_eq!(
+            render(&["rename(amount,amount_usd)", "cast(amount,Float64)"]),
+            "SELECT * EXCEPT (amount), CAST(amount AS Float64) AS amount_usd FROM silver.`orders`"
+        );
+    }
+
+    /// BLD-11 F7: a filter or dedupe with no `select` still selects every
+    /// column — this is today's behaviour and stays unchanged.
+    #[test]
+    fn a_filter_or_dedupe_alone_still_selects_star() {
+        assert_eq!(
+            render(&["filter(status = 'active')", "dedupe(id)"]),
+            "SELECT * FROM silver.`orders` WHERE status = 'active' ORDER BY id LIMIT 1 BY id"
+        );
+    }
+
+    /// BLD-11 F7 (D11): the rendered `* EXCEPT`/`* REPLACE` statements must
+    /// be SQL the access rewrite can parse; otherwise a transform step would
+    /// compile to text no tenant gate or lineage pass can read.
+    #[test]
+    fn a_no_select_cast_or_rename_statement_parses_and_names_its_input() {
+        let dialect = sqlparser::dialect::ClickHouseDialect {};
+        for transforms in [
+            vec!["cast(amount,Float64)"],
+            vec!["rename(amount,amount_usd)"],
+            vec!["rename(amount,amount_usd)", "cast(amount,Float64)"],
+        ] {
+            let sql = render_from("orders", &transforms);
+            assert_eq!(
+                crate::sql_rewrite::referenced_tables(&sql, &dialect),
+                Some(vec!["orders".to_owned()]),
+                "statement parses and reads its input: {sql}"
+            );
+        }
     }
 
     #[test]
@@ -1144,6 +1318,38 @@ mod tests {
         )];
         let err = refusal(&one_input(), &steps);
         assert_eq!(err.path(), "steps[0].transforms[1]");
+    }
+
+    // BLD-11 review R5: a rename that lands on a name this step also emits
+    // would fail the next run on a duplicate column; refuse it at save.
+    #[test]
+    fn a_second_rename_to_the_same_name_is_refused_at_save() {
+        let steps = vec![transform_step(
+            "dup",
+            "orders",
+            &["rename(a,b)", "rename(c,b)"],
+        )];
+        let err = refusal(&one_input(), &steps);
+        assert_eq!(err.path(), "steps[0]");
+        assert_eq!(err.message(), super::DUPLICATE_OUTPUT_COLUMN);
+    }
+
+    #[test]
+    fn a_rename_onto_another_selected_column_is_refused_at_save() {
+        let steps = vec![transform_step(
+            "dup",
+            "orders",
+            &["select(a,b)", "rename(a,b)"],
+        )];
+        let err = refusal(&one_input(), &steps);
+        assert_eq!(err.path(), "steps[0]");
+        assert_eq!(err.message(), super::DUPLICATE_OUTPUT_COLUMN);
+    }
+
+    #[test]
+    fn a_single_rename_still_compiles() {
+        let steps = vec![transform_step("ok", "orders", &["rename(a,b)"])];
+        assert!(compile(&one_input(), &steps, None, Some("icecat_api")).is_ok());
     }
 
     #[test]

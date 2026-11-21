@@ -24,6 +24,11 @@
 #                     here. Exactly `true` selects every gate group and sets
 #                     `stack=true` so `images` runs too; any other value does
 #                     nothing but warn, like CI_PUSH_FULL (R4).
+#   PR_DRAFT        — raw `github.event.pull_request.draft` (OPS-38 D1).
+#                     Exactly `true` (lower case) on a `pull_request` event
+#                     writes `draft=true` so CI runs only the fast checks;
+#                     any other value or event leaves `draft=false` (fail
+#                     closed: full run).
 #   GATE_PATHS_FILE — the gate path map (OPS-25 D2). Defaults to
 #                     `gate_paths.txt` next to this script. A missing or
 #                     unreadable map selects every gate group and warns; a
@@ -66,6 +71,7 @@ stack=false
 docs_only=true
 all=false
 push_full=false
+draft=false
 
 gate_paths_error() {
   echo "::error::$1"
@@ -211,7 +217,7 @@ emit_scope() {
   echo "Scope detection result:"
   for line in "rust=${rust}" "frontend=${frontend}" "dagster=${dagster}" \
               "stack=${stack}" "docs_only=${docs_only}" "all=${all}" \
-              "push_full=${push_full}"; do
+              "push_full=${push_full}" "draft=${draft}"; do
     echo "  ${line}"
   done
   echo "  gate_groups=${gate_groups}"
@@ -225,6 +231,7 @@ emit_scope() {
     echo "docs_only=${docs_only}"
     echo "all=${all}"
     echo "push_full=${push_full}"
+    echo "draft=${draft}"
     for group in "${GATE_GROUPS[@]}"; do
       if [ -n "${SELECTED_GROUPS[$group]:-}" ]; then
         echo "gates_${group}=true"
@@ -287,9 +294,23 @@ EVENT="${EVENT_NAME:-}"
 BASE="${BASE_SHA:-}"
 
 echo "Event: ${EVENT:-unknown}"
+echo "PR_DRAFT: ${PR_DRAFT:-unset}"
 echo "CI_PUSH_FULL: ${FORCE_ALL:-unset}"
 echo "Gate path map: ${GATE_PATHS}"
 echo "Base SHA: ${BASE:-none}"
+
+# OPS-38 D1: a draft pull request runs only the fast checks. Only `true`
+# (lower case) on `pull_request` sets draft=true; any other value or event
+# leaves draft=false (fail closed: full run).
+if [ "$EVENT" = "pull_request" ]; then
+  if [ "${PR_DRAFT:-}" = "true" ]; then
+    draft=true
+  elif [ -n "${PR_DRAFT:-}" ] && [ "$PR_DRAFT" != "false" ]; then
+    echo "::warning::PR_DRAFT is '${PR_DRAFT}', not 'true' or 'false'; treating as non-draft (fail closed)"
+  fi
+elif [ "${PR_DRAFT:-}" = "true" ]; then
+  echo "::warning::PR_DRAFT is 'true' on non-pull_request event '${EVENT:-none}'; ignoring (fail closed)"
+fi
 
 # R4: one comparison, here, and it is case-sensitive. The workflow passes the
 # variable through `env:` raw and never compares it again, so `TRUE` or `1`
