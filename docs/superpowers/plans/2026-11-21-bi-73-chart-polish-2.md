@@ -91,4 +91,20 @@ commit per decision group (console a–d+f, e-mail e) with CHANGELOG lines
 
 ## Handoff
 
-(developer appends here)
+Developer: Claude Sonnet. Commits: `b41671cf0` (console, a-d and f), `e056b0629` (e-mail, e). Not pushed.
+
+Commands run (this VM, under the bun wrapper):
+
+- `bun test` on category-labels, chart-axis, gantt-option, chart-option, combined-option, echart-stable, geo-chart, style-option, combined-tile: 102 pass, 0 fail.
+- `bun x tsc --noEmit -p .`: no output (clean). `bun x eslint` on the changed `.ts`/`.tsx` files: no output (clean).
+- `rustfmt --edition 2024 --check` on `lakehouse-alerts/src/lib.rs`, `routes/chart_alerts.rs`, `routes/alerts.rs`: clean.
+
+What differs from the plan's wording:
+
+- (a, b) `containLabel: true` was already set on every grid, so the clipping is not a missing `containLabel`. The fix is a new `features/dashboards/category-labels.ts`: builders draw the category axis unrotated (`categoryAxisLabel`), and the chart wrapper (`echart.tsx`) calls `fitCategoryLabels(option, tileWidth)` on apply and on resize. Colliding labels rotate 30 degrees, long ones are cut at 96 px with an ellipsis, and the grid's `left` gets extra room for the rotated first label. The old fixed rule (`rotate` only above 6 categories) is gone; width is estimated at 6.4 px per character, so it is a heuristic. The box plot, heatmap, combo, combined and every bar/line/area/stacked axis use it; horizontal bars are untouched. The histogram (`type-b-option.ts`) keeps its own rule (not in the plan's list).
+- (c) The ordered-key check the plan mentions (`categoryKeys`) only sorts ISO dates and has no reusable predicate, so a new `isOrderedAxis` is in `lib/chart-axis.ts` (dates, months, years, quarters, weekdays, hours, numbers).
+- (d) The label is `position: "end"` (top end of the vertical line), and the Gantt grid top grows by 8 px when the line is drawn so the label has room.
+- (f) A heat layer has no shapes to hover, so besides `tooltip.show: true` an invisible scatter point per row (same data, with the row's label) carries the tooltip.
+- (e) The plan's anchors (`:3344`, `:2742`) were `:3198` and `:2606` on this base. Numbers come from `lakehouse_bi::export_format::format_text` (the export formatter, `number` style, 0 decimals); the locale comes from `lakehouse_store::reporting_settings` via `routes::settings::format_settings(..).number_locale`, read once per run by the new `chart_alerts::number_locale` (falls back to `en-US` and logs when unreadable). The old `fmt_id_id` is removed. The digest's tile numbers use the same locale. `Reading::against_threshold`, `run_rules`, `run_one`, `run_alert`, `run_digest`, `digest_text` gained a locale; `run_rules` takes `(silence, state)` as a tuple and `run_one`/`run_alert`/`run_digest` take `(rule, locale)` to stay within `too-many-arguments-threshold = 8`. The recovery subject also lost its emoji ("Back to normal: <name>"), which the plan did not name; the digest subject keeps its emoji.
+
+Not verified: all Rust compilation, clippy and Rust tests (CI only; new Rust tests: `fmt_number_*`, `a_reading_writes_its_numbers_in_the_workspace_locale`); no existing Rust assertion on the old emoji subjects or `fmt_id_id` text was found by grep, but a compile was not run. The browser look (label rotation thresholds, left room, ellipsis, Today label placement, the density tooltip actually firing on hover, the resize refit) was not seen. No Rust test checks the API reading the locale from Settings.
