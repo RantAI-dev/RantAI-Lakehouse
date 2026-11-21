@@ -38,6 +38,8 @@ export const CAPABILITIES: Capability[] = [
       // offers it here; enabling, the filter modes and the withdrawal are
       // writes and live in the Dashboard Builder.
       "get_embed_snippet",
+      // BI-18 D review round 1, SHOULD-FIX 2: listing the reports one may read is a question.
+      "list_reports",
       // AI-2 AC1: "show only 2026" narrows the person's own view of the page
       // and saves nothing, so Ask mode offers it here; the board's default
       // filters change what every viewer sees and stay in the Dashboard Builder.
@@ -77,7 +79,10 @@ export const CAPABILITIES: Capability[] = [
       "list_dashboard_comments",
       // RPT-1 / AI-10: scheduled reports by email. Creating one for the person alone waits for the Confirm button;
       // naming anyone else, and every delete, waits in Approvals (the composer sends this list as the allowlist, see BI-8 R1).
-      "list_report_subscriptions", "create_report_subscription", "update_report_subscription", "delete_report_subscription",
+      "list_report_subscriptions",
+      // AI-30: the report picker's people, read-only.
+      "find_report_recipients",
+      "create_report_subscription", "update_report_subscription", "delete_report_subscription",
       // BI-16 part C2 / AI-5: the maps a map chart can use, built-in and uploaded (read-only).
       "list_maps",
       // BI-26 slice 2 D4/D10 (AI-11-AC3): signed embedding. `enable_embed` and
@@ -85,7 +90,13 @@ export const CAPABILITIES: Capability[] = [
       // needs the chat's Confirm, and `get_embed_snippet` is a read (it is on
       // Query Data for Ask mode too). None of them signs or shows a token: the
       // customer's server does, with the embedding secret.
-      "enable_embed", "set_embed_filter_modes", "withdraw_embed_tokens", "get_embed_snippet"],
+      "enable_embed", "set_embed_filter_modes", "withdraw_embed_tokens", "get_embed_snippet",
+      // BI-18 part D (T4): written reports with live charts, and dashboard templates. Writing
+      // a report and starting from a template wait for the Confirm button; deleting either
+      // waits in Approvals. Listing templates is a read, but needs `dashboard:write` like
+      // its route, so it lives here and not in Query Data.
+      "list_reports", "create_report", "update_report", "delete_report",
+      "list_templates", "create_dashboard_from_template", "delete_template"],
   },
   {
     key: "pipeline",

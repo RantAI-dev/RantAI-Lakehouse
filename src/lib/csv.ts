@@ -28,7 +28,7 @@ const PLAIN_NUMBER = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/
  * before the quoting, so it ends up inside the quotes. The price is that a
  * program reading the export back gets `'=A1`, not `=A1`.
  */
-function neutralizeFormula(value: string): string {
+export function neutralizeFormula(value: string): string {
   return FORMULA_START.test(value) && !PLAIN_NUMBER.test(value)
     ? `'${value}`
     : value

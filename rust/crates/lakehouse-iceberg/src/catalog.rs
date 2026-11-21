@@ -612,6 +612,16 @@ impl GoldTable {
             .map(|snapshot| snapshot.timestamp_ms())
     }
 
+    /// The value of the `rantai.latest-copy-of` marker property, or `None`
+    /// when the table is not a latest-copy table (`DATA-6` D7). Delegates to
+    /// [`gold::latest_copy_of`] — the single definition of the marker — so
+    /// the export's refusal and any other reader cannot disagree about the
+    /// property's name or shape.
+    #[must_use]
+    pub fn latest_copy_of(&self) -> Option<&str> {
+        gold::latest_copy_of(self.table.metadata().properties())
+    }
+
     /// Appends `batch` as one new Parquet data file, in one fast-append
     /// snapshot, committed through `catalog`. Same mechanics as
     /// [`BronzeTable::append`], partitioned by `day(_exported_at)` instead

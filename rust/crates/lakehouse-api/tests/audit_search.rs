@@ -934,9 +934,14 @@ async fn a_cell_that_starts_like_a_formula_is_neutralised_in_the_export() {
     let (_, cookie) = auditor(&pool).await;
     for (id, label, detail) in [
         ("fx-1", "=HYPERLINK(\"http://x\")", "=1+1"),
-        ("fx-2", "+cmd", "+1"),
-        ("fx-3", "-cmd", "-1"),
+        // `BI-30` (PR #527 review BLOCKER 1): a plain number stays a number in
+        // every download, so the formula cases are non-numbers; `+1`/`-1`
+        // themselves are fx-5/fx-6 below and are written unchanged.
+        ("fx-2", "+cmd", "+1+1"),
+        ("fx-3", "-cmd", "-1+1"),
         ("fx-4", "@SUM(A1)", "@x"),
+        ("fx-5", "plain-plus", "+1"),
+        ("fx-6", "plain-minus", "-1"),
     ] {
         let mut seed = Seed::new(id, "2026-06-10T00:00:00Z", "fx.event");
         seed.actor_label = Some(label);
@@ -951,7 +956,7 @@ async fn a_cell_that_starts_like_a_formula_is_neutralised_in_the_export() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let rows = parse_csv(&String::from_utf8(body).unwrap());
-    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.len(), 7);
     let cells: Vec<(&str, &str)> = rows[1..]
         .iter()
         .map(|r| (r[2].as_str(), r[9].as_str()))
@@ -959,9 +964,11 @@ async fn a_cell_that_starts_like_a_formula_is_neutralised_in_the_export() {
     assert_eq!(
         cells,
         [
+            ("plain-minus", "-1"),
+            ("plain-plus", "+1"),
             ("'@SUM(A1)", "'@x"),
-            ("'-cmd", "'-1"),
-            ("'+cmd", "'+1"),
+            ("'-cmd", "'-1+1"),
+            ("'+cmd", "'+1+1"),
             ("'=HYPERLINK(\"http://x\")", "'=1+1"),
         ]
     );
