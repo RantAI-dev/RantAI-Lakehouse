@@ -560,6 +560,7 @@ function PanZoomBox({ content, children }: { content: Size; children: React.Reac
   const [held, setHeld] = React.useState(0)
   const slotRef = React.useRef<HTMLDivElement>(null)
   const buttonRef = React.useRef<HTMLButtonElement>(null)
+  const overlayRef = React.useRef<HTMLDivElement>(null)
   const [toggled, setToggled] = React.useState(false)
   const timer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   React.useEffect(() => () => {
@@ -590,6 +591,30 @@ function PanZoomBox({ content, children }: { content: Size; children: React.Reac
     const before = document.body.style.overflow
     document.body.style.overflow = "hidden"
     const onKey = (e: KeyboardEvent) => {
+      // PR #642 review SHOULD-FIX 1: the overlay is modal, so Tab loops
+      // inside it instead of reaching the page behind. The app's Dialog
+      // primitive is a centred popup with its own Esc and focus return, which
+      // would change what the owner passed in QA, so only the loop is kept here.
+      if (e.key === "Tab" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const items = Array.from(
+          overlayRef.current?.querySelectorAll<HTMLElement>(
+            'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])'
+          ) ?? []
+        )
+        if (items.length === 0) return
+        const first = items[0]
+        const last = items[items.length - 1]
+        const at = document.activeElement
+        const inside = overlayRef.current?.contains(at) ?? false
+        if (e.shiftKey && (!inside || at === first)) {
+          e.preventDefault()
+          last.focus()
+        } else if (!e.shiftKey && (!inside || at === last)) {
+          e.preventDefault()
+          first.focus()
+        }
+        return
+      }
       if (e.ctrlKey || e.metaKey || e.altKey) return
       if (e.key === "Escape" || e.key === "f" || e.key === "F") {
         e.preventDefault()
@@ -623,6 +648,7 @@ function PanZoomBox({ content, children }: { content: Size; children: React.Reac
       {full &&
         createPortal(
           <div
+            ref={overlayRef}
             role="dialog"
             aria-modal="true"
             aria-label="Lineage map, full screen"

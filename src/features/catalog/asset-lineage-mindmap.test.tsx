@@ -249,5 +249,26 @@ describe("LineageMindmap pan and zoom (BI-71)", () => {
       await settle()
       expect(dialog()).toBeNull()
     })
+
+    // PR #642 review SHOULD-FIX 1: Tab stays inside the overlay.
+    it("keeps Tab and Shift+Tab inside the overlay", () => {
+      render(<LineageMindmap model={WIDE} />)
+      fireEvent.click(button("Full screen"))
+      const items = Array.from(
+        dialog()!.querySelectorAll<HTMLElement>('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])')
+      )
+      expect(items.length).toBeGreaterThan(1)
+      const first = items[0]
+      const last = items[items.length - 1]
+      last.focus()
+      const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })
+      last.dispatchEvent(tab)
+      expect(tab.defaultPrevented).toBe(true)
+      expect(document.activeElement).toBe(first)
+      const back = new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })
+      first.dispatchEvent(back)
+      expect(back.defaultPrevented).toBe(true)
+      expect(document.activeElement).toBe(last)
+    })
   })
 })
