@@ -31,6 +31,17 @@
 }
 
 /*
+ * BI-64 (`BI-26-AC2`): an embed with `background=transparent` lets the host
+ * page show through. The only opaque paint behind the tiles is `body`'s
+ * `bg-background` from the design system's base layer; `EmbedView` sets this
+ * class on `<html>` while the option is on.
+ */
+html.embed-transparent,
+html.embed-transparent body {
+  background: transparent;
+}
+
+/*
  * DESIGN.md §3: when the system asks for less motion, every movement stops.
  * One rule here instead of a `motion-reduce:` on each element, so a component
  * added later cannot forget it. A near-zero duration (not `none`) keeps
