@@ -168,3 +168,27 @@ describe("a metric's format hint", () => {
     expect(withMetricFormats(none, undefined)).toBe(none)
   })
 })
+
+describe("a year column (BI-64)", () => {
+  test("a year prints without a separator in a year column, in any case", () => {
+    for (const name of ["year", "Tahun", "YR", "order_year", "birth_TAHUN"]) {
+      expect(cellContent(2020, undefined, "en-US", name)).toEqual({ kind: "text", text: "2020" })
+    }
+    expect(formatValue(2020, undefined, "en-US", 0, "tahun")).toBe("2020")
+  })
+  test("the same number in another column keeps its separator", () => {
+    expect(cellContent(2020, undefined, "en-US", "visitors")).toEqual({ kind: "text", text: "2,020" })
+    expect(cellContent(2020, undefined, "en-US", "yearly_total")).toEqual({ kind: "text", text: "2,020" })
+    expect(formatValue(2020, undefined, "en-US", 0, "visitors")).toBe("2,020")
+  })
+  test("only an integer from 1000 to 9999 counts as a year", () => {
+    expect(cellContent(999, undefined, "en-US", "year")).toEqual({ kind: "text", text: "999" })
+    expect(cellContent(12345, undefined, "en-US", "year")).toEqual({ kind: "text", text: "12,345" })
+    expect(cellContent(2020.5, undefined, "en-US", "year")).toEqual({ kind: "text", text: "2,020.5" })
+  })
+  test("an explicit thousands setting wins", () => {
+    expect(formatValue(2020, { thousands: true }, "en-US", 0, "year")).toBe("2,020")
+    expect(formatValue(2020, { style: "number", thousands: true }, "en-US", 0, "year")).toBe("2,020")
+    expect(formatValue(2020, { style: "number" }, "en-US", 0, "year")).toBe("2020")
+  })
+})

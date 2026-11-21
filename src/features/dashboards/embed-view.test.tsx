@@ -156,6 +156,19 @@ describe("the look in the embed address (BI-26 D6)", () => {
     expect((root.firstElementChild as HTMLElement).className).not.toContain("bg-card")
   })
 
+  it("background=transparent clears html and body while the embed is shown (BI-64)", async () => {
+    serve()
+    const view = render(<EmbedView jwt="j" look={{ ...DEFAULT_EMBED_LOOK, transparent: true }} />)
+    await screen.findByTestId("tile")
+    expect(document.documentElement.classList.contains("embed-transparent")).toBe(true)
+    view.unmount()
+    expect(document.documentElement.classList.contains("embed-transparent")).toBe(false)
+    serve()
+    render(<EmbedView jwt="j" />)
+    await screen.findByTestId("tile")
+    expect(document.documentElement.classList.contains("embed-transparent")).toBe(false)
+  })
+
   it("a chart token's payload is drawn as one chart filling the frame", async () => {
     serve({ data: payload({ onlyChart: "c1" }) })
     const { container } = render(<EmbedView jwt="j" />)
@@ -294,6 +307,18 @@ describe("height messages (BI-26 D7, decision 9)", () => {
     const root = measured()
     expect(root).not.toBeNull()
     expect(root?.contains(screen.getByText("RantAI Lakehouse"))).toBe(true)
+  })
+
+  it("measures the padding with the content, not outside it (BI-64)", async () => {
+    const { posted, measured } = frameUnderTest()
+    serve({ origins: ["https://a.example"] })
+    const { container } = render(<EmbedView jwt="j" />)
+    await screen.findByTestId("tile")
+    await waitFor(() => expect(posted.length).toBe(1), { timeout: 2000 })
+    // The measured root carries the 8 px padding, so the posted height includes it;
+    // the min-h-screen wrapper (never measured) carries none, or the frame would scroll.
+    expect((measured() as HTMLElement).className).toContain("p-2")
+    expect((container.firstElementChild as HTMLElement).className).not.toMatch(/(^|\s)p-2(\s|$)/)
   })
 
   it("posts nothing while the payload is still loading, then the real height (BI-26 review fix R5)", async () => {

@@ -9,6 +9,10 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Fixed
+
+- Embeds look right on the host page (backlog `BI-64`, from `BI-26-AC2` and `AC5`). With `background=transparent` the frame is transparent: the root layout's `body` background was what stayed opaque, and it is now cleared (with `html`) while the option is on; tiles keep their cards. The height posted to the host page now includes the 8 px padding, so the frame no longer scrolls by 16 px. A year (an integer from 1000 to 9999) in a column named `year`, `tahun`, `yr`, or ending `_year` / `_tahun` prints as "2020", not "2,020", in raw tables and table tiles, in the console too; an explicit thousands setting still wins.
+
 ### Added
 
 - A scheduled report's email now ends "RantAI Lakehouse, scheduled report" (it read "Rantai Lake"), as do the alert emails, and a PDF's page margin is white all round instead of a dark band (backlog `RPT-3`; plan `docs/superpowers/plans/2026-11-21-rpt-3-report-email-polish.md`).

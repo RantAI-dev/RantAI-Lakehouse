@@ -177,6 +177,17 @@ export function EmbedView({
   // a single chart (whether the token is a chart token is known only from the payload).
   useEmbedHeight(measured, frameOrigins, state === "ok" && data !== null && !(chartId ?? data.onlyChart));
 
+  // BI-64 (`BI-26-AC2`): what paints behind the tiles is the root layout's
+  // `body { @apply bg-background }` (design-system `globals.css`), outside this
+  // component, so clearing the wrapper's own background was not enough: the
+  // frame stayed opaque. `globals.css` clears `html` and `body` for this class.
+  React.useEffect(() => {
+    if (!look.transparent) return;
+    const root = document.documentElement;
+    root.classList.add("embed-transparent");
+    return () => root.classList.remove("embed-transparent");
+  }, [look.transparent]);
+
   if (state === "password") {
     return <PasswordGate token={token ?? ""} onOpen={() => { setState("loading"); setAttempt((n) => n + 1); }} />;
   }
@@ -225,8 +236,10 @@ export function EmbedView({
 
   return (
     <ReportingProvider reporting={data?.reporting}>
-    <div className={cn("min-h-screen p-2", boardLook.className, look.transparent ? "!bg-transparent" : "bg-background")} style={boardLook.style}>
-      <div ref={measured}>
+    <div className={cn("min-h-screen", boardLook.className, look.transparent ? "!bg-transparent" : "bg-background")} style={boardLook.style}>
+      {/* BI-64: the padding is inside the measured root, so the posted height is the
+          content's whole height and the frame does not scroll by the padding. */}
+      <div ref={measured} className="p-2">
       {jwt && data?.embedFilters?.length ? (
         <EmbedFilterBar jwt={jwt} filters={data.embedFilters} onChange={setViewerFilters} />
       ) : null}
