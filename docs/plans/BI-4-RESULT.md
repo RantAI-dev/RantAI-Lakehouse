@@ -42,7 +42,9 @@ far, and it shows the scheduling, not the speed of a real board.
   the shared stacks on this machine run other branches. The script for it
   exists (`ops/bench/dashboard_open_bench.py`, T2) and has not been run
   against anything. Machine, data size and ClickHouse version are therefore
-  not recorded.
+  not recorded. (**`BI-4-AC3` was amended on 2026-11-21, `BI-56` D3: it
+  measures cold vs remembered, which section 5 does; the pre-cache build is
+  no longer required.**)
 - Warm-cache open time and the 3-second target: part B.
 - Behaviour under real engine limits (connection pool, `max_concurrent_queries`)
   with 24 tiles in flight per process.
@@ -149,6 +151,8 @@ size a remembered result gives no gain that stands out of the spread (about 0.02
 the API): ClickHouse answers these tiles well under a second either way. The cache's gain
 shows only on slower queries than these, which this stack does not have.
 
-**Not measured:** a before/after against an API build without the cache, concurrent users,
-and tiles that take seconds each.
+**Not measured:** the pre-cache build's 12-tile timing (`feat/bi-phase-4`); `BI-56` D3
+(owner, 2026-11-21) defines "before and after" for `BI-4-AC3` as cold vs remembered, so
+that build is no longer required. Also not measured: concurrent users, and tiles that take
+seconds each.
 

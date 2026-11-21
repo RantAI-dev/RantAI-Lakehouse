@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | Module | Dashboards |
-| Backlog | `BI-56` (and `BI-66`, the timing that `BI-4-AC3` still needs) |
+| Backlog | `BI-56` (and `BI-66`, the timing now in section 5 of `docs/plans/BI-4-RESULT.md`) |
 | Kind | Feature |
 | Spec | none: the row came from the feature-row audit of 2026-11-13, which found the base of the module without an acceptance run. The other `BI-` rows cover only additions |
 | Status | Released (accepted by the product owner on 2026-11-21) |
@@ -68,7 +68,8 @@
   delete control; the API refuses an edit from that account.
 - [x] `BI-56-AC8`: at 390 px wide the gallery dashboard stacks, every tile is readable, and
   the page does not scroll sideways.
-- [x] `BI-66` (`BI-4-AC3`): the 12-tile timing is in `docs/plans/BI-4-RESULT.md`.
+- [x] `BI-66` (`BI-4-AC3`): the 12-tile cold and remembered timing (`BI-56` D3) is in section 5
+  of `docs/plans/BI-4-RESULT.md`.
 
 ## Result (2026-11-21)
 
