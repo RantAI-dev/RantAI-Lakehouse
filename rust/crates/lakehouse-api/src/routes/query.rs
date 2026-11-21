@@ -1788,6 +1788,96 @@ async fn execute_query_against_engine(
     }
 }
 
+/// What [`run_engine_detached`] needs, all owned: the task it spawns outlives
+/// the request that asked for it, so it borrows nothing from the handler.
+struct DetachedRun {
+    state: AppState,
+    principal: Principal,
+    headers: HeaderMap,
+    /// The text the person wrote, which the history row keeps.
+    statement: String,
+    /// What the engine runs, after the policy rewrite.
+    rewritten: String,
+    engine: String,
+    user_id: String,
+    tables_read: Vec<String>,
+    run: std::sync::Arc<crate::query_limits::QueryRun>,
+    limits: crate::query_limits::TileLimits,
+    text: FailureText,
+    started: Instant,
+}
+
+/// The rows, the columns, the duration and the scanned bytes of a completed
+/// engine call (see [`execute_query_against_engine`]).
+type EngineRows = (Vec<String>, Vec<Value>, u64, u64);
+
+/// Runs the engine call, and records a run that did not complete, in a
+/// detached task that this function awaits (`BI-63`, finding `BI-5-AC2`).
+///
+/// Why detached: Stop makes the console abort the run request at once, and
+/// axum drops the handler's future with the connection. A history write
+/// placed after the engine call in the handler never ran for a stopped run,
+/// so History did not list it. A spawned task is not dropped with its
+/// caller, so the call finishes and the row is written either way; the
+/// engine's own time limit (`max_execution_time`, the `Trino` client's
+/// timeout) still bounds it.
+///
+/// A run the caller pressed Stop on is `stopped` whatever the engine
+/// answered (`query_limits::QueryRun::is_stopped`): `ClickHouse` kills the
+/// query, but `Trino` has no kill here, so its query runs to its end and
+/// the row still says stopped, not completed.
+///
+/// A completed run's history row is still written by the caller.
+///
+/// # Errors
+///
+/// The [`EngineFailure`] of the call, or the fixed "stopped" failure when the
+/// run was stopped, or a fixed internal failure when the task itself died
+/// (a panic); the task's own error text goes to the log only.
+async fn run_engine_detached(call: DetachedRun) -> Result<EngineRows, EngineFailure> {
+    let task = tokio::spawn(async move {
+        let outcome = execute_query_against_engine(
+            &call.state,
+            &call.engine,
+            &call.rewritten,
+            &call.user_id,
+            call.started,
+            (&call.run, &call.limits),
+            call.text,
+        )
+        .await;
+        // BI-63 decision 2: a stop wins over whatever the engine answered.
+        let outcome = if call.run.is_stopped() {
+            Err(EngineFailure::stopped())
+        } else {
+            outcome
+        };
+        if let Err(failure) = &outcome {
+            record_uncompleted_run(
+                &call.state,
+                (&call.principal, &call.headers),
+                &call.statement,
+                &call.engine,
+                failure.status,
+                &failure.message,
+                &call.tables_read,
+                call.started.elapsed().as_millis(),
+            )
+            .await;
+        }
+        outcome
+    });
+    match task.await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::error!(%err, "the detached query task did not finish");
+            Err(EngineFailure::fixed(ApiError::Internal(
+                "The query could not be completed.".to_owned(),
+            )))
+        }
+    }
+}
+
 /// Answers whether `sql` would run for `principal` on `engine`, without
 /// running it. Plan 15's proposal check: a statement a person could be
 /// shown as a fix must pass the same guard and policy `run` applies, and
@@ -2206,38 +2296,36 @@ async fn run_statement_with(
     // carries, exactly as the response does. A Stop is recorded `stopped`; a
     // statement the engine refused is recorded as a classified sentence with
     // the reference the response carries (`EngineFailure`).
-    let (columns, mut rows, duration_ms, scanned_bytes) = match execute_query_against_engine(
-        state,
-        engine,
-        &rewritten,
-        &user_id,
-        started,
-        (&run, &limits),
+    //
+    // `BI-63` (`BI-5-AC2`): the engine call and the write of a run that did not
+    // complete run in a detached task (`run_engine_detached`), because the
+    // console aborts the run request right after it presses Stop and axum
+    // drops this future with the connection; a write placed after the call
+    // here never ran for a stopped run.
+    let (columns, mut rows, duration_ms, scanned_bytes) = match run_engine_detached(DetachedRun {
+        state: state.clone(),
+        principal: p.clone(),
+        headers: headers.clone(),
+        statement: statement.to_owned(),
+        rewritten: rewritten.clone(),
+        engine: engine.to_owned(),
+        user_id: user_id.clone(),
+        tables_read: tables_read.clone(),
+        run,
+        limits,
         text,
-    )
+        started,
+    })
     .await
     {
         Ok(result) => result,
-        Err(failure) => {
-            record_uncompleted_run(
-                state,
-                (p, headers),
-                statement,
-                engine,
-                failure.status,
-                &failure.message,
-                &tables_read,
-                started.elapsed().as_millis(),
-            )
-            .await;
-            // LH-QS-2-08 (owner 2026-11-12): the failure comes in two
-            // copies — the model's copy (`failure.response`, the engine's
-            // trimmed diagnosis so the model can correct its SQL) and the
-            // browser's copy (`failure.message`, the fixed sentence and the
-            // same reference). The console's copy is the response's text
-            // already; the assistant's tools need both.
-            return Err(AssistantFailure::from_engine(failure));
-        }
+        // LH-QS-2-08 (owner 2026-11-12): the failure comes in two
+        // copies — the model's copy (`failure.response`, the engine's
+        // trimmed diagnosis so the model can correct its SQL) and the
+        // browser's copy (`failure.message`, the fixed sentence and the
+        // same reference). The console's copy is the response's text
+        // already; the assistant's tools need both.
+        Err(failure) => return Err(AssistantFailure::from_engine(failure)),
     };
 
     // The console renders every row it receives, so an unbounded `SELECT *`

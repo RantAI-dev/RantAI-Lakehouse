@@ -803,6 +803,46 @@ describe("useQueryStudio statements", () => {
     expect(result.current.running).toBe(false)
   })
 
+  it("asks the server to cancel a Trino run too, and aborts the request only after the answer (BI-63)", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    let signal: AbortSignal | undefined
+    const run = spyOn(queryService, "run").mockImplementation(((
+      _sql: string,
+      _options: unknown,
+      sig?: AbortSignal
+    ) => {
+      signal = sig
+      return new Promise(() => {})
+    }) as never)
+    let answer: () => void = () => {}
+    const cancel = spyOn(queryService, "cancel").mockImplementation(
+      () => new Promise((resolve) => { answer = () => resolve({ stopped: 0 }) })
+    )
+    const { result } = mountWith("SELECT 1")
+    expect(result.current.engine).toBe("trino")
+
+    await act(async () => {
+      void result.current.runQuery()
+    })
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+    const runId = (run.mock.calls[0]?.[1] as { runId: string }).runId
+
+    await act(async () => {
+      result.current.stopRun()
+    })
+
+    // Cancel went first and the request is still open; "Stopped" is already on screen.
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(cancel.mock.calls[0]?.[0]).toBe(runId)
+    expect(signal?.aborted).toBe(false)
+    expect(result.current.running).toBe(false)
+
+    await act(async () => {
+      answer()
+    })
+    await waitFor(() => expect(signal?.aborted).toBe(true))
+  })
+
   it("runs only the selection when there is one", async () => {
     const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
     const sql = "SELECT 1; SELECT 2; SELECT 3"
