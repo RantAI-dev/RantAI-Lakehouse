@@ -71,3 +71,47 @@ compiles and tests. Be careful with every call site and test that builds a
 MemoryMax=3G -p MemorySwapMax=0 nice -n 15 …`; `bun x tsc --noEmit -p .`,
 `bun x eslint <changed>`, `bun test` on `combined-option.test.ts` and the
 alert UI tests you touch. CHANGELOG entry.
+
+## Handoff
+
+Developer: Claude Sonnet. Branch `fix/bi-67-chart-metric-findings`, not pushed.
+
+### Commits
+
+1. `904ab2d73` decision 1: `categoryKeys` sorts numerically when every key is a strict number (`/^-?\d+(\.\d+)?$/`); dates still sort as before; mixed keys keep base order.
+2. `5efb6dd8d` decision 2: `failed` on the run result, console shows "Failed: <reason>".
+3. `b1d1b6e75` decision 3: a SQL source a metric uses is refused with 409.
+
+Each commit also has a CHANGELOG entry under `[Unreleased]` / `### Fixed`.
+
+### Commands run (VM, scoped)
+
+- `bun test src/features/dashboards/combined-option.test.ts`: 12 pass, 0 fail (2 new).
+- `bun x eslint` on the changed dashboards files: clean.
+- `bun x tsc --noEmit -p .`: clean (run once, on the decision 2 tree).
+- `bun x eslint` on the alert files: 0 errors, 1 warning (`react-hooks/exhaustive-deps` on `rules` in `alerts-page.tsx`, present before this change).
+- `bun test src/features/alerts/run-result.test.ts src/features/alerts/alerts-page-test-run.test.tsx`: 6 pass, 0 fail (3 new in `run-result.test.ts`).
+- `bun test src/features/alerts/alerts-page.test.tsx`: 36 pass, 0 fail.
+- `rustfmt --edition 2024 --check` on every changed `.rs` file: clean.
+
+### Every place changed for the new `failed` field
+
+- `rust/crates/lakehouse-alerts/src/lib.rs`: field `RunResult::failed` (`skip_serializing_if = "Option::is_none"`, doc says never set with `skipped`); `failed: None` added to all five `RunResult { .. }` literals (`settle` x2, `run_digest`, `run_freshness` x2) and to `skipped()`; new `fn failed(rule, reason)`; `settle`'s read-failure `Err` arm returns `failed(..)` (still calls `record_failed` first). `metric_value` doc says "failed". The other `settle` `Err` arms (state unreadable, claim failed, claimed elsewhere), `stop`, the gate `Stop`, the digest restriction, freshness, and the event-driven kinds stay `skipped`.
+- Rust tests updated from `skipped` to `failed` where the path goes through `settle`'s read-failure arm: gate-refused (`REFUSED`), metric gone, metric store down, the demo-metric-gone one, "the value could not be read." New test `a_metric_whose_sql_source_is_gone_reports_failed_with_the_source_sentence`; the metric-gone test was renamed `..._fail_with_a_fixed_reason_...`. Existing skip tests (Stop, restricted digest, freshness, chart rule via `run_one`, state unreadable, claimed elsewhere) are unchanged and still assert `skipped`.
+- `rust/crates/lakehouse-api`: no non-test code builds or reads a `RunResult` field that needed changing (`alerts.rs` only assigns `result.skipped` for `PipelineLate`; `chart_alerts.rs` goes through `settle`). Tests changed to read `failed`: `routes/alerts.rs` (tenant-scope refusal, `JOB_NEEDS_CATALOG_TENANT`), `routes/ai/tools/alerts.rs` (chart rule that cannot be read; SEC-20 refusal), `tests/ai_alert_tools.rs` (chart_number sentence, and the exact key set now `failed, fired, id, name, type`).
+- `src/services/contracts/alerts.ts`: `AlertRunResult.failed?: string`.
+- `src/features/alerts/run-result.ts` (new, `formatRunResult` moved out of `alerts-page.tsx`, "Failed: <reason>"), `run-result.test.ts` (new), `alerts-page.tsx` (icon and text in the destructive tone for `failed`; skip keeps amber).
+- No fixtures changed: `tests/fixtures/tool_schemas.json` does not describe the run result, and grep found no JSON fixture with a run result's `skipped`.
+
+### Decision 3 details
+
+- `lakehouse_bi::sources::metrics_using_source(&[MetricDef], id) -> Vec<&str>` beside `charts_using_source` (only `SourceKind::SqlSource` with that `source_id`), with a unit test.
+- `routes/dashboard_sources.rs::delete` reads the metric list (a read failure refuses, fail closed) and builds the 409 with `in_use_message(charts, hidden_charts, metrics)`. Charts only: same wording as before except the sentence now always ends with a full stop (before, only the hidden-dashboard one did). Metrics are named for everyone (they are not per-person).
+- Route tests in `routes/organise_paths.rs` (beside the hidden-chart one): metric-only use is refused with exactly "SQL source is still used by 1 metric(s): orphaned." and no write; a source with only a metric on another source or a mart metric of the same id is deleted (an `INSERT ... is_deleted` is sent).
+- Console check: no console screen deletes a SQL source (the only caller of `DELETE /api/dashboard/sources` is `deleteSqlSource` in `src/services/clients/dashboards.ts`, which has no UI consumer), and that client already throws a `ServiceError` carrying the server's 409 sentence. Nothing to change there.
+
+### Not verified
+
+- **All Rust is uncompiled** (no `cargo build/check/clippy/test` on this VM, by instruction). Only `rustfmt --check` ran. Risks I could not rule out: clippy pedantic on the new code; the wiremock-based tests (the `bi_metric` row shape, mock ordering in the new alerts test, and the `organise_paths` engine fallthrough returning no rows for the other statements); `outcome.is_ok()` in the new route test.
+- The two new alerts-crate behaviours depend on `lakehouse_bi::metrics::list_metrics` and `get_source` going through the mocked ClickHouse as I read them; CI is the first run.
+- No full `bun run test` / `bun run lint`; no browser check of the "Failed:" row.
