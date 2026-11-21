@@ -191,7 +191,45 @@ describe("the column filters", () => {
   })
 })
 
+// QS-11 (LH-QS-2-01), D12: the summary counts the rows on screen, not the
+// engine's pre-cut rowCount.
+describe("the result summary", () => {
+  it("counts the rows shown and not the engine's rowCount when the result was cut", () => {
+    renderSection(result({ rowCount: 65600, truncated: true }))
+
+    const value = screen.getByText("Rows").nextElementSibling
+    expect(value?.textContent).toBe("3 shown")
+    expect(screen.queryByText("65,600")).toBeNull()
+  })
+
+  it("counts the rows shown with no suffix when nothing was cut", () => {
+    renderSection(result())
+
+    expect(screen.getByText("Rows").nextElementSibling?.textContent).toBe("3")
+  })
+})
+
 describe("the statistics panel", () => {
+  // QS-11 (LH-QS-2-04), D14: a long value is cut inside its own cell and its
+  // full text is in the cell's title.
+  it("keeps a long minimum in its cell's title and truncates the cell", () => {
+    const long = "x".repeat(200)
+    renderSection(
+      result({
+        columns: ["note", "amount"],
+        rows: [{ note: long, amount: 1 }],
+        rowCount: 1,
+      })
+    )
+
+    // One row means min and max are the same string: both cells carry it.
+    const cells = panel().getAllByTitle(long)
+    expect(cells.length).toBe(2)
+    for (const cell of cells) {
+      expect(cell.className).toContain("truncate")
+    }
+  })
+
   it("says how many rows the grid shows", () => {
     renderSection(result())
     expect(screen.getByText(/of the 3 rows shown/)).toBeTruthy()

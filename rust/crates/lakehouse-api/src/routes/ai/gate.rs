@@ -177,6 +177,15 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         "delete_report_subscription" => {
             format!("Deletes scheduled report {} permanently.", s("id"))
         }
+        // BI-18 part D (T4): a deleted report goes to the trash, a template away.
+        "delete_report" => format!(
+            "Moves report {} to the trash; it can be restored for 30 days.",
+            s("id")
+        ),
+        "delete_template" => format!(
+            "Deletes dashboard template {} permanently; dashboards created from it remain.",
+            s("id")
+        ),
         "delete_tab" => format!(
             "Deletes tab {} from dashboard {}; its charts move to the first tab.",
             s("tab"),
@@ -250,14 +259,14 @@ fn embed_write_high_reason(name: &str, args: &Map<String, Value>) -> String {
 /// language (`AI-31`, D11).
 ///
 /// Today it is the sentence [`risk_for_write_high`] gives every `WriteHigh`
-/// tool except `delete_chart`, `delete_board`, `pause_pipeline` and
-/// `set_embed_filter_modes` — a deleted chart and a deleted board go to the
-/// trash and can be restored, a paused pipeline runs again after a resume, and
-/// the embed filter modes can be set again; so they get
+/// tool except `delete_chart`, `delete_board`, `delete_report`,
+/// `pause_pipeline` and `set_embed_filter_modes` — a deleted chart, board or
+/// report goes to the trash and can be restored, a paused pipeline runs again
+/// after a resume, and the embed filter modes can be set again; so they get
 /// [`WRITE_HIGH_RISK_TRASHED_CHART`], [`WRITE_HIGH_RISK_TRASHED_BOARD`],
-/// [`WRITE_HIGH_RISK_PAUSED_PIPELINE`] and
+/// [`WRITE_HIGH_RISK_TRASHED_REPORT`], [`WRITE_HIGH_RISK_PAUSED_PIPELINE`] and
 /// [`WRITE_HIGH_RISK_EMBED_FILTER_MODES`] instead;
-/// [`risk_for_write_high`] picks between the sentences (`AI-1`).
+/// [`risk_for_write_high`] picks between the sentences (`AI-1`, `BI-18` part D).
 const WRITE_HIGH_RISK: &str = "High-risk action: it cannot be undone once it runs.";
 
 /// The risk statement for `delete_chart`: the chart is not gone, it is in the
@@ -283,6 +292,16 @@ const WRITE_HIGH_RISK_TRASHED_CHART: &str =
 /// The constant is named here so the two are changed together.
 const WRITE_HIGH_RISK_TRASHED_BOARD: &str = "High-risk action: the dashboard and its charts go to the trash and can be restored for 30 days.";
 
+/// The risk statement for `delete_report` (`BI-18` part D): the report is not
+/// gone, it is in the trash and can be restored, so the generic sentence would
+/// contradict the reason on the very same approval card (as for `AI-1`).
+///
+/// The `30` is the trash's retention, `lakehouse_bi::trash::RETENTION_DAYS`
+/// (30 days), a literal for the reason given at
+/// [`WRITE_HIGH_RISK_TRASHED_CHART`].
+const WRITE_HIGH_RISK_TRASHED_REPORT: &str =
+    "High-risk action: the report goes to the trash and can be restored for 30 days.";
+
 /// The risk statement for `pause_pipeline`: the pipeline only stops running
 /// until `resume_pipeline` starts it again, so the generic sentence would be
 /// false (`AI-1`).
@@ -307,12 +326,12 @@ const WRITE_HIGH_RISK_EMBED_FILTER_MODES: &str =
 
 /// The risk sentence stored on a `WriteHigh` approval, chosen per tool.
 ///
-/// One sentence for every tool hid the mismatch: `delete_chart` and
-/// `delete_board` go to the trash and stay restorable, `pause_pipeline` runs
-/// again after a `resume_pipeline`, and `set_embed_filter_modes` can be set
-/// again, so the generic "cannot be undone" sentence contradicted the
-/// reason line on the same card (`AI-1`). Every other `WriteHigh` tool keeps
-/// [`WRITE_HIGH_RISK`] word for word.
+/// One sentence for every tool hid the mismatch: `delete_chart`,
+/// `delete_board` and `delete_report` go to the trash and stay restorable,
+/// `pause_pipeline` runs again after a `resume_pipeline`, and
+/// `set_embed_filter_modes` can be set again, so the generic "cannot be
+/// undone" sentence contradicted the reason line on the same card (`AI-1`).
+/// Every other `WriteHigh` tool keeps [`WRITE_HIGH_RISK`] word for word.
 ///
 /// `pub(in crate::routes)`: the headless agent run (`routes::agents`) stores
 /// the same sentence on the approval it creates, so there is one source for
@@ -321,6 +340,9 @@ pub(in crate::routes) fn risk_for_write_high(spec: &ToolSpec) -> &'static str {
     match spec.name {
         "delete_chart" => WRITE_HIGH_RISK_TRASHED_CHART,
         "delete_board" => WRITE_HIGH_RISK_TRASHED_BOARD,
+        // BI-18 part D (OPS-32 merge, aligned with #525): a deleted report goes
+        // to the trash too, so its card says so, as its reason line does.
+        "delete_report" => WRITE_HIGH_RISK_TRASHED_REPORT,
         "pause_pipeline" => WRITE_HIGH_RISK_PAUSED_PIPELINE,
         "set_embed_filter_modes" => WRITE_HIGH_RISK_EMBED_FILTER_MODES,
         _ => WRITE_HIGH_RISK,
@@ -580,6 +602,46 @@ fn alert_summary(name: &str, args: &Map<String, Value>) -> String {
     )
 }
 
+/// The Confirm card's sentence for the report and template writes (`BI-18`
+/// part D, T4): what is made or changed, and how many charts it places.
+fn written_summary(name: &str, args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let charts = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_array)
+            .map_or(0, |b| b.iter().filter(|b| b["type"] == "chart").count())
+    };
+    match name {
+        "create_report" => format!(
+            "Creates report \"{}\" with {} chart(s) directly from the dashboard.",
+            s("title"),
+            charts("blocks")
+        ),
+        "update_report" => {
+            let added = charts("append") + usize::from(!s("chart").trim().is_empty());
+            if args.contains_key("blocks") {
+                format!(
+                    "Replaces all contents of report {} ({} chart(s)).",
+                    s("id"),
+                    charts("blocks")
+                )
+            } else if added > 0 || args.contains_key("append") {
+                format!(
+                    "Appends content to report {} ({added} new chart(s)).",
+                    s("id")
+                )
+            } else {
+                format!("Updates report {}.", s("id"))
+            }
+        }
+        _ => format!(
+            "Creates a new dashboard \"{}\" from template {}; this copy does not change the template.",
+            s("name"),
+            s("template")
+        ),
+    }
+}
+
 /// The `AI-31` (D14) tail of the `create_chart` card: when a chart has layers,
 /// name every extra question's source so the person confirms all of them, not
 /// just the chart's own mart. Empty for a single-question chart, so the card
@@ -671,6 +733,10 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             report_summary(spec.name, args)
         }
         "create_alert_rule" | "update_alert_rule" => alert_summary(spec.name, args),
+        // BI-18 part D (T4): the Confirm card's text for the report and template writes.
+        "create_report" | "update_report" | "create_dashboard_from_template" => {
+            written_summary(spec.name, args)
+        }
         "create_calculated_field" => format!(
             "Creates calculated field \"{}\" = {} (on {}).",
             s("name"),
@@ -1402,6 +1468,23 @@ mod tests {
         assert!(risk.contains("30 days"), "{risk}");
     }
 
+    /// `BI-18` part D (OPS-32 merge, aligned with #525): a deleted report is in
+    /// the trash for 30 days, so its card says so and never that the action
+    /// cannot be undone.
+    #[test]
+    fn a_deleted_report_says_it_can_be_restored_for_thirty_days() {
+        let risk = risk_for_write_high(spec("delete_report"));
+        assert_eq!(
+            risk,
+            "High-risk action: the report goes to the trash and can be restored for 30 days."
+        );
+        assert!(
+            !risk.contains("cannot be undone"),
+            "the card must not say the action cannot be undone: {risk}"
+        );
+        assert!(risk.contains("30 days"), "{risk}");
+    }
+
     /// The card a person reads before approving a board deletion must not
     /// contradict its own reason sentence: a deleted board and its charts go
     /// to the trash and can be restored, so the risk line says so instead of
@@ -1440,7 +1523,12 @@ mod tests {
     /// tombstone their row (`is_deleted = 1`), and nothing brings it back.
     #[test]
     fn the_other_write_high_tools_keep_the_generic_risk_sentence() {
-        for name in ["delete_calculated_field", "delete_metric"] {
+        // `delete_template` removes the template for good (`BI-18` part D).
+        for name in [
+            "delete_calculated_field",
+            "delete_metric",
+            "delete_template",
+        ] {
             assert_eq!(
                 risk_for_write_high(spec(name)),
                 "High-risk action: it cannot be undone once it runs.",
