@@ -120,7 +120,7 @@ function UploadForm({ onUploaded }: { onUploaded: () => void }) {
                 </SelectContent>
               </Select>
               <p className="text-xs text-muted-foreground">
-                First region: <span className="font-medium">{String(chosen.properties[nameProperty] ?? "(empty)")}</span>. Every region must have a different, non-empty name here.
+                First region: <span className="font-medium">{String(chosen.properties[nameProperty] ?? "(empty)")}</span>. Each region needs its own name.
               </p>
             </div>
             <Button className="w-fit" onClick={() => void upload()} disabled={busy || !name.trim() || !nameProperty}>

@@ -389,13 +389,16 @@ describe("table suggestions in the pipeline editor", () => {
     const input = await screen.findByPlaceholderText("orders_events")
     // The suggestions come from `/api/lakehouse/tables` for the input's
     // zone, once the zone is one the lakehouse client lists.
-    await waitFor(() => expect(input.getAttribute("list")).toBe("input-table-options-input-1"))
-    const options = Array.from(document.querySelectorAll("#input-table-options-input-1 option")).map((o) =>
-      o.getAttribute("value")
-    )
-    expect(options).toEqual(["orders_raw", "stock_raw"])
+    // The console's own list (`UX-7`), not the browser's `datalist`: it opens
+    // under the field once the names have loaded.
+    await waitFor(() => {
+      fireEvent.keyDown(input, { key: "ArrowDown" })
+      expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["orders_raw", "stock_raw"])
+    })
+    expect(document.querySelector("datalist")).toBeNull()
+    fireEvent.keyDown(input, { key: "Escape" })
 
-    // Typing is still allowed: a datalist filters, it never narrows.
+    // Typing is still allowed: the list filters, it never narrows.
     fireEvent.change(input, { target: { value: "typed_by_hand" } })
     expect((input as HTMLInputElement).value).toBe("typed_by_hand")
   })

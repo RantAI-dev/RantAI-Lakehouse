@@ -1,5 +1,6 @@
 "use client"
 
+import { SuggestInput } from "@/components/patterns/suggest-input"
 import * as React from "react"
 import Link from "next/link"
 import { ArrowDownIcon, ArrowUpIcon, FileCodeIcon, PlusIcon, Trash2Icon, WandSparklesIcon } from "lucide-react"
@@ -184,7 +185,6 @@ export function InputPane({
     [zone, listable]
   )
   const suggestions = tables.status === "success" ? tables.data.map((table) => table.name).sort() : []
-  const listId = `input-table-options-${input.id}`
   const tableControl =
     !fromConnector || (connector !== null && !connector.failed && connector.targets !== null && connector.targets.length > 0)
 
@@ -271,23 +271,18 @@ export function InputPane({
             )
           ) : (
             <>
-              {/* A `datalist`, not a picker, so a table the namespace listing
+              {/* Suggestions, not a picker, so a table the namespace listing
                   has not caught up with can still be named by hand. */}
-              <Input
+              <SuggestInput
                 id={`input-table-${input.id}`}
                 aria-required
                 value={input.table}
-                onChange={(e) => onTable(e.target.value)}
+                onValueChange={onTable}
                 placeholder="orders_events"
                 {...tie(invalid, "table")}
-                list={suggestions.length > 0 ? listId : undefined}
+                suggestions={suggestions.map((name) => ({ value: name }))}
                 title={suggestions.length > 0 ? `Suggestions from ${zone}; any other name can be typed.` : undefined}
               />
-              <datalist id={listId}>
-                {suggestions.map((name) => (
-                  <option key={name} value={name} />
-                ))}
-              </datalist>
             </>
           )}
         </div>
