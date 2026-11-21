@@ -92,6 +92,7 @@ once a first release is tagged.
 
 ### Changed
 
+- Draft pull requests now run only fast CI checks (`changes`, `repo-lints`, `verify`, `Rust · fmt`, `ci-required`, and `security.yml`) and run full CI when marked `ready_for_review`, and `scripts/ci/gate_paths.txt` narrows 13 `lakehouse-api` and `lakehouse-store` modules using proven route and caller evidence (backlog `OPS-38`; plan `docs/superpowers/plans/2026-11-21-ops-38-lighter-runs.md`).
 - The audit page's person filter lists the people in the trail; settings rows name the settings that changed; the export has the event id and the same outcome words as the page.
 - Alert scheduler runs and alert tests no longer write audit rows.
 - The sign-in page, the sidebar, the browser tab and the embed footer show the workspace's own name, logo and icon when an administrator has set them (backlog `ADM-2`; feature page `docs/core/features/workspace-name-and-logo.md`).
