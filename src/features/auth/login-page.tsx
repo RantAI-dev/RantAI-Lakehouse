@@ -256,8 +256,9 @@ export function LoginPage() {
   const router = useRouter();
   const { refresh, status, user } = useAuth();
   // The workspace's own name and logo (`ADM-2`). The route is public, so
-  // the page reads it before anyone signs in; the product's own name and
-  // logos stand in until the answer arrives.
+  // the page reads it before anyone signs in; the name and the logo stay
+  // empty until the answer arrives, so the product's own never flashes
+  // first (`adm-121`, `adm-120`).
   const branding = useBranding();
   const [email, setEmail] = React.useState("");
   const [password, setPassword] = React.useState("");
