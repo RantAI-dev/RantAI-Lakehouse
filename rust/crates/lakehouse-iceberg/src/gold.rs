@@ -47,6 +47,23 @@ pub const GOLD_NAMESPACE: &str = "gold";
 /// column the mart itself may also carry.
 pub const EXPORTED_AT_COLUMN: &str = "_exported_at";
 
+/// Suffix appended to a published table's own (sanitized) name to form the
+/// latest-copy table's name (`DATA-6` D1): the Iceberg table for mart
+/// `sales` is `gold.sales`, and the table that always holds only the
+/// newest copy is `gold.sales_latest`. A constant in both languages —
+/// `dagster/dispar_orchestrate/gold_latest_copy.py` names this one as the
+/// source of the mirror.
+pub const LATEST_TABLE_SUFFIX: &str = "_latest";
+
+/// Table property marking a table as "the latest-copy table of exactly
+/// this published table" (`DATA-6` D7): set to the published table's own
+/// (sanitized) name by the Dagster op that creates `gold.<table>_latest`,
+/// read by `GoldExportError::TargetIsLatestCopy`'s check so the Rust
+/// export can never append a publish into another mart's latest-copy
+/// table (a mart named `sales_latest` and the latest table of `sales`
+/// are the same Iceberg name — the marker is what keeps them apart).
+pub const LATEST_COPY_OF_PROPERTY: &str = "rantai.latest-copy-of";
+
 /// Field id reserved for [`EXPORTED_AT_COLUMN`], mirroring
 /// `bronze::INGESTED_AT_FIELD_ID`.
 pub const EXPORTED_AT_FIELD_ID: i32 = 1;
@@ -74,6 +91,32 @@ pub fn gold_namespace() -> Result<NamespaceIdent> {
 /// See `bronze::sanitize_table_name`.
 pub fn sanitize_mart_name(raw: &str) -> Result<String> {
     sanitize_table_name(raw)
+}
+
+/// The latest-copy table's name for an already-sanitized published table
+/// name (`DATA-6` D1): `latest_table_name("sales") == "sales_latest"`.
+/// `table` is the *sanitized* name, the same string `GoldExportResult`
+/// reports — the caller does not sanitize twice.
+#[must_use]
+pub fn latest_table_name(table: &str) -> String {
+    format!("{table}{LATEST_TABLE_SUFFIX}")
+}
+
+/// Reads [`LATEST_COPY_OF_PROPERTY`] off a table's properties: `Some(table)`
+/// when the table is the latest-copy table of `table`, `None` when the
+/// property is absent (`DATA-6` D7). A plain read, deliberately no
+/// validation of the named table here — the two enforcement sites (the
+/// Rust export's refusal, the Python op's `name_taken`) decide what a
+/// present-but-wrong value means.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "the map is always the Iceberg metadata's own properties() — a std \
+              HashMap deserialized by the iceberg crate; no caller of this \
+              function ever builds the map, so a non-default hasher cannot occur"
+)]
+#[must_use]
+pub fn latest_copy_of(properties: &std::collections::HashMap<String, String>) -> Option<&str> {
+    properties.get(LATEST_COPY_OF_PROPERTY).map(String::as_str)
 }
 
 /// Builds the full Gold export schema: [`EXPORTED_AT_COLUMN`] at
@@ -165,6 +208,37 @@ mod tests {
             Type::Primitive(PrimitiveType::String),
         )];
         assert!(gold_schema(domain).is_err());
+    }
+
+    // DATA-6 D1/D7: the latest-copy table's name and marker are pinned to
+    // these exact strings in BOTH languages (`gold_latest_copy.py` names
+    // this module's constants as the source); a drift would make the Rust
+    // refusal and the Python write disagree about the same table.
+    #[test]
+    fn latest_table_constants_are_pinned() {
+        assert_eq!(LATEST_TABLE_SUFFIX, "_latest");
+        assert_eq!(LATEST_COPY_OF_PROPERTY, "rantai.latest-copy-of");
+    }
+
+    #[test]
+    fn latest_table_name_appends_the_suffix() {
+        assert_eq!(latest_table_name("sales"), "sales_latest");
+        assert_eq!(
+            latest_table_name("sales"),
+            format!("sales{LATEST_TABLE_SUFFIX}")
+        );
+    }
+
+    #[test]
+    fn latest_copy_of_reads_the_marker_or_none() {
+        let mut properties = std::collections::HashMap::new();
+        assert_eq!(latest_copy_of(&properties), None);
+        properties.insert(LATEST_COPY_OF_PROPERTY.to_owned(), "sales".to_owned());
+        assert_eq!(latest_copy_of(&properties), Some("sales"));
+        // An unrelated property never reads as a marker.
+        properties.clear();
+        properties.insert("other".to_owned(), "sales".to_owned());
+        assert_eq!(latest_copy_of(&properties), None);
     }
 
     #[test]

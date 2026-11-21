@@ -1,17 +1,23 @@
 "use client"
 
 import Link from "next/link"
-import { CalendarClockIcon, ChevronRightIcon, CpuIcon, HandIcon, PenToolIcon } from "lucide-react"
+import { CalendarClockIcon, ChevronRightIcon, CpuIcon, HandIcon, PenToolIcon, RadarIcon } from "lucide-react"
 import { Pill, StatusBadge } from "@/components/patterns/status-badge"
 import { BrandBackdrop } from "@/components/ui/brand-glow"
 import { formatDateTime, formatDuration, formatPercent, formatRelativeTime, isPast } from "@/lib/format"
 import { ENTITY_STATUS_LABEL, type EntityStatus } from "@/lib/status"
 import { cn } from "@/lib/utils"
-import type { PipelineDetail, PipelineRun } from "@/services/contracts/pipelines"
+import type { PipelineDetail, PipelineRun, TargetLag } from "@/services/contracts/pipelines"
 import type { RunSummary } from "./pipeline-run-stats"
 import { runDurationMs } from "./pipeline-run-stats"
 import { readsAsLine, type ReadsAs } from "./pipeline-reads-as"
-import { describeCron, localizeScheduleTime, type ParsedSchedule } from "./pipeline-schedule"
+import {
+  describeCron,
+  isLagTrigger,
+  localizeScheduleTime,
+  type ParsedSchedule,
+  triggerSummary,
+} from "./pipeline-schedule"
 
 /** A status the shared badge knows, or `null` for what the API sends outside it ("unknown" for a never-run job). */
 export function knownStatus(status: string): EntityStatus | null {
@@ -20,13 +26,26 @@ export function knownStatus(status: string): EntityStatus | null {
 
 function ScheduleChip({
   schedule,
+  targetLag,
   paused,
   nextRunAt,
 }: {
   schedule: ParsedSchedule
+  targetLag: TargetLag | null | undefined
   paused: boolean
   nextRunAt: string | null | undefined
 }) {
+  const trigger = triggerSummary(schedule, targetLag)
+  // BLD-11 F2/D3: with a target lag the stored cron never fires, so naming
+  // it (or saying "Manual only") would deny that the lag sensor runs this.
+  if (isLagTrigger(trigger)) {
+    return (
+      <Pill tone="violet">
+        <RadarIcon className="size-3" aria-hidden />
+        {trigger.label}
+      </Pill>
+    )
+  }
   if (schedule.kind === "manual") {
     return (
       <Pill tone="neutral">
@@ -109,7 +128,12 @@ export function PipelineMasthead({
               {authored ? <PenToolIcon className="size-3" aria-hidden /> : <CpuIcon className="size-3" aria-hidden />}
               {authored ? "Authored pipeline" : "Dagster job"}
             </Pill>
-            <ScheduleChip schedule={schedule} paused={schedulePaused} nextRunAt={pipeline.nextRunAt} />
+            <ScheduleChip
+              schedule={schedule}
+              targetLag={pipeline.targetLag}
+              paused={schedulePaused}
+              nextRunAt={pipeline.nextRunAt}
+            />
             <span className="text-xs text-muted-foreground">
               Owner <span className="font-medium text-foreground">{pipeline.owner}</span>
             </span>
@@ -170,6 +194,7 @@ export function PipelineVitals({
   nextRunAt,
   schedule,
   schedulePaused,
+  targetLag,
   now,
 }: {
   summary: RunSummary
@@ -177,10 +202,13 @@ export function PipelineVitals({
   nextRunAt: string | null | undefined
   schedule: ParsedSchedule
   schedulePaused: boolean
+  targetLag: TargetLag | null | undefined
   now: number
 }) {
   const latestMs = latest ? runDurationMs(latest, now) : null
   const rate = summary.successRate
+  // BLD-11 D3: a target-lag pipeline has no next scheduled fire time.
+  const lagDriven = targetLag != null
   return (
     <div className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border lg:grid-cols-4 [&>*]:bg-card">
       <Vital label="Last run" delay={0} foot={latest ? `${formatDateTime(latest.startedAt)}` : "No run in the orchestrator's history"}>
@@ -237,16 +265,18 @@ export function PipelineVitals({
         label="Next run"
         delay={180}
         foot={
-          schedule.kind === "manual"
-            ? "Runs only when launched"
-            : schedulePaused
-              ? "Schedule paused: nothing will fire"
-              : nextRunAt
-                ? formatDateTime(nextRunAt)
-                : "The orchestrator gave no next time"
+          lagDriven
+            ? "Runs when an input changes"
+            : schedule.kind === "manual"
+              ? "Runs only when launched"
+              : schedulePaused
+                ? "Schedule paused: nothing will fire"
+                : nextRunAt
+                  ? formatDateTime(nextRunAt)
+                  : "The orchestrator gave no next time"
         }
       >
-        {schedule.kind === "manual" || schedulePaused || !nextRunAt ? (
+        {lagDriven || schedule.kind === "manual" || schedulePaused || !nextRunAt ? (
           <span className="text-lg font-semibold text-muted-foreground">—</span>
         ) : isPast(nextRunAt, now) ? (
           <span className="text-lg font-semibold text-amber-600 dark:text-amber-400">Overdue</span>

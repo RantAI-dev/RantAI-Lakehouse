@@ -134,6 +134,13 @@ reviews that part.
 - Every run rebuilds the output table and gives it the columns of the last
   step. A dashboard that reads a column the pipeline no longer returns
   breaks.
+- A `cast` or `rename` in a step with no `select` now applies to every column
+  (`BLD-11`, decision D11): a cast changes that column's type in place, and a
+  renamed column loses its old name and moves to the end of the table. A
+  pipeline already saved with such a step therefore produces a different
+  table on its next run — a chart or a downstream pipeline reading the old
+  name or type can break. A rename onto another name the same step already
+  emits is refused when the pipeline is saved.
 - A pipeline reads as its author: a column masked for the author is masked
   in the output table too.
 - A preview shows what the person looking may see. It can differ from what

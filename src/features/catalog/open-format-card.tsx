@@ -3,6 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { RefreshCwIcon } from "lucide-react"
+import { Copyable } from "@/components/copyable"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
@@ -24,6 +25,7 @@ import { goldService } from "@/services"
 import type {
   GoldConsumers,
   GoldExportRun,
+  GoldLatestCopyHolds,
   GoldPublication,
   GoldReadBack,
   GoldTrimSummary,
@@ -90,6 +92,48 @@ function copiesKeptDetail(trim: GoldTrimSummary): string {
     trim.oldestKeptExportedAt ? `oldest ${formatDateTime(trim.oldestKeptExportedAt)}` : null,
   ].filter((part): part is string => part !== null)
   return parts.length > 0 ? ` (${parts.join("; ")})` : ""
+}
+
+/**
+ * The "Holds" line of the latest-copy block (`DATA-6` D4): which publish
+ * the held copy came from and how many rows it carries. A success row
+ * always records both; a missing fact renders as an em dash rather than
+ * a guessed number (the same "never fabricated" posture as every other
+ * measured value on this card).
+ */
+function latestHoldsLine(holds: GoldLatestCopyHolds): string {
+  const when = holds.copyExportedAt ? formatDateTime(holds.copyExportedAt) : "—"
+  const rows = holds.rows !== null ? `${holds.rows} rows` : "—"
+  return `The copy published ${when} (${rows})`
+}
+
+/**
+ * The fixed sentence for a failed latest-copy run (`DATA-6` D12): one
+ * English sentence per recorded reason, the map this feature owes the
+ * card. An unknown code gets the generic sentence with the code in
+ * parentheses — the code is this repo's own fixed string, never
+ * exception text, so showing it is honest; inventing a sentence for it
+ * would not be.
+ */
+function latestCopyFailureText(reason: string | null): string {
+  const sentences: Record<string, string> = {
+    not_started: "The latest copy was not updated: the update job could not be started.",
+    invalid_request: "The latest copy was not updated: the update request was malformed.",
+    publication_state_unavailable:
+      "The latest copy was not updated: the publishing state could not be read.",
+    catalog_unavailable: "The latest copy was not updated: the data catalog could not be reached.",
+    name_taken:
+      "The latest copy was not updated: the latest-copy table name is already used by another table.",
+    schema_incompatible:
+      "The latest copy was not updated: the latest-copy table's columns no longer match the published table's.",
+    copy_incomplete:
+      "The latest copy was not updated: the published copy was incomplete or already removed.",
+    commit_conflict: "The latest copy was not updated: another update committed at the same moment.",
+    write_failed: "The latest copy was not updated: writing the new copy failed.",
+  }
+  if (reason === null) return "The latest copy was not updated."
+  const sentence = sentences[reason]
+  return sentence ?? `The latest copy was not updated. (${reason})`
 }
 
 const stateLabelClass = (label: string): string => {
@@ -204,7 +248,7 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
   return (
     <SectionCard
       title="Publish in open format (Iceberg)"
-      description="A copy in open Iceberg format that outside tools can read. Publishing adds one full copy each time; old copies stay."
+      description="A copy in open Iceberg format that outside tools can read. Publishing adds one full copy each time; old copies stay. A second table holds only the newest copy, for tools that do not filter on export time."
       action={
         <label className="flex items-center gap-2" data-testid="open-format-switch">
           <Switch
@@ -309,6 +353,42 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
               <dd className="col-span-2 text-destructive">
                 Trim failed{p.trim.reason ? `: ${p.trim.reason}` : ""}
               </dd>
+            </>
+          )}
+          {p.latestCopy && (
+            <>
+              {/* DATA-6 D4: the second table's name with a copy button, so a
+                  tool can be pointed at it without retyping it. The name is
+                  shown before the first update too — it is a fact of the
+                  design, not of any run. */}
+              <dt className="text-muted-foreground">Latest copy only</dt>
+              <dd className="col-span-2">
+                <Copyable value={p.latestCopy.table}>
+                  <span className="font-mono text-xs">{p.latestCopy.table}</span>
+                </Copyable>
+              </dd>
+              <dt className="text-muted-foreground">Holds</dt>
+              <dd className="col-span-2">
+                {p.latestCopy.holds ? latestHoldsLine(p.latestCopy.holds) : "Not written yet"}
+              </dd>
+              {/* The run's own outcome, after the holds: a failure never
+                  erases the copy that is still there, so the card says both. */}
+              {p.latestCopy.lastRun?.status === "failed" && (
+                <>
+                  <dt className="text-muted-foreground">Latest copy run</dt>
+                  <dd className="col-span-2 text-destructive" data-testid="latest-copy-failure">
+                    {latestCopyFailureText(p.latestCopy.lastRun.reason)}
+                  </dd>
+                </>
+              )}
+              {p.latestCopy.lastRun?.status === "skipped" && (
+                <>
+                  <dt className="text-muted-foreground">Latest copy run</dt>
+                  <dd className="col-span-2 text-muted-foreground">
+                    Not updated: publishing is off.
+                  </dd>
+                </>
+              )}
             </>
           )}
         </dl>

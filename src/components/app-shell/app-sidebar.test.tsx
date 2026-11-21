@@ -1,3 +1,7 @@
+// `AppSidebar` reads the route through `next/navigation`, which needs a
+// Next.js AppRouter context that a bare happy-dom environment does not
+// have, so the module is stubbed at the boundary (the same pattern as
+// `per-role-navigation.test.tsx`).
 mock.module("next/navigation", () => ({
   usePathname: () => "/catalog",
   useSearchParams: () => new URLSearchParams(""),
@@ -13,7 +17,7 @@ import { SidebarProvider } from "@/components/ui/sidebar"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { forgetRow, readRow, rememberRow, setRowOwner } from "@/features/dashboards/dashboards-row"
 import { readLastBoard, rememberLastBoard } from "@/features/dashboards/last-board"
-import { PRODUCT_NAME } from "@/lib/product-branding"
+import { PRODUCT_LOGO_DARK, PRODUCT_LOGO_LIGHT, PRODUCT_NAME } from "@/lib/product-branding"
 import { AppSidebar } from "./app-sidebar"
 
 const json = (body: unknown, status = 200) =>
@@ -193,30 +197,45 @@ describe("AppSidebar, the Dashboards row names what it opens", () => {
 })
 
 // ADM-2 (from main): the header shows the workspace's own name and logo.
+/** The session the sidebar's chrome needs; the branding is what it shows. */
+const SESSION = {
+  id: "u1",
+  name: "Test User",
+  email: "test@rantai.dev",
+  roles: ["Viewer"],
+  permissions: ["dashboard:read"],
+  tenants: [{ id: "t1", name: "Default Tenant", role: "Viewer" }],
+}
 /**
  * Serves the session check and the public branding route. The branding is
  * what the header shows; the session check only keeps the console chrome
  * rendered.
+ *
+ * With `hold`, the branding answer waits for `release`, so a test can look
+ * at the header while the answer is still on its way.
  */
-function stubApi(branding: unknown): string[] {
+function stubApi(
+  branding: unknown,
+  options: { hold?: boolean } = {},
+): { requested: string[]; release: () => void } {
   const requested: string[] = []
+  let release: () => void = () => {}
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
   global.fetch = mock(async (input: RequestInfo | URL) => {
     const url = String(input)
     requested.push(url)
     if (url.includes("/api/auth/me")) {
-      return json({
-        id: "u1",
-        name: "Test User",
-        email: "test@rantai.dev",
-        roles: ["Viewer"],
-        permissions: ["dashboard:read"],
-        tenants: [{ id: "t1", name: "Default Tenant", role: "Viewer" }],
-      })
+      return json(SESSION)
     }
-    if (url.includes("/api/branding")) return json(branding)
+    if (url.includes("/api/branding")) {
+      if (options.hold) await held
+      return json(branding)
+    }
     return json({})
   }) as unknown as typeof fetch
-  return requested
+  return { requested, release }
 }
 
 function renderBranded() {
@@ -238,6 +257,22 @@ function renderBranded() {
 function pictures(container: HTMLElement): HTMLImageElement[] {
   return Array.from(container.querySelectorAll("img"))
 }
+
+beforeEach(() => {
+  // happy-dom starts on `about:blank`: a relative URL has no base to
+  // resolve against, so a picture with a relative source counts as broken
+  // and the branding falls back to the product's own file. The pictures
+  // must resolve the way they do in a browser (the same setup as
+  // `public-dashboard.test.tsx`).
+  ;(window as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM.setURL(
+    "http://localhost/",
+  )
+})
+
+afterEach(() => {
+  cleanup()
+  global.fetch = originalFetch
+})
 
 describe("the sidebar header shows the workspace's own branding (ADM-2)", () => {
   it("shows the workspace name and logo from settings, not a fixed product name", async () => {
@@ -294,7 +329,7 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
   })
 
   it("falls back to the product's own name and logos when the workspace set none", async () => {
-    const requested = stubApi({
+    const { requested } = stubApi({
       workspaceName: null,
       logo: null,
       logoDark: null,
@@ -329,5 +364,34 @@ describe("the sidebar header shows the workspace's own branding (ADM-2)", () => 
     // A broken picture must never be left on the page: the product's own
     // file stands in for it.
     expect(shown[0].getAttribute("src")).toBe("/logo-light.svg")
+  })
+
+  it("shows no logo at all while the branding answer is on its way", async () => {
+    const { release } = stubApi(
+      {
+        workspaceName: "Acme Data",
+        logo: { type: "image/png", version: "v1" },
+        logoDark: { type: "image/png", version: "v2" },
+        icon: null,
+      },
+      { hold: true },
+    )
+    const { container } = renderBranded()
+    // The sidebar is drawn (the session answered); the branding has not.
+    await screen.findByText("Dashboards")
+
+    // No picture at all while the answer is on its way: the product's own
+    // logo must not stand on the page for a moment before the workspace's
+    // own logo lands (`adm-120`).
+    expect(container.querySelectorAll("img")).toHaveLength(0)
+    expect(container.innerHTML).not.toContain(PRODUCT_LOGO_LIGHT)
+    expect(container.innerHTML).not.toContain(PRODUCT_LOGO_DARK)
+
+    release()
+    await waitFor(() => expect(pictures(container)).toHaveLength(2))
+    expect(pictures(container).map((p) => p.getAttribute("src"))).toEqual([
+      "/api/branding/images/logo?v=v1",
+      "/api/branding/images/logo-dark?v=v2",
+    ])
   })
 })
