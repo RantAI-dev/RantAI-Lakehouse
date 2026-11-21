@@ -65,6 +65,11 @@ table's schema. The product owner chose to fix the code to the decision
     run. That is accepted: the person asked for the column to be left out,
     and the next successful run replaces the rows. Say so in the
     function's doc comment.
+  - Signed by the product owner 2026-11-21, on the two-commit window above
+    (`PR #621 review 1` BLOCKER): on a replace table the source is the
+    truth; a failed load leaves the table stale without the unticked
+    column until the next successful load, which rewrites every row; a
+    column ticked again is refilled by the next replace.
 - **D4. Ticking the column again.** The next replace reads the column and
   `dlt` adds it back, so it is filled from that load (decision 10's
   "Limits" line). No extra code is expected. The test in task 3 proves it.
@@ -245,3 +250,26 @@ wrong.
   `run` has not been measured;
 - if the retest shows the column back after a second replace, that is a
   new finding against this item.
+
+### Round 2 (planner PR review 1, 2026-11-20, PR #621)
+
+The review on the pull request (`CHANGES_REQUESTED`, 2026-11-20) asked for
+two changes; both are recorded here so the plan stays the one place a
+reader looks.
+
+- **BLOCKER: the column drop commits before the rows, not with them.**
+  `_drop_left_out_columns` commits its `update_schema().delete_column` on
+  its own, then `dlt` writes the rows, and the backlog row's "in the same
+  commit as the rows" was relaxed by D3 without an owner sign-off at
+  review time. **resolved: owner signed D3 2026-11-21** -- the product
+  owner signed the two-commit window (recorded under D3 above, with the
+  reason), so the code keeps two commits. A comment at the drop site names
+  the decision.
+- **SHOULD-FIX: the no-data-loss case does not go through `load_via_sink`.**
+  `test_src_48_an_incremental_table_keeps_the_column...` called
+  `_drop_left_out_columns` directly. Fixed in the test commit
+  (`test_sink_drop_columns_modes.py`): tests that call
+  `load_via_sink(..., drop_columns=["c"])` with `incremental`,
+  `incremental_dedup` and `history` plans and read the Iceberg schema and
+  the stored `dlt` schema back, so a change to the `plan.mode` handling in
+  `load_via_sink` is caught.

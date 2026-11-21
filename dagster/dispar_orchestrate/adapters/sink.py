@@ -900,6 +900,8 @@ def _drop_left_out_columns(
     rows without the column until the next run. That is accepted (the person asked for the
     column to be left out, and the next successful run replaces the rows). Ticking the
     column again needs nothing here: the next replace reads it and `dlt` adds it back.
+    That two-commit window (the schema commit lands before the rows) is plan decision
+    `D3`, owner-signed 2026-11-21: on a replace table the source is the truth.
 
     Returns the names dropped, empty when nothing was (then no commit is made).
 
