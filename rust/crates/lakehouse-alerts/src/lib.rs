@@ -3479,6 +3479,7 @@ fn not_due(rule: &AlertRule) -> RunResult {
         value: None,
         delivered: None,
         skipped: None,
+        failed: None,
         recovered: false,
     }
 }
