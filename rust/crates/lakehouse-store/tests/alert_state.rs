@@ -238,3 +238,23 @@ async fn editing_a_digests_schedule_starts_its_clock_over(pool: PgPool) {
         DigestTurn::StartedClock
     );
 }
+
+/// `BI-65` (PR #650 CI): starting a digest's clock over touches the clock and
+/// nothing else of its row, and a rule with no row stays without one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn starting_a_clock_over_keeps_the_rest_of_the_row(pool: PgPool) {
+    record_check(&pool, "al_d", "firing", Some(150.0), None, at(0))
+        .await
+        .unwrap();
+    digest_turn(&pool, "al_d", weekly_monday_8(), JKT, utc(SAT))
+        .await
+        .unwrap();
+    let before = get(&pool, "al_d").await.unwrap().unwrap();
+    clear_digest_clock(&pool, "al_d").await.unwrap();
+    assert_eq!(digest_clock(&pool, "al_d").await.unwrap(), None);
+    let after = get(&pool, "al_d").await.unwrap().unwrap();
+    assert_eq!(after, before);
+    assert_eq!(after.state, "firing");
+    clear_digest_clock(&pool, "al_none").await.unwrap();
+    assert!(get(&pool, "al_none").await.unwrap().is_none());
+}
