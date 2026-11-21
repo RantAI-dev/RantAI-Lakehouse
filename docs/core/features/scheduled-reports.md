@@ -92,3 +92,6 @@ Run by the product owner on a running console. A step not performed is never a p
   2026-11-12 (`RPT-2`) for QA `LH-RPT-1-06`; the words on screen are *(proposed, not
   yet signed)*.
 - `AI-10-AC1` "Send this dashboard to me every Monday as a PDF." creates a Monday PDF subscription for the person. Accepted by the AI owner, 2026-11-13 (staging `80fb2f68`). The PDF itself not rendered: staging has no Gotenberg.
+
+**Accepted by:** the product owner **Date:** 2026-11-21 **Build:** the QA stack, against a local mail catcher with TLS.  
+Released by the product owner on 2026-11-21 on the planner's run (the owner does not check e-mail in the dev setup).
