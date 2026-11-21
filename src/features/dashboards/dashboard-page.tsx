@@ -4,9 +4,8 @@ import * as React from "react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, Bell, MessageSquare, ChartColumn, Download, GitFork, ImageDown, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, RefreshCw, Smartphone, SlidersHorizontal, Sparkles, Square, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, Bell, Check, ChartColumn, Download, GitFork, ImageDown, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Pointer, RefreshCw, Smartphone, SlidersHorizontal, Bot, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
-import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -19,15 +18,17 @@ import { ParamDialog } from "./param-dialog";
 import { PARAMS_PARAM, acceptedParams, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, savedParamsBody, withParamsParam, withValue, type BoardParam, type ParamControl, type ParamValue, type RefusedParam } from "@/lib/params";
 import { GRAIN_PARAM, differsFromSaved, grainNotAppliedSentence, grainQuery, readGrainParam, savedGrainBody, shownGrain, withGrainParam, type GrainChoice } from "@/lib/grain-switch";
 import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type ColumnKind, type Grain, type ReportingContext } from "@/lib/time-grain";
-import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
+import { REFRESH_OPTIONS, effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
+import { dataFromLabel } from "@/lib/result-cache";
+import { tileFreshness } from "./tile-freshness";
 import { readableErrorMessage } from "@/lib/notify-message";
 import { buildDashboardPageContext, summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
-import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, isActiveFilter, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
+import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
 import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-chat";
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
-import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
+import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import {
   TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeCopyBelow, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
@@ -36,15 +37,18 @@ import type { BoardTab, LayoutMap, PhoneTile, ChartClick, FilterDef, FilterField
 import { useAuth } from "@/features/auth/auth-provider";
 import { useCopilotSelect } from "@/features/copilot/use-copilot";
 import { useService } from "@/hooks/use-service";
+import { useScrollFade } from "@/hooks/use-scroll-fade";
 import { newRunId, RUN_ID_HEADER } from "@/lib/run-id";
 import { STOPPED_SENTENCE } from "@/lib/query-limits";
 import { apiFetch } from "@/services/http";
 import { useAutoRefresh } from "./auto-refresh";
-import { BoardSwitcher } from "./board-switcher";
+import { DashboardHeader, EASE, EditPencil, FOCUS, ShareButton } from "./dashboard-header";
 import type { ChartDef } from "./chart-builder";
 import { chartEditHref, chartNewHref } from "./chart-page";
 import { fmtInt } from "./chart-option";
-import { DashboardActionsMenu, EditLayoutButton, NewChartButton, RenameDashboardDialog } from "./dashboard-actions";
+import { KpiValue, OverflowText } from "./fit-text";
+import { compactKpiText } from "@/lib/kpi-fit";
+import { DashboardActionsMenu, NewChartButton, RenameDashboardDialog } from "./dashboard-actions";
 import { SaveTemplateDialog } from "./template-dialogs";
 import { chartWriteItems } from "./tile-write-items";
 import { ThemeFontDialog } from "./theme-font-dialog";
@@ -78,10 +82,14 @@ import { DashboardTilesSkeleton } from "./dashboard-skeleton";
 import { DrillMenu, NoteDialog, RecordsDialog, type DrillTarget } from "./drill";
 import { DrillTrail, useTileDrills } from "./tile-drills";
 import type { RecordsRequest } from "./records";
+import { forgetRow, rememberRow } from "./dashboards-row";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
 import { offerFor } from "@/lib/access-level";
 import { ShareDialog } from "./share-dialog";
-import { CommentsDialog } from "./comments-panel";
+import { CommentsPanel } from "./comments-panel";
+import { DetailsPanel } from "./details-panel";
+import { useSidePanel, useSidePanelTabs, type SidePanelTab } from "@/components/app-shell/side-panel";
+import { createPortal } from "react-dom";
 import { TileBody } from "./tile-body";
 import { exportNotice } from "./table-export";
 import { downloadChartData, downloadChartPng, downloadDashboardFile, downloadDashboardPdf, downloadMenuKind, type DataChoice, type PdfChoice, type ReadState } from "./chart-download";
@@ -136,11 +144,6 @@ type Payload = {
   charts: ChartCard[]; results: Record<string, Cell>; storeError?: string | null;
 };
 
-const SOURCE_BADGE: Record<ChartSource, { label: string; cls: string } | null> = {
-  builtin: null,
-  ai: { label: "AI", cls: "bg-violet-500/15 text-violet-600 dark:text-violet-400" },
-  ui: { label: "Manual", cls: "bg-sky-500/15 text-sky-600 dark:text-sky-400" },
-};
 const NO_CHARTS: ChartCard[] = [];
 const NO_KPIS: KpiMeta[] = [];
 const NO_RESULTS: Record<string, Cell> = {};
@@ -148,6 +151,45 @@ const NO_FILTERS: FilterDef[] = [];
 const NO_FIELDS: FilterField[] = [];
 const NO_CONTROLS: ParamControl[] = [];
 const NO_TABS: BoardTab[] = [];
+/** The dashboard's tabs of the shell's side panel (`BI-61` T6); the built-in dashboard has neither. */
+const PANEL_TABS: readonly SidePanelTab[] = [{ id: "comments", label: "Comments" }, { id: "details", label: "Details" }];
+const NO_PANEL_TABS: readonly SidePanelTab[] = [];
+
+/**
+ * BI-61 T7: the page is a frame that ends above the assistant's bar, so the
+ * bar never covers a tile (spec T5); the tiles scroll inside it from `lg` up,
+ * and below `lg` the whole frame scrolls, header included, so a phone keeps
+ * its room for the tiles. Its height is the viewport less the navbar (`--app-navbar-h`),
+ * the shell's top padding (1, 1.25 or 1.5rem) and the room kept under it.
+ *
+ * That room is read from the app shell's `--content-bottom`, the token BI-58
+ * adds (`c4d87211`, `50295df6`: the composer's measured height plus its offset
+ * and gap while it shows, 1.5rem when it hides), the way BI-59's `PageFrame`
+ * reads it; no BI-58 code is copied. Until it lands the variable is absent
+ * and the fallbacks are today's shell:
+ * - `bar`: the composer floats at the bottom. A 5rem dock spacer follows
+ *   `main`, and the negative margin gives back `main`'s `pb-24` / `lg:pb-28`.
+ * - `padded`: the assistant is on but its bar is not (docked in the side
+ *   panel, or a page tab has the panel). No spacer; the margin still gives
+ *   back `main`'s bottom padding and the frame keeps the shell's own gap.
+ * - `plain`: no assistant, no bottom padding on `main`.
+ * With the token present the frame's height alone puts its end where the
+ * shell says, as in BI-59; the margin then only shortens `main` below it.
+ */
+type Frame = "bar" | "padded" | "plain";
+function frameClass(frame: Frame): string {
+  const giveBack = "mb-[calc(var(--content-bottom,0px)-6rem)] lg:mb-[calc(var(--content-bottom,0px)-7rem)]";
+  // Below lg the frame itself scrolls, header included, so its cut edges fade too (review round 1, SHOULD-FIX 1).
+  const scroll = "scroll-fade overflow-y-auto lg:overflow-hidden print:h-auto print:overflow-visible print:m-0";
+  if (frame === "bar") {
+    return cn(scroll, giveBack, "h-[calc(100dvh-var(--app-navbar-h)-1rem-var(--content-bottom,5rem))] sm:h-[calc(100dvh-var(--app-navbar-h)-1.25rem-var(--content-bottom,5rem))] lg:h-[calc(100dvh-var(--app-navbar-h)-1.5rem-var(--content-bottom,5rem))]");
+  }
+  const own = "h-[calc(100dvh-var(--app-navbar-h)-1rem-var(--content-bottom,1rem))] sm:h-[calc(100dvh-var(--app-navbar-h)-1.25rem-var(--content-bottom,1.25rem))] lg:h-[calc(100dvh-var(--app-navbar-h)-1.5rem-var(--content-bottom,1.5rem))]";
+  return cn(scroll, own, frame === "padded" && giveBack);
+}
+/** The part of the frame that scrolls on a laptop; an edge that cuts a tile fades instead (review round 1, SHOULD-FIX 1). */
+// BI-61 review round 1, SHOULD-FIX 1: both edges fade, each only while it hides something (`scroll-fade`, `useScrollFade`).
+const SCROLL_REGION = "scroll-fade lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:pb-5 print:overflow-visible";
 const SECTION_TEXT_MAX = 120;
 
 /** "open the Sales dashboard", for the hover cue of a chart with a saved click. */
@@ -252,26 +294,45 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // Folders only group the title switcher here. Managing them and filing
   // a dashboard are on the dashboard list (`dashboard-list-page.tsx`).
   const foldersState = useService((signal) => dashboardService.listFolders(signal), []);
+  // BI-61 T1: the facts line's owner and "Updated", and its comment count.
+  const boardList = useService((signal) => dashboardService.listBoards(signal), []);
+  const comments = useService(
+    (signal) => (isDefault ? Promise.resolve(null) : dashboardService.listComments(board, signal)),
+    [board, isDefault],
+  );
+  const commentCount = comments.status === "success" && comments.data ? comments.data.comments.length : null;
   const folders = React.useMemo(() => labelledFolders(foldersState.data ?? [], user?.id), [foldersState.data, user?.id]);
   const [shareOpen, setShareOpen] = React.useState(false);
-  const [commentsOpen, setCommentsOpen] = React.useState(false);
-  // BI-19 owner QA 2026-10-28, QA-3: a mention in the bell links to `?comments=1`. The dialog
-  // opens once the board is loaded (also when the reader is already on this board and only the
-  // parameter is new), and closing it removes the parameter, keeping the others.
+  // BI-61 T6: Comments and Details are tabs of the shell's one side panel, the
+  // panel the AI Copilot docks in, so the two never show side by side.
+  const sidePanel = useSidePanel();
+  useSidePanelTabs(isDefault ? NO_PANEL_TABS : PANEL_TABS);
+  const openSide = sidePanel.open;
+  const commentsOpen = sidePanel.active === "comments";
+  // BI-19 owner QA 2026-10-28, QA-3: a mention in the bell links to `?comments=1`. The comments
+  // open once the board is loaded (also when the reader is already on this board and only the
+  // parameter is new), and closing them removes the parameter, keeping the others.
   const commentsAsked = searchParams.get("comments") === "1";
   const boardLoaded = data !== null;
+  const askedOpened = React.useRef(false);
   React.useEffect(() => {
-    if (commentsAsked && boardLoaded && !isDefault) setCommentsOpen(true);
-  }, [commentsAsked, boardLoaded, isDefault]);
-  const changeCommentsOpen = React.useCallback((open: boolean) => {
-    setCommentsOpen(open);
-    if (open) return;
+    if (!commentsAsked) { askedOpened.current = false; return; }
+    if (boardLoaded && !isDefault && !askedOpened.current) {
+      askedOpened.current = true;
+      openSide("comments");
+    }
+  }, [commentsAsked, boardLoaded, isDefault, openSide]);
+  const wasCommentsOpen = React.useRef(false);
+  React.useEffect(() => {
+    const was = wasCommentsOpen.current;
+    wasCommentsOpen.current = commentsOpen;
+    if (!was || commentsOpen) return;
     const q = new URLSearchParams(searchParams.toString());
     if (!q.has("comments")) return;
     q.delete("comments");
     const qs = q.toString();
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
-  }, [router, pathname, searchParams]);
+  }, [commentsOpen, router, pathname, searchParams]);
   const [historyOpen, setHistoryOpen] = React.useState(false);
   // BI-18 part C, part 2: favourites, and "recent" noted once per dashboard opened.
   const shortcuts = useService((signal) => dashboardService.shortcuts(signal), []);
@@ -393,7 +454,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // Charts added or removed elsewhere (Copilot, board menus); folders are
   // reloaded too, since the same event covers filing a dashboard.
   const reloadFolders = foldersState.reload;
-  useDashboardsChanged(React.useCallback(() => { void load(); reloadFolders(); }, [load, reloadFolders]));
+  const reloadBoardList = boardList.reload;
+  useDashboardsChanged(React.useCallback(() => { void load(); reloadFolders(); reloadBoardList(); }, [load, reloadFolders, reloadBoardList]));
   // Periodic refresh for presenting; pauses while the tab is hidden.
   const savedSec = listedInterval(data?.refreshSeconds);
   const autoSec = effectiveRefresh(data?.refreshSeconds, sessionSec);
@@ -777,15 +839,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       notifyFailure("The dashboard was not duplicated", writeError(e));
     }
   }
-  async function createDashboard() {
-    try {
-      const created = await dashboardService.createBoard({ name: "New dashboard" });
-      notifyDashboardsChanged();
-      if (created.id) router.push(`/dashboards/${created.id}`);
-    } catch (e) {
-      notifyFailure("The dashboard was not created", writeError(e));
-    }
-  }
   async function deleteDashboard() {
     if (isDefault) return;
     try {
@@ -798,6 +851,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     notifyDashboardsChanged();
     // Lupakan sebelum pergi, kalau tidak `/dashboards` menuntun balik ke sini.
     forgetLastBoard(board);
+    forgetRow({ kind: "dashboard", id: board });
     router.push("/dashboards/browse");
   }
   async function renameDashboard(name: string) {
@@ -822,6 +876,41 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const boards = data?.boards ?? [{ id: "default", name: "Main" }];
   const dashName = boards.find((b) => b.id === board)?.name ?? "Dashboards";
   const ownerId = boards.find((b) => b.id === board)?.ownerId;
+  // BI-61 T1: the facts line. Who made it and when it was last written come from
+  // the dashboard list (the page's own read carries neither); a failed read
+  // leaves them out rather than guessing.
+  const listed = boardList.status === "success" ? boardList.data.find((b) => b.id === board) : undefined;
+  // Owner QA 2026-11-14: until the board's name is known (from this page's read or the
+  // dashboard list, whichever lands first) the header holds a title-sized placeholder,
+  // not "Dashboards" switching to the name. Once both reads have answered, the old
+  // stand-in is kept, so a placeholder never stays on a page that is not loading.
+  const knownName = boards.find((b) => b.id === board)?.name ?? listed?.name;
+  // BI-61 T10/T11: the sidebar's Dashboards row is named after the last dashboard or report
+  // opened (its own memory, apart from the last board), refreshed when the board is renamed.
+  React.useEffect(() => { if (knownName) rememberRow("dashboard", board, knownName); }, [board, knownName]);
+  const headerTitle = knownName ?? (data === null && (loading || boardList.status === "loading") ? null : dashName);
+  const folderId = boards.find((b) => b.id === board)?.folderId;
+  const folderChain = React.useMemo(() => {
+    const names: string[] = [];
+    const seen = new Set<string>();
+    let at = folderId ? folders.find((f) => f.id === folderId) : undefined;
+    while (at && !seen.has(at.id)) {
+      seen.add(at.id);
+      names.unshift(at.name);
+      const parent = at.parentId;
+      at = parent ? folders.find((f) => f.id === parent) : undefined;
+    }
+    return names;
+  }, [folders, folderId]);
+  // "Data from" for the page is its oldest tile: everything on screen is at least that fresh.
+  const pageDataFrom = React.useMemo(() => {
+    let oldest: string | undefined;
+    for (const cell of Object.values(data?.results ?? NO_RESULTS)) {
+      if (!hasRows(cell) || !cell.computedAt) continue;
+      if (!oldest || new Date(cell.computedAt).getTime() < new Date(oldest).getTime()) oldest = cell.computedAt;
+    }
+    return dataFromLabel(oldest, data?.reporting?.timeZone, false);
+  }, [data?.results, data?.reporting?.timeZone]);
   // Stable empty fallbacks: a fresh `[]` each render re-ran the Copilot
   // context effect, which re-rendered this page, forever, while loading.
   const kpis = data?.kpis ?? NO_KPIS;
@@ -953,6 +1042,15 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const setPageContext = useCopilotSelect((c) => c.setPageContext);
   const setCopilotMode = useCopilotSelect((c) => c.setMode);
   const setCopilotExpanded = useCopilotSelect((c) => c.setExpanded);
+  // BI-61 T7 with BI-32: the dock's position is one more stable slice.
+  const dockPosition = useCopilotSelect((c) => c.dockPosition);
+  // BI-61 T7: the room the frame leaves under itself: the composer's while its bar
+  // floats at the bottom; the shell's padding while the Copilot sits in the side
+  // panel or a page tab has the panel; none of it without the assistant.
+  const hasAssistant = hasPermission("assistant:use") || hasPermission("assistant:ask");
+  const frameFade = useScrollFade<HTMLDivElement>();
+  const scrollFade = useScrollFade<HTMLDivElement>();
+  const frame: Frame = !hasAssistant ? "plain" : dockPosition === "bottom" && sidePanel.active === null ? "bar" : "padded";
   // AI-2 (plan 20): a `set_board_view_filters` step in the most recent
   // assistant answer applies when its `board` matches the board on screen —
   // mirror what it set into the page address (`?f=`) with the same helper a
@@ -1146,7 +1244,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     // says why. Without a grain on screen the mark would answer nobody.
     const notApplied = hasRows(cell) && data?.appliedGrain && grainedCharts.length > 0
       ? grainNotAppliedSentence(cell.grainNotApplied) : null;
-    const badge = SOURCE_BADGE[spec.source];
     const drilled = tileDrills.drills[spec.id];
     const level = drilled ? tileDrills.currentLevel(spec) : undefined;
     const clickSpec = clickSpecOf(spec, level);
@@ -1161,47 +1258,63 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       onDuplicate: () => void duplicateChart(spec),
       onDelete: () => setRemoving({ id: spec.id, title: spec.title }),
     });
+    // BI-61 T4: one ⋯ per tile, in the mockup's order: edit, refresh, view
+    // data, download ›, alert, lineage, then the rest the old menu held, then
+    // the writes. Nothing the old menu offered is left out.
+    const [editChart, ...otherWrites] = write.edit;
+    const downloads: TileMenuItem[] = downloadKind === "data"
+      ? [
+          // BI-1: a chart of the board downloads its whole result from the server, as
+          // Excel or CSV, formatted or raw (the dialog asks).
+          { label: "Download data…", icon: <Table2 />, onSelect: () => setDataFor({ id: spec.id, title: spec.title }) },
+          // BI-19 part D (plan D13): the chart as a picture, drawn by the same renderer as the PDF, so only where there is one.
+          ...(data?.pdfSupported === true
+            ? [{ label: "Download PNG", icon: <ImageDown />, onSelect: () => void downloadPng(spec.id) }]
+            : []),
+        ]
+      : downloadKind === "csv"
+        // A built-in tile has no stored definition to read and keeps the rows on screen as CSV.
+        ? [{ label: "Download CSV", icon: <Table2 />, onSelect: () => hasRows(cell) && downloadRowsCsv(spec.title, cell) }]
+        : [];
     const menu: TileMenuItem[] = [
-      { label: "Expand", icon: <Maximize2 />, onSelect: () => setTileDialog({ kind: "expand", id: spec.id }) },
-      { label: "View data", icon: <Table2 />, onSelect: () => setTileDialog({ kind: "data", id: spec.id }) },
+      ...(editChart ? [editChart] : []),
       // BI-4 part B (feature decision 6): this tile is computed again and replaces what is remembered; the others stay.
       ...(hasRows(cell) && cell.computedAt ? [{ label: "Refresh this tile", icon: <RefreshCw />, onSelect: () => void load(spec.id) }] : []),
-      // The drill menu stays reachable on a chart that opens somewhere else.
-      ...(spec.def?.click && drillable
-        ? [{ label: menuTiles.has(spec.id) ? "Click opens its destination" : "Click opens the drill menu", icon: <MousePointerClick />, onSelect: () => toggleMenuTile(spec.id) }]
-        : []),
+      { label: "View data", icon: <Table2 />, onSelect: () => setTileDialog({ kind: "data", id: spec.id }) },
+      ...(downloads.length ? [{ label: "Download", icon: <Download />, onSelect: () => {}, sub: downloads }] : []),
+      // BI-19 part C (C3): everyone who can view a stored chart may alert on it
+      // for themselves; the server decides who may send it elsewhere.
+      ...(own && !edit ? [{ label: "Alert me…", icon: <Bell />, onSelect: () => setAlertChart({ id: spec.id, title: spec.title, kind: spec.kind, measures: hasRows(cell) ? cell.columns.filter((c) => c !== spec.def?.dimension) : [], latestPoint: chartHasLatestPoint(spec.def), labels: tileMeasureLabels(spec.def?.measures, spec.y, spec.def?.steps, hasRows(cell) ? cell.metricLabels : undefined, spec.def?.aggregate) }) }] : []),
+      // BI-14 (decision 1, Q6): everyone who sees a stored chart gets the item; the panel says what a person without `lineage:read` may do.
+      ...(own ? [{ label: "Where does this come from", icon: <GitFork />, onSelect: () => setLineageChart({ id: spec.id, title: spec.title }) }] : []),
+      { label: "Expand", icon: <Maximize2 />, onSelect: () => setTileDialog({ kind: "expand", id: spec.id }), separatorBefore: true },
       // A KPI, gauge or table has no mark to click: its rows are one step away here.
       ...((offersTileRecords(spec.kind) || spec.def?.steps?.length) && (spec.mart || spec.sqlSource)
         ? [{ label: "View records", icon: <Table2 />, onSelect: () => openRecords({ title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec) }, spec.source === "builtin", NO_FILTERS, spec.id) }]
         : []),
-      // BI-14 (decision 1, Q6): everyone who sees a stored chart gets the item; the panel says what a person without `lineage:read` may do.
-      ...(own ? [{ label: "Where does this come from", icon: <GitFork />, onSelect: () => setLineageChart({ id: spec.id, title: spec.title }) }] : []),
-      // BI-19 part C (C3): everyone who can view a stored chart may alert on it
-      // for themselves; the server decides who may send it elsewhere.
-      ...(own && !edit ? [{ label: "Alert me…", icon: <Bell />, onSelect: () => setAlertChart({ id: spec.id, title: spec.title, kind: spec.kind, measures: hasRows(cell) ? cell.columns.filter((c) => c !== spec.def?.dimension) : [], latestPoint: chartHasLatestPoint(spec.def), labels: tileMeasureLabels(spec.def?.measures, spec.y, spec.def?.steps, hasRows(cell) ? cell.metricLabels : undefined, spec.def?.aggregate) }) }] : []),
+      // The drill menu stays reachable on a chart that opens somewhere else.
+      ...(spec.def?.click && drillable
+        ? [{ label: menuTiles.has(spec.id) ? "Click opens its destination" : "Click opens the drill menu", icon: <MousePointerClick />, onSelect: () => toggleMenuTile(spec.id) }]
+        : []),
       // BI-9: a chart grouped by a part of the date (a weekday) has no rows to
       // list or range to filter; the menu says why instead of leaving the click dead.
       ...(hasRows(cell) && isGrain(cell.grain) && !isTruncation(cell.grain)
         ? [{ label: "Why clicking does nothing", icon: <MousePointerClick />, onSelect: () => notifyInfo("Nothing to open from this value", PART_NO_CLICK_REASON) }]
         : []),
-      // BI-1: a chart of the board downloads its whole result from the server, as
-      // Excel or CSV, formatted or raw. A built-in tile has no stored definition to
-      // read and keeps the rows on screen as CSV.
-      ...(downloadKind === "data"
-        ? [
-            { label: "Download data…", icon: <Download />, onSelect: () => setDataFor({ id: spec.id, title: spec.title }) },
-            // BI-19 part D (plan D13): the chart as a picture, drawn by the same renderer as the PDF, so only where there is one.
-            ...(data?.pdfSupported === true
-              ? [{ label: "Download PNG", icon: <ImageDown />, onSelect: () => void downloadPng(spec.id) }]
-              : []),
-          ]
-        : downloadKind === "csv"
-          ? [{ label: "Download CSV", icon: <Download />, onSelect: () => hasRows(cell) && downloadRowsCsv(spec.title, cell) }]
-          : []),
-      ...write.edit,
-      ...moveItems(spec.id),
+      ...otherWrites.map((w, i) => (i === 0 ? { ...w, separatorBefore: true } : w)),
+      ...moveItems(spec.id).map((m, i) => (i === 0 && otherWrites.length === 0 ? m : { ...m, separatorBefore: false })),
       ...write.remove,
     ];
+    // BI-61 review round 1, SHOULD-FIX 3: one short line at the top of the tile ⋯,
+    // "12:47 · mart_wisman", that never wraps; the full sentence ("Data from 12:47,
+    // remembered. Reads mart_wisman.") is its tooltip and accessible name. The
+    // dashboard's auto-refresh is the header's, not a tile's, and who made the
+    // chart is the mark beside an AI-made tile's title.
+    const reads = spec.sqlSource ? "SQL source" : spec.mart || null;
+    const { dataFrom: tileFrom, menuNote } = tileFreshness(
+      hasRows(cell) ? cell.computedAt : undefined, data?.reporting?.timeZone, hasRows(cell) ? cell.remembered : undefined,
+      reads, reads ? `Reads ${spec.sqlSource ? "a SQL source" : reads}.` : null,
+    );
     return {
       id: spec.id,
       span: spec.span,
@@ -1221,10 +1334,22 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 limit={typeof spec.def?.limit === "number" ? spec.def.limit : undefined}
                 notApplied={notApplied ?? undefined}
               /> : null}
+          {/* BI-61 review round 1, SHOULD-FIX 2: a chart made with the assistant says so with a quiet,
+              muted mark (no sparkles, DESIGN.md); one made by hand, the default, says nothing. */}
+          {spec.source === "ai" ? (
+            <Tooltip>
+              <TooltipTrigger render={<span className="inline-flex shrink-0 text-muted-foreground/70" />}>
+                <Bot className="size-3.5" aria-label="Made with the assistant" />
+              </TooltipTrigger>
+              <TooltipContent>Made with the assistant</TooltipContent>
+            </Tooltip>
+          ) : null}
           {drillable ? (
         <Tooltip>
           <TooltipTrigger render={<span className="inline-flex shrink-0 text-muted-foreground/70" />}>
-            <MousePointerClick className="size-3.5" aria-label="Clickable chart" />
+            {/* BI-61 review round 1, SHOULD-FIX 2: a pointing hand. The pointer with rays read as the
+                sparkles DESIGN.md lists as AI slop, and as an "AI-made" mark it never was. */}
+            <Pointer className="size-3.5" aria-label="Clickable chart" />
           </TooltipTrigger>
           <TooltipContent>
             {spec.source === "builtin"
@@ -1237,29 +1362,20 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           ) : null}
         </>
       ),
-      badge: (
-        <div className="flex items-center gap-1.5">
-          {badge ? (
-            <span className={cn("inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium", badge.cls)}>
-              {spec.source === "ai" ? <Sparkles className="size-2.5" /> : null}{badge.label}
-            </span>
-          ) : null}
-          {/* The source table is detail for whoever arranges the board. */}
-          {edit ? <span className="hidden rounded-full border px-2 py-0.5 font-mono text-[10px] text-muted-foreground sm:inline">{spec.sqlSource ? "SQL source" : spec.mart}</span> : null}
-        </div>
-      ),
-      menuLabel: spec.sqlSource ? "Source: SQL source" : spec.mart ? `Source: ${spec.mart}` : undefined,
+      // BI-61 T3: no badge on the tile face; its facts are in `menuNote`.
+      menuNote,
+      dataFrom: tileFrom,
       menu,
       body: drilled ? (
         <div className="flex h-full min-h-0 flex-col">
           <DrillTrail steps={drilled.steps} onClimb={(index) => tileDrills.climb(spec, index)} />
           <div className="min-h-0 flex-1">
-            <TileBody spec={{ ...spec, x: level ?? spec.x, def: { ...spec.def, dimension: level } }} cell={drilled.cell} dark={dark} loading={loading || drilled.loading}
+            <TileBody hideDataFrom spec={{ ...spec, x: level ?? spec.x, def: { ...spec.def, dimension: level } }} cell={drilled.cell} dark={dark} loading={loading || drilled.loading}
               onDataClick={drillable ? onChartClick(spec, clickSpec) : undefined} />
           </div>
         </div>
       ) : (
-        <TileBody spec={spec} cell={cell} dark={dark} loading={loading} paging={{ filters: filtersOnTab(filters, tabOf(tabs, layout, spec.id)) }} onTableSort={(sort) => { tableSorts.current[spec.id] = sort; }}
+        <TileBody hideDataFrom spec={spec} cell={cell} dark={dark} loading={loading} paging={{ filters: filtersOnTab(filters, tabOf(tabs, layout, spec.id)) }} onTableSort={(sort) => { tableSorts.current[spec.id] = sort; }}
           onDataClick={drillable ? onChartClick(spec, clickSpec) : undefined} />
       ),
     };
@@ -1270,6 +1386,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const drillOffer = drillChart ? tileDrills.offer(drillChart) : null;
   const filterFields = data?.filterFields ?? NO_FIELDS;
   const showFilterBar = filterFields.length > 0 || filters.length > 0;
+  // BI-61 T3: "+ Filter" is an edit-mode control. A reader who cannot edit has no
+  // edit mode, so for them it stays in reading mode: adding a temporary filter
+  // (kept in the address, never saved) was theirs before and stays reachable.
+  const canAddFilter = edit || !canWrite;
+  const hasFilterRow = showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 || Object.keys(paramRefusals).length > 0
+    || (edit && hasPermission("dashboard:write"));
 
   // BI-19 owner QA 2026-10-28, QA-1: a board that never loaded (for the caller, "dashboard not
   // found") shows the error and nothing that acts on the board: no star, menu, comments or
@@ -1288,210 +1410,258 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // console, and anything portalled out of this element, keeps its theme.
   return (
     <ReportingProvider reporting={data?.reporting}>
-    <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", look.className || (fullscreen && fsDark && "dark"), look.className && !fullscreen && "rounded-lg p-4")} style={look.style}>
-      <PageHeader
-        title={
-          <BoardSwitcher
-            boards={boards}
-            activeId={board}
-            activeName={dashName}
-            onSelect={(id) => router.push(`/dashboards/${id}`)}
-            onCreate={() => void createDashboard()}
-            folders={folders}
-            badge={ownerId ? <PrivateBadge /> : undefined}
-          />
-        }
-        actions={
-          <span data-print-hide className="contents">
-            {fullscreen ? (
-              <Button variant="outline" size="sm" aria-pressed={fsDark} onClick={toggleFsDark}>
-                <Moon className="size-4" /> Dark
-              </Button>
-            ) : null}
-            <EditLayoutButton canWrite={canWrite} edit={edit} onToggle={() => setEdit((e) => !e)} />
+    <div
+      ref={frameFade}
+      data-slot="dashboard-frame"
+      data-frame={fullscreen ? "fullscreen" : frame}
+      className={cn(
+        "flex min-h-0 flex-col gap-4",
+        fullscreen ? "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6" : frameClass(frame),
+        look.className || (fullscreen && fsDark && "dark"),
+        look.className && !fullscreen && "rounded-lg p-4",
+      )}
+      style={look.style}
+    >
+      <DashboardHeader
+        folderPath={folderChain}
+        title={headerTitle}
+        titleAccessory={
+          <>
             {!isDefault ? (
               <FavouriteButton
                 on={isFavourite}
                 name={dashName}
-                onToggle={() => {
-                  void dashboardService.setFavourite("board", board, !isFavourite).then(reloadShortcuts).catch(() => undefined);
-                }}
+                // Micro-interaction audit 2026-11-14: the promise lets the star show the change at once and undo it on failure.
+                onToggle={() => dashboardService.setFavourite("board", board, !isFavourite).then(reloadShortcuts)}
               />
             ) : null}
-            {loading ? (
-              <Button size="sm" variant="outline" onClick={stopLoading}>
-                <Square className="size-4" aria-hidden /> Stop
+            {ownerId ? <PrivateBadge /> : null}
+          </>
+        }
+        facts={{
+          owner: listed?.createdBy || undefined,
+          // BI-61 review round 1, SHOULD-FIX 11 (owner): one time in the header, the data's; when the
+          // dashboard was last edited is in Details ("Edited 5h ago").
+          dataFrom: pageDataFrom,
+          comments: isDefault ? undefined : commentCount,
+        }}
+        loading={loading}
+        onStop={stopLoading}
+        notice={edit ? (
+          // BI-61 T5: what edit mode does, in one line, with the layout's own extras beside it.
+          // Micro-interaction audit 2026-11-14: the line arrives with edit mode (a short fade down from the
+          // title row) instead of popping in; leaving edit mode drops it at once, as the reader asked for.
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl bg-primary/8 px-3 py-2 text-sm transition-[opacity,translate] duration-200 ease-ui starting:-translate-y-1 starting:opacity-0" data-print-hide>
+            <Move className="size-4 shrink-0 text-primary dark:text-sky-300" aria-hidden />
+            {/* BI-18 part C review fix (SHOULD-FIX) R2: the hint's colour is its own; the buttons beside it keep theirs. */}
+            <span className="min-w-0 flex-1 basis-[calc(100%-2rem)] text-primary sm:basis-0 dark:text-sky-200">
+              {phoneEdit
+                // BI-61 review round 1, SHOULD-FIX 4: a short line, not sentences.
+                ? "Move tiles up or down · saves automatically"
+                : "Drag tiles to move · drag a corner to resize · saves automatically"}
+            </span>
+            {canWrite && !isDefault && !phoneEdit ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger render={<Button variant="ghost" size="sm" className="text-primary hover:text-primary dark:text-sky-300" />}><Plus className="size-3.5" /> Heading or section</DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-40">
+                  <DropdownMenuItem onClick={() => setLineDialog({ mode: "add", kind: "heading" })}><Heading className="size-4" /> Heading</DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setLineDialog({ mode: "add", kind: "section" })}><Rows3 className="size-4" /> Section</DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => void addSectionTile("divider", "")}><Minus className="size-4" /> Divider</DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : null}
+            {canWrite ? (
+              <Button variant={phoneEdit ? "default" : "ghost"} size="sm" aria-pressed={phoneEdit} onClick={() => setPhoneEdit((v) => !v)}
+                className={phoneEdit ? undefined : "text-primary hover:text-primary dark:text-sky-300"}>
+                <Smartphone className="size-3.5" /> {phoneEdit ? "Done with phone layout" : "Edit phone layout"}
               </Button>
             ) : null}
-            <DashboardActionsMenu
-              isDefault={isDefault}
-              canWrite={canWrite}
-              canManage={canManage}
-              isPrivate={Boolean(ownerId)}
-              onHistory={() => setHistoryOpen(true)}
-              onTheme={canWrite ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
-              onFreshness={canWrite ? () => { setFreshError(null); setFreshOpen(true); } : undefined}
-              loading={loading}
-              fullscreen={fullscreen}
-              autoSec={String(autoSec)}
-              savedSec={String(savedSec)}
-              canSaveRefresh={refreshIsSaveable({ mayWrite: canWrite, saved: savedSec, effective: autoSec })}
-              savingRefresh={savingRefresh}
-              onRefresh={() => void load("1")}
-              onToggleFullscreen={toggleFullscreen}
-              onAutoSec={(v) => setSessionSec(Number(v))}
-              onSaveRefresh={() => void saveRefreshDefault()}
-              onRename={() => setRenameOpen(true)}
-              onShare={() => setShareOpen(true)}
-              onExportPdf={exportPdf}
-              onDownloadPdf={() => setPdfOpen(true)}
-              onExportFile={() => void downloadFile()}
-              onSaveTemplate={hasPermission("dashboard:write") ? () => setTemplateOpen(true) : undefined}
-              onSubscriptions={() => setSubsOpen(true)}
-              pdfSupported={data?.pdfSupported === true}
-              canDownload={canDownload}
-              onDuplicate={() => void duplicateDashboard()}
-              onDelete={() => void deleteDashboard()}
-            />
-            {/* BI-19 part E: anyone who can see the dashboard can read and write comments; the server checks. */}
-            {!isDefault ? (
-              <Button size="sm" variant="outline" onClick={() => setCommentsOpen(true)}>
-                <MessageSquare className="size-4" /> Comments
+            {phoneEdit && phone?.length ? <Button variant="ghost" size="sm" onClick={() => void resetPhone()}>Use the computed order</Button> : null}
+          </div>
+        ) : undefined}
+        // Owner QA 2026-11-15: the side panel has no close button; pressing the
+        // one that opened it again closes it.
+        onComments={isDefault ? undefined : () => sidePanel.toggle("comments")}
+        onDetails={isDefault ? undefined : () => sidePanel.toggle("details")}
+        actions={
+          <>
+            {fullscreen ? (
+              <Button variant="outline" aria-pressed={fsDark} onClick={toggleFsDark}>
+                <Moon className="size-4" /> Dark
               </Button>
             ) : null}
-            {hasPermission("dashboard:write") ? (
-              <Button size="sm" variant="outline" onClick={() => setParamsOpen(true)}>
-                <SlidersHorizontal className="size-4" /> Parameters
-              </Button>
-            ) : null}
-            <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
-          </span>
+            {edit ? (
+              // BI-61 T5: edit mode's own two controls; Done is the one way back (one action, one button).
+              <>
+                <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
+                <Button variant="outline" className="min-w-20" onClick={() => setEdit(false)}>
+                  <Check data-icon="inline-start" aria-hidden /> Done
+                </Button>
+              </>
+            ) : (
+              <>
+                <EditPencil canWrite={canWrite} onEdit={() => setEdit(true)} />
+                <DashboardActionsMenu
+                  isDefault={isDefault}
+                  canWrite={canWrite}
+                  canManage={canManage}
+                  dataFrom={pageDataFrom?.replace(/^Data from /, "")}
+                  onHistory={() => setHistoryOpen(true)}
+                  onTheme={canWrite ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
+                  onFreshness={canWrite ? () => { setFreshError(null); setFreshOpen(true); } : undefined}
+                  loading={loading}
+                  fullscreen={fullscreen}
+                  autoSec={String(autoSec)}
+                  savedSec={String(savedSec)}
+                  canSaveRefresh={refreshIsSaveable({ mayWrite: canWrite, saved: savedSec, effective: autoSec })}
+                  savingRefresh={savingRefresh}
+                  onRefresh={() => void load("1")}
+                  onToggleFullscreen={toggleFullscreen}
+                  onAutoSec={(v) => setSessionSec(Number(v))}
+                  onSaveRefresh={() => void saveRefreshDefault()}
+                  onRename={() => setRenameOpen(true)}
+                  onExportPdf={exportPdf}
+                  onDownloadPdf={() => setPdfOpen(true)}
+                  onExportFile={() => void downloadFile()}
+                  onSaveTemplate={hasPermission("dashboard:write") ? () => setTemplateOpen(true) : undefined}
+                  onSubscriptions={() => setSubsOpen(true)}
+                  pdfSupported={data?.pdfSupported === true}
+                  canDownload={canDownload}
+                  onDuplicate={() => void duplicateDashboard()}
+                  onDelete={() => void deleteDashboard()}
+                />
+                {/* BI-61 review round 1, SHOULD-FIX 10: Share, the primary, last, as New is on the Dashboards page. */}
+                <ShareButton isDefault={isDefault} isPrivate={Boolean(ownerId)} canManage={canManage} onShare={() => setShareOpen(true)} />
+              </>
+            )}
+          </>
         }
       />
+
+      {/* BI-61 T3: the tabs and the filter chips share one quiet line under the header. */}
+      {tabs.length > 0 || tabEditing || hasFilterRow ? (
+        <div className="flex min-w-0 shrink-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+          <TabBar tabs={tabs} selected={selTab} onSelect={selectTab} editing={tabEditing} />
+          {hasFilterRow ? (
+            // BI-61 review round 1, SHOULD-FIX 5: with no tabs beside them the chips start at the left.
+            <FilterRow className="sm:flex-1" align={tabs.length > 0 || tabEditing ? "end" : "start"}>
+              {grainedCharts.length > 0 ? (
+                <GrainSwitch
+                  choices={grainChoices}
+                  value={shownGrainValue}
+                  changed={grainDirty}
+                  onChange={(next) => writeGrain(next === "" ? "own" : next)}
+                />
+              ) : null}
+              <ParamControls controls={paramControls} onChange={changeParam} refusals={paramRefusals} defaults={data?.defaultParams} />
+              <FilterBar
+                board={board}
+                fields={filterFields}
+                filters={filters}
+                savedFilters={defaultFilters}
+                onChange={applyFilters}
+                dirty={rowDirty}
+                canSaveDefault={!isDefault && canWrite}
+                canAdd={canAddFilter}
+                tabs={tabs}
+                saving={savingDefault}
+                onSaveDefault={() => void saveRowDefault()}
+                onReset={resetRow}
+              />
+              {/* BI-61 T5: which parameters the row shows is an edit-mode choice, beside "+ Filter". */}
+              {edit && hasPermission("dashboard:write") ? (
+                <button type="button" onClick={() => setParamsOpen(true)}
+                  className={cn("inline-flex h-8 shrink-0 items-center gap-1 rounded-full px-3 text-sm font-medium text-primary hover:bg-primary/10 active:scale-[0.97] dark:text-sky-300", EASE, FOCUS)}>
+                  <SlidersHorizontal className="size-3.5" aria-hidden /> Parameters
+                </button>
+              ) : null}
+            </FilterRow>
+          ) : null}
+        </div>
+      ) : null}
 
       {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{readableErrorMessage(error)}</div> : null}
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
 
-      {showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 || Object.keys(paramRefusals).length > 0 ? (
-        <FilterRow count={filters.filter(isActiveFilter).length + (pValues ? Object.keys(pValues).length : 0)}>
-          {grainedCharts.length > 0 ? (
-            <GrainSwitch
-              choices={grainChoices}
-              value={shownGrainValue}
-              onChange={(next) => writeGrain(next === "" ? "own" : next)}
+      {/* BI-61 T7: on a laptop only the tiles scroll, inside the frame, so the
+          header and the filter row stay and the composer never covers a tile. */}
+      <div ref={scrollFade} className={cn("flex min-w-0 flex-col gap-4", !fullscreen && SCROLL_REGION)} data-slot="dashboard-scroll">
+        {/* KPI row (builtin dashboard) */}
+        {kpis.length ? (
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            {kpis.map((k) => {
+              const cell = data?.results[k.id];
+              const v = hasRows(cell) ? Number(cell.rows[0]?.v ?? 0) : null;
+              return (
+                <div key={k.id} className="rounded-2xl bg-muted/45 p-4 dark:bg-card">
+                  {/* Owner QA 2026-11-15: one line, the full title in a tooltip when it is cut. */}
+                  <OverflowText as="p" text={k.title} className="text-xs font-medium text-muted-foreground" />
+                  {loading && v === null ? <div className="mt-2 h-7 w-24 animate-pulse rounded bg-muted" /> : (
+                    // Owner QA 2026-11-15: the number fits its card (`KpiValue`), compact only when even 60% of its size is too wide.
+                    <KpiValue
+                      className="mt-1 text-2xl font-semibold tabular-nums text-foreground"
+                      full={v === null ? "—" : fmtInt(v)} compact={v === null ? null : compactKpiText(Math.round(v), undefined, "en-US", 0)}
+                    />
+                  )}
+                  {k.caption ? <OverflowText as="p" lines={2} text={k.caption} className="mt-1 text-[11px] text-muted-foreground" /> : null}
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+
+        {/* Canvas */}
+        {stopped ? (
+          <p role="status" className="text-sm text-muted-foreground">{STOPPED_SENTENCE}. Press Refresh to load the dashboard again.</p>
+        ) : null}
+        {loading && charts.length === 0 ? (
+          <DashboardTilesSkeleton />
+        ) : !loading && charts.length === 0 && !stopped ? (
+          <Empty className="rounded-2xl bg-muted/45 dark:bg-card">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <ChartColumn />
+              </EmptyMedia>
+              <EmptyTitle>No charts yet</EmptyTitle>
+              <EmptyDescription>
+                Build one yourself, or ask AI Copilot — for example “a bar chart of foreign visitors by region”.
+              </EmptyDescription>
+            </EmptyHeader>
+            <EmptyContent className="flex-row justify-center gap-2">
+              <NewChartButton size="sm" canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setCopilotMode("build");
+                  setCopilotExpanded(true);
+                }}
+              >
+                {/* BI-61 review round 1, SHOULD-FIX 2: no sparkles icon (DESIGN.md, AI slop). */}
+              <Bot className="size-4" aria-hidden /> Ask AI Copilot
+              </Button>
+            </EmptyContent>
+          </Empty>
+        ) : (
+          <>
+            <DashboardGrid
+              items={items} layout={shownLayout} editable={edit && !phoneEdit} onLayoutChange={persistLayout}
+              tabs={tabs} tab={selTab} phone={phone} phoneEdit={edit && phoneEdit} onPhoneChange={persistPhone}
+              foldKey={board}
+              look="soft"
             />
-          ) : null}
-          <ParamControls controls={paramControls} onChange={changeParam} refusals={paramRefusals} />
-          <FilterBar
-            board={board}
-            fields={filterFields}
-            filters={filters}
-            savedFilters={defaultFilters}
-            onChange={applyFilters}
-            dirty={rowDirty}
-            canSaveDefault={!isDefault && canWrite}
-            tabs={tabs}
-            saving={savingDefault}
-            onSaveDefault={() => void saveRowDefault()}
-            onReset={resetRow}
-          />
-        </FilterRow>
-      ) : null}
-
-      {/* KPI row (builtin dashboard) */}
-      {kpis.length ? (
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-          {kpis.map((k) => {
-            const cell = data?.results[k.id];
-            const v = hasRows(cell) ? Number(cell.rows[0]?.v ?? 0) : null;
-            return (
-              <div key={k.id} className="rounded-xl border bg-card p-4 shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]">
-                <p className="text-xs font-medium text-muted-foreground">{k.title}</p>
-                {loading && v === null ? <div className="mt-2 h-7 w-24 animate-pulse rounded bg-muted" /> : <p className="mt-1 text-2xl font-semibold tabular-nums text-foreground">{v === null ? "—" : fmtInt(v)}</p>}
-                {k.caption ? <p className="mt-1 text-[11px] text-muted-foreground">{k.caption}</p> : null}
-              </div>
-            );
-          })}
-        </div>
-      ) : null}
-
-      {/* Canvas */}
-      {stopped ? (
-        <p role="status" className="text-sm text-muted-foreground">{STOPPED_SENTENCE}. Press Refresh to load the dashboard again.</p>
-      ) : null}
-      {loading && charts.length === 0 ? (
-        <DashboardTilesSkeleton />
-      ) : !loading && charts.length === 0 && !stopped ? (
-        <Empty className="border border-dashed">
-          <EmptyHeader>
-            <EmptyMedia variant="icon">
-              <ChartColumn />
-            </EmptyMedia>
-            <EmptyTitle>No charts yet</EmptyTitle>
-            <EmptyDescription>
-              Build one yourself, or ask AI Copilot — for example “a bar chart of foreign visitors by region”.
-            </EmptyDescription>
-          </EmptyHeader>
-          <EmptyContent className="flex-row justify-center gap-2">
-            <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                setCopilotMode("build");
-                setCopilotExpanded(true);
-              }}
-            >
-              <Sparkles className="size-4" /> Ask AI Copilot
-            </Button>
-          </EmptyContent>
-        </Empty>
-      ) : (
-        <>
-          {edit ? (
-            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-primary/30 bg-primary/5 px-3 py-1.5 text-xs">
-              <Move className="size-3.5 text-primary" />
-              {/* BI-18 part C review fix (SHOULD-FIX) R2: the muted colour is the hint's alone; on the bar it was inherited by the buttons and made them look disabled. */}
-              <span className="min-w-0 flex-1 text-muted-foreground">
-                {phoneEdit
-                  ? <>Phone layout: <span className="font-medium text-foreground">move tiles up or down</span> and change their height. Saved automatically.</>
-                  : <>Edit mode: <span className="font-medium text-foreground">drag the header</span> to move, <span className="font-medium text-foreground">drag the bottom-right corner</span> to resize. Saved automatically.</>}
-              </span>
-              {canWrite && !isDefault && !phoneEdit ? (
-                <DropdownMenu>
-                  <DropdownMenuTrigger render={<Button variant="outline" size="sm" />}><Plus className="size-3.5" /> Add</DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-40">
-                    <DropdownMenuItem onClick={() => setLineDialog({ mode: "add", kind: "heading" })}><Heading className="size-4" /> Heading</DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => setLineDialog({ mode: "add", kind: "section" })}><Rows3 className="size-4" /> Section</DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => void addSectionTile("divider", "")}><Minus className="size-4" /> Divider</DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              ) : null}
-              {canWrite ? (
-                <Button variant={phoneEdit ? "default" : "outline"} size="sm" aria-pressed={phoneEdit} onClick={() => setPhoneEdit((v) => !v)}>
-                  <Smartphone className="size-3.5" /> {phoneEdit ? "Done with phone layout" : "Edit phone layout"}
-                </Button>
-              ) : null}
-              {phoneEdit && phone?.length ? <Button variant="ghost" size="sm" onClick={() => void resetPhone()}>Use the computed order</Button> : null}
-            </div>
-          ) : null}
-          <TabBar tabs={tabs} selected={selTab} onSelect={selectTab} editing={tabEditing} />
-          <DashboardGrid
-            items={items} layout={shownLayout} editable={edit && !phoneEdit} onLayoutChange={persistLayout}
-            tabs={tabs} tab={selTab} phone={phone} phoneEdit={edit && phoneEdit} onPhoneChange={persistPhone}
-            foldKey={board}
-          />
-          {tabs.length > 0 && selTab && tilesOnTab(tabs, layout, chartIds, selTab).length === 0 ? (
-            // BI-18 part C review fix (SHOULD-FIX) R3: the page's own empty state.
-            <Empty className="border border-dashed">
-              <EmptyHeader>
-                <EmptyTitle>No tiles on this tab</EmptyTitle>
-                {edit ? <EmptyDescription>Use “Move to” in a tile&apos;s menu on another tab.</EmptyDescription> : null}
-              </EmptyHeader>
-            </Empty>
-          ) : null}
-        </>
-      )}
+            {tabs.length > 0 && selTab && tilesOnTab(tabs, layout, chartIds, selTab).length === 0 ? (
+              // BI-18 part C review fix (SHOULD-FIX) R3: the page's own empty state.
+              <Empty className="rounded-2xl bg-muted/45 dark:bg-card">
+                <EmptyHeader>
+                  <EmptyTitle>No tiles on this tab</EmptyTitle>
+                  {edit ? <EmptyDescription>Use “Move to” in a tile&apos;s menu on another tab.</EmptyDescription> : null}
+                </EmptyHeader>
+              </Empty>
+            ) : null}
+          </>
+        )}
+      </div>
 
       {lineDialog ? (
         <LineDialog
@@ -1577,7 +1747,30 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onReverted={() => { notifyDashboardsChanged(); void load(); }}
         />
       ) : null}
-      {!isDefault ? <CommentsDialog board={board} dashName={dashName} open={commentsOpen} onOpenChange={changeCommentsOpen} /> : null}
+      {/* BI-61 T6: drawn by this page into the shared side panel's body, so they keep this page's state. */}
+      {!isDefault && sidePanel.host && sidePanel.active === "comments"
+        ? createPortal(<CommentsPanel board={board} onChanged={comments.reload} className="flex-1 p-4" />, sidePanel.host)
+        : null}
+      {!isDefault && sidePanel.host && sidePanel.active === "details"
+        ? createPortal(
+            <DetailsPanel
+              board={board}
+              listed={listed}
+              canManage={canManage}
+              canShare={canManage && !ownerId}
+              canWrite={canWrite}
+              canDownload={canDownload}
+              dataFrom={pageDataFrom}
+              autoRefresh={autoSec > 0 ? (REFRESH_OPTIONS.find((o) => o.seconds === autoSec)?.label ?? "On") : "Off"}
+              cacheRule={data?.cacheRule}
+              onShare={() => setShareOpen(true)}
+              onFreshness={() => { setFreshError(null); setFreshOpen(true); }}
+              onSubscriptions={() => setSubsOpen(true)}
+              onHistory={() => setHistoryOpen(true)}
+            />,
+            sidePanel.host,
+          )
+        : null}
       {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen && canManage} onOpenChange={setShareOpen} /> : null}
       {themeOpen ? (
         <ThemeFontDialog open={themeOpen} onOpenChange={setThemeOpen} theme={data?.theme} font={data?.font}
