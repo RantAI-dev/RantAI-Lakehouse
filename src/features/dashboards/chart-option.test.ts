@@ -270,3 +270,18 @@ test("BI-72: a goal label carries its number once", () => {
   assert.equal(labelOf("Q4 target", 1000), "Q4 target 1,000")
   assert.equal(labelOf(undefined, 1000), "1,000")
 })
+
+test("BI-72: a widened axis ends on a round tick and every value axis hides overlapping labels", () => {
+  const base = buildOption({ kind: "bar", x: "k", y: "v", source: "ui" } as never, [{ k: "a", v: 12000 }], false)
+  const option = withReferenceLines(base, [{ value: 15700, label: "Goal" }], false, false) as unknown as {
+    yAxis: { max: (r: { max: number }) => number; axisLabel: { hideOverlap?: boolean } }
+  }
+  assert.equal(option.yAxis.max({ max: 12000 }), 20000)
+  assert.equal(option.yAxis.max({ max: 90000 }), 90000, "a higher data max is kept")
+  for (const kind of ["bar", "line", "area", "hbar"] as const) {
+    const o = buildOption({ kind, x: "k", y: "v", source: "ui" } as never, [{ k: "a", v: 1 }], false) as unknown as Record<string, { type?: string; axisLabel?: { hideOverlap?: boolean } }>
+    const axis = kind === "hbar" ? o.xAxis : o.yAxis
+    assert.equal(axis.type, "value")
+    assert.equal(axis.axisLabel?.hideOverlap, true, kind)
+  }
+})

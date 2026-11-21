@@ -153,7 +153,7 @@ export function buildOption(
     type: "value" as const,
     name, nameTextStyle: { color: axis, fontSize: 10 }, nameGap: 8,
     position: (right ? "right" : "left") as "right" | "left",
-    axisLabel: { color: axis, fontSize: 11, formatter: (v: number) => fmtCompact(v) },
+    axisLabel: { color: axis, fontSize: 11, hideOverlap: true, formatter: (v: number) => fmtCompact(v) },
     splitLine: { show: !right, lineStyle: { color: split } },
     axisLine: { show: false }, axisTick: { show: false },
   });
@@ -400,7 +400,7 @@ export function buildOption(
   const horizontal = spec.kind === "hbar";
   const valueAxis = {
     type: "value" as const,
-    axisLabel: { color: axis, fontSize: 11, formatter: (v: number) => fmtCompact(v) },
+    axisLabel: { color: axis, fontSize: 11, hideOverlap: true, formatter: (v: number) => fmtCompact(v) },
     splitLine: { lineStyle: { color: split } },
     axisLine: { show: false },
     axisTick: { show: false },
@@ -712,6 +712,15 @@ function carriesNumber(label: string, formatted: string, value: number): boolean
   return wanted.some((w) => text.includes(w));
 }
 
+/** The next 1, 2, 2.5 or 5 x 10^n step above `top`, with steps sized for about five intervals from `min` (BI-72). */
+function niceCeil(top: number, min: number): number {
+  const raw = (top - Math.min(min, 0)) / 5;
+  if (!(raw > 0)) return top;
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * p).find((c) => c >= raw) ?? raw;
+  return Math.ceil(top / step) * step;
+}
+
 function withMarkLines(
   option: EChartsOption,
   lines: readonly ReferenceLine[] | undefined,
@@ -807,7 +816,8 @@ function withMarkLines(
   const widen = (axis: unknown, top: number) => {
     if (!axis || typeof axis !== "object" || (axis as { type?: string }).type !== "value") return axis;
     if (!Number.isFinite(top)) return axis;
-    return { ...(axis as object), max: (range: { max: number }) => Math.max(range.max, top) };
+    // BI-72: end on a round tick above the line, not on its raw value, so no second max label sits beside the last tick.
+    return { ...(axis as object), max: (range: { max: number; min?: number }) => (top <= range.max ? range.max : niceCeil(top, range.min ?? 0)) };
   };
   const valueAxes = horizontal ? option.xAxis : option.yAxis;
   const widened = Array.isArray(valueAxes)
