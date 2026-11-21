@@ -1576,9 +1576,13 @@ async fn an_alert_owned_by_a_narrowed_user_records_not_found() {
     let body: Value = serde_json::from_slice(&bytes).expect("a JSON body");
 
     assert_eq!(
-        body["results"][0]["skipped"],
+        body["results"][0]["failed"],
         "Table not found or not available to your organisation: serving.mart_x",
         "the run records the not-found sentence, not a generic failure: {body}"
+    );
+    assert!(
+        body["results"][0].get("skipped").is_none(),
+        "a refused read is failed, not skipped: {body}"
     );
     assert!(
         fake.log
