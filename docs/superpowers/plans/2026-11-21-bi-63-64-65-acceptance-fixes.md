@@ -341,3 +341,20 @@ status of the unknown-field 400 is covered only through the existing
 `parse_body` mapping, not by a new route test. No browser check of the form,
 no QA. `docs/core/features/sharing-and-delivery.md` (AC12 wording) and
 `BACKLOG.md` are not updated (planner's after merge).
+## Handoff 3, PR 2 (`BI-64`)
+
+Review SHOULD-FIX 1, second pass. The planner found in a real headless Chrome
+that `html.embed-transparent { color-scheme: normal; }` had no effect: the
+theme provider (next-themes via the Rantai Design System `ThemeProvider`)
+sets `color-scheme: dark` as an inline style on `<html>`, and an inline style
+beats a class rule, so Chrome still painted an opaque dark backdrop on a light
+host page. Changed in `src/app/globals.css`: the rule is now
+`color-scheme: normal !important`, with the reason in the comment, and
+`html.dark.embed-transparent body { color-scheme: dark; }` keeps scrollbars
+and form controls dark inside a dark embed (the canvas backdrop follows only
+the root's scheme). No light counterpart: light already maps to normal. No
+provider option was used and no other page is touched. CHANGELOG unchanged
+(its BI-64 entry does not describe the rule).
+
+Checks: `bun test src/features/dashboards/embed-view.test.tsx` (counts in the
+report). Browser check: planner re-verifies on the QA stack.
