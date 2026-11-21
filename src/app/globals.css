@@ -41,9 +41,19 @@
  * browser paints an opaque canvas behind the iframe (CSS Color Adjust, the
  * iframe backdrop rule), and the console's dark theme sets `color-scheme:
  * dark` on `<html>`. `normal` leaves the host page's scheme to decide.
+ *
+ * Second pass (BI-64 review SHOULD-FIX 1, second pass): the `ThemeProvider`
+ * (next-themes, from the Rantai Design System, mounted in `src/app/layout.tsx`)
+ * writes `color-scheme` as an inline `style` on `<html>`. An inline style beats
+ * a class rule, so only an `!important` declaration outranks it. The canvas
+ * backdrop follows the root's scheme only, so `body` keeps the theme's scheme
+ * and native scrollbars and form controls stay dark in a dark embed.
  */
 html.embed-transparent {
-  color-scheme: normal;
+  color-scheme: normal !important;
+}
+html.dark.embed-transparent body {
+  color-scheme: dark;
 }
 html.embed-transparent,
 html.embed-transparent body {

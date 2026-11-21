@@ -222,3 +222,21 @@ already asserts the class on `<html>`, and a CSS rule is not testable in
 happy-dom, so no test change. Not verified in a browser (no login to the QA
 console was possible). Checks: `bun test embed-view.test.tsx` and
 `bun x tsc --noEmit -p .` run after the edit, results below in the report.
+
+## Handoff 3, PR 2 (`BI-64`)
+
+Review SHOULD-FIX 1, second pass. The planner found in a real headless Chrome
+that `html.embed-transparent { color-scheme: normal; }` had no effect: the
+theme provider (next-themes via the Rantai Design System `ThemeProvider`)
+sets `color-scheme: dark` as an inline style on `<html>`, and an inline style
+beats a class rule, so Chrome still painted an opaque dark backdrop on a light
+host page. Changed in `src/app/globals.css`: the rule is now
+`color-scheme: normal !important`, with the reason in the comment, and
+`html.dark.embed-transparent body { color-scheme: dark; }` keeps scrollbars
+and form controls dark inside a dark embed (the canvas backdrop follows only
+the root's scheme). No light counterpart: light already maps to normal. No
+provider option was used and no other page is touched. CHANGELOG unchanged
+(its BI-64 entry does not describe the rule).
+
+Checks: `bun test src/features/dashboards/embed-view.test.tsx` (counts in the
+report). Browser check: planner re-verifies on the QA stack.
