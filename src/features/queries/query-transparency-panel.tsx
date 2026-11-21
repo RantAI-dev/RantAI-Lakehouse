@@ -171,14 +171,14 @@ export function QueryTransparencyPanel({
           reporting a confident "0 B · 1.00 cu · Fresh · 0 s" about
           nothing. A statement that waits for a parameter names it. */}
       {waitingFor !== null ? (
-        <p className="text-muted-foreground">
+        <p className="text-sm text-muted-foreground">
           {`Fill in {{${waitingFor}}} for a pre-run estimate.`}
         </p>
       ) : state.status === "idle" || estimatable === false ? (
-        <p className="text-muted-foreground">Type SQL for a pre-run estimate.</p>
+        <p className="text-sm text-muted-foreground">Type SQL for a pre-run estimate.</p>
       ) : null}
       {state.status === "error" ? (
-        <p className="text-muted-foreground">
+        <p className="text-sm text-muted-foreground">
           Estimate unavailable.{" "}
           <button
             type="button"
@@ -202,8 +202,8 @@ export function QueryTransparencyPanel({
           read. The engine is the status bar's. */}
       {state.data?.supported === false && estimatable !== false ? (
         <div className="space-y-1">
-          <p className="font-medium">No pre-run estimate</p>
-          <p className="text-muted-foreground">{state.data.reason}</p>
+          <p className="text-sm font-medium">No pre-run estimate</p>
+          <p className="text-sm text-muted-foreground">{state.data.reason}</p>
         </div>
       ) : null}
       {/* A query ClickHouse cannot even plan has no estimate. Its reason is
@@ -212,7 +212,7 @@ export function QueryTransparencyPanel({
           on this panel, so it is shown instead of a row of zeros. */}
       {state.data?.error && state.data.supported !== false && estimatable !== false ? (
         <div className="space-y-1">
-          <p className="font-medium">This query cannot be planned</p>
+          <p className="text-sm font-medium">This query cannot be planned</p>
           <p className="font-mono text-xs leading-relaxed text-muted-foreground">
             {state.data.error}
           </p>

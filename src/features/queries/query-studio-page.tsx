@@ -11,12 +11,14 @@ import { Tabs, TabsContent } from "@/components/ui/tabs"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useCopilot } from "@/features/copilot/use-copilot"
 import { builtInBoardEditable } from "@/features/dashboards/chart-page"
+import { useService } from "@/hooks/use-service"
 import { useWindowWidth } from "@/hooks/use-window-width"
 import { summarizeQuery } from "@/lib/page-context-summary"
 import { queryDraftKey } from "@/lib/query-draft"
 import { pinnedSnapshots, unpinSnapshots } from "@/lib/snapshot-picker"
 import { formatSql } from "@/lib/sql-format"
 import { queryEngineLabel } from "@/lib/status"
+import { settingsService } from "@/services"
 import { FormatSettingsDialog } from "./format-settings-dialog"
 import { KeyboardShortcutsDialog } from "./keyboard-shortcuts-dialog"
 import { NaturalLanguagePanel } from "./nl-panel"
@@ -90,6 +92,12 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
   // edit that dashboard as well as the right to write the SQL source.
   const canMakeChart = canAuthorSources && builtInBoardEditable(hasPermission)
   const format = useFormatSettings()
+  // UX-9 browser review: the result grid writes numbers in the deployment's
+  // number locale, as the dashboards' tables do. Any signed-in person may
+  // read it (`GET /api/settings/reporting`); until it answers, or if it
+  // does not, the grid uses the server's own default.
+  const reporting = useService((signal) => settingsService.getReporting(signal), [])
+  const numberLocale = reporting.status === "success" ? reporting.data.numberLocale : undefined
 
   // The side panel is open on a laptop and closed on a narrow screen until
   // the person says otherwise; their choice then holds at every width.
@@ -324,6 +332,7 @@ function QueryStudioWorkspace({ draftKey }: { draftKey: string | null }) {
                   studio.download.start(openRun.result.id, format, openRun.runId)
                 }
                 onMakeChart={canMakeChart ? () => makeChart(openRun.statement.text) : undefined}
+                numberLocale={numberLocale}
               />
             ) : null}
             {openRun?.status === "error" ? (

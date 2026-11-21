@@ -104,8 +104,8 @@ export function SchemaBrowser({
             // missing; here the person needs to know it is the catalog.
             <div className="flex flex-col items-center gap-2 px-3 py-6 text-center" role="status">
               <Lock className="size-5 text-muted-foreground" aria-hidden />
-              <p className="font-medium">The schema browser needs catalog access</p>
-              <p className="text-muted-foreground">
+              <p className="text-sm font-medium">The schema browser needs catalog access</p>
+              <p className="text-[13px] leading-5 text-muted-foreground">
                 Your role cannot read the catalog. The editor still runs SQL; ask a workspace
                 administrator for catalog access to browse tables here.
               </p>
@@ -114,11 +114,11 @@ export function SchemaBrowser({
             <ErrorState error={assetsState.error} className="px-3 py-6" />
           )
         ) : tables.length === 0 ? (
-          <p className="px-2 py-4 text-muted-foreground">The catalog shows no tables.</p>
+          <p className="px-2 py-4 text-[13px] leading-5 text-muted-foreground">The catalog shows no tables.</p>
         ) : matched.length === 0 ? (
           // QS-11 (LH-QS-1-07), D10: say the search found nothing rather than
           // drawing an empty browser that looks like a broken catalog.
-          <p className="px-2 py-4 text-muted-foreground">
+          <p className="px-2 py-4 text-[13px] leading-5 text-muted-foreground">
             No table matches &quot;{search}&quot;.
           </p>
         ) : (
@@ -195,7 +195,10 @@ function TableRow({
   const columnsLocked = columnsFollowRow && !insertable
   const noTable = columnsFollowRow && proof?.status === "missing"
   return (
-    <li>
+    // The console's base styles size a bare `li` and `p` at 16 px
+    // (globals.css), so every text element here names its own size: the
+    // app's 13 px list text (UX-9 browser review, SHOULD-FIX 1).
+    <li className="text-[13px] leading-5">
       <div className="flex items-center gap-0.5 rounded-md hover:bg-muted/60">
         <Button
           size="icon-xs"
@@ -218,7 +221,14 @@ function TableRow({
           type="button"
           className="flex h-7 min-w-0 flex-1 items-center gap-1.5 rounded px-1 text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/50 aria-disabled:cursor-not-allowed aria-disabled:opacity-60"
           aria-disabled={!insertable}
-          title={insertable ? `Insert ${table.reference}` : missingReason}
+          // UX-9 browser review: one row shape for every layer, the name
+          // alone on the line; the full name, and the address it inserts or
+          // why it cannot, are the row's tooltip.
+          title={
+            insertable
+              ? `${table.label} · insert ${table.reference}`
+              : `${table.label}: ${missingReason}`
+          }
           aria-label={insertable ? `Insert ${table.reference}` : table.label}
           onClick={
             insertable
@@ -229,12 +239,9 @@ function TableRow({
           }
         >
           <Table2 className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-          <span className="truncate font-medium">{table.label}</span>
-          {insertable ? (
-            <span className="ml-auto truncate pl-1 font-mono text-[11px] text-muted-foreground">
-              {table.reference}
-            </span>
-          ) : null}
+          <span className="min-w-0 truncate text-[13px] font-normal text-foreground">
+            {table.label}
+          </span>
         </button>
       </div>
       {open ? (
@@ -245,7 +252,7 @@ function TableRow({
             <p className="py-1 text-xs text-muted-foreground">Loading columns…</p>
           ) : state.status === "failed" ? (
             <div className="py-1 text-xs">
-              <p className="text-muted-foreground">
+              <p className="text-xs text-muted-foreground">
                 Columns could not be loaded{state.reason ? `: ${state.reason}` : "."}
               </p>
               <Button
@@ -261,7 +268,7 @@ function TableRow({
           ) : (
             <ul>
               {state.columns.map((column) => (
-                <li key={column.name}>
+                <li key={column.name} className="text-xs leading-5">
                   <button
                     type="button"
                     className="flex h-6 w-full items-center justify-between gap-2 rounded px-1.5 text-left outline-none transition-colors duration-150 ease-ui hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent"
@@ -283,7 +290,7 @@ function TableRow({
             // A failed read is not an answer about the table: it says so and
             // is read again here, on the next open or on request.
             <div className="py-1 text-xs">
-              <p className="text-muted-foreground">{TABLE_PROOF_FAILED}</p>
+              <p className="text-xs text-muted-foreground">{TABLE_PROOF_FAILED}</p>
               <Button
                 size="xs"
                 variant="outline"
