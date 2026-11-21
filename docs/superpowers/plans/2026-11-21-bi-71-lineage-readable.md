@@ -243,3 +243,18 @@ CI were not run. Nothing pushed.
   containment: Tab reaches the page behind it. Use the app's dialog
   primitive (or its focus trap) so Tab stays inside, as every other dialog
   does; keep Esc, `F` and the focus return. Fix with the next owner QA round.
+
+## Handoff 3 (review SHOULD-FIX 1)
+
+- Fixed in one commit: the full-screen overlay now loops Tab (last to first)
+  and Shift+Tab (first to last), and pulls focus back in if it is outside.
+  Kept to a minimal containment in the existing keydown handler, not the
+  `Dialog` primitive, because that is a centred popup with its own Esc and
+  focus return and would change the look and behaviour the owner passed.
+  Esc, `F`, focus return, scroll lock, fade and reduced motion are untouched.
+- Test: "keeps Tab and Shift+Tab inside the overlay" in
+  `asset-lineage-mindmap.test.tsx`.
+- Ran: `tsc --noEmit` clean; `eslint` on both files clean; `bun test` on
+  the mindmap and map tests: 18 pass, 0 fail.
+- Not verified: no browser check; the focusable list is a selector, so a
+  control that is hidden but focusable would count as an edge. Not pushed.
