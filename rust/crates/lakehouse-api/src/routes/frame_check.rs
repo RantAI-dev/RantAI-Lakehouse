@@ -41,7 +41,7 @@ use crate::state::AppState;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long an answer is kept for an address.
-const CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const CACHE_TTL: Duration = Duration::from_mins(10);
 
 /// The most addresses kept; the cache is emptied when it is full, so a caller
 /// cannot grow it without bound.
@@ -50,8 +50,21 @@ const CACHE_MAX: usize = 512;
 /// What an address off the content sites, or no address, gets.
 const NOT_ALLOWED: &str = "url must be an address on an allowed content site.";
 
-static CACHE: LazyLock<Mutex<HashMap<String, (Instant, Option<bool>)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// What a site's headers said: `Some(framable)`, or `None` for "no claim".
+type Verdict = Option<bool>;
+
+/// An address's remembered answer and when it was learned.
+type CacheEntries = HashMap<String, (Instant, Verdict)>;
+
+static CACHE: LazyLock<Mutex<CacheEntries>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// What the cache holds for an address.
+enum Cached {
+    /// Never asked, or the answer is older than [`CACHE_TTL`].
+    Unknown,
+    /// Asked recently; the answer may itself be "no claim".
+    Known(Verdict),
+}
 
 /// The query of `GET /api/dashboard/frame-check`. Optional so a missing
 /// address is the route's own 400.
@@ -204,10 +217,14 @@ async fn probe(
     verdict(response.headers(), site, console)
 }
 
-fn cached(url: &str) -> Option<Option<bool>> {
-    let cache = CACHE.lock().ok()?;
-    let (at, answer) = cache.get(url)?;
-    (at.elapsed() < CACHE_TTL).then_some(*answer)
+fn cached(url: &str) -> Cached {
+    let Ok(cache) = CACHE.lock() else {
+        return Cached::Unknown;
+    };
+    match cache.get(url) {
+        Some((at, answer)) if at.elapsed() < CACHE_TTL => Cached::Known(*answer),
+        _ => Cached::Unknown,
+    }
 }
 
 fn remember(url: &str, answer: Option<bool>) {
@@ -240,7 +257,7 @@ pub async fn frame_check(
     if !format.content_sites.contains(&site) {
         return Err(not_allowed().into());
     }
-    if let Some(answer) = cached(&url) {
+    if let Cached::Known(answer) = cached(&url) {
         return Ok(ApiJson(json!({ "framable": answer })));
     }
     let answer = match (
