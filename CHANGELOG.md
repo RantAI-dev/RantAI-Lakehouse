@@ -119,6 +119,7 @@ once a first release is tagged.
 
 ### Fixed
 
+- A non-streamed chat turn on a slow model ends with a reply built from the tools that already ran, instead of a timeout error; a streamed turn stops starting new rounds but has no hard end (backlog `AI-34`).
 - An Excel download (a dashboard tile, Query Studio) shows a text that starts with =, +, - or @ as it is, without the guarding apostrophe; the cell is a text cell and is never run as a formula. CSV and TSV downloads keep the apostrophe (backlog `BI-55`, QA `LH-BI-1-08`).
 - The console refuses an oversized or a wrong-format workspace logo or icon before sending it, showing the same rule sentence, so the upload never leaves the browser (backlog `ADM-2`).
 - An oversized workspace logo or icon is refused with the size rule it broke, instead of a server error (backlog `ADM-2`).
