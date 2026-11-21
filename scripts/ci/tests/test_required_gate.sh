@@ -39,7 +39,7 @@ expect() {
   (
     # Clean subshell environment
     unset EVENT_NAME SCOPE_RUST SCOPE_FRONTEND SCOPE_DAGSTER SCOPE_STACK SCOPE_DOCS_ONLY SCOPE_ALL \
-          PUSH_PROVEN SELECTED_GATE_GROUPS GATE_PATHS_FILE \
+          PUSH_PROVEN PR_DRAFT SELECTED_GATE_GROUPS GATE_PATHS_FILE \
           CHANGES_RESULT REPO_LINTS_RESULT FRONTEND_RESULT RUST_FMT_RESULT RUST_CLIPPY_RESULT \
           RUST_BUILD_RESULT RUST_TEST_RESULT RUST_MSRV_RESULT DAGSTER_TESTS_RESULT DAGSTER_LOADER_TESTS_RESULT \
           G1_RUSTFS_RESULT G2_SEAWEEDFS_RESULT G3A_DAGSTER_RESULT G3_MAINTENANCE_RESULT \
@@ -307,6 +307,60 @@ mkdir -p "$REPO_TMP"
 grep -v '^group cdc ' "${SCRIPT_DIR}/../gate_paths.txt" > "$no_cdc_map"
 expect 1 "a gate job with no group line is required even when cdc is not selected" "${base_none_selected[@]}" GATE_PATHS_FILE="$no_cdc_map"
 expect 1 "an unreadable gate path map makes every gate required" "${base_cdc_selected[@]}" GATE_PATHS_FILE=/nonexistent
+
+# OPS-38 D1: a draft pull request runs only the fast checks (changes,
+# repo-lints, verify when frontend/all, fmt when rust/all); heavy Rust, Dagster,
+# images, and acceptance gates are skipped and accepted as skipped. Unknown
+# draft state, ready PRs, and non-PR events fail closed and require full checks.
+base_draft_rust_green=(
+  EVENT_NAME=pull_request PR_DRAFT=true SCOPE_RUST=true
+  CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=skipped
+  RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=skipped RUST_BUILD_RESULT=skipped
+  RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped
+  DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
+  IMAGES_RESULT=skipped IMAGE_SMOKE_RESULT=skipped
+)
+
+base_draft_all_green=(
+  EVENT_NAME=pull_request PR_DRAFT=true SCOPE_ALL=true
+  CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=success
+  RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=skipped RUST_BUILD_RESULT=skipped
+  RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped
+  DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
+  IMAGES_RESULT=skipped IMAGE_SMOKE_RESULT=skipped
+)
+
+base_draft_dagster_green=(
+  EVENT_NAME=pull_request PR_DRAFT=true SCOPE_DAGSTER=true
+  CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=skipped
+  RUST_FMT_RESULT=skipped RUST_CLIPPY_RESULT=skipped RUST_BUILD_RESULT=skipped
+  RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped
+  DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
+  IMAGES_RESULT=skipped IMAGE_SMOKE_RESULT=skipped
+)
+
+expect 0 "draft rust PR passes with fast checks green and heavy jobs skipped" "${base_draft_rust_green[@]}"
+expect 0 "draft scope-all PR passes with verify and fmt green and heavy jobs skipped" "${base_draft_all_green[@]}"
+expect 0 "draft dagster PR passes with repo-lints green and dagster/gates skipped" "${base_draft_dagster_green[@]}"
+expect 0 "draft frontend PR passes with verify green" "${base_frontend_green[@]}" PR_DRAFT=true
+expect 1 "draft frontend PR still fails when verify is skipped" "${base_frontend_green[@]}" PR_DRAFT=true FRONTEND_RESULT=skipped
+expect 1 "draft rust PR still fails when fmt is skipped" "${base_draft_rust_green[@]}" RUST_FMT_RESULT=skipped
+expect 1 "draft rust PR still fails when repo-lints fails" "${base_draft_rust_green[@]}" REPO_LINTS_RESULT=failure
+expect 1 "draft rust PR still fails if a heavy job ran and failed" "${base_draft_rust_green[@]}" RUST_TEST_RESULT=failure
+expect 1 "draft rust PR still fails if a gate ran and was cancelled" "${base_draft_rust_green[@]}" G1_RUSTFS_RESULT=cancelled
+expect 1 "ready rust PR fails when heavy jobs are skipped" "${base_draft_rust_green[@]}" PR_DRAFT=false
+expect 1 "pull request with empty PR_DRAFT fails closed when heavy jobs are skipped" "${base_draft_rust_green[@]}" PR_DRAFT=
+expect 1 "pull request with PR_DRAFT=TRUE (wrong case) fails closed when heavy jobs are skipped" "${base_draft_rust_green[@]}" PR_DRAFT=TRUE
+expect 1 "pull request with PR_DRAFT=unknown fails closed when heavy jobs are skipped" "${base_draft_rust_green[@]}" PR_DRAFT=unknown
+expect 1 "non-PR event ignores PR_DRAFT=true and requires heavy jobs" "${base_draft_rust_green[@]}" EVENT_NAME=push
+expect 1 "scheduled event ignores PR_DRAFT=true and requires heavy jobs" "${base_draft_rust_green[@]}" EVENT_NAME=schedule
+
+draft_log="$(env -i PATH="$PATH" "${base_draft_rust_green[@]}" bash "$SCRIPT" 2>&1)" || draft_rc=$?
+if [ "${draft_rc:-0}" -eq 0 ] && grep -qi "draft" <<< "$draft_log"; then
+  log_pass "draft PR logs that the PR is a draft"
+else
+  log_fail "draft PR did not log draft state (rc=${draft_rc:-0})"
+fi
 
 # 3. Workflow & Gate structure consistency checks (SHOULD-FIX 6)
 CI_YML="${SCRIPT_DIR}/../../../.github/workflows/ci.yml"

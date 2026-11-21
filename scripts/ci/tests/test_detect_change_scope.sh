@@ -99,6 +99,7 @@ run_case() {
     EVENT_NAME="${CASE_EVENT:-pull_request}" \
     FORCE_ALL="${CASE_FORCE_ALL:-}" \
     ALL_GATES_LABEL="${CASE_ALL_GATES_LABEL:-}" \
+    PR_DRAFT="${CASE_PR_DRAFT:-}" \
     GATE_PATHS_FILE="${CASE_GATE_PATHS_FILE:-}" \
     BASE_SHA="$BASE_SHA" \
     GITHUB_OUTPUT="$output" \
@@ -604,6 +605,26 @@ if test_classify_mode; then
 else
   log_fail "--classify did not print the expected groups"
 fi
+
+# ── OPS-38 D1: draft PR detection (fail closed) ───────────────────────────
+assert_draft() {
+  local label="$1" want="$2"
+  local output got
+  output="$(run_case docs/test.md)"
+  got="$(grep "^draft=" <<< "$output" | cut -d= -f2)"
+  if [ "$got" = "$want" ]; then
+    log_pass "$label"
+  else
+    log_fail "$label (got draft=${got}, want ${want})"
+  fi
+}
+
+CASE_PR_DRAFT=true assert_draft "draft=true on pull_request with PR_DRAFT=true" "true"
+CASE_PR_DRAFT=false assert_draft "draft=false on pull_request with PR_DRAFT=false" "false"
+CASE_PR_DRAFT= assert_draft "draft=false on pull_request with empty PR_DRAFT (fail closed)" "false"
+CASE_PR_DRAFT=TRUE assert_draft "draft=false on pull_request with PR_DRAFT=TRUE (case-sensitive, fail closed)" "false"
+CASE_PR_DRAFT=unknown assert_draft "draft=false on pull_request with unknown PR_DRAFT (fail closed)" "false"
+CASE_EVENT=push CASE_PR_DRAFT=true assert_draft "draft=false on push even with PR_DRAFT=true" "false"
 
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
