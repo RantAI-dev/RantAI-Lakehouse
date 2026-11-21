@@ -10,6 +10,7 @@ import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { MAX_TABS, TAB_TITLE_MAX } from "@/lib/dashboard-tabs";
+import { useSlidingIndicator } from "@/hooks/use-sliding-indicator";
 import { cn } from "@/lib/utils";
 import { LineDialog } from "./line-dialog";
 import type { BoardTab } from "@/services";
@@ -55,24 +56,39 @@ function DeleteTabDialog({
  * The tab bar of a dashboard (BI-18 part C). Read-only unless `editing` is
  * given, which adds a ⋯ menu to each tab (rename, move, delete) and a button
  * to add one. A dashboard with no tabs shows nothing to a reader.
+ *
+ * `BI-61` T3: quiet underlined tabs with no rule across the page; they share
+ * one line with the filter chips, so the bar sizes to its tabs.
  */
 export function TabBar({
   tabs, selected, onSelect, editing,
 }: { tabs: BoardTab[]; selected?: string; onSelect: (id: string) => void; editing?: TabEditing }) {
   const [dialog, setDialog] = React.useState<{ kind: "add" } | { kind: "rename" | "delete"; tab: BoardTab } | null>(null);
+  // Micro-interaction audit 2026-11-14 (emil): one underline that slides to the chosen tab, instead of
+  // one per tab fading out here and in there. The key also changes when a tab is added, renamed or
+  // moved, or edit mode adds the tabs' ⋯, all of which move the chosen tab without resizing it.
+  const { listRef, indicatorRef } = useSlidingIndicator(
+    `${selected ?? ""}|${tabs.map((t) => `${t.id}:${t.title}`).join(",")}|${editing ? "edit" : ""}`,
+  );
   if (tabs.length === 0 && !editing) return null;
   const close = () => setDialog(null);
   return (
-    <div data-print-hide className="flex items-center gap-1 overflow-x-auto border-b border-border" role="tablist" aria-label="Dashboard tabs">
+    <div ref={listRef} data-print-hide className="relative flex min-w-0 items-center gap-4 overflow-x-auto [scrollbar-width:none]" role="tablist" aria-label="Dashboard tabs">
       {tabs.map((t, i) => {
         const active = t.id === selected;
         return (
-          <div key={t.id} className={cn("flex shrink-0 items-center border-b-2 -mb-px", active ? "border-primary" : "border-transparent")}>
+          <div key={t.id} className="flex shrink-0 items-center gap-0.5">
             <button
               type="button"
               role="tab"
               aria-selected={active}
-              className={cn("px-3 py-2 text-sm font-medium", active ? "text-foreground" : "text-muted-foreground hover:text-foreground")}
+              data-indicator-item
+              data-indicator-active={active || undefined}
+              className={cn(
+                "relative h-8 rounded-sm text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+                "transition-[color,scale] duration-200 ease-ui active:scale-[0.97]",
+                active ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+              )}
               onClick={() => onSelect(t.id)}
             >
               {t.title}
@@ -94,8 +110,10 @@ export function TabBar({
           </div>
         );
       })}
+      <span ref={indicatorRef} aria-hidden data-slot="tab-indicator"
+        className="pointer-events-none absolute bottom-0 left-0 h-0.5 rounded-full bg-foreground data-ready:transition-[transform,width] data-ready:duration-[240ms] data-ready:ease-move" />
       {editing ? (
-        <Button variant="ghost" size="sm" className="shrink-0" disabled={tabs.length >= MAX_TABS} onClick={() => setDialog({ kind: "add" })}>
+        <Button variant="ghost" size="sm" className="h-8 shrink-0 rounded-full text-primary hover:text-primary dark:text-sky-300" disabled={tabs.length >= MAX_TABS} onClick={() => setDialog({ kind: "add" })}>
           <Plus className="size-3.5" /> {tabs.length === 0 ? "Add tabs" : "Tab"}
         </Button>
       ) : null}

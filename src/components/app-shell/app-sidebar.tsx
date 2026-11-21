@@ -4,7 +4,7 @@ import * as React from "react"
 import { createPortal } from "react-dom"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { CircleUserRound, ChevronRight } from "lucide-react"
+import { ChevronDown, ChevronRight, FileText } from "lucide-react"
 import { BrandPicture } from "@/components/brand-picture"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useBranding, type BrandingView } from "@/hooks/use-branding"
@@ -16,39 +16,88 @@ import {
   SidebarGroup,
   SidebarHeader,
   SidebarMenu,
-  SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSub,
   SidebarMenuSubItem,
   SidebarRail,
+  SIDEBAR_FADE,
+  SIDEBAR_MOTION,
   useSidebar,
 } from "@/components/ui/sidebar"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { useDashboardsRow } from "@/features/dashboards/dashboards-row"
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups"
 import { PRODUCT_LOGO_DARK, PRODUCT_LOGO_LIGHT } from "@/lib/product-branding"
 import { cn } from "@/lib/utils"
 import { NAV_GROUPS, activeNavHref, canOpen, type NavGroup, type NavItem } from "./nav-config"
+import {
+  ACCOUNT_AVATAR_CLASS,
+  ACCOUNT_CARD_CLASS,
+  SIDEBAR_CLASS,
+  SIDEBAR_CONTENT_CLASS,
+  SIDEBAR_FOOTER_CLASS,
+  SIDEBAR_GROUP_CLASS,
+  SIDEBAR_MENU_CLASS,
+  SIDEBAR_SUB_CLASS,
+  SIDEBAR_VIEW_PANE_CLASS,
+  initialsOf,
+  navRowClass,
+} from "./sidebar-classes"
+import { SidebarChats } from "./sidebar-chats"
+import { UserMenu } from "./user-menu"
+
+/** The conversation page, where the sidebar lists the chats instead of the menu (`WEB-18`). */
+export const CONVERSATION_PATH = "/copilot"
 
 function BrandLogo({ branding }: { branding: BrandingView }) {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
   // The workspace's own logos come from `GET /api/branding`; the product's
   // own files stand in for the ones it did not set.
   return (
-    <div className="relative size-8 shrink-0" aria-hidden>
+    // A 32 px slot (the rail's icon column) holds the 24 px mark, centred in it (BI-61, owner QA
+    // 2026-11-14); the pictures are the workspace's own (`ADM-2`), each kept inside a 28 x 24 box.
+    <div className="grid size-8 shrink-0 place-items-center" aria-hidden>
       <BrandPicture
         src={branding.logoSrc}
         alt={branding.name}
         fallbackSrc={PRODUCT_LOGO_LIGHT}
-        className="size-8 object-contain dark:hidden"
+        className="h-6 w-7 object-contain dark:hidden"
       />
       <BrandPicture
         src={branding.logoDarkSrc}
         alt={branding.name}
         fallbackSrc={PRODUCT_LOGO_DARK}
-        className="hidden size-8 object-contain dark:block"
+        className="hidden h-6 w-7 object-contain dark:block"
       />
     </div>
+  )
+}
+
+/**
+ * The sidebar's header: the logo and the product's name. Nothing in it
+ * depends on who is signed in, so the loading shell (`AppShellSkeleton`)
+ * draws this same component while the session is checked, and the header
+ * does not change at all when the real sidebar mounts.
+ */
+export function SidebarBrand() {
+  // `--app-navbar-h`, so the header is exactly as tall as the navbar (`app-navbar.tsx` reads the
+  // same variable) and their bottom borders meet in one straight line across the screen. The
+  // header used to take its height from its content (padding and the logo row), 69 px, 5 px lower
+  // than the navbar, and the break showed right where the sidebar meets the content.
+  // The workspace's own name and logo (`ADM-2`); the product's own stand in for whatever it did
+  // not set. The loading shell draws this too: the route is public, so it needs no session.
+  const branding = useBranding()
+  return (
+    // The logo sits 8 px in, centred on the 48 px rail, in both states; the name fades.
+    <SidebarHeader className="flex h-(--app-navbar-h) shrink-0 flex-col justify-center border-b border-sidebar-border px-2 py-0">
+      <div className="flex min-w-0 items-center justify-start gap-2">
+        <BrandLogo branding={branding} />
+        <div className={cn("grid min-w-0 flex-1 gap-0.5 whitespace-nowrap leading-none", SIDEBAR_FADE)}>
+          <span className="truncate text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">{branding.name}</span>
+        </div>
+      </div>
+    </SidebarHeader>
   )
 }
 
@@ -72,10 +121,8 @@ export function AppSidebar() {
   const activeHref = activeNavHref(pathname)
   const { state } = useSidebar()
   const iconMode = state === "collapsed"
-  const { user, hasPermission } = useAuth()
-  // The workspace's own name and logo (`ADM-2`); the product's own stand
-  // in for whatever it did not set.
-  const branding = useBranding()
+  const dashboardsRow = useDashboardsRow()
+  const { user, hasPermission, logout } = useAuth()
   const groups = React.useMemo(() => {
     return NAV_GROUPS.map((g) => ({
       ...g,
@@ -91,6 +138,51 @@ export function AppSidebar() {
     activeLabel: activeGroup?.label,
     defaultOpenLabels,
   })
+  // WEB-18: on a conversation the sidebar lists the chats instead of the menu. "Back to menu"
+  // brings the menu back for this visit only: any navigation (another page, the browser's Back)
+  // resets it, so the next conversation opens on its chats again.
+  const hasAssistant = hasPermission("assistant:use") || hasPermission("assistant:ask")
+  const onConversation = pathname === CONVERSATION_PATH && hasAssistant
+  // Owner QA 2026-11-14: Home's split row opens the list on any page, so the view is the route's
+  // default (the list on a conversation, the menu elsewhere) unless the person chose one for this
+  // visit; any pathname change drops the choice.
+  const [chatsChoice, setChatsChoice] = React.useState<boolean | null>(null)
+  React.useEffect(() => setChatsChoice(null), [pathname])
+  const showChats = hasAssistant && (chatsChoice ?? onConversation)
+
+  // The slide between the two views. The chat view mounts the first time it is wanted, off to the
+  // right, and only then moves in, so the browser has a place to move it from; after that it stays
+  // mounted, out of view and inert, and the two views just trade places.
+  const [chatsMounted, setChatsMounted] = React.useState(showChats)
+  const [chatsIn, setChatsIn] = React.useState(showChats)
+  const chatsPaneRef = React.useRef<HTMLDivElement>(null)
+  const contentRef = React.useRef<HTMLDivElement>(null)
+  // The view that gets the focus once it is in: the control that leads back to the other one.
+  const focusOnArrival = React.useRef<"chats" | "menu" | null>(null)
+  React.useEffect(() => {
+    if (showChats && !chatsMounted) {
+      setChatsMounted(true)
+      return
+    }
+    if (showChats === chatsIn) return
+    // Lay the pane out at its starting place before it moves (a fresh pane has no "from" yet).
+    void chatsPaneRef.current?.offsetWidth
+    setChatsIn(showChats)
+  }, [showChats, chatsMounted, chatsIn])
+  React.useEffect(() => {
+    const target = focusOnArrival.current
+    if (!target) return
+    focusOnArrival.current = null
+    contentRef.current?.querySelector<HTMLElement>(`[data-view-focus="${target}"]`)?.focus({ preventScroll: true })
+  }, [chatsIn])
+  const backToMenu = () => {
+    focusOnArrival.current = "menu"
+    setChatsChoice(false)
+  }
+  const openChats = () => {
+    focusOnArrival.current = "chats"
+    setChatsChoice(true)
+  }
   const [flyout, setFlyout] = React.useState<FlyoutState>(null)
   const flyoutRef = React.useRef<HTMLDivElement>(null)
   const [mounted, setMounted] = React.useState(false)
@@ -133,13 +225,7 @@ export function AppSidebar() {
     setFlyout({ label, top: r.top, left: r.right + 8 })
   }
 
-  const menuBtnClass = (active: boolean) =>
-    cn(
-      "h-8 rounded-md px-2.5 py-1.5 text-sm tracking-normal transition-colors duration-150",
-      active
-        ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
-        : "font-normal text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
-    )
+  const menuBtnClass = navRowClass
 
   /**
    * Satu baris halaman.
@@ -157,7 +243,7 @@ export function AppSidebar() {
         href={item.href}
         onClick={(e) => handleNavClick(e, item.href)}
         className={cn(
-          "flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm transition-colors duration-150",
+          "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors duration-150 ease-ui",
           active
             ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
             : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
@@ -174,167 +260,201 @@ export function AppSidebar() {
     const first = group.items[0]
     const Icon = group.icon ?? first.icon
     // A group declared with one page shows that page's title, which is the
-    // more descriptive of the two ("History" over "History").
-    const label = single ? first.title : group.label
+    // more descriptive of the two.
+    // Only the Dashboards row is named after what it opens: the last dashboard or report
+    // opened (its own memory, cleared by Browse). Nothing remembered keeps "Dashboards".
+    const remembered = first.href === "/dashboards" ? dashboardsRow : null
+    const label = remembered?.name ?? (single ? first.title : group.label)
+    const labelHref = remembered
+      ? remembered.kind === "report"
+        ? `/dashboards/reports/${encodeURIComponent(remembered.id)}`
+        : `/dashboards/${encodeURIComponent(remembered.id)}`
+      : first.href === "/dashboards"
+        ? (first.action?.href ?? first.href)
+        : first.href
+    // The icon follows the kind. BI-61 T11 review: a dashboard keeps the row's own chart icon
+    // (the Browse part beside it already uses the grid); a report gets the document icon.
+    const RowIcon = remembered?.kind === "report" ? FileText : Icon
     const active = group.items.some((it) => it.href === activeHref)
 
     // One page, or icon mode with one page: nothing to expand.
     if (single) {
       return (
-        <SidebarMenuItem key={group.label} className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:justify-center">
-          <SidebarMenuButton
-            isActive={active}
-            tooltip={label}
-            className={menuBtnClass(active)}
-            render={
-              <Link href={first.href} onClick={(e) => handleNavClick(e, first.href)}>
-                <Icon className="size-4 shrink-0" />
-                <span className="truncate leading-5">{label}</span>
-              </Link>
-            }
-          />
-          {/* A second destination at the row's right end, where a section's
-              chevron sits. `SidebarMenuAction` hides itself in icon mode. */}
-          {first.action ? (
-            // The app's tooltips open at once: the root `TooltipProvider`
-            // has delay 0, and in base-ui a provider's zero wins over a
-            // `delay` set on the trigger. This one sits on a navigation row
-            // the pointer crosses all the time, so it gets its own provider
-            // and waits for the pointer to rest.
-            <TooltipProvider delay={500}>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <SidebarMenuAction
-                    aria-label={first.action.title}
-                    // Sits where a section's chevron sits: same size
-                    // (3.5) and the same 18px from the row's right edge
-                    // to its centre, measured against the Data chevron.
-                    className="right-2 text-sidebar-foreground/50 [&>svg]:size-3.5"
-                    render={
-                      <Link
-                        href={first.action.href}
-                        onClick={(e) => handleNavClick(e, first.action?.href ?? first.href)}
-                      />
-                    }
-                  />
-                }
-              >
-                <first.action.icon />
-              </TooltipTrigger>
-              <TooltipContent side="right">{first.action.title}</TooltipContent>
-            </Tooltip>
-            </TooltipProvider>
-          ) : null}
+        <SidebarMenuItem key={group.label} className={first.action ? "flex items-stretch" : undefined}>
+          {(() => {
+            // A split row (shadcn's button group): the label part and, at the right end, a square
+            // part that is the whole touch target for a second destination, one thin separator
+            // between them. Each part lights up on its own; the active route lights only its own part.
+            const action = first.action
+            const href = action?.href
+            const actionActive = !!action && (href ? pathname === href || pathname.startsWith(`${href}/`) : onConversation)
+            const labelActive = active && !actionActive
+            const actionClass = cn(
+              "grid size-8 shrink-0 place-items-center rounded-r-md outline-hidden ring-sidebar-ring transition-colors duration-150 focus-visible:ring-2 group-data-[collapsible=icon]:hidden [&>svg]:size-3.5",
+              actionActive
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
+            )
+            return (
+              <>
+                <SidebarMenuButton
+                  isActive={labelActive}
+                  tooltip={label}
+                  aria-label={remembered ? `${remembered.kind === "report" ? "Report" : "Dashboard"}: ${remembered.name}` : undefined}
+                  className={cn(
+                    menuBtnClass(labelActive),
+                    action && "min-w-0 flex-1 rounded-r-none group-data-[collapsible=icon]:flex-none group-data-[collapsible=icon]:rounded-md",
+                  )}
+                  render={
+                    <Link href={labelHref} onClick={(e) => handleNavClick(e, labelHref)}>
+                      <RowIcon className="size-4 shrink-0" />
+                      <span className={cn("truncate leading-5", SIDEBAR_FADE)}>{label}</span>
+                    </Link>
+                  }
+                />
+                {action ? (
+                  // The app's tooltips open at once: the root `TooltipProvider` has delay 0, and in
+                  // base-ui a provider's zero wins over a `delay` set on the trigger. This sits on
+                  // a navigation row the pointer crosses all the time, so it gets its own provider
+                  // and waits for the pointer to rest. Hidden with the rail's collapse: Browse stays
+                  // reachable from the page itself.
+                  <TooltipProvider delay={500}>
+                    <span aria-hidden className="my-2 w-px shrink-0 bg-sidebar-border group-data-[collapsible=icon]:hidden" />
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={
+                          href ? (
+                            <Link
+                              href={href}
+                              aria-label={action.title}
+                              aria-current={actionActive ? "page" : undefined}
+                              onClick={(e) => handleNavClick(e, href)}
+                              className={actionClass}
+                            />
+                          ) : (
+                            <button
+                              type="button"
+                              aria-label={action.title}
+                              aria-current={actionActive ? "page" : undefined}
+                              data-view-focus="menu"
+                              onClick={openChats}
+                              className={actionClass}
+                            />
+                          )
+                        }
+                      >
+                        <action.icon />
+                      </TooltipTrigger>
+                      <TooltipContent side="right">{action.title}</TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                ) : null}
+              </>
+            )
+          })()}
         </SidebarMenuItem>
       )
     }
 
-    // Expanded mode, several pages → the header expands the section in
-    // place instead of navigating. Previously it was a link to the first
-    // page, so simply looking at what a section contained cost a page
-    // load, and only the active section could ever be seen.
-    if (!iconMode) {
-      const expanded = isGroupOpen(group.label)
-      return (
-        <SidebarMenuItem key={group.label}>
-          <SidebarMenuButton
-            isActive={active && !expanded}
-            className={menuBtnClass(active && !expanded)}
-            render={
-              <button
-                type="button"
-                aria-expanded={expanded}
-                onClick={() => toggleGroup(group.label)}
-              >
-                <Icon className="size-4 shrink-0" />
-                <span className="flex-1 truncate text-left leading-5">
-                  {label}
-                </span>
-                <ChevronRight
-                  className={cn(
-                    "size-3.5 shrink-0 text-sidebar-foreground/50 transition-transform duration-150",
-                    expanded && "rotate-90"
-                  )}
-                  aria-hidden
-                />
-              </button>
-            }
-          />
-          {expanded ? (
-            <SidebarMenuSub className="mr-0 gap-0.5 border-sidebar-border pr-0">
+    // Several pages. Expanded, the header opens and closes the section in
+    // place instead of navigating (it used to link to the first page, so
+    // looking at what a section held cost a page load). Collapsed, the same
+    // row opens a FLYOUT of its pages, as there is no room to show them. One
+    // element in both states, so the row does not swap as the sidebar moves:
+    // its box narrows, its label fades and its pages fold away with it.
+    const expanded = !iconMode && isGroupOpen(group.label)
+    const flyoutOpen = iconMode && flyout?.label === group.label
+    const lit = iconMode ? active || flyoutOpen : active && !expanded
+    return (
+      <SidebarMenuItem key={group.label}>
+        <SidebarMenuButton
+          isActive={lit}
+          className={menuBtnClass(lit)}
+          render={
+            <button
+              type="button"
+              data-section-trigger
+              title={iconMode ? label : undefined}
+              aria-expanded={iconMode ? flyoutOpen : expanded}
+              onClick={(e) => (iconMode ? openFlyout(group.label, e.currentTarget) : toggleGroup(group.label))}
+            >
+              <Icon className="size-4 shrink-0" />
+              <span className={cn("flex-1 truncate text-left leading-5", SIDEBAR_FADE)}>
+                {label}
+              </span>
+              <ChevronRight
+                className={cn(
+                  // Micro-interaction audit 2026-11-14: `rotate-90` sets `rotate`, not `transform`, in
+                  // Tailwind v4, so the chevron used to snap; it now turns with the section's fold.
+                  "size-3.5 shrink-0 text-sidebar-foreground/50 transition-[rotate,opacity] duration-200 ease-ui",
+                  expanded && "rotate-90",
+                  "group-data-[collapsible=icon]:opacity-0",
+                )}
+                aria-hidden
+              />
+            </button>
+          }
+        />
+        {/* The pages fold (0fr) and unfold (1fr) in the sidebar's time; folded they are inert,
+            so they take no focus. */}
+        <div
+          className={cn("grid transition-[grid-template-rows]", SIDEBAR_MOTION, expanded ? "grid-rows-[1fr]" : "grid-rows-[0fr]")}
+          inert={!expanded}
+        >
+          <div className="min-h-0 overflow-hidden">
+            <SidebarMenuSub className={SIDEBAR_SUB_CLASS}>
               {group.items.map((item) => (
                 <SidebarMenuSubItem key={item.href}>
                   {linkRow(item, item.href === activeHref, false)}
                 </SidebarMenuSubItem>
               ))}
             </SidebarMenuSub>
-          ) : null}
-        </SidebarMenuItem>
-      )
-    }
-
-    // Icon mode + multi-item → a flyout button.
-    const isOpen = flyout?.label === group.label
-    return (
-      <SidebarMenuItem key={group.label} className="flex justify-center">
-        <button
-          type="button"
-          data-section-trigger
-          title={label}
-          aria-expanded={isOpen}
-          onClick={(e) => openFlyout(group.label, e.currentTarget)}
-          className={cn(
-            "grid size-8 place-items-center rounded-md transition-colors duration-150",
-            (active || isOpen)
-              ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium"
-              : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
-          )}
-        >
-          <Icon className="size-4" />
-        </button>
+          </div>
+        </div>
       </SidebarMenuItem>
     )
   }
 
   const openGroup = groups.find((g) => g.label === flyout?.label)
 
+  const menuEntries = groups.map(renderEntry)
+
   return (
-    <Sidebar data-print-hide collapsible="icon" side="left" className="border-r border-sidebar-border bg-sidebar shadow-sm">
-      {/* `h-16` supaya persis setinggi navbar (`app-navbar.tsx` juga
-          `h-16`), sehingga garis bawah keduanya menyambung jadi satu
-          garis lurus di seluruh lebar layar. Sebelumnya tinggi header ini
-          dihitung dari isinya (padding + baris logo) dan jatuh di 69px —
-          5px lebih rendah dari navbar, dan patahannya terlihat tepat di
-          pertemuan sidebar dengan konten. */}
-      <SidebarHeader className="flex h-16 shrink-0 flex-col justify-center border-b border-sidebar-border px-3 py-0 group-data-[collapsible=icon]:px-2">
-        <div className="flex min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:justify-center">
-          <BrandLogo branding={branding} />
-          {/* Owner QA 2026-11-14, sidebar width: at 14rem the name stands alone, on one line. */}
-          <span className="min-w-0 flex-1 text-sm leading-none font-semibold tracking-[-0.084px] whitespace-nowrap text-sidebar-foreground group-data-[collapsible=icon]:hidden">
-            {branding.name}
-          </span>
+    <Sidebar data-print-hide collapsible="icon" side="left" className={SIDEBAR_CLASS}>
+      <SidebarBrand />
+
+      <SidebarContent ref={contentRef} className={cn(SIDEBAR_CONTENT_CLASS, "relative overflow-hidden")}>
+        {/* WEB-18 (owner 2026-11-14): on a conversation the chat list takes the menu's place,
+            as in a chat app, so the history is beside the chat it belongs to instead of on a
+            page of its own. The account card and the logo row stay. */}
+        {/* The two views sit side by side and slide together (`SIDEBAR_VIEW_PANE_CLASS`): the
+            menu leaves to the left as the chats come in from the right, so the sidebar is never
+            empty mid-move, and its width does not change. The one out of view is inert. */}
+        <div
+          className={cn(
+            SIDEBAR_VIEW_PANE_CLASS,
+            "no-scrollbar overflow-y-auto group-data-[collapsible=icon]:overflow-hidden",
+            chatsIn && "-translate-x-full",
+          )}
+          inert={chatsIn}
+          data-sidebar-view="menu"
+        >
+          <SidebarGroup className={SIDEBAR_GROUP_CLASS}>
+            <SidebarMenu className={SIDEBAR_MENU_CLASS}>
+              {menuEntries}
+            </SidebarMenu>
+          </SidebarGroup>
         </div>
-      </SidebarHeader>
-
-      <SidebarContent className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:flex-col group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:gap-0">
-        <SidebarGroup className="gap-0 px-2 py-2 group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-2">
-          <SidebarMenu className="mt-0 flex flex-col gap-0.5 group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:gap-1.5">
-            {groups.map(renderEntry)}
-          </SidebarMenu>
-        </SidebarGroup>
-
-        {/* A dashboard list and Copilot history used to live here. Both
-            only ever appeared once you were already on their page, so
-            they could never be used to NAVIGATE there — that was page
-            content occupying navigation space, and it vanished the moment
-            the sidebar collapsed to icons. Both now live in their own
-            page's header instead (`BoardSwitcher`, `CopilotHistoryMenu`),
-            and the sidebar purely reads `nav-config` with no per-route
-            exception. */}
-        {/* The active section's pages used to be repeated down here, in a
-            separate block. They now sit inside their own group above, so
-            the section that is open is the one you are reading. */}
+        {chatsMounted ? (
+          <div
+            ref={chatsPaneRef}
+            className={cn(SIDEBAR_VIEW_PANE_CLASS, !chatsIn && "translate-x-full")}
+            inert={!chatsIn}
+            data-sidebar-view="chats"
+          >
+            <SidebarChats shown={chatsIn} onBack={backToMenu} />
+          </div>
+        ) : null}
       </SidebarContent>
 
       {/* Flyout (icon mode only) */}
@@ -343,7 +463,8 @@ export function AppSidebar() {
             <div
               ref={flyoutRef}
               style={{ position: "fixed", top: Math.min(flyout.top, window.innerHeight - 40 - openGroup.items.length * 34), left: flyout.left }}
-              className="z-[60] w-56 rounded-xl border border-sidebar-border bg-sidebar p-1.5 shadow-2xl"
+              // Micro-interaction audit 2026-11-14: the flyout grows out of the rail it belongs to, like the menus.
+              className="z-[60] w-56 origin-left rounded-xl border border-sidebar-border bg-sidebar p-1.5 shadow-2xl transition-[opacity,scale] duration-150 ease-ui starting:scale-[0.97] starting:opacity-0"
             >
               <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">{openGroup.label}</p>
               {openGroup.items.map((item) => (
@@ -354,25 +475,34 @@ export function AppSidebar() {
           )
         : null}
 
-      <SidebarFooter className="border-t border-sidebar-border p-2">
+      <SidebarFooter className={SIDEBAR_FOOTER_CLASS}>
         <SidebarMenu>
           <SidebarMenuItem>
-            <SidebarMenuButton
-              size="lg"
-              tooltip={user?.name ?? "Signed in"}
-              className="h-14 rounded-lg px-2 hover:bg-sidebar-accent group-data-[collapsible=icon]:size-10! group-data-[collapsible=icon]:h-10!"
-              render={
-                <div role="group" aria-label="Current user">
-                  <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20">
-                    <CircleUserRound className="size-5" aria-hidden />
-                  </div>
-                  <div className="grid min-w-0 flex-1 text-left leading-tight group-data-[collapsible=icon]:hidden">
-                    <span className="truncate text-sm font-semibold text-sidebar-foreground">{user?.name ?? "Signed in"}</span>
-                    <span className="truncate text-xs text-sidebar-foreground/60">{user?.email ?? ""}</span>
-                  </div>
-                </div>
+            {/* BI-61 review round 1, SHOULD-FIX 7 (owner decision 2026-11-14): the card is the
+                account menu's one trigger. It looked clickable and did nothing; the navbar's
+                profile button that held the menu is gone. Collapsed, the avatar alone opens it. */}
+            <UserMenu
+              userName={user?.name}
+              userEmail={user?.email}
+              roles={user?.roles}
+              onLogout={logout}
+              side={state === "collapsed" ? "right" : "top"}
+              align={state === "collapsed" ? "end" : "start"}
+              trigger={
+                <SidebarMenuButton
+                  tooltip={user?.name ?? "Signed in"}
+                  aria-label={`Account menu, ${user?.name ?? "signed in"}`}
+                  className={cn(ACCOUNT_CARD_CLASS, "hover:bg-sidebar-accent data-[popup-open]:bg-sidebar-accent")}
+                />
               }
-            />
+            >
+              <div className={ACCOUNT_AVATAR_CLASS} aria-hidden>{initialsOf(user?.name)}</div>
+              {/* Avatar, name, chevron; the email and role are in the menu's header. */}
+              <span className={cn("min-w-0 flex-1 truncate whitespace-nowrap text-left text-sm font-medium text-sidebar-foreground", SIDEBAR_FADE)}>
+                {user?.name ?? "Signed in"}
+              </span>
+              <ChevronDown className={cn("ml-auto size-4 shrink-0 text-sidebar-foreground/60", SIDEBAR_FADE)} aria-hidden />
+            </UserMenu>
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>
