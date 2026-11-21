@@ -268,7 +268,7 @@ in `docs/KNOWN-LIMITATIONS.md` (moved from the README, 2026-11-05).
   whichever comes first, and the banner says which limit cut the result. The
   administrator's row limit ranges from 100 to 100,000. A chart built on a
   saved query is limited to 2,000 rows and 30 seconds.
-- PDF export is released and scheduled reports are built but in acceptance; both are off on a
+- PDF export and scheduled reports are released; both are off on a
   fresh install until `CONSOLE_INTERNAL_URL` is set (`REL-18`). A PDF has no
   web cards (`BI-42`).
 
