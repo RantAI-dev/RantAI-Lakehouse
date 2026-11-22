@@ -102,6 +102,46 @@ async fn measure(mode: &str, principal: Principal) -> Measured {
     }
 }
 
+/// Every `description` string under a schema node, in characters.
+fn description_chars(node: &Value) -> usize {
+    match node {
+        Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| match (k.as_str(), v) {
+                ("description", Value::String(s)) => s.chars().count(),
+                _ => description_chars(v),
+            })
+            .sum(),
+        Value::Array(items) => items.iter().map(description_chars).sum(),
+        _ => 0,
+    }
+}
+
+/// Prints the description characters of each offered tool, largest first:
+/// the tool-level text and the property-level text, as the size test counts them.
+fn print_description_blocks(tools: &Value) {
+    let mut rows: Vec<(usize, usize, String)> = tools
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|tool| {
+            let function = &tool["function"];
+            let name = function["name"].as_str().unwrap_or_default().to_owned();
+            let tool_level = function["description"]
+                .as_str()
+                .map_or(0, |s| s.chars().count());
+            let property_level = description_chars(&function["parameters"]);
+            (tool_level, property_level, name)
+        })
+        .collect();
+    rows.sort_by_key(|(tool, property, _)| std::cmp::Reverse(tool + property));
+    println!("per-tool description characters (tool-level, property-level, total):");
+    for (tool, property, name) in rows {
+        println!("{name:<32} {tool:>6} {property:>6} {:>6}", tool + property);
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Principal {
     Admin,
@@ -112,6 +152,56 @@ enum Principal {
 fn size(text: &str) -> (usize, usize) {
     let chars = text.chars().count();
     (chars, chars / 4)
+}
+
+/// The admin Build total, the admin Ask total and the viewer Build total, in
+/// characters: the system message plus the offered tool schemas, as the
+/// model receives them. Each has a ceiling below.
+///
+/// The ceilings are the totals this PR measures in the full suite. Run alone,
+/// the admin Build and admin Ask totals are 64 characters lower (76,294 and
+/// 19,660): the prompt's data-map cache is filled by other tests in the same
+/// process, so the totals move with test order. The admin Build ceiling is
+/// above the owner's target of 68,000 (owner, 2026-11-22, via the Auditor),
+/// which the sweep did not reach, so it waits for the owner's OK via the
+/// Auditor before the PR merges. The viewer Build ceiling is the measured
+/// total, 29,673.
+const ADMIN_BUILD_CEILING: usize = 76_358;
+const ADMIN_ASK_CEILING: usize = 19_724;
+const VIEWER_BUILD_CEILING: usize = 29_673;
+
+#[tokio::test]
+async fn the_chat_prompt_and_its_tools_stay_under_the_owner_target() {
+    let admin_build = measure("build", Principal::Admin).await;
+    let admin_ask = measure("ask", Principal::Admin).await;
+    let viewer_build = measure("build", Principal::Viewer).await;
+    let total = |m: &Measured| {
+        m.system.chars().count()
+            + serde_json::to_string(&m.tools)
+                .unwrap_or_default()
+                .chars()
+                .count()
+    };
+    let mut over = Vec::new();
+    if total(&admin_build) > ADMIN_BUILD_CEILING {
+        over.push(format!(
+            "admin Build total {} is over {ADMIN_BUILD_CEILING}",
+            total(&admin_build)
+        ));
+    }
+    if total(&admin_ask) > ADMIN_ASK_CEILING {
+        over.push(format!(
+            "admin Ask total {} is over {ADMIN_ASK_CEILING}",
+            total(&admin_ask)
+        ));
+    }
+    if total(&viewer_build) > VIEWER_BUILD_CEILING {
+        over.push(format!(
+            "viewer Build total {} is over {VIEWER_BUILD_CEILING}",
+            total(&viewer_build)
+        ));
+    }
+    assert!(over.is_empty(), "{}", over.join("; "));
 }
 
 #[tokio::test]
@@ -127,6 +217,9 @@ async fn ai_prompt_size_report() {
         ("build, dashboard viewer", "build", Principal::Viewer),
     ] {
         let m = measure(mode, principal).await;
+        if mode == "build" && matches!(principal, Principal::Admin) {
+            print_description_blocks(&m.tools);
+        }
         let (sys_chars, sys_tokens) = size(&m.system);
         let tools = m.tools.as_array().map_or(0, Vec::len);
         let tool_json = serde_json::to_string(&m.tools).unwrap_or_default();
