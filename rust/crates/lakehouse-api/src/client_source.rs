@@ -24,17 +24,29 @@
 //!   trusted: the source is the peer.
 //! * An empty trusted list trusts no header at all (fail closed).
 //!
+//! # The refresh
+//!
+//! A compose service NAME is resolved again every few minutes, because a
+//! compose network's addresses are not fixed (see
+//! [`refresh_trusted_proxies`]). The resolution runs with NO lock held:
+//! every request reads the same lock — the `ClientSource` extractor takes
+//! it to tell the caller from the proxy — so a resolver under the lock
+//! would stall every request for as long as the DNS takes, and the
+//! resolver runs every five minutes.
+//!
 //! # What the header is NOT
 //!
 //! The header decides the source and nothing else. It is not an
 //! authorization input, and it never reaches a decision the peer's own
 //! address would not reach.
 
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
 use ipnet::IpNet;
+use tokio::sync::RwLock;
 
 use crate::state::AppState;
 
@@ -56,7 +68,7 @@ pub const UNKNOWN_SOURCE: &str = "unknown";
 /// Two kinds of entry, because a compose network's addresses are not
 /// fixed: an address or a network stays an address or a network, while a
 /// compose service NAME is resolved again every few minutes (see
-/// [`TrustedProxies::refresh`]) — a container that is recreated comes
+/// [`refresh_trusted_proxies`]) — a container that is recreated comes
 /// back with another address.
 #[derive(Debug, Clone, Default)]
 pub struct TrustedProxies {
@@ -92,30 +104,82 @@ impl TrustedProxies {
         self.networks.iter().any(|net| net.contains(&ip)) || self.resolved.contains(&ip)
     }
 
-    /// Resolve the service names again, now.
+    /// The compose service names to resolve, copied out.
     ///
-    /// A name that does not resolve is logged and skipped: the proxy is
-    /// then not trusted until the next refresh, which is the fail-closed
-    /// direction (the header of an unresolvable proxy is not read).
-    pub async fn refresh(&mut self) {
-        let mut resolved = Vec::new();
-        for name in &self.service_names {
-            match tokio::net::lookup_host((name.as_str(), 80_u16)).await {
-                Ok(addresses) => resolved.extend(
-                    addresses.map(|address| crate::internal_hosts::canonical(&address.ip())),
-                ),
-                Err(err) => {
-                    tracing::warn!(
-                        %name,
-                        %err,
-                        "a trusted proxy's service name did not resolve; its \
-                         X-Forwarded-For is not read until the next refresh"
-                    );
-                }
-            }
-        }
+    /// A copy, not a borrow: the names are resolved with NO lock held
+    /// (see [`refresh_trusted_proxies`]), so the caller cannot hold the
+    /// lock while it waits for the resolver.
+    #[must_use]
+    fn service_names(&self) -> Vec<String> {
+        self.service_names.clone()
+    }
+
+    /// The addresses the service names resolved to, swapped in.
+    ///
+    /// The swap is the only write this lock ever sees.
+    fn set_resolved(&mut self, resolved: Vec<IpAddr>) {
         self.resolved = resolved;
     }
+}
+
+/// Resolve the trusted proxies' compose service names and swap the
+/// answers in.
+///
+/// The names are copied out under a short read lock, the resolution runs
+/// with NO lock held, and the write lock is taken only for the moment it
+/// takes to swap the addresses in.
+///
+/// Why: every request reads this lock — the `ClientSource` extractor
+/// takes it to tell the caller from the proxy — so holding the write
+/// lock across the resolver's await would stall EVERY request for as
+/// long as the DNS takes. The resolver runs every five minutes, so a
+/// slow or unreachable one would stop the API every five minutes.
+pub async fn refresh_trusted_proxies(trusted: &RwLock<TrustedProxies>) {
+    refresh_trusted_proxies_with(trusted, |name: &str| {
+        let name = name.to_owned();
+        async move {
+            let addresses = tokio::net::lookup_host((name.as_str(), 80_u16)).await?;
+            Ok(addresses.collect::<Vec<_>>())
+        }
+    })
+    .await
+}
+
+/// [`refresh_trusted_proxies`] with the resolver injected: a test can
+/// hold the resolution open and prove that a reader is not blocked while
+/// it runs.
+async fn refresh_trusted_proxies_with<F, Fut>(trusted: &RwLock<TrustedProxies>, lookup: F)
+where
+    F: Fn(&str) -> Fut + Send,
+    Fut: Future<Output = Result<Vec<SocketAddr>, std::io::Error>> + Send,
+{
+    // The names are copied out under a short read lock.
+    let names = trusted.read().await.service_names();
+    let mut resolved = Vec::new();
+    // The resolution runs with no lock held.
+    for name in names {
+        match lookup(&name).await {
+            Ok(addresses) => resolved.extend(
+                addresses
+                    .iter()
+                    .map(|address| crate::internal_hosts::canonical(&address.ip())),
+            ),
+            Err(err) => {
+                // A name that does not resolve is logged and skipped: the
+                // proxy is then not trusted until the next refresh, which
+                // is the fail-closed direction (the header of an
+                // unresolvable proxy is not read).
+                tracing::warn!(
+                    %name,
+                    %err,
+                    "a trusted proxy's service name did not resolve; its \
+                     X-Forwarded-For is not read until the next refresh"
+                );
+            }
+        }
+    }
+    // The write lock is taken only to swap the answers in.
+    trusted.write().await.set_resolved(resolved);
 }
 
 /// Split `TRUSTED_PROXIES` into the networks it lists and the service
@@ -274,7 +338,12 @@ impl FromRequestParts<AppState> for ClientSource {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -285,6 +354,11 @@ mod tests {
     fn trusted(raw: &str) -> TrustedProxies {
         let (networks, service_names) = parse_trusted_proxies(raw).unwrap();
         TrustedProxies::new(networks, service_names)
+    }
+
+    /// The address the refresh test's resolver answers with.
+    fn proxy_address() -> Ipv4Addr {
+        Ipv4Addr::new(192, 0, 2, 7)
     }
 
     #[test]
@@ -411,5 +485,62 @@ mod tests {
         // A network written with host bits set is refused the same way
         // the connector allowlist refuses it.
         assert!(parse_trusted_proxies("192.0.2.5/24").is_err());
+    }
+
+    /// `SEC-75` (pre-merge review SHOULD-FIX 1): the resolver's await
+    /// must not be under the lock.
+    ///
+    /// Every request reads this lock — the `ClientSource` extractor takes
+    /// it — so a slow DNS under the lock stops the whole API, and the
+    /// resolver runs every five minutes. The resolver here stays open
+    /// until the test releases it, and the read lock is taken while it
+    /// is open: that is the proof that a caller reading the source is not
+    /// blocked.
+    #[tokio::test]
+    async fn a_reader_is_not_blocked_while_the_names_are_being_resolved() {
+        let (networks, names) = parse_trusted_proxies("console").unwrap();
+        let trusted = Arc::new(RwLock::new(TrustedProxies::new(networks, names)));
+
+        // The resolver stays open until the test releases it: the
+        // resolution IS the await the lock must not be held across.
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let lookup = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move |_name: &str| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(vec![SocketAddr::new(IpAddr::V4(proxy_address()), 80)])
+                }
+            }
+        };
+
+        let refresh = tokio::spawn({
+            let trusted = Arc::clone(&trusted);
+            async move { refresh_trusted_proxies_with(&trusted, lookup).await }
+        });
+
+        // The resolver is inside its await now.
+        entered.notified().await;
+
+        // A caller that reads the source is not blocked: the lock is free
+        // while the names resolve. `try_read` says so without waiting, so
+        // the assertion does not depend on how slow the resolver is.
+        let reader = trusted
+            .try_read()
+            .expect("the read lock must be free while the names resolve");
+        assert!(!reader.is_trusted(&IpAddr::V4(proxy_address())));
+        drop(reader);
+
+        release.notify_one();
+        refresh.await.expect("the refresh task");
+
+        // The resolved addresses are in: the swap happened.
+        let reader = trusted.read().await;
+        assert!(reader.is_trusted(&IpAddr::V4(proxy_address())));
     }
 }

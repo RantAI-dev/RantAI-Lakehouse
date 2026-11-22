@@ -324,7 +324,7 @@ pub struct Config {
     ///
     /// A name, not an address, because a compose network's addresses are
     /// not fixed: the name is resolved again every few minutes (see
-    /// [`crate::client_source::TrustedProxies::refresh`]).
+    /// [`crate::client_source::refresh_trusted_proxies`]).
     pub trusted_proxy_names: Vec<String>,
     /// Test-only: lets webhook tests reach a `wiremock` listener on
     /// loopback, which no deployment setting can open. `WEBHOOK_TEST_ALLOW_ALL`

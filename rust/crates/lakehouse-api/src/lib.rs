@@ -290,11 +290,10 @@ const TRUSTED_PROXY_REFRESH: std::time::Duration = std::time::Duration::from_sec
 /// feature exists to remove.
 ///
 /// A name that does not resolve is logged and skipped (see
-/// [`crate::client_source::TrustedProxies::refresh`]): the proxy is then
+/// [`crate::client_source::refresh_trusted_proxies`]): the proxy is then
 /// not trusted, which is the fail-closed direction.
 async fn resolve_trusted_proxies(state: &AppState) {
-    let mut trusted = state.trusted_proxies.write().await;
-    trusted.refresh().await;
+    crate::client_source::refresh_trusted_proxies(&state.trusted_proxies).await;
 }
 
 /// Resolve the trusted proxies' service names again, every
@@ -313,8 +312,7 @@ fn spawn_trusted_proxy_refresh(state: &AppState) {
         );
         loop {
             ticker.tick().await;
-            let mut trusted = state.trusted_proxies.write().await;
-            trusted.refresh().await;
+            crate::client_source::refresh_trusted_proxies(&state.trusted_proxies).await;
         }
     });
 }
