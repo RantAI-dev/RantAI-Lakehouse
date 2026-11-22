@@ -159,16 +159,16 @@ fn size(text: &str) -> (usize, usize) {
 /// model receives them. Each has a ceiling below.
 ///
 /// The ceilings are the totals this PR measures in the full suite. Run alone,
-/// the admin Build and admin Ask totals are 64 characters lower (76,294 and
+/// the admin Build and admin Ask totals are 64 characters lower (76,343 and
 /// 19,660): the prompt's data-map cache is filled by other tests in the same
 /// process, so the totals move with test order. The admin Build ceiling is
 /// above the owner's target of 68,000 (owner, 2026-11-22, via the Auditor),
 /// which the sweep did not reach, so it waits for the owner's OK via the
 /// Auditor before the PR merges. The viewer Build ceiling is the measured
-/// total, 29,673.
-const ADMIN_BUILD_CEILING: usize = 76_358;
+/// total, 29,699.
+const ADMIN_BUILD_CEILING: usize = 76_407;
 const ADMIN_ASK_CEILING: usize = 19_724;
-const VIEWER_BUILD_CEILING: usize = 29_673;
+const VIEWER_BUILD_CEILING: usize = 29_699;
 
 #[tokio::test]
 async fn the_chat_prompt_and_its_tools_stay_under_the_owner_target() {

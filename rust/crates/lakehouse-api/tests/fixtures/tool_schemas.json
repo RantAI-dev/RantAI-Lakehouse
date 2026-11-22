@@ -3086,7 +3086,7 @@
     "type": "function",
     "function": {
       "name": "arrange_board",
-      "description": "Place chart tiles on a board's 12-column grid. Send only the tiles that change; Refuses a chart that is not on the board, a box that does not fit the 12-column grid, and a width or height below 1. The board's saved layout is replaced whole; last write wins.",
+      "description": "Place chart tiles on a board's 12-column grid. Send only the tiles that change. It refuses a chart that is not on the board, a box that does not fit the 12-column grid, and a width or height below 1. The board's saved layout is replaced whole; last write wins.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -3997,7 +3997,7 @@
     "type": "function",
     "function": {
       "name": "create_parameter",
-      "description": "Then use it in a formula as {name}, as a chart's limit, as a reference line (referenceLines) or, for a list, as the dimension, breakdown or a measure's column.",
+      "description": "Define a parameter. Then use it in a formula as {name}, as a chart's limit, as a reference line (referenceLines) or, for a list, as the dimension, breakdown or a measure's column.",
       "parameters": {
         "type": "object",
         "properties": {
