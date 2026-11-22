@@ -2779,7 +2779,7 @@ dependencies = [
  "lakehouse-test-support",
  "lakehouse-trino",
  "moka",
- "nix 0.31.3",
+ "nix 0.32.0",
  "object_store",
  "parquet",
  "postgres-protocol",
@@ -3016,7 +3016,7 @@ dependencies = [
  "clap",
  "ecdsa",
  "hex",
- "nix 0.31.3",
+ "nix 0.32.0",
  "p256",
  "rand 0.10.4",
  "serde",
@@ -3340,9 +3340,9 @@ checksum = "9252111cf132ba0929b6f8e030cac2a24b507f3a4d6db6fb2896f27b354c714b"
 
 [[package]]
 name = "nix"
-version = "0.31.3"
+version = "0.31.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+checksum = "2bc81ce8148d3b4f3274da811f11cdd824ae661ee4ef732cdb229825cf5be7f7"
 dependencies = [
  "bitflags 2.13.1",
  "cfg-if",
@@ -3527,7 +3527,7 @@ dependencies = [
  "hyper",
  "itertools 0.15.0",
  "md-5",
- "nix 0.31.3",
+ "nix 0.31.4",
  "parking_lot",
  "percent-encoding",
  "quick-xml 0.41.0",
