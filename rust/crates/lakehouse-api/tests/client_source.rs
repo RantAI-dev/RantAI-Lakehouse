@@ -34,6 +34,16 @@ const WRONG_PASSWORD: &str = "not-the-password";
 /// The address the test's peer has on the loopback interface.
 const LOOPBACK: &str = "127.0.0.1";
 
+/// How many seconds of its window a run of failures needs, so that it
+/// cannot cross the boundary.
+///
+/// Every failed sign-in costs an `Argon2id` verification, so the run of
+/// fifty failures of the biggest scenario takes tens of seconds on a
+/// loaded machine. The margin is two to four times that, so the run
+/// finishes inside its window; the wait it can cause is bounded by the
+/// margin itself and happens only when the window is nearly over.
+const WINDOW_MARGIN_SECONDS: i64 = 120;
+
 /// A deployment that trusts `trusted` as a proxy.
 fn env_with_trusted(trusted: &str) -> HashMap<String, String> {
     let mut env = HashMap::new();
@@ -89,64 +99,80 @@ async fn current_window(pool: &sqlx::PgPool) -> OffsetDateTime {
         .expect("the current window")
 }
 
-/// Fail `count` sign-ins from one source, each with an identifier of its
-/// own, and return the window they landed in.
+/// The seconds left in the current window, by the database's clock.
+async fn seconds_left_in_the_window(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT floor(extract(epoch FROM (to_timestamp(floor(extract(epoch FROM now()) / 900) * 900) \
+         + interval '900 seconds' - now())))::bigint",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the time left in the window")
+}
+
+/// Wait until the window has room for a run of failures, and return its
+/// start.
 ///
 /// The counter's window is a wall-clock window of 15 minutes: a run that
 /// crosses its boundary splits its own count over two windows, and the
 /// scenario would then measure the sum of two windows instead of one.
-/// The run is therefore repeated in the fresh window — the closed
-/// window's row of THIS source is removed — so the scenario always
-/// measures exactly one window.
+/// The wait is bounded by the window itself, and happens only when the
+/// window is nearly over.
+async fn wait_for_a_window_with_room(pool: &sqlx::PgPool) -> OffsetDateTime {
+    for _ in 0..3 {
+        let left = seconds_left_in_the_window(pool).await;
+        if left >= WINDOW_MARGIN_SECONDS {
+            return current_window(pool).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(
+            u64::try_from(left + 1).unwrap_or(1),
+        ))
+        .await;
+    }
+    panic!("the window did not open again");
+}
+
+/// Fail `count` sign-ins from one source, each with an identifier of its
+/// own.
 ///
-/// `source` is the source the failures are counted against, and
-/// `prefix` names the identifiers of the run (a fresh prefix per round,
-/// so a repeated run does not walk an account toward its own lock).
+/// The source is the one the REQUEST names — the peer, or the header's
+/// right-most untrusted entry when a trusted proxy writes one — so the
+/// scenario, not this helper, says which source it counts.
+///
+/// The counter's window is a wall-clock window of 15 minutes: a run that
+/// crosses its boundary splits its own count over two windows, and the
+/// scenario would then measure the sum of two windows instead of one.
+/// The run therefore starts in a window with room for it, and a run that
+/// still crosses the boundary fails here instead of quietly measuring
+/// two windows.
+///
+/// `prefix` names the identifiers of the run (a fresh identifier per
+/// attempt, so the run does not walk an account toward its own lock).
 async fn fail_sign_ins(
     pool: &sqlx::PgPool,
     client: &reqwest::Client,
     addr: SocketAddr,
-    source: &str,
     prefix: &str,
     count: usize,
     forwarded_for: Option<&str>,
-) -> OffsetDateTime {
-    for round in 0..3 {
-        let window = current_window(pool).await;
-        for attempt in 0..count {
-            let resp = sign_in(
-                client,
-                addr,
-                &format!("{prefix}-{round}-{attempt}@meridian.example"),
-                WRONG_PASSWORD,
-                forwarded_for,
-            )
-            .await;
-            assert_eq!(
-                resp.status(),
-                StatusCode::UNAUTHORIZED,
-                "attempt {attempt} of round {round}"
-            );
-        }
-        let now = current_window(pool).await;
-        if now == window {
-            return window;
-        }
-        // The window closed while the run was going: the failures before
-        // the boundary sit in the closed window and the ones after it in
-        // the fresh one. The closed row goes, and the run is repeated in
-        // the fresh window.
-        sqlx::query(
-            "DELETE FROM login_source_throttle \
-             WHERE source = $1 AND window_started_at <> $2",
+) {
+    let window = wait_for_a_window_with_room(pool).await;
+    for attempt in 0..count {
+        let resp = sign_in(
+            client,
+            addr,
+            &format!("{prefix}-{attempt}@meridian.example"),
+            WRONG_PASSWORD,
+            forwarded_for,
         )
-        .bind(source)
-        .bind(now)
-        .execute(pool)
-        .await
-        .expect("remove the closed window's row");
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "attempt {attempt}");
     }
-    panic!("the wall-clock window closed three times in a row");
+    assert_eq!(
+        current_window(pool).await,
+        window,
+        "the run crossed the window boundary: it took longer than the margin"
+    );
 }
 
 /// The per-source counters, one row per source, in the order the
@@ -197,16 +223,7 @@ async fn a_forged_header_from_an_untrusted_peer_is_ignored() {
     let addr = serve(router).await;
     let client = reqwest::Client::new();
 
-    fail_sign_ins(
-        &pool,
-        &client,
-        addr,
-        LOOPBACK,
-        "ghost",
-        1,
-        Some("203.0.113.7"),
-    )
-    .await;
+    fail_sign_ins(&pool, &client, addr, "ghost", 1, Some("203.0.113.7")).await;
 
     assert_eq!(
         source_counts(&pool).await,
@@ -227,7 +244,6 @@ async fn a_trusted_peer_takes_the_rightmost_untrusted_entry_of_the_header() {
         &pool,
         &client,
         addr,
-        "198.51.100.4",
         "ghost",
         1,
         Some("203.0.113.7, 198.51.100.4"),
@@ -248,7 +264,7 @@ async fn a_trusted_peer_without_a_header_falls_back_to_the_peer() {
     let addr = serve(router).await;
     let client = reqwest::Client::new();
 
-    fail_sign_ins(&pool, &client, addr, LOOPBACK, "ghost", 1, None).await;
+    fail_sign_ins(&pool, &client, addr, "ghost", 1, None).await;
 
     assert_eq!(source_counts(&pool).await, vec![(LOOPBACK.to_owned(), 1)]);
 }
@@ -266,7 +282,7 @@ async fn the_signin_after_the_per_source_limit_is_refused_with_429() {
     // 50 failures, each with an identifier of its own, so that no
     // ACCOUNT is locked on the way (the account throttle is keyed by the
     // identifier) and only the source's budget is spent.
-    fail_sign_ins(&pool, &client, addr, LOOPBACK, "spray", 50, None).await;
+    fail_sign_ins(&pool, &client, addr, "spray", 50, None).await;
     assert_eq!(source_counts(&pool).await, vec![(LOOPBACK.to_owned(), 50)]);
 
     let rows_before = audit_rows(&pool, "auth.login").await.len();
@@ -306,26 +322,8 @@ async fn two_sources_count_separately() {
     let addr = serve(router).await;
     let client = reqwest::Client::new();
 
-    fail_sign_ins(
-        &pool,
-        &client,
-        addr,
-        "203.0.113.7",
-        "first",
-        3,
-        Some("203.0.113.7"),
-    )
-    .await;
-    fail_sign_ins(
-        &pool,
-        &client,
-        addr,
-        "198.51.100.4",
-        "second",
-        3,
-        Some("198.51.100.4"),
-    )
-    .await;
+    fail_sign_ins(&pool, &client, addr, "first", 3, Some("203.0.113.7")).await;
+    fail_sign_ins(&pool, &client, addr, "second", 3, Some("198.51.100.4")).await;
 
     assert_eq!(
         source_counts(&pool).await,
@@ -346,16 +344,7 @@ async fn a_successful_signin_does_not_reset_the_source_count() {
     let client = reqwest::Client::new();
     seed_password_identity(&pool).await;
 
-    fail_sign_ins(
-        &pool,
-        &client,
-        addr,
-        "203.0.113.7",
-        "spray",
-        3,
-        Some("203.0.113.7"),
-    )
-    .await;
+    fail_sign_ins(&pool, &client, addr, "spray", 3, Some("203.0.113.7")).await;
     assert_eq!(
         source_counts(&pool).await,
         vec![("203.0.113.7".to_owned(), 3)]
