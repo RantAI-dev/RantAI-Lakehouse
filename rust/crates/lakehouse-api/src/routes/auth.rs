@@ -252,6 +252,13 @@ fn source_limited_response(retry_after_secs: u64) -> ApiError {
 /// caller is still trying, and the count is what the summary row of the
 /// window reports. The refusal writes no row of its own: the first failure
 /// of the window wrote that.
+///
+/// # Errors
+///
+/// Returns a `429` when the source is over its budget (`SEC-75`
+/// decision 2). When the counter cannot be read, the storage error of
+/// [`source_throttle::current`] surfaces as its classified 500
+/// (`"authentication error"`).
 async fn check_source_budget(pool: &PgPool, source: &str) -> ApiResult<()> {
     if let Some(window) = source_throttle::current(pool, source).await?
         && window.failures >= source_throttle::MAX_FAILURES_PER_SOURCE
@@ -552,7 +559,12 @@ async fn refuse_sign_in(
     // `SEC-75` decision 3: only the FIRST failure of the source's
     // window writes that row; the later ones only count, and the
     // sweep writes one summary row for the window.
-    if window.is_some_and(|window| window.failures == 1) {
+    //
+    // A counter that cannot be written writes the row every time
+    // (`window.is_none_or`): refused attempts stay visible on the
+    // trail, never a silent drop — the same fail-visible fallback the
+    // gate's `record_gate_refusal` writes when its counter fails.
+    if window.is_none_or(|window| window.failures == 1) {
         let written = audit_coverage::record_best_effort_checked(
             state,
             sign_in_refused_event(source.as_str()),

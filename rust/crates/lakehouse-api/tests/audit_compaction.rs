@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use futures::FutureExt;
 use serde_json::{Value, json};
 use time::{Duration, OffsetDateTime};
 use tower::ServiceExt;
@@ -642,4 +643,93 @@ async fn a_closed_window_of_gate_refusals_gets_one_summary_row() {
         .await
         .expect("count the counter rows");
     assert_eq!(counter_rows, 0, "the summarised counter row is deleted");
+}
+
+/// A counter that cannot be written still writes the refused row: a
+/// refused sign-in stays visible on the trail, which is what the trail
+/// held before the compaction, and never for fewer (`SEC-75` decision 3,
+/// the gate's fail-visible fallback).
+///
+/// The write failure is injected with a trigger, because the budget
+/// check reads the counter with a `SELECT` and the failure being
+/// reproduced is a failed WRITE: the check still answers, and the
+/// counting of this failure is what fails.
+#[tokio::test]
+async fn a_failed_counter_write_still_writes_the_refused_row() {
+    let TestApp { router, pool } = spin_up_with_env(&env_trusting_the_loopback()).await;
+    let addr = serve(router).await;
+    let client = reqwest::Client::new();
+
+    // Fixed global names collide when the suite runs in parallel against
+    // the same test Postgres (one process's objects block another's
+    // CREATE) and a panic that skips the DROP leaves residue for later
+    // runs. A nonce per run keeps processes isolated; the setup is also
+    // idempotent and the DROP runs in all paths below.
+    let nonce = uuid::Uuid::new_v4().simple();
+    let fun_name = format!("fail_source_counter_writes_{nonce}");
+    let trigger_name = format!("source_counter_unwritable_{nonce}");
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        r"CREATE OR REPLACE FUNCTION {fun_name}() RETURNS trigger
+           AS 'BEGIN RAISE EXCEPTION ''injected counter write failure''; END;'
+           LANGUAGE plpgsql"
+    )))
+    .execute(&pool)
+    .await
+    .expect("create the failing trigger function");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER IF EXISTS {trigger_name} ON login_source_throttle"
+    )))
+    .execute(&pool)
+    .await
+    .expect("clear any stale trigger");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        r"CREATE TRIGGER {trigger_name}
+           BEFORE INSERT OR UPDATE ON login_source_throttle
+           FOR EACH ROW EXECUTE FUNCTION {fun_name}()"
+    )))
+    .execute(&pool)
+    .await
+    .expect("arm the failing trigger");
+
+    // Run the assertions under a panic catch so the DROP below runs even
+    // if one fails; the panic is re-raised after cleanup.
+    let result = std::panic::AssertUnwindSafe(async {
+        for attempt in 0..2 {
+            let identifier = format!("counter-fail-{attempt}@{IDENTIFIER_DOMAIN}");
+            let status = fail_sign_in(&client, addr, &identifier, SOURCE).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a counter failure changes nothing about the answer"
+            );
+        }
+
+        let rows = audit_rows(&pool, "auth.login").await;
+        assert_eq!(rows.len(), 2, "two failures, a refused row each: {rows:#?}");
+        for row in &rows {
+            assert_eq!(row["outcome"], "refused");
+            assert_eq!(row["args"]["source"], SOURCE, "the row names the source");
+            assert_nothing_the_visitor_typed(row, "counter-fail", 2);
+        }
+    })
+    .catch_unwind()
+    .await;
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER IF EXISTS {trigger_name} ON login_source_throttle"
+    )))
+    .execute(&pool)
+    .await
+    .expect("disarm the failing trigger");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP FUNCTION IF EXISTS {fun_name}()"
+    )))
+    .execute(&pool)
+    .await
+    .expect("drop the failing trigger function");
+
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }

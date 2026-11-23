@@ -142,7 +142,7 @@ pub async fn refresh_trusted_proxies(trusted: &RwLock<TrustedProxies>) {
             Ok(addresses.collect::<Vec<_>>())
         }
     })
-    .await
+    .await;
 }
 
 /// [`refresh_trusted_proxies`] with the resolver injected: a test can
