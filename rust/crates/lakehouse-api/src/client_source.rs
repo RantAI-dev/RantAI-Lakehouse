@@ -332,7 +332,15 @@ impl FromRequestParts<AppState> for ClientSource {
             .get(FORWARDED_FOR)
             .and_then(|value| value.to_str().ok());
         let trusted = state.trusted_proxies.read().await;
-        Ok(Self(resolve(peer, forwarded_for, &trusted)))
+        let source = resolve(peer, forwarded_for, &trusted);
+        // `SEC-75` step 4 (plan `adm-130`): one debug line per request
+        // so a real stack can prove what the API saw as the source —
+        // through the console's `/api` proxy and straight to the API
+        // port (a forged header must not move the source). At `debug`
+        // this is one line per request; at the default `info` level it
+        // emits nothing.
+        tracing::debug!(%source, "request source resolved");
+        Ok(Self(source))
     }
 }
 
