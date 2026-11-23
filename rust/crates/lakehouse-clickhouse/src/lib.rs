@@ -172,6 +172,15 @@ pub struct QueryOptions {
     /// the two paths a download reads through; the buffered
     /// [`ChClient::query_with_options`] leaves the engine's own default.
     pub max_memory_usage: Option<u64>,
+    /// Server-side query parameters: `(name, value)` pairs the engine
+    /// substitutes for `{name:Type}` placeholders in the SQL, sent as
+    /// `param_<name>=<value>` URL parameters of this request only.
+    ///
+    /// A value bound this way never appears in the statement text, so a
+    /// quote or a backslash in it cannot end a literal or start an escape
+    /// (AGENTS.md: SQL values must be bound). Used by the AI conversation
+    /// store (`SEC-60`) and available to any caller that needs bound values.
+    pub params: Vec<(String, String)>,
 }
 
 /// Most progress headers one limited request may receive; hyper's client
@@ -183,6 +192,16 @@ const PROGRESS_HEADERS_MAX: u128 = 80;
 /// [`PROGRESS_HEADERS_MAX`].
 fn progress_interval_ms(limit: std::time::Duration) -> u128 {
     (limit.as_millis() / PROGRESS_HEADERS_MAX).max(1000)
+}
+
+/// `param_<name>=<value>` pairs for the engine's server-side query
+/// parameters (`SEC-60`). The keys are owned because the `param_` prefix is
+/// added here; callers keep their placeholder names unprefixed.
+fn query_param_pairs(params: &[(String, String)]) -> Vec<(String, String)> {
+    params
+        .iter()
+        .map(|(name, value)| (format!("param_{name}"), value.clone()))
+        .collect()
 }
 
 /// The `max_execution_time` URL setting for `limit`: whole seconds, rounded
@@ -388,7 +407,15 @@ impl ChClient {
             "cancel_http_readonly_queries_on_client_close",
             "1".to_owned(),
         ));
-        let borrowed: Vec<(&str, &str)> = settings.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        // Bound values travel beside the settings as `param_*` URL parameters
+        // (SEC-60): the statement is the one the caller wrote, with
+        // `{name:Type}` placeholders the engine fills from these pairs.
+        let params = query_param_pairs(&options.params);
+        let borrowed: Vec<(&str, &str)> = settings
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .chain(params.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .collect();
         self.query_with_settings(sql, &borrowed, options.request_timeout(), cancel)
             .await
     }
@@ -456,6 +483,25 @@ impl ChClient {
         Ok(self.query(sql, cancel).await?.data)
     }
 
+    /// Run `sql` under `options` and return only its rows. Equivalent to
+    /// `self.query_with_options(sql, options, cancel).await?.data`.
+    ///
+    /// Unlike [`ChClient::rows`], this passes bound parameters through to the
+    /// engine (`SEC-60`), so a caller whose SQL uses `{name:Type}` placeholders
+    /// can supply the values without writing them into the statement.
+    ///
+    /// # Errors
+    ///
+    /// See [`ChClient::query_with_options`].
+    pub async fn rows_with_options(
+        &self,
+        sql: &str,
+        options: &QueryOptions,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<Map<String, Value>>, ChError> {
+        Ok(self.query_with_options(sql, options, cancel).await?.data)
+    }
+
     /// Run a non-`SELECT` statement (DDL/DML: `CREATE`/`INSERT`/`ALTER`)
     /// verbatim — with no `FORMAT` wrapping, which would break
     /// `INSERT`/DDL — and discard the response body.
@@ -478,6 +524,53 @@ impl ChClient {
                 .body(sql.to_owned())
                 .send()
                 .await?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(());
+            }
+            let text = response.text().await?;
+            Err(ChError::Server(server_error_message(status, &text)))
+        };
+        run_cancellable(fut, cancel).await
+    }
+
+    /// Run a non-`SELECT` statement with the bound values in `options.params`
+    /// (`SEC-60`). The statement goes to the engine verbatim — no `FORMAT`
+    /// wrapping, like [`ChClient::exec`] — and each `{name:Type}` placeholder
+    /// is filled by the engine from a `param_<name>=<value>` URL parameter.
+    /// Caller text therefore never enters the statement, so quotes and
+    /// backslashes in a value cannot break out of a literal.
+    ///
+    /// Only `options.params` is sent here: `exec` is used for DDL/DML that
+    /// does not run under a tile's limits or identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChError::Transport`] on a network-level failure, or
+    /// [`ChError::Server`] when `ClickHouse` responds with a non-2xx status.
+    pub async fn exec_with_options(
+        &self,
+        sql: &str,
+        options: &QueryOptions,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), ChError> {
+        let params = query_param_pairs(&options.params);
+        let borrowed: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let fut = async {
+            let mut request = self
+                .client
+                .post(&self.url)
+                .basic_auth(&self.user, Some(&self.password))
+                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                .header(CACHE_CONTROL, "no-store")
+                .body(sql.to_owned());
+            if !borrowed.is_empty() {
+                request = request.query(&borrowed);
+            }
+            let response = request.send().await?;
             let status = response.status();
             if status.is_success() {
                 return Ok(());
@@ -1131,6 +1224,57 @@ mod tests {
             .unwrap();
     }
 
+    /// SEC-60: a bound value reaches the engine as a `param_<name>` URL
+    /// parameter, never as text in the statement. A quote and a backslash are
+    /// the characters that broke the old hand-escaped SQL.
+    #[tokio::test]
+    async fn exec_with_options_sends_bound_values_as_http_parameters() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param("param_id", "s'1\\2"))
+            .and(query_param("param_owner", "o'w\\ner"))
+            .and(body_string_contains("{id:String}"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = QueryOptions {
+            params: vec![
+                ("id".to_owned(), "s'1\\2".to_owned()),
+                ("owner".to_owned(), "o'w\\ner".to_owned()),
+            ],
+            ..QueryOptions::default()
+        };
+        client(&server.uri())
+            .exec_with_options(
+                "INSERT INTO t (id, owner) VALUES ({id:String}, {owner:String})",
+                &options,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(
+            !body.contains("s'1\\2") && !body.contains("o'w\\ner"),
+            "raw bound values must not be written into the SQL: {body}"
+        );
+        let pairs: Vec<(String, String)> = requests[0]
+            .url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("param_id".to_owned(), "s'1\\2".to_owned()),
+                ("param_owner".to_owned(), "o'w\\ner".to_owned()),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn exec_surfaces_clickhouse_error_body() {
         let server = MockServer::start().await;
@@ -1432,6 +1576,7 @@ mod tests {
             query_id: Some("u:r:1".to_owned()),
             quote_decimals: false,
             max_memory_usage: None,
+            params: Vec::new(),
         };
         let result = client(&server.uri())
             .query_with_options("SELECT n FROM t", &options, None)
@@ -1443,6 +1588,40 @@ mod tests {
         assert!(
             !body.contains("SETTINGS"),
             "the SQL text stays as written: {body}"
+        );
+    }
+
+    /// SEC-60: `rows_with_options` carries the same bound values through the
+    /// `query_with_options` path that SELECTs use, without writing them into
+    /// the SQL body.
+    #[tokio::test]
+    async fn rows_with_options_binds_values_without_interpolating_them_into_the_sql() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param("param_q", "sea'rch\\%"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":[{"name":"n","type":"UInt64"}],"data":[{"n":1}],"rows":1}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = QueryOptions {
+            params: vec![("q".to_owned(), "sea'rch\\%".to_owned())],
+            ..QueryOptions::default()
+        };
+        let rows = client(&server.uri())
+            .rows_with_options("SELECT n FROM t WHERE title = {q:String}", &options, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(body.contains("WHERE title = {q:String}"), "{body}");
+        assert!(
+            !body.contains("sea'rch"),
+            "the value stays out of the SQL: {body}"
         );
     }
 
