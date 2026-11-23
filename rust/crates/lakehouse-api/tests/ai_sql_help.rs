@@ -632,13 +632,16 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
 // bytes are unchanged. (Before: `bdb95459...f810`.) The AI team reviews the
 // sentence (Assistant parity).
 //
-// Updated by hand for `BLD-19`: `create_pipeline`'s tool description now names
-// `serving` (the Gold database the catalog lists) instead of `gold` in its
-// source/target zone lines; the system prompt carries the tool list, so those
-// changed bytes move this pin. The offered-tool list above is untouched — no
-// tool was added or removed. (Before: `f77c95e5...e1ed`.)
+// Checked for `BLD-19` (PR #707 review fix, ci-required failure on da2a7c9):
+// `create_pipeline`'s tool description now names `serving` instead of `gold`,
+// but that description lives in the registry schema, which travels in the
+// request's `tools` array — not in these system-prompt bytes. The prompt's
+// own Pipelines line (`prompt.rs`) names the tool only ("authors one as a
+// draft") and carries no zone words, so this pin does not move; the zone
+// wording is pinned by `tests/fixtures/tool_schemas.json` instead. The
+// offered-tool list above is untouched — no tool was added or removed.
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
-    "9b30b77a862c97ecd8d4af3b409850e1731ca2802097cdeebfc7b42967ab805a";
+    "f77c95e5d54877e61a80a4ef1dee442a31e92a5ecda832d3f803148f762ae1ed";
 
 fn sha256_hex(text: &str) -> String {
     use std::fmt::Write as _;
