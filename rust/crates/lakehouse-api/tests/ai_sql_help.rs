@@ -647,13 +647,10 @@ fn sha256_hex(text: &str) -> String {
 #[tokio::test]
 async fn a_chat_with_no_allowlist_is_offered_today_s_tools_and_today_s_prompt() {
     for switch in ["true", "false"] {
-        // The DATA MAP cache is one entry for the whole process, kept for two
-        // minutes: a chat that ran before this one in the same process would
-        // leave its map behind, and the prompt's bytes would then be the ones
-        // of that map instead of the ones this test mocks. The cache is
-        // cleared here, so the pin is the same in one process as it is alone
-        // (`AI-32`).
-        lakehouse_api::clear_data_map_cache().await;
+        // OPS-36: the DATA MAP cache lives on each AppState now, so this app
+        // gets the map its own mocks build. A chat in another test app can no
+        // longer leave its map in a process-wide slot and change the pinned
+        // bytes, even when the assistant tests run in parallel (`AI-32`).
         let llm = mock_model(vec![model_round(Some("Hi."), &[])]).await;
         let ch = mock_clickhouse(ResponseTemplate::new(200)).await;
 
