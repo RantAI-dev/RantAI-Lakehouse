@@ -4,13 +4,19 @@ import { SHIPPED_FONT_IDS } from "./formatting-settings"
 
 describe("dashboardLook", () => {
   test("auto follows the console", () => {
-    expect(dashboardLook(undefined, true)).toEqual({ dark: true, className: "", style: undefined })
-    expect(dashboardLook({ theme: "auto" }, false)).toEqual({ dark: false, className: "", style: undefined })
+    expect(dashboardLook(undefined, true)).toEqual({ dark: true, className: "", surfaceThemeClass: undefined, style: undefined })
+    expect(dashboardLook({ theme: "auto" }, false)).toEqual({ dark: false, className: "", surfaceThemeClass: undefined, style: undefined })
   })
 
   test("a dark dashboard is dark inside a light console, a light one is light inside a dark console", () => {
     expect(dashboardLook({ theme: "dark" }, false)).toMatchObject({ dark: true, className: "dark bg-background text-foreground" })
     expect(dashboardLook({ theme: "light" }, true)).toMatchObject({ dark: false, className: "theme-light bg-background text-foreground" })
+  })
+
+  test("only a light surface gives portaled popups a theme class to copy", () => {
+    expect(dashboardLook({ theme: "light" }, true).surfaceThemeClass).toBe("theme-light")
+    expect(dashboardLook({ theme: "dark" }, false).surfaceThemeClass).toBeUndefined()
+    expect(dashboardLook({ theme: "auto" }, false).surfaceThemeClass).toBeUndefined()
   })
 
   test("a font the console ships and the administrator allows is applied", () => {
