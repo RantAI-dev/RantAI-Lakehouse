@@ -224,12 +224,12 @@ pub struct AppState {
     pub pipeline_source_allowlist: Arc<crate::pipeline_source::SourceAllowlist>,
     /// Ring buffer of the last [`POLICY_DECISION_LATENCY_CAP`]
     /// `sql_rewrite::enforce` prefetch+rewrite durations (WS7 item C2) —
-    /// `routes::query::run` records one sample per call, refused or not;
-    /// `GET /api/ops/observability`'s `policyDecisionP95Ms` computes a
-    /// real p95 from it instead of the literal `null` WS1's honesty pass
-    /// left in place. Always populated (same pattern as
-    /// [`Self::gold_export_locks`]/[`Self::bronze_stats_cache`]): needs no
-    /// external dependency, just an in-process buffer.
+    /// `routes::query::run` records one sample per call, refused or not.
+    /// `GET /api/ops/observability` used to compute a real p95 from it;
+    /// WEB-4 retired that view (no caller), so the buffer is written but
+    /// read only by its own tests until another consumer needs it. It is
+    /// kept, not dropped, because it costs no external dependency (same
+    /// pattern as [`Self::gold_export_locks`]/[`Self::bronze_stats_cache`]).
     pub policy_decision_latencies: PolicyDecisionLatencies,
     /// Client for Lakekeeper's `management/v1/*` API, used by `POST
     /// /api/identity/tenants` to provision a tenant's
@@ -369,11 +369,12 @@ const POLICY_DECISION_LATENCY_CAP: usize = 1000;
 
 /// Thread-safe ring buffer of policy-decision durations, shared (via
 /// [`Arc`]) across every clone of [`AppState`] so every request records
-/// into, and every `/api/ops/observability` read sees, the SAME buffer.
+/// into the SAME buffer.
 ///
 /// A plain `Mutex<VecDeque<Duration>>`, not a lock-free structure: this is
-/// written once per `routes::query::run` call and read at most once per
-/// `/api/ops/observability` request — nowhere near a contention hot path
+/// written once per `routes::query::run` call. WEB-4 removed the
+/// `/api/ops/observability` reader, so there is no request-time read today
+/// (only the type's own unit tests) — nowhere near a contention hot path
 /// (WS7 item C2 Step 2's own "implementer's choice, documented").
 #[derive(Clone, Default)]
 pub struct PolicyDecisionLatencies(

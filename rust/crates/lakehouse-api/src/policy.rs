@@ -86,16 +86,17 @@
 //! alongside these table entries rather than gating them behind a token
 //! nothing can hold:
 //!
-//! * `agent:manage` (`POST /api/agents/employees` and
-//!   `/api/agents/employees/{id}/{suspend,resume,revoke}`)
-//!   — same `agent` resource family as Approver's seeded `agent:approve`,
-//!   but a different action: lifecycle control of the employee identity
-//!   itself (a kill switch), not approving one action it proposed.
-//!   Deliberately gets NO seed grant: Approver's remit is narrow
+//! * `agent:manage` — same `agent` resource family as Approver's seeded
+//!   `agent:approve`, but a different action: lifecycle control of the
+//!   employee identity itself (a kill switch), not approving one action it
+//!   proposed. Deliberately gets NO seed grant: Approver's remit is narrow
 //!   per-decision approval, not blanket administration of the employees
 //!   themselves, and no other seeded role plausibly owns "agent
 //!   operations" — reachable only via Platform Admin's `*:*`, same as
-//!   `identity:write`.
+//!   `identity:write`. WEB-4 retired the policy-gated create/suspend/resume/
+//!   revoke routes; the permission is kept because `routes::agents::
+//!   check_employee_run_auth` still uses it to let a person trigger a
+//!   headless run manually.
 //! * `workload:cancel` (`/api/ops/workloads/{id}/cancel`) — granted to
 //!   Data Engineer (`0020`) alongside its existing `pipeline:*`: Data
 //!   Engineer is the role that operates pipelines end-to-end and is the
@@ -1245,22 +1246,20 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/knowledge/vector-jobs",   Policy::RequiresAuth),
     ("POST", "/api/knowledge/vector-jobs",   Policy::RequiresAuth),
 
-    // ── Agents (digital employees / workflows / tools / runs): no seeded
-    //    resource for most of this domain — auth only. `approvals` maps to
-    //    the seeded Approver permission `agent:approve`. Employee lifecycle
-    //    control (suspend/resume/revoke) requires `agent:manage`,
-    //    deliberately Platform-Admin-only — see module doc comment. ──────
-    ("GET",  "/api/agents/workflows",                Policy::RequiresAuth),
-    ("POST", "/api/agents/workflows",                Policy::RequiresAuth),
+    // ── Agents (digital employees / tools / runs): no seeded resource for
+    //    most of this domain — auth only. `approvals` maps to the seeded
+    //    Approver permission `agent:approve`. WEB-4 retired the workflows,
+    //    employee-create, employee lifecycle (suspend/resume/revoke) and
+    //    runs-LIST routes: no assistant tool, console page, CLI or script
+    //    calls them, so their entries were removed with the routes and the
+    //    paths now answer 404. `agent:manage` stays a real permission — the
+    //    headless-run handler still uses it for a manual trigger — but no
+    //    route is gated on it at the policy layer any more. ────────────────
+    // `GET /employees` feeds Dagster's code-load schedule factory and
+    // `GET /employees/{id}` names the employee on the retained run-detail
+    // page; both are live consumers (see `routes::agents_router`).
     ("GET",  "/api/agents/employees",                Policy::RequiresAuth),
-    // SEC-20, plan 97: a scheduled run takes its permissions from the
-    // employee's own column and needs no `agent:manage`, so creating one is
-    // the gate (the handler also caps its permissions at the creator's).
-    ("POST", "/api/agents/employees",                Policy::RequiresPermission("agent:manage")),
     ("GET",  "/api/agents/employees/{id}",           Policy::RequiresAuth),
-    ("POST", "/api/agents/employees/{id}/suspend",   Policy::RequiresPermission("agent:manage")),
-    ("POST", "/api/agents/employees/{id}/resume",    Policy::RequiresPermission("agent:manage")),
-    ("POST", "/api/agents/employees/{id}/revoke",    Policy::RequiresPermission("agent:manage")),
     // `/employees/{id}/run` (T3.2, copilot-operations-handover plan): same
     // "floor" shape as `/api/alerts/run`/`/api/gold/export/{mart}` —
     // `RequiresAuth` here, PLUS `routes::agents::check_employee_run_auth`'s
@@ -1274,7 +1273,6 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // POST /api/agents/tools removed (WS7 item G4): the real tool
     // registry (ai_registry::TOOLS) has no "register" concept.
     ("GET",  "/api/agents/tools",                    Policy::RequiresAuth),
-    ("GET",  "/api/agents/runs",                     Policy::RequiresAuth),
     ("GET",  "/api/agents/runs/{id}",                Policy::RequiresAuth),
     ("GET",  "/api/agents/approvals",                Policy::RequiresPermission("agent:approve")),
     ("POST", "/api/agents/approvals/{id}/decide",    Policy::RequiresPermission("agent:approve")),
@@ -1963,39 +1961,12 @@ mod tests {
         );
     }
 
-    /// #1: digital-employee lifecycle control (`agent:manage`) is
-    /// deliberately Platform-Admin-only — an Analyst (and even Approver,
-    /// whose `agent:approve` is a narrower per-decision grant) must be
-    /// denied; only `*:*` gets through.
-    #[test]
-    fn agent_lifecycle_routes_deny_analyst_and_approver_allow_platform_admin() {
-        use lakehouse_auth::PermissionSet;
+    // WEB-4 removed the `agent:manage`-gated lifecycle routes, so there is
+    // no route left for the both-ways table check this block used to hold.
+    // The permission stays: the seed-alignment test below still pins it, and
+    // `routes::agents::check_employee_run_auth` uses it for a manual run.
 
-        for path in [
-            "/api/agents/employees/{id}/suspend",
-            "/api/agents/employees/{id}/resume",
-            "/api/agents/employees/{id}/revoke",
-        ] {
-            assert_denied_then_allowed(
-                "POST",
-                path,
-                &PermissionSet::parse("query:read, catalog:read, lineage:read"),
-                "an Analyst",
-                &PermissionSet::parse("*:*"),
-                "a Platform Admin (*:*)",
-            );
-            assert_denied_then_allowed(
-                "POST",
-                path,
-                &PermissionSet::parse("agent:approve, policy:review"),
-                "an Approver (agent:approve only)",
-                &PermissionSet::parse("*:*"),
-                "a Platform Admin (*:*)",
-            );
-        }
-    }
-
-    /// #2: cancelling a workload (`workload:cancel`) is granted to Data
+    /// #1: cancelling a workload (`workload:cancel`) is granted to Data
     /// Engineer (0020) — an Analyst must be denied, Data Engineer allowed.
     #[test]
     fn workload_cancel_denies_analyst_allows_data_engineer() {
@@ -2011,7 +1982,7 @@ mod tests {
         );
     }
 
-    /// #3: storage restore (`storage:restore`) is deliberately
+    /// #2: storage restore (`storage:restore`) is deliberately
     /// Platform-Admin-only — Data Engineer, despite operating pipelines and
     /// connectors, must still be denied; only `*:*` gets through.
     #[test]
@@ -2028,7 +1999,7 @@ mod tests {
         );
     }
 
-    /// #4 (changed by `BI-19` part C, C3): alert rule CRUD is "signed in" at the
+    /// #3 (changed by `BI-19` part C, C3): alert rule CRUD is "signed in" at the
     /// router, because a person who can view a chart may alert on it for
     /// themselves. `alert:write` is judged in the handler
     /// (`tests/route_auth.rs`, `the_alert_routes_are_signed_in_at_the_router_and_the_handler_asks_for_the_right`).

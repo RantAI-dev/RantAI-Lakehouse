@@ -268,22 +268,22 @@ async fn requires_any_permission_rows_accept_each_permission_alone_and_refuse_un
 /// A seeded Analyst (`sari@meridian.example` — `query:read, catalog:read,
 /// lineage:read`, no other grants) is a second, independently-seeded
 /// "real, under-permissioned" principal, spot-checked against one route
-/// from each of the four privilege-escalation-hardened permission
-/// families the module doc comment on `policy.rs` calls out by name
-/// (`identity:write`, `agent:manage`, `storage:restore`, `alert:write`):
-/// every one of them must refuse an Analyst exactly the same way the
-/// zero-permission principal is refused above, proving the 403 is about
-/// the SPECIFIC permission, not merely "this principal happens to hold
-/// nothing".
+/// from each of the privilege-escalation-hardened permission families the
+/// module doc comment on `policy.rs` calls out by name (`identity:write`,
+/// `storage:restore`): every one of them must refuse an
+/// Analyst exactly the same way the zero-permission principal is refused
+/// above, proving the 403 is about the SPECIFIC permission, not merely
+/// "this principal happens to hold nothing". WEB-4 retired the two
+/// `agent:manage`-gated examples this test used (employee creation and
+/// suspension), so that family has no policy-level route left to name;
+/// the permission itself is still checked by the headless-run handler.
 #[tokio::test]
-async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
+async fn a_seeded_analyst_is_denied_the_hardened_permission_families() {
     let TestApp { router, pool } = spin_up().await;
     let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
 
     for (method, path) in [
         ("POST", "/api/identity/roles"),
-        ("POST", "/api/agents/employees/x/suspend"),
-        ("POST", "/api/agents/employees"),
         ("POST", "/api/storage/restore"),
     ] {
         let resp = request_with_cookie(&router, method, path, &cookie).await;
@@ -293,32 +293,6 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
             "{method} {path}: a seeded Analyst must be denied"
         );
     }
-}
-
-/// `SEC-20`, plan 97: `POST /api/agents/employees` needs `agent:manage`, both
-/// directions with real principals. A principal holding another permission is
-/// refused at the router; one holding `agent:manage` alone is let past it, so
-/// the empty body reaches the handler and is refused as a 400, not a 401 or 403.
-#[tokio::test]
-async fn creating_an_employee_needs_agent_manage_both_ways() {
-    let TestApp { router, pool } = spin_up().await;
-    let other = create_principal_with_permissions(&pool, "agent:approve").await;
-    let manager = create_principal_with_permissions(&pool, "agent:manage").await;
-
-    let cookie = session_cookie_for_user(&pool, other).await;
-    let denied = request_with_cookie(&router, "POST", "/api/agents/employees", &cookie).await;
-    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-
-    let cookie = session_cookie_for_user(&pool, manager).await;
-    let allowed = request_with_cookie_and_body(
-        &router,
-        "POST",
-        "/api/agents/employees",
-        &cookie,
-        b"{}".to_vec(),
-    )
-    .await;
-    assert_eq!(allowed.status(), StatusCode::BAD_REQUEST);
 }
 
 /// `GOV-7` D7: a role's table access is read with `identity:read` and changed
@@ -5019,4 +4993,97 @@ async fn the_pipeline_step_sql_route_authorization_is_asserted_both_ways() {
         "a pipeline:write holder must get past the gate, got {}",
         through.status()
     );
+}
+
+/// WEB-4 (regression): the routes the audit found no caller for are gone;
+/// the three employee routes and the run detail that DO have live callers
+/// are still mounted. With no credentials the gate answers 401 for a
+/// registered route, while the router's fallback — set after the gate —
+/// answers 404 for a path with no route at all. That difference is the
+/// clean "is it mounted?" probe this test asserts.
+#[tokio::test]
+async fn web4_retired_paths_are_not_registered_and_kept_paths_are() {
+    // A real harness: with no Postgres the auth extractor itself is
+    // unavailable (503), which would mask the 401-vs-404 probe below.
+    let TestApp { router, pool: _ } = spin_up().await;
+
+    for (method, path) in [
+        ("GET", "/api/agents/workflows"),
+        ("POST", "/api/agents/workflows"),
+        ("POST", "/api/agents/employees/emp-x/suspend"),
+        ("POST", "/api/agents/employees/emp-x/resume"),
+        ("POST", "/api/agents/employees/emp-x/revoke"),
+        ("GET", "/api/agents/runs"),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+    }
+
+    // `POST /api/agents/employees` is a method gone from a path that is
+    // still registered for GET (Dagster's schedule factory reads it), so
+    // axum correctly answers 405 — not the 404 an unregistered path gets.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/employees")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    // These have live consumers: Dagster's schedule factory and job
+    // (list + run), the retained run-detail page (detail + run), approvals
+    // (run detail), and the assistant's `list_workloads` (`ops/workloads`).
+    for (method, path) in [
+        ("GET", "/api/agents/employees"),
+        ("GET", "/api/agents/employees/emp-x"),
+        ("POST", "/api/agents/employees/emp-x/run"),
+        ("GET", "/api/agents/runs/run-x"),
+        ("GET", "/api/agents/approvals"),
+        ("GET", "/api/ops/workloads"),
+        ("GET", "/api/ops/services"),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+    }
+}
+
+/// WEB-4: `/api/ops/observability` still matches the `{kind}` dispatcher
+/// that serves `workloads`/`services`, so it needs a signed-in caller to
+/// reach the handler. There it is 404, distinct from a never-known kind's
+/// 400 (which the parity corpus pins).
+#[tokio::test]
+async fn web4_retired_observability_kind_answers_404_to_a_signed_in_caller() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let retired = request_with_cookie(&router, "GET", "/api/ops/observability", &cookie).await;
+    assert_eq!(retired.status(), StatusCode::NOT_FOUND);
+
+    let unknown = request_with_cookie(&router, "GET", "/api/ops/bogus-kind", &cookie).await;
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
 }
