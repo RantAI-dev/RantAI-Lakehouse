@@ -534,53 +534,6 @@ impl ChClient {
         run_cancellable(fut, cancel).await
     }
 
-    /// Run a non-`SELECT` statement with the bound values in `options.params`
-    /// (`SEC-60`). The statement goes to the engine verbatim — no `FORMAT`
-    /// wrapping, like [`ChClient::exec`] — and each `{name:Type}` placeholder
-    /// is filled by the engine from a `param_<name>=<value>` URL parameter.
-    /// Caller text therefore never enters the statement, so quotes and
-    /// backslashes in a value cannot break out of a literal.
-    ///
-    /// Only `options.params` is sent here: `exec` is used for DDL/DML that
-    /// does not run under a tile's limits or identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ChError::Transport`] on a network-level failure, or
-    /// [`ChError::Server`] when `ClickHouse` responds with a non-2xx status.
-    pub async fn exec_with_options(
-        &self,
-        sql: &str,
-        options: &QueryOptions,
-        cancel: Option<&CancellationToken>,
-    ) -> Result<(), ChError> {
-        let params = query_param_pairs(&options.params);
-        let borrowed: Vec<(&str, &str)> = params
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let fut = async {
-            let mut request = self
-                .client
-                .post(&self.url)
-                .basic_auth(&self.user, Some(&self.password))
-                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-                .header(CACHE_CONTROL, "no-store")
-                .body(sql.to_owned());
-            if !borrowed.is_empty() {
-                request = request.query(&borrowed);
-            }
-            let response = request.send().await?;
-            let status = response.status();
-            if status.is_success() {
-                return Ok(());
-            }
-            let text = response.text().await?;
-            Err(ChError::Server(server_error_message(status, &text)))
-        };
-        run_cancellable(fut, cancel).await
-    }
-
     /// Run `sql` verbatim (no `FORMAT JSON` wrapping — the caller supplies
     /// its own `FORMAT` clause) and return the raw response body bytes,
     /// unparsed.
@@ -1222,57 +1175,6 @@ mod tests {
             .exec("INSERT INTO t VALUES (1)", None)
             .await
             .unwrap();
-    }
-
-    /// SEC-60: a bound value reaches the engine as a `param_<name>` URL
-    /// parameter, never as text in the statement. A quote and a backslash are
-    /// the characters that broke the old hand-escaped SQL.
-    #[tokio::test]
-    async fn exec_with_options_sends_bound_values_as_http_parameters() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(query_param("param_id", "s'1\\2"))
-            .and(query_param("param_owner", "o'w\\ner"))
-            .and(body_string_contains("{id:String}"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let options = QueryOptions {
-            params: vec![
-                ("id".to_owned(), "s'1\\2".to_owned()),
-                ("owner".to_owned(), "o'w\\ner".to_owned()),
-            ],
-            ..QueryOptions::default()
-        };
-        client(&server.uri())
-            .exec_with_options(
-                "INSERT INTO t (id, owner) VALUES ({id:String}, {owner:String})",
-                &options,
-                None,
-            )
-            .await
-            .unwrap();
-
-        let requests = server.received_requests().await.unwrap();
-        let body = String::from_utf8(requests[0].body.clone()).unwrap();
-        assert!(
-            !body.contains("s'1\\2") && !body.contains("o'w\\ner"),
-            "raw bound values must not be written into the SQL: {body}"
-        );
-        let pairs: Vec<(String, String)> = requests[0]
-            .url
-            .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
-        assert_eq!(
-            pairs,
-            vec![
-                ("param_id".to_owned(), "s'1\\2".to_owned()),
-                ("param_owner".to_owned(), "o'w\\ner".to_owned()),
-            ]
-        );
     }
 
     #[tokio::test]

@@ -46,7 +46,7 @@ use lakehouse_core::ApiError;
 use lakehouse_llm::{
     ChatOptions, HiddenSpans, LlmMessage, LlmMessageRole, StreamPiece, ToolCall, ToolCallFunction,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
@@ -2784,39 +2784,51 @@ fn derive_title(messages: &[Value]) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// The INSERT head for [`CREATE_CHAT_SESSION_TABLE`]. The data follows on the
+/// next line as `JSONEachRow`, so no caller value is ever part of the SQL.
+const INSERT_SESSION: &str = "INSERT INTO console.chat_session \
+     (id, title, mode, messages_json, owner_id, title_locked, is_deleted) FORMAT JSONEachRow";
+
+/// One row of [`CREATE_CHAT_SESSION_TABLE`] in `ClickHouse`'s `JSONEachRow`
+/// shape (the pattern `lakehouse_bi::geo::region_inserts` uses). The field
+/// names are the table's columns; `serde_json` quotes every value, so a
+/// quote, a backslash, a newline or Unicode in a conversation cannot end a
+/// field, and the whole row stays in the POST body instead of a URL
+/// parameter (`SEC-60` review: a 200 KB `messages_json` would overflow the
+/// URL once percent-encoded).
+#[derive(Serialize)]
+struct SessionJsonRow<'a> {
+    id: &'a str,
+    title: &'a str,
+    mode: &'a str,
+    messages_json: &'a str,
+    owner_id: &'a str,
+    title_locked: u8,
+    is_deleted: u8,
+}
+
 /// Insert one full version of a session row (`ReplacingMergeTree` keeps the
 /// newest by `updated_at`).
 async fn write_session(
     ch: &ChClient,
     row: &SessionWrite<'_>,
 ) -> Result<(), lakehouse_clickhouse::ChError> {
-    // SEC-60: every column is bound, including the two booleans. The body of
-    // a conversation can hold any text at all, so it must never be printed
-    // into the statement — the engine substitutes these placeholders.
-    let sql = "INSERT INTO console.chat_session \
-         (id, title, mode, messages_json, owner_id, title_locked, is_deleted) \
-         VALUES ({id:String}, {title:String}, {mode:String}, {messages_json:String}, \
-         {owner:String}, {title_locked:UInt8}, {is_deleted:UInt8})";
-    ch.exec_with_options(
-        sql,
-        &QueryOptions {
-            params: vec![
-                ("id".to_owned(), row.id.to_owned()),
-                ("title".to_owned(), row.title.to_owned()),
-                ("mode".to_owned(), row.mode.to_owned()),
-                ("messages_json".to_owned(), row.messages_json.to_owned()),
-                ("owner".to_owned(), row.owner.to_owned()),
-                (
-                    "title_locked".to_owned(),
-                    u8::from(row.title_locked).to_string(),
-                ),
-                ("is_deleted".to_owned(), u8::from(row.deleted).to_string()),
-            ],
-            ..QueryOptions::default()
-        },
-        None,
-    )
-    .await
+    let json = serde_json::to_string(&SessionJsonRow {
+        id: row.id,
+        title: row.title,
+        mode: row.mode,
+        messages_json: row.messages_json,
+        owner_id: row.owner,
+        title_locked: u8::from(row.title_locked),
+        is_deleted: u8::from(row.deleted),
+    })
+    .map_err(|err| {
+        lakehouse_clickhouse::ChError::Server(format!(
+            "could not serialize a chat session row: {err}"
+        ))
+    })?;
+    // The statement itself has no user text; the data follows on one line.
+    ch.exec(&format!("{INSERT_SESSION}\n{json}\n"), None).await
 }
 
 struct SessionWrite<'a> {
@@ -4672,8 +4684,12 @@ mod tests {
         );
     }
 
+    /// SEC-60 review: a 200 KB conversation must not go into the URL, where
+    /// percent-encoding can push it past the HTTP/ClickHouse URI limit. The
+    /// row goes in the POST body as one `JSONEachRow` object, and `serde_json`
+    /// — not hand-escaping — handles every tricky character.
     #[tokio::test]
-    async fn write_session_sends_every_column_as_an_http_parameter() {
+    async fn write_session_sends_a_json_each_row_body_not_url_parameters() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
@@ -4681,12 +4697,17 @@ mod tests {
             .await;
 
         let id = "s'1\\2";
-        let owner = "o'w\\ner";
-        let title = "a 'quoted' \\ title";
-        let messages = r#"[{"content":"it's \\ data"}]"#;
+        let owner = "o'w\\ner\n☃";
+        let title = "a 'quoted' \\ title\nline 2";
+        let messages = serde_json::to_string(&json!([{
+            "role": "user",
+            "content": format!("it's \\ C:\\data\n100%_wild ☃ {}", "x".repeat(70_000)),
+        }]))
+        .unwrap();
+        assert!(messages.len() > 64 * 1024, "a large conversation body");
         assert!(id.contains('\'') && id.contains('\\'), "a hostile id");
         assert!(
-            owner.contains('\'') && owner.contains('\\'),
+            owner.contains('\'') && owner.contains('\\') && owner.contains('\n'),
             "a hostile owner"
         );
         write_session(
@@ -4697,7 +4718,7 @@ mod tests {
                 title,
                 title_locked: true,
                 mode: "ask",
-                messages_json: messages,
+                messages_json: &messages,
                 deleted: false,
             },
         )
@@ -4706,39 +4727,30 @@ mod tests {
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
-        let body = String::from_utf8(requests[0].body.clone()).unwrap();
-        for placeholder in [
-            "{id:String}",
-            "{title:String}",
-            "{mode:String}",
-            "{messages_json:String}",
-            "{owner:String}",
-            "{title_locked:UInt8}",
-            "{is_deleted:UInt8}",
-        ] {
-            assert!(
-                body.contains(placeholder),
-                "missing {placeholder} in {body}"
-            );
-        }
         assert!(
-            !body.contains(id)
-                && !body.contains(owner)
-                && !body.contains(title)
-                && !body.contains(messages),
-            "no raw value may be written into the SQL: {body}"
+            requests[0].url.query().is_none(),
+            "the whole row stays in the POST body, never in the URL: {:?}",
+            requests[0].url.query()
         );
-        assert_eq!(
-            bound_pairs(&requests[0]),
-            vec![
-                ("param_id".to_owned(), id.to_owned()),
-                ("param_title".to_owned(), title.to_owned()),
-                ("param_mode".to_owned(), "ask".to_owned()),
-                ("param_messages_json".to_owned(), messages.to_owned()),
-                ("param_owner".to_owned(), owner.to_owned()),
-                ("param_title_locked".to_owned(), "1".to_owned()),
-                ("param_is_deleted".to_owned(), "0".to_owned()),
-            ]
+
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        let (head, data) = body
+            .split_once('\n')
+            .expect("an INSERT head line then one JSONEachRow object");
+        assert_eq!(head, INSERT_SESSION);
+        assert!(data.ends_with('\n'), "one JSON object per line");
+        let row: Value = serde_json::from_str(data.trim_end()).expect("a JSONEachRow object");
+        assert_eq!(row.as_object().unwrap().len(), 7, "every column is named");
+        assert_eq!(row["id"], json!(id));
+        assert_eq!(row["title"], json!(title));
+        assert_eq!(row["mode"], json!("ask"));
+        assert_eq!(row["messages_json"], json!(messages));
+        assert_eq!(row["owner_id"], json!(owner));
+        assert_eq!(row["title_locked"], json!(1));
+        assert_eq!(row["is_deleted"], json!(0));
+        assert!(
+            !head.contains(id) && !head.contains(owner) && !head.contains(title),
+            "no caller value may be part of the SQL: {head}"
         );
     }
 
