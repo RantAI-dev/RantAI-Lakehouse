@@ -1164,7 +1164,7 @@ async fn bootstrap_ingest_run_service(state: &AppState) {
 /// plan T1: the schedule's nightly run reached the router and got `401`
 /// at `auth_gate`, every night, because no identity existed for it).
 ///
-/// # Why this identity gets NO scopes
+/// # Why this identity gets exactly one scope
 ///
 /// `POST /api/gold/export/{mart}` is `Policy::RequiresAuth`
 /// (`policy::POLICY_TABLE`) — a FLOOR, not a ceiling: `auth_gate` demands
@@ -1175,17 +1175,20 @@ async fn bootstrap_ingest_run_service(state: &AppState) {
 /// `Authorization: Bearer <GOLD_EXPORT_RUN_TOKEN>` clears the floor, and
 /// `x-run-token: <GOLD_EXPORT_RUN_TOKEN>` satisfies
 /// `check_export_token`'s token branch — which is what actually gates the
-/// export. An empty [`lakehouse_auth::PermissionSet`] still authenticates
-/// (`verify_service_token` builds it from `service_identity.scopes`
-/// regardless of whether that array is empty) and satisfies
-/// `RequiresAuth`; it simply satisfies no `RequiresPermission` check.
-/// Granting this identity `gold:export` would be strictly more privilege
-/// than the route it authenticates for ever inspects — a leaked
-/// `GOLD_EXPORT_RUN_TOKEN` would then also pass every permission check
-/// keyed to `gold:export` (e.g. the per-mart publication toggle this
-/// same plan gates behind it, whose UI decision is "who may switch
-/// publishing on", not "may the scheduler flip it"), instead of only the
-/// token-matched export.
+/// export. The write route inspects no permission, so it needs no scope.
+///
+/// SEC-66 made the Gold GETs permission-gated (`gold:read`), and this same
+/// schedule calls `GET /api/gold/publications` to learn which marts are
+/// switched on. A principal with no scopes authenticates but would now be
+/// refused at `auth_gate`, so this identity is seeded with exactly
+/// `gold:read` — the narrowest grant the GETs require. It deliberately
+/// does NOT get `gold:export`: a leaked `GOLD_EXPORT_RUN_TOKEN` would
+/// then also pass every permission check keyed to `gold:export` (e.g.
+/// the per-mart publication toggle, whose UI decision is "who may switch
+/// publishing on", not "may the scheduler flip it"). Migration
+/// `0153_sec66_read_permissions.sql` grants the same single scope to the
+/// identity on an existing deployment, where this bootstrap reuses rather
+/// than rewrites the row.
 ///
 /// # What happens when `GOLD_EXPORT_RUN_TOKEN` is absent
 ///
@@ -1200,7 +1203,7 @@ async fn bootstrap_gold_export_service(state: &AppState) {
         state,
         state.config.gold_export_run_token.clone(),
         GOLD_EXPORT_SERVICE_IDENTITY_NAME,
-        Vec::new(),
+        vec!["gold:read".to_owned()],
         "GOLD_EXPORT_RUN_TOKEN",
     )
     .await;
@@ -2643,12 +2646,13 @@ mod tests {
         }
 
         /// With `GOLD_EXPORT_RUN_TOKEN` set, boot seeds exactly one
-        /// identity (no scopes — see [`bootstrap_gold_export_service`]'s
-        /// doc comment for why) and one matching credential; the token
-        /// authenticates a real service principal that nonetheless does
-        /// NOT hold `gold:export` — the route it authenticates for is
-        /// gated by `check_export_token`'s token branch, not by that
-        /// permission (gold-publish-per-mart plan T1).
+        /// identity with only `gold:read` (see
+        /// [`bootstrap_gold_export_service`]'s doc comment for why) and one
+        /// matching credential; the token authenticates a real service
+        /// principal that can read the scheduler's publication list but
+        /// does NOT hold `gold:export` — the write route is gated by
+        /// `check_export_token`'s token branch, not by that permission
+        /// (gold-publish-per-mart plan T1; SEC-66 for the read scope).
         #[tokio::test]
         async fn bootstrap_gold_export_service_seeds_identity_and_credential() {
             let mut overrides = HashMap::new();
@@ -2670,7 +2674,7 @@ mod tests {
                     .fetch_one(pool)
                     .await
                     .expect("read the seeded identity's scopes");
-            assert_eq!(scopes, Vec::<String>::new());
+            assert_eq!(scopes, vec!["gold:read".to_owned()]);
 
             let principal = lakehouse_auth::service_token::verify_service_token(
                 pool,
@@ -2678,6 +2682,7 @@ mod tests {
             )
             .await
             .expect("the configured token must authenticate a real service principal");
+            assert!(principal.permissions.has("gold:read"));
             assert!(!principal.permissions.has("gold:export"));
         }
 
@@ -2716,6 +2721,7 @@ mod tests {
             )
             .await
             .expect("the original token must still authenticate after a second boot");
+            assert!(principal.permissions.has("gold:read"));
             assert!(!principal.permissions.has("gold:export"));
         }
 
