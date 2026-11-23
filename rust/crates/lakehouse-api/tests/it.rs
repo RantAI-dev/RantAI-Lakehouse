@@ -65,6 +65,7 @@ mod ai_dashboard_reach;
 mod ai_embed_tools;
 mod ai_export_tools;
 mod ai_next_step;
+mod ai_prompt_size;
 mod ai_report_tools;
 mod ai_sessions;
 mod ai_sql_help;
