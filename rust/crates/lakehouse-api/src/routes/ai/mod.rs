@@ -2823,9 +2823,10 @@ async fn write_session(
         is_deleted: u8::from(row.deleted),
     })
     .map_err(|err| {
-        lakehouse_clickhouse::ChError::Server(format!(
-            "could not serialize a chat session row: {err}"
-        ))
+        // SEC-11 / SEC-60: log the serde error's raw text, but never put it in
+        // a response. The caller gets only this fixed sentence.
+        tracing::error!(error = %err, "could not serialize a chat session row");
+        lakehouse_clickhouse::ChError::Server("could not serialize a chat session row".to_owned())
     })?;
     // The statement itself has no user text; the data follows on one line.
     ch.exec(&format!("{INSERT_SESSION}\n{json}\n"), None).await
