@@ -3,6 +3,7 @@
 import * as React from "react";
 import { cn } from "@/lib/utils";
 import { dashboardLook } from "@/lib/dashboard-look";
+import { SurfaceThemeProvider } from "@/components/ui/surface-theme";
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
 import { filterLine, issuedLine, paperContentWidth, paramLines } from "@/lib/render-summary";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
@@ -239,6 +240,7 @@ export function RenderView({ token, chart = false }: { token: string; chart?: bo
     return (
       <ReportingProvider reporting={data.reporting}>
         <RenderModeProvider value={mode}>
+        <SurfaceThemeProvider themeClass={look.surfaceThemeClass}>
           <div className={cn("w-[1200px] bg-background p-4 text-foreground", look.className)} style={look.style} data-render-chart>
             <h1 className="text-xl font-semibold">{only?.title ?? name}</h1>
             <p className="mt-1 text-xs text-muted-foreground" data-testid="render-filters">
@@ -247,6 +249,7 @@ export function RenderView({ token, chart = false }: { token: string; chart?: bo
             </p>
             <div className="mt-3 h-[480px]">{items[0]?.body}</div>
           </div>
+        </SurfaceThemeProvider>
         </RenderModeProvider>
       </ReportingProvider>
     );
@@ -258,6 +261,7 @@ export function RenderView({ token, chart = false }: { token: string; chart?: bo
   return (
     <ReportingProvider reporting={data.reporting}>
       <RenderModeProvider value={mode}>
+        <SurfaceThemeProvider themeClass={look.surfaceThemeClass}>
         <div
           className={cn("mx-auto min-h-screen bg-background p-2 text-foreground", look.className)}
           style={{ ...look.style, width }}
@@ -286,6 +290,7 @@ export function RenderView({ token, chart = false }: { token: string; chart?: bo
             ))
           )}
         </div>
+        </SurfaceThemeProvider>
       </RenderModeProvider>
     </ReportingProvider>
   );
